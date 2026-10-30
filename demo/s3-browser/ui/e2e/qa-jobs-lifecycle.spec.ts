@@ -65,7 +65,7 @@ test('lifecycle: create a rule, preview count = confirmed count = deleted count'
 
   // Sign in, open Storage → Lifecycle.
   await page.goto('/_/browse');
-  await page.getByPlaceholder('Admin password').fill(PASSWORD);
+  await page.getByLabel('Admin password', { exact: true }).fill(PASSWORD);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
   await page.goto('/_/admin/storage/lifecycle');
@@ -80,6 +80,9 @@ test('lifecycle: create a rule, preview count = confirmed count = deleted count'
   await drawer.getByPlaceholder('builds/releases/').fill('logs/');
   await drawer.getByRole('switch').first().click();
   await page.keyboard.press('Escape');
+  // While the drawer is open its footer carries the apply bar; the page bar
+  // returns once the drawer has closed.
+  await expect(drawer).toBeHidden();
 
   // The master switch, then apply. The review step names the first run.
   const master = page.getByRole('switch', { name: 'Run lifecycle rules on schedule' });

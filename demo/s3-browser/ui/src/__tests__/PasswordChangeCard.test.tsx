@@ -16,7 +16,7 @@ async function submit() {
   const user = userEvent.setup();
   await user.type(screen.getByLabelText('Current admin password'), 'old');
   await user.type(screen.getByLabelText('New admin password'), 'new');
-  await user.click(screen.getByRole('button', { name: /Change Admin Password/ }));
+  await user.click(screen.getByRole('button', { name: /Change admin password/ }));
 }
 
 test('a 409 shows the server sentence and the button is usable again', async () => {
@@ -24,7 +24,7 @@ test('a 409 shows the server sentence and the button is usable again', async () 
   renderWithQuery(<PasswordChangeCard />);
   await submit();
   expect(await screen.findByText(/would be lost at the next start/)).toBeTruthy();
-  expect(screen.getByRole('button', { name: /Change Admin Password/ }).className).not.toContain('ant-btn-loading');
+  expect(screen.getByRole('button', { name: /Change admin password/ }).className).not.toContain('ant-btn-loading');
 });
 
 test('a failure without a result body shows the error too', async () => {

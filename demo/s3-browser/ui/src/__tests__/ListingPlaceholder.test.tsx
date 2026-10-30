@@ -64,6 +64,6 @@ test('no buckets: create one, and the setup wizard for an admin', () => {
 
 test('a search with no hits says so', () => {
   mount({ searchQuery: 'zzz', prefix: 'builds/' });
-  expect(screen.getByText('No results for "zzz"')).toBeInTheDocument();
+  expect(screen.getByText('No objects or folders in releases/builds/ match "zzz".')).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: 'Go to the parent folder' })).toBeNull();
 });

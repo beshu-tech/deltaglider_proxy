@@ -209,7 +209,7 @@ A change of a bucket's encryption is a storage-section update (`PUT /_/api/admin
 
 No response carries a provider's `client_secret`: it reads `****`. An OIDC provider's `extra_config` takes `allow_local` and `ca_cert_path` for an identity provider in a private network (see [How to set up SSO](../how-to/set-up-sso.md#an-identity-provider-in-a-private-network)).
 
-A Test Connection request may carry a JSON body with the fields of the provider form (`client_id`, `client_secret`, `issuer_url`, `scopes`, `extra_config`). For a saved provider, each field in the body replaces the saved value for this test only, and the proxy saves nothing. A blank or absent `client_secret` keeps the saved secret, because the form never shows it. The answer is `200` with `{success, issuer, authorization_endpoint, error}`. A failed test, for example an unreachable issuer or a form without a client ID, has `success: false` and names the cause in `error`. An unknown provider id returns `404`.
+A test connection request may carry a JSON body with the fields of the provider form (`client_id`, `client_secret`, `issuer_url`, `scopes`, `extra_config`). For a saved provider, each field in the body replaces the saved value for this test only, and the proxy saves nothing. A blank or absent `client_secret` keeps the saved secret, because the form never shows it. The answer is `200` with `{success, issuer, authorization_endpoint, error}`. A failed test, for example an unreachable issuer or a form without a client ID, has `success: false` and names the cause in `error`. An unknown provider id returns `404`.
 
 ### OAuth redirect flow (public, no session)
 

@@ -44,13 +44,13 @@ function renderCard(originBackend: string | null, effectiveEncryption: Effective
 
 test('a bucket on a non-default backend without a route names that backend and its encryption', () => {
   renderCard('hetzner-fsn1', inheritedAesEff('hetzner-fsn1', 'k1'));
-  expect(screen.getByText('on hetzner-fsn1')).toBeInTheDocument();
-  expect(screen.queryByText(/default — local-disk/)).toBeNull();
+  expect(screen.getByText('On hetzner-fsn1')).toBeInTheDocument();
+  expect(screen.queryByText(/Default backend/)).toBeNull();
   expect(screen.getByText('Encrypted · from hetzner-fsn1')).toBeInTheDocument();
 });
 
 test('a bucket on the default backend keeps the default label', () => {
   renderCard('local-disk', eff({ backend: 'local-disk' }));
-  expect(screen.getByText('default — local-disk')).toBeInTheDocument();
+  expect(screen.getByText('Default backend · local-disk')).toBeInTheDocument();
   expect(screen.getByText('Not encrypted')).toBeInTheDocument();
 });

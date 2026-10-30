@@ -1,20 +1,12 @@
-/* DashboardGrid: density-based span collapse.
+/* DashboardGrid spans.
  *
- * Panels declare their comfortable span via `data-colspan`. When the
- * parent grid is in compact density, each span collapses to roughly
- * half (capped at 6) so 12-col rows become 6-col rows. This keeps
- * the grid's row story intact — same rows, narrower columns, without
- * media queries scattered through every panel.
+ * Every row sums to 12 and all column edges sit on the 4- or 6-column
+ * lines, at every container width above 900px. (A "compact" collapse of
+ * each span to half made rows of 9 columns and ragged edges.)
  *
  * Below ~900px the parent admin shell is already in Drawer mode;
- * the grid stays but every panel goes to `span 12` (full width).
+ * every panel goes to `span 12` (full width).
  */
-
-[data-density="compact"] > [data-colspan="12"] { grid-column: span 12; }
-[data-density="compact"] > [data-colspan="8"]  { grid-column: span 6; }
-[data-density="compact"] > [data-colspan="6"]  { grid-column: span 6; }
-[data-density="compact"] > [data-colspan="4"]  { grid-column: span 3; }
-[data-density="compact"] > [data-colspan="3"]  { grid-column: span 3; }
 
 /* Below 900px — everything stacks. The outer container is already
  * set to `maxWidth: min(100%, 2400px)` and to the viewport at this

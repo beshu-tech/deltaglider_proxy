@@ -118,21 +118,25 @@ export default function TracePanel({ onSessionExpired }: Props) {
     >
       {/* Request form — TabHeader already titles the page "Trace". */}
       <div style={cardStyle}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <FormField label="Method" helpText="The HTTP method of the sample request.">
-            <Radio.Group
-              value={method}
-              onChange={(e) => setMethod(e.target.value)}
-              optionType="button"
-              size="middle"
-            >
-              {METHODS.map((m) => (
-                <Radio.Button key={m} value={m}>
-                  {m}
-                </Radio.Button>
-              ))}
-            </Radio.Group>
-          </FormField>
+        {/* Two columns on a wide screen, one on a narrow one. Method and the
+            button take a full row. */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', columnGap: 24, rowGap: 4 }}>
+          <div style={{ gridColumn: '1 / -1' }}>
+            <FormField label="Method" helpText="The HTTP method of the sample request.">
+              <Radio.Group
+                value={method}
+                onChange={(e) => setMethod(e.target.value)}
+                optionType="button"
+                size="middle"
+              >
+                {METHODS.map((m) => (
+                  <Radio.Button key={m} value={m}>
+                    {m}
+                  </Radio.Button>
+                ))}
+              </Radio.Group>
+            </FormField>
+          </div>
 
           <FormField
             label="Path"
@@ -157,21 +161,21 @@ export default function TracePanel({ onSessionExpired }: Props) {
             <Input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="(empty)"
+              placeholder="No query string"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
             />
           </FormField>
 
           <FormField
             label="Source IP"
-            helpText="Leave empty to send the request without a source address. Rules that match on a source IP then do not match."
+            helpText="Leave empty to test without a source IP. Rules that need a source IP will not match."
             examples={['203.0.113.5', '198.51.100.42', '2001:db8::1']}
             onExampleClick={(v) => setSourceIp(String(v))}
           >
             <Input
               value={sourceIp}
               onChange={(e) => setSourceIp(e.target.value)}
-              placeholder="(none)"
+              placeholder="No source IP"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
             />
           </FormField>
@@ -191,17 +195,17 @@ export default function TracePanel({ onSessionExpired }: Props) {
             </Space>
           </FormField>
 
-          <Button
-            type="primary"
-            icon={<ExperimentOutlined />}
-            loading={running}
-            onClick={run}
-            style={{ marginTop: 8, borderRadius: 8, fontWeight: 600 }}
-            block
-            size="large"
-          >
-            Test request
-          </Button>
+          <div style={{ gridColumn: '1 / -1', marginTop: 8 }}>
+            <Button
+              type="primary"
+              icon={<ExperimentOutlined />}
+              loading={running}
+              onClick={run}
+              style={{ borderRadius: 8, fontWeight: 600 }}
+            >
+              Test request
+            </Button>
+          </div>
         </div>
       </div>
 

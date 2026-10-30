@@ -53,3 +53,38 @@ export function summaryFromResponse(resp: PrefixSavingsResponse): DeltaSummary {
     loading: false,
   };
 }
+
+/**
+ * The headline of the inspector's storage card for one object.
+ *
+ * The folder's baseline is stored whole: it is the reference that the other
+ * versions are deltas against. A "0.0% saved" in success green and a
+ * "Delta" chip told three contradicting things about it; it gets a neutral
+ * "Stored whole" headline and a "Baseline" chip instead.
+ */
+export type ObjectStorageHeadline =
+  | { kind: 'baseline'; title: string; detail: string; chip: string }
+  | { kind: 'savings'; title: string; detail: string; chip: string };
+
+export function objectStorageHeadline(o: {
+  storageType: string | undefined;
+  isBaseline: boolean;
+  savingsPct: number;
+  savedBytesText: string;
+}): ObjectStorageHeadline {
+  if (o.storageType === 'delta' && o.isBaseline) {
+    return {
+      kind: 'baseline',
+      title: 'Stored whole',
+      detail: "Reference for this folder's deltas",
+      chip: 'Baseline',
+    };
+  }
+  const type = o.storageType || 'Original';
+  return {
+    kind: 'savings',
+    title: `${o.savingsPct.toFixed(1)}%`,
+    detail: `${o.savedBytesText} saved`,
+    chip: type === 'passthrough' ? 'Original' : type.charAt(0).toUpperCase() + type.slice(1),
+  };
+}

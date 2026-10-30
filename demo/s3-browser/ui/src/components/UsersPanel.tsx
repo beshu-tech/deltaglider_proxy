@@ -1,18 +1,20 @@
 import { useEffect, useMemo, useState, useCallback } from 'react';
 import { Button, Typography, message } from 'antd';
-import { TeamOutlined, CopyOutlined } from '@ant-design/icons';
+import { UserOutlined, CopyOutlined } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
 import { getUsers } from '../adminApi';
 import type { IamUser } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useUsers, useCloneUser } from '../queries/users';
-import { useIamMode } from '../queries/config';
+import { useAdminConfig, useIamMode } from '../queries/config';
 import { qk } from '../queries/keys';
 import { userPermissionSummary, filterItems } from '../masterDetailFilter';
 import MasterDetailPanel from './MasterDetailPanel';
 import UserForm from './UserForm';
 import CredentialsModal from './CredentialsModal';
 import IamSourceBanner from './IamSourceBanner';
+import { EmptyState } from './StatePlaceholders';
+import { firstUserSwitchText } from '../firstUser';
 import { normalizeUiError } from '../errorHandling';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
@@ -41,7 +43,9 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   const [selectedId, setSelectedId] = useState<number | null>(urlUserId);
   const [creating, setCreating] = useState(false);
   const [filterText, setFilterText] = useState('');
-  const [newCreds, setNewCreds] = useState<{ ak: string; sk: string } | null>(null);
+  // `firstSwitch`: this create was the first IAM user, so the dialog also
+  // says that sign-in changed (and names the bootstrap key it kept).
+  const [newCreds, setNewCreds] = useState<{ ak: string; sk: string; firstSwitch?: { bootstrapAccessKey?: string } } | null>(null);
 
   // IAM mode banner: tells the operator where user state lives (DB in
   // `gui` mode vs YAML in `declarative`). Snapshot once via TanStack
@@ -60,6 +64,10 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   const loading = usersQuery.isLoading;
   const rawError = usersQuery.error;
   const error = rawError ? (normalizeUiError(rawError, "Failed to load users")) : '';
+  // The first create switches the proxy to IAM mode (UserForm confirms it).
+  // Only when the list is known to be empty: a failed load says nothing.
+  const isFirstUser = !loading && !rawError && usersQuery.data !== undefined && users.length === 0;
+  const bootstrapAccessKey = useAdminConfig({ enabled: isFirstUser }).data?.access_key_id ?? undefined;
 
   // Bubble up 401 to the parent so the login screen can take over. Effect, not
   // render-body: react-query keeps `error` populated across renders, so calling
@@ -115,6 +123,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   };
 
   const handleCreated = async (ak: string, sk: string) => {
+    const firstSwitch = isFirstUser ? { bootstrapAccessKey } : undefined;
     // Refetch synchronously to capture the new user's ID, then select it.
     const result = await qc.fetchQuery({ queryKey: qk.users.list(), queryFn: getUsers });
     const newUser = result.find(u => u.access_key_id === ak);
@@ -123,7 +132,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
       writeSelectionUrl(newUser.id);
     }
     setCreating(false);
-    setNewCreds({ ak, sk });
+    setNewCreds({ ak, sk, firstSwitch });
   };
 
   const handleClone = async (user: IamUser) => {
@@ -160,6 +169,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
           accessKey={newCreds.ak}
           secretKey={newCreds.sk}
           title="User created: save these credentials"
+          note={newCreds.firstSwitch ? firstUserSwitchText(newCreds.firstSwitch.bootstrapAccessKey) : undefined}
           onClose={() => setNewCreds(null)}
         />
       )}
@@ -173,6 +183,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
           onCancel={() => { void confirmDiscardEdits(IAM_DIRTY_KEYS.users).then((ok) => { if (ok) setCreating(false); }); }}
           onSavingChange={onSavingChange}
           onNavigateToGroup={onNavigateToGroup}
+          firstUser={isFirstUser ? { bootstrapAccessKey } : undefined}
         />
       ) : selectedUser ? (
         <UserForm
@@ -185,24 +196,20 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
           onNavigateToGroup={onNavigateToGroup}
         />
       ) : (
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: colors.TEXT_MUTED }}>
-          <div style={{ textAlign: 'center', maxWidth: 360, padding: 24 }}>
-            {users.length === 0 ? (
-              <>
-                <TeamOutlined style={{ fontSize: 40, marginBottom: 12, color: colors.TEXT_MUTED }} />
-                <div><Text type="secondary" style={{ fontSize: 15, fontWeight: 500 }}>{readOnly ? 'No users declared' : 'Create the first user'}</Text></div>
-                <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
-                  {readOnly
-                    ? 'Your YAML config has no users. Add them under access.iam_users and apply.'
-                    : 'Click New to create the first user. Each user gets its own credentials and permissions. Your current credentials are kept as an admin user.'}
-                </Text>
-              </>
-            ) : (
-              <Text type="secondary" style={{ fontSize: 14 }}>
-                {readOnly ? 'Select a user to view' : 'Select a user to edit, or create a new one'}
-              </Text>
-            )}
-          </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+          {users.length === 0 ? (
+            <EmptyState
+              icon={<UserOutlined />}
+              title={readOnly ? 'No users declared' : 'Create the first user'}
+              hint={readOnly
+                ? 'Your YAML config has no users. Add them under access.iam_users and apply.'
+                : 'Click New to create a user with its own credentials and permissions. The first user switches sign-in from the admin password to IAM users.'}
+            />
+          ) : (
+            <Text type="secondary" style={{ fontSize: 14 }}>
+              {readOnly ? 'Select a user to view' : 'Select a user to edit, or create a new one'}
+            </Text>
+          )}
         </div>
       )}
     </>
@@ -229,13 +236,13 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
       onSearchChange={setFilterText}
       loading={loading}
       error={error}
-      // ONE empty state (the detail pane explains) and ONE call to action
-      // (the list's "New" button): the list only says it is empty.
-      listEmptyState={(
+      // ONE empty state: with no users the detail pane explains, so the list
+      // stays blank. It speaks only when the search hides every user.
+      listEmptyState={users.length > 0 ? (
         <div style={{ padding: 20, textAlign: 'center' }}>
-          <Text type="secondary" style={{ fontSize: 13 }}>No users yet</Text>
+          <Text type="secondary" style={{ fontSize: 13 }}>No users match the search</Text>
         </div>
-      )}
+      ) : undefined}
       renderRowBody={user => {
         const isExternal = user.auth_source === 'external';
         const summary = userPermissionSummary(user);

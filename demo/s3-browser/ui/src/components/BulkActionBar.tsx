@@ -9,6 +9,7 @@ import { type BulkProgress, bulkProgressPercent, bulkProgressText } from '../bul
 import { type DeleteJobOutcome, type DeletePlanSummary, bulkDeleteConfirm, deleteJobMessage } from '../bulkDelete';
 import { type BulkTransferOutcome, bulkTransferOutcomeMessage } from '../bulkTransfer';
 import { confirmDeletePlan } from './confirmDelete';
+import { pluralize } from '../utils';
 
 interface Props {
   selectedCount: number;
@@ -38,6 +39,8 @@ interface Props {
 
 export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove, onDownloadZip, progress, onCancel, hint, currentPrefix, selectionKeys, onSessionExpired }: Props) {
   const colors = useColors();
+  // "2 selected objects" / "1 selected object": the names of the bulk buttons.
+  const selected = pluralize(selectedCount, 'selected object');
   const [modal, setModal] = useState<'copy' | 'move' | null>(null);
   const [operating, setOperating] = useState(false);
   const [downloading, setDownloading] = useState(false);
@@ -91,7 +94,10 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
   };
 
   const busy = operating || downloading;
-  const percent = progress ? bulkProgressPercent(progress) : null;
+  // While the confirmation dialog asks, it is the one surface: a second line
+  // here that says "waiting for your confirmation" is noise.
+  const shown = progress?.phase === 'confirming' ? null : progress;
+  const percent = shown ? bulkProgressPercent(shown) : null;
   const statusStyle = { fontSize: 13, fontFamily: 'var(--font-ui)', color: colors.TEXT_SECONDARY, whiteSpace: 'nowrap' } as const;
 
   return (
@@ -99,6 +105,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
       {/* Floats over the listing instead of sitting above it: an in-flow bar
           pushed every row down the moment the first box was ticked, so the
           next click landed on a different row. */}
+      {progress?.phase !== 'confirming' && (
       <div
         role="toolbar"
         aria-label="Selection actions"
@@ -112,18 +119,18 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
           boxShadow: '0 8px 28px rgba(0, 0, 0, 0.35)',
         }}
       >
-        {progress ? (
+        {shown ? (
           // A running bulk action replaces the actions: its phase, a bar and Cancel.
           <>
             <span role="status" style={statusStyle}>
-              {bulkProgressText(progress)}
+              {bulkProgressText(shown)}
             </span>
-            {progress.phase === 'confirming' ? null : percent === null ? (
+            {percent === null ? (
               // Counting: the size of a folder is unknown until it is listed.
-              <Spin size="small" aria-label={`Bulk ${progress.action} counting`} />
+              <Spin size="small" aria-label={`Bulk ${shown.action} counting`} />
             ) : (
               <Progress
-                aria-label={`Bulk ${progress.action} progress`}
+                aria-label={`Bulk ${shown.action} progress`}
                 percent={percent}
                 status="active"
                 showInfo={false}
@@ -131,17 +138,14 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
                 style={{ width: 140, margin: 0 }}
               />
             )}
-            {/* The confirmation dialog has its own Cancel. */}
-            {progress.phase !== 'confirming' && (
-              <Button
-                size="small"
-                onClick={onCancel}
-                disabled={!onCancel || progress.stopping}
-                aria-label={`Cancel ${progress.action}`}
-              >
-                Cancel
-              </Button>
-            )}
+            <Button
+              size="small"
+              onClick={onCancel}
+              disabled={!onCancel || shown.stopping}
+              aria-label={`Cancel ${shown.action}`}
+            >
+              Cancel
+            </Button>
           </>
         ) : (
           <>
@@ -159,7 +163,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
                 icon={<CopyOutlined />}
                 onClick={() => setModal('copy')}
                 disabled={busy}
-                aria-label={`Copy ${selectedCount} selected items`}
+                aria-label={`Copy ${selected}`}
               >
                 Copy
               </Button>
@@ -170,7 +174,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
                 icon={<ScissorOutlined />}
                 onClick={() => setModal('move')}
                 disabled={busy}
-                aria-label={`Move ${selectedCount} selected items`}
+                aria-label={`Move ${selected}`}
               >
                 Move
               </Button>
@@ -182,7 +186,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
                 onClick={handleZip}
                 loading={downloading}
                 disabled={busy}
-                aria-label={`Download ${selectedCount} selected items as ZIP`}
+                aria-label={`Download ${selected} as ZIP`}
               >
                 ZIP
               </Button>
@@ -196,7 +200,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
                 // Counts first (nothing is deleted), then asks with the exact number.
                 onClick={() => void handleDelete()}
                 disabled={busy}
-                aria-label={`Delete ${selectedCount} selected items`}
+                aria-label={`Delete ${selected}`}
               >
                 Delete
               </Button>
@@ -204,6 +208,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
           </>
         )}
       </div>
+      )}
 
       <DestinationPickerModal
         open={modal !== null}

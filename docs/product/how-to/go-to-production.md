@@ -34,7 +34,7 @@ Wire that into CI so that the review catches drift. Full field reference: [Confi
 
 ### 2. Pin a storage backend
 
-Decide where the bytes live and say so explicitly. Do not take the filesystem default into production. In the admin UI, add the backend on **Storage → Backends** with **Add Backend**, and select **Set as default backend**. [How to route a bucket to a different backend](route-a-bucket-to-a-backend.md) shows every step with screenshots. The backend is saved when you create it, so this step has no **Review & apply**.
+Decide where the bytes live and say so explicitly. Do not take the filesystem default into production. In the admin UI, add the backend on **Storage → Backends** with **Add backend**, and select **Set as default backend**. [How to route a bucket to a different backend](route-a-bucket-to-a-backend.md) shows every step with screenshots. The backend is saved when you create it, so this step has no **Review & apply**.
 
 In YAML, the backend goes into the `storage` section ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)). Keep the credentials out of the file with `${env:NAME}` references:
 

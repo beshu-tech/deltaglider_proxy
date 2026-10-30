@@ -362,7 +362,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   <div>
                     <div style={condLabelStyle}>
                       List prefix
-                      <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 6, opacity: 0.6 }}>
+                      <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 6 }}>
                         s3:prefix StringLike
                       </span>
                     </div>
@@ -380,7 +380,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   <div>
                     <label htmlFor={`${uid}-ip-${id}`} style={{ ...condLabelStyle, display: 'block' }}>
                       IP restriction
-                      <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 6, opacity: 0.6 }}>
+                      <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 6 }}>
                         IpAddress on aws:SourceIp
                       </span>
                     </label>
@@ -403,7 +403,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                     <div>
                       <div style={condLabelStyle}>
                         Other conditions
-                        <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 6, opacity: 0.6 }}>
+                        <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 6 }}>
                           set by the API or YAML, read-only here
                         </span>
                       </div>
@@ -442,7 +442,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
       })}
 
       <Button type="dashed" icon={<PlusOutlined />} onClick={() => onChange([...permissions, { _uiId: freshPermissionRowId(), effect: 'Allow', actions: [], resources: [] }])} block style={{ borderRadius: 8, marginBottom: 16 }}>
-        Add Permission Rule
+        Add permission rule
       </Button>
     </>
   );

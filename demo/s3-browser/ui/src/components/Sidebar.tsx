@@ -22,6 +22,7 @@ import {
 import type { BucketInfo } from '../types';
 import { useColors } from '../ThemeContext';
 import BucketEncryptionIcon from './BucketEncryptionIcon';
+import BucketPublicIcon from './BucketPublicIcon';
 import SidebarResizeHandle from './SidebarResizeHandle';
 import { describeBackend } from '../bucketBackend';
 import {
@@ -47,7 +48,7 @@ import {
 import { ApiError } from '../errorHandling';
 import CreateBucketModal from './CreateBucketModal';
 import { useNavigation } from '../NavigationContext';
-import { bucketSettingsUrl } from '../urlState';
+import { bucketSettingsUrl, parseViewLocation } from '../urlState';
 
 const { Sider } = Layout;
 const { Text } = Typography;
@@ -335,6 +336,10 @@ export default function Sidebar({
   };
 
   const activeBucket = getBucket();
+  // The upload page is a place in this sidebar: its entry is the current one
+  // there. App re-renders the sidebar on every navigation, so the URL is
+  // current here.
+  const onUploadPage = parseViewLocation(window.location.pathname).view === 'upload';
   // Backend names come with the admin bucket-origins data only.
   const groups = useMemo(() => (canAdmin ? groupBucketsByBackend(buckets) : null), [buckets, canAdmin]);
   const menuItemStyle: React.CSSProperties = {
@@ -350,6 +355,9 @@ export default function Sidebar({
   const renderBucketRow = (b: BucketInfo) => {
     const isUnavailable = Boolean(b.unavailable);
     const isActive = b.name === activeBucket;
+    // On the upload page the bucket is the target, not the current entry:
+    // it keeps its accent text and edge, the fill goes to "Upload files".
+    const isCurrent = isActive && !onUploadPage;
     // The full name first: a long one is cut with an ellipsis in the row.
     const hoverText = [
       b.name,
@@ -361,7 +369,7 @@ export default function Sidebar({
           className="btn-reset"
           onClick={() => { if (!isUnavailable) handleSelectBucket(b.name); }}
           disabled={isUnavailable}
-          aria-current={isActive ? 'true' : undefined}
+          aria-current={isCurrent ? 'true' : undefined}
           aria-disabled={isUnavailable || undefined}
           title={hoverText}
           style={{
@@ -373,16 +381,16 @@ export default function Sidebar({
             marginBottom: 2,
             cursor: isUnavailable ? 'not-allowed' : 'pointer',
             opacity: isUnavailable ? 0.5 : 1,
-            background: isActive ? `rgba(45, 212, 191, 0.1)` : 'transparent',
+            background: isCurrent ? `rgba(45, 212, 191, 0.1)` : 'transparent',
             color: isActive ? ACCENT_BLUE_LIGHT : TEXT_SECONDARY,
             transition: 'all 0.15s ease',
             borderLeft: isActive ? `2px solid ${ACCENT_BLUE}` : '2px solid transparent',
           }}
           onMouseEnter={(e) => {
-            if (!isUnavailable && !isActive) e.currentTarget.style.background = 'var(--surface-hover)';
+            if (!isUnavailable && !isCurrent) e.currentTarget.style.background = 'var(--surface-hover)';
           }}
           onMouseLeave={(e) => {
-            if (!isActive) e.currentTarget.style.background = 'transparent';
+            if (!isCurrent) e.currentTarget.style.background = 'transparent';
           }}
         >
           <span style={{
@@ -397,6 +405,7 @@ export default function Sidebar({
           }}>
             {b.name}
           </span>
+          <BucketPublicIcon bucket={b.name} canAdmin={canAdmin} />
           <BucketEncryptionIcon origin={b.backend} />
           {isUnavailable && (
             <span
@@ -544,12 +553,20 @@ export default function Sidebar({
             <button
               className="btn-reset"
               onClick={onUploadClick}
-              style={menuItemStyle}
-              onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
-              onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
+              aria-current={onUploadPage ? 'page' : undefined}
+              style={onUploadPage ? {
+                ...menuItemStyle,
+                borderRadius: 6,
+                background: 'rgba(45, 212, 191, 0.1)',
+                color: ACCENT_BLUE_LIGHT,
+                fontWeight: 600,
+                borderLeft: `2px solid ${ACCENT_BLUE}`,
+              } : { ...menuItemStyle, borderLeft: '2px solid transparent' }}
+              onMouseEnter={(e) => { if (!onUploadPage) e.currentTarget.style.color = TEXT_PRIMARY; }}
+              onMouseLeave={(e) => { if (!onUploadPage) e.currentTarget.style.color = TEXT_SECONDARY; }}
             >
               <UploadOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
-              <span>Upload Files</span>
+              <span>Upload files</span>
             </button>
           </div>
         )}
@@ -557,50 +574,21 @@ export default function Sidebar({
 
       {/* Bottom group: glass panels + branding — pinned to bottom */}
       <div style={{ marginTop: 'auto' }}>
-        {/* Branding */}
-        <div style={{ padding: '28px 16px 32px', borderTop: `1px solid ${BORDER}` }}>
-          <div style={{ fontSize: 16, fontWeight: 800, letterSpacing: 4, color: TEXT_PRIMARY, lineHeight: 1, fontFamily: "var(--font-ui)", textTransform: 'uppercase' }}>
-            DeltaGlider
-          </div>
-          {/* Tagline on its own row so the version does not steal width (avoids awkward wraps). */}
-          <div
-            style={{
-              fontSize: 10,
-              fontWeight: 600,
-              letterSpacing: 1.1,
-              color: ACCENT_BLUE,
-              textTransform: 'uppercase',
-              marginTop: 6,
-              fontFamily: "var(--font-ui)",
-              lineHeight: 1.35,
-            }}
-          >
-            Object storage control plane
-          </div>
-          {/* Version + build time come from the session-authenticated
-              whoami — never from a build-time constant, which would bake
-              the build identity into the public JS bundle. Blank until
-              whoami resolves. */}
-          <div
-            style={{
-              display: 'flex',
-              flexWrap: 'wrap',
-              alignItems: 'baseline',
-              gap: '4px 10px',
-              marginTop: 10,
-              fontSize: 10,
-              color: TEXT_FAINT,
-              fontFamily: "var(--font-mono)",
-              letterSpacing: 0.3,
-            }}
-          >
-            {proxyVersion && (
-              <span style={{ fontWeight: 400, letterSpacing: 0.5, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
-                v{proxyVersion}
-              </span>
-            )}
-            {proxyBuildTime && <span>{formatBuildTime(proxyBuildTime)}</span>}
-          </div>
+        {/* Product name and version: a tool sidebar, not a landing page. The
+            build time is in the hover text. Version and build time come from
+            the session-authenticated whoami — never from a build-time
+            constant, which would bake the build identity into the public JS
+            bundle. Blank until whoami resolves. */}
+        <div
+          style={{
+            display: 'flex', alignItems: 'baseline', gap: 8,
+            padding: '12px 16px', borderTop: `1px solid ${BORDER}`,
+            fontSize: 12, fontFamily: 'var(--font-ui)', color: TEXT_MUTED,
+          }}
+          title={proxyBuildTime ? `Built ${formatBuildTime(proxyBuildTime)}` : undefined}
+        >
+          <span style={{ fontWeight: 700, color: TEXT_SECONDARY }}>DeltaGlider</span>
+          {proxyVersion && <span style={{ fontVariantNumeric: 'tabular-nums' }}>v{proxyVersion}</span>}
         </div>
       </div>{/* end bottom group */}
     </div>

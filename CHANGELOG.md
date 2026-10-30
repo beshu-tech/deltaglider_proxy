@@ -22,6 +22,27 @@
 - The docs index showed `//api/admin/` for `/_/api/admin/*`, and page descriptions dropped the `_` of names such as `config_sync_bucket`. A summary now keeps the text of code spans.
 - The upload page no longer says that every file is compressed.
 
+### Changed — A user name follows one rule
+
+- A user name has 1 to 64 characters: letters, digits and `+ = , . @ _ -`, and it is not `.` or `..`. Create, clone and rename refuse another name with `400 invalid_request`, and the form shows the error on the field. Before, any name was accepted, for example `bad name with spaces!!`. An existing user keeps its name, and a rename to the same name still passes.
+- A clone without a name is named `<name>-copy`, then `<name>-copy2`, and so on.
+- When no IAM user exists, **Create user** asks before it continues. The first user switches sign-in from the bootstrap password to IAM users, and the bootstrap key becomes the user `legacy-admin`.
+
+### Fixed — Interface, second pass
+
+- A bucket edit that was waiting for **Review & apply** could open the review of another section with 0 changes. A hidden dirty bar kept its layout box and its buttons. A hidden bar is now hidden for the pointer, the keyboard and screen readers, and a review opens only for a section with changes.
+- After an encryption change on one bucket, the next staged apply of another bucket sent a stale copy of the first bucket. The staged edits now rebase onto the server's new rows, bucket by bucket.
+- With a rule drawer open, the dirty bar is in the drawer's footer. Before, the drawer covered a third of it.
+- Field errors show on the field, with `aria-invalid` and `aria-describedby`, in the user, group, provider and backend forms. A secret input links its error too.
+- The login page no longer scrolls at 900 px high. A wrong key or secret says so in one sentence; the request id is in the hover text.
+- The reference baseline of a folder shows "Stored whole" and a neutral **Baseline** chip, not a green 0.0 % and a **Delta** chip.
+- Small text gets a little more word spacing: at 12 px the UI font drew a space 2 px wide, so "2h 45m ago" read "2h45mago".
+- Links use the brand colour and are underlined in running text. Tags and bucket chips reach 4.5:1 contrast in both themes.
+- Public buckets show a globe in the browser sidebar. A bucket with a quota shows its usage against the quota in the header.
+- On a phone, the object list shows the size under the name, the session and event tables hide minor columns, bucket rows show two chips and "+N", and the analytics hero stacks.
+- The dashboard cards share one style and one grid. System logs expand a row on click. Unknown docs addresses and unknown admin pages show a clear message.
+- Labels and buttons use sentence case, and the browser says "objects" for objects.
+
 ### Changed — One error body for the admin API
 
 - An admin API error now always has the JSON body `{"error": <code>, "message": <text>}`. Before, an error had one of four bodies: plain text, `{"error": <text>}`, `{"error": <code>, "message": <text>}`, or an empty body for a server error. The `error` field now holds a stable machine code (for example `not_found`, `conflict` or `invalid_request`), and the text is in `message`. The codes that clients already matched on, such as `iam_declarative`, `admin_session_required` and `invalid_path`, stay in `error`. A script that showed `error` as the reason must now show `message`. See [Errors](docs/product/reference/admin-api.md#errors).

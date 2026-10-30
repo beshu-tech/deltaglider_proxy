@@ -157,7 +157,7 @@ const REPLICATION_SPEC: RuleKindSpec<ReplicationConfig, ReplicationRuleConfig> =
   applySummary: (value) => <ReplicationApplySummary replication={value} />,
   drawer: (editor) => ({ replication: editor }),
   newLabel: 'New replication rule',
-  empty: 'No replication rules yet. Use "New replication rule" to copy a bucket, or a folder of it, to another bucket.',
+  empty: 'No replication rules yet. A replication rule copies a bucket, or a folder of it, to another bucket.',
   settings: {
     switchLabel: 'Run replication rules',
     switchPath: 'storage.replication.enabled',
@@ -165,7 +165,7 @@ const REPLICATION_SPEC: RuleKindSpec<ReplicationConfig, ReplicationRuleConfig> =
       'The switch for every replication rule. While it is off, no rule copies on schedule or on events. Each rule also has its own Enabled switch.',
     tickLabel: 'Check for due rules every',
     tickPath: 'storage.replication.tick_interval',
-    tickHelp: 'How often the scheduler looks for a rule whose interval has passed. Humantime, at least 5s, e.g. 30s, 1m.',
+    tickHelp: 'How often the scheduler looks for a rule whose interval has passed. A duration such as 30s or 1m. The minimum is 5s.',
     tickPlaceholder: '30s',
   },
 };
@@ -181,7 +181,7 @@ const LIFECYCLE_SPEC: RuleKindSpec<LifecycleConfig, LifecycleRuleConfig> = {
   applySummary: (value) => <LifecycleApplySummary lifecycle={value} />,
   drawer: (editor) => ({ lifecycle: editor }),
   newLabel: 'New lifecycle rule',
-  empty: 'No lifecycle rules yet. Use "New lifecycle rule" to expire or archive objects by age.',
+  empty: 'No lifecycle rules yet. A lifecycle rule deletes or archives objects by age or by count.',
   settings: {
     switchLabel: 'Run lifecycle rules on schedule',
     switchPath: 'storage.lifecycle.enabled',
@@ -190,7 +190,7 @@ const LIFECYCLE_SPEC: RuleKindSpec<LifecycleConfig, LifecycleRuleConfig> = {
     tickLabel: 'Run each lifecycle rule every',
     tickPath: 'storage.lifecycle.tick_interval',
     tickHelp:
-      'A rule runs this long after its last run ended. A new rule first runs this long after you apply it, so you can preview it first. Humantime, at least 1m, e.g. 1h, 30m, 1d.',
+      'A rule runs this long after its last run ended. A new rule first runs this long after you apply it, so you can preview it first. A duration such as 30m, 1h or 1d. The minimum is 1m.',
     tickPlaceholder: '1h',
   },
 };
@@ -861,6 +861,9 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
   }
 
   const st = spec.settings;
+  // The list's empty state carries the "New rule" button; a failed list has
+  // no empty state, so the header keeps it then.
+  const showHeader = displayRows.length > 0 || !!jobsQuery.error;
   return (
     <div style={contentColumn(CONTENT_WIDE)}>
       {msgCtx}
@@ -879,7 +882,17 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
         onRemoveDraft={removeDraft}
         onCloneRule={cloneRuleRow}
         lifecycleVerbOf={ruleVerb}
-        bottomInset={ed.isDirty}
+        footer={
+          ed.isDirty ? (
+            <StickyDirtyBar
+              visible
+              applying={ed.applying}
+              onDiscard={discardEditor}
+              onApply={() => void startApply()}
+              inline
+            />
+          ) : undefined
+        }
         activeTab={drawerTab}
         onTabChange={handleTabChange}
         inputRadius={inputRadius}
@@ -887,23 +900,26 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
       />
 
       <div style={cardStyle}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-          <Text type="secondary" style={{ fontSize: 13, minWidth: 0 }}>
-            {/* With no rules, the list's empty state says so (once). */}
-            {displayRows.length === 0
-              ? ''
-              : `${displayRows.length} rule${displayRows.length === 1 ? '' : 's'} — select one for its definition, runs, and failures.`}
-          </Text>
-          <Button type="primary" icon={<PlusOutlined />} onClick={newRule}>
-            {spec.newLabel}
-          </Button>
-        </div>
+        {/* With no rules, the list's empty state says so (once) and carries
+            the one call to action; the header row shows only with rules. */}
+        {showHeader && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <Text type="secondary" style={{ fontSize: 13, minWidth: 0 }}>
+              {displayRows.length === 0
+                ? ''
+                : `${displayRows.length} rule${displayRows.length === 1 ? '' : 's'} — select one for its definition, runs, and failures.`}
+            </Text>
+            <Button type="primary" icon={<PlusOutlined />} onClick={newRule}>
+              {spec.newLabel}
+            </Button>
+          </div>
+        )}
 
         <FormField
           label={st.switchLabel}
           yamlPath={st.switchPath}
           helpText={st.switchHelp}
-          style={{ marginTop: 16, marginBottom: 0 }}
+          style={{ marginTop: showHeader ? 16 : 0, marginBottom: 0 }}
         >
           <Switch
             checked={ed.value.enabled}
@@ -940,14 +956,22 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string }>({
               columns={columns}
               rowKey={(d) => d.row.id}
               onRowClick={(d) => openDrawer(d.row.id)}
-              empty={spec.empty}
+              empty={
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
+                  <span>{spec.empty}</span>
+                  <Button type="primary" icon={<PlusOutlined />} onClick={newRule}>
+                    {spec.newLabel}
+                  </Button>
+                </div>
+              }
             />
           </div>
         )}
       </div>
 
+      {/* With the drawer open the bar sits in its footer (above). */}
       <StickyDirtyBar
-        visible={ed.isDirty}
+        visible={ed.isDirty && !drawerJobId}
         applying={ed.applying}
         onDiscard={discardEditor}
         onApply={() => void startApply()}

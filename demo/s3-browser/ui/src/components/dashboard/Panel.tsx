@@ -7,14 +7,14 @@
  *   - optional accent top border (for category signalling)
  *   - loading / empty / error states
  *
- * The `colSpan` + `rowSpan` props drive the grid placement. Panels
- * declare their *comfortable* span; below 1280px the parent grid
- * collapses spans to half (capped at 6) so the same row descriptions
- * still look right on a 1080p laptop.
+ * The `colSpan` + `rowSpan` props drive the grid placement. Each row
+ * of a dashboard sums to 12; below 900px every panel takes the full
+ * width (dashboard.css).
  */
 import { useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
 import { Spin } from 'antd';
+import { EmptyState } from '../StatePlaceholders';
 import { useColors } from '../../ThemeContext';
 import type { ColorTokens } from '../../ThemeContext';
 
@@ -27,13 +27,15 @@ interface Props {
   title: string;
   /** One-line muted description under the title. Keep concise. */
   subtitle?: string;
-  /** Column span at comfortable density (1280px+). Collapses to half below. */
+  /** Column span of 12. The spans of one row sum to 12. */
   colSpan: PanelSpan;
   /** Row span at comfortable density. Default 1. */
   rowSpan?: PanelRows;
   /** Right-side actions slot — tiny buttons or tag-like chips. */
   actions?: ReactNode;
-  /** Accent stripe along the top border. */
+  /** Status stripe along the top border. Set it only for a state that needs
+   *  attention (bad / warn), never for "all good": a stripe on a healthy tile
+   *  reads as "selected" or "alert". */
   accent?: PanelAccent;
   /** Shows a spinner/skeleton in place of body. */
   loading?: boolean;
@@ -57,13 +59,6 @@ export default function Panel({
 }: Props) {
   const colors = useColors();
 
-  // Grid placement. At comfortable density every panel gets its
-  // stated colSpan; at compact density the grid reads the `data-
-  // density` attribute from the parent DashboardGrid (set via a
-  // ResizeObserver) and the CSS below collapses spans to half.
-  // We encode the intended span on a data attribute so the CSS
-  // rule below can match on it — inline styles can't do media-free
-  // conditional logic.
   const accentHex = accent ? accentColor(colors, accent) : null;
   // Light theme gets a machined top inner highlight; dark a faint one.
   const isLight = colors.BG_CARD === '#ffffff';
@@ -76,9 +71,8 @@ export default function Panel({
         // Comfortable density default.
         gridColumn: `span ${colSpan}`,
         gridRow: `span ${rowSpan}`,
-        background: accentHex
-          ? `linear-gradient(180deg, ${accentHex}0d 0%, ${colors.BG_CARD} 120px)`
-          : colors.BG_CARD,
+        // One card chrome for every tile: the accent is only the top stripe.
+        background: colors.BG_CARD,
         border: `1px solid ${colors.BORDER}`,
         borderRadius: 12,
         boxShadow: `${colors.ELEV_SHADOW}, inset 0 1px 0 ${isLight ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.04)'}`,
@@ -234,43 +228,7 @@ function PanelBody({
   }
 
   if (empty) {
-    return (
-      <div
-        style={{
-          flex: 1,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          justifyContent: 'center',
-          gap: 4,
-          padding: 16,
-          textAlign: 'center',
-        }}
-      >
-        <div
-          style={{
-            fontSize: 13,
-            color: colors.TEXT_SECONDARY,
-            fontWeight: 500,
-            fontFamily: 'var(--font-ui)',
-          }}
-        >
-          {empty.title}
-        </div>
-        {empty.hint && (
-          <div
-            style={{
-              fontSize: 11,
-              color: colors.TEXT_MUTED,
-              fontFamily: 'var(--font-ui)',
-              maxWidth: 360,
-            }}
-          >
-            {empty.hint}
-          </div>
-        )}
-      </div>
-    );
+    return <EmptyState compact title={empty.title} hint={empty.hint} />;
   }
 
   return (

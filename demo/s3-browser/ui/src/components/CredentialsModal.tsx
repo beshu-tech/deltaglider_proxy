@@ -1,4 +1,5 @@
-import { Button, Modal, Space, Typography } from 'antd';
+import type { ReactNode } from 'react';
+import { Alert, Button, Modal, Space, Typography } from 'antd';
 import { CopyOutlined } from '@ant-design/icons';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 
@@ -9,6 +10,8 @@ interface CredentialsModalProps {
   secretKey: string;
   /** Dialog title, e.g. "User created: save these credentials". */
   title: string;
+  /** What else changed with this create, e.g. the first user's switch of sign-in to IAM mode. */
+  note?: ReactNode;
   onClose: () => void;
 }
 
@@ -18,7 +21,7 @@ interface CredentialsModalProps {
  * no Escape, no mask click, no close icon, and no parent re-render (a URL
  * change, a list refetch) can take it away.
  */
-export default function CredentialsModal({ accessKey, secretKey, title, onClose }: CredentialsModalProps) {
+export default function CredentialsModal({ accessKey, secretKey, title, note, onClose }: CredentialsModalProps) {
   const { copy } = useCopyToClipboard();
   return (
     <Modal
@@ -29,6 +32,7 @@ export default function CredentialsModal({ accessKey, secretKey, title, onClose 
       keyboard={false}
       footer={<Button type="primary" onClick={onClose}>I have copied it</Button>}
     >
+      {note && <Alert type="info" showIcon title={note} style={{ marginBottom: 16, borderRadius: 8 }} />}
       <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase' }}>Access key</Text>
       <Space.Compact block style={{ marginBottom: 12, alignItems: 'center' }}>
         <Text code style={{ fontFamily: 'var(--font-mono)', flex: 1, wordBreak: 'break-all' }}>{accessKey}</Text>

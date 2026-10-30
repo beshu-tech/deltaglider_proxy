@@ -112,13 +112,14 @@ test('a bucket key from the bucket card: ciphertext at rest, re-encrypt, rotate'
 
   // Sign in.
   await page.goto('/_/browse');
-  await page.getByPlaceholder('Admin password').fill(PASSWORD);
+  await page.getByLabel('Admin password', { exact: true }).fill(PASSWORD);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
 
   // Storage → Buckets → the bucket → Encryption → Encrypt with a bucket key.
   await page.goto('/_/admin/storage/buckets');
-  const row = page.getByRole('button', { name: new RegExp(`^${BUCKET} — click to edit`) });
+  // The row's name is its visible text: the bucket name, then the chips.
+  const row = page.getByRole('button', { name: new RegExp(`^${BUCKET} `), expanded: false });
   await expect(row).toContainText('Not encrypted', { timeout: 30_000 });
   await row.click();
   const group = page.getByTestId('bucket-encryption-group');
@@ -146,7 +147,7 @@ test('a bucket key from the bucket card: ciphertext at rest, re-encrypt, rotate'
 
   // Rotate: a new key and key id; the old key becomes the legacy key.
   await page.reload();
-  await page.getByRole('button', { name: new RegExp(`^${BUCKET} — click to edit`) }).click();
+  await page.getByRole('button', { name: new RegExp(`^${BUCKET} `), expanded: false }).click();
   await page.getByTestId('bucket-encryption-group').getByRole('button', { name: /Rotate key/ }).click();
   await applyNewKey(page, KEY_ID_2);
   const rotate = page.getByRole('dialog').filter({ hasText: 'Re-encrypt existing objects with the new key?' });

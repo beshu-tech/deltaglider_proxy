@@ -1,7 +1,8 @@
-import { Alert, Button, Card, Space, Typography } from 'antd';
-import { DownloadOutlined, UploadOutlined } from '@ant-design/icons';
+import { Alert, Button, Space, Typography } from 'antd';
+import { CloudDownloadOutlined, DownloadOutlined, UploadOutlined } from '@ant-design/icons';
 
-import { contentColumn, CONTENT_FORM } from './shared-styles';
+import SectionHeader from './SectionHeader';
+import { useCardStyles } from './shared-styles';
 
 const { Text } = Typography;
 
@@ -10,15 +11,18 @@ interface RecoveryPanelProps {
   onImportBackup: () => void;
 }
 
+/** The System page's Backup card: same chrome and header as the other System
+ *  cards (SystemPanel spaces them). */
 export default function RecoveryPanel({ onExportBackup, onImportBackup }: RecoveryPanelProps) {
-  // Same content column as the other System cards (was full-width).
+  const { cardStyle } = useCardStyles();
   return (
-    <div style={{ ...contentColumn(CONTENT_FORM), paddingTop: 0 }}>
-    <Card style={{ borderRadius: 12 }}>
+    <div style={{ ...cardStyle, marginBottom: 0 }}>
+      <SectionHeader
+        icon={<CloudDownloadOutlined />}
+        title="Backup"
+        description="Download a full backup bundle (configuration, users, groups and providers), or restore from a previous export."
+      />
       <Space orientation="vertical" size={16} style={{ width: '100%' }}>
-        <Text type="secondary">
-          Download a full backup bundle (config + IAM/control-plane data), or restore from a previous export.
-        </Text>
         {/* The zip is not encrypted: secrets.json and iam.json carry every
             access key, user secret and backend credential in plain text. */}
         <Text type="secondary">
@@ -35,10 +39,9 @@ export default function RecoveryPanel({ onExportBackup, onImportBackup }: Recove
         <Alert
           type="warning"
           showIcon
-          title="Restores can replace IAM users/groups/providers and configuration state for this instance."
+          title="Restores can replace the users, groups, providers and configuration of this instance."
         />
       </Space>
-    </Card>
     </div>
   );
 }

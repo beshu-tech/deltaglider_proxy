@@ -87,7 +87,7 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
             <a
               onClick={(e) => { e.preventDefault(); onSelectDoc(faqDoc.id); }}
               href="#"
-              style={{ color: colors.ACCENT_BLUE, cursor: 'pointer' }}
+              style={{ color: colors.ACCENT_BLUE, cursor: 'pointer', textDecoration: 'underline', textUnderlineOffset: 3 }}
             >
               What problem does this solve?
             </a>

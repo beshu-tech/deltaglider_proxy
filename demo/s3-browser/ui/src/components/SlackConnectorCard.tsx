@@ -259,7 +259,7 @@ export default function SlackConnectorCard({
           bound to one channel by Slack, so per-bucket/prefix routing needs the
           Web API). Collapsed by default; the channel above is the fallback. */}
       {mode === 'bot' && (
-        <AdvancedDisclosure title="Channel routing (per bucket / prefix)">
+        <AdvancedDisclosure title="Channel routing" hint="A different channel for a bucket or prefix">
           <ChannelRoutingEditor
             form={form}
             inputRadius={inputRadius}
@@ -275,7 +275,7 @@ export default function SlackConnectorCard({
       )}
 
       {/* What gets posted */}
-      <AdvancedDisclosure title="What gets posted (event kinds + prefix filters)">
+      <AdvancedDisclosure title="What gets posted" hint="Event kinds and prefix filters">
         <FormField
           label="Event kinds"
           yamlPath="advanced.event_delivery.slack_notify_kinds"

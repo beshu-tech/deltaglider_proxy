@@ -53,7 +53,7 @@ test('the refused bucket carries the chip, and its link opens the witness', asyn
       <BucketsPanel />
     </NavigationContext.Provider>,
   );
-  const releases = await screen.findByRole('button', { name: /^releases — click to edit/ });
+  const releases = await screen.findByRole('button', { name: /^releases / });
   const chip = await screen.findByTestId('witness-refused-chip');
   expect(chip).toHaveTextContent(CHIP);
   // On the releases card, the one after its status row.
@@ -67,7 +67,7 @@ test('the refused bucket carries the chip, and its link opens the witness', asyn
 test('a single instance shows no chip', async () => {
   http.on('GET', WITNESS, json(null));
   renderWithQuery(<BucketsPanel />);
-  await screen.findByRole('button', { name: /^releases — click to edit/ });
+  await screen.findByRole('button', { name: /^releases / });
   await vi.waitFor(() => expect(http.callsTo('GET', WITNESS)).toHaveLength(1));
   expect(screen.queryByTestId('witness-refused-chip')).toBeNull();
 });

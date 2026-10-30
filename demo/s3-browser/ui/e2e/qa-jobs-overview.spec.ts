@@ -59,7 +59,7 @@ test('jobs overview: palette, second tab sees a new job, 390 px layout', async (
 
   // Sign in (bootstrap password), then ⌘K → Jobs.
   await tabA.goto('/_/browse');
-  await tabA.getByPlaceholder('Admin password').fill(PASSWORD);
+  await tabA.getByLabel('Admin password', { exact: true }).fill(PASSWORD);
   await tabA.getByRole('button', { name: 'Sign in' }).click();
   await expect(tabA.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
   await tabA.goto('/_/admin/dashboard');

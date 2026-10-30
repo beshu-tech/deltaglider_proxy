@@ -66,7 +66,7 @@ ls -lh fw-1.4.0.tar
 Now back in the browser:
 
 1. In the left sidebar, click the **+** button (**Create bucket**). Type `releases` in **Bucket name** and click **Create**. The bucket appears in the sidebar. Click it.
-2. Click **Upload Files** in the sidebar.
+2. Click **Upload files** in the sidebar.
 3. In the **Files will be uploaded to** box, type `firmware/widget-3000` as the destination path. The target readout above the field changes to `releases / firmware/widget-3000/`.
 4. Drop `fw-1.4.0.tar` onto the drop zone, or click **Select files** and pick it. The page lists the file as ready to upload.
 5. Click **Upload 1 file to firmware/widget-3000/**.

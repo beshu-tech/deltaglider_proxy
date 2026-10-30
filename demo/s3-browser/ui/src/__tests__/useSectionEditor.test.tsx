@@ -194,6 +194,14 @@ describe('dirty → validate → apply', () => {
     expect(await screen.findByText(/Apply failed: .*boom/)).toBeInTheDocument();
   });
 
+  test('runApply on a clean editor validates nothing and opens no dialog', async () => {
+    http.on('POST', `${SECTION}/validate`, json({ ok: true, diff: {} }));
+    const { result } = await loaded();
+    await act(() => result.current.runApply());
+    expect(http.callsTo('POST', `${SECTION}/validate`)).toHaveLength(0);
+    expect(result.current.applyOpen).toBe(false);
+  });
+
   test('confirmApply without a validated body does nothing', async () => {
     const { result } = await loaded();
     let ok = true;

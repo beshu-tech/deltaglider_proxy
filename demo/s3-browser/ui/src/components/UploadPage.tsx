@@ -119,7 +119,9 @@ export default function UploadPage({
     setPendingFiles([]);
   };
 
-  const destLabel = normalizedDest ? `${normalizedDest}/` : '/ (bucket root)';
+  // The folder (the readout above shows the bucket), or words for the root
+  // instead of a "/ (bucket root)" that read like a path.
+  const destLabel = normalizedDest ? `${normalizedDest}/` : 'the bucket root';
 
   // Existing-folder suggestions for the destination autocomplete (debounced,
   // cached per level; free text still allowed for brand-new folders).
@@ -136,7 +138,7 @@ export default function UploadPage({
   // edited after the upload finished. Use the LAST success so a session with two
   // batches to different folders lands at the most recent one.
   const uploadedDest = succeeded[succeeded.length - 1]?.destination ?? normalizedDest;
-  const uploadedDestLabel = uploadedDest ? `${uploadedDest}/` : '/ (bucket root)';
+  const uploadedDestLabel = `${bucket}/${uploadedDest ? `${uploadedDest}/` : ''}`;
 
   // Drag-drop listeners live on the PAGE ROOT, not the dashed drop-zone box:
   // the box is hidden once files are in context (staged or uploading), but
@@ -216,17 +218,8 @@ export default function UploadPage({
 
   return (
     <div ref={pageDropRef} className="animate-fade-in" style={{ flex: 1, overflow: 'auto', padding: 'clamp(16px, 3vw, 32px)', background: BG_BASE }}>
-      {/* Breadcrumb */}
-      <nav aria-label="Upload breadcrumb">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 24 }}>
-          <Text style={{ color: TEXT_MUTED, fontSize: 13, fontFamily: "var(--font-ui)" }}>Bucket</Text>
-          <Text style={{ color: TEXT_MUTED, fontSize: 13 }} aria-hidden="true">&middot;</Text>
-          <Text style={{ color: TEXT_SECONDARY, fontSize: 13, fontFamily: "var(--font-mono)" }}>{bucket}</Text>
-          <Text style={{ color: TEXT_MUTED, fontSize: 13 }} aria-hidden="true">&middot;</Text>
-          <Text style={{ color: ACCENT_BLUE, fontSize: 13, fontWeight: 600, fontFamily: "var(--font-ui)" }} aria-current="page">Upload</Text>
-        </div>
-      </nav>
-
+      {/* No breadcrumb of its own: the header shows the bucket, and the
+          sidebar marks "Upload files" as the current page. */}
       {/* Title */}
       <Title level={1} style={{ color: TEXT_PRIMARY, margin: '0 0 4px', fontWeight: 700, fontSize: 'clamp(20px, 3vw, 24px)', fontFamily: "var(--font-ui)" }}>
         Upload to {bucket}
@@ -253,9 +246,15 @@ export default function UploadPage({
           <CloudUploadOutlined aria-hidden="true" style={{ color: ACCENT_BLUE }} />
           <Text style={{ color: TEXT_SECONDARY, fontFamily: 'var(--font-mono)' }}>{bucket}</Text>
           <Text style={{ color: TEXT_MUTED }} aria-hidden="true">/</Text>
-          <Text strong style={{ color: ACCENT_BLUE, fontFamily: 'var(--font-mono)' }} aria-live="polite">
-            {normalizedDest ? `${normalizedDest}/` : '(bucket root)'}
-          </Text>
+          {normalizedDest ? (
+            <Text strong style={{ color: ACCENT_BLUE, fontFamily: 'var(--font-mono)' }} aria-live="polite">
+              {`${normalizedDest}/`}
+            </Text>
+          ) : (
+            <Text style={{ color: TEXT_MUTED, fontFamily: 'var(--font-ui)', fontSize: 13 }} aria-live="polite">
+              bucket root
+            </Text>
+          )}
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <AutoComplete
@@ -266,7 +265,7 @@ export default function UploadPage({
               value: f,
               label: <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}>{f}</span>,
             }))}
-            placeholder="/ (bucket root)"
+            placeholder="folder/ (optional)"
             aria-label="Destination path prefix — type to autocomplete existing folders"
             status={destError ? 'error' : undefined}
             style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 13 }}
@@ -295,7 +294,7 @@ export default function UploadPage({
                 <span>You can upload to:</span>
                 {writablePrefixes.map((p) => (
                   <Button key={p} size="small" onClick={() => setDestination(p)} style={{ fontFamily: 'var(--font-mono)' }}>
-                    {p || '/ (bucket root)'}
+                    {p || 'Bucket root'}
                   </Button>
                 ))}
               </div>
@@ -573,7 +572,7 @@ export default function UploadPage({
             onClick={handleBack}
             style={{ background: BG_ELEVATED, borderColor: BORDER, color: TEXT_SECONDARY, borderRadius: 8 }}
           >
-            Back to browse
+            Back to browser
           </Button>
           {pendingCount > 0 && (
             <Text aria-live="polite" role="status" style={{ fontSize: 12, color: ACCENT_BLUE, fontFamily: "var(--font-mono)" }}>

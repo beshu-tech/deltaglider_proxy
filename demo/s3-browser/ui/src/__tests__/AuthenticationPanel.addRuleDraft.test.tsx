@@ -1,7 +1,7 @@
 /**
- * "Add Rule" used to POST an empty email_glob rule at once, so a page left
+ * "Add rule" used to POST an empty email_glob rule at once, so a page left
  * without saving kept an empty rule on the server. Now the new rule is a
- * local draft: nothing is sent until Save Rules, and Save Rules refuses a
+ * local draft: nothing is sent until Save rules, and Save rules refuses a
  * draft with no pattern.
  */
 import { screen, waitFor } from '@testing-library/react';
@@ -29,20 +29,20 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllGlobals());
 
-test('Add Rule creates nothing on the server until Save Rules', async () => {
+test('Add rule creates nothing on the server until Save rules', async () => {
   http.on('POST', '/_/api/admin/ext-auth/mappings', json({ id: 11, provider_id: null, priority: 0, match_type: 'email_glob', match_field: 'email', match_value: '*@acme.example', group_id: 3, created_at: '' }));
   const user = userEvent.setup();
   renderWithQuery(<AuthenticationPanel />);
-  await user.click(await screen.findByRole('button', { name: /Add Rule/ }));
+  await user.click(await screen.findByRole('button', { name: /Add rule/ }));
   const pattern = await screen.findByRole('textbox', { name: /Match value|Pattern/i });
   expect(http.callsTo('POST', '/_/api/admin/ext-auth/mappings')).toHaveLength(0);
 
   // An empty draft is refused, not saved.
-  await user.click(screen.getByRole('button', { name: 'Save Rules' }));
+  await user.click(screen.getByRole('button', { name: 'Save rules' }));
   expect(http.callsTo('POST', '/_/api/admin/ext-auth/mappings')).toHaveLength(0);
 
   await user.type(pattern, '*@acme.example');
-  await user.click(screen.getByRole('button', { name: 'Save Rules' }));
+  await user.click(screen.getByRole('button', { name: 'Save rules' }));
   await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/ext-auth/mappings')).toHaveLength(1));
   expect(http.callsTo('POST', '/_/api/admin/ext-auth/mappings')[0].body).toMatchObject({
     match_type: 'email_glob',

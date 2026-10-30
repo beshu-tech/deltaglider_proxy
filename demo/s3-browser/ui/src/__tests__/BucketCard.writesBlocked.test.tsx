@@ -58,13 +58,13 @@ function renderCard(writesBlocked: boolean) {
 
 test('gate armed: busy', async () => {
   renderCard(true);
-  expect(await screen.findByText(/busy/)).toBeInTheDocument();
+  expect(await screen.findByText(/Busy/)).toBeInTheDocument();
 });
 
 test('gate open while the job row is active: not busy', async () => {
   renderCard(false);
-  expect(await screen.findByText(/job finishing/)).toBeInTheDocument();
-  expect(screen.queryByText(/busy/)).toBeNull();
+  expect(await screen.findByText(/Job finishing/)).toBeInTheDocument();
+  expect(screen.queryByText(/Busy/)).toBeNull();
 });
 
 test('Cancel asks before it cancels', async () => {

@@ -3,8 +3,8 @@ import { withKeyboardSort } from '../tableSort';
 import { confirmDialog } from '../confirmDialog';
 import { Alert, Button, Input, message, Select, Space, Switch, Table, Tag, Typography } from 'antd';
 import {
-  DatabaseOutlined,
   DeleteOutlined,
+  InboxOutlined,
   ReloadOutlined,
   SearchOutlined,
   SyncOutlined,
@@ -20,6 +20,8 @@ import {
   type EventOutboxStatus,
 } from '../adminApi';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
+import { EmptyState } from './StatePlaceholders';
+import { useIsNarrow } from '../useIsNarrow';
 import { normalizeUiError } from '../errorHandling';
 import { isSessionExpired } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
@@ -74,8 +76,16 @@ function nextStep(row: EventOutboxRecord): string {
   return `queued ${fmtRelative(row.created_at)}`;
 }
 
+/** A bulk-action label: the count only when there is something to act on
+ *  (a disabled "Purge failed (0)" says the same thing twice). */
+function bulkLabel(label: string, count: number): string {
+  return count > 0 ? `${label} (${count})` : label;
+}
+
 export default function EventOutboxPanel({ onSessionExpired }: Props) {
   const colors = useColors();
+  // Phone: hide the secondary columns; the table keeps its own scroller.
+  const narrow = useIsNarrow(600);
   const [filter, setFilter] = useState('');
   const [status, setStatus] = useState<StatusFilter>('all');
   const [page, setPage] = useState(1);
@@ -180,6 +190,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       dataIndex: 'kind',
       key: 'kind',
       width: 170,
+      responsive: ['md'],
       sorter: true,
       sortOrder: sort === 'kind' ? (order === 'asc' ? 'ascend' : 'descend') : null,
       render: (_: string, row) => (
@@ -212,6 +223,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       dataIndex: 'occurred_at',
       key: 'occurred_at',
       width: 160,
+      responsive: ['sm'],
       sorter: true,
       defaultSortOrder: 'descend',
       sortOrder: sort === 'occurred_at' ? (order === 'asc' ? 'ascend' : 'descend') : null,
@@ -233,6 +245,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
     {
       title: 'Error / Payload',
       key: 'last_error',
+      responsive: ['md'],
       // No fixed width: this column takes the space that is left, so the
       // table fits the page at desktop widths.
       render: (_: unknown, row) => {
@@ -328,33 +341,6 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
 
   return (
     <div style={{ ...contentColumn(CONTENT_WIDE), padding: 'clamp(12px, 2vw, 18px)', display: 'flex', flexDirection: 'column', gap: 10 }}>
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          gap: 12,
-          padding: '10px 12px',
-          border: `1px solid ${colors.BORDER}`,
-          borderRadius: 10,
-          background: colors.BG_CARD,
-        }}
-      >
-        <Space size={10}>
-          <DatabaseOutlined style={{ color: colors.ACCENT_BLUE }} />
-          <Text strong>Object change events</Text>
-          <Tag
-            color={DELIVERY_STATE[deliveryState].color}
-            title="Delivery runs in the background. Pending rows stay queued; failed rows can be requeued."
-          >
-            delivery {DELIVERY_STATE[deliveryState].label.toLowerCase()}
-          </Tag>
-        </Space>
-        <Text type="secondary" style={{ fontSize: 12 }} title="Events are stored safely until they're delivered. Delivered events are eventually cleaned up; pending and failed events are kept so they can still be retried.">
-          Durable queue for S3 object changes
-        </Text>
-      </div>
-
       {error && <Alert type="error" showIcon title="Fetch failed" description={error} />}
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -364,7 +350,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           prefix={<SearchOutlined style={{ color: colors.TEXT_MUTED }} />}
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          style={{ width: 300 }}
+          style={{ flex: narrow ? '1 1 100%' : '0 1 300px', minWidth: 0 }}
           allowClear
         />
         <Select
@@ -374,7 +360,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
             setStatus(value);
             setPage(1);
           }}
-          style={{ width: 170 }}
+          style={{ width: 170, flex: narrow ? '1 1 140px' : undefined }}
           options={[
             { value: 'all', label: 'All statuses' },
             { value: 'pending', label: `Pending (${counts.pending})` },
@@ -383,7 +369,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
             { value: 'delivered', label: `Delivered (${counts.delivered})` },
           ]}
         />
-        <Button icon={<ReloadOutlined />} onClick={() => void refresh()} loading={loading && !autoRefresh}>
+        <Button icon={<ReloadOutlined />} onClick={() => void refresh()} loading={loading && !autoRefresh} style={{ flex: narrow ? '1 1 140px' : undefined }}>
           Refresh
         </Button>
         <Button
@@ -391,8 +377,10 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           onClick={() => void requeueVisibleFailed()}
           disabled={visibleFailedIds.length === 0}
           loading={requeueing === 'bulk'}
+          title="Requeue the failed events on this page"
+          style={{ flex: narrow ? '1 1 140px' : undefined }}
         >
-          Requeue failed shown ({visibleFailedIds.length})
+          {bulkLabel('Requeue failed', visibleFailedIds.length)}
         </Button>
         {/* eslint-disable-next-line no-restricted-syntax -- toolbar bulk action (confirmed), not a row action */}
         <Button
@@ -402,13 +390,21 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           disabled={counts.failed === 0}
           loading={requeueing === 'purge'}
           title="Permanently delete all failed events (retries exhausted)"
+          style={{ flex: narrow ? '1 1 140px' : undefined }}
         >
-          Purge failed ({counts.failed})
+          {bulkLabel('Purge failed', counts.failed)}
         </Button>
         <Space size={6}>
           <Switch id="outbox-auto-refresh" size="small" checked={autoRefresh} onChange={setAutoRefresh} />
           <label htmlFor="outbox-auto-refresh" style={{ fontSize: 12, color: colors.TEXT_MUTED }}>Auto-refresh (3s)</label>
         </Space>
+        <Tag
+          color={DELIVERY_STATE[deliveryState].color}
+          title="Delivery runs in the background. Pending events stay queued; failed events can be requeued."
+          style={{ marginInlineEnd: 0 }}
+        >
+          delivery {DELIVERY_STATE[deliveryState].label.toLowerCase()}
+        </Tag>
         <Text type="secondary" style={{ fontSize: 12 }}>
           {filtered.length} shown on this page · {total} total
         </Text>
@@ -437,22 +433,31 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           size="small"
           tableLayout="fixed"
           showSorterTooltip={false}
-          scroll={{ x: 1040 }}
+          scroll={{ x: narrow ? 'max-content' : 1040 }}
           onChange={onTableChange}
           expandable={{
             // Per-endpoint delivery state: which webhook URL or Slack channel
             // accepted the event, and why the others failed.
+            // An accessible name for the expand column's header cell.
+            columnTitle: <span className="sr-only">Details</span>,
             rowExpandable: (row) => (row.deliveries?.length ?? 0) > 0,
             expandedRowRender: (row) => <EndpointDeliveries deliveries={row.deliveries} />,
           }}
           locale={{
             // While loading the Table's own spinner overlay provides the motion;
             // a static "Loading..." underneath it just reads as a dead label.
-            emptyText: loading
-              ? ' '
-              : status === 'all' && !filter
-                ? 'No object events have been recorded yet. The proxy records events only while event delivery or replication is on.'
-                : 'No events match this view.',
+            emptyText: loading ? (
+              ' '
+            ) : status === 'all' && !filter ? (
+              <EmptyState
+                compact
+                icon={<InboxOutlined />}
+                title="No object events have been recorded yet"
+                hint="The proxy records events only while event delivery or replication is on."
+              />
+            ) : (
+              <EmptyState compact title="No events match this view" hint="Change the search or the status filter." />
+            ),
           }}
           pagination={{
             current: page,

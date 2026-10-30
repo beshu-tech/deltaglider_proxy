@@ -40,3 +40,41 @@ test('lead percent is the saved share and agrees with the pill', () => {
   expect(screen.getByText('smaller on disk')).toBeInTheDocument();
   expect(document.body.textContent).not.toMatch(/270\s*%/);
 });
+
+function renderHero(unscannedCount: number, bucketCount = 4) {
+  writeStorage('dgp-hero-animated', '1', 'session');
+  const original = 28.6 * 1024 ** 2;
+  const stored = 21 * 1024 ** 2;
+  return render(
+    <HeroSavingsPanel
+      totalOriginal={original}
+      totalStored={stored}
+      savingsPercent={summarizeScopeSavings(original, stored).pctOneDecimal}
+      monthlySavings={0}
+      costRate={0.023}
+      onChangeCostRate={() => {}}
+      totalObjects={20}
+      bucketCount={bucketCount}
+      biggestSave={null}
+      referenceShare={null}
+      unscannedCount={unscannedCount}
+      onScanMissing={() => {}}
+      liveScanning={false}
+    />,
+  );
+}
+
+// UX harvest B35: figures from usage counters were shown as facts while
+// every bucket read "not scanned".
+test('the figures are labelled an estimate while a bucket is not scanned', () => {
+  renderHero(4);
+  expect(screen.getByText('Estimated saving')).toBeInTheDocument();
+  expect(screen.getByText(/4 of 4 buckets are not scanned/)).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Scan 4 buckets' })).toBeInTheDocument();
+});
+
+test('the figures are not an estimate when every bucket is scanned', () => {
+  renderHero(0);
+  expect(screen.getByText('Storage saved')).toBeInTheDocument();
+  expect(screen.queryByText('Estimated saving')).toBeNull();
+});

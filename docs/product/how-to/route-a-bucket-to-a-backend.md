@@ -9,20 +9,20 @@ The example registers three backends: `hetzner-fsn1` (S3-compatible storage at H
 In the admin UI:
 
 1. In the sidebar, open **Storage → Backends** (`/_/admin/storage/backends`).
-2. Click **Add Backend** below the list of backends.
+2. Click **Add backend** below the list of backends.
 
-   ![The Backends page with callout 1 at the Backends entry of the sidebar and callout 2 at the Add Backend button below the backend list.](/_/screenshots/route-bucket-add-backend.webp)
+   ![The Backends page with callout 1 at the Backends entry of the sidebar and callout 2 at the Add backend button below the backend list.](/_/screenshots/route-bucket-add-backend.webp)
 
-3. In the **New Backend** form, type `hetzner-fsn1` in **Name** and select **S3** in **Type**. Fill in **Endpoint** (`https://fsn1.your-objectstorage.com`), **Region** (`fsn1`), **Access Key ID** and **Secret Access Key**. Select **Force path-style URLs**, because Hetzner is not AWS, and select **Set as default backend**.
-4. Click **Create Backend**.
+3. In the **New backend** form, type `hetzner-fsn1` in **Name** and select **S3** in **Type**. Fill in **Endpoint** (`https://fsn1.your-objectstorage.com`), **Region** (`fsn1`), **Access key ID** and **Secret access key**. Select **Force path-style URLs**, because Hetzner is not AWS, and select **Set as default backend**.
+4. Click **Create backend**.
 
-   ![The New Backend form filled in for hetzner-fsn1, with callout 3 on a box around the S3 fields and callout 4 at the Create Backend button.](/_/screenshots/route-bucket-backend-form.webp)
+   ![The New backend form filled in for hetzner-fsn1, with callout 3 on a box around the S3 fields and callout 4 at the Create backend button.](/_/screenshots/route-bucket-backend-form.webp)
 
 Before it saves an S3 backend, the page tests the connection with the keys that you typed. If the test fails, the page does not create the backend and shows the error. The server then probes the new backend again, and it refuses a backend that fails its probe. A backend that passes is saved at once and written to the config file, so the Backends page has no **Review & apply** step.
 
 Repeat steps 2 to 4 for the other two backends:
 
-- For `local-disk`, select **Filesystem** in **Type** and type `/var/lib/dgp-local` in **Data Directory**. The admin UI and `POST /_/api/admin/backends` refuse a filesystem backend whose path is not absolute. A relative path resolves against the working directory of the proxy process, and that directory is different under systemd, Docker and a shell.
+- For `local-disk`, select **Filesystem** in **Type** and type `/var/lib/dgp-local` in **Data directory**. The admin UI and `POST /_/api/admin/backends` refuse a filesystem backend whose path is not absolute. A relative path resolves against the working directory of the proxy process, and that directory is different under systemd, Docker and a shell.
 - For `aws-dr`, select **S3**, leave **Endpoint** empty, type `eu-west-1` in **Region**, and leave **Force path-style URLs** off, because AWS itself needs `false`. Every non-AWS provider (Hetzner, MinIO, Backblaze, Wasabi) needs it on.
 
 The form needs both an access key and a secret key for an S3 backend. Two options work only in YAML (see below): on AWS you can omit both keys and let the SDK pick up instance credentials, and you can keep a secret out of the file with a `${env:...}` reference.

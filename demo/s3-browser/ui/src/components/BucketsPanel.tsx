@@ -57,6 +57,8 @@ import {
   ownEncryptionMode,
   policyMustSurvive,
   policyToRow,
+  bucketRowEdited,
+  rebaseBucketRows,
 } from './bucketPolicyPayload';
 import { getSectionVersioned } from '../adminApi';
 import { applySection, sectionApplyErrorText } from '../applySection';
@@ -103,6 +105,7 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
     loading,
     error,
     rebase,
+    baseline,
   } = useSectionEditor<BucketWire, BucketPolicyRow[]>({
     section: 'storage',
     dirtyKey: 'storage/buckets',
@@ -128,6 +131,9 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
       const res = buildBucketPayload(v, baselineNamesRef.current, unmodeledNamesRef.current);
       return res.ok ? res.body : { buckets: {} };
     },
+    // An encryption change applies at once; the staged rows of the other
+    // buckets survive it, and an untouched bucket takes the server's copy.
+    rebaseMerge: rebaseBucketRows,
   });
 
   // Config (backends + default backend + global compression) from the cache.
@@ -138,7 +144,8 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
   // Backends + real bucket names from the SHARED query cache — not a per-mount
   // Promise.all. `useBucketNames` derives names from the cached origins map, so
   // this panel no longer re-fetches /buckets that other consumers already hold.
-  const fallbackBackends = useBackends().data?.backends ?? [];
+  const backendsData = useBackends().data;
+  const fallbackBackends = backendsData?.backends ?? [];
   const realBuckets = useBucketNames();
   // The backend that holds each bucket now (the server resolves routes,
   // aliases and buckets that live only on a non-default backend), and the
@@ -179,7 +186,11 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
   // uniformly. Fall back to /api/admin/backends for legacy shapes.
   const backends =
     cfg?.backends && cfg.backends.length > 0 ? cfg.backends : fallbackBackends;
-  const defaultBackend = cfg?.default_backend ?? null;
+  // `Config::default_backend_name`: the config's `default_backend`, else the
+  // first backend. The config read leaves it null on a one-backend setup,
+  // and the chip then said "on default" for every bucket.
+  const defaultBackend =
+    cfg?.default_backend ?? backendsData?.default_backend ?? backends[0]?.name ?? null;
   const globalRatio = cfg?.max_delta_ratio ?? 0.75;
   const globalCompressionOn = globalRatio > 0;
   const defaultDeltaExtensions = cfg?.delta_extensions_default ?? [];
@@ -392,8 +403,12 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
                 defaultBackend={defaultBackend}
                 originBackend={originBackendByName.get(name) ?? null}
                 effectiveEncryption={effectiveByName.get(name) ?? null}
+                // Only this bucket's own staged edits wait: the edits of
+                // other buckets survive the change (`rebaseBucketRows`).
                 encryptionBlockedReason={
-                  dirty ? 'Apply or discard the unsaved bucket changes first: an encryption change applies at once.' : null
+                  bucketRowEdited(rows, baseline, name)
+                    ? `Apply or discard the unsaved changes of ${name} first: an encryption change applies at once.`
+                    : null
                 }
                 onEncryptionApplied={(before) => void onEncryptionApplied(name, before)}
                 globalCompressionOn={globalCompressionOn}

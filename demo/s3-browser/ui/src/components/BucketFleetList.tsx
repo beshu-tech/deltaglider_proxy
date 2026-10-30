@@ -20,6 +20,7 @@ import type { AdminConfig } from '../adminApi';
 import { formatBytes, relativeTime, noun } from '../utils';
 import { fmtNum } from './dashboard/chartDefaults';
 import type { BucketRow } from './AnalyticsSection';
+import { useIsNarrow } from '../useIsNarrow';
 
 interface Props {
   bucketRows: BucketRow[];
@@ -51,6 +52,9 @@ export default function BucketFleetList({
   onStopOne,
   onScanOne,
 }: Props) {
+  // Phone: the six-column row is wider than the screen and the numbers were
+  // cut off at the right; a two-line row keeps them visible.
+  const narrow = useIsNarrow(600);
   const maxOriginal = Math.max(1, ...bucketRows.map(r => r.totalOriginal));
   return (
     <div
@@ -77,6 +81,7 @@ export default function BucketFleetList({
           backendOf={backendOf}
           onStopOne={onStopOne}
           onScanOne={onScanOne}
+          narrow={narrow}
         />
       ))}
     </div>
@@ -94,6 +99,7 @@ function FleetRow({
   backendOf,
   onStopOne,
   onScanOne,
+  narrow,
 }: {
   b: BucketRow;
   rank: number;
@@ -105,6 +111,8 @@ function FleetRow({
   backendOf: (bucket: string) => string | null;
   onStopOne: (bucket: string) => void;
   onScanOne: (bucket: string) => void;
+  /** Under 600px: name, saved % and action on line 1; bar and bytes on line 2. */
+  narrow: boolean;
 }) {
   const [hover, setHover] = useState(false);
   const hasData = b.totalOriginal > 0;
@@ -127,10 +135,20 @@ function FleetRow({
       onMouseLeave={() => setHover(false)}
       style={{
         display: 'grid',
-        gridTemplateColumns:
-          '20px minmax(130px, 0.9fr) minmax(180px, 1.6fr) minmax(150px, auto) 58px 30px',
+        ...(narrow
+          ? {
+              gridTemplateColumns: 'minmax(0, 1fr) auto 30px',
+              gridTemplateAreas: '"name pct action" "bar bytes bytes"',
+              columnGap: 10,
+              rowGap: 6,
+            }
+          : {
+              gridTemplateColumns:
+                '20px minmax(130px, 0.9fr) minmax(180px, 1.6fr) minmax(150px, auto) 58px 30px',
+              gridTemplateAreas: '"rank name bar bytes pct action"',
+              gap: 14,
+            }),
         alignItems: 'center',
-        gap: 14,
         padding: '9px 10px',
         margin: '0 -10px',
         borderRadius: 8,
@@ -142,6 +160,8 @@ function FleetRow({
       {/* rank */}
       <span
         style={{
+          gridArea: 'rank',
+          display: narrow ? 'none' : undefined,
           fontFamily: 'var(--font-mono)',
           fontSize: 10,
           color: colors.TEXT_FAINT,
@@ -152,7 +172,7 @@ function FleetRow({
       </span>
 
       {/* name + chips */}
-      <div style={{ minWidth: 0 }}>
+      <div style={{ gridArea: 'name', minWidth: 0 }}>
         <div
           style={{
             display: 'flex',
@@ -223,7 +243,7 @@ function FleetRow({
       </div>
 
       {/* ratio bar + footprint under-bar */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
+      <div style={{ gridArea: 'bar', display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
         <div
           role="img"
           aria-label={
@@ -305,6 +325,7 @@ function FleetRow({
       {/* bytes before → after */}
       <span
         style={{
+          gridArea: 'bytes',
           fontFamily: 'var(--font-mono)',
           fontSize: 11,
           fontWeight: 500,
@@ -330,6 +351,7 @@ function FleetRow({
       {/* saved % */}
       <span
         style={{
+          gridArea: 'pct',
           fontFamily: 'var(--font-mono)',
           fontSize: 13,
           fontWeight: 700,
@@ -348,6 +370,7 @@ function FleetRow({
           danger
           icon={<StopOutlined />}
           onClick={() => onStopOne(b.bucket)}
+          style={{ gridArea: 'action' }}
           title={`Stop scanning ${b.bucket}`}
         />
       ) : isQueuedNonHead ? (
@@ -356,6 +379,7 @@ function FleetRow({
           type="default"
           icon={<StopOutlined />}
           onClick={() => onStopOne(b.bucket)}
+          style={{ gridArea: 'action' }}
           title={`Remove ${b.bucket} from scan queue`}
         />
       ) : (
@@ -364,6 +388,7 @@ function FleetRow({
           type="text"
           icon={b.completedAt ? <ReloadOutlined /> : <PlayCircleOutlined />}
           onClick={() => onScanOne(b.bucket)}
+          style={{ gridArea: 'action' }}
           title={
             b.completedAt
               ? `Re-scan ${b.bucket} (currently ${relativeTime(b.completedAt)})`

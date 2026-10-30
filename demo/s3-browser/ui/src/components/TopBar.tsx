@@ -2,13 +2,14 @@ import { useRef, useState, useEffect } from 'react';
 import { flushSync } from 'react-dom';
 import { Layout, Space, Button, Input, theme } from 'antd';
 import type { InputRef } from 'antd';
-import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, QuestionCircleOutlined, SettingOutlined } from '@ant-design/icons';
+import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, QuestionCircleOutlined, SettingOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
 import { metaKeyLabel } from '../platform';
 import Breadcrumb from './Breadcrumb';
 import DeltaSavingsChip from './DeltaSavingsChip';
 import BucketUsageChip from './BucketUsageChip';
+import BucketPublicIcon from './BucketPublicIcon';
 import type { DeltaSummary } from '../deltaSummary';
-import { useColors } from '../ThemeContext';
+import { useColors, useTheme } from '../ThemeContext';
 import { useDocumentEvent } from '../useDocumentEvent';
 import { isTypingTarget, anyOverlayOpen } from '../keyboard';
 import { useIsNarrow } from '../useIsNarrow';
@@ -97,6 +98,7 @@ function SearchInput({
 export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, onShowShortcuts, accountMenu, onOpenSettings, deltaSummary = null }: Props) {
   const { token } = theme.useToken();
   const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
+  const { isDark, toggleTheme } = useTheme();
   // Open when the URL already carries a filter (?q= from a deep link, reload
   // or Back): a filtered list with no visible search box looked like missing
   // files.
@@ -154,22 +156,27 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
           </>
         )}
         {!isMobile && (
-          searchOpen ? (
-            <SearchInput
-              inputRef={inputRef}
-              placeholder="Filter objects and folders..."
-              value={searchQuery}
-              onChange={onSearchChange}
-              onClose={handleCloseSearch}
-              style={{ maxWidth: 400 }}
-            />
-          ) : (
-            <>
-              <Breadcrumb bucket={bucket} prefix={prefix} onNavigate={onNavigate} canAdmin={canAdmin} />
-              {bucket && <BucketUsageChip bucket={bucket} canAdmin={canAdmin} inFolder={!!prefix} />}
-              {!hideSavingsChip && <DeltaSavingsChip summary={deltaSummary} />}
-            </>
-          )
+          <>
+            {/* The breadcrumb stays while the filter is open: the filter
+                works on this folder, so the folder stays named. */}
+            <Breadcrumb bucket={bucket} prefix={prefix} onNavigate={onNavigate} canAdmin={canAdmin} />
+            {searchOpen ? (
+              <SearchInput
+                inputRef={inputRef}
+                placeholder="Filter this folder"
+                value={searchQuery}
+                onChange={onSearchChange}
+                onClose={handleCloseSearch}
+                style={{ flex: '1 1 240px', maxWidth: 360, minWidth: 160 }}
+              />
+            ) : (
+              <>
+                {bucket && <BucketPublicIcon bucket={bucket} canAdmin={canAdmin} label />}
+                {bucket && <BucketUsageChip bucket={bucket} canAdmin={canAdmin} inFolder={!!prefix} />}
+                {!hideSavingsChip && <DeltaSavingsChip summary={deltaSummary} />}
+              </>
+            )}
+          </>
         )}
       </div>
 
@@ -178,7 +185,7 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
         {isMobile && searchOpen ? (
           <SearchInput
             inputRef={inputRef}
-            placeholder="Filter..."
+            placeholder="Filter this folder"
             value={searchQuery}
             onChange={onSearchChange}
             onClose={handleCloseSearch}
@@ -218,6 +225,16 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
             style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
           />
         )}
+        {/* Phones keep the header for navigation; the account menu has the toggle. */}
+        {!isMobile && <Button
+          type="text"
+          icon={isDark ? <SunOutlined /> : <MoonOutlined />}
+          size="small"
+          title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          onClick={toggleTheme}
+          style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
+        />}
         {onOpenSettings && (
           <Button
             type="text"

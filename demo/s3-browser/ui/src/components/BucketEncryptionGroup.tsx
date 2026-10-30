@@ -53,6 +53,11 @@ import { formRow } from './ruleEditorHelpers';
 
 const { Text } = Typography;
 
+/** A radio beside a two-line (or taller) option: the dot sits on the
+ *  title line, not centred on the whole block (it read as the radio of
+ *  the prefix input below the title). */
+const RADIO_TOP = { icon: { alignSelf: 'flex-start', marginTop: 3 } } as const;
+
 interface Props {
   bucket: string;
   /** The server's answer; null = the bucket routes to an undefined backend. */
@@ -235,6 +240,14 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
     <div style={{ marginTop: 14 }} data-testid="bucket-encryption-group">
       <Text style={groupLabel}>
         Encryption
+        {/* Marks the one immediate control of a card whose other fields are
+            staged, before the user touches it. */}
+        <Tag
+          title="An encryption change is not staged with the other settings: it has its own Review & apply, and applies at once."
+          style={{ fontSize: 10, margin: '0 0 0 8px', padding: '0 6px', lineHeight: '16px', textTransform: 'none', letterSpacing: 0, fontWeight: 500 }}
+        >
+          applies at once
+        </Tag>
         {eff.key_env && (
           <Tag style={{ fontSize: 10, fontFamily: 'var(--font-mono)', margin: '0 0 0 8px', padding: '0 6px', lineHeight: '16px', textTransform: 'none', letterSpacing: 0 }}>
             from env {eff.key_env}
@@ -277,6 +290,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
               // A Radio's own `disabled` wins over the group's, so repeat it.
               disabled={!!blocked || readOnly || !!blockedReason || busy}
               style={{ alignItems: 'flex-start' }}
+              styles={RADIO_TOP}
               title={blocked ?? undefined}
             >
               <div>

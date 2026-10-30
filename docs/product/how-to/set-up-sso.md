@@ -51,16 +51,16 @@ In the default IAM mode (`gui`), providers live in the encrypted config database
 In the admin UI:
 
 1. In the sidebar, open **Access → External authentication** (`/_/admin/access/external-auth`), and click **Add provider**.
-2. Fill in the form. **Display Name** is the label of the sign-in button (`Okta` gives **Sign in with Okta**). **Provider Name (unique identifier)** is the name in URLs and in YAML (`okta`). **Issuer URL**, **Client ID** and **Client Secret** come from step 1. **Scopes** needs at least `openid email`; add `profile`, and `groups` when you map on groups. Leave **Enabled** on.
+2. Fill in the form. **Display name** is the label of the sign-in button (`Okta` gives **Sign in with Okta**). **Provider name** is the unique name in URLs and in YAML (`okta`). **Issuer URL**, **Client ID** and **Client secret** come from step 1. **Scopes** needs at least `openid email`; add `profile`, and `groups` when you map on groups. Leave **Enabled** on.
 3. Click **Create**.
 
-   ![The External authentication page with the form of a new Okta provider; callout 1 marks the Add provider button, callout 2 the provider fields from Display Name to Scopes, and callout 3 the Create button.](/_/screenshots/sso-add-provider.webp)
+   ![The External authentication page with the form of a new Okta provider; callout 1 marks the Add provider button, callout 2 the provider fields from Display name to Scopes, and callout 3 the Create button.](/_/screenshots/sso-add-provider.webp)
 
-The form shows the **Callback URL (register this with your provider)** below **Scopes**, with a button that copies it. It is the URL of step 1.
+The form shows the **Callback URL** below **Scopes**, with a button that copies it. It is the URL of step 1.
 
 The form has no priority field. In the admin API and in YAML, `priority` sets the order of the buttons on the login page: a provider with a higher number is shown first.
 
-Click **Test Connection**, before or after you save. The proxy tests the values that are in the form at that moment and saves nothing. A blank client secret keeps the saved secret for the test. The proxy fetches the issuer's `.well-known/openid-configuration` and reports DNS, TLS, or connectivity problems before any person tries to log in. The error names the underlying cause, for example `invalid peer certificate: UnknownIssuer` for a certificate from a CA that the proxy does not trust. Test Connection also works in declarative IAM mode, because it changes nothing. In the admin API, `POST /_/api/admin/ext-auth/providers/:id/test` tests a saved provider, and an optional JSON body with the form fields replaces the saved values for that test only. `POST /_/api/admin/ext-auth/providers/test` tests a provider that is not saved yet. A test that fails answers `200` with `success: false` and the reason in `error`.
+Click **Test connection**, before or after you save. The proxy tests the values that are in the form at that moment and saves nothing. A blank client secret keeps the saved secret for the test. The proxy fetches the issuer's `.well-known/openid-configuration` and reports DNS, TLS, or connectivity problems before any person tries to log in. The error names the underlying cause, for example `invalid peer certificate: UnknownIssuer` for a certificate from a CA that the proxy does not trust. Test Connection also works in declarative IAM mode, because it changes nothing. In the admin API, `POST /_/api/admin/ext-auth/providers/:id/test` tests a saved provider, and an optional JSON body with the form fields replaces the saved values for that test only. `POST /_/api/admin/ext-auth/providers/test` tests a provider that is not saved yet. A test that fails answers `200` with `success: false` and the reason in `error`.
 
 The proxy checks the issuer URL when you save the provider. By default the issuer must use `https://` and a public address, because the proxy refuses requests to private, loopback, and cloud-metadata addresses. A provider that breaks this rule is refused with `422` and a message that names the rule. The client secret is never returned in a response: the API shows `****` in its place.
 
@@ -100,11 +100,11 @@ Mapping rules decide which IAM groups an identity joins, based on its claims. Ac
 
 In the admin UI:
 
-1. On **Access → External authentication**, click **Add Rule** next to **Allowed Users & Group Assignment**. A new, empty rule appears as a row. The proxy does not store it until you click **Save Rules**, so if you leave the page first, the rule is gone.
+1. On **Access → External authentication**, click **Add rule** next to **Allowed users and group assignment**. A new, empty rule appears as a row. The proxy does not store it until you click **Save rules**, so if you leave the page first, the rule is gone.
 2. Fill in the row. In **Match type**, select **Claim value**. Type `groups` in **Claim field** and `engineering` in **Match value**. In **Assign to group**, select `Engineering`. In **Provider**, select `Okta`, or **All providers**.
-3. Click **Save Rules**.
+3. Click **Save rules**.
 
-   ![A new mapping rule assigns everyone whose groups claim contains engineering to the Engineering group; callout 1 marks the Add Rule button, callout 2 the rule, and callout 3 the Save Rules button.](/_/screenshots/sso-mapping-rule.webp)
+   ![A new mapping rule assigns everyone whose groups claim contains engineering to the Engineering group; callout 1 marks the Add rule button, callout 2 the rule, and callout 3 the Save rules button.](/_/screenshots/sso-mapping-rule.webp)
 
 The match types are **Email pattern** (`*` matches any characters, for example `*@acme.example`), **Email domain**, **Email exact**, **Email regex**, and **Claim value**. A claim-value rule matches when the claim is a string equal to the value, or a list that contains the value, without regard to case. It does not support wildcards. Rules that read the email match only when the provider marks the email as verified.
 
@@ -158,7 +158,7 @@ The screenshot shows the button only. It does not show a completed sign-in, beca
 
 Have `dana` click it. She authenticates at the provider, consents, and is redirected back. On success:
 
-- A row appears under **Login Activity** on the **External authentication** page, linking the provider's subject ID to a DeltaGlider user.
+- A row appears under **Login activity** on the **External authentication** page, linking the provider's subject ID to a DeltaGlider user.
 - The matching mapping rules apply, so `dana` is now a member of `Engineering`.
 - She gets a session cookie and lands in the file browser. Only a user with admin permissions (direct or through a group) gets an admin session. Every other user gets a browser-only session, which opens the file browser with the user's own S3 permissions and refuses the admin API with `403`. The bulk copy, move, delete, and ZIP actions of the file browser work in that session, under the same permissions.
 
@@ -170,7 +170,7 @@ These three failures come from the provider side:
 
 1. **`invalid_redirect_uri` at the provider.** The registered URI does not match `https://s3.acme.example/_/api/admin/oauth/callback` byte for byte. Check trailing slashes and `http` versus `https`. If a reverse proxy fronts DeltaGlider, also confirm it forwards the same `Host` header the user sees. The proxy builds the callback URL from the `Host` header. It uses `X-Forwarded-Host` and `X-Forwarded-Proto` only when `DGP_TRUST_PROXY_HEADERS=true` and the request comes from a network in `DGP_TRUSTED_PROXY_CIDRS`, because otherwise any client could choose the host that receives the authorization code.
 2. **Azure `groups` claim missing.** Azure AD omits groups by default; in the app registration go to Token configuration → Add groups claim, then retry the flow.
-3. **"Code exchange failed" on the error page, or a failed Test Connection.** The proxy could not reach the provider. Read the error first: it names the cause (DNS, a refused connection, a refused private address, or a TLS error such as `UnknownIssuer`). A `curl` from the proxy container is not a reliable check. `curl` trusts the operating system's certificate store and connects to private addresses, but the proxy does neither unless you set `ca_cert_path` and `allow_local` (see [An identity provider in a private network](#an-identity-provider-in-a-private-network)). So `curl` can succeed while the proxy fails. If `curl` fails too, fix DNS, the network, or the certificate first, because the problem is not in OAuth.
+3. **"Code exchange failed" on the error page, or a failed Test connection.** The proxy could not reach the provider. Read the error first: it names the cause (DNS, a refused connection, a refused private address, or a TLS error such as `UnknownIssuer`). A `curl` from the proxy container is not a reliable check. `curl` trusts the operating system's certificate store and connects to private addresses, but the proxy does neither unless you set `ca_cert_path` and `allow_local` (see [An identity provider in a private network](#an-identity-provider-in-a-private-network)). So `curl` can succeed while the proxy fails. If `curl` fails too, fix DNS, the network, or the certificate first, because the problem is not in OAuth.
 
 For Google, the proxy asks for the account chooser (`prompt=select_account`), so a browser that is signed in to a personal and a work account asks which one to use. Without it, Google signs in with the browser's current account. To send another `prompt` value, or none, set `prompt` in the provider's `extra_config` (an empty string sends none). Other providers get no `prompt` unless you set one, because not every provider accepts `select_account`.
 

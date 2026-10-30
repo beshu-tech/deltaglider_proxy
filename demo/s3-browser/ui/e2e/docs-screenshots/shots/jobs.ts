@@ -188,8 +188,10 @@ async function migrateRunning(page: Page): Promise<void> {
 }
 
 async function openBucket(page: Page, name: string): Promise<void> {
-  await page.getByRole('button', { name: new RegExp(`^${name} — click to edit`) }).click();
-  await page.getByRole('button', { name: new RegExp(`^${name} — click to collapse`) }).waitFor();
+  // The row's name is its visible text: the bucket name, then the chips.
+  const row = new RegExp(`^${name} `);
+  await page.getByRole('button', { name: row, expanded: false }).click();
+  await page.getByRole('button', { name: row, expanded: true }).waitFor();
 }
 
 async function migrateModal(page: Page): Promise<void> {
@@ -434,7 +436,7 @@ export const JOBS_SHOTS: Shot[] = [
     setup: (page) => openBucket(page, 'db-archive'),
     annotations: [
       { target: nav('Buckets'), kind: 'callout', label: '1', side: 'right' },
-      { target: { role: 'button', name: /^db-archive — click to/ }, kind: 'callout', label: '2', side: 'left' },
+      { target: { role: 'button', name: /^db-archive / }, kind: 'callout', label: '2', side: 'left' },
       { target: { role: 'button', name: 'Migrate data…' }, kind: 'box', label: '3' },
     ],
   },

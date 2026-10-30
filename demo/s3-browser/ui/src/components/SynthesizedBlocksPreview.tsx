@@ -11,11 +11,12 @@
  * at a glance, but the rows are locked and link to the Storage tab
  * where the source-of-truth lives.
  */
-import { Tag, Typography } from 'antd';
+import { Typography } from 'antd';
 import { LockOutlined, RightOutlined } from '@ant-design/icons';
 import type { AdminConfig } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { numericCompare } from '../utils';
+import { ActionBadge } from './AdmissionBlockList';
 
 const { Text } = Typography;
 
@@ -82,11 +83,12 @@ export default function SynthesizedBlocksPreview({
             gridTemplateColumns: 'auto 1fr auto auto',
             gap: 12,
             alignItems: 'center',
-            opacity: 0.75,
+            // No opacity: it faded the tag text to 2.5:1. The lock icon
+            // marks the row read-only.
           }}
           aria-label={`public-access rule ${row.name}`}
         >
-          <span title="Read-only — edit via Storage → Buckets" style={{ display: 'inline-flex' }}>
+          <span title="Read-only: edit it in the bucket settings" style={{ display: 'inline-flex' }}>
             <LockOutlined style={{ color: TEXT_MUTED, fontSize: 14 }} />
           </span>
           <div style={{ minWidth: 0 }}>
@@ -99,7 +101,7 @@ export default function SynthesizedBlocksPreview({
               >
                 {row.name}
               </Text>
-              <Tag color="green">allow-anonymous</Tag>
+              <ActionBadge action="allow-anonymous" />
             </div>
             <Text
               type="secondary"
@@ -119,7 +121,7 @@ export default function SynthesizedBlocksPreview({
           </div>
           <span />
           <button
-            title="Edit this bucket's public prefixes in Storage"
+            title="Edit this bucket's public prefixes"
             onClick={() => onEditInStorage(row.bucket)}
             style={{
               background: 'transparent',
@@ -130,10 +132,10 @@ export default function SynthesizedBlocksPreview({
               display: 'flex',
               alignItems: 'center',
               gap: 4,
-              fontSize: 11,
+              fontSize: 12,
             }}
           >
-            Storage <RightOutlined />
+            Bucket settings <RightOutlined />
           </button>
         </div>
       ))}

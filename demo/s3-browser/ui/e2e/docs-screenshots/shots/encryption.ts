@@ -246,7 +246,7 @@ async function exampleOrigins(page: Page, applied: () => boolean = () => false):
 }
 
 async function openDbArchive(page: Page): Promise<void> {
-  await page.getByRole('button', { name: /^db-archive — click to edit/ }).click();
+  await page.getByRole('button', { name: /^db-archive /, expanded: false }).click();
   await page.getByTestId('bucket-encryption-group').waitFor();
 }
 
@@ -301,11 +301,11 @@ export const BUCKET_ENCRYPTION_SHOTS: Shot[] = [
     },
     // The seed routes db-archive to local-disk: crop to the row header
     // (its route chip hidden) and the Encryption group.
-    clip: { union: [{ role: 'button', name: /^db-archive — click to collapse/ }, { testId: 'bucket-encryption-group' }] },
+    clip: { union: [{ role: 'button', name: /^db-archive / }, { testId: 'bucket-encryption-group' }] },
     clipPadding: 48,
     mask: [{ text: /LOCAL-DISK/i }],
     annotations: [
-      { target: { role: 'button', name: /^db-archive — click to collapse/ }, kind: 'callout', label: '1', side: 'left' },
+      { target: { role: 'button', name: /^db-archive / }, kind: 'callout', label: '1', side: 'left' },
       { target: { text: 'Encrypt with a bucket key', exact: true }, kind: 'callout', label: '2', side: 'right' },
     ],
   },

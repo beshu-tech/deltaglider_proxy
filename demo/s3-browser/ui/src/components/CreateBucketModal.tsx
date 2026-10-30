@@ -241,7 +241,7 @@ export default function CreateBucketModal({
                 <div>
                   <div>{opt.data.label}</div>
                   {opt.data.sublabel && (
-                    <div style={{ fontSize: 11, opacity: 0.65 }}>{opt.data.sublabel}</div>
+                    <Text type="secondary" style={{ fontSize: 11, display: 'block' }}>{opt.data.sublabel}</Text>
                   )}
                 </div>
               )}

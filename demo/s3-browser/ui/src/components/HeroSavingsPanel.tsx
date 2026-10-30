@@ -39,6 +39,7 @@ import {
   useTransform,
   animate,
 } from 'motion/react';
+import { Button } from 'antd';
 import { SettingOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { formatBytes, clamp, noun } from '../utils';
@@ -58,6 +59,31 @@ const COST_PRESETS = [
 ] as const;
 
 const SESSION_GATE_KEY = 'dgp-hero-animated';
+/** Under this hero width the two zones stack (phone, narrow panel). */
+const STACK_BELOW_PX = 600;
+/** Mono 10 px uppercase with 0.08em tracking: about 7 px per character. */
+const BAR_LABEL_CHAR_PX = 7;
+const BAR_LABEL_PAD_PX = 24;
+
+/** True when an in-bar label fits its segment; a cut label ("KEPT 2 B") lies. */
+function barLabelFits(segmentPx: number, text: string): boolean {
+  return segmentPx >= text.length * BAR_LABEL_CHAR_PX + BAR_LABEL_PAD_PX;
+}
+
+/** Content width of an element, tracked with a ResizeObserver (0 until measured). */
+function useElementWidth(el: HTMLElement | null): number {
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(entries => {
+      const w = entries[0]?.contentRect.width ?? 0;
+      if (w > 0) setWidth(prev => (Math.abs(prev - w) < 0.5 ? prev : w));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [el]);
+  return width;
+}
 const ANIMATION_MS = 1400;
 const EASE = [0.16, 1, 0.3, 1] as const;
 
@@ -207,19 +233,13 @@ function HeroInner({
   // like the keptWidth/savedWidth transforms above.
   const leadString = targetPercent.toFixed(1);
   const [leftCol, setLeftCol] = useState<HTMLDivElement | null>(null);
-  const [leftColWidth, setLeftColWidth] = useState(0);
-  useEffect(() => {
-    if (!leftCol) return;
-    const ro = new ResizeObserver(entries => {
-      const w = entries[0]?.contentRect.width ?? 0;
-      if (w > 0) {
-        setLeftColWidth(prev => (Math.abs(prev - w) < 0.5 ? prev : w));
-      }
-    });
-    ro.observe(leftCol);
-    return () => ro.disconnect();
-  }, [leftCol]);
+  const leftColWidth = useElementWidth(leftCol);
   const heroFontSize = heroFontPx(leadString.length, leftColWidth);
+  const [root, setRoot] = useState<HTMLDivElement | null>(null);
+  const rootWidth = useElementWidth(root);
+  const stacked = rootWidth > 0 && rootWidth < STACK_BELOW_PX;
+  const [bar, setBar] = useState<HTMLDivElement | null>(null);
+  const barWidth = useElementWidth(bar);
 
   // ─── Empty state ─────────────────────────────────────────────────
   if (!hasData) {
@@ -236,6 +256,16 @@ function HeroInner({
   const savedBytes = Math.max(0, totalOriginal - totalStored);
   const keptPct = 100 - targetSavedWidth;
   const yearlySavings = targetDollars * 12;
+  // Totals of a bucket without a scan come from its usage counters: an
+  // estimate, so the hero says so until every bucket is scanned.
+  const estimated = unscannedCount > 0;
+  const keptLabel = `kept ${formatBytes(totalStored)}`;
+  const savedLabel = `saved ${formatBytes(savedBytes)}`;
+  // Before the bar is measured, fall back to the share thresholds.
+  const showKeptLabel = barWidth > 0 ? barLabelFits((barWidth * keptPct) / 100, keptLabel) : keptPct >= 14;
+  const showSavedLabel = barWidth > 0
+    ? barLabelFits((barWidth * targetSavedWidth) / 100, savedLabel)
+    : targetSavedWidth >= 22;
 
   // The two bills the dollar line tells: what you'd pay WITHOUT compression
   // (struck through) vs. what you actually pay WITH it (the green headline).
@@ -254,9 +284,10 @@ function HeroInner({
 
   return (
     <div
+      ref={setRoot}
       style={{
         display: 'grid',
-        gridTemplateColumns: 'minmax(240px, 0.9fr) 1.6fr',
+        gridTemplateColumns: stacked ? 'minmax(0, 1fr)' : 'minmax(240px, 0.9fr) 1.6fr',
         gap: 'clamp(20px, 2.5vw, 44px)',
         alignItems: 'center',
         height: '100%',
@@ -296,14 +327,14 @@ function HeroInner({
             fontWeight: 800,
             letterSpacing: '0.16em',
             textTransform: 'uppercase',
-            color: colors.SAVED_TEXT,
+            color: estimated ? colors.ACCENT_AMBER : colors.SAVED_TEXT,
           }}
         >
-          Storage saved
+          {estimated ? 'Estimated saving' : 'Storage saved'}
         </div>
         <m.div
           aria-live="polite"
-          aria-label={`${targetPercent.toFixed(1)} percent smaller on disk`}
+          aria-label={`${estimated ? 'About ' : ''}${targetPercent.toFixed(1)} percent smaller on disk`}
           animate={settled ? { scale: [1, 1.015, 1] } : undefined}
           transition={{ duration: 0.32, ease: 'easeOut' }}
           style={{
@@ -406,6 +437,7 @@ function HeroInner({
             </span>
           </div>
           <div
+            ref={setBar}
             role="img"
             aria-label={`${formatBytes(totalStored)} stored from ${formatBytes(totalOriginal)} original — ${targetPercent.toFixed(1)} percent saved`}
             style={{
@@ -434,7 +466,7 @@ function HeroInner({
               }}
               title={`Kept on disk: ${formatBytes(totalStored)}`}
             >
-              {keptPct >= 14 && (
+              {showKeptLabel && (
                 <span
                   style={{
                     ...monoLabel,
@@ -444,7 +476,7 @@ function HeroInner({
                     whiteSpace: 'nowrap',
                   }}
                 >
-                  kept {formatBytes(totalStored)}
+                  {keptLabel}
                 </span>
               )}
             </m.div>
@@ -462,7 +494,7 @@ function HeroInner({
               }}
               title={`Saved: ${formatBytes(savedBytes)}`}
             >
-              {targetSavedWidth >= 22 && (
+              {showSavedLabel && (
                 <span
                   style={{
                     ...monoLabel,
@@ -472,7 +504,7 @@ function HeroInner({
                     whiteSpace: 'nowrap',
                   }}
                 >
-                  saved {formatBytes(savedBytes)}
+                  {savedLabel}
                 </span>
               )}
               {/* Shimmer sweep after settle, then a faint slow loop. */}
@@ -729,15 +761,32 @@ function HeroInner({
             />
           </>
         )}
-        {unscannedCount > 0 && (
-          <>
-            <Dot colors={colors} />
-            <span style={{ color: colors.ACCENT_AMBER }}>
-              {unscannedCount} bucket{unscannedCount === 1 ? '' : 's'} not scanned
-            </span>
-          </>
-        )}
       </div>
+      {estimated && (
+        <div
+          role="note"
+          style={{
+            gridColumn: '1 / -1',
+            display: 'flex',
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: 10,
+            fontSize: 12.5,
+            lineHeight: 1.45,
+            color: colors.TEXT_SECONDARY,
+            zIndex: 1,
+          }}
+        >
+          <span style={{ flex: '1 1 260px' }}>
+            {unscannedCount} of {bucketCount} {noun(bucketCount, 'bucket')}{' '}
+            {unscannedCount === 1 ? 'is' : 'are'} not scanned. Their sizes come from the live usage
+            counters, so these figures are an estimate. A scan gives the exact figures.
+          </span>
+          <Button size="small" onClick={onScanMissing}>
+            Scan {unscannedCount} {noun(unscannedCount, 'bucket')}
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

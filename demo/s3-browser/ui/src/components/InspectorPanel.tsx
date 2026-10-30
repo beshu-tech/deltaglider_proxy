@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Drawer, Button, Modal, message, Tag, Skeleton, Input, Spin } from 'antd';
-import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CopyOutlined, LoadingOutlined, EyeOutlined } from '@ant-design/icons';
+import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CheckOutlined, CopyOutlined, LoadingOutlined, EyeOutlined } from '@ant-design/icons';
 import { deleteObject, getDownloadUrl, getPresignedUrl, getObjectUrl, headObject, getBucket } from '../s3client';
 import { GlobalOutlined } from '@ant-design/icons';
 import { formatBytes, getFileName, downloadFromUrl } from '../utils';
@@ -21,6 +21,7 @@ import { activateOnKey } from '../keyboard';
 import { passthroughReason, passthroughSentence } from '../passthroughReason';
 import { useNavigation } from '../NavigationContext';
 import { bucketSettingsUrl } from '../urlState';
+import { objectStorageHeadline } from '../deltaSummary';
 
 const SHARE_DURATIONS = [
   { label: '1 hour', seconds: 3600 },
@@ -188,15 +189,19 @@ function ShareDurationButton({
             overflow: 'hidden',
           }}
         >
-          <div style={{ padding: '8px 14px 4px', fontSize: 11, color: textMuted, fontFamily: 'var(--font-ui)' }}>
+          <div style={{ padding: '10px 14px 6px', fontSize: 12, fontWeight: 600, color: textMuted, fontFamily: 'var(--font-ui)' }}>
             Link expires after
           </div>
-          {durations.map((d) => (
+          {durations.map((d) => {
+            // The main Share button uses the last (longest) duration: the
+            // list marks it, so the default is visible before a choice.
+            const isDefault = d.seconds === durations[durations.length - 1].seconds;
+            return (
             <div
               key={d.seconds}
               role="option"
               tabIndex={0}
-              aria-selected={false}
+              aria-selected={isDefault}
               onClick={() => { onSelect(d.seconds); setOpen(false); }}
               onKeyDown={activateOnKey(() => { onSelect(d.seconds); setOpen(false); })}
               style={{
@@ -206,19 +211,20 @@ function ShareDurationButton({
                 fontFamily: 'var(--font-ui)',
                 color: textPrimary,
                 display: 'flex',
-                justifyContent: 'space-between',
                 alignItems: 'center',
-                borderBottom: `1px solid ${border}`,
+                gap: 10,
+                fontWeight: isDefault ? 600 : 400,
+                borderTop: `1px solid ${border}`,
               }}
               onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = `${accentBlue}18`; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = 'transparent'; }}
             >
+              <CheckOutlined aria-hidden="true" style={{ fontSize: 12, width: 12, color: accentBlue, visibility: isDefault ? 'visible' : 'hidden' }} />
               <span>{d.label}</span>
-              {d.seconds === durations[durations.length - 1].seconds && (
-                <span style={{ fontSize: 11, color: textMuted, fontFamily: 'var(--font-ui)' }}>default</span>
-              )}
+              {isDefault && <span style={{ marginLeft: 'auto', fontSize: 12, color: textMuted }}>Default</span>}
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
@@ -323,7 +329,7 @@ export default function InspectorPanel({
     // metadata for the wrong file. Capture a flag, only commit when alive.
     let cancelled = false;
     setHeadReadable(false);
-    // Seed from the listing's facts so Storage Stats renders at once; one
+    // Seed from the listing's facts so Storage stats renders at once; one
     // HEAD per opened object fills in the full header view.
     const seed = listedFacts.current;
     setHeadData(seed.storageType ? { headers: {}, ...seed } : null);
@@ -396,8 +402,19 @@ export default function InspectorPanel({
   const dgMeta = getDgMetadata(headers);
   const userMeta = getUserMetadata(headers);
 
-  const storageTypeLabel = storageType || 'Original';
-  const storageTypeColor = STORAGE_TYPE_COLORS[storageType || 'passthrough'] || STORAGE_TYPE_DEFAULT;
+  const headline = objectStorageHeadline({
+    storageType,
+    isBaseline,
+    savingsPct: savings,
+    savedBytesText: formatBytes(savedBytes),
+  });
+  const baselineHeadline = headline.kind === 'baseline';
+  // The baseline is neither a saving nor a delta: neutral colours, not the
+  // success green and the Delta palette.
+  const neutralChip = { bg: 'transparent', border: BORDER, text: TEXT_MUTED };
+  const storageTypeColor = baselineHeadline
+    ? neutralChip
+    : STORAGE_TYPE_COLORS[storageType || 'passthrough'] || STORAGE_TYPE_DEFAULT;
   // Once the HEAD resolves, an object stored as `passthrough` (e.g. a `.sha512`
   // checksum sidecar, an already-compressed asset, or any non-delta-eligible
   // file) has NO compression to report — stored == original. Showing a
@@ -611,7 +628,7 @@ export default function InspectorPanel({
 
             {/* STORAGE STATS */}
             {bucketPolicyLoading ? (
-              <InspectorSection title="Storage Stats">
+              <InspectorSection title="Storage stats">
                 <div style={{
                   background: BG_SIDEBAR, borderRadius: 10, padding: '24px 16px',
                   display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
@@ -623,7 +640,7 @@ export default function InspectorPanel({
                 </div>
               </InspectorSection>
             ) : compressionEnabled ? (
-              <InspectorSection title="Storage Stats">
+              <InspectorSection title="Storage stats">
                 {headLoading && Object.keys(headers).length === 0 && storedSize == null ? (
                   /* Spin only while the HEAD is in flight AND we have nothing
                    * renderable yet. If the listing's facts already seeded a
@@ -646,13 +663,18 @@ export default function InspectorPanel({
                     textAlign: 'center',
                   }}>
                     <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1, color: TEXT_MUTED, textTransform: 'uppercase', marginBottom: 4, fontFamily: "var(--font-ui)" }}>
-                      Savings
+                      {baselineHeadline ? 'Baseline' : 'Savings'}
                     </div>
-                    <div style={{ fontSize: 32, fontWeight: 800, color: ACCENT_GREEN, lineHeight: 1.1, fontFamily: "var(--font-mono)" }}>
-                      {savings.toFixed(1)}%
+                    <div
+                      data-testid="inspector-headline"
+                      style={baselineHeadline
+                        ? { fontSize: 24, fontWeight: 700, color: TEXT_PRIMARY, lineHeight: 1.2, fontFamily: 'var(--font-ui)' }
+                        : { fontSize: 32, fontWeight: 800, color: ACCENT_GREEN, lineHeight: 1.1, fontFamily: 'var(--font-mono)' }}
+                    >
+                      {headline.title}
                     </div>
-                    <div style={{ fontSize: 11, color: TEXT_MUTED, marginBottom: 12, fontFamily: "var(--font-mono)" }}>
-                      {formatBytes(savedBytes)} saved
+                    <div style={{ fontSize: baselineHeadline ? 12 : 11, color: TEXT_MUTED, marginBottom: 12, fontFamily: baselineHeadline ? 'var(--font-ui)' : 'var(--font-mono)' }}>
+                      {headline.detail}
                     </div>
                     {/* Visual comparison bar */}
                     <div style={{ marginBottom: 10 }}>
@@ -676,7 +698,7 @@ export default function InspectorPanel({
                           height: '100%',
                           borderRadius: 3,
                           width: `${effectiveStored != null && originalSize > 0 ? Math.min(100, Math.max(2, (effectiveStored / originalSize) * 100)) : 100}%`,
-                          background: ACCENT_GREEN,
+                          background: baselineHeadline ? `${TEXT_MUTED}99` : ACCENT_GREEN,
                           transition: 'width 0.4s ease-out',
                         }} />
                       </div>
@@ -689,12 +711,12 @@ export default function InspectorPanel({
                       borderRadius: 6,
                       fontFamily: "var(--font-mono)",
                     }}>
-                      {storageTypeLabel.charAt(0).toUpperCase() + storageTypeLabel.slice(1)}
+                      {headline.chip}
                     </Tag>
                     {storageType === 'delta' && (
                       <div style={{ fontSize: 11, color: TEXT_MUTED, marginTop: 10, lineHeight: 1.5, textAlign: 'left', fontFamily: 'var(--font-ui)' }}>
                         {isBaseline
-                          ? 'This file is the baseline of its folder: it is stored in full once, and later versions in the folder are stored as deltas against it.'
+                          ? 'This file is stored in full once. Later versions in this folder are stored as deltas against it, so they take little space.'
                           : 'This figure is for this file alone. It does not include the baseline that all versions in this folder share, so bucket and folder totals are lower.'}
                       </div>
                     )}
@@ -734,7 +756,7 @@ export default function InspectorPanel({
             )}
 
             {/* OBJECT INFO */}
-            <InspectorSection title="Object Info">
+            <InspectorSection title="Object info">
               <InfoRow
                 label="Last modified"
                 value={object.lastModified ? new Date(object.lastModified).toLocaleString() : '--'}
@@ -742,7 +764,7 @@ export default function InspectorPanel({
             </InspectorSection>
 
             {/* S3 METADATA */}
-            <InspectorSection title="S3 Metadata">
+            <InspectorSection title="S3 metadata">
               {headLoading ? (
                 <Skeleton active paragraph={{ rows: 1 }} />
               ) : (
@@ -754,7 +776,7 @@ export default function InspectorPanel({
             </InspectorSection>
 
             {/* CUSTOM METADATA (DG + User) */}
-            <InspectorSection title="Custom Metadata">
+            <InspectorSection title="Custom metadata">
               {headLoading ? (
                 <Skeleton active paragraph={{ rows: 2 }} />
               ) : (

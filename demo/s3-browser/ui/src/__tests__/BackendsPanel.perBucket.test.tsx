@@ -108,3 +108,18 @@ test('a plaintext new default backend is confirmed and sends route:default', asy
   await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/backends')).toHaveLength(1));
   expect(http.callsTo('POST', '/_/api/admin/backends')[0].headers['x-dgp-confirm-encryption-downgrade']).toBe('route:default');
 });
+
+/** UX harvest B66: Create is never a silent disabled button. A click with
+ *  empty required fields marks them on the field and sends nothing. */
+test('Create with an empty name and path marks both fields and sends nothing', async () => {
+  const user = userEvent.setup();
+  renderWithQuery(<BackendsPanel />);
+  await user.click(await screen.findByTestId('backends-add'));
+  const create = screen.getByTestId('backend-create');
+  expect(create).toBeEnabled();
+  await user.click(create);
+  expect(screen.getByText('Enter a name for the backend.')).toBeInTheDocument();
+  expect(screen.getByTestId('backend-name')).toHaveAttribute('aria-invalid', 'true');
+  expect(screen.getByTestId('backend-path')).toHaveAttribute('aria-invalid', 'true');
+  expect(http.callsTo('POST', '/_/api/admin/backends')).toHaveLength(0);
+});

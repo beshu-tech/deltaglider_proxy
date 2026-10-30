@@ -75,8 +75,9 @@ interface Props {
   onCancelJob?: (row: JobRow) => Promise<unknown> | void;
   /** What a lifecycle rule does to an object (meter words). */
   lifecycleVerbOf?: (row: JobRow) => LifecycleVerb | undefined;
-  /** The page's unsaved-changes bar is showing: keep the last fields clear of it. */
-  bottomInset?: boolean;
+  /** Pinned under the body: the rule page's unsaved-changes bar, so it sits
+   *  inside the drawer instead of half under its edge. */
+  footer?: React.ReactNode;
   /** Currently active tab (URL-deep-linked). */
   activeTab?: string;
   /** Called when the user switches tabs. */
@@ -105,7 +106,7 @@ export default function JobDrawer({
   onCloneRule,
   onCancelJob,
   lifecycleVerbOf,
-  bottomInset,
+  footer,
   activeTab,
   onTabChange,
   inputRadius,
@@ -404,8 +405,7 @@ export default function JobDrawer({
       // 100%, not 100vw: the drawer sits left of a classic scrollbar, and
       // 100vw pushed its left edge off a phone screen.
       size="min(640px, 100%)"
-      // Room under the last field for the page's floating unsaved-changes bar.
-      styles={bottomInset ? { body: { paddingBottom: 96 } } : undefined}
+      footer={footer}
       extra={
         parsed && ruleKind && onCloneRule && onRemoveDraft ? (
           <RowActionsMenu

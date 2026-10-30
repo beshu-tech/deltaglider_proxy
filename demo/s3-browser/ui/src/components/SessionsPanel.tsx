@@ -77,11 +77,24 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
   };
 
   const columns = [
-    { title: 'Session', dataIndex: 'id', key: 'id', render: (v: string) => <Text code>{v}</Text> },
+    {
+      title: 'Session',
+      dataIndex: 'id',
+      key: 'id',
+      // nowrap: a 12-character id broke into three lines on a phone.
+      render: (v: string, r: SessionSummary) => (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
+          <Text code style={{ whiteSpace: 'nowrap' }}>{v}</Text>
+          {r.current && <Tag style={{ margin: 0 }}>you</Tag>}
+        </span>
+      ),
+    },
     {
       title: 'Auth',
       dataIndex: 'auth',
       key: 'auth',
+      // Secondary columns step aside on a narrow screen (AntD breakpoints).
+      responsive: ['sm' as const],
       render: (v: string, r: SessionSummary) => (
         <Space size={4}>
           {/* Neutral chips: red and amber are kept for real problems. */}
@@ -91,37 +104,44 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
       ),
     },
     { title: 'Identity', dataIndex: 'identity', key: 'identity', render: (v: string | null) => v ?? <Text type="secondary">—</Text> },
-    { title: 'IP', dataIndex: 'ip', key: 'ip', render: (v: string | null) => v ?? <Text type="secondary">—</Text> },
-    { title: 'Age', dataIndex: 'age_secs', key: 'age', render: (v: number) => formatDuration(v) },
+    { title: 'IP', dataIndex: 'ip', key: 'ip', responsive: ['md' as const], render: (v: string | null) => v ?? <Text type="secondary">—</Text> },
+    { title: 'Age', dataIndex: 'age_secs', key: 'age', responsive: ['md' as const], render: (v: number) => formatDuration(v) },
     {
-      title: '',
+      title: 'Actions',
       key: 'action',
       align: 'right' as const,
-      // The server refuses to revoke the caller's own session (use Sign out),
-      // so that row is labelled instead of offering a button that errors.
-      render: (_: unknown, r: SessionSummary) =>
-        r.current ? (
-          <Text type="secondary">This session</Text>
-        ) : (
-          <RowActionsMenu
-            label={`More actions for session ${r.id}`}
-            loading={busy === r.id}
-            actions={[
-              {
-                key: 'revoke',
-                label: 'Sign out this session…',
-                icon: <LogoutOutlined />,
-                danger: true,
-                confirm: {
-                  title: 'Sign out this session?',
-                  content: `Session ${r.id}${r.identity ? ` (${r.identity})` : ''} is signed out immediately.`,
-                  okText: 'Sign out',
+      width: 80,
+      // Every row has the same "⋯" menu. The server refuses to revoke the
+      // caller's own session, so that row's item is off and says why (the
+      // "you" tag in the Session cell marks the row).
+      render: (_: unknown, r: SessionSummary) => (
+        <RowActionsMenu
+          label={`More actions for session ${r.id}`}
+          loading={busy === r.id}
+          actions={[
+            r.current
+              ? {
+                  key: 'revoke',
+                  label: 'Your session: use Sign out in the account menu',
+                  icon: <LogoutOutlined />,
+                  disabled: true,
+                  onSelect: () => {},
+                }
+              : {
+                  key: 'revoke',
+                  label: 'Sign out this session…',
+                  icon: <LogoutOutlined />,
+                  danger: true,
+                  confirm: {
+                    title: 'Sign out this session?',
+                    content: `Session ${r.id}${r.identity ? ` (${r.identity})` : ''} is signed out immediately.`,
+                    okText: 'Sign out',
+                  },
+                  onSelect: () => revokeOne(r.id),
                 },
-                onSelect: () => revokeOne(r.id),
-              },
-            ]}
-          />
-        ),
+          ]}
+        />
+      ),
     },
   ];
 
@@ -131,19 +151,28 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
         <Button icon={<ReloadOutlined />} onClick={() => void sessions.refetch()} loading={loading}>Refresh</Button>
         <Text type="secondary">{rows.length} live session{rows.length === 1 ? '' : 's'}</Text>
       </Space>
-      <Table rowKey="id" size="small" columns={columns} dataSource={rows} loading={loading} pagination={false} />
-      <Space.Compact style={{ maxWidth: 480 }}>
-        <Input
-          aria-label="Identity to force-logout"
-          placeholder="identity to force-logout: access_key_id, or provider:user-id for external users"
-          value={revokeKey}
-          onChange={(e) => setRevokeKey(e.target.value)}
-          onPressEnter={() => void revokeUser()}
-        />
-        <Button danger loading={busy === 'user'} disabled={!revokeKey.trim()} onClick={() => void revokeUser()}>
-          Revoke key
-        </Button>
-      </Space.Compact>
+      <Table rowKey="id" size="small" columns={columns} dataSource={rows} loading={loading} pagination={false} scroll={{ x: 'max-content' }} />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 480, width: '100%' }}>
+        <label htmlFor="sessions-revoke-identity" style={{ fontSize: 13.5, fontWeight: 600 }}>
+          Sign out every session of an identity
+        </label>
+        <Space.Compact style={{ width: '100%' }}>
+          <Input
+            id="sessions-revoke-identity"
+            aria-describedby="sessions-revoke-identity-help"
+            placeholder="Access key or provider:user"
+            value={revokeKey}
+            onChange={(e) => setRevokeKey(e.target.value)}
+            onPressEnter={() => void revokeUser()}
+          />
+          <Button danger loading={busy === 'user'} disabled={!revokeKey.trim()} onClick={() => void revokeUser()}>
+            Revoke key
+          </Button>
+        </Space.Compact>
+        <Text id="sessions-revoke-identity-help" type="secondary" style={{ fontSize: 12.5 }}>
+          An IAM user&apos;s access key ID, or provider:user-id for a user who signs in with an external provider.
+        </Text>
+      </div>
     </div>
   );
 }

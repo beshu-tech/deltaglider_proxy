@@ -70,9 +70,12 @@ export default function DeltaSavingsChip({ summary }: Props) {
         background: palette.bg,
         border: `1px solid ${palette.border}`,
         color: palette.text,
-        fontFamily: 'var(--font-mono)',
-        fontSize: 11,
+        // The UI face and the Delta chip's palette: the pill is a summary of
+        // the Delta rows below it, not a code value.
+        fontFamily: 'var(--font-ui)',
+        fontSize: 12,
         fontWeight: 600,
+        fontVariantNumeric: 'tabular-nums',
         lineHeight: 1,
         whiteSpace: 'nowrap',
         flexShrink: 0,

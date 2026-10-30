@@ -265,7 +265,6 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
                 aria-label="Resource pattern"
                 value={row.text}
                 filterText={row.text}
-                autoComplete={`dgp-resource-${row.id}`}
                 onChange={(v) => updateRow(row.id, v)}
                 onBlur={() => normalizeRowOnBlur(row.id)}
                 optionGroups={optionGroups}

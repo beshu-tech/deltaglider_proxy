@@ -147,6 +147,8 @@ export default function CommandPalette({
   const colors = useColors();
   const [query, setQuery] = useState('');
   const [cursor, setCursor] = useState(0);
+  // Enter with no match: say so, instead of doing nothing visible.
+  const [nothingToRun, setNothingToRun] = useState(false);
   const [recentIds, setRecentIds] = useState<string[]>(() => loadRecents());
   const inputRef = useRef<import('antd').InputRef>(null);
 
@@ -273,6 +275,7 @@ export default function CommandPalette({
       e.preventDefault();
       const pick = items[cursor];
       if (pick) runAndRemember(pick.command);
+      else setNothingToRun(true);
     } else if (e.key === 'Escape') {
       onClose();
     }
@@ -307,6 +310,7 @@ export default function CommandPalette({
           onChange={(e) => {
             setQuery(e.target.value);
             setCursor(0);
+            setNothingToRun(false);
           }}
           onKeyDown={onKeyDown}
           autoFocus
@@ -334,15 +338,22 @@ export default function CommandPalette({
         }}
       >
         {items.length === 0 ? (
-          <div
-            style={{
-              padding: 40,
-              textAlign: 'center',
-              color: colors.TEXT_MUTED,
-              fontSize: 13,
-            }}
-          >
-            No matches. Try a shorter query.
+          <div role="status" style={{ padding: '32px 24px', textAlign: 'center', fontFamily: 'var(--font-ui)' }}>
+            <div style={{ color: colors.TEXT_PRIMARY, fontSize: 14, fontWeight: 600 }}>
+              No pages or actions match &ldquo;{query.trim()}&rdquo;.
+            </div>
+            <div
+              style={{
+                marginTop: 6,
+                fontSize: 12.5,
+                color: nothingToRun ? colors.ACCENT_AMBER : colors.TEXT_MUTED,
+                fontWeight: nothingToRun ? 600 : 400,
+              }}
+            >
+              {nothingToRun
+                ? 'Nothing to run. Change the search, or press Esc to close.'
+                : 'Try fewer letters or a different word.'}
+            </div>
           </div>
         ) : (
           (() => {
@@ -385,9 +396,12 @@ export default function CommandPalette({
           <kbd>↑</kbd> <kbd>↓</kbd> navigate · <kbd>Enter</kbd> run ·{' '}
           <kbd>Esc</kbd> close
         </span>
-        <span>
-          {items.length} result{items.length === 1 ? '' : 's'}
-        </span>
+        {/* The empty state already says "no match"; a "0 results" here only repeats it. */}
+        {items.length > 0 && (
+          <span>
+            {items.length} result{items.length === 1 ? '' : 's'}
+          </span>
+        )}
       </div>
     </Modal>
   );

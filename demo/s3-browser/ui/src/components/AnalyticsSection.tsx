@@ -369,7 +369,16 @@ export default function AnalyticsSection({ config }: Props) {
           and one quiet footer strip of derived facts. Animation fires
           once per session; honours prefers-reduced-motion.
       */}
-      <Panel title="Total savings" colSpan={12} rowSpan={3} accent="green">
+      <Panel
+        title="Total savings"
+        subtitle={
+          unscannedCount > 0 && totalOriginal > 0
+            ? 'Estimate until every bucket is scanned'
+            : undefined
+        }
+        colSpan={12}
+        rowSpan={3}
+      >
         <HeroSavingsPanel
           totalOriginal={totalOriginal}
           totalStored={totalStored}
@@ -420,7 +429,6 @@ export default function AnalyticsSection({ config }: Props) {
               <TopBucketsSortSelect
                 value={topBucketsSort}
                 onChange={setTopBucketsSort}
-                colors={colors}
               />
               {unscannedCount > 0 && (
                 <Button

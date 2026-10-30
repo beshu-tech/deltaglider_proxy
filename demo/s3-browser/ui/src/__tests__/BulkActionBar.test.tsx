@@ -47,7 +47,7 @@ describe('delete', () => {
     const user = userEvent.setup();
     const deleted = vi.fn(done);
     bar({ onDelete: askingDelete({ objects: 1_201, folders: 1, files: 1 }, deleted) });
-    await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
+    await user.click(screen.getByRole('button', { name: 'Delete 2 selected objects' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getAllByText('Delete 1,201 objects permanently?').length).toBeGreaterThan(0);
     expect(
@@ -60,7 +60,7 @@ describe('delete', () => {
     expect(deleted).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
 
-    await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
+    await user.click(screen.getByRole('button', { name: 'Delete 2 selected objects' }));
     await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete' }));
     await waitFor(() => expect(deleted).toHaveBeenCalledTimes(1));
   });
@@ -68,7 +68,7 @@ describe('delete', () => {
   test('a large delete explains how it runs and names the count on its button', async () => {
     const user = userEvent.setup();
     bar({ onDelete: askingDelete({ objects: 230_412, folders: 2, files: 0 }, done) });
-    await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
+    await user.click(screen.getByRole('button', { name: 'Delete 2 selected objects' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByText(/It runs on the server, so you can close this tab\./)).toBeInTheDocument();
     expect(
@@ -81,6 +81,15 @@ describe('delete', () => {
     bar({ hint: 'Sign in as an administrator for bulk actions.' });
     expect(screen.queryByRole('button', { name: /Delete|Copy|Move|ZIP/ })).toBeNull();
     expect(screen.getByText('Sign in as an administrator for bulk actions.')).toBeInTheDocument();
+  });
+
+  test('while the confirmation dialog asks, the bar shows nothing (one surface for one question)', () => {
+    bar({
+      onDelete: done,
+      progress: { action: 'delete', phase: 'confirming', total: 2, stopping: false },
+    });
+    expect(screen.queryByRole('toolbar', { name: 'Selection actions' })).toBeNull();
+    expect(screen.queryByText(/Waiting for your confirmation/)).toBeNull();
   });
 
   test('while a delete runs the bar shows its phase, a named progress bar and Cancel instead of the actions', async () => {
@@ -122,7 +131,7 @@ describe('delete', () => {
   async function confirmDeleteWith(run: () => Promise<DeleteJobOutcome>, extra: Parameters<typeof bar>[0] = {}) {
     const user = userEvent.setup();
     bar({ onDelete: askingDelete({ objects: 9_800, folders: 1, files: 1 }, run), ...extra });
-    await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
+    await user.click(screen.getByRole('button', { name: 'Delete 2 selected objects' }));
     await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete' }));
   }
 
@@ -159,11 +168,11 @@ describe('copy / move destination', () => {
   async function openPicker(op: 'Copy' | 'Move', handler: Op) {
     const user = userEvent.setup();
     bar(op === 'Copy' ? { onCopy: handler } : { onMove: handler });
-    await user.click(screen.getByRole('button', { name: `${op} 2 selected items` }));
+    await user.click(screen.getByRole('button', { name: `${op} 2 selected objects` }));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getAllByText(`${op} 2 items`).length).toBeGreaterThan(0);
+    expect(within(dialog).getAllByText(`${op} 2 objects`).length).toBeGreaterThan(0);
     const path = within(dialog).getByPlaceholderText('/ (bucket root)');
-    const ok = within(dialog).getByRole('button', { name: `${op} 2 items` });
+    const ok = within(dialog).getByRole('button', { name: `${op} 2 objects` });
     return { user, dialog, path, ok };
   }
 
@@ -195,7 +204,7 @@ describe('copy / move destination', () => {
     expect(ok).toBeEnabled();
     await user.click(ok);
     await waitFor(() => expect(handler).toHaveBeenCalledWith('releases', 'old/builds/'));
-    expect(await screen.findByText('2 items moved')).toBeInTheDocument();
+    expect(await screen.findByText('2 objects moved')).toBeInTheDocument();
   });
 
   test('a partial failure warns with the counts', async () => {
@@ -210,7 +219,7 @@ describe('copy / move destination', () => {
     await user.type(path, 'elsewhere');
     await user.click(ok);
     expect(
-      await screen.findByText('1 of 2 items copied. 1 failed, for example builds/app.zip: AccessDenied.'),
+      await screen.findByText('1 of 2 objects copied. 1 failed, for example builds/app.zip: AccessDenied.'),
     ).toBeInTheDocument();
   });
 
@@ -223,12 +232,12 @@ describe('copy / move destination', () => {
         throw new ApiError('Bulk copy failed (401): unauthorized', 401, 'unauthorized');
       },
     });
-    await user.click(screen.getByRole('button', { name: 'Copy 2 selected items' }));
+    await user.click(screen.getByRole('button', { name: 'Copy 2 selected objects' }));
     const dialog = await screen.findByRole('dialog');
     const path = within(dialog).getByPlaceholderText('/ (bucket root)');
     await user.clear(path);
     await user.type(path, 'elsewhere');
-    await user.click(within(dialog).getByRole('button', { name: 'Copy 2 items' }));
+    await user.click(within(dialog).getByRole('button', { name: 'Copy 2 objects' }));
     await waitFor(() => expect(onSessionExpired).toHaveBeenCalledTimes(1));
     expect(screen.queryByText(/unauthorized/)).toBeNull();
   });

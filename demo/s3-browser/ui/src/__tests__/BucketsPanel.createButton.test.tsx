@@ -38,18 +38,18 @@ afterEach(() => vi.unstubAllGlobals());
 
 test('Create bucket comes before every bucket card, also with the last card expanded', async () => {
   renderWithQuery(<BucketsPanel />);
-  const last = await screen.findByRole('button', { name: /^releases — click to edit/ });
+  const last = await screen.findByRole('button', { name: /^releases / });
   await userEvent.setup().click(last);
   expect(last).toHaveAttribute('aria-expanded', 'true');
   const create = screen.getByTestId('buckets-create');
-  for (const card of screen.getAllByRole('button', { name: / — click to (edit|collapse)/ })) {
+  for (const card of document.querySelectorAll('[data-bucket-card] > [role="button"]')) {
     expect(create.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   }
 });
 
 test('?bucket= opens that bucket card', async () => {
   renderWithQuery(<BucketsPanel search="?bucket=releases" />);
-  const card = await screen.findByRole('button', { name: /^releases — click to collapse/ });
+  const card = await screen.findByRole('button', { name: /^releases / });
   expect(card).toHaveAttribute('aria-expanded', 'true');
-  expect(screen.getByRole('button', { name: /^downloads — click to edit/ })).toHaveAttribute('aria-expanded', 'false');
+  expect(screen.getByRole('button', { name: /^downloads / })).toHaveAttribute('aria-expanded', 'false');
 });

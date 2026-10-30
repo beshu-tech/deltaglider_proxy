@@ -13,6 +13,7 @@ import { useGroups } from '../queries/groups';
 import { useColors } from '../ThemeContext';
 import { useFormLabelStyle, contentColumn, CONTENT_FORM } from './shared-styles';
 import SectionHeader from './SectionHeader';
+import FormField from './FormField';
 import IamSourceBanner from './IamSourceBanner';
 import MappingRuleRow from './MappingRuleRow';
 import MaskedSecretInput from './MaskedSecretInput';
@@ -64,8 +65,8 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   const { iamMode, readOnly, loadError: iamLoadError } = useIamMode(onSessionExpired);
   // Declarative IAM: providers + mapping rules are declared in YAML and the
   // admin API 403s every mutation. Render the config surfaces read-only (no
-  // New Provider / Add Rule / Save Rules / provider Save+Delete). Non-mutating
-  // diagnostics stay live: Test Connection, mapping Preview, and Sync Groups
+  // New provider / Add rule / Save rules / provider Save+Delete). Non-mutating
+  // diagnostics stay live: Test connection, mapping Preview, and Sync groups
   // (re-derives memberships from the declared rules — it doesn't edit them).
   // An unknown mode (config still loading, or failed) is read-only too.
 
@@ -77,7 +78,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   // Mapping rules dirty/saving state (local edits, batch-saved)
   const [pendingRules, setPendingRules] = useState<Record<number, Partial<typeof rules[number]>>>({});
   const [rulesSaving, setRulesSaving] = useState(false);
-  // "Add Rule" makes a local draft (negative id); Save Rules creates it.
+  // "Add rule" makes a local draft (negative id); Save rules creates it.
   // Creating at once left an empty rule on the server when the operator
   // left the page without saving.
   const [draftRules, setDraftRules] = useState<typeof rules>([]);
@@ -146,7 +147,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   };
 
   // Flush any pending local rule edits to the server before an action that
-  // refetches (e.g. "Add Rule"), so the server snapshot doesn't overwrite them.
+  // refetches (e.g. "Add rule"), so the server snapshot doesn't overwrite them.
   const flushPendingRules = async () => {
     if (!rulesDirty) return;
     for (const rule of mergedRules) {
@@ -203,7 +204,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   if (error) return <Alert type="error" title={error} style={{ margin: 16 }} />;
 
   // Nothing configured yet: ONE empty state with ONE next step. The rule
-  // editor, the preview, and "Sync Groups" all need a provider first, so
+  // editor, the preview, and "Sync groups" all need a provider first, so
   // showing them here only added controls that could not do anything.
   const nothingConfigured =
     providers.length === 0 && !creating && rules.length === 0 && identities.length === 0;
@@ -236,10 +237,23 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       {/* IAM source-of-truth banner — OAuth providers + mapping rules
           live in the encrypted IAM DB, not YAML, in GUI mode. */}
       <IamSourceBanner iamMode={iamMode} loadError={iamLoadError} resource="OAuth providers + mapping rules" />
-      {/* Identity Providers */}
-      <SectionHeader icon={<SafetyOutlined />} title="Identity Providers" />
+      {/* Identity providers */}
+      <SectionHeader icon={<SafetyOutlined />} title="Identity providers" />
+      {providers.length === 0 && !creating && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 24 }}>
+          <Text type="secondary" style={{ fontSize: 12.5 }}>No providers configured.</Text>
+          {!readOnly && (
+            <Button icon={<PlusOutlined />} size="small" onClick={() => setCreating(true)}>
+              Add provider
+            </Button>
+          )}
+        </div>
+      )}
       <div style={{ display: 'flex', gap: 16, marginBottom: 24, flexWrap: 'wrap' }}>
-        {/* Left: provider list — stacks above the detail when the row wraps. */}
+        {/* Left: provider list — only when there is a list to show; the
+            first provider's form takes the full width (no empty column).
+            Stacks above the detail when the row wraps. */}
+        {providers.length > 0 && (
         <div style={{ width: 220, flexShrink: 0, flexGrow: 1, maxWidth: '100%' }}>
           {!readOnly && (
             <Button icon={<PlusOutlined />} block size="small" onClick={async () => {
@@ -272,10 +286,8 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
               </div>
             </div>
           ))}
-          {providers.length === 0 && !creating && (
-            <Text type="secondary" style={{ fontSize: 12 }}>No providers configured</Text>
-          )}
         </div>
+        )}
 
         {/* Right: provider form — keyed remount resets state per selection
             (key={provider.id} for edit, key="new" for create), so there's no
@@ -287,6 +299,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
               provider={null}
               callbackUrl={callbackUrl}
               onSaved={() => setCreating(false)}
+              onCancel={() => { void confirmDiscardEdits(IAM_DIRTY_KEYS.providers).then((ok) => { if (ok) setCreating(false); }); }}
               onTest={handleTest}
             />
           ) : selectedProvider ? (
@@ -299,7 +312,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
               onDeleted={() => setSelectedProviderId(null)}
               onTest={handleTest}
             />
-          ) : (
+          ) : providers.length === 0 ? null : (
             <div style={{ color: colors.TEXT_MUTED, fontSize: 13, padding: 20 }}>
               {readOnly
                 ? 'Select a provider to view its configuration. Providers are declared in your YAML config.'
@@ -311,9 +324,9 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
 
       <Divider style={{ margin: '16px 0' }} />
 
-      {/* Allowed Users & Group Assignment */}
+      {/* Allowed users and group assignment */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <SectionHeader icon={<SafetyOutlined />} title="Allowed Users & Group Assignment" />
+        <SectionHeader icon={<SafetyOutlined />} title="Allowed users and group assignment" />
         {!readOnly && (
           <Button
             size="small"
@@ -321,7 +334,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
             disabled={rulesSaving}
             onClick={() => {
               if (groups.length === 0) { message.warning('Create a group first'); return; }
-              // A local draft, saved with Save Rules. It starts empty; the
+              // A local draft, saved with Save rules. It starts empty; the
               // placeholder shows the syntax hint.
               setDraftRules((prev) => [
                 ...prev,
@@ -338,7 +351,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
               ]);
             }}
           >
-            Add Rule
+            Add rule
           </Button>
         )}
       </div>
@@ -398,7 +411,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
           style={{ borderRadius: 8, fontWeight: 600, marginBottom: 16 }}
           block
         >
-          Save Rules
+          Save rules
         </Button>
       )}
 
@@ -439,14 +452,14 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
 
       <Divider style={{ margin: '16px 0' }} />
 
-      {/* Login Activity */}
+      {/* Login activity */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <SectionHeader icon={<SafetyOutlined />} title={`Login Activity (${identities.length})`} />
+        <SectionHeader icon={<SafetyOutlined />} title={`Login activity (${identities.length})`} />
         {/* Sync writes group memberships to the DB, which declarative mode
             refuses (403); the YAML owns IAM there. */}
         {!readOnly && (
           <Button size="small" icon={<SyncOutlined spin={syncing} />} onClick={handleSync} loading={syncing}>
-            Sync Groups
+            Sync groups
           </Button>
         )}
       </div>
@@ -488,11 +501,13 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
 interface ProviderFormProps {
   provider: AuthProvider | null; // null = create mode
   callbackUrl: string;
-  /** Declarative IAM: disable inputs, hide Save/Delete. Test Connection and
+  /** Declarative IAM: disable inputs, hide Save/Delete. Test connection and
    *  the Copy-callback-URL affordance stay live (non-mutating). */
   readOnly?: boolean;
   onSaved: () => void;
   onDeleted?: () => void;
+  /** Create mode: leave the form without saving. */
+  onCancel?: () => void;
   /** Test the form as it is now (unsaved edits included); `id` null =
    *  a provider that is not saved yet. */
   onTest: (
@@ -503,10 +518,8 @@ interface ProviderFormProps {
   ) => void;
 }
 
-function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDeleted, onTest }: ProviderFormProps) {
+function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDeleted, onCancel, onTest }: ProviderFormProps) {
   const colors = useColors();
-  const label = useFormLabelStyle();
-  const labelBlock = { ...label, display: 'block' };
   const fid = useId();
   const isEdit = provider !== null;
 
@@ -541,9 +554,21 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
     formAllowLocal, formCaCertPath,
   });
   useDirtyFlag(IAM_DIRTY_KEYS.providers, isDirty && !readOnly);
-  const canSave = Boolean(formName && formClientId && formIssuerUrl);
+  // Field errors show after the first Create/Save or Test, then follow each
+  // keystroke. The buttons stay enabled: a disabled button does not say why.
+  const [checked, setChecked] = useState<'save' | 'test' | null>(null);
+  const required = (v: string, what: string) => (v.trim() ? undefined : `Enter the ${what}.`);
+  const fieldErrors = {
+    name: checked === 'save' ? required(formName, 'provider name') : undefined,
+    issuer: checked ? required(formIssuerUrl, 'issuer URL') : undefined,
+    clientId: checked ? required(formClientId, 'client ID') : undefined,
+  };
+  const canSave = Boolean(formName.trim() && formClientId.trim() && formIssuerUrl.trim());
+  const canTest = Boolean(formClientId.trim() && formIssuerUrl.trim());
 
   const handleSave = async () => {
+    setChecked('save');
+    if (!canSave) return;
     setSaving(true);
     setSaveRefusal(null);
     const extraConfig = withNetworkPolicy(provider?.extra_config, formAllowLocal, formCaCertPath);
@@ -587,7 +612,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
     }
   };
 
-  useApplyHandler(IAM_DIRTY_KEYS.providers, () => { if (!saving && canSave) void handleSave(); }, isDirty && !readOnly);
+  useApplyHandler(IAM_DIRTY_KEYS.providers, () => { if (!saving) void handleSave(); }, isDirty && !readOnly);
 
   const handleDelete = async () => {
     if (!provider) return;
@@ -608,43 +633,56 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
 
   return (
     <div style={{ background: colors.BG_CARD, border: `1px solid ${colors.BORDER}`, borderRadius: 10, padding: 20 }}>
-      <label htmlFor={`${fid}-display`} style={labelBlock}>Display Name</label>
-      <Input id={`${fid}-display`} value={formDisplayName} onChange={e => setFormDisplayName(e.target.value)} placeholder="Google Workspace" disabled={readOnly} style={{ marginBottom: 12 }} />
+      <FormField label="Display name" helpText="The sign-in button shows this name." style={{ marginBottom: 16 }}>
+        <Input value={formDisplayName} onChange={e => setFormDisplayName(e.target.value)} placeholder="Google Workspace" disabled={readOnly} />
+      </FormField>
 
-      <label htmlFor={`${fid}-name`} style={labelBlock}>Provider Name (unique identifier)</label>
-      <Input id={`${fid}-name`} value={formName} onChange={e => setFormName(e.target.value)} placeholder="google-corp" disabled={readOnly} style={{ marginBottom: 12 }} />
+      <FormField label="Provider name" helpText="A unique identifier, for example google-corp." error={fieldErrors.name} style={{ marginBottom: 16 }}>
+        <Input value={formName} onChange={e => setFormName(e.target.value)} placeholder="google-corp" disabled={readOnly} />
+      </FormField>
 
-      <label htmlFor={`${fid}-issuer`} style={labelBlock}>Issuer URL</label>
-      <Input id={`${fid}-issuer`} value={formIssuerUrl} onChange={e => setFormIssuerUrl(e.target.value)} placeholder="https://accounts.google.com" disabled={readOnly} style={{ marginBottom: 12 }} />
+      <FormField label="Issuer URL" error={fieldErrors.issuer} style={{ marginBottom: 16 }}>
+        <Input value={formIssuerUrl} onChange={e => setFormIssuerUrl(e.target.value)} placeholder="https://accounts.google.com" disabled={readOnly} />
+      </FormField>
 
-      <label htmlFor={`${fid}-client-id`} style={labelBlock}>Client ID</label>
-      <Input id={`${fid}-client-id`} value={formClientId} onChange={e => setFormClientId(e.target.value)} placeholder="123456.apps.googleusercontent.com" disabled={readOnly} style={{ marginBottom: 12 }} />
+      <FormField label="Client ID" error={fieldErrors.clientId} style={{ marginBottom: 16 }}>
+        <Input value={formClientId} onChange={e => setFormClientId(e.target.value)} placeholder="123456.apps.googleusercontent.com" disabled={readOnly} />
+      </FormField>
 
       {!readOnly && (
-        <>
-          <label htmlFor={`${fid}-secret`} style={labelBlock}>Client Secret</label>
+        <FormField
+          label="Client secret"
+          helpText={isEdit ? 'Leave empty to keep the current secret.' : undefined}
+          style={{ marginBottom: 16 }}
+        >
           <MaskedSecretInput
             id={`${fid}-secret`}
             mode={isEdit ? 'blank-keeps' : 'new'}
             value={formClientSecret}
             onChange={setFormClientSecret}
-            placeholder={isEdit ? undefined : 'Client secret'}
-            style={{ marginBottom: 12 }}
+            placeholder={isEdit ? 'Unchanged' : 'Client secret'}
           />
-        </>
+        </FormField>
       )}
 
-      <label htmlFor={`${fid}-scopes`} style={labelBlock}>Scopes</label>
-      <Input id={`${fid}-scopes`} value={formScopes} onChange={e => setFormScopes(e.target.value)} disabled={readOnly} style={{ marginBottom: 12 }} />
+      <FormField label="Scopes" style={{ marginBottom: 16 }}>
+        <Input value={formScopes} onChange={e => setFormScopes(e.target.value)} disabled={readOnly} />
+      </FormField>
 
       {/* Callback URL */}
-      <div style={label}>Callback URL (register this with your provider)</div>
+      {/* Same label look as the FormField labels above. */}
+      <div style={{ fontSize: 13.5, fontWeight: 600, color: colors.TEXT_PRIMARY, marginBottom: 6 }}>
+        Callback URL
+      </div>
       <div style={{
-        display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16,
+        display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6,
         background: colors.BG_BASE, border: `1px solid ${colors.BORDER}`, borderRadius: 6, padding: '8px 12px',
       }}>
-        <code style={{ fontSize: 12, color: colors.TEXT_SECONDARY, flex: 1, wordBreak: 'break-all' }}>
-          {callbackUrl}
+        {/* Break only after a "/" (a <wbr> each), never inside a word. */}
+        <code style={{ fontSize: 12, color: colors.TEXT_SECONDARY, flex: 1, overflowWrap: 'anywhere' }}>
+          {callbackUrl.split('/').map((part, i, all) => (
+            <span key={i}>{part}{i < all.length - 1 && <>/<wbr /></>}</span>
+          ))}
         </code>
         <Button
           size="small" icon={<CopyOutlined />}
@@ -653,10 +691,13 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
           onClick={() => { void copy(callbackUrl, { successMessage: 'Callback URL copied' }); }}
         />
       </div>
+      <div style={{ fontSize: 12.5, color: colors.TEXT_MUTED, marginBottom: 16, lineHeight: 1.4 }}>
+        Register this URL with your identity provider.
+      </div>
 
       {/* Network policy */}
-      <div style={label}>Network</div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+      <div style={{ fontSize: 13.5, fontWeight: 600, color: colors.TEXT_PRIMARY, marginBottom: 6 }}>Network</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
         <Switch
           checked={formAllowLocal}
           onChange={setFormAllowLocal}
@@ -666,26 +707,23 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
         />
         <Text style={{ fontSize: 13 }}>Allow http:// and private addresses</Text>
       </div>
-      <div style={{ fontSize: 12, color: colors.TEXT_MUTED, marginBottom: 12, lineHeight: 1.5 }}>
+      <div style={{ fontSize: 12.5, color: colors.TEXT_MUTED, marginBottom: 16, lineHeight: 1.4 }}>
         Turn this on only for an identity provider on your own network. The proxy then sends
         requests to any address that the issuer and its discovery document name, so a wrong
         issuer URL can reach internal services. Cloud metadata addresses stay refused.
       </div>
-      <label htmlFor={`${fid}-ca-cert`} style={labelBlock}>
-        CA certificate file
-      </label>
-      <Input
-        id={`${fid}-ca-cert`}
-        value={formCaCertPath}
-        onChange={e => setFormCaCertPath(e.target.value)}
-        placeholder="/etc/deltaglider/idp-ca.pem"
-        disabled={readOnly}
-        style={{ marginBottom: 4 }}
-      />
-      <div style={{ fontSize: 12, color: colors.TEXT_MUTED, marginBottom: 16, lineHeight: 1.5 }}>
-        Optional. A PEM file on the proxy host, for an identity provider whose certificate a private
-        CA signs. The proxy trusts it in addition to the public roots.
-      </div>
+      <FormField
+        label="CA certificate file"
+        helpText="Optional. A PEM file on the proxy host, for an identity provider whose certificate a private CA signs. The proxy trusts it in addition to the public roots."
+        style={{ marginBottom: 16 }}
+      >
+        <Input
+          value={formCaCertPath}
+          onChange={e => setFormCaCertPath(e.target.value)}
+          placeholder="/etc/deltaglider/idp-ca.pem"
+          disabled={readOnly}
+        />
+      </FormField>
 
       {saveRefusal && (
         <Alert
@@ -723,27 +761,32 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
             type="primary"
             onClick={handleSave}
             loading={saving}
-            disabled={!canSave}
           >
             {isEdit ? 'Save' : 'Create'}
           </Button>
         )}
         <Button
-          onClick={() => onTest(provider?.id ?? null, {
+          onClick={() => {
+            setChecked((c) => c ?? 'test');
+            if (!canTest) return;
+            onTest(provider?.id ?? null, {
             client_id: formClientId,
             client_secret: formClientSecret,
             issuer_url: formIssuerUrl,
             scopes: formScopes,
             extra_config: withNetworkPolicy(provider?.extra_config, formAllowLocal, formCaCertPath),
-          }, setTestResult, setTesting)}
+          }, setTestResult, setTesting);
+          }}
           loading={testing}
-          disabled={!formClientId || !formIssuerUrl}
           title="Test the values in this form. Nothing is saved."
         >
-          Test Connection
+          Test connection
         </Button>
         {isEdit && !readOnly && (
           <Button danger onClick={handleDelete}>Delete</Button>
+        )}
+        {!isEdit && onCancel && (
+          <Button onClick={onCancel}>Cancel</Button>
         )}
       </div>
     </div>

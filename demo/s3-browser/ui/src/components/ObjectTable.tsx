@@ -16,6 +16,13 @@ import { usePersistedPageSize } from '../usePersistedPageSize';
 import { describeVisibleRange } from '../paginationLabels';
 import StorageTypeTag from './StorageTypeTag';
 import { buildRows, sortRows, type BrowserRow, type SortColumn, type SortState } from '../browserNav';
+import { useIsNarrow } from '../useIsNarrow';
+
+/** Below this width the Size column folds into a line under the name: the
+ *  name column alone did not fit next to it on a phone. */
+const SIZE_SUBLINE_BELOW = 720;
+/** The minimum table width (fixed columns ~370 + a Name minimum) on wider screens. */
+const TABLE_MIN_WIDTH = 700;
 
 const { Text } = Typography;
 
@@ -255,6 +262,7 @@ export default function ObjectTable({
     PAGE_SIZE_OPTIONS,
   );
   const [currentPage, setCurrentPage] = useState(1);
+  const sizeSubline = useIsNarrow(SIZE_SUBLINE_BELOW);
   // Controlled sort: AntD only draws the header state (`sorter: true` never
   // sorts); `sortedRows` below is the one displayed order.
   const [sortState, setSortState] = useState<SortState | null>(null);
@@ -342,6 +350,9 @@ export default function ObjectTable({
   // status bar). Content changes can't move that number, only real window /
   // pane geometry changes can.
   const [bodyHeight, setBodyHeight] = useState(400);
+  // Narrow screens: the table is exactly as wide as its container, so no
+  // horizontal scrollbar strip shows under the rows.
+  const [containerWidth, setContainerWidth] = useState(0);
   // The pager row renders only when there is more than one page.
   const multiPage = folders.length + objects.length > pageSize;
   useEffect(() => {
@@ -354,6 +365,7 @@ export default function ObjectTable({
       // the height stays viewport-bounded instead of growing by the scroll.
       const top = Math.max(0, el.getBoundingClientRect().top);
       setBodyHeight(Math.max(240, window.innerHeight - top - CHROME_BELOW));
+      setContainerWidth(Math.floor(el.clientWidth));
     };
     measure();
     window.addEventListener('resize', measure);
@@ -489,19 +501,30 @@ export default function ObjectTable({
           );
         }
         return (
-          <span data-testid={`object-row-${record.name}`} title={record.name} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span data-testid={`object-row-${record.name}`} title={record.name} style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
             <FileOutlined aria-hidden="true" style={{ color: fileIconColor(record.name), fontSize: 14 }} />
-            <span style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: TEXT_PRIMARY, cursor: 'pointer', flex: 1 }}>
-              {record.name}
+            <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1, cursor: 'pointer' }}>
+              <span style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: TEXT_PRIMARY, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {record.name}
+              </span>
+              {sizeSubline && (
+                <span data-testid="object-size-subline" style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: 'var(--font-ui)', lineHeight: 1.3 }}>
+                  {formatBytes(record.size)}
+                  {record.lastModified ? ` · ${relativeTime(new Date(record.lastModified))}` : ''}
+                </span>
+              )}
             </span>
           </span>
         );
       },
     },
-    {
+    // A number column: right-aligned, the folder Size action too (it sat
+    // left in it and read as a stray chip).
+    ...(sizeSubline ? [] : [{
       title: () => <span style={{ ...COL_HEADER_STYLE, color: TEXT_MUTED }}>Size</span>,
       key: 'size',
-      width: isMobile ? 80 : 100,
+      width: isMobile ? 80 : 110,
+      align: 'right' as const,
       sorter: true,
       sortOrder: sortOrderFor('size'),
       render: (_: unknown, record: RowData) => {
@@ -518,9 +541,9 @@ export default function ObjectTable({
             />
           );
         }
-        return <span style={{ ...MONO_CELL_STYLE, color: TEXT_SECONDARY }}>{formatBytes(record.size)}</span>;
+        return <span style={{ ...MONO_CELL_STYLE, color: TEXT_SECONDARY, fontVariantNumeric: 'tabular-nums' }}>{formatBytes(record.size)}</span>;
       },
-    },
+    }]),
     {
       title: () => <span style={{ ...COL_HEADER_STYLE, color: TEXT_MUTED }}>Modified</span>,
       key: 'modified',
@@ -606,7 +629,7 @@ export default function ObjectTable({
              so the old `sticky` + free-flow scroll={undefined} are gone.
              `x` must be numeric in virtual mode (rc-table warns + forces 1
              otherwise): fixed columns sum to ~370, plus a Name minimum. */
-          scroll={{ y: bodyHeight, x: 700 }}
+          scroll={{ y: bodyHeight, x: sizeSubline && containerWidth > 0 ? containerWidth : TABLE_MIN_WIDTH }}
           rowClassName={(record) => {
             const classes: string[] = [];
             if (!record._isFolder && selected?.key === record.key) classes.push('ant-table-row-selected');
@@ -669,7 +692,7 @@ export default function ObjectTable({
         }}
       >
         <div role="status" aria-live="polite" style={{ flex: 1, minWidth: 0 }}>
-          <Text style={{ fontSize: 12, color: TEXT_MUTED, fontFamily: 'var(--font-mono)' }}>
+          <Text style={{ fontSize: 12, color: TEXT_MUTED, fontFamily: 'var(--font-ui)', fontVariantNumeric: 'tabular-nums' }}>
             {describeVisibleRange(totalItems, currentPage, pageSize)}
             {restListedAt !== null && (
               <span title="The automatic refresh updates the first 1,000 entries only. Refresh updates all of them.">
@@ -678,6 +701,8 @@ export default function ObjectTable({
             )}
           </Text>
         </div>
+        {/* The page size matters only when a folder can fill a page. */}
+        {totalItems > PAGE_SIZE_OPTIONS[0] && (
         <label
           style={{
             display: 'inline-flex',
@@ -705,6 +730,7 @@ export default function ObjectTable({
             style={{ width: 84 }}
           />
         </label>
+        )}
       </div>
     </div>
   );

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Button, Input, Typography, Space, Alert, Spin, message } from 'antd';
-import { WarningOutlined, CheckCircleOutlined, CopyOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
+import { Button, ConfigProvider, Input, Typography, Space, Alert, Spin, message } from 'antd';
+import { WarningOutlined, CheckCircleOutlined, CopyOutlined, SunOutlined, MoonOutlined, EyeOutlined, EyeInvisibleOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession, getBucket } from '../s3client';
 import { adminLogin, loginAs, isNotAdminDenial, whoami, isConfigDbLocked, recoverDb, browserSessionConnect, openBrowserConnect } from '../adminApi';
 import type { ExternalProviderInfo, WhoamiResponse } from '../adminApi';
@@ -34,9 +34,59 @@ function finishConnect(onConnect: (outcome: ConnectOutcome) => void, outcome: Co
   onConnect(outcome);
 }
 
-/** Tiny diagram for the locked-DB wizard: one password + random salt → two
- *  different hashes; only the original hash is the DB's key. Explains, honestly
- *  and at a glance, why the password alone can't unlock the database. */
+/** Input tokens of the sign-in card: a focus ring that is visible (AntD's
+ *  default is a 2px shadow at 12% alpha, near invisible on the glass card). */
+const LOGIN_INPUT_THEME = {
+  components: {
+    Input: {
+      activeShadow: '0 0 0 3px color-mix(in srgb, var(--focus-ring) 45%, transparent)',
+      activeBorderColor: 'var(--focus-ring)',
+      hoverBorderColor: 'color-mix(in srgb, var(--focus-ring) 60%, var(--login-card-border))',
+    },
+  },
+};
+
+/** A secret field whose show/hide control is a real button (AntD's
+ *  Input.Password renders a focusable `span`), named for what it does. */
+function SecretInput({ id, value, onChange, onPressEnter, autoFocus, style, autoComplete }: {
+  id: string;
+  value: string;
+  onChange: (v: string) => void;
+  onPressEnter: () => void;
+  autoFocus?: boolean;
+  style: React.CSSProperties;
+  autoComplete: string;
+}) {
+  const [shown, setShown] = useState(false);
+  return (
+    <Input
+      id={id}
+      type={shown ? 'text' : 'password'}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      onPressEnter={onPressEnter}
+      autoFocus={autoFocus}
+      autoComplete={autoComplete}
+      spellCheck={false}
+      size="large"
+      style={style}
+      suffix={
+        <button
+          type="button"
+          className="btn-reset dg-login-reveal"
+          aria-label={shown ? 'Hide' : 'Show'}
+          aria-pressed={shown}
+          title={shown ? 'Hide' : 'Show'}
+          onClick={() => setShown((v) => !v)}
+          style={{ padding: 4, borderRadius: 6, color: 'inherit', cursor: 'pointer', lineHeight: 1 }}
+        >
+          {shown ? <EyeInvisibleOutlined aria-hidden="true" /> : <EyeOutlined aria-hidden="true" />}
+        </button>
+      }
+    />
+  );
+}
+
 interface Props {
   onConnect: (outcome: ConnectOutcome) => void;
   showError?: boolean;
@@ -53,7 +103,14 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   // calls in the same tick (onPressEnter + button onClick) both see loading===false
   // and double-fire.  The ref is set synchronously before the first await.
   const loginInFlight = useRef(false);
-  const [error, setError] = useState('');
+  const [error, setErrorText] = useState('');
+  // The server's request id of the last failure: in the hover text of the
+  // error, for support, never in the sentence itself.
+  const [errorRequestId, setErrorRequestId] = useState<string | undefined>();
+  const setError = useCallback((text: string, requestId?: string) => {
+    setErrorText(text);
+    setErrorRequestId(requestId);
+  }, []);
   const [authMode, setAuthMode] = useState<WhoamiResponse['mode'] | null>(null);
   const [externalProviders, setExternalProviders] = useState<ExternalProviderInfo[]>([]);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -154,7 +211,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [onConnect, runOpenModeConnect]);
+  }, [onConnect, runOpenModeConnect, setError]);
 
   const handleConnect = async () => {
     if (loginInFlight.current) return;
@@ -165,7 +222,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       if (signInChoices(authMode).primary === 'password') {
         // Bootstrap mode: login with password, session auto-provides S3 creds
         if (!adminPassword.trim()) {
-          setError('Admin password is required');
+          setError('Enter the admin password.');
           setLoading(false);
           return;
         }
@@ -205,13 +262,13 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       // IAM mode: connect with S3 credentials
       const cleanEndpoint = detectDefaultEndpoint().replace(/\/+$/, '');
       if (!accessKey.trim() || !secretKey.trim()) {
-        setError('Access Key and Secret Key are required');
+        setError('Enter the access key ID and the secret access key.');
         setLoading(false);
         return;
       }
       const result = await testConnection(cleanEndpoint, accessKey, secretKey);
       if (!result.ok) {
-        setError(`Connection failed: ${result.error || 'Invalid credentials'}`);
+        setError(result.error || 'The access key ID or the secret access key is wrong.', result.requestId);
         setLoading(false);
         return;
       }
@@ -324,7 +381,6 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const choices = signInChoices(authMode);
   const isBootstrap = choices.primary === 'password';
   const isOpenSignedOutReconnect = authMode === 'open' && openSignedOut;
-  const canSubmit = isBootstrap ? adminPassword.trim() : (accessKey.trim() && secretKey.trim());
 
   const inputStyle = {
     background: 'var(--input-bg)',
@@ -341,7 +397,6 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     borderRadius: 16,
     height: 52,
     fontSize: 14,
-    boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.04)',
   };
   const recoveryInputStyle = {
     ...inputStyle,
@@ -362,7 +417,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   // Recovery wizard
   if (showRecovery) {
     return (
-      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', padding: 24 }}>
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100dvh', padding: 24, boxSizing: 'border-box' }}>
         <div className="dg-login-card animate-fade-in" style={{ borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 520 }}>
           <Space orientation="vertical" size="large" style={{ width: '100%' }}>
             {recoveredHash?.kind === 'config_db_key' ? (
@@ -370,7 +425,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
                   <CheckCircleOutlined style={{ fontSize: 28, color: 'var(--accent-success)', flexShrink: 0 }} />
                   <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
-                    Database Key Found
+                    Database key found
                   </div>
                 </div>
                 <div style={{ color: TEXT_SECONDARY, fontSize: 14, fontFamily: "var(--font-ui)", lineHeight: 1.7 }}>
@@ -387,7 +442,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
                     <CheckCircleOutlined style={{ fontSize: 28, color: 'var(--accent-success)', flexShrink: 0 }} />
                     <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
-                      Database Recovered
+                      Database recovered
                     </div>
                   </div>
                   <div style={{ color: TEXT_SECONDARY, fontSize: 14, fontFamily: "var(--font-ui)", lineHeight: 1.7 }}>
@@ -428,7 +483,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
                     <WarningOutlined style={{ fontSize: 28, color: 'var(--accent-warning)', flexShrink: 0 }} />
                     <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
-                      Config Database Locked
+                      Config database locked
                     </div>
                   </div>
                   <div style={{ color: TEXT_SECONDARY, fontSize: 14, lineHeight: 1.7, fontFamily: "var(--font-ui)" }}>
@@ -455,7 +510,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 {recoveryError && <Alert type="error" title={recoveryError} showIcon />}
                 <div>
                   <label htmlFor="recovery-key" style={{ fontSize: 13, fontWeight: 600, color: TEXT_SECONDARY, fontFamily: "var(--font-ui)", marginBottom: 6, display: 'block' }}>
-                    Config DB Key or Legacy Password Hash
+                    Config DB key or legacy password hash
                   </label>
                   <Input.TextArea
                     id="recovery-key"
@@ -477,7 +532,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   onClick={handleRecover}
                   style={{ height: 48, borderRadius: 10, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 15, letterSpacing: '0.02em', marginTop: 4 }}
                 >
-                  Try Key
+                  Try key
                 </Button>
               </>
             )}
@@ -494,17 +549,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       <div className="dg-login-grid" />
 
       <section className="dg-login-card animate-fade-in" aria-label="DeltaGlider sign in">
-        <Button
-          type="text"
-          shape="circle"
-          size="small"
-          icon={isDark ? <MoonOutlined /> : <SunOutlined />}
-          title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-          aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-          onClick={toggleTheme}
-          className="dg-login-theme-toggle"
-        />
-
+        <ConfigProvider theme={LOGIN_INPUT_THEME}>
         <Space orientation="vertical" size={22} style={{ width: '100%' }}>
           <div className="dg-login-brand-block">
             <div className="dg-login-brand">DeltaGlider</div>
@@ -536,7 +581,13 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           {showError && !error && (
             <Alert type="warning" title="Stored credentials are invalid or the endpoint is unreachable." showIcon />
           )}
-          {error && <Alert type="error" title={error} showIcon />}
+          {error && (
+            <Alert
+              type="error"
+              showIcon
+              title={<span title={errorRequestId ? `Request ID: ${errorRequestId}` : undefined}>{error}</span>}
+            />
+          )}
 
           {/* OAuth provider buttons — shown prominently when available */}
           {externalProviders.length > 0 && (
@@ -583,14 +634,13 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 /* Bootstrap mode: password only */
                 <div>
                   <label htmlFor="connect-admin-password" className="dg-login-label">Admin password</label>
-                  <Input.Password
+                  <SecretInput
                     id="connect-admin-password"
                     value={adminPassword}
-                    onChange={(e) => setAdminPassword(e.target.value)}
+                    onChange={setAdminPassword}
                     onPressEnter={handleConnect}
-                    placeholder="Admin password"
-                    size="large"
                     autoFocus={externalProviders.length === 0}
+                    autoComplete="current-password"
                     style={loginInputStyle}
                   />
                   <Text className="dg-login-hint">
@@ -606,8 +656,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                       id="connect-access-key"
                       value={accessKey}
                       onChange={(e) => setAccessKey(e.target.value)}
-                      placeholder="Access Key ID"
                       size="large"
+                      autoComplete="username"
+                      spellCheck={false}
                       autoFocus={externalProviders.length === 0}
                       style={loginInputStyle}
                     />
@@ -615,13 +666,12 @@ export default function ConnectPage({ onConnect, showError }: Props) {
 
                   <div>
                     <label htmlFor="connect-secret-key" className="dg-login-label">Secret access key</label>
-                    <Input.Password
+                    <SecretInput
                       id="connect-secret-key"
                       value={secretKey}
-                      onChange={(e) => setSecretKey(e.target.value)}
+                      onChange={setSecretKey}
                       onPressEnter={handleConnect}
-                      placeholder="Secret Access Key"
-                      size="large"
+                      autoComplete="current-password"
                       style={loginInputStyle}
                     />
                   </div>
@@ -633,7 +683,6 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 block
                 size="large"
                 loading={loading}
-                disabled={!canSubmit}
                 onClick={handleConnect}
                 className="dg-login-submit"
               >
@@ -644,6 +693,20 @@ export default function ConnectPage({ onConnect, showError }: Props) {
             </>
           )}
         </Space>
+
+        {/* After the form in the tab order (it sits top-right on screen):
+            the fields come first. */}
+        <Button
+          type="text"
+          shape="circle"
+          size="small"
+          icon={isDark ? <MoonOutlined /> : <SunOutlined />}
+          title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          onClick={toggleTheme}
+          className="dg-login-theme-toggle"
+        />
+        </ConfigProvider>
       </section>
     </main>
   );

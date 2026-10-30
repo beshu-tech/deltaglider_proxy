@@ -4,7 +4,9 @@ import { getBucketUsage, refreshBucketUsage } from '../adminApi';
 import { useBucketOrigins } from '../queries/backends';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
-import { formatBytes, noun } from '../utils';
+import { formatBytes, formatBytesIec, noun } from '../utils';
+import { useAdminConfig } from '../queries/config';
+import { bucketPolicyFor } from '../bucketPolicyLookup';
 import { relativeTime } from '../utils';
 
 /**
@@ -50,6 +52,10 @@ export default function BucketUsageChip({
   // reach). Render a warning chip instead. Shares the cached origins query.
   const origins = useBucketOrigins({ enabled: canAdmin && !!bucket });
   const unavailable = origins.data?.buckets.find((b) => b.name === bucket)?.unavailable;
+  // The quota, when the bucket has one: the server's gate compares it with
+  // the STORED bytes, so the chip shows those against it.
+  const { data: config } = useAdminConfig({ enabled: canAdmin && !!bucket });
+  const quota = bucketPolicyFor(config, bucket)?.quota_bytes ?? null;
 
   // No session, no data, or a "disabled" payload (open-mode dev) → render nothing.
   if (!canAdmin || !data || data.object_count == null) return null;
@@ -67,13 +73,14 @@ export default function BucketUsageChip({
           border: `1px solid ${c.ACCENT_AMBER}66`,
           background: c.BG_ELEVATED,
           fontSize: 12,
+          lineHeight: '18px',
           color: c.ACCENT_AMBER,
           whiteSpace: 'nowrap',
           cursor: 'default',
         }}
       >
         <span style={{ width: 7, height: 7, borderRadius: '50%', background: c.ACCENT_AMBER }} />
-        backend unreachable
+        Backend unreachable
       </span>
     );
   }
@@ -94,21 +101,31 @@ export default function BucketUsageChip({
           : '')
       : '');
 
+  // Quota: share of it used, amber from 90 %. A quota of 0 freezes the bucket.
+  const quotaShare = quota != null && quota > 0 ? data.stored_bytes / quota : null;
+  const quotaTone = quota === 0 || (quotaShare != null && quotaShare >= 0.9) ? c.ACCENT_AMBER : c.TEXT_MUTED;
+  const quotaTitle = quota == null
+    ? ''
+    : quota === 0
+      ? ' Quota 0: the bucket takes no new writes.'
+      : ` Quota: ${formatBytes(data.stored_bytes)} stored of ${formatBytesIec(quota)} (writes that pass the quota are refused).`;
+
+  // Plain text after the breadcrumb, not a box: a framed pill the height of
+  // the header read as a second breadcrumb tab. The Header's 52px line
+  // height is reset so the row stays one line of text.
   return (
     <span
-      title={scannedTitle}
+      title={scannedTitle + quotaTitle}
       style={{
         display: 'inline-flex',
         alignItems: 'center',
         gap: 6,
-        padding: '2px 8px',
-        borderRadius: 6,
-        border: `1px solid ${c.BORDER}`,
-        background: c.BG_ELEVATED,
         fontSize: 12,
+        lineHeight: '18px',
         color: c.TEXT_SECONDARY,
         whiteSpace: 'nowrap',
         cursor: 'default',
+        fontFamily: 'var(--font-ui)',
       }}
     >
       {inFolder && <span style={{ color: c.TEXT_MUTED }}>Bucket total</span>}
@@ -124,6 +141,16 @@ export default function BucketUsageChip({
       <span style={{ fontVariantNumeric: 'tabular-nums' }}>
         {data.object_count.toLocaleString()} {noun(data.object_count, 'object')}
       </span>
+      {quota != null && (
+        <>
+          <span style={{ color: c.TEXT_MUTED }}>·</span>
+          <span data-testid="bucket-quota" style={{ color: quotaTone, fontVariantNumeric: 'tabular-nums' }}>
+            {quota === 0
+              ? 'Frozen (quota 0)'
+              : `${Math.min(999, Math.round((quotaShare ?? 0) * 100))}% of ${formatBytesIec(quota)} quota`}
+          </span>
+        </>
+      )}
       <button
         type="button"
         onClick={() => !refresh.isPending && refresh.mutate()}

@@ -77,7 +77,7 @@ export async function deleteAuthProvider(id: number): Promise<void> {
   });
 }
 
-/** The provider form as it is now, for a Test Connection that saves nothing.
+/** The provider form as it is now, for a Test connection that saves nothing.
  *  A blank `client_secret` keeps the saved secret. */
 export interface ProviderTestForm {
   client_id: string;

@@ -57,18 +57,13 @@ function healthLabel(h: BackendHealthEntry): string {
   }
 }
 
-/** The status pills after a backend's name: default, legacy singleton, health. */
+/** The status pills after a backend's name: default and health. The
+ *  unnamed YAML backend has no pill ("Legacy singleton" was an internal
+ *  word): the section description says what it is. */
 function backendPills(b: BackendInfo, isDefault: boolean, colors: ReturnType<typeof useColors>): BackendPill[] {
   const pills: BackendPill[] = [];
   if (isDefault) {
     pills.push({ label: 'Default', color: colors.ACCENT_BLUE, title: 'Buckets without a backend of their own are created here.' });
-  }
-  if (b.is_synthesized) {
-    pills.push({
-      label: 'Legacy singleton',
-      color: colors.ACCENT_AMBER,
-      title: 'This entry stands for the single backend defined under storage.backend in YAML. It is not a named backend, so you cannot delete it. When you add a named backend, this backend becomes the named backend "default", and its buckets stay on it.',
-    });
   }
   const h = b.health;
   if (h) {
@@ -169,6 +164,10 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   // the page-top Alert is out of view when the form is open.
   const [formError, setFormError] = useState<string | null>(null);
   const pathInvalid = formType === 'filesystem' && !isAbsolutePath(formPath);
+  // Set by the first Create click: from then on, empty required fields say
+  // so on the field itself (a disabled Create button said nothing).
+  const [createTried, setCreateTried] = useState(false);
+  const nameMissing = !formName.trim();
 
   const [testingBackend, setTestingBackend] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ name: string; ok: boolean; message: string } | null>(null);
@@ -185,6 +184,8 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   };
 
   const handleCreate = async () => {
+    setCreateTried(true);
+    if (nameMissing || pathInvalid) return;
     setSaving(true);
     setSaveResult(null);
     setFormError(null);
@@ -208,7 +209,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       // failing uploads) is the worse failure mode.
       if (formType === 's3') {
         if (!formAccessKey || !formSecretKey) {
-          setFormError('S3 backends need both an Access Key ID and a Secret Access Key.');
+          setFormError('An S3 backend needs an access key ID and a secret access key.');
           return;
         }
         const probe = await testS3Connection({
@@ -324,7 +325,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   };
 
   const resetForm = () => {
-    setFormName(''); setFormType('filesystem'); setFormPath(''); setFormError(null);
+    setFormName(''); setFormType('filesystem'); setFormPath(''); setFormError(null); setCreateTried(false);
     setFormEndpoint(''); setFormRegion('us-east-1'); setFormForcePathStyle(true);
     setFormAccessKey(''); setFormSecretKey(''); setFormSetDefault(false);
   };
@@ -477,16 +478,16 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           <Alert type="error" title={error} showIcon style={{ borderRadius: 8, marginBottom: 12 }} />
         )}
 
-        {/* Storage Backends — the page's subject, first. */}
+        {/* Storage backends — the page's subject, first. */}
         <div style={cardStyle}>
           <SectionHeader
             icon={<DatabaseOutlined />}
-            title="Storage Backends"
+            title="Storage backends"
             description={
               backends.length === 0
                 ? 'No backend configured.'
                 : backends.every((b) => b.is_synthesized)
-                  ? 'Running on a single unnamed backend (below). When you add a named backend, this one becomes the named backend "default" and keeps its buckets.'
+                  ? 'The proxy uses one unnamed backend, from storage.backend in the YAML (below). You cannot delete it. When you add a named backend, this one becomes the named backend "default" and keeps its buckets.'
                   : `${backends.length} backend${backends.length !== 1 ? 's' : ''} configured.`
             }
           />
@@ -641,18 +642,23 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
 
           {!showForm && (
             <Button data-testid="backends-add" aria-label="Add backend" icon={<PlusOutlined />} onClick={() => setShowForm(true)} style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }} block type="dashed">
-              Add Backend
+              Add backend
             </Button>
           )}
         </div>
 
-        {/* New Backend Form */}
+        {/* New backend form */}
         {showForm && (
           <div style={cardStyle}>
-            <SectionHeader icon={<PlusOutlined />} title="New Backend" />
+            <SectionHeader icon={<PlusOutlined />} title="New backend" />
             <div>
               <FormField label="Name" yamlPath="storage.backends[].name">
-                <Input data-testid="backend-name" aria-label="Backend name" value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="e.g. local, hetzner, aws-prod" style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
+                <Input data-testid="backend-name" aria-label="Backend name" value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="e.g. local, hetzner, aws-prod" status={createTried && nameMissing ? 'error' : undefined} aria-invalid={createTried && nameMissing} style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
+                {createTried && nameMissing && (
+                  <Text type="danger" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
+                    Enter a name for the backend.
+                  </Text>
+                )}
               </FormField>
               <FormField label="Type" yamlPath="storage.backends[].type">
                 <Radio.Group value={formType} onChange={(e) => setFormType(e.target.value)} style={{ display: 'flex', gap: 0 }}>
@@ -662,7 +668,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               </FormField>
               {formType === 'filesystem' && (
                 <FormField
-                  label="Data Directory"
+                  label="Data directory"
                   yamlPath="storage.backends[].path"
                   helpText="An absolute path on the proxy host, for example /var/lib/deltaglider/data. A relative path would depend on the directory the proxy starts in."
                 >
@@ -672,10 +678,11 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                     value={formPath}
                     onChange={(e) => setFormPath(e.target.value)}
                     placeholder="/var/lib/deltaglider/data"
-                    status={formPath.trim() && pathInvalid ? 'error' : undefined}
+                    status={(formPath.trim() || createTried) && pathInvalid ? 'error' : undefined}
+                    aria-invalid={(formPath.trim() || createTried) && pathInvalid ? true : undefined}
                     style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
                   />
-                  {formPath.trim() && pathInvalid && (
+                  {(formPath.trim() || createTried) && pathInvalid && (
                     <Text type="danger" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
                       {ABSOLUTE_PATH_ERROR}
                     </Text>
@@ -699,10 +706,10 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       Keep ON for S3-compatibles (MinIO, Hetzner, Ceph). Turn OFF for AWS S3.
                     </Text>
                   </div>
-                  <FormField label="Access Key ID" yamlPath="storage.backends[].access_key_id">
+                  <FormField label="Access key ID" yamlPath="storage.backends[].access_key_id">
                     <Input value={formAccessKey} onChange={(e) => setFormAccessKey(e.target.value)} placeholder="AKIAIOSFODNN7EXAMPLE" style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
                   </FormField>
-                  <FormField label="Secret Access Key" yamlPath="storage.backends[].secret_access_key">
+                  <FormField label="Secret access key" yamlPath="storage.backends[].secret_access_key">
                     {/* Create-only form: no existing secret to keep, and blank is rejected. */}
                     <MaskedSecretInput
                       mode="new"
@@ -723,8 +730,8 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               <Alert type="error" showIcon title={formError} style={{ marginTop: 16, borderRadius: 8 }} />
             )}
             <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
-              <Button data-testid="backend-create" aria-label="Create backend" type="primary" icon={<CheckCircleOutlined />} onClick={handleCreate} loading={saving} disabled={!formName.trim() || pathInvalid} style={{ flex: 1, borderRadius: 8, fontWeight: 600 }}>
-                Create Backend
+              <Button data-testid="backend-create" type="primary" icon={<CheckCircleOutlined />} onClick={handleCreate} loading={saving} style={{ borderRadius: 8, fontWeight: 600 }}>
+                Create backend
               </Button>
               <Button onClick={() => { setShowForm(false); resetForm(); }} style={{ borderRadius: 8 }}>Cancel</Button>
             </div>
@@ -757,7 +764,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
             />
             <div>
               <Text style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--font-ui)', color: colors.TEXT_PRIMARY }}>
-                Delta compression: <span style={{ color: globalCompressionOn ? colors.ACCENT_GREEN : colors.TEXT_SECONDARY }}>{globalCompressionOn ? 'ON' : 'OFF'}</span>
+                Delta compression: <span style={{ color: globalCompressionOn ? colors.ACCENT_GREEN : colors.TEXT_SECONDARY }}>{globalCompressionOn ? 'on' : 'off'}</span>
                 <span style={{ fontWeight: 400, color: colors.TEXT_MUTED, marginLeft: 8, fontSize: 12 }}>
                   {ratioEnv ? `from env ${envOverrideSource(ratioEnv)}` : 'applies immediately'}
                 </span>

@@ -19,6 +19,7 @@ test('an estimated Refresh shows "≈" and says that the counter was kept', asyn
     savings_percentage: 90, last_scan_at: 1_760_000_000, never_scanned: false,
   };
   http.on('GET', '/_/api/admin/buckets', json({ buckets: [{ name: 'releases' }] }));
+  http.on('GET', '/_/api/admin/config', json({ bucket_policies: {} }));
   http.on('GET', '/_/api/admin/usage/bucket/releases', json(row));
   http.on('POST', /^\/_\/api\/admin\/usage\/refresh\?/, json({
     ...row, estimated: true, estimate: { object_count: 5, logical_bytes: 500, stored_bytes: 50 },

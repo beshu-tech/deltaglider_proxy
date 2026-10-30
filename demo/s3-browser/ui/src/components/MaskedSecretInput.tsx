@@ -32,12 +32,12 @@
  * password manager does not fill a saved login password into a credential
  * field (and then save or rotate it). Callers can override it.
  *
- * Styling comes from `useColors()` tokens — no hardcoded hex — and the usual
- * mono font / radius pass-throughs the call sites already used.
+ * The font is the form's font, like every other input (a secret is not code);
+ * a caller may pass its own `style`. The ARIA and `status` props that a
+ * FormField gives its control (label, error link, invalid state) pass through.
  */
 import { Input } from 'antd';
 import type { CSSProperties } from 'react';
-import { useColors } from '../ThemeContext';
 
 // NOTE: the secret-mask sentinel itself (`__redacted__`, mirrored in
 // `src/config.rs` + `webhookDeliveryPayload.ts`) never appears here — this
@@ -64,6 +64,12 @@ interface BaseProps {
   id?: string;
   'aria-label'?: string;
   'aria-labelledby'?: string;
+  /** Set by FormField: the help text and the error under the field. */
+  'aria-describedby'?: string;
+  /** Set by FormField when the field has an error. */
+  'aria-invalid'?: boolean;
+  /** Set by FormField when the field has an error (red border). */
+  status?: 'error';
 }
 
 interface SentinelProps extends BaseProps {
@@ -95,7 +101,6 @@ const BLANK_KEEPS_PLACEHOLDER = '(leave blank to keep existing)';
 const NEW_PLACEHOLDER = 'Secret';
 
 export default function MaskedSecretInput(props: MaskedSecretInputProps) {
-  const colors = useColors();
   const { onChange, placeholder, size, style, autoComplete = 'new-password', reveal } = props;
 
   // In sentinel mode a masked field renders EMPTY (never the sentinel, never a
@@ -124,11 +129,10 @@ export default function MaskedSecretInput(props: MaskedSecretInputProps) {
       id={props.id}
       aria-label={props['aria-label']}
       aria-labelledby={props['aria-labelledby']}
-      style={{
-        fontFamily: 'var(--font-mono)',
-        color: colors.TEXT_PRIMARY,
-        ...style,
-      }}
+      aria-describedby={props['aria-describedby']}
+      aria-invalid={props['aria-invalid']}
+      status={props.status}
+      style={style}
     />
   );
 }

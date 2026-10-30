@@ -334,3 +334,59 @@ export function buildBucketPayload(
   }
   return { ok: true, body: { buckets: bp } };
 }
+
+/** Two rows hold the same settings (the client-only `_id` aside). */
+function sameSettings(a: BucketPolicyRow, b: BucketPolicyRow): boolean {
+  const strip = ({ _id: _drop, ...rest }: BucketPolicyRow) => {
+    void _drop;
+    return { ...rest, public_prefixes: rest.public_prefixes.map((p) => p.value) };
+  };
+  return JSON.stringify(strip(a)) === JSON.stringify(strip(b));
+}
+
+/**
+ * Whether the user changed the settings of bucket `name`: its staged row
+ * differs from the server row (an added, edited or removed row).
+ */
+export function bucketRowEdited(cur: readonly BucketPolicyRow[], baseline: readonly BucketPolicyRow[], name: string): boolean {
+  const c = cur.find((r) => r.name === name);
+  const b = baseline.find((r) => r.name === name);
+  if (!c || !b) return !!c !== !!b;
+  return !sameSettings(c, b);
+}
+
+/**
+ * Per-bucket 3-way rebase of the staged rows after another request changed
+ * the section (an encryption change, which applies at once). A bucket the
+ * user did not edit takes the server's new row; an edited bucket and a draft
+ * keep the user's row. Without this, the stale copy of the changed bucket
+ * stayed in the staged rows, and the next apply sent it back.
+ */
+export function rebaseBucketRows(
+  cur: BucketPolicyRow[],
+  before: readonly BucketPolicyRow[],
+  next: BucketPolicyRow[],
+): BucketPolicyRow[] {
+  const byName = (rows: readonly BucketPolicyRow[], name: string) => rows.find((r) => r.name === name);
+  const out: BucketPolicyRow[] = [];
+  for (const n of next) {
+    const c = byName(cur, n.name);
+    const b = byName(before, n.name);
+    if (!c) {
+      // Absent from the staged rows: removed by the user if it was there
+      // before, else new on the server.
+      if (!b) out.push(n);
+      continue;
+    }
+    out.push(b && sameSettings(c, b) ? n : c);
+  }
+  for (const c of cur) {
+    if (c.name && byName(next, c.name)) continue;
+    const b = c.name ? byName(before, c.name) : undefined;
+    // Removed on the server and not edited here: follow the server.
+    if (b && sameSettings(c, b)) continue;
+    out.push(c);
+  }
+  return out;
+}
+

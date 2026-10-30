@@ -82,3 +82,40 @@ test('a mapping rule row names every control', async () => {
   for (const name of ['Claim field', 'Match value']) expect(screen.getByRole('textbox', { name })).toBeInTheDocument();
   for (const name of ['Match type', 'Assign to group', 'Provider']) expect(screen.getByRole('combobox', { name })).toBeInTheDocument();
 });
+
+test('an error marks the control invalid, describes it and shows under the field', () => {
+  renderWithQuery(
+    <FormField label="Name" helpText="Letters and digits." error="Name is required.">
+      <Input value="" onChange={() => {}} />
+    </FormField>,
+  );
+  const box = screen.getByRole('textbox');
+  expect(box).toHaveAttribute('aria-invalid', 'true');
+  expect(box).toHaveAccessibleDescription('Name is required. Letters and digits.');
+  expect(screen.getByRole('alert')).toHaveTextContent('Name is required.');
+  // AntD's status="error" draws the red border.
+  expect(box.className).toContain('ant-input-status-error');
+});
+
+test('a field without an error is not invalid but keeps its help as description', () => {
+  renderWithQuery(
+    <FormField label="Name" helpText="Letters and digits.">
+      <Input value="" onChange={() => {}} />
+    </FormField>,
+  );
+  const box = screen.getByRole('textbox');
+  expect(box).not.toHaveAttribute('aria-invalid');
+  expect(box).toHaveAccessibleDescription('Letters and digits.');
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+
+test("a FormField error is linked to a MaskedSecretInput: aria-invalid and aria-describedby", () => {
+  const { container } = renderWithQuery(
+    <FormField label="Client secret" helpText="Leave empty to keep it." error="Enter a secret.">
+      <MaskedSecretInput mode="new" value="" onChange={() => {}} />
+    </FormField>,
+  );
+  const input = container.querySelector('input[type="password"]');
+  expect(input).toHaveAttribute('aria-invalid', 'true');
+  expect(input).toHaveAccessibleDescription('Enter a secret. Leave empty to keep it.');
+});

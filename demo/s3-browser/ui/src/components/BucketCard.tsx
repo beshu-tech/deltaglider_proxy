@@ -23,7 +23,9 @@
  * for pre-provisioning drafts).
  */
 import { bucketNameError } from '../bucketName';
-import { useState, useId } from 'react';
+import { Children, isValidElement, useState, useId } from 'react';
+import type { ReactNode } from 'react';
+import { useIsNarrow } from '../useIsNarrow';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
 import { Button, Collapse, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
 import { DownOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
@@ -46,7 +48,7 @@ import { cancelConfirmText } from '../jobsView';
 import { formatBytesIec } from '../utils';
 import { bytesFromGib, gibFromBytes } from '../savings';
 import { activateOnKey } from '../keyboard';
-import RowActionsMenu from './RowActionsMenu';
+import { confirmDialog } from '../confirmDialog';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl } from '../urlState';
 import type { BucketRule } from '../runsView';
@@ -54,6 +56,11 @@ import { runsUrl } from './jobs/runsLink';
 import { WITNESS_CARD_ID } from './EncryptionWitnessCard';
 
 const { Text } = Typography;
+
+/** A radio beside a two-line (or taller) option: the dot sits on the
+ *  title line, not centred on the whole block (it read as the radio of
+ *  the prefix input below the title). */
+const RADIO_TOP = { icon: { alignSelf: 'flex-start', marginTop: 3 } } as const;
 
 interface CardProps {
   /** The replication and lifecycle rules that read or write this bucket. */
@@ -104,7 +111,9 @@ interface CardProps {
   witnessRefused?: boolean;
 }
 
-/** Small status chip used in the collapsed row. */
+/** Small status chip used in the collapsed row. Sentence case, never an
+ *  uppercase transform: it shouted units ("GIB") and changed the case of
+ *  bucket and backend names, which are case-sensitive. */
 function Chip({ tone, children, title }: { tone: string; children: React.ReactNode; title?: string }) {
   return (
     <span
@@ -113,13 +122,13 @@ function Chip({ tone, children, title }: { tone: string; children: React.ReactNo
         display: 'inline-flex',
         alignItems: 'center',
         gap: 4,
-        fontSize: 10,
+        fontSize: 11,
         fontWeight: 600,
-        letterSpacing: 0.4,
-        textTransform: 'uppercase',
         padding: '2px 8px',
         borderRadius: 10,
-        background: `${tone}22`,
+        // A light tint (8%): the tone text keeps 4.5:1 on it in both
+        // themes, also on the amber wash of a public bucket's card.
+        background: `${tone}14`,
         color: tone,
         whiteSpace: 'nowrap',
         cursor: title ? 'help' : undefined,
@@ -129,6 +138,23 @@ function Chip({ tone, children, title }: { tone: string; children: React.ReactNo
       {children}
     </span>
   );
+}
+
+/** The visible text of a chip (its string children, icons dropped). */
+function chipText(node: ReactNode): string {
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (!isValidElement<{ children?: ReactNode }>(node)) return '';
+  return Children.toArray(node.props.children).map(chipText).join('').trim();
+}
+
+/** On a phone a row shows this many chips, then a "+N" chip. */
+const PHONE_CHIPS = 2;
+
+/** "File types: 2 added, 1 removed" — the per-bucket change to the
+ *  built-in compressible types, in words (it was "+2 −1"). */
+function fileTypesLabel(added: number, removed: number): string {
+  const parts = [added ? `${added} added` : '', removed ? `${removed} removed` : ''].filter(Boolean);
+  return `File types: ${parts.join(', ')}`;
 }
 
 /** What a rule does with the bucket (the button's title). */
@@ -167,6 +193,8 @@ export default function BucketCard({
 }: CardProps) {
   const uid = useId();
   const colors = useColors();
+  // Phone: all the chips took three or four lines under the name.
+  const phone = useIsNarrow(600);
   const { navigate } = useNavigation();
   const witnessUrl = buildViewUrl('admin', 'system', { focus: WITNESS_CARD_ID });
   const [migrateOpen, setMigrateOpen] = useState(false);
@@ -225,6 +253,8 @@ export default function BucketCard({
   };
 
   // ── Collapsed status chips (effective state, always resolved) ──
+  // `Config::default_backend_name`: the singleton backend is "default".
+  const defaultName = defaultBackend ?? 'default';
   // The server's answer, never a client-side resolution (a bucket's own
   // block overrides its backend).
   const encryptionInfo = describeBucketEncryption(effectiveEncryption);
@@ -247,7 +277,7 @@ export default function BucketCard({
             : 'A job is still finishing on this bucket. Reads, uploads and deletes work.'
         }
       >
-        <SyncOutlined spin style={{ fontSize: 10 }} /> {writesBlocked ? 'busy' : 'job finishing'}
+        <SyncOutlined spin aria-hidden style={{ fontSize: 10 }} /> {writesBlocked ? 'Busy' : 'Job finishing'}
         {pct != null ? ` ${pct}%` : ''}
       </Chip>
     );
@@ -255,7 +285,7 @@ export default function BucketCard({
   if (!real) {
     chips.push(
       <Chip key="missing" tone={colors.ACCENT_AMBER} title="No bucket with this name exists yet — the policy applies once it's created.">
-        bucket not found
+        Bucket not found
       </Chip>
     );
   }
@@ -264,17 +294,18 @@ export default function BucketCard({
       <Chip key="backend" tone={colors.ACCENT_BLUE} title={`Explicitly routed to ${eff.backend}`}>
         → {eff.backend}
       </Chip>
-    ) : originBackend && originBackend !== defaultBackend ? (
+    ) : originBackend && originBackend !== defaultName ? (
       <Chip
         key="backend"
         tone={colors.ACCENT_BLUE}
         title={`No explicit route — the bucket exists on ${originBackend}${defaultBackend ? ` (the default backend is ${defaultBackend})` : ''}`}
       >
-        on {originBackend}
+        On {originBackend}
       </Chip>
     ) : (
-      <Chip key="backend" tone={colors.TEXT_MUTED} title="No explicit route — uses the default backend">
-        default{defaultBackend ? ` — ${defaultBackend}` : ''}
+      // "Default backend", not "on default": that read as "on by default".
+      <Chip key="backend" tone={colors.TEXT_MUTED} title={`No explicit route: the bucket uses the default backend (${defaultName}).`}>
+        Default backend{defaultName !== 'default' ? ` · ${defaultName}` : ''}
       </Chip>
     )
   );
@@ -292,7 +323,7 @@ export default function BucketCard({
   chips.push(
     eff.publicMode === 'none' ? (
       <Chip key="pub" tone={colors.TEXT_MUTED} title="Authenticated requests only">
-        private
+        Private
       </Chip>
     ) : (
       <Chip
@@ -304,15 +335,15 @@ export default function BucketCard({
             : 'Some prefixes are readable without credentials'
         }
       >
-        {eff.publicMode === 'entire' ? '⚠ public bucket' : `⚠ ${publicPrefixCount} public prefix${publicPrefixCount === 1 ? '' : 'es'}`}
+        {eff.publicMode === 'entire' ? '⚠ Public bucket' : `⚠ ${publicPrefixCount} public prefix${publicPrefixCount === 1 ? '' : 'es'}`}
       </Chip>
     )
   );
   if (eff.quota_bytes != null) {
     chips.push(
       // A quota is a normal setting, not a problem: neutral, not amber.
-      <Chip key="quota" tone={colors.TEXT_MUTED} title="Storage quota">
-        ≤ {formatBytesIec(eff.quota_bytes)}
+      <Chip key="quota" tone={colors.TEXT_MUTED} title="The bucket accepts uploads up to this total size">
+        Quota {formatBytesIec(eff.quota_bytes)}
       </Chip>
     );
   }
@@ -323,7 +354,7 @@ export default function BucketCard({
         tone={colors.ACCENT_BLUE}
         title="replication_target_only: client writes are rejected (403); replication is the only writer."
       >
-        replication target
+        Replication target
       </Chip>
     );
   }
@@ -331,10 +362,10 @@ export default function BucketCard({
     chips.push(
       <Chip key="comp" tone={colors.ACCENT_PURPLE} title="Compression override on this bucket">
         {eff.compression === false
-          ? 'compression off'
+          ? 'Compression off'
           : eff.max_delta_ratio !== null
-            ? `delta ≤ ${eff.max_delta_ratio}`
-            : 'compression on'}
+            ? `Delta cutoff ${eff.max_delta_ratio}`
+            : 'Compression on'}
       </Chip>
     );
   }
@@ -349,13 +380,64 @@ export default function BucketCard({
           eff.delta_remove.length ? `Stored whole: ${eff.delta_remove.join(', ')}` : '',
         ].filter(Boolean).join('\n')}
       >
-        file types{eff.delta_add.length ? ` +${eff.delta_add.length}` : ''}{eff.delta_remove.length ? ` −${eff.delta_remove.length}` : ''}
+        {fileTypesLabel(eff.delta_add.length, eff.delta_remove.length)}
       </Chip>
     );
   }
 
+  // On a phone: the first chips, then "+N" with the others in its title.
+  const shownChips =
+    phone && chips.length > PHONE_CHIPS + 1
+      ? [
+          ...chips.slice(0, PHONE_CHIPS),
+          <Chip
+            key="more"
+            tone={colors.TEXT_MUTED}
+            title={chips.slice(PHONE_CHIPS).map(chipText).join('\n')}
+          >
+            +{chips.length - PHONE_CHIPS}
+          </Chip>,
+        ]
+      : chips;
+
+  const cardActions: { key: string; label: string; confirm: { title: string; content: string; okText: string }; onSelect: () => void }[] = [
+    ...(hasOverrides
+      ? [{
+          key: 'reset',
+          label: 'Reset to defaults…',
+          confirm: {
+            title: `Reset ${name || 'this bucket'} to defaults?`,
+            content: hasOwnEncryption(row)
+              ? 'Public access, quota, and compression go back to the defaults. The bucket keeps its own encryption and its backend: a bucket key that objects use cannot be removed here. To change the encryption, use the Encryption group. Nothing changes until you review and apply.'
+              : 'Public access, routing, quota, and compression go back to the defaults. Nothing changes until you review and apply.',
+            okText: 'Reset',
+          },
+          onSelect: () => onPatch(resetRowFields(row)),
+        }]
+      : []),
+    ...(onRemoveDraft
+      ? [{
+          key: 'remove',
+          label: 'Remove these settings…',
+          confirm: hasOwnEncryption(row)
+            ? {
+                title: `Remove the settings and the encryption key of ${name}?`,
+                content:
+                  'No bucket with this name exists, so no object uses its key. The settings and the key are removed from the configuration at once (not when you review and apply). If you create this bucket later and want this key again, keep a copy of the key.',
+                okText: 'Remove settings and key',
+              }
+            : {
+                title: 'Remove these settings?',
+                content: 'The settings for this bucket name are removed when you review and apply.',
+                okText: 'Remove',
+              },
+          onSelect: onRemoveDraft,
+        }]
+      : []),
+  ];
+
   const groupLabel: React.CSSProperties = {
-    fontSize: 10,
+    fontSize: 11,
     fontWeight: 700,
     letterSpacing: 0.5,
     textTransform: 'uppercase',
@@ -379,7 +461,9 @@ export default function BucketCard({
         role="button"
         tabIndex={0}
         aria-expanded={expanded}
-        aria-label={`${name || 'new bucket policy'} — click to ${expanded ? 'collapse' : 'edit'}`}
+        // No aria-label: the name comes from the visible text (bucket name
+        // + chips), so it always contains what the user sees (axe
+        // label-content-name-mismatch); aria-expanded says edit/collapse.
         onClick={onToggle}
         onKeyDown={activateOnKey(onToggle)}
         style={{
@@ -396,9 +480,9 @@ export default function BucketCard({
         }}
       >
         {expanded ? (
-          <DownOutlined style={{ fontSize: 10, color: colors.TEXT_MUTED }} />
+          <DownOutlined aria-hidden style={{ fontSize: 10, color: colors.TEXT_MUTED }} />
         ) : (
-          <RightOutlined style={{ fontSize: 10, color: colors.TEXT_MUTED }} />
+          <RightOutlined aria-hidden style={{ fontSize: 10, color: colors.TEXT_MUTED }} />
         )}
         {onDraftNameChange ? (
           <span onClick={(e) => e.stopPropagation()} style={{ flex: 1, minWidth: 160 }}>
@@ -441,7 +525,10 @@ export default function BucketCard({
             justifyContent: 'flex-end',
           }}
         >
-          {chips}
+          {/* Spaces between chips: the row's accessible name reads
+              "releases Default backend Private", not "releasesDefault…". */}
+          {' '}
+          {shownChips.flatMap((chip, i) => (i === 0 ? [chip] : [' ', chip]))}
         </span>
       </div>
 
@@ -564,7 +651,7 @@ export default function BucketCard({
             <Text style={{ ...groupLabel, color: isPublic ? colors.ACCENT_AMBER : colors.TEXT_MUTED }}>
               Public access
               {isPublic && (
-                <span style={{ fontSize: 10, marginLeft: 8, fontWeight: 500, letterSpacing: 0, textTransform: 'none' }}>
+                <span style={{ fontSize: 11, marginLeft: 8, fontWeight: 500, letterSpacing: 0, textTransform: 'none' }}>
                   ⚠ readable without credentials
                 </span>
               )}
@@ -585,7 +672,7 @@ export default function BucketCard({
               }}
               style={formRow(6, { flexDirection: 'column', alignItems: 'stretch' })}
             >
-              <Radio value="none" style={{ alignItems: 'flex-start' }}>
+              <Radio value="none" style={{ alignItems: 'flex-start' }} styles={RADIO_TOP}>
                 <div>
                   <span style={{ fontSize: 13 }}>Private (default)</span>
                   <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 1 }}>
@@ -593,7 +680,7 @@ export default function BucketCard({
                   </Text>
                 </div>
               </Radio>
-              <Radio value="entire" style={{ alignItems: 'flex-start' }}>
+              <Radio value="entire" style={{ alignItems: 'flex-start' }} styles={RADIO_TOP}>
                 <div>
                   <span style={{ fontSize: 13 }}>Entire bucket public</span>
                   <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 1 }}>
@@ -601,7 +688,7 @@ export default function BucketCard({
                   </Text>
                 </div>
               </Radio>
-              <Radio value="prefixes" style={{ alignItems: 'flex-start' }}>
+              <Radio value="prefixes" style={{ alignItems: 'flex-start' }} styles={RADIO_TOP}>
                 <div style={{ width: '100%' }}>
                   <span style={{ fontSize: 13 }}>Specific prefixes public</span>
                   <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 1 }}>
@@ -636,7 +723,7 @@ export default function BucketCard({
                 These settings carry the bucket&apos;s own encryption ({String(row?.encryption?.mode ?? '')}
                 {row?.encryption?.key_id ? `, key id ${String(row.encryption.key_id)}` : ''}). It applies
                 when the bucket is created. The name cannot change while the settings hold a key;
-                to drop them, use Remove these settings in the menu below.
+                to drop them, use Remove these settings below.
               </Text>
             </div>
           )}
@@ -669,7 +756,7 @@ export default function BucketCard({
                     <div>
                       <div>{opt.data.label}</div>
                       {opt.data.sublabel && (
-                        <div style={{ fontSize: 11, opacity: 0.65 }}>{opt.data.sublabel}</div>
+                        <Text type="secondary" style={{ fontSize: 11, display: 'block' }}>{opt.data.sublabel}</Text>
                       )}
                     </div>
                   )}
@@ -878,50 +965,26 @@ export default function BucketCard({
                   Re-encrypt existing objects
                 </Button>
               )}
-              {/* Destructive actions sit behind a "⋯" menu, never as red
-                  buttons on the row, and each one is confirmed. */}
-              <span style={{ marginLeft: 'auto' }}>
-                <RowActionsMenu
-                  label={`More actions for bucket ${name || '(new)'}`}
-                  actions={[
-                    ...(hasOverrides
-                      ? [{
-                          key: 'reset',
-                          danger: true as const,
-                          label: 'Reset to defaults…',
-                          confirm: {
-                            title: `Reset ${name || 'this bucket'} to defaults?`,
-                            content: hasOwnEncryption(row)
-                              ? 'Public access, quota, and compression go back to the defaults. The bucket keeps its own encryption and its backend: a bucket key that objects use cannot be removed here. To change the encryption, use the Encryption group. Nothing changes until you review and apply.'
-                              : 'Public access, routing, quota, and compression go back to the defaults. Nothing changes until you review and apply.',
-                            okText: 'Reset',
-                          },
-                          onSelect: () => onPatch(resetRowFields(row)),
-                        }]
-                      : []),
-                    ...(onRemoveDraft
-                      ? [{
-                          key: 'remove',
-                          danger: true as const,
-                          label: 'Remove these settings…',
-                          confirm: hasOwnEncryption(row)
-                            ? {
-                                title: `Remove the settings and the encryption key of ${name}?`,
-                                content:
-                                  'No bucket with this name exists, so no object uses its key. The settings and the key are removed from the configuration at once (not when you review and apply). If you create this bucket later and want this key again, keep a copy of the key.',
-                                okText: 'Remove settings and key',
-                              }
-                            : {
-                                title: 'Remove these settings?',
-                                content: 'The settings for this bucket name are removed when you review and apply.',
-                                okText: 'Remove',
-                              },
-                          onSelect: onRemoveDraft,
-                        }]
-                      : []),
-                  ]}
-                />
-              </span>
+              {/* The card's own actions, as plain text buttons at its foot
+                  (a "⋯" menu with one item hid them, and its popup spilled
+                  over the card edge). Each one is confirmed. */}
+              {cardActions.length > 0 && (
+                <span style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+                  {cardActions.map((a) => (
+                    <Button
+                      key={a.key}
+                      size="small"
+                      type="text"
+                      style={{ fontSize: 11, padding: '0 4px' }}
+                      onClick={async () => {
+                        if (await confirmDialog({ ...a.confirm, danger: true })) a.onSelect();
+                      }}
+                    >
+                      {a.label}
+                    </Button>
+                  ))}
+                </span>
+              )}
             </div>
           )}
         </div>

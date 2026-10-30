@@ -27,6 +27,13 @@ body {
   margin: 0;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* Manrope's space is narrow: at 11-13 px "2h 55m ago" reads as one token.
+     Inherited by every element, AntD tables and portals included. */
+  word-spacing: 0.12em;
+}
+/* Monospace has a full-width space already. */
+code, kbd, pre, samp, .ant-typography code {
+  word-spacing: normal;
 }
 
 /* ───── Theme-aware CSS custom properties ───── */
@@ -34,8 +41,8 @@ body {
   --scrollbar-track: rgba(255, 255, 255, 0.03);
   --scrollbar-thumb: rgba(255, 255, 255, 0.08);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.14);
-  --table-row-hover: rgba(45, 212, 191, 0.06);
-  --table-row-selected: rgba(45, 212, 191, 0.12);
+  --table-row-hover: rgba(45, 212, 191, 0.10);
+  --table-row-selected: rgba(45, 212, 191, 0.17);
   --focus-ring: #2dd4bf;
   --glass-bg: rgba(15, 23, 42, 0.6);
   --glass-border: rgba(255, 255, 255, 0.06);
@@ -104,8 +111,8 @@ body {
   --scrollbar-track: rgba(0, 0, 0, 0.02);
   --scrollbar-thumb: rgba(0, 0, 0, 0.12);
   --scrollbar-thumb-hover: rgba(0, 0, 0, 0.2);
-  --table-row-hover: rgba(13, 148, 136, 0.05);
-  --table-row-selected: rgba(13, 148, 136, 0.10);
+  --table-row-hover: rgba(13, 148, 136, 0.09);
+  --table-row-selected: rgba(13, 148, 136, 0.15);
   --focus-ring: #0f766e;
   --glass-bg: rgba(255, 255, 255, 0.7);
   --glass-border: rgba(0, 0, 0, 0.06);
@@ -530,27 +537,27 @@ body {
   align-items: center;
   gap: 10px;
   width: 100%;
-  margin: 0 0 6px;
-  padding: 10px 12px;
+  margin: 0 0 2px;
+  padding: 8px 10px;
   border: none;
-  border-radius: 10px;
+  border-radius: 6px;
   cursor: pointer;
   text-align: left;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 500;
   font-family: var(--font-ui);
-  letter-spacing: 0.01em;
   transition: background 0.15s ease, color 0.15s ease;
 }
 .account-menu-item:last-child {
   margin-bottom: 0;
 }
+/* A plain menu row: no fill at rest, a tint on hover. */
 [data-theme="dark"] .account-menu-item {
-  background: rgba(0, 0, 0, 0.28);
+  background: transparent;
   color: rgba(248, 250, 252, 0.94);
 }
 [data-theme="light"] .account-menu-item {
-  background: rgba(13, 148, 136, 0.08);
+  background: transparent;
   color: #0c1629;
 }
 [data-theme="dark"] .account-menu-item:hover {
@@ -784,7 +791,10 @@ body {
 .dg-login-shell {
   position: relative;
   isolation: isolate;
-  min-height: 100vh;
+  /* border-box + dvh: the 24px padding is inside the min-height, so the
+     page does not scroll by 48px and cut the frame. */
+  box-sizing: border-box;
+  min-height: 100dvh;
   display: grid;
   place-items: center;
   overflow: hidden;
@@ -1062,9 +1072,37 @@ body {
   }
 }
 
-/* WCAG AA: AntD's dark preset purple tag text is 3.4:1 on its own tint. */
-[data-theme="dark"] .ant-tag.ant-tag-purple {
-  color: #c4b5fd !important;
+/* ───── Tags: WCAG AA text (4.5:1) on the tag's own tint ─────
+ * AntD paints preset tags with palette step 7 and status tags with
+ * colorSuccess/Warning/Error/Info. Several of those are 2-3.4:1 on their
+ * tint; these steps reach 4.5:1 (checked in __tests__/contrast.test.ts).
+ * Solid tags keep their own (white or dark) text. */
+[data-theme="light"] .ant-tag:not(.ant-tag-solid).ant-tag-cyan { color: #006d75 !important; }
+[data-theme="light"] .ant-tag:not(.ant-tag-solid).ant-tag-green { color: #237804 !important; }
+[data-theme="light"] .ant-tag:not(.ant-tag-solid).ant-tag-orange { color: #ad4e00 !important; }
+[data-theme="light"] .ant-tag:not(.ant-tag-solid).ant-tag-volcano { color: #ad2102 !important; }
+[data-theme="light"] .ant-tag:not(.ant-tag-solid).ant-tag-yellow { color: #876800 !important; }
+[data-theme="light"] .ant-tag:not(.ant-tag-solid).ant-tag-lime { color: #3f6600 !important; }
+[data-theme="light"] .ant-tag:not(.ant-tag-solid).ant-tag-gold { color: #874d00 !important; }
+[data-theme="light"] .ant-tag:not(.ant-tag-solid).ant-tag-success { color: #065f46 !important; }
+[data-theme="light"] .ant-tag:not(.ant-tag-solid).ant-tag-warning { color: #92400e !important; }
+[data-theme="light"] .ant-tag:not(.ant-tag-solid).ant-tag-error { color: #9f1239 !important; }
+[data-theme="light"] .ant-tag:not(.ant-tag-solid).ant-tag-processing { color: #0958d9 !important; }
+[data-theme="dark"] .ant-tag:not(.ant-tag-solid).ant-tag-purple { color: #c4b5fd !important; }
+[data-theme="dark"] .ant-tag:not(.ant-tag-solid).ant-tag-geekblue { color: #7f9ef3 !important; }
+[data-theme="dark"] .ant-tag:not(.ant-tag-solid).ant-tag-processing { color: #65a9f3 !important; }
+/* No tag text under 11 px: some callers set 9-10 px inline. */
+.ant-tag[style*="font-size: 9px"],
+.ant-tag[style*="font-size: 10px"] {
+  font-size: 11px !important;
+}
+
+/* ───── Links in running text: underlined, so colour is not the only cue
+ * (axe link-in-text-block). Stand-alone links and link buttons stay plain. */
+:is(p, li, dd, .ant-typography, .ant-alert-message, .ant-alert-description, .ant-form-item-extra, .ant-empty-description) a:not(.ant-btn):not([role='button']) {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
 }
 
 /* ───── Backend card (BackendCard.tsx): follows its OWN width ─────

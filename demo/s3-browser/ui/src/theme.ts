@@ -33,6 +33,10 @@ export const darkTheme = {
     colorTextSecondary: '#8b93a1',
     colorTextTertiary: '#8b93a1',
     colorTextPlaceholder: '#858f9e',
+    // Links use the brand teal, not AntD's default blue.
+    colorLink: '#2dd4bf',
+    colorLinkHover: '#5eead4',
+    colorLinkActive: '#14b8a6',
     fontSize: 14,
     borderRadius: 8,
     fontFamilyCode: "'JetBrains Mono', 'Fira Code', monospace",
@@ -46,6 +50,9 @@ export const lightTheme = {
     ...DG_BRAND,
     // #0d9488 under white button text is 3.7:1; #0f766e is 5.5:1 (WCAG AA).
     colorPrimary: '#0f766e',
+    colorLink: '#0f766e',
+    colorLinkHover: '#115e59',
+    colorLinkActive: '#134e4a',
     colorTextSecondary: '#55627a',
     colorTextTertiary: '#55627a',
     colorTextPlaceholder: '#5f6c80',

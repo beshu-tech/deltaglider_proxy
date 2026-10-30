@@ -12,6 +12,7 @@
  * listeners themselves accept BOTH modifiers — someone on a Mac with a PC
  * keyboard can still press Ctrl+K and everything works.
  */
+import { useRef, useState } from 'react';
 import { Modal, Typography } from 'antd';
 import { useColors } from '../ThemeContext';
 import { metaKeyLabel } from '../platform';
@@ -80,6 +81,14 @@ export default function ShortcutsHelp({ open, onClose }: Props) {
   // Computed at render time so we don't freeze the list at module
   // load — cheap, and keeps the detection logic owned by platform.ts.
   const groups = buildGroups();
+  // The list scrolls inside the modal (it is taller than a laptop or phone
+  // screen). A fade at the bottom shows that there is more below.
+  const listRef = useRef<HTMLDivElement>(null);
+  const [moreBelow, setMoreBelow] = useState(false);
+  const measure = () => {
+    const el = listRef.current;
+    if (el) setMoreBelow(el.scrollTop + el.clientHeight < el.scrollHeight - 4);
+  };
   return (
     <Modal
       open={open}
@@ -88,53 +97,85 @@ export default function ShortcutsHelp({ open, onClose }: Props) {
       title="Keyboard shortcuts"
       width={480}
       destroyOnHidden
+      // Focus the list, not the close button: no focus ring on open, and the
+      // arrow keys scroll the list at once.
+      afterOpenChange={(isOpen) => {
+        if (!isOpen) return;
+        listRef.current?.focus({ preventScroll: true, focusVisible: false } as FocusOptions);
+        measure();
+      }}
     >
-      {groups.map((group) => (
-        <div key={group.title} style={{ marginBottom: 18 }}>
-          <Text
-            style={{
-              display: 'block',
-              fontSize: 11,
-              fontWeight: 600,
-              letterSpacing: '0.04em',
-              textTransform: 'uppercase',
-              color: colors.TEXT_MUTED,
-              marginBottom: 4,
-            }}
-          >
-            {group.title}
+      <div style={{ position: 'relative' }}>
+        <div
+          ref={listRef}
+          tabIndex={0}
+          role="region"
+          aria-label="Shortcut list"
+          onScroll={measure}
+          style={{ maxHeight: '70vh', overflowY: 'auto', paddingRight: 4 }}
+        >
+          {groups.map((group) => (
+            <div key={group.title} style={{ marginBottom: 18 }}>
+              <Text
+                style={{
+                  display: 'block',
+                  fontSize: 11,
+                  fontWeight: 600,
+                  letterSpacing: '0.04em',
+                  textTransform: 'uppercase',
+                  color: colors.TEXT_MUTED,
+                  marginBottom: 4,
+                }}
+              >
+                {group.title}
+              </Text>
+              <table
+                style={{
+                  width: '100%',
+                  borderCollapse: 'collapse',
+                  fontSize: 13,
+                  fontFamily: 'var(--font-ui)',
+                }}
+              >
+                <tbody>
+                  {group.shortcuts.map((s) => (
+                    <tr
+                      key={s.keys.join('+') + s.description}
+                      style={{ borderBottom: `1px solid ${colors.BORDER}` }}
+                    >
+                      <td style={{ padding: '8px 12px 8px 0', width: 160 }}>
+                        <KeyCombo keys={s.keys} />
+                      </td>
+                      <td style={{ padding: '8px 0', color: colors.TEXT_SECONDARY }}>
+                        {s.description}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ))}
+          <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 4, lineHeight: 1.6 }}>
+            Tip: the palette accepts fuzzy input, e.g.{' '}
+            <code style={{ fontFamily: 'var(--font-mono)' }}>adm cred</code>{' '}
+            matches "Credentials &amp; mode" under Access.
           </Text>
-          <table
-            style={{
-              width: '100%',
-              borderCollapse: 'collapse',
-              fontSize: 13,
-              fontFamily: 'var(--font-ui)',
-            }}
-          >
-            <tbody>
-              {group.shortcuts.map((s) => (
-                <tr
-                  key={s.keys.join('+') + s.description}
-                  style={{ borderBottom: `1px solid ${colors.BORDER}` }}
-                >
-                  <td style={{ padding: '8px 12px 8px 0', width: 160 }}>
-                    <KeyCombo keys={s.keys} />
-                  </td>
-                  <td style={{ padding: '8px 0', color: colors.TEXT_SECONDARY }}>
-                    {s.description}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
         </div>
-      ))}
-      <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 4, lineHeight: 1.6 }}>
-        Tip: the palette accepts fuzzy input, e.g.{' '}
-        <code style={{ fontFamily: 'var(--font-mono)' }}>adm cred</code>{' '}
-        matches "Credentials &amp; mode" under Access.
-      </Text>
+        {moreBelow && (
+          <div
+            aria-hidden
+            style={{
+              position: 'absolute',
+              left: 0,
+              right: 0,
+              bottom: 0,
+              height: 40,
+              pointerEvents: 'none',
+              background: `linear-gradient(to bottom, transparent, ${colors.BG_ELEVATED})`,
+            }}
+          />
+        )}
+      </div>
     </Modal>
   );
 }

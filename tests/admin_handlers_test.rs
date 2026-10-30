@@ -2181,6 +2181,17 @@ async fn admin_error_bodies_keep_their_shape() {
             err("invalid_request", "user name cannot start with '$'"),
         ),
         (
+            "user name with a space",
+            admin
+                .post(api("/users"))
+                .json(&json!({ "name": "a b", "permissions": [] })),
+            StatusCode::BAD_REQUEST,
+            err(
+                "invalid_request",
+                "user name can contain only letters, digits and the characters + = , . @ _ -",
+            ),
+        ),
+        (
             "mapping missing",
             admin.delete(api("/ext-auth/mappings/999999")),
             StatusCode::NOT_FOUND,

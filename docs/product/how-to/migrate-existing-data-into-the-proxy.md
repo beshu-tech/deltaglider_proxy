@@ -16,12 +16,12 @@ Use this route when the existing data can stay where it is. In the example, the 
 In the admin UI:
 
 1. In the sidebar, open **Storage → Backends** (`/_/admin/storage/backends`).
-2. Click **Add Backend** below the list of backends.
+2. Click **Add backend** below the list of backends.
 
-   ![The Backends page lists the configured backends; callout 1 marks Backends in the sidebar and callout 2 marks the Add Backend button.](/_/screenshots/route-bucket-add-backend.webp)
+   ![The Backends page lists the configured backends; callout 1 marks Backends in the sidebar and callout 2 marks the Add backend button.](/_/screenshots/route-bucket-add-backend.webp)
 
-3. In the **New Backend** form, type `aws-dr` in **Name** and select **S3** in **Type**. Leave **Endpoint** empty, type `eu-west-1` in **Region**, and leave **Force path-style URLs** off, because AWS needs `false`. Fill in **Access Key ID** and **Secret Access Key** with a key that can read and write `acme-firmware`.
-4. Click **Create Backend**. The page tests the connection first, and it does not create a backend that fails the test.
+3. In the **New backend** form, type `aws-dr` in **Name** and select **S3** in **Type**. Leave **Endpoint** empty, type `eu-west-1` in **Region**, and leave **Force path-style URLs** off, because AWS needs `false`. Fill in **Access key ID** and **Secret access key** with a key that can read and write `acme-firmware`.
+4. Click **Create backend**. The page tests the connection first, and it does not create a backend that fails the test.
 
 [How to route a bucket to a different backend](route-a-bucket-to-a-backend.md#1-declare-the-backends) shows the same form for another backend.
 

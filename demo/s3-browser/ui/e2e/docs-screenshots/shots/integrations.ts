@@ -133,7 +133,7 @@ export const INTEGRATIONS_SHOTS: Shot[] = [
     alt: 'The What gets posted section of the Slack connector is open; the box marks the event kinds and the include and exclude prefix filters.',
     setup: async (page) => {
       await slack(page, 'webhook');
-      const summary = page.getByText('What gets posted (event kinds + prefix filters)', { exact: true });
+      const summary = page.getByText('What gets posted', { exact: true });
       await summary.click();
       await page.getByRole('button', { name: 'Add prefix glob' }).first().click();
       await page.getByRole('textbox', { name: 'Include prefixes 1' }).fill('firmware/**');
@@ -154,7 +154,7 @@ export const INTEGRATIONS_SHOTS: Shot[] = [
     route: '/_/admin/integrations/event-outbox',
     // Wide enough for the Action column of the table; cropped to the table.
     viewport: { width: 1440, height: 800 },
-    clip: { union: [{ text: 'Object change events', exact: true }, { text: /^1-\d+ of \d+$/ }, { role: 'button', name: /^(sync )?Requeue$/, nth: 0 }] },
+    clip: { union: [{ placeholder: 'Search loaded rows...' }, { text: /^1-\d+ of \d+$/ }, { role: 'button', name: /^(sync )?Requeue$/, nth: 0 }] },
     clipPadding: 32,
     alt: 'The Event log lists an event whose delivery failed; the arrow points at the Requeue button of that row.',
     setup: async (page) => {

@@ -27,7 +27,7 @@ import { useState } from 'react';
 import { Button, Typography } from 'antd';
 import {
   PlusOutlined,
-  InfoCircleOutlined,
+
 } from '@ant-design/icons';
 import type { AdmissionBlock } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
@@ -57,7 +57,7 @@ export default function AdmissionPanel({
   onSessionExpired,
   onNavigateToBucket,
 }: Props) {
-  const { BORDER, TEXT_MUTED } = useColors();
+  const { BORDER } = useColors();
 
   // Bucket-policies for the synthesised-blocks preview come from the
   // cached config query (shared, invalidated by config mutations).
@@ -166,8 +166,8 @@ export default function AdmissionPanel({
               Your rules
             </h3>
             <Text type="secondary" style={{ fontSize: 12 }}>
-              Drag to reorder. The first matching rule wins. Your rules are
-              checked <b>before</b> the public-access rules below.
+              Drag to reorder. Your rules are checked before the
+              public-access rules below.
             </Text>
           </div>
           <Button icon={<PlusOutlined />} onClick={openAdd} disabled={loading}>
@@ -199,13 +199,10 @@ export default function AdmissionPanel({
               Public-access rules
             </h3>
             <Text type="secondary" style={{ fontSize: 12 }}>
-              Created from the public access setting of each bucket. Change
-              them on the Buckets page.
+              Created from the public access setting of each bucket, and
+              checked after your rules. Change them in the bucket settings.
             </Text>
           </div>
-          <Text type="secondary" style={{ fontSize: 11, color: TEXT_MUTED }}>
-            <InfoCircleOutlined /> checked after your rules
-          </Text>
         </header>
         {config && (
           <SynthesizedBlocksPreview

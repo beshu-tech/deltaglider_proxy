@@ -48,10 +48,13 @@ const CELL_TRUNCATE_STYLE = {
 } as const;
 
 /** The column tracks of the audit table, defined once on the outer grid.
- *  The action column sizes to its widest tag, so a long action such as
- *  `apply_config_section:admission` never runs into the user column. */
+ *  Time, action, user, IP and bucket size to their content (up to a cap,
+ *  then ellipsis), and the target column takes the rest. Short values do
+ *  not spread over the full width. The action column fits its widest tag,
+ *  so a long action such as `apply_config_section:admission` never runs
+ *  into the user column. */
 const AUDIT_COLUMNS =
-  '110px minmax(120px, max-content) minmax(100px, 180px) minmax(90px, 140px) minmax(80px, 140px) minmax(160px, 1fr)';
+  '76px max-content fit-content(200px) fit-content(150px) fit-content(160px) minmax(160px, 1fr)';
 
 /** A header or data row: a subgrid that spans every column of the table. */
 const AUDIT_ROW = {
@@ -249,7 +252,7 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
             // Fill the card; below the sum of the column minimums the card
             // scrolls sideways instead of squeezing the columns.
             width: '100%',
-            minWidth: 820,
+            minWidth: 720,
           }}
         >
           <div

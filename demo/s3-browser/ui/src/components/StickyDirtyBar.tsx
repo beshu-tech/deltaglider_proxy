@@ -7,8 +7,14 @@
  * scroll, and animates in/out subtly. The pattern admin UIs converge on
  * (GitHub / Linear / Vercel settings bars).
  *
- * Renders nothing (and reserves no space) when not dirty — but because it's
- * sticky/floating, its appearance never shifts the layout above it.
+ * A hidden bar stays mounted (for the fade) but is `visibility: hidden`, so
+ * its buttons are not hit-testable, not focusable and not found by "visible"
+ * queries. Before, a page with two bars (Buckets: the page bar and the
+ * object-size card's inline bar) had a ghost "Review & apply" over the
+ * content, and a click on it opened a 0-change dialog for the wrong section.
+ *
+ * A floating bar reserves its own height in the flow while it shows, so the
+ * last field on the page can scroll out from under it.
  */
 import { Button, Space } from 'antd';
 import { ExclamationCircleFilled } from '@ant-design/icons';
@@ -52,7 +58,7 @@ export default function StickyDirtyBar({
   const hasErrors = errorCount > 0;
 
   const positionStyle: React.CSSProperties = inline
-    ? { height: visible ? 'auto' : 0, marginBottom: visible ? 8 : 0 }
+    ? { height: visible ? 'auto' : 0, marginBottom: visible ? 8 : 0, overflow: visible ? undefined : 'hidden' }
     : floating
       ? {
         // Fixed to the viewport bottom-center. Anchored right of the sidebar
@@ -67,9 +73,10 @@ export default function StickyDirtyBar({
         bottom: 12,
         height: visible ? 'auto' : 0,
         marginTop: visible ? 8 : 0,
+        overflow: visible ? undefined : 'hidden',
       };
 
-  return (
+  const bar = (
     <div
       // pointer-events none on the wrapper lets clicks through the empty
       // margins; the inner bar re-enables them.
@@ -84,7 +91,11 @@ export default function StickyDirtyBar({
         // Subtle enter/leave: translate + fade, no reflow of siblings.
         opacity: visible ? 1 : 0,
         transform: visible ? 'translateY(0)' : 'translateY(8px)',
-        transition: 'opacity 160ms ease, transform 160ms ease',
+        // Hidden only after the fade-out ends; shown at once on the way in.
+        visibility: visible ? 'visible' : 'hidden',
+        transition: visible
+          ? 'opacity 160ms ease, transform 160ms ease'
+          : 'opacity 160ms ease, transform 160ms ease, visibility 0s linear 160ms',
       }}
       aria-hidden={!visible}
       // A collapsed bar is still mounted (for the fade), and aria-hidden
@@ -142,5 +153,15 @@ export default function StickyDirtyBar({
         </Space>
       </div>
     </div>
+  );
+
+  if (!floating || inline) return bar;
+  // A fixed bar is out of the flow: reserve its height (bar + bottom offset)
+  // at the end of the page while it shows, so it never covers the last card.
+  return (
+    <>
+      {visible && <div data-testid="dirty-bar-spacer" aria-hidden style={{ height: 64, flexShrink: 0 }} />}
+      {bar}
+    </>
   );
 }

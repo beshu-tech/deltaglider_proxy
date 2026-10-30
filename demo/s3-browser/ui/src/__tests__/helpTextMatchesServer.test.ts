@@ -16,14 +16,14 @@ test('Enable delivery help matches the outbox prune rule', () => {
   expect(panel).toMatch(/Enable delivery[\s\S]{0,400}replication/);
 });
 
-// The backup buttons live in the last card of System → System (RecoveryPanel,
+// The backup buttons live in the last card of the System page (RecoveryPanel,
 // "Download backup"); there is no Backup entry in the account menu.
-test('texts that point at the backup name System → System', () => {
+test('texts that point at the backup name the System page', () => {
   for (const f of ['components/CopySectionYamlButton.tsx', 'components/IamSourceBanner.tsx']) {
-    const s = src(f);
-    expect(s, f).not.toMatch(/Avatar menu|use Backup →|Full Backup/);
-    expect(s, f).toContain('System → System');
+    expect(src(f), f).not.toMatch(/Avatar menu|use Backup →|Full Backup/);
   }
+  expect(src('components/CopySectionYamlButton.tsx')).toContain('System → System');
+  expect(src('components/IamSourceBanner.tsx')).toMatch(/download a backup[\s\S]*System page/);
   expect(src('components/RecoveryPanel.tsx')).toContain('Download backup');
 });
 

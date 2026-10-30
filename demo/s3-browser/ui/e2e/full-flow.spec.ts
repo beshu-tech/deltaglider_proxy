@@ -31,7 +31,7 @@ test('open auth: bucket, upload, list, admin login, sign out, reconnect, object 
   await bucketRowBtn.click();
 
   // ── Upload page ─────────────────────────────────────────────────
-  await page.getByRole('button', { name: 'Upload Files' }).click();
+  await page.getByRole('button', { name: 'Upload files' }).click();
   await expect(page.getByRole('heading', { name: new RegExp(`Upload to ${bucketName}`) })).toBeVisible({
     timeout: 30_000,
   });

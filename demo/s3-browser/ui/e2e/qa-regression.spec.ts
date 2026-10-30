@@ -148,7 +148,7 @@ function expectSessionProbe() {
 async function signIn() {
   expectSessionProbe();
   await page.goto('/_/browse');
-  await page.getByPlaceholder('Admin password').fill(PASSWORD);
+  await page.getByLabel('Admin password', { exact: true }).fill(PASSWORD);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
 }
@@ -185,7 +185,7 @@ async function uploadViaUi(
   files: { name: string; mimeType: string; buffer: Buffer }[],
 ) {
   await openBucket(bucket);
-  await page.getByRole('button', { name: 'Upload Files' }).click();
+  await page.getByRole('button', { name: 'Upload files' }).click();
   await expect(page.getByRole('heading', { name: new RegExp(`Upload to ${bucket}`) })).toBeVisible({ timeout: 30_000 });
   if (dest) {
     const input = page.getByRole('combobox', { name: /Destination path prefix/ });
@@ -235,7 +235,7 @@ test('1. bootstrap login, create bucket, upload, inspect, preview, download, del
   // Inspector.
   await row('notes.txt').click();
   await expect(page.getByRole('heading', { name: 'notes.txt' })).toBeVisible();
-  await expect(page.getByRole('region', { name: 'Object Info' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Object info' })).toBeVisible();
 
   // Preview.
   await page.getByRole('button', { name: /Preview/ }).click();
@@ -338,7 +338,7 @@ test('3. bulk copy, move, ZIP, delete; refusals for move-into-source and path es
   await select('notes.txt', 'tiny.bin');
   await expect(toolbar()).toContainText('2 selected');
   await bulkTo('Copy', BUCKET2, 'copied/');
-  await expect(toast()).toContainText('2 items copied', { timeout: 30_000 });
+  await expect(toast()).toContainText('2 objects copied', { timeout: 30_000 });
   expect(await listKeys(BUCKET2)).toEqual(['copied/notes.txt', 'copied/tiny.bin']);
   expect(await getText(BUCKET2, 'copied/notes.txt')).toBe(SMALL_TEXT);
 
@@ -387,7 +387,7 @@ test('3. bulk copy, move, ZIP, delete; refusals for move-into-source and path es
 
   // Upload to a '..' destination: refused on the page, no request is sent.
   await page.goto(`/_/browse/${BUCKET}/`);
-  await page.getByRole('button', { name: 'Upload Files' }).click();
+  await page.getByRole('button', { name: 'Upload files' }).click();
   await page.getByRole('combobox', { name: /Destination path prefix/ }).fill('../up-escape/');
   await expect(page.getByRole('alert').filter({ hasText: 'cannot be "." or ".."' })).toBeVisible();
   await expect(page.getByRole('button', { name: /Select files/ })).toBeDisabled();
@@ -504,10 +504,10 @@ test('5. IAM: create prefix-scoped user and a group, delete the last user → bo
   await ensureSignedIn();
   await s3().send(new CreateBucketCommand({ Bucket: BUCKET })).catch(() => undefined);
   await openAdmin('access/users', 'Users');
-  await page.getByRole('button', { name: /New User/ }).click();
-  await page.getByRole('textbox', { name: 'User name' }).fill(`qa-scoped-${RUN}`);
-  await page.getByPlaceholder('e.g. user@company.com').fill(SCOPED_KEY);
-  await page.getByPlaceholder('e.g. mysecretkey or leave empty').fill(SCOPED_SECRET);
+  await page.getByRole('button', { name: 'New user' }).click();
+  await page.getByTestId('user-name').fill(`qa-scoped-${RUN}`);
+  await page.getByLabel('Access key ID', { exact: true }).fill(SCOPED_KEY);
+  await page.getByLabel('Secret access key', { exact: true }).fill(SCOPED_SECRET);
   const resource = page.getByRole('combobox', { name: 'Resource pattern' });
   await resource.fill(`${BUCKET}/scoped/*`);
   // Leaving the WHERE field must not move CAN DO: its suggestion chips used
@@ -521,6 +521,8 @@ test('5. IAM: create prefix-scoped user and a group, delete the last user → bo
   // Click straight from the focused field, as a user does.
   await write.check();
   await page.getByRole('button', { name: 'Create user' }).click();
+  // The first IAM user switches sign-in to IAM users: the form asks first.
+  await page.getByRole('dialog').filter({ hasText: 'Switch sign-in to IAM users?' }).getByRole('button', { name: 'Create user and switch' }).click();
   const userItem = page.getByText(`qa-scoped-${RUN}`, { exact: true }).first();
   await expect(userItem).toBeVisible({ timeout: 30_000 });
 
@@ -533,8 +535,8 @@ test('5. IAM: create prefix-scoped user and a group, delete the last user → bo
 
   // A group.
   await openAdmin('access/groups', 'Groups');
-  await page.getByRole('button', { name: /New Group/ }).click();
-  await page.getByRole('textbox', { name: 'Group name' }).fill(`qa-group-${RUN}`);
+  await page.getByRole('button', { name: 'New group' }).click();
+  await page.getByTestId('group-name').fill(`qa-group-${RUN}`);
   await page.getByRole('button', { name: 'Create group' }).click();
   await expect(page.getByText(`qa-group-${RUN}`, { exact: true }).first()).toBeVisible({ timeout: 30_000 });
 
@@ -547,12 +549,12 @@ test('5. IAM: create prefix-scoped user and a group, delete the last user → bo
   // Delete the scoped user, then the last one (legacy-admin).
   for (const name of [`qa-scoped-${RUN}`, 'legacy-admin']) {
     await page.getByText(name, { exact: true }).first().click();
-    await expect(page.getByRole('textbox', { name: 'User name' })).toHaveValue(name);
-    await page.getByRole('button', { name: 'Delete User' }).click();
+    await expect(page.getByTestId('user-name')).toHaveValue(name);
+    await page.getByRole('button', { name: 'Delete user' }).click();
     await page.getByRole('dialog').filter({ hasText: `Delete "${name}"?` }).getByRole('button', { name: 'Delete' }).click();
     await expect(page.getByText(name, { exact: true })).toHaveCount(0, { timeout: 30_000 });
   }
-  await expect(page.getByText('No users yet')).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText('Create the first user')).toBeVisible({ timeout: 30_000 });
 
   // Back to bootstrap mode, NOT open access: unsigned S3 is still refused,
   // the bootstrap key works again, and the deleted key does not.
@@ -750,14 +752,14 @@ test('9. sign out, sign back in, data and settings persist', async () => {
   await page.getByRole('button', { name: /Account menu/ }).click();
   await page.getByRole('menuitem', { name: 'Sign out' }).click();
   await page.getByRole('dialog').filter({ hasText: 'Sign out?' }).getByRole('button', { name: 'Sign out' }).click();
-  await expect(page.getByPlaceholder('Admin password')).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByLabel('Admin password', { exact: true })).toBeVisible({ timeout: 30_000 });
   // The session is gone on the server, not only in the page.
   watch.expectFailure(401, /\/_\/api\/admin\/users$/, 'GET');
   const probe = await page.request.get('/_/api/admin/users');
   expect(probe.status()).toBe(401);
 
   expectSessionProbe();
-  await page.getByPlaceholder('Admin password').fill(PASSWORD);
+  await page.getByLabel('Admin password', { exact: true }).fill(PASSWORD);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
   await openBucket(BUCKET);

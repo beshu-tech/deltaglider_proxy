@@ -60,7 +60,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 async function expand(name: string) {
   const user = userEvent.setup();
-  await user.click(await screen.findByRole('button', { name: new RegExp(`^${name} — click to edit`) }));
+  await user.click(await screen.findByRole('button', { name: new RegExp(`^${name} `) }));
   return user;
 }
 
@@ -78,9 +78,40 @@ test('unsaved staged edits block the immediate encryption change', async () => {
   renderWithQuery(<BucketsPanel />);
   const user = await expand('db-archive');
   await user.click(await screen.findByText('Entire bucket public'));
-  expect(await screen.findByText(/Apply or discard the unsaved bucket changes first/)).toBeInTheDocument();
+  expect(await screen.findByText(/Apply or discard the unsaved changes of db-archive first/)).toBeInTheDocument();
   const group = screen.getByTestId('bucket-encryption-group');
   for (const r of within(group).getAllByRole('radio')) expect(r).toBeDisabled();
+});
+
+// UX harvest B26: a staged edit of ANOTHER bucket no longer disables the
+// encryption group, and it survives the encryption change, which does not
+// send back a stale copy of the changed bucket.
+test("another bucket's staged edit does not block an encryption change, and survives it", async () => {
+  renderWithQuery(<BucketsPanel />);
+  const user = await expand('downloads');
+  await user.click(await screen.findByText('Entire bucket public'));
+  await user.click(screen.getByRole('button', { name: /^downloads / })); // collapse
+  await user.click(screen.getByRole('button', { name: /^db-archive / }));
+  const group = await screen.findByTestId('bucket-encryption-group');
+  for (const r of within(group).getAllByRole('radio')) expect(r).toBeEnabled();
+
+  await user.click(within(group).getByText('Encrypt with a bucket key'));
+  const key = (screen.getByLabelText('Generated key') as HTMLTextAreaElement).value;
+  await user.type(screen.getByLabelText('Last 6 characters of the key'), key.slice(-6));
+  await user.click(within(group).getByRole('button', { name: 'Review & apply' }));
+  const dialog = await screen.findByRole('dialog');
+  await user.click(within(dialog).getByRole('button', { name: /Apply/ }));
+  await screen.findByText('Encrypt existing objects?');
+  await waitFor(() => expect(http.callsTo('GET', SECTION).length).toBeGreaterThan(1));
+
+  // The page's staged apply sends the downloads edit, and db-archive's
+  // server copy keeps the backend that its new key needs. A stale copy of
+  // db-archive (no settings) cleared the route (`backend: null`).
+  await user.click(await screen.findByRole('button', { name: 'Review & apply' }));
+  await waitFor(() => expect(http.callsTo('POST', `${SECTION}/validate`)).toHaveLength(2));
+  const body = http.callsTo('POST', `${SECTION}/validate`)[1].body as { buckets: Record<string, { backend?: string | null; public_prefixes?: string[] | null }> };
+  expect(body.buckets.downloads.public_prefixes).toEqual(['']);
+  expect(body.buckets['db-archive'].backend).toBe('hetzner-fsn1');
 });
 
 test('after enabling a bucket key, the page offers the re-encrypt job for that bucket', async () => {
@@ -120,8 +151,8 @@ test('settings with a key for a missing bucket can be removed', async () => {
   renderWithQuery(<BucketsPanel />);
   const user = await expand('ghost');
   expect(screen.queryByRole('combobox', { name: 'Bucket name' })).toBeNull();
-  await user.click(screen.getByRole('button', { name: 'More actions for bucket ghost' }));
-  await user.click(await screen.findByText('Remove these settings…'));
+  // A text button at the card's foot (UX harvest B25: not a one-item "⋯" menu).
+  await user.click(screen.getByRole('button', { name: 'Remove these settings…' }));
   const dialogs = await screen.findAllByRole('dialog');
   const dialog = dialogs[dialogs.length - 1];
   expect(dialog).toHaveTextContent(/No bucket with this name exists, so no object uses its key/);

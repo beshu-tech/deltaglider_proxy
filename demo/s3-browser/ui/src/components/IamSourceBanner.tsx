@@ -7,6 +7,8 @@
 import { useColors } from '../ThemeContext';
 import { DatabaseOutlined, FileTextOutlined } from '@ant-design/icons';
 import type { IamMode } from '../adminApi';
+import { useNavigation } from '../NavigationContext';
+import { buildViewUrl } from '../urlState';
 
 interface Props {
   iamMode: IamMode | undefined;
@@ -18,6 +20,7 @@ interface Props {
 
 export default function IamSourceBanner({ iamMode, loadError, resource }: Props) {
   const colors = useColors();
+  const { navigate } = useNavigation();
   // Mode unknown and still loading: say nothing rather than guess.
   if (!iamMode && !loadError) return null;
   const isDeclarative = iamMode === 'declarative';
@@ -27,7 +30,8 @@ export default function IamSourceBanner({ iamMode, loadError, resource }: Props)
     ? `Read-only — could not load the IAM mode, so editing ${resource} is off until it loads. ${loadError}`
     : isDeclarative
     ? `Read-only — your YAML config owns ${resource}. Edit it and apply to make changes.`
-    : `${capitalise(resource)} live in the encrypted database, not YAML. To export everything, click Download backup on System → System.`;
+    : `${capitalise(resource)} live in the encrypted database, not YAML. To export them, download a backup on the`;
+  const systemHref = buildViewUrl('admin', 'system');
 
   return (
     <div
@@ -51,7 +55,23 @@ export default function IamSourceBanner({ iamMode, loadError, resource }: Props)
         {isDeclarative ? <FileTextOutlined /> : <DatabaseOutlined />}
       </span>
       <span>
-        {text}{' '}
+        {text}
+        {!loadError && !isDeclarative && (
+          <>
+            {' '}
+            <a
+              href={systemHref}
+              onClick={(e) => {
+                if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                e.preventDefault();
+                navigate(systemHref);
+              }}
+            >
+              System page
+            </a>
+            .
+          </>
+        )}{' '}
         {!loadError && (
           <code
             title="YAML key controlling where IAM state lives"

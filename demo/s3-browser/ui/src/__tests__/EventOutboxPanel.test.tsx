@@ -236,5 +236,36 @@ test('Purge asks first, then deletes the failed events and refetches the counts'
   await user.click(within(dialogs[dialogs.length - 1]).getByRole('button', { name: 'Delete' }));
   await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/event-outbox/purge-failed')).toHaveLength(1));
   expect(await screen.findByText('Purged 2 failed events')).toBeInTheDocument();
-  await waitFor(() => expect(screen.getByRole('button', { name: /Purge failed \(0\)/ })).toBeDisabled());
+  await waitFor(() => expect(screen.getByRole('button', { name: /Purge failed$/ })).toBeDisabled());
+});
+
+test('with nothing failed, the bulk buttons are disabled and carry no "(0)" count', async () => {
+  http.on('GET', LIST, page([record(1)], { pending: 0, in_progress: 0, delivered: 1, failed: 0 }));
+  renderWithQuery(<EventOutboxPanel />);
+  await rowWith('v1.1.zip');
+  expect(screen.getByRole('button', { name: /Purge failed$/ })).toBeDisabled();
+  expect(screen.getByRole('button', { name: /Requeue failed$/ })).toBeDisabled();
+  expect(screen.queryByText(/\(0\)/)).not.toBeInTheDocument();
+});
+
+test('with failed events, the bulk buttons are enabled and show the count', async () => {
+  http.on('GET', LIST, page([record(7, { status: 'failed', delivered_at: null })], { pending: 0, in_progress: 0, delivered: 0, failed: 3 }));
+  renderWithQuery(<EventOutboxPanel />);
+  await rowWith('v1.7.zip');
+  expect(screen.getByRole('button', { name: /Purge failed \(3\)$/ })).toBeEnabled();
+  expect(screen.getByRole('button', { name: /Requeue failed \(1\)$/ })).toBeEnabled();
+});
+
+test('the expand column has a header name for screen readers', async () => {
+  http.on('GET', LIST, page([record(1)]));
+  renderWithQuery(<EventOutboxPanel />);
+  await rowWith('v1.1.zip');
+  expect(screen.getByRole('columnheader', { name: 'Details' })).toBeInTheDocument();
+});
+
+test('the page has no second header that repeats the page title', async () => {
+  http.on('GET', LIST, page([record(1)]));
+  renderWithQuery(<EventOutboxPanel />);
+  await rowWith('v1.1.zip');
+  expect(screen.queryByText('Object change events')).not.toBeInTheDocument();
 });

@@ -22,6 +22,7 @@ import { useColors } from '../ThemeContext';
 import { cacheEntrySubtitle, formatBytes } from '../utils';
 import { usePrometheusMetrics } from '../queries/metrics';
 import { LoadingState } from './StatePlaceholders';
+import { CONTENT_WIDE, contentColumn } from './shared-styles';
 import { cacheMissSeverity, serverErrorSeverity } from '../statusTone';
 import AnalyticsSection from './AnalyticsSection';
 import BucketScanCard from './BucketScanCard';
@@ -156,6 +157,12 @@ interface Snapshot {
 
 const MAX_HISTORY = 60;
 
+/** The one placeholder of a time-series chart before it has two points. */
+const WAITING_FOR_DATA = {
+  title: 'Waiting for data',
+  hint: 'The chart starts after two samples, a few seconds after you open the dashboard.',
+};
+
 interface Props {
   search?: string;
   /** Running proxy version from the session-authenticated whoami (App owns it, as for Sidebar). */
@@ -170,10 +177,8 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
   // Action chrome for the BucketScanCard. The card itself decides
   // what button to render (Scan / Re-scan / Stop) based on its own
   // state; it projects it back here via `onRenderActions` so the
-  // surrounding Panel header carries it. `scanCardAccent` is reserved
-  // for future use (e.g. amber when results are >30 days old).
+  // surrounding Panel header carries it.
   const [scanCardActions, setScanCardActions] = useState<React.ReactNode>(null);
-  const scanCardAccent: 'green' | 'amber' | null = null;
   const [activeView, setActiveView] = useState<'monitoring' | 'analytics'>(() => {
     // Deep-linked via ?view=analytics. The URL is the source of truth; the
     // toggle below replace-navigates instead of touching localStorage.
@@ -308,7 +313,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
   const statusStacked = [{ name: 'HTTP', ...httpByStatus }];
 
   return (
-    <div className="animate-fade-in" style={{ width: '100%', padding: 'clamp(14px, 1.8vw, 24px) clamp(12px, 1.6vw, 20px)' }}>
+    <div className="animate-fade-in" style={contentColumn(CONTENT_WIDE)}>
       <DashboardToolbar
         meta={<>v{buildVersion} · {backendType === 'mixed' ? 'mixed backends' : `${backendType} backend`} · up {uptimeStr}</>}
         view={activeView}
@@ -345,26 +350,19 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
           <Panel
             title="Storage used"
             subtitle="From the on-disk scan cache"
-            colSpan={6}
-            accent={
-              scanCardAccent === 'green'
-                ? 'green'
-                : scanCardAccent === 'amber'
-                  ? 'amber'
-                  : undefined
-            }
+            colSpan={4}
             actions={scanCardActions}
           >
             <BucketScanCard onRenderActions={setScanCardActions} />
           </Panel>
-          <Panel title="Total requests" colSpan={3}>
+          <Panel title="Total requests" colSpan={4}>
             <StatValue
               value={fmtNum(totalHttp)}
               hint={`Avg latency ${fmtDuration(latencyStats.avg)}${errorSeverity === 'bad' ? ` · ${fmtPct(errorRate)} server errors` : ''}`}
               tone={errorSeverity === 'bad' ? 'bad' : 'neutral'}
             />
           </Panel>
-          <Panel title="Peak memory" colSpan={3}>
+          <Panel title="Peak memory" colSpan={4}>
             <StatValue
               value={formatBytes(peakRss)}
               hint="Process RSS high-water mark"
@@ -377,7 +375,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             subtitle="Per 5-second interval (in-memory window)"
             colSpan={8}
             rowSpan={2}
-            empty={history.length < 2 ? { title: 'Waiting for data', hint: 'The first data point lands a few seconds after opening the dashboard.' } : undefined}
+            empty={history.length < 2 ? WAITING_FOR_DATA : undefined}
           >
             {history.length >= 2 && (
               <div style={{ flex: 1, minHeight: 0 }}>
@@ -399,7 +397,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             subtitle="Share of responses with a 5xx status"
             colSpan={4}
             rowSpan={2}
-            accent={errorSeverity === 'bad' ? 'red' : errorSeverity === 'warn' ? 'amber' : 'green'}
+            accent={errorSeverity === 'bad' ? 'red' : errorSeverity === 'warn' ? 'amber' : undefined}
           >
             <StatValue
               value={totalHttp > 0 ? fmtPct(errorRate) : '—'}
@@ -457,13 +455,15 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             title="Cache hit rate"
             subtitle={`${fmtNum(cacheHits)} hits · ${fmtNum(cacheMisses)} misses`}
             colSpan={4}
-            accent={cacheSeverity === 'bad' ? 'red' : cacheSeverity === 'warn' ? 'amber' : cacheSeverity === 'good' ? 'green' : undefined}
+            accent={cacheSeverity === 'bad' ? 'red' : cacheSeverity === 'warn' ? 'amber' : undefined}
           >
             <StatValue
               value={cacheTotal > 0 ? fmtPct(1 - cacheMissRate) : '—'}
               tone={cacheSeverity}
               hint={
-                cacheSeverity === 'neutral' && cacheTotal > 0
+                cacheTotal === 0
+                  ? 'No cache lookups yet'
+                  : cacheSeverity === 'neutral'
                   ? 'Too few lookups yet to judge the cache'
                   : cacheSeverity === 'bad'
                     ? 'More than half of lookups miss — cache undersized'
@@ -485,7 +485,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             subtitle="Per 5-second interval, stacked"
             colSpan={12}
             rowSpan={2}
-            empty={history.length < 2 ? { title: 'Warming up' } : undefined}
+            empty={history.length < 2 ? WAITING_FOR_DATA : undefined}
           >
             {history.length >= 2 && (
               <div style={{ flex: 1, minHeight: 0 }}>
@@ -535,7 +535,6 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             title="Avg compression"
             subtitle={compressionHist.count > 0 ? `Across ${fmtNum(compressionHist.count)} deltas` : 'No deltas yet'}
             colSpan={3}
-            accent={compressionHist.avg > 0 && compressionHist.avg < 0.5 ? 'green' : undefined}
           >
             <StatValue
               value={compressionHist.count > 0 ? fmtPct(compressionHist.avg) : '—'}
@@ -665,7 +664,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
               title="Authentication"
               subtitle="SigV4 verification outcomes since process start"
               colSpan={12}
-              accent={totalAuthFails > 0 ? 'red' : 'green'}
+              accent={totalAuthFails > 0 ? 'red' : undefined}
             >
               <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'center' }}>
                 <div style={{ minWidth: 160 }}>

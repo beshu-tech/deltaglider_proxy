@@ -110,13 +110,13 @@ One shared credential is better than none, but Acme's CI pipeline should not hol
 
 In the admin UI:
 
-1. In the sidebar, open **Access → Users** (`/_/admin/access/users`). Because no IAM users exist yet, the page says **Create the first user**. Notice the note under it: your current credentials are kept as an admin user, so nothing that you just set up breaks.
+1. In the sidebar, open **Access → Users** (`/_/admin/access/users`). Because no IAM users exist yet, the page says **Create the first user**. Notice the note under it: the first user switches sign-in from the admin password to IAM users.
 2. Click **New** above the user list.
-3. In **Name**, type `ci-uploader`. Leave **Access Key ID** and **Secret Access Key** empty, so that the proxy generates them.
+3. In **Name**, type `ci-uploader`. Leave **Access key ID** and **Secret access key** empty, so that the proxy generates them.
 4. Edit the rule under **Permissions**. A new user starts with one rule that allows **List** and **Read** everywhere. Keep **Allow**, replace `*` under **WHERE** with `releases/firmware/*`, and click **Write** under **CAN DO**, so that **List**, **Read** and **Write** are on.
-5. Click **Create User**.
+5. Click **Create user**. Because this is the first user, the proxy asks **Switch sign-in to IAM users?** The proxy keeps your `acme-admin` key pair as a user with the name `legacy-admin` and full access, so nothing that you just set up breaks. Click **Create user and switch**.
 
-   ![The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New button, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create User button.](/_/screenshots/iam-users-new-form.webp)
+   ![The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New button, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create user button.](/_/screenshots/iam-users-new-form.webp)
 
    The screenshot comes from a proxy that already has more users, so its list is not empty.
 

@@ -31,7 +31,7 @@ test('the quota field and chip label GiB and write GiB × 1024³ bytes', async (
       inputRadius={{ borderRadius: 6 }}
     />,
   );
-  expect(screen.getByText('≤ 10.0 GiB')).toBeInTheDocument();
+  expect(screen.getByText('Quota 10.0 GiB')).toBeInTheDocument();
   const input = screen.getByRole('spinbutton', { name: 'Quota' });
   expect(input).toHaveValue('10.0'); // step 0.1 shows one decimal
   expect(screen.getByText('GiB')).toBeInTheDocument();

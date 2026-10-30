@@ -26,6 +26,8 @@ import {
 } from '../adminApi';
 import { useBucketNames } from '../queries/backends';
 import HoverHint from './HoverHint';
+import FormLabel from './FormLabel';
+import { EmptyState } from './StatePlaceholders';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
 import { useCopyToClipboard } from '../useCopyToClipboard';
@@ -136,30 +138,34 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
         to re-upload.
       </Paragraph>
 
-      <Space wrap style={{ marginBottom: 16 }}>
-        <Select
-          aria-label="Bucket"
-          style={{ minWidth: 280 }}
-          placeholder="Select bucket"
-          value={bucket}
-          onChange={setBucket}
-          options={buckets.map(b => ({ value: b, label: b }))}
-          showSearch
-        />
-        <HoverHint hint="Skip folders with fewer than this many compressed files. Smaller folders don't have enough signal to draw a verdict from.">
-          <span>
-            <label htmlFor="delta-efficiency-min-deltas">min deltas:</label>{' '}
-            <InputNumber
-              id="delta-efficiency-min-deltas"
-              size="small"
-              min={1}
-              max={1000}
-              value={minDeltas}
-              onChange={v => setMinDeltas(typeof v === 'number' ? v : 3)}
-              style={{ width: 70 }}
-            />
-          </span>
-        </HoverHint>
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-end', gap: 16, marginBottom: 16 }}>
+        <div>
+          <FormLabel text="Bucket" htmlFor="delta-efficiency-bucket" />
+          <Select
+            id="delta-efficiency-bucket"
+            style={{ minWidth: 280 }}
+            placeholder="Select a bucket"
+            value={bucket}
+            onChange={setBucket}
+            options={buckets.map(b => ({ value: b, label: b }))}
+            showSearch
+          />
+        </div>
+        <div>
+          <HoverHint hint="Skip folders with fewer than this many compressed files. Smaller folders do not give enough signal for a verdict.">
+            <span>
+              <FormLabel text="Minimum deltas per folder" htmlFor="delta-efficiency-min-deltas" />
+            </span>
+          </HoverHint>
+          <InputNumber
+            id="delta-efficiency-min-deltas"
+            min={1}
+            max={1000}
+            value={minDeltas}
+            onChange={v => setMinDeltas(typeof v === 'number' ? v : 3)}
+            style={{ width: 96 }}
+          />
+        </div>
         {/* One button. The first scan may answer from the server's 5-minute
             cache; once a result is on screen, the button forces a fresh scan
             (a cached re-read would only show the same result again). After
@@ -181,7 +187,15 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
             <Text type="secondary">Scan running on the server, polling…</Text>
           </Space>
         )}
-      </Space>
+      </div>
+
+      {!response && !error && !loading && !scanning && (
+        <EmptyState
+          icon={<ThunderboltOutlined />}
+          title="No scan yet"
+          hint="Select a bucket and click Scan to see how well each folder compresses."
+        />
+      )}
 
       {error && (
         <Alert
@@ -199,7 +213,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
             <Alert
               type="success"
               title="No compression scopes met the reporting threshold"
-              description={`No prefix in '${response.bucket}' has at least ${response.min_deltas} deltas. Try lowering 'min deltas' or pick another bucket.`}
+              description={`No prefix in '${response.bucket}' has at least ${response.min_deltas} deltas. Try a lower minimum, or select a different bucket.`}
               showIcon
             />
           ) : (

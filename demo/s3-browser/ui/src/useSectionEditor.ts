@@ -83,6 +83,15 @@ interface UseSectionEditorOptions<Wire, Local = Wire> {
    * Default: the section name.
    */
   noun?: string;
+  /**
+   * How `rebase` folds staged edits onto the new server value. Default:
+   * the edits stay as they are (the whole value), so a staged value that
+   * also holds the part another request just changed keeps the OLD copy of
+   * it. A panel whose value is a list of independent records (bucket
+   * settings) passes a per-record 3-way merge: records the user did not
+   * touch take the server's new copy.
+   */
+  rebaseMerge?: (cur: Local, before: Local, next: Local) => Local;
 }
 
 export interface UseSectionEditorResult<Local, Wire = Local> {
@@ -148,6 +157,7 @@ export function useSectionEditor<Wire, Local = Wire>(
     pick,
     toPayload,
     noun = section,
+    rebaseMerge,
   } = opts;
 
   const [loading, setLoading] = useState(true);
@@ -165,10 +175,14 @@ export function useSectionEditor<Wire, Local = Wire>(
   const initialRef = useRef(initial);
   const pickRef = useRef(pick);
   const resetWithRef = useRef(resetWith);
+  const rebaseMergeRef = useRef(rebaseMerge);
+  const baselineRef = useRef(baseline);
   useEffect(() => {
     initialRef.current = initial;
     pickRef.current = pick;
     resetWithRef.current = resetWith;
+    rebaseMergeRef.current = rebaseMerge;
+    baselineRef.current = baseline;
   });
 
   // Apply-dialog state. `pendingBody` captures the exact body that
@@ -235,12 +249,16 @@ export function useSectionEditor<Wire, Local = Wire>(
       // so keep the snapshot and version we already have.
       if (versionRef.current !== expected) return;
       versionRef.current = version;
-      rebase(toLocal(body));
+      const next = toLocal(body);
+      const before = baselineRef.current;
+      rebase(next);
+      const merge = rebaseMergeRef.current;
+      if (merge) setValue((cur) => merge(cur, before, next));
     } catch (e) {
       // The apply itself succeeded; the snapshot is already the sent value.
       if (isSessionExpired(e)) onSessionExpired?.();
     }
-  }, [section, onSessionExpired, rebase, toLocal]);
+  }, [section, onSessionExpired, rebase, setValue, toLocal]);
 
   useEffect(() => {
     void refresh();
@@ -252,6 +270,10 @@ export function useSectionEditor<Wire, Local = Wire>(
   );
 
   const runApply = useCallback(async () => {
+    // A clean editor has nothing to review. Without this guard a stray
+    // trigger (a hidden bar's button, a sibling editor's shortcut) opened a
+    // "0 changes" dialog for the wrong section.
+    if (!isDirty) return;
     const snapshot = buildPayload(value);
     // An expired session is handled below us: adminFetch asks to sign in
     // again and re-sends the same snapshot (sessionRelogin.ts).
@@ -264,7 +286,7 @@ export function useSectionEditor<Wire, Local = Wire>(
     } catch (e) {
       message.error(`Validate failed: ${normalizeUiError(e, 'unknown')}`);
     }
-  }, [section, buildPayload, value]);
+  }, [section, buildPayload, value, isDirty]);
 
   const cancelApply = useCallback(() => {
     setApplyOpen(false);

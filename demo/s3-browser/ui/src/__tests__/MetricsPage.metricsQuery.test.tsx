@@ -51,11 +51,11 @@ test('scrapes every 5 s by default, and on Refresh now', async () => {
   renderWithQuery(<MetricsPage />);
   await screen.findByText(/v9\.9\.9/);
   expect(scrapes()).toHaveLength(1);
-  // The time series needs two scrapes.
-  expect(screen.getByText('Waiting for data')).toBeInTheDocument();
+  // The time series need two scrapes; both charts say so in the same words.
+  expect(screen.getAllByText('Waiting for data')).toHaveLength(2);
   await act(() => vi.advanceTimersByTimeAsync(5_100));
   await waitFor(() => expect(scrapes()).toHaveLength(2));
-  await waitFor(() => expect(screen.queryByText('Waiting for data')).toBeNull());
+  await waitFor(() => expect(screen.queryAllByText('Waiting for data')).toHaveLength(0));
   await user.click(screen.getByRole('button', { name: 'Refresh now' }));
   await waitFor(() => expect(scrapes()).toHaveLength(3));
 });

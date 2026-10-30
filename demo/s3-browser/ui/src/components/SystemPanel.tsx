@@ -17,6 +17,7 @@ import {
   LoggingPanel,
 } from './advancedPanels';
 import RecoveryPanel from './RecoveryPanel';
+import { contentColumn, CONTENT_FORM } from './shared-styles';
 import EncryptionWitnessCard from './EncryptionWitnessCard';
 
 interface Props {
@@ -26,8 +27,10 @@ interface Props {
 }
 
 export default function SystemPanel({ onSessionExpired, onExportBackup, onImportBackup }: Props) {
+  // ONE column and ONE gap for every card on the page (the cards add no
+  // margin or padding of their own).
   return (
-    <div>
+    <div style={{ ...contentColumn(CONTENT_FORM), display: 'flex', flexDirection: 'column', gap: 24 }}>
       <ListenerTlsPanel onSessionExpired={onSessionExpired} />
       <CachesPanel onSessionExpired={onSessionExpired} />
       <LimitsPanel onSessionExpired={onSessionExpired} />

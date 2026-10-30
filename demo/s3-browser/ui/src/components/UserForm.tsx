@@ -7,7 +7,7 @@ import { useCannedPolicies } from '../queries/cannedPolicies';
 import { useGroups } from '../queries/groups';
 import { setCredentials, getCredentials } from '../s3client';
 import { useCardStyles } from './shared-styles';
-import FormLabel from './FormLabel';
+import FormField from './FormField';
 import MaskedSecretInput from './MaskedSecretInput';
 import { useColors } from '../ThemeContext';
 import PermissionEditor from './PermissionEditor';
@@ -22,8 +22,10 @@ import CredentialsModal from './CredentialsModal';
 import PillButton from './PillButton';
 import { confirmDialog } from '../confirmDialog';
 import { generateId, generateSecret } from '../credentialGeneration';
-import { normalizeUiError } from '../errorHandling';
+import { ApiError, normalizeUiError } from '../errorHandling';
 import { IAM_DIRTY_KEYS, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
+import { USER_NAME_HELP, userNameError } from '../userName';
+import { firstUserSwitchText } from '../firstUser';
 import { useApplyHandler } from '../useDirtySection';
 
 const { Text, Title } = Typography;
@@ -53,9 +55,15 @@ interface UserFormProps {
   onSavingChange?: (saving: boolean) => void;
   /** Navigate to a group by ID (switches to Groups tab) */
   onNavigateToGroup?: (groupId: number) => void;
+  /**
+   * Create mode, no IAM user exists yet: this create switches the proxy to
+   * IAM mode, so Create asks first. `bootstrapAccessKey` is the running
+   * bootstrap key, which the server keeps as the user `legacy-admin`.
+   */
+  firstUser?: { bootstrapAccessKey?: string };
 }
 
-export default function UserForm({ user, readOnly = false, onSaved, onDeleted, onCancel, onCreated, onSavingChange, onNavigateToGroup }: UserFormProps) {
+export default function UserForm({ user, readOnly = false, onSaved, onDeleted, onCancel, onCreated, onSavingChange, onNavigateToGroup, firstUser }: UserFormProps) {
   const uid = useId();
   const isEdit = user !== null;
   const { inputRadius } = useCardStyles();
@@ -80,6 +88,10 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   const [saving, setSavingState] = useState(false);
   const [deleting, setDeletingState] = useState(false);
   const [error, setError] = useState('');
+  // Field errors show after the first submit, then follow each keystroke.
+  const [showFieldErrors, setShowFieldErrors] = useState(false);
+  // The server's refusal of the name (400), shown on the field.
+  const [serverNameError, setServerNameError] = useState<string | null>(null);
   const [savedCredentials, setSavedCredentials] = useState<{ ak: string; sk: string } | null>(null);
 
   // Presets + groups are read from the shared query cache (no per-mount fetch
@@ -104,10 +116,18 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   });
   useDirtyFlag(IAM_DIRTY_KEYS.users, isDirty && !readOnly);
 
+  // A name that is not changed stays valid: an OAuth user keeps the display
+  // name its identity provider gave it (the server accepts it unchanged).
+  const nameChanged = !isEdit || name.trim() !== user.name;
+  const nameRuleError = nameChanged ? userNameError(name.trim()) : null;
+  const nameError = (showFieldErrors ? nameRuleError : null) ?? serverNameError;
+
   const handleSave = async () => {
-    if (!name.trim()) { setError('Name is required'); return; }
+    setShowFieldErrors(true);
+    if (nameRuleError) return;
     setSaving(true);
     setError('');
+    setServerNameError(null);
     setSavedCredentials(null);
     try {
       if (isEdit) {
@@ -149,7 +169,10 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
         onCreated?.(created.access_key_id, created.secret_access_key ?? '');
       }
     } catch (e) {
-      setError(normalizeUiError(e, 'Operation failed'));
+      // The server's name rule (400 "user name …") belongs on the field.
+      const detail = e instanceof ApiError && e.status === 400 ? e.detail ?? '' : '';
+      if (/^user name /i.test(detail)) setServerNameError(`${detail.charAt(0).toUpperCase()}${detail.slice(1)}.`);
+      else setError(normalizeUiError(e, 'Operation failed'));
     } finally {
       setSaving(false);
     }
@@ -176,6 +199,11 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   // One entry point for the Save button and ⌘S: key changes need a confirm
   // because the new secret is shown only once.
   const submit = async () => {
+    if (!isEdit && firstUser && !userNameError(name.trim()) && !(await confirmDialog({
+      title: 'Switch sign-in to IAM users?',
+      content: `This is the first IAM user. ${firstUserSwitchText(firstUser.bootstrapAccessKey)}`,
+      okText: 'Create user and switch',
+    }))) return;
     if (hasKeyChanges && !(await confirmDialog({
       title: 'Update the credentials?',
       content: 'The new secret is shown only once. Be ready to save it.',
@@ -189,8 +217,9 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
     <div style={{ padding: '24px 28px', maxWidth: 600, overflow: 'auto', height: '100%' }}>
       <div style={{ marginBottom: 20 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-          <Title level={5} style={{ margin: 0, fontFamily: 'var(--font-ui)' }}>
-            {isEdit ? `${readOnly ? 'View' : 'Edit'}: ${user?.name}` : 'Create New User'}
+          {/* h3: the page title above is an h2 (TabHeader). */}
+          <Title level={3} style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 16 }}>
+            {isEdit ? `${readOnly ? 'View' : 'Edit'}: ${user?.name}` : 'New user'}
           </Title>
           {isEdit && (
             <>
@@ -237,47 +266,67 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
 
       {error && <Alert type="error" title={error} showIcon closable={{ onClose: () => setError('') }} style={{ marginBottom: 16, borderRadius: 8 }} />}
 
-      <div style={{ marginBottom: 16 }}>
-        <FormLabel text="Name" />
-        <Input data-testid="user-name" aria-label="User name" autoFocus={!isEdit} value={name} onChange={e => setName(e.target.value)} placeholder="e.g. ci-bot" disabled={readOnly} style={{ ...inputRadius }} />
-      </div>
+      <FormField
+        label="Name"
+        helpText={readOnly ? undefined : USER_NAME_HELP}
+        error={nameError ?? undefined}
+        style={{ marginBottom: 20 }}
+      >
+        <Input
+          data-testid="user-name"
+          autoFocus={!isEdit}
+          value={name}
+          onChange={e => { setName(e.target.value); setServerNameError(null); }}
+          placeholder="e.g. ci-bot"
+          disabled={readOnly}
+          style={{ ...inputRadius }}
+        />
+      </FormField>
 
-      <div style={{ marginBottom: 16 }}>
-        <FormLabel text="Access Key ID" hint={isEdit ? undefined : '(auto-generated if empty)'} htmlFor={`${uid}-akid`} />
+      <FormField
+        label="Access key ID"
+        helpText={isEdit || readOnly ? undefined : 'Leave empty to generate one.'}
+        controlId={`${uid}-akid`}
+        style={{ marginBottom: 20 }}
+      >
         <Space.Compact style={{ width: '100%' }}>
           <Input
             id={`${uid}-akid`}
             value={accessKeyId}
             onChange={e => setAccessKeyId(e.target.value)}
-            placeholder={isEdit ? user?.access_key_id : 'e.g. user@company.com'}
+            placeholder={isEdit ? user?.access_key_id : 'e.g. AKCIUPLOADER01'}
             disabled={readOnly}
-            style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
+            style={{ ...inputRadius }}
           />
           {!isEdit && !readOnly && (
-            <Button icon={<ThunderboltOutlined />} onClick={() => setAccessKeyId(generateId())} title="Generate random key" />
+            <Button icon={<ThunderboltOutlined />} onClick={() => setAccessKeyId(generateId())} title="Generate random key" aria-label="Generate random key" />
           )}
         </Space.Compact>
-      </div>
+      </FormField>
 
       {!readOnly && (
-        <div style={{ marginBottom: 16 }}>
-          <FormLabel text="Secret Access Key" hint={isEdit ? undefined : '(auto-generated if empty)'} htmlFor={`${uid}-secret`} />
+        <FormField
+          label="Secret access key"
+          helpText={isEdit ? 'Leave empty to keep the current secret.' : 'Leave empty to generate one.'}
+          controlId={`${uid}-secret`}
+          style={{ marginBottom: 20 }}
+        >
           <Space.Compact style={{ width: '100%' }}>
             <MaskedSecretInput
               id={`${uid}-secret`}
               mode={isEdit ? 'blank-keeps' : 'new'}
               value={secretKey}
               onChange={setSecretKey}
-              placeholder={isEdit ? undefined : 'e.g. mysecretkey or leave empty'}
+              placeholder={isEdit ? 'Unchanged' : 'Generated if empty'}
               style={{ ...inputRadius }}
             />
-            <Button icon={<ThunderboltOutlined />} onClick={() => setSecretKey(generateSecret())} title="Generate random secret" />
+            <Button icon={<ThunderboltOutlined />} onClick={() => setSecretKey(generateSecret())} title="Generate random secret" aria-label="Generate random secret" />
           </Space.Compact>
-        </div>
+        </FormField>
       )}
 
       <div style={{ marginBottom: 20, display: 'flex', alignItems: 'center', gap: 12 }}>
-        <FormLabel text="Enabled" htmlFor={`${uid}-enabled`} />
+        <label htmlFor={`${uid}-enabled`} style={{ fontSize: 13.5, fontWeight: 600, color: colors.TEXT_PRIMARY }}>Enabled</label>
         <Switch id={`${uid}-enabled`} checked={enabled} onChange={setEnabled} size="small" disabled={readOnly} />
       </div>
 
@@ -310,7 +359,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
 
       {/* Native <fieldset disabled> disables every descendant form control; the
           pointer-events guard also neutralises AntD's non-form clickable spans
-          (Segmented, Tag, the "Clear all"/"Add Rule" buttons) so the whole
+          (Segmented, Tag, the "Clear all"/"Add permission rule" buttons) so the whole
           editor is a true read-only snapshot without threading `disabled`
           through PermissionEditor's deep control tree. */}
       <fieldset
@@ -344,11 +393,11 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
               <Button danger loading={deleting} disabled={deleting} onClick={async () => {
                 if (!(await confirmDialog({ title: `Delete "${user?.name}"?`, content: 'This cannot be undone.', okText: 'Delete', danger: true }))) return;
                 await handleDelete();
-              }}>Delete User</Button>
+              }}>Delete user</Button>
             )}
             {!isEdit && onCancel && <Button onClick={onCancel}>Cancel</Button>}
           </div>
-          <Button data-testid="user-save" aria-label={isEdit ? 'Save user' : 'Create user'} type="primary" onClick={submit} loading={saving}>{isEdit ? 'Save' : 'Create User'}</Button>
+          <Button data-testid="user-save" aria-label={isEdit ? 'Save user' : 'Create user'} type="primary" onClick={submit} loading={saving}>{isEdit ? 'Save' : 'Create user'}</Button>
         </div>
       )}
     </div>

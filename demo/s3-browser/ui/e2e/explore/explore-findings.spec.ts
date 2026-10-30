@@ -64,8 +64,8 @@ function s3(ak = ACCESS_KEY, sk = SECRET_KEY): S3Client {
 
 async function signIn(page: Page) {
   await page.goto('/_/admin');
-  await page.getByPlaceholder('Access Key ID').fill(ACCESS_KEY);
-  await page.getByPlaceholder('Secret Access Key').fill(SECRET_KEY);
+  await page.getByLabel('Access key ID', { exact: true }).fill(ACCESS_KEY);
+  await page.getByLabel('Secret access key', { exact: true }).fill(SECRET_KEY);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByText('ADMIN SETTINGS', { exact: false })).toBeVisible({ timeout: 30_000 });
 }
@@ -255,14 +255,14 @@ test('a locked-out sign-in says so instead of "Login failed: Login failed"', asy
   const page = await ctx.newPage();
   await page.goto('/_/browse');
   for (let i = 0; i < 4; i++) {
-    await page.getByPlaceholder('Admin password').fill(`wrong-${i}`);
+    await page.getByLabel('Admin password', { exact: true }).fill(`wrong-${i}`);
     const resp = page.waitForResponse((r) => r.url().endsWith('/_/api/admin/login'));
     await page.getByRole('button', { name: 'Sign in' }).click();
     await resp;
   }
   // The 4th attempt is a 429. The correct password is also refused while
   // the lockout lasts; the user must learn that it is a lockout.
-  await page.getByPlaceholder('Admin password').fill(process.env.EXPLORE_PASSWORD ?? 'wrong');
+  await page.getByLabel('Admin password', { exact: true }).fill(process.env.EXPLORE_PASSWORD ?? 'wrong');
   const last = page.waitForResponse((r) => r.url().endsWith('/_/api/admin/login'));
   await page.getByRole('button', { name: 'Sign in' }).click();
   expect((await last).status()).toBe(429);
@@ -290,7 +290,7 @@ test('the upload page sends 300 tiny files in under a minute', async ({ page }) 
   await s3().send(new CreateBucketCommand({ Bucket: bucket }));
   await signIn(page);
   await page.goto(`/_/browse/${bucket}/`);
-  await page.getByRole('button', { name: 'Upload Files' }).first().click();
+  await page.getByRole('button', { name: 'Upload files' }).first().click();
   const files = Array.from({ length: 300 }, (_, i) => ({
     name: `bulk-${String(i).padStart(4, '0')}.txt`,
     mimeType: 'text/plain',
@@ -308,7 +308,7 @@ test('the upload page sends 1000 tiny files with a bounded heap', async ({ page 
   await s3().send(new CreateBucketCommand({ Bucket: bucket }));
   await signIn(page);
   await page.goto(`/_/browse/${bucket}/`);
-  await page.getByRole('button', { name: 'Upload Files' }).first().click();
+  await page.getByRole('button', { name: 'Upload files' }).first().click();
   const files = Array.from({ length: 1000 }, (_, i) => ({
     name: `k-${String(i).padStart(4, '0')}.txt`,
     mimeType: 'text/plain',

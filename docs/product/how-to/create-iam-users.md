@@ -40,11 +40,15 @@ In the admin UI:
 
 1. In the sidebar, open **Access → Users** (`/_/admin/access/users`).
 2. Click **New** above the user list.
-3. In **Name**, type `ci-uploader`. Leave **Access Key ID** and **Secret Access Key** empty, so that the proxy generates them.
+3. In **Name**, type `ci-uploader`. Leave **Access key ID** and **Secret access key** empty, so that the proxy generates them.
 4. Set the permissions under **Permissions**. A new user starts with one rule that allows **List** and **Read** on every resource (`*`). For `ci-uploader`, keep **Allow**, type `releases/firmware/*` under **WHERE**, and turn on **List**, **Read** and **Write** under **CAN DO**.
-5. Click **Create User**.
+5. Click **Create user**.
 
-   ![The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New button, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create User button.](/_/screenshots/iam-users-new-form.webp)
+   ![The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New button, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create user button.](/_/screenshots/iam-users-new-form.webp)
+
+A user name has 1 to 64 characters. Each character is a letter, a digit, or one of `+ = , . @ _ -`, so a name cannot contain a space. The name cannot be `.` or `..`. When a name breaks this rule, the form shows the reason under **Name**, and the admin API refuses the request with `400`.
+
+The first user changes how you sign in. While no IAM user exists, the proxy runs in bootstrap mode, and you sign in to the admin UI with the admin password. When the first user exists, the proxy changes to IAM mode, and the sign-in page asks for an access key ID and a secret access key instead. For this reason, **Create user** asks **Switch sign-in to IAM users?** before the proxy creates the first user. The proxy keeps your bootstrap key pair as a user with the name `legacy-admin` and full access, so the S3 clients that use the bootstrap key keep working. Click **Create user and switch** to continue.
 
 The proxy shows the secret **once**, in the dialog **User created: save these credentials**. Copy it now. If you lose it, rotate the keys (section 4).
 
@@ -54,7 +58,7 @@ To script the same step, send `POST /_/api/admin/users` with a `name`. The proxy
 
 ## 3. Choose the permissions
 
-Each rule in the permission editor has an effect (**Allow** or **Deny**), a list of resources under **WHERE**, and a set of actions under **CAN DO** (**List**, **Read**, **Write**, **Delete** and **Admin**). The buttons above the rules (**Read Only**, **Read/Write (no delete)**, **Read/Write/Delete** and **Full Access (admin)**) replace all rules with a preset. **Add Permission Rule** adds a rule. The admin API stores the same rules in this shape, and these are the shapes that you will use most often.
+Each rule in the permission editor has an effect (**Allow** or **Deny**), a list of resources under **WHERE**, and a set of actions under **CAN DO** (**List**, **Read**, **Write**, **Delete** and **Admin**). The buttons above the rules (**Read Only**, **Read/Write (no delete)**, **Read/Write/Delete** and **Full Access (admin)**) replace all rules with a preset. **Add permission rule** adds a rule. The admin API stores the same rules in this shape, and these are the shapes that you will use most often.
 
 A CI pipeline that may upload firmware builds and list its bucket, and do nothing else:
 
@@ -88,7 +92,7 @@ A key rotation in place swaps the credential at once: the old key stops working 
 
 In the admin UI:
 
-1. On **Access → Users**, click the `ci-uploader` row. Click **Generate random secret** next to **Secret Access Key**, or type a new secret. To change the key ID as well, type it in **Access Key ID**.
+1. On **Access → Users**, click the `ci-uploader` row. Click **Generate random secret** next to **Secret access key**, or type a new secret. To change the key ID as well, type it in **Access key ID**.
 2. Click **Save**, and confirm **Update credentials** in the dialog.
 
    ![The form of the ci-uploader user after a click on Generate random secret; callout 1 marks the Generate random secret button, and callout 2 marks the Save button.](/_/screenshots/iam-users-rotate.webp)
@@ -102,7 +106,7 @@ If a client cannot accept a short period of `403` responses while you roll out t
    ![The list of users; the box marks the Duplicate user with fresh credentials button on the ci-uploader row.](/_/screenshots/iam-users-duplicate.webp)
 
 2. Roll the new credentials out to every client.
-3. Delete the original user with **Delete User** once nothing signs with it. The audit log at **Observability → Audit log** (`/_/admin/diagnostics/audit`) shows which user sent each request.
+3. Delete the original user with **Delete user** once nothing signs with it. The audit log at **Observability → Audit log** (`/_/admin/diagnostics/audit`) shows which user sent each request.
 
 ## 5. Put shared rules in a group
 
@@ -114,9 +118,9 @@ In the admin UI:
 2. In **Name**, type `Engineering`. A **Description** is optional.
 3. Under **Permissions**, type `releases/*` under **WHERE**, and turn on **List** and **Read** under **CAN DO**.
 4. Under **Members**, tick `dana` and `backup-bot`.
-5. Click **Create Group**.
+5. Click **Create group**.
 
-   ![The form of a new Engineering group; callout 1 marks the New button, callout 2 the Name field, callout 3 the rule that allows List and Read on releases/*, callout 4 the members dana and backup-bot, and callout 5 the Create Group button.](/_/screenshots/iam-groups-new-form.webp)
+   ![The form of a new Engineering group; callout 1 marks the New button, callout 2 the Name field, callout 3 the rule that allows List and Read on releases/*, callout 4 the members dana and backup-bot, and callout 5 the Create group button.](/_/screenshots/iam-groups-new-form.webp)
 
 Members get the rules of the group in addition to their direct rules, and a Deny from either source wins. The user form of `dana` then lists `Engineering` under **Groups & Inherited Access**, next to the effective permissions. If you use SSO, mapping rules can add people to `Engineering` automatically when they sign in. See [How to set up OAuth/OIDC single sign-on](set-up-sso.md).
 

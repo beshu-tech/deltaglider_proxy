@@ -66,7 +66,7 @@ test('a move counts the removed sources: a batch with a failed copy keeps all of
   assert.equal(outcome.deleted, 1000);
   assert.deepEqual(bulkTransferOutcomeMessage(outcome), {
     type: 'warning',
-    text: '1,000 of 1,500 items moved. 1 failed, for example src/500.zip: quota exceeded. 499 copied items also stay in the source folder. A batch with a failed copy keeps all its sources.',
+    text: '1,000 of 1,500 objects moved. 1 failed, for example src/500.zip: quota exceeded. 499 copied objects also stay in the source folder. A batch with a failed copy keeps all its sources.',
   });
 });
 
@@ -127,9 +127,9 @@ test('the report after a run', () => {
     action: 'copy', total: 1201, succeeded: 1201, failed: 0, deleted: 0, failures: [], cancelled: false,
   };
   const move: BulkTransferOutcome = { ...copy, action: 'move', deleted: 1201 };
-  assert.deepEqual(bulkTransferOutcomeMessage(copy), { type: 'success', text: '1,201 items copied' });
-  assert.deepEqual(bulkTransferOutcomeMessage(move), { type: 'success', text: '1,201 items moved' });
-  assert.deepEqual(bulkTransferOutcomeMessage({ ...copy, total: 1, succeeded: 1 }), { type: 'success', text: '1 item copied' });
+  assert.deepEqual(bulkTransferOutcomeMessage(copy), { type: 'success', text: '1,201 objects copied' });
+  assert.deepEqual(bulkTransferOutcomeMessage(move), { type: 'success', text: '1,201 objects moved' });
+  assert.deepEqual(bulkTransferOutcomeMessage({ ...copy, total: 1, succeeded: 1 }), { type: 'success', text: '1 object copied' });
   assert.deepEqual(bulkTransferOutcomeMessage({ ...copy, total: 0, succeeded: 0 }), { type: 'info', text: 'Nothing to copy.' });
   assert.deepEqual(bulkTransferOutcomeMessage({ ...move, succeeded: 0, deleted: 0, cancelled: true }), {
     type: 'info',
@@ -137,7 +137,7 @@ test('the report after a run', () => {
   });
   assert.deepEqual(bulkTransferOutcomeMessage({ ...copy, succeeded: 500, cancelled: true }), {
     type: 'info',
-    text: 'Copy stopped. 500 of 1,201 items copied.',
+    text: 'Copy stopped. 500 of 1,201 objects copied.',
   });
   assert.deepEqual(
     bulkTransferOutcomeMessage({
@@ -146,23 +146,23 @@ test('the report after a run', () => {
       failed: 1,
       failures: [{ source_key: 'a/b.zip', dest_key: 'old/b.zip', error: 'AccessDenied' }],
     }),
-    { type: 'warning', text: '1,200 of 1,201 items copied. 1 failed, for example a/b.zip: AccessDenied.' },
+    { type: 'warning', text: '1,200 of 1,201 objects copied. 1 failed, for example a/b.zip: AccessDenied.' },
   );
   // A move whose sources were not all removed (one changed during the copy) says so.
   assert.deepEqual(bulkTransferOutcomeMessage({ ...move, deleted: 1200 }), {
     type: 'warning',
-    text: '1,200 of 1,201 items moved. 1 copied item also stays in the source folder.',
+    text: '1,200 of 1,201 objects moved. 1 copied object also stays in the source folder.',
   });
   // A move onto itself (two names of one storage) deletes no source: the
   // item already is at the destination, not "kept in the source folder".
   const self = { ...move, total: 1, succeeded: 1, deleted: 0, inPlace: 1 };
   assert.deepEqual(bulkTransferOutcomeMessage(self), {
     type: 'info',
-    text: '1 item moved. 1 item already was at the destination.',
+    text: '1 object moved. 1 object already was at the destination.',
   });
   assert.deepEqual(bulkTransferOutcomeMessage({ ...move, deleted: 1199, inPlace: 1 }), {
     type: 'warning',
-    text: '1,200 of 1,201 items moved. 1 copied item also stays in the source folder. 1 item already was at the destination.',
+    text: '1,200 of 1,201 objects moved. 1 copied object also stays in the source folder. 1 object already was at the destination.',
   });
 });
 

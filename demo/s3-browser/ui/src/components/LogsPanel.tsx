@@ -10,7 +10,8 @@
  *   * Follow (live tail): an SSE stream (`/logs/stream`) prepends new entries as
  *     they happen, matching the same filters.
  *   * Virtualized list (@tanstack/react-virtual) so a 2000-row + live-appending
- *     view stays smooth. Click a row to expand its structured fields.
+ *     view stays smooth. Click a row (or press Enter on it) to wrap the whole
+ *     line and list its structured fields, one per line.
  *
  * Captured at INFO+ by default (DGP_LOG_RING_LEVEL). Read-only, per-instance,
  * bounded — a triage convenience, not a log store.
@@ -18,7 +19,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useDebounced } from '../hooks/useDebounced';
 import { Typography, Input, Button, Tag, Select, Space, Switch } from 'antd';
-import { ReloadOutlined, SearchOutlined, FileTextOutlined } from '@ant-design/icons';
+import { ReloadOutlined, SearchOutlined } from '@ant-design/icons';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useColors } from '../ThemeContext';
 import { relativeTime } from '../utils';
@@ -27,6 +28,8 @@ import { useLogBacklog } from '../queries/logs';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { normalizeUiError } from '../errorHandling';
 import { useDocumentVisible } from '../useVisiblePolling';
+import { contentColumn, CONTENT_WIDE } from './shared-styles';
+import { activateOnKey } from '../keyboard';
 
 const { Text } = Typography;
 const RING_CAP = 2000; // client-side trim ceiling for the live tail
@@ -53,6 +56,12 @@ function levelColour(level: string): string {
   }
 }
 
+/** Stable identity of a log line across prepends (an index moves when the
+ *  live tail adds lines on top). */
+function lineKey(e: LogEntry): string {
+  return `${e.ts}\u0000${e.target}\u0000${e.message}`;
+}
+
 export default function LogsPanel({ onSessionExpired }: Props) {
   const c = useColors();
   const [level, setLevel] = useState<string | undefined>(undefined);
@@ -62,6 +71,15 @@ export default function LogsPanel({ onSessionExpired }: Props) {
   const [streamError, setStreamError] = useState<string | null>(null);
   const [now, setNow] = useState(new Date());
   const unsubRef = useRef<(() => void) | null>(null);
+  // Lines the user opened: the whole message wraps and the fields show.
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const toggleLine = (key: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
 
   // Typing in target/q must not fire a backlog fetch + SSE reconnect per
   // keystroke: the text filters feed `filters` only after a pause.
@@ -150,9 +168,17 @@ export default function LogsPanel({ onSessionExpired }: Props) {
   });
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 12 }}>
+    <div
+      style={{
+        ...contentColumn(CONTENT_WIDE),
+        boxSizing: 'border-box',
+        display: 'flex',
+        flexDirection: 'column',
+        height: '100%',
+        gap: 12,
+      }}
+    >
       <Space wrap style={{ flexShrink: 0 }}>
-        <FileTextOutlined style={{ color: c.TEXT_MUTED }} />
         <Select
           aria-label="Minimum level"
           value={level ?? 'all'}
@@ -203,7 +229,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
           overflow: 'auto',
           border: `1px solid ${c.BORDER}`,
           borderRadius: 6,
-          fontFamily: 'monospace',
+          fontFamily: 'var(--font-mono)',
           fontSize: 12,
         }}
       >
@@ -211,21 +237,37 @@ export default function LogsPanel({ onSessionExpired }: Props) {
           {rowVirtualizer.getVirtualItems().map((vi) => {
             const e = entries[vi.index];
             const hasFields = e.fields && Object.keys(e.fields).length > 0;
+            const key = lineKey(e);
+            const open = expanded.has(key);
+            const fieldText = hasFields
+              ? Object.entries(e.fields).map(([k, v]) => `${k}=${String(v)}`)
+              : [];
             return (
               <div
                 key={vi.key}
+                ref={rowVirtualizer.measureElement}
+                data-index={vi.index}
+                role="button"
+                tabIndex={0}
+                aria-expanded={open}
+                title={open ? 'Click to collapse' : 'Click to show the full line'}
+                onClick={() => toggleLine(key)}
+                onKeyDown={activateOnKey(() => toggleLine(key))}
                 style={{
                   position: 'absolute',
                   top: 0,
                   left: 0,
                   width: '100%',
+                  boxSizing: 'border-box',
                   transform: `translateY(${vi.start}px)`,
                   padding: '4px 10px',
                   borderBottom: `1px solid ${c.BORDER}`,
                   display: 'flex',
                   gap: 8,
                   alignItems: 'baseline',
-                  whiteSpace: 'nowrap',
+                  whiteSpace: open ? 'normal' : 'nowrap',
+                  cursor: 'pointer',
+                  background: open ? c.BG_ELEVATED : undefined,
                 }}
               >
                 <Tag color={levelColour(e.level)} style={{ margin: 0, minWidth: 48, textAlign: 'center' }}>
@@ -235,30 +277,35 @@ export default function LogsPanel({ onSessionExpired }: Props) {
                   title={new Date(e.ts).toLocaleString()}
                   // Width in `ch` (monospace): the longest relativeTime output,
                   // "23h 59m ago", is 11 characters.
-                  style={{ color: c.TEXT_MUTED, width: '11ch', flexShrink: 0 }}
+                  style={{ color: c.TEXT_MUTED, width: '11ch', flexShrink: 0, whiteSpace: 'nowrap' }}
                 >
                   {relativeTime(e.ts, { now })}
                 </span>
-                <span style={{ color: c.TEXT_SECONDARY, flexShrink: 0 }}>
+                <span style={{ color: c.TEXT_SECONDARY, flexShrink: 0, whiteSpace: 'nowrap' }}>
                   {e.target.replace(/^deltaglider_proxy::/, '')}
                 </span>
-                <span
-                  style={{
-                    color: c.TEXT_PRIMARY,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                  }}
-                >
-                  {e.message}
-                  {hasFields && (
-                    <span style={{ color: c.TEXT_MUTED }}>
-                      {' '}
-                      {Object.entries(e.fields)
-                        .map(([k, v]) => `${k}=${String(v)}`)
-                        .join(' ')}
-                    </span>
-                  )}
-                </span>
+                {open ? (
+                  <span style={{ color: c.TEXT_PRIMARY, minWidth: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+                    {e.message}
+                    {fieldText.map((f) => (
+                      <span key={f} style={{ display: 'block', color: c.TEXT_MUTED }}>
+                        {f}
+                      </span>
+                    ))}
+                  </span>
+                ) : (
+                  <span
+                    style={{
+                      color: c.TEXT_PRIMARY,
+                      minWidth: 0,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                    }}
+                  >
+                    {e.message}
+                    {hasFields && <span style={{ color: c.TEXT_MUTED }}> {fieldText.join(' ')}</span>}
+                  </span>
+                )}
               </div>
             );
           })}

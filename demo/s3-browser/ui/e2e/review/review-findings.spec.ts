@@ -42,8 +42,8 @@ function s3(): S3Client {
 
 async function signIn(page: Page) {
   await page.goto('/_/admin');
-  await page.getByPlaceholder('Access Key ID').fill(ACCESS_KEY);
-  await page.getByPlaceholder('Secret Access Key').fill(SECRET_KEY);
+  await page.getByLabel('Access key ID', { exact: true }).fill(ACCESS_KEY);
+  await page.getByLabel('Secret access key', { exact: true }).fill(SECRET_KEY);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByText('ADMIN SETTINGS', { exact: false })).toBeVisible({ timeout: 30_000 });
 }
@@ -75,11 +75,14 @@ test.beforeAll(async () => {
 test('creating a user without a secret shows the generated secret once', async ({ page }) => {
   await signIn(page);
   await page.goto('/_/admin/access/users');
-  await page.getByRole('button', { name: /New/ }).click();
+  await page.getByRole('button', { name: 'New user' }).click();
   const name = `review-user-${RUN}`;
   await page.getByPlaceholder('e.g. ci-bot').fill(name);
   const created = page.waitForResponse((r) => r.url().endsWith('/_/api/admin/users') && r.request().method() === 'POST');
-  await page.locator('button:has-text("Create User")').click();
+  await page.getByRole('button', { name: 'Create user', exact: true }).click();
+  // The first IAM user asks to switch sign-in to IAM users first.
+  const switchSignIn = page.getByRole('button', { name: 'Create user and switch' });
+  await Promise.race([created, switchSignIn.click({ timeout: 5_000 }).catch(() => undefined)]);
   const body = (await (await created).json()) as { id: number; secret_access_key: string };
   try {
     // The API returns the secret exactly once; the UI must show it, or the

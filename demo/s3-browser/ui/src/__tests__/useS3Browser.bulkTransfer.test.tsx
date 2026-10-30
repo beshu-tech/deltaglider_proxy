@@ -150,7 +150,7 @@ describe.each(['copy', 'move'] as const)('bulk %s', (op) => {
     held[1].answer(json({ error: 'disk full' }, 500));
     const label = op === 'copy' ? 'Bulk copy' : 'Bulk move';
     await expect(run).rejects.toThrow(
-      `${label} failed (500): disk full. 500 of 1,201 items were ${past[op]} before the failure.`,
+      `${label} failed (500): disk full. 500 of 1,201 objects were ${past[op]} before the failure.`,
     );
     expect(http.callsTo('POST', PATH[op])).toHaveLength(2);
     await waitFor(() => expect(result.current.bulkRunning).toBe(false));
@@ -275,12 +275,12 @@ test('wired to the action bar: the copy closes the picker, shows its progress, a
   const user = userEvent.setup();
   renderWithQuery(<Harness />);
   await user.click(await screen.findByRole('button', { name: 'pick' }));
-  await user.click(screen.getByRole('button', { name: 'Copy 1 selected items' }));
+  await user.click(screen.getByRole('button', { name: 'Copy 1 selected object' }));
   const dialog = await screen.findByRole('dialog');
   const path = within(dialog).getByPlaceholderText('/ (bucket root)');
   await user.clear(path);
   await user.type(path, 'old');
-  await user.click(within(dialog).getByRole('button', { name: 'Copy 1 item' }));
+  await user.click(within(dialog).getByRole('button', { name: 'Copy 1 object' }));
 
   const toolbar = screen.getByRole('toolbar', { name: 'Selection actions' });
   await waitFor(() => expect(held).toHaveLength(1));
@@ -294,6 +294,6 @@ test('wired to the action bar: the copy closes the picker, shows its progress, a
   await user.click(within(toolbar).getByRole('button', { name: 'Cancel copy' }));
   expect(within(toolbar).getByRole('status')).toHaveTextContent('Stopping after this batch…');
   held[1].answer();
-  expect(await screen.findByText('Copy stopped. 1,000 of 1,201 items copied.')).toBeInTheDocument();
+  expect(await screen.findByText('Copy stopped. 1,000 of 1,201 objects copied.')).toBeInTheDocument();
   expect(http.callsTo('POST', PATH.copy)).toHaveLength(2);
 });

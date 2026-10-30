@@ -31,7 +31,7 @@ import {
 import { confirmDialog } from '../confirmDialog';
 import { normalizeUiError } from '../errorHandling';
 import { useColors } from '../ThemeContext';
-import { contentColumn, CONTENT_FORM, useCardStyles } from './shared-styles';
+import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
 
 const { Text } = Typography;
@@ -118,8 +118,8 @@ export default function EncryptionWitnessCard() {
   const mismatches = status?.mismatches ?? [];
 
   return (
-    <div ref={ref} id={WITNESS_CARD_ID} style={{ ...contentColumn(CONTENT_FORM), paddingTop: 0 }}>
-      <div style={cardStyle}>
+    <div ref={ref} id={WITNESS_CARD_ID}>
+      <div style={{ ...cardStyle, marginBottom: 0 }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16 }}>
           <SectionHeader
             icon={<SafetyCertificateOutlined />}

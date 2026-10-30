@@ -118,7 +118,7 @@ test('migrate a bucket from the UI: busy banner, live row, succeeded, listing wo
 
   // Sign in.
   await page.goto('/_/browse');
-  await page.getByPlaceholder('Admin password').fill(PASSWORD);
+  await page.getByLabel('Admin password', { exact: true }).fill(PASSWORD);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
 

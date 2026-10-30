@@ -12,9 +12,13 @@ import { useColors } from '../ThemeContext';
  * help.
  */
 
-/** Collapsible HTML5 `<details>` block with an uppercase summary header. */
-export function AdvancedDisclosure({ title, children }: { title: string; children: ReactNode }) {
-  const { BORDER, TEXT_SECONDARY } = useColors();
+/**
+ * Collapsible HTML5 `<details>` block. The summary is the title in sentence
+ * case (13px, 600), with an optional `hint` as a muted second line that says
+ * what is inside, so the reader knows before opening it.
+ */
+export function AdvancedDisclosure({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
+  const { BORDER, TEXT_PRIMARY, TEXT_MUTED } = useColors();
   return (
     <details
       style={{
@@ -26,15 +30,18 @@ export function AdvancedDisclosure({ title, children }: { title: string; childre
       <summary
         style={{
           cursor: 'pointer',
-          color: TEXT_SECONDARY,
-          fontSize: 12,
-          fontWeight: 700,
-          letterSpacing: 0.5,
-          textTransform: 'uppercase',
+          color: TEXT_PRIMARY,
+          fontSize: 13,
+          fontWeight: 600,
           userSelect: 'none',
         }}
       >
-        {title}
+        <span>{title}</span>
+        {hint && (
+          <span style={{ display: 'block', marginLeft: 16, fontSize: 12, fontWeight: 400, color: TEXT_MUTED }}>
+            {hint}
+          </span>
+        )}
       </summary>
       <div style={{ marginTop: 12 }}>
         {children}

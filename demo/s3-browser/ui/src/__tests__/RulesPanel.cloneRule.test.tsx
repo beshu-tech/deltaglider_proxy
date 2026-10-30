@@ -47,5 +47,8 @@ test('Clone stages a copy, opens it, and warns that it acts on the same objects'
     expect(rows).toHaveLength(2);
     expect(rows[1]).toMatch(/^nightly-copydraft/);
   });
+  // The unsaved-changes bar sits in the drawer's footer, not half under the
+  // drawer's edge, and the page's own bar is hidden meanwhile (one button).
   expect(screen.getByRole('button', { name: 'Review & apply' })).toBeInTheDocument();
+  expect(within(drawer).getByRole('button', { name: 'Review & apply' })).toBeInTheDocument();
 });

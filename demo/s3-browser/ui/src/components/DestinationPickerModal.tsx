@@ -21,9 +21,9 @@ interface Props {
   selectionKeys?: Iterable<string>;
 }
 
-/** "Move 3 items" / "Copy 1 item" — shared by the modal title and OK button. */
+/** "Move 3 objects" / "Copy 1 object" — shared by the modal title and OK button. */
 function getModalTitle(mode: 'copy' | 'move', itemCount: number): string {
-  return `${mode === 'move' ? 'Move' : 'Copy'} ${pluralize(itemCount, 'item')}`;
+  return `${mode === 'move' ? 'Move' : 'Copy'} ${pluralize(itemCount, 'object')}`;
 }
 
 /** Uppercase field caption shared by the bucket/path inputs. */
@@ -118,7 +118,7 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
         <Alert
           type="info"
           showIcon
-          title={`The selected items are already in this folder. Choose another folder or bucket to ${mode} them.`}
+          title={`The selected objects are already in this folder. Choose another folder or bucket to ${mode} them.`}
           style={{ borderRadius: 8, marginBottom: mode === 'move' ? 12 : 0 }}
         />
       )}

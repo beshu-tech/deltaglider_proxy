@@ -19,13 +19,11 @@
  *
  *   - Comfortable: 12 logical columns, full padding, larger type.
  *     Above ~1280px container width.
- *   - Compact: 6 logical columns, tighter padding, smaller type.
+ *   - Compact: the same 12 columns and spans, a tighter gap.
  *     Between 900 and 1280px.
  *
  * Below 900px the outer admin layout has already switched to a
- * Drawer, so we let the grid collapse to 1-col via `grid-auto-flow`
- * — individual Panels read their `colSpan` as "up to 6" in that
- * mode and wrap naturally.
+ * Drawer, and every panel takes the full width (dashboard.css).
  *
  * Density is exposed via `data-density` on the grid and a CSS
  * custom property `--dg-density`. Panels read both; consumers only

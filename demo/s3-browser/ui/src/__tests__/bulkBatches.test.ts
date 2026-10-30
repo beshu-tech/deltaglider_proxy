@@ -38,10 +38,6 @@ test('progress text and percent, per phase and action', () => {
   assert.equal(bulkProgressText(listing), 'Counting objects to delete in folder 13 of 50… 4,310 found. Nothing is deleted yet.');
   assert.equal(bulkProgressText({ ...listing, folders: 1, listed: 0 }), 'Counting objects to delete… 4,310 found. Nothing is deleted yet.');
   assert.equal(bulkProgressPercent(listing), null);
-  // Counted: the dialog asks, the bar says so and shows no bar.
-  const confirming = { action: 'delete' as const, phase: 'confirming' as const, total: 12_346, stopping: false };
-  assert.equal(bulkProgressText(confirming), '12,346 objects to delete. Waiting for your confirmation.');
-  assert.equal(bulkProgressPercent(confirming), null);
   const copyListing = { ...listing, action: 'copy' as const };
   assert.equal(bulkProgressText(copyListing), 'Listing folders 12 of 50… 4,310 objects found');
   assert.equal(bulkProgressPercent(copyListing), 24);
@@ -74,11 +70,11 @@ test('a failure names how many objects went before it, and keeps its cause', () 
   );
   assert.equal(
     new BulkActionFailed('copy', new Error('Bulk copy failed (502): bad gateway'), 500, 1201).message,
-    'Bulk copy failed (502): bad gateway. 500 of 1,201 items were copied before the failure.',
+    'Bulk copy failed (502): bad gateway. 500 of 1,201 objects were copied before the failure.',
   );
   assert.equal(
     new BulkActionFailed('move', new Error('Bulk move failed (502): bad gateway'), 1, 2).message,
-    'Bulk move failed (502): bad gateway. 1 of 2 items were moved before the failure.',
+    'Bulk move failed (502): bad gateway. 1 of 2 objects were moved before the failure.',
   );
   // The listing failed: no request was sent.
   assert.equal(

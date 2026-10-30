@@ -251,7 +251,7 @@ describe('bulkDelete', () => {
     const user = userEvent.setup();
     renderWithQuery(<Harness />);
     await user.click(await screen.findByRole('button', { name: 'pick' }));
-    await user.click(screen.getByRole('button', { name: 'Delete 1 selected items' }));
+    await user.click(screen.getByRole('button', { name: 'Delete 1 selected object' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getAllByText('Delete 2 objects permanently?').length).toBeGreaterThan(0);
     await user.click(within(dialog).getByRole('button', { name: 'Delete' }));

@@ -1,5 +1,5 @@
 /**
- * H9: Test Connection tests the form as it is now (unsaved edits
+ * H9: Test connection tests the form as it is now (unsaved edits
  * included), also for a provider that is not saved yet, and shows a failed
  * test (a 200 with success: false) as the cause.
  */
@@ -37,7 +37,7 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllGlobals());
 
-test('Test Connection sends the unsaved form of a saved provider', async () => {
+test('Test connection sends the unsaved form of a saved provider', async () => {
   http.on(
     'POST',
     '/_/api/admin/ext-auth/providers/7/test',
@@ -49,7 +49,7 @@ test('Test Connection sends the unsaved form of a saved provider', async () => {
   const issuer = await screen.findByLabelText('Issuer URL');
   await user.clear(issuer);
   await user.type(issuer, 'https://new.acme.example');
-  await user.click(screen.getByRole('button', { name: /Test Connection/ }));
+  await user.click(screen.getByRole('button', { name: /Test connection/ }));
   await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/ext-auth/providers/7/test')).toHaveLength(1));
   expect(http.callsTo('POST', '/_/api/admin/ext-auth/providers/7/test')[0].body).toEqual({
     client_id: 'cid',
@@ -62,7 +62,7 @@ test('Test Connection sends the unsaved form of a saved provider', async () => {
   expect(http.callsTo('PUT', '/_/api/admin/ext-auth/providers/7')).toHaveLength(0);
 });
 
-test('Test Connection works on the create form', async () => {
+test('Test connection works on the create form', async () => {
   http.on(
     'POST',
     '/_/api/admin/ext-auth/providers/test',
@@ -72,11 +72,25 @@ test('Test Connection works on the create form', async () => {
   renderWithQuery(<AuthenticationPanel />);
   await user.click(await screen.findByRole('button', { name: /Add provider/ }));
   await user.type(await screen.findByLabelText('Client ID'), 'new-cid');
-  await user.click(screen.getByRole('button', { name: /Test Connection/ }));
+  await user.click(screen.getByRole('button', { name: /Test connection/ }));
   await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/ext-auth/providers/test')).toHaveLength(1));
   expect(http.callsTo('POST', '/_/api/admin/ext-auth/providers/test')[0].body).toMatchObject({
     client_id: 'new-cid',
     issuer_url: 'https://accounts.google.com',
   });
   expect(await screen.findByText(/Connected\. Issuer: https:\/\/accounts\.google\.com/)).toBeTruthy();
+});
+
+test('B20: Create is never a silent disabled button; missing fields are named on the field', async () => {
+  http.on('GET', '/_/api/admin/ext-auth/providers', json([]));
+  const user = userEvent.setup();
+  renderWithQuery(<AuthenticationPanel />);
+  await user.click(await screen.findByRole('button', { name: /Add provider/ }));
+  const create = await screen.findByRole('button', { name: 'Create' });
+  expect(create).toBeEnabled();
+  await user.click(create);
+  expect(await screen.findByText('Enter the provider name.')).toBeInTheDocument();
+  expect(screen.getByText('Enter the client ID.')).toBeInTheDocument();
+  expect(screen.getByLabelText('Client ID')).toHaveAttribute('aria-invalid', 'true');
+  expect(http.callsTo('POST', '/_/api/admin/ext-auth/providers')).toHaveLength(0);
 });

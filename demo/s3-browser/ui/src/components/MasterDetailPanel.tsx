@@ -59,8 +59,12 @@ interface MasterDetailPanelProps<T> {
 
   loading: boolean;
   error: string;
-  /** Rendered in the list area when there are zero items and not loading/error. */
-  listEmptyState: ReactNode;
+  /**
+   * Rendered in the list area when there are zero items and not loading/error.
+   * Leave it out when the detail pane already shows the empty state, so the
+   * page says "nothing here" once, not twice.
+   */
+  listEmptyState?: ReactNode;
 
   /** The right-hand detail pane (form-or-empty-state). */
   detail: ReactNode;
@@ -130,7 +134,7 @@ export default function MasterDetailPanel<T>({
               {!readOnly && (
                 <Button
                   data-testid={`md-new-${title.toLowerCase().replace(/\s+/g, '-')}`}
-                  aria-label={`New ${title.replace(/s$/, '') || title}`}
+                  aria-label={`New ${(title.replace(/s$/, '') || title).toLowerCase()}`}
                   type="primary"
                   size="small"
                   icon={<PlusOutlined />}

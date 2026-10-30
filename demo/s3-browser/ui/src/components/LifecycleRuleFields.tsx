@@ -1,4 +1,4 @@
-import { Alert, Input, InputNumber, Select, Switch } from 'antd';
+import { Alert, Input, InputNumber, Select, Switch, Typography } from 'antd';
 import type { LifecycleAction, LifecycleRuleConfig } from '../adminApi';
 import BucketPrefixInput from './BucketPrefixInput';
 import FormField from './FormField';
@@ -7,6 +7,8 @@ import RuleFilterFields from './RuleFilterFields';
 import { ruleFolderPrefix } from '../ruleFilterPreview';
 import { actionKind } from './lifecyclePayload';
 import { ruleGlobError } from './jobs/lifecycleText';
+
+const { Text } = Typography;
 
 type RetainAction = Extract<LifecycleAction, { type: 'retain-newest' }>;
 type TransitionAction = Extract<LifecycleAction, { type: 'transition' | 'archive' }>;
@@ -60,14 +62,6 @@ export default function RuleEditor({
 
   return (
     <div>
-      <Alert
-        type="warning"
-        showIcon
-        title="Lifecycle actions"
-        description="Delete removes expired candidates. Archive/move copies through the same DeltaGlider engine path as replication, then optionally deletes the source after the copy verifies."
-        style={{ marginTop: 14 }}
-      />
-
       <div style={{ marginTop: 16, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
         <FormField
           label="Rule name"
@@ -83,7 +77,7 @@ export default function RuleEditor({
         <FormField
           label="Enabled"
           yamlPath="storage.lifecycle.rules[].enabled"
-          helpText="Per-rule switch. The rule runs only when “Run lifecycle rules on schedule” on the Jobs page is also on."
+          helpText="Per-rule switch. The rule runs only when “Run lifecycle rules on schedule”, at the top of this page, is also on."
         >
           <Switch checked={rule.enabled} onChange={(enabled) => onChange({ enabled })} />
         </FormField>
@@ -104,7 +98,7 @@ export default function RuleEditor({
           <FormField
             label="Expire after"
             yamlPath="storage.lifecycle.rules[].expire_after"
-            helpText="Objects whose creation time is older than this age become candidates. The proxy stamps the creation time when it stores an object. For an object that was written without the proxy (a restore, a copy straight to the disk or the backend), it uses the file's modification time instead. Humantime duration, e.g. 30d, 12h, 90d."
+            helpText="Objects whose creation time is older than this age become candidates. The proxy stamps the creation time when it stores an object. For an object that was written without the proxy (a restore, a copy straight to the disk or the backend), it uses the file's modification time instead. A duration such as 12h, 30d or 90d."
           >
             <Input
               value={rule.expire_after || ''}
@@ -117,7 +111,7 @@ export default function RuleEditor({
         <FormField
           label="Action"
           yamlPath="storage.lifecycle.rules[].action"
-          helpText="What to do with candidates: delete by age, keep the newest N by count, or archive/move them through the engine to another bucket."
+          helpText="What to do with candidates. Delete removes them. Keep newest N keeps the newest N objects and deletes the rest. Archive / move copies them to another bucket the same way replication does, and can then delete the source after the copy is verified."
         >
           <Select
             value={kind}
@@ -145,7 +139,7 @@ export default function RuleEditor({
               <div>
                 <div>{opt.data.label}</div>
                 {opt.data.sublabel && (
-                  <div style={{ fontSize: 11, opacity: 0.65 }}>{opt.data.sublabel}</div>
+                  <Text type="secondary" style={{ fontSize: 11, display: 'block' }}>{opt.data.sublabel}</Text>
                 )}
               </div>
             )}
@@ -197,7 +191,7 @@ export default function RuleEditor({
             <FormField
               label="Ignore objects younger than"
               yamlPath="storage.lifecycle.rules[].action.qualify.min_age"
-              helpText="Humantime, e.g. 1h. Objects this young are ignored (still being uploaded). Leave blank for no age filter."
+              helpText="A duration such as 1h. The rule ignores objects younger than this, because they can still be uploading. Leave it empty for no age filter."
             >
               <Input
                 value={retainAction.qualify?.min_age || ''}
@@ -207,11 +201,11 @@ export default function RuleEditor({
               />
             </FormField>
           </div>
-          <AdvancedDisclosure title="Delete-side guard (advanced)">
+          <AdvancedDisclosure title="Delete-side guard" hint="Never delete objects younger than an age">
             <FormField
               label="Don't delete anything younger than"
               yamlPath="storage.lifecycle.rules[].action.protect_younger_than"
-              helpText="Humantime. An object selected for deletion is spared THIS run if younger than this — distinct from the qualify filters above (which exclude from counting). Most rules leave this blank."
+              helpText="A duration such as 1h. This run does not delete a selected object that is younger than this. The filters above are different: they remove objects from the count. Most rules leave this empty."
             >
               <Input
                 value={retainAction.protect_younger_than || ''}
@@ -269,7 +263,7 @@ export default function RuleEditor({
         inputRadius={inputRadius}
       />
 
-      <AdvancedDisclosure title="Batch size">
+      <AdvancedDisclosure title="Batch size" hint="Objects per page of a run">
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 }}>
           <FormField
             label="Batch size"

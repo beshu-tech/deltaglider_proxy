@@ -328,7 +328,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
         {/* Generic delivery tuning lives WITH the rest of the generic config —
             it's format-agnostic (applies to raw + Slack alike). */}
         <div style={{ marginTop: 8 }}>
-          <AdvancedDisclosure title="Delivery tuning (retry, retention, batching)">
+          <AdvancedDisclosure title="Delivery tuning" hint="Retry, retention, batching">
             <DurationField
               label="Tick interval"
               yamlPath="advanced.event_delivery.tick_interval"

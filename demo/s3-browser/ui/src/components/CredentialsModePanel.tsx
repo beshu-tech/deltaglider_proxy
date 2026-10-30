@@ -292,7 +292,23 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
             </Radio>
             <Radio value="declarative" disabled={declarativeBlocked} style={{ alignItems: 'flex-start' }}>
               <div>
-                <div style={{ fontWeight: 600 }}>Declarative (YAML-authoritative)</div>
+                {/* A disabled radio greys its label to about 2.5:1; the title
+                    keeps full contrast and the lock tag says it is off. */}
+                <div style={{ fontWeight: 600, color: colors.TEXT_PRIMARY, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  Declarative (YAML-authoritative)
+                  {declarativeBlocked && (
+                    <span
+                      data-testid="declarative-unavailable"
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 4,
+                        fontSize: 11, fontWeight: 600, padding: '0 6px', borderRadius: 4,
+                        color: colors.TEXT_SECONDARY, border: `1px solid ${colors.BORDER}`,
+                      }}
+                    >
+                      <LockOutlined aria-hidden /> Not available
+                    </span>
+                  )}
+                </div>
                 <Text type="secondary" style={{ fontSize: 12, lineHeight: 1.5 }}>
                   Your YAML config is the source of truth. The user
                   management panels turn read-only, and every time you
@@ -302,8 +318,8 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
               </div>
             </Radio>
             {declarativeBlocked && (
-              <Text type="secondary" style={{ fontSize: 12, lineHeight: 1.5, marginLeft: 24 }}>
-                Not available here: your YAML config has no users yet, and the proxy refuses a
+              <Text type="secondary" style={{ fontSize: 12, lineHeight: 1.5, marginLeft: 24, marginTop: -4 }}>
+                Why it is not available: your YAML config has no users yet, and the proxy refuses a
                 switch that would empty the user database. Apply a full YAML document that lists
                 your users in <code>access.iam_users</code> and sets <code>iam_mode: declarative</code>.
                 See{' '}
@@ -408,7 +424,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
               value={accessKeyShown}
               onChange={(e) => setAccessKey(e.target.value)}
               placeholder="AKIAIOSFODNN7EXAMPLE"
-              style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
+              style={{ ...inputRadius }}
             />
           </FormField>
           <FormField
@@ -416,7 +432,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
             yamlPath="access.secret_access_key"
             helpText={
               accessKeyShown
-                ? 'Leave empty to keep the current secret unchanged. Paste a new value to rotate.'
+                ? 'The current secret is never shown. Leave the field empty to keep it, or enter a new secret to rotate it.'
                 : 'Shared secret paired with the access key.'
             }
           >
@@ -436,15 +452,11 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
               mode="blank-keeps"
               value={form.secret_access_key ?? ''}
               onChange={setSecretKey}
-              placeholder="Leave empty to keep current"
+              placeholder={accessKeyShown ? 'Unchanged' : undefined}
               autoComplete="new-password"
               style={{ ...inputRadius }}
             />
           </FormField>
-          <Text type="secondary" style={{ fontSize: 12, marginTop: -4 }}>
-            The current secret is never shown. To rotate the credentials,
-            set both fields. An empty field keeps the current value.
-          </Text>
           {runningKeyId && !accessKeyEnv && (
             <div>
               <Button danger loading={removing} onClick={() => void removeBootstrap()}>
@@ -460,18 +472,9 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
       </div>
 
       {/* Admin GUI password change — separate endpoint, always
-          available (distinct from S3 SigV4 auth). The PasswordChangeCard
-          already carries its own SectionHeader; we just prepend a
-          one-line contextual note so operators know this is the GUI
-          password, not the bootstrap SigV4 secret above. */}
-      <div style={{ marginTop: 4 }}>
-        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
-          <b>Note:</b> The admin GUI password is SEPARATE from the S3
-          SigV4 credentials above. It unlocks this GUI. It does not
-          encrypt the IAM database, which has its own key.
-        </Text>
-        <PasswordChangeCard />
-      </div>
+          available (distinct from S3 SigV4 auth). Its header says that it
+          is not the SigV4 secret above. */}
+      <PasswordChangeCard />
 
       <StickyDirtyBar
         visible={isDirty}

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Modal, Spin, Alert, Button, Typography } from 'antd';
-import { DownloadOutlined } from '@ant-design/icons';
+import { DownloadOutlined, FileExclamationOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
 import { downloadObject, getDownloadUrl, getPresignedUrl } from '../s3client';
 import { formatBytes, getFileName, downloadFromUrl } from '../utils';
@@ -11,6 +11,15 @@ import { normalizeUiError } from '../errorHandling';
 const { Text } = Typography;
 
 const MAX_TEXT_PREVIEW = 512 * 1024; // 512 KB
+
+type MediaMode = 'image' | 'video' | 'audio';
+
+/** What the preview says when the browser fetched the file but cannot decode it. */
+const UNREADABLE: Record<MediaMode, { title: string; hint: string }> = {
+  image: { title: 'This file is not a readable image.', hint: 'Your browser cannot show it. Download the file to inspect it.' },
+  video: { title: 'This browser cannot play this video.', hint: 'The codec may not be supported. Download the file to play it locally.' },
+  audio: { title: 'This browser cannot play this audio file.', hint: 'The codec may not be supported. Download the file to play it locally.' },
+};
 
 interface FilePreviewProps {
   open: boolean;
@@ -25,6 +34,8 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
   const [textContent, setTextContent] = useState('');
   // Presigned URL for any binary media rendered inline (image / video / audio).
   const [mediaUrl, setMediaUrl] = useState('');
+  // The browser loaded the media URL but could not decode it (not a failed request).
+  const [unreadable, setUnreadable] = useState<MediaMode | null>(null);
 
   const filename = object ? getFileName(object.key) : '';
   const mode = object ? getPreviewMode(object.key) : null;
@@ -43,6 +54,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
     setError('');
     setTextContent('');
     setMediaUrl('');
+    setUnreadable(null);
 
     if (mode === 'text' && !tooLarge) {
       downloadObject(object.key)
@@ -154,7 +166,29 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
         </pre>
       )}
 
-      {!loading && !error && mediaUrl && mode === 'image' && (
+      {unreadable && (
+        <div
+          role="status"
+          style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, padding: '48px 16px', textAlign: 'center' }}
+        >
+          <FileExclamationOutlined aria-hidden="true" style={{ fontSize: 32, color: colors.TEXT_MUTED }} />
+          <div style={{ fontSize: 15, fontWeight: 600, color: colors.TEXT_PRIMARY, fontFamily: 'var(--font-ui)' }}>
+            {UNREADABLE[unreadable].title}
+          </div>
+          <div style={{ fontSize: 13, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)', maxWidth: 420 }}>
+            {UNREADABLE[unreadable].hint}
+          </div>
+          <div style={{ fontSize: 12, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
+            {filename} · {formatBytes(object.size)}
+            {object.headers?.['content-type'] ? ` · ${object.headers['content-type']}` : ''}
+          </div>
+          <Button type="primary" icon={<DownloadOutlined />} onClick={handleDownload} style={{ marginTop: 8 }}>
+            Download
+          </Button>
+        </div>
+      )}
+
+      {!loading && !error && !unreadable && mediaUrl && mode === 'image' && (
         <div style={{ textAlign: 'center' }}>
           <img
             src={mediaUrl}
@@ -165,12 +199,12 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
               borderRadius: 8,
               border: `1px solid ${colors.BORDER}`,
             }}
-            onError={() => setError('Failed to load image')}
+            onError={() => setUnreadable('image')}
           />
         </div>
       )}
 
-      {!loading && !error && mediaUrl && mode === 'video' && (
+      {!loading && !error && !unreadable && mediaUrl && mode === 'video' && (
         <div style={{ textAlign: 'center' }}>
           <video
             src={mediaUrl}
@@ -184,19 +218,19 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
               border: `1px solid ${colors.BORDER}`,
               background: '#000',
             }}
-            onError={() => setError('Failed to load video — the browser may not support this codec. Use Download to play it locally.')}
+            onError={() => setUnreadable('video')}
           />
         </div>
       )}
 
-      {!loading && !error && mediaUrl && mode === 'audio' && (
+      {!loading && !error && !unreadable && mediaUrl && mode === 'audio' && (
         <div style={{ textAlign: 'center', padding: '24px 8px' }}>
           <audio
             src={mediaUrl}
             controls
             autoPlay
             style={{ width: '100%' }}
-            onError={() => setError('Failed to load audio — the browser may not support this codec. Use Download to play it locally.')}
+            onError={() => setUnreadable('audio')}
           />
         </div>
       )}

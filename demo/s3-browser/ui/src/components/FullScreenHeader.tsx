@@ -1,6 +1,7 @@
 import { Button } from 'antd';
 import { ArrowLeftOutlined, QuestionCircleOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
+import { useIsNarrow } from '../useIsNarrow';
 
 interface Props {
   title: string;
@@ -18,12 +19,17 @@ interface Props {
 /** Shared header bar for full-screen views (Admin, Docs) */
 export default function FullScreenHeader({ title, onBack, leading, extra, onShowShortcuts, accountMenu }: Props) {
   const colors = useColors();
+  // On a phone the header holds the menu button, "Browser", help and the
+  // account menu; the letter-spaced title then wraps onto two lines. The page
+  // header below names the page, so the bar drops the title there.
+  const phone = useIsNarrow(600);
   return (
     <div style={{
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'space-between',
-      padding: '0 20px',
+      padding: phone ? '0 8px' : '0 20px',
+      gap: 8,
       height: 52,
       borderBottom: `1px solid ${colors.BORDER}`,
       background: colors.BG_CARD,
@@ -47,7 +53,7 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
       </div>
 
       {/* Center: branding + section title */}
-      <div style={{
+      {!phone && <div style={{
         display: 'flex',
         alignItems: 'baseline',
         gap: 10,
@@ -76,22 +82,22 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
           fontSize: 13,
           fontWeight: 600,
           letterSpacing: 2,
+          whiteSpace: 'nowrap',
           color: colors.ACCENT_BLUE,
           fontFamily: 'var(--font-mono)',
           textTransform: 'uppercase',
         }}>
           {title}
         </span>
-      </div>
+      </div>}
 
       {/* Right: optional actions + account menu */}
-      <div style={{ minWidth: 100, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4 }}>
+      <div style={{ minWidth: phone ? 0 : 100, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4 }}>
         {extra}
         {onShowShortcuts && (
           <Button
             type="text"
             icon={<QuestionCircleOutlined />}
-            size="small"
             title="Keyboard shortcuts (press ?)"
             aria-label="Keyboard shortcuts"
             onClick={onShowShortcuts}

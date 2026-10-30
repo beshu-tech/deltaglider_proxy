@@ -86,12 +86,21 @@ interface FormFieldProps {
   controlId?: string;
   /** Optional override for the outer container style. */
   style?: CSSProperties;
+  /**
+   * Validation error of this field (one sentence). Shown under the input in
+   * the error colour and announced; the control gets `aria-invalid`,
+   * `aria-describedby` and AntD's `status="error"` (red border).
+   */
+  error?: string;
 }
 
 interface LabelledProps {
   id?: string;
   'aria-label'?: string;
   'aria-labelledby'?: string;
+  'aria-describedby'?: string;
+  'aria-invalid'?: boolean;
+  status?: 'error';
 }
 
 /**
@@ -101,16 +110,55 @@ interface LabelledProps {
  * `aria-label`. AntD Input/InputNumber/Select/Switch forward
  * both to their focusable element. Anything else renders untouched.
  */
-function labelChild(children: ReactNode, controlId: string, labelId: string): ReactNode {
+function labelChild(
+  children: ReactNode,
+  controlId: string,
+  labelId: string,
+  describedBy: string | undefined,
+  invalid: boolean,
+): ReactNode {
   if (Children.count(children) !== 1 || !isValidElement(children) || children.type === Fragment) {
     return children;
   }
   const child = children as ReactElement<LabelledProps>;
+  const ownDescribedBy = child.props['aria-describedby'];
+  const allDescribedBy = [describedBy, ownDescribedBy].filter(Boolean).join(' ') || undefined;
   return cloneElement(child, {
     id: child.props.id ?? controlId,
     // A caller's own aria-label wins (aria-labelledby would override it).
     'aria-labelledby': child.props['aria-label'] ? undefined : (child.props['aria-labelledby'] ?? labelId),
+    'aria-describedby': allDescribedBy,
+    // Only an invalid field gets the two error props, so a valid field's
+    // control (a Switch, a Radio.Group) never receives a prop it ignores.
+    ...(invalid ? { 'aria-invalid': true, status: 'error' as const } : {}),
   });
+}
+
+/**
+ * A value that the GUI shows but cannot edit (set by an environment
+ * variable, or env-only): mono text in a dashed box, ONE look for "set
+ * outside the GUI". FormField uses it for env-controlled fields; panels use
+ * it as the child of a FormField for env-only settings.
+ */
+export function ReadOnlyValue({ children, muted = false, testId }: { children: ReactNode; muted?: boolean; testId?: string }) {
+  const { TEXT_PRIMARY, TEXT_MUTED, BG_CARD, BORDER } = useColors();
+  return (
+    <div
+      data-testid={testId}
+      style={{
+        fontFamily: 'var(--font-mono)',
+        fontSize: 13,
+        color: muted ? TEXT_MUTED : TEXT_PRIMARY,
+        background: BG_CARD,
+        border: `1px dashed ${BORDER}`,
+        borderRadius: 6,
+        padding: '5px 11px',
+        wordBreak: 'break-all',
+      }}
+    >
+      {children}
+    </div>
+  );
 }
 
 /** The id a FormField gives its control: `useId`, unless the child brings one. */
@@ -132,8 +180,9 @@ export default function FormField({
   children,
   style,
   controlId: explicitControlId,
+  error,
 }: FormFieldProps) {
-  const { TEXT_PRIMARY: TEXT, TEXT_MUTED, TEXT_FAINT, BG_CARD, BORDER, ACCENT_AMBER } = useColors();
+  const { TEXT_PRIMARY: TEXT, TEXT_MUTED, TEXT_FAINT, BG_CARD, BORDER, ACCENT_AMBER, ACCENT_RED } = useColors();
   // THE env rule: a field that a `DGP_*` variable controls shows the
   // effective value read-only with a "from env" badge, never an empty or
   // editable-looking input (an edit would be overridden again at restart).
@@ -145,6 +194,10 @@ export default function FormField({
       : undefined;
   const baseId = useId();
   const labelId = `${baseId}-label`;
+  const helpId = `${baseId}-help`;
+  const errorId = `${baseId}-error`;
+  // The error first: a screen reader reads what is wrong before the hint.
+  const describedBy = [error ? errorId : '', helpText ? helpId : ''].filter(Boolean).join(' ') || undefined;
   const controlId = explicitControlId ?? controlIdOf(children, `${baseId}-control`);
   const barColour = overrideColour || ACCENT_AMBER; // amber — matches §2.6 "override" indicator
   // Tight groups, air between: the label→input→help unit hugs together; the
@@ -227,23 +280,24 @@ export default function FormField({
       {/* Input — hugs the label above it. An env-controlled field shows its
           effective value instead of the editor. */}
       {envOverride ? (
-        <div
-          data-testid="env-override-value"
-          style={{
-            fontFamily: 'var(--font-mono)',
-            fontSize: 13,
-            color: envOverride.secret ? TEXT_MUTED : TEXT,
-            background: BG_CARD,
-            border: `1px dashed ${BORDER}`,
-            borderRadius: 6,
-            padding: '5px 11px',
-            wordBreak: 'break-all',
-          }}
-        >
+        <ReadOnlyValue testId="env-override-value" muted={envOverride.secret}>
           {envOverrideText(envOverride)}
-        </div>
+        </ReadOnlyValue>
       ) : (
-        <div>{explicitControlId ? children : labelChild(children, controlId, labelId)}</div>
+        <div>{explicitControlId ? children : labelChild(children, controlId, labelId, describedBy, Boolean(error))}</div>
+      )}
+      {/* Field error — directly under the input, so it is next to the field
+          the user looks at (a banner at the top of the form can be scrolled
+          away). role="alert" announces it when it appears. */}
+      {error && !envOverride && (
+        <div
+          id={errorId}
+          role="alert"
+          data-testid="field-error"
+          style={{ marginTop: 6, fontSize: 12.5, color: ACCENT_RED, lineHeight: 1.4 }}
+        >
+          {error}
+        </div>
       )}
       {/* Help text — clearly subordinate: smaller, fainter, tight line-height.
           Example chips share this row. */}
@@ -265,7 +319,7 @@ export default function FormField({
             alignItems: 'center',
           }}
         >
-          {helpText && <span>{helpText}</span>}
+          {helpText && <span id={helpId}>{helpText}</span>}
           {!envOverride && defaultPlaceholder && (
             <span
               style={{
@@ -279,7 +333,9 @@ export default function FormField({
             </span>
           )}
           {!envOverride && examples && examples.length > 0 && (
-            <span style={{ display: 'inline-flex', gap: 4, flexWrap: 'wrap' }}>
+            <span style={{ display: 'inline-flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+              {/* Says what the dashed chips are: without it they read as values. */}
+              <span>Examples:</span>
               {examples.map((ex) => (
                 <button
                   key={`ex-${ex}`}

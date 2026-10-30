@@ -8,8 +8,8 @@ test.describe.configure({ timeout: 120_000 });
 test.skip(process.env.E2E_AUTH !== 'bootstrap', 'bootstrap-auth flow');
 
 async function signIn(page: import('@playwright/test').Page) {
-  await expect(page.getByPlaceholder('Admin password')).toBeVisible({ timeout: 60_000 });
-  await page.getByPlaceholder('Admin password').fill(TEST_BOOTSTRAP_PASSWORD);
+  await expect(page.getByLabel('Admin password', { exact: true })).toBeVisible({ timeout: 60_000 });
+  await page.getByLabel('Admin password', { exact: true }).fill(TEST_BOOTSTRAP_PASSWORD);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
 }
@@ -34,7 +34,7 @@ test('bootstrap auth: sign in, bucket, upload, list, admin, sign out, sign in, o
   await bucketRowBtn.click();
 
   // ── Upload (signed by the session's S3 credentials) ──────────────
-  await page.getByRole('button', { name: 'Upload Files' }).click();
+  await page.getByRole('button', { name: 'Upload files' }).click();
   await expect(page.getByRole('heading', { name: new RegExp(`Upload to ${bucketName}`) })).toBeVisible({
     timeout: 30_000,
   });

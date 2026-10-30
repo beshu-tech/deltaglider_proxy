@@ -35,12 +35,12 @@ As an example, refuse every listing of `dana` whose prefix starts with a dot (fo
 
 In the admin UI:
 
-1. On **Access → Users**, click the `dana` row, and click **Add Permission Rule** below her rules.
+1. On **Access → Users**, click the `dana` row, and click **Add permission rule** below her rules.
 2. Select **Deny** at the top of the new rule. Type `*` under **WHERE**, and turn on **List** under **CAN DO**.
 3. Click **Conditions**, and type `.*` in **List prefix**.
 4. Click **Save**.
 
-   ![A second rule of the dana user denies List on every bucket when the listed prefix matches .*; callout 1 marks Add Permission Rule, callout 2 the Deny setting, callout 3 the List prefix field, and callout 4 the Save button.](/_/screenshots/iam-conditions-list-prefix.webp)
+   ![A second rule of the dana user denies List on every bucket when the listed prefix matches .*; callout 1 marks Add permission rule, callout 2 the Deny setting, callout 3 the List prefix field, and callout 4 the Save button.](/_/screenshots/iam-conditions-list-prefix.webp)
 
 This rule refuses the request with `AccessDenied`. It does not hide dot-prefixed keys from a listing with a wider prefix, because the `s3:prefix` condition compares the requested prefix, not the keys. To hide keys from a listing, write a Deny on **List** whose resource pattern matches those keys. The proxy then leaves each matching key out of the result.
 

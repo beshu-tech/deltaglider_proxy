@@ -31,8 +31,20 @@ test('lists the live sessions and labels the caller’s own', async () => {
   http.on('GET', LIST, json({ sessions: [session('s-mine', 'dana', true), session('s-ci', 'ci-uploader')] }));
   renderWithQuery(<SessionsPanel />);
   expect(await screen.findByText('2 live sessions')).toBeInTheDocument();
-  expect(screen.getByText('This session')).toBeInTheDocument();
+  expect(screen.getByText('you')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'More actions for session s-ci' })).toBeInTheDocument();
+  // B32: every row keeps its menu, and the last column has a header.
+  expect(screen.getByRole('button', { name: 'More actions for session s-mine' })).toBeInTheDocument();
+  expect(screen.getByRole('columnheader', { name: 'Actions' })).toBeInTheDocument();
+});
+
+test('the caller’s own session cannot be revoked from the menu, and it says why', async () => {
+  http.on('GET', LIST, json({ sessions: [session('s-mine', 'dana', true)] }));
+  const user = userEvent.setup();
+  renderWithQuery(<SessionsPanel />);
+  await user.click(await screen.findByRole('button', { name: 'More actions for session s-mine' }));
+  const item = await screen.findByRole('menuitem', { name: /use Sign out in the account menu/ });
+  expect(item).toHaveAttribute('aria-disabled', 'true');
 });
 
 test('no sessions reads as zero', async () => {
@@ -79,14 +91,14 @@ test('revoke-user sends the identity after confirmation and refetches', async ()
   const user = userEvent.setup();
   renderWithQuery(<SessionsPanel />);
   await screen.findByText('1 live session');
-  await user.type(screen.getByRole('textbox', { name: 'Identity to force-logout' }), ' ci-uploader ');
+  await user.type(screen.getByRole('textbox', { name: 'Sign out every session of an identity' }), ' ci-uploader ');
   await user.click(screen.getByRole('button', { name: 'Revoke key' }));
   await user.click(within(await lastDialog()).getByRole('button', { name: 'Sign out all sessions' }));
   await waitFor(() => expect(http.callsTo('POST', REVOKE_USER)).toHaveLength(1));
   expect(http.callsTo('POST', REVOKE_USER)[0].body).toEqual({ identity: 'ci-uploader' });
   expect(await screen.findByText(/Revoked 2 sessions locally; peers converge within ~5 min/)).toBeInTheDocument();
   await waitFor(() => expect(http.callsTo('GET', LIST)).toHaveLength(2));
-  expect(screen.getByRole('textbox', { name: 'Identity to force-logout' })).toHaveValue('');
+  expect(screen.getByRole('textbox', { name: 'Sign out every session of an identity' })).toHaveValue('');
 });
 
 test('revoke-user warns when the revocation was not persisted', async () => {
@@ -97,7 +109,7 @@ test('revoke-user warns when the revocation was not persisted', async () => {
   const user = userEvent.setup();
   renderWithQuery(<SessionsPanel />);
   await screen.findByText('0 live sessions');
-  await user.type(screen.getByRole('textbox', { name: 'Identity to force-logout' }), 'backup-bot');
+  await user.type(screen.getByRole('textbox', { name: 'Sign out every session of an identity' }), 'backup-bot');
   await user.click(screen.getByRole('button', { name: 'Revoke key' }));
   await user.click(within(await lastDialog()).getByRole('button', { name: 'Sign out all sessions' }));
   expect(await screen.findByText(/could NOT be persisted/)).toBeInTheDocument();

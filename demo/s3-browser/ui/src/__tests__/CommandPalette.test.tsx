@@ -75,11 +75,22 @@ describe('filter', () => {
     expect(optionLabels()).toEqual(['Export YAML']);
   });
 
-  test('no match shows the empty state and 0 results', async () => {
+  test('no match names the query, and the footer does not repeat "0 results"', async () => {
     renderPalette();
     await userEvent.setup().type(search(), 'zzzzqqq');
-    expect(screen.getByText('No matches. Try a shorter query.')).toBeInTheDocument();
-    expect(screen.getByText('0 results')).toBeInTheDocument();
+    expect(screen.getByText('No pages or actions match “zzzzqqq”.')).toBeInTheDocument();
+    expect(screen.queryByText('0 results')).not.toBeInTheDocument();
+  });
+
+  test('Enter with no match says that nothing runs, and stays open', async () => {
+    const { onNavigateAdmin, onClose } = renderPalette();
+    const user = userEvent.setup();
+    await user.type(search(), 'zzzzqqq');
+    expect(screen.queryByText(/Nothing to run/)).not.toBeInTheDocument();
+    await user.keyboard('{Enter}');
+    expect(screen.getByText('Nothing to run. Change the search, or press Esc to close.')).toBeInTheDocument();
+    expect(onNavigateAdmin).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
   });
 });
 

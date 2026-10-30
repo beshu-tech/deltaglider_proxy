@@ -50,7 +50,7 @@ After you edit the file, restart the proxy, or apply the file to the running pro
 
 Raw webhook mode delivers **every** event kind, so filter at the receiver on `event.kind` (`ObjectCreated`, `ObjectDeleted`, `ObjectCopied`, `ReplicationObjectCopied`, `LifecycleExpired`, `LifecycleTransitioned`).
 
-In Slack format, you filter at the source instead. The filters are part of the Slack connector (section 3): open **What gets posted (event kinds + prefix filters)**, select the **Event kinds**, and add globs under **Include prefixes** and **Exclude prefixes**. The default kind is `ObjectCreated` only. An empty include list means every user object, and an exclude glob wins over an include glob.
+In Slack format, you filter at the source instead. The filters are part of the Slack connector (section 3): open **What gets posted**, select the **Event kinds**, and add globs under **Include prefixes** and **Exclude prefixes**. The default kind is `ObjectCreated` only. An empty include list means every user object, and an exclude glob wins over an include glob.
 
 ![The What gets posted section of the Slack connector is open; the box marks the event kinds and the include and exclude prefix filters.](/_/screenshots/events-slack-filter.webp)
 
@@ -80,7 +80,7 @@ The Slack format posts formatted messages. It uses no OAuth: you paste a credent
 
    ![Event delivery in Slack format with a bot token; callout 1 marks Bot token in How to connect, callout 2 marks the Bot token field, and callout 3 marks the Channel field.](/_/screenshots/events-slack-bot.webp)
 
-4. To send some buckets or prefixes to another channel, open **Channel routing (per bucket / prefix)** and add a route.
+4. To send some buckets or prefixes to another channel, open **Channel routing** and add a route.
 5. Click **Review & apply**, and then click **Apply and Persist**.
 
 The page shows a live preview of the message that lands in the channel. The proxy masks the bot token on export and in the GUI, and an unchanged round-trip preserves the real token.
@@ -156,7 +156,7 @@ The admin UI does the same on the Event log page:
 
 1. In the sidebar, open **Integrations → Event log** (`/_/admin/integrations/event-outbox`).
 2. Optionally, select **Failed** in the status list, so that the table shows only the failed rows.
-3. Click **Requeue** in the row. To requeue every failed row that the table shows, click **Requeue failed shown**.
+3. Click **Requeue** in the row. To requeue every failed row that the page of the table shows, click **Requeue failed**.
 
    ![The Event log lists an event whose delivery failed; the arrow points at the Requeue button of that row.](/_/screenshots/events-log-requeue.webp)
 

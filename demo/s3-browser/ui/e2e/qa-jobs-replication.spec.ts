@@ -75,7 +75,7 @@ test('replication: create a rule, watch it run, verify the mirror', async ({ pag
   const errors = collectErrors(page);
   await page.setViewportSize({ width: 1400, height: 900 });
   await page.goto('/_/browse');
-  await page.getByPlaceholder('Admin password').fill(PASSWORD);
+  await page.getByLabel('Admin password', { exact: true }).fill(PASSWORD);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
   await page.goto('/_/admin/storage/replication');

@@ -87,12 +87,12 @@ export default function ReplicationRuleFields({
         inputRadius={inputRadius}
       />
 
-      <AdvancedDisclosure title="Advanced rule behavior">
+      <AdvancedDisclosure title="Advanced rule behavior" hint="Interval, batch size, conflicts, delete replication">
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 }}>
           <FormField
             label="Interval"
             yamlPath="storage.replication.rules[].interval"
-            helpText="How often the full reconcile sweep runs for this rule. Events replicate changes as they happen; the sweep catches anything an event missed. Humantime duration, e.g. 6h or 24h (the default). Minimum 30s."
+            helpText="How often the full reconcile sweep runs for this rule. Events replicate changes as they happen; the sweep catches anything an event missed. A duration such as 6h or 24h (the default). The minimum is 30s."
           >
             <Input
               value={rule.interval}

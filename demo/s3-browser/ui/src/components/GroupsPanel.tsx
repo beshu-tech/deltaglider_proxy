@@ -1,12 +1,13 @@
 import { useState, useEffect, useMemo, useCallback, useId } from 'react';
 import { Button, Typography, Alert, Input, Divider, Checkbox, message } from 'antd';
-import { FolderOutlined, CopyOutlined } from '@ant-design/icons';
+import { TeamOutlined, CopyOutlined } from '@ant-design/icons';
 import type { IamGroup, IamUser } from '../adminApi';
 import { useIamMode } from '../queries/config';
 import { useGroups, useCreateGroup, useUpdateGroup, useDeleteGroup, useCloneGroup, useAddGroupMember, useRemoveGroupMember } from '../queries/groups';
 import { useUsers } from '../queries/users';
 import { useCardStyles } from './shared-styles';
-import FormLabel from './FormLabel';
+import FormField from './FormField';
+import { EmptyState } from './StatePlaceholders';
 import { useColors } from '../ThemeContext';
 import PermissionEditor from './PermissionEditor';
 import { permissionsToRows, rowsToPermissions, freshPermissionRowId, type PermissionRow } from './permissionRows';
@@ -195,24 +196,20 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       onSavingChange={onSavingChange}
     />
   ) : (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: colors.TEXT_MUTED }}>
-      <div style={{ textAlign: 'center', maxWidth: 360, padding: 24 }}>
-        {groups.length === 0 ? (
-          <>
-            <FolderOutlined style={{ fontSize: 40, marginBottom: 12, color: colors.TEXT_MUTED }} />
-            <div><Text type="secondary" style={{ fontSize: 15, fontWeight: 500 }}>{readOnly ? 'No groups declared' : 'Create the first group'}</Text></div>
-            <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
-              {readOnly
-                ? 'Your YAML config has no groups. Add them under access.iam_groups and apply.'
-                : 'Click New to create the first group. Users inherit every permission of their groups.'}
-            </Text>
-          </>
-        ) : (
-          <Text type="secondary" style={{ fontSize: 14 }}>
-            {readOnly ? 'Select a group to view' : 'Select a group to edit, or create a new one'}
-          </Text>
-        )}
-      </div>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+      {groups.length === 0 ? (
+        <EmptyState
+          icon={<TeamOutlined />}
+          title={readOnly ? 'No groups declared' : 'Create the first group'}
+          hint={readOnly
+            ? 'Your YAML config has no groups. Add them under access.iam_groups and apply.'
+            : 'Click New to create the first group. Users inherit every permission of their groups.'}
+        />
+      ) : (
+        <Text type="secondary" style={{ fontSize: 14 }}>
+          {readOnly ? 'Select a group to view' : 'Select a group to edit, or create a new one'}
+        </Text>
+      )}
     </div>
   );
 
@@ -233,15 +230,17 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       onSearchChange={setFilterText}
       loading={loading}
       error={error}
-      listEmptyState={(
+      // ONE empty state: with no groups the detail pane explains, so the
+      // list stays blank. It speaks only when the search hides every group.
+      listEmptyState={groups.length > 0 ? (
         <div style={{ padding: 20, textAlign: 'center' }}>
-          <Text type="secondary" style={{ fontSize: 13 }}>No groups yet</Text>
+          <Text type="secondary" style={{ fontSize: 13 }}>No groups match the search</Text>
         </div>
-      )}
+      ) : undefined}
       renderRowBody={group => (
         <>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <FolderOutlined style={{ color: colors.TEXT_MUTED, flexShrink: 0 }} />
+            <TeamOutlined style={{ color: colors.TEXT_MUTED, flexShrink: 0 }} />
             <Text strong title={group.name} style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
               {group.name}
             </Text>
@@ -319,6 +318,9 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
   const [saving, setSavingState] = useState(false);
   const [deleting, setDeletingState] = useState(false);
   const [error, setError] = useState('');
+  // The name error shows after the first submit, then follows each keystroke.
+  const [showFieldErrors, setShowFieldErrors] = useState(false);
+  const nameError = showFieldErrors && !name.trim() ? 'Enter a name.' : undefined;
 
   const setSaving = (v: boolean) => { setSavingState(v); onSavingChange?.(v); };
   const setDeleting = (v: boolean) => { setDeletingState(v); onSavingChange?.(v); };
@@ -330,7 +332,8 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
   useDirtyFlag(IAM_DIRTY_KEYS.groups, isDirty && !readOnly);
 
   const handleSave = async () => {
-    if (!name.trim()) { setError('Name is required'); return; }
+    setShowFieldErrors(true);
+    if (!name.trim()) return;
     setSaving(true);
     setError('');
     try {
@@ -414,21 +417,20 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
 
   return (
     <div style={{ padding: '24px 28px', maxWidth: 600, overflow: 'auto', height: '100%' }}>
-      <Title level={5} style={{ margin: '0 0 20px', fontFamily: 'var(--font-ui)' }}>
-        {isEdit ? `${readOnly ? 'View' : 'Edit'}: ${group?.name}` : 'Create New Group'}
+      {/* h3: the page title above is an h2 (TabHeader). */}
+      <Title level={3} style={{ margin: '0 0 20px', fontFamily: 'var(--font-ui)', fontSize: 16 }}>
+        {isEdit ? `${readOnly ? 'View' : 'Edit'}: ${group?.name}` : 'New group'}
       </Title>
 
       {error && <Alert type="error" title={error} showIcon closable={{ onClose: () => setError('') }} style={{ marginBottom: 16, borderRadius: 8 }} />}
 
-      <div style={{ marginBottom: 16 }}>
-        <FormLabel text="Name" />
-        <Input data-testid="group-name" aria-label="Group name" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. developers" disabled={readOnly} style={{ ...inputRadius }} />
-      </div>
+      <FormField label="Name" error={nameError} style={{ marginBottom: 20 }}>
+        <Input data-testid="group-name" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. developers" disabled={readOnly} style={{ ...inputRadius }} />
+      </FormField>
 
-      <div style={{ marginBottom: 16 }}>
-        <FormLabel text="Description" htmlFor={`${uid}-description`} />
-        <Input id={`${uid}-description`} value={description} onChange={e => setDescription(e.target.value)} placeholder="e.g. Development team access" disabled={readOnly} style={{ ...inputRadius }} />
-      </div>
+      <FormField label="Description" style={{ marginBottom: 20 }}>
+        <Input value={description} onChange={e => setDescription(e.target.value)} placeholder="e.g. Development team access" disabled={readOnly} style={{ ...inputRadius }} />
+      </FormField>
 
       <Divider style={{ margin: '16px 0 12px' }}>Permissions</Divider>
 
@@ -490,11 +492,11 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
               <Button danger loading={deleting} disabled={deleting} onClick={async () => {
                 if (!(await confirmDialog({ title: `Delete group "${group?.name}"?`, content: 'This cannot be undone.', okText: 'Delete', danger: true }))) return;
                 await handleDelete();
-              }}>Delete Group</Button>
+              }}>Delete group</Button>
             )}
             {!isEdit && onCancel && <Button onClick={onCancel}>Cancel</Button>}
           </div>
-          <Button data-testid="group-save" aria-label={isEdit ? 'Save group' : 'Create group'} type="primary" onClick={handleSave} loading={saving}>{isEdit ? 'Save' : 'Create Group'}</Button>
+          <Button data-testid="group-save" aria-label={isEdit ? 'Save group' : 'Create group'} type="primary" onClick={handleSave} loading={saving}>{isEdit ? 'Save' : 'Create group'}</Button>
         </div>
       )}
     </div>

@@ -186,14 +186,15 @@ test('Cancel of a running migration asks first and says what it deletes', async 
 });
 
 // Regression: the floating unsaved-changes bar covered the last fields of
-// the create drawer (Action / Destination).
-test('while edits are unsaved, the drawer leaves room under its last field', async () => {
+// the create drawer (Action / Destination), then sat half under the drawer's
+// edge. It now lives in the drawer footer, out of the body's way.
+test('while edits are unsaved, the dirty bar is in the drawer footer', async () => {
   http.on('GET', JOBS, json({ jobs: [] }));
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   renderWithQuery(<LifecycleRulesPanel />);
   await user.click(await screen.findByRole('button', { name: /New lifecycle rule/ }));
-  const body = (await screen.findByRole('dialog')).querySelector('.ant-drawer-body') as HTMLElement;
-  expect(body.style.paddingBottom).toBe('96px');
+  const footer = (await screen.findByRole('dialog')).querySelector('.ant-drawer-footer') as HTMLElement;
+  expect(within(footer).getByRole('button', { name: 'Review & apply' })).toBeInTheDocument();
 });
 
 // Regression (QA nightly step 7): the header and the empty list both said

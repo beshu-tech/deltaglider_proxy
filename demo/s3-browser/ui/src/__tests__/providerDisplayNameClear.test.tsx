@@ -51,9 +51,9 @@ test('every provider form field is named by its label', async () => {
   const user = userEvent.setup();
   renderWithQuery(<AuthenticationPanel />);
   await user.click(await screen.findByText('Corp SSO'));
-  for (const name of ['Display Name', 'Provider Name (unique identifier)', 'Issuer URL', 'Client ID', 'Scopes', 'CA certificate file']) {
+  for (const name of ['Display name', 'Provider name', 'Issuer URL', 'Client ID', 'Scopes', 'CA certificate file']) {
     expect(screen.getByRole('textbox', { name })).toBeInTheDocument();
   }
-  expect(screen.getByLabelText('Client Secret')).toBeInTheDocument();
+  expect(screen.getByLabelText('Client secret')).toBeInTheDocument();
   expect(screen.getByRole('switch', { name: 'Enabled' })).toBeInTheDocument();
 });

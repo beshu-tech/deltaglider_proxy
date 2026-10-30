@@ -38,7 +38,10 @@ export default function RecordList<T>({
 }) {
   const c = useColors();
   if (rows.length === 0) {
-    return <div className="dg-record-empty">{empty}</div>;
+    // The muted token of the theme (4.5:1 on every surface): the empty state
+    // sits outside the list that sets --rl-text-muted, so the CSS fallback
+    // (a dark-theme grey) was the colour in the light theme too.
+    return <div className="dg-record-empty" style={{ color: c.TEXT_MUTED }}>{empty}</div>;
   }
   const wideTemplate = columns.map((col) => col.track).join(' ');
   return (

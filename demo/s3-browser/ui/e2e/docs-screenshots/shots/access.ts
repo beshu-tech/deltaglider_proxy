@@ -187,7 +187,7 @@ export const ACCESS_SHOTS: Shot[] = [
     auth: 'none',
     alt: 'The sign-in page of a proxy with IAM users asks for an access key ID and a secret access key; the box marks the two fields.',
     annotations: [
-      { target: { union: [{ placeholder: 'Access Key ID' }, { placeholder: 'Secret Access Key' }] }, kind: 'box' },
+      { target: { union: [{ label: 'Access key ID', exact: true }, { label: 'Secret access key', exact: true }] }, kind: 'box' },
     ],
   },
   // ── tutorials/secure-your-proxy ──
@@ -207,12 +207,12 @@ export const ACCESS_SHOTS: Shot[] = [
   {
     id: 'iam-users-new-form',
     route: '/_/admin/access/users',
-    alt: 'The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New button, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create User button.',
+    alt: 'The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New button, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create user button.',
     viewport: { width: 1040, height: 1200 },
     setup: async (page) => {
       await withoutUser(page, 'ci-uploader');
-      await page.getByRole('button', { name: 'New User' }).click();
-      await page.getByRole('textbox', { name: 'User name' }).fill('ci-uploader');
+      await page.getByRole('button', { name: 'New user' }).click();
+      await page.getByTestId('user-name').fill('ci-uploader');
       await setResource(page, 0, 'releases/firmware/*');
       await page.getByRole('checkbox', { name: 'Write', exact: true }).click();
       await calm(page);
@@ -226,8 +226,8 @@ export const ACCESS_SHOTS: Shot[] = [
         label: '1',
         side: 'right',
       },
-      { target: { role: 'button', name: 'New User' }, kind: 'callout', label: '2', side: 'left' },
-      { target: { role: 'textbox', name: 'User name' }, kind: 'callout', label: '3', side: 'left' },
+      { target: { role: 'button', name: 'New user' }, kind: 'callout', label: '2', side: 'left' },
+      { target: { testId: 'user-name' }, kind: 'callout', label: '3', side: 'left' },
       { target: ruleCard(0), kind: 'box', label: '4' },
       { target: { role: 'button', name: 'Create user' }, kind: 'callout', label: '5', side: 'left' },
     ],
@@ -266,12 +266,12 @@ export const ACCESS_SHOTS: Shot[] = [
   {
     id: 'iam-groups-new-form',
     route: '/_/admin/access/groups',
-    alt: 'The form of a new Engineering group; callout 1 marks the New button, callout 2 the Name field, callout 3 the rule that allows List and Read on releases/*, callout 4 the members dana and backup-bot, and callout 5 the Create Group button.',
+    alt: 'The form of a new Engineering group; callout 1 marks the New button, callout 2 the Name field, callout 3 the rule that allows List and Read on releases/*, callout 4 the members dana and backup-bot, and callout 5 the Create group button.',
     viewport: TALL,
     setup: async (page) => {
       await withoutEngineering(page);
-      await page.getByRole('button', { name: 'New Group' }).click();
-      await page.getByRole('textbox', { name: 'Group name' }).fill('Engineering');
+      await page.getByRole('button', { name: 'New group' }).click();
+      await page.getByTestId('group-name').fill('Engineering');
       await page.getByPlaceholder('e.g. Development team access').fill('Firmware and platform engineers');
       await setResource(page, 0, 'releases/*');
       await page.getByRole('checkbox', { name: 'List', exact: true }).click();
@@ -284,8 +284,8 @@ export const ACCESS_SHOTS: Shot[] = [
     clip: { union: [{ css: '.dg-md-list >> text="Groups"' }, { role: 'button', name: 'Create group' }] },
     clipPadding: 24,
     annotations: [
-      { target: { role: 'button', name: 'New Group' }, kind: 'callout', label: '1', side: 'left' },
-      { target: { role: 'textbox', name: 'Group name' }, kind: 'callout', label: '2', side: 'left' },
+      { target: { role: 'button', name: 'New group' }, kind: 'callout', label: '1', side: 'left' },
+      { target: { testId: 'group-name' }, kind: 'callout', label: '2', side: 'left' },
       { target: ruleCard(0), kind: 'box', label: '3' },
       {
         target: { union: [{ role: 'checkbox', name: 'dana' }, { role: 'checkbox', name: 'backup-bot' }] },
@@ -315,11 +315,11 @@ export const ACCESS_SHOTS: Shot[] = [
   {
     id: 'iam-conditions-list-prefix',
     route: '/_/admin/access/users',
-    alt: 'A second rule of the dana user denies List on every bucket when the listed prefix matches .*; callout 1 marks Add Permission Rule, callout 2 the Deny setting, callout 3 the List prefix field, and callout 4 the Save button.',
+    alt: 'A second rule of the dana user denies List on every bucket when the listed prefix matches .*; callout 1 marks Add permission rule, callout 2 the Deny setting, callout 3 the List prefix field, and callout 4 the Save button.',
     viewport: { width: 1040, height: 2200 },
     setup: async (page) => {
       await pick(page, 'dana');
-      await page.getByRole('button', { name: 'Add Permission Rule' }).click();
+      await page.getByRole('button', { name: 'Add permission rule' }).click();
       const card = page.locator('text="WHERE" >> nth=1 >> xpath=../../..');
       await card.getByText('Deny', { exact: true }).click();
       await setResource(page, 1, '*');
@@ -333,7 +333,7 @@ export const ACCESS_SHOTS: Shot[] = [
     clip: { union: [ruleCard(1), { role: 'button', name: 'Save user' }] },
     clipPadding: 40,
     annotations: [
-      { target: { role: 'button', name: 'Add Permission Rule' }, kind: 'callout', label: '1', side: 'left' },
+      { target: { role: 'button', name: 'Add permission rule' }, kind: 'callout', label: '1', side: 'left' },
       { target: { text: 'Deny', exact: true, within: ruleCard(1) }, kind: 'box', label: '2', side: 'right' },
       { target: { role: 'combobox', name: 'Prefix pattern' }, kind: 'box', label: '3' },
       { target: { role: 'button', name: 'Save user' }, kind: 'callout', label: '4', side: 'left' },
@@ -376,37 +376,37 @@ export const ACCESS_SHOTS: Shot[] = [
   {
     id: 'sso-add-provider',
     route: '/_/admin/access/external-auth',
-    alt: 'The External authentication page with the form of a new Okta provider; callout 1 marks the Add provider button, callout 2 the provider fields from Display Name to Scopes, and callout 3 the Create button.',
+    alt: 'The External authentication page with the form of a new Okta provider; callout 1 marks the Add provider button, callout 2 the provider fields from Display name to Scopes, and callout 3 the Create button.',
     viewport: TALL,
     setup: async (page) => {
       await removeProviders();
       await page.reload();
       await page.getByRole('button', { name: 'Add provider' }).click();
-      await page.getByLabel('Display Name').fill(OKTA.display_name);
-      await page.getByLabel('Provider Name (unique identifier)').fill(OKTA.name);
+      await page.getByLabel('Display name', { exact: true }).fill(OKTA.display_name);
+      await page.getByLabel('Provider name', { exact: true }).fill(OKTA.name);
       await page.getByLabel('Issuer URL').fill(OKTA.issuer_url);
       await page.getByLabel('Client ID').fill(OKTA.client_id);
-      await page.getByLabel('Client Secret').fill(OKTA.client_secret);
+      await page.getByLabel('Client secret', { exact: true }).fill(OKTA.client_secret);
       await page.getByLabel('Scopes').fill(OKTA.scopes);
       await calm(page);
     },
-    clip: { union: [{ role: 'button', name: 'Add provider' }, { label: 'Scopes' }, { role: 'button', name: 'Test Connection' }] },
+    clip: { union: [{ role: 'button', name: 'Add provider' }, { label: 'Scopes' }, { role: 'button', name: 'Test connection' }] },
     clipPadding: 32,
     annotations: [
       { target: { role: 'button', name: 'Add provider' }, kind: 'box', label: '1', side: 'bottom' },
-      { target: { union: [{ text: 'Display Name', exact: true }, { label: 'Scopes' }] }, kind: 'box', label: '2' },
+      { target: { union: [{ text: 'Display name', exact: true }, { label: 'Scopes' }] }, kind: 'box', label: '2' },
       { target: { role: 'button', name: 'Create', exact: true }, kind: 'callout', label: '3', side: 'left' },
     ],
   },
   {
     id: 'sso-mapping-rule',
     route: '/_/admin/access/external-auth',
-    alt: 'A new mapping rule assigns everyone whose groups claim contains engineering to the Engineering group; callout 1 marks the Add Rule button, callout 2 the rule, and callout 3 the Save Rules button.',
+    alt: 'A new mapping rule assigns everyone whose groups claim contains engineering to the Engineering group; callout 1 marks the Add rule button, callout 2 the rule, and callout 3 the Save rules button.',
     viewport: TALL,
     setup: async (page) => {
       await oktaWithoutRules();
       await page.reload();
-      await page.getByRole('button', { name: 'Add Rule' }).click();
+      await page.getByRole('button', { name: 'Add rule' }).click();
       await page.getByRole('combobox', { name: 'Match type' }).click();
       await openOption(page, 'Claim value').click();
       await page.getByRole('textbox', { name: 'Claim field' }).fill('groups');
@@ -415,12 +415,12 @@ export const ACCESS_SHOTS: Shot[] = [
       await openOption(page, 'Okta').click();
       await calm(page);
     },
-    clip: { union: [{ text: 'Allowed Users & Group Assignment', exact: true }, { role: 'button', name: 'Save Rules' }] },
+    clip: { union: [{ text: 'Allowed users and group assignment', exact: true }, { role: 'button', name: 'Save rules' }] },
     clipPadding: 60,
     annotations: [
-      { target: { role: 'button', name: 'Add Rule' }, kind: 'callout', label: '1', side: 'left' },
+      { target: { role: 'button', name: 'Add rule' }, kind: 'callout', label: '1', side: 'left' },
       { target: { css: 'text="When" >> xpath=..' }, kind: 'box', label: '2' },
-      { target: { role: 'button', name: 'Save Rules' }, kind: 'callout', label: '3', side: 'left' },
+      { target: { role: 'button', name: 'Save rules' }, kind: 'callout', label: '3', side: 'left' },
     ],
   },
   {

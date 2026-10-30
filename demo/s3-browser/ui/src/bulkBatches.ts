@@ -26,7 +26,8 @@ export const MAX_REPORTED_FAILURES = 20;
 /** What the action bar shows while a bulk action runs. */
 export type BulkProgress =
   | ({ action: BulkAction; phase: 'listing'; stopping: boolean } & ListingProgress)
-  /** Counted; the confirmation dialog is open and nothing has started. */
+  /** Counted; the confirmation dialog is open and nothing has started. The
+   *  dialog is the one surface then: the action bar shows nothing. */
   | { action: BulkAction; phase: 'confirming'; stopping: boolean; total: number }
   | {
       action: BulkAction;
@@ -73,8 +74,8 @@ export const count = (n: number) => n.toLocaleString('en-US');
 
 const RUNNING: Record<BulkAction, string> = { delete: 'Deleting', copy: 'Copying', move: 'Moving' };
 const DONE: Record<BulkAction, string> = { delete: 'deleted', copy: 'copied', move: 'moved' };
-/** What the reports count: a delete says objects, copy and move say items (as their picker does). */
-export const UNIT: Record<BulkAction, string> = { delete: 'object', copy: 'item', move: 'item' };
+/** What the reports count: objects, for every action (folders are expanded to their objects). */
+export const UNIT: Record<BulkAction, string> = { delete: 'object', copy: 'object', move: 'object' };
 
 /** No time left is shown before the run has gone this long: the first batches say little about the rate. */
 const ESTIMATE_AFTER_MS = 5_000;
@@ -89,14 +90,14 @@ export function timeLeftText(done: number, total: number, elapsedMs: number): st
   return `about ${Math.round(minutes / 60)} h left`;
 }
 
+/** A bulk action that the bar shows: every phase but the confirmation, which the dialog owns. */
+export type ShownBulkProgress = Exclude<BulkProgress, { phase: 'confirming' }>;
+
 /**
  * The status line of the action bar while a bulk action runs. A delete
  * counts its objects first and says that nothing is deleted yet.
  */
-export function bulkProgressText(p: BulkProgress, now: number = Date.now()): string {
-  if (p.phase === 'confirming') {
-    return `${count(p.total)} ${noun(p.total, UNIT[p.action])} to ${p.action}. Waiting for your confirmation.`;
-  }
+export function bulkProgressText(p: ShownBulkProgress, now: number = Date.now()): string {
   if (p.phase === 'listing') {
     if (p.stopping) return 'Stopping…';
     if (p.action === 'delete') {
@@ -119,9 +120,9 @@ export function bulkProgressText(p: BulkProgress, now: number = Date.now()): str
  * The progress bar's percent for the current phase; `null` while a delete
  * counts (the size of a folder is unknown until it is listed).
  */
-export function bulkProgressPercent(p: BulkProgress): number | null {
+export function bulkProgressPercent(p: ShownBulkProgress): number | null {
   // A delete only counts and starts its job here: no percent to show.
-  if (p.phase === 'confirming' || p.action === 'delete') return null;
+  if (p.action === 'delete') return null;
   const [part, whole] = p.phase === 'listing' ? [p.listed, p.folders] : [p.done, p.total];
   return whole === 0 ? 100 : Math.floor((part / whole) * 100);
 }

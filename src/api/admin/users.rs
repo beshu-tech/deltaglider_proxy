@@ -17,7 +17,7 @@ use crate::iam::{
     SharedIamState,
 };
 
-use super::{audit_log, next_copy_name, trigger_config_sync, AdminError, AdminState};
+use super::{audit_log, trigger_config_sync, AdminError, AdminState};
 
 #[derive(Deserialize)]
 pub struct CreateUserRequest {
@@ -45,6 +45,83 @@ pub struct RotateKeysRequest {
 
 fn default_copy_group_memberships() -> bool {
     true
+}
+
+/// Longest user name the admin API accepts (the AWS IAM limit).
+pub(crate) const USER_NAME_MAX_LEN: usize = 64;
+
+/// THE user-name rule of the admin API (create, rename, clone): 1 to 64
+/// characters, each a letter, a digit or one of `+ = , . @ _ -` (the AWS IAM
+/// user-name set), and not `.` or `..` (a path segment in `${iam:username}`).
+/// The GUI checks the same rule (`userNameError` in
+/// `demo/s3-browser/ui/src/userName.ts`). OAuth auto-provisioning,
+/// declarative YAML and backup restore do not go through it, so a name made
+/// there before stays valid; a rename only has to pass it when it changes
+/// the name.
+pub(crate) fn user_name_error(name: &str) -> Option<&'static str> {
+    if crate::iam::types::is_blank_principal_name(name) {
+        return Some("user name cannot be blank");
+    }
+    if crate::iam::types::is_reserved_principal_name(name) {
+        return Some("user name cannot start with '$'");
+    }
+    if name.chars().count() > USER_NAME_MAX_LEN {
+        return Some("user name is longer than 64 characters");
+    }
+    if !name.chars().all(is_user_name_char) {
+        return Some("user name can contain only letters, digits and the characters + = , . @ _ -");
+    }
+    if matches!(name, "." | "..") {
+        return Some("user name cannot be '.' or '..'");
+    }
+    None
+}
+
+fn is_user_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '=' | ',' | '.' | '@' | '_' | '-')
+}
+
+/// 400 with the rule's sentence unless `name` passes [`user_name_error`].
+fn check_user_name(name: &str) -> Result<(), AdminError> {
+    match user_name_error(name) {
+        None => Ok(()),
+        Some(msg) => {
+            tracing::warn!("Invalid user name {:?}: {}", name, msg);
+            Err(AdminError::invalid(msg))
+        }
+    }
+}
+
+/// The name a clone gets when the request names none: `<base>-copy`, then
+/// `<base>-copy2`, ... — the first that no user has. A source name made
+/// before the rule (an OAuth display name such as "Jane Doe") has each
+/// character outside the rule replaced by `-`, so the result always passes
+/// [`user_name_error`].
+fn next_user_copy_name(base: &str, existing: impl IntoIterator<Item = String>) -> String {
+    let existing: std::collections::HashSet<String> = existing.into_iter().collect();
+    let mut stem: String = base
+        .chars()
+        .map(|c| if is_user_name_char(c) { c } else { '-' })
+        .collect();
+    let stem_trimmed = stem.trim_matches('-').to_string();
+    stem = if stem_trimmed.is_empty() {
+        "user".to_string()
+    } else {
+        stem_trimmed
+    };
+    for n in 1.. {
+        let suffix = if n == 1 {
+            "-copy".to_string()
+        } else {
+            format!("-copy{n}")
+        };
+        let room = USER_NAME_MAX_LEN - suffix.len();
+        let candidate = format!("{}{suffix}", crate::security::str_prefix(&stem, room));
+        if !existing.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded copy-name search should always return")
 }
 
 /// 400 unless `access_key_id` has a usable format
@@ -250,15 +327,7 @@ pub async fn create_user(
 
     check_access_key_id(&access_key_id)?;
 
-    // Block reserved and blank names
-    if crate::iam::types::is_blank_principal_name(&body.name) {
-        tracing::warn!("User name cannot be blank");
-        return Err(AdminError::invalid("user name cannot be blank"));
-    }
-    if crate::iam::types::is_reserved_principal_name(&body.name) {
-        tracing::warn!("User name cannot start with '$': {:?}", body.name);
-        return Err(AdminError::invalid("user name cannot start with '$'"));
-    }
+    check_user_name(&body.name)?;
 
     let mut perms = body.permissions.clone();
     normalize_permissions(&mut perms);
@@ -317,13 +386,10 @@ pub async fn clone_user(
                 .unwrap_or_default()
                 .into_iter()
                 .map(|u| u.name);
-            next_copy_name(&source.name, names)
+            next_user_copy_name(&source.name, names)
         });
 
-    if crate::iam::types::is_reserved_principal_name(&name) {
-        tracing::warn!("User name cannot start with '$': {:?}", name);
-        return Err(AdminError::invalid("user name cannot start with '$'"));
-    }
+    check_user_name(&name)?;
 
     let access_key_id = iam::generate_access_key_id();
     check_access_key_id(&access_key_id)?;
@@ -373,19 +439,14 @@ pub async fn update_user(
         .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
-    // Refuse a RENAME to a reserved name. A row that already carries one (an
-    // OAuth user provisioned before names were checked) stays editable: the
-    // GUI always sends the current name back.
+    // Refuse a RENAME to a name outside the rule. A row that already carries
+    // one (an OAuth user named by its IdP, a name from before the rule)
+    // stays editable: the GUI always sends the current name back.
     if let Some(name) = body.name.as_deref() {
-        if crate::iam::types::is_reserved_principal_name(name)
-            || crate::iam::types::is_blank_principal_name(name)
-        {
+        if user_name_error(name).is_some() {
             let current = db.get_user_by_id(user_id)?;
             if current.name != name {
-                tracing::warn!("User name cannot be blank or start with '$': {:?}", name);
-                return Err(AdminError::invalid(
-                    "user name cannot be blank or start with '$'",
-                ));
+                check_user_name(name)?;
             }
         }
     }
@@ -613,6 +674,66 @@ pub async fn rotate_user_keys(
 mod tests {
     use super::*;
     use arc_swap::ArcSwap;
+
+    #[test]
+    fn user_name_rule_truth_table() {
+        for ok in [
+            "ci-uploader",
+            "backup-bot",
+            "dana",
+            "dana@example.com",
+            "a+b=c,d.e_f-g",
+            "X",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(user_name_error(ok), None, "{ok:?} is valid");
+        }
+        let cases: [(&str, &str); 9] = [
+            ("", "user name cannot be blank"),
+            ("   ", "user name cannot be blank"),
+            ("$x", "user name cannot start with '$'"),
+            ("bad name with spaces!!", "user name can contain only"),
+            ("tab\there", "user name can contain only"),
+            ("slash/name", "user name can contain only"),
+            ("ünïcode", "user name can contain only"),
+            ("..", "user name cannot be '.' or '..'"),
+            (&"a".repeat(65), "user name is longer than 64 characters"),
+        ];
+        for (bad, want) in cases {
+            let got = user_name_error(bad).unwrap_or_else(|| panic!("{bad:?} must be refused"));
+            assert!(got.starts_with(want), "{bad:?}: {got}");
+        }
+        assert_eq!(
+            user_name_error("."),
+            Some("user name cannot be '.' or '..'")
+        );
+    }
+
+    proptest::proptest! {
+        /// Whatever the rule accepts is non-blank ASCII of at most 64 chars
+        /// from the allowed set; the clone-name generator always passes it.
+        #[test]
+        fn user_name_rule_and_copy_names_agree(name in "\\PC{0,80}") {
+            if user_name_error(&name).is_none() {
+                proptest::prop_assert!(!name.is_empty() && name.len() <= USER_NAME_MAX_LEN);
+                proptest::prop_assert!(name.chars().all(is_user_name_char));
+            }
+            let copy = next_user_copy_name(&name, [format!("{name}-copy")]);
+            proptest::prop_assert_eq!(user_name_error(&copy), None, "{:?} -> {:?}", name, copy);
+        }
+    }
+
+    #[test]
+    fn copy_names_skip_taken_ones_and_fix_old_names() {
+        assert_eq!(next_user_copy_name("dana", Vec::new()), "dana-copy");
+        assert_eq!(
+            next_user_copy_name("dana", vec!["dana-copy".into(), "dana-copy2".into()]),
+            "dana-copy3"
+        );
+        assert_eq!(next_user_copy_name("Jane Doe", Vec::new()), "Jane-Doe-copy");
+        assert_eq!(next_user_copy_name("!!", Vec::new()), "user-copy");
+        assert_eq!(next_user_copy_name(&"a".repeat(64), Vec::new()).len(), 64);
+    }
 
     fn legacy_state() -> SharedIamState {
         Arc::new(ArcSwap::from_pointee(IamState::Legacy(iam::AuthConfig {

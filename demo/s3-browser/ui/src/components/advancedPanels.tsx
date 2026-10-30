@@ -22,7 +22,7 @@
  * through the `requires_restart` flag on the section PUT response —
  * ApplyDialog renders it as a blue banner.
  */
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Alert, Input, InputNumber, Radio, Switch } from 'antd';
 import {
   CloudServerOutlined,
@@ -33,12 +33,12 @@ import {
 } from '@ant-design/icons';
 import { useAdminConfig } from '../queries/config';
 import { useColors } from '../ThemeContext';
-import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
+import { useCardStyles } from './shared-styles';
 import { useSectionEditor } from '../useSectionEditor';
 import type { UseSectionEditorResult } from '../useSectionEditor';
 import { undefinedToNullSubset } from './advancedPayload';
 import SectionHeader from './SectionHeader';
-import FormField from './FormField';
+import FormField, { ReadOnlyValue } from './FormField';
 import ApplyDialog from './ApplyDialog';
 import StickyDirtyBar from './StickyDirtyBar';
 import { LoadingState } from './StatePlaceholders';
@@ -212,19 +212,18 @@ function AdvancedApplyRail({ editor }: { editor: ApplyRailEditor }) {
   );
 }
 
+/** The System page (SystemPanel) owns the column and ONE gap between all its
+ *  cards; a panel's shell adds no box of its own, so the gap between two cards
+ *  is the same inside a panel and between panels. */
 function PanelShell(props: { children: React.ReactNode }) {
-  return (
-    <div
-      style={{
-        ...contentColumn(CONTENT_FORM),
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 16,
-      }}
-    >
-      {props.children}
-    </div>
-  );
+  return <div style={{ display: 'contents' }}>{props.children}</div>;
+}
+
+/** A System card: the shared card chrome without its own bottom margin (the
+ *  page's flex gap spaces the cards). */
+function useStackCardStyle(): React.CSSProperties {
+  const { cardStyle } = useCardStyles();
+  return useMemo(() => ({ ...cardStyle, marginBottom: 0 }), [cardStyle]);
 }
 
 /** The shared "failed to load" / "loading" early return of every Advanced
@@ -240,7 +239,8 @@ function loadGate({ loading, error }: { loading: boolean; error: string | null }
 // ───────────────────────────────────────────────────────────
 
 export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
-  const { cardStyle, inputRadius } = useCardStyles();
+  const { inputRadius } = useCardStyles();
+  const cardStyle = useStackCardStyle();
   const subset = useAdvancedSubset(LISTENER_INITIAL, onSessionExpired, 'system/listener');
   const { value, setValue } = subset;
 
@@ -359,7 +359,8 @@ export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
 // ───────────────────────────────────────────────────────────
 
 export function CachesPanel({ onSessionExpired }: PanelProps) {
-  const { cardStyle, inputRadius } = useCardStyles();
+  const { inputRadius } = useCardStyles();
+  const cardStyle = useStackCardStyle();
   const subset = useAdvancedSubset(CACHES_INITIAL, onSessionExpired, 'system/caches');
   const { value, setValue } = subset;
   const gate = loadGate(subset);
@@ -505,8 +506,7 @@ export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
 // ───────────────────────────────────────────────────────────
 
 export function LimitsPanel({ onSessionExpired }: PanelProps) {
-  const { cardStyle } = useCardStyles();
-  const { TEXT_PRIMARY } = useColors();
+  const cardStyle = useStackCardStyle();
   // Read-only env-var view of the running config (cached react-query read).
   // A 401 surfaces as `queryError`; useAdminConfig routes it to onSessionExpired.
   const { data: config, error: queryError, isError } = useAdminConfig({ onSessionExpired });
@@ -527,7 +527,9 @@ export function LimitsPanel({ onSessionExpired }: PanelProps) {
     envName: string
   ) => (
     <FormField label={label} helpText={helpText} envVar={envName}>
-      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: TEXT_PRIMARY }}>{String(value)}</div>
+      {/* The same read-only box as an env-controlled FormField (e.g. Log
+          level when RUST_LOG is set): one look for "set outside the GUI". */}
+      <ReadOnlyValue>{String(value)}</ReadOnlyValue>
     </FormField>
   );
 
@@ -567,7 +569,8 @@ export function LimitsPanel({ onSessionExpired }: PanelProps) {
 // ───────────────────────────────────────────────────────────
 
 export function LoggingPanel({ onSessionExpired }: PanelProps) {
-  const { cardStyle, inputRadius } = useCardStyles();
+  const { inputRadius } = useCardStyles();
+  const cardStyle = useStackCardStyle();
   const subset = useAdvancedSubset(LOG_INITIAL, onSessionExpired, 'system/logging');
   const { value, setValue } = subset;
   // The operator clicked "Custom" on a preset value. Everything else about
@@ -649,7 +652,8 @@ export function LoggingPanel({ onSessionExpired }: PanelProps) {
 // ───────────────────────────────────────────────────────────
 
 export function ConfigDbSyncPanel({ onSessionExpired }: PanelProps) {
-  const { cardStyle, inputRadius } = useCardStyles();
+  const { inputRadius } = useCardStyles();
+  const cardStyle = useStackCardStyle();
   const subset = useAdvancedSubset(SYNC_INITIAL, onSessionExpired, 'system/sync');
   const { value, setValue } = subset;
   const gate = loadGate(subset);

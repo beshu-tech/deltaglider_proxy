@@ -18,7 +18,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { S3Object, ListResult, BucketInfo } from './types';
 import { codePointCompare, detectDefaultEndpoint, numericCompare } from './utils';
 import { createBucketOnBackend, getBucketOrigins } from './adminApi';
-import { normalizeS3Error } from './errorHandling';
+import { normalizeS3Error, requestIdSuffix } from './errorHandling';
 import { queryClient } from './queries/client';
 import { qk } from './queries/keys';
 import {
@@ -678,7 +678,36 @@ export function getObjectUrl(key: string): string {
 interface TestConnectionResult {
   ok: boolean;
   buckets?: string[];
+  /** Plain words for the sign-in card (see `connectionFailure`). */
   error?: string;
+  /** The server's request id, for support; kept out of the message. */
+  requestId?: string;
+}
+
+/** S3 error codes that mean "these credentials do not sign in". */
+const WRONG_CREDENTIAL_CODES = new Set(['InvalidAccessKeyId', 'SignatureDoesNotMatch', 'AccessDenied']);
+
+/**
+ * The sign-in card's words for a failed test request: the reason a person
+ * can act on, without the HTTP status, the S3 code or the request id (the
+ * caller keeps the id apart). Other failures keep the normalised message.
+ */
+export function connectionFailure(err: unknown): { error: string; requestId?: string } {
+  const e = err as { name?: string; Code?: string; code?: string; message?: string; $metadata?: { httpStatusCode?: number; requestId?: string } };
+  const status = e?.$metadata?.httpStatusCode;
+  const requestId = e?.$metadata?.requestId || undefined;
+  const code = e?.Code || e?.code || e?.name || '';
+  if (WRONG_CREDENTIAL_CODES.has(code) || (status === 403 && /SignatureDoesNotMatch|AccessDenied|InvalidAccessKeyId/i.test(String(e?.message ?? '')))) {
+    return { error: 'The access key ID or the secret access key is wrong.', requestId };
+  }
+  if (status === 403) {
+    return { error: 'The server refused these credentials.', requestId };
+  }
+  if (!status && (err instanceof TypeError || /Failed to fetch|NetworkError|Load failed/i.test(String(e?.message ?? '')))) {
+    return { error: 'Could not reach the server. Check the network connection, then try again.', requestId };
+  }
+  const message = normalizeS3Error(err, 'Sign-in test').message;
+  return { error: message.replace(requestIdSuffix(requestId), ''), requestId };
 }
 
 /** Test connectivity with arbitrary settings without affecting the active client. */
@@ -699,7 +728,7 @@ export async function testConnection(
     const buckets = (resp.Buckets || []).map((b) => b.Name || '').filter(Boolean);
     return { ok: true, buckets };
   } catch (e) {
-    return { ok: false, error: normalizeS3Error(e, 'Test S3 connection').message };
+    return { ok: false, ...connectionFailure(e) };
   }
 }
 

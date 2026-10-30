@@ -8,11 +8,14 @@ import { nav } from './common';
 import { BASE } from '../seed';
 
 /** The collapsed status row of a bucket on the Buckets page. */
-const bucketRow = (name: string): Target => ({ role: 'button', name: new RegExp(`^${name} — click to`) });
+/** The row's name is its visible text: the bucket name, then the chips. */
+const bucketRow = (name: string): Target => ({ role: 'button', name: new RegExp(`^${name} `) });
 
 async function openBucket(page: Page, name: string): Promise<void> {
-  await page.getByRole('button', { name: new RegExp(`^${name} — click to edit`) }).click();
-  await page.getByRole('button', { name: new RegExp(`^${name} — click to collapse`) }).waitFor();
+  // The row's name is its visible text: the bucket name, then the chips.
+  const row = new RegExp(`^${name} `);
+  await page.getByRole('button', { name: row, expanded: false }).click();
+  await page.getByRole('button', { name: row, expanded: true }).waitFor();
 }
 
 /** Open the Advanced disclosure of the open bucket card (it stays open when a setting in it is in use). */
@@ -55,7 +58,7 @@ export const STORAGE_SHOTS: Shot[] = [
   {
     id: 'route-bucket-add-backend',
     route: '/_/admin/storage/backends',
-    alt: 'The Backends page lists the configured backends; callout 1 marks Backends in the sidebar and callout 2 marks the Add Backend button.',
+    alt: 'The Backends page lists the configured backends; callout 1 marks Backends in the sidebar and callout 2 marks the Add backend button.',
     annotations: [
       { target: nav('Backends'), kind: 'callout', label: '1', side: 'right' },
       { target: { testId: 'backends-add' }, kind: 'box', label: '2' },
@@ -64,16 +67,16 @@ export const STORAGE_SHOTS: Shot[] = [
   {
     id: 'route-bucket-backend-form',
     route: '/_/admin/storage/backends',
-    alt: 'The New Backend form holds the S3 settings of hetzner-fsn1; callout 3 marks the S3 fields and callout 4 marks the Create Backend button.',
+    alt: 'The New backend form holds the S3 settings of hetzner-fsn1; callout 3 marks the S3 fields and callout 4 marks the Create backend button.',
     setup: openNewS3Backend,
     // The form is taller than what is left of the screen under the list:
     // scroll it to the middle, then crop to it.
     viewport: { width: 1040, height: 900 },
-    clip: { union: [{ text: 'New Backend', exact: true }, { testId: 'backend-create' }] },
+    clip: { union: [{ text: 'New backend', exact: true }, { testId: 'backend-create' }] },
     clipPadding: 56,
     annotations: [
       {
-        // From the Endpoint field down to the Secret Access Key field.
+        // From the Endpoint field down to the Secret access key field.
         target: {
           union: [
             { text: 'Endpoint', exact: true },

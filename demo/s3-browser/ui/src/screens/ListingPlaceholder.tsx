@@ -1,4 +1,6 @@
-import { Alert, Button, Empty, Space, Spin } from 'antd';
+import { Alert, Button, Space, Spin } from 'antd';
+import { FolderOpenOutlined, InboxOutlined, SearchOutlined } from '@ant-design/icons';
+import { useColors } from '../ThemeContext';
 import DemoDataGenerator from '../components/DemoDataGenerator';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl } from '../urlState';
@@ -95,11 +97,15 @@ export default function ListingPlaceholder({
     );
   }
 
+  // An icon of the situation (search, folder, bucket), not AntD's stock
+  // illustration, which matched no other empty state in the app.
+  const Icon = searchQuery ? SearchOutlined : prefix || onlyHiddenEntries ? FolderOpenOutlined : InboxOutlined;
   return (
-    <Empty
+    <EmptyListing
+      icon={<Icon aria-hidden="true" />}
       description={<span style={{ display: 'inline-block', maxWidth: 520 }}>{
         searchQuery
-          ? `No results for "${searchQuery}"`
+          ? `No objects or folders in ${bucket}/${prefix} match "${searchQuery}".`
           : hasNoBuckets
             ? 'Create a bucket before uploading objects or generating demo data.'
             : onlyHiddenEntries
@@ -111,7 +117,6 @@ export default function ListingPlaceholder({
               ? `Nothing is stored under ${bucket}/${prefix}. A folder exists only while it holds files, so check the path for a typo${canUpload ? ', or upload files to create it' : ''}.`
               : 'No objects yet. Upload files or generate demo data.'
       }</span>}
-      style={{ padding: '64px 0' }}
     >
       {prefix && !searchQuery && (
         <Space size={16} wrap style={{ justifyContent: 'center' }}>
@@ -152,6 +157,25 @@ export default function ListingPlaceholder({
           </Button>
         </Space>
       )}
-    </Empty>
+    </EmptyListing>
+  );
+}
+
+/** Icon, sentence, then the next steps, centred in the listing area. */
+function EmptyListing({ icon, description, children }: {
+  icon: React.ReactNode;
+  description: React.ReactNode;
+  children?: React.ReactNode;
+}) {
+  const { TEXT_MUTED, TEXT_SECONDARY } = useColors();
+  return (
+    <div
+      role="status"
+      style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: '64px 16px', textAlign: 'center' }}
+    >
+      <span style={{ fontSize: 32, color: TEXT_MUTED, lineHeight: 1 }}>{icon}</span>
+      <div style={{ fontSize: 14, color: TEXT_SECONDARY, fontFamily: 'var(--font-ui)', lineHeight: 1.5 }}>{description}</div>
+      {children}
+    </div>
   );
 }

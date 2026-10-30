@@ -61,5 +61,5 @@ test('a session found expired when the tab comes back sends the user to sign in,
 
   await waitFor(() => expect(warning).toHaveBeenCalledWith(expect.stringMatching(/Your session expired/)), SLOW);
   await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/logout')).toHaveLength(1), SLOW);
-  expect(await screen.findByPlaceholderText('Admin password', {}, SLOW)).toBeInTheDocument();
+  expect(await screen.findByLabelText('Admin password', {}, SLOW)).toBeInTheDocument();
 });

@@ -223,19 +223,30 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
   );
 }
 
-function ActionBadge({ action }: { action: AdmissionBlock['action'] }) {
+/**
+ * The action of a rule as a tag. The AntD preset colours put light green
+ * text on a green tint (2.5:1); the theme accents reach 4.5:1 on light and
+ * dark surfaces, so the text uses them and only the tint stays pale.
+ */
+export function ActionBadge({ action }: { action: AdmissionBlock['action'] }) {
+  const colors = useColors();
   const kind = actionKind(action);
   const colour: Record<string, string> = {
-    'allow-anonymous': 'green',
-    deny: 'red',
-    continue: 'blue',
-    reject: 'orange',
+    'allow-anonymous': colors.ACCENT_GREEN,
+    deny: colors.ACCENT_RED,
+    continue: colors.ACCENT_BLUE,
+    reject: colors.ACCENT_AMBER,
   };
+  const c = colour[kind] ?? colors.TEXT_SECONDARY;
   const label =
     kind === 'reject' && typeof action !== 'string'
       ? `reject ${action.status}`
       : kind;
-  return <Tag color={colour[kind]}>{label}</Tag>;
+  return (
+    <Tag style={{ margin: 0, fontSize: 12, color: c, background: `${c}14`, borderColor: `${c}55` }}>
+      {label}
+    </Tag>
+  );
 }
 
 /**

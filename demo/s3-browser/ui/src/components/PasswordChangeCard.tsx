@@ -39,7 +39,11 @@ export default function PasswordChangeCard() {
   return (
     <form onSubmit={(e) => { e.preventDefault(); handleSubmit(); }} style={cardStyle}>
       <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
-        <SectionHeader icon={<LockOutlined />} title="Change Admin Password" />
+        <SectionHeader
+          icon={<LockOutlined />}
+          title="Admin password"
+          description="Unlocks this admin GUI. It is not the S3 SigV4 secret above."
+        />
 
         <div style={{ fontSize: 13, color: TEXT_MUTED, lineHeight: 1.6 }}>
           <Text style={{ color: TEXT_MUTED, fontSize: 13 }}>
@@ -101,7 +105,7 @@ export default function PasswordChangeCard() {
           block
           style={{ ...inputRadius, fontFamily: "var(--font-ui)", fontWeight: 600 }}
         >
-          Change Admin Password
+          Change admin password
         </Button>
       </Space>
     </form>

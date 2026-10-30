@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo, useCallback, type ReactNode } fro
 import ReactMarkdown, { type Components } from 'react-markdown';
 import mermaid from 'mermaid';
 import { Button, Drawer, Spin } from 'antd';
-import { CheckOutlined, CopyOutlined, MenuOutlined } from '@ant-design/icons';
+import { CheckOutlined, CopyOutlined, FileSearchOutlined, MenuOutlined } from '@ant-design/icons';
 import { findDocByFilename, type DocEntry } from '../docsBundle';
 import { DOC_REHYPE_PLUGINS, DOC_REMARK_PLUGINS, classifyDocHref, splitMermaid, themedShotSrc } from '../docsMarkdown';
 import { useCopyToClipboard } from '../useCopyToClipboard';
@@ -13,7 +13,9 @@ import FullScreenHeader from './FullScreenHeader';
 import DocSearch from './DocSearch';
 import Lightbox from './Lightbox';
 import { useNavigation } from '../NavigationContext';
+import { buildViewUrl } from '../urlState';
 import DocsLanding from './DocsLanding';
+import { EmptyState } from './StatePlaceholders';
 import '../docs.css';
 
 mermaid.initialize({
@@ -345,7 +347,10 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
   const contentRef = useRef<HTMLDivElement>(null);
 
   const selectedDoc = useMemo(() => DOCS.find(d => d.id === selectedId), [selectedId, DOCS]);
-  const showLanding = !!bundle && (selectedId === 'readme' || !selectedDoc);
+  // An address that names no doc (an old or mistyped link): say so instead
+  // of silently showing the landing page.
+  const unknownDocId = !!bundle && !!docId && !DOCS.some(d => d.id === docId);
+  const showLanding = !!bundle && !unknownDocId && (selectedId === 'readme' || !selectedDoc);
 
   // Scroll only the content pane. scrollIntoView would also scroll every
   // scrollable ancestor, and pushed the page header out of view.
@@ -578,7 +583,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
             <Button size="small" icon={<MenuOutlined />} onClick={() => setNavOpen(true)}>
               All docs
             </Button>
-            {selectedDoc && !showLanding && <CopyPageButton doc={selectedDoc} />}
+            {selectedDoc && !showLanding && !unknownDocId && <CopyPageButton doc={selectedDoc} />}
           </div>
         )}
         <div style={{ display: 'flex', gap: 40, maxWidth: 1200, margin: '0 auto', paddingTop: narrow ? 20 : 0 }}>
@@ -586,6 +591,15 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
           {!bundle ? (
             <div style={{ flex: 1, minWidth: 0, display: 'flex', justifyContent: 'center', padding: 60, color: colors.TEXT_MUTED }}>
               {docsError ? <span>Could not load the documentation: {docsError.message}</span> : <Spin />}
+            </div>
+          ) : unknownDocId ? (
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <EmptyState
+                icon={<FileSearchOutlined />}
+                title="No page at this address"
+                hint={<>There is no document at <code>/_/docs/{docId}</code>. The link can be old or mistyped. Search the docs or open the index.</>}
+                action={<Button type="primary" onClick={() => navigate(buildViewUrl('docs'))}>Go to the docs index</Button>}
+              />
             </div>
           ) : showLanding ? (
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -617,7 +631,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
           )}
 
           {/* ToC — sticky inside the scroll container (hidden on landing page) */}
-          {!narrow && !showLanding && headings.length > 2 && (
+          {!narrow && !showLanding && !unknownDocId && headings.length > 2 && (
             <nav className="docs-toc" aria-label="On this page" style={{
               width: 180,
               flexShrink: 0,
