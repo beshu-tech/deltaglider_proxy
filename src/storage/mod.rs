@@ -53,8 +53,8 @@ pub use traits::{
     unfenced_reference_fence_with_metadata, unfenced_reference_write, BucketListing, BulkListing,
     ByteStream, ClaimOutcome, ClaimWrite, CopyOutcome, DelegatedListResult, DynStorageBackend,
     KeyClaim, ListedForms, ListedToken, MultipartUpload, ObjectAt, ObjectRead, ObjectVariant,
-    RangeRead, RefFence, RefWrite, ReferenceSource, RewriteBasis, StorageBackend, StorageError,
-    StoredObject, UploadedPart,
+    RangeRead, RefFence, RefWrite, ReferenceSource, RewriteBasis, StorageBackend,
+    StorageBackendExt, StorageError, StoredObject, UploadedPart,
 };
 
 tokio::task_local! {

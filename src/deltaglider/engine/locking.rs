@@ -292,7 +292,6 @@ mod reference_writes {
             deltaspace: &str,
             op: crate::storage::RefWrite<'_>,
         ) -> Result<(), EngineError> {
-            use crate::storage::RefWrite;
             self.ensure_held().await?;
             if let Some(h) = &self.hold {
                 let fence = h.fence.lock().clone();
@@ -302,24 +301,9 @@ mod reference_writes {
                 *h.fence.lock() = next;
                 return Ok(());
             }
-            match op {
-                RefWrite::Put { data, metadata } => {
-                    storage
-                        .put_reference(bucket, deltaspace, data.clone(), metadata, PROOF)
-                        .await?
-                }
-                RefWrite::PutFile { path, metadata } => {
-                    storage
-                        .put_reference_from_file(bucket, deltaspace, path, metadata, PROOF)
-                        .await?
-                }
-                RefWrite::Metadata { metadata } => {
-                    storage
-                        .put_reference_metadata(bucket, deltaspace, metadata, PROOF)
-                        .await?
-                }
-                RefWrite::Delete => storage.delete_reference(bucket, deltaspace, PROOF).await?,
-            }
+            storage
+                .write_reference(bucket, deltaspace, op, PROOF)
+                .await?;
             Ok(())
         }
 

@@ -1265,24 +1265,63 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     }
 }
 
+/// A reference write as the inner backend stores it.
+enum SealedRefWrite {
+    Put(bytes::Bytes, FileMetadata),
+    Metadata(FileMetadata),
+    Delete,
+}
+
+impl SealedRefWrite {
+    fn op(&self) -> super::traits::RefWrite<'_> {
+        use super::traits::RefWrite;
+        match self {
+            Self::Put(data, metadata) => RefWrite::Put { data, metadata },
+            Self::Metadata(metadata) => RefWrite::Metadata { metadata },
+            Self::Delete => RefWrite::Delete,
+        }
+    }
+}
+
+impl<B: StorageBackend> EncryptingBackend<B> {
+    /// The transformation of a reference write, fenced or not: seal a
+    /// body, re-seal a metadata-only write.
+    async fn seal_reference_write(
+        &self,
+        b: &str,
+        p: &str,
+        op: super::traits::RefWrite<'_>,
+    ) -> Result<SealedRefWrite, StorageError> {
+        use super::traits::RefWrite;
+        Ok(match op {
+            RefWrite::Put { data, metadata } => {
+                let (body, stored) =
+                    self.seal_bytes(b, p, StoredObject::Reference, data, metadata)?;
+                SealedRefWrite::Put(body, stored)
+            }
+            RefWrite::PutFile { path, metadata } => {
+                let data = bytes::Bytes::from(tokio::fs::read(path).await?);
+                let (body, stored) =
+                    self.seal_bytes(b, p, StoredObject::Reference, &data, metadata)?;
+                SealedRefWrite::Put(body, stored)
+            }
+            RefWrite::Metadata { metadata } => {
+                let raw = self.inner.get_reference_metadata(b, p).await?;
+                SealedRefWrite::Metadata(self.reseal(
+                    b,
+                    p,
+                    StoredObject::Reference,
+                    metadata,
+                    &raw,
+                )?)
+            }
+            RefWrite::Delete => SealedRefWrite::Delete,
+        })
+    }
+}
+
 impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     // ── Writes: seal ──
-
-    async fn put_reference(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        data: bytes::Bytes,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.check_write(bucket).await?;
-        let (body, stored) =
-            self.seal_bytes(bucket, prefix, StoredObject::Reference, &data, metadata)?;
-        self.inner
-            .put_reference(bucket, prefix, body, &stored, proof)
-            .await
-    }
 
     /// A storage-level copy moves the stored bytes as they are, so it is
     /// valid only when the destination would store them the same way:
@@ -1839,20 +1878,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .put_passthrough_metadata(b, p, f, &stored, basis)
             .await
     }
-    async fn put_reference_metadata(
-        &self,
-        b: &str,
-        p: &str,
-        m: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.check_write(b).await?;
-        let raw = self.inner.get_reference_metadata(b, p).await?;
-        let stored = self.reseal(b, p, StoredObject::Reference, m, &raw)?;
-        self.inner
-            .put_reference_metadata(b, p, &stored, proof)
-            .await
-    }
     async fn reference_fence_with_metadata(
         &self,
         b: &str,
@@ -1878,60 +1903,26 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     ) -> Result<super::traits::RefFence, StorageError> {
         self.check_write_unless(b, matches!(op, super::traits::RefWrite::Delete))
             .await?;
-        use super::traits::RefWrite;
-        match op {
-            RefWrite::Put { data, metadata } => {
-                let (body, stored) =
-                    self.seal_bytes(b, p, StoredObject::Reference, data, metadata)?;
-                self.inner
-                    .write_reference_fenced(
-                        b,
-                        p,
-                        RefWrite::Put {
-                            data: &body,
-                            metadata: &stored,
-                        },
-                        fence,
-                        proof,
-                    )
-                    .await
-            }
-            RefWrite::PutFile { path, metadata } => {
-                let data = bytes::Bytes::from(tokio::fs::read(path).await?);
-                let (body, stored) =
-                    self.seal_bytes(b, p, StoredObject::Reference, &data, metadata)?;
-                self.inner
-                    .write_reference_fenced(
-                        b,
-                        p,
-                        RefWrite::Put {
-                            data: &body,
-                            metadata: &stored,
-                        },
-                        fence,
-                        proof,
-                    )
-                    .await
-            }
-            RefWrite::Metadata { metadata } => {
-                let raw = self.inner.get_reference_metadata(b, p).await?;
-                let stored = self.reseal(b, p, StoredObject::Reference, metadata, &raw)?;
-                self.inner
-                    .write_reference_fenced(
-                        b,
-                        p,
-                        RefWrite::Metadata { metadata: &stored },
-                        fence,
-                        proof,
-                    )
-                    .await
-            }
-            RefWrite::Delete => {
-                self.inner
-                    .write_reference_fenced(b, p, RefWrite::Delete, fence, proof)
-                    .await
-            }
+        let sealed = self.seal_reference_write(b, p, op).await?;
+        self.inner
+            .write_reference_fenced(b, p, sealed.op(), fence, proof)
+            .await
+    }
+
+    /// As the fenced write, except that a delete skips the checks
+    /// entirely (as the plain delete always did).
+    async fn write_reference(
+        &self,
+        b: &str,
+        p: &str,
+        op: super::traits::RefWrite<'_>,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), StorageError> {
+        if !matches!(op, super::traits::RefWrite::Delete) {
+            self.check_write(b).await?;
         }
+        let sealed = self.seal_reference_write(b, p, op).await?;
+        self.inner.write_reference(b, p, sealed.op(), proof).await
     }
 
     // ── Listings: present ──
@@ -2071,14 +2062,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     }
     async fn has_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
         self.inner.has_reference(b, p).await
-    }
-    async fn delete_reference(
-        &self,
-        b: &str,
-        p: &str,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.inner.delete_reference(b, p, proof).await
     }
     async fn flush_pending(&self) -> Result<(), StorageError> {
         self.inner.flush_pending().await

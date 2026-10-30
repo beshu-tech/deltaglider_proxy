@@ -350,44 +350,6 @@ impl StorageBackend for FaultyFs {
         self.inner.get_reference_to_file(bucket, prefix, dest).await
     }
 
-    async fn put_reference(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        data: bytes::Bytes,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.inner
-            .put_reference(bucket, prefix, data, metadata, proof)
-            .await
-    }
-
-    async fn put_reference_from_file(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        source_path: &Path,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.inner
-            .put_reference_from_file(bucket, prefix, source_path, metadata, proof)
-            .await
-    }
-
-    async fn put_reference_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        metadata: &FileMetadata,
-        _proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.inner
-            .put_reference_metadata(bucket, prefix, metadata, _proof)
-            .await
-    }
-
     async fn get_passthrough_metadata_for_rewrite(
         &self,
         bucket: &str,
@@ -438,6 +400,16 @@ impl StorageBackend for FaultyFs {
         self.inner
             .reference_fence_with_metadata(bucket, prefix)
             .await
+    }
+
+    async fn write_reference(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        op: RefWrite<'_>,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), StorageError> {
+        self.inner.write_reference(bucket, prefix, op, proof).await
     }
 
     async fn write_reference_fenced(
@@ -496,15 +468,6 @@ impl StorageBackend for FaultyFs {
             ObjectVariant::Passthrough => self.delete_passthrough(bucket, prefix, filename).await?,
         }
         Ok(true)
-    }
-
-    async fn delete_reference(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.inner.delete_reference(bucket, prefix, proof).await
     }
 
     async fn get_delta(

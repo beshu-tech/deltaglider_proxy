@@ -3,6 +3,7 @@
 //! Unit tests of the filesystem backend.
 
 use super::*;
+use crate::storage::StorageBackendExt;
 
 #[cfg(test)]
 mod backend_tests {

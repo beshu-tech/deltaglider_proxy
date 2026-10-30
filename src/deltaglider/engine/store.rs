@@ -2519,6 +2519,7 @@ mod stale_reference_cache_tests {
     use super::*;
     use crate::config::Config;
     use crate::storage::FilesystemBackend;
+    use crate::storage::StorageBackendExt;
 
     fn noise(seed: u64, n: usize) -> Vec<u8> {
         let mut x = seed;

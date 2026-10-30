@@ -4,6 +4,7 @@
 //! itself is tested in `v2.rs`, the sealed metadata in `seal.rs`.
 
 use super::*;
+use crate::storage::StorageBackendExt;
 use bytes::Bytes;
 use futures::TryStreamExt;
 
@@ -461,6 +462,15 @@ mod wrapper_tests {
         ) -> Result<(crate::storage::RefFence, Option<FileMetadata>), StorageError> {
             crate::storage::unfenced_reference_fence_with_metadata(self, b, p).await
         }
+        async fn write_reference(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::storage::RefWrite<'_>,
+            _: &RefWriteProof,
+        ) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
         async fn write_reference_fenced(
             &self,
             b: &str,
@@ -622,16 +632,6 @@ mod wrapper_tests {
         async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
             Ok(false)
         }
-        async fn put_reference(
-            &self,
-            _: &str,
-            _: &str,
-            _: Bytes,
-            _: &FileMetadata,
-            _: &RefWriteProof,
-        ) -> Result<(), StorageError> {
-            Err(cb_err())
-        }
         async fn get_reference(&self, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
             Err(cb_err())
         }
@@ -640,23 +640,6 @@ mod wrapper_tests {
             _: &str,
             _: &str,
         ) -> Result<FileMetadata, StorageError> {
-            Err(cb_err())
-        }
-        async fn put_reference_metadata(
-            &self,
-            _: &str,
-            _: &str,
-            _: &FileMetadata,
-            _: &RefWriteProof,
-        ) -> Result<(), StorageError> {
-            Err(cb_err())
-        }
-        async fn delete_reference(
-            &self,
-            _: &str,
-            _: &str,
-            _: &RefWriteProof,
-        ) -> Result<(), StorageError> {
             Err(cb_err())
         }
         async fn flush_pending(&self) -> Result<(), StorageError> {

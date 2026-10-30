@@ -250,7 +250,7 @@ mod tests {
     use crate::bucket_usage::{usage_delta_for, BucketUsage, BucketUsageRow};
     use crate::deltaglider::savings::SavingsTotals;
     use crate::metrics::Metrics;
-    use crate::storage::{DynStorageBackend, FakeS3, FilesystemBackend};
+    use crate::storage::{DynStorageBackend, FakeS3, FilesystemBackend, StorageBackendExt};
     use md5::Md5;
     use sha2::Sha256;
 

@@ -1294,60 +1294,6 @@ impl StorageBackend for FilesystemBackend {
         Ok(super::ReferenceSource::local(path, file, size, meta))
     }
 
-    #[instrument(skip(self, data, metadata))]
-    async fn put_reference(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        data: bytes::Bytes,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.require_bucket_exists(bucket).await?;
-        self.put_object_file(
-            bucket,
-            &self.reference_path(bucket, prefix)?,
-            data,
-            metadata,
-            "reference",
-            prefix,
-            "reference.bin",
-            Durability::Sync,
-        )
-        .await
-    }
-
-    #[instrument(skip(self, metadata))]
-    async fn put_reference_from_file(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        source_path: &Path,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.require_bucket_exists(bucket).await?;
-        let dest = self.reference_path(bucket, prefix)?;
-        // `ensure_dir`, never `create_dir_all`: that re-created a bucket
-        // deleted after `require_bucket_exists` (C-P0-1, storage-12).
-        let dir = self.ensure_dir(bucket, &dest)?;
-        // Copy to a temp file + xattr + fsync + rename. Delete-then-copy lost
-        // the baseline on a failed or short copy, and a hardlink shared the
-        // inode (and so the xattr) with the caller's source file.
-        atomic_copy_with_metadata(dir, source_path, &dest, metadata, Durability::Sync).await
-    }
-
-    async fn put_reference_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        metadata: &FileMetadata,
-        _proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.require_bucket_exists(bucket).await?;
-        xattr_meta::write_metadata(&self.reference_path(bucket, prefix)?, metadata).await
-    }
-
     /// One metadata read; the filesystem has no response headers to keep.
     async fn get_passthrough_metadata_for_rewrite(
         &self,
@@ -1407,6 +1353,59 @@ impl StorageBackend for FilesystemBackend {
         super::traits::unfenced_reference_fence_with_metadata(self, bucket, prefix).await
     }
 
+    #[instrument(skip(self, op, _proof))]
+    async fn write_reference(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        op: RefWrite<'_>,
+        _proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), StorageError> {
+        // Each arm in the order of the old per-op method: the bucket
+        // check (not for a delete), then the path.
+        match op {
+            RefWrite::Put { data, metadata } => {
+                self.require_bucket_exists(bucket).await?;
+                self.put_object_file(
+                    bucket,
+                    &self.reference_path(bucket, prefix)?,
+                    data.clone(),
+                    metadata,
+                    "reference",
+                    prefix,
+                    "reference.bin",
+                    Durability::Sync,
+                )
+                .await
+            }
+            RefWrite::PutFile { path, metadata } => {
+                self.require_bucket_exists(bucket).await?;
+                let dest = self.reference_path(bucket, prefix)?;
+                // `ensure_dir`, never `create_dir_all`: that re-created a bucket
+                // deleted after `require_bucket_exists` (C-P0-1, storage-12).
+                let dir = self.ensure_dir(bucket, &dest)?;
+                // Copy to a temp file + xattr + fsync + rename. Delete-then-copy lost
+                // the baseline on a failed or short copy, and a hardlink shared the
+                // inode (and so the xattr) with the caller's source file.
+                atomic_copy_with_metadata(dir, path, &dest, metadata, Durability::Sync).await
+            }
+            RefWrite::Metadata { metadata } => {
+                self.require_bucket_exists(bucket).await?;
+                xattr_meta::write_metadata(&self.reference_path(bucket, prefix)?, metadata).await
+            }
+            RefWrite::Delete => {
+                self.delete_object_file(
+                    &self.reference_path(bucket, prefix)?,
+                    &self.deltaspace_dir(bucket, "")?,
+                    "reference",
+                    prefix,
+                    "reference.bin",
+                )
+                .await
+            }
+        }
+    }
+
     /// Ignores the fence and returns `Unfenced` (single node, see above).
     async fn write_reference_fenced(
         &self,
@@ -1423,23 +1422,6 @@ impl StorageBackend for FilesystemBackend {
         // A stat error is an error (B11): read as "no reference", a PUT
         // wrote a new baseline over the live one.
         fsio::exists(&self.reference_path(bucket, prefix)?).await
-    }
-
-    #[instrument(skip(self))]
-    async fn delete_reference(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.delete_object_file(
-            &self.reference_path(bucket, prefix)?,
-            &self.deltaspace_dir(bucket, "")?,
-            "reference",
-            prefix,
-            "reference.bin",
-        )
-        .await
     }
 
     async fn copy_within(

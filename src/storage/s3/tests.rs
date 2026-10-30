@@ -3,6 +3,7 @@
 //! Unit tests of the S3 backend.
 
 use super::*;
+use crate::storage::StorageBackendExt;
 
 // ────────────────────────────────────────────────────────────────────
 // Unit tests for error classification.

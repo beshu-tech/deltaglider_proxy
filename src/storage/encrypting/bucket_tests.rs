@@ -356,21 +356,20 @@ async fn a_witness_refusal_stops_every_write_also_a_folder_marker() {
 }
 
 /// Source guard: every write method of `StorageBackend` is overridden by
-/// the encrypting wrapper and calls the witness check first. A new write
-/// method fails here until it does.
+/// the encrypting wrapper and calls the witness check in its first
+/// statement. A new write method fails here until it does.
+/// (`StorageBackendExt` only delegates to checked methods.)
 #[test]
 fn every_write_method_checks_the_witness() {
     let traits = std::fs::read_to_string("src/storage/traits.rs").unwrap();
+    let traits = &traits[traits.find("pub trait StorageBackend:").unwrap()..];
+    let traits = &traits[..traits.find("\n}\n").unwrap()];
     let wrapper = std::fs::read_to_string("src/storage/encrypting/mod.rs").unwrap();
     // Trait defaults that only delegate to a checked method,
     // `write_refusal`, the witness query itself (it writes nothing), and
     // `write_key_claim`, which the wrapper's own check sends to the raw
     // backend below it (nothing above the wrapper writes a claim).
-    let delegating = [
-        "put_reference_from_file",
-        "write_refusal",
-        "write_key_claim",
-    ];
+    let delegating = ["write_refusal", "write_key_claim"];
     let prefixes = [
         "put_",
         "write_",
@@ -400,9 +399,10 @@ fn every_write_method_checks_the_witness() {
             continue;
         };
         let body_start = wrapper[at..].find("{\n").map(|i| at + i).unwrap();
-        let first = wrapper[body_start + 2..].lines().next().unwrap_or("");
+        let fn_text = &wrapper[body_start + 2..];
+        let first = &fn_text[..fn_text.find(';').unwrap_or(fn_text.len())];
         if !first.contains("self.check_write(") && !first.contains("self.check_write_unless(") {
-            missing.push(format!("{name}: first line is `{}`", first.trim()));
+            missing.push(format!("{name}: first statement is `{}`", first.trim()));
         }
     }
     assert!(missing.is_empty(), "{missing:?}");

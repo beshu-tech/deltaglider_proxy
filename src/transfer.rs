@@ -2725,6 +2725,15 @@ mod multipart_abort_tests {
         > {
             crate::storage::unfenced_reference_fence_with_metadata(self, b, p).await
         }
+        async fn write_reference(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::storage::RefWrite<'_>,
+            _proof: &crate::deltaglider::RefWriteProof,
+        ) -> Result<(), StorageError> {
+            Err(nope())
+        }
         async fn write_reference_fenced(
             &self,
             b: &str,
@@ -2834,25 +2843,6 @@ mod multipart_abort_tests {
         async fn get_reference(&self, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
             Err(nope())
         }
-        async fn put_reference(
-            &self,
-            _: &str,
-            _: &str,
-            _: bytes::Bytes,
-            _: &FileMetadata,
-            _proof: &crate::deltaglider::RefWriteProof,
-        ) -> Result<(), StorageError> {
-            Err(nope())
-        }
-        async fn put_reference_metadata(
-            &self,
-            _: &str,
-            _: &str,
-            _: &FileMetadata,
-            _proof: &crate::deltaglider::RefWriteProof,
-        ) -> Result<(), StorageError> {
-            Err(nope())
-        }
         async fn get_reference_metadata(
             &self,
             _: &str,
@@ -2862,14 +2852,6 @@ mod multipart_abort_tests {
         }
         async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
             Ok(false)
-        }
-        async fn delete_reference(
-            &self,
-            _: &str,
-            _: &str,
-            _proof: &crate::deltaglider::RefWriteProof,
-        ) -> Result<(), StorageError> {
-            Err(nope())
         }
         async fn flush_pending(&self) -> Result<(), StorageError> {
             Ok(())
@@ -3031,6 +3013,15 @@ mod multipart_abort_tests {
         > {
             self.0.reference_fence_with_metadata(b, p).await
         }
+        async fn write_reference(
+            &self,
+            b: &str,
+            p: &str,
+            op: crate::storage::RefWrite<'_>,
+            proof: &crate::deltaglider::RefWriteProof,
+        ) -> Result<(), StorageError> {
+            self.0.write_reference(b, p, op, proof).await
+        }
         async fn write_reference_fenced(
             &self,
             b: &str,
@@ -3118,25 +3109,6 @@ mod multipart_abort_tests {
         async fn get_reference(&self, b: &str, p: &str) -> Result<Vec<u8>, StorageError> {
             self.0.get_reference(b, p).await
         }
-        async fn put_reference(
-            &self,
-            b: &str,
-            p: &str,
-            d: bytes::Bytes,
-            m: &FileMetadata,
-            proof: &crate::deltaglider::RefWriteProof,
-        ) -> Result<(), StorageError> {
-            self.0.put_reference(b, p, d, m, proof).await
-        }
-        async fn put_reference_metadata(
-            &self,
-            b: &str,
-            p: &str,
-            m: &FileMetadata,
-            proof: &crate::deltaglider::RefWriteProof,
-        ) -> Result<(), StorageError> {
-            self.0.put_reference_metadata(b, p, m, proof).await
-        }
         async fn get_reference_metadata(
             &self,
             b: &str,
@@ -3146,14 +3118,6 @@ mod multipart_abort_tests {
         }
         async fn has_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
             self.0.has_reference(b, p).await
-        }
-        async fn delete_reference(
-            &self,
-            b: &str,
-            p: &str,
-            proof: &crate::deltaglider::RefWriteProof,
-        ) -> Result<(), StorageError> {
-            self.0.delete_reference(b, p, proof).await
         }
         async fn flush_pending(&self) -> Result<(), StorageError> {
             self.0.flush_pending().await

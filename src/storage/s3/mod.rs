@@ -526,58 +526,6 @@ impl StorageBackend for S3Backend {
 
     // === Reference file operations ===
 
-    #[instrument(skip(self, data, metadata))]
-    async fn put_reference(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        data: Bytes,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        let key = self.reference_key(prefix);
-        self.put_object_with_metadata(bucket, &key, data.clone(), metadata)
-            .await?;
-        debug!(
-            "Stored reference for {}/{} ({} bytes)",
-            bucket,
-            prefix,
-            data.len()
-        );
-        Ok(())
-    }
-
-    async fn put_reference_from_file(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        source_path: &std::path::Path,
-        metadata: &FileMetadata,
-        _proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        // Stream the file body to S3 (ByteStream::from_path) — never heap-load it.
-        let key = self.reference_key(prefix);
-        self.put_object_file_with_metadata(bucket, &key, source_path, metadata)
-            .await?;
-        debug!("Stored reference from file for {}/{}", bucket, prefix);
-        Ok(())
-    }
-
-    #[instrument(skip(self, metadata))]
-    async fn put_reference_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        let key = self.reference_key(prefix);
-        self.replace_metadata_in_place(bucket, &key, metadata)
-            .await?;
-        debug!("Updated reference metadata for {}/{}", bucket, prefix);
-        Ok(())
-    }
-
     /// One HEAD: the metadata, and the response for the rewrite.
     #[instrument(skip(self))]
     async fn get_passthrough_metadata_for_rewrite(
@@ -735,19 +683,6 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
-    async fn delete_reference(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        let key = self.reference_key(prefix);
-        self.delete_s3_object(bucket, &key).await?;
-        debug!("Deleted reference for {}/{}", bucket, prefix);
-        Ok(())
-    }
-
-    #[instrument(skip(self))]
     async fn reference_fence(&self, bucket: &str, prefix: &str) -> Result<RefFence, StorageError> {
         let key = self.reference_key(prefix);
         BACKEND_HEAD_REQUESTS.inc();
@@ -783,6 +718,45 @@ impl StorageBackend for S3Backend {
             Err(StorageError::NotFound(_)) => Ok((RefFence::Absent, None)),
             Err(e) => Err(e),
         }
+    }
+
+    #[instrument(skip(self, op, _proof))]
+    async fn write_reference(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        op: RefWrite<'_>,
+        _proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), StorageError> {
+        let key = self.reference_key(prefix);
+        match op {
+            RefWrite::Put { data, metadata } => {
+                self.put_object_with_metadata(bucket, &key, data.clone(), metadata)
+                    .await?;
+                debug!(
+                    "Stored reference for {}/{} ({} bytes)",
+                    bucket,
+                    prefix,
+                    data.len()
+                );
+            }
+            RefWrite::PutFile { path, metadata } => {
+                // Stream the file body to S3 (ByteStream::from_path) — never heap-load it.
+                self.put_object_file_with_metadata(bucket, &key, path, metadata)
+                    .await?;
+                debug!("Stored reference from file for {}/{}", bucket, prefix);
+            }
+            RefWrite::Metadata { metadata } => {
+                self.replace_metadata_in_place(bucket, &key, metadata)
+                    .await?;
+                debug!("Updated reference metadata for {}/{}", bucket, prefix);
+            }
+            RefWrite::Delete => {
+                self.delete_s3_object(bucket, &key).await?;
+                debug!("Deleted reference for {}/{}", bucket, prefix);
+            }
+        }
+        Ok(())
     }
 
     #[instrument(skip(self, op))]

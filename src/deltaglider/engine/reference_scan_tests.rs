@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::config::Config;
+use crate::storage::StorageBackendExt;
 use crate::storage::{fake_s3, s3_test_support, FilesystemBackend, StorageBackend};
 use crate::types::FileMetadata;
 use md5::{Digest, Md5};

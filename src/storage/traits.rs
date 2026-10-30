@@ -436,7 +436,7 @@ pub fn object_changed_while_read(bucket: &str, key: &str) -> StorageError {
     ))
 }
 
-/// One fenced write to `reference.bin` (see
+/// One write to `reference.bin` ([`StorageBackend::write_reference`],
 /// [`StorageBackend::write_reference_fenced`]).
 #[derive(Debug, Clone, Copy)]
 pub enum RefWrite<'a> {
@@ -675,24 +675,7 @@ pub async fn unfenced_reference_write<B: StorageBackend + ?Sized>(
     op: RefWrite<'_>,
     proof: &crate::deltaglider::RefWriteProof,
 ) -> Result<RefFence, StorageError> {
-    match op {
-        RefWrite::Put { data, metadata } => {
-            backend
-                .put_reference(bucket, prefix, data.clone(), metadata, proof)
-                .await?
-        }
-        RefWrite::PutFile { path, metadata } => {
-            backend
-                .put_reference_from_file(bucket, prefix, path, metadata, proof)
-                .await?
-        }
-        RefWrite::Metadata { metadata } => {
-            backend
-                .put_reference_metadata(bucket, prefix, metadata, proof)
-                .await?
-        }
-        RefWrite::Delete => backend.delete_reference(bucket, prefix, proof).await?,
-    }
+    backend.write_reference(bucket, prefix, op, proof).await?;
     Ok(RefFence::Unfenced)
 }
 
@@ -880,42 +863,17 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
     ) -> impl Future<Output = Result<ReferenceSource, StorageError>> + Send;
 
-    /// Store a reference file with its metadata
-    fn put_reference(
+    /// Write `reference.bin` without a fence: a body, a local file
+    /// (streamed or linked, never heap-loaded where the backend can avoid
+    /// it), the metadata only, or a delete. The single-instance path of the
+    /// reference lock; [`Self::write_reference_fenced`] is the
+    /// cross-instance one. Callers use the names in [`StorageBackendExt`].
+    /// No default: every wrapper must forward it with its own transform.
+    fn write_reference(
         &self,
         bucket: &str,
         prefix: &str,
-        data: Bytes,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
-
-    /// Store a reference whose data is on a local file, WITHOUT heap-loading it
-    /// (review M1.4: the streaming baseline path must not read a multi-GB first
-    /// member into RAM). Default reads the file then delegates to `put_reference`
-    /// (correct for any backend); the filesystem backend hardlinks and S3 streams
-    /// the upload from the file — mirrors `get_reference_to_file`.
-    fn put_reference_from_file(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        source_path: &std::path::Path,
-        metadata: &FileMetadata,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        async move {
-            let data = tokio::fs::read(source_path).await?;
-            self.put_reference(bucket, prefix, Bytes::from(data), metadata, proof)
-                .await
-        }
-    }
-
-    /// Store/update reference metadata without rewriting reference data.
-    fn put_reference_metadata(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        metadata: &FileMetadata,
+        op: RefWrite<'_>,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
@@ -980,14 +938,6 @@ pub trait StorageBackend: Send + Sync {
         bucket: &str,
         prefix: &str,
     ) -> impl Future<Output = Result<bool, StorageError>> + Send;
-
-    /// Delete a reference file and its metadata
-    fn delete_reference(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Make durable every object write that this backend deferred (see
     /// [`crate::storage::with_deferred_fsync`]). A backend whose writes are
@@ -1683,6 +1633,74 @@ pub trait StorageBackend: Send + Sync {
         async move { Ok(None) }
     }
 }
+
+/// The unfenced reference writes by name, over
+/// [`StorageBackend::write_reference`]. One implementation for every
+/// backend (the blanket impl below), so no wrapper forwards them.
+pub trait StorageBackendExt: StorageBackend {
+    /// Store a reference file with its metadata.
+    fn put_reference(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        data: Bytes,
+        metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        async move {
+            let op = RefWrite::Put {
+                data: &data,
+                metadata,
+            };
+            self.write_reference(bucket, prefix, op, proof).await
+        }
+    }
+
+    /// Store a reference whose data is on a local file, WITHOUT
+    /// heap-loading it where the backend can avoid it (review M1.4).
+    fn put_reference_from_file(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        path: &Path,
+        metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        async move {
+            let op = RefWrite::PutFile { path, metadata };
+            self.write_reference(bucket, prefix, op, proof).await
+        }
+    }
+
+    /// Store/update reference metadata without rewriting reference data.
+    fn put_reference_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        async move {
+            let op = RefWrite::Metadata { metadata };
+            self.write_reference(bucket, prefix, op, proof).await
+        }
+    }
+
+    /// Delete a reference file and its metadata.
+    fn delete_reference(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        async move {
+            self.write_reference(bucket, prefix, RefWrite::Delete, proof)
+                .await
+        }
+    }
+}
+
+impl<B: StorageBackend + ?Sized> StorageBackendExt for B {}
 
 /// Handle for an in-progress multipart upload (Phase B streaming copy).
 #[derive(Debug, Clone)]

@@ -146,8 +146,8 @@ Keep one trait and dynosaur. Remove methods in two ways:
   still made only in `engine/locking.rs::reference_writes`.
 - **Formats.** None changes: each `match` arm runs the old method's body
   (same key, path, xattr, headers, durability).
-- **Round trips.** None changes: same bodies. The tracing span names stay
-  (`#[instrument(name = "put_reference")]` on the moved bodies).
+- **Round trips.** None changes: same bodies. Only tracing span names
+  change (`write_reference` instead of `put_reference` and so on).
 - **Source guards.** Guards that pin a removed name move to the new name
   in the same step, or go away when the compiler takes over the rule (a
   removed method cannot be called).
@@ -198,4 +198,11 @@ format, a request count, or who can make a proof.
 
 ## 6. Progress
 
-- None yet.
+- Step 1: done (commit "drop the two metadata-less passthrough stream reads").
+- Step 2: done (commit "one unfenced reference write"). 67 → 62 methods.
+- Found while doing step 2, kept as it was: the encrypting wrapper runs the
+  witness check on a FENCED reference delete (`check_write_unless(.., true)`
+  still calls `check_witness`), but never on an UNFENCED one (the old
+  `delete_reference` forwarded as is). So a single-instance delete-reclaim
+  of `reference.bin` passes a witness refusal that a multi-instance one
+  does not. Decide which one is right before step 5.

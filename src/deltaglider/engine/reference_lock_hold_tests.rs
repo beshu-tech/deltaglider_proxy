@@ -5,6 +5,7 @@ use crate::coordination::DynReferenceLock;
 use crate::coordination::LeaseError;
 use crate::storage::DynStorageBackend;
 use crate::storage::FilesystemBackend;
+use crate::storage::StorageBackendExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A lock that always grants, and whose renew answer the test sets.
@@ -556,28 +557,6 @@ impl crate::storage::StorageBackend for FencingFs {
     async fn get_reference(&self, b: &str, p: &str) -> Result<Vec<u8>, StorageError> {
         self.inner.get_reference(b, p).await
     }
-    async fn put_reference(
-        &self,
-        b: &str,
-        p: &str,
-        d: bytes::Bytes,
-        m: &Meta,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.maybe_peer_write(b, p).await;
-        self.inner.put_reference(b, p, d, m, proof).await?;
-        self.bump(b, p);
-        Ok(())
-    }
-    async fn put_reference_metadata(
-        &self,
-        b: &str,
-        p: &str,
-        m: &Meta,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.inner.put_reference_metadata(b, p, m, proof).await
-    }
     async fn get_reference_metadata(&self, b: &str, p: &str) -> Result<Meta, StorageError> {
         self.inner.get_reference_metadata(b, p).await
     }
@@ -586,16 +565,6 @@ impl crate::storage::StorageBackend for FencingFs {
     }
     async fn flush_pending(&self) -> Result<(), StorageError> {
         self.inner.flush_pending().await
-    }
-    async fn delete_reference(
-        &self,
-        b: &str,
-        p: &str,
-        proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), StorageError> {
-        self.inner.delete_reference(b, p, proof).await?;
-        self.versions.lock().remove(&Self::slot(b, p));
-        Ok(())
     }
     async fn reference_fence(&self, b: &str, p: &str) -> Result<RefFence, StorageError> {
         Ok(match self.versions.lock().get(&Self::slot(b, p)) {
@@ -615,6 +584,25 @@ impl crate::storage::StorageBackend for FencingFs {
             Err(e) => return Err(e),
         };
         Ok((fence, meta))
+    }
+    async fn write_reference(
+        &self,
+        b: &str,
+        p: &str,
+        op: RefWrite<'_>,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), StorageError> {
+        let body = matches!(op, RefWrite::Put { .. } | RefWrite::PutFile { .. });
+        if body {
+            self.maybe_peer_write(b, p).await;
+        }
+        self.inner.write_reference(b, p, op, proof).await?;
+        if body {
+            self.bump(b, p);
+        } else if let RefWrite::Delete = op {
+            self.versions.lock().remove(&Self::slot(b, p));
+        }
+        Ok(())
     }
     async fn write_reference_fenced(
         &self,

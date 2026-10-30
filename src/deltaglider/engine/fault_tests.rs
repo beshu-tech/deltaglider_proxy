@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::config::Config;
+use crate::storage::StorageBackendExt;
 use crate::storage::{
     fail_io, DynStorageBackend, Fault, FaultPoint, Faults, FaultyFs, FilesystemBackend,
     StorageBackend,

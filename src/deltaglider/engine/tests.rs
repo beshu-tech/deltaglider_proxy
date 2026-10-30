@@ -47,6 +47,15 @@ impl crate::storage::StorageBackend for NullInner {
     > {
         crate::storage::unfenced_reference_fence_with_metadata(self, b, p).await
     }
+    async fn write_reference(
+        &self,
+        _: &str,
+        _: &str,
+        _: crate::storage::RefWrite<'_>,
+        _proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), crate::storage::StorageError> {
+        Ok(())
+    }
     async fn write_reference_fenced(
         &self,
         b: &str,
@@ -77,16 +86,6 @@ impl crate::storage::StorageBackend for NullInner {
     async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
         Ok(false)
     }
-    async fn put_reference(
-        &self,
-        _: &str,
-        _: &str,
-        _: bytes::Bytes,
-        _: &crate::types::FileMetadata,
-        _proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), crate::storage::StorageError> {
-        Ok(())
-    }
     async fn get_reference(
         &self,
         _: &str,
@@ -111,23 +110,6 @@ impl crate::storage::StorageBackend for NullInner {
         crate::storage::StorageError,
     > {
         Err(crate::storage::StorageError::Other("null".into()))
-    }
-    async fn put_reference_metadata(
-        &self,
-        _: &str,
-        _: &str,
-        _: &crate::types::FileMetadata,
-        _proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), crate::storage::StorageError> {
-        Ok(())
-    }
-    async fn delete_reference(
-        &self,
-        _: &str,
-        _: &str,
-        _proof: &crate::deltaglider::RefWriteProof,
-    ) -> Result<(), crate::storage::StorageError> {
-        Ok(())
     }
     async fn flush_pending(&self) -> Result<(), crate::storage::StorageError> {
         Ok(())

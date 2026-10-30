@@ -10,7 +10,7 @@ use super::multipart::adapter_test_support::{request, service};
 use super::object::get_object;
 use crate::api::handlers::AppState;
 use crate::deltaglider::{DeltaGliderEngine, DynEngine};
-use crate::storage::{DynStorageBackend, FakeS3, StorageBackend};
+use crate::storage::{DynStorageBackend, FakeS3, StorageBackend, StorageBackendExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 
