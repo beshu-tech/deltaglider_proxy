@@ -219,6 +219,39 @@ fn reference_size_mismatch(size: u64, got: u64) -> StorageError {
     ))
 }
 
+/// The key claim of a stored bucket (`storage/encrypting/sentinel.rs`):
+/// the fingerprint label (`fp-<hex>`) of the key that encrypts the bucket,
+/// and the version that a conditional replace or remove names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyClaim {
+    pub fingerprint: String,
+    pub version: String,
+}
+
+/// A conditional write of a bucket's key claim.
+#[derive(Debug, Clone, Copy)]
+pub enum ClaimWrite<'a> {
+    /// Create the claim; lost when one exists.
+    Create(&'a str),
+    /// Replace the claim at `version`; lost when it changed.
+    Replace {
+        fingerprint: &'a str,
+        version: &'a str,
+    },
+    /// Remove the claim at `version`.
+    Remove { version: &'a str },
+}
+
+/// The outcome of a [`ClaimWrite`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    Written,
+    /// Another writer changed the claim first: read it again.
+    Lost,
+    /// The backend keeps no claims (a test double).
+    NoStore,
+}
+
 /// One range read of a passthrough object
 /// ([`StorageBackend::open_passthrough_range`]).
 /// A listing token, and the stored object it was kept for.
@@ -1406,6 +1439,26 @@ pub trait StorageBackend: Send + Sync {
     /// asks the backend that stores the bucket.
     fn write_refusal(&self, _bucket: &str) -> Option<String> {
         None
+    }
+
+    /// The key claim of `bucket` (`storage/encrypting/sentinel.rs`), or
+    /// `None`. A raw backend keeps it where listings do not show it; the
+    /// encrypting wrapper asks its inner backend. The default keeps none.
+    fn read_key_claim(
+        &self,
+        _bucket: &str,
+    ) -> impl Future<Output = Result<Option<KeyClaim>, StorageError>> + Send {
+        async { Ok(None) }
+    }
+
+    /// Write the key claim of `bucket` with the condition of `op`. A
+    /// backend without conditional writes writes without the condition.
+    fn write_key_claim(
+        &self,
+        _bucket: &str,
+        _op: ClaimWrite<'_>,
+    ) -> impl Future<Output = Result<ClaimOutcome, StorageError>> + Send {
+        async { Ok(ClaimOutcome::NoStore) }
     }
 
     /// A name for the STORAGE behind `bucket`: two bucket names that store

@@ -21,6 +21,7 @@
 //!   - `tests.rs`    — unit tests
 
 mod body;
+mod claim;
 mod client;
 mod copy;
 mod errors;
@@ -1456,6 +1457,21 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
+    async fn read_key_claim(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::storage::KeyClaim>, StorageError> {
+        self.read_claim(bucket).await
+    }
+
+    async fn write_key_claim(
+        &self,
+        bucket: &str,
+        op: crate::storage::ClaimWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, StorageError> {
+        self.write_claim(bucket, op).await
+    }
+
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
         let buckets_to_scan = if let Some(b) = bucket {
             vec![b.to_string()]

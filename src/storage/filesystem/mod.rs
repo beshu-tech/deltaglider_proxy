@@ -1122,6 +1122,9 @@ impl FilesystemBackend {
     }
 }
 
+/// The file of a bucket's key claim, in the bucket's directory.
+const KEY_CLAIM_FILE: &str = ".dg-key-claim";
+
 impl StorageBackend for FilesystemBackend {
     async fn flush_pending(&self) -> Result<(), StorageError> {
         tokio::task::spawn_blocking(flush_pending_fsync)
@@ -1987,6 +1990,84 @@ impl StorageBackend for FilesystemBackend {
             Durability::Sync,
         )
         .await
+    }
+
+    /// The key claim is a file in the bucket's directory, beside
+    /// `deltaspaces/`: listings do not see it, and DeleteBucket prunes it
+    /// with the other residue. Its version is its content.
+    async fn read_key_claim(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::storage::KeyClaim>, StorageError> {
+        match fs::read_to_string(self.bucket_dir(bucket).join(KEY_CLAIM_FILE)).await {
+            Ok(text) => {
+                let fingerprint = text.trim().to_string();
+                Ok(Some(crate::storage::KeyClaim {
+                    version: fingerprint.clone(),
+                    fingerprint,
+                }))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn write_key_claim(
+        &self,
+        bucket: &str,
+        op: crate::storage::ClaimWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, StorageError> {
+        use crate::storage::{ClaimOutcome, ClaimWrite};
+        let dir = self.bucket_dir(bucket);
+        if !fsio::exists(&dir).await? {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let path = dir.join(KEY_CLAIM_FILE);
+        let current = self.read_key_claim(bucket).await?;
+        match op {
+            ClaimWrite::Create(fp) => {
+                // `create_new` is the condition: one creator wins.
+                let created = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .await;
+                match created {
+                    Ok(mut f) => {
+                        use tokio::io::AsyncWriteExt;
+                        f.write_all(fp.as_bytes()).await?;
+                        f.sync_all().await?;
+                        Ok(ClaimOutcome::Written)
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        Ok(ClaimOutcome::Lost)
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            ClaimWrite::Replace {
+                fingerprint,
+                version,
+            } => {
+                if current.as_ref().map(|c| c.version.as_str()) != Some(version) {
+                    return Ok(ClaimOutcome::Lost);
+                }
+                let tmp = dir.join(format!("{KEY_CLAIM_FILE}.{}", std::process::id()));
+                fs::write(&tmp, fingerprint.as_bytes()).await?;
+                fs::rename(&tmp, &path).await?;
+                Ok(ClaimOutcome::Written)
+            }
+            ClaimWrite::Remove { version } => {
+                if current.as_ref().map(|c| c.version.as_str()) != Some(version) {
+                    return Ok(ClaimOutcome::Lost);
+                }
+                match fsio::remove_file(&path).await {
+                    Ok(()) => Ok(ClaimOutcome::Written),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClaimOutcome::Lost),
+                    Err(e) => Err(e.into()),
+                }
+            }
+        }
     }
 
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {

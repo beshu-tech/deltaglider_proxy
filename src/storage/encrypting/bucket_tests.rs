@@ -364,9 +364,15 @@ async fn a_witness_refusal_stops_every_write_also_a_folder_marker() {
 fn every_write_method_checks_the_witness() {
     let traits = std::fs::read_to_string("src/storage/traits.rs").unwrap();
     let wrapper = std::fs::read_to_string("src/storage/encrypting/mod.rs").unwrap();
-    // Trait defaults that only delegate to a checked method, and
-    // `write_refusal`, the witness query itself (it writes nothing).
-    let delegating = ["put_reference_from_file", "write_refusal"];
+    // Trait defaults that only delegate to a checked method,
+    // `write_refusal`, the witness query itself (it writes nothing), and
+    // `write_key_claim`, which the wrapper's own check sends to the raw
+    // backend below it (nothing above the wrapper writes a claim).
+    let delegating = [
+        "put_reference_from_file",
+        "write_refusal",
+        "write_key_claim",
+    ];
     let prefixes = [
         "put_",
         "write_",
@@ -531,4 +537,158 @@ async fn a_read_of_a_foreign_seal_refuses_later_writes() {
     assert!(seal::names_a_key_not_held(&read.to_string()), "{read}");
     let err = put_b("third.txt").await.unwrap_err();
     assert!(err.to_string().contains("sealed.bin"), "{err}");
+}
+
+/// A proxy with the sentinel over `dir`, with the backend key `k` (`None`:
+/// plaintext) and the read-only keys `ring`.
+async fn proxy(
+    dir: &std::path::Path,
+    k: Option<u8>,
+    ring: &[u8],
+) -> (
+    EncryptingBackend<FilesystemBackend>,
+    Arc<ArcSwap<EncryptionConfig>>,
+) {
+    let cfg = Arc::new(ArcSwap::new(Arc::new(keyed_config(k, ring))));
+    let p = EncryptingBackend::new(
+        FilesystemBackend::new(dir.to_path_buf()).await.unwrap(),
+        cfg.clone(),
+    )
+    .with_sentinel(Arc::new(KeySentinel::default()));
+    (p, cfg)
+}
+
+fn keyed_config(k: Option<u8>, ring: &[u8]) -> EncryptionConfig {
+    EncryptionConfig {
+        key: k.map(key),
+        key_id: k.map(|b| format!("k{b:02x}")),
+        keyring: ring
+            .iter()
+            .map(|b| (format!("old{b:02x}"), key(*b)))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn claim_of(dir: &std::path::Path, bucket: &str) -> Option<String> {
+    std::fs::read_to_string(dir.join(bucket).join(".dg-key-claim")).ok()
+}
+
+fn fp_label(b: u8) -> String {
+    fingerprint_label(&key(b))
+}
+
+/// Two proxies with different keys start on one EMPTY bucket at the same
+/// moment. No object exists for a sample to find, so only the claim can
+/// decide: exactly one of the two first writes succeeds, and the bucket
+/// holds one key.
+#[tokio::test]
+async fn two_keys_racing_on_an_empty_bucket_leave_one_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _) = proxy(dir.path(), Some(0xa1), &[]).await;
+    let (b, _) = proxy(dir.path(), Some(0xb2), &[]).await;
+    a.create_bucket("releases").await.unwrap();
+    let (ra, rb) = tokio::join!(
+        put_x(&a, "releases", "from-a.bin"),
+        put_x(&b, "releases", "from-b.bin")
+    );
+    assert!(ra.is_ok() != rb.is_ok(), "exactly one wins: {ra:?} {rb:?}");
+    let (winner, loser, lost) = if ra.is_ok() {
+        (0xa1, &b, rb.unwrap_err())
+    } else {
+        (0xb2, &a, ra.unwrap_err())
+    };
+    assert_eq!(claim_of(dir.path(), "releases").unwrap(), fp_label(winner));
+    let msg = lost.to_string();
+    assert!(msg.contains(&fp_label(winner)), "{msg}");
+    assert!(seal::names_a_key_not_held(&msg), "{msg}");
+    // The loser stays refused.
+    assert!(put_x(loser, "releases", "again.bin").await.is_err());
+}
+
+/// The claim does not depend on what a sample of the bucket finds: with
+/// the encrypted objects out of reach (here: gone), a proxy with another
+/// key, and a proxy without a key, are still refused.
+#[tokio::test]
+async fn the_claim_refuses_without_any_encrypted_object_in_sight() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _) = proxy(dir.path(), Some(0xa1), &[]).await;
+    a.create_bucket("releases").await.unwrap();
+    put_x(&a, "releases", "sealed.bin").await.unwrap();
+    a.delete_passthrough("releases", "", "sealed.bin")
+        .await
+        .unwrap();
+    assert_eq!(claim_of(dir.path(), "releases").unwrap(), fp_label(0xa1));
+
+    for k in [Some(0xb2), None] {
+        let (other, _) = proxy(dir.path(), k, &[]).await;
+        let err = put_x(&other, "releases", "x.bin").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("key claim"), "{k:?}: {msg}");
+        assert!(msg.contains(&fp_label(0xa1)), "{k:?}: {msg}");
+    }
+    // A proxy that holds the key as a read-only entry writes again.
+    let (reader, _) = proxy(dir.path(), None, &[0xa1]).await;
+    put_x(&reader, "releases", "x.bin").await.unwrap();
+}
+
+/// A key rotation moves the claim to the new key (the old one is still in
+/// the ring); a proxy that has only the old key is then refused, because it
+/// cannot read what the rotated proxy writes.
+#[tokio::test]
+async fn a_rotation_moves_the_claim_and_refuses_the_old_key_only_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, a_cfg) = proxy(dir.path(), Some(0xa1), &[]).await;
+    a.create_bucket("releases").await.unwrap();
+    put_x(&a, "releases", "v1.bin").await.unwrap();
+    let (old_only, _) = proxy(dir.path(), Some(0xa1), &[]).await;
+    put_x(&old_only, "releases", "peer.bin").await.unwrap();
+
+    a_cfg.store(Arc::new(keyed_config(Some(0xa2), &[0xa1])));
+    put_x(&a, "releases", "v2.bin").await.unwrap();
+    assert_eq!(claim_of(dir.path(), "releases").unwrap(), fp_label(0xa2));
+
+    // The peer's cached claim names its own key; a fresh peer reads the
+    // new claim at once.
+    let (old_fresh, _) = proxy(dir.path(), Some(0xa1), &[]).await;
+    let err = put_x(&old_fresh, "releases", "x.bin").await.unwrap_err();
+    assert!(err.to_string().contains(&fp_label(0xa2)), "{err}");
+}
+
+/// The owner turns encryption off (it keeps the key to read the history):
+/// its next write removes the claim. A bucket without a claim and without
+/// encrypted objects is open to a proxy without a key.
+#[tokio::test]
+async fn the_owner_that_stops_encrypting_removes_the_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, a_cfg) = proxy(dir.path(), Some(0xa1), &[]).await;
+    a.create_bucket("releases").await.unwrap();
+    put_x(&a, "releases", "sealed.bin").await.unwrap();
+    a.delete_passthrough("releases", "", "sealed.bin")
+        .await
+        .unwrap();
+
+    a_cfg.store(Arc::new(keyed_config(None, &[0xa1])));
+    put_x(&a, "releases", "plain.bin").await.unwrap();
+    assert_eq!(claim_of(dir.path(), "releases"), None);
+
+    let (keyless, _) = proxy(dir.path(), None, &[]).await;
+    put_x(&keyless, "releases", "other.bin").await.unwrap();
+}
+
+/// A writer never claims a bucket that already holds another key (an
+/// earlier release encrypted it, so it has no claim): the sample refuses
+/// first, and the bucket stays unclaimed.
+#[tokio::test]
+async fn a_writer_does_not_claim_a_bucket_that_holds_another_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _) = proxy(dir.path(), Some(0xa1), &[]).await;
+    a.create_bucket("releases").await.unwrap();
+    put_x(&a, "releases", "sealed.bin").await.unwrap();
+    std::fs::remove_file(dir.path().join("releases").join(".dg-key-claim")).unwrap();
+
+    let (b, _) = proxy(dir.path(), Some(0xb2), &[]).await;
+    let err = put_x(&b, "releases", "x.bin").await.unwrap_err();
+    assert!(err.to_string().contains("sealed.bin"), "{err}");
+    assert_eq!(claim_of(dir.path(), "releases"), None);
 }

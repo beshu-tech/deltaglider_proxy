@@ -49,6 +49,13 @@ use super::list_size_cache::LogicalFacts;
 /// `.dg`, which listings already hide as an internal directory.
 pub const FACTS_ROOT: &str = ".dg/facts/";
 
+/// The key claim of the bucket (`storage/encrypting/sentinel.rs`). It is in
+/// the facts namespace so that listings hide it and the purge before a
+/// DeleteBucket removes it. It is not a facts key that parses (the stored
+/// key part is empty, and `key-claim` is no payload format), so the scans
+/// and the GC leave it alone.
+pub const KEY_CLAIM_KEY: &str = ".dg/facts/!!key-claim";
+
 /// Ends the encoded stored key inside a facts key.
 const TERMINATOR: &str = "!!";
 

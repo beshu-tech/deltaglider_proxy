@@ -109,6 +109,12 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
             being re-encrypted, writes to it get 503 and reads pass.
           </li>
           <li>
+            A bucket holds one key. A second proxy that shares the backend
+            but not the key cannot write into an encrypted bucket. It
+            refuses the write, so nothing lands in plaintext or under
+            another key next to your ciphertext.
+          </li>
+          <li>
             Every S3 request lands in the structured stdout log.
             Proxy-AES mode does not emit per-decrypt audit events. If you
             need "who decrypted what, when", use <code>sse-kms</code> and

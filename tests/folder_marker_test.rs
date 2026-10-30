@@ -116,7 +116,8 @@ async fn delete_of_a_prefix_key_deletes_only_the_marker_on_encrypted_s3() {
     skip_unless_minio!();
     let server = TestServer::builder()
         .s3_endpoint(&common::minio_endpoint_url())
-        .bucket(common::MINIO_BUCKET)
+        // Its own bucket: the shared test bucket is written in plaintext.
+        .bucket(&common::unique_bucket("fm-encrypted"))
         .encryption_key("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         .build()
         .await;

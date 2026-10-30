@@ -13,16 +13,29 @@
 //! its key by fingerprint (the `dg-sealed` metadata and the `!!2` listing
 //! token both start with it).
 //!
-//! Evidence comes from two places:
+//! Evidence comes from three places:
 //!
-//! 1. **Sightings**, at no cost: every sealed object that this wrapper reads
+//! 1. **The key claim**: a proxy that encrypts a bucket claims it for its
+//!    key, with one small object that it creates with a conditional write
+//!    (`If-None-Match: *` on S3, `create_new` on a filesystem;
+//!    [`crate::storage::listing_facts::KEY_CLAIM_KEY`]). Two proxies with
+//!    different keys cannot both claim one bucket, also not when both
+//!    start on an empty bucket at the same moment, and a claim does not
+//!    depend on the size of the bucket. [`claim_step`] decides what a
+//!    writer does with it: create it, keep it, replace it after a key
+//!    rotation (the old key is still in the ring), remove it when the
+//!    bucket stops encrypting, or refuse the write. A proxy that writes
+//!    plaintext only reads the claim, every [`OPEN_CLAIM_TTL`].
+//! 2. **Sightings**, at no cost: every sealed object that this wrapper reads
 //!    (GET, HEAD, a listing with metadata, the reference fence before a
 //!    delta write) records the fingerprint of its key.
-//! 2. **A probe**, before the first write to a bucket and then every
+//! 3. **A probe**, before the first write to a bucket and then every
 //!    [`PROBE_TTL`]: one listing page from the root, the listing tokens of
 //!    that page (S3: one more LIST of the facts namespace) and a HEAD of a
 //!    few baselines and objects spread over the page. It stops at the first
-//!    key that this proxy does not have.
+//!    key that this proxy does not have. It finds the buckets that an
+//!    earlier release encrypted, which have no claim. A writer probes
+//!    before it claims, so it never claims a bucket that holds another key.
 //!
 //! The verdict is computed against the CURRENT keyring on every write, so
 //! an operator who adds the missing key (as the write key, or as a read-only
@@ -49,6 +62,11 @@ pub const SIGHTING_TTL: Duration = Duration::from_secs(3600);
 pub const PROBE_LIST: usize = 200;
 /// Objects (baselines first) that the probe sends a HEAD for.
 pub const PROBE_HEADS: usize = 8;
+/// How long the claim holds that this proxy keeps (its own key).
+pub const CLAIM_TTL: Duration = Duration::from_secs(600);
+/// How long a missing or refused claim holds before the next read: a
+/// proxy that writes plaintext sees another proxy's new claim this soon.
+pub const OPEN_CLAIM_TTL: Duration = Duration::from_secs(60);
 
 /// The fingerprint of a key, as the objects carry it.
 pub type Fingerprint = [u8; FP_LEN];
@@ -61,6 +79,10 @@ struct BucketEvidence {
     seen: HashMap<Fingerprint, (Instant, String)>,
     /// When the probe verdict expires; `None` = never probed.
     probe_valid_until: Option<Instant>,
+    /// The key claim as last read or written (`None` = no claim).
+    claim: Option<Fingerprint>,
+    /// When the claim must be read again; `None` = never read.
+    claim_valid_until: Option<Instant>,
 }
 
 /// The sentinel state of one raw backend, shared by every engine of the
@@ -118,6 +140,48 @@ impl KeySentinel {
         e.probe_valid_until = Some(now + ttl);
     }
 
+    /// Must the claim be read (again) before a write that writes with
+    /// `write`? When the cached claim calls for a change (a rotation, the
+    /// first claim), yes.
+    pub fn claim_due(
+        &self,
+        bucket: &str,
+        held: impl Fn(&Fingerprint) -> bool,
+        write: Option<Fingerprint>,
+    ) -> bool {
+        let now = Instant::now();
+        let buckets = self.buckets.lock();
+        let Some(e) = buckets.get(bucket) else {
+            return true;
+        };
+        if e.claim_valid_until.is_none_or(|until| now >= until) {
+            return true;
+        }
+        let cached = e.claim.map(|fp| (Some(fp), String::new()));
+        !matches!(
+            claim_step(cached.as_ref().map(|(f, v)| (*f, v.as_str())), held, write),
+            ClaimStep::Keep | ClaimStep::Refuse(_)
+        )
+    }
+
+    /// Record the claim of `bucket` as read or written. `own`: the claim
+    /// names this proxy's write key (it holds longer).
+    pub fn claim_seen(&self, bucket: &str, claim: Option<Fingerprint>, own: bool) {
+        let ttl = if own { CLAIM_TTL } else { OPEN_CLAIM_TTL };
+        let mut buckets = self.buckets.lock();
+        let e = buckets.entry(bucket.to_string()).or_default();
+        e.claim = claim;
+        e.claim_valid_until = Some(Instant::now() + ttl);
+    }
+
+    /// The claim could not be read or written: keep the cached one, and try
+    /// again after `OPEN_CLAIM_TTL`.
+    pub fn claim_failed(&self, bucket: &str) {
+        let mut buckets = self.buckets.lock();
+        let e = buckets.entry(bucket.to_string()).or_default();
+        e.claim_valid_until = Some(Instant::now() + OPEN_CLAIM_TTL);
+    }
+
     /// The probe lock (see [`Self::needs_probe`]).
     pub async fn probe_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.probe.lock().await
@@ -130,11 +194,76 @@ impl KeySentinel {
         let now = Instant::now();
         let mut buckets = self.buckets.lock();
         let e = buckets.get_mut(bucket)?;
+        if let Some(claim) = e.claim.filter(|fp| ring.get(fp).is_none()) {
+            return Some(refusal_message(
+                bucket,
+                &claim,
+                "named by the key claim of the bucket",
+                write_key,
+            ));
+        }
         e.seen
             .retain(|_, (at, _)| now.duration_since(*at) < SIGHTING_TTL);
         let foreign = first_foreign(&e.seen, |fp| ring.get(fp).is_some())?;
-        Some(refusal_message(bucket, &foreign.0, &foreign.1, write_key))
+        Some(refusal_message(
+            bucket,
+            &foreign.0,
+            &format!("for example '{}'", foreign.1),
+            write_key,
+        ))
     }
+}
+
+/// What a writer does with the key claim of a bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimStep {
+    /// Nothing to change.
+    Keep,
+    /// Claim the bucket for this key.
+    Create(Fingerprint),
+    /// Replace the claim (at the version) with this key: a key rotation.
+    Replace(Fingerprint, String),
+    /// Remove the claim (at the version): the bucket stops encrypting.
+    Remove(String),
+    /// The claim names a key that this proxy does not have.
+    Refuse(Fingerprint),
+}
+
+/// THE claim rule (pure). `claim`: the claim as read, its fingerprint
+/// (`None` when it is not a fingerprint label) and its version. `held`:
+/// is a key in this proxy's ring. `write`: the key that this proxy writes
+/// the bucket with, `None` for plaintext.
+///
+/// A claim of a key that this proxy does not have refuses every write. A
+/// claim of a key in the ring belongs to this proxy's history, so the
+/// writer may move it to its write key (a rotation) or remove it (the
+/// bucket stops encrypting). An unreadable claim is replaced by a writer
+/// that encrypts and ignored by one that does not.
+pub fn claim_step(
+    claim: Option<(Option<Fingerprint>, &str)>,
+    held: impl Fn(&Fingerprint) -> bool,
+    write: Option<Fingerprint>,
+) -> ClaimStep {
+    match (claim, write) {
+        (None, None) | (Some((None, _)), None) => ClaimStep::Keep,
+        (None, Some(w)) => ClaimStep::Create(w),
+        (Some((None, version)), Some(w)) => ClaimStep::Replace(w, version.to_string()),
+        (Some((Some(c), _)), _) if !held(&c) => ClaimStep::Refuse(c),
+        (Some((Some(c), _)), Some(w)) if c == w => ClaimStep::Keep,
+        (Some((Some(_), version)), Some(w)) => ClaimStep::Replace(w, version.to_string()),
+        (Some((Some(_), version)), None) => ClaimStep::Remove(version.to_string()),
+    }
+}
+
+/// The text of a claim: `fp-` and the hex of the fingerprint.
+pub fn claim_label(fp: &Fingerprint) -> String {
+    format!("fp-{}", hex::encode(fp))
+}
+
+/// The fingerprint that a claim's text names, or `None`.
+pub fn parse_claim_label(text: &str) -> Option<Fingerprint> {
+    let bytes = hex::decode(text.trim().strip_prefix("fp-")?).ok()?;
+    bytes.try_into().ok()
 }
 
 /// The first fingerprint (in a stable order) of `seen` that `held` does not
@@ -161,7 +290,7 @@ pub const KEY_NOT_HELD: &str = "with a key that this proxy does not have";
 pub fn refusal_message(
     bucket: &str,
     fp: &Fingerprint,
-    object: &str,
+    evidence: &str,
     write_key: Option<&str>,
 ) -> String {
     let how = match write_key {
@@ -170,7 +299,7 @@ pub fn refusal_message(
     };
     format!(
         "bucket '{bucket}' holds objects that were encrypted {KEY_NOT_HELD} (key fp-{}, \
-         for example '{object}'). This proxy would write {how}, and the proxy that holds \
+         {evidence}). This proxy would write {how}, and the proxy that holds \
          that key could not read the result, so it refuses the write. Add that key to this \
          proxy's encryption config of the bucket, or send the writes through the proxy that \
          holds it. Reads and deletes still work",
@@ -249,6 +378,68 @@ mod tests {
         s.probed("b", Some(vec![]));
         assert!(!s.needs_probe_at("b", Instant::now() + FAILED_PROBE_TTL));
         assert!(s.needs_probe_at("b", Instant::now() + PROBE_TTL));
+    }
+
+    /// The truth table of the claim rule.
+    #[test]
+    fn claim_step_truth_table() {
+        let (a, b, c) = ([1; FP_LEN], [2; FP_LEN], [3; FP_LEN]);
+        // The ring holds a and b; c is another proxy's key.
+        let held = |fp: &Fingerprint| *fp == a || *fp == b;
+        use ClaimStep::*;
+        assert_eq!(claim_step(None, held, None), Keep);
+        assert_eq!(claim_step(None, held, Some(a)), Create(a));
+        assert_eq!(claim_step(Some((Some(a), "v")), held, Some(a)), Keep);
+        // Rotation: the claimed key is still in the ring.
+        assert_eq!(
+            claim_step(Some((Some(a), "v")), held, Some(b)),
+            Replace(b, "v".into())
+        );
+        // The bucket stops encrypting: the owner removes its claim.
+        assert_eq!(
+            claim_step(Some((Some(a), "v")), held, None),
+            Remove("v".into())
+        );
+        // Another proxy's key: refused, writing plaintext or another key.
+        assert_eq!(claim_step(Some((Some(c), "v")), held, None), Refuse(c));
+        assert_eq!(claim_step(Some((Some(c), "v")), held, Some(a)), Refuse(c));
+        // An unreadable claim.
+        assert_eq!(claim_step(Some((None, "v")), held, None), Keep);
+        assert_eq!(
+            claim_step(Some((None, "v")), held, Some(a)),
+            Replace(a, "v".into())
+        );
+    }
+
+    #[test]
+    fn a_claim_label_round_trips() {
+        let fp = [0xab; FP_LEN];
+        assert_eq!(claim_label(&fp), "fp-abababababababab");
+        assert_eq!(parse_claim_label(&claim_label(&fp)), Some(fp));
+        assert_eq!(parse_claim_label(" fp-abababababababab\n"), Some(fp));
+        for bad in [
+            "",
+            "fp-",
+            "fp-abab",
+            "abababababababab",
+            "fp-zzabababababababab",
+        ] {
+            assert_eq!(parse_claim_label(bad), None, "{bad}");
+        }
+    }
+
+    /// A claim of another proxy's key refuses the write, whatever the
+    /// sightings say; a claim of a key in the ring does not.
+    #[test]
+    fn a_foreign_claim_refuses() {
+        let (ring, own) = ring_with(&[7; 32]);
+        let s = KeySentinel::default();
+        s.claim_seen("b", Some(own), true);
+        assert_eq!(s.refusal("b", &ring, Some("k")), None);
+        s.claim_seen("b", Some([9; FP_LEN]), false);
+        let msg = s.refusal("b", &ring, Some("k")).expect("refused");
+        assert!(msg.contains("key claim"), "{msg}");
+        assert!(msg.contains(&hex::encode([9u8; FP_LEN])), "{msg}");
     }
 
     #[test]

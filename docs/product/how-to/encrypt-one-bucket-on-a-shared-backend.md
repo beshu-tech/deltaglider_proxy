@@ -135,6 +135,10 @@ In the admin UI, on an instance that has the new config:
 
 After the publish, the instances that have the same encryption write the bucket again. An instance that still has the old config refuses writes until you give it the new config. The card is not on the page of a single instance, because a single instance has no witness. To publish from the command line (`deltaglider_proxy witness publish`), and for the rules of the witness, see [How to run multiple instances](run-multiple-instances.md#8-keep-the-encryption-of-each-bucket-the-same-on-every-instance).
 
+### Other proxies on the same backend
+
+A proxy with its own configuration, which shares no sync bucket with these instances, has no witness. When it has the credentials of the backend but not the key of the bucket, it refuses to write the bucket with `400 InvalidRequest`, because the bucket holds a key claim and encrypted objects of a key that it does not have. To let its users write the bucket, create IAM users for them on these instances instead of giving the key to the other proxy. See [Buckets that another proxy encrypts](../reference/encryption.md#buckets-that-another-proxy-encrypts).
+
 ## Verify
 
 1. On **Storage → Buckets**, check the encryption chip of each row. `db-archive` shows **Encrypted · bucket key db-archive-2026-10**, and `downloads` shows **Not encrypted**. A bucket that takes the encryption of an encrypting backend shows **Encrypted · from hetzner-fsn1**.

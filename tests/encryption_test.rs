@@ -399,6 +399,146 @@ async fn a_proxy_without_the_key_refuses_to_write_an_encrypted_s3_bucket() {
     keyless_proxy_refuses_to_write(builder, &bucket).await;
 }
 
+/// Two proxies RUNNING AT ONCE with separate configs over one S3 bucket:
+/// the report's case (the owner encrypts, a second team's proxy has no key
+/// or another key). `key` is the second proxy's key, `None` for plaintext.
+async fn two_live_proxies(key: Option<&str>) -> (TestServer, TestServer, String) {
+    let bucket = common::unique_bucket("two-proxies");
+    let owner = TestServer::builder()
+        .bucket(&bucket)
+        .auth("OWNER", "OWNERSECRET")
+        .s3_endpoint(&common::minio_endpoint_url())
+        .encryption_key(TEST_KEY)
+        .build()
+        .await;
+    let mut other = TestServer::builder()
+        .bucket(&bucket)
+        .auth("OTHER", "OTHERSECRET")
+        .s3_endpoint(&common::minio_endpoint_url());
+    if let Some(k) = key {
+        other = other.encryption_key(k);
+    }
+    (owner, other.build().await, bucket)
+}
+
+async fn put_status(server: &TestServer, bucket: &str, key: &str) -> (u16, String) {
+    let resp = server
+        .http()
+        .put(format!("{}/{bucket}/{key}", server.endpoint()))
+        .body(format!("body of {key}"))
+        .send()
+        .await
+        .unwrap();
+    (resp.status().as_u16(), resp.text().await.unwrap())
+}
+
+/// The report: the second team's proxy has no key. Its PUT and its GET of
+/// the owner's object both answer 400 that names the owner's key; the
+/// owner never sees a plaintext object appear.
+#[tokio::test]
+async fn a_second_proxy_without_the_key_cannot_write_the_owners_bucket() {
+    skip_unless_minio!();
+    let (owner, other, bucket) = two_live_proxies(None).await;
+    assert_eq!(put_status(&owner, &bucket, "integrity/a.html").await.0, 200);
+    let fp = common::key_fp_label(TEST_KEY);
+
+    let (status, body) = put_status(&other, &bucket, "integrity/b.html").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains(fp.trim_start_matches("fp-")), "{body}");
+
+    let get = other
+        .http()
+        .get(format!("{}/{bucket}/integrity/a.html", other.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    let get_status = get.status();
+    let get_body = get.text().await.unwrap();
+    assert_eq!(get_status, 400, "{get_body}");
+    assert!(
+        get_body.contains(fp.trim_start_matches("fp-")),
+        "{get_body}"
+    );
+
+    let listed = owner
+        .s3_client()
+        .await
+        .list_objects_v2()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<_> = listed.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, ["integrity/a.html"]);
+}
+
+/// Two keys in one bucket: a second proxy with ANOTHER key is refused, and
+/// so is the owner once the other key holds the claim. Writes from both at
+/// the same moment on an empty bucket leave exactly one key.
+#[tokio::test]
+async fn two_proxies_with_different_keys_never_both_write_one_bucket() {
+    skip_unless_minio!();
+    let (owner, other, bucket) = two_live_proxies(Some(OTHER_KEY)).await;
+    // Both write their first object at the same moment, on an empty bucket.
+    let (a, b) = tokio::join!(
+        put_status(&owner, &bucket, "first-owner.bin"),
+        put_status(&other, &bucket, "first-other.bin")
+    );
+    assert!(
+        (a.0 == 200) != (b.0 == 200),
+        "exactly one key wins the bucket: owner {a:?}, other {b:?}"
+    );
+    let (winner, loser, winner_key) = if a.0 == 200 {
+        (&owner, &other, TEST_KEY)
+    } else {
+        (&other, &owner, OTHER_KEY)
+    };
+    let fp = common::key_fp_label(winner_key);
+    for key in ["later-1.bin", "integrity/later-2.bin"] {
+        let (status, body) = put_status(loser, &bucket, key).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains(fp.trim_start_matches("fp-")), "{body}");
+    }
+    assert_eq!(put_status(winner, &bucket, "more.bin").await.0, 200);
+
+    // The claim is internal: it does not list, and it does not keep an
+    // emptied bucket from being deleted.
+    let client = winner.s3_client().await;
+    let listed = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    let mut keys: Vec<_> = listed
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect();
+    keys.sort();
+    let first = if a.0 == 200 {
+        "first-owner.bin"
+    } else {
+        "first-other.bin"
+    };
+    assert_eq!(keys, [first, "more.bin"]);
+    for key in &keys {
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+    }
+    client
+        .delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("the key claim must not keep an empty bucket");
+}
+
 #[tokio::test]
 async fn test_unencrypted_still_readable() {
     // Start WITHOUT encryption, write an object

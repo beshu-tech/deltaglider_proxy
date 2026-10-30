@@ -699,6 +699,18 @@ impl TestServerBuilder {
 
     /// Build the config string (YAML) and spawn the test server.
     pub async fn build(self) -> TestServer {
+        // The shared MinIO bucket is written in plaintext by many tests at
+        // once. A proxy refuses to write a bucket that another proxy
+        // encrypts (the key sentinel), so an encrypting test there would
+        // fail the others: it takes a `unique_bucket` of its own.
+        assert!(
+            !(self.s3_endpoint.is_some()
+                && self.encryption_key.is_some()
+                && self.bucket == MINIO_BUCKET),
+            "an encrypting S3 test needs its own bucket (common::unique_bucket), \
+             not the shared {}",
+            MINIO_BUCKET
+        );
         let (config, data_dir) = self.build_config();
         let auth = self.auth_creds.clone();
         let mut extra_env = self.extra_env.clone();

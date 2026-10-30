@@ -384,18 +384,104 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             }
         }
         let cfg = self.config.load();
-        let write_key = self.write_key(bucket)?.map(|site| {
+        let site = self.write_key(bucket)?;
+        let write_key = site.as_ref().map(|site| {
             cfg.ring()
                 .get(&site.fingerprint())
-                .map_or_else(|| fingerprint_hex(&site), |e| e.id.clone())
+                .map_or_else(|| fingerprint_hex(site), |e| e.id.clone())
         });
-        match sentinel.refusal(bucket, cfg.ring(), write_key.as_deref()) {
-            Some(msg) => {
-                tracing::warn!("encryption: refused a write: {msg}");
-                Err(StorageError::Encryption(msg))
+        let refuse = |msg: String| {
+            tracing::warn!("encryption: refused a write: {msg}");
+            Err(StorageError::Encryption(msg))
+        };
+        // The probe and the sightings first: a writer never claims a bucket
+        // that holds another key.
+        if let Some(msg) = sentinel.refusal(bucket, cfg.ring(), write_key.as_deref()) {
+            return refuse(msg);
+        }
+        let write_fp = site.as_ref().map(|s| s.fingerprint());
+        let held = |fp: &sentinel::Fingerprint| cfg.ring().get(fp).is_some();
+        if sentinel.claim_due(bucket, held, write_fp) {
+            let _one = sentinel.probe_lock().await;
+            if sentinel.claim_due(bucket, held, write_fp) {
+                if let Err(e) = self.settle_claim(sentinel, bucket, held, write_fp).await {
+                    tracing::warn!(
+                        "encryption: the key claim of bucket '{bucket}' could not be read or \
+                         written, the write goes ahead on the evidence it has: {e}"
+                    );
+                    sentinel.claim_failed(bucket);
+                }
             }
+        }
+        match sentinel.refusal(bucket, cfg.ring(), write_key.as_deref()) {
+            Some(msg) => refuse(msg),
             None => Ok(()),
         }
+    }
+
+    /// Read the key claim of `bucket` and apply [`sentinel::claim_step`]:
+    /// create, replace or remove it with a conditional write, and read it
+    /// again when another writer changed it first.
+    async fn settle_claim(
+        &self,
+        sentinel: &KeySentinel,
+        bucket: &str,
+        held: impl Fn(&sentinel::Fingerprint) -> bool,
+        write: Option<sentinel::Fingerprint>,
+    ) -> Result<(), StorageError> {
+        use super::{ClaimOutcome, ClaimWrite};
+        use sentinel::ClaimStep;
+        for _ in 0..3 {
+            let claim = self.inner.read_key_claim(bucket).await?;
+            let parsed = claim.as_ref().map(|c| {
+                (
+                    sentinel::parse_claim_label(&c.fingerprint),
+                    c.version.as_str(),
+                )
+            });
+            let (outcome, now_claimed) = match sentinel::claim_step(parsed, &held, write) {
+                ClaimStep::Keep | ClaimStep::Refuse(_) => {
+                    let fp = parsed.and_then(|(fp, _)| fp);
+                    sentinel.claim_seen(bucket, fp, fp.is_some() && fp == write);
+                    return Ok(());
+                }
+                ClaimStep::Create(w) => {
+                    let label = sentinel::claim_label(&w);
+                    let op = ClaimWrite::Create(&label);
+                    (self.inner.write_key_claim(bucket, op).await?, Some(w))
+                }
+                ClaimStep::Replace(w, version) => {
+                    let label = sentinel::claim_label(&w);
+                    let op = ClaimWrite::Replace {
+                        fingerprint: &label,
+                        version: &version,
+                    };
+                    (self.inner.write_key_claim(bucket, op).await?, Some(w))
+                }
+                ClaimStep::Remove(version) => {
+                    let op = ClaimWrite::Remove { version: &version };
+                    (self.inner.write_key_claim(bucket, op).await?, None)
+                }
+            };
+            match outcome {
+                ClaimOutcome::Written => {
+                    tracing::info!(
+                        "encryption: key claim of bucket '{bucket}' is now {}",
+                        now_claimed.map_or("none".to_string(), |fp| sentinel::claim_label(&fp))
+                    );
+                    sentinel.claim_seen(bucket, now_claimed, now_claimed.is_some());
+                    return Ok(());
+                }
+                ClaimOutcome::NoStore => {
+                    sentinel.claim_seen(bucket, None, true);
+                    return Ok(());
+                }
+                ClaimOutcome::Lost => continue,
+            }
+        }
+        Err(StorageError::Throttled(format!(
+            "the key claim of bucket '{bucket}' changed three times while this proxy wrote it"
+        )))
     }
 
     /// The fingerprints of the keys that sealed a sample of `bucket`, with

@@ -459,10 +459,13 @@ async fn list_reports_original_delta_sizes_without_backend_heads() {
 async fn cold_list_of_an_encrypted_backend_reports_plaintext_facts() {
     skip_unless_minio!();
     const KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // Its own bucket: the shared test bucket is written in plaintext by
+    // other tests, and a proxy refuses to mix the two.
+    let bucket = common::unique_bucket("enc-cold-list");
     let encrypted = || {
         TestServer::builder()
             .s3_endpoint(&common::minio_endpoint_url())
-            .bucket(common::MINIO_BUCKET)
+            .bucket(&bucket)
             .encryption_key(KEY_HEX)
     };
     let writer = encrypted().build().await;
@@ -485,7 +488,7 @@ async fn cold_list_of_an_encrypted_backend_reports_plaintext_facts() {
         .send()
         .await
         .unwrap();
-    wait_for_facts(&common::minio_client().await, &key, 1).await;
+    wait_for_facts_in(&common::minio_client().await, &bucket, &key, 1).await;
 
     let reader = encrypted().build().await;
     let reader_client = reader.s3_client().await;
@@ -506,9 +509,10 @@ async fn cold_list_of_an_encrypted_backend_reports_plaintext_facts() {
     // The backend holds one facts entry for the object; a DELETE drops it.
     let raw = common::minio_client().await;
     let prefix = &prefix;
+    let bucket = &bucket;
     let facts = |raw: aws_sdk_s3::Client| async move {
         raw.list_objects_v2()
-            .bucket(common::MINIO_BUCKET)
+            .bucket(bucket)
             .prefix(format!(".dg/facts/{prefix}/"))
             .send()
             .await
@@ -646,6 +650,10 @@ async fn a_list_heals_missing_listing_facts() {
 /// A PUT writes its listing facts in the background (storage-8): wait until
 /// the facts namespace under `prefix` holds at least `n` entries.
 async fn wait_for_facts(raw: &aws_sdk_s3::Client, prefix: &str, n: usize) {
+    wait_for_facts_in(raw, MINIO_BUCKET, prefix, n).await
+}
+
+async fn wait_for_facts_in(raw: &aws_sdk_s3::Client, bucket: &str, prefix: &str, n: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let mut have = 0;
@@ -653,7 +661,7 @@ async fn wait_for_facts(raw: &aws_sdk_s3::Client, prefix: &str, n: usize) {
         loop {
             let r = raw
                 .list_objects_v2()
-                .bucket(MINIO_BUCKET)
+                .bucket(bucket)
                 .prefix(format!(".dg/facts/{prefix}"))
                 .set_continuation_token(token)
                 .send()
@@ -689,11 +697,13 @@ async fn facts_requests(endpoint: &str, kind: &str) -> u64 {
 /// one batched delete), not one facts LIST per key.
 #[tokio::test]
 async fn batch_delete_drops_listing_facts_in_a_few_requests() {
+    // Its own bucket: the shared test bucket is written in plaintext.
+    let bucket = common::unique_bucket("enc-batch-delete");
     skip_unless_minio!();
     const N: usize = 1000;
     let server = TestServer::builder()
         .s3_endpoint(&common::minio_endpoint_url())
-        .bucket(MINIO_BUCKET)
+        .bucket(&bucket)
         .encryption_key("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         .build()
         .await;
@@ -726,13 +736,14 @@ async fn batch_delete_drops_listing_facts_in_a_few_requests() {
         p.await.unwrap();
     }
     let raw = minio_client().await;
+    let bucket_ref = &bucket;
     let facts_left = |raw: aws_sdk_s3::Client, prefix: String| async move {
         let mut n = 0;
         let mut token = None;
         loop {
             let r = raw
                 .list_objects_v2()
-                .bucket(MINIO_BUCKET)
+                .bucket(bucket_ref)
                 .prefix(format!(".dg/facts/{prefix}/"))
                 .set_continuation_token(token)
                 .send()
@@ -745,7 +756,7 @@ async fn batch_delete_drops_listing_facts_in_a_few_requests() {
             }
         }
     };
-    wait_for_facts(&raw, &format!("{prefix}/"), N).await;
+    wait_for_facts_in(&raw, &bucket, &format!("{prefix}/"), N).await;
     assert_eq!(facts_left(raw.clone(), prefix.clone()).await, N);
 
     let (lists, deletes) = (
