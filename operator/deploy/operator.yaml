@@ -29,10 +29,10 @@ rules:
     resources: ["services", "configmaps"]
     verbs: ["get", "list", "watch", "create", "patch"]
   # Preflight reads the env Secret's KEY NAMES; autoGenerate creates <name>-bootstrap
-  # once. get + create only — the operator can never list or overwrite secrets.
+  # once. get, create, and patch to add a missing dbKey; never list.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "create"]
+    verbs: ["get", "create", "patch"]
   # PDB is create-once and not watched: no list/watch needed.
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
@@ -78,7 +78,7 @@ spec:
         runAsUser: 999
       containers:
         - name: operator
-          image: beshultd/deltaglider-operator:0.3.23
+          image: beshultd/deltaglider-operator:0.3.24
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false

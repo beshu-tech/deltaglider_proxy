@@ -25,6 +25,58 @@ pub enum Error {
     NoNamespace,
 }
 
+/// One RBAC grant: (apiGroup, resource, verbs).
+#[cfg(test)]
+pub type Grant = (&'static str, &'static str, &'static [&'static str]);
+
+/// Every API verb this reconciler sends, per resource. The ClusterRole in
+/// `deploy/operator.yaml` must grant all of them (test
+/// `cluster_role_grants_every_verb_the_reconciler_uses`). Server-side apply
+/// is `patch`, plus `create` when the object does not exist yet.
+/// `Controller::new`/`owns` need `list` + `watch`; `get_opt` needs `get`.
+#[cfg(test)]
+pub const RBAC_USED: &[Grant] = &[
+    (
+        "deltaglider.beshu.tech",
+        "deltagliderproxies",
+        &["get", "list", "watch"],
+    ),
+    (
+        "deltaglider.beshu.tech",
+        "deltagliderproxies/status",
+        &["patch"],
+    ),
+    (
+        "apps",
+        "statefulsets",
+        &["get", "list", "watch", "create", "patch"],
+    ),
+    (
+        "apps",
+        "deployments",
+        &["get", "list", "watch", "create", "patch"],
+    ),
+    ("", "services", &["list", "watch", "create", "patch"]),
+    ("", "configmaps", &["list", "watch", "create", "patch"]),
+    // get + create for a new Secret; patch adds a missing dbKey (merge patch).
+    ("", "secrets", &["get", "create", "patch"]),
+    ("policy", "poddisruptionbudgets", &["create", "patch"]),
+];
+
+/// The resource that each typed `Api<K>` in this file talks to. The source
+/// test refuses a kind that is used here but missing from this map, so a new
+/// child type cannot skip `RBAC_USED`.
+#[cfg(test)]
+pub const KIND_RESOURCES: &[(&str, &str)] = &[
+    ("DeltaGliderProxy", "deltagliderproxies"),
+    ("StatefulSet", "statefulsets"),
+    ("Deployment", "deployments"),
+    ("Service", "services"),
+    ("ConfigMap", "configmaps"),
+    ("Secret", "secrets"),
+    ("PodDisruptionBudget", "poddisruptionbudgets"),
+];
+
 pub struct Ctx {
     pub client: Client,
 }

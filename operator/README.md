@@ -34,6 +34,12 @@ kubectl apply -f deploy/operator.yaml
 To upgrade the operator, apply the new `deploy/crd.yaml` first, and then the new
 `deploy/operator.yaml`. Operator 0.3.0 adds `spec.router.trustedProxyCidrs` to the CRD.
 
+Operator 0.3.24 fixes the ClusterRole: it adds `patch` on Secrets. Operator
+releases before it could not add the config DB key (`dbKey`) to an existing
+`<name>-bootstrap` Secret, so every reconcile failed with 403 and the operator
+changed nothing in the cluster. Apply the new `deploy/operator.yaml` to get the
+new ClusterRole and image together.
+
 Create the credentials Secret and a `DeltaGliderProxy` resource. A complete example
 lives in [`deploy/example.yaml`](deploy/example.yaml):
 

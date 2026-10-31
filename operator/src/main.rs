@@ -52,4 +52,85 @@ mod tests {
             "deploy/operator.yaml must reference {expected} (bump it with the crate version)"
         );
     }
+
+    /// (apiGroup, resource, verb) triples that the ClusterRole grants.
+    fn cluster_role_grants() -> Vec<(String, String, String)> {
+        let on_disk = include_str!("../deploy/operator.yaml");
+        let mut out = vec![];
+        for doc in serde_yaml::Deserializer::from_str(on_disk) {
+            let v = <serde_yaml::Value as serde::Deserialize>::deserialize(doc).unwrap();
+            if v["kind"].as_str() != Some("ClusterRole") {
+                continue;
+            }
+            let strs = |x: &serde_yaml::Value| -> Vec<String> {
+                x.as_sequence()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.as_str().unwrap().to_string())
+                    .collect()
+            };
+            for rule in v["rules"].as_sequence().unwrap() {
+                for g in strs(&rule["apiGroups"]) {
+                    for r in strs(&rule["resources"]) {
+                        for verb in strs(&rule["verbs"]) {
+                            out.push((g.clone(), r.clone(), verb));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn cluster_role_grants_every_verb_the_reconciler_uses() {
+        let granted = cluster_role_grants();
+        assert!(
+            !granted.is_empty(),
+            "no ClusterRole in deploy/operator.yaml"
+        );
+        let mut missing = vec![];
+        for (group, resource, verbs) in reconcile::RBAC_USED {
+            for verb in *verbs {
+                let want = (group.to_string(), resource.to_string(), verb.to_string());
+                if !granted.contains(&want) {
+                    missing.push(want);
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "deploy/operator.yaml ClusterRole is missing {missing:?}"
+        );
+    }
+
+    #[test]
+    fn every_api_kind_in_the_reconciler_has_an_rbac_row() {
+        // `Api<K>` and `apply::<K>` name the kinds the reconciler talks to.
+        let src = include_str!("reconcile.rs");
+        let mut kinds = std::collections::BTreeSet::new();
+        for pat in ["Api<", "Api::<", "apply::<"] {
+            for part in src.split(pat).skip(1) {
+                let k: String = part
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                if k.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && k != "K" {
+                    kinds.insert(k);
+                }
+            }
+        }
+        assert!(kinds.contains("Secret"), "scan found no kinds: {kinds:?}");
+        for kind in &kinds {
+            let resource = reconcile::KIND_RESOURCES
+                .iter()
+                .find(|(k, _)| k == kind)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("kind {kind} has no row in KIND_RESOURCES"));
+            assert!(
+                reconcile::RBAC_USED.iter().any(|(_, r, _)| *r == resource),
+                "kind {kind} ({resource}) has no row in RBAC_USED"
+            );
+        }
+    }
 }
