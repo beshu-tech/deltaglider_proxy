@@ -26,7 +26,6 @@ env:
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
   CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
   CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: unpacked
-  BUILDER_IMAGE: ghcr.io/${{ github.repository }}/builder:latest
   # ── Dependency cache: Swatinem/rust-cache restores target/ + the cargo
   #    registry as ONE Actions-cache entry per job. sccache's GHA backend made
   #    one cache request per object file (~860 per job, 5 jobs in parallel);
@@ -106,8 +105,19 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # The [skip-integration] check diffs the whole push range.
+          fetch-depth: 0
       - name: Verify tests/*.rs map to CI --test flags
         run: ./scripts/check-integration-tests-in-ci.sh
+      # SHA-pinned actions, one MinIO digest, and [skip-integration] only on a
+      # push range that changes only *.md, docs/** and CHANGELOG.md.
+      - name: Workflow drift
+        env:
+          SKIP_CHECK_BEFORE: ${{ github.event.before }}
+          SKIP_CHECK_AFTER: ${{ github.sha }}
+          SKIP_CHECK_MESSAGE: ${{ github.event_name == 'push' && github.event.head_commit.message || '' }}
+        run: ./scripts/check-workflows.sh
       # macOS resolves imports case-insensitively; a pair such as
       # htmlPreview.ts + HtmlPreview.tsx breaks tsc in the macOS release builds.
       - name: No module paths that differ only in case
