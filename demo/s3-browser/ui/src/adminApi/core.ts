@@ -335,6 +335,8 @@ interface ConversionStarted {
   /** The re-encrypt job on this node; null when none was queued. */
   job_id: number | null;
   versioned: boolean;
+  /** The queued job deletes the noncurrent plaintext versions. */
+  purge_plaintext_versions: boolean;
 }
 
 export interface BackendInfo {
@@ -809,10 +811,15 @@ export interface ConfirmHeaders {
   /** A change of `default_backend` that makes the buckets without a route
    *  store plaintext (token `route:default`). */
   routeDefault?: boolean;
+  /** Not a confirmation but an option of the same write: the re-encrypt
+   *  jobs that the write queues for versioned buckets delete the
+   *  noncurrent plaintext versions (`X-DGP-Purge-Plaintext-Versions`). */
+  purgePlaintextVersions?: boolean;
 }
 
 const CONFIRM_KEY_REMOVAL_HEADER = 'X-DGP-Confirm-Key-Removal';
 const CONFIRM_DOWNGRADE_HEADER = 'X-DGP-Confirm-Encryption-Downgrade';
+const PURGE_PLAINTEXT_VERSIONS_HEADER = 'X-DGP-Purge-Plaintext-Versions';
 
 /** Pure: the request headers of `confirm` (empty lists send nothing). */
 export function confirmHeaderMap(confirm?: ConfirmHeaders): Record<string, string> {
@@ -826,6 +833,7 @@ export function confirmHeaderMap(confirm?: ConfirmHeaders): Record<string, strin
     ...(confirm?.routeDefault ? ['route:default'] : []),
   ];
   if (downgrades.length > 0) out[CONFIRM_DOWNGRADE_HEADER] = downgrades.join(',');
+  if (confirm?.purgePlaintextVersions) out[PURGE_PLAINTEXT_VERSIONS_HEADER] = 'true';
   return out;
 }
 

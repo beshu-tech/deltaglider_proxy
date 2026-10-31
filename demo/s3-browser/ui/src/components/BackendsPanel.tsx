@@ -7,7 +7,8 @@ import { Button, Input, Radio, Switch, Typography, Space, Alert, message } from 
 import { ErrorState, LoadingState } from './StatePlaceholders';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
 import type { BackendEncryptionMode, BackendHealthEntry, BackendInfo, ConfirmHeaders, ConversionView, CreateBackendRequest } from '../adminApi';
-import { conversionCountText, versionedWarnings } from '../conversionView';
+import { conversionCountText, offersPurge, versionedWarnings } from '../conversionView';
+import PurgeVersionsBox from './PurgeVersionsBox';
 import { confirmDialog } from '../confirmDialog';
 import { backendHealthSentence, createBackend, deleteBackend, plainError, probeBackend, testS3Connection, updateAdminConfig, getSectionVersioned, validateSection } from '../adminApi';
 import type { PlainError } from '../adminApi';
@@ -362,13 +363,16 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       const body = buildEncryptionSectionBody(backendName, patch, storage);
       // Turning a backend's encryption off confirms the downgrade for the
       // buckets that inherit from it (`backend:<name>`).
-      const confirm = patch.mode === 'none' && prevMode !== 'none' ? { backendDowngrades: [backendName] } : undefined;
+      let confirm: ConfirmHeaders | undefined =
+        patch.mode === 'none' && prevMode !== 'none' ? { backendDowngrades: [backendName] } : undefined;
       // Turning on proxy AES over buckets that hold objects starts their
       // conversion on the server: say how many objects, and ask first.
       if (patch.mode === 'aes256-gcm-proxy') {
         const plan = await validateSection('storage', body, confirm);
         const text = conversionCountText(plan.conversion_preview);
         if (plan.ok && text) {
+          // The dialog's content is static: the box reports into a local.
+          let purge = false;
           const ok = await confirmDialog({
             title: `Encrypt backend ${backendName}?`,
             content: (
@@ -379,6 +383,13 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                     {w}
                   </Text>
                 ))}
+                {offersPurge(plan.conversion_preview) && (
+                  <PurgeVersionsBox
+                    onChange={(v) => {
+                      purge = v;
+                    }}
+                  />
+                )}
               </div>
             ),
             okText: 'Encrypt',
@@ -387,6 +398,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
             resultSet = true;
             throw new Error('cancelled');
           }
+          if (purge) confirm = { ...confirm, purgePlaintextVersions: true };
         }
       }
       const result = await applySection(qc, 'storage', body, version, confirm);

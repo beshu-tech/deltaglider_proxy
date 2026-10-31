@@ -442,12 +442,10 @@ async fn serve_is_still_served_with_a_deprecation_warning() {
     assert_eq!(env.get("applyserve", "a.txt").await, (200, BODY.to_vec()));
 }
 
-/// A versioned backend bucket (MinIO): the validate and the apply warn
-/// that the plaintext versions stay as noncurrent versions.
-#[tokio::test]
-async fn a_versioned_bucket_warns_that_plaintext_versions_stay() {
-    skip_unless_minio!();
-    let bucket = common::unique_bucket("applyver");
+/// A versioned MinIO bucket that holds `a.txt` (a plain object) and
+/// `app.zip` (a delta and a reference), both plaintext.
+async fn versioned_bucket(prefix: &str) -> (String, Env) {
+    let bucket = common::unique_bucket(prefix);
     let minio = common::minio_client().await;
     minio.create_bucket().bucket(&bucket).send().await.unwrap();
     minio
@@ -463,13 +461,123 @@ async fn a_versioned_bucket_warns_that_plaintext_versions_stay() {
         .unwrap();
     let env = Env::minio(&bucket).await;
     env.put(&bucket, "a.txt").await;
+    env.put(&bucket, "rel/app.zip").await;
+    (bucket, env)
+}
 
-    let (code, v) = env.encrypt(true).await;
+/// Encrypt only `bucket`: the shared MinIO holds the buckets of other
+/// tests, and a backend-wide key would start their conversions too.
+/// `purge`: the config write carries the purge header.
+async fn encrypt_bucket(env: &Env, bucket: &str, validate: bool, purge: bool) -> (u16, Value) {
+    let url = format!(
+        "{}/_/api/admin/config/section/storage{}",
+        env.server.endpoint(),
+        if validate { "/validate" } else { "" }
+    );
+    let req = if validate {
+        env.admin.post(url)
+    } else {
+        env.admin.put(url)
+    };
+    let req = if purge {
+        req.header("X-DGP-Purge-Plaintext-Versions", "true")
+    } else {
+        req
+    };
+    let resp = req
+        .json(&json!({ "buckets": { bucket: { "encryption": aes() } } }))
+        .send()
+        .await
+        .unwrap();
+    let code = resp.status().as_u16();
+    (code, resp.json().await.unwrap_or_default())
+}
+
+/// The entry of `bucket` in the list `list` of a response.
+fn entry<'a>(v: &'a Value, list: &str, bucket: &str) -> &'a Value {
+    v[list]
+        .as_array()
+        .and_then(|a| a.iter().find(|c| c["bucket"] == bucket))
+        .unwrap_or_else(|| panic!("no {list} entry for {bucket}: {v}"))
+}
+
+/// Every version of the bucket on MinIO, outside the facts namespace:
+/// `(key, is latest, carries the encryption marker)`.
+async fn raw_versions(bucket: &str) -> Vec<(String, bool, bool)> {
+    let minio = common::minio_client().await;
+    let page = minio
+        .list_object_versions()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(page.is_truncated(), Some(true), "one page is enough here");
+    let mut out = Vec::new();
+    for v in page.versions() {
+        let key = v.key().unwrap().to_string();
+        if key.starts_with(".dg/facts/") {
+            continue;
+        }
+        let head = minio
+            .head_object()
+            .bucket(bucket)
+            .key(&key)
+            .version_id(v.version_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+        // The S3 backend stores the wrapper's `dg-encrypted` as user metadata.
+        let sealed = head
+            .metadata()
+            .is_some_and(|m| m.contains_key("user-dg-encrypted"));
+        out.push((key, v.is_latest() == Some(true), sealed));
+    }
+    out.sort();
+    out
+}
+
+/// The noncurrent versions, as `(key, sealed)`.
+fn noncurrent(versions: &[(String, bool, bool)]) -> Vec<(String, bool)> {
+    versions
+        .iter()
+        .filter(|(_, latest, _)| !latest)
+        .map(|(k, _, sealed)| (k.clone(), *sealed))
+        .collect()
+}
+
+/// Every current version is encrypted, and both objects read back.
+async fn current_is_sealed_and_readable(
+    env: &Env,
+    bucket: &str,
+    versions: &[(String, bool, bool)],
+) {
+    let current: Vec<_> = versions.iter().filter(|(_, latest, _)| *latest).collect();
+    assert!(current.iter().any(|(k, _, _)| k == "a.txt"), "{versions:?}");
+    assert!(
+        current.iter().all(|(_, _, sealed)| *sealed),
+        "every current version is encrypted: {versions:?}"
+    );
+    assert_eq!(env.get(bucket, "a.txt").await, (200, BODY.to_vec()));
+    assert_eq!(env.get(bucket, "rel/app.zip").await, (200, BODY.to_vec()));
+}
+
+/// A versioned backend bucket (MinIO): the validate and the apply warn
+/// that the plaintext versions stay as noncurrent versions, and they do.
+/// A later re-encrypt job with `purge_plaintext_versions` deletes them,
+/// and keeps the current versions and an encrypted noncurrent version.
+#[tokio::test]
+async fn a_versioned_bucket_keeps_plaintext_versions_until_a_job_purges_them() {
+    skip_unless_minio!();
+    let (bucket, env) = versioned_bucket("applyver").await;
+
+    let (code, v) = encrypt_bucket(&env, &bucket, true, false).await;
     assert_eq!(code, 200, "{v}");
-    assert_eq!(v["conversion_preview"][0]["versioned"], true, "{v}");
-    let (code, v) = env.encrypt(false).await;
+    assert_eq!(entry(&v, "conversion_preview", &bucket)["versioned"], true);
+    let (code, v) = encrypt_bucket(&env, &bucket, false, false).await;
     assert_eq!(code, 200, "{v}");
-    assert_eq!(v["conversions"][0]["versioned"], true, "{v}");
+    let started = entry(&v, "conversions", &bucket);
+    assert_eq!(started["versioned"], true, "{v}");
+    assert_eq!(started["purge_plaintext_versions"], false, "{v}");
     assert!(
         v["warnings"]
             .as_array()
@@ -479,5 +587,75 @@ async fn a_versioned_bucket_warns_that_plaintext_versions_stay() {
         "{v}"
     );
     env.wait_done(&bucket).await;
-    assert_eq!(env.get(&bucket, "a.txt").await, (200, BODY.to_vec()));
+    let versions = raw_versions(&bucket).await;
+    current_is_sealed_and_readable(&env, &bucket, &versions).await;
+    assert!(
+        noncurrent(&versions).contains(&("a.txt".to_string(), false)),
+        "without the purge the plaintext v1 stays: {versions:?}"
+    );
+
+    // An encrypted noncurrent version: a second encrypted write of a.txt.
+    env.put(&bucket, "a.txt").await;
+    let r = env
+        .admin
+        .post(format!(
+            "{}/_/api/admin/jobs/reencrypt",
+            env.server.endpoint()
+        ))
+        .json(&json!({ "buckets": [bucket], "purge_plaintext_versions": true }))
+        .send()
+        .await
+        .unwrap();
+    let v: Value = r.json().await.unwrap();
+    let id = v["started"][0]["job_id"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{v}"));
+    env.wait_done(&bucket).await;
+
+    let versions = raw_versions(&bucket).await;
+    current_is_sealed_and_readable(&env, &bucket, &versions).await;
+    let old = noncurrent(&versions);
+    assert!(
+        old.iter().all(|(_, sealed)| *sealed),
+        "no plaintext version is left: {versions:?}"
+    );
+    assert!(
+        old.contains(&("a.txt".to_string(), true)),
+        "the encrypted noncurrent version stays: {versions:?}"
+    );
+    let job = env.job(id).await;
+    assert_eq!(job["status_raw"], "completed", "{job}");
+    assert!(
+        job.to_string()
+            .contains("3 noncurrent plaintext version(s) deleted"),
+        "the run summary counts the purge (a.txt, app.zip, reference.bin): {job}"
+    );
+}
+
+/// The apply's header asks the job it queues to purge: the plaintext
+/// versions are gone after the conversion, the current ones are intact.
+#[tokio::test]
+async fn an_apply_with_the_purge_header_deletes_the_plaintext_versions() {
+    skip_unless_minio!();
+    let (bucket, env) = versioned_bucket("applypurge").await;
+
+    let (code, v) = encrypt_bucket(&env, &bucket, false, true).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(
+        entry(&v, "conversions", &bucket)["purge_plaintext_versions"],
+        true,
+        "{v}"
+    );
+    env.wait_done(&bucket).await;
+
+    let versions = raw_versions(&bucket).await;
+    current_is_sealed_and_readable(&env, &bucket, &versions).await;
+    assert_eq!(
+        noncurrent(&versions)
+            .iter()
+            .filter(|(_, sealed)| !sealed)
+            .count(),
+        0,
+        "the plaintext versions are gone: {versions:?}"
+    );
 }

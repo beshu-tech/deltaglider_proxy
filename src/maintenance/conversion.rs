@@ -41,6 +41,61 @@ pub const ADOPTED_AFTER_CUTOFF: &str = "adopted_after_cutoff";
 /// The failure-ring key of the marker itself (a blocked close).
 pub const MARKER_KEY: &str = ".dg/facts/!!conversion";
 
+/// The job's optional last phase before the close: delete the noncurrent
+/// plaintext versions of a versioned backend bucket
+/// ([`StorageBackend::purge_plaintext_versions`]).
+pub const PURGE_PHASE: &str = "purge-versions";
+
+/// The re-encrypt job's parameters, stored as JSON in its row (absent
+/// params: the defaults).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReencryptParams {
+    /// After a run that converted every object: delete the noncurrent
+    /// plaintext versions of the converted keys. The deleted versions
+    /// cannot be restored.
+    #[serde(default)]
+    pub purge_plaintext_versions: bool,
+}
+
+impl ReencryptParams {
+    /// The params JSON of a new job (`None`: the defaults).
+    pub fn to_json(self) -> Option<String> {
+        (self != Self::default()).then(|| serde_json::to_string(&self).expect("params serialize"))
+    }
+
+    /// The params of a job row. A row without params, or with params of
+    /// another shape, gets the defaults: the purge never runs by mistake.
+    pub(crate) fn of(params: Option<&str>) -> Self {
+        params
+            .and_then(|p| serde_json::from_str(p).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// Where the purge phase is, saved as the job's cursor: the backend's
+/// page cursor and the versions deleted so far (the run summary counts
+/// them across a resume).
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PurgeCursor {
+    #[serde(default)]
+    pub at: Option<String>,
+    #[serde(default)]
+    pub deleted: u64,
+}
+
+impl PurgeCursor {
+    /// The cursor of a job persisted in the purge phase (a cursor that
+    /// does not parse starts the phase again: deleting is idempotent).
+    pub(crate) fn parse(token: Option<&str>) -> Self {
+        token
+            .and_then(|t| serde_json::from_str(t).ok())
+            .unwrap_or_default()
+    }
+    pub(crate) fn token(&self) -> String {
+        serde_json::to_string(self).expect("cursor serializes")
+    }
+}
+
 /// The marker that one run of the job works with.
 #[derive(Debug)]
 pub(crate) enum JobMarker {
@@ -330,6 +385,36 @@ pub fn backfill_refusal(bucket: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_purge_runs_only_when_a_job_asked_for_it() {
+        assert_eq!(ReencryptParams::default().to_json(), None);
+        let purge = ReencryptParams {
+            purge_plaintext_versions: true,
+        };
+        let json = purge.to_json().unwrap();
+        assert_eq!(ReencryptParams::of(Some(&json)), purge);
+        assert_eq!(ReencryptParams::of(None), ReencryptParams::default());
+        assert_eq!(
+            ReencryptParams::of(Some("{\"refresh_last_modified\":true}")),
+            ReencryptParams::default()
+        );
+        assert_eq!(
+            ReencryptParams::of(Some("not json")),
+            ReencryptParams::default()
+        );
+    }
+
+    #[test]
+    fn the_purge_cursor_keeps_its_count_across_a_resume() {
+        let c = PurgeCursor {
+            at: Some("{\"k\":\"a\",\"v\":\"1\"}".into()),
+            deleted: 7,
+        };
+        assert_eq!(PurgeCursor::parse(Some(&c.token())), c);
+        assert_eq!(PurgeCursor::parse(None), PurgeCursor::default());
+        assert_eq!(PurgeCursor::parse(Some("x")), PurgeCursor::default());
+    }
 
     #[test]
     fn a_resume_never_shortens_the_deadline() {

@@ -2956,6 +2956,13 @@ mod multipart_abort_tests {
         > {
             Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
         }
+        async fn purge_plaintext_versions(
+            &self,
+            _bucket: &str,
+            _cursor: Option<&str>,
+        ) -> Result<crate::storage::VersionPurgePage, crate::storage::StorageError> {
+            Ok(crate::storage::VersionPurgePage::default())
+        }
         async fn scan_deltaspace(
             &self,
             _: &str,
@@ -3223,6 +3230,13 @@ mod multipart_abort_tests {
             crate::storage::StorageError,
         > {
             self.0.conversion(bucket, op).await
+        }
+        async fn purge_plaintext_versions(
+            &self,
+            bucket: &str,
+            cursor: Option<&str>,
+        ) -> Result<crate::storage::VersionPurgePage, crate::storage::StorageError> {
+            self.0.purge_plaintext_versions(bucket, cursor).await
         }
         async fn scan_deltaspace(
             &self,

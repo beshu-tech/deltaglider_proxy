@@ -272,6 +272,16 @@ pub struct MarkerRead {
     pub server_now: Option<i64>,
 }
 
+/// One page of the purge of plaintext versions
+/// ([`StorageBackend::purge_plaintext_versions`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionPurgePage {
+    /// The noncurrent plaintext versions that this page deleted.
+    pub deleted: u64,
+    /// Where the next page starts; `None`: this was the last page.
+    pub next: Option<String>,
+}
+
 /// A conditional write of a bucket's conversion marker.
 #[derive(Debug, Clone, Copy)]
 pub enum MarkerWrite<'a> {
@@ -1409,6 +1419,22 @@ pub trait StorageBackend: Send + Sync {
     ) -> impl Future<
         Output = Result<crate::storage::encrypting::conversion::ConversionReply, StorageError>,
     > + Send;
+
+    /// Delete, on one page of the bucket's versions from `cursor` (`None`:
+    /// the first page), the NONCURRENT versions that carry no encryption
+    /// marker (`dg-encrypted`: plaintext), of keys whose current object
+    /// carries one in every stored form that exists (the object, its
+    /// delta, a reference). Never a current version, never a version with
+    /// the marker, never a `.dg/facts/` key, never the history of an
+    /// object with no current form (a reference is internal: its history
+    /// goes also when it is removed). The re-encrypt job's optional last phase
+    /// (`maintenance::worker`). A backend without versions answers an
+    /// empty last page. No default: a wrapper must forward it.
+    fn purge_plaintext_versions(
+        &self,
+        bucket: &str,
+        cursor: Option<&str>,
+    ) -> impl Future<Output = Result<VersionPurgePage, StorageError>> + Send;
 
     /// Does the backend keep old versions of `bucket` (S3
     /// `GetBucketVersioning` answers `Enabled` or `Suspended`)? `None`:

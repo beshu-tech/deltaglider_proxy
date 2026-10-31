@@ -85,6 +85,53 @@ test('the dialog names the objects the job encrypts, that they stay readable, an
   expect(dialog).not.toHaveTextContent(/Refuse unencrypted objects/);
 });
 
+/** Open the bucket dialog of a new bucket key, with `versioned` previews. */
+async function openBucketDialog(versioned: boolean) {
+  http.on(
+    'POST',
+    VALIDATE,
+    json({
+      ok: true,
+      diff: { storage: { 'buckets.db-archive.encryption.mode': { before: 'none', after: 'aes256-gcm-proxy' } } },
+      conversion_preview: [{ bucket: 'db-archive', objects: 3, more: false, versioned }],
+    }),
+  );
+  const user = userEvent.setup();
+  renderGroup(eff());
+  await user.click(screen.getByText('Encrypt with a bucket key'));
+  const key = (screen.getByLabelText('Generated key') as HTMLTextAreaElement).value;
+  await user.type(screen.getByLabelText('Last 6 characters of the key'), key.slice(-6));
+  const review = screen.getByRole('button', { name: 'Review & apply' });
+  await waitFor(() => expect(review).toBeEnabled());
+  await user.click(review);
+  return { user, dialog: await screen.findByRole('dialog') };
+}
+
+const PURGE_HEADER = 'x-dgp-purge-plaintext-versions';
+
+test('a versioned bucket: the purge box is unchecked, and the apply asks for no purge', async () => {
+  const { user, dialog } = await openBucketDialog(true);
+  const box = within(dialog).getByRole('checkbox', { name: 'Also delete the old unencrypted versions' });
+  expect(box).not.toBeChecked();
+  expect(dialog).toHaveTextContent(/deleted for good/);
+  await user.click(within(dialog).getByTestId('apply-dialog-confirm'));
+  await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
+  expect(http.callsTo('PUT', SECTION)[0].headers[PURGE_HEADER]).toBeUndefined();
+});
+
+test('a versioned bucket: a ticked purge box sends the purge header with the apply', async () => {
+  const { user, dialog } = await openBucketDialog(true);
+  await user.click(within(dialog).getByRole('checkbox', { name: 'Also delete the old unencrypted versions' }));
+  await user.click(within(dialog).getByTestId('apply-dialog-confirm'));
+  await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
+  expect(http.callsTo('PUT', SECTION)[0].headers[PURGE_HEADER]).toBe('true');
+});
+
+test('a bucket without versions offers no purge box', async () => {
+  const { dialog } = await openBucketDialog(false);
+  expect(within(dialog).queryByRole('checkbox', { name: 'Also delete the old unencrypted versions' })).toBeNull();
+});
+
 test('running: the progress of this node\'s job and a link to the run, no Resume', async () => {
   const user = userEvent.setup();
   const navigate = renderGroup(
@@ -227,6 +274,38 @@ test('turning on a backend key over objects names the count first; Cancel sends 
   expect(http.callsTo('PUT', SECTION)).toHaveLength(0);
   // The edit stays, so the operator can apply after all.
   expect(screen.getByRole('button', { name: 'Apply encryption change' })).toBeInTheDocument();
+});
+
+test('a backend over a versioned bucket: the ticked purge box sends the purge header', async () => {
+  const backend = {
+    name: 'hetzner-fsn1', backend_type: 's3', path: null, endpoint: 'https://fsn1.example', region: 'eu-central-1',
+    force_path_style: true, has_credentials: true,
+    encryption: { mode: 'none', has_key: false, shim_active: false },
+  };
+  http.on('GET', '/_/api/admin/config', json({ env_overrides: [], max_delta_ratio: 0.75 }));
+  http.on('GET', '/_/api/admin/backends', json({ backends: [backend], default_backend: 'hetzner-fsn1' }));
+  http.on('GET', '/_/api/admin/buckets', json({
+    buckets: [{ name: 'releases', backend_name: 'hetzner-fsn1', effective_encryption: eff() }],
+  }));
+  http.on('GET', SECTION, json({ backends: [{ name: 'hetzner-fsn1', type: 's3' }] }));
+  http.on('GET', '/_/api/admin/jobs', json({ jobs: [] }));
+  http.on('POST', VALIDATE, json({
+    ok: true,
+    conversion_preview: [{ bucket: 'releases', objects: 5, more: false, versioned: true }],
+  }));
+  const user = userEvent.setup();
+  renderWithQuery(<BackendsPanel />);
+  await user.click(within(await screen.findByTestId('encryption-mode-select')).getByRole('combobox'));
+  await user.click(await screen.findByText('AES-256-GCM (proxy-side)', { selector: '.ant-select-item-option-content' }));
+  await user.click(screen.getByTestId('encryption-key-stored'));
+  await user.click(screen.getByRole('button', { name: 'Apply encryption change' }));
+  const dialog = await screen.findByRole('dialog');
+  const box = within(dialog).getByRole('checkbox', { name: 'Also delete the old unencrypted versions' });
+  expect(box).not.toBeChecked();
+  await user.click(box);
+  await user.click(within(dialog).getByRole('button', { name: 'Encrypt' }));
+  await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
+  expect(http.callsTo('PUT', SECTION)[0].headers['x-dgp-purge-plaintext-versions']).toBe('true');
 });
 
 /** The visual review's bug: a job that finished left "encrypting…" on the

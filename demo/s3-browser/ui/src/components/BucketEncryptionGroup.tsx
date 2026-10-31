@@ -56,7 +56,8 @@ import BucketKeySetup, { type BucketKeyValue } from './BucketKeySetup';
 import LegacyKeyBanner from './LegacyKeyBanner';
 import { ConversionStatusInline } from './ConversionStatus';
 import ServeDeprecationNotice from './ServeDeprecationNotice';
-import { conversionCountText, conversionRowState, versionedWarnings } from '../conversionView';
+import { conversionCountText, conversionRowState, offersPurge, versionedWarnings } from '../conversionView';
+import PurgeVersionsBox from './PurgeVersionsBox';
 import { formRow } from './ruleEditorHelpers';
 
 const { Text } = Typography;
@@ -94,6 +95,8 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
   const [kmsKeyId, setKmsKeyId] = useState('');
   const [bucketKeyEnabled, setBucketKeyEnabled] = useState(true);
   const [dialog, setDialog] = useState<{ response: SectionApplyResponse; change: BucketEncryptionChange } | null>(null);
+  // The dialog's purge box: unchecked each time the dialog opens.
+  const [purge, setPurge] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<PlainError | null>(null);
 
@@ -174,6 +177,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
     setBusy(true);
     try {
       const response = await validateSection('storage', bucketEncryptionBody(bucket, eff, change), confirmFor(bucket, eff, change));
+      setPurge(false);
       setDialog({ response, change });
     } catch (e) {
       setError(plainError(e, 'The proxy refused the change.'));
@@ -187,7 +191,8 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
     setError(null);
     try {
       const { version } = await getSectionVersioned('storage');
-      const resp = await applySection(qc, 'storage', bucketEncryptionBody(bucket, eff, change), version, confirmFor(bucket, eff, change));
+      const options = { ...confirmFor(bucket, eff, change), purgePlaintextVersions: purge && offersPurge(dialog?.response.conversion_preview) };
+      const resp = await applySection(qc, 'storage', bucketEncryptionBody(bucket, eff, change), version, options);
       if (!resp.ok) {
         setError(plainError(resp.error || '', 'The proxy refused the change.'));
         return false;
@@ -242,6 +247,9 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           {w}
         </Text>
       ))}
+      {offersPurge(dialog.response.conversion_preview) && (
+        <PurgeVersionsBox checked={purge} onChange={setPurge} />
+      )}
       {(enabling || dialog.change.kind === 'bucket-key') && (
         <Text type="warning" style={{ fontSize: 12 }}>
           While the re-encrypt job runs on the bucket, reads keep working, but uploads and deletes

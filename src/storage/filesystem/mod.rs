@@ -2103,6 +2103,13 @@ impl StorageBackend for FilesystemBackend {
     {
         Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
     }
+    async fn purge_plaintext_versions(
+        &self,
+        _bucket: &str,
+        _cursor: Option<&str>,
+    ) -> Result<crate::storage::VersionPurgePage, crate::storage::StorageError> {
+        Ok(crate::storage::VersionPurgePage::default())
+    }
 
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
         if let Some(b) = bucket {

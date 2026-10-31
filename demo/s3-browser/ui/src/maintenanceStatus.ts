@@ -72,6 +72,8 @@ export function phaseLabel(job: MaintenanceJobView): string {
       return 'Counting objects…';
     case 'references':
       return 'Finalizing shared reference files…';
+    case 'purge-versions':
+      return 'Deleting the old unencrypted versions…';
     case 'stage':
       return 'Preparing the target…';
     case 'copy':

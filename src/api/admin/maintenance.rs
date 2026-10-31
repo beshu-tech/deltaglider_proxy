@@ -4,7 +4,8 @@
 //!
 //! Routes:
 //!
-//! - `POST /_/api/admin/jobs/reencrypt` `{buckets: [..]}` — create
+//! - `POST /_/api/admin/jobs/reencrypt` `{buckets: [..], open_window?,
+//!   purge_plaintext_versions?}` — create
 //!   queued jobs (admin tier). Validation per bucket: must exist, must
 //!   route to a backend whose encryption mode the job supports
 //!   (none / aes256-gcm-proxy), must not already have an active job.
@@ -92,6 +93,11 @@ pub struct ReencryptRequest {
     /// clients read its plaintext history until the job closes it.
     #[serde(default)]
     pub open_window: bool,
+    /// After a run that converts every object, delete the noncurrent
+    /// plaintext versions of the bucket's encrypted keys (a versioned
+    /// backend; elsewhere nothing to do). They cannot be restored.
+    #[serde(default)]
+    pub purge_plaintext_versions: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +162,10 @@ pub async fn start_reencrypt(
 ) -> Result<Json<ReencryptResponse>, AdminError> {
     let (db, real, buckets) = check_job_request(&state, req.buckets).await?;
 
+    let params = crate::maintenance::conversion::ReencryptParams {
+        purge_plaintext_versions: req.purge_plaintext_versions,
+    }
+    .to_json();
     let cfg = state.config.read().await;
     let mut started = Vec::new();
     let mut errors = Vec::new();
@@ -193,7 +203,7 @@ pub async fn start_reencrypt(
                 "reencrypt",
                 &key,
                 "counting",
-                None,
+                params.as_deref(),
                 "admin",
                 current_unix_seconds(),
             );
@@ -224,12 +234,12 @@ pub async fn start_reencrypt(
         crate::maintenance::wake_workers(&state.s3_state.maintenance_notify);
         let names: Vec<&str> = started.iter().map(|s| s.bucket.as_str()).collect();
         info!("maintenance: re-encrypt requested for {:?}", names);
-        super::audit_log(
-            "maintenance_reencrypt_requested",
-            "admin",
-            &names.join(","),
-            &headers,
-        );
+        let what = if req.purge_plaintext_versions {
+            format!("{} (purge plaintext versions)", names.join(","))
+        } else {
+            names.join(",")
+        };
+        super::audit_log("maintenance_reencrypt_requested", "admin", &what, &headers);
     }
 
     Ok(Json(ReencryptResponse { started, errors }))

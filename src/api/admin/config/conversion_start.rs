@@ -77,8 +77,25 @@ pub struct ConversionStarted {
     pub job_id: Option<i64>,
     /// The backend keeps old versions of the bucket.
     pub versioned: bool,
+    /// The job deletes the noncurrent plaintext versions after it
+    /// converted every object ([`PURGE_HEADER`]; a versioned bucket only).
+    pub purge_plaintext_versions: bool,
     #[serde(skip)]
     pub(crate) run_id: RunId,
+}
+
+/// The request header of a config write that asks the re-encrypt jobs it
+/// queues to delete the noncurrent plaintext versions of the versioned
+/// buckets (`true`). The admin UI sends it when the operator ticks the box
+/// in the conversion dialog.
+pub const PURGE_HEADER: &str = "x-dgp-purge-plaintext-versions";
+
+/// Pure: does a write with `headers` ask for the purge?
+pub(crate) fn purge_requested(headers: &HeaderMap) -> bool {
+    headers
+        .get(PURGE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
 }
 
 /// Pure: can the change from `old` to `new` start a conversion at all?
@@ -196,8 +213,9 @@ pub(crate) fn versioning_warning(bucket: &str) -> String {
     format!(
         "bucket '{bucket}' keeps old versions on its backend (versioning is enabled or \
          suspended): the job converts the current objects, and their plaintext versions stay \
-         on the backend as noncurrent versions. Delete those versions on the backend if they \
-         must go"
+         on the backend as noncurrent versions, unless the write asks the job to delete them \
+         (the header X-DGP-Purge-Plaintext-Versions: true, or the box in the admin UI's \
+         dialog). A deleted version cannot be restored"
     )
 }
 
@@ -340,6 +358,7 @@ async fn open_one(
         reused,
         job_id: None,
         versioned: p.versioned,
+        purge_plaintext_versions: false,
         run_id,
     })
 }
@@ -405,12 +424,28 @@ pub(crate) async fn enqueue(
         return;
     };
     let now = crate::maintenance::store::current_unix_seconds();
+    let purge = purge_requested(headers);
     {
         let db = db.lock().await;
         for s in started.iter_mut() {
-            match db.maintenance_create_job("reencrypt", &s.bucket, "counting", None, "config", now)
-            {
-                Ok(Some(id)) => s.job_id = Some(id),
+            let params = crate::maintenance::conversion::ReencryptParams {
+                purge_plaintext_versions: purge && s.versioned,
+            };
+            // The response says "purge" only for a job that will do it.
+            s.purge_plaintext_versions = false;
+            let json = params.to_json();
+            match db.maintenance_create_job(
+                "reencrypt",
+                &s.bucket,
+                "counting",
+                json.as_deref(),
+                "config",
+                now,
+            ) {
+                Ok(Some(id)) => {
+                    s.job_id = Some(id);
+                    s.purge_plaintext_versions = params.purge_plaintext_versions;
+                }
                 Ok(None) => warnings.push(no_job_warning(
                     &s.bucket,
                     "another job became active on the bucket during the apply",
@@ -458,6 +493,21 @@ fn audit(action: &str, target: &str, bucket: &str, headers: &HeaderMap) {
 mod tests {
     use super::*;
     use crate::storage::encrypting::conversion::Fields;
+
+    #[test]
+    fn only_a_true_header_asks_for_the_purge() {
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(PURGE_HEADER, v.parse().unwrap());
+            purge_requested(&h)
+        };
+        assert!(!purge_requested(&HeaderMap::new()));
+        assert!(with("true"));
+        assert!(with("TRUE "));
+        assert!(!with("false"));
+        assert!(!with("1"));
+        assert!(!with(""));
+    }
 
     fn fields(run: u8) -> Fields {
         Fields {

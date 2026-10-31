@@ -605,6 +605,13 @@ impl StorageBackend for FaultyFs {
     {
         self.inner.conversion(bucket, op).await
     }
+    async fn purge_plaintext_versions(
+        &self,
+        bucket: &str,
+        cursor: Option<&str>,
+    ) -> Result<crate::storage::VersionPurgePage, crate::storage::StorageError> {
+        self.inner.purge_plaintext_versions(bucket, cursor).await
+    }
     async fn bucket_versioning(&self, bucket: &str) -> Option<bool> {
         self.inner.bucket_versioning(bucket).await
     }

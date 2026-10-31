@@ -995,6 +995,8 @@ export function phaseWord(kind: JobKind, phase: string | null | undefined): stri
       return 'counting objects';
     case 'references':
       return 'finishing shared reference files';
+    case 'purge-versions':
+      return 'deleting the old unencrypted versions';
     case 'stage':
       return 'preparing';
     case 'copy':

@@ -56,7 +56,7 @@ pub use traits::{
     DynStorageBackend, KeyClaim, ListedForms, ListedToken, MarkerRead, MarkerWrite,
     MultipartUpload, ObjectAt, ObjectRead, ObjectVariant, PutBody, RangeRead, RefFence, RefWrite,
     ReferenceSource, RewriteBasis, StorageBackend, StorageBackendExt, StorageError, StoredObject,
-    StoredWrite, UploadedPart,
+    StoredWrite, UploadedPart, VersionPurgePage,
 };
 
 tokio::task_local! {

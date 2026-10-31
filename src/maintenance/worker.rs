@@ -685,6 +685,28 @@ async fn execute_phases(
         persist(db, job, "references", &c, None).await;
     }
 
+    // ── Phase: purge-versions (optional; before the close) ──
+    let params = super::conversion::ReencryptParams::of(job.params.as_deref());
+    let mut notes = Vec::new();
+    if params.purge_plaintext_versions {
+        if phase == "references" {
+            phase = super::conversion::PURGE_PHASE.to_string();
+            persist(db, job, &phase, &c, None).await;
+        }
+        let row = current_row(db, job).await;
+        if row.objects_failed > 0 {
+            notes.push(format!(
+                "the noncurrent plaintext versions were not deleted, because {} object(s) were \
+                 not converted: a run that converts every object deletes them",
+                row.objects_failed
+            ));
+        } else {
+            let deleted =
+                purge_plaintext_versions(state, db, holder, job, &Counters::of(&row)).await?;
+            notes.push(format!("{deleted} noncurrent plaintext version(s) deleted"));
+        }
+    }
+
     // ── Close the conversion: only when nothing failed, by identity. ──
     let row = current_row(db, job).await;
     let adopted = adoptions.count();
@@ -704,16 +726,22 @@ async fn execute_phases(
         persist(db, job, &row.phase, &c, None).await;
     }
     if adopted > 0 {
-        // The run summary names the adoptions (the generic settle that
-        // follows leaves a settled row alone).
+        notes.insert(
+            0,
+            format!(
+                "{adopted} object(s) adopted after the conversion's cutoff in this run: clients \
+                 could not read them, the job converted them (see the Failures tab)"
+            ),
+        );
+    }
+    if !notes.is_empty() {
+        // The run summary names the adoptions and the purge (the generic
+        // settle that follows leaves a settled row alone).
         let row = current_row(db, job).await;
         let (status, summary) =
             super::settle_status(row.objects_done, row.objects_skipped, row.objects_failed);
-        let note = format!(
-            "{adopted} object(s) adopted after the conversion's cutoff in this run: clients \
-             could not read them, the job converted them (see the Failures tab){}",
-            summary.map(|s| format!("; {s}")).unwrap_or_default()
-        );
+        notes.extend(summary);
+        let note = notes.join("; ");
         let db = db.lock().await;
         if let Err(e) = db.maintenance_finish(job.id, status, Some(&note)) {
             warn!("maintenance: failed to settle job #{}: {}", job.id, e);
@@ -721,6 +749,60 @@ async fn execute_phases(
     }
 
     Ok(())
+}
+
+/// The purge phase: delete the noncurrent plaintext versions of the
+/// bucket's encrypted keys, one backend page at a time (8 requests at once
+/// inside a page), the cursor and the count saved after each page. A
+/// bucket without versions is a no-op. Returns the versions deleted in
+/// this run, a resumed phase included.
+async fn purge_plaintext_versions(
+    state: &Arc<AppState>,
+    db: &Arc<Mutex<JobsDb>>,
+    holder: Holder<'_>,
+    job: &MaintenanceJob,
+    c: &Counters,
+) -> Result<u64, PhaseStop> {
+    use super::conversion::{PurgeCursor, PURGE_PHASE};
+    let engine = state.engine.load().clone();
+    let storage = engine.storage();
+    if storage.bucket_versioning(&job.bucket).await != Some(true) {
+        return Ok(0);
+    }
+    let mut cursor = PurgeCursor::parse(resumable_in(job, PURGE_PHASE).as_deref());
+    loop {
+        stop_if_shutting_down()?;
+        check_cancel(db, job.id).await?;
+        let page = storage
+            .purge_plaintext_versions(&job.bucket, cursor.at.as_deref())
+            .await
+            .map_err(|e| {
+                PhaseStop::FailedTransient(format!(
+                    "the purge of noncurrent plaintext versions failed: {e}"
+                ))
+            })?;
+        cursor.deleted += page.deleted;
+        if page.deleted > 0 {
+            crate::audit::audit_log(
+                "encryption_conversion_versions_purged",
+                "system",
+                &format!(
+                    "job:{}: {} noncurrent plaintext version(s) deleted",
+                    job.id, page.deleted
+                ),
+                &axum::http::HeaderMap::new(),
+                &job.bucket,
+                "",
+            );
+        }
+        let Some(next) = page.next else {
+            break;
+        };
+        cursor.at = Some(next);
+        persist(db, job, PURGE_PHASE, c, Some(&cursor.token())).await;
+        heartbeat(db, job.id, holder).await?;
+    }
+    Ok(cursor.deleted)
 }
 
 /// The reencrypt per-object step: rewrite an object whose at-rest state

@@ -1381,6 +1381,13 @@ impl StorageBackend for S3Backend {
     {
         Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
     }
+    async fn purge_plaintext_versions(
+        &self,
+        bucket: &str,
+        cursor: Option<&str>,
+    ) -> Result<crate::storage::VersionPurgePage, crate::storage::StorageError> {
+        self.purge_plaintext_page(bucket, cursor).await
+    }
     async fn bucket_versioning(&self, bucket: &str) -> Option<bool> {
         let out = self
             .client

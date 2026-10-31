@@ -37,8 +37,20 @@ export function versionedWarnings(previews: readonly ConversionPreview[] | undef
     .filter((p) => p.versioned)
     .map(
       (p) =>
-        `The backend keeps old versions of bucket ${p.bucket}. The job encrypts the current objects, and their plaintext versions stay on the backend as noncurrent versions. Delete those versions on the backend if they must go.`,
+        `The backend keeps old versions of bucket ${p.bucket}. The job encrypts the current objects, and their plaintext versions stay on the backend as noncurrent versions.`,
     );
+}
+
+/** The label of the box that asks the job to delete the plaintext versions. */
+export const PURGE_LABEL = 'Also delete the old unencrypted versions';
+
+/** What the box does, in plain words: shown under it. */
+export const PURGE_EXPLANATION =
+  'When the job has encrypted every object, it deletes the old unencrypted versions of those objects from the backend. They are deleted for good: nobody can restore them afterwards. Encrypted versions and the current objects are never deleted.';
+
+/** Does the dialog offer the purge box? Only for a versioned bucket. */
+export function offersPurge(previews: readonly ConversionPreview[] | undefined): boolean {
+  return (previews ?? []).some((p) => p.versioned);
 }
 
 /** What the conversion row of a bucket shows. */

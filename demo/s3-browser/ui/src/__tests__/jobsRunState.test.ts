@@ -230,6 +230,7 @@ test('phaseWord and lifecycleVerb', () => {
   assert.equal(phaseWord('migrate', 'copy'), 'copying');
   assert.equal(phaseWord('migrate', 'flip'), 'switching to the new backend');
   assert.equal(phaseWord('reencrypt', 'objects'), null, 'the plain walk has no word');
+  assert.equal(phaseWord('reencrypt', 'purge-versions'), 'deleting the old unencrypted versions');
   assert.equal(phaseWord('reencrypt', 'counting'), 'counting objects');
   assert.equal(lifecycleVerb('delete'), 'delete');
   assert.equal(lifecycleVerb({ type: 'transition', destination: { bucket: 'd' }, delete_source_after_success: true }), 'move');

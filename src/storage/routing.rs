@@ -1418,6 +1418,13 @@ impl StorageBackend for RoutingBackend {
     {
         route_existing!(self, bucket, conversion, op)
     }
+    async fn purge_plaintext_versions(
+        &self,
+        bucket: &str,
+        cursor: Option<&str>,
+    ) -> Result<crate::storage::VersionPurgePage, crate::storage::StorageError> {
+        route_existing!(self, bucket, purge_plaintext_versions, cursor)
+    }
     async fn bucket_versioning(&self, bucket: &str) -> Option<bool> {
         route_existing!(self, bucket, bucket_versioning)
     }
@@ -1945,6 +1952,13 @@ mod tests {
             crate::storage::StorageError,
         > {
             Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
+        }
+        async fn purge_plaintext_versions(
+            &self,
+            _bucket: &str,
+            _cursor: Option<&str>,
+        ) -> Result<crate::storage::VersionPurgePage, crate::storage::StorageError> {
+            Ok(crate::storage::VersionPurgePage::default())
         }
 
         async fn get_passthrough_metadata_for_rewrite(

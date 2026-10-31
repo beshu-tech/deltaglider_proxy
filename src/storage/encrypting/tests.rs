@@ -572,6 +572,13 @@ mod wrapper_tests {
         > {
             Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
         }
+        async fn purge_plaintext_versions(
+            &self,
+            _bucket: &str,
+            _cursor: Option<&str>,
+        ) -> Result<crate::storage::VersionPurgePage, crate::storage::StorageError> {
+            Ok(crate::storage::VersionPurgePage::default())
+        }
         async fn get_passthrough_metadata_for_rewrite(
             &self,
             b: &str,

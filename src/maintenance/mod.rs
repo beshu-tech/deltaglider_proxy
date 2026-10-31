@@ -245,7 +245,7 @@ pub fn progress_percent(
         "counting" => None,
         // Migrate phases: see `migrate_percent`.
         "stage" | "copy" | "verify" => None,
-        "references" | "flip" | "cleanup" => Some(99),
+        "references" | "purge-versions" | "flip" | "cleanup" => Some(99),
         _ => {
             let total = objects_total?;
             if total <= 0 {
