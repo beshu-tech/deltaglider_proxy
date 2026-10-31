@@ -275,11 +275,13 @@ proptest! {
         size in 0u64..3,
         serves in any::<bool>(),
         cutoff in proptest::option::of(0i64..4_000_000_000),
-        lm_off in proptest::option::of(-1000i64..1000),
+        // The stored time relative to cutoff + grace: often right at the
+        // boundary, where an off-by-one hides.
+        lm_off in proptest::option::of(prop_oneof![-1000i64..1000, -2i64..2]),
         grace in 0i64..600,
         job in any::<bool>(),
     ) {
-        let lm = lm_off.map(|o| cutoff.unwrap_or(2_000_000_000) + o);
+        let lm = lm_off.map(|o| cutoff.unwrap_or(2_000_000_000) + grace + o);
         let mut meta = plain(lm, size);
         if has_marker {
             meta.user_metadata.insert(ENCRYPTION_MARKER_KEY.into(), "x".into());
