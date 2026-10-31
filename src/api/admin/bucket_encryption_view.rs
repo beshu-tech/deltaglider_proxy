@@ -82,8 +82,24 @@ pub struct ConversionView {
     pub job_on_this_node: Option<ConversionJob>,
     /// The backend keeps old versions of the bucket's objects, so a Resume
     /// can also ask to purge the old unencrypted versions. Read only for a
-    /// bucket with a marker; a failed read counts as not versioned.
+    /// bucket with a marker.
     pub versioned: bool,
+    /// The versioning read failed: `versioned` is then unknown (shown as
+    /// `false`), and Resume asks the purge question anyway. The job reads
+    /// the versioning again before it purges. The same shape as
+    /// `ConversionPreview::versioning_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub versioning_error: Option<String>,
+}
+
+/// Pure: `versioned` and `versioning_error` of a view from the versioning
+/// read (`None`: not read).
+fn versioning_fields(read: Option<&Result<bool, String>>) -> (bool, Option<String>) {
+    match read {
+        Some(Ok(v)) => (*v, None),
+        Some(Err(e)) => (false, Some(e.clone())),
+        None => (false, None),
+    }
 }
 
 /// A re-encrypt job, as the conversion row shows it.
@@ -226,10 +242,14 @@ pub async fn attach_conversions(
         .collect();
     let versioning = super::config::conversion_start::in_parallel(&with_marker, |b| async move {
         use crate::storage::StorageBackend;
-        engine.storage().bucket_versioning(b).await.unwrap_or(false)
+        engine
+            .storage()
+            .bucket_versioning(b)
+            .await
+            .map_err(|e| e.to_string())
     })
     .await;
-    let versioned: std::collections::HashMap<String, bool> =
+    let versioned: std::collections::HashMap<String, Result<bool, String>> =
         with_marker.into_iter().zip(versioning).collect();
     let db = match jobs_db {
         Some(db) if !markers.is_empty() => Some(db.lock().await),
@@ -241,10 +261,15 @@ pub async fn attach_conversions(
         let Some(Some((fields, server_now))) = markers.get(&key) else {
             continue;
         };
-        let job = db
-            .as_ref()
-            .and_then(|db| db.maintenance_latest_job_for_bucket(&key, "reencrypt").ok())
-            .flatten();
+        let job = db.as_ref().and_then(|db| {
+            db.maintenance_latest_job_for_bucket(&key, "reencrypt")
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "conversion view of {key}: reading its re-encrypt job failed: {e}"
+                    );
+                    None
+                })
+        });
         let adopted = job.as_ref().map_or(0, |j| j.objects_adopted);
         let view = eff.conversion.get_or_insert_with(Default::default);
         view.open = *server_now < fields.deadline;
@@ -254,7 +279,7 @@ pub async fn attach_conversions(
             &fields.run,
         ));
         view.adopted_after_cutoff = adopted;
-        view.versioned = versioned.get(&key).copied().unwrap_or(false);
+        (view.versioned, view.versioning_error) = versioning_fields(versioned.get(&key));
         view.job_on_this_node = job.map(|j| ConversionJob {
             percent: crate::maintenance::display_percent(&j),
             id: j.id,
@@ -286,6 +311,27 @@ async fn marker_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ARCH F-03: a failed versioning read is not "not versioned".
+    #[test]
+    fn a_failed_versioning_read_is_reported() {
+        let failed = Err("SlowDown".to_string());
+        assert_eq!(
+            versioning_fields(Some(&failed)),
+            (false, Some("SlowDown".into()))
+        );
+        assert_eq!(versioning_fields(Some(&Ok(true))), (true, None));
+        assert_eq!(versioning_fields(Some(&Ok(false))), (false, None));
+        assert_eq!(versioning_fields(None), (false, None));
+        let view = ConversionView {
+            versioning_error: Some("SlowDown".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["versioning_error"], "SlowDown");
+        let json = serde_json::to_value(ConversionView::default()).unwrap();
+        assert!(json.get("versioning_error").is_none());
+    }
 
     const KA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const KB: &str = "2222222222222222222222222222222222222222222222222222222222222222";

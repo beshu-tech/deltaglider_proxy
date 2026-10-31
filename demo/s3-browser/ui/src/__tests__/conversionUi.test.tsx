@@ -380,6 +380,21 @@ test('review 2: Resume of a bucket without versions is one click', async () => {
   expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'], open_window: true });
 });
 
+/** ARCH F-03: a failed versioning read is not "no versions": Resume shows
+ *  the error and asks the purge question anyway. */
+test('a failed versioning read: Resume shows the error and asks about the old versions', async () => {
+  const user = userEvent.setup();
+  renderGroup(bucketKeyEff({ conversion: view({ versioned: false, versioning_error: 'SlowDown: reduce your request rate' }) }));
+  await user.click(screen.getByRole('button', { name: /^Resume/ }));
+  const dialog = await screen.findByRole('dialog');
+  expect(dialog).toHaveTextContent('SlowDown: reduce your request rate');
+  const box = within(dialog).getByRole('checkbox', { name: /^Also delete the old unencrypted versions/ });
+  expect(box).not.toBeChecked();
+  await user.click(within(dialog).getByRole('button', { name: 'Resume' }));
+  await waitFor(() => expect(http.callsTo('POST', REENCRYPT)).toHaveLength(1));
+  expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'], open_window: true });
+});
+
 /** Finding 4: the versioning note shows once, in plain words. */
 test('review 4: the bucket dialog shows the versioning note once, with no header name', async () => {
   const server =

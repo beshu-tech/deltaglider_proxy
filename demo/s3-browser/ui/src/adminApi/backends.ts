@@ -76,6 +76,10 @@ export interface ConversionView {
    *  the job deletes the old unencrypted ones. Absent = unknown (Resume
    *  asks nothing). */
   versioned?: boolean;
+  /** The versioning read failed, so `versioned` is unknown: Resume shows
+   *  this error and asks about the old versions anyway (the job reads the
+   *  versioning again before it purges). */
+  versioning_error?: string;
 }
 
 interface BucketOriginListResponse {

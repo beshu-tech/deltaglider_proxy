@@ -28,7 +28,8 @@
  * config write, so a read-only encryption (key from an env var) still
  * offers it; these components render only on admin pages. On a versioned
  * bucket Resume first asks whether the job deletes the old unencrypted
- * versions (the box starts unchecked). The bucket list refetches on its
+ * versions (the box starts unchecked); so does a bucket whose versioning
+ * read failed, with the error. The bucket list refetches on its
  * own while a job runs (`useBucketOrigins`), so the state follows the job
  * and the status goes away when the conversion ends.
  */
@@ -55,19 +56,27 @@ interface Props {
 
 const LINK = { padding: 0, height: 'auto', fontSize: 12 } as const;
 
-/** On a versioned bucket: ask whether the job deletes the old unencrypted
- *  versions. `null` = cancelled. */
-async function askPurge(bucket: string): Promise<boolean | null> {
+/** On a versioned bucket, or one whose versioning read failed: ask whether
+ *  the job deletes the old unencrypted versions. `null` = cancelled. */
+async function askPurge(bucket: string, versioningError?: string): Promise<boolean | null> {
   // The dialog's content is static: the box reports into a local.
   let purge = false;
   const ok = await confirmDialog({
     title: `Resume the conversion of ${bucket}?`,
     content: (
       <Space orientation="vertical" size={SPACE.xs} style={{ width: '100%' }}>
-        <Text>
-          The backend keeps old versions of bucket {bucket}. The job encrypts the current objects; their
-          old unencrypted versions stay on the backend.
-        </Text>
+        {versioningError ? (
+          <Text>
+            The proxy could not read whether the backend keeps old versions of bucket {bucket}: {versioningError.replace(/\.$/, '')}.
+            If it keeps them, the job encrypts the current objects, and their old unencrypted versions stay on the
+            backend.
+          </Text>
+        ) : (
+          <Text>
+            The backend keeps old versions of bucket {bucket}. The job encrypts the current objects; their old
+            unencrypted versions stay on the backend.
+          </Text>
+        )}
         <PurgeVersionsBox
           onChange={(v) => {
             purge = v;
@@ -88,7 +97,7 @@ function useActions(bucket: string, view: ConversionView, state: ConversionRowSt
   const openRun = (jobId: number, tab?: string) =>
     navigate(buildViewUrl('admin', 'jobs', tab ? { job: runId(jobId), tab } : { job: runId(jobId) }));
   const resume = async () => {
-    const purge = view.versioned ? await askPurge(bucket) : false;
+    const purge = view.versioned || view.versioning_error ? await askPurge(bucket, view.versioning_error) : false;
     if (purge === null) return;
     setBusy(true);
     try {
