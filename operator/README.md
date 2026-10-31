@@ -202,8 +202,12 @@ spec:
 ```
 
 `kubectl get dgp` shows the replica count and the phase (`Ready`, `Progressing`, or
-`Degraded`), and `status.message` reports how many proxy and router pods are ready, or
-the problems that stop a scale-up.
+`Degraded`), and `status.message` reports how many proxy and router pods are ready, the
+problems that stop a scale-up, or the error of a failed reconcile.
+
+`spec.storage` cannot change after you create the resource. A StatefulSet refuses a
+change to its volume claim templates, so the API server refuses the change to the
+resource first. To change the volume size or class, create a new resource.
 
 ## TLS
 

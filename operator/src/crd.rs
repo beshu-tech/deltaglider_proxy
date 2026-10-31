@@ -2,7 +2,7 @@
 
 //! The DeltaGliderProxy custom resource definition.
 
-use kube::CustomResource;
+use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +16,14 @@ pub const DEFAULT_TRUSTED_PROXY_CIDRS: &str =
     "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,fc00::/7";
 /// The single port everything listens on (S3 API + admin UI).
 pub const PROXY_PORT: i32 = 9000;
+/// CEL transition rule on `spec`: `storage` cannot be added, removed or
+/// changed, because a StatefulSet refuses a volumeClaimTemplates change.
+/// `has()` covers the optional field; a plain `self == oldSelf` on the field
+/// would not run when it is added or removed.
+pub const STORAGE_IMMUTABLE_RULE: &str = "has(self.storage) == has(oldSelf.storage) && \
+     (!has(self.storage) || self.storage == oldSelf.storage)";
 
-#[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[derive(CustomResource, Deserialize, Serialize, Clone, Debug, KubeSchema)]
 #[kube(
     group = "deltaglider.beshu.tech",
     version = "v1alpha1",
@@ -29,6 +35,7 @@ pub const PROXY_PORT: i32 = 9000;
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#
 )]
 #[serde(rename_all = "camelCase")]
+#[x_kube(validation = Rule::new(STORAGE_IMMUTABLE_RULE).message("storage is immutable; create a new resource"))]
 pub struct DeltaGliderProxySpec {
     /// Number of proxy pods. Above 1, read the HA notes in the operator README first:
     /// you need an S3 storage backend, a shared config DB key and bootstrap password
@@ -184,5 +191,36 @@ impl DeltaGliderProxy {
             .as_ref()
             .and_then(|b| b.auto_generate)
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kube::CustomResourceExt;
+
+    #[test]
+    fn crd_refuses_a_storage_change() {
+        // A StatefulSet refuses a volumeClaimTemplates change, so a changed
+        // spec.storage would fail every later apply. The API server refuses it first.
+        let crd = serde_json::to_value(DeltaGliderProxy::crd()).unwrap();
+        let spec = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let rules = spec["x-kubernetes-validations"]
+            .as_array()
+            .expect("spec has CEL rules");
+        let rule = rules
+            .iter()
+            .find(|r| {
+                r["rule"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("oldSelf.storage")
+            })
+            .expect("a storage transition rule");
+        assert_eq!(rule["rule"], STORAGE_IMMUTABLE_RULE);
+        assert_eq!(
+            rule["message"],
+            "storage is immutable; create a new resource"
+        );
     }
 }

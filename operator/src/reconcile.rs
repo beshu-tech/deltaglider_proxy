@@ -263,6 +263,49 @@ pub async fn reconcile(cr: Arc<DeltaGliderProxy>, ctx: Arc<Ctx>) -> Result<Actio
     Ok(Action::requeue(Duration::from_secs(requeue)))
 }
 
+/// The longest `status.message` that a failed reconcile writes, in bytes.
+const MAX_STATUS_MESSAGE: usize = 1024;
+
+/// `reconcile failed: <err>`, cut to `MAX_STATUS_MESSAGE` bytes on a char boundary.
+fn status_message(err: &str) -> String {
+    let full = format!("reconcile failed: {err}");
+    if full.len() <= MAX_STATUS_MESSAGE {
+        return full;
+    }
+    let mut end = MAX_STATUS_MESSAGE;
+    while !full.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &full[..end])
+}
+
+/// The status merge patch for a failed reconcile: phase and message only, so
+/// the ready counts of the last good reconcile stay.
+fn degraded_status(err: &Error) -> Value {
+    json!({ "status": { "phase": "Degraded", "message": status_message(&err.to_string()) } })
+}
+
+/// `reconcile`, plus a Degraded status when it fails. Without it, a failed
+/// reconcile (for example a 403 from RBAC) left the last phase, often Ready.
+async fn reconcile_and_report(cr: Arc<DeltaGliderProxy>, ctx: Arc<Ctx>) -> Result<Action, Error> {
+    let result = reconcile(cr.clone(), ctx.clone()).await;
+    if let (Err(err), Some(ns)) = (&result, cr.namespace()) {
+        let api: Api<DeltaGliderProxy> = Api::namespaced(ctx.client.clone(), &ns);
+        let patch = degraded_status(err);
+        if let Err(e) = api
+            .patch_status(
+                &cr.name_any(),
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
+            )
+            .await
+        {
+            tracing::warn!(cr = %cr.name_any(), error = %e, "could not write Degraded status");
+        }
+    }
+    result
+}
+
 fn error_policy(cr: Arc<DeltaGliderProxy>, err: &Error, _ctx: Arc<Ctx>) -> Action {
     tracing::warn!(cr = %cr.name_any(), error = %err, "reconcile failed, requeueing");
     Action::requeue(Duration::from_secs(30))
@@ -291,7 +334,7 @@ pub async fn run(client: Client) -> anyhow::Result<()> {
             watcher::Config::default(),
         )
         .shutdown_on_signal()
-        .run(reconcile, error_policy, ctx)
+        .run(reconcile_and_report, error_policy, ctx)
         .for_each(|res| async move {
             if let Err(e) = res {
                 tracing::warn!(error = %e, "controller event error");
@@ -347,5 +390,30 @@ mod bootstrap_hash_tests {
         // Emit a specimen for the manual end-to-end boot test.
         eprintln!("SPECIMEN_PASSWORD={password}");
         eprintln!("SPECIMEN_HASH_B64={b64}");
+    }
+}
+
+#[cfg(test)]
+mod degraded_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_reconcile_error_reads_as_degraded() {
+        let patch = degraded_status(&Error::NoNamespace);
+        assert_eq!(patch["status"]["phase"], "Degraded");
+        assert_eq!(
+            patch["status"]["message"],
+            "reconcile failed: CR has no namespace"
+        );
+        // A merge patch of two fields: readyReplicas and the rest stay as they are.
+        assert_eq!(patch["status"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_long_error_is_cut_on_a_char_boundary() {
+        let long = "é".repeat(2 * MAX_STATUS_MESSAGE);
+        let msg = status_message(&long);
+        assert!(msg.len() <= MAX_STATUS_MESSAGE + "…".len());
+        assert!(msg.ends_with('…'));
     }
 }

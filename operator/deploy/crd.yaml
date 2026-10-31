@@ -145,6 +145,9 @@ spec:
                     type: string
                 type: object
             type: object
+            x-kubernetes-validations:
+            - message: storage is immutable; create a new resource
+              rule: has(self.storage) == has(oldSelf.storage) && (!has(self.storage) || self.storage == oldSelf.storage)
           status:
             nullable: true
             properties:
