@@ -394,7 +394,7 @@ impl Config {
 
     /// The `listed` buckets (name, the backend that holds it) that this
     /// config stops encrypting with a proxy key, compared with `old`
-    /// ([`stops_encryption`]): an apply closes their conversion markers.
+    /// (`stops_encryption`): an apply closes their conversion markers.
     pub fn buckets_stopping_encryption(
         &self,
         old: &Config,
