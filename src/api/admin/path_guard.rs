@@ -150,97 +150,126 @@ mod tests {
         assert_eq!(b, AdminBucket("releases".into()));
     }
 
-    /// Source guard: every inbound admin request struct (derives Deserialize
-    /// but not Serialize) that carries a bucket / prefix / key must use the
+    /// The path-shaped `String` fields of the inbound structs in `src`
+    /// (`fname:Struct.field`), and raw `Path<String>` buckets. A struct
+    /// that derives `Deserialize` is inbound, whatever else it derives
+    /// (SEC F-06: a `Serialize, Deserialize` request struct was skipped).
+    fn offenders(src: &str, fname: &str) -> Vec<String> {
+        let mut offenders = Vec::new();
+        let lines: Vec<&str> = src.lines().collect();
+        for (n, l) in lines.iter().enumerate() {
+            // A raw `Path<String>` bucket is fine only when the handler
+            // runs `check_bucket` on it at once (`start_migrate` trims
+            // first, which AdminBucket would refuse).
+            let checked_at_once = lines[n..(n + 16).min(lines.len())]
+                .iter()
+                .any(|l| l.contains("check_bucket("));
+            if l.contains(concat!("Path(bucket): ", "Path<String>"))
+                && fname != "path_guard.rs"
+                && !checked_at_once
+            {
+                offenders.push(format!("{fname}:{}: Path<String> bucket", n + 1));
+            }
+        }
+        let mut i = 0;
+        while i < lines.len() {
+            let l = lines[i].trim();
+            if !(l.starts_with("#[derive(") && l.contains("Deserialize")) {
+                i += 1;
+                continue;
+            }
+            // Find the struct line, then scan fields to the closing brace.
+            let mut j = i + 1;
+            while j < lines.len() && !lines[j].contains("struct ") && !lines[j].contains("enum ") {
+                j += 1;
+            }
+            if j >= lines.len() || lines[j].contains("enum ") {
+                i = j;
+                continue;
+            }
+            let name = lines[j]
+                .split("struct ")
+                .nth(1)
+                .unwrap_or("")
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let mut k = j + 1;
+            while k < lines.len() && !lines[k].trim_start().starts_with('}') {
+                let f = lines[k].trim().trim_start_matches("pub ");
+                if let Some((field, ty)) = f.split_once(':') {
+                    let field = field.trim();
+                    let pathy = field == "bucket"
+                        || field == "buckets"
+                        || field.ends_with("_bucket")
+                        || field.ends_with("prefix")
+                        || field == "key"
+                        || (field.ends_with("_key") && !field.contains("access_key"))
+                        || field == "relative"
+                        || field == "keys";
+                    if pathy && ty.contains("String") {
+                        offenders.push(format!("{fname}:{name}.{field}"));
+                    }
+                }
+                k += 1;
+            }
+            i = k;
+        }
+        offenders
+    }
+
+    #[test]
+    fn a_struct_that_derives_deserialize_is_inbound() {
+        for derive in [
+            "#[derive(Deserialize)]",
+            "#[derive(Serialize, Deserialize)]",
+            "#[derive(Debug, Clone, Serialize, Deserialize)]",
+            "#[derive(Deserialize, Serialize)]",
+        ] {
+            let src = format!("{derive}\nstruct X {{\n    bucket: String,\n}}\n");
+            assert_eq!(offenders(&src, "f.rs"), ["f.rs:X.bucket"], "{derive}");
+        }
+        let response = "#[derive(Serialize)]\nstruct Y {\n    bucket: String,\n}\n";
+        assert!(offenders(response, "f.rs").is_empty());
+    }
+
+    /// Source guard: every inbound admin request struct (derives
+    /// Deserialize) that carries a bucket / prefix / key must use the
     /// validated types. Plain `String` there is the S6 defect.
     #[test]
     fn admin_inputs_use_validated_types() {
-        // Fields that are not storage paths (UI hints, synthetic trace input).
+        // Fields that are not storage paths (UI hints, synthetic trace
+        // input), and response structs that also derive Deserialize.
         const ALLOW: &[&str] = &[
             "auth.rs:BrowserSessionConnectRequest.bucket",
             "auth.rs:OpenBrowserConnectRequest.bucket",
             // A JSON array (or a legacy list); download_zip checks each key.
             "objects.rs:ZipQuery.keys",
+            // Encryption keys in a backup, not object keys.
+            "backup.rs:SecretsEncryption.key",
+            "backup.rs:SecretsEncryption.legacy_key",
+            // The scan record that the proxy itself writes to disk and
+            // reads back; no request sends it.
+            "bucket_scan.rs:ScanResult.bucket",
+            // Response bodies, not request input.
+            "delta_efficiency.rs:DeltaspaceReport.bucket",
+            "delta_efficiency.rs:DeltaspaceReport.prefix",
+            "delta_efficiency.rs:EfficiencyResponse.bucket",
         ];
-        let mut offenders = Vec::new();
+        let mut found = Vec::new();
         for path in &crate::source_scan::rust_files("src/api/admin") {
             let src = std::fs::read_to_string(path).unwrap();
             let fname = path.file_name().unwrap().to_string_lossy().to_string();
-            let lines: Vec<&str> = src.lines().collect();
-            for (n, l) in src.lines().enumerate() {
-                // A raw `Path<String>` bucket is fine only when the handler
-                // runs `check_bucket` on it at once (`start_migrate` trims
-                // first, which AdminBucket would refuse).
-                let checked_at_once = lines[n..(n + 16).min(lines.len())]
-                    .iter()
-                    .any(|l| l.contains("check_bucket("));
-                if l.contains(concat!("Path(bucket): ", "Path<String>"))
-                    && fname != "path_guard.rs"
-                    && !checked_at_once
-                {
-                    offenders.push(format!("{fname}:{}: Path<String> bucket", n + 1));
-                }
-            }
-            let mut i = 0;
-            while i < lines.len() {
-                let l = lines[i].trim();
-                let inbound = l.starts_with("#[derive(")
-                    && l.contains("Deserialize")
-                    && !l.contains("Serialize,")
-                    && !l.contains(" Serialize)")
-                    && !l.contains("(Serialize");
-                if !inbound {
-                    i += 1;
-                    continue;
-                }
-                // Find the struct line, then scan fields to the closing brace.
-                let mut j = i + 1;
-                while j < lines.len()
-                    && !lines[j].contains("struct ")
-                    && !lines[j].contains("enum ")
-                {
-                    j += 1;
-                }
-                if j >= lines.len() || lines[j].contains("enum ") {
-                    i = j;
-                    continue;
-                }
-                let name = lines[j]
-                    .split("struct ")
-                    .nth(1)
-                    .unwrap_or("")
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let mut k = j + 1;
-                while k < lines.len() && !lines[k].starts_with('}') {
-                    let f = lines[k].trim().trim_start_matches("pub ");
-                    if let Some((field, ty)) = f.split_once(':') {
-                        let field = field.trim();
-                        let pathy = field == "bucket"
-                            || field == "buckets"
-                            || field.ends_with("_bucket")
-                            || field.ends_with("prefix")
-                            || field == "key"
-                            || (field.ends_with("_key") && !field.contains("access_key"))
-                            || field == "relative"
-                            || field == "keys";
-                        if pathy
-                            && ty.contains("String")
-                            && !ALLOW.contains(&format!("{fname}:{name}.{field}").as_str())
-                        {
-                            offenders.push(format!("{fname}:{name}.{field}"));
-                        }
-                    }
-                    k += 1;
-                }
-                i = k;
-            }
+            found.extend(
+                offenders(&src, &fname)
+                    .into_iter()
+                    .filter(|o| !ALLOW.contains(&o.as_str())),
+            );
         }
         assert!(
-            offenders.is_empty(),
-            "admin request fields must use AdminBucket / AdminObjectPath, found String: {offenders:?}"
+            found.is_empty(),
+            "admin request fields must use AdminBucket / AdminObjectPath, found String: {found:?}"
         );
     }
 }
