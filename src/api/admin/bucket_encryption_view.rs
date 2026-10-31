@@ -200,8 +200,10 @@ pub fn effective_encryption(
 }
 
 /// Fill in the conversion state of each bucket in `rows` that encrypts
-/// with a proxy key: its marker (one fresh read per bucket, 8 at once)
-/// and its latest re-encrypt job on this node.
+/// with a proxy key: its marker from the encrypting wrapper's window
+/// cache (one marker read per bucket per minute, 8 at once; this node's
+/// apply, job and Resume write through it, so their result shows at
+/// once) and its latest re-encrypt job on this node.
 pub async fn attach_conversions(
     engine: &crate::deltaglider::DynEngine,
     jobs_db: Option<&std::sync::Arc<tokio::sync::Mutex<crate::config_db::JobsDb>>>,
@@ -269,7 +271,7 @@ async fn marker_state(
     use crate::storage::StorageBackend;
     match engine
         .storage()
-        .conversion(bucket, ConversionOp::Status)
+        .conversion(bucket, ConversionOp::CachedStatus)
         .await
     {
         Ok(ConversionReply::Status(MarkerState::Ours { fields, server_now })) => {

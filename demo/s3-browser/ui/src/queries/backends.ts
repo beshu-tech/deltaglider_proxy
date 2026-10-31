@@ -10,6 +10,7 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { getBackends, getBucketOrigins, getLegacyKeyUsage } from '../adminApi';
 import { qk } from './keys';
+import { CONVERSION_POLL_MS, conversionNeedsPolling } from '../conversionView';
 
 /**
  * The server re-probes every backend every 30 s and marks one unhealthy as
@@ -37,6 +38,9 @@ export function useBucketOrigins(opts?: { enabled?: boolean }) {
     queryKey: qk.backends.origins(),
     queryFn: getBucketOrigins,
     enabled: opts?.enabled ?? true,
+    // While a conversion runs or waits for Resume, follow it: the job ends
+    // (the row goes away) or progresses without a click on this page.
+    refetchInterval: (query) => (conversionNeedsPolling(query.state.data?.buckets) ? CONVERSION_POLL_MS : false),
   });
 }
 

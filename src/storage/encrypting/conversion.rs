@@ -378,6 +378,10 @@ struct Slot {
 struct SlotState {
     /// The window, when it was read, and how long it stays.
     entry: Option<(Window, Instant, Duration)>,
+    /// The fields of this bucket's marker at the last read or write, also
+    /// past its deadline (`None`: no marker of this bucket). The admin
+    /// view tells "deadline passed" from "closed" with it.
+    fields: Option<Fields>,
     /// The backend clock minus the local clock at the read (seconds).
     skew: i64,
     last_refusal_refresh: Option<Instant>,
@@ -431,6 +435,28 @@ impl WindowCache {
             st.skew = server.saturating_sub(wall);
         }
         st.entry = Some((window, now, ttl));
+    }
+
+    /// Record the fields of the marker that the last read or write of
+    /// `bucket` found (`None`: no marker of this bucket).
+    pub fn store_fields(&self, bucket: &str, fields: Option<Fields>) {
+        self.slot(bucket).state.lock().fields = fields;
+    }
+
+    /// The cached marker fields of `bucket` with the backend clock now
+    /// (local `wall` plus the skew of the last read), while the cached
+    /// window is fresh; `None` when the marker must be read.
+    pub fn cached_fields(
+        &self,
+        bucket: &str,
+        now: Instant,
+        wall: i64,
+    ) -> Option<(Option<Fields>, i64)> {
+        let slot = self.slot(bucket);
+        let st = slot.state.lock();
+        let (_, at, ttl) = st.entry.as_ref()?;
+        (now.saturating_duration_since(*at) < *ttl)
+            .then(|| (st.fields, wall.saturating_add(st.skew)))
     }
 
     /// May a refused plaintext read of `bucket` read the marker again now?
@@ -514,6 +540,10 @@ pub enum ConversionOp {
     Extend { run: RunId, deadline: i64 },
     /// Remove the marker of `run` by identity.
     Close { run: RunId },
+    /// [`Self::Status`] from the wrapper's window cache ([`TTL`], kept
+    /// fresh by this node's own writes): the admin bucket list. A foreign
+    /// marker reads as [`MarkerState::Absent`] here.
+    CachedStatus,
     /// [`Self::Open`] with the config that the wrapper was BUILT with, not
     /// the published one: the apply opens the conversion before it
     /// publishes the engine that encrypts the bucket. A marker whose

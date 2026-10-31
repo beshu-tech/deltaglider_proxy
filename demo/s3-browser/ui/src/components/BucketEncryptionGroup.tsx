@@ -25,7 +25,7 @@
  * Turning on proxy AES for a bucket that holds objects starts their
  * conversion on the server (window + re-encrypt job): the dialog names
  * the object count from the validate, and the conversion row shows its
- * state afterwards (ConversionStatusRow).
+ * state afterwards on the "Now:" line (ConversionStatusInline).
  */
 import { useState } from 'react';
 import { Alert, Button, Checkbox, Input, Radio, Space, Tag, Typography, message } from 'antd';
@@ -54,9 +54,9 @@ import { useColors } from '../ThemeContext';
 import ApplyDialog from './ApplyDialog';
 import BucketKeySetup, { type BucketKeyValue } from './BucketKeySetup';
 import LegacyKeyBanner from './LegacyKeyBanner';
-import ConversionStatusRow from './ConversionStatusRow';
+import { ConversionStatusInline } from './ConversionStatus';
 import ServeDeprecationNotice from './ServeDeprecationNotice';
-import { conversionCountText, versionedWarnings } from '../conversionView';
+import { conversionCountText, conversionRowState, versionedWarnings } from '../conversionView';
 import { formRow } from './ruleEditorHelpers';
 
 const { Text } = Typography;
@@ -275,7 +275,13 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         )}
       </Text>
       <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
-        Now: {desc.label}.
+        Now: {desc.label}
+        {/* The conversion continues the state line; no separate block. */}
+        {!editing && conversionRowState(eff.conversion) ? (
+          <ConversionStatusInline bucket={bucket} view={eff.conversion} readOnly={readOnly} />
+        ) : (
+          '.'
+        )}
       </Text>
       {blockedReason && !readOnly && (
         <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
@@ -336,8 +342,6 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           Rotate key
         </Button>
       )}
-
-      {!editing && <ConversionStatusRow bucket={bucket} view={eff.conversion} readOnly={readOnly} />}
 
       {eff.source === 'bucket' && eff.conversion?.serves_plaintext_deprecated && !editing && (
         <ServeDeprecationNotice

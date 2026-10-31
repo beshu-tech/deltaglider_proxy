@@ -31,7 +31,7 @@ import { generateAesKeyHex } from '../aesKeyGen';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { aesKeyPatch, encryptionKeyEnvVar } from '../backendEncryptionPayload';
 import LegacyKeyBanner from './LegacyKeyBanner';
-import ConversionStatusRow from './ConversionStatusRow';
+import { ConversionStatusLine } from './ConversionStatus';
 import ServeDeprecationNotice from './ServeDeprecationNotice';
 import type { ConversionView } from '../adminApi';
 
@@ -269,6 +269,11 @@ export default function BackendEncryptionEditor({
                 {usage}
               </Text>
             )}
+            {/* The conversions of its buckets: part of the status block. */}
+            {!pending &&
+              (conversions ?? []).map((c) => (
+                <ConversionStatusLine key={c.bucket} bucket={c.bucket} view={c.view} readOnly={readOnly} />
+              ))}
           </div>
         </div>
         {!pending && !readOnly && (
@@ -308,10 +313,6 @@ export default function BackendEncryptionEditor({
           {keyChangeBlockedReason}
         </Text>
       )}
-      {!pending &&
-        (conversions ?? []).map((c) => (
-          <ConversionStatusRow key={c.bucket} bucket={c.bucket} view={c.view} showBucket readOnly={readOnly} />
-        ))}
       {current.serves_plaintext_deprecated && !pending && (
         <ServeDeprecationNotice subject="backend" onConvert={readOnly ? undefined : onConvertNow} />
       )}

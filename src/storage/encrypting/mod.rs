@@ -738,9 +738,17 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         match self.inner.read_conversion_marker(bucket).await {
             Ok(read) => {
                 let server_now = read.server_now.unwrap_or(wall);
+                let cfg = self.config.load();
+                let fields = read.marker.as_ref().and_then(|m| {
+                    conversion::open_fields(
+                        &m.content,
+                        cfg.ring(),
+                        &self.conversion_identity(bucket),
+                    )
+                });
+                self.windows.store_fields(bucket, fields);
                 let window = match &read.marker {
                     Some(m) => {
-                        let cfg = self.config.load();
                         let w = conversion::open(
                             m,
                             cfg.ring(),
@@ -777,6 +785,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                     None,
                     conversion::FAILED_TTL,
                 );
+                self.windows.store_fields(bucket, None);
                 conversion::Window::Closed
             }
         }
@@ -1036,6 +1045,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         }
         Ok(match op {
             Op::Status => Reply::Status(self.conversion_status(bucket).await?),
+            Op::CachedStatus => Reply::Status(self.cached_conversion_status(bucket).await),
             Op::Open { window_secs } => {
                 Reply::Opened(self.open_conversion_secs(bucket, window_secs).await?)
             }
@@ -1047,8 +1057,30 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         })
     }
 
+    /// The marker state of `bucket` from the window cache (one marker read
+    /// per [`conversion::TTL`]; this node's own writes update it).
+    async fn cached_conversion_status(&self, bucket: &str) -> conversion::MarkerState {
+        let wall = || chrono::Utc::now().timestamp();
+        let now = std::time::Instant::now;
+        let cached = match self.windows.cached_fields(bucket, now(), wall()) {
+            Some(c) => c,
+            None => {
+                self.window_of(bucket).await;
+                self.windows
+                    .cached_fields(bucket, now(), wall())
+                    .unwrap_or((None, wall()))
+            }
+        };
+        match cached {
+            (Some(fields), server_now) => conversion::MarkerState::Ours { fields, server_now },
+            (None, _) => conversion::MarkerState::Absent,
+        }
+    }
+
     /// Cache the window that this node just wrote (`None`: closed).
     fn cache_written(&self, bucket: &str, written: Option<(conversion::Fields, String)>) {
+        self.windows
+            .store_fields(bucket, written.as_ref().map(|(f, _)| *f));
         let window = match written {
             Some((f, version)) => conversion::Window::Open {
                 cutoff: f.cutoff,

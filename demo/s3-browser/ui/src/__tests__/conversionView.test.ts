@@ -10,7 +10,14 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { test } from 'vitest';
 import type { ConversionView } from '../adminApi';
-import { conversionCountText, conversionRowState, versionedWarnings } from '../conversionView';
+import {
+  conversionCountText,
+  conversionNeedsPolling,
+  conversionPhrase,
+  conversionRowState,
+  sentence,
+  versionedWarnings,
+} from '../conversionView';
 
 function view(over: Partial<ConversionView> = {}): ConversionView {
   return {
@@ -73,6 +80,34 @@ test('the row state of every conversion', () => {
     kind: 'stopped',
     jobId: 4,
   });
+});
+
+test('every state reads as a sentence-case sentence on its own', () => {
+  const states = [
+    conversionRowState(view({ job_on_this_node: { id: 1, status: 'running', percent: 42 } }))!,
+    conversionRowState(view({ job_on_this_node: { id: 1, status: 'queued', percent: null } }))!,
+    conversionRowState(view())!,
+    conversionRowState(view({ job_on_this_node: { id: 1, status: 'failed', percent: null } }))!,
+    conversionRowState(view({ open: false }))!,
+  ];
+  const lines = states.map((s) => sentence(conversionPhrase(s)));
+  assert.deepEqual(lines, [
+    'Encrypting the existing objects, 42%.',
+    'Starting to encrypt the existing objects…',
+    'Not every existing object is encrypted, and no job runs on this instance; they stay readable until the window closes.',
+    'The encryption of the existing objects stopped with failures; they stay readable until the window closes.',
+    'The conversion stopped before it finished; objects that are not encrypted yet fail to read.',
+  ]);
+});
+
+test('the list polls only while a conversion runs or waits for Resume', () => {
+  const row = (conversion?: ConversionView) => ({ effective_encryption: { conversion } });
+  assert.equal(conversionNeedsPolling(undefined), false);
+  assert.equal(conversionNeedsPolling([row()]), false);
+  assert.equal(conversionNeedsPolling([row(view({ run: undefined, serves_plaintext_deprecated: true }))]), false);
+  assert.equal(conversionNeedsPolling([row(view({ open: false }))]), false, 'stopped changes only on a click');
+  assert.equal(conversionNeedsPolling([row(), row(view())]), true);
+  assert.equal(conversionNeedsPolling([row(view({ job_on_this_node: { id: 1, status: 'running', percent: 3 } }))]), true);
 });
 
 const SRC = join(__dirname, '..');

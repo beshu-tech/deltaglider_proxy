@@ -688,3 +688,59 @@ async fn on_s3_the_marker_is_a_cas_object_with_the_server_clock() {
     ));
     assert_eq!(s3.read_conversion_marker("b").await.unwrap().marker, None);
 }
+
+/// The admin view's marker state, from the wrapper's window cache.
+async fn cached_status(
+    w: &EncryptingBackend<crate::storage::FilesystemBackend>,
+) -> super::conversion::MarkerState {
+    match w
+        .conversion("releases", super::conversion::ConversionOp::CachedStatus)
+        .await
+        .unwrap()
+    {
+        super::conversion::ConversionReply::Status(s) => s,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The admin view reads the marker state from the window cache: this
+/// node's own writes show at once (open, close), a marker past its
+/// deadline still names its fields (the "stopped" state), and a write by
+/// another node shows only after the TTL (no backend read per view).
+#[tokio::test]
+async fn the_cached_status_follows_this_nodes_writes_and_keeps_an_expired_marker() {
+    use super::conversion::MarkerState;
+    let rig = Rig::new(encrypting(0xaa, "releases-2026")).await;
+    let a = rig.wrapper("local-disk", None).await;
+    assert_eq!(cached_status(&a).await, MarkerState::Absent);
+    let run = a.open_conversion("releases", 7).await.unwrap();
+    let MarkerState::Ours { fields, server_now } = cached_status(&a).await else {
+        panic!("an open shows at once")
+    };
+    assert_eq!(fields.run, run);
+    assert!(server_now < fields.deadline);
+
+    // Another node closes it: this node's view stays cached (TTL); the
+    // closer's view shows the close at once.
+    let b = rig.wrapper("local-disk", None).await;
+    assert!(matches!(
+        b.close_conversion("releases", &run).await.unwrap(),
+        ByIdentity::Done(None, _)
+    ));
+    assert!(
+        matches!(cached_status(&a).await, MarkerState::Ours { .. }),
+        "cached"
+    );
+    assert_eq!(cached_status(&b).await, MarkerState::Absent);
+
+    // A marker past its deadline keeps its fields: the view says "stopped".
+    let c = rig.wrapper("local-disk", None).await;
+    let run = c.open_conversion_secs("releases", 1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let fresh = rig.wrapper("local-disk", None).await;
+    let MarkerState::Ours { fields, server_now } = cached_status(&fresh).await else {
+        panic!("an expired marker of this bucket still has fields")
+    };
+    assert_eq!(fields.run, run);
+    assert!(server_now >= fields.deadline, "past its deadline");
+}

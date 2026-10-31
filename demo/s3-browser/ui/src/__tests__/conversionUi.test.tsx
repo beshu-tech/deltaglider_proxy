@@ -14,6 +14,7 @@ import BackendsPanel from '../components/BackendsPanel';
 import BucketEncryptionGroup from '../components/BucketEncryptionGroup';
 import type { ConversionView, EffectiveEncryption } from '../adminApi';
 import { NavigationContext } from '../NavigationContext';
+import { useBucketOrigins } from '../queries/backends';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 import { bucketKeyEff, eff } from '../test/encryption';
@@ -89,18 +90,25 @@ test('running: the progress of this node\'s job and a link to the run, no Resume
   const navigate = renderGroup(
     bucketKeyEff({ conversion: view({ job_on_this_node: { id: 7, status: 'running', percent: 42 } }) }),
   );
-  const row = screen.getByTestId('conversion-status-row');
+  const row = screen.getByTestId('conversion-status');
   expect(row).toHaveAttribute('data-state', 'running');
-  expect(row).toHaveTextContent('encrypting the existing objects, 42%. They stay readable meanwhile.');
+  // On the state line, as its continuation: one block, one hierarchy.
+  expect(screen.getByText(/^Now:/)).toContainElement(row);
+  expect(screen.getByText(/^Now:/)).toHaveTextContent(/^Now: .* · encrypting the existing objects, 42% · View run$/);
   expect(within(row).queryByRole('button', { name: 'Resume' })).toBeNull();
   await user.click(within(row).getByRole('button', { name: 'View run' }));
   expect(navigate).toHaveBeenCalledWith('/_/admin/jobs?job=maintenance%3A7');
 });
 
+test('running with no count yet says it is starting', () => {
+  renderGroup(bucketKeyEff({ conversion: view({ job_on_this_node: { id: 7, status: 'queued', percent: null } }) }));
+  expect(screen.getByTestId('conversion-status')).toHaveTextContent('starting to encrypt the existing objects…');
+});
+
 test('no job on this node: Resume starts the re-encrypt job of the bucket', async () => {
   const user = userEvent.setup();
   renderGroup(bucketKeyEff({ conversion: view() }));
-  const row = screen.getByTestId('conversion-status-row');
+  const row = screen.getByTestId('conversion-status');
   expect(row).toHaveAttribute('data-state', 'resume');
   expect(row).toHaveTextContent(/no job runs on this instance/);
   await user.click(within(row).getByRole('button', { name: 'Resume' }));
@@ -110,7 +118,7 @@ test('no job on this node: Resume starts the re-encrypt job of the bucket', asyn
 
 test('a failed job offers Resume', () => {
   renderGroup(bucketKeyEff({ conversion: view({ job_on_this_node: { id: 7, status: 'failed', percent: null } }) }));
-  const row = screen.getByTestId('conversion-status-row');
+  const row = screen.getByTestId('conversion-status');
   expect(row).toHaveAttribute('data-state', 'resume');
   expect(row).toHaveTextContent(/stopped with failures/);
   expect(within(row).getByRole('button', { name: 'Resume' })).toBeInTheDocument();
@@ -120,7 +128,7 @@ test('deadline passed: a warning that the conversion stopped before it finished,
   renderGroup(
     bucketKeyEff({ conversion: view({ open: false, job_on_this_node: { id: 7, status: 'cancelled', percent: null } }) }),
   );
-  const row = screen.getByTestId('conversion-status-row');
+  const row = screen.getByTestId('conversion-status');
   expect(row).toHaveAttribute('data-state', 'stopped');
   expect(row).toHaveTextContent('the conversion stopped before it finished');
   expect(row.querySelector('.ant-typography-warning')).not.toBeNull();
@@ -134,20 +142,20 @@ test('objects stored after the cutoff are counted, with a link to the run\'s fai
       conversion: view({ adopted_after_cutoff: 3, job_on_this_node: { id: 7, status: 'running', percent: 80 } }),
     }),
   );
-  const row = screen.getByTestId('conversion-status-row');
+  const row = screen.getByTestId('conversion-status');
   await user.click(within(row).getByRole('button', { name: '3 objects stored after the cutoff' }));
   expect(navigate).toHaveBeenCalledWith('/_/admin/jobs?job=maintenance%3A7&tab=failures');
 });
 
 test('no marker: no row', () => {
   renderGroup(bucketKeyEff());
-  expect(screen.queryByTestId('conversion-status-row')).toBeNull();
+  expect(screen.queryByTestId('conversion-status')).toBeNull();
 });
 
 test('a bucket with the deprecated serve: Convert now removes the line', async () => {
   const user = userEvent.setup();
   renderGroup(bucketKeyEff({ conversion: view({ run: undefined, open: false, serves_plaintext_deprecated: true }) }));
-  expect(screen.queryByTestId('conversion-status-row')).toBeNull();
+  expect(screen.queryByTestId('conversion-status')).toBeNull();
   const notice = screen.getByTestId('serve-deprecation-notice');
   expect(notice).toHaveTextContent(/next release no longer accepts/);
   await user.click(within(notice).getByRole('button', { name: 'Convert now' }));
@@ -172,10 +180,13 @@ test('a backend card: one row per bucket in conversion, and Convert now for a de
       ]}
     />,
   );
-  const rows = screen.getAllByTestId('conversion-status-row');
+  const rows = screen.getAllByTestId('conversion-status');
   expect(rows.map((r) => r.getAttribute('data-state'))).toEqual(['running', 'stopped']);
-  expect(rows[0]).toHaveTextContent(/^releases: encrypting/);
-  expect(rows[1]).toHaveTextContent(/^downloads: the conversion stopped/);
+  // The bucket is a mono label; the state a sentence-case sentence.
+  expect(within(rows[0]).getByText('releases').tagName).toBe('CODE');
+  expect(rows[0]).toHaveTextContent(/^releasesEncrypting the existing objects, 10%\./);
+  expect(within(rows[1]).getByText('downloads').tagName).toBe('CODE');
+  expect(rows[1]).toHaveTextContent(/^downloadsThe conversion stopped before it finished; .*\./);
   await user.click(within(screen.getByTestId('serve-deprecation-notice')).getByRole('button', { name: 'Convert now' }));
   expect(onConvertNow).toHaveBeenCalledTimes(1);
 });
@@ -217,3 +228,30 @@ test('turning on a backend key over objects names the count first; Cancel sends 
   // The edit stays, so the operator can apply after all.
   expect(screen.getByRole('button', { name: 'Apply encryption change' })).toBeInTheDocument();
 });
+
+/** The visual review's bug: a job that finished left "encrypting…" on the
+ *  card until a reload. The bucket list refetches while a conversion runs,
+ *  so the state follows the job, and goes away when the window closes. */
+test('a running conversion follows the job to its close with no reload', async () => {
+  let calls = 0;
+  http.on('GET', '/_/api/admin/buckets', () => {
+    calls += 1;
+    const conversion = calls === 1 ? view({ job_on_this_node: { id: 7, status: 'running', percent: null } }) : undefined;
+    return json({
+      buckets: [{ name: 'db-archive', backend_name: 'hetzner-fsn1', effective_encryption: bucketKeyEff({ conversion }) }],
+    });
+  });
+  function Harness() {
+    const origins = useBucketOrigins();
+    const e = origins.data?.buckets[0]?.effective_encryption;
+    return e ? <BucketEncryptionGroup bucket="db-archive" eff={e} onApplied={vi.fn()} /> : null;
+  }
+  renderWithQuery(<Harness />);
+  expect(await screen.findByTestId('conversion-status')).toHaveAttribute('data-state', 'running');
+  await waitFor(() => expect(screen.queryByTestId('conversion-status')).toBeNull(), { timeout: 6_000 });
+  expect(screen.getByText(/^Now:/)).toHaveTextContent(/^Now: .*\.$/);
+  const after = calls;
+  // Closed: no more polling.
+  await new Promise((r) => setTimeout(r, 3_500));
+  expect(calls).toBe(after);
+}, 15_000);

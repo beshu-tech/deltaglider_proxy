@@ -61,6 +61,47 @@ export function conversionRowState(view: ConversionView | null | undefined): Con
   return { kind: 'resume', jobId: job?.id ?? null, failed: !!job && job.status !== 'completed' };
 }
 
+/**
+ * The words of a conversion state, as a continuation of a status line
+ * ("Now: Encrypted · bucket key k · <phrase>"): lower case, no full stop.
+ * [`sentence`] makes it a sentence of its own.
+ */
+export function conversionPhrase(state: ConversionRowState): string {
+  switch (state.kind) {
+    case 'running':
+      return state.percent === null
+        ? 'starting to encrypt the existing objects…'
+        : `encrypting the existing objects, ${state.percent}%`;
+    case 'resume':
+      return state.failed
+        ? 'the encryption of the existing objects stopped with failures; they stay readable until the window closes'
+        : 'not every existing object is encrypted, and no job runs on this instance; they stay readable until the window closes';
+    case 'stopped':
+      return 'the conversion stopped before it finished; objects that are not encrypted yet fail to read';
+  }
+}
+
+/** A phrase as a sentence: capital first letter, full stop (not after "…"). */
+export function sentence(phrase: string): string {
+  const s = phrase.charAt(0).toUpperCase() + phrase.slice(1);
+  return /[.…]$/.test(s) ? s : `${s}.`;
+}
+
+/** Does a view in `buckets` need a refetch to follow its conversion? A
+ *  running or resumable conversion changes without a click here (the job
+ *  ends, or another tab resumes it); a stopped one does not. */
+export function conversionNeedsPolling(
+  buckets: ReadonlyArray<{ effective_encryption?: { conversion?: ConversionView } | null }> | undefined,
+): boolean {
+  return (buckets ?? []).some((b) => {
+    const s = conversionRowState(b.effective_encryption?.conversion);
+    return s !== null && s.kind !== 'stopped';
+  });
+}
+
+/** How often the bucket list refetches while a conversion runs. */
+export const CONVERSION_POLL_MS = 3_000;
+
 /** The id of a re-encrypt job in the Jobs page (`?job=`). */
 export function runId(jobId: number): string {
   return `maintenance:${jobId}`;
