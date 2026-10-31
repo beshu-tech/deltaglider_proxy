@@ -177,6 +177,7 @@ The fields of `conversion`:
 | `adopted_after_cutoff` | The objects that the latest re-encrypt job of the bucket on this instance converted although clients could not read them. |
 | `job_on_this_node` | `{id, status, percent}` of the latest re-encrypt job of the bucket on this instance, or `null`. Job ids are local to an instance. |
 | `serves_plaintext_deprecated` | The bucket's block, or its backend's block, has the deprecated `plaintext_reads: serve`. |
+| `versioned` | The backend keeps old versions of the bucket's objects. The proxy reads this only for a bucket that has a conversion marker, and a failed read counts as `false`. |
 
 The proxy reads each marker through a cache of 60 seconds, so a window that another instance closed can show as open for up to a minute. The response never carries a key. `GET /_/api/admin/backends` also lists, per backend, `bucket_encryption_modes`: the modes that a bucket's own block accepts on that backend. The `encryption` summary of each backend has `serves_plaintext_deprecated`, which is `true` when the backend's own block has the deprecated `plaintext_reads: serve`.
 

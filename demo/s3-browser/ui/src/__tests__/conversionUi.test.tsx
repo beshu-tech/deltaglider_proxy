@@ -175,7 +175,7 @@ test('no job on this node: Resume starts the re-encrypt job of the bucket', asyn
   expect(row).toHaveTextContent(/this proxy runs no re-encrypt job/);
   await user.click(within(row).getByRole('button', { name: 'Resume the conversion of db-archive' }));
   await waitFor(() => expect(http.callsTo('POST', REENCRYPT)).toHaveLength(1));
-  expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'] });
+  expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'], open_window: true });
 });
 
 test('a failed job offers Resume', () => {
@@ -390,7 +390,7 @@ test('review 2: Resume of a versioned bucket asks about the old versions and sen
   await user.click(box);
   await user.click(within(dialog).getByRole('button', { name: 'Resume' }));
   await waitFor(() => expect(http.callsTo('POST', REENCRYPT)).toHaveLength(1));
-  expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'], purge_plaintext_versions: true });
+  expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'], purge_plaintext_versions: true, open_window: true });
 });
 
 test('review 2: Resume of a bucket without versions is one click', async () => {
@@ -399,7 +399,7 @@ test('review 2: Resume of a bucket without versions is one click', async () => {
   await user.click(screen.getByRole('button', { name: /^Resume/ }));
   await waitFor(() => expect(http.callsTo('POST', REENCRYPT)).toHaveLength(1));
   expect(screen.queryByRole('dialog')).toBeNull();
-  expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'] });
+  expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'], open_window: true });
 });
 
 /** Finding 3: Convert now starts a conversion like turning encryption on,

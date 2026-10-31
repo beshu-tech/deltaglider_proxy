@@ -386,14 +386,20 @@ export async function previewLifecycleJob(id: string, fresh = false): Promise<Li
  *  unencrypted versions (a versioned backend); sent only when true. */
 export async function startReencrypt(
   buckets: string[],
-  opts?: { purgePlaintextVersions?: boolean },
+  opts?: { purgePlaintextVersions?: boolean; openWindow?: boolean },
 ): Promise<{
   started: Array<{ bucket: string; job_id: number }>;
   errors: Array<{ bucket: string; error: string }>;
 }> {
   return adminJson('/api/admin/jobs/reencrypt', {
     method: 'POST',
-    body: opts?.purgePlaintextVersions ? { buckets, purge_plaintext_versions: true } : { buckets },
+    body: {
+      buckets,
+      ...(opts?.purgePlaintextVersions ? { purge_plaintext_versions: true } : {}),
+      // Resume: the job takes over the bucket's conversion window (run
+      // ownership), so it extends the window and closes it on success.
+      ...(opts?.openWindow ? { open_window: true } : {}),
+    },
     context: 'Start re-encryption',
   });
 }

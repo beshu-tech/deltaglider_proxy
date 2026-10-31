@@ -83,6 +83,10 @@ pub struct ConversionView {
     /// The bucket's own block, or its backend's, sets the deprecated
     /// `plaintext_reads: serve`.
     pub serves_plaintext_deprecated: bool,
+    /// The backend keeps old versions of the bucket's objects, so a Resume
+    /// can also ask to purge the old unencrypted versions. Read only for a
+    /// bucket with a marker; a failed read counts as not versioned.
+    pub versioned: bool,
 }
 
 /// A re-encrypt job, as the conversion row shows it.
@@ -221,6 +225,18 @@ pub async fn attach_conversions(
         super::config::conversion_start::in_parallel(&wanted, |b| marker_state(engine, b)).await;
     let markers: std::collections::HashMap<String, _> =
         wanted.iter().cloned().zip(states).collect();
+    let with_marker: Vec<String> = markers
+        .iter()
+        .filter(|(_, m)| m.is_some())
+        .map(|(b, _)| b.clone())
+        .collect();
+    let versioning = super::config::conversion_start::in_parallel(&with_marker, |b| async move {
+        use crate::storage::StorageBackend;
+        engine.storage().bucket_versioning(b).await.unwrap_or(false)
+    })
+    .await;
+    let versioned: std::collections::HashMap<String, bool> =
+        with_marker.into_iter().zip(versioning).collect();
     let db = match jobs_db {
         Some(db) if !markers.is_empty() => Some(db.lock().await),
         _ => None,
@@ -244,6 +260,7 @@ pub async fn attach_conversions(
             &fields.run,
         ));
         view.adopted_after_cutoff = adopted;
+        view.versioned = versioned.get(&key).copied().unwrap_or(false);
         view.job_on_this_node = job.map(|j| ConversionJob {
             percent: crate::maintenance::display_percent(&j),
             id: j.id,

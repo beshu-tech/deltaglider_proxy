@@ -92,7 +92,7 @@ function useActions(bucket: string, view: ConversionView, state: ConversionRowSt
     if (purge === null) return;
     setBusy(true);
     try {
-      const r = await startReencrypt([bucket], { purgePlaintextVersions: purge });
+      const r = await startReencrypt([bucket], { purgePlaintextVersions: purge, openWindow: true });
       const error = r.errors[0]?.error;
       if (error) message.error(`Resume of ${bucket}: ${error}`);
       else message.success(`Conversion of ${bucket} resumed`);
