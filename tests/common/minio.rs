@@ -62,6 +62,15 @@ pub async fn minio_client() -> Client {
 /// A bucket or object older than this belongs to a finished run: no test lives this long.
 const STALE_AGE_SECS: i64 = 2 * 3600;
 
+/// Is a bucket or object with this timestamp (Unix seconds) left by a
+/// finished run? A time at or before the Unix epoch is not a real time:
+/// MinIO lists a bucket that another test creates at this instant with
+/// `0001-01-01T00:00:00Z`, and a sweep that took that for "old" deleted
+/// the bucket of a running test (its versioning went with it).
+fn is_stale(timestamp_secs: i64, now: i64) -> bool {
+    timestamp_secs > 0 && now - timestamp_secs >= STALE_AGE_SECS
+}
+
 /// Tests create buckets and objects and do not delete them (a panic would
 /// skip any cleanup anyway), and MinIO's scanner re-crawls all of them for
 /// ever. So the first MinIO test of each process deletes what earlier runs
@@ -94,7 +103,7 @@ async fn sweep_stale_buckets() {
         let (Some(name), Some(created)) = (bucket.name(), bucket.creation_date()) else {
             continue;
         };
-        if name == MINIO_BUCKET || now - created.secs() < STALE_AGE_SECS {
+        if name == MINIO_BUCKET || !is_stale(created.secs(), now) {
             continue;
         }
         // MinIO's force delete removes the objects, versions and pending
@@ -130,10 +139,7 @@ async fn sweep_stale_objects(client: &Client, now: i64) {
         let stale: Vec<ObjectIdentifier> = page
             .contents()
             .iter()
-            .filter(|o| {
-                o.last_modified()
-                    .is_some_and(|t| now - t.secs() >= STALE_AGE_SECS)
-            })
+            .filter(|o| o.last_modified().is_some_and(|t| is_stale(t.secs(), now)))
             .filter_map(|o| {
                 ObjectIdentifier::builder()
                     .set_key(o.key().map(Into::into))

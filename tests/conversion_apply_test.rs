@@ -599,7 +599,11 @@ async fn a_versioned_bucket_keeps_plaintext_versions_until_a_job_purges_them() {
 
     let (code, v) = encrypt_bucket(&env, &bucket, true, false).await;
     assert_eq!(code, 200, "{v}");
-    assert_eq!(entry(&v, "conversion_preview", &bucket)["versioned"], true);
+    assert_eq!(
+        entry(&v, "conversion_preview", &bucket)["versioned"],
+        true,
+        "{v}"
+    );
     let (code, v) = encrypt_bucket(&env, &bucket, false, false).await;
     assert_eq!(code, 200, "{v}");
     let started = entry(&v, "conversions", &bucket);
