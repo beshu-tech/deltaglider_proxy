@@ -865,6 +865,57 @@ impl StorageBackend for S3Backend {
         Ok(())
     }
 
+    /// One PUT with `If-Match: version`: a body in memory, or a passthrough
+    /// file streamed from disk.
+    #[instrument(skip(self, target, body, metadata))]
+    async fn put_if_unchanged(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        target: crate::storage::RewriteTarget<'_>,
+        body: PutBody<'_>,
+        metadata: &FileMetadata,
+        version: &str,
+    ) -> Result<crate::storage::WriteIf, StorageError> {
+        use crate::storage::{RewriteTarget, WriteIf};
+        use objects::{FencedPut, OnUnsupported};
+        let key = self.object_key(prefix, target.object());
+        let fence = RefFence::ETag(version.to_string());
+        let put = match (target, body) {
+            (RewriteTarget::Passthrough { .. }, PutBody::File { path, .. }) => {
+                self.put_object_file_with_metadata_fenced_with(
+                    bucket,
+                    &key,
+                    path,
+                    metadata,
+                    &fence,
+                    OnUnsupported::Report,
+                )
+                .await?
+            }
+            (_, body) => {
+                let data = body.into_bytes().await?;
+                self.put_object_with_metadata_fenced_with(
+                    bucket,
+                    &key,
+                    data,
+                    metadata,
+                    &fence,
+                    OnUnsupported::Report,
+                )
+                .await?
+            }
+        };
+        Ok(match put {
+            FencedPut::Stored(_) => WriteIf::Written,
+            FencedPut::Lost => {
+                debug!("S3 conditional rewrite {bucket}/{key}: the object changed; not written");
+                WriteIf::Changed
+            }
+            FencedPut::Unsupported => WriteIf::Unsupported,
+        })
+    }
+
     async fn copy_within(
         &self,
         variant: ObjectVariant,

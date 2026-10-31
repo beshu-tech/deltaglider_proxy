@@ -46,6 +46,9 @@ pub struct MaintenanceJobView {
     pub objects_done: i64,
     pub objects_skipped: i64,
     pub objects_failed: i64,
+    /// Re-encrypt: of `objects_skipped`, the objects that a client wrote
+    /// after the job read them; each keeps the client's version.
+    pub objects_skipped_changed: i64,
     pub bytes_done: i64,
     /// 0-99 while running (`None` while counting); 100 on `completed`.
     pub percent: Option<u8>,
@@ -76,6 +79,7 @@ impl From<MaintenanceJob> for MaintenanceJobView {
             objects_done: j.objects_done,
             objects_skipped: j.objects_skipped,
             objects_failed: j.objects_failed,
+            objects_skipped_changed: j.objects_changed,
             bytes_done: j.bytes_done,
             percent,
             writes_blocked: None,
@@ -217,11 +221,12 @@ pub async fn start_reencrypt(
                 purge_plaintext_versions: req.purge_plaintext_versions,
                 // Only a job with the marker's run extends and closes it.
                 run: opened.map(|w| w.run),
+                ..Default::default()
             },
         });
         origins.push((bucket.to_string(), opened));
     }
-    let results = queue_reencrypt(&state.s3_state, db, &requests, "admin", &headers).await;
+    let results = queue_reencrypt(&state.s3_state, &cfg, db, &requests, "admin", &headers).await;
     drop(cfg);
 
     let mut started = Vec::new();

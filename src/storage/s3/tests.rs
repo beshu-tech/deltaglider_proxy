@@ -3063,3 +3063,110 @@ mod stored_last_modified_tests {
         }
     }
 }
+
+/// The re-encrypt job's conditional rewrite on S3
+/// (`StorageBackend::put_if_unchanged`): the PUT carries `If-Match` on the
+/// version that the caller read, a refused condition is `Changed` (never
+/// an overwrite), and 501 is `Unsupported` with nothing written.
+mod put_if_unchanged_tests {
+    use super::super::objects::conditional_target_gone;
+    use crate::storage::{RefFence, RewriteTarget, StorageBackend, StorageBackendExt, WriteIf};
+    use crate::types::FileMetadata;
+
+    fn meta(body: &[u8]) -> FileMetadata {
+        FileMetadata::new_passthrough(
+            "k.txt".into(),
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(body)),
+            hex::encode(<md5::Md5 as md5::Digest>::digest(body)),
+            body.len() as u64,
+            None,
+        )
+    }
+
+    async fn rewrite(
+        s3: &crate::storage::S3Backend,
+        body: &'static [u8],
+        version: &str,
+    ) -> WriteIf {
+        s3.put_if_unchanged(
+            "b",
+            "",
+            RewriteTarget::Passthrough { name: "k.txt" },
+            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(body)),
+            &meta(body),
+            version,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn put(s3: &crate::storage::S3Backend, body: &'static [u8]) {
+        let data = bytes::Bytes::from_static(body);
+        s3.put_passthrough("b", "", "k.txt", data, &meta(body))
+            .await
+            .unwrap();
+    }
+
+    async fn version(s3: &crate::storage::S3Backend) -> String {
+        let read = s3.get_passthrough_metadata("b", "", "k.txt").await.unwrap();
+        read.backend_version.expect("a HEAD names the ETag")
+    }
+
+    #[tokio::test]
+    async fn the_read_names_the_version_and_the_rewrite_is_conditional_on_it() {
+        let (s3, fake) = crate::storage::fake_s3::backend().await;
+        put(&s3, b"old").await;
+        let v = version(&s3).await;
+        let md5 = hex::encode(<md5::Md5 as md5::Digest>::digest(b"old"));
+        assert_eq!(v, format!("\"{md5}\""));
+
+        // A client writes the object after the read: the backend refuses
+        // the rewrite (412) and the client's object stays.
+        fake.replace_body("b/k.txt", b"client");
+        assert_eq!(rewrite(&s3, b"job", &v).await, WriteIf::Changed);
+        assert_eq!(
+            s3.get_passthrough("b", "", "k.txt").await.unwrap(),
+            b"client"
+        );
+
+        // The version of a fresh read: written.
+        let v = version(&s3).await;
+        assert_eq!(rewrite(&s3, b"job", &v).await, WriteIf::Written);
+        assert_eq!(s3.get_passthrough("b", "", "k.txt").await.unwrap(), b"job");
+
+        // A deleted object is not written again.
+        s3.delete_passthrough("b", "", "k.txt").await.unwrap();
+        assert_eq!(rewrite(&s3, b"job", &v).await, WriteIf::Changed);
+        assert!(s3.get_passthrough("b", "", "k.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_backend_without_conditional_writes_gets_nothing_written() {
+        let (s3, fake) = crate::storage::fake_s3::backend().await;
+        put(&s3, b"old").await;
+        let v = version(&s3).await;
+        fake.fail("PUT", "k.txt", 501, "NotImplemented", 1);
+        assert_eq!(rewrite(&s3, b"job", &v).await, WriteIf::Unsupported);
+        assert_eq!(s3.get_passthrough("b", "", "k.txt").await.unwrap(), b"old");
+    }
+
+    #[test]
+    fn a_404_to_an_if_match_put_means_the_object_is_gone() {
+        let etag = RefFence::ETag("\"abc\"".into());
+        assert!(conditional_target_gone(&etag, "status=404 code=NoSuchKey"));
+        assert!(conditional_target_gone(&etag, "status=404 code="));
+        assert!(!conditional_target_gone(
+            &etag,
+            "status=404 code=NoSuchBucket"
+        ));
+        assert!(!conditional_target_gone(&etag, "status=503 code=SlowDown"));
+        assert!(!conditional_target_gone(
+            &RefFence::Unfenced,
+            "status=404 code=NoSuchKey"
+        ));
+        assert!(!conditional_target_gone(
+            &RefFence::Absent,
+            "status=404 code=NoSuchKey"
+        ));
+    }
+}

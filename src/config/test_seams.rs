@@ -51,6 +51,16 @@ pub struct TestSeams {
     /// `DGP_TEST_CONVERSION_WINDOW_SECS`: the length of a conversion window
     /// (default 7 days), so a test can see a deadline pass.
     pub conversion_window_secs: Option<i64>,
+    /// `DGP_TEST_REWRITE_STALL_MS`: the re-encrypt job's in-place rewrite
+    /// of an object sleeps after its read and before its conditional write
+    /// (inside the object's locks), so a test can write the object from
+    /// another instance in that window.
+    pub rewrite_stall_ms: u64,
+    /// `DGP_TEST_REWRITE_LOCK_STALL_MS`: the re-encrypt job sleeps after
+    /// its HEAD of an object and before the rewrite takes the object's
+    /// write lock, so a test can write the object through the same
+    /// instance in that window.
+    pub rewrite_lock_stall_ms: u64,
 }
 
 impl TestSeams {
@@ -84,6 +94,8 @@ impl TestSeams {
                 .filter(|n| *n >= 0),
             conversion_window_secs: lookup_parse::<i64>(env, "DGP_TEST_CONVERSION_WINDOW_SECS")
                 .filter(|n| *n > 0),
+            rewrite_stall_ms: lookup_parse(env, "DGP_TEST_REWRITE_STALL_MS").unwrap_or(0),
+            rewrite_lock_stall_ms: lookup_parse(env, "DGP_TEST_REWRITE_LOCK_STALL_MS").unwrap_or(0),
         }
     }
 }

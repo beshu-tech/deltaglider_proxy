@@ -1650,6 +1650,23 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         metadata: &FileMetadata,
         spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
+        let at = (bucket, prefix, filename);
+        self.put_encrypted_files_if(site, at, parts, metadata, spool, None)
+            .await
+            .map(drop)
+    }
+
+    /// [`Self::put_encrypted_files`]; with `version`, the store is
+    /// [`StorageBackend::put_if_unchanged`] on it.
+    async fn put_encrypted_files_if(
+        &self,
+        site: Arc<v2::SiteKey>,
+        (bucket, prefix, filename): (&str, &str, &str),
+        parts: &[std::path::PathBuf],
+        metadata: &FileMetadata,
+        spool: SpoolBudget<'_>,
+        version: Option<&str>,
+    ) -> Result<super::traits::WriteIf, StorageError> {
         let mut plain_len = 0u64;
         for p in parts {
             plain_len += tokio::fs::metadata(p)
@@ -1669,16 +1686,25 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                 "a source file changed while it was encrypted ({plain_len} → {written} bytes)"
             )));
         }
-        self.inner
-            .put_passthrough_file(
-                bucket,
-                prefix,
-                filename,
-                ct.path(),
-                &stored,
-                spool.holding(&ct),
-            )
-            .await
+        let body = PutBody::File {
+            path: ct.path(),
+            spool: spool.holding(&ct),
+        };
+        match version {
+            Some(version) => {
+                let target = super::traits::RewriteTarget::Passthrough { name: filename };
+                self.inner
+                    .put_if_unchanged(bucket, prefix, target, body, &stored, version)
+                    .await
+            }
+            None => {
+                let target = StoredWrite::Passthrough { name: filename };
+                self.inner
+                    .put_object(bucket, prefix, target, body, &stored)
+                    .await?;
+                Ok(super::traits::WriteIf::Written)
+            }
+        }
     }
 
     /// A follow-up read of `start..=end` of the stored (raw) object whose
@@ -2095,6 +2121,51 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
                     .await
             }
         }
+    }
+
+    /// Sealed (or written as plaintext, with no markers, where the bucket
+    /// writes plaintext) as `put_object` and `write_reference` do, then
+    /// stored by the inner backend on the same condition. A file is
+    /// encrypted into a spool file; parts and chunks are not a rewrite's
+    /// body and are collected.
+    async fn put_if_unchanged(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        target: super::traits::RewriteTarget<'_>,
+        body: PutBody<'_>,
+        metadata: &FileMetadata,
+        version: &str,
+    ) -> Result<super::traits::WriteIf, StorageError> {
+        self.check_write(bucket).await?;
+        if let (super::traits::RewriteTarget::Passthrough { name }, PutBody::File { path, spool }) =
+            (target, &body)
+        {
+            if let Some(site) = self.write_key(bucket)? {
+                let parts = [path.to_path_buf()];
+                let at = (bucket, prefix, name);
+                return self
+                    .put_encrypted_files_if(site, at, &parts, metadata, *spool, Some(version))
+                    .await;
+            }
+            let plain = without_markers(metadata);
+            return self
+                .inner
+                .put_if_unchanged(bucket, prefix, target, body, &plain, version)
+                .await;
+        }
+        let data = body.into_bytes().await?;
+        let (sealed, stored) = self.seal_bytes(bucket, prefix, target.object(), &data, metadata)?;
+        self.inner
+            .put_if_unchanged(
+                bucket,
+                prefix,
+                target,
+                PutBody::Bytes(sealed),
+                &stored,
+                version,
+            )
+            .await
     }
 
     async fn file_put_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {

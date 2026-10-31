@@ -2859,6 +2859,19 @@ mod multipart_abort_tests {
             Err(nope())
         }
 
+        async fn put_if_unchanged(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::storage::RewriteTarget<'_>,
+            body: crate::storage::PutBody<'_>,
+            _: &FileMetadata,
+            _: &str,
+        ) -> Result<crate::storage::WriteIf, StorageError> {
+            body.into_bytes().await?;
+            Err(nope())
+        }
+
         // Source-object reads used by the streaming copy path.
         async fn head_object(
             &self,
@@ -3141,6 +3154,19 @@ mod multipart_abort_tests {
         ) -> Result<(), StorageError> {
             let body = crate::storage::PutBody::Bytes(body.into_bytes().await?);
             self.0.put_object(b, p, t, body, m).await
+        }
+
+        async fn put_if_unchanged(
+            &self,
+            b: &str,
+            p: &str,
+            t: crate::storage::RewriteTarget<'_>,
+            body: crate::storage::PutBody<'_>,
+            m: &FileMetadata,
+            v: &str,
+        ) -> Result<crate::storage::WriteIf, StorageError> {
+            let body = crate::storage::PutBody::Bytes(body.into_bytes().await?);
+            self.0.put_if_unchanged(b, p, t, body, m, v).await
         }
 
         async fn head_object(

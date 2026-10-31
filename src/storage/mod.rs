@@ -55,9 +55,9 @@ pub use traits::{
     BucketListing, BulkListing, ByteStream, ClaimOutcome, ClaimWrite, ConversionMarker,
     CopyOutcome, DelegatedListResult, DynStorageBackend, KeyClaim, ListedForms, ListedToken,
     MarkerRead, MarkerWrite, MultipartUpload, ObjectAt, ObjectRead, ObjectVariant, PutBody,
-    RangeRead, RefFence, RefWrite, ReferenceSource, RewriteBasis, StorageBackend,
+    RangeRead, RefFence, RefWrite, ReferenceSource, RewriteBasis, RewriteTarget, StorageBackend,
     StorageBackendExt, StorageError, StoredObject, StoredWrite, UploadedPart, VersionPurgePage,
-    MAX_BUCKET_OBJECT_BYTES,
+    WriteIf, MAX_BUCKET_OBJECT_BYTES,
 };
 
 tokio::task_local! {

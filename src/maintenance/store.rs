@@ -58,6 +58,11 @@ pub struct MaintenanceJob {
     /// them ([`JobsDb::maintenance_record_adoption`]), all of them; the
     /// failure ring keeps a sample of their keys.
     pub objects_adopted: i64,
+    /// Re-encrypt: the objects (and references) that the job did not
+    /// rewrite because a client wrote them after the job read them
+    /// (`skipped_changed`; they are counted as skipped too). Each keeps the
+    /// client's version.
+    pub objects_changed: i64,
 }
 
 /// A worker lane: which kinds it claims.
@@ -118,12 +123,14 @@ fn row_to_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<MaintenanceJob> {
         finished_at: r.get(16)?,
         updated_at: r.get(17)?,
         objects_adopted: r.get(18)?,
+        objects_changed: r.get(19)?,
     })
 }
 
 const JOB_COLUMNS: &str = "id, kind, bucket, status, phase, objects_total, objects_done, \
      objects_skipped, objects_failed, bytes_done, continuation_token, last_error, \
-     triggered_by, params, created_at, started_at, finished_at, updated_at, objects_adopted";
+     triggered_by, params, created_at, started_at, finished_at, updated_at, objects_adopted, \
+     objects_changed";
 
 /// The adoption rows that the failure ring keeps per job: a sample of the
 /// keys (the job row counts them all). They never count toward the ring's
@@ -341,7 +348,10 @@ impl JobsDb {
 
     /// The write-gate arms of the active jobs: the ONE input of
     /// [`super::gate::MaintenanceGate::sync_from`]. Kind/phase-aware: a
-    /// reencrypt or backfill gates its bucket; a PRE-flip migrate gates its
+    /// backfill gates its bucket; a reencrypt gates it unless its rewrites
+    /// are conditional (`ReencryptParams::conditional_writes`: every write
+    /// of the job is conditional on the object it read, so a client write
+    /// is never overwritten and needs no 503); a PRE-flip migrate gates its
     /// bucket AND its transient staging route (admin copy/move could
     /// otherwise write through the transient mid-copy); a POST-flip migrate
     /// (cleanup) gates NOTHING — the flipped bucket is fully live and must
@@ -360,6 +370,11 @@ impl JobsDb {
         for (job_id, bucket, kind, phase, params) in rows {
             // A delete never gates its bucket: clients keep writing to it.
             if kind == super::delete::KIND {
+                continue;
+            }
+            if kind == "reencrypt"
+                && super::conversion::ReencryptParams::of(params.as_deref()).conditional_writes
+            {
                 continue;
             }
             let migrate = kind == "migrate";
@@ -782,6 +797,31 @@ impl JobsDb {
                 "error",
                 crate::maintenance::conversion::ADOPTED_AFTER_CUTOFF,
             )),
+        )?;
+        Ok(())
+    }
+
+    /// Count one object that a re-encrypt job did not rewrite because a
+    /// client wrote it after the job read it (`objects_changed`).
+    pub fn maintenance_count_changed(&self, job_id: i64) -> Result<(), ConfigDbError> {
+        self.conn.execute(
+            "UPDATE maintenance_jobs SET objects_changed = objects_changed + 1 WHERE id = ?",
+            params![job_id],
+        )?;
+        Ok(())
+    }
+
+    /// Replace the params JSON of a job (a re-encrypt run that judged its
+    /// backend's conditional writes again). The caller syncs the write
+    /// gate after it.
+    pub fn maintenance_set_params(
+        &self,
+        job_id: i64,
+        params: Option<&str>,
+    ) -> Result<(), ConfigDbError> {
+        self.conn.execute(
+            "UPDATE maintenance_jobs SET params = ? WHERE id = ?",
+            params![params, job_id],
         )?;
         Ok(())
     }

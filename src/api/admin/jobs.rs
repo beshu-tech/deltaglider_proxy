@@ -277,6 +277,11 @@ pub struct JobRunEntry {
     /// Objects decompressed + re-stored (recompress/re-encrypt). Straight
     /// passthrough = copied − delta_passthrough − reconstructed.
     pub reconstructed: i64,
+    /// Re-encrypt only: of `objects_skipped`, the objects that a client
+    /// wrote after the job read them (`skipped_changed`); each keeps the
+    /// client's version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objects_skipped_changed: Option<i64>,
 }
 
 /// Unified failure entry — field union; `object_key` is always set
@@ -562,6 +567,7 @@ fn lifecycle_run_entry(
         delta_passthrough: 0,
         bytes_egress_saved: 0,
         reconstructed: 0,
+        objects_skipped_changed: None,
     };
     let mut v = serde_json::to_value(entry).unwrap_or_default();
     if let (true, Some(obj)) = (known, v.as_object_mut()) {
@@ -640,6 +646,7 @@ fn maintenance_run_entry(job: &MaintenanceJob) -> JobRunEntry {
         delta_passthrough: 0,
         bytes_egress_saved: 0,
         reconstructed: 0,
+        objects_skipped_changed: (job.kind == "reencrypt").then_some(job.objects_changed),
     }
 }
 
@@ -972,6 +979,7 @@ pub async fn job_runs(
                 delta_passthrough: r.delta_passthrough,
                 bytes_egress_saved: r.bytes_egress_saved,
                 reconstructed: r.reconstructed,
+                objects_skipped_changed: None,
             })
             .collect(),
         JobSubsystem::Lifecycle => {
@@ -1584,6 +1592,7 @@ mod tests {
             finished_at: Some(3),
             updated_at: 3,
             objects_adopted: 0,
+            objects_changed: 0,
         }
     }
 

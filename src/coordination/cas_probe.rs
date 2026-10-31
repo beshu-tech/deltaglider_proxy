@@ -104,9 +104,48 @@ async fn key_holds(client: &Client, bucket: &str, key: &str, body: &[u8]) -> boo
     }
 }
 
+/// On a bucket that keeps versions, the probe's writes and its delete stay
+/// as noncurrent versions and a delete marker. The probe runs in data
+/// buckets (the re-encrypt job probes the bucket it converts), so it
+/// removes every version of its own key, best effort. A bucket without
+/// versioning lists none, or only the deleted key's.
+async fn purge_versions(client: &Client, bucket: &str, key: &str) {
+    let Ok(page) = client
+        .list_object_versions()
+        .bucket(bucket)
+        .prefix(key)
+        .send()
+        .await
+    else {
+        return;
+    };
+    let ids = page
+        .versions()
+        .iter()
+        .filter(|v| v.key() == Some(key))
+        .filter_map(|v| v.version_id())
+        .chain(
+            page.delete_markers()
+                .iter()
+                .filter(|m| m.key() == Some(key))
+                .filter_map(|m| m.version_id()),
+        );
+    for id in ids {
+        let _ = client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(id)
+            .send()
+            .await;
+    }
+}
+
 /// Run the probe on `bucket/key` and delete the key afterwards (best
-/// effort). `Err` = indeterminate, as in [`classify_cas_probe`]. Six
-/// requests: four PUTs, the DELETE with a wrong ETag, and the cleanup.
+/// effort). `Err` = indeterminate, as in [`classify_cas_probe`]. Seven
+/// requests: four PUTs, the DELETE with a wrong ETag, the cleanup, and the
+/// version listing of the version cleanup (plus one DELETE for each version
+/// of the key on a bucket that keeps versions).
 pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<ProbeResult, String> {
     let first = client
         .put_object()
@@ -157,6 +196,7 @@ pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<Probe
             .await,
     );
     let _ = client.delete_object().bucket(bucket).key(key).send().await;
+    purge_versions(client, bucket, key).await;
     Ok(ProbeResult {
         cas: classify_cas_probe(&create, &wrong, &right)?,
         conditional_delete: classify_conditional_delete(&delete_wrong),
@@ -329,7 +369,7 @@ mod conditional_delete_tests {
                 conditional_delete: true
             })
         );
-        assert_eq!(fake.requests().len(), 6, "{:?}", fake.requests());
+        assert_eq!(fake.requests().len(), 7, "{:?}", fake.requests());
     }
 
     /// A backend that enforces `If-Match` on PUT only: CAS holds, but a

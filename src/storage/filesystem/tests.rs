@@ -1886,3 +1886,92 @@ mod stored_last_modified_tests {
         );
     }
 }
+
+/// `put_if_unchanged` on the filesystem: the file's version (inode, mtime,
+/// size) from a read; a write or a delete after the read makes the rewrite
+/// `Changed` and nothing is written.
+#[cfg(test)]
+mod put_if_unchanged_tests {
+    use super::*;
+    use crate::storage::{RewriteTarget, WriteIf};
+
+    fn meta(body: &[u8]) -> FileMetadata {
+        FileMetadata::new_passthrough(
+            "a.txt".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            body.len() as u64,
+            None,
+        )
+    }
+
+    async fn rewrite(b: &FilesystemBackend, version: &str) -> WriteIf {
+        b.put_if_unchanged(
+            "releases",
+            "p",
+            RewriteTarget::Passthrough { name: "a.txt" },
+            PutBody::Bytes(Bytes::from_static(b"job")),
+            &meta(b"job"),
+            version,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn read_version(b: &FilesystemBackend) -> String {
+        let head = b
+            .head_object("releases", "p", StoredObject::Passthrough("a.txt"))
+            .await
+            .unwrap();
+        let read = b
+            .open_object("releases", "p", StoredObject::Passthrough("a.txt"))
+            .await
+            .unwrap();
+        assert_eq!(head.backend_version, read.metadata.backend_version);
+        head.backend_version.expect("a version")
+    }
+
+    async fn body(b: &FilesystemBackend) -> Vec<u8> {
+        b.get_passthrough("releases", "p", "a.txt").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_write_after_the_read_makes_the_rewrite_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        b.create_bucket("releases").await.unwrap();
+        b.put_passthrough(
+            "releases",
+            "p",
+            "a.txt",
+            Bytes::from_static(b"old"),
+            &meta(b"old"),
+        )
+        .await
+        .unwrap();
+        let v = read_version(&b).await;
+        b.put_passthrough(
+            "releases",
+            "p",
+            "a.txt",
+            Bytes::from_static(b"cli"),
+            &meta(b"cli"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rewrite(&b, &v).await, WriteIf::Changed);
+        assert_eq!(body(&b).await, b"cli");
+
+        let v = read_version(&b).await;
+        assert_eq!(rewrite(&b, &v).await, WriteIf::Written);
+        assert_eq!(body(&b).await, b"job");
+
+        b.delete_passthrough("releases", "p", "a.txt")
+            .await
+            .unwrap();
+        assert_eq!(rewrite(&b, &v).await, WriteIf::Changed);
+        assert!(b.get_passthrough("releases", "p", "a.txt").await.is_err());
+    }
+}

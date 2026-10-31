@@ -234,7 +234,8 @@ encryption_test, maintenance_reencrypt_test).
 ## As built
 
 Phases P1-P7 and P6b are on `main` (P7 = the product docs and the
-CHANGELOG). P8 (drop the write gate) is not done: the re-encrypt job still
+CHANGELOG). P8 (drop the write gate) is done in N1 of
+`encryption-needs-atomic-writes.md` (see its as-built). Before N1, the re-encrypt job still
 arms the write gate. Deviations from v2, from the commits:
 
 - **Filesystem marker.** The file `.dg-conversion` in the bucket directory,

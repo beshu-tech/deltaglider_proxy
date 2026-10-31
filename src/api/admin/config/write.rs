@@ -325,8 +325,10 @@ pub(super) async fn run(
     {
         reconcile_job_rules(state).await;
         let no_headers = HeaderMap::new();
+        let config = state.config.read().await.clone();
         super::conversion_start::enqueue(
             &state.s3_state,
+            &config,
             conversions,
             &mut warnings.transition,
             write.headers.unwrap_or(&no_headers),
@@ -920,8 +922,10 @@ where
     run_discoveries(discoveries).await;
     let mut result = result;
     if let Ok(applied) = &mut result {
+        let config = state.config.read().await.clone();
         super::conversion_start::enqueue(
             &state.s3_state,
+            &config,
             &mut applied.conversions,
             &mut applied.warnings,
             write.headers,

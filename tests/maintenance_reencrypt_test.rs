@@ -118,6 +118,11 @@ async fn wait_job_done_within(
 /// objects at a time) and is still running when the gated request goes out.
 const GATE_TEST_STALL: (&str, &str) = ("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "300");
 
+/// A gate test keeps the write gate: on the filesystem every rewrite is
+/// conditional and the job runs without it, unless the backend is named
+/// non-CAS (`tests/conditional_rewrite_test.rs` covers both sides).
+const GATE_KEPT: (&str, &str) = ("DGP_TEST_FORCE_NONCAS_BACKEND", "default");
+
 /// Fail unless a maintenance job holds `bucket` busy now. A gate test calls
 /// it right before its gated request: a job that already ended would make
 /// the request pass the gate, and the test would prove nothing.
@@ -231,6 +236,7 @@ async fn test_gate_state_hidden_from_unauthenticated_writers() {
         .bucket(bucket)
         .auth("gatekey", "gatesecret")
         .env(GATE_TEST_STALL.0, GATE_TEST_STALL.1)
+        .env(GATE_KEPT.0, GATE_KEPT.1)
         .build()
         .await;
     let endpoint = server.endpoint();
@@ -280,6 +286,7 @@ async fn test_reencrypt_full_cycle() {
         .bucket(bucket)
         .extra_yaml_root(crate::common::OUTBOX_READER_YAML)
         .env(GATE_TEST_STALL.0, GATE_TEST_STALL.1)
+        .env(GATE_KEPT.0, GATE_KEPT.1)
         .build()
         .await;
     let http = server.http();
@@ -516,6 +523,7 @@ async fn test_reencrypt_validation_errors() {
     let server = TestServer::builder()
         .bucket(bucket)
         .env(GATE_TEST_STALL.0, GATE_TEST_STALL.1)
+        .env(GATE_KEPT.0, GATE_KEPT.1)
         .build()
         .await;
     let endpoint = server.endpoint();
@@ -995,6 +1003,7 @@ async fn review2_busy_bucket(bucket: &str) -> (TestServer, reqwest::Client) {
         .bucket(bucket)
         .auth("gatekey", "gatesecret")
         .env(GATE_TEST_STALL.0, GATE_TEST_STALL.1)
+        .env(GATE_KEPT.0, GATE_KEPT.1)
         .build()
         .await;
     let endpoint = server.endpoint();

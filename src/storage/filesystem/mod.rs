@@ -55,6 +55,25 @@ fn mtime_of(stat: &std::fs::Metadata) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(chrono::DateTime::<chrono::Utc>::from)
 }
 
+/// The file's version ([`FileMetadata::backend_version`]): its inode, its
+/// mtime in nanoseconds and its size. Every write of an object stores a new
+/// file and renames it over the old one (`write.rs`), so a write changes
+/// the inode and the mtime. `None` when the filesystem names no mtime.
+pub(crate) fn version_of(stat: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mtime = stat.modified().ok()?;
+    let nanos = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    Some(format!("fs:{:x}:{nanos:x}:{:x}", stat.ino(), stat.len()))
+}
+
+/// Set the read-side facts of a stored file on `meta`: its mtime
+/// ([`FileMetadata::stored_last_modified`]) and its version
+/// ([`FileMetadata::backend_version`]).
+fn stamp_stored(meta: &mut FileMetadata, stat: Option<&std::fs::Metadata>) {
+    meta.stored_last_modified = stat.and_then(mtime_of);
+    meta.backend_version = stat.and_then(version_of);
+}
+
 /// Metadata read by [`FilesystemBackend::object_metadata`], named for the
 /// key: the key's file name wins over what the xattr says (review D4); an
 /// unmanaged file's stat metadata is named already.
@@ -561,7 +580,7 @@ impl FilesystemBackend {
             None,
             StorageInfo::Passthrough,
         );
-        meta.stored_last_modified = mtime_of(&stat);
+        stamp_stored(&mut meta, Some(&stat));
         Ok(meta)
     }
 
@@ -604,7 +623,7 @@ impl FilesystemBackend {
                 ),
             };
             // The open file's mtime: the same version as the metadata.
-            meta.0.stored_last_modified = file.metadata().ok().as_ref().and_then(mtime_of);
+            stamp_stored(&mut meta.0, file.metadata().ok().as_ref());
             Ok::<_, StorageError>((file, meta))
         })
         .await
@@ -640,7 +659,7 @@ impl FilesystemBackend {
         tokio::task::spawn_blocking(move || match fsio::metadata_xattr_blocking(&path)? {
             fsio::StoredXattr::Value(json) => {
                 let mut meta: FileMetadata = serde_json::from_slice(&json)?;
-                meta.stored_last_modified = fsio::stat_blocking(&path)?.as_ref().and_then(mtime_of);
+                stamp_stored(&mut meta, fsio::stat_blocking(&path)?.as_ref());
                 Ok((meta, true))
             }
             fsio::StoredXattr::NoFile => Err(StorageError::NotFound(path.display().to_string())),
@@ -716,7 +735,7 @@ impl FilesystemBackend {
             None,
             kind,
         );
-        meta.stored_last_modified = mtime_of(&stat);
+        stamp_stored(&mut meta, Some(&stat));
         Ok(Some((key_filename.to_string(), meta)))
     }
 
@@ -1784,6 +1803,58 @@ impl StorageBackend for FilesystemBackend {
             Durability::for_object(),
         )
         .await
+    }
+
+    /// The file's version (inode, mtime and size) is checked, then the file is
+    /// written as `put_object` / `write_reference` write it. The caller
+    /// holds the engine's in-process lock of the object (and of the
+    /// deltaspace for a delta or the reference), which every write of it
+    /// takes: on a single-node backend nothing writes between the check
+    /// and the write.
+    #[instrument(skip(self, target, body, metadata))]
+    async fn put_if_unchanged(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        target: crate::storage::RewriteTarget<'_>,
+        body: PutBody<'_>,
+        metadata: &FileMetadata,
+        version: &str,
+    ) -> Result<crate::storage::WriteIf, StorageError> {
+        use crate::storage::{RewriteTarget, WriteIf};
+        let (path, _, _) = self.object_path(bucket, prefix, target.object())?;
+        let now = fsio::stat(&path).await?;
+        if now.as_ref().and_then(version_of).as_deref() != Some(version) {
+            debug!("conditional rewrite of {path:?}: the file changed; not written");
+            return Ok(WriteIf::Changed);
+        }
+        match target {
+            RewriteTarget::Delta { name, proof } => {
+                let target = StoredWrite::Delta { name, proof };
+                self.put_object(bucket, prefix, target, body, metadata)
+                    .await?
+            }
+            RewriteTarget::Passthrough { name } => {
+                let target = StoredWrite::Passthrough { name };
+                self.put_object(bucket, prefix, target, body, metadata)
+                    .await?
+            }
+            RewriteTarget::Reference { proof } => match body {
+                PutBody::File { path, .. } => {
+                    let op = RefWrite::PutFile { path, metadata };
+                    self.write_reference(bucket, prefix, op, proof).await?
+                }
+                body => {
+                    let data = body.into_bytes().await?;
+                    let op = RefWrite::Put {
+                        data: &data,
+                        metadata,
+                    };
+                    self.write_reference(bucket, prefix, op, proof).await?
+                }
+            },
+        }
+        Ok(WriteIf::Written)
     }
 
     #[instrument(skip(self))]

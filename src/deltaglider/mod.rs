@@ -24,7 +24,7 @@ pub(crate) use engine::{s3_engine, store_deltas};
 pub use engine::{
     ConditionalDelete, DeleteHooks, DeleteItem, DeleteOutcome, DeltaGliderEngine, DynEngine,
     EngineError, ListObjectsPage, ListedPageForms, RefWriteProof, ReferenceScan, RetrieveResponse,
-    StoredForms, BULK_DELETE_CONCURRENCY, REFERENCE_SCAN_LIMIT,
+    Rewritten, StoredForms, Unconditional, BULK_DELETE_CONCURRENCY, REFERENCE_SCAN_LIMIT,
 };
 pub use file_router::{
     normalize_extension, CompressionStrategy, FileRouter, DEFAULT_DELTA_EXTENSIONS,

@@ -667,6 +667,19 @@ mod wrapper_tests {
             Ok(())
         }
 
+        async fn put_if_unchanged(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::storage::RewriteTarget<'_>,
+            body: crate::storage::PutBody<'_>,
+            _: &FileMetadata,
+            _: &str,
+        ) -> Result<crate::storage::WriteIf, StorageError> {
+            body.into_bytes().await?;
+            Err(cb_err())
+        }
+
         async fn head_object(
             &self,
             _: &str,

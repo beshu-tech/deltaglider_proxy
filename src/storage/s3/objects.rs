@@ -288,7 +288,7 @@ impl S3Backend {
         }
     }
 
-    /// See [`Self::own_write_or_lost`]; for a metadata-only rewrite the
+    /// See [`Self::own_write`]; for a metadata-only rewrite the
     /// proof is the object's user metadata, which a peer's write changes.
     pub(super) async fn own_metadata_write_or_lost(
         &self,
@@ -329,7 +329,9 @@ impl S3Backend {
     }
 
     /// `put_object_with_metadata` with a write precondition; returns the new
-    /// ETag. See [`fenced_write_verdict`] for how a refused condition reads.
+    /// ETag. See [`fenced_write_verdict`] for how a refused condition reads:
+    /// a lost condition is [`reference_fence_lost`], and a backend without
+    /// conditional writes (501) gets the write without the condition.
     pub(super) async fn put_object_with_metadata_fenced(
         &self,
         bucket: &str,
@@ -338,6 +340,29 @@ impl S3Backend {
         metadata: &FileMetadata,
         fence: &RefFence,
     ) -> Result<Option<String>, StorageError> {
+        self.put_object_with_metadata_fenced_with(
+            bucket,
+            key,
+            data,
+            metadata,
+            fence,
+            OnUnsupported::Unfenced,
+        )
+        .await?
+        .stored(bucket, key)
+    }
+
+    /// The fenced PUT of a body in memory, with a refused condition as an
+    /// outcome ([`FencedPut`]).
+    pub(super) async fn put_object_with_metadata_fenced_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: Bytes,
+        metadata: &FileMetadata,
+        fence: &RefFence,
+        on_unsupported: OnUnsupported,
+    ) -> Result<FencedPut, StorageError> {
         let mut fence = fence.clone();
         let mut headers = self.metadata_to_headers(metadata);
         // Stamp the native-encryption marker so reads know this object
@@ -407,20 +432,25 @@ impl S3Backend {
                             data.len()
                         );
                     }
-                    return Ok(etag);
+                    return Ok(FencedPut::Stored(etag));
                 }
                 Err(e) => {
-                    match fenced_write_verdict(
-                        &fence,
-                        &crate::coordination::cas::sdk_error_signal(&e),
-                    ) {
+                    let signal = crate::coordination::cas::sdk_error_signal(&e);
+                    match fenced_write_verdict(&fence, &signal) {
                         FencedWriteVerdict::Lost => {
                             let md5 = hex::encode(<md5::Md5 as md5::Digest>::digest(&data));
-                            let etag = self.own_write_or_lost(bucket, key, &md5).await?;
+                            let Some(etag) = self.own_write(bucket, key, &md5).await else {
+                                return Ok(FencedPut::Lost);
+                            };
                             let stored = data.len() as u64;
                             self.remember_listed_facts(bucket, key, &etag, stored, metadata);
                             self.persist_listing_facts(bucket, key, &etag, stored, metadata);
-                            return Ok(Some(etag));
+                            return Ok(FencedPut::Stored(Some(etag)));
+                        }
+                        FencedWriteVerdict::Unsupported
+                            if on_unsupported == OnUnsupported::Report =>
+                        {
+                            return Ok(FencedPut::Unsupported);
                         }
                         // Retry at once without the condition. Unfenced,
                         // the write cannot get this verdict again.
@@ -428,6 +458,12 @@ impl S3Backend {
                             warn!("S3 PUT {bucket}/{key}: the backend has no conditional writes (501); writing without the fence");
                             fence = RefFence::Unfenced;
                             continue;
+                        }
+                        FencedWriteVerdict::Other
+                            if on_unsupported == OnUnsupported::Report
+                                && conditional_target_gone(&fence, &signal) =>
+                        {
+                            return Ok(FencedPut::Lost);
                         }
                         FencedWriteVerdict::Other => {}
                     }
@@ -479,13 +515,14 @@ impl S3Backend {
     /// lost, the retry meets our own write: the object then holds exactly
     /// our bytes, and its ETag is their MD5. That is a success, not a lost
     /// fence (a false SlowDown, and a rollback that deleted our own
-    /// baseline). Any other object is a peer's write: lost.
-    pub(super) async fn own_write_or_lost(
+    /// baseline). Any other object is a peer's write: lost (`None`; a
+    /// failed HEAD too).
+    pub(super) async fn own_write(
         &self,
         bucket: &str,
         key: &str,
         body_md5_hex: &str,
-    ) -> Result<String, StorageError> {
+    ) -> Option<String> {
         BACKEND_HEAD_REQUESTS.inc();
         let head = self
             .client
@@ -497,14 +534,15 @@ impl S3Backend {
         match head.ok().and_then(|h| h.e_tag().map(str::to_string)) {
             Some(etag) if etag_is_body_md5(&etag, body_md5_hex) => {
                 debug!("S3 PUT {bucket}/{key}: the refused retry met its own landed write");
-                Ok(etag)
+                Some(etag)
             }
-            _ => Err(reference_fence_lost(bucket, key)),
+            _ => None,
         }
     }
 
     /// `put_object_file_with_metadata` with a write precondition; returns
-    /// the new ETag.
+    /// the new ETag. A refused condition reads as in
+    /// [`Self::put_object_with_metadata_fenced`].
     pub(super) async fn put_object_file_with_metadata_fenced(
         &self,
         bucket: &str,
@@ -513,6 +551,29 @@ impl S3Backend {
         metadata: &FileMetadata,
         fence: &RefFence,
     ) -> Result<Option<String>, StorageError> {
+        self.put_object_file_with_metadata_fenced_with(
+            bucket,
+            key,
+            source_path,
+            metadata,
+            fence,
+            OnUnsupported::Unfenced,
+        )
+        .await?
+        .stored(bucket, key)
+    }
+
+    /// The fenced PUT of a file body, with a refused condition as an
+    /// outcome ([`FencedPut`]).
+    pub(super) async fn put_object_file_with_metadata_fenced_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        source_path: &std::path::Path,
+        metadata: &FileMetadata,
+        fence: &RefFence,
+        on_unsupported: OnUnsupported,
+    ) -> Result<FencedPut, StorageError> {
         let mut fence = fence.clone();
         let mut headers = self.metadata_to_headers(metadata);
         let native = self.native_encryption.for_bucket(bucket);
@@ -565,23 +626,28 @@ impl S3Backend {
                             metadata,
                         );
                     }
-                    return Ok(resp.e_tag().map(str::to_string));
+                    return Ok(FencedPut::Stored(resp.e_tag().map(str::to_string)));
                 }
                 Err(e) => {
-                    match fenced_write_verdict(
-                        &fence,
-                        &crate::coordination::cas::sdk_error_signal(&e),
-                    ) {
+                    let signal = crate::coordination::cas::sdk_error_signal(&e);
+                    match fenced_write_verdict(&fence, &signal) {
                         FencedWriteVerdict::Lost => {
                             let Some(md5) = md5_hex_of_file(source_path).await else {
-                                return Err(reference_fence_lost(bucket, key));
+                                return Ok(FencedPut::Lost);
                             };
-                            let etag = self.own_write_or_lost(bucket, key, &md5).await?;
+                            let Some(etag) = self.own_write(bucket, key, &md5).await else {
+                                return Ok(FencedPut::Lost);
+                            };
                             if let Some(size) = stored_size {
                                 self.remember_listed_facts(bucket, key, &etag, size, metadata);
                                 self.persist_listing_facts(bucket, key, &etag, size, metadata);
                             }
-                            return Ok(Some(etag));
+                            return Ok(FencedPut::Stored(Some(etag)));
+                        }
+                        FencedWriteVerdict::Unsupported
+                            if on_unsupported == OnUnsupported::Report =>
+                        {
+                            return Ok(FencedPut::Unsupported);
                         }
                         // Retry at once without the condition. Unfenced,
                         // the write cannot get this verdict again.
@@ -589,6 +655,12 @@ impl S3Backend {
                             warn!("S3 PUT {bucket}/{key}: the backend has no conditional writes (501); writing without the fence");
                             fence = RefFence::Unfenced;
                             continue;
+                        }
+                        FencedWriteVerdict::Other
+                            if on_unsupported == OnUnsupported::Report
+                                && conditional_target_gone(&fence, &signal) =>
+                        {
+                            return Ok(FencedPut::Lost);
                         }
                         FencedWriteVerdict::Other => {}
                     }
@@ -724,6 +796,50 @@ pub(super) fn apply_put_fence(
         RefFence::ETag(e) if !e.is_empty() => req.if_match(e),
         _ => req,
     }
+}
+
+/// What a fenced PUT does when the backend answers 501 to its condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OnUnsupported {
+    /// Write again without the condition (reference writes: a non-CAS
+    /// backend is refused for multi-instance delta storage).
+    Unfenced,
+    /// Write nothing and say so ([`FencedPut::Unsupported`]): the caller
+    /// decides (the re-encrypt job's rewrites).
+    Report,
+}
+
+/// What a fenced PUT ended in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum FencedPut {
+    /// Stored, with the new ETag when the response named one.
+    Stored(Option<String>),
+    /// The condition does not hold: another writer changed the object (or,
+    /// for an `If-Match`, removed it). Nothing written.
+    Lost,
+    /// The backend has no conditional writes (501). Nothing written.
+    Unsupported,
+}
+
+impl FencedPut {
+    /// The ETag of a stored write; a lost condition is
+    /// [`reference_fence_lost`].
+    pub(super) fn stored(self, bucket: &str, key: &str) -> Result<Option<String>, StorageError> {
+        match self {
+            FencedPut::Stored(etag) => Ok(etag),
+            FencedPut::Lost => Err(reference_fence_lost(bucket, key)),
+            FencedPut::Unsupported => Err(StorageError::Other(format!(
+                "PUT {bucket}/{key}: the backend has no conditional writes"
+            ))),
+        }
+    }
+}
+
+/// Pure: did an `If-Match` PUT fail because the object is gone
+/// ([`crate::coordination::cas::if_match_target_gone`])?
+pub(super) fn conditional_target_gone(fence: &RefFence, signal: &str) -> bool {
+    matches!(fence, RefFence::ETag(e) if !e.is_empty())
+        && crate::coordination::cas::if_match_target_gone(signal)
 }
 
 /// Pure: does an object's user metadata (as a HEAD returns it; S3

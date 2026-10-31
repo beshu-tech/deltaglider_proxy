@@ -73,6 +73,11 @@ impl StoredForms {
             ObjectVariant::Passthrough => self.passthrough,
         }
     }
+
+    /// Whether the read found the stored form `form`.
+    pub fn has_form(self, form: ObjectVariant) -> bool {
+        self.has(form)
+    }
 }
 
 /// PURE: newest-wins between the two stored forms of one object (a crash
@@ -98,7 +103,11 @@ impl StoredForms {
 /// Only a maintenance job may HEAD one form on this proof: its bucket's
 /// write gate holds every client write (and defers replication and
 /// lifecycle writes) from before the listing until after the HEAD, so no
-/// form appears between the two. A client HEAD reads both forms (plan
+/// form appears between the two. A re-encrypt job without the gate
+/// (conditional rewrites) relies on it too: it rewrites only the form it
+/// read, conditional on that form's version, so a client write of the
+/// other form in between is never overwritten, and it is the newest form
+/// (the rewrite keeps the object's created-at). A client HEAD reads both forms (plan
 /// decision D4: a crash between a write and its other-form DELETE leaves
 /// both, and newest-wins needs both reads).
 #[derive(Debug, Clone, Default)]

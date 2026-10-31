@@ -38,6 +38,13 @@ pub(crate) fn is_not_implemented(err_str: &str) -> bool {
     err_str.contains("NotImplemented") || err_str.contains("501")
 }
 
+/// Pure: does the signal of a failed `If-Match` PUT say that the object is
+/// gone? S3 answers 404 `NoSuchKey` to `If-Match` on a key that does not
+/// exist; a missing bucket is not that.
+pub(crate) fn if_match_target_gone(signal: &str) -> bool {
+    signal.starts_with("status=404") && !signal.contains("NoSuchBucket")
+}
+
 /// Pure: does a stringified GET error signal the object is ABSENT (a 404-class
 /// response) rather than a real failure? Used by the sync witness read and
 /// the lease and lock reads.

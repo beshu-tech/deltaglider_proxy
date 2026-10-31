@@ -114,6 +114,19 @@ impl crate::storage::StorageBackend for NullInner {
         Ok(())
     }
 
+    async fn put_if_unchanged(
+        &self,
+        _: &str,
+        _: &str,
+        _: crate::storage::RewriteTarget<'_>,
+        body: crate::storage::PutBody<'_>,
+        _: &crate::types::FileMetadata,
+        _: &str,
+    ) -> Result<crate::storage::WriteIf, crate::storage::StorageError> {
+        body.into_bytes().await?;
+        Ok(crate::storage::WriteIf::Written)
+    }
+
     async fn head_object(
         &self,
         _: &str,

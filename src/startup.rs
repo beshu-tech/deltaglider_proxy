@@ -166,6 +166,8 @@ fn warn_active_test_seams() {
         "DGP_TEST_FORCE_NONCAS_BACKEND",
         "DGP_TEST_CONVERSION_GRACE_SECS",
         "DGP_TEST_CONVERSION_WINDOW_SECS",
+        "DGP_TEST_REWRITE_STALL_MS",
+        "DGP_TEST_REWRITE_LOCK_STALL_MS",
         "DGP_RELAY_FOREIGN_MIN_AGE_SECS",
     ];
     let active: Vec<&str> = SEAMS
@@ -1923,7 +1925,7 @@ pub(crate) fn spawn_plaintext_refusal_check(state: &Arc<AppState>, config: &Conf
         });
         use deltaglider_proxy::maintenance::conversion::{start_at_boot, BootConversion};
         for bucket in refusing {
-            match start_at_boot(&state, bucket, SAMPLE).await {
+            match start_at_boot(&state, &config, bucket, SAMPLE).await {
                 Ok(BootConversion::WindowOpen | BootConversion::NoPlaintext) => {}
                 Ok(BootConversion::Started { run, job_id }) => info!(
                     "bucket '{bucket}' encrypts with a proxy key and holds plaintext history: \

@@ -552,6 +552,47 @@ impl<'a> StoredWrite<'a> {
     }
 }
 
+/// What [`StorageBackend::put_if_unchanged`] rewrites: one stored object of
+/// a deltaspace. A delta and the reference are written under the
+/// deltaspace lock, so they need the lock's proof.
+#[derive(Debug, Clone, Copy)]
+pub enum RewriteTarget<'a> {
+    Delta {
+        name: &'a str,
+        proof: &'a crate::deltaglider::RefWriteProof,
+    },
+    Passthrough {
+        name: &'a str,
+    },
+    Reference {
+        proof: &'a crate::deltaglider::RefWriteProof,
+    },
+}
+
+impl<'a> RewriteTarget<'a> {
+    /// The stored object this target names.
+    pub fn object(&self) -> StoredObject<'a> {
+        match *self {
+            RewriteTarget::Delta { name, .. } => StoredObject::Delta(name),
+            RewriteTarget::Passthrough { name } => StoredObject::Passthrough(name),
+            RewriteTarget::Reference { .. } => StoredObject::Reference,
+        }
+    }
+}
+
+/// What a [`StorageBackend::put_if_unchanged`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteIf {
+    /// Stored: the object was still the version the caller read.
+    Written,
+    /// Not stored: another writer changed or removed the object after the
+    /// caller read it. The object stays as that writer left it.
+    Changed,
+    /// Not stored: the backend has no conditional writes (S3 501). The
+    /// caller decides whether an unconditional write is safe.
+    Unsupported,
+}
+
 /// The body of a [`StorageBackend::put_object`].
 pub enum PutBody<'a> {
     /// In memory. A write (and each retry of it) shares the caller's
@@ -1166,6 +1207,34 @@ pub trait StorageBackend: Send + Sync {
         body: PutBody<'_>,
         metadata: &FileMetadata,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Store `body` with `metadata` at `target`, but ONLY while the stored
+    /// object is still `version` (the [`FileMetadata::backend_version`] of
+    /// the caller's read). The re-encrypt job rewrites objects in place
+    /// with it, so a client write that lands between the job's read and
+    /// its write is never overwritten, on any instance.
+    ///
+    /// S3: the PUT carries `If-Match: version`; 412, 409 and 404 (the
+    /// object is gone) are [`WriteIf::Changed`], 501 is
+    /// [`WriteIf::Unsupported`]; nothing is written in either case.
+    /// Filesystem: the file's version is checked, then the file written.
+    /// The engine's in-process locks make the two one step: every write of
+    /// an object takes its object write lock, and every write of a delta or
+    /// of reference.bin the deltaspace lock. That is enough because a
+    /// filesystem backend has one node.
+    ///
+    /// No default: every wrapper must forward it with its own transform
+    /// (the encrypting wrapper seals the body, the routing wrapper picks
+    /// the backend).
+    fn put_if_unchanged(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        target: RewriteTarget<'_>,
+        body: PutBody<'_>,
+        metadata: &FileMetadata,
+        version: &str,
+    ) -> impl Future<Output = Result<WriteIf, StorageError>> + Send;
 
     /// Spool bytes that a `put_object` of a [`PutBody::File`] (`parts =
     /// false`) or [`PutBody::Parts`] (`parts = true`) needs for its own

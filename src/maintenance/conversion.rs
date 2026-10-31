@@ -66,6 +66,14 @@ pub struct ReencryptParams {
     /// rotation, a plain re-encrypt) never writes a marker.
     #[serde(default, with = "run_hex", skip_serializing_if = "Option::is_none")]
     pub run: Option<RunId>,
+    /// Every rewrite of the job is conditional on the object the job read,
+    /// on a backend proven to enforce conditional writes
+    /// ([`rewrites_are_conditional`]): the job holds no write gate, so
+    /// client writes to the bucket go on (no 503). Decided when the job is
+    /// queued and again when a run starts; `false` (a row of an older
+    /// release too) keeps the gate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conditional_writes: bool,
 }
 
 /// A run id in the params JSON: hex text.
@@ -526,6 +534,7 @@ pub enum BootConversion {
 /// stays until the job ends.
 pub async fn start_at_boot(
     app: &crate::api::handlers::AppState,
+    config: &crate::config::Config,
     bucket: &str,
     sample: u32,
 ) -> Result<BootConversion, String> {
@@ -596,10 +605,19 @@ pub async fn start_at_boot(
         params: ReencryptParams {
             purge_plaintext_versions: false,
             run: Some(opened.run),
+            ..Default::default()
         },
     };
     let none = axum::http::HeaderMap::new();
-    let queued = queue_reencrypt(app, db, std::slice::from_ref(&request), "boot", &none).await;
+    let queued = queue_reencrypt(
+        app,
+        config,
+        db,
+        std::slice::from_ref(&request),
+        "boot",
+        &none,
+    )
+    .await;
     match queued.into_iter().next() {
         Some(Ok(job_id)) => Ok(BootConversion::Started {
             run: opened.run,
@@ -636,29 +654,100 @@ pub enum NotQueued {
     Failed(String),
 }
 
+/// Whether every write that a re-encrypt job makes in `bucket` is
+/// conditional on the object that the job read, so that the job runs
+/// without the bucket's write gate and client writes go on (no 503):
+///
+/// - a filesystem backend: yes. It has one node, and the in-process locks
+///   that every write of an object takes make the job's version check and
+///   its write one step;
+/// - an S3 backend: when its conditional writes are proven, by the
+///   capability verdict of this backend definition or, without one, by a
+///   probe now (`If-None-Match` / `If-Match` PUTs, cached). A backend
+///   without them (B2 answers 501), one that the test seam
+///   `DGP_TEST_FORCE_NONCAS_BACKEND` names, or one that the probe could not
+///   judge keeps the gate.
+pub async fn rewrites_are_conditional(
+    app: &crate::api::handlers::AppState,
+    config: &crate::config::Config,
+    bucket: &str,
+) -> bool {
+    use crate::coordination::capability::{
+        establish_backend_verdict, forced_noncas_backends, ClientWritableGroup,
+    };
+    use crate::coordination::CapabilityVerdict;
+    let Some((name, backend)) = config.effective_backend_for_bucket(bucket) else {
+        return false;
+    };
+    // The test seam names any backend (a filesystem one too: the gate
+    // tests keep the gate with it).
+    let forced = forced_noncas_backends();
+    if forced.contains(&name) {
+        return false;
+    }
+    if matches!(backend, crate::config::BackendConfig::Filesystem { .. }) {
+        return true;
+    }
+    match app.backend_capabilities.get(&name, backend) {
+        Some(CapabilityVerdict::CasVerified { .. }) => return true,
+        Some(CapabilityVerdict::NonCas) => return false,
+        Some(CapabilityVerdict::Unknown { .. }) | None => {}
+    }
+    let probe_bucket = config
+        .buckets
+        .get(&bucket.to_ascii_lowercase())
+        .and_then(|p| p.alias.clone())
+        .unwrap_or_else(|| bucket.to_string());
+    let group = ClientWritableGroup {
+        backend: backend.clone(),
+        buckets: vec![bucket.to_string()],
+        probe_bucket,
+    };
+    let verdict = establish_backend_verdict(&name, &group, &forced).await;
+    app.backend_capabilities
+        .set(&name, backend, verdict.clone());
+    if let CapabilityVerdict::Unknown { reason } = &verdict {
+        tracing::warn!(
+            "re-encrypt of '{bucket}': the conditional writes of backend '{name}' could not \
+             be verified ({reason}); the job keeps the bucket's write gate"
+        );
+    }
+    matches!(verdict, CapabilityVerdict::CasVerified { .. })
+}
+
 /// THE creation of re-encrypt jobs (the apply, the boot, the admin
 /// endpoint): one row per request in one lock of the jobs DB, the write
-/// gate armed from creation (no create-to-claim window for writes), the
-/// workers woken, and one `maintenance_reencrypt_requested` audit entry by
-/// `by`. Returns one answer per request, in order.
+/// gate armed from creation (no create-to-claim window for writes) unless
+/// the job's rewrites are conditional ([`rewrites_are_conditional`], judged
+/// with `config` before the lock), the workers woken, and one
+/// `maintenance_reencrypt_requested` audit entry by `by`. Returns one
+/// answer per request, in order.
 pub async fn queue_reencrypt(
     app: &crate::api::handlers::AppState,
+    config: &crate::config::Config,
     db: &std::sync::Arc<tokio::sync::Mutex<crate::config_db::JobsDb>>,
     requests: &[QueuedReencrypt],
     by: &str,
     headers: &axum::http::HeaderMap,
 ) -> Vec<Result<i64, NotQueued>> {
     let now = super::store::current_unix_seconds();
+    let mut params = Vec::with_capacity(requests.len());
+    for r in requests {
+        let mut p = r.params;
+        p.conditional_writes = rewrites_are_conditional(app, config, &r.bucket).await;
+        params.push(p);
+    }
     let results: Vec<Result<i64, NotQueued>> = {
         let db = db.lock().await;
         let results = requests
             .iter()
-            .map(|r| {
+            .zip(&params)
+            .map(|(r, params)| {
                 match db.maintenance_create_job(
                     "reencrypt",
                     &r.bucket,
                     "counting",
-                    r.params.to_json().as_deref(),
+                    params.to_json().as_deref(),
                     by,
                     now,
                 ) {
@@ -716,6 +805,7 @@ mod tests {
         let purge = ReencryptParams {
             purge_plaintext_versions: true,
             run: None,
+            ..Default::default()
         };
         let json = purge.to_json().unwrap();
         assert_eq!(ReencryptParams::of(Some(&json)), purge);
@@ -799,10 +889,22 @@ mod tests {
         let p = ReencryptParams {
             purge_plaintext_versions: false,
             run: Some([0xab; 16]),
+            ..Default::default()
         };
         let json = p.to_json().unwrap();
         assert!(json.contains(&"ab".repeat(16)), "{json}");
+        assert!(!json.contains("conditional_writes"), "{json}");
         assert_eq!(ReencryptParams::of(Some(&json)), p);
+        let ungated = ReencryptParams {
+            conditional_writes: true,
+            ..p
+        };
+        let json = ungated.to_json().unwrap();
+        assert_eq!(ReencryptParams::of(Some(&json)), ungated);
+        // A row of an older release: the gate stays.
+        assert!(
+            !ReencryptParams::of(Some("{\"purge_plaintext_versions\":true}")).conditional_writes
+        );
         // A run that does not parse: the defaults (no run, no purge).
         assert_eq!(
             ReencryptParams::of(Some("{\"run\":\"zz\",\"purge_plaintext_versions\":true}")),

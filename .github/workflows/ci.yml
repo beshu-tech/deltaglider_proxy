@@ -329,6 +329,7 @@ jobs:
               cli_s3_cp_test::
               cli_s3_stats_test::
               cli_s3_verify_test::
+              conditional_rewrite_test::
               config_sync_ha_test::
               config_sync_test::
               conversion_apply_test::

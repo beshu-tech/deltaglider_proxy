@@ -335,6 +335,17 @@ pub struct FileMetadata {
     /// never stored, so a write ignores it.
     #[serde(skip)]
     pub stored_last_modified: Option<DateTime<Utc>>,
+
+    /// The backend's own version of the STORED object, from the read that
+    /// made this metadata: the S3 ETag (as S3 sends it, quoted), on the
+    /// filesystem the file's inode, mtime and size. A conditional write
+    /// ([`crate::storage::StorageBackend::put_if_unchanged`]) names it, so
+    /// the write lands only while the object is still that version. `None`
+    /// when the backend named none. Set only by the backends' read paths
+    /// (source guard `stored_last_modified_comes_from_the_backend`); never
+    /// stored.
+    #[serde(skip)]
+    pub backend_version: Option<String>,
 }
 
 /// Makes the listing token of a sealed object from its stored key, stored
@@ -449,6 +460,7 @@ impl FileMetadata {
             storage_info: StorageInfo::Reference { source_name },
             listing_token: Default::default(),
             stored_last_modified: None,
+            backend_version: None,
         }
     }
 
@@ -486,6 +498,7 @@ impl FileMetadata {
             },
             listing_token: Default::default(),
             stored_last_modified: None,
+            backend_version: None,
         }
     }
 
@@ -510,6 +523,7 @@ impl FileMetadata {
             storage_info: StorageInfo::Passthrough,
             listing_token: Default::default(),
             stored_last_modified: None,
+            backend_version: None,
         }
     }
 
@@ -537,6 +551,7 @@ impl FileMetadata {
             storage_info,
             listing_token: Default::default(),
             stored_last_modified: None,
+            backend_version: None,
         }
     }
 
@@ -555,6 +570,7 @@ impl FileMetadata {
             storage_info: StorageInfo::Passthrough,
             listing_token: Default::default(),
             stored_last_modified: None,
+            backend_version: None,
         }
     }
 

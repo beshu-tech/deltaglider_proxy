@@ -5,7 +5,8 @@
 
 use super::*;
 use crate::deltaglider::s3_engine;
-use crate::storage::FakeS3;
+use crate::storage::encrypting::ENCRYPTION_MARKER_KEY;
+use crate::storage::{FakeS3, StorageBackendExt};
 
 /// A `created_at` no other test job has: the transient-stop count of a
 /// job is process-global and matched on (id, kind, bucket, created_at),
@@ -316,7 +317,9 @@ async fn reencrypt_heads_only_the_listed_form() {
 
 /// P6.1 edge: a key that the listing saw in both stored forms (a crash
 /// between a write and its other-form DELETE) is HEADed in both, so the
-/// newer form wins as on a client HEAD.
+/// newer form wins as on a client HEAD; then the older form once more, for
+/// its own version (the job rewrites each form in place, conditional on
+/// the version it read).
 #[tokio::test]
 async fn a_key_listed_in_both_forms_is_headed_in_both() {
     let (engine, fake) = counted_engine().await;
@@ -328,7 +331,7 @@ async fn a_key_listed_in_both_forms_is_headed_in_both() {
     assert_eq!(row.objects_failed, 0, "{row:?}");
     let ops = |k: &str| object_ops(&fake, "b", k);
     assert_eq!(ops(&keys[0]).get("HEAD"), Some(&1), "{:?}", ops(&keys[0]));
-    assert_eq!(ops(&keys[1]).get("HEAD"), Some(&2), "{:?}", ops(&keys[1]));
+    assert_eq!(ops(&keys[1]).get("HEAD"), Some(&3), "{:?}", ops(&keys[1]));
 }
 
 /// P6.1 edge: a listed form that is gone when the job HEADs it (changed
@@ -372,10 +375,10 @@ async fn store_marked(engine: &crate::deltaglider::DynEngine, n: usize) {
     engine.metadata_cache().invalidate_prefix("b", "");
 }
 
-/// P6.1 + P6.2: a re-encrypt that rewrites an object HEADed both forms,
-/// then the copy HEADed them again, the store read the prior (2 more),
-/// and the write DELETEd the other form that the job had seen absent.
-/// Now the job's one HEAD is the copy's source and the store's prior.
+/// P6.1 + P6.2 + N1: a re-encrypt that rewrites an object HEADs the
+/// listed form, GETs it (the body and its version in one read), and PUTs
+/// it conditional on that version: no prior read, no verify HEAD, no
+/// DELETE of a form that the job had seen absent.
 #[tokio::test]
 async fn reencrypt_rewrite_reuses_the_jobs_head() {
     let (engine, fake) = counted_engine().await;
@@ -386,9 +389,8 @@ async fn reencrypt_rewrite_reuses_the_jobs_head() {
     for i in 0..5 {
         let key = format!("k-{i:03}.txt");
         let ops = object_ops(&fake, "b", &key);
-        // HEAD (the listed form), GET (the bytes), PUT (the rewrite), and
-        // the copy's verify of the destination (a HEAD of the written form).
-        assert_eq!(object_requests(&fake, "b", &key), 4, "{key}: {ops:?}");
+        // HEAD (the listed form), GET (the bytes), PUT (the rewrite).
+        assert_eq!(object_requests(&fake, "b", &key), 3, "{key}: {ops:?}");
         assert_eq!(ops.get("DELETE"), None, "{key}: {ops:?}");
     }
 }

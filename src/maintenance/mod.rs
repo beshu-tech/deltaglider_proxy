@@ -176,10 +176,11 @@ pub fn stamped_with_key_id(user_metadata: &HashMap<String, String>, key_id: &str
 }
 
 // `strip_encryption_markers` lives in `storage::encrypting` (where the marker
-// consts do) — the single home shared by the re-encrypt job here AND the
-// delta-passthrough ship in `transfer`. Re-exported so `super::` callers in this
-// module are unaffected.
-pub(crate) use crate::storage::encrypting::strip_encryption_markers;
+// consts do): the single home shared by the re-encrypt rewrite
+// (`deltaglider::engine::rewrite`) AND the delta-passthrough ship in
+// `transfer`.
+#[cfg(test)]
+use crate::storage::encrypting::strip_encryption_markers;
 
 /// Pure: the terminal status of a job that ran to its end. A job with
 /// per-object failures is never plain `completed`: `completed_with_errors`

@@ -592,6 +592,19 @@ impl crate::storage::StorageBackend for FencingFs {
         self.inner.put_object(b, p, t, body, m).await
     }
 
+    async fn put_if_unchanged(
+        &self,
+        b: &str,
+        p: &str,
+        t: crate::storage::RewriteTarget<'_>,
+        body: crate::storage::PutBody<'_>,
+        m: &Meta,
+        v: &str,
+    ) -> Result<crate::storage::WriteIf, StorageError> {
+        let body = crate::storage::PutBody::Bytes(body.into_bytes().await?);
+        self.inner.put_if_unchanged(b, p, t, body, m, v).await
+    }
+
     async fn head_object(
         &self,
         b: &str,

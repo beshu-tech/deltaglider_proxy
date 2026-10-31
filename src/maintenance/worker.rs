@@ -29,7 +29,7 @@
 //!
 //! [`needs_rewrite`]: super::needs_rewrite
 
-use crate::storage::{StorageBackend, StorageBackendExt};
+use crate::storage::StorageBackend;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -42,16 +42,15 @@ use crate::config_apply::ConfigMutator;
 use crate::config_db::JobsDb;
 use crate::config_sections::LeaseTiming;
 use crate::coordination::LeaseError;
-use crate::deltaglider::CounterPrior;
-use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
-use crate::transfer::{copy_object_known, ObjectTransferRequest};
+use crate::deltaglider::Rewritten;
+use crate::storage::ObjectVariant;
 
 use super::paged::{
     list_job_keys, paged_phase, BackgroundCount, JobCtx, KeyPage, ListError, PageStep, PhaseSpec,
     CANCEL_CHECK_EVERY, PAGE_CONCURRENCY,
 };
 use super::store::{current_unix_seconds, Lane, MaintenanceJob};
-use super::{needs_rewrite, resolve_desired, strip_encryption_markers, DesiredEncryption};
+use super::{needs_rewrite, resolve_desired, DesiredEncryption};
 
 /// How long a job whose backend is gated waits before a worker claims it
 /// again (about one health re-probe interval).
@@ -624,12 +623,44 @@ async fn execute_phases(
 ) -> Result<(), PhaseStop> {
     let bucket = &job.bucket;
 
-    // ── Drain in-flight writes admitted before the gate armed. ──
-    drain_inflight_writes(state, bucket).await?;
+    // ── The write gate of this run: none when every rewrite is
+    // conditional on what the job read (judged again now: a backend
+    // definition can change while a job waits). ──
+    let mut params = super::conversion::ReencryptParams::of(job.params.as_deref());
+    let conditional = {
+        let cfg = config.read().await.clone();
+        super::conversion::rewrites_are_conditional(state, &cfg, bucket).await
+    };
+    if conditional != params.conditional_writes {
+        params.conditional_writes = conditional;
+        let db = db.lock().await;
+        if let Err(e) = db.maintenance_set_params(job.id, params.to_json().as_deref()) {
+            // Fail closed: a row that still says "gated" keeps the gate,
+            // and a rewrite without the gate must be conditional.
+            warn!("maintenance: job #{} params not saved: {e}", job.id);
+            params.conditional_writes = false;
+        }
+        state.maintenance_gate.sync_from(&db);
+    }
+    let unconditional = if params.conditional_writes {
+        crate::deltaglider::Unconditional::Refused
+    } else {
+        // ── Drain in-flight writes admitted before the gate armed. ──
+        drain_inflight_writes(state, bucket).await?;
+        crate::deltaglider::Unconditional::Allowed
+    };
+    info!(
+        "maintenance: job #{} rewrites '{bucket}' {}",
+        job.id,
+        if params.conditional_writes {
+            "with conditional writes; client writes go on during the run"
+        } else {
+            "behind the bucket's write gate (no proven conditional writes)"
+        }
+    );
 
     // ── The conversion marker of this job's run: a resume extends its
     // deadline (a job without a run never writes a marker). ──
-    let params = super::conversion::ReencryptParams::of(job.params.as_deref());
     let marker = super::conversion::begin(&state.engine.load(), bucket, params.run)
         .await
         .map_err(PhaseStop::FailedTransient)?;
@@ -642,6 +673,7 @@ async fn execute_phases(
         serves: false,
         marker: &marker,
         adoptions: &adoptions,
+        unconditional,
     };
     let walked = run_count_then_walk(db, state, holder, job, "rewrite", &mut visitor).await?;
     let mut c = walked.c;
@@ -679,12 +711,22 @@ async fn execute_phases(
             let adopted = |meta: &crate::types::FileMetadata| {
                 super::conversion::adopted(&marker, serves, &key, meta)
             };
-            match rewrite_reference_if_needed(&engine, bucket, &prefix, &desired, adopted).await {
-                Ok(false) => {}
-                Ok(true) => {
+            let rewrite = rewrite_reference_if_needed(
+                &engine,
+                (bucket, &prefix),
+                &desired,
+                adopted,
+                unconditional,
+            );
+            match rewrite.await {
+                Ok(ReferenceRewrite::Kept | ReferenceRewrite::Done { adopted: false }) => {}
+                Ok(ReferenceRewrite::Done { adopted: true }) => {
                     adoptions.add();
                     record_adoption(db, job, &key).await?;
                 }
+                // A client re-wrote (or a delete reclaimed) the reference
+                // after the job read it: it stays as it is now.
+                Ok(ReferenceRewrite::Changed) => record_changed(db, job, &key).await?,
                 Err(e) => {
                     let reason = format!("{}: {e}", super::conversion::REWRITE_FAILED);
                     record_failure(db, job.id, &key, &reason).await?;
@@ -747,6 +789,13 @@ async fn execute_phases(
                 super::store::ADOPTED_SAMPLES
             ),
         );
+    }
+    if row.objects_changed > 0 {
+        notes.push(format!(
+            "{} object(s) skipped as changed: a client wrote them after the job read them, \
+             and they keep the client's version",
+            row.objects_changed
+        ));
     }
     if !notes.is_empty() {
         // The run summary names the adoptions and the purge (the generic
@@ -835,6 +884,9 @@ struct Reencrypt<'a> {
     /// The bucket's conversion marker for this run.
     marker: &'a super::conversion::JobMarker,
     adoptions: &'a super::conversion::Adoptions,
+    /// Whether a rewrite may be unconditional on a backend that answers
+    /// 501 to a condition: only behind the bucket's write gate.
+    unconditional: crate::deltaglider::Unconditional,
 }
 
 impl ObjectVisitor for Reencrypt<'_> {
@@ -860,51 +912,81 @@ impl ObjectVisitor for Reencrypt<'_> {
         listed: Option<crate::storage::ObjectVariant>,
     ) -> Visit {
         let desired = self.desired.as_ref().expect("begin_page runs first");
-        let (meta, forms) = match read_listed(engine, self.bucket, key, listed).await {
-            Ok(read) => read,
-            Err(Visit::Failed(e)) => {
-                return Visit::Failed(format!("{}: {e}", super::conversion::REWRITE_FAILED))
-            }
-            Err(visit) => return visit,
+        let failed = |e: &dyn std::fmt::Display| {
+            Visit::Failed(format!("{}: {e}", super::conversion::REWRITE_FAILED))
         };
-        let meta = &meta;
-        if !needs_rewrite(&meta.user_metadata, desired) {
+        // A key that is gone since the listing: a client deleted it (or
+        // replaced it in a way the listing did not see). Nothing to do.
+        let (meta, forms) = match engine.head_listed(self.bucket, key, listed).await {
+            Ok(read) => read,
+            Err(crate::deltaglider::EngineError::NotFound(_)) => return Visit::Changed,
+            Err(e) => return failed(&format!("could not read object metadata: {e}")),
+        };
+        // The newest stored form (the object), and the other one when a
+        // crash between a write and its other-form DELETE left both: each
+        // is rewritten in place, so no plaintext form stays behind.
+        let newest = form_of(&meta);
+        let mut targets = vec![(newest, meta)];
+        let other = match newest {
+            ObjectVariant::Delta => ObjectVariant::Passthrough,
+            ObjectVariant::Passthrough => ObjectVariant::Delta,
+        };
+        if forms.has_form(other) {
+            match engine.stored_form(self.bucket, key, other).await {
+                Ok(Some(m)) => targets.push((other, m)),
+                Ok(None) => {}
+                Err(e) => return failed(&format!("could not read object metadata: {e}")),
+            }
+        }
+        let mut bytes = 0i64;
+        let mut wrote = false;
+        let mut changed = false;
+        for (i, (form, read)) in targets.iter().enumerate() {
+            if !needs_rewrite(&read.user_metadata, desired) {
+                continue;
+            }
+            let rewrite = engine.rewrite_object_if_unchanged(
+                self.bucket,
+                key,
+                *form,
+                read,
+                self.unconditional,
+            );
+            match rewrite.await {
+                // The count and the bytes are the object's (the newest form).
+                Ok(Rewritten::Done { bytes: b }) if i == 0 => {
+                    wrote = true;
+                    bytes = b as i64;
+                }
+                Ok(Rewritten::Done { .. }) => {}
+                // The object is a client's newer write now, sealed by the
+                // proxy that took it: it stays as the client wrote it.
+                Ok(Rewritten::Changed) if i == 0 => changed = true,
+                // A stale other form that a client write replaced.
+                Ok(Rewritten::Changed) => {}
+                Err(e) => return failed(&e),
+            }
+        }
+        if changed {
+            return Visit::Changed;
+        }
+        if !wrote {
             return Visit::Skipped;
         }
         // Judged on this read (the backend's metadata, never a cache).
-        let adopted = super::conversion::adopted(self.marker, self.serves, key, meta);
-        let req = ObjectTransferRequest {
-            source_bucket: self.bucket,
-            source_key: key,
-            destination_bucket: self.bucket,
-            destination_key: key,
-            provenance: None,
-            // Shed stale markers; the encrypting wrapper re-stamps
-            // fresh ones when the destination mode encrypts.
-            strip_user_metadata_keys: &[ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY],
-            operation: "maintenance-reencrypt",
-            upload_concurrency: None,
-            keep_created_at: true,
-        };
-        // The visit's HEAD is the copy's source HEAD and the write's prior
-        // (source == destination): the write gate freezes the bucket, so a
-        // second read would find the same object in the same forms.
-        let prior = CounterPrior::Present {
-            object: Box::new(meta.clone()),
-            forms,
-        };
-        match copy_object_known(engine, req, Some(meta), Some(&prior)).await {
-            Ok(outcome) if adopted => {
-                self.adoptions.add();
-                Visit::Adopted {
-                    bytes: outcome.bytes_copied as i64,
-                }
-            }
-            Ok(outcome) => Visit::Done {
-                bytes: outcome.bytes_copied as i64,
-            },
-            Err(e) => Visit::Failed(format!("{}: {e}", super::conversion::REWRITE_FAILED)),
+        if super::conversion::adopted(self.marker, self.serves, key, &targets[0].1) {
+            self.adoptions.add();
+            return Visit::Adopted { bytes };
         }
+        Visit::Done { bytes }
+    }
+}
+
+/// The stored form whose metadata `meta` is.
+fn form_of(meta: &crate::types::FileMetadata) -> ObjectVariant {
+    match meta.storage_info {
+        crate::types::StorageInfo::Delta { .. } => ObjectVariant::Delta,
+        _ => ObjectVariant::Passthrough,
     }
 }
 
@@ -920,6 +1002,10 @@ pub(crate) enum Visit {
         bytes: i64,
     },
     Skipped,
+    /// Not rewritten: a client wrote (or deleted) the object after the job
+    /// read it, and it stays as the client left it. Counted as skipped and
+    /// as changed (`skipped_changed`); never a failure.
+    Changed,
     /// Recorded in the failure ring and counted; the phase goes on.
     Failed(String),
 }
@@ -1189,6 +1275,10 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
                 record_adoption(self.db, self.job, key).await?;
             }
             Visit::Skipped => self.c.skipped += 1,
+            Visit::Changed => {
+                self.c.skipped += 1;
+                record_changed(self.db, self.job, key).await?;
+            }
             Visit::Failed(reason) => {
                 record_failure(self.db, self.job.id, key, &reason).await?;
                 self.c.failed += 1;
@@ -1203,37 +1293,66 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
 /// PLAINTEXT bytes are unchanged, so the engine's in-memory
 /// ReferenceCache (keyed by content) stays valid. The check and the
 /// rewrite run under the deltaspace's prefix lock AND the cross-instance
-/// reference lock (`with_dest_prefix_lock`), like every reference write.
-/// `Ok(true)`: rewritten, and `adopted` judged the reference's job read
-/// adopted (a client could not read it: it is reported like an object).
+/// reference lock (`with_dest_prefix_lock`), like every reference write,
+/// and the write is conditional on the version that the job read
+/// ([`crate::deltaglider::DynEngine::rewrite_reference_if_unchanged`]).
 async fn rewrite_reference_if_needed(
     engine: &crate::deltaglider::DynEngine,
-    bucket: &str,
-    prefix: &str,
+    (bucket, prefix): (&str, &str),
     desired: &DesiredEncryption,
     adopted: impl Fn(&crate::types::FileMetadata) -> bool,
-) -> Result<bool, String> {
-    let res: Result<bool, crate::deltaglider::EngineError> = engine
-        .with_dest_prefix_lock(bucket, prefix, || async {
-            let storage = engine.storage();
-            if !storage.has_reference(bucket, prefix).await? {
-                return Ok(false);
-            }
-            let meta = storage.get_reference_metadata(bucket, prefix).await?;
-            if !needs_rewrite(&meta.user_metadata, desired) {
-                return Ok(false);
-            }
-            let was_adopted = adopted(&meta);
-            let data = engine.get_reference_raw(bucket, prefix).await?;
-            let mut new_meta = meta;
-            strip_encryption_markers(&mut new_meta.user_metadata);
-            engine
-                .put_reference_raw(bucket, prefix, &bytes::Bytes::from(data), &new_meta)
-                .await?;
-            Ok(was_adopted)
+    unconditional: crate::deltaglider::Unconditional,
+) -> Result<ReferenceRewrite, String> {
+    let res = engine
+        .with_dest_prefix_lock(bucket, prefix, || {
+            engine.rewrite_reference_if_unchanged(
+                bucket,
+                prefix,
+                |meta| needs_rewrite(&meta.user_metadata, desired),
+                unconditional,
+            )
         })
         .await;
-    res.map_err(|e| format!("reference rewrite failed for {bucket}/{prefix}: {e}"))
+    match res {
+        Ok(None) => Ok(ReferenceRewrite::Kept),
+        Ok(Some((Rewritten::Changed, _))) => Ok(ReferenceRewrite::Changed),
+        Ok(Some((Rewritten::Done { .. }, read))) => Ok(ReferenceRewrite::Done {
+            adopted: adopted(&read),
+        }),
+        Err(e) => Err(format!(
+            "reference rewrite failed for {bucket}/{prefix}: {e}"
+        )),
+    }
+}
+
+/// What the references phase did with one reference.bin.
+enum ReferenceRewrite {
+    /// None there, or it is in the desired state already.
+    Kept,
+    /// Rewritten; `adopted`: the job's read of it was adopted (a client
+    /// could not read it: it is reported like an object).
+    Done { adopted: bool },
+    /// A client re-wrote or reclaimed it after the job read it.
+    Changed,
+}
+
+/// Count one object (or reference) `key` that the job did not rewrite
+/// because a client wrote it after the job read it.
+async fn record_changed(
+    db: &Arc<Mutex<JobsDb>>,
+    job: &MaintenanceJob,
+    key: &str,
+) -> Result<(), PhaseStop> {
+    stop_if_shutting_down()?;
+    if let Err(e) = db.lock().await.maintenance_count_changed(job.id) {
+        warn!("maintenance: changed count failed for job #{}: {e}", job.id);
+    }
+    tracing::debug!(
+        "maintenance: job #{} left {}/{key} as a client wrote it after the job read it",
+        job.id,
+        job.bucket
+    );
+    Ok(())
 }
 
 /// Wait for the gated bucket's in-flight S3 writes to reach zero. The

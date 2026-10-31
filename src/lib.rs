@@ -1388,18 +1388,29 @@ mod source_guards {
     /// mtime). A read rule trusts it to tell history from a plant, so only
     /// the backends' read paths set it, and the constructors start it at
     /// `None`. A new assignment elsewhere (a write path, a test fixture, a
-    /// wrapper) could hand the rule a time that no backend reported.
+    /// wrapper) could hand the rule a time that no backend reported. The
+    /// same holds for `FileMetadata::backend_version` (N1): a conditional
+    /// rewrite names it, so a version that no backend read could let the
+    /// re-encrypt job overwrite a client's write.
     #[test]
     fn stored_last_modified_comes_from_the_backend() {
+        for field in [
+            ["stored_last", "_modified"].concat(),
+            ["backend", "_version"].concat(),
+        ] {
+            only_backend_reads_set(&field);
+        }
+    }
+
+    fn only_backend_reads_set(field: &str) {
         const ALLOWED: &[&str] = &[
             "src/types.rs",
             "src/storage/s3/metadata.rs",
             "src/storage/s3/listing.rs",
             "src/storage/filesystem/mod.rs",
         ];
-        let field = ["stored_last", "_modified"].concat();
         let assigns = |code: &str| -> bool {
-            code.match_indices(field.as_str()).any(|(i, _)| {
+            code.match_indices(field).any(|(i, _)| {
                 let rest = code[i + field.len()..].trim_start();
                 let before = code[..i].trim_end();
                 let assign = rest.starts_with('=') && !rest.starts_with("==");
@@ -1436,7 +1447,7 @@ mod source_guards {
         }
         assert!(
             bad.is_empty(),
-            "stored_last_modified set outside the backends' read paths: {bad:?}"
+            "{field} set outside the backends' read paths: {bad:?}"
         );
     }
 

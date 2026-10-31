@@ -533,6 +533,33 @@ mod tests {
         assert!(busy(&g).is_empty());
     }
 
+    /// A re-encrypt job whose rewrites are all conditional gates nothing;
+    /// one that is not (or a row of an older release) gates its bucket. A
+    /// run that judges the backend again moves the row between the two.
+    #[test]
+    fn a_reencrypt_with_conditional_rewrites_gates_nothing() {
+        use crate::maintenance::conversion::ReencryptParams;
+        let db = JobsDb::in_memory("testpass").unwrap();
+        let g = MaintenanceGate::new();
+        let ungated = ReencryptParams {
+            conditional_writes: true,
+            ..Default::default()
+        };
+        let json = ungated.to_json();
+        let id = db
+            .maintenance_create_job("reencrypt", "cas", "counting", json.as_deref(), "a", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_create_job("reencrypt", "noncas", "counting", None, "a", 1)
+            .unwrap()
+            .unwrap();
+        g.sync_from(&db);
+        assert_eq!(busy(&g), vec!["noncas"]);
+        db.maintenance_set_params(id, None).unwrap();
+        g.sync_from(&db);
+        assert_eq!(busy(&g), vec!["cas", "noncas"]);
+    }
+
     #[test]
     fn sync_from_an_unreadable_db_changes_nothing() {
         let db = JobsDb::in_memory("testpass").unwrap();

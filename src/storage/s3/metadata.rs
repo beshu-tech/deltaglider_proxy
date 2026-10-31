@@ -360,6 +360,7 @@ impl S3Backend {
             storage_info,
             listing_token: Default::default(),
             stored_last_modified: None,
+            backend_version: None,
         })
     }
 
@@ -483,6 +484,7 @@ impl S3Backend {
             match Self::headers_to_metadata(&headers, s3_last_modified) {
                 Ok(mut meta) => {
                     meta.stored_last_modified = stored_last_modified;
+                    meta.backend_version = response.e_tag.map(str::to_string);
                     // No size, no facts: a wrong stored size would make the
                     // listing facts disagree with the object.
                     if let Some(stored_size) = stored_size {
@@ -566,6 +568,7 @@ impl S3Backend {
             StorageInfo::Passthrough,
         );
         meta.stored_last_modified = stored_last_modified;
+        meta.backend_version = response.e_tag.map(str::to_string);
         Ok(meta)
     }
 }

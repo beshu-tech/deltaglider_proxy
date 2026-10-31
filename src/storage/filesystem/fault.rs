@@ -424,6 +424,20 @@ impl StorageBackend for FaultyFs {
         self.inner.get_object(bucket, prefix, object).await
     }
 
+    async fn put_if_unchanged(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        target: crate::storage::RewriteTarget<'_>,
+        body: PutBody<'_>,
+        metadata: &FileMetadata,
+        version: &str,
+    ) -> Result<crate::storage::WriteIf, StorageError> {
+        self.inner
+            .put_if_unchanged(bucket, prefix, target, body, metadata, version)
+            .await
+    }
+
     async fn put_object(
         &self,
         bucket: &str,

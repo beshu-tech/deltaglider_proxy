@@ -545,6 +545,7 @@ async fn close_one(
 /// config write lock is released.
 pub(crate) async fn enqueue(
     app: &AppState,
+    config: &crate::config::Config,
     started: &mut [ConversionStarted],
     warnings: &mut Vec<String>,
     headers: &HeaderMap,
@@ -569,12 +570,14 @@ pub(crate) async fn enqueue(
             params: ReencryptParams {
                 purge_plaintext_versions: purge && s.versioned,
                 run: Some(s.run_id),
+                ..Default::default()
             },
         })
         .collect();
-    let results =
-        crate::maintenance::conversion::queue_reencrypt(app, db, &requests, "config", headers)
-            .await;
+    let results = crate::maintenance::conversion::queue_reencrypt(
+        app, config, db, &requests, "config", headers,
+    )
+    .await;
     // The response says "purge" only for a job that will do it (`open`
     // starts every entry with `false`).
     for ((s, r), q) in started.iter_mut().zip(results).zip(&requests) {

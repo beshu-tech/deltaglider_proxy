@@ -1262,6 +1262,27 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, put_object, prefix, target, body, metadata)
     }
 
+    async fn put_if_unchanged(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        target: super::RewriteTarget<'_>,
+        body: super::PutBody<'_>,
+        metadata: &FileMetadata,
+        version: &str,
+    ) -> Result<super::WriteIf, StorageError> {
+        route_existing!(
+            self,
+            bucket,
+            put_if_unchanged,
+            prefix,
+            target,
+            body,
+            metadata,
+            version
+        )
+    }
+
     async fn file_put_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {
         route_existing!(self, bucket, file_put_spool_bytes, bytes, parts)
     }
@@ -1853,6 +1874,19 @@ mod tests {
         ) -> Result<(), StorageError> {
             body.into_bytes().await?;
             Ok(())
+        }
+
+        async fn put_if_unchanged(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::storage::RewriteTarget<'_>,
+            body: crate::storage::PutBody<'_>,
+            _: &FileMetadata,
+            _: &str,
+        ) -> Result<crate::storage::WriteIf, StorageError> {
+            body.into_bytes().await?;
+            Ok(crate::storage::WriteIf::Written)
         }
 
         async fn head_object(

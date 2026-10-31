@@ -360,6 +360,72 @@ mod reference_writes {
             self.write_reference(storage, bucket, deltaspace, op).await
         }
 
+        /// The re-encrypt job's in-place rewrite of a delta: the same delta
+        /// bytes against the same reference, stored only while the delta is
+        /// still `version` ([`StorageBackend::put_if_unchanged`]). The
+        /// bytes do not change, so the delta needs no reference check after
+        /// the write (unlike [`Self::put_delta`]).
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) async fn rewrite_delta_if<B: StorageBackend + ?Sized>(
+            &self,
+            storage: &B,
+            bucket: &str,
+            deltaspace: &str,
+            filename: &str,
+            data: Bytes,
+            meta: &FileMetadata,
+            version: &str,
+        ) -> Result<crate::storage::WriteIf, EngineError> {
+            self.ensure_held().await?;
+            let target = crate::storage::RewriteTarget::Delta {
+                name: filename,
+                proof: PROOF,
+            };
+            let body = crate::storage::PutBody::Bytes(data);
+            Ok(storage
+                .put_if_unchanged(bucket, deltaspace, target, body, meta, version)
+                .await?)
+        }
+
+        /// The re-encrypt job's in-place rewrite of reference.bin (the same
+        /// plaintext), stored only while it is still `version`. Under a
+        /// cross-instance hold, the hold observed the reference when it was
+        /// taken: a read of another version means that a writer got in
+        /// before the hold, so the rewrite is `Changed` without a request.
+        pub(crate) async fn rewrite_reference_if<B: StorageBackend + ?Sized>(
+            &self,
+            storage: &B,
+            bucket: &str,
+            deltaspace: &str,
+            data: Bytes,
+            meta: &FileMetadata,
+            version: &str,
+        ) -> Result<crate::storage::WriteIf, EngineError> {
+            use crate::storage::{RefFence, WriteIf};
+            self.ensure_held().await?;
+            if let Some(h) = &self.hold {
+                match &*h.fence.lock() {
+                    RefFence::ETag(e) if e != version => return Ok(WriteIf::Changed),
+                    RefFence::Absent => return Ok(WriteIf::Changed),
+                    _ => {}
+                }
+            }
+            let target = crate::storage::RewriteTarget::Reference { proof: PROOF };
+            let body = crate::storage::PutBody::Bytes(data);
+            let out = storage
+                .put_if_unchanged(bucket, deltaspace, target, body, meta, version)
+                .await?;
+            if let (WriteIf::Written, Some(h)) = (out, &self.hold) {
+                // The next write of this hold is fenced on what we wrote.
+                let next = storage
+                    .reference_fence(bucket, deltaspace)
+                    .await
+                    .unwrap_or(RefFence::Unfenced);
+                *h.fence.lock() = next;
+            }
+            Ok(out)
+        }
+
         /// A delta is valid only against the baseline it was encoded from. The
         /// delta write cannot be conditional on reference.bin (another object),
         /// so under a cross-instance hold re-read the reference fence AFTER the

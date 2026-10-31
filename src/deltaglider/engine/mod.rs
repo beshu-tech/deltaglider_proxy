@@ -35,6 +35,7 @@ mod metadata;
 mod raw;
 mod resources;
 mod retrieve;
+mod rewrite;
 mod server_copy;
 pub(crate) mod store;
 mod usage;
@@ -47,6 +48,7 @@ pub(crate) use list::interleave_and_paginate;
 
 pub use locking::RefWriteProof;
 pub use metadata::{ListedPageForms, StoredForms};
+pub use rewrite::{Rewritten, Unconditional};
 pub(crate) use usage::CounterPrior;
 
 /// Errors from the DeltaGlider engine

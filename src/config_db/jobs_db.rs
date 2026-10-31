@@ -56,11 +56,18 @@ pub(crate) const JOBS_ONLY_TABLES: &[&str] = &["lifecycle_scan_cache", "lifecycl
 /// Columns that only the jobs DB has on a node-local table (table, column,
 /// declaration): added at every open when missing, without a schema version
 /// bump, like the `JOBS_ONLY_TABLES`.
-pub(crate) const JOBS_ONLY_COLUMNS: &[(&str, &str, &str)] = &[(
-    "maintenance_jobs",
-    "objects_adopted",
-    "INTEGER NOT NULL DEFAULT 0",
-)];
+pub(crate) const JOBS_ONLY_COLUMNS: &[(&str, &str, &str)] = &[
+    (
+        "maintenance_jobs",
+        "objects_adopted",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "maintenance_jobs",
+        "objects_changed",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+];
 
 /// The node-local job database. Shared as `Arc<tokio::sync::Mutex<JobsDb>>`;
 /// its own lock, so a job write never waits for an IAM read.

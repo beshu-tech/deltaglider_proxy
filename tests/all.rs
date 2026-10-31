@@ -68,6 +68,8 @@ mod cli_s3_sync_test;
 mod cli_s3_verify_test;
 #[path = "concurrency_test.rs"]
 mod concurrency_test;
+#[path = "conditional_rewrite_test.rs"]
+mod conditional_rewrite_test;
 #[path = "config_sync_ha_test.rs"]
 mod config_sync_ha_test;
 #[path = "config_sync_test.rs"]
