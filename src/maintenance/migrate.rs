@@ -243,6 +243,54 @@ pub fn real_bucket_name<'a>(
     }
 }
 
+/// Pure: the OTHER configured virtual names that store into the storage a
+/// migrate of `bucket` deletes from: its real bucket on `from_backend` (the
+/// cleanup with `delete_source`) or on `target_backend` (the `mirror`
+/// prune). The write gate and the cleanup match the migrated name only, so
+/// a write through an alias is neither gated nor copied, and the cleanup
+/// deletes it. The job's own transient routes do not count. An unrouted
+/// bare name never counts: the router skips storage that an alias owns
+/// (`alias_owns_real_bucket` in `storage/routing.rs`).
+pub fn aliases_of(
+    cfg: &crate::config::Config,
+    bucket: &str,
+    from_backend: &str,
+    target_backend: &str,
+) -> Vec<String> {
+    let bucket = bucket.to_ascii_lowercase();
+    let real = real_bucket_name(&cfg.buckets, &bucket).to_ascii_lowercase();
+    let on = |backend: &str| crate::config::StorageKey {
+        backend: backend.to_string(),
+        real_bucket: real.clone(),
+    };
+    let (source, target) = (on(from_backend), on(target_backend));
+    cfg.buckets
+        .keys()
+        .filter(|name| **name != bucket && !name.starts_with(TRANSIENT_PREFIX))
+        .filter(|name| {
+            let key = cfg.storage_key_of(name);
+            key == source || key == target
+        })
+        .cloned()
+        .collect()
+}
+
+/// The refusal text of [`aliases_of`], or `None` when no alias exists.
+pub fn alias_refusal(bucket: &str, aliases: &[String]) -> Option<String> {
+    (!aliases.is_empty()).then(|| {
+        format!(
+            "bucket '{bucket}' shares its storage with {}: the migrate gates and copies only \
+             '{bucket}', so the cleanup would delete objects written through the other \
+             name(s). Remove the alias first, or migrate by hand.",
+            aliases
+                .iter()
+                .map(|a| format!("'{a}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 /// Proof that the deferred copy writes are durable. Only [`flush_copies`]
 /// makes one, and [`persist_flushed`] (the only save this file can reach)
 /// takes one, so every migrate save waits for a successful flush.
@@ -983,6 +1031,18 @@ impl MigrateRun<'_> {
         super::resolve_desired(&cfg, &self.params.transient_key).ok()
     }
 
+    /// [`alias_refusal`] of this job, under the live config.
+    async fn alias_refusal(&self) -> Option<String> {
+        let cfg = self.mutator.read().await;
+        let aliases = aliases_of(
+            &cfg,
+            &self.job.bucket,
+            &self.params.from_backend,
+            &self.params.target_backend,
+        );
+        alias_refusal(&self.job.bucket, &aliases)
+    }
+
     async fn ensure_staging_route(&self, context: &str) -> Result<(), String> {
         ensure_route(
             self.mutator,
@@ -1233,6 +1293,14 @@ impl MigrateRun<'_> {
                     "cleanup refused: bucket '{}' is not routed to '{}' in the live \
                      config — source data left untouched",
                     bucket, params.target_backend
+                ));
+                break 'cleanup;
+            }
+            // Also every sweep: a config apply can add an alias of the
+            // source storage after the job started (NEW-10).
+            if let Some(reason) = self.alias_refusal().await {
+                stopped = Some(format!(
+                    "cleanup refused: {reason} — source data left untouched"
                 ));
                 break 'cleanup;
             }
@@ -1603,6 +1671,13 @@ impl PageStep for PruneStep<'_, '_> {
     type Done = Result<bool, PhaseStop>;
 
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
+        // Every page: an alias of the target storage, added after the job
+        // started, would lose its objects to the prune (NEW-10).
+        if let Some(reason) = self.m.alias_refusal().await {
+            return Err(PhaseStop::Failed(format!(
+                "mirror refused: {reason} — nothing more deleted on the destination"
+            )));
+        }
         self.engine = Some(self.m.state.engine.load().clone());
         Ok(())
     }
@@ -1781,6 +1856,49 @@ mod tests {
     }
 
     use super::*;
+
+    /// NEW-10: two names on one storage. The migrate gated and cleaned up
+    /// `releases` only; `downloads` kept taking writes that the cleanup
+    /// then deleted. `aliases_of` names every other route to the source or
+    /// the target storage.
+    #[test]
+    fn aliases_of_names_every_other_route_to_the_storage() {
+        let cfg = crate::config::Config::from_yaml_str(
+            r#"
+storage:
+  backends:
+    - name: hetzner-fsn1
+      type: filesystem
+      path: /tmp/dgp-aliases-a
+    - name: aws-dr
+      type: filesystem
+      path: /tmp/dgp-aliases-b
+  buckets:
+    releases: { backend: hetzner-fsn1 }
+    downloads: { backend: hetzner-fsn1, alias: releases }
+    db-archive: { backend: aws-dr, alias: releases }
+    __dgmigrate_releases_0: { backend: aws-dr, alias: releases }
+    other: {}
+"#,
+        )
+        .unwrap();
+        // Source side (downloads) and target side (db-archive); the
+        // transient route and an unrelated bucket do not count.
+        assert_eq!(
+            aliases_of(&cfg, "releases", "hetzner-fsn1", "aws-dr"),
+            vec!["db-archive".to_string(), "downloads".to_string()]
+        );
+        // The alias itself, migrated: `releases` is the other name.
+        assert_eq!(
+            aliases_of(&cfg, "Downloads", "hetzner-fsn1", "local-disk"),
+            vec!["releases".to_string()]
+        );
+        // A bucket alone on its storage has none, and no refusal.
+        assert!(aliases_of(&cfg, "other", "hetzner-fsn1", "aws-dr").is_empty());
+        assert!(alias_refusal("other", &[]).is_none());
+        let msg = alias_refusal("releases", &["downloads".into()]).unwrap();
+        assert!(msg.contains("'downloads'"), "{msg}");
+    }
 
     #[test]
     fn real_bucket_name_follows_the_routing_rule() {

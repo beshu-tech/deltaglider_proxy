@@ -473,6 +473,50 @@ async fn test_migrate_honours_bucket_alias() {
     assert!(leftover.is_empty(), "source objects left: {leftover:?}");
 }
 
+/// NEW-10: `releases` and `downloads` store into one real bucket. The
+/// migrate gates and copies `releases` only, so writes through `downloads`
+/// are not copied, and the cleanup deletes them. The start is refused with
+/// 409, and the refusal names the alias.
+#[tokio::test]
+async fn test_migrate_refuses_a_bucket_with_an_alias() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let server = TestServer::builder()
+        .bucket("releases")
+        .bucket_policy("releases", "backend: src")
+        .bucket_policy("downloads", "backend: src\nalias: releases")
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    http.put(format!("{endpoint}/releases"))
+        .send()
+        .await
+        .unwrap();
+    seed(&http, &endpoint, "releases", 2).await;
+
+    let admin = admin_http_client(&endpoint).await;
+    for (bucket, other) in [("releases", "'downloads'"), ("downloads", "'releases'")] {
+        let resp = start_migrate(&admin, &endpoint, bucket, "dst", true).await;
+        assert_eq!(
+            resp.status(),
+            409,
+            "the migrate of '{bucket}' must be refused"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("shares its storage") && body.contains(other),
+            "{body}"
+        );
+    }
+    // No job, and the data stays where it is.
+    for i in 0..2 {
+        let bytes = get_bytes(&http, &endpoint, "downloads", &format!("obj-{i:03}.json")).await;
+        assert!(bytes.starts_with(MARKER));
+    }
+}
+
 /// D10: a key that already exists on the target is not proof of a copy. A
 /// cancelled earlier attempt leaves old copies behind, and the source keeps
 /// taking writes until the retry. The retry must re-copy a target object

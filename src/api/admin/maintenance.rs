@@ -395,6 +395,24 @@ pub async fn start_migrate(
     let bucket = super::admit_bucket(&state, &bucket)?.into_string();
     let db = state.jobs_db.as_ref().ok_or_else(AdminError::no_jobs_db)?;
 
+    // NEW-10: another name of the same storage is neither gated nor copied,
+    // and the cleanup or the prune would delete its objects. Config only,
+    // so before the existence check: the bucket listing shows one name of
+    // an aliased storage, not both.
+    {
+        let cfg = state.config.read().await;
+        let from_backend = cfg.storage_key_of(&bucket_key).backend;
+        let aliases = crate::maintenance::migrate::aliases_of(
+            &cfg,
+            &bucket_key,
+            &from_backend,
+            &target_backend,
+        );
+        if let Some(reason) = crate::maintenance::migrate::alias_refusal(&bucket, &aliases) {
+            return Err(AdminError::conflict(reason));
+        }
+    }
+
     // The bucket must actually exist (the old handler skipped this check).
     let engine = state.s3_state.engine.load().clone();
     let exists = engine
