@@ -37,6 +37,7 @@ jobs:
     permissions:
       actions: read
       contents: read
+      packages: read # pull the builder image for the supply-chain step
     outputs:
       tagged_sha: ${{ steps.resolve.outputs.tagged_sha }}
       ci_run_url: ${{ steps.wait.outputs.ci_run_url }}
@@ -128,6 +129,24 @@ jobs:
             fi
             sleep 30
           done
+
+      # The merge gate does not run RustSec or cargo-deny (the nightly does),
+      # so a release refuses a known advisory here. The same three commands
+      # as test-all-nightly.yml's supply-chain job, in the same builder image.
+      - name: Supply chain (cargo audit + cargo deny)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          BUILDER: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker run --rm -v "$PWD:/w" -w /w "$BUILDER" bash -euo pipefail -c '
+            git config --global --add safe.directory /w
+            cargo audit
+            cargo deny check
+            cargo deny --manifest-path operator/Cargo.toml check advisories
+          '
 
   # ── Job 2: Validate ─────────────────────────────────────────────────
   validate:
