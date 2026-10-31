@@ -1,15 +1,18 @@
 import { useState, useEffect, useId, useMemo, useRef } from 'react';
-import { Layout, Button, Typography, Drawer, theme, message, Modal } from 'antd';
+import { Layout, Button, Typography, Drawer, Input, theme, message, Modal } from 'antd';
 import Dropdown from './KeyboardDropdown';
 import type { MenuProps } from 'antd';
 import {
   PlusOutlined,
+  CloudOutlined,
   DeleteOutlined,
   EditOutlined,
   EllipsisOutlined,
+  HddOutlined,
   UploadOutlined,
   ExclamationCircleOutlined,
   RightOutlined,
+  SearchOutlined,
 } from '@ant-design/icons';
 import {
   countBucketObjects,
@@ -27,8 +30,11 @@ import BucketPublicIcon from './BucketPublicIcon';
 import SidebarResizeHandle from './SidebarResizeHandle';
 import { describeBackend } from '../bucketBackend';
 import {
+  BUCKET_FILTER_MIN,
   COLLAPSED_GROUPS_STORAGE_KEY,
   SIDEBAR_DEFAULT_WIDTH,
+  filterBuckets,
+  filterTerms,
   groupBucketsByBackend,
   groupKey,
   parseCollapsedGroups,
@@ -112,7 +118,7 @@ export default function Sidebar({
 }: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_SECONDARY,
-    TEXT_MUTED, TEXT_FAINT, ACCENT_BLUE, ACCENT_BLUE_LIGHT,
+    TEXT_MUTED, ACCENT_BLUE, ACCENT_BLUE_LIGHT,
   } = useColors();
   const [buckets, setBuckets] = useState<BucketInfo[]>([]);
   // Distinguishes "the bucket listing FAILED" (a backend is down / 503-ing)
@@ -134,6 +140,11 @@ export default function Sidebar({
   const [collapsedGroups, setCollapsedGroups] = useState(
     () => parseCollapsedGroups(readStorage(COLLAPSED_GROUPS_STORAGE_KEY)),
   );
+  // The filter is session-only: a stored filter would hide buckets on the
+  // next visit with no visible reason.
+  const [filter, setFilter] = useState('');
+  const activeRowRef = useRef<HTMLButtonElement | null>(null);
+  const scrolledToActiveRef = useRef(false);
   const sidebarWidth = useSidebarWidth();
   const groupIdPrefix = useId();
   const { token } = theme.useToken();
@@ -342,11 +353,15 @@ export default function Sidebar({
     onBucketChange(name);
   };
 
+  const storeCollapsed = (next: Set<string>) => {
+    setCollapsedGroups(next);
+    writeStorage(COLLAPSED_GROUPS_STORAGE_KEY, serializeCollapsedGroups(next));
+  };
+
   const toggleGroup = (key: string) => {
     const next = new Set(collapsedGroups);
     if (!next.delete(key)) next.add(key);
-    setCollapsedGroups(next);
-    writeStorage(COLLAPSED_GROUPS_STORAGE_KEY, serializeCollapsedGroups(next));
+    storeCollapsed(next);
   };
 
   const activeBucket = getBucket();
@@ -354,8 +369,33 @@ export default function Sidebar({
   // there. App re-renders the sidebar on every navigation, so the URL is
   // current here.
   const onUploadPage = parseViewLocation(window.location.pathname).view === 'upload';
-  // Backend names come with the admin bucket-origins data only.
-  const groups = useMemo(() => (canAdmin ? groupBucketsByBackend(buckets) : null), [buckets, canAdmin]);
+  const filtering = filterTerms(filter).length > 0;
+  const visibleBuckets = useMemo(() => filterBuckets(buckets, filter), [buckets, filter]);
+  // Backend names come with the admin bucket-origins data only. The groups
+  // are made from the whole list, so a filter that leaves one backend still
+  // shows its header (the backend is part of the answer).
+  const groups = useMemo(() => {
+    if (!canAdmin) return null;
+    const all = groupBucketsByBackend(buckets);
+    if (!all || !filtering) return all;
+    const visible = new Set(visibleBuckets.map((b) => b.name));
+    return all
+      .map((g) => ({ ...g, buckets: g.buckets.filter((b) => visible.has(b.name)) }))
+      .filter((g) => g.buckets.length > 0);
+  }, [buckets, canAdmin, filtering, visibleBuckets]);
+  const groupKeys = useMemo(() => (groups ?? []).map(groupKey), [groups]);
+  const anyExpanded = groupKeys.some((k) => !collapsedGroups.has(k));
+
+  // The list opens at the open bucket, once per mount: with groups in name
+  // order it was often below the fold, and the sidebar showed no current row.
+  useEffect(() => {
+    if (scrolledToActiveRef.current || buckets.length === 0) return;
+    const row = activeRowRef.current;
+    if (!row) return;
+    scrolledToActiveRef.current = true;
+    // jsdom has no scrollIntoView.
+    row.scrollIntoView?.({ block: 'center' });
+  }, [buckets]);
   const menuItemStyle: React.CSSProperties = {
     gap: SPACE.sm,
     padding: `${SPACE.xs}px ${SPACE.xxs}px`,
@@ -380,6 +420,7 @@ export default function Sidebar({
       <li key={b.name} style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
         <button
           className="btn-reset"
+          ref={isCurrent ? activeRowRef : undefined}
           onClick={() => { if (!isUnavailable) handleSelectBucket(b.name); }}
           disabled={isUnavailable}
           aria-current={isCurrent ? 'true' : undefined}
@@ -459,73 +500,117 @@ export default function Sidebar({
 
   const renderGroup = (group: BucketGroup, index: number) => {
     const key = groupKey(group);
-    const expanded = !collapsedGroups.has(key);
+    // A filter opens every group: a hidden match is a wrong "no match".
+    const expanded = filtering || !collapsedGroups.has(key);
     const label = group.backend ?? 'Unknown backend';
     // Not the backend name: an id must not hold spaces (aria-controls is a list).
     const listId = `${groupIdPrefix}-group-${index}`;
     // A collapsed group hides the open bucket: its header takes the accent
-    // colour so the operator can see where the open bucket is.
+    // colour and a dot, so the operator can see where the open bucket is.
     const hidesActive = !expanded && group.buckets.some((b) => b.name === activeBucket);
     // Backend-level facts only; the real bucket differs per row.
     const origin = group.buckets[0].backend;
     const backendFacts = describeBackend(origin && { ...origin, realBucket: undefined });
+    const backendType = origin?.backendType;
+    const TypeIcon = backendType === 'filesystem' ? HddOutlined : backendType ? CloudOutlined : null;
     return (
-      <li key={`group:${key}`} style={{ marginTop: index === 0 ? 0 : 8 }}>
+      <li
+        key={`group:${key}`}
+        className="dg-bucket-group"
+        data-collapsed={!expanded}
+        style={{ marginTop: index === 0 ? 0 : SPACE.xs }}
+      >
         <button
           className="btn-reset dg-bucket-group-header"
           aria-expanded={expanded}
           aria-controls={listId}
           aria-label={`${label} (${group.buckets.length} buckets)`}
-          title={[backendFacts, hidesActive ? 'Contains the open bucket' : null].filter(Boolean).join('\n')}
+          title={[backendFacts, hidesActive ? `Contains the open bucket ${activeBucket}` : null].filter(Boolean).join('\n')}
           onClick={() => toggleGroup(key)}
           style={{
-            '--dg-group-color': hidesActive ? ACCENT_BLUE_LIGHT : TEXT_MUTED,
+            '--dg-group-color': hidesActive ? ACCENT_BLUE_LIGHT : TEXT_PRIMARY,
             '--dg-group-hover-color': hidesActive ? ACCENT_BLUE_LIGHT : TEXT_PRIMARY,
           } as React.CSSProperties}
         >
           <RightOutlined aria-hidden="true" className="dg-bucket-group-chevron" />
+          {TypeIcon && <TypeIcon aria-hidden="true" className="dg-bucket-group-type" />}
           <TruncatedName
             text={label}
             title={false}
             style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 12, fontWeight: 600 }}
           />
-          <span style={{ flexShrink: 0, fontSize: 11, color: TEXT_FAINT, fontVariantNumeric: 'tabular-nums' }}>
+          {hidesActive && <span aria-hidden="true" className="dg-bucket-group-active-dot" />}
+          <span style={{ flexShrink: 0, fontSize: 11, color: TEXT_MUTED, fontVariantNumeric: 'tabular-nums' }}>
             {group.buckets.length}
           </span>
         </button>
-        <ul id={listId} hidden={!expanded} style={{ ...LIST_STYLE, marginTop: 2 }}>
+        <ul id={listId} hidden={!expanded} className="dg-bucket-group-rows">
           {group.buckets.map(renderBucketRow)}
         </ul>
       </li>
     );
   };
 
+  const filterInput = buckets.length >= BUCKET_FILTER_MIN && (
+    <Input
+      allowClear
+      size="small"
+      value={filter}
+      onChange={(e) => setFilter(e.target.value)}
+      prefix={<SearchOutlined aria-hidden="true" style={{ color: TEXT_MUTED }} />}
+      placeholder="Filter buckets"
+      aria-label="Filter buckets"
+      style={{ marginBottom: SPACE.xs, fontFamily: 'var(--font-ui)' }}
+    />
+  );
+
+  const noMatch = filtering && visibleBuckets.length === 0 && (
+    <div role="status" style={{ padding: `${SPACE.xs}px ${SPACE.sm}px`, fontSize: 12, color: TEXT_MUTED }}>
+      No bucket matches “{filter.trim()}”.
+    </div>
+  );
+
   const sidebarContent = (
     <div className="dot-grid-bg" style={{ display: 'flex', flexDirection: 'column', height: '100%', background: BG_SIDEBAR }}>
       {contextHolder}
 
-      {/* BUCKETS */}
-      <nav
-        aria-label="Bucket list"
-        style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: `${SPACE.lg}px ${SPACE.md}px 0` }}
-      >
+      {/* BUCKETS. The title row and the filter stay put; only the list
+          scrolls, so a group header can stick to the top of the list. The
+          landmark holds all of it: the title row's Create bucket and the
+          filter belong to the bucket list. */}
+      <nav aria-label="Bucket list" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+      <div style={{ padding: `${SPACE.lg}px ${SPACE.md}px 0`, flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: SPACE.sm }}>
           <Text className="dg-eyebrow" style={{ color: TEXT_MUTED }}>
             Buckets ({buckets.length})
           </Text>
-          {canCreateBucket && (
-            <Button
-              type="text"
-              size="small"
-              icon={<PlusOutlined />}
-              aria-label="Create bucket"
-              title="Create bucket"
-              style={{ color: TEXT_MUTED, fontSize: 13 }}
-              onClick={() => setCreateBucketOpen(true)}
-            />
-          )}
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE.xxs }}>
+            {groups && groups.length > 1 && !filtering && (
+              <Button
+                type="text"
+                size="small"
+                style={{ color: TEXT_MUTED, fontSize: 12, fontFamily: 'var(--font-ui)' }}
+                onClick={() => storeCollapsed(anyExpanded ? new Set(groupKeys) : new Set())}
+              >
+                {anyExpanded ? 'Collapse all' : 'Expand all'}
+              </Button>
+            )}
+            {canCreateBucket && (
+              <Button
+                type="text"
+                size="small"
+                icon={<PlusOutlined />}
+                aria-label="Create bucket"
+                title="Create bucket"
+                style={{ color: TEXT_MUTED, fontSize: 13 }}
+                onClick={() => setCreateBucketOpen(true)}
+              />
+            )}
+          </span>
         </div>
-
+        {filterInput}
+      </div>
+      <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: `0 ${SPACE.md}px` }}>
         {loadError && (
           <div
             role="alert"
@@ -551,12 +636,13 @@ export default function Sidebar({
           </div>
         )}
 
+        {noMatch}
         {groups ? (
           <ul style={LIST_STYLE}>
             {groups.map(renderGroup)}
           </ul>
         ) : (
-          <ul style={LIST_STYLE}>{buckets.map(renderBucketRow)}</ul>
+          <ul style={LIST_STYLE}>{visibleBuckets.map(renderBucketRow)}</ul>
         )}
 
         {canUpload && (
@@ -581,6 +667,7 @@ export default function Sidebar({
             </button>
           </div>
         )}
+      </div>
       </nav>
 
       {/* Bottom group: glass panels + branding — pinned to bottom */}

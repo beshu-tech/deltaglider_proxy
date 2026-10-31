@@ -5,6 +5,8 @@ import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
   clampSidebarWidth,
+  filterBuckets,
+  filterTerms,
   groupBucketsByBackend,
   groupKey,
   parseCollapsedGroups,
@@ -68,4 +70,18 @@ test('collapsed groups round-trip; malformed storage reads as none', () => {
   assert.deepEqual(parseCollapsedGroups(serializeCollapsedGroups(keys)), keys);
   for (const raw of [null, '', '{', '{"a":1}', '"x"']) assert.equal(parseCollapsedGroups(raw).size, 0, String(raw));
   assert.deepEqual(parseCollapsedGroups('["a", 3, null]'), new Set(['a']));
+});
+
+test('filterTerms: lower-cased words; blank is no terms', () => {
+  assert.deepEqual(filterTerms(''), []);
+  assert.deepEqual(filterTerms('   '), []);
+  assert.deepEqual(filterTerms(' Rel  DR '), ['rel', 'dr']);
+});
+
+test('filterBuckets: every term in the name, any case, list order kept; blank keeps all', () => {
+  const list = [bucket('releases-dr', 'aws-dr'), bucket('downloads'), bucket('Releases', 'hetzner-fsn1')];
+  assert.deepEqual(filterBuckets(list, ''), list);
+  assert.deepEqual(filterBuckets(list, 'REL').map((b) => b.name), ['releases-dr', 'Releases']);
+  assert.deepEqual(filterBuckets(list, 'rel dr').map((b) => b.name), ['releases-dr']);
+  assert.deepEqual(filterBuckets(list, 'aws'), []);
 });

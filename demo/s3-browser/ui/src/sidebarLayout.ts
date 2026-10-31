@@ -70,6 +70,27 @@ export function groupBucketsByBackend(buckets: BucketInfo[]): BucketGroup[] | nu
     });
 }
 
+/** The filter input shows from this many buckets: below it the whole list
+ *  fits on one screen and a filter is one more control to read. */
+export const BUCKET_FILTER_MIN = 8;
+
+/** The query's terms, lower-cased: a bucket matches when its name holds
+ *  every term (so "rel dr" finds "releases-dr"). */
+export function filterTerms(query: string): string[] {
+  return query.toLowerCase().split(/\s+/).filter(Boolean);
+}
+
+/** The buckets whose name holds every term of `query`; all of them for a
+ *  blank query. List order is kept. */
+export function filterBuckets(buckets: BucketInfo[], query: string): BucketInfo[] {
+  const terms = filterTerms(query);
+  if (terms.length === 0) return buckets;
+  return buckets.filter((b) => {
+    const name = b.name.toLowerCase();
+    return terms.every((t) => name.includes(t));
+  });
+}
+
 /** The stored collapsed group keys; anything malformed reads as none. */
 export function parseCollapsedGroups(raw: string | null): Set<string> {
   if (!raw) return new Set();

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed — The bucket list with many backends
+
+- Each backend is one card in the bucket list. Its header shows the backend type, its name and its number of buckets, and it stays at the top of the list while you scroll through its buckets. The buckets are indented under the header.
+- A filter box above the list finds a bucket by name when there are 8 buckets or more. A backend group with a match opens.
+- **Collapse all** and **Expand all** fold or open every backend group at once.
+- When the list opens, it scrolls to the bucket that is open. A collapsed group that holds the open bucket shows its name in the accent colour, with a dot.
+
 ## v2.0.21 — 2026-10-31
 
 ### Added — More file types are stored as deltas, and a bucket can change the list

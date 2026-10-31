@@ -54,6 +54,11 @@ code, kbd, pre, samp, .ant-typography code,
   --glass-bg: rgba(15, 23, 42, 0.6);
   --glass-border: rgba(255, 255, 255, 0.06);
   --surface-hover: rgba(255, 255, 255, 0.04);
+  /* Sidebar bucket groups: a card per backend, its header opaque (sticky). */
+  --group-bg: rgba(255, 255, 255, 0.025);
+  --group-border: rgba(255, 255, 255, 0.08);
+  --group-header-bg: #131c2e;
+  --group-rail: rgba(255, 255, 255, 0.10);
   --shimmer-color: rgba(255, 255, 255, 0.03);
   --drop-glow: rgba(45, 212, 191, 0.15);
   --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.04);
@@ -124,6 +129,10 @@ code, kbd, pre, samp, .ant-typography code,
   --glass-bg: rgba(255, 255, 255, 0.7);
   --glass-border: rgba(0, 0, 0, 0.06);
   --surface-hover: rgba(0, 0, 0, 0.03);
+  --group-bg: rgba(255, 255, 255, 0.55);
+  --group-border: rgba(12, 22, 41, 0.10);
+  --group-header-bg: #e3e8f0;
+  --group-rail: rgba(12, 22, 41, 0.12);
   --shimmer-color: rgba(0, 0, 0, 0.02);
   --drop-glow: rgba(13, 148, 136, 0.1);
   --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 0 0 1px rgba(0, 0, 0, 0.04);
@@ -450,25 +459,67 @@ code, kbd, pre, samp, .ant-typography code,
   transition: none !important;
 }
 
+/* One card per backend. The header is sticky inside the scrolling bucket
+   list, so the backend name stays on screen while its buckets scroll; it is
+   opaque for that reason. The rows are indented under a rail. */
+.dg-bucket-group {
+  border: 1px solid var(--group-border);
+  border-radius: 8px;
+  background: var(--group-bg);
+}
+.dg-bucket-group[data-collapsed='true'] {
+  background: transparent;
+}
 .dg-bucket-group-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   width: 100%;
   gap: 8px;
-  height: 28px;
-  padding: 0 10px 0 12px;
-  border-radius: 6px;
+  height: 32px;
+  padding: 0 8px 0 8px;
+  border-radius: 7px 7px 0 0;
+  background: var(--group-header-bg);
   color: var(--dg-group-color);
-  transition: color 0.15s, background 0.15s;
+  transition: color 0.15s, filter 0.15s;
+}
+.dg-bucket-group[data-collapsed='true'] .dg-bucket-group-header {
+  border-radius: 7px;
 }
 .dg-bucket-group-header:hover {
   color: var(--dg-group-hover-color);
-  background: var(--surface-hover);
+  filter: brightness(1.06);
+}
+[data-theme='light'] .dg-bucket-group-header:hover {
+  filter: brightness(0.97);
 }
 .dg-bucket-group-chevron {
-  font-size: 9px;
+  font-size: 10px;
   transition: transform 0.15s ease;
 }
 .dg-bucket-group-header[aria-expanded='true'] .dg-bucket-group-chevron {
   transform: rotate(90deg);
+}
+.dg-bucket-group-type {
+  font-size: 13px;
+  opacity: 0.8;
+}
+/* The open bucket is inside a collapsed group: a dot in the accent colour. */
+.dg-bucket-group-active-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--focus-ring);
+  flex-shrink: 0;
+}
+.dg-bucket-group-rows {
+  list-style: none;
+  margin: 0 0 0 16px;
+  padding: 4px 4px 4px 0;
+  border-left: 2px solid var(--group-rail);
+}
+.dg-bucket-group-rows > li {
+  padding-left: 4px;
 }
 
 /* ───── Animations ───── */
