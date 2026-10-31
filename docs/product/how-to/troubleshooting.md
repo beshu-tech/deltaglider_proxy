@@ -250,6 +250,22 @@ The full message is "bucket '…' has an active reencrypt job (maintenance:…, 
 
 The bucket holds a conversion marker. A backfill would give its plaintext objects a new stored time after the cutoff, and clients could then no longer read them. Let the re-encrypt job finish and close the window, and then start the backfill.
 
+### An encryption change is refused with 409: "encryption needs atomic writes"
+
+Symptom: a config apply or validate, a bucket create, a re-encrypt job, Resume, or a migrate answers `409`. The body has `atomic_writes.code` `atomic_writes_required` (a bucket create and a migrate answer `"error": "atomic_writes_required"`), and the message names the backend and the probe result.
+
+Cause: proxy encryption needs a backend whose conditional writes a fresh probe proves. The probe found that the backend ignores or refuses a conditional write (`non-cas`, for example a Backblaze B2 backend), or it could not reach the backend (`unknown`). Nothing changed.
+
+Fix: put the encrypted bucket on a backend with atomic writes, or use native SSE on that backend. When the result says `could not reach the backend to verify`, fix the connection, and then click **Check again** on the backend card. See [How to use a backend without conditional writes](backend-capability-validation.md#encryption-needs-a-backend-with-atomic-writes).
+
+### Writes to an encrypted bucket return 403: "Bucket '…' is read-only"
+
+Symptom: reads of the bucket work, but every PUT, DELETE, multipart upload, copy into the bucket, form POST and admin bulk operation gets `403 AccessDenied` with the message `Bucket '<bucket>' is read-only: it is encrypted, and encryption needs atomic writes, which backend '<backend>' does not provide`. Replication into the bucket waits. The startup log has a warning that names the read-only buckets.
+
+Cause: the bucket encrypts with the proxy, and the probe of its backend says that the backend has no atomic writes. The proxy refuses the writes, because a rewrite of the bucket could overwrite a newer client write there.
+
+Fix: move the bucket to a backend with atomic writes with a migrate job. After a fix on the backend side, click **Check again** on the backend card: a backend that proves atomic writes makes the bucket writable at once. See [Make a read-only bucket writable again](backend-capability-validation.md#make-a-read-only-bucket-writable-again).
+
 ### The proxy does not start: "encryption.plaintext_reads was removed"
 
 The configuration file still has the field in an `encryption` block, on a backend or on a bucket. This release removed the field, so the proxy refuses to load the file, and `config lint`, `config apply` and the admin API refuse it too. Delete the line from each `encryption` block. A bucket that still holds plaintext objects needs its conversion window after the start, because without the window the proxy refuses to read those objects. [How to upgrade](upgrade.md#the-conversion-window-replaces-a-read-setting-the-release-after-2023) gives the steps.

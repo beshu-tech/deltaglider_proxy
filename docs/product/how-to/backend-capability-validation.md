@@ -87,7 +87,88 @@ With the marker set:
 
 Keep one replication rule per destination prefix. The single-writer guarantee assumes that replication is the *only* writer. The proxy warns at config validation when it finds destination rules that overlap, a lifecycle rule that also writes into a marked bucket, or an unmarked second virtual bucket that aliases the same real storage. The marker protects a virtual name, so every alias that points at the protected bucket must carry it too.
 
+## Encryption needs a backend with atomic writes
+
+Proxy encryption (`aes256-gcm-proxy`) works only on a backend whose conditional writes the probe proves. This rule applies with one instance too. The proxy rewrites encrypted objects in place when it converts a bucket or rotates a key, and each rewrite is conditional on the version that it read. A backend that ignores the condition could let a rewrite overwrite a newer client write. The full rule is in the [encryption reference](../reference/encryption.md#encryption-needs-atomic-writes). Native SSE modes (`sse-s3`, `sse-kms`) are outside the rule, because the backend encrypts those objects itself.
+
+The rule has two effects:
+
+- The proxy refuses every action that turns proxy encryption on (or changes its key) on such a backend. It runs a fresh probe first, and it answers `409` with an `atomic_writes` object that names the backend and the probe result.
+- A bucket that already encrypts with the proxy on such a backend becomes read-only. Reads keep working, and every write gets `403 AccessDenied` with a message that names the bucket, the backend and the reason.
+
+A Backblaze B2 backend is such a backend. B2 drops the connection on a conditional `PUT`. The probe sends a plain `PUT` next, and because that one works, the probe reads the dropped connection as a refusal of the condition (verdict `non-cas`).
+
+### Read the verdict
+
+In the admin UI:
+
+1. In the sidebar, open **Storage → Backends** (`/_/admin/storage/backends`).
+2. Find the card of the backend, for example `aws-dr`. The card shows the verdict of the last probe:
+   - **Conditional writes: verified by live probe** for an S3 backend with verdict `cas-verified` (`via: probe`). A filesystem backend has atomic writes without a probe (`via: local-filesystem`).
+   - **Conditional writes NOT supported** for verdict `non-cas`. Proxy encryption is not offered on this backend.
+   - **Conditional-write support could not be verified** for verdict `unknown`. Proxy encryption is not offered on this backend either.
+3. When the backend holds encrypted buckets that are read-only, the card shows **Read-only: aws-dr does not support atomic writes** and lists those buckets. The Buckets page shows the same text on the card of each such bucket.
+4. Click **Check again** to run a fresh probe now. When the backend now proves atomic writes, its encrypted buckets become writable at once, without a restart.
+
+On the Buckets page and in the backend encryption editor, the proxy-AES options are disabled on a backend whose verdict is `non-cas` or `unknown`. The reason and a link to this page show under the options. Turning encryption off stays possible.
+
+The same check with the admin API:
+
+```bash
+curl -b cookies https://s3.acme.example/_/api/admin/backends
+curl -b cookies -X POST https://s3.acme.example/_/api/admin/backends/aws-dr/capability-probe
+```
+
+The first request lists `capability` and `read_only_buckets` for each backend. The second request runs the probe and answers `{backend, capability, probe_result, read_only_buckets}`.
+
+### Make a read-only bucket writable again
+
+The example bucket `releases` encrypts with the proxy on `aws-dr`, a Backblaze B2 backend, so it is read-only. Move it to `hetzner-fsn1`, which enforces conditional writes. A migrate job out of a read-only bucket is allowed: it only reads the source, and its last phase deletes the old copies only when you ask for that.
+
+In the admin UI:
+
+1. In the sidebar, open **Storage → Buckets** (`/_/admin/storage/buckets`).
+2. Click the `releases` row to open it.
+3. Click **Migrate data…** next to **Backend**.
+4. In the dialog, select `hetzner-fsn1` in **Target backend**, and then click **Start migration**.
+
+The proxy probes `hetzner-fsn1` before it starts the job. When `hetzner-fsn1` has no atomic writes either, the proxy refuses the job with `409 atomic_writes_required`. The full steps and the phases of the job are in [How to move a bucket to another backend](move-a-bucket-between-backends.md).
+
+A migrate job has no YAML form, because it is a one-off job and not configuration. The same job with the admin API:
+
+```bash
+curl -b cookies -X POST \
+  https://s3.acme.example/_/api/admin/buckets/releases/migrate \
+  -H 'Content-Type: application/json' \
+  -d '{"target_backend": "hetzner-fsn1", "delete_source": false}'
+```
+
+The other way out is to turn proxy encryption off for the bucket. That change is a downgrade, so it needs the confirmation header `X-DGP-Confirm-Encryption-Downgrade: releases` (see [A downgrade needs a confirmation](../reference/encryption.md#a-downgrade-needs-a-confirmation)). The new objects are then plaintext. A decrypt job converts the old objects. On a backend without atomic writes, that job keeps the bucket's write gate, so uploads and deletes on the instance that runs it get a temporary `503 SlowDown`.
+
+### Verify
+
+1. Open **Storage → Buckets**. The card of `releases` shows no **Read-only** text, and its backend is `hetzner-fsn1`.
+2. Write an object:
+
+   ```bash
+   aws --endpoint-url https://s3.acme.example s3 cp probe.txt s3://releases/probe.txt   # works
+   ```
+
+3. `GET /_/api/admin/buckets` shows no `read_only` field on `releases`.
+
 ## The messages, verbatim, and their fixes
+
+### `409 — atomic_writes_required`
+
+> encryption of bucket 'releases' refused: encryption needs atomic writes (conditional PUT and DELETE), and backend 'aws-dr' does not provide them: Backblaze-like: the backend ignored or rejected a conditional write. Keep encrypted buckets on a backend with atomic writes (move a bucket there with a migrate job) — see https://deltaglider.com/docs/how-to/backend-capability-validation
+
+A config change, a bucket create, a re-encrypt job (or Resume), a migrate, or the boot conversion tried to make the proxy encrypt on a backend without proven atomic writes. Nothing changed. Put the encrypted bucket on a backend with atomic writes. When the result says `could not reach the backend to verify (...)`, fix the connection to the backend first, and then click **Check again** on its card.
+
+### `403 — Bucket '<name>' is read-only`
+
+> Bucket 'releases' is read-only: it is encrypted, and encryption needs atomic writes, which backend 'aws-dr' does not provide (Backblaze-like: the backend ignored or rejected a conditional write). Reads keep working. To write to it again, move the bucket to a backend with atomic writes with a migrate job — see https://deltaglider.com/docs/how-to/backend-capability-validation
+
+Follow [Make a read-only bucket writable again](#make-a-read-only-bucket-writable-again).
 
 ### `403 — bucket is replication_target_only`
 

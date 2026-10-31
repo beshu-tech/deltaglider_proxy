@@ -237,6 +237,23 @@ A restart does start the conversion of a bucket that never encrypted before. Whe
 
 With several instances, apply the change on every instance, and then let the job finish. An instance whose configuration does not encrypt the bucket yet writes plaintext into it, and the instances that encrypt refuse those objects after the cutoff. While the job runs, stop client writes to the bucket on every instance, or send them all to the instance that runs the job: the write gate of the job holds only on its own instance ([A conversion on several instances](../reference/encryption.md#a-conversion-on-several-instances)).
 
+## Encryption needs atomic writes (the next release)
+
+Proxy encryption (`aes256-gcm-proxy`) now works only on a backend whose conditional writes the proxy proves with a probe. The proxy rewrites encrypted objects in place, each rewrite conditional on the version that it read, and a backend that ignores the condition could let a rewrite overwrite a newer client write ([Encryption needs atomic writes](../reference/encryption.md#encryption-needs-atomic-writes)). Native SSE modes are not affected.
+
+The changes that you can see:
+
+- **Read-only buckets.** A bucket that encrypts with the proxy on a backend without proven atomic writes becomes read-only after the upgrade. An example is an encrypted bucket on a Backblaze B2 backend: B2 drops the connection on a conditional `PUT`. Reads keep working. Every write gets `403 AccessDenied` with a message that names the bucket, the backend and the reason, and replication into the bucket waits. The start log has a warning that names the read-only buckets.
+- **New `409` refusals.** A config change, a bucket create, a re-encrypt job (also Resume), a migrate and a restart that would turn proxy encryption on for such a backend are refused with `409` and an `atomic_writes` object.
+- **The probe runs on one instance too.** Before, the capability probe ran only with `config_sync_bucket` set. The proxy now probes, in the background, every backend that holds a bucket that encrypts with the proxy.
+- **A form POST checks the signature first.** A browser form POST into a bucket marked `replication_target_only` now gets its `403` after the signature check, so an unsigned form gets the authentication error instead.
+
+Check your backends before or right after the upgrade:
+
+1. Open **Storage → Backends** (`/_/admin/storage/backends`), or send `GET /_/api/admin/backends`. A backend whose `capability.verdict` is `non-cas` or `unknown` lists its read-only buckets in `read_only_buckets`, and its card shows **Read-only: aws-dr does not support atomic writes** (with the name of the backend).
+2. For an `unknown` verdict, fix the connection to the backend, and then click **Check again** on its card (`POST /_/api/admin/backends/<name>/capability-probe`).
+3. For a `non-cas` verdict, move each read-only bucket to a backend with atomic writes with a migrate job: [Make a read-only bucket writable again](backend-capability-validation.md#make-a-read-only-bucket-writable-again). The move out of a read-only bucket is allowed.
+
 ## Common gotchas
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.

@@ -79,3 +79,71 @@ Status: approved by the owner 2026-10-31 (decisions below are his).
 - **UI.** No UI file changed. The UI already follows `writes_blocked`; the apply
   dialog copy "uploads and deletes get a temporary 503" must say that this holds
   only on a backend without conditional writes (routed separately).
+
+## As built: N2 (2026-11-01)
+
+- **One module.** `coordination/atomicity.rs`: `probe_atomic_writes` (FRESH, never a cached
+  verdict: the forced seam → NonCas; filesystem → `CasVerified { via: LocalFilesystem }`, no
+  request; S3 → the `cas_probe` on a bucket the backend lists, the action's own bucket first;
+  stores the verdict), `require_atomic_writes` → `AtomicWrites` proof (only it makes one) or
+  `AtomicityRefusal { backend, verdict, what }` (`message()`, `details()` = the `atomic_writes`
+  object `{code, backend, probe, probe_result, doc_url}`), `require_for_bucket`,
+  `gate_encryption_change(old, new)` (one probe per backend of `Config::atomic_write_targets`),
+  `EncryptedPlan` (from `Config::proxy_encrypted_storage`) and `spawn_watch`.
+- **Targets.** `Config::atomic_write_targets(old)`: a backend site that becomes proxy-AES with a
+  key or changes it (or is new), a new default backend that encrypts, a configured bucket that
+  starts or changes proxy encryption or moves backend with it. Transient migrate routes skipped.
+- **SSE decision.** The rule covers `aes256-gcm-proxy` only. SSE-S3/KMS objects are encrypted by
+  the backend; the proxy never converts or rotates them (`resolve_desired` refuses SSE), so no
+  conditional write of the proxy is at stake. A keyless proxy mode refuses writes: no target.
+  The read-only rule covers every proxy-mode bucket (with or without a key).
+- **Dropped connection.** `cas_probe::StepOutcome::Dropped` (SDK `DispatchFailure`,
+  `TimeoutError`, `ResponseError`). When a conditional step drops, the probe sends a plain PUT of
+  the key: written → `resolve_dropped` maps the drop to `NotImplemented` (definitive non-CAS,
+  the B2 eu-central-003 behaviour), else `Other` (unknown). Bounded by the SDK retries and the
+  15 s `PROBE_TIMEOUT`. Unit tests use a TCP-level fake (`cas_probe::b2_like`) that closes the
+  socket on `If-Match`/`If-None-Match` PUTs.
+- **Entry points (409 everywhere).** `TransitionError` and `Rejection` carry `details`; every
+  config surface renders it as `atomic_writes` (section PUT/validate, document apply/validate,
+  field PATCH body; PATCH has no encryption fields, so it never triggers). The apply gate runs
+  in `transition_gates` for forward admin writes and in the dry run (`dry_run_gates`). Bucket
+  create: an explicit `require_atomic_writes` when the new bucket's write encryption is proxy
+  (also when it inherits the backend's) → 409 `atomic_writes_required`. `POST /jobs/reencrypt`:
+  a proof per Proxy-target bucket before `open_window`; `errors[].atomic_writes`, 409 when none
+  started for that reason. `queue_reencrypt` checks every Proxy job (`NotQueued::NotAtomic`)
+  unless the request carries a proof for the bucket's backend; the apply's enqueue probes again
+  (the lock was released). Boot conversion: probe before the window, audit
+  `encryption_conversion_refused`. Migrate: `gate_encryption_change(cfg, flipped)` → 409.
+  Re-encrypt run start: a cached CAS verdict of the current definition, else a fresh probe;
+  Unknown → `FailedTransient`, NonCas → `Failed`.
+- **Read-only.** `BackendCapabilityCache` holds the `EncryptedPlan`; `read_only_reason(bucket)`
+  = plan backend × verdict of its current definition (non-CAS / unknown → reason; no verdict
+  yet → writable). Enforced by `check_client_write_allowed` (403 AccessDenied: the refusal is
+  configuration, not transient, so a client must not retry it as it would a 503; S3 has no
+  read-only code; the same code as `replication_target_only`), so every caller of it (s3s
+  PUT/DELETE/DeleteObjects/multipart create+complete/copy ×2/DeleteBucket, form POST, admin
+  bulk, delete jobs) refuses; by the maintenance gate's write-refusal probe (`main.rs`), so
+  replication, lifecycle and running delete jobs wait (`write_blocked`); and by
+  `BackendCheck::gated` for maintenance jobs, migrate exempt (`ignoring_read_only`: moving the
+  bucket out is the way out). Backfill creation refuses with 403. The plan is set at boot and
+  in `apply_config_transition` (commit phase, also background transitions).
+- **Watch.** `spawn_watch` (boot, background): probes every plan backend without a verdict,
+  re-probes a non-CAS / unknown one every 10 min, wakes on `plan_changed`; logs each change of
+  the read-only set. `POST /_/api/admin/backends/:name/capability-probe` = "Check again".
+- **Form POST.** The client-write gate moved after the policy-signature check: its 403 names the
+  bucket's configuration and backend, which an unverified caller must not learn (S23).
+- **Seams.** `DGP_TEST_KEEP_WRITE_GATE` (the gate tests: encryption now runs only on atomic
+  backends, so the gated path is a decrypt job; the seam keeps the same mechanics with an
+  encrypt job) and `DGP_TEST_FORCE_NONCAS_WHILE_FILE` (the forced verdict holds while the file
+  exists, so a test turns it CAS without a restart).
+- **Flake (D).** `conversion_apply_test::a_versioned_bucket_keeps_plaintext_versions_until_a_job_purges_them`
+  (5 of 80 runs): MinIO lists a bucket that is being created with creation date
+  `0001-01-01T00:00:00Z`; the harness's stale-bucket sweep (`tests/common/minio.rs`) read it as
+  older than 2 h and force-deleted the running test's own bucket; the proxy made it again
+  without versioning, so the preview said `versioned: false`. Fix: `is_stale` never treats a
+  time at or before the Unix epoch as stale (buckets and objects). 0 of 30 after.
+- **Deviations.** No source guard existed for the `replication_target_only` call sites (none
+  added). PATCH /config has no encryption fields (n/a). A re-encrypt run start trusts a cached
+  CAS verdict. An S3 CreateBucket on a default backend that encrypts with the proxy is not
+  refused (the bucket is read-only at once). Buckets the config does not name, on such a default
+  backend, are read-only but not listed in `read_only_buckets`.
