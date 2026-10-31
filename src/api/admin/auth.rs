@@ -338,12 +338,48 @@ pub(super) fn secure_cookies_with(explicit: Option<bool>, headers: Option<&Heade
     if let Some(secure) = explicit {
         return secure;
     }
-    if crate::tls::listener_tls() {
+    let listener_tls = crate::tls::listener_tls();
+    if listener_tls {
         return true;
     }
-    headers
-        .and_then(|h| rate_limiter::trusted_forwarded_header(h, "x-forwarded-proto", None))
-        .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
+    let trusted =
+        headers.and_then(|h| rate_limiter::trusted_forwarded_header(h, "x-forwarded-proto", None));
+    if insecure_behind_tls_proxy(explicit, listener_tls, headers, trusted.is_some()) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "Session cookies are sent without the Secure flag, but a request arrived \
+                 with X-Forwarded-Proto: https from a proxy that is not trusted. Behind a \
+                 TLS proxy, set DGP_SECURE_COOKIES=true, or set DGP_TRUST_PROXY_HEADERS=true \
+                 and DGP_TRUSTED_PROXY_CIDRS to the networks of the proxy."
+            )
+        });
+    }
+    trusted.is_some_and(is_https)
+}
+
+fn is_https(proto: &str) -> bool {
+    proto.trim().eq_ignore_ascii_case("https")
+}
+
+/// Pure (SEC F-04): the cookie decision gave no `Secure` flag, yet the
+/// request probably came through a TLS proxy: `X-Forwarded-Proto: https`
+/// arrived, but from a proxy that is not trusted (`trusted`: the header
+/// passed [`rate_limiter::trusted_forwarded_header`]). The proxy only
+/// warns: a default of `Secure` would end the session of plain-HTTP dev.
+pub(super) fn insecure_behind_tls_proxy(
+    explicit: Option<bool>,
+    listener_tls: bool,
+    headers: Option<&HeaderMap>,
+    trusted: bool,
+) -> bool {
+    explicit.is_none()
+        && !listener_tls
+        && !trusted
+        && headers
+            .and_then(|h| h.get("x-forwarded-proto"))
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_https)
 }
 
 /// Remove the caller's previous session, if any. Called at every
@@ -2022,6 +2058,39 @@ mod tests {
             format!("dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}");
         assert!(expected.contains("SameSite=Strict"));
         assert!(expected.contains("Max-Age=0"));
+    }
+
+    /// SEC F-04: warn only for an untrusted `X-Forwarded-Proto: https`
+    /// that left the cookie without `Secure`.
+    #[test]
+    fn insecure_behind_tls_proxy_truth_table() {
+        let mut https = HeaderMap::new();
+        https.insert("x-forwarded-proto", "https".parse().unwrap());
+        let mut upper = HeaderMap::new();
+        upper.insert("x-forwarded-proto", " HTTPS".parse().unwrap());
+        let mut http = HeaderMap::new();
+        http.insert("x-forwarded-proto", "http".parse().unwrap());
+        let none = HeaderMap::new();
+        // (explicit, listener_tls, headers, trusted) -> warn
+        type Row<'a> = (Option<bool>, bool, Option<&'a HeaderMap>, bool, bool);
+        let table: &[Row] = &[
+            (None, false, Some(&https), false, true),
+            (None, false, Some(&upper), false, true),
+            (None, false, Some(&https), true, false),
+            (None, true, Some(&https), false, false),
+            (Some(false), false, Some(&https), false, false),
+            (Some(true), false, Some(&https), false, false),
+            (None, false, Some(&http), false, false),
+            (None, false, Some(&none), false, false),
+            (None, false, None, false, false),
+        ];
+        for &(explicit, tls, headers, trusted, want) in table {
+            assert_eq!(
+                insecure_behind_tls_proxy(explicit, tls, headers, trusted),
+                want,
+                "{explicit:?} tls={tls} {headers:?} trusted={trusted}"
+            );
+        }
     }
 
     /// `secure_cookies_with` consults `X-Forwarded-Proto: https` only
