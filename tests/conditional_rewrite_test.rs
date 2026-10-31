@@ -5,7 +5,8 @@
 //! that lands between the job's read and its write, on any instance, is
 //! never overwritten; the job counts the object as `skipped_changed`. On a
 //! backend with proven conditional writes the job holds no write gate, so
-//! client writes go on (no 503); a backend without them keeps the gate.
+//! client writes go on (no 503); a job that keeps the gate (a decrypt on a
+//! backend without them; encryption needs them, N2) answers 503.
 
 use crate::common;
 
@@ -277,17 +278,18 @@ async fn a_cas_backend_takes_client_writes_during_the_walk() {
     assert_eq!(node.get(&bucket, "during.txt").await, (200, NEW.to_vec()));
 }
 
-/// Test (3), the control: a backend without proven conditional writes
-/// (forced non-CAS) keeps the write gate: the same PUT gets 503.
+/// Test (3), the control: a job that keeps the write gate (in production a
+/// decrypt job on a backend without proven conditional writes; encryption
+/// itself needs them, N2) answers the same PUT with 503.
 #[tokio::test]
-async fn a_noncas_backend_keeps_the_write_gate() {
+async fn a_gated_job_keeps_the_write_gate() {
     skip_unless_minio!();
     let bucket = new_minio_bucket("condnoncas").await;
     let node = Node::minio(
         &bucket,
         &[
             ("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "300"),
-            ("DGP_TEST_FORCE_NONCAS_BACKEND", "default"),
+            ("DGP_TEST_KEEP_WRITE_GATE", "true"),
         ],
     )
     .await;

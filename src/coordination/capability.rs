@@ -22,6 +22,9 @@ pub const CAPABILITY_DOC_URL: &str =
 pub enum VerifiedVia {
     /// Live `If-None-Match` + `If-Match` probe (`cas_probe`) ran this boot.
     Probe,
+    /// A filesystem backend: one node, whose in-process object locks make
+    /// every check-then-write one step. No request is sent.
+    LocalFilesystem,
 }
 
 /// The capability verdict for one backend.
@@ -48,6 +51,12 @@ pub enum CapabilityVerdict {
 #[derive(Debug, Default)]
 pub struct BackendCapabilityCache {
     verdicts: parking_lot::RwLock<HashMap<String, (String, CapabilityVerdict)>>,
+    /// Which buckets encrypt with the proxy, on which backend, by the
+    /// running config ([`super::atomicity`]): the read-only rule.
+    encrypted: parking_lot::RwLock<super::atomicity::EncryptedPlan>,
+    /// Wakes the atomicity watch ([`super::atomicity::spawn_watch`]) after
+    /// a config change.
+    pub(crate) plan_changed: tokio::sync::Notify,
 }
 
 /// In-memory identity of a backend definition (includes credentials — never
@@ -81,6 +90,49 @@ impl BackendCapabilityCache {
             .get(backend)
             .filter(|(fp, _)| *fp == fingerprint(config))
             .map(|(_, v)| v.clone())
+    }
+
+    /// Install the encrypted-bucket plan of `config` (boot, and every
+    /// config transition) and wake the atomicity watch.
+    pub fn set_encrypted_plan(&self, config: &crate::config::Config) {
+        *self.encrypted.write() = super::atomicity::EncryptedPlan::of(config);
+        self.plan_changed.notify_one();
+    }
+
+    /// The running encrypted-bucket plan.
+    pub(crate) fn encrypted_plan(&self) -> super::atomicity::EncryptedPlan {
+        self.encrypted.read().clone()
+    }
+
+    /// THE read-only rule (N2): why every write to `bucket` is refused now,
+    /// or `None`. A bucket that encrypts with the proxy needs atomic writes
+    /// on its backend; while that backend's verdict (for its current
+    /// definition) is non-CAS or unknown, the bucket serves reads only. No
+    /// verdict yet (the boot probe runs) refuses nothing. Memory only.
+    pub fn read_only_reason(&self, bucket: &str) -> Option<String> {
+        let plan = self.encrypted.read();
+        let (backend, fp) = plan.backend_of(bucket)?;
+        let verdict = self
+            .verdicts
+            .read()
+            .get(backend)
+            .filter(|(stored, _)| stored == fp)
+            .map(|(_, v)| v.clone())?;
+        super::atomicity::read_only_message(bucket, backend, &verdict)
+    }
+
+    /// The buckets that [`Self::read_only_reason`] refuses now, by backend
+    /// (configured buckets; the default backend's unnamed buckets are not
+    /// listed).
+    pub fn read_only_buckets(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        let plan = self.encrypted.read().clone();
+        let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (bucket, backend) in plan.buckets() {
+            if self.read_only_reason(&bucket).is_some() {
+                out.entry(backend).or_default().push(bucket);
+            }
+        }
+        out
     }
 
     /// Snapshot for the admin backends API (name → verdict).
@@ -216,14 +268,20 @@ pub async fn client_writable_groups_with_default(
 /// separated) get a forced NonCas verdict without probing — the only way to
 /// exercise the fail-fast path against a MinIO-only test harness.
 pub fn forced_noncas_backends() -> std::collections::BTreeSet<String> {
-    crate::config::test_seams::test_seams()
-        .force_noncas_backends
-        .clone()
+    let seams = crate::config::test_seams::test_seams();
+    if seams
+        .force_noncas_while_file
+        .as_ref()
+        .is_some_and(|f| !f.exists())
+    {
+        return Default::default();
+    }
+    seams.force_noncas_backends.clone()
 }
 
 /// How long a backend capability probe may run before we give up with an
 /// `Unknown` verdict (bounds both the startup gate and the hot-apply gate).
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Establish a CAS verdict for one backend group: forced-hook → live probe.
 /// Shared by the startup gate and the hot-apply pre-commit gate; the CALLER

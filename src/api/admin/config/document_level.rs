@@ -67,6 +67,10 @@ pub struct ConfigValidateResponse {
     /// encrypt and hold objects).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub conversions: Vec<super::ConversionPreview>,
+    /// A change refused for lack of atomic writes (N2): the backend, the
+    /// probe result in plain words and the doc link.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atomic_writes: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -103,6 +107,10 @@ pub struct ConfigApplyResponse {
     /// The conversions that the apply started, with their re-encrypt jobs.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub conversions: Vec<super::ConversionStarted>,
+    /// A change refused for lack of atomic writes (N2): the backend, the
+    /// probe result in plain words and the doc link.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atomic_writes: Option<serde_json::Value>,
 }
 
 /// Query params shared by `/config/export` and `/config/defaults`.
@@ -449,8 +457,9 @@ fn rejection_warnings(stage: Stage, w: Warnings) -> Vec<String> {
 /// The `/config/validate` body of a write outcome.
 fn shape_validate(result: WriteResult) -> Response {
     let WriteResult { outcome, refs } = result;
-    let refused = |status, error, warnings| {
+    let refused = |status, error, warnings, atomic_writes| {
         let body = ConfigValidateResponse {
+            atomic_writes,
             ok: false,
             warnings,
             existing_warnings: Vec::new(),
@@ -460,15 +469,19 @@ fn shape_validate(result: WriteResult) -> Response {
         write::respond(status, body, &refs, None)
     };
     match outcome {
-        Outcome::Rejected(r) => {
-            refused(r.status, r.error, rejection_warnings(r.stage, *r.warnings))
-        }
+        Outcome::Rejected(r) => refused(
+            r.status,
+            r.error,
+            rejection_warnings(r.stage, *r.warnings),
+            r.details,
+        ),
         Outcome::Validated {
             warnings: w,
             conversions,
             ..
         } => {
             let body = ConfigValidateResponse {
+                atomic_writes: None,
                 ok: true,
                 warnings: [w.check_new, w.preserve, w.env].concat(),
                 existing_warnings: w.existing,
@@ -482,6 +495,7 @@ fn shape_validate(result: WriteResult) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal: a dry run applied".to_string(),
             Vec::new(),
+            None,
         ),
     }
 }
@@ -560,6 +574,7 @@ pub(crate) async fn apply_config_inner_with_env(
 /// The `/config/apply` body of a write outcome (not yet scrubbed).
 fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
     let refused = |error: String, warnings: Vec<String>| ConfigApplyResponse {
+        atomic_writes: None,
         applied: false,
         persisted: false,
         requires_restart: false,
@@ -590,7 +605,9 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
                 _ => r.error,
             };
             let warnings = rejection_warnings(r.stage, *r.warnings);
-            (r.status, refused(error, warnings))
+            let mut resp = refused(error, warnings);
+            resp.atomic_writes = r.details;
+            (r.status, resp)
         }
         Outcome::Applied {
             warnings: w,
@@ -616,6 +633,7 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
                 ),
             };
             let resp = ConfigApplyResponse {
+                atomic_writes: None,
                 applied: true,
                 persisted: persisted_path.is_some(),
                 requires_restart: !restart.is_empty(),

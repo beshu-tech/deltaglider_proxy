@@ -369,6 +369,7 @@ jobs:
             filters: >-
               admin_bulk_objects_test::
               admission_test::
+              atomic_writes_gate_test::
               backend_capability_gate_test::
               backend_health_test::
               browser_session_connect_test::

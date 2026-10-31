@@ -787,9 +787,6 @@ pub async fn handle_form_post_upload(
         tracing::warn!("form-POST DENY | reason=invalid_bucket_name | bucket={bucket} err={e:?}");
         return Err(S3Error::InvalidBucketName(bucket.to_string()));
     }
-    // Refuse a replication_target_only bucket before any backend I/O or body
-    // parse (403-before-404 parity with the PUT path, commit b1b2249).
-    check_client_write_allowed(state, bucket)?;
     // Authenticate BEFORE the existence check: a 404 to an unauthenticated
     // caller reveals which buckets exist, and the backend round-trip would
     // delay the health gate's fast 503 behind a backend timeout.
@@ -810,6 +807,12 @@ pub async fn handle_form_post_upload(
             return Err(e);
         }
     };
+    // The client-write gate (a replication_target_only bucket, a read-only
+    // encrypted bucket), after the signature check: its 403 names the
+    // bucket's configuration and backend, which an unverified caller must
+    // not learn (S23). Still before any backend I/O (403-before-404 parity
+    // with the PUT path, commit b1b2249).
+    check_client_write_allowed(state, bucket)?;
     // Only now, with the policy signature verified: the gates' 503 names a
     // busy bucket or a backend's state.
     crate::maintenance::gate::check_verified_request(

@@ -8,8 +8,9 @@ pub use bucket_encryption::{BucketOverride, EncryptionSite};
 mod encryption_state;
 pub(crate) use encryption_state::{confirmed_downgrades, confirmed_subjects};
 pub use encryption_state::{
-    key_check_value, starts_conversion, EncryptionChange, EncryptionChangeKind, WriteEncryption,
-    CONFIRM_ENCRYPTION_DOWNGRADE_HEADER, DEFAULT_ROUTE_SUBJECT,
+    key_check_value, starts_conversion, AtomicWriteTarget, EncryptionChange, EncryptionChangeKind,
+    ProxyEncryptedStorage, WriteEncryption, CONFIRM_ENCRYPTION_DOWNGRADE_HEADER,
+    DEFAULT_ROUTE_SUBJECT,
 };
 mod keys;
 pub(crate) use keys::*;

@@ -892,10 +892,21 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     {
         let weak = Arc::downgrade(&state);
         maintenance_gate.set_write_refusal_probe(Arc::new(move |bucket: &str| {
-            weak.upgrade()
-                .and_then(|s| s.engine.load().write_refusal(bucket))
+            weak.upgrade().and_then(|s| {
+                s.engine
+                    .load()
+                    .write_refusal(bucket)
+                    // An encrypted bucket on a backend without atomic
+                    // writes is read-only (N2): background writers wait.
+                    .or_else(|| s.backend_capabilities.read_only_reason(bucket))
+            })
         }));
     }
+    // Encryption needs atomic writes (N2): probe the backends of the
+    // proxy-encrypted buckets in the background (boot does not wait); a
+    // bucket on a backend without them serves reads only.
+    backend_capabilities.set_encrypted_plan(&config);
+    deltaglider_proxy::coordination::atomicity::spawn_watch(state.clone(), shared_config.clone());
     if deltaglider_proxy::config::env_bool("DGP_BOOT_PLAINTEXT_CHECK", true) {
         startup::spawn_plaintext_refusal_check(&state, &config);
     }

@@ -247,6 +247,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             post(admin::probe_backend),
         )
         .route(
+            "/_/api/admin/backends/:name/capability-probe",
+            post(admin::probe_backend_capability),
+        )
+        .route(
             "/_/api/admin/backends/:name/legacy-key-usage",
             get(admin::legacy_key_usage),
         )

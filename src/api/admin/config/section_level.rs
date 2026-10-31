@@ -124,6 +124,10 @@ pub struct SectionApplyResponse {
     /// re-encrypt jobs.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub conversions: Vec<super::ConversionStarted>,
+    /// A change refused for lack of atomic writes (N2): the backend, the
+    /// probe result in plain words and the doc link.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atomic_writes: Option<serde_json::Value>,
 }
 
 /// Build an early-return rejection response for the section endpoints.
@@ -139,6 +143,7 @@ fn reject(status: StatusCode, error: impl Into<String>) -> Response {
     (
         status,
         Json(SectionApplyResponse {
+            atomic_writes: None,
             ok: false,
             existing_warnings: Vec::new(),
             warnings: vec![],
@@ -330,6 +335,7 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
                 _ => (r.error, Vec::new(), Vec::new(), None),
             };
             let body = SectionApplyResponse {
+                atomic_writes: r.details,
                 ok: false,
                 warnings,
                 existing_warnings: existing,
@@ -351,6 +357,7 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
             conversions,
         } => {
             let body = SectionApplyResponse {
+                atomic_writes: None,
                 ok: true,
                 warnings: [w.preserve, w.env, w.check_new, w.preview].concat(),
                 existing_warnings: w.existing,
@@ -391,6 +398,7 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
                 ),
             };
             let body = SectionApplyResponse {
+                atomic_writes: None,
                 ok: true,
                 warnings: [w.preserve, w.env, w.check_new, w.transition]
                     .concat()

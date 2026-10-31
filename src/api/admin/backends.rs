@@ -37,6 +37,10 @@ pub struct BucketBackendOriginResponse {
     /// flagged unavailable — never silently dropped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable: Option<String>,
+    /// Why the bucket is read-only (N2: it encrypts with the proxy, and its
+    /// backend has no proven atomic writes). Absent when writable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<String>,
     /// How the bucket's new writes are encrypted, and whether that is the
     /// bucket's own block or its backend's (issue #116). `None` only when
     /// the bucket routes to an undefined backend. The admin UI shows this
@@ -175,10 +179,15 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
     // Stamp connectivity/auth health (boot probe + re-probe loop) — drives
     // the panel's health column. Absent = never probed (probe off).
     let health = state.s3_state.backend_health.snapshot();
+    let mut read_only = state.s3_state.backend_capabilities.read_only_buckets();
     for b in &mut backends {
-        b.capability = verdicts.get(&b.name).cloned();
+        b.capability = verdicts
+            .get(&b.name)
+            .cloned()
+            .or_else(|| static_verdict(&cfg, &b.name));
         b.health = health.get(&b.name).cloned();
         b.bucket_encryption_modes = Some(cfg.bucket_encryption_modes(&b.name));
+        b.read_only_buckets = read_only.remove(&b.name).unwrap_or_default();
     }
 
     Json(BackendListResponse {
@@ -189,6 +198,71 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
         // that takes the default from an encrypting backend.
         default_backend: Some(cfg.default_backend_name()),
     })
+}
+
+/// The verdict of a backend that needs no probe: a filesystem backend has
+/// atomic writes (one node, in-process locks), unless the test seam names
+/// it non-CAS (then its verdict comes from a probe).
+fn static_verdict(
+    cfg: &crate::config::Config,
+    name: &str,
+) -> Option<crate::coordination::CapabilityVerdict> {
+    let def = cfg.backend_by_name(name)?;
+    (matches!(def, crate::config::BackendConfig::Filesystem { .. })
+        && !crate::coordination::capability::forced_noncas_backends().contains(name))
+    .then_some(crate::coordination::CapabilityVerdict::CasVerified {
+        via: crate::coordination::VerifiedVia::LocalFilesystem,
+    })
+}
+
+/// The answer of `POST /backends/:name/capability-probe`.
+#[derive(Serialize)]
+pub struct CapabilityProbeResponse {
+    pub backend: String,
+    /// The fresh verdict (`cas-verified`, `non-cas`, `unknown`).
+    pub capability: crate::coordination::CapabilityVerdict,
+    /// The verdict in plain words.
+    pub probe_result: String,
+    /// The buckets of this backend that are read-only after this probe.
+    pub read_only_buckets: Vec<String>,
+}
+
+/// POST /api/admin/backends/:name/capability-probe — "Check again": run
+/// the atomic-writes probe of one backend NOW (fresh: one small object,
+/// removed with all its versions), store the verdict, and return it. A
+/// backend that now proves atomic writes lifts the read-only state of its
+/// encrypted buckets at once; one that does not makes them read-only.
+pub async fn probe_backend_capability(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<CapabilityProbeResponse>, AdminError> {
+    let cfg = state.config.read().await.clone();
+    if cfg.backend_by_name(&name).is_none() {
+        return Err(AdminError::not_found(format!("no backend named '{name}'")));
+    }
+    let cache = &state.s3_state.backend_capabilities;
+    let hint = cfg
+        .proxy_encrypted_storage()
+        .buckets
+        .into_iter()
+        .find(|(_, b)| *b == name)
+        .map(|(bucket, _)| {
+            cfg.buckets
+                .get(&bucket)
+                .and_then(|p| p.alias.clone())
+                .unwrap_or(bucket)
+        });
+    let verdict =
+        crate::coordination::atomicity::probe_atomic_writes(&cfg, cache, &name, hint.as_deref())
+            .await;
+    audit_log("backend_capability_probe", "admin", &name, &headers);
+    Ok(Json(CapabilityProbeResponse {
+        backend: name.clone(),
+        probe_result: crate::coordination::atomicity::verdict_words(&verdict),
+        capability: verdict,
+        read_only_buckets: cache.read_only_buckets().remove(&name).unwrap_or_default(),
+    }))
 }
 
 /// POST /api/admin/backends/:name/probe — "Test connection": run a live
@@ -276,6 +350,10 @@ pub async fn list_bucket_origins(
             );
             BucketBackendOriginResponse {
                 effective_encryption,
+                read_only: state
+                    .s3_state
+                    .backend_capabilities
+                    .read_only_reason(&bucket.name),
                 name: bucket.name,
                 creation_date: bucket.creation_date.map(|d| d.to_rfc3339()),
                 backend_name,
@@ -355,6 +433,32 @@ pub async fn create_bucket_on_backend(
     .await
     {
         return Err(AdminError::conflict(e));
+    }
+    // Encryption needs atomic writes (N2): a bucket created to encrypt
+    // with the proxy (its own block, or its backend's) on a backend
+    // without them is refused before anything is created. A fresh probe;
+    // the transition's gate runs again under the lock for a block of the
+    // bucket's own.
+    let encrypts = probe
+        .write_encryption_for_bucket(&bucket_key)
+        .is_some_and(|w| w.mode == "aes256-gcm-proxy");
+    if let Err(r) = match encrypts {
+        true => crate::coordination::atomicity::require_atomic_writes(
+            &probe,
+            &state.s3_state.backend_capabilities,
+            &backend_name,
+            None,
+            &format!("encryption of the new bucket '{bucket_key}'"),
+        )
+        .await
+        .map(|_| ()),
+        false => Ok(()),
+    } {
+        return Err(AdminError::coded(
+            crate::coordination::atomicity::ATOMIC_WRITES_REQUIRED,
+            StatusCode::CONFLICT,
+            r.message(),
+        ));
     }
     drop(probe);
 

@@ -335,10 +335,22 @@ fn object_created_event(
 /// makes a non-CAS backend (e.g. B2) safe as a mirror. Replication,
 /// lifecycle, and maintenance call the engine directly and never pass
 /// through this gate.
+///
+/// The same gate refuses every client write to a bucket that encrypts with
+/// the proxy on a backend without proven atomic writes (N2,
+/// `BackendCapabilityCache::read_only_reason`): reads keep working. 403
+/// AccessDenied, like the marker above: the refusal is the operator's
+/// configuration, not a transient state, so a client must not retry it
+/// (a 503 would be retried), and S3 has no "read-only bucket" code. The
+/// background writers ask the same rule through the maintenance gate's
+/// `write_blocked`.
 pub(crate) fn check_client_write_allowed(
     state: &Arc<AppState>,
     bucket: &str,
 ) -> Result<(), S3Error> {
+    if let Some(reason) = state.backend_capabilities.read_only_reason(bucket) {
+        return Err(S3Error::AccessDeniedReason(reason));
+    }
     let engine = state.engine.load();
     // Blocks the configured marked name AND an unconfigured name that resolves
     // onto marked storage (the alias hole). Registry lowercases internally.

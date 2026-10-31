@@ -45,6 +45,11 @@ pub struct TestSeams {
     /// `DGP_TEST_FORCE_NONCAS_BACKEND` (comma-separated): backends that get
     /// a forced NonCas capability verdict without a probe.
     pub force_noncas_backends: BTreeSet<String>,
+    /// `DGP_TEST_FORCE_NONCAS_WHILE_FILE`: the forced verdict of
+    /// `DGP_TEST_FORCE_NONCAS_BACKEND` holds only while this file exists, so
+    /// a test can turn a backend's verdict to CAS without a restart (the
+    /// next probe, e.g. "Check again", sees it).
+    pub force_noncas_while_file: Option<std::path::PathBuf>,
     /// `DGP_TEST_CONVERSION_GRACE_SECS`: the grace after a conversion's
     /// cutoff (default 300 s), so a test can plant an object after it.
     pub conversion_grace_secs: Option<i64>,
@@ -61,6 +66,11 @@ pub struct TestSeams {
     /// write lock, so a test can write the object through the same
     /// instance in that window.
     pub rewrite_lock_stall_ms: u64,
+    /// `DGP_TEST_KEEP_WRITE_GATE=true`: a re-encrypt job keeps the bucket's
+    /// write gate although its rewrites are conditional. Encryption runs
+    /// only on backends with atomic writes (N2), so the gate tests (whose
+    /// mechanics a decrypt job on a backend without them uses) need it.
+    pub keep_write_gate: bool,
 }
 
 impl TestSeams {
@@ -90,12 +100,16 @@ impl TestSeams {
                         .collect()
                 })
                 .unwrap_or_default(),
+            force_noncas_while_file: env("DGP_TEST_FORCE_NONCAS_WHILE_FILE")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from),
             conversion_grace_secs: lookup_parse::<i64>(env, "DGP_TEST_CONVERSION_GRACE_SECS")
                 .filter(|n| *n >= 0),
             conversion_window_secs: lookup_parse::<i64>(env, "DGP_TEST_CONVERSION_WINDOW_SECS")
                 .filter(|n| *n > 0),
             rewrite_stall_ms: lookup_parse(env, "DGP_TEST_REWRITE_STALL_MS").unwrap_or(0),
             rewrite_lock_stall_ms: lookup_parse(env, "DGP_TEST_REWRITE_LOCK_STALL_MS").unwrap_or(0),
+            keep_write_gate: lookup_parse(env, "DGP_TEST_KEEP_WRITE_GATE").unwrap_or(false),
         }
     }
 }

@@ -115,6 +115,10 @@ pub struct ReencryptStarted {
 pub struct ReencryptError {
     pub bucket: String,
     pub error: String,
+    /// Refused for lack of atomic writes on the bucket's backend (N2): the
+    /// backend, the probe result in plain words and the doc link.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atomic_writes: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,14 +164,20 @@ async fn check_job_request(
 }
 
 /// POST /_/api/admin/jobs/reencrypt
+///
+/// A bucket whose job would encrypt with a proxy key gets a fresh
+/// atomicity probe of its backend first (N2), before a window opens; a
+/// backend without atomic writes refuses it (`errors[].atomic_writes`).
+/// When no job starts and a bucket was refused that way, the answer is
+/// 409 (the same body).
 pub async fn start_reencrypt(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(req): AdminJson<ReencryptRequest>,
-) -> Result<Json<ReencryptResponse>, AdminError> {
+) -> Result<(StatusCode, Json<ReencryptResponse>), AdminError> {
     use crate::maintenance::conversion::{
-        close_opened, open_window, queue_reencrypt, NotQueued, OpenedWindow, QueuedReencrypt,
-        ReencryptParams,
+        close_opened, open_window, queue_reencrypt, require_reencrypt_atomic, NotQueued,
+        OpenedWindow, QueuedReencrypt, ReencryptParams,
     };
     let (db, real, buckets) = check_job_request(&state, req.buckets).await?;
 
@@ -183,15 +193,32 @@ pub async fn start_reencrypt(
         let refuse = |error: String| ReencryptError {
             bucket: bucket.to_string(),
             error,
+            atomic_writes: None,
         };
         if !real.contains(&key) {
             errors.push(refuse("bucket not found".into()));
             continue;
         }
-        if let Err(reason) = resolve_desired(&cfg, &key) {
-            errors.push(refuse(reason));
-            continue;
-        }
+        let atomic = match resolve_desired(&cfg, &key) {
+            Err(reason) => {
+                errors.push(refuse(reason));
+                continue;
+            }
+            Ok(crate::maintenance::DesiredEncryption::Proxy { .. }) => {
+                match require_reencrypt_atomic(&state.s3_state, &cfg, &key).await {
+                    Ok(proof) => Some(proof),
+                    Err(r) => {
+                        errors.push(ReencryptError {
+                            bucket: bucket.to_string(),
+                            error: r.message(),
+                            atomic_writes: Some(r.details()),
+                        });
+                        continue;
+                    }
+                }
+            }
+            Ok(_) => None,
+        };
         let mut opened = None;
         if req.open_window {
             // An active job first: never open a window for a job that
@@ -223,6 +250,7 @@ pub async fn start_reencrypt(
                 run: opened.map(|w| w.run),
                 ..Default::default()
             },
+            atomic,
         });
         origins.push((bucket.to_string(), opened));
     }
@@ -231,21 +259,31 @@ pub async fn start_reencrypt(
 
     let mut started = Vec::new();
     for ((result, (bucket, opened)), q) in results.into_iter().zip(origins).zip(&requests) {
-        let error = match result {
+        let (error, atomic_writes) = match result {
             Ok(job_id) => {
                 started.push(ReencryptStarted { bucket, job_id });
                 continue;
             }
-            Err(NotQueued::Active) => ALREADY_ACTIVE.to_string(),
-            Err(NotQueued::Failed(e)) => format!("failed to create job: {e}"),
+            Err(NotQueued::Active) => (ALREADY_ACTIVE.to_string(), None),
+            Err(NotQueued::Failed(e)) => (format!("failed to create job: {e}"), None),
+            Err(NotQueued::NotAtomic(r)) => (r.message(), Some(r.details())),
         };
         // The window this request opened is for a job that does not exist.
         if let Some(w) = opened.filter(|w| w.created) {
             close_opened(&engine, &q.bucket, w.run, "the job could not be queued").await;
         }
-        errors.push(ReencryptError { bucket, error });
+        errors.push(ReencryptError {
+            bucket,
+            error,
+            atomic_writes,
+        });
     }
-    Ok(Json(ReencryptResponse { started, errors }))
+    let status = if started.is_empty() && errors.iter().any(|e| e.atomic_writes.is_some()) {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(ReencryptResponse { started, errors })))
 }
 
 const ALREADY_ACTIVE: &str = "a maintenance job is already active for this bucket";
@@ -285,6 +323,11 @@ pub async fn start_backfill(
         if !real.contains(&key) {
             continue;
         }
+        // A backfill rewrites metadata in place: an encrypted bucket on a
+        // backend without atomic writes is read-only (N2).
+        if let Some(reason) = state.s3_state.backend_capabilities.read_only_reason(&key) {
+            return Err(AdminError::forbidden(reason));
+        }
         match crate::maintenance::conversion::marker_exists(&engine, &key).await {
             Ok(false) => {}
             Ok(true) => {
@@ -309,6 +352,7 @@ pub async fn start_backfill(
             errors.push(ReencryptError {
                 bucket: bucket.to_string(),
                 error: "bucket not found".into(),
+                atomic_writes: None,
             });
             continue;
         }
@@ -336,10 +380,12 @@ pub async fn start_backfill(
             Ok(None) => errors.push(ReencryptError {
                 bucket: bucket.to_string(),
                 error: "a maintenance job is already active for this bucket".into(),
+                atomic_writes: None,
             }),
             Err(e) => errors.push(ReencryptError {
                 bucket: bucket.to_string(),
                 error: format!("failed to create job: {e}"),
+                atomic_writes: None,
             }),
         }
     }
@@ -485,6 +531,30 @@ pub async fn start_migrate(
         )
         .await
         .map_err(AdminError::conflict)?;
+        // Encryption needs atomic writes (N2): a bucket that encrypts with
+        // a proxy key on the target would be read-only there. A fresh
+        // probe of the target backend; the move OUT of a read-only bucket
+        // is the way out and is never refused for its source.
+        let mut flipped = cfg.clone();
+        crate::maintenance::migrate::apply_flip(
+            &mut flipped,
+            &bucket_key,
+            &params.target_backend,
+            None,
+        );
+        crate::coordination::atomicity::gate_encryption_change(
+            &cfg,
+            &flipped,
+            &state.s3_state.backend_capabilities,
+        )
+        .await
+        .map_err(|r| {
+            AdminError::coded(
+                crate::coordination::atomicity::ATOMIC_WRITES_REQUIRED,
+                StatusCode::CONFLICT,
+                r.message(),
+            )
+        })?;
     }
 
     // A backend that the health loop gates would fail every copy: refuse

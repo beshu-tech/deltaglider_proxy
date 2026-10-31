@@ -596,6 +596,16 @@ pub async fn start_at_boot(
         }
         Err(e) => return refused(&format!("the active jobs could not be read: {e}")),
     }
+    // Encryption needs atomic writes (N2): a fresh probe before the window
+    // (the marker is a write) and the job. Refused: the bucket stays
+    // read-only, its plaintext history unread, until the operator moves it.
+    let atomic = match require_reencrypt_atomic(app, config, bucket).await {
+        Ok(a) => a,
+        Err(r) => {
+            audit("encryption_conversion_refused", "boot", &r.backend, bucket);
+            return refused(&r.message());
+        }
+    };
     let opened = match open_window(&engine, bucket, OpenMode::Refresh, "boot").await {
         Ok(w) => w,
         Err(e) => return refused(&format!("the window could not be opened: {e}")),
@@ -607,6 +617,7 @@ pub async fn start_at_boot(
             run: Some(opened.run),
             ..Default::default()
         },
+        atomic: Some(atomic),
     };
     let none = axum::http::HeaderMap::new();
     let queued = queue_reencrypt(
@@ -643,6 +654,10 @@ pub async fn start_at_boot(
 pub struct QueuedReencrypt {
     pub bucket: String,
     pub params: ReencryptParams,
+    /// The fresh atomicity probe that the caller ran for this action
+    /// (before it opened a window). `None`: [`queue_reencrypt`] runs one
+    /// when the job encrypts with a proxy key.
+    pub atomic: Option<crate::coordination::atomicity::AtomicWrites>,
 }
 
 /// Why a re-encrypt job was not queued.
@@ -652,6 +667,57 @@ pub enum NotQueued {
     Active,
     /// The jobs database refused the row.
     Failed(String),
+    /// The job encrypts with a proxy key, and the bucket's backend has no
+    /// proven atomic writes (N2).
+    NotAtomic(Box<crate::coordination::atomicity::AtomicityRefusal>),
+}
+
+/// The atomicity check of one re-encrypt job (N2): a job whose target is
+/// a proxy key needs atomic writes on the bucket's backend, proven by
+/// `r.atomic` (the caller's fresh probe for this backend) or by a fresh
+/// probe now. A decrypt job (target `none`) needs none: on a backend
+/// without them it keeps the write gate. A target that does not resolve
+/// is the job's own error later.
+async fn encrypts_on_atomic_backend(
+    app: &crate::api::handlers::AppState,
+    config: &crate::config::Config,
+    r: &QueuedReencrypt,
+) -> Result<(), crate::coordination::atomicity::AtomicityRefusal> {
+    if !matches!(
+        super::resolve_desired(config, &r.bucket),
+        Ok(super::DesiredEncryption::Proxy { .. })
+    ) {
+        return Ok(());
+    }
+    let backend = config
+        .effective_backend_for_bucket(&r.bucket)
+        .map(|(b, _)| b);
+    if r.atomic.as_ref().map(|a| a.backend()) == backend.as_deref() && backend.is_some() {
+        return Ok(());
+    }
+    require_reencrypt_atomic(app, config, &r.bucket)
+        .await
+        .map(|_| ())
+}
+
+/// THE fresh atomicity probe before a re-encrypt of `bucket` that
+/// encrypts with a proxy key (the admin start and Resume before they open
+/// a window, the boot conversion, [`queue_reencrypt`]).
+pub async fn require_reencrypt_atomic(
+    app: &crate::api::handlers::AppState,
+    config: &crate::config::Config,
+    bucket: &str,
+) -> Result<
+    crate::coordination::atomicity::AtomicWrites,
+    crate::coordination::atomicity::AtomicityRefusal,
+> {
+    crate::coordination::atomicity::require_for_bucket(
+        config,
+        &app.backend_capabilities,
+        bucket,
+        &format!("the re-encrypt job of bucket '{bucket}'"),
+    )
+    .await
 }
 
 /// Whether every write that a re-encrypt job makes in `bucket` is
@@ -679,8 +745,11 @@ pub async fn rewrites_are_conditional(
     let Some((name, backend)) = config.effective_backend_for_bucket(bucket) else {
         return false;
     };
-    // The test seam names any backend (a filesystem one too: the gate
-    // tests keep the gate with it).
+    // The gate tests keep the gate (`DGP_TEST_KEEP_WRITE_GATE`).
+    if crate::config::test_seams::test_seams().keep_write_gate {
+        return false;
+    }
+    // The test seam names any backend (a filesystem one too).
     let forced = forced_noncas_backends();
     if forced.contains(&name) {
         return false;
@@ -734,8 +803,15 @@ pub async fn queue_reencrypt(
     let mut params = Vec::with_capacity(requests.len());
     for r in requests {
         let mut p = r.params;
+        // Encryption needs atomic writes (N2): a job that encrypts with
+        // a proxy key is queued only on a backend with them, proven by
+        // the caller's fresh probe for this action or by one now.
+        if let Err(refusal) = encrypts_on_atomic_backend(app, config, r).await {
+            params.push(Err(NotQueued::NotAtomic(Box::new(refusal))));
+            continue;
+        }
         p.conditional_writes = rewrites_are_conditional(app, config, &r.bucket).await;
-        params.push(p);
+        params.push(Ok(p));
     }
     let results: Vec<Result<i64, NotQueued>> = {
         let db = db.lock().await;
@@ -743,6 +819,7 @@ pub async fn queue_reencrypt(
             .iter()
             .zip(&params)
             .map(|(r, params)| {
+                let params = params.as_ref().map_err(Clone::clone)?;
                 match db.maintenance_create_job(
                     "reencrypt",
                     &r.bucket,

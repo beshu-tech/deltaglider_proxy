@@ -28,6 +28,8 @@ mod admin_login_as_test;
 mod admin_section_test;
 #[path = "admission_test.rs"]
 mod admission_test;
+#[path = "atomic_writes_gate_test.rs"]
+mod atomic_writes_gate_test;
 #[path = "auth_integration_test.rs"]
 mod auth_integration_test;
 #[path = "aws_chunked_upload_test.rs"]

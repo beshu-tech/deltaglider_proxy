@@ -184,6 +184,10 @@ pub(super) struct Rejection {
     /// Boxed: the warnings are large and a `Rejection` rides in `Result`s.
     pub warnings: Box<Warnings>,
     pub diff: Option<serde_json::Value>,
+    /// The structured part of a refusal (the `atomic_writes` object of a
+    /// change refused for lack of atomic writes, N2); every surface puts
+    /// it in its body as `atomic_writes`.
+    pub details: Option<serde_json::Value>,
 }
 
 impl Rejection {
@@ -194,7 +198,19 @@ impl Rejection {
             error: error.into(),
             warnings: Box::default(),
             diff: None,
+            details: None,
         }
+    }
+
+    /// Add the structured part of the refusal to a JSON `body` object.
+    pub(super) fn attach_details(
+        details: Option<serde_json::Value>,
+        mut body: serde_json::Value,
+    ) -> serde_json::Value {
+        if let (Some(d), Some(obj)) = (details, body.as_object_mut()) {
+            obj.insert("atomic_writes".to_string(), d);
+        }
+        body
     }
 }
 
@@ -274,14 +290,16 @@ pub(super) async fn run(
                     error,
                     warnings: Box::new(p.warnings),
                     diff: p.diff,
+                    details: None,
                 }),
-                Ok(()) => match preview_conversions(state, &old, &p.new_cfg).await {
-                    Err((status, error)) => Outcome::Rejected(Rejection {
+                Ok(()) => match dry_run_gates(state, &old, &p.new_cfg).await {
+                    Err(e) => Outcome::Rejected(Rejection {
                         stage: Stage::Transition,
-                        status,
-                        error,
+                        status: e.status,
+                        error: e.message,
                         warnings: Box::new(p.warnings),
                         diff: p.diff,
+                        details: e.details,
                     }),
                     Ok(conversions) => {
                         if write.surface.section().is_some() {
@@ -338,23 +356,28 @@ pub(super) async fn run(
     WriteResult { outcome, refs }
 }
 
-/// The dry run's conversion step: what the apply would start (with the
-/// RUNNING engine's listing and an object count for the dialog), and the
-/// same active-job refusal. `Err`: the status and the message.
-async fn preview_conversions(
+/// The dry run's gates after the static ones: the atomic-writes gate of
+/// the apply (N2, a fresh probe: a validate answers what the apply would),
+/// then the conversion step: what the apply would start (with the RUNNING
+/// engine's listing and an object count for the dialog), and the same
+/// active-job refusal.
+async fn dry_run_gates(
     state: &Arc<AdminState>,
     old: &Config,
     new: &Config,
-) -> Result<Vec<ConversionPreview>, (StatusCode, String)> {
+) -> Result<Vec<ConversionPreview>, super::transition::TransitionError> {
+    crate::coordination::atomicity::gate_encryption_change(
+        old,
+        new,
+        &state.s3_state.backend_capabilities,
+    )
+    .await?;
     let engine = state.s3_state.engine.load_full();
     let planned =
         super::conversion_start::plan(&engine, old, new, super::conversion_start::COUNT_CAP)
-            .await
-            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            .await?;
     let buckets: Vec<&str> = planned.iter().map(|p| p.bucket.as_str()).collect();
-    super::conversion_start::refuse_active_jobs(&state.s3_state, &buckets, false)
-        .await
-        .map_err(|e| (e.status, e.message))?;
+    super::conversion_start::refuse_active_jobs(&state.s3_state, &buckets, false).await?;
     Ok(planned)
 }
 
@@ -456,6 +479,7 @@ async fn apply_locked(
                 error: e.message,
                 warnings: Box::new(warnings),
                 diff,
+                details: e.details,
             });
         }
     };
@@ -521,6 +545,7 @@ pub(super) fn prepare_with_refs(
                 error: $err.into(),
                 warnings: Box::new(w),
                 diff: None,
+                details: None,
             })
         };
     }

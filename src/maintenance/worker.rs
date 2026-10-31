@@ -607,8 +607,14 @@ fn backend_check(
     // A migrate writes its copies through the staging route (the target
     // storage): the encryption witness is asked about it too.
     let mut buckets = vec![job.bucket.clone()];
+    let is_migrate = job.kind == "migrate";
     buckets.extend(migrate.map(|p| p.transient_key));
-    super::gate::BackendCheck::new(state.clone(), config.clone(), buckets, backends)
+    let check = super::gate::BackendCheck::new(state.clone(), config.clone(), buckets, backends);
+    if is_migrate {
+        check.ignoring_read_only()
+    } else {
+        check
+    }
 }
 
 /// The three phases, resumable at page granularity. Returns Err(reason)
@@ -627,6 +633,39 @@ async fn execute_phases(
     // conditional on what the job read (judged again now: a backend
     // definition can change while a job waits). ──
     let mut params = super::conversion::ReencryptParams::of(job.params.as_deref());
+    // ── Encryption needs atomic writes (N2): a run that encrypts with a
+    // proxy key starts only on a backend with a CAS verdict for its
+    // current definition, else after a fresh probe that proves them (a
+    // queued job of an older release, a backend redefined meanwhile). ──
+    {
+        let cfg = config.read().await.clone();
+        if matches!(
+            resolve_desired(&cfg, bucket),
+            Ok(super::DesiredEncryption::Proxy { .. })
+        ) {
+            let cached_cas = cfg
+                .effective_backend_for_bucket(bucket)
+                .and_then(|(n, d)| state.backend_capabilities.get(&n, d))
+                .is_some_and(|v| {
+                    matches!(
+                        v,
+                        crate::coordination::CapabilityVerdict::CasVerified { .. }
+                    )
+                });
+            if !cached_cas {
+                if let Err(r) =
+                    super::conversion::require_reencrypt_atomic(state, &cfg, bucket).await
+                {
+                    return Err(match r.verdict {
+                        crate::coordination::CapabilityVerdict::Unknown { .. } => {
+                            PhaseStop::FailedTransient(r.message())
+                        }
+                        _ => PhaseStop::Failed(r.message()),
+                    });
+                }
+            }
+        }
+    }
     let conditional = {
         let cfg = config.read().await.clone();
         super::conversion::rewrites_are_conditional(state, &cfg, bucket).await

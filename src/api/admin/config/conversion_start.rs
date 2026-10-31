@@ -333,6 +333,7 @@ pub(crate) async fn refuse_active_jobs(
                 message: "the jobs database stayed busy, so the proxy could not check the \
                           buckets that start to encrypt for active jobs. Try again"
                     .into(),
+                details: None,
             })?
     } else {
         db.lock().await
@@ -346,6 +347,7 @@ pub(crate) async fn refuse_active_jobs(
                 return Err(TransitionError {
                     status: StatusCode::SERVICE_UNAVAILABLE,
                     message: format!("could not read the active jobs of bucket '{bucket}': {e}"),
+                    details: None,
                 })
             }
         }
@@ -572,6 +574,9 @@ pub(crate) async fn enqueue(
                 run: Some(s.run_id),
                 ..Default::default()
             },
+            // The apply's gate probed before the commit; the queue probes
+            // again now (the lock was released in between).
+            atomic: None,
         })
         .collect();
     let results = crate::maintenance::conversion::queue_reencrypt(
@@ -594,6 +599,7 @@ pub(crate) async fn enqueue(
                 &s.bucket,
                 &format!("the job could not be created: {e}"),
             )),
+            Err(NotQueued::NotAtomic(r)) => warnings.push(no_job_warning(&s.bucket, &r.message())),
         }
     }
 }

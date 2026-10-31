@@ -448,6 +448,156 @@ impl Config {
         }
         errors
     }
+
+    /// Where a change from `old` to `self` makes the proxy encrypt with a
+    /// key on a backend, so the proxy will rewrite objects there (a
+    /// conversion or a key rotation): those backends need atomic writes
+    /// (`docs/plan/encryption-needs-atomic-writes.md`, N2). One entry per
+    /// backend and per configured bucket that starts or changes proxy
+    /// encryption, or moves to another backend with it:
+    ///
+    /// - a backend whose own site encrypts with a proxy key in `self` and
+    ///   wrote otherwise in `old` (or did not exist);
+    /// - the new default backend, when the default route changes to a
+    ///   backend whose own site encrypts with a proxy key;
+    /// - a configured bucket that encrypts with a proxy key in `self` and
+    ///   wrote otherwise, or lived on another backend, in `old`.
+    ///
+    /// Native SSE (`sse-s3`, `sse-kms`) is not in it: the backend encrypts
+    /// those objects itself, and the proxy neither converts nor rotates
+    /// them (the re-encrypt job refuses SSE modes). A proxy mode without a
+    /// key refuses writes, so it rewrites nothing either. Migrate's
+    /// transient routes are internal and skipped.
+    pub fn atomic_write_targets(&self, old: &Config) -> Vec<AtomicWriteTarget> {
+        let proxy_key = |w: &WriteEncryption| w.mode == PROXY_MODE && !w.refuses_writes();
+        let mut out = Vec::new();
+        let (before, after) = (old.backend_sites(), self.backend_sites());
+        for (name, a) in &after {
+            if proxy_key(&a.write) && before.get(name).is_none_or(|b| b.write != a.write) {
+                out.push(AtomicWriteTarget {
+                    backend: name.clone(),
+                    bucket: None,
+                });
+            }
+        }
+        let nd = self.default_backend_name();
+        if old.default_backend_name() != nd
+            && after.get(&nd).is_some_and(|a| proxy_key(&a.write))
+            && !out.iter().any(|t| t.backend == nd)
+        {
+            out.push(AtomicWriteTarget {
+                backend: nd,
+                bucket: None,
+            });
+        }
+        for name in self.buckets.keys() {
+            if name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX) {
+                continue;
+            }
+            let Some(a) = self.encryption_for_bucket(name) else {
+                continue;
+            };
+            let wa = a.write_encryption();
+            if !proxy_key(&wa) {
+                continue;
+            }
+            let unchanged = old
+                .encryption_for_bucket(name)
+                .is_some_and(|b| b.backend == a.backend && b.write_encryption() == wa);
+            if !unchanged {
+                out.push(AtomicWriteTarget {
+                    backend: a.backend.clone(),
+                    bucket: Some(name.clone()),
+                });
+            }
+        }
+        out
+    }
+
+    /// The buckets that encrypt with the proxy (`aes256-gcm-proxy`, with or
+    /// without a usable key), by the backend that stores them: the read-only
+    /// rule of N2 needs atomic writes there. Configured buckets by name
+    /// (lowercase; migrate's transient routes skipped), and the default
+    /// backend for every bucket that the config does not name, when its own
+    /// site encrypts with the proxy.
+    pub fn proxy_encrypted_storage(&self) -> ProxyEncryptedStorage {
+        let proxy = |w: &WriteEncryption| w.mode == PROXY_MODE;
+        let mut buckets = std::collections::BTreeMap::new();
+        for name in self.buckets.keys() {
+            if name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX) {
+                continue;
+            }
+            if let Some(e) = self.encryption_for_bucket(name) {
+                if proxy(&e.write_encryption()) {
+                    buckets.insert(name.to_ascii_lowercase(), e.backend.clone());
+                }
+            }
+        }
+        let nd = self.default_backend_name();
+        let default = self
+            .backend_sites()
+            .get(&nd)
+            .is_some_and(|s| proxy(&s.write))
+            .then_some(nd);
+        ProxyEncryptedStorage {
+            configured: self
+                .buckets
+                .keys()
+                .map(|b| b.to_ascii_lowercase())
+                .collect(),
+            buckets,
+            default,
+        }
+    }
+}
+
+/// The YAML tag of proxy encryption.
+const PROXY_MODE: &str = "aes256-gcm-proxy";
+
+/// One place where a config change makes the proxy encrypt with a key
+/// ([`Config::atomic_write_targets`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicWriteTarget {
+    /// The backend that stores the objects.
+    pub backend: String,
+    /// The configured bucket, or `None` for the backend's own site (the
+    /// buckets that the config does not name).
+    pub bucket: Option<String>,
+}
+
+/// The output of [`Config::proxy_encrypted_storage`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyEncryptedStorage {
+    /// Every configured bucket name, lowercase.
+    pub configured: std::collections::BTreeSet<String>,
+    /// Configured bucket (lowercase) that encrypts with the proxy → its
+    /// backend.
+    pub buckets: std::collections::BTreeMap<String, String>,
+    /// The default backend, when the buckets the config does not name
+    /// encrypt with the proxy there.
+    pub default: Option<String>,
+}
+
+impl ProxyEncryptedStorage {
+    /// The backend whose atomic writes `bucket` needs, or `None` when the
+    /// bucket does not encrypt with the proxy.
+    pub fn backend_of(&self, bucket: &str) -> Option<&str> {
+        let key = bucket.to_ascii_lowercase();
+        if self.configured.contains(&key) {
+            self.buckets.get(&key).map(String::as_str)
+        } else {
+            self.default.as_deref()
+        }
+    }
+
+    /// Every backend that stores a bucket that encrypts with the proxy.
+    pub fn backends(&self) -> std::collections::BTreeSet<&str> {
+        self.buckets
+            .values()
+            .map(String::as_str)
+            .chain(self.default.as_deref())
+            .collect()
+    }
 }
 
 #[cfg(test)]

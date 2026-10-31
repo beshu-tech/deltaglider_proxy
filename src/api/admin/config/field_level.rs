@@ -236,6 +236,11 @@ pub struct BackendInfoResponse {
     /// Populated by `GET /backends` only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket_encryption_modes: Option<Vec<&'static str>>,
+    /// The configured buckets on this backend that are read-only because
+    /// they encrypt with the proxy and the backend has no proven atomic
+    /// writes (N2). Populated by `GET /backends` only; omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only_buckets: Vec<String>,
 }
 
 impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
@@ -256,6 +261,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 capability: None,
                 health: None,
                 bucket_encryption_modes: None,
+                read_only_buckets: Vec::new(),
             },
             crate::config::BackendConfig::S3 {
                 endpoint,
@@ -277,6 +283,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 capability: None,
                 health: None,
                 bucket_encryption_modes: None,
+                read_only_buckets: Vec::new(),
             },
         }
     }
@@ -660,7 +667,10 @@ fn shape_patch(result: WriteResult) -> axum::response::Response {
                     r.error
                 )
             };
-            let body = serde_json::json!({ "success": false, "error": error });
+            let body = write::Rejection::attach_details(
+                r.details,
+                serde_json::json!({ "success": false, "error": error }),
+            );
             write::respond(r.status, body, &refs, None)
         }
         Outcome::Applied {

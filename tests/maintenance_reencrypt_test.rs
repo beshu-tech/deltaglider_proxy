@@ -118,10 +118,13 @@ async fn wait_job_done_within(
 /// objects at a time) and is still running when the gated request goes out.
 const GATE_TEST_STALL: (&str, &str) = ("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "300");
 
-/// A gate test keeps the write gate: on the filesystem every rewrite is
-/// conditional and the job runs without it, unless the backend is named
-/// non-CAS (`tests/conditional_rewrite_test.rs` covers both sides).
-const GATE_KEPT: (&str, &str) = ("DGP_TEST_FORCE_NONCAS_BACKEND", "default");
+/// A gate test keeps the write gate (`DGP_TEST_KEEP_WRITE_GATE`): on the
+/// filesystem every rewrite is conditional and the job runs without it.
+/// Encryption runs only on backends with atomic writes (N2), so the gate
+/// is kept in production only by a decrypt job on a backend without them;
+/// the seam lets these tests use the same gate mechanics with an encrypt
+/// job (`tests/conditional_rewrite_test.rs` covers both sides).
+const GATE_KEPT: (&str, &str) = ("DGP_TEST_KEEP_WRITE_GATE", "true");
 
 /// Fail unless a maintenance job holds `bucket` busy now. A gate test calls
 /// it right before its gated request: a job that already ended would make

@@ -12,6 +12,12 @@
 //! It does not change the CAS verdict: a lock or lease release on a bucket
 //! that ignores it reads the object first and deletes only its own
 //! ([`ProbeResult::conditional_delete`]).
+//!
+//! A backend that drops the connection on a conditional PUT (Backblaze B2,
+//! eu-central-003, 2026-10-31) gives no answer at all. When an
+//! unconditional PUT of the same key goes through right after, the drop is
+//! the backend's answer to the condition: the probe reads it as a refusal
+//! (definitive non-CAS), not as an unreachable backend.
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
@@ -25,8 +31,25 @@ pub enum StepOutcome {
     PreconditionFailed,
     /// 501 / NotImplemented: the condition was rejected (Backblaze B2).
     NotImplemented,
+    /// No HTTP answer: the connection dropped, reset or timed out. See
+    /// [`resolve_dropped`].
+    Dropped(String),
     /// Anything else: the probe cannot tell.
     Other(String),
+}
+
+/// Pure: what a [`StepOutcome::Dropped`] conditional step means, given
+/// whether an unconditional PUT of the same key went through right after
+/// (`control_written`). The backend answers plain writes but drops the
+/// conditional one: it refuses the condition ([`StepOutcome::NotImplemented`]).
+/// Otherwise the backend cannot be reached and the step is indeterminate.
+/// Other outcomes pass through.
+pub fn resolve_dropped(step: StepOutcome, control_written: bool) -> StepOutcome {
+    match step {
+        StepOutcome::Dropped(_) if control_written => StepOutcome::NotImplemented,
+        StepOutcome::Dropped(e) => StepOutcome::Other(format!("connection dropped: {e}")),
+        other => other,
+    }
 }
 
 /// Verdict from the three conditional steps (after an unconditional PUT
@@ -45,14 +68,14 @@ pub fn classify_cas_probe(
         match outcome {
             PreconditionFailed => {}
             Written | NotImplemented => return Ok(false),
-            Other(e) => return Err(format!("{step}: {e}")),
+            Dropped(e) | Other(e) => return Err(format!("{step}: {e}")),
         }
     }
     match if_match_right_etag {
         Written => Ok(true),
         // Refusing the CORRECT etag breaks renew and release just as surely.
         PreconditionFailed | NotImplemented => Ok(false),
-        Other(e) => Err(format!("If-Match with the current etag: {e}")),
+        Dropped(e) | Other(e) => Err(format!("If-Match with the current etag: {e}")),
     }
 }
 
@@ -79,6 +102,11 @@ where
 {
     match res {
         Ok(_) => StepOutcome::Written,
+        Err(
+            e @ (aws_sdk_s3::error::SdkError::DispatchFailure(_)
+            | aws_sdk_s3::error::SdkError::TimeoutError(_)
+            | aws_sdk_s3::error::SdkError::ResponseError(_)),
+        ) => StepOutcome::Dropped(format!("{e:?}")),
         Err(e) => {
             let signal = crate::coordination::cas::sdk_error_signal(e);
             if crate::coordination::cas::conditional_write_lost(&signal) {
@@ -182,6 +210,22 @@ pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<Probe
             }
             other => other,
         }
+    };
+    // A conditional step without an HTTP answer: does a plain PUT of the
+    // key go through now? Then the backend dropped the condition, not the
+    // connection (Backblaze B2).
+    let (create, wrong, right) = if [&create, &wrong, &right]
+        .iter()
+        .any(|o| matches!(o, StepOutcome::Dropped(_)))
+    {
+        let control = put(b"5").send().await.is_ok();
+        (
+            resolve_dropped(create, control),
+            resolve_dropped(wrong, control),
+            resolve_dropped(right, control),
+        )
+    } else {
+        (create, wrong, right)
     };
     // The key exists here (the probe wrote it). A DELETE with a wrong ETag
     // must leave it; a backend that ignores the condition deletes it, and
@@ -333,6 +377,169 @@ mod lost_response_tests {
             verdict.map(|p| p.cas),
             Ok(true),
             "the probe's own landed write read as NonCas"
+        );
+    }
+}
+
+/// A TCP-level fake of a backend that drops the connection on every
+/// conditional PUT (Backblaze B2, eu-central-003): no HTTP answer at all.
+/// Plain PUTs, DELETEs and listings work. Shared with the atomicity tests.
+#[cfg(test)]
+pub(crate) mod b2_like {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The fake's counters.
+    #[derive(Debug, Default)]
+    pub(crate) struct Counts {
+        /// Conditional PUTs whose connection the fake dropped.
+        pub dropped: AtomicU32,
+    }
+
+    /// Start the fake; returns its endpoint and counters. `reachable =
+    /// false`: every request is dropped (an unreachable backend).
+    pub(crate) async fn start(reachable: bool) -> (String, Arc<Counts>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let counts = Arc::new(Counts::default());
+        let c = counts.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let c = c.clone();
+                tokio::spawn(async move { serve(sock, c, reachable).await });
+            }
+        });
+        (endpoint, counts)
+    }
+
+    async fn serve(mut sock: tokio::net::TcpStream, c: Arc<Counts>, reachable: bool) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() < head_end + len {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let line = head.lines().next().unwrap_or("").to_string();
+        let conditional = head.contains("\nif-match:") || head.contains("\nif-none-match:");
+        if !reachable || (line.starts_with("put ") && conditional) {
+            if reachable {
+                c.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+            return; // close without a byte of answer
+        }
+        let (status, extra, body) = if line.starts_with("put ") {
+            ("200 OK", "ETag: \"e1\"\r\n", String::new())
+        } else if line.starts_with("delete ") {
+            ("204 No Content", "", String::new())
+        } else if line.starts_with("get / ") || line.starts_with("get /?") {
+            (
+                "200 OK",
+                "",
+                "<ListAllMyBucketsResult><Buckets><Bucket><Name>coord</Name>\
+                 </Bucket></Buckets></ListAllMyBucketsResult>"
+                    .to_string(),
+            )
+        } else if line.contains("versions") {
+            (
+                "200 OK",
+                "",
+                "<ListVersionsResult></ListVersionsResult>".to_string(),
+            )
+        } else {
+            (
+                "404 Not Found",
+                "",
+                "<Error><Code>NoSuchKey</Code></Error>".to_string(),
+            )
+        };
+        let resp = format!(
+            "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = sock.write_all(resp.as_bytes()).await;
+    }
+}
+
+#[cfg(test)]
+mod dropped_connection_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    async fn client(endpoint: String) -> Client {
+        crate::config_db_sync::ConfigDbSync::build_client(&crate::config::BackendConfig::S3 {
+            endpoint: Some(endpoint),
+            region: "us-east-1".into(),
+            force_path_style: true,
+            access_key_id: Some("k".into()),
+            secret_access_key: Some("s".into()),
+            allow_local: true,
+            session_token: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Backblaze B2 drops the connection on `If-None-Match` / `If-Match`
+    /// PUTs. A plain PUT works, so the drop is the backend's answer to the
+    /// condition: a definitive non-CAS verdict, after a bounded number of
+    /// attempts (the SDK's retries), not an endless retry.
+    #[tokio::test]
+    async fn a_backend_that_drops_conditional_puts_is_not_cas() {
+        let (endpoint, counts) = b2_like::start(true).await;
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            probe_cas(&client(endpoint).await, "coord", "_probe"),
+        )
+        .await
+        .expect("the probe ends");
+        assert_eq!(got.map(|p| p.cas), Ok(false));
+        let dropped = counts.dropped.load(Ordering::SeqCst);
+        assert!(
+            (3..=12).contains(&dropped),
+            "three conditional PUTs, each retried a bounded number of times: {dropped}"
+        );
+    }
+
+    /// A backend that answers nothing at all is unreachable, not non-CAS.
+    #[tokio::test]
+    async fn an_unreachable_backend_is_indeterminate() {
+        let (endpoint, _) = b2_like::start(false).await;
+        let got = probe_cas(&client(endpoint).await, "coord", "_probe").await;
+        assert!(got.is_err(), "{got:?}");
+    }
+
+    #[test]
+    fn a_dropped_step_is_a_refusal_only_when_a_plain_put_works() {
+        let dropped = || StepOutcome::Dropped("reset".into());
+        assert_eq!(
+            resolve_dropped(dropped(), true),
+            StepOutcome::NotImplemented
+        );
+        assert!(matches!(
+            resolve_dropped(dropped(), false),
+            StepOutcome::Other(_)
+        ));
+        assert_eq!(
+            resolve_dropped(StepOutcome::PreconditionFailed, true),
+            StepOutcome::PreconditionFailed
         );
     }
 }

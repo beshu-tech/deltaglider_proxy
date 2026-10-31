@@ -102,6 +102,9 @@ impl TransitionCtx<'_> {
 pub(crate) struct TransitionError {
     pub status: axum::http::StatusCode,
     pub message: String,
+    /// The structured part of the refusal body, when the refusal has one
+    /// (`atomic_writes`: [`crate::coordination::atomicity::AtomicityRefusal::details`]).
+    pub details: Option<serde_json::Value>,
 }
 
 impl TransitionError {
@@ -110,6 +113,7 @@ impl TransitionError {
         Self {
             status: axum::http::StatusCode::CONFLICT,
             message: message.into(),
+            details: None,
         }
     }
 }
@@ -120,6 +124,19 @@ impl From<String> for TransitionError {
         Self {
             status: axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             message,
+            details: None,
+        }
+    }
+}
+
+impl From<crate::coordination::atomicity::AtomicityRefusal> for TransitionError {
+    /// Encryption on a backend without atomic writes (409: the backend's
+    /// state refuses it, the request is well-formed).
+    fn from(r: crate::coordination::atomicity::AtomicityRefusal) -> Self {
+        Self {
+            status: axum::http::StatusCode::CONFLICT,
+            message: r.message(),
+            details: Some(r.details()),
         }
     }
 }
@@ -429,6 +446,9 @@ pub(crate) async fn apply_config_transition(
     if let Some(db) = ctx.app().jobs_db.as_ref() {
         crate::event_outbox::set_config_readers(db, &new_cfg);
     }
+    // The read-only rule (N2) follows the new config; the atomicity watch
+    // probes a backend of an encrypted bucket that has no verdict yet.
+    ctx.app().backend_capabilities.set_encrypted_plan(&new_cfg);
     **cfg = new_cfg;
 
     Ok(TransitionReport {
@@ -589,7 +609,7 @@ async fn transition_gates(
     ctx: &TransitionCtx<'_>,
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
-) -> Result<(), String> {
+) -> Result<(), TransitionError> {
     let app = ctx.app();
     // A background change (migrate) confirms nothing; the gates judge
     // forward admin writes only.
@@ -611,12 +631,25 @@ async fn transition_gates(
     // live connection probe ("Test connection" built into apply).
     crate::coordination::health::hot_apply_health_gate(new_cfg, &app.backend_health).await?;
 
+    // Encryption needs atomic writes (N2): a forward change that turns
+    // proxy encryption on, changes its key or moves an encrypted bucket
+    // probes each backend concerned NOW (fresh) and refuses one without
+    // them. A background change (migrate flip) was judged when it started.
+    if forward {
+        crate::coordination::atomicity::gate_encryption_change(
+            old_cfg,
+            new_cfg,
+            &app.backend_capabilities,
+        )
+        .await?;
+    }
+
     // Declarative-IAM validation (H8/H19): the same fallible checks as the
     // reconcile, write-free. A background change never needs it (refused
     // above when the IAM fields change).
     match ctx {
         TransitionCtx::Admin { state, .. } => {
-            declarative_iam_precommit_gate(state, old_cfg, new_cfg).await
+            Ok(declarative_iam_precommit_gate(state, old_cfg, new_cfg).await?)
         }
         TransitionCtx::Background { .. } => Ok(()),
     }

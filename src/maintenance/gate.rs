@@ -356,6 +356,10 @@ pub(crate) struct BackendCheck {
     buckets: Vec<String>,
     /// Backends the job uses by name (a migrate's source and target).
     backends: Vec<String>,
+    /// Wait while a bucket of the job is read-only (N2: encrypted, on a
+    /// backend without atomic writes). Off for a migrate: moving the
+    /// bucket to another backend is the way out of that state.
+    read_only_waits: bool,
 }
 
 impl BackendCheck {
@@ -370,7 +374,14 @@ impl BackendCheck {
             config,
             buckets,
             backends,
+            read_only_waits: true,
         }
+    }
+
+    /// A check that does not wait for a read-only bucket (a migrate).
+    pub(crate) fn ignoring_read_only(mut self) -> Self {
+        self.read_only_waits = false;
+        self
     }
 
     /// Why the job must wait: the first gated backend and its cause, or
@@ -384,6 +395,15 @@ impl BackendCheck {
             self.state.engine.load().storage().write_refusal(b)
         }) {
             return Some(why);
+        }
+        if self.read_only_waits {
+            if let Some(why) = self
+                .buckets
+                .iter()
+                .find_map(|b| self.state.backend_capabilities.read_only_reason(b))
+            {
+                return Some(why);
+            }
         }
         let health = &self.state.backend_health;
         if health.unhealthy_names().is_empty() {

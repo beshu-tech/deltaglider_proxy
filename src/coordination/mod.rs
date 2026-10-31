@@ -21,6 +21,7 @@
 //! on `expires_at < now` (strict), renew while `expires_at >= now` (non-strict), so
 //! the exact expiry instant is never simultaneously renewable and stealable.
 
+pub mod atomicity;
 pub mod capability;
 pub mod cas;
 pub mod cas_probe;
