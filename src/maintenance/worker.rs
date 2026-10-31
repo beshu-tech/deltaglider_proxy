@@ -627,8 +627,10 @@ async fn execute_phases(
     // ── Drain in-flight writes admitted before the gate armed. ──
     drain_inflight_writes(state, bucket).await?;
 
-    // ── The conversion marker: a resume extends its deadline. ──
-    let marker = super::conversion::begin(&state.engine.load(), bucket)
+    // ── The conversion marker of this job's run: a resume extends its
+    // deadline (a job without a run never writes a marker). ──
+    let params = super::conversion::ReencryptParams::of(job.params.as_deref());
+    let marker = super::conversion::begin(&state.engine.load(), bucket, params.run)
         .await
         .map_err(PhaseStop::FailedTransient)?;
     let adoptions = super::conversion::Adoptions::default();
@@ -637,6 +639,7 @@ async fn execute_phases(
         config,
         bucket,
         desired: None,
+        serves: false,
         marker: &marker,
         adoptions: &adoptions,
     };
@@ -651,9 +654,11 @@ async fn execute_phases(
     // ── Phase: references (deltaspace reference.bin blobs) ──
     if phase == "references" {
         check_cancel(db, job.id).await?;
-        let desired = {
+        let (desired, serves) = {
             let cfg = config.read().await;
-            resolve_desired(&cfg, bucket).map_err(|e| format!("config changed mid-run: {e}"))?
+            let desired = resolve_desired(&cfg, bucket)
+                .map_err(|e| format!("config changed mid-run: {e}"))?;
+            (desired, super::rule_serves_plaintext(&cfg, bucket))
         };
         let engine = state.engine.load().clone();
         // The objects walk read them (one listing of the bucket, not two);
@@ -670,12 +675,19 @@ async fn execute_phases(
             // A graceful stop waits for the end of the current object only.
             stop_if_shutting_down()?;
             check_cancel(db, job.id).await?;
-            match rewrite_reference_if_needed(&engine, bucket, &prefix, &desired).await {
-                Ok(()) => {}
+            let key = format!("{prefix}/.dg/reference.bin");
+            let adopted = |meta: &crate::types::FileMetadata| {
+                super::conversion::adopted(&marker, serves, &key, meta)
+            };
+            match rewrite_reference_if_needed(&engine, bucket, &prefix, &desired, adopted).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    adoptions.add();
+                    record_adoption(db, job, &key).await?;
+                }
                 Err(e) => {
                     let reason = format!("{}: {e}", super::conversion::REWRITE_FAILED);
-                    record_failure(db, job.id, &format!("{prefix}/.dg/reference.bin"), &reason)
-                        .await?;
+                    record_failure(db, job.id, &key, &reason).await?;
                     c.failed += 1;
                 }
             }
@@ -686,7 +698,6 @@ async fn execute_phases(
     }
 
     // ── Phase: purge-versions (optional; before the close) ──
-    let params = super::conversion::ReencryptParams::of(job.params.as_deref());
     let mut notes = Vec::new();
     if params.purge_plaintext_versions {
         if phase == "references" {
@@ -709,7 +720,9 @@ async fn execute_phases(
 
     // ── Close the conversion: only when nothing failed, by identity. ──
     let row = current_row(db, job).await;
-    let adopted = adoptions.count();
+    // Every adoption of the job, a resumed run's included (the row counts
+    // them; the in-memory count is this process's run only).
+    let adopted = row.objects_adopted.max(adoptions.count());
     let closed = super::conversion::finish(
         &state.engine.load(),
         bucket,
@@ -729,8 +742,9 @@ async fn execute_phases(
         notes.insert(
             0,
             format!(
-                "{adopted} object(s) adopted after the conversion's cutoff in this run: clients \
-                 could not read them, the job converted them (see the Failures tab)"
+                "{adopted} object(s) adopted after the conversion's cutoff: clients could not \
+                 read them, the job converted them (the Failures tab lists up to {} of them)",
+                super::store::ADOPTED_SAMPLES
             ),
         );
     }
@@ -766,7 +780,13 @@ async fn purge_plaintext_versions(
     use super::conversion::{PurgeCursor, PURGE_PHASE};
     let engine = state.engine.load().clone();
     let storage = engine.storage();
-    if storage.bucket_versioning(&job.bucket).await != Some(true) {
+    // A read error stops the phase (retried): a purge that the job was
+    // asked for never ends as "not versioned" by mistake.
+    let versioned = storage
+        .bucket_versioning(&job.bucket)
+        .await
+        .map_err(|e| PhaseStop::FailedTransient(format!("the purge could not start: {e}")))?;
+    if !versioned {
         return Ok(0);
     }
     let mut cursor = PurgeCursor::parse(resumable_in(job, PURGE_PHASE).as_deref());
@@ -811,6 +831,9 @@ struct Reencrypt<'a> {
     config: &'a SharedConfig,
     bucket: &'a str,
     desired: Option<DesiredEncryption>,
+    /// The bucket's rule serves plaintext (it writes plaintext, or the
+    /// deprecated `serve`): its unsealed objects are never adopted.
+    serves: bool,
     /// The bucket's conversion marker for this run.
     marker: &'a super::conversion::JobMarker,
     adoptions: &'a super::conversion::Adoptions,
@@ -828,6 +851,7 @@ impl ObjectVisitor for Reencrypt<'_> {
             resolve_desired(&cfg, self.bucket)
                 .map_err(|e| format!("config changed mid-run: {e}"))?,
         );
+        self.serves = super::rule_serves_plaintext(&cfg, self.bucket);
         Ok(())
     }
 
@@ -850,7 +874,7 @@ impl ObjectVisitor for Reencrypt<'_> {
             return Visit::Skipped;
         }
         // Judged on this read (the backend's metadata, never a cache).
-        let adopted = super::conversion::adopted(self.marker, meta);
+        let adopted = super::conversion::adopted(self.marker, self.serves, key, meta);
         let req = ObjectTransferRequest {
             source_bucket: self.bucket,
             source_key: key,
@@ -1164,25 +1188,7 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
             Visit::Adopted { bytes } => {
                 self.c.done += 1;
                 self.c.bytes += bytes;
-                record_failure(
-                    self.db,
-                    self.job.id,
-                    key,
-                    &format!(
-                        "{}: converted, but clients could not read it (the backend stored it \
-                         after the conversion's cutoff, or names no time)",
-                        super::conversion::ADOPTED_AFTER_CUTOFF
-                    ),
-                )
-                .await?;
-                crate::audit::audit_log(
-                    "encryption_conversion_adopted_after_cutoff",
-                    "system",
-                    &format!("job:{}", self.job.id),
-                    &axum::http::HeaderMap::new(),
-                    &self.job.bucket,
-                    key,
-                );
+                record_adoption(self.db, self.job, key).await?;
             }
             Visit::Skipped => self.c.skipped += 1,
             Visit::Failed(reason) => {
@@ -1200,29 +1206,33 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
 /// ReferenceCache (keyed by content) stays valid. The check and the
 /// rewrite run under the deltaspace's prefix lock AND the cross-instance
 /// reference lock (`with_dest_prefix_lock`), like every reference write.
+/// `Ok(true)`: rewritten, and `adopted` judged the reference's job read
+/// adopted (a client could not read it: it is reported like an object).
 async fn rewrite_reference_if_needed(
     engine: &crate::deltaglider::DynEngine,
     bucket: &str,
     prefix: &str,
     desired: &DesiredEncryption,
-) -> Result<(), String> {
-    let res: Result<(), crate::deltaglider::EngineError> = engine
+    adopted: impl Fn(&crate::types::FileMetadata) -> bool,
+) -> Result<bool, String> {
+    let res: Result<bool, crate::deltaglider::EngineError> = engine
         .with_dest_prefix_lock(bucket, prefix, || async {
             let storage = engine.storage();
             if !storage.has_reference(bucket, prefix).await? {
-                return Ok(());
+                return Ok(false);
             }
             let meta = storage.get_reference_metadata(bucket, prefix).await?;
             if !needs_rewrite(&meta.user_metadata, desired) {
-                return Ok(());
+                return Ok(false);
             }
+            let was_adopted = adopted(&meta);
             let data = engine.get_reference_raw(bucket, prefix).await?;
             let mut new_meta = meta;
             strip_encryption_markers(&mut new_meta.user_metadata);
             engine
                 .put_reference_raw(bucket, prefix, &bytes::Bytes::from(data), &new_meta)
                 .await?;
-            Ok(())
+            Ok(was_adopted)
         })
         .await;
     res.map_err(|e| format!("reference rewrite failed for {bucket}/{prefix}: {e}"))
@@ -1487,6 +1497,41 @@ pub(crate) async fn record_failure(
             job_id, e
         );
     }
+    Ok(())
+}
+
+/// Report one object (or reference) `key` that the conversion job
+/// converted although a client could not read it: counted in the job row,
+/// sampled in the failure ring, audited.
+async fn record_adoption(
+    db: &Arc<Mutex<JobsDb>>,
+    job: &MaintenanceJob,
+    key: &str,
+) -> Result<(), PhaseStop> {
+    stop_if_shutting_down()?;
+    let note = format!(
+        "{}: converted, but clients could not read it (no conversion window of this job's run, \
+         or the backend stored it after the conversion's cutoff, or names no time)",
+        super::conversion::ADOPTED_AFTER_CUTOFF
+    );
+    if let Err(e) = db
+        .lock()
+        .await
+        .maintenance_record_adoption(job.id, key, &note)
+    {
+        warn!(
+            "maintenance: adoption record failed for job #{}: {}",
+            job.id, e
+        );
+    }
+    crate::audit::audit_log(
+        "encryption_conversion_adopted_after_cutoff",
+        "system",
+        &format!("job:{}", job.id),
+        &axum::http::HeaderMap::new(),
+        &job.bucket,
+        key,
+    );
     Ok(())
 }
 

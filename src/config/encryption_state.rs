@@ -261,6 +261,14 @@ pub fn starts_conversion(
     }
 }
 
+/// Pure: does a bucket stop encrypting with a proxy key from `before` to
+/// `after` (write encryptions)? Its conversion marker, if any, then
+/// closes: a later start must not find a window with an old cutoff.
+pub fn stops_encryption(before: Option<&WriteEncryption>, after: Option<&WriteEncryption>) -> bool {
+    let proxy_key = |w: &WriteEncryption| w.mode == "aes256-gcm-proxy" && !w.refuses_writes();
+    before.is_some_and(proxy_key) && !after.is_some_and(proxy_key)
+}
+
 impl Config {
     /// The write encryption of a configured bucket name, or `None` when it
     /// routes to an undefined backend.
@@ -379,6 +387,31 @@ impl Config {
                 };
                 let before = read_form(old, name, held.as_deref());
                 starts_conversion(before.as_ref().map(|(w, s)| (w, *s)), (&after.0, after.1))
+            })
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect()
+    }
+
+    /// The `listed` buckets (name, the backend that holds it) that this
+    /// config stops encrypting with a proxy key, compared with `old`
+    /// ([`stops_encryption`]): an apply closes their conversion markers.
+    pub fn buckets_stopping_encryption(
+        &self,
+        old: &Config,
+        listed: &[(String, Option<String>)],
+    ) -> Vec<String> {
+        let write = |c: &Config, name: &str, held: Option<&str>| {
+            c.encryption_for_listed_bucket(name, held)
+                .map(|e| e.write_encryption())
+        };
+        listed
+            .iter()
+            .filter(|(name, _)| !name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX))
+            .filter(|(name, held)| {
+                stops_encryption(
+                    write(old, name, held.as_deref()).as_ref(),
+                    write(self, name, held.as_deref()).as_ref(),
+                )
             })
             .map(|(name, _)| name.to_ascii_lowercase())
             .collect()
@@ -680,6 +713,26 @@ mod tests {
         // After: no usable proxy key.
         for after in [&none, &sse, &keyless] {
             assert!(!starts_conversion(Some((&none, false)), (after, false)));
+        }
+    }
+
+    /// The truth table of [`stops_encryption`]: from a usable proxy key to
+    /// anything else.
+    #[test]
+    fn a_marker_closes_where_the_proxy_key_goes_away() {
+        let aes = w("aes256-gcm-proxy", Some("a"));
+        let aes_b = w("aes256-gcm-proxy", Some("b"));
+        let keyless = w("aes256-gcm-proxy", None);
+        let none = w("none", None);
+        let sse = w("sse-s3", None);
+        for after in [Some(&none), Some(&sse), Some(&keyless), None] {
+            assert!(stops_encryption(Some(&aes), after), "{after:?}");
+        }
+        // A rotation keeps the window; plaintext before stops nothing.
+        assert!(!stops_encryption(Some(&aes), Some(&aes_b)));
+        assert!(!stops_encryption(Some(&aes), Some(&aes)));
+        for before in [Some(&none), Some(&sse), Some(&keyless), None] {
+            assert!(!stops_encryption(before, Some(&none)), "{before:?}");
         }
     }
 

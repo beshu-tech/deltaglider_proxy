@@ -487,13 +487,17 @@ impl Config {
     /// For the apply response: one note per configured bucket whose
     /// effective write encryption (mode and key id) changes from `old`.
     /// Existing objects keep the form they were written in; the
-    /// re-encrypt job rewrites them. Migrate's transient routes are skipped.
-    pub fn bucket_encryption_notes(&self, old: &Config) -> Vec<String> {
+    /// re-encrypt job rewrites them. Migrate's transient routes are skipped,
+    /// and so are the buckets in `converting` (the apply started their
+    /// conversion and queued the job itself).
+    pub fn bucket_encryption_notes(&self, old: &Config, converting: &[&str]) -> Vec<String> {
         let names: std::collections::BTreeSet<&String> =
             self.buckets.keys().chain(old.buckets.keys()).collect();
         let mut notes = Vec::new();
         for name in names {
-            if name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX) {
+            if name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX)
+                || converting.iter().any(|c| c.eq_ignore_ascii_case(name))
+            {
                 continue;
             }
             let (Some(before), Some(after)) = (

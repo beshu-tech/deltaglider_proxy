@@ -1388,15 +1388,20 @@ impl StorageBackend for S3Backend {
     ) -> Result<crate::storage::VersionPurgePage, crate::storage::StorageError> {
         self.purge_plaintext_page(bucket, cursor).await
     }
-    async fn bucket_versioning(&self, bucket: &str) -> Option<bool> {
+    async fn bucket_versioning(&self, bucket: &str) -> Result<bool, StorageError> {
         let out = self
             .client
             .get_bucket_versioning()
             .bucket(bucket)
             .send()
             .await
-            .ok()?;
-        Some(out.status().is_some())
+            .map_err(|e| {
+                StorageError::Other(format!(
+                    "GetBucketVersioning of '{bucket}' failed: {}",
+                    aws_sdk_s3::error::DisplayErrorContext(&e)
+                ))
+            })?;
+        Ok(out.status().is_some())
     }
 
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {

@@ -88,6 +88,60 @@ async fn test_config_apply_happy_path() {
     );
 }
 
+/// Review X4: `config apply` prints the warnings that the running config
+/// already produces (`existing_warnings`), so the `plaintext_reads: serve`
+/// deprecation shows on every apply, also one that changes nothing.
+#[tokio::test]
+async fn test_config_apply_prints_the_existing_warnings() {
+    let server = TestServer::builder()
+        .auth("CLIWARNK", "CLIWARNS")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let admin = common::admin_http_client(&endpoint).await;
+    let resp = admin
+        .put(format!("{endpoint}/_/api/admin/config/section/storage"))
+        .json(&serde_json::json!({ "backend_encryption": {
+            "mode": "aes256-gcm-proxy",
+            "key": "11".repeat(32),
+            "key_id": "cli-warn",
+            "plaintext_reads": "serve",
+        }}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    let exported = admin
+        .get(format!("{endpoint}/_/api/admin/config/export"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let yaml_path = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(yaml_path.path(), exported).unwrap();
+    let output = Command::new(BIN)
+        .current_dir(std::env::temp_dir())
+        .args([
+            "config",
+            "apply",
+            yaml_path.path().to_str().unwrap(),
+            "--server",
+            &endpoint,
+        ])
+        .env("DGP_BOOTSTRAP_PASSWORD", TEST_PASSWORD)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("warning (already in the running config): ")
+            && stderr.contains("plaintext_reads: serve` is deprecated"),
+        "the deprecation of the running config is printed: {stderr}"
+    );
+}
+
 #[tokio::test]
 async fn test_config_apply_missing_password_exits_7() {
     // With DGP_BOOTSTRAP_PASSWORD unset, the CLI must refuse to run and

@@ -215,19 +215,40 @@ pub(crate) fn prune_failure_ring(
     key: &dyn ToSql,
     max_retained: u32,
 ) -> Result<(), ConfigDbError> {
+    prune_failure_ring_except(conn, table, key_col, key, max_retained, None)
+}
+
+/// [`prune_failure_ring`] over the rows whose `except.0` column does NOT
+/// start with `except.1`: those rows are bounded elsewhere, and neither
+/// count toward `max_retained` nor are deleted here.
+pub(crate) fn prune_failure_ring_except(
+    conn: &Connection,
+    table: &str,
+    key_col: &str,
+    key: &dyn ToSql,
+    max_retained: u32,
+    except: Option<(&str, &str)>,
+) -> Result<(), ConfigDbError> {
     check_idents(&[table, key_col])?;
+    let (filter, prefix) = match except {
+        Some((col, prefix)) => {
+            check_idents(&[col])?;
+            (format!("AND substr({col}, 1, length(?4)) != ?4"), prefix)
+        }
+        None => ("AND ?4 IS NOT NULL".to_string(), ""),
+    };
     let deleted = conn.execute(
         &format!(
             "DELETE FROM {table}
-              WHERE {key_col} = ?1
+              WHERE {key_col} = ?1 {filter}
                 AND id NOT IN (
                     SELECT id FROM {table}
-                    WHERE {key_col} = ?2
+                    WHERE {key_col} = ?2 {filter}
                     ORDER BY id DESC
                     LIMIT ?3
                 )"
         ),
-        params![key, key, max_retained],
+        params![key, key, max_retained, prefix],
     )?;
     if deleted > 0 {
         super::reclaim_free_pages(conn);

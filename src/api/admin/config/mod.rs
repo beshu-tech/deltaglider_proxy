@@ -24,7 +24,7 @@
 //! `document_level::config_defaults`) agree on the wire-level name
 //! spelling and 404 message.
 
-mod conversion_start;
+pub(crate) mod conversion_start;
 pub mod document_level;
 pub mod field_level;
 pub mod password;

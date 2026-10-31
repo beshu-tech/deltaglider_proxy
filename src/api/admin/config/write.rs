@@ -287,12 +287,9 @@ pub(super) async fn run(
                         if write.surface.section().is_some() {
                             p.warnings.preview = declarative_preview(state, &old, &p.new_cfg).await;
                         }
-                        p.warnings.check_new.extend(
-                            conversions
-                                .iter()
-                                .filter(|c| c.versioned)
-                                .map(|c| super::conversion_start::versioning_warning(&c.bucket)),
-                        );
+                        p.warnings.check_new.extend(conversions.iter().filter_map(
+                            super::conversion_start::ConversionPreview::versioning_warning,
+                        ));
                         Outcome::Validated {
                             warnings: p.warnings,
                             restart: p.restart,

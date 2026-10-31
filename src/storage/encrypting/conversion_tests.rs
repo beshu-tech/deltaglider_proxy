@@ -6,7 +6,7 @@
 
 use super::conversion::{
     self, by_identity, open, open_fields, open_or_reuse, seal, ByIdentity, Fields, MarkerIo,
-    OpenOutcome, Window, WindowCache,
+    OpenMode, OpenOutcome, Window, WindowCache,
 };
 use super::seal::Keyring;
 use super::*;
@@ -309,7 +309,7 @@ async fn a_close_blocked_by_a_foreign_re_put_is_not_ours() {
     let ours = seal(&site, RELEASES, &fields(100, 200, 1)).unwrap();
     let io = Scripted::holding(150, ours);
     io.before_write(|s| *s = Some((b"planted by a backend writer".to_vec(), 9)));
-    let got = by_identity(&io, &ring, Some(&site), RELEASES, &[1; 16], close)
+    let got = by_identity(&io, &ring, Some(&site), RELEASES, Some(&[1; 16]), close)
         .await
         .unwrap();
     assert_eq!(got, ByIdentity::NotOurs);
@@ -321,7 +321,7 @@ async fn a_close_blocked_by_a_foreign_re_put_is_not_ours() {
 
     // A foreign marker from the start: not even a write.
     let io = Scripted::holding(150, b"garbage".to_vec());
-    let got = by_identity(&io, &ring, Some(&site), RELEASES, &[1; 16], close)
+    let got = by_identity(&io, &ring, Some(&site), RELEASES, Some(&[1; 16]), close)
         .await
         .unwrap();
     assert_eq!((got, io.writes()), (ByIdentity::NotOurs, 0));
@@ -330,7 +330,7 @@ async fn a_close_blocked_by_a_foreign_re_put_is_not_ours() {
     // Another run's marker: NotOurs, kept.
     let theirs = seal(&site, RELEASES, &fields(100, 200, 2)).unwrap();
     let io = Scripted::holding(150, theirs.clone());
-    let got = by_identity(&io, &ring, Some(&site), RELEASES, &[1; 16], close)
+    let got = by_identity(&io, &ring, Some(&site), RELEASES, Some(&[1; 16]), close)
         .await
         .unwrap();
     assert_eq!((got, io.body()), (ByIdentity::NotOurs, Some(theirs)));
@@ -344,7 +344,7 @@ async fn a_lost_condition_reads_again_and_retries() {
     let ours = seal(&site, RELEASES, &fields(100, 200, 1)).unwrap();
     let io = Scripted::holding(150, ours.clone());
     io.before_write(move |s| *s = Some((ours, 7)));
-    let got = by_identity(&io, &ring, Some(&site), RELEASES, &[1; 16], close)
+    let got = by_identity(&io, &ring, Some(&site), RELEASES, Some(&[1; 16]), close)
         .await
         .unwrap();
     assert_eq!(got, ByIdentity::Done(None, String::new()));
@@ -361,7 +361,7 @@ async fn a_condition_lost_every_time_is_blocked() {
         let body = ours.clone();
         io.before_write(move |s| *s = Some((body, 50 + v)));
     }
-    let got = by_identity(&io, &ring, Some(&site), RELEASES, &[1; 16], close)
+    let got = by_identity(&io, &ring, Some(&site), RELEASES, Some(&[1; 16]), close)
         .await
         .unwrap();
     assert_eq!(got, ByIdentity::Blocked);
@@ -373,7 +373,7 @@ async fn a_condition_lost_every_time_is_blocked() {
 async fn an_absent_marker_is_absent() {
     let (ring, site) = ring(&[("k", 0x11)]);
     let io = Scripted::at(150);
-    let got = by_identity(&io, &ring, Some(&site), RELEASES, &[1; 16], close)
+    let got = by_identity(&io, &ring, Some(&site), RELEASES, Some(&[1; 16]), close)
         .await
         .unwrap();
     assert_eq!((got, io.writes()), (ByIdentity::Absent, 0));
@@ -386,7 +386,7 @@ async fn an_extension_keeps_cutoff_and_run() {
     let (ring, site) = ring(&[("k", 0x11)]);
     let f = fields(100, 200, 1);
     let io = Scripted::holding(500, seal(&site, RELEASES, &f).unwrap());
-    let got = by_identity(&io, &ring, Some(&site), RELEASES, &f.run, |f| {
+    let got = by_identity(&io, &ring, Some(&site), RELEASES, Some(&f.run), |f| {
         Some(Fields {
             deadline: 900,
             ..*f
@@ -406,14 +406,14 @@ async fn an_extension_keeps_cutoff_and_run() {
 async fn open_or_reuse_creates_once_and_reuses() {
     let (ring, site) = ring(&[("k", 0x11)]);
     let io = Scripted::at(1_000);
-    let created = open_or_reuse(&io, &ring, &site, RELEASES, 600)
+    let created = open_or_reuse(&io, &ring, &site, RELEASES, 600, OpenMode::Resume)
         .await
         .unwrap();
     let OpenOutcome::Created(f, _) = created else {
         panic!("{created:?}")
     };
     assert_eq!((f.cutoff, f.deadline), (1_000, 1_600), "server clock");
-    let again = open_or_reuse(&io, &ring, &site, RELEASES, 600)
+    let again = open_or_reuse(&io, &ring, &site, RELEASES, 600, OpenMode::Resume)
         .await
         .unwrap();
     assert!(
@@ -427,7 +427,7 @@ async fn open_or_reuse_creates_once_and_reuses() {
     let theirs = fields(990, 5_000, 4);
     let body = seal(&site, RELEASES, &theirs).unwrap();
     io.before_write(move |s| *s = Some((body, 3)));
-    let got = open_or_reuse(&io, &ring, &site, RELEASES, 600)
+    let got = open_or_reuse(&io, &ring, &site, RELEASES, 600, OpenMode::Resume)
         .await
         .unwrap();
     assert!(
@@ -435,21 +435,103 @@ async fn open_or_reuse_creates_once_and_reuses() {
         "{got:?}"
     );
 
-    // Past its deadline: Expired, never replaced (its cutoff must stay).
-    let old = seal(&site, RELEASES, &fields(10, 20, 5)).unwrap();
+    // Past its deadline: a Resume keeps it as it is (the job of its run
+    // extends the deadline and keeps the cutoff).
+    let old_fields = fields(10, 20, 5);
+    let old = seal(&site, RELEASES, &old_fields).unwrap();
     let io = Scripted::holding(1_000, old.clone());
-    let got = open_or_reuse(&io, &ring, &site, RELEASES, 600)
+    let got = open_or_reuse(&io, &ring, &site, RELEASES, 600, OpenMode::Resume)
         .await
         .unwrap();
-    assert!(matches!(got, OpenOutcome::Expired(_)), "{got:?}");
+    assert!(
+        matches!(got, OpenOutcome::Reused(g, _) if g == old_fields),
+        "{got:?}"
+    );
     assert_eq!((io.writes(), io.body()), (0, Some(old)));
 
-    // Foreign: never overwritten.
-    let io = Scripted::holding(1_000, b"junk".to_vec());
-    let got = open_or_reuse(&io, &ring, &site, RELEASES, 600)
+    // Foreign: never overwritten, in either mode.
+    for mode in [OpenMode::Resume, OpenMode::Refresh] {
+        let io = Scripted::holding(1_000, b"junk".to_vec());
+        let got = open_or_reuse(&io, &ring, &site, RELEASES, 600, mode)
+            .await
+            .unwrap();
+        assert_eq!((got, io.writes()), (OpenOutcome::Foreign, 0));
+    }
+}
+
+/// Review S3/C1: a conversion that STARTS over a marker of this bucket
+/// (open, expired, or a leftover) keeps its run id but gets the cutoff
+/// "now" and a new deadline, by identity: an old cutoff would refuse
+/// what the bucket stored as plaintext since.
+#[tokio::test]
+async fn a_start_refreshes_a_leftover_marker_with_a_new_cutoff() {
+    let (ring, site) = ring(&[("k", 0x11)]);
+    for old in [fields(10, 20, 5), fields(900, 5_000, 5)] {
+        let io = Scripted::holding(1_000, seal(&site, RELEASES, &old).unwrap());
+        let got = open_or_reuse(&io, &ring, &site, RELEASES, 600, OpenMode::Refresh)
+            .await
+            .unwrap();
+        let fresh = fields(1_000, 1_600, 5);
+        assert!(
+            matches!(&got, OpenOutcome::Refreshed(g, _) if *g == fresh),
+            "{got:?}"
+        );
+        assert_eq!(io.writes(), 1, "one conditional replace");
+        assert_eq!(
+            open_fields(&io.body().unwrap(), &ring, RELEASES),
+            Some(fresh)
+        );
+    }
+    // No marker: created.
+    let io = Scripted::at(1_000);
+    let got = open_or_reuse(&io, &ring, &site, RELEASES, 600, OpenMode::Refresh)
         .await
         .unwrap();
-    assert_eq!((got, io.writes()), (OpenOutcome::Foreign, 0));
+    assert!(matches!(got, OpenOutcome::Created(..)), "{got:?}");
+}
+
+/// Review C2: a create whose answer was lost (a timeout, then a 412 on
+/// the retry) finds the marker of the run that this call generated: it
+/// is `Created` (so the apply compensates it), never `Reused`.
+#[tokio::test]
+async fn a_lost_answer_to_our_own_create_is_created() {
+    /// The create lands, but the caller sees a lost condition (the SDK
+    /// retried after a timeout and got a 412), or an error.
+    struct LostAnswer {
+        inner: Scripted,
+        error: bool,
+    }
+    impl MarkerIo for LostAnswer {
+        async fn read(&self) -> Result<MarkerRead, StorageError> {
+            self.inner.read().await
+        }
+        async fn write(&self, op: MarkerWrite<'_>) -> Result<ClaimOutcome, StorageError> {
+            self.inner.write(op).await?;
+            if self.error {
+                Err(StorageError::Other("timed out".into()))
+            } else {
+                Ok(ClaimOutcome::Lost)
+            }
+        }
+    }
+    let (ring, site) = ring(&[("k", 0x11)]);
+    for (mode, error) in [
+        (OpenMode::Refresh, false),
+        (OpenMode::Resume, false),
+        (OpenMode::Refresh, true),
+    ] {
+        let io = LostAnswer {
+            inner: Scripted::at(1_000),
+            error,
+        };
+        let got = open_or_reuse(&io, &ring, &site, RELEASES, 600, mode).await;
+        let stored = open_fields(&io.inner.body().unwrap(), &ring, RELEASES).unwrap();
+        assert!(
+            matches!(&got, Ok(OpenOutcome::Created(f, _)) if *f == stored),
+            "{mode:?} error={error}: {got:?}"
+        );
+        assert_eq!(io.inner.writes(), 1, "never a second write");
+    }
 }
 
 // ── Cache ──
@@ -543,7 +625,10 @@ async fn the_wrapper_opens_reuses_and_closes_by_identity() {
     let rig = Rig::new(encrypting(0xaa, "releases-2026")).await;
     let a = rig.wrapper("local-disk", None).await;
     assert_eq!(a.window_of("releases").await, Window::Closed);
-    let run = a.open_conversion("releases", 7).await.unwrap();
+    let run = a
+        .open_conversion_secs("releases", 7 * 86_400)
+        .await
+        .unwrap();
     let Window::Open {
         cutoff, deadline, ..
     } = a.window_of("releases").await
@@ -552,7 +637,12 @@ async fn the_wrapper_opens_reuses_and_closes_by_identity() {
     };
     assert_eq!(deadline - cutoff, 7 * 86_400);
     // Idempotent: a second open reuses the marker and its cutoff.
-    assert_eq!(a.open_conversion("releases", 3).await.unwrap(), run);
+    assert_eq!(
+        a.open_conversion_secs("releases", 3 * 86_400)
+            .await
+            .unwrap(),
+        run
+    );
 
     // A peer node (same backend name, fresh cache) sees the window.
     let b = rig.wrapper("local-disk", None).await;
@@ -605,7 +695,7 @@ async fn a_refusal_picks_up_a_window_opened_elsewhere() {
     let a = rig.wrapper("local-disk", None).await;
     let b = rig.wrapper("local-disk", None).await;
     assert_eq!(b.window_of("releases").await, Window::Closed);
-    a.open_conversion("releases", 1).await.unwrap();
+    a.open_conversion_secs("releases", 86_400).await.unwrap();
     assert_eq!(b.window_of("releases").await, Window::Closed, "cached");
     assert!(b.refresh_after_refusal("releases").await.is_open());
 }
@@ -614,10 +704,13 @@ async fn a_refusal_picks_up_a_window_opened_elsewhere() {
 async fn a_bucket_that_writes_plaintext_has_no_conversion() {
     let rig = Rig::new(EncryptionConfig::default()).await;
     let a = rig.wrapper("local-disk", None).await;
-    let e = a.open_conversion("releases", 7).await.unwrap_err();
-    assert!(e.to_string().contains("writes plaintext"), "{e}");
-    let e = a.open_conversion("releases", 0).await.unwrap_err();
-    assert!(e.to_string().contains("1 to 365 days"), "{e}");
+    let e = a
+        .open_conversion_secs("releases", 7 * 86_400)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("does not encrypt"), "{e}");
+    let e = a.open_conversion_secs("releases", 0).await.unwrap_err();
+    assert!(e.to_string().contains("1 second to 365 days"), "{e}");
 }
 
 /// On S3 (the fake), the cutoff is the server's `Date`, the create is
@@ -677,7 +770,7 @@ async fn on_s3_the_marker_is_a_cas_object_with_the_server_clock() {
         .unwrap(),
         ClaimOutcome::Written
     );
-    let run = wrapper.open_conversion("b", 7).await.unwrap();
+    let run = wrapper.open_conversion_secs("b", 7 * 86_400).await.unwrap();
     let Window::Open { cutoff, .. } = wrapper.window_of("b").await else {
         panic!("open")
     };
@@ -713,7 +806,10 @@ async fn the_cached_status_follows_this_nodes_writes_and_keeps_an_expired_marker
     let rig = Rig::new(encrypting(0xaa, "releases-2026")).await;
     let a = rig.wrapper("local-disk", None).await;
     assert_eq!(cached_status(&a).await, MarkerState::Absent);
-    let run = a.open_conversion("releases", 7).await.unwrap();
+    let run = a
+        .open_conversion_secs("releases", 7 * 86_400)
+        .await
+        .unwrap();
     let MarkerState::Ours { fields, server_now } = cached_status(&a).await else {
         panic!("an open shows at once")
     };
@@ -743,4 +839,39 @@ async fn the_cached_status_follows_this_nodes_writes_and_keeps_an_expired_marker
     };
     assert_eq!(fields.run, run);
     assert!(server_now >= fields.deadline, "past its deadline");
+}
+
+/// Review C2: the read-back after a successful create fails. The marker is
+/// stored, so the open must still answer `Created` (with the run id and no
+/// version), or the apply's compensation never removes it.
+struct ReadBackFails {
+    inner: Scripted,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl MarkerIo for ReadBackFails {
+    async fn read(&self) -> Result<MarkerRead, StorageError> {
+        if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            return Err(StorageError::Other("read timed out".into()));
+        }
+        self.inner.read().await
+    }
+    async fn write(&self, op: MarkerWrite<'_>) -> Result<ClaimOutcome, StorageError> {
+        self.inner.write(op).await
+    }
+}
+
+#[tokio::test]
+async fn a_failed_read_back_still_counts_as_created() {
+    let (ring, site) = ring(&[("k", 0x11)]);
+    let io = ReadBackFails {
+        inner: Scripted::at(1_000),
+        reads: 0.into(),
+    };
+    let got = open_or_reuse(&io, &ring, &site, RELEASES, 600, OpenMode::Resume).await;
+    let stored = open_fields(&io.inner.body().unwrap(), &ring, RELEASES).unwrap();
+    assert!(
+        matches!(&got, Ok(OpenOutcome::Created(f, v)) if *f == stored && v.is_empty()),
+        "open returned {got:?} but left the marker {stored:?} behind"
+    );
 }

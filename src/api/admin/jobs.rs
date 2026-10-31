@@ -1583,6 +1583,7 @@ mod tests {
             started_at: Some(2),
             finished_at: Some(3),
             updated_at: 3,
+            objects_adopted: 0,
         }
     }
 

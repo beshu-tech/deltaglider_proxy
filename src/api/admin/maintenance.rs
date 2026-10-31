@@ -26,6 +26,7 @@ use crate::api::admin::extract::AdminJson;
 use crate::maintenance::migrate::{pick_transient_key, MigrateParams, MigrateTarget};
 use crate::maintenance::store::{current_unix_seconds, CancelOutcome, MaintenanceJob};
 use crate::maintenance::{display_percent, resolve_desired};
+use crate::storage::encrypting::conversion::OpenMode;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -160,90 +161,89 @@ pub async fn start_reencrypt(
     headers: HeaderMap,
     AdminJson(req): AdminJson<ReencryptRequest>,
 ) -> Result<Json<ReencryptResponse>, AdminError> {
+    use crate::maintenance::conversion::{
+        close_opened, open_window, queue_reencrypt, NotQueued, OpenedWindow, QueuedReencrypt,
+        ReencryptParams,
+    };
     let (db, real, buckets) = check_job_request(&state, req.buckets).await?;
 
-    let params = crate::maintenance::conversion::ReencryptParams {
-        purge_plaintext_versions: req.purge_plaintext_versions,
-    }
-    .to_json();
+    let engine = state.s3_state.engine.load_full();
     let cfg = state.config.read().await;
-    let mut started = Vec::new();
     let mut errors = Vec::new();
+    // The jobs to queue, with the bucket as the request named it and the
+    // window that this request opened for it.
+    let mut requests = Vec::new();
+    let mut origins: Vec<(String, Option<OpenedWindow>)> = Vec::new();
     for bucket in &buckets {
         let key = bucket.to_ascii_lowercase();
+        let refuse = |error: String| ReencryptError {
+            bucket: bucket.to_string(),
+            error,
+        };
         if !real.contains(&key) {
-            errors.push(ReencryptError {
-                bucket: bucket.to_string(),
-                error: "bucket not found".into(),
-            });
+            errors.push(refuse("bucket not found".into()));
             continue;
         }
         if let Err(reason) = resolve_desired(&cfg, &key) {
-            errors.push(ReencryptError {
-                bucket: bucket.to_string(),
-                error: reason,
-            });
+            errors.push(refuse(reason));
             continue;
         }
+        let mut opened = None;
         if req.open_window {
-            let engine = state.s3_state.engine.load().clone();
-            if let Err(e) =
-                crate::maintenance::conversion::open_window(&engine, &key, "admin").await
-            {
-                errors.push(ReencryptError {
-                    bucket: bucket.to_string(),
-                    error: format!("could not open the conversion window: {e}"),
-                });
-                continue;
+            // An active job first: never open a window for a job that
+            // cannot be queued.
+            match db.lock().await.maintenance_active_job_for_bucket(&key) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    errors.push(refuse(ALREADY_ACTIVE.into()));
+                    continue;
+                }
+                Err(e) => {
+                    errors.push(refuse(format!("could not read the active jobs: {e}")));
+                    continue;
+                }
+            }
+            match open_window(&engine, &key, OpenMode::Resume, "admin").await {
+                Ok(w) => opened = Some(w),
+                Err(e) => {
+                    errors.push(refuse(format!("could not open the conversion window: {e}")));
+                    continue;
+                }
             }
         }
-        let created = {
-            let db = db.lock().await;
-            let created = db.maintenance_create_job(
-                "reencrypt",
-                &key,
-                "counting",
-                params.as_deref(),
-                "admin",
-                current_unix_seconds(),
-            );
-            // Gate from CREATION: no create→claim window for writes.
-            state.s3_state.maintenance_gate.sync_from(&db);
-            created
-        };
-        match created {
-            Ok(Some(job_id)) => {
-                started.push(ReencryptStarted {
-                    bucket: bucket.to_string(),
-                    job_id,
-                });
-            }
-            Ok(None) => errors.push(ReencryptError {
-                bucket: bucket.to_string(),
-                error: "a maintenance job is already active for this bucket".into(),
-            }),
-            Err(e) => errors.push(ReencryptError {
-                bucket: bucket.to_string(),
-                error: format!("failed to create job: {e}"),
-            }),
-        }
+        requests.push(QueuedReencrypt {
+            bucket: key,
+            params: ReencryptParams {
+                purge_plaintext_versions: req.purge_plaintext_versions,
+                // Only a job with the marker's run extends and closes it.
+                run: opened.map(|w| w.run),
+            },
+        });
+        origins.push((bucket.to_string(), opened));
     }
+    let results = queue_reencrypt(&state.s3_state, db, &requests, "admin", &headers).await;
     drop(cfg);
 
-    if !started.is_empty() {
-        crate::maintenance::wake_workers(&state.s3_state.maintenance_notify);
-        let names: Vec<&str> = started.iter().map(|s| s.bucket.as_str()).collect();
-        info!("maintenance: re-encrypt requested for {:?}", names);
-        let what = if req.purge_plaintext_versions {
-            format!("{} (purge plaintext versions)", names.join(","))
-        } else {
-            names.join(",")
+    let mut started = Vec::new();
+    for ((result, (bucket, opened)), q) in results.into_iter().zip(origins).zip(&requests) {
+        let error = match result {
+            Ok(job_id) => {
+                started.push(ReencryptStarted { bucket, job_id });
+                continue;
+            }
+            Err(NotQueued::Active) => ALREADY_ACTIVE.to_string(),
+            Err(NotQueued::Failed(e)) => format!("failed to create job: {e}"),
         };
-        super::audit_log("maintenance_reencrypt_requested", "admin", &what, &headers);
+        // The window this request opened is for a job that does not exist.
+        if let Some(w) = opened.filter(|w| w.created) {
+            close_opened(&engine, &q.bucket, w.run, "the job could not be queued").await;
+        }
+        errors.push(ReencryptError { bucket, error });
     }
-
     Ok(Json(ReencryptResponse { started, errors }))
 }
+
+const ALREADY_ACTIVE: &str = "a maintenance job is already active for this bucket";
 
 #[derive(Debug, Deserialize)]
 pub struct BackfillRequest {
@@ -269,6 +269,11 @@ pub async fn start_backfill(
 
     // A backfill moves the stored time of the objects it stamps: in a
     // bucket in conversion it would push plaintext history past the cutoff.
+    // The config read lock is held from the marker check to the job
+    // creation: an apply opens a marker under the write lock, then queues
+    // its job; it either finds this backfill job active (409) or this
+    // check finds its marker.
+    let config_guard = state.config.read().await;
     let engine = state.s3_state.engine.load().clone();
     for bucket in &buckets {
         let key = bucket.to_ascii_lowercase();
@@ -333,6 +338,7 @@ pub async fn start_backfill(
             }),
         }
     }
+    drop(config_guard);
 
     if !started.is_empty() {
         crate::maintenance::wake_workers(&state.s3_state.maintenance_notify);

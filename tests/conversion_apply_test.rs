@@ -390,7 +390,10 @@ async fn an_existing_marker_is_reused() {
     let env = Env::new("applyreuse", &[]).await;
     env.put("applyreuse", "a.txt").await;
     let node = env.node().await;
-    let run = node.open_conversion("applyreuse", 7).await.unwrap();
+    let run = node
+        .open_conversion_secs("applyreuse", 7 * 86_400)
+        .await
+        .unwrap();
 
     let (code, v) = env.encrypt(false).await;
     assert_eq!(code, 200, "{v}");
@@ -657,5 +660,80 @@ async fn an_apply_with_the_purge_header_deletes_the_plaintext_versions() {
             .count(),
         0,
         "the plaintext versions are gone: {versions:?}"
+    );
+}
+
+/// Review S3/C1: an apply that makes a bucket stop encrypting closes its
+/// marker, and an apply that starts a conversion over a marker that is
+/// still there (a leftover: here a backend writer puts the old one back)
+/// keeps its run id but gets a NEW cutoff, so objects that the bucket
+/// wrote as plaintext in between stay readable.
+#[tokio::test]
+async fn a_stale_marker_gets_a_new_cutoff_from_the_next_apply() {
+    let env = Env::new(
+        "applystale",
+        &[
+            ("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "1500"),
+            ("DGP_TEST_CONVERSION_GRACE_SECS", "0"),
+        ],
+    )
+    .await;
+    for i in 0..4 {
+        env.put("applystale", &format!("a-{i}.txt")).await;
+    }
+    let (code, v) = env.encrypt(false).await;
+    assert_eq!(code, 200, "{v}");
+    let job = v["conversions"][0]["job_id"].as_i64().unwrap();
+    let run1 = v["conversions"][0]["run"].as_str().unwrap().to_string();
+    let old_marker = std::fs::read(env.marker_file("applystale")).unwrap();
+    let r = env
+        .admin
+        .post(format!(
+            "{}/_/api/admin/jobs/maintenance:{job}/cancel",
+            env.server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    env.wait_done("applystale").await;
+    // Decrypt (the operator rolls back).
+    let resp = env
+        .admin
+        .put(format!(
+            "{}/_/api/admin/config/section/storage",
+            env.server.endpoint()
+        ))
+        .header(
+            "x-dgp-confirm-encryption-downgrade",
+            "backend:default,route:default,applystale",
+        )
+        .json(&json!({ "backend_encryption": { "mode": "none" } }))
+        .send()
+        .await
+        .unwrap();
+    let code = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or_default();
+    assert_eq!(code, 200, "decrypt: {body}");
+    assert!(
+        !env.marker_file("applystale").exists(),
+        "the apply that stops the encryption closes the marker"
+    );
+    // A leftover marker (a node that could not close it, a replay).
+    std::fs::write(env.marker_file("applystale"), &old_marker).unwrap();
+    env.put("applystale", "z-new.txt").await;
+    assert!(env.plaintext("applystale", "z-new.txt"));
+    // The cutoff is in whole seconds, and the grace is 0 here.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (code, v) = env.encrypt(false).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["conversions"][0]["reused"], true, "{v}");
+    assert_eq!(v["conversions"][0]["run"], run1.as_str(), "{v}");
+    let got = env.get("applystale", "z-new.txt").await;
+    assert_eq!(
+        got.0,
+        200,
+        "an object the bucket wrote as plaintext before this apply must read: {}",
+        String::from_utf8_lossy(&got.1)
     );
 }

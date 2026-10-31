@@ -77,6 +77,24 @@ pub enum DesiredEncryption {
     Proxy { key_id: String },
 }
 
+/// Does the read rule of `bucket` serve every unsealed object
+/// (`seal::PlaintextRule::Serves`)? Yes when the bucket does not encrypt
+/// with a proxy key, or encrypts with the deprecated
+/// `plaintext_reads: serve`. The conversion job adopts silently only
+/// there; in a bucket that encrypts it reports every unsealed object that
+/// a client could not read.
+pub fn rule_serves_plaintext(config: &Config, bucket: &str) -> bool {
+    match config.encryption_for_bucket(bucket) {
+        None => false,
+        Some(resolved) => match &resolved.config {
+            BackendEncryptionConfig::Aes256GcmProxy { .. } => {
+                resolved.site_keys().primary.is_none() || resolved.config.serves_plaintext()
+            }
+            _ => true,
+        },
+    }
+}
+
 /// Resolve the bucket's desired at-rest state from the config.
 ///
 /// Reads the bucket's encryption through `Config::encryption_for_bucket`

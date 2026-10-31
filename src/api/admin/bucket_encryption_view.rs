@@ -217,11 +217,10 @@ pub async fn attach_conversions(
         })
         .map(|(b, _)| b.to_ascii_lowercase())
         .collect();
-    let mut markers = std::collections::HashMap::new();
-    for chunk in wanted.chunks(8) {
-        let states = futures::future::join_all(chunk.iter().map(|b| marker_state(engine, b))).await;
-        markers.extend(chunk.iter().cloned().zip(states));
-    }
+    let states =
+        super::config::conversion_start::in_parallel(&wanted, |b| marker_state(engine, b)).await;
+    let markers: std::collections::HashMap<String, _> =
+        wanted.iter().cloned().zip(states).collect();
     let db = match jobs_db {
         Some(db) if !markers.is_empty() => Some(db.lock().await),
         _ => None,
@@ -236,15 +235,7 @@ pub async fn attach_conversions(
             .as_ref()
             .and_then(|db| db.maintenance_latest_job_for_bucket(&key, "reencrypt").ok())
             .flatten();
-        let adopted = match (&db, &job) {
-            (Some(db), Some(j)) => db
-                .maintenance_count_failures_with_prefix(
-                    j.id,
-                    crate::maintenance::conversion::ADOPTED_AFTER_CUTOFF,
-                )
-                .unwrap_or(0),
-            _ => 0,
-        };
+        let adopted = job.as_ref().map_or(0, |j| j.objects_adopted);
         let view = eff.conversion.get_or_insert_with(Default::default);
         view.open = *server_now < fields.deadline;
         view.cutoff = Some(fields.cutoff);

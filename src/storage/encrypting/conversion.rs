@@ -214,33 +214,63 @@ impl<B: crate::storage::StorageBackend + Sync> MarkerIo for OnBackend<'_, B> {
     }
 }
 
+/// How an open treats a marker of this bucket that is already there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Keep it as it is, also past its deadline: the run id, the cutoff
+    /// and the deadline stay, and the job of that run extends the deadline
+    /// (`POST /jobs/reencrypt {open_window: true}`, the Resume).
+    Resume,
+    /// A conversion STARTS (an apply or a boot found that the bucket did
+    /// not encrypt before): rewrite it by identity with the same run id,
+    /// a cutoff of the backend's clock now and a new deadline. An old
+    /// cutoff would refuse what the bucket stored as plaintext since.
+    Refresh,
+}
+
 /// What opening a conversion found or did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenOutcome {
-    /// This call wrote a new marker.
+    /// This call wrote a new marker. The version is empty when the read
+    /// after the write failed: the marker is still this call's.
     Created(Fields, String),
-    /// A valid marker was there already (another node, or an earlier
-    /// apply): its window is kept, cutoff included.
+    /// A marker of this bucket was there ([`OpenMode::Resume`]): kept as
+    /// it is, also past its deadline.
     Reused(Fields, String),
-    /// A marker of this identity is there, but its deadline is past: only
-    /// a resume (extension by identity) may reopen it, with its original
-    /// cutoff.
-    Expired(Fields),
+    /// A marker of this bucket was there ([`OpenMode::Refresh`]): its run
+    /// id stays, its cutoff and deadline are new.
+    Refreshed(Fields, String),
     /// A marker is there that this proxy cannot open (another key, another
     /// format, edited): this proxy never overwrites it.
     Foreign,
 }
 
-/// Open a conversion of the bucket behind `io`: reuse a valid marker, or
-/// create one with `cutoff = now` on the backend clock and
-/// `deadline = cutoff + window_secs`. Lost creates read again.
+impl OpenOutcome {
+    /// The fields and version of the marker that the bucket holds now
+    /// (`None`: a foreign marker).
+    pub fn marker(&self) -> Option<(Fields, &str)> {
+        match self {
+            Self::Created(f, v) | Self::Reused(f, v) | Self::Refreshed(f, v) => Some((*f, v)),
+            Self::Foreign => None,
+        }
+    }
+}
+
+/// Open a conversion of the bucket behind `io` (see [`OpenMode`]), or
+/// create a marker with `cutoff = now` on the backend clock and
+/// `deadline = cutoff + window_secs`. Lost writes read again. A marker
+/// with the run id that this call generated is this call's (`Created`):
+/// a create whose answer was lost (a timeout, then a 412 on the retry)
+/// counts as written, so that the caller can remove it.
 pub(crate) async fn open_or_reuse(
     io: &impl MarkerIo,
     ring: &Keyring,
     site: &SiteKey,
     identity: &str,
     window_secs: i64,
+    mode: OpenMode,
 ) -> Result<OpenOutcome, StorageError> {
+    let run = fresh_run();
     for _ in 0..RETRIES {
         let read = io.read().await?;
         let now = read.server_now.ok_or_else(|| {
@@ -250,32 +280,67 @@ pub(crate) async fn open_or_reuse(
                     .into(),
             )
         })?;
-        if let Some(m) = read.marker {
-            return Ok(match open_fields(&m.content, ring, identity) {
-                Some(f) if now < f.deadline => OpenOutcome::Reused(f, m.version),
-                Some(f) => OpenOutcome::Expired(f),
-                None => OpenOutcome::Foreign,
-            });
-        }
-        let fields = Fields {
+        let fresh = Fields {
             cutoff: now,
             deadline: now.saturating_add(window_secs),
-            run: fresh_run(),
+            run,
         };
-        let body = seal(site, identity, &fields)?;
-        match io.write(MarkerWrite::Create(&body)).await? {
-            ClaimOutcome::Written => {
-                // The version a later identity write names: read it back.
-                let version = match io.read().await?.marker {
-                    Some(m) if m.content == body => m.version,
-                    _ => String::new(),
-                };
-                return Ok(OpenOutcome::Created(fields, version));
+        if let Some(m) = read.marker {
+            let Some(f) = open_fields(&m.content, ring, identity) else {
+                return Ok(OpenOutcome::Foreign);
+            };
+            if f.run == run {
+                return Ok(OpenOutcome::Created(f, m.version));
             }
-            ClaimOutcome::Lost => continue,
+            if mode == OpenMode::Resume {
+                return Ok(OpenOutcome::Reused(f, m.version));
+            }
+            let next = Fields {
+                run: f.run,
+                ..fresh
+            };
+            let body = seal(site, identity, &next)?;
+            let op = MarkerWrite::Replace {
+                body: &body,
+                version: &m.version,
+            };
+            match io.write(op).await? {
+                ClaimOutcome::Written => {
+                    let version = read_back(io, &body).await;
+                    return Ok(OpenOutcome::Refreshed(next, version));
+                }
+                ClaimOutcome::Lost => continue,
+            }
+        }
+        let body = seal(site, identity, &fresh)?;
+        match io.write(MarkerWrite::Create(&body)).await {
+            Ok(ClaimOutcome::Written) => {
+                let version = read_back(io, &body).await;
+                return Ok(OpenOutcome::Created(fresh, version));
+            }
+            Ok(ClaimOutcome::Lost) => continue,
+            Err(e) => {
+                // The create may have landed although its answer did not.
+                return match io.read().await.map(|r| r.marker) {
+                    Ok(Some(m)) if m.content == body => Ok(OpenOutcome::Created(fresh, m.version)),
+                    _ => Err(e),
+                };
+            }
         }
     }
     Err(lost_three_times())
+}
+
+/// The version of the marker that holds `body` now, for a later write by
+/// identity; empty when the read fails or finds another body (that write
+/// reads again anyway).
+async fn read_back(io: &impl MarkerIo, body: &[u8]) -> String {
+    match io.read().await {
+        Ok(MarkerRead {
+            marker: Some(m), ..
+        }) if m.content == body => m.version,
+        _ => String::new(),
+    }
 }
 
 /// The result of a write by identity.
@@ -292,15 +357,16 @@ pub enum ByIdentity {
     Blocked,
 }
 
-/// Read the marker, check that it is `run`'s, and write `change(fields)`
-/// (`Some(fields)`: replace with them; `None`: remove) on the version just
-/// read. A lost condition reads again, up to [`RETRIES`] times.
+/// Read the marker, check that it is `run`'s (`None`: any run, a marker
+/// that opens for this bucket), and write `change(fields)` (`Some`:
+/// replace with them; `None`: remove) on the version just read. A lost
+/// condition reads again, up to [`RETRIES`] times.
 pub(crate) async fn by_identity(
     io: &impl MarkerIo,
     ring: &Keyring,
     site: Option<&SiteKey>,
     identity: &str,
-    run: &RunId,
+    run: Option<&RunId>,
     change: impl Fn(&Fields) -> Option<Fields>,
 ) -> Result<ByIdentity, StorageError> {
     for _ in 0..RETRIES {
@@ -310,7 +376,7 @@ pub(crate) async fn by_identity(
         let Some(fields) = open_fields(&marker.content, ring, identity) else {
             return Ok(ByIdentity::NotOurs);
         };
-        if fields.run != *run {
+        if run.is_some_and(|run| fields.run != *run) {
             return Ok(ByIdentity::NotOurs);
         }
         let next = change(&fields);
@@ -335,12 +401,9 @@ pub(crate) async fn by_identity(
         };
         match io.write(op).await? {
             ClaimOutcome::Written => {
-                let version = match (&body, next) {
-                    (Some(b), Some(_)) => match io.read().await?.marker {
-                        Some(m) if &m.content == b => m.version,
-                        _ => String::new(),
-                    },
-                    _ => String::new(),
+                let version = match &body {
+                    Some(b) => read_back(io, b).await,
+                    None => String::new(),
                 };
                 return Ok(ByIdentity::Done(next, version));
             }
@@ -533,26 +596,25 @@ pub const DEFAULT_WINDOW_SECS: i64 = 7 * 86_400;
 pub enum ConversionOp {
     /// The marker as stored now (read fresh, not from the cache).
     Status,
-    /// Open a conversion, or reuse the valid one
-    /// ([`super::EncryptingBackend::open_conversion_secs`]).
-    Open { window_secs: i64 },
-    /// Move the deadline of `run` to `deadline` by identity (a resume).
-    Extend { run: RunId, deadline: i64 },
-    /// Remove the marker of `run` by identity.
-    Close { run: RunId },
     /// [`Self::Status`] from the wrapper's window cache ([`TTL`], kept
     /// fresh by this node's own writes): the admin bucket list. A foreign
     /// marker reads as [`MarkerState::Absent`] here.
     CachedStatus,
-    /// [`Self::Open`] with the config that the wrapper was BUILT with, not
-    /// the published one: the apply opens the conversion before it
-    /// publishes the engine that encrypts the bucket. A marker whose
-    /// deadline passed, and one that does not open, are answers here
-    /// ([`OpenOutcome`]), not errors.
-    OpenAsBuilt { window_secs: i64 },
+    /// Open a conversion ([`OpenMode`]) with the config that the wrapper
+    /// was BUILT with (the published one, once the engine is installed):
+    /// the apply opens the conversion before it publishes the engine that
+    /// encrypts the bucket. A foreign marker is an answer
+    /// ([`OpenOutcome::Foreign`]), not an error.
+    Open { window_secs: i64, mode: OpenMode },
+    /// Move the deadline of `run` to `deadline` by identity (a resume).
+    Extend { run: RunId, deadline: i64 },
+    /// Remove the marker of `run` by identity.
+    Close { run: RunId },
     /// [`Self::Close`] with the keyring of the built config: the apply's
-    /// compensation, also after a rollback published another config.
-    CloseAsBuilt { run: RunId },
+    /// compensation (also after a rollback published another config), and
+    /// the close of an apply that makes the bucket stop encrypting, sent
+    /// to the engine that encrypted it (`run: None`: any run).
+    CloseAsBuilt { run: Option<RunId> },
 }
 
 /// The stored marker of a bucket, as this proxy reads it.
@@ -575,9 +637,8 @@ pub enum ConversionReply {
     /// wrapper: it has no conversion.
     NotEncrypted,
     Status(MarkerState),
-    Opened(RunId),
+    Opened(OpenOutcome),
     Changed(ByIdentity),
-    OpenedAsBuilt(OpenOutcome),
 }
 
 // ── Metrics ──

@@ -1437,14 +1437,18 @@ pub trait StorageBackend: Send + Sync {
     ) -> impl Future<Output = Result<VersionPurgePage, StorageError>> + Send;
 
     /// Does the backend keep old versions of `bucket` (S3
-    /// `GetBucketVersioning` answers `Enabled` or `Suspended`)? `None`:
-    /// the backend has no versions (filesystem) or did not answer. The
-    /// apply that starts a conversion warns with it: the plaintext
-    /// versions stay as noncurrent versions. A wrapper forwards it.
-    fn bucket_versioning(&self, bucket: &str) -> impl Future<Output = Option<bool>> + Send {
+    /// `GetBucketVersioning` answers `Enabled` or `Suspended`)? `false`:
+    /// the backend has no versions (filesystem) or never enabled them;
+    /// `Err`: it did not answer (never read as "not versioned"). The apply
+    /// that starts a conversion warns with it: the plaintext versions stay
+    /// as noncurrent versions. A wrapper forwards it.
+    fn bucket_versioning(
+        &self,
+        bucket: &str,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
         async move {
             let _ = bucket;
-            None
+            Ok(false)
         }
     }
 

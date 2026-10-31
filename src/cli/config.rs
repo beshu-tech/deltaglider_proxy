@@ -547,11 +547,24 @@ async fn apply_async(
     })?;
 
     // Surface the server's warnings verbatim so the operator sees everything
-    // the admin GUI would show.
-    if let Some(warnings) = body.get("warnings").and_then(|v| v.as_array()) {
-        for w in warnings {
+    // the admin GUI would show: the ones this document introduces, then the
+    // ones the running config already produces (a deprecation shows on
+    // every apply).
+    for (field, prefix) in [
+        ("warnings", "warning"),
+        (
+            "existing_warnings",
+            "warning (already in the running config)",
+        ),
+    ] {
+        for w in body
+            .get(field)
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
             if let Some(s) = w.as_str() {
-                eprintln!("warning: {s}");
+                eprintln!("{prefix}: {s}");
             }
         }
     }

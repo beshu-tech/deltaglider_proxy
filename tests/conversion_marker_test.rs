@@ -77,7 +77,7 @@ async fn the_conversion_marker_is_cas_hidden_and_closed_by_identity() {
 
     // Create: the cutoff is the server's clock.
     let a = wrapper().await;
-    let run = a.open_conversion(&bucket, 7).await.unwrap();
+    let run = a.open_conversion_secs(&bucket, 7 * 86_400).await.unwrap();
     let Window::Open {
         cutoff, deadline, ..
     } = a.window_of(&bucket).await
@@ -94,7 +94,10 @@ async fn the_conversion_marker_is_cas_hidden_and_closed_by_identity() {
     // A second create (another node, fresh cache) reuses it: same run, same
     // bytes on MinIO.
     let b = wrapper().await;
-    assert_eq!(b.open_conversion(&bucket, 3).await.unwrap(), run);
+    assert_eq!(
+        b.open_conversion_secs(&bucket, 3 * 86_400).await.unwrap(),
+        run
+    );
     assert_eq!(raw_marker(&bucket).await.as_deref(), Some(&stored[..]));
     // MinIO enforces the create condition.
     let second = common::minio_client()
@@ -210,7 +213,10 @@ async fn on_the_filesystem_no_client_key_reaches_the_marker_or_the_claim() {
     enc.key_id = Some("test-key".into());
     let wrapper = EncryptingBackend::new(fs, Arc::new(arc_swap::ArcSwap::new(Arc::new(enc))))
         .with_witness("default", Arc::new(WitnessGate::default()));
-    let run = wrapper.open_conversion("releases", 7).await.unwrap();
+    let run = wrapper
+        .open_conversion_secs("releases", 7 * 86_400)
+        .await
+        .unwrap();
     // A client write makes the proxy claim the bucket for its key.
     let put = server
         .http()
@@ -305,11 +311,14 @@ struct Conv {
 
 impl Conv {
     /// A plaintext proxy with `n` plaintext objects `h-NN.txt`, then a
-    /// restart with the encryption in the config file: no apply, so no
-    /// conversion window and no job (an apply opens both, see
-    /// `tests/conversion_apply_test.rs`).
+    /// restart with the encryption in the config file: no apply, and the
+    /// boot's conversion is off here (`DGP_BOOT_PLAINTEXT_CHECK=false`, which
+    /// `env` may turn on), so no conversion window and no job (an apply
+    /// opens both, see `tests/conversion_apply_test.rs`).
     async fn start(bucket: &str, n: usize, env: &[(&str, &str)], minio: bool) -> Self {
-        let mut b = TestServer::builder().bucket(bucket);
+        let mut b = TestServer::builder()
+            .bucket(bucket)
+            .env("DGP_BOOT_PLAINTEXT_CHECK", "false");
         if minio {
             b = b.s3_endpoint(&common::minio_endpoint_url());
         }
@@ -573,8 +582,8 @@ enum Node {
 impl Node {
     async fn open(&self, bucket: &str) -> [u8; 16] {
         match self {
-            Node::Fs(w) => w.open_conversion(bucket, 7).await.unwrap(),
-            Node::S3(w) => w.open_conversion(bucket, 7).await.unwrap(),
+            Node::Fs(w) => w.open_conversion_secs(bucket, 7 * 86_400).await.unwrap(),
+            Node::S3(w) => w.open_conversion_secs(bucket, 7 * 86_400).await.unwrap(),
         }
     }
     async fn status(&self, bucket: &str) -> MarkerState {
@@ -620,7 +629,7 @@ async fn clients_read_the_history_through_the_window_while_the_job_converts() {
         (206, body_of(2)[5..].to_vec())
     );
 
-    let id = c.reencrypt(false).await;
+    let id = c.reencrypt(true).await;
     // During the job: every object reads, plaintext or converted.
     let mut seen_mid = false;
     for round in 0..200 {
@@ -677,7 +686,7 @@ async fn a_plant_after_the_cutoff_is_refused_for_clients_and_adopted_by_the_job(
     assert_eq!(status, 500, "{}", String::from_utf8_lossy(&body));
     assert_eq!(c.head("planted.txt").await, 500);
 
-    let id = c.reencrypt(false).await;
+    let id = c.reencrypt(true).await;
     c.wait_done().await;
     let job = c.job(id).await;
     assert_eq!(job["status"], "succeeded", "{job}");
@@ -886,7 +895,7 @@ async fn a_key_rotation_mid_window_keeps_it() {
     .await;
     // The apply rebuilt the engine (fresh cache): the window still opens.
     assert_eq!(c.get("h-01.txt").await, (200, body_of(1)));
-    let id = c.reencrypt(false).await;
+    let id = c.reencrypt(true).await;
     c.wait_done().await;
     assert_eq!(c.job(id).await["status"], "succeeded");
     assert!(!c.marker_file().exists());
@@ -916,7 +925,7 @@ async fn backfill_is_refused_while_a_marker_exists() {
     assert_eq!(resp.status().as_u16(), 409);
     let text = resp.text().await.unwrap();
     assert!(text.contains("being converted to encryption"), "{text}");
-    let id = c.reencrypt(false).await;
+    let id = c.reencrypt(true).await;
     c.wait_done().await;
     assert_eq!(c.job(id).await["status"], "succeeded");
     let resp = backfill().await;
@@ -955,7 +964,7 @@ async fn a_failed_rewrite_keeps_the_window() {
     );
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(c.get("h-01.txt").await, (200, body_of(1)), "history reads");
-    let id = c.reencrypt(false).await;
+    let id = c.reencrypt(true).await;
     c.wait_done().await;
     assert_eq!(c.job(id).await["status"], "succeeded");
     assert!(!c.marker_file().exists());
@@ -991,7 +1000,7 @@ async fn history_reads_and_a_plant_is_adopted_minio() {
     );
     assert_eq!(c.get("planted.txt").await.0, 500, "after the cutoff");
 
-    let id = c.reencrypt(false).await;
+    let id = c.reencrypt(true).await;
     c.wait_done().await;
     let job = c.job(id).await;
     assert_eq!(job["status"], "succeeded", "{job}");
@@ -1008,4 +1017,172 @@ async fn history_reads_and_a_plant_is_adopted_minio() {
         c.node(TEST_KEY).await.status(&bucket).await,
         MarkerState::Absent
     );
+}
+
+/// Review S1: a backend writer plants an object after the cutoff, then
+/// deletes the marker before the job starts. The job still reports the
+/// plant as adopted: in a bucket that encrypts, every unsealed object that
+/// a client could not read is reported, with or without a marker.
+#[tokio::test]
+async fn a_deleted_marker_never_makes_the_job_adopt_silently() {
+    const N: usize = 4;
+    let c = Conv::start("convsilent", N, &[], false).await;
+    c.node(TEST_KEY).await.open(&c.bucket).await;
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    c.plant("planted.txt", b"PLANTED_AFTER_THE_CUTOFF", later);
+    assert_eq!(c.get("planted.txt").await.0, 500, "refused for clients");
+    // The backend writer closes the window ("availability only").
+    std::fs::remove_file(c.marker_file()).unwrap();
+    let id = c.reencrypt(false).await;
+    c.wait_done().await;
+    let failures = c.failures(id).await;
+    assert!(
+        failures
+            .iter()
+            .any(|(k, e)| k == "planted.txt" && e.starts_with("adopted_after_cutoff")),
+        "the plant was converted with no adoption report: {failures:?}"
+    );
+    assert!(
+        !c.audit("encryption_conversion_adopted_after_cutoff")
+            .await
+            .is_empty(),
+        "audited"
+    );
+}
+
+/// Review S2: a replayed marker whose deadline passed is NOT extended by a
+/// job that did not open it (a plain re-encrypt, a key rotation), so an
+/// object with an old stored time (a version restore) is not served and
+/// sealed as history without a report.
+#[tokio::test]
+async fn a_job_without_a_run_never_extends_a_replayed_marker() {
+    const N: usize = 4;
+    let c = Conv::start(
+        "convreopen",
+        N,
+        &[
+            ("DGP_TEST_CONVERSION_GRACE_SECS", "0"),
+            ("DGP_TEST_CONVERSION_WINDOW_SECS", "3"),
+        ],
+        false,
+    )
+    .await;
+    let id = c.reencrypt(true).await;
+    let old_body = std::fs::read(c.marker_file()).expect("the marker of open_window");
+    c.wait_done().await;
+    assert_eq!(c.job(id).await["status"], "succeeded");
+    assert!(!c.marker_file().exists(), "closed on success");
+    let extended_before = c.audit("encryption_conversion_extended").await.len();
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // A rollback to an old plaintext object (old stored time).
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    c.plant("rolled.txt", b"ROLLED_BACK", old);
+    // The backend writer replays the expired marker.
+    std::fs::write(c.marker_file(), &old_body).unwrap();
+    assert_eq!(c.get("rolled.txt").await.0, 500, "expired replay: closed");
+    // A routine re-encrypt job (no open_window).
+    let id2 = c.reencrypt(false).await;
+    c.wait_done().await;
+    assert_eq!(
+        c.audit("encryption_conversion_extended").await.len(),
+        extended_before,
+        "a replayed expired marker was extended by a job that did not open it"
+    );
+    assert!(
+        c.marker_file().exists(),
+        "a job without a run never closes a marker"
+    );
+    let failures = c.failures(id2).await;
+    assert!(
+        failures
+            .iter()
+            .any(|(k, e)| k == "rolled.txt" && e.starts_with("adopted_after_cutoff")),
+        "the rolled-back object is reported: {failures:?}"
+    );
+}
+
+/// Review X2: `POST /jobs/reencrypt {open_window: true}` on a bucket with
+/// an active job opens no window: the request fails before the open, so
+/// no marker is left for a job that does not exist.
+#[tokio::test]
+async fn open_window_with_an_active_job_leaves_no_marker() {
+    const N: usize = 6;
+    let c = Conv::start("convbusy", N, &[STALL], false).await;
+    let first = c.reencrypt(false).await;
+    let v: serde_json::Value = c
+        .admin
+        .post(format!(
+            "{}/_/api/admin/jobs/reencrypt",
+            c.server.endpoint()
+        ))
+        .json(&serde_json::json!({ "buckets": [c.bucket], "open_window": true }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["started"], serde_json::json!([]), "{v}");
+    assert!(
+        v["errors"][0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already active"),
+        "{v}"
+    );
+    assert!(
+        !c.marker_file().exists(),
+        "no window for a job that is not queued"
+    );
+    c.wait_done().await;
+    assert_eq!(c.job(first).await["status"], "succeeded");
+}
+
+/// Review X1: a restart-based deployment (operator, Helm, GitOps) adds the
+/// encryption to the config file. The boot finds plaintext, no key claim
+/// and no marker: it opens the window and queues the job of its run.
+/// Clients read the history meanwhile, the job converts everything and
+/// closes the window, and the next restart starts nothing.
+#[tokio::test]
+async fn a_restart_with_encryption_in_the_file_starts_the_conversion() {
+    const N: usize = 6;
+    let mut c = Conv::start(
+        "convboot",
+        N,
+        &[
+            ("DGP_BOOT_PLAINTEXT_CHECK", "true"),
+            // Long enough that the reads below run while the job does.
+            ("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "2000"),
+        ],
+        false,
+    )
+    .await;
+    // The boot runs in the background: the window opens shortly (30 s at
+    // most on a loaded host).
+    let mut audits = Vec::new();
+    for _ in 0..600 {
+        audits = c.audit("encryption_conversion_opened").await;
+        if !audits.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(audits.len(), 1, "the boot opened the window: {audits:?}");
+    assert!(c.plaintext_left(N) > 0, "the job still runs");
+    // History reads while the job converts.
+    for i in 0..N {
+        assert_eq!(c.get(&format!("h-{i:02}.txt")).await, (200, body_of(i)));
+    }
+    c.wait_done().await;
+    assert_eq!(c.plaintext_left(N), 0, "the job converted everything");
+    assert!(!c.marker_file().exists(), "the job closed the window");
+    assert_eq!(c.audit("encryption_conversion_closed").await.len(), 1);
+    for i in 0..N {
+        assert_eq!(c.get(&format!("h-{i:02}.txt")).await, (200, body_of(i)));
+    }
+    // A second restart: the bucket is claimed and converted, no new window.
+    c.server.respawn_with_env(&[]).await;
+    c.admin = common::admin_http_client(&c.server.endpoint()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!c.marker_file().exists(), "idempotent across restarts");
 }

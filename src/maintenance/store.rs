@@ -54,6 +54,10 @@ pub struct MaintenanceJob {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub updated_at: i64,
+    /// Re-encrypt: the objects converted although a client could not read
+    /// them ([`JobsDb::maintenance_record_adoption`]), all of them; the
+    /// failure ring keeps a sample of their keys.
+    pub objects_adopted: i64,
 }
 
 /// A worker lane: which kinds it claims.
@@ -113,12 +117,18 @@ fn row_to_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<MaintenanceJob> {
         started_at: r.get(15)?,
         finished_at: r.get(16)?,
         updated_at: r.get(17)?,
+        objects_adopted: r.get(18)?,
     })
 }
 
 const JOB_COLUMNS: &str = "id, kind, bucket, status, phase, objects_total, objects_done, \
      objects_skipped, objects_failed, bytes_done, continuation_token, last_error, \
-     triggered_by, params, created_at, started_at, finished_at, updated_at";
+     triggered_by, params, created_at, started_at, finished_at, updated_at, objects_adopted";
+
+/// The adoption rows that the failure ring keeps per job: a sample of the
+/// keys (the job row counts them all). They never count toward the ring's
+/// bound, so they never evict a rewrite failure.
+pub const ADOPTED_SAMPLES: i64 = 100;
 
 /// One write-gate key that an active job needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -760,14 +770,53 @@ impl JobsDb {
              VALUES (?, ?, ?, ?)",
             params![job_id, object_key, error, current_unix_seconds()],
         )?;
-        job_store::prune_failure_ring(
+        // The adoption samples are bounded on their own
+        // (`maintenance_record_adoption`): they never evict a failure.
+        job_store::prune_failure_ring_except(
             &self.conn,
             "maintenance_failures",
             "job_id",
             &job_id,
             max_retained as u32,
+            Some((
+                "error",
+                crate::maintenance::conversion::ADOPTED_AFTER_CUTOFF,
+            )),
         )?;
         Ok(())
+    }
+
+    /// Count one object that a re-encrypt job converted although a client
+    /// could not read it (`objects_adopted`, every one), and keep its key
+    /// with `note` in the failure ring while the job has fewer than
+    /// [`ADOPTED_SAMPLES`] such rows. One transaction.
+    pub fn maintenance_record_adoption(
+        &self,
+        job_id: i64,
+        object_key: &str,
+        note: &str,
+    ) -> Result<(), ConfigDbError> {
+        let prefix = crate::maintenance::conversion::ADOPTED_AFTER_CUTOFF;
+        crate::config_db::iam_merge::immediate_tx(&self.conn, |conn| {
+            conn.execute(
+                "UPDATE maintenance_jobs SET objects_adopted = objects_adopted + 1 WHERE id = ?",
+                params![job_id],
+            )?;
+            let samples: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM maintenance_failures
+                  WHERE job_id = ?1 AND substr(error, 1, length(?2)) = ?2",
+                params![job_id, prefix],
+                |r| r.get(0),
+            )?;
+            if samples < ADOPTED_SAMPLES {
+                conn.execute(
+                    "INSERT INTO maintenance_failures (job_id, object_key, error, created_at)
+                     VALUES (?, ?, ?, ?)",
+                    params![job_id, object_key, note, current_unix_seconds()],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Newest-first failures for a job.

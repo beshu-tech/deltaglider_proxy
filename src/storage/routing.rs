@@ -1425,7 +1425,7 @@ impl StorageBackend for RoutingBackend {
     ) -> Result<crate::storage::VersionPurgePage, crate::storage::StorageError> {
         route_existing!(self, bucket, purge_plaintext_versions, cursor)
     }
-    async fn bucket_versioning(&self, bucket: &str) -> Option<bool> {
+    async fn bucket_versioning(&self, bucket: &str) -> Result<bool, crate::storage::StorageError> {
         route_existing!(self, bucket, bucket_versioning)
     }
 

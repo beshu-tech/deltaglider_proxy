@@ -417,7 +417,9 @@ async fn clients_read_plaintext_history_only_inside_the_window() {
     assert!(refused(get(&w, "old.txt").await));
     assert!(reads(conversion::REFUSED) > refused_before);
 
-    w.open_conversion("releases", 7).await.unwrap();
+    w.open_conversion_secs("releases", 7 * 86_400)
+        .await
+        .unwrap();
     // History: HEAD, GET and a range read.
     let served_before = reads(conversion::SERVED_IN_WINDOW);
     assert!(head(&w, "old.txt").await.is_ok());
@@ -495,7 +497,9 @@ async fn sealed_objects_do_not_depend_on_the_window() {
         .await
         .unwrap();
     assert_eq!(get(&w, "s.txt").await.unwrap(), body, "window closed");
-    w.open_conversion("releases", 7).await.unwrap();
+    w.open_conversion_secs("releases", 7 * 86_400)
+        .await
+        .unwrap();
     assert_eq!(get(&w, "s.txt").await.unwrap(), body, "window open");
     let proof = crate::maintenance::worker::ConversionReadProof::for_tests();
     conversion::as_conversion_job(proof, async {
@@ -512,7 +516,9 @@ async fn a_refused_read_picks_up_a_window_opened_elsewhere() {
     let a = rig.wrapper(encrypting(false)).await;
     let b = rig.wrapper(encrypting(false)).await;
     assert!(refused(head(&b, "old.txt").await), "caches Closed");
-    a.open_conversion("releases", 7).await.unwrap();
+    a.open_conversion_secs("releases", 7 * 86_400)
+        .await
+        .unwrap();
     assert!(head(&b, "old.txt").await.is_ok());
 }
 

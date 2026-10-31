@@ -358,13 +358,18 @@ fn a_changed_bucket_encryption_names_the_reencrypt_job() {
     let new = with_override(&format!(
         "{{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: db-archive-2026 }}"
     ));
-    let notes = new.bucket_encryption_notes(&old);
+    let notes = new.bucket_encryption_notes(&old, &[]);
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(notes[0].contains("bucket 'db-archive'"), "{}", notes[0]);
     assert!(notes[0].contains("db-archive-2026"), "{}", notes[0]);
     assert!(notes[0].contains("local-2026"), "{}", notes[0]);
     assert!(notes[0].contains("/jobs/reencrypt"), "{}", notes[0]);
-    assert!(new.bucket_encryption_notes(&new).is_empty());
+    assert!(new.bucket_encryption_notes(&new, &[]).is_empty());
+    // Review X3: the apply started this bucket's conversion and queued its
+    // job, so no note asks the operator to start one.
+    assert!(new
+        .bucket_encryption_notes(&old, &["DB-Archive"])
+        .is_empty());
 }
 
 /// Owner decision 4: encrypted → plaintext replication is a warning.

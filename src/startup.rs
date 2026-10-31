@@ -1893,11 +1893,13 @@ pub async fn shutdown_signal() {
 // ─────────────────────────────────────────────────────────────────────
 /// Issue #120: an admin apply that turns on encryption over a bucket's
 /// plaintext history opens a conversion window and starts the re-encrypt
-/// job, but a restart from an edited file does neither. In the
-/// background (boot does not wait), sample each bucket that encrypts with
-/// a proxy key, does not serve plaintext and has no open conversion
-/// window, and log a warning that names the first object the read rule
-/// refuses.
+/// job; a restart from an edited file (operator, Helm, GitOps) does the
+/// same here. In the background (boot does not wait), sample each bucket
+/// that encrypts with a proxy key, does not serve plaintext and has no
+/// open conversion window. A bucket with plaintext, no key claim and no
+/// marker starts its conversion
+/// (`maintenance::conversion::start_at_boot`); any other refused object
+/// is a warning that names it and the request that converts it.
 pub(crate) fn spawn_plaintext_refusal_check(state: &Arc<AppState>, config: &Config) {
     const SAMPLE: u32 = 100;
     let state = state.clone();
@@ -1919,20 +1921,24 @@ pub(crate) fn spawn_plaintext_refusal_check(state: &Arc<AppState>, config: &Conf
                 ) && !e.config.serves_plaintext()
             })
         });
+        use deltaglider_proxy::maintenance::conversion::{start_at_boot, BootConversion};
         for bucket in refusing {
-            // An open window serves the history while the job converts it.
-            if deltaglider_proxy::maintenance::conversion::window_open(&engine, bucket).await {
-                continue;
-            }
-            match engine.first_refused_plaintext(bucket, SAMPLE).await {
-                Ok(Some(key)) => warn!(
+            match start_at_boot(&state, bucket, SAMPLE).await {
+                Ok(BootConversion::WindowOpen | BootConversion::NoPlaintext) => {}
+                Ok(BootConversion::Started { run, job_id }) => info!(
+                    "bucket '{bucket}' encrypts with a proxy key and holds plaintext history: \
+                     the boot opened its conversion window (run {}) and queued the re-encrypt \
+                     job maintenance:{job_id}; clients read the history until the job ends",
+                    hex::encode(run)
+                ),
+                Ok(BootConversion::Refused { key, why }) => warn!(
                     "bucket '{bucket}' encrypts with a proxy key, but holds objects that are \
                      not encrypted (for example '{key}'): every read of them fails with 500. \
-                     Convert them: POST /_/api/admin/jobs/reencrypt with \
-                     {{\"buckets\": [\"{bucket}\"], \"open_window\": true}} opens a \
-                     conversion window (the history stays readable) and starts the job"
+                     The boot did not convert it: {why}. Convert them: POST \
+                     /_/api/admin/jobs/reencrypt with {{\"buckets\": [\"{bucket}\"], \
+                     \"open_window\": true}} opens a conversion window (the history stays \
+                     readable) and starts the job"
                 ),
-                Ok(None) => {}
                 Err(e) => warn!("plaintext check of bucket '{bucket}' failed: {e}"),
             }
         }

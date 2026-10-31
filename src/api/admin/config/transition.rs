@@ -273,11 +273,11 @@ pub(crate) async fn apply_config_transition(
     // their conversion windows now, with the config the new engine is
     // built with (docs/plan/encryption-conversion-marker.md section 4).
     // Its Err leaves no marker of its own behind.
-    let conversions = match (&new_engine, admin) {
+    let (conversions, stopping) = match (&new_engine, admin) {
         (Some(engine), Some((_, headers, false))) => {
             start_conversions(ctx.app(), engine, old_cfg, &new_cfg, headers).await?
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), Vec::new()),
     };
 
     // ── Phase 2: commit ──────────────────────────────────────────────────
@@ -300,8 +300,7 @@ pub(crate) async fn apply_config_transition(
     warnings.extend(
         conversions
             .iter()
-            .filter(|c| c.versioned)
-            .map(|c| super::conversion_start::versioning_warning(&c.bucket)),
+            .filter_map(super::conversion_start::ConversionStarted::versioning_warning),
     );
 
     // Log-level hot reload. An invalid filter is a warning: the old filter
@@ -348,8 +347,10 @@ pub(crate) async fn apply_config_transition(
     // uses it too).
     warnings.extend(requires_restart_warnings(old_cfg, &new_cfg));
     // A bucket whose write encryption changes: existing objects keep their
-    // form; the response names the re-encrypt job (issue #116).
-    warnings.extend(new_cfg.bucket_encryption_notes(old_cfg));
+    // form; the response names the re-encrypt job (issue #116). Not for a
+    // bucket whose conversion this apply started: its job is queued.
+    let converting: Vec<&str> = conversions.iter().map(|c| c.bucket.as_str()).collect();
+    warnings.extend(new_cfg.bucket_encryption_notes(old_cfg, &converting));
     // One audit entry per subject whose write encryption changes (issue
     // #116 P3): here, so every write path (document, section, field,
     // backends, backup, migrate flip) emits it once. Key ids only.
@@ -358,12 +359,19 @@ pub(crate) async fn apply_config_transition(
     // The engine store and the config swap are the LAST steps: every check
     // above passed, and the write guard is held across both.
     let engine_rebuilt = new_engine.is_some();
+    // The engine that encrypted the buckets that stop encrypting: its
+    // keyring opens their markers.
+    let old_engine = ctx.app().engine.load_full();
     if let Some(engine) = new_engine {
         let context = match &ctx {
             TransitionCtx::Admin { .. } => "Engine rebuilt on config transition",
             TransitionCtx::Background { context, .. } => context,
         };
         crate::config_apply::install_engine(ctx.app(), engine, context);
+    }
+    if let Some((_, headers, _)) = admin.filter(|_| !stopping.is_empty()) {
+        warnings
+            .extend(super::conversion_start::close_stopped(&old_engine, &stopping, headers).await);
     }
     // Multi-instance (issue #116 P3): publish this node's encryption of
     // every bucket that the change re-encrypted, and of every bucket that
@@ -431,18 +439,20 @@ pub(crate) async fn apply_config_transition(
 
 /// The pre-commit conversion step of a forward admin transition: plan
 /// with the new engine, refuse when a job is active on a planned bucket,
-/// then open the windows.
+/// then open the windows. Also returns the buckets that stop encrypting
+/// (their markers close after the commit).
 async fn start_conversions(
     app: &AppState,
     engine: &crate::deltaglider::DynEngine,
     old_cfg: &Config,
     new_cfg: &Config,
     headers: &HeaderMap,
-) -> Result<Vec<super::conversion_start::ConversionStarted>, TransitionError> {
-    let planned = super::conversion_start::plan(engine, old_cfg, new_cfg, 1).await?;
-    let buckets: Vec<&str> = planned.iter().map(|p| p.bucket.as_str()).collect();
+) -> Result<(Vec<super::conversion_start::ConversionStarted>, Vec<String>), TransitionError> {
+    let planned = super::conversion_start::plan_all(engine, old_cfg, new_cfg, 1).await?;
+    let buckets: Vec<&str> = planned.starting.iter().map(|p| p.bucket.as_str()).collect();
     super::conversion_start::refuse_active_jobs(app, &buckets, true).await?;
-    Ok(super::conversion_start::open(engine, &planned, headers).await?)
+    let started = super::conversion_start::open(engine, &planned.starting, headers).await?;
+    Ok((started, planned.stopping))
 }
 
 /// The audit entries of a transition's encryption changes.

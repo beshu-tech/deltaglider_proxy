@@ -53,6 +53,15 @@ pub(crate) const NODE_LOCAL_TABLES: &[&str] = &[
 #[cfg(test)]
 pub(crate) const JOBS_ONLY_TABLES: &[&str] = &["lifecycle_scan_cache", "lifecycle_run_counts"];
 
+/// Columns that only the jobs DB has on a node-local table (table, column,
+/// declaration): added at every open when missing, without a schema version
+/// bump, like the `JOBS_ONLY_TABLES`.
+pub(crate) const JOBS_ONLY_COLUMNS: &[(&str, &str, &str)] = &[(
+    "maintenance_jobs",
+    "objects_adopted",
+    "INTEGER NOT NULL DEFAULT 0",
+)];
+
 /// The node-local job database. Shared as `Arc<tokio::sync::Mutex<JobsDb>>`;
 /// its own lock, so a job write never waits for an IAM read.
 pub struct JobsDb {
@@ -155,6 +164,14 @@ impl JobsDb {
             tx.commit()?;
         }
         conn.execute_batch(SCHEMA_JOBS_ONLY)?;
+        // JOBS_ONLY_COLUMNS: additive, outside the schema version (an older
+        // binary ignores them, and the copy from the config DB copies the
+        // columns both have).
+        for (table, column, decl) in JOBS_ONLY_COLUMNS {
+            if !columns(conn, "main", table)?.iter().any(|c| c == column) {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
+            }
+        }
         Ok(())
     }
 

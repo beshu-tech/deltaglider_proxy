@@ -769,7 +769,7 @@ impl crate::storage::StorageBackend for FencingFs {
     ) -> Result<crate::storage::VersionPurgePage, crate::storage::StorageError> {
         self.inner.purge_plaintext_versions(bucket, cursor).await
     }
-    async fn bucket_versioning(&self, bucket: &str) -> Option<bool> {
+    async fn bucket_versioning(&self, bucket: &str) -> Result<bool, crate::storage::StorageError> {
         self.inner.bucket_versioning(bucket).await
     }
     async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<Meta>, StorageError> {

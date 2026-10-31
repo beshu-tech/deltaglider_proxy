@@ -77,9 +77,22 @@ fn count(conn: &Connection, table: &str) -> i64 {
         .unwrap()
 }
 
+/// The rows of `table` without the jobs DB's own columns
+/// (`JOBS_ONLY_COLUMNS`), so that both databases compare.
 fn rows(conn: &Connection, table: &str) -> Vec<Vec<Value>> {
+    let list = shape(conn, table)
+        .into_iter()
+        .map(|c| c.0)
+        .filter(|c| {
+            !super::JOBS_ONLY_COLUMNS
+                .iter()
+                .any(|(t, col, _)| *t == table && c == col)
+        })
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut stmt = conn
-        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+        .prepare(&format!("SELECT {list} FROM {table} ORDER BY rowid"))
         .unwrap();
     let n = stmt.column_count();
     stmt.query_map([], |r| (0..n).map(|i| r.get::<_, Value>(i)).collect())
@@ -195,7 +208,14 @@ fn jobs_tables_match_the_config_db() {
     expected.sort();
     assert_eq!(tables(&jobs.conn), expected);
     for t in NODE_LOCAL_TABLES {
-        assert_eq!(shape(&config.conn, t), shape(&jobs.conn, t), "{t}: columns");
+        // The jobs DB's own columns come last, and only it has them.
+        let mut jobs_shape = shape(&jobs.conn, t);
+        jobs_shape.retain(|c| {
+            !super::JOBS_ONLY_COLUMNS
+                .iter()
+                .any(|(table, column, _)| table == t && c.0 == *column)
+        });
+        assert_eq!(shape(&config.conn, t), jobs_shape, "{t}: columns");
         assert_eq!(
             fks(&config.conn, t),
             fks(&jobs.conn, t),
