@@ -783,7 +783,7 @@ storage:
 | `alias` | string | same as bucket name | Virtual → real bucket name mapping on the backend |
 | `public_prefixes` | `[string]` | `[]` | Anonymous read (GET/HEAD/LIST) scoped to these key prefixes |
 | `public` | bool | — | Shorthand for `public_prefixes: [""]` (entire bucket public) |
-| `quota_bytes` | u64 | — | Soft storage quota (it may overshoot by up to 5 minutes of writes); `0` freezes the bucket |
+| `quota_bytes` | u64 | — | Soft storage quota in stored bytes; `0` freezes the bucket. Before each write, the proxy compares the bucket's running usage counter plus the new bytes with the quota. The bucket can still go over the quota for two reasons: concurrent writes each check the counter before any of them stores its bytes, and each instance of the proxy keeps its own counter, so it does not see the writes of the other instances. See [set a soft quota](../how-to/set-bucket-compression-and-quotas.md#5-set-a-soft-quota). |
 | `replication_target_only` | bool | `false` | Client writes return 403; replication is the only writer. This makes a non-CAS backend (e.g. Backblaze B2) a safe mirror (see [backend capability validation](../how-to/backend-capability-validation.md)) |
 | `encryption` | encryption block | the backend's | The bucket's own encryption at rest, with the same fields as a backend's `encryption` block. Only `aes256-gcm-proxy` and `none`; `key_id` is required. See [Encryption at rest](#encryption-at-rest) |
 

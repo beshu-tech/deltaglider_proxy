@@ -67,7 +67,9 @@ jobs:
           set -euo pipefail
 
           url="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${TAGGED_SHA}&per_page=20"
-          deadline=$((SECONDS + 2700)) # 45 minutes: longer than the current CI timeout budget.
+          # A green CI run on main takes 7-10 min (last 30 runs, 2026-10). 45 min
+          # leaves room for a queued run; it is not the CI timeout budget.
+          deadline=$((SECONDS + 2700))
 
           while true; do
             runs_json="$(curl -fsSL \

@@ -24,8 +24,8 @@ operator's job is "click Run, review the PR, merge."
                                  ▼
 ┌──────────────────────────┐
 │ release.yml              │
-│   CI gate                │
-│   stamp Cargo.toml       │
+│   CI gate + audit/deny   │
+│   tag == Cargo.toml      │
 │   4-target binaries      │
 │   multi-arch Docker      │
 │   GitHub Release         │ ───────────────────► artifacts on
@@ -87,6 +87,12 @@ Standard merge into `main`. `tag-on-merge.yml` picks it up:
 The tag push fires the existing release pipeline (5 stages, ~50–70 min
 total). Monitor with `gh run list --limit 1` and `gh run watch`.
 
+The macOS targets build only in this pipeline. The merge gate runs on Linux,
+so a defect that only macOS shows (for example two UI module paths that differ
+only in case, which a case-insensitive filesystem resolves to one file) first
+fails here. `scripts/check-module-case-collisions.sh` in the merge gate catches
+that class before the tag.
+
 When done:
 - GitHub Release exists with binaries + checksums + SBOM.
 - DockerHub has `:X.Y.Z`, `:X.Y`, `:X`, `:latest`.
@@ -144,8 +150,9 @@ You do NOT need to do any of this manually:
 | `## Unreleased` → `## vX.Y.Z — date` rewrite in CHANGELOG | [`scripts/release-prep.sh`](../../scripts/release-prep.sh) |
 | Open release PR with diff for review | [`.github/workflows/prepare-release.yml`](../../.github/workflows/prepare-release.yml) |
 | Tag the merge commit and push the tag | [`.github/workflows/tag-on-merge.yml`](../../.github/workflows/tag-on-merge.yml) |
-| Version stamping in `Cargo.toml` for release artifacts | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — extracts from git tag, `sed` into Cargo.toml inside CI |
+| Version check: the tag must equal the `Cargo.toml` version | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — the `validate` job refuses a mismatch; it never rewrites `Cargo.toml`, because cargo would then rewrite `Cargo.lock` and the binary would not be the commit that CI tested. [`scripts/release-prep.sh`](../../scripts/release-prep.sh) makes the bump before the tag exists. |
 | UI build (`npm ci && npm run build`) | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — runs in each build job |
+| Supply-chain check (`cargo audit`, `cargo deny check`, operator advisories) | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — the `verify-ci` job, after the CI wait, in the builder image; a RustSec advisory stops the release |
 | Binary compilation (4 targets) | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — Linux x86/ARM, macOS Intel/ARM |
 | Binary stripping | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — `strip` on each binary |
 | Docker multi-arch build + push | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — native `amd64`/`arm64` builds plus manifest merge |
