@@ -9,6 +9,8 @@ import { getPreviewMode } from './filePreviewMode';
 import { plainError } from '../plainError';
 import { EmptyState, ErrorState, LoadingState } from './StatePlaceholders';
 import { SPACE } from './shared-styles';
+import HtmlPreview from './HtmlPreview';
+import { MAX_HTML_PREVIEW } from './htmlPreview';
 
 const { Text } = Typography;
 
@@ -37,6 +39,8 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
   // Bumped by Retry: the effect loads the file again.
   const [attempt, setAttempt] = useState(0);
   const [textContent, setTextContent] = useState('');
+  // The page an HTML preview renders (`null` = not loaded).
+  const [htmlContent, setHtmlContent] = useState<string | null>(null);
   // Presigned URL for any binary media rendered inline (image / video / audio).
   const [mediaUrl, setMediaUrl] = useState('');
   // The browser loaded the media URL but could not decode it (not a failed request).
@@ -44,7 +48,8 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
 
   const filename = object ? getFileName(object.key) : '';
   const mode = object ? getPreviewMode(object.key) : null;
-  const tooLarge = mode === 'text' && (object?.size ?? 0) > MAX_TEXT_PREVIEW;
+  const previewLimit = mode === 'html' ? MAX_HTML_PREVIEW : MAX_TEXT_PREVIEW;
+  const tooLarge = (mode === 'text' || mode === 'html') && (object?.size ?? 0) > previewLimit;
 
   useEffect(() => {
     if (!open || !object) return;
@@ -58,10 +63,17 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
     setLoading(true);
     setError(null);
     setTextContent('');
+    setHtmlContent(null);
     setMediaUrl('');
     setUnreadable(null);
 
-    if (mode === 'text' && !tooLarge) {
+    if (mode === 'html' && !tooLarge) {
+      downloadObject(object.key)
+        .then(blob => blob.text())
+        .then(raw => { if (!cancelled) setHtmlContent(raw); })
+        .catch(e => { if (!cancelled) setError(e ?? new Error("The file could not be read.")); })
+        .finally(() => { if (!cancelled) setLoading(false); });
+    } else if (mode === 'text' && !tooLarge) {
       downloadObject(object.key)
         .then(blob => blob.text())
         .then(raw => {
@@ -113,7 +125,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
       onCancel={onClose}
       title={<Text strong style={{ fontFamily: 'var(--font-mono)', fontSize: 14 }}>{filename}</Text>}
       centered
-      width={mode === 'image' || mode === 'video' ? 820 : mode === 'audio' ? 560 : 900}
+      width={mode === 'html' ? 1100 : mode === 'image' || mode === 'video' ? 820 : mode === 'audio' ? 560 : 900}
       footer={
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <Text type="secondary" style={{ fontSize: 12 }}>
@@ -135,7 +147,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
           type="info"
           showIcon
           title={`File too large for preview (${formatBytes(object.size)})`}
-          description="Text preview is limited to 512 KiB. Use the Download button to view the full file."
+          description={`The preview is limited to ${formatBytes(previewLimit)}. Use the Download button to view the full file.`}
           style={{ borderRadius: 8 }}
         />
       )}
@@ -148,6 +160,10 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
           description="Use the Download button to save the file locally."
           style={{ borderRadius: 8 }}
         />
+      )}
+
+      {!loading && error == null && htmlContent != null && (
+        <HtmlPreview html={htmlContent} filename={filename} />
       )}
 
       {!loading && error == null && textContent && (

@@ -1,7 +1,9 @@
+import { isHtmlKey } from './htmlPreview';
+
 const TEXT_EXTENSIONS = new Set([
   'txt', 'md', 'json', 'yaml', 'yml', 'xml', 'csv', 'log',
   'toml', 'ini', 'cfg', 'conf', 'properties', 'env',
-  'sh', 'bash', 'py', 'rs', 'js', 'ts', 'html', 'css',
+  'sh', 'bash', 'py', 'rs', 'js', 'ts', 'css',
   'sha', 'sha1', 'sha256', 'sha512', 'sum',
   'gitignore', 'dockerignore', 'dockerfile', 'makefile',
   'license', 'readme', 'changelog',
@@ -23,11 +25,12 @@ const AUDIO_EXTENSIONS = new Set([
   'mp3', 'wav', 'ogg', 'oga', 'm4a', 'aac', 'flac', 'opus',
 ]);
 
-type PreviewMode = 'text' | 'image' | 'video' | 'audio';
+type PreviewMode = 'html' | 'text' | 'image' | 'video' | 'audio';
 
 export function getPreviewMode(filename: string): PreviewMode | null {
   const ext = filename.split('.').pop()?.toLowerCase() ?? '';
   const basename = filename.split('/').pop()?.toLowerCase() ?? '';
+  if (isHtmlKey(filename)) return 'html';
   if (TEXT_EXTENSIONS.has(ext) || TEXT_EXTENSIONS.has(basename)) return 'text';
   if (IMAGE_EXTENSIONS.has(ext)) return 'image';
   if (VIDEO_EXTENSIONS.has(ext)) return 'video';
