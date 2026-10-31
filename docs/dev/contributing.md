@@ -223,6 +223,15 @@ old `loadData()`-after-every-mutation + prop→state-mirror idiom is gone.
 3. Run `cargo fmt`, `cargo clippy`, and `cargo test`
 4. Open a pull request with a clear description of what and why
 
+### AI review
+
+A Claude Code workflow reviews every pull request, and a maintainer can ask it a
+question with `@claude` in a comment. Its review is advisory: it does not approve or
+block a merge, and a maintainer reviews every change. The workflow reads the issue or
+pull request text as instructions, so a maintainer does not invoke `@claude` on an
+issue or a pull request whose body comes from an untrusted author. The workflow can
+read the repository and write comments only; it cannot edit files or push commits.
+
 ## Reporting Issues
 
 Open an issue on GitHub. If it's a bug, include:
