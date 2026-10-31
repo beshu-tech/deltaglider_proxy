@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.23 — 2026-10-31
+
 ### Added — A preview of HTML files
 
 - A double-click on an `.html`, `.htm` or `.xhtml` object shows the page as a browser renders it, in a frame inside the preview window. **Source** shows the markup as text. The preview opens pages up to 5 MiB.

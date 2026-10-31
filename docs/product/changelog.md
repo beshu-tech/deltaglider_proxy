@@ -10,6 +10,15 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-10-31_
 
+## v2.0.23 — 2026-10-31
+
+### Added — A preview of HTML files
+
+- A double-click on an `.html`, `.htm` or `.xhtml` object shows the page as a browser renders it, in a frame inside the preview window. **Source** shows the markup as text. The preview opens pages up to 5 MiB.
+- The page runs isolated from the console. It has its own origin, so it cannot read your session, your credentials or the console page, and it cannot send requests or submit forms.
+- The page's scripts do not run, and it loads nothing from the network, until you turn on **Run scripts** or **Load remote content** for that preview. Remote content loads over https only.
+- Images and styles that the page names with a relative path do not load in the preview, because the preview has no address in the bucket to resolve them against.
+
 ## v2.0.22 — 2026-10-31
 
 ### Changed — The bucket list with many backends
