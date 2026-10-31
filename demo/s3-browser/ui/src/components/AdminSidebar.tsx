@@ -38,6 +38,7 @@ import {
 import { ADMIN_IA, type SidebarEntry } from './adminNavigation';
 import { dirtyDotForEntry } from '../adminNavTree';
 import { buildViewUrl } from '../urlState';
+import { tint } from '../themeVars';
 
 interface Props {
   /** Current sub-path under `/_/admin/`. */
@@ -111,7 +112,7 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
             width: '100%',
             padding: `8px 20px 8px ${20 + depth * 16}px`,
             border: 'none',
-            background: isActive ? ACCENT_BLUE + '18' : 'transparent',
+            background: isActive ? tint(ACCENT_BLUE, 9) : 'transparent',
             borderLeft: isActive
               ? `3px solid ${ACCENT_BLUE}`
               : '3px solid transparent',

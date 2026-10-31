@@ -1,4 +1,6 @@
 import type { useColors } from '../ThemeContext';
+import { cssVar } from '../themeVars';
+import { Z } from '../theme';
 
 /**
  * Shared visual constants + base-style builder for the app's
@@ -12,10 +14,10 @@ import type { useColors } from '../ThemeContext';
  */
 
 /** Drop shadow for floating overlays (no blur radius variance — flat soft shadow). */
-export const OVERLAY_SHADOW = '0 8px 24px rgba(0,0,0,0.3)';
+export const OVERLAY_SHADOW = cssVar('FLOAT_SHADOW');
 
 /** z-index for floating overlays — above every in-page stacking context. */
-export const Z_INDEX_OVERLAY = 99999;
+export const Z_INDEX_OVERLAY = Z.overlay;
 
 /** Border-radius scale used across overlay chrome. */
 export const BORDER_RADIUS = { xs: 4, sm: 6, md: 8 } as const;

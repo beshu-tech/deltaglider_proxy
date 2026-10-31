@@ -7,6 +7,7 @@ import {
   CheckOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
+import { tint } from '../themeVars';
 import { effectiveActions, toggleAction } from './permissionActions';
 
 /**
@@ -97,7 +98,7 @@ export default function ActionChips({ actions, onChange, prefixScoped, disabled 
               whiteSpace: 'nowrap',
               border: `1px ${on ? 'solid' : 'dashed'} ${on ? accent : colors.BORDER}`,
               background: on ? accent : 'transparent',
-              color: on ? '#fff' : (isDisabled ? colors.TEXT_MUTED : colors.TEXT_SECONDARY),
+              color: on ? colors.ON_ACCENT : (isDisabled ? colors.TEXT_MUTED : colors.TEXT_SECONDARY),
               opacity: isDisabled && !on ? 0.45 : 1,
               transition: 'background 0.12s, border-color 0.12s, color 0.12s',
             }}
@@ -113,12 +114,12 @@ export default function ActionChips({ actions, onChange, prefixScoped, disabled 
                 alignItems: 'center',
                 justifyContent: 'center',
                 flex: '0 0 auto',
-                border: `1.5px solid ${on ? 'rgba(255,255,255,0.9)' : colors.BORDER}`,
-                background: on ? 'rgba(255,255,255,0.18)' : 'transparent',
-                fontSize: 10,
+                border: `1.5px solid ${on ? tint(colors.ON_ACCENT, 90) : colors.BORDER}`,
+                background: on ? tint(colors.ON_ACCENT, 18) : 'transparent',
+                fontSize: 11,
               }}
             >
-              {on && <CheckOutlined style={{ fontSize: 9, color: '#fff' }} />}
+              {on && <CheckOutlined style={{ fontSize: 9, color: colors.ON_ACCENT }} />}
             </span>
             <span aria-hidden style={{ fontSize: 13, display: 'inline-flex', opacity: on ? 1 : 0.85 }}>{chip.icon}</span>
             {chip.label}

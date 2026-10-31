@@ -18,19 +18,25 @@ const COMPONENTS = join(__dirname, '..', 'components');
 const ALLOWED_PX = new Set([...SPACING_SCALE, 1, 2]);
 const PROP =
   /\b(margin|padding|gap|rowGap|columnGap|(?:margin|padding)(?:Top|Bottom|Left|Right|Inline|Block|InlineStart|InlineEnd|BlockStart|BlockEnd))\s*:\s*(-?\d+(?:\.\d+)?|'[^'\n]*'|"[^"\n]*")/g;
+/** Each branch of a conditional value: `gap: cond ? 10 : 8` checks 10 and 8. */
+const BRANCH =
+  /\b(margin|padding|gap|rowGap|columnGap|(?:margin|padding)(?:Top|Bottom|Left|Right|Inline|Block|InlineStart|InlineEnd|BlockStart|BlockEnd))\s*:\s*[\w.!()]+\s*\?\s*(-?\d+(?:\.\d+)?|'[^'\n]*'|"[^"\n]*"|[\w.]+)\s*:\s*(-?\d+(?:\.\d+)?|'[^'\n]*'|"[^"\n]*")?/g;
 
 /** Off-scale spacing values in one file's source. Pure. */
 export function offScaleSpacing(source: string): string[] {
   const out: string[] = [];
-  for (const m of source.matchAll(PROP)) {
-    const value = m[2];
+  const values = [
+    ...[...source.matchAll(PROP)].map((m) => [m[1], m[2]] as const),
+    ...[...source.matchAll(BRANCH)].flatMap((m) => [[m[1], m[2]], [m[1], m[3]]] as const).filter(([, v]) => v !== undefined && /^(-?\d|['"])/.test(v)),
+  ];
+  for (const [prop, value] of values) {
     let px: number[];
     if (/^-?\d/.test(value)) px = [Number(value)];
     else {
       if (/clamp|calc|var\(|%|\bem\b|rem|auto/.test(value)) continue;
       px = [...value.matchAll(/(-?\d+(?:\.\d+)?)px/g)].map((x) => Number(x[1]));
     }
-    if (px.some((n) => !ALLOWED_PX.has(Math.abs(n)))) out.push(`${m[1]}: ${value}`);
+    if (px.some((n) => !ALLOWED_PX.has(Math.abs(n)))) out.push(`${prop}: ${value}`);
   }
   return out;
 }
@@ -49,6 +55,7 @@ const ALLOWED: Record<string, number> = {};
 test('the scanner finds off-scale values and skips scale values', () => {
   expect(offScaleSpacing("padding: '12px 20px', gap: 8, margin: 0, marginTop: 2")).toEqual(["padding: '12px 20px'"]);
   expect(offScaleSpacing('gap: 10, padding: clamp(16px, 3vw, 24px)')).toEqual(['gap: 10']);
+  expect(offScaleSpacing("gap: wide ? 10 : 8, padding: phone ? '0 8px' : '0 20px', margin: a ? SPACE.xs : 0")).toEqual(['gap: 10', "padding: '0 20px'"]);
 });
 
 test('components use the spacing scale (ratchet)', () => {

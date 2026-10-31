@@ -74,7 +74,7 @@ export default function ListingPlaceholder({
       <div style={{ maxWidth: 560, margin: '0 auto', padding: `${SPACE.xl}px ${SPACE.md}px` }}>
         <ErrorState error={error} what={`the objects of ${bucket}`} onRetry={onReload} />
         {missingOnBackend && (
-          <p style={{ margin: 0, textAlign: 'center', fontSize: 12.5, lineHeight: 1.45, fontFamily: 'var(--font-ui)', color: TEXT_MUTED }}>
+          <p style={{ margin: 0, textAlign: 'center', fontSize: 13, lineHeight: 1.45, fontFamily: 'var(--font-ui)', color: TEXT_MUTED }}>
             The bucket is in this proxy&apos;s configuration, but not on the backend it routes to. Check the
             bucket&apos;s backend under Settings, Storage, Buckets, or create the bucket on that backend.
           </p>

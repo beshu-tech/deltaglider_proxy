@@ -35,6 +35,7 @@ import { ErrorState } from './StatePlaceholders';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
+import { tint } from '../themeVars';
 
 const { Text } = Typography;
 
@@ -148,7 +149,7 @@ export default function EncryptionWitnessCard() {
                 role="listitem"
                 key={`${m.backend}/${m.bucket}`}
                 style={{
-                  border: `1px solid ${colors.ACCENT_AMBER}55`,
+                  border: `1px solid ${tint(colors.ACCENT_AMBER, 33)}`,
                   borderRadius: 8,
                   padding: '8px 12px',
                   display: 'flex',
@@ -157,7 +158,7 @@ export default function EncryptionWitnessCard() {
                   gap: 12,
                 }}
               >
-                <div style={{ flex: '1 1 320px', minWidth: 0, fontSize: 12.5, lineHeight: 1.6 }}>
+                <div style={{ flex: '1 1 320px', minWidth: 0, fontSize: 13, lineHeight: 1.6 }}>
                   <div>
                     <Text strong>{storageLabel(m)}</Text>
                     <Text type="secondary"> on backend </Text>

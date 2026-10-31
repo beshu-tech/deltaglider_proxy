@@ -40,7 +40,7 @@ import { ExclamationCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { plainError } from '../plainError';
 import { queriesView, queryView, type QueryLike } from '../queryView';
-import { CARD_PADDING, CARD_RADIUS, SPACE } from './shared-styles';
+import { CARD_PADDING, CARD_RADIUS, DISPLAY_SIZES, SPACE, TYPE } from './shared-styles';
 
 export type LoadingVariant = 'list' | 'card' | 'form' | 'inline';
 
@@ -70,7 +70,7 @@ export function LoadingState({
         style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: SPACE.sm, padding: SPACE.lg }}
       >
         <Spin size="small" />
-        <span style={{ fontSize: 12.5, color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>{label}</span>
+        <span style={{ fontSize: 13, color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>{label}</span>
       </div>
     );
   }
@@ -158,14 +158,14 @@ export function EmptyState({
       }}
     >
       {icon && (
-        <div aria-hidden style={{ fontSize: compact ? 22 : 32, color: TEXT_MUTED, lineHeight: 1, marginBottom: compact ? SPACE.xs : SPACE.sm }}>
+        <div aria-hidden style={{ fontSize: compact ? TYPE.xxl : DISPLAY_SIZES[0], color: TEXT_MUTED, lineHeight: 1, marginBottom: compact ? SPACE.xs : SPACE.sm }}>
           {icon}
         </div>
       )}
       <div
         style={{
           fontFamily: 'var(--font-ui)',
-          fontSize: compact ? 13.5 : 15,
+          fontSize: compact ? TYPE.base : TYPE.lg,
           fontWeight: 600,
           color: TEXT_PRIMARY,
           lineHeight: 1.3,
@@ -177,7 +177,7 @@ export function EmptyState({
         <div
           style={{
             fontFamily: 'var(--font-ui)',
-            fontSize: 12.5,
+            fontSize: 13,
             color: TEXT_MUTED,
             lineHeight: 1.45,
             marginTop: compact ? SPACE.xxs : SPACE.xs,
@@ -229,11 +229,11 @@ export function ErrorState({
         alignItems: 'center',
       }}
     >
-      <ExclamationCircleOutlined aria-hidden style={{ fontSize: compact ? 22 : 32, color: ACCENT_RED, marginBottom: compact ? SPACE.xs : SPACE.sm }} />
-      <div style={{ fontFamily: 'var(--font-ui)', fontSize: compact ? 13.5 : 15, fontWeight: 600, color: TEXT_PRIMARY, lineHeight: 1.3 }}>
+      <ExclamationCircleOutlined aria-hidden style={{ fontSize: compact ? TYPE.xxl : DISPLAY_SIZES[0], color: ACCENT_RED, marginBottom: compact ? SPACE.xs : SPACE.sm }} />
+      <div style={{ fontFamily: 'var(--font-ui)', fontSize: compact ? TYPE.base : TYPE.lg, fontWeight: 600, color: TEXT_PRIMARY, lineHeight: 1.3 }}>
         Could not load {what}
       </div>
-      <div style={{ fontFamily: 'var(--font-ui)', fontSize: 12.5, color: TEXT_MUTED, lineHeight: 1.45, marginTop: SPACE.xs, maxWidth: 460 }}>
+      <div style={{ fontFamily: 'var(--font-ui)', fontSize: 13, color: TEXT_MUTED, lineHeight: 1.45, marginTop: SPACE.xs, maxWidth: 460 }}>
         {plain.text}
       </div>
       <div style={{ marginTop: compact ? SPACE.sm : SPACE.md, display: 'flex', gap: SPACE.xs, flexWrap: 'wrap', justifyContent: 'center' }}>

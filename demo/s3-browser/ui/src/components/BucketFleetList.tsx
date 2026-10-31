@@ -21,8 +21,10 @@ import { formatBytes, relativeTime, noun } from '../utils';
 import { fmtNum } from './dashboard/chartDefaults';
 import type { BucketRow } from './AnalyticsSection';
 import { useIsNarrow } from '../useIsNarrow';
+import { BREAKPOINT } from './shared-styles';
 import TruncatedName from './TruncatedName';
 import { savingsColors } from '../savings';
+import { tint } from '../themeVars';
 
 interface Props {
   bucketRows: BucketRow[];
@@ -56,7 +58,7 @@ export default function BucketFleetList({
 }: Props) {
   // Phone: the six-column row is wider than the screen and the numbers were
   // cut off at the right; a two-line row keeps them visible.
-  const narrow = useIsNarrow(600);
+  const narrow = useIsNarrow(BREAKPOINT.phone);
   const maxOriginal = Math.max(1, ...bucketRows.map(r => r.totalOriginal));
   return (
     <div
@@ -154,7 +156,7 @@ function FleetRow({
         padding: '8px 12px',
         margin: '0 -12px',
         borderRadius: 8,
-        background: hover ? `${colors.TEXT_FAINT}14` : 'transparent',
+        background: hover ? tint(colors.TEXT_FAINT, 8) : 'transparent',
         transition: 'background 120ms ease',
         position: 'relative',
       }}
@@ -165,7 +167,7 @@ function FleetRow({
           gridArea: 'rank',
           display: narrow ? 'none' : undefined,
           fontFamily: 'var(--font-mono)',
-          fontSize: 10,
+          fontSize: 11,
           color: colors.TEXT_FAINT,
           textAlign: 'right',
         }}
@@ -181,7 +183,7 @@ function FleetRow({
             alignItems: 'center',
             gap: 8,
             fontFamily: 'var(--font-mono)',
-            fontSize: 12.5,
+            fontSize: 13,
             fontWeight: 600,
             color: colors.TEXT_PRIMARY,
             overflow: 'hidden',
@@ -206,7 +208,7 @@ function FleetRow({
             <span
               title={backendTip}
               style={{
-                fontSize: 9,
+                fontSize: 11,
                 fontWeight: 700,
                 color: colors.TEXT_MUTED,
                 border: `1px solid ${colors.BORDER}`,
@@ -223,7 +225,7 @@ function FleetRow({
             </span>
           )}
         </div>
-        <div style={{ fontSize: 10.5, color: colors.TEXT_MUTED, marginTop: 2, fontFamily: 'var(--font-ui)' }}>
+        <div style={{ fontSize: 12, color: colors.TEXT_MUTED, marginTop: 2, fontFamily: 'var(--font-ui)' }}>
           {b.scanning && b.objectCount === 0 ? (
             <span style={{ color: colors.ACCENT_BLUE }}>Scanning…</span>
           ) : !b.completedAt && !b.scanning ? (

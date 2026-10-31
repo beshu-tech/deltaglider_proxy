@@ -49,18 +49,18 @@ export default function DemoDataGenerator({ onDone, variant = 'inline', label = 
     }
   };
 
-  const { TEXT_PRIMARY, TEXT_SECONDARY, ACCENT_BLUE } = useColors();
+  const { TEXT_SECONDARY, ACCENT_BLUE } = useColors();
   const isEmptyState = variant === 'empty-state';
 
   return (
     <div>
       <button
-        className="btn-reset"
+        className="btn-reset dg-hover-text"
         onClick={generate}
         disabled={generating}
         style={{
-          gap: isEmptyState ? 10 : 8,
-          padding: isEmptyState ? '4px 8px' : '6px 6px',
+          gap: isEmptyState ? 12 : 8,
+          padding: '4px 8px',
           color: isEmptyState ? ACCENT_BLUE : TEXT_SECONDARY,
           fontSize: isEmptyState ? 13 : 11,
           fontWeight: isEmptyState ? 600 : 400,
@@ -72,8 +72,6 @@ export default function DemoDataGenerator({ onDone, variant = 'inline', label = 
           fontFamily: "var(--font-ui)",
           opacity: generating ? 0.6 : (isEmptyState ? 1 : 0.7),
         }}
-        onMouseEnter={(e) => { if (!generating) e.currentTarget.style.color = TEXT_PRIMARY; }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = isEmptyState ? ACCENT_BLUE : TEXT_SECONDARY; }}
       >
         {generating
           ? <LoadingOutlined aria-hidden="true" style={MENU_ICON_STYLE} />

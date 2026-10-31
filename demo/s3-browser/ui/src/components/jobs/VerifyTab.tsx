@@ -53,6 +53,7 @@ import { relativeTime, noun } from '../../utils';
 import PlainErrorAlert from '../PlainErrorAlert';
 import { plainError } from '../../plainError';
 import { EmptyState } from '../StatePlaceholders';
+import { tint } from '../../themeVars';
 
 const { Text } = Typography;
 
@@ -312,7 +313,7 @@ export default function VerifyTab({ ruleName }: Props) {
         <div style={{ padding: '8px 4px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
             <SafetyCertificateOutlined style={{ fontSize: 18, color: c.ACCENT_BLUE }} />
-            <Text strong style={{ fontSize: 15 }}>
+            <Text strong style={{ fontSize: 16 }}>
               Audit replication parity
             </Text>
           </div>
@@ -320,7 +321,7 @@ export default function VerifyTab({ ruleName }: Props) {
             A fast <strong>metadata audit</strong>: it checks that every source object exists on the
             destination and that their recorded checksums and sizes agree.
           </Text>
-          <Text type="secondary" style={{ display: 'block', fontSize: 12.5, marginBottom: 16 }}>
+          <Text type="secondary" style={{ display: 'block', fontSize: 13, marginBottom: 16 }}>
             No downloads — it does not re-read the destination's bytes. Runs in the background;
             the result is saved, so you can leave this page and come back.
           </Text>
@@ -429,7 +430,7 @@ function LoadingBlock({
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            background: `radial-gradient(circle at center, ${c.ACCENT_BLUE}33 0%, transparent 70%)`,
+            background: `radial-gradient(circle at center, ${tint(c.ACCENT_BLUE, 20)} 0%, transparent 70%)`,
           }}
         >
           <div
@@ -441,8 +442,8 @@ function LoadingBlock({
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              background: `${c.ACCENT_BLUE}1f`,
-              border: `1.5px solid ${c.ACCENT_BLUE}66`,
+              background: tint(c.ACCENT_BLUE, 12),
+              border: `1.5px solid ${tint(c.ACCENT_BLUE, 40)}`,
             }}
           >
             <span className="dg-verify-spinner dg-verify-ring" aria-hidden />
@@ -450,7 +451,7 @@ function LoadingBlock({
           </div>
         </div>
 
-        <div style={{ fontSize: 18, fontWeight: 700, color: c.TEXT_PRIMARY, marginBottom: 8 }}>
+        <div style={{ fontSize: 20, fontWeight: 700, color: c.TEXT_PRIMARY, marginBottom: 8 }}>
           {label}
         </div>
 
@@ -502,7 +503,7 @@ function LoadingBlock({
           )}
         </div>
 
-        <Text type="secondary" style={{ display: 'block', fontSize: 11.5, color: c.TEXT_MUTED, marginTop: 16 }}>
+        <Text type="secondary" style={{ display: 'block', fontSize: 12, color: c.TEXT_MUTED, marginTop: 16 }}>
           Comparing recorded metadata — no downloads. Runs in the background, so you can
           leave this page and come back.
         </Text>
@@ -608,10 +609,10 @@ export function ParityResult({
     tone === 'green'
       ? c.GLOW_GREEN
       : tone === 'red'
-        ? 'rgba(251,113,133,0.30)'
+        ? tint(c.ACCENT_RED, 30)
         : tone === 'blue'
-          ? 'rgba(45,212,191,0.28)'
-          : 'rgba(251,191,36,0.30)';
+          ? tint(c.ACCENT_BLUE, 28)
+          : tint(c.ACCENT_AMBER, 30);
 
   const scannedDate = new Date(outcome.scanned_at * 1000);
   const scannedAbsolute = scannedDate.toLocaleString();
@@ -693,8 +694,8 @@ export function ParityResult({
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              background: `${haloColor}1f`,
-              border: `1.5px solid ${haloColor}66`,
+              background: tint(haloColor, 12),
+              border: `1.5px solid ${tint(haloColor, 40)}`,
             }}
           >
             {inSync ? (
@@ -708,7 +709,7 @@ export function ParityResult({
         </div>
 
         {/* Headline — one word from the authoritative verdict. */}
-        <div style={{ fontSize: 21, fontWeight: 700, color: c.TEXT_PRIMARY, marginBottom: 8 }}>
+        <div style={{ fontSize: 20, fontWeight: 700, color: c.TEXT_PRIMARY, marginBottom: 8 }}>
           {headlineFor(outcome)}
         </div>
 
@@ -958,7 +959,7 @@ function UnreadObjectsNote({
       </div>
       {errors.length > 0 && (
         <div style={{ marginTop: 8 }}>
-          <Text strong style={{ fontSize: 12.5 }}>
+          <Text strong style={{ fontSize: 13 }}>
             {errors.length === 1 ? 'Error of the last read' : 'Errors of the last reads'}
           </Text>
           {errors.map((e) => (
@@ -970,7 +971,7 @@ function UnreadObjectsNote({
       )}
       {listed.length > 0 && (
         <details style={{ marginTop: 8 }}>
-          <summary style={{ cursor: 'pointer', fontSize: 12.5 }}>
+          <summary style={{ cursor: 'pointer', fontSize: 13 }}>
             {recheckable === 1 ? 'The unread object' : `The unread objects (${recheckable.toLocaleString()})`}
           </summary>
           <ul aria-label="Unread objects" style={{ margin: '8px 0 0', paddingInlineStart: 16 }}>
@@ -1008,7 +1009,7 @@ function UnreadObjectsNote({
 function BlockedNote({ reason, c }: { reason?: string | null; c: ReturnType<typeof useColors> }) {
   if (!reason) return null;
   return (
-    <Text type="secondary" role="note" style={{ display: 'block', fontSize: 12.5, marginTop: 8, color: c.TEXT_MUTED }}>
+    <Text type="secondary" role="note" style={{ display: 'block', fontSize: 13, marginTop: 8, color: c.TEXT_MUTED }}>
       {reason}
     </Text>
   );
@@ -1038,10 +1039,10 @@ function DeepVerifyAffordance({ c }: { c: ReturnType<typeof useColors> }) {
     >
       <SafetyCertificateOutlined style={{ fontSize: 20, color: c.TEXT_MUTED, flexShrink: 0 }} />
       <div style={{ flex: 1, minWidth: 0 }}>
-        <Text strong style={{ display: 'block', fontSize: 13.5, color: c.TEXT_PRIMARY }}>
+        <Text strong style={{ display: 'block', fontSize: 14, color: c.TEXT_PRIMARY }}>
           Want byte-level certainty?
         </Text>
-        <Text type="secondary" style={{ fontSize: 12.5, color: c.TEXT_MUTED, lineHeight: 1.5 }}>
+        <Text type="secondary" style={{ fontSize: 13, color: c.TEXT_MUTED, lineHeight: 1.5 }}>
           This audit compares recorded metadata — it doesn't re-read the destination's bytes.
           Deep verify (coming soon) will reconstruct a sample of objects and re-hash them to prove
           they actually restore.
@@ -1090,7 +1091,7 @@ function ReverifyBanner({
         marginBottom: 12,
         borderRadius: 12,
         background: c.BG_ELEVATED,
-        border: `1px solid ${c.ACCENT_BLUE}40`,
+        border: `1px solid ${tint(c.ACCENT_BLUE, 25)}`,
       }}
     >
       <span className="dg-verify-spinner dg-verify-spinner-sm" aria-hidden />
@@ -1098,7 +1099,7 @@ function ReverifyBanner({
         <Text strong style={{ display: 'block', fontSize: 14, color: c.TEXT_PRIMARY }}>
           {label ?? 'Re-verifying parity…'}
         </Text>
-        <Text type="secondary" style={{ fontSize: 12.5, color: c.TEXT_MUTED }}>
+        <Text type="secondary" style={{ fontSize: 13, color: c.TEXT_MUTED }}>
           {scanned != null && prog.text ? `${prog.text} · ${rate} · ` : ''}
           the result below is from {relativeTime(since)} and is being refreshed.
         </Text>
@@ -1131,7 +1132,7 @@ function RuleContextLine({
   c: ReturnType<typeof useColors>;
 }) {
   return (
-    <div style={{ fontSize: 12.5, color: c.TEXT_MUTED, marginTop: 12 }}>
+    <div style={{ fontSize: 13, color: c.TEXT_MUTED, marginTop: 12 }}>
       Conflict policy:{' '}
       <span style={{ color: c.TEXT_SECONDARY, fontWeight: 600 }}>
         {conflictPolicyLabel(outcome.conflict_policy)}
@@ -1182,13 +1183,13 @@ function Chip({ color, text }: { color: string; text: string }) {
         display: 'inline-flex',
         alignItems: 'center',
         gap: 8,
-        fontSize: 12.5,
+        fontSize: 13,
         fontWeight: 600,
         padding: '4px 12px',
         borderRadius: 999,
         color,
-        background: `${color}1a`,
-        border: `1px solid ${color}40`,
+        background: tint(color, 10),
+        border: `1px solid ${tint(color, 25)}`,
       }}
     >
       <span style={{ width: 7, height: 7, borderRadius: '50%', background: color }} />
@@ -1227,7 +1228,7 @@ function FindingsTable({
   return (
     <div style={{ marginTop: 16 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8, flexWrap: 'wrap' }}>
-        <Text strong style={{ fontSize: 13.5 }}>
+        <Text strong style={{ fontSize: 14 }}>
           Differences
         </Text>
         {fixedByRun > 0 && (
@@ -1345,10 +1346,10 @@ function FixCell({ finding, c }: { finding: ParityFinding; c: ReturnType<typeof 
   if (meta.runnable) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }} title={rem.fix_detail}>
-        <Text strong style={{ fontSize: 12.5, color: c.TEXT_PRIMARY, lineHeight: 1.35 }}>
+        <Text strong style={{ fontSize: 13, color: c.TEXT_PRIMARY, lineHeight: 1.35 }}>
           Run the rule
         </Text>
-        <Text type="secondary" style={{ fontSize: 11.5, color: c.TEXT_MUTED, lineHeight: 1.4 }}>
+        <Text type="secondary" style={{ fontSize: 12, color: c.TEXT_MUTED, lineHeight: 1.4 }}>
           {rem.fix_detail} (Run now, above)
         </Text>
       </div>
@@ -1359,10 +1360,10 @@ function FixCell({ finding, c }: { finding: ParityFinding; c: ReturnType<typeof 
   // action verb + the how-to), NOT a chip that mimics a clickable button.
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }} title={rem.fix_detail}>
-      <Text strong style={{ fontSize: 12.5, color: c.TEXT_PRIMARY, lineHeight: 1.35 }}>
+      <Text strong style={{ fontSize: 13, color: c.TEXT_PRIMARY, lineHeight: 1.35 }}>
         {meta.label}
       </Text>
-      <Text type="secondary" style={{ fontSize: 11.5, color: c.TEXT_MUTED, lineHeight: 1.4 }}>
+      <Text type="secondary" style={{ fontSize: 12, color: c.TEXT_MUTED, lineHeight: 1.4 }}>
         {meta.how ?? rem.fix_detail}
       </Text>
     </div>

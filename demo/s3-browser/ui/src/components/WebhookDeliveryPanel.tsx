@@ -33,7 +33,7 @@ import { ApiOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { SectionApplyResponse } from '../adminApi';
 import { deliveryStateOf } from '../adminApi';
 import { useEventOutboxSummary } from '../queries/eventOutbox';
-import { useCardStyles, contentColumn, CONTENT_WIDE } from './shared-styles';
+import { useCardStyles, contentColumn, CONTENT_WIDE, BREAKPOINT } from './shared-styles';
 import { ErrorState, LoadingState } from './StatePlaceholders';
 import { useIsNarrow } from '../useIsNarrow';
 import { useSectionEditor } from '../useSectionEditor';
@@ -112,7 +112,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
   const { cardStyle, inputRadius } = useCardStyles();
   const nav = useNavigation();
   // Below ~900px the Slack two-column (config + preview) split stacks vertically.
-  const isNarrow = useIsNarrow(900);
+  const isNarrow = useIsNarrow(BREAKPOINT.shell);
 
   // Per-instance row-id counter (no module global) — only used for React keys
   // within this panel instance.

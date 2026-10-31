@@ -3,6 +3,7 @@ import type { IamUser, IamGroup } from '../adminApi';
 import { rowsToPermissions, type PermissionRow } from './permissionRows';
 import { useColors } from '../ThemeContext';
 import PillButton from './PillButton';
+import { tint } from '../themeVars';
 
 const { Text } = Typography;
 
@@ -38,14 +39,14 @@ export default function PermissionSummarySection({ user, permissions, userGroups
               onNavigateToGroup ? (
                 <PillButton key={g.id} onClick={() => onNavigateToGroup(g.id)} title={`Open group ${g.name}`}>
                   {g.name}
-                  <span style={{ marginLeft: 4, fontSize: 10 }}>
+                  <span style={{ marginLeft: 4, fontSize: 11 }}>
                     {g.permissions.length} rule{g.permissions.length !== 1 ? 's' : ''} · {g.member_ids.length} member{g.member_ids.length !== 1 ? 's' : ''}
                   </span>
                 </PillButton>
               ) : (
                 <Tag key={g.id} color="blue" style={{ borderRadius: 8, fontSize: 12, padding: '4px 12px', margin: 0 }}>
                   {g.name}
-                  <span style={{ marginLeft: 4, fontSize: 10 }}>
+                  <span style={{ marginLeft: 4, fontSize: 11 }}>
                     {g.permissions.length} rule{g.permissions.length !== 1 ? 's' : ''} · {g.member_ids.length} member{g.member_ids.length !== 1 ? 's' : ''}
                   </span>
                 </Tag>
@@ -77,19 +78,19 @@ export default function PermissionSummarySection({ user, permissions, userGroups
               <Text style={{ fontSize: 12, fontWeight: 600, color: colors.ACCENT_BLUE }}>
                 From {g.name}
               </Text>
-              <span aria-hidden="true" style={{ fontSize: 10, color: colors.TEXT_MUTED }}>↗</span>
+              <span aria-hidden="true" style={{ fontSize: 11, color: colors.TEXT_MUTED }}>↗</span>
             </button>
             {g.permissions.map((perm, i) => {
               const isDeny = perm.effect === 'Deny';
               return (
                 <div key={i} style={{
-                  border: `1px solid ${isDeny ? `${colors.ACCENT_RED}20` : colors.BORDER}`,
-                  borderLeft: isDeny ? `3px solid ${colors.ACCENT_RED}60` : `3px solid ${colors.ACCENT_BLUE}40`,
+                  border: `1px solid ${isDeny ? tint(colors.ACCENT_RED, 13) : colors.BORDER}`,
+                  borderLeft: isDeny ? `3px solid ${tint(colors.ACCENT_RED, 38)}` : `3px solid ${tint(colors.ACCENT_BLUE, 25)}`,
                   borderRadius: 8, padding: '8px 12px', marginBottom: 4,
-                  background: isDeny ? `${colors.ACCENT_RED}05` : colors.BG_BASE,
+                  background: isDeny ? tint(colors.ACCENT_RED, 2) : colors.BG_BASE,
                 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <Tag color={isDeny ? 'red' : 'green'} style={{ fontSize: 10, borderRadius: 4, margin: 0 }}>{perm.effect}</Tag>
+                    <Tag color={isDeny ? 'red' : 'green'} style={{ fontSize: 11, borderRadius: 4, margin: 0 }}>{perm.effect}</Tag>
                     <Text style={{ fontSize: 12 }}>
                       <strong>{perm.actions.join(', ')}</strong> on {perm.resources.join(', ')}
                     </Text>
@@ -105,7 +106,7 @@ export default function PermissionSummarySection({ user, permissions, userGroups
       {allPerms.length > 0 && (
         <div style={{
           marginTop: 16, padding: 12, borderRadius: 8,
-          background: `${colors.ACCENT_BLUE}08`, border: `1px solid ${colors.ACCENT_BLUE}20`,
+          background: tint(colors.ACCENT_BLUE, 3), border: `1px solid ${tint(colors.ACCENT_BLUE, 13)}`,
         }}>
           <Text style={{
             fontSize: 12, fontWeight: 600,
@@ -121,13 +122,13 @@ export default function PermissionSummarySection({ user, permissions, userGroups
                 display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0',
                 borderBottom: i < allPerms.length - 1 ? `1px solid ${colors.BORDER}` : undefined,
               }}>
-                <Tag color={isDeny ? 'red' : 'green'} style={{ fontSize: 10, borderRadius: 4, margin: 0, flexShrink: 0 }}>
+                <Tag color={isDeny ? 'red' : 'green'} style={{ fontSize: 11, borderRadius: 4, margin: 0, flexShrink: 0 }}>
                   {perm.effect}
                 </Tag>
                 <Text style={{ fontSize: 12, flex: 1 }}>
                   {perm.actions.join(', ')} on {perm.resources.join(', ')}
                 </Text>
-                <Text style={{ fontSize: 10, color: colors.TEXT_MUTED, flexShrink: 0 }}>
+                <Text style={{ fontSize: 11, color: colors.TEXT_MUTED, flexShrink: 0 }}>
                   {source}
                 </Text>
               </div>

@@ -1,5 +1,5 @@
-/* RecordList: subgrid + container-query responsive record list. Colors come
-   from injected CSS vars (useColors()); this file owns layout only. */
+/* RecordList: subgrid + container-query responsive record list. Colours are
+   the palette vars (--dg-*, themeVars.ts); the column tracks come inline. */
 .dg-record-list {
   container-type: inline-size;
   container-name: recordlist;
@@ -35,16 +35,16 @@
 }
 
 .dg-record-head {
-  border-bottom: 1px solid var(--rl-border);
+  border-bottom: 1px solid var(--dg-border);
 }
 
 .dg-record-hcell {
-  font-family: var(--font-ui, 'Manrope', sans-serif);
+  font-family: var(--font-ui);
   font-weight: 600;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
   font-size: 11px;
-  color: var(--rl-text-secondary);
+  color: var(--dg-text-secondary);
   padding: 0 0 8px;
   white-space: nowrap;
 }
@@ -53,7 +53,7 @@
 
 /* One separator per row (not per cell) → a single clean line the full width. */
 .dg-record-row + .dg-record-row {
-  border-top: 1px solid var(--rl-border);
+  border-top: 1px solid var(--dg-border);
 }
 
 .dg-record-cell {
@@ -68,7 +68,7 @@
 /* Hover highlights the whole row as one band (edge to edge via the gaps),
    not per-cell squares with gutters between them. */
 .dg-record-row[data-clickable] { cursor: pointer; }
-.dg-record-row[data-clickable]:hover { background: var(--rl-hover); }
+.dg-record-row[data-clickable]:hover { background: var(--dg-bg-elevated); }
 /* The empty state is an <EmptyState>: it brings its own padding and type. */
 .dg-record-empty {
   display: flex;
@@ -77,12 +77,12 @@
 
 /* A row the user just saved: a short flash of the accent, then normal. */
 @keyframes dg-record-flash {
-  from { background: var(--rl-highlight); }
+  from { background: color-mix(in srgb, var(--dg-accent-blue) 13%, transparent); }
   to { background: transparent; }
 }
 .dg-record-row[data-highlight] { animation: dg-record-flash 2.4s ease-out; }
 @media (prefers-reduced-motion: reduce) {
-  .dg-record-row[data-highlight] { animation: none; background: var(--rl-highlight); }
+  .dg-record-row[data-highlight] { animation: none; background: color-mix(in srgb, var(--dg-accent-blue) 13%, transparent); }
 }
 /* A row on its way out (staged for removal): dimmed, the name struck. */
 .dg-record-row[data-dimmed] > .dg-record-cell:not([data-col='actions']) { opacity: 0.55; }
@@ -138,12 +138,12 @@
     /* Dense: a phone shows several jobs per screen, not one. */
     row-gap: 6px;
     padding: 10px 12px;
-    border: 1px solid var(--rl-border);
+    border: 1px solid var(--dg-border);
     border-radius: 10px;
-    background: var(--rl-bg-card);
+    background: var(--dg-bg-card);
   }
-  .dg-record-row + .dg-record-row { border-top: 1px solid var(--rl-border); }
-  .dg-record-row[data-clickable]:hover { background: var(--rl-hover); }
+  .dg-record-row + .dg-record-row { border-top: 1px solid var(--dg-border); }
+  .dg-record-row[data-clickable]:hover { background: var(--dg-bg-elevated); }
 
   .dg-record-cell {
     grid-column: 1 / -1;
@@ -159,7 +159,7 @@
     content: attr(data-label);
     display: block;
     font-size: 11px;
-    color: var(--rl-text-muted);
+    color: var(--dg-text-muted);
     margin-bottom: 2px;
   }
   /* Actions sit as a full-width button row at the bottom of the card, and the
@@ -167,7 +167,7 @@
   .dg-record-cell[data-col='actions'] {
     margin-top: 2px;
     padding-top: 8px;
-    border-top: 1px solid var(--rl-border);
+    border-top: 1px solid var(--dg-border);
   }
   .dg-action-label {
     position: static;

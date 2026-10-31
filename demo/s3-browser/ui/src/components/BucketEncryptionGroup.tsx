@@ -281,12 +281,12 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
             staged, before the user touches it. */}
         <Tag
           title="An encryption change is not staged with the other settings: it has its own Review & apply, and applies at once."
-          style={{ fontSize: 10, margin: '0 0 0 8px', padding: '0 8px', lineHeight: '16px', textTransform: 'none', letterSpacing: 0, fontWeight: 500 }}
+          style={{ fontSize: 11, margin: '0 0 0 8px', padding: '0 8px', lineHeight: '16px', textTransform: 'none', letterSpacing: 0, fontWeight: 500 }}
         >
           applies at once
         </Tag>
         {eff.key_env && (
-          <Tag style={{ fontSize: 10, fontFamily: 'var(--font-mono)', margin: '0 0 0 8px', padding: '0 8px', lineHeight: '16px', textTransform: 'none', letterSpacing: 0 }}>
+          <Tag style={{ fontSize: 11, fontFamily: 'var(--font-mono)', margin: '0 0 0 8px', padding: '0 8px', lineHeight: '16px', textTransform: 'none', letterSpacing: 0 }}>
             from env {eff.key_env}
           </Tag>
         )}

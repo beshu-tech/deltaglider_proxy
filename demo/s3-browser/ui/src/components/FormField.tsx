@@ -253,7 +253,7 @@ export default function FormField({
         <label
           id={labelId}
           htmlFor={envOverride ? undefined : controlId}
-          style={{ color: TEXT, fontSize: 13.5, fontWeight: 600, letterSpacing: '-0.005em', flex: '0 0 auto', maxWidth: '100%' }}
+          style={{ color: TEXT, fontSize: 14, fontWeight: 600, letterSpacing: '-0.005em', flex: '0 0 auto', maxWidth: '100%' }}
         >
           {label}
         </label>
@@ -284,7 +284,7 @@ export default function FormField({
         {(envBadge ?? ownerBadge) && (
           <Tag
             style={{
-              fontSize: 10,
+              fontSize: 11,
               fontFamily: 'var(--font-mono)',
               margin: 0,
               padding: `0 ${SPACE.xxs}px`,
@@ -315,7 +315,7 @@ export default function FormField({
           id={errorId}
           role="alert"
           data-testid="field-error"
-          style={{ marginTop: SPACE.xxs, fontSize: 12.5, color: ACCENT_RED, lineHeight: 1.4 }}
+          style={{ marginTop: SPACE.xxs, fontSize: 13, color: ACCENT_RED, lineHeight: 1.4 }}
         >
           {error}
         </div>
@@ -323,7 +323,7 @@ export default function FormField({
       {/* Help text — clearly subordinate: smaller, fainter, tight line-height.
           Example chips share this row. */}
       {envOverride && (
-        <div style={{ marginTop: SPACE.xxs, fontSize: 12.5, color: TEXT_MUTED, lineHeight: 1.4 }}>
+        <div style={{ marginTop: SPACE.xxs, fontSize: 13, color: TEXT_MUTED, lineHeight: 1.4 }}>
           {envOverrideHelp(envOverride)}
         </div>
       )}
@@ -331,7 +331,7 @@ export default function FormField({
         <div
           style={{
             marginTop: SPACE.xxs,
-            fontSize: 12.5,
+            fontSize: 13,
             color: TEXT_MUTED,
             lineHeight: 1.4,
             display: 'flex',

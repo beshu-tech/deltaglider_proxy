@@ -1,10 +1,15 @@
-/* Google Fonts: Manrope (UI + reading sans) + JetBrains Mono (data/code) */
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
-
-:root {
-  --font-ui: 'Manrope', sans-serif;
-  --font-mono: 'JetBrains Mono', monospace;
-}
+/*
+ * Theme layers (read before you add a colour, a font or a size):
+ *   1. ThemeContext.tsx  `darkColors` / `lightColors` — THE palette. Every
+ *      theme colour is a token there. themeVars.ts publishes each one as
+ *      `--dg-<token>` (BG_CARD → --dg-bg-card) on [data-theme], and the
+ *      fonts as --font-ui / --font-mono (bundled, no CDN).
+ *   2. This file — derived roles (--focus-ring, --docs-*, --hljs-*, …) that
+ *      name a palette var, plus the few tints that exist only here; the
+ *      app-wide AntD overrides; and the shared classes (dg-*).
+ *   3. theme.ts — AntD tokens, read from the palette.
+ * A colour literal outside a token block is a regression (cssTokens.test.ts).
+ */
 
 /*
  * Reserve the vertical-scrollbar gutter unconditionally.
@@ -25,6 +30,9 @@ html {
 
 body {
   margin: 0;
+  /* The default for every element: AntD sets its font on its own
+     components only, so plain text fell back to the browser serif. */
+  font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   /* Manrope's space is narrow: at 11-13 px "2h 55m ago" reads as one token.
@@ -43,14 +51,31 @@ code, kbd, pre, samp, .ant-typography code,
   word-spacing: 0.12em;
 }
 
-/* ───── Theme-aware CSS custom properties ───── */
+
+/* ───── Roles: one palette var per role, the same mapping in both themes ───── */
+:root {
+  --focus-ring: var(--dg-accent-blue);
+  --docs-text: var(--dg-text-primary);
+  --docs-heading: var(--dg-text-primary);
+  --docs-border: var(--dg-border);
+  --docs-toc-text: var(--dg-text-muted);
+  --docs-muted: var(--dg-text-muted);
+  --docs-toc-active: var(--dg-accent-blue);
+  --docs-link: var(--dg-accent-blue);
+  --hljs-keyword: var(--dg-accent-purple);
+  --hljs-string: var(--dg-accent-green);
+  --hljs-comment: var(--dg-text-faint);
+  --hljs-attr: var(--dg-accent-red);
+  --hljs-title: var(--dg-accent-blue);
+}
+
+/* ───── Theme-only tints ───── */
 [data-theme="dark"] {
   --scrollbar-track: rgba(255, 255, 255, 0.03);
   --scrollbar-thumb: rgba(255, 255, 255, 0.08);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.14);
   --table-row-hover: rgba(45, 212, 191, 0.10);
   --table-row-selected: rgba(45, 212, 191, 0.17);
-  --focus-ring: #2dd4bf;
   --glass-bg: rgba(15, 23, 42, 0.6);
   --glass-border: rgba(255, 255, 255, 0.06);
   --surface-hover: rgba(255, 255, 255, 0.04);
@@ -59,12 +84,9 @@ code, kbd, pre, samp, .ant-typography code,
   --group-border: rgba(255, 255, 255, 0.08);
   --group-header-bg: #131c2e;
   --group-rail: rgba(255, 255, 255, 0.10);
-  --shimmer-color: rgba(255, 255, 255, 0.03);
   --drop-glow: rgba(45, 212, 191, 0.15);
   --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.04);
-  --card-shadow-hover: 0 4px 16px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(45, 212, 191, 0.12);
   --input-bg: rgba(255, 255, 255, 0.04);
-  --badge-glow: 0 0 8px rgba(45, 212, 191, 0.3);
   --dot-color: rgba(255, 255, 255, 0.035);
   --overlay-bg: rgba(8, 12, 20, 0.85);
   --login-shell-bg:
@@ -72,50 +94,31 @@ code, kbd, pre, samp, .ant-typography code,
     radial-gradient(circle at 82% 8%, rgba(167, 139, 250, 0.16), transparent 30%),
     linear-gradient(135deg, #071018 0%, #0b1120 42%, #101827 100%);
   --login-panel-bg: rgba(9, 15, 27, 0.74);
-  --login-story-bg: linear-gradient(145deg, rgba(18, 28, 47, 0.72), rgba(9, 15, 27, 0.58));
   --login-card-border: rgba(255, 255, 255, 0.10);
   --login-soft-line: rgba(255, 255, 255, 0.08);
   --login-hero-text: #f8fbff;
   --login-shadow: 0 34px 100px rgba(0, 0, 0, 0.48);
+  --login-submit-blend: #60a5fa;
+  /* Account menu */
+  --menu-panel-bg: rgba(22, 48, 48, 0.94);
+  --menu-trigger-bg: rgba(26, 58, 58, 0.76);
+  --menu-border: rgba(255, 255, 255, 0.10);
+  --menu-trigger-hover-border: rgba(255, 255, 255, 0.16);
+  --menu-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+  --menu-item-text: rgba(248, 250, 252, 0.94);
+  --menu-item-hover: rgba(255, 255, 255, 0.08);
+  --menu-avatar-bg: rgba(14, 36, 36, 0.95);
+  --menu-avatar-text: var(--dg-accent-blue-light);
   /* Docs */
-  --docs-text: #e4e9f2;
-  --docs-border: #1e2d45;
-  --docs-code-bg: #0b1120;
+  --docs-code-bg: var(--dg-bg-sidebar);
+  --docs-code-inline-text: var(--dg-accent-blue-light);
   --docs-code-inline-bg: rgba(45, 212, 191, 0.08);
   --docs-code-inline-border: rgba(45, 212, 191, 0.15);
-  --docs-code-inline-text: #5eead4;
   --docs-blockquote-bg: rgba(45, 212, 191, 0.04);
   --docs-table-stripe: rgba(11, 17, 32, 0.4);
-  --docs-toc-text: #9aa5b5;
-  --docs-toc-active: #2dd4bf;
-  --docs-link: #2dd4bf;
-  --docs-heading: #e4e9f2;
-  /* Semantic status colors */
-  --accent-success: #52c41a;
-  --accent-warning: #faad14;
-  --accent-deny: #ff4d4f;
-  /* Status code colors (metrics) */
-  --status-2xx: #2dd4bf;
-  --status-3xx: #60a5fa;
-  --status-4xx: #fbbf24;
-  --status-5xx: #fb7185;
-  /* Chart palette */
-  --chart-1: #2dd4bf;
-  --chart-2: #60a5fa;
-  --chart-3: #a78bfa;
-  --chart-4: #fbbf24;
-  --chart-5: #fb7185;
-  --chart-6: #34d399;
-  --chart-7: #f472b6;
-  --chart-8: #818cf8;
   /* Syntax highlighting */
-  --hljs-keyword: #a78bfa;
-  --hljs-string: #34d399;
   --hljs-number: #fbbf24;
-  --hljs-comment: #88a0b8;
   --hljs-builtin: #60a5fa;
-  --hljs-attr: #fb7185;
-  --hljs-title: #2dd4bf;
   color-scheme: dark;
 }
 
@@ -125,7 +128,6 @@ code, kbd, pre, samp, .ant-typography code,
   --scrollbar-thumb-hover: rgba(0, 0, 0, 0.2);
   --table-row-hover: rgba(13, 148, 136, 0.09);
   --table-row-selected: rgba(13, 148, 136, 0.15);
-  --focus-ring: #0f766e;
   --glass-bg: rgba(255, 255, 255, 0.7);
   --glass-border: rgba(0, 0, 0, 0.06);
   --surface-hover: rgba(0, 0, 0, 0.03);
@@ -133,12 +135,9 @@ code, kbd, pre, samp, .ant-typography code,
   --group-border: rgba(12, 22, 41, 0.10);
   --group-header-bg: #e3e8f0;
   --group-rail: rgba(12, 22, 41, 0.12);
-  --shimmer-color: rgba(0, 0, 0, 0.02);
   --drop-glow: rgba(13, 148, 136, 0.1);
   --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 0 0 1px rgba(0, 0, 0, 0.04);
-  --card-shadow-hover: 0 4px 16px rgba(0, 0, 0, 0.10), 0 0 0 1px rgba(13, 148, 136, 0.1);
   --input-bg: rgba(0, 0, 0, 0.02);
-  --badge-glow: 0 0 8px rgba(13, 148, 136, 0.2);
   --dot-color: rgba(0, 0, 0, 0.04);
   --overlay-bg: rgba(245, 247, 250, 0.9);
   --login-shell-bg:
@@ -146,60 +145,37 @@ code, kbd, pre, samp, .ant-typography code,
     radial-gradient(circle at 86% 10%, rgba(124, 58, 237, 0.14), transparent 28%),
     linear-gradient(135deg, #f7fbfb 0%, #eef5f7 46%, #f7f1ff 100%);
   --login-panel-bg: rgba(255, 255, 255, 0.78);
-  --login-story-bg: linear-gradient(145deg, rgba(255, 255, 255, 0.70), rgba(236, 245, 246, 0.58));
   --login-card-border: rgba(12, 22, 41, 0.10);
   --login-soft-line: rgba(12, 22, 41, 0.10);
   --login-hero-text: #07111f;
   --login-shadow: 0 34px 100px rgba(12, 22, 41, 0.18);
+  --login-submit-blend: #60a5fa;
+  /* Account menu */
+  --menu-panel-bg: rgba(248, 252, 251, 0.94);
+  --menu-trigger-bg: rgba(13, 148, 136, 0.16);
+  --menu-border: rgba(12, 22, 41, 0.12);
+  --menu-trigger-hover-border: rgba(13, 148, 136, 0.35);
+  --menu-shadow: 0 10px 36px rgba(12, 22, 41, 0.12);
+  --menu-item-text: var(--dg-text-primary);
+  --menu-item-hover: rgba(13, 148, 136, 0.16);
+  --menu-avatar-bg: rgba(255, 255, 255, 0.65);
+  --menu-avatar-text: var(--dg-accent-blue);
   /* Docs */
-  --docs-text: #0c1629;
-  --docs-border: #d5dbe5;
   --docs-code-bg: #f1f5f9;
   --docs-code-inline-bg: rgba(13, 148, 136, 0.08);
   --docs-code-inline-border: rgba(13, 148, 136, 0.18);
   --docs-code-inline-text: #0d7367;
   --docs-blockquote-bg: rgba(13, 148, 136, 0.04);
   --docs-table-stripe: rgba(0, 0, 0, 0.02);
-  --docs-toc-text: #55627a;
-  --docs-toc-active: #0f766e;
-  --docs-link: #0f766e;
-  --docs-heading: #0c1629;
-  --hljs-keyword: #7c3aed;
-  --hljs-string: #047857;
   --hljs-number: #b45309;
-  --hljs-comment: #5f6c80;
   --hljs-builtin: #2563eb;
-  --hljs-attr: #be123c;
-  --hljs-title: #0f766e;
-  /* Semantic status */
-  --accent-success: #389e0d;
-  --accent-warning: #d48806;
-  --accent-deny: #cf1322;
-  /* Status codes */
-  --status-2xx: #0d9488;
-  --status-3xx: #2563eb;
-  --status-4xx: #d97706;
-  --status-5xx: #e11d48;
-  /* Chart palette */
-  --chart-1: #0d9488;
-  --chart-2: #2563eb;
-  --chart-3: #7c3aed;
-  --chart-4: #d97706;
-  --chart-5: #e11d48;
-  --chart-6: #059669;
-  --chart-7: #db2777;
-  --chart-8: #4f46e5;
   color-scheme: light;
 }
 
 /* ───── Responsive breakpoints ───── */
 @media (max-width: 768px) {
-  .responsive-grid-3 { grid-template-columns: 1fr !important; }
   .responsive-grid-2 { grid-template-columns: 1fr !important; }
   .hide-mobile { display: none !important; }
-}
-@media (min-width: 769px) and (max-width: 1024px) {
-  .responsive-grid-3 { grid-template-columns: repeat(2, 1fr) !important; }
 }
 
 /* ───── Scrollbar styling ───── */
@@ -208,14 +184,14 @@ code, kbd, pre, samp, .ant-typography code,
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: var(--scrollbar-track, transparent);
+  background: var(--scrollbar-track);
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--scrollbar-thumb, rgba(255, 255, 255, 0.08));
+  background: var(--scrollbar-thumb);
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--scrollbar-thumb-hover, rgba(255, 255, 255, 0.14));
+  background: var(--scrollbar-thumb-hover);
 }
 
 /* ───── Kill ALL Ant Design tooltips/popovers (broken positioning in this layout) ───── */
@@ -247,7 +223,7 @@ code, kbd, pre, samp, .ant-typography code,
 
 /* Table header refinement */
 .ant-table-wrapper .ant-table-thead > tr > th {
-  font-family: 'Manrope', sans-serif !important;
+  font-family: var(--font-ui) !important;
   font-weight: 600 !important;
   letter-spacing: 0.06em !important;
   text-transform: uppercase !important;
@@ -312,15 +288,15 @@ code, kbd, pre, samp, .ant-typography code,
   clip: auto;
   white-space: normal;
   z-index: 10000;
-  background: #2dd4bf;
-  color: #0a0e17;
-  font-family: 'Manrope', sans-serif;
+  background: var(--dg-accent-blue);
+  color: var(--dg-on-accent);
+  font-family: var(--font-ui);
   font-size: 14px;
   font-weight: 600;
   border-radius: 8px;
   text-decoration: none;
   outline: none;
-  box-shadow: 0 4px 12px rgba(45, 212, 191, 0.3);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--dg-accent-blue) 30%, transparent);
 }
 
 /* ───── Accessibility: ONE focus ring for the whole app ─────
@@ -337,7 +313,7 @@ code, kbd, pre, samp, .ant-typography code,
   --focus-ring-offset: 2px;
 }
 :focus-visible:not(input, textarea, select, [tabindex='-1']) {
-  outline: var(--focus-ring-width) solid var(--focus-ring, #2dd4bf) !important;
+  outline: var(--focus-ring-width) solid var(--focus-ring) !important;
   outline-offset: var(--focus-ring-offset) !important;
 }
 /* Text fields (D2): the focused <input> of an AntD field sits inside a
@@ -350,7 +326,7 @@ code, kbd, pre, samp, .ant-typography code,
 .ant-select-focused:not(.ant-select-disabled),
 .ant-picker-focused,
 :is(input, textarea, select):focus-visible:not([class*="ant-"], [type='checkbox'], [type='radio'], [tabindex='-1']) {
-  outline: var(--focus-ring-width) solid var(--focus-ring, #2dd4bf) !important;
+  outline: var(--focus-ring-width) solid var(--focus-ring) !important;
   outline-offset: 1px !important;
 }
 /* Segmented (D3): rc-segmented makes BOTH its root and the radio of the
@@ -394,10 +370,38 @@ code, kbd, pre, samp, .ant-typography code,
   display: flex;
   align-items: center;
   box-sizing: border-box;
-  font-family: 'Manrope', sans-serif;
+  font-family: var(--font-ui);
 }
 .btn-reset:focus-visible {
   border-radius: 6px;
+}
+
+/* ───── Hover feedback: CSS, never an onMouseEnter style write ─────
+   A mouse handler that writes `style` misses keyboard focus and keeps a
+   stale colour across a theme flip. Add the class only while the hover
+   applies (not on the current/selected row). The element's inline style
+   sets its rest state, so the hover wins with !important. */
+.dg-hover-surface:not(:disabled):is(:hover, :focus-visible, :has(:focus-visible)) {
+  background: var(--surface-hover) !important;
+}
+.dg-hover-tint:not(:disabled):is(:hover, :focus-visible) {
+  background: color-mix(in srgb, var(--dg-accent-blue) 9%, transparent) !important;
+}
+.dg-hover-text:not(:disabled):is(:hover, :focus-visible) {
+  color: var(--dg-text-primary) !important;
+}
+.dg-hover-accent:not(:disabled):is(:hover, :focus-visible) {
+  color: var(--dg-accent-blue) !important;
+}
+.dg-hover-border-accent:is(:hover, :focus-visible) {
+  border-color: var(--dg-accent-blue) !important;
+}
+/* A secondary row action: dim until the pointer or the focus reaches it. */
+.dg-hover-reveal {
+  opacity: 0.5;
+}
+.dg-hover-reveal:is(:hover, :focus-visible) {
+  opacity: 1;
 }
 
 /* ───── Theme flip: one paint ─────
@@ -494,7 +498,7 @@ code, kbd, pre, samp, .ant-typography code,
   filter: brightness(0.97);
 }
 .dg-bucket-group-chevron {
-  font-size: 10px;
+  font-size: 11px;
   transition: transform 0.15s ease;
 }
 .dg-bucket-group-header[aria-expanded='true'] .dg-bucket-group-chevron {
@@ -533,29 +537,14 @@ code, kbd, pre, samp, .ant-typography code,
   to { opacity: 1; transform: translateX(0); }
 }
 
-@keyframes pulse-glow {
-  0%, 100% { box-shadow: 0 0 4px rgba(45, 212, 191, 0.2); }
-  50% { box-shadow: 0 0 12px rgba(45, 212, 191, 0.4); }
-}
-
-@keyframes pulse-dot {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-
 @keyframes shimmer {
   0% { background-position: -200% 0; }
   100% { background-position: 200% 0; }
 }
 
 @keyframes dropGlow {
-  0%, 100% { border-color: rgba(45, 212, 191, 0.3); }
-  50% { border-color: rgba(45, 212, 191, 0.7); }
-}
-
-@keyframes spin-slow {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+  0%, 100% { border-color: color-mix(in srgb, var(--dg-accent-blue) 30%, transparent); }
+  50% { border-color: color-mix(in srgb, var(--dg-accent-blue) 70%, transparent); }
 }
 
 /* Upload-complete celebration: one springy pop on entry, then a soft green
@@ -566,9 +555,9 @@ code, kbd, pre, samp, .ant-typography code,
   100% { opacity: 1; transform: scale(1); }
 }
 @keyframes successGlow {
-  0% { box-shadow: 0 0 0 rgba(82, 196, 26, 0); }
-  40% { box-shadow: 0 0 28px rgba(82, 196, 26, 0.35); }
-  100% { box-shadow: 0 0 12px rgba(82, 196, 26, 0.15); }
+  0% { box-shadow: 0 0 0 transparent; }
+  40% { box-shadow: 0 0 28px color-mix(in srgb, var(--dg-accent-green) 35%, transparent); }
+  100% { box-shadow: 0 0 12px color-mix(in srgb, var(--dg-accent-green) 15%, transparent); }
 }
 .dg-upload-success {
   animation: successPop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1), successGlow 1.6s ease-out forwards;
@@ -582,12 +571,6 @@ code, kbd, pre, samp, .ant-typography code,
   animation: slideInRight 0.25s ease-out;
 }
 
-/* Staggered animation delays */
-.delay-1 { animation-delay: 0.05s; animation-fill-mode: both; }
-.delay-2 { animation-delay: 0.1s; animation-fill-mode: both; }
-.delay-3 { animation-delay: 0.15s; animation-fill-mode: both; }
-.delay-4 { animation-delay: 0.2s; animation-fill-mode: both; }
-
 /* ───── Glass morphism utility ───── */
 .glass-card {
   background: var(--glass-bg);
@@ -597,27 +580,15 @@ code, kbd, pre, samp, .ant-typography code,
   box-shadow: var(--card-shadow);
 }
 
-/* Interactive glass card — for clickable cards with hover lift */
-.glass-card-interactive {
-  background: var(--glass-bg);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid var(--glass-border);
-  box-shadow: var(--card-shadow);
-  transition: box-shadow 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
-}
-.glass-card-interactive:hover {
-  box-shadow: var(--card-shadow-hover);
-  transform: translateY(-1px);
-}
-
 /* ───── Dot-grid background texture ───── */
 .dot-grid-bg {
   background-image: radial-gradient(circle, var(--dot-color) 1px, transparent 1px);
   background-size: 24px 24px;
 }
 
-/* ───── Account menu — reused by browser sidebar + fullscreen headers ───── */
+/* ───── Account menu — reused by browser sidebar + fullscreen headers ─────
+   Colours are the --menu-* roles of the theme blocks above: one rule per
+   element, no [data-theme] pairs. */
 .account-menu-wrap {
   position: relative;
 }
@@ -632,12 +603,13 @@ code, kbd, pre, samp, .ant-typography code,
   z-index: 20;
   padding: 12px;
   border-radius: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--menu-border);
+  background: var(--menu-panel-bg);
+  box-shadow: var(--menu-shadow);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   box-sizing: border-box;
   min-width: 244px;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
 }
 .account-menu-wrap--up .account-menu-panel {
   bottom: calc(100% + 8px);
@@ -647,15 +619,8 @@ code, kbd, pre, samp, .ant-typography code,
   left: auto;
   right: 0;
 }
-[data-theme="dark"] .account-menu-panel {
-  background: rgba(22, 48, 48, 0.94);
-}
-[data-theme="light"] .account-menu-panel {
-  background: rgba(248, 252, 251, 0.94);
-  border-color: rgba(12, 22, 41, 0.12);
-  box-shadow: 0 10px 36px rgba(12, 22, 41, 0.12);
-}
 
+/* A plain menu row: no fill at rest, a tint on hover. */
 .account-menu-item {
   appearance: none;
   -webkit-appearance: none;
@@ -672,48 +637,32 @@ code, kbd, pre, samp, .ant-typography code,
   font-size: 13px;
   font-weight: 500;
   font-family: var(--font-ui);
+  background: transparent;
+  color: var(--menu-item-text);
   transition: background 0.15s ease, color 0.15s ease;
 }
 .account-menu-item:last-child {
   margin-bottom: 0;
 }
-/* A plain menu row: no fill at rest, a tint on hover. */
-[data-theme="dark"] .account-menu-item {
-  background: transparent;
-  color: rgba(248, 250, 252, 0.94);
-}
-[data-theme="light"] .account-menu-item {
-  background: transparent;
-  color: #0c1629;
-}
-[data-theme="dark"] .account-menu-item:hover {
-  background: rgba(255, 255, 255, 0.08);
-}
-[data-theme="light"] .account-menu-item:hover {
-  background: rgba(13, 148, 136, 0.16);
+.account-menu-item:hover {
+  background: var(--menu-item-hover);
 }
 
 .account-menu-section {
   margin: 10px 0 6px;
   padding-top: 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  border-top: 1px solid var(--menu-border);
 }
 .account-menu-section--first {
   margin-top: 0;
   padding-top: 0;
   border-top: 0;
 }
-[data-theme="light"] .account-menu-section {
-  border-top-color: rgba(12, 22, 41, 0.1);
-}
 
 .account-menu-signout-section {
   margin: 14px -4px 0;
   padding: 12px 4px 0;
-  border-top: 1px solid rgba(251, 113, 133, 0.28);
-}
-[data-theme="light"] .account-menu-signout-section {
-  border-top-color: rgba(225, 29, 72, 0.22);
+  border-top: 1px solid color-mix(in srgb, var(--dg-accent-red) 25%, transparent);
 }
 
 .account-menu-section-label {
@@ -724,7 +673,6 @@ code, kbd, pre, samp, .ant-typography code,
   text-transform: uppercase;
 }
 
-
 /* Dropdown trigger: do NOT use `.btn-reset` (`all: unset` breaks Ant Design trigger ref + layout). */
 .account-menu-trigger {
   appearance: none;
@@ -732,10 +680,14 @@ code, kbd, pre, samp, .ant-typography code,
   margin: 0;
   font: inherit;
   color: inherit;
+  display: flex;
+  align-items: center;
+  gap: 12px;
   width: 100%;
   padding: 10px 12px;
   border-radius: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--menu-border);
+  background: var(--menu-trigger-bg);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   box-sizing: border-box;
@@ -743,23 +695,8 @@ code, kbd, pre, samp, .ant-typography code,
   text-align: left;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
-[data-theme="dark"] .account-menu-trigger {
-  background: rgba(26, 58, 58, 0.76);
-}
-[data-theme="light"] .account-menu-trigger {
-  background: rgba(13, 148, 136, 0.16);
-  border-color: rgba(12, 22, 41, 0.12);
-}
 .account-menu-trigger:hover {
-  border-color: rgba(255, 255, 255, 0.16);
-}
-[data-theme="light"] .account-menu-trigger:hover {
-  border-color: rgba(13, 148, 136, 0.35);
-}
-.account-menu-trigger {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+  border-color: var(--menu-trigger-hover-border);
 }
 .account-menu-wrap--compact .account-menu-trigger {
   gap: 8px;
@@ -772,12 +709,12 @@ code, kbd, pre, samp, .ant-typography code,
 /* D57: in the compact header the avatar IS the button. The trigger's own
    tinted pill around it read as a focus ring that never went away; the
    real ring is the shared :focus-visible outline. */
-[data-theme] .account-menu-wrap--compact .account-menu-trigger {
+.account-menu-wrap--compact .account-menu-trigger {
   background: transparent;
   border-color: transparent;
   backdrop-filter: none;
 }
-[data-theme] .account-menu-wrap--compact .account-menu-trigger:hover .account-menu-avatar {
+.account-menu-wrap--compact .account-menu-trigger:hover .account-menu-avatar {
   border-color: var(--focus-ring);
 }
 
@@ -789,25 +726,18 @@ code, kbd, pre, samp, .ant-typography code,
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 700;
   font-family: var(--font-ui);
   letter-spacing: -0.02em;
+  background: var(--menu-avatar-bg);
+  border: 1px solid color-mix(in srgb, var(--menu-avatar-text) 44%, transparent);
+  color: var(--menu-avatar-text);
 }
 .account-menu-wrap--compact .account-menu-avatar {
   width: 28px;
   height: 28px;
   font-size: 13px;
-}
-[data-theme="dark"] .account-menu-avatar {
-  background: rgba(14, 36, 36, 0.95);
-  border: 1px solid rgba(94, 234, 212, 0.42);
-  color: #5eead4;
-}
-[data-theme="light"] .account-menu-avatar {
-  background: rgba(255, 255, 255, 0.65);
-  border: 1px solid rgba(13, 148, 136, 0.45);
-  color: #0f766e;
 }
 
 .account-menu-name {
@@ -820,27 +750,17 @@ code, kbd, pre, samp, .ant-typography code,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--dg-text-primary);
 }
 .account-menu-wrap--compact .account-menu-name {
   font-size: 13px;
-}
-[data-theme="dark"] .account-menu-name {
-  color: #f1f5f9;
-}
-[data-theme="light"] .account-menu-name {
-  color: #0c1629;
 }
 
 .account-menu-chevron {
   flex-shrink: 0;
   font-size: 11px;
   opacity: 0.9;
-}
-[data-theme="dark"] .account-menu-chevron {
-  color: rgba(248, 250, 252, 0.92);
-}
-[data-theme="light"] .account-menu-chevron {
-  color: rgba(28, 38, 52, 0.75);
+  color: var(--menu-item-text);
 }
 
 /* ───── Heading case (D67): ONE eyebrow style ─────
@@ -890,19 +810,19 @@ code, kbd, pre, samp, .ant-typography code,
 .ant-select-focused,
 .ant-input-number:focus,
 .ant-input-number-focused {
-  border-color: var(--focus-ring, #2dd4bf) !important;
+  border-color: var(--focus-ring) !important;
   box-shadow: none !important;
 }
 
 /* ───── Custom selection color ───── */
 ::selection {
-  background: rgba(45, 212, 191, 0.25);
+  background: color-mix(in srgb, var(--dg-accent-blue) 25%, transparent);
   color: inherit;
 }
 
 /* ───── Ant Button primary override ───── */
 .ant-btn-primary {
-  font-family: 'Manrope', sans-serif !important;
+  font-family: var(--font-ui) !important;
   font-weight: 600 !important;
   letter-spacing: 0.01em !important;
 }
@@ -964,13 +884,13 @@ code, kbd, pre, samp, .ant-typography code,
 .dg-login-orb-one {
   left: -140px;
   bottom: -170px;
-  background: radial-gradient(circle, rgba(45, 212, 191, 0.32), transparent 68%);
+  background: radial-gradient(circle, color-mix(in srgb, var(--dg-accent-blue) 32%, transparent), transparent 68%);
 }
 
 .dg-login-orb-two {
   right: -150px;
   top: -150px;
-  background: radial-gradient(circle, rgba(167, 139, 250, 0.26), transparent 68%);
+  background: radial-gradient(circle, color-mix(in srgb, var(--dg-accent-purple) 26%, transparent), transparent 68%);
 }
 
 .dg-login-card {
@@ -1069,7 +989,7 @@ code, kbd, pre, samp, .ant-typography code,
   text-decoration: none;
   text-align: center;
   cursor: pointer;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 1px 0 var(--login-soft-line);
   transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease, transform 0.15s ease;
 }
 
@@ -1135,13 +1055,13 @@ code, kbd, pre, samp, .ant-typography code,
   margin-top: 8px;
   border: 0 !important;
   border-radius: 16px !important;
-  background: linear-gradient(135deg, var(--focus-ring), color-mix(in srgb, var(--focus-ring) 72%, #60a5fa)) !important;
-  color: #06121a !important;
-  font: 800 15px/1 var(--font-ui) !important;
+  background: linear-gradient(135deg, var(--focus-ring), color-mix(in srgb, var(--focus-ring) 72%, var(--login-submit-blend))) !important;
+  color: var(--dg-on-accent) !important;
+  font: 800 16px/1 var(--font-ui) !important;
   letter-spacing: 0.01em !important;
   box-shadow:
     0 18px 38px color-mix(in srgb, var(--focus-ring) 22%, transparent),
-    inset 0 1px 0 rgba(255, 255, 255, 0.30) !important;
+    inset 0 1px 0 color-mix(in srgb, var(--dg-on-accent) 30%, transparent) !important;
 }
 
 .dg-login-submit:disabled {
@@ -1234,11 +1154,6 @@ code, kbd, pre, samp, .ant-typography code,
 [data-theme="dark"] .ant-tag:not(.ant-tag-solid).ant-tag-purple { color: #c4b5fd !important; }
 [data-theme="dark"] .ant-tag:not(.ant-tag-solid).ant-tag-geekblue { color: #7f9ef3 !important; }
 [data-theme="dark"] .ant-tag:not(.ant-tag-solid).ant-tag-processing { color: #65a9f3 !important; }
-/* No tag text under 11 px: some callers set 9-10 px inline. */
-.ant-tag[style*="font-size: 9px"],
-.ant-tag[style*="font-size: 10px"] {
-  font-size: 11px !important;
-}
 
 /* ───── Links in running text: underlined, so colour is not the only cue
  * (axe link-in-text-block). Stand-alone links and link buttons stay plain. */

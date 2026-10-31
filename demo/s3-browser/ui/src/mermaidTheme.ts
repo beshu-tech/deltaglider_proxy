@@ -4,6 +4,7 @@
  * the theme tokens and a text size that never drops below 12 px.
  */
 import type { ColorTokens } from './ThemeContext';
+import { FONT_UI } from './themeVars';
 
 /** The diagram text size, and the smallest size it may be scaled down to. */
 const MERMAID_FONT_PX = 14;
@@ -26,7 +27,7 @@ export function mermaidConfig(colors: ColorTokens, isDark: boolean) {
     theme: 'base' as const,
     themeVariables: {
       darkMode: isDark,
-      fontFamily: "'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      fontFamily: FONT_UI,
       fontSize: `${MERMAID_FONT_PX}px`,
       background: colors.BG_CARD,
       primaryColor: node,

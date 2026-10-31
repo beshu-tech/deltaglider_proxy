@@ -33,7 +33,7 @@ export default function OAuthProviderList({ providers, nextUrl, height, fontSize
             key={p.name}
             href={`/_/api/admin/oauth/authorize/${encodeURIComponent(p.name)}?next=${encodeURIComponent(nextUrl)}`}
             aria-label={`Sign in with ${label}`}
-            className={isHero ? 'dg-login-sso-button' : undefined}
+            className={isHero ? 'dg-login-sso-button' : 'dg-hover-border-accent'}
             style={isHero ? { ...(height ? { height } : {}), fontSize } : {
               display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
               width: '100%', padding: '8px 16px', marginBottom: 8,
@@ -44,8 +44,6 @@ export default function OAuthProviderList({ providers, nextUrl, height, fontSize
               transition: 'border-color 0.15s, background 0.15s',
               ...(height ? { height } : {}),
             }}
-            onMouseEnter={isHero ? undefined : e => { e.currentTarget.style.borderColor = colors.ACCENT_BLUE; }}
-            onMouseLeave={isHero ? undefined : e => { e.currentTarget.style.borderColor = colors.BORDER; }}
           >
             <SafetyOutlined style={height ? { fontSize: 18 } : undefined} />
             Sign in with {label}

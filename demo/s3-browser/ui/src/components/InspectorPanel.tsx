@@ -24,6 +24,8 @@ import { passthroughReason, passthroughSentence } from '../passthroughReason';
 import { useNavigation } from '../NavigationContext';
 import { bucketSettingsUrl } from '../urlState';
 import { objectStorageHeadline } from '../deltaSummary';
+import { cssVar, tint } from '../themeVars';
+import { Z } from '../theme';
 
 const SHARE_DURATIONS = [
   { label: '1 hour', seconds: 3600 },
@@ -178,10 +180,10 @@ function ShareDurationButton({
           justifyContent: 'center',
           ...primary,
           border: 'none',
-          borderLeft: `1px solid ${token.colorBgContainer}55`,
+          borderLeft: `1px solid ${tint(token.colorBgContainer, 33)}`,
           borderRadius: '0 10px 10px 0',
           cursor: 'pointer',
-          fontSize: 10,
+          fontSize: 11,
         }}
       >
         <span style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>&#9660;</span>
@@ -200,8 +202,8 @@ function ShareDurationButton({
             background: bgSidebar,
             border: `1px solid ${border}`,
             borderRadius: 8,
-            boxShadow: '0 8px 24px rgba(0,0,0,0.35)',
-            zIndex: 10,
+            boxShadow: cssVar('FLOAT_SHADOW'),
+            zIndex: Z.menu,
             overflow: 'hidden',
           }}
         >
@@ -216,6 +218,7 @@ function ShareDurationButton({
             <div
               key={d.seconds}
               role="option"
+              className="dg-hover-tint"
               tabIndex={0}
               aria-selected={isDefault}
               onClick={() => { onSelect(d.seconds); setOpen(false); }}
@@ -232,8 +235,6 @@ function ShareDurationButton({
                 fontWeight: isDefault ? 600 : 400,
                 borderTop: `1px solid ${border}`,
               }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = `${accentBlue}18`; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = 'transparent'; }}
             >
               <CheckOutlined aria-hidden="true" style={{ fontSize: 12, width: 12, color: accentBlue, visibility: isDefault ? 'visible' : 'hidden' }} />
               <span>{d.label}</span>
@@ -556,8 +557,8 @@ export default function InspectorPanel({
               width: 40,
               height: 40,
               borderRadius: CARD_RADIUS,
-              background: `linear-gradient(135deg, ${ACCENT_BLUE}15, ${ACCENT_BLUE}08)`,
-              border: `1px solid ${ACCENT_BLUE}22`,
+              background: `linear-gradient(135deg, ${tint(ACCENT_BLUE, 8)}, ${tint(ACCENT_BLUE, 3)})`,
+              border: `1px solid ${tint(ACCENT_BLUE, 13)}`,
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
@@ -566,7 +567,7 @@ export default function InspectorPanel({
               <FileOutlined aria-hidden="true" style={{ fontSize: 20, color: ACCENT_BLUE }} />
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <h2 style={{ fontSize: 15, fontWeight: 600, color: TEXT_PRIMARY, overflowWrap: 'break-word', margin: 0, fontFamily: "var(--font-ui)" }}>
+              <h2 style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, overflowWrap: 'break-word', margin: 0, fontFamily: "var(--font-ui)" }}>
                 {fileNameBreakHints(fileName)}
               </h2>
               <div style={{ fontSize: 11, color: TEXT_MUTED, marginTop: 2, overflowWrap: 'anywhere', fontFamily: "var(--font-mono)" }}>
@@ -639,7 +640,7 @@ export default function InspectorPanel({
               <div style={{
                 display: 'flex', alignItems: 'center', gap: SPACE.xs,
                 padding: '8px 12px', marginBottom: 12,
-                background: `${ACCENT_BLUE}10`, border: `1px solid ${ACCENT_BLUE}30`,
+                background: tint(ACCENT_BLUE, 6), border: `1px solid ${tint(ACCENT_BLUE, 19)}`,
                 borderRadius: 8, fontSize: 12, color: ACCENT_BLUE,
                 fontFamily: 'var(--font-ui)', fontWeight: 600,
               }}>
@@ -707,8 +708,8 @@ export default function InspectorPanel({
                         <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Original</div>
                         <div style={{ fontSize: 12, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)" }}>{formatBytes(originalSize)}</div>
                       </div>
-                      <div style={{ height: 6, borderRadius: 3, background: `${TEXT_FAINT}33`, overflow: 'hidden' }}>
-                        <div style={{ height: '100%', borderRadius: 3, width: '100%', background: `${TEXT_MUTED}66` }} />
+                      <div style={{ height: 6, borderRadius: 3, background: tint(TEXT_FAINT, 20), overflow: 'hidden' }}>
+                        <div style={{ height: '100%', borderRadius: 3, width: '100%', background: tint(TEXT_MUTED, 40) }} />
                       </div>
                     </div>
                     <div style={{ marginBottom: 8 }}>
@@ -718,12 +719,12 @@ export default function InspectorPanel({
                           {effectiveStored != null ? formatBytes(effectiveStored) : formatBytes(originalSize)}
                         </div>
                       </div>
-                      <div style={{ height: 6, borderRadius: 3, background: `${TEXT_FAINT}33`, overflow: 'hidden' }}>
+                      <div style={{ height: 6, borderRadius: 3, background: tint(TEXT_FAINT, 20), overflow: 'hidden' }}>
                         <div style={{
                           height: '100%',
                           borderRadius: 3,
                           width: `${effectiveStored != null && originalSize > 0 ? Math.min(100, Math.max(2, (effectiveStored / originalSize) * 100)) : 100}%`,
-                          background: baselineHeadline ? `${TEXT_MUTED}99` : SAVED,
+                          background: baselineHeadline ? tint(TEXT_MUTED, 60) : SAVED,
                           transition: 'width 0.4s ease-out',
                         }} />
                       </div>

@@ -1,21 +1,17 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { useColors, useTheme } from '../ThemeContext';
+import { useColors } from '../ThemeContext';
 
-function sectionPanelStyle(
-  gi: number,
-  isDark: boolean,
-): Pick<React.CSSProperties, 'background' | 'borderColor'> {
-  if (isDark) {
-    return gi % 2 === 0
-      ? { background: '#152238', borderColor: 'rgba(255,255,255,0.07)' }
-      : { background: '#101a2c', borderColor: 'rgba(255,255,255,0.06)' };
-  }
-  return gi % 2 === 0
-    ? { background: '#f8fafc', borderColor: 'rgba(15,23,42,0.08)' }
-    : { background: '#f1f5f9', borderColor: 'rgba(15,23,42,0.07)' };
+/** Zebra panels over the elevated popup: a faint tint of the text colour,
+ *  so one rule serves both themes. */
+function sectionPanelStyle(gi: number): Pick<React.CSSProperties, 'background' | 'borderColor'> {
+  return {
+    background: tint(cssVar('TEXT_PRIMARY'), gi % 2 === 0 ? 4 : 2),
+    borderColor: tint(cssVar('TEXT_PRIMARY'), 7),
+  };
 }
 import { useOverlayDropdown } from '../useOverlayDropdown';
 import { BORDER_RADIUS, getOverlayBaseStyles } from './overlayStyles';
+import { cssVar, tint } from '../themeVars';
 
 /**
  * Self-contained autocomplete input. Type to filter, click to select,
@@ -98,7 +94,6 @@ export default function SimpleAutoComplete({
 }: Props) {
   const listId = useId();
   const colors = useColors();
-  const { isDark } = useTheme();
   const [open, setOpen] = useState(false);
   const [focused, setFocused] = useState(false);
   const [highlightIndex, setHighlightIndex] = useState(0);
@@ -231,13 +226,13 @@ export default function SimpleAutoComplete({
           role="listbox"
           style={{
             ...getOverlayBaseStyles(colors, pos, { minWidth: 220, maxHeight: 280, flexLayout: true }),
-            padding: useSectionPanels ? '8px 6px 10px' : '4px 0',
-            gap: useSectionPanels ? 10 : 0,
+            padding: useSectionPanels ? '8px 8px 12px' : '4px 0',
+            gap: useSectionPanels ? 12 : 0,
           }}
         >
           {displayGroups.map((group, gi) => {
             const headerPad = { paddingLeft: 2, paddingRight: 2 };
-            const stripe = sectionPanelStyle(gi, isDark);
+            const stripe = sectionPanelStyle(gi);
             const panelWrap = useSectionPanels
               ? {
                   borderRadius: 8,
@@ -258,7 +253,7 @@ export default function SimpleAutoComplete({
                   <div
                     style={{
                       ...headerPad,
-                      marginBottom: group.subtitle ? 6 : 8,
+                      marginBottom: group.subtitle ? 4 : 8,
                       fontSize: 11,
                       fontWeight: 600,
                       letterSpacing: '0.01em',
@@ -313,9 +308,9 @@ export default function SimpleAutoComplete({
                         lineHeight: 1.4,
                         fontFamily: 'var(--font-mono)',
                         background: hi
-                          ? `${colors.ACCENT_BLUE}28`
+                          ? tint(colors.ACCENT_BLUE, 16)
                           : entry.value === value
-                            ? `${colors.ACCENT_BLUE}1c`
+                            ? tint(colors.ACCENT_BLUE, 11)
                             : 'transparent',
                         transition: 'background 0.08s',
                         color: colors.TEXT_PRIMARY,

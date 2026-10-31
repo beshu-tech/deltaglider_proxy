@@ -1,5 +1,5 @@
-/* Outcome meter: [dot] [proportional track] [label]. Colors are injected as
-   CSS custom props from useColors() — this file owns layout only. */
+/* Outcome meter: [dot] [proportional track] [label]. Colours are the palette
+   vars (--dg-*, themeVars.ts); the two widths come inline from the data. */
 .dg-meter {
   display: grid;
   grid-template-columns: auto minmax(28px, 1fr) auto;
@@ -33,10 +33,10 @@
   border-radius: 50%;
   flex-shrink: 0;
 }
-.dg-meter-dot[data-dot='green'] { background: var(--m-green); }
-.dg-meter-dot[data-dot='red'] { background: var(--m-red); }
-.dg-meter-dot[data-dot='amber'] { background: var(--m-amber); }
-.dg-meter-dot[data-dot='muted'] { background: var(--m-track); }
+.dg-meter-dot[data-dot='green'] { background: var(--dg-accent-green); }
+.dg-meter-dot[data-dot='red'] { background: var(--dg-accent-red); }
+.dg-meter-dot[data-dot='amber'] { background: var(--dg-accent-amber); }
+.dg-meter-dot[data-dot='muted'] { background: var(--dg-border); }
 
 .dg-meter-track {
   position: relative;
@@ -45,7 +45,7 @@
   border-radius: 999px;
   overflow: hidden;
   display: flex;
-  background: var(--m-track);
+  background: var(--dg-border);
 }
 /* Calm: in-sync / cancelled / waiting tracks are the muted border color, ghosted. */
 .dg-meter[data-state='in-sync'] .dg-meter-track,
@@ -55,14 +55,14 @@
 }
 
 .dg-meter-seg { height: 100%; }
-.dg-meter-green { width: var(--m-green-pct); background: var(--m-green); }
-.dg-meter-red { width: var(--m-red-pct); background: var(--m-red); }
+.dg-meter-green { width: var(--m-green-pct); background: var(--dg-accent-green); }
+.dg-meter-red { width: var(--m-red-pct); background: var(--dg-accent-red); }
 
 /* Running with unknown percent: amber indeterminate shimmer. */
 .dg-meter-indeterminate {
   position: absolute;
   inset: 0;
-  background: linear-gradient(90deg, transparent, var(--m-amber), transparent);
+  background: linear-gradient(90deg, transparent, var(--dg-accent-amber), transparent);
   opacity: 0.5;
   animation: dg-meter-slide 1.4s ease-in-out infinite;
 }
@@ -82,7 +82,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
-  color: var(--m-text-muted);
+  color: var(--dg-text-muted);
 }
 /* Loud states get full-strength text; calm states stay muted. */
 .dg-meter[data-state='copied'] .dg-meter-label,
@@ -90,7 +90,7 @@
 .dg-meter[data-state='mixed'] .dg-meter-label,
 .dg-meter[data-state='running'] .dg-meter-label,
 .dg-meter[data-state='cancelling'] .dg-meter-label {
-  color: var(--m-text);
+  color: var(--dg-text-primary);
 }
 
 /* Narrow cell: the label goes on its own line under the bar and wraps,

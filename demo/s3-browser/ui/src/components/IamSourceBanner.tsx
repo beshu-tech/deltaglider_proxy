@@ -46,7 +46,7 @@ export default function IamSourceBanner({ iamMode, loadError, resource }: Props)
         background: colors.BG_ELEVATED,
         borderRadius: 6,
         fontFamily: 'var(--font-ui)',
-        fontSize: 12.5,
+        fontSize: 13,
         color: colors.TEXT_SECONDARY,
         lineHeight: 1.5,
       }}

@@ -21,6 +21,7 @@ import { useNavigation } from '../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { IAM_DIRTY_KEYS, confirmDiscardEdits } from '../useDirtyFlag';
+import { tint } from '../themeVars';
 
 const { Text } = Typography;
 
@@ -268,7 +269,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
               {isExternal && (
                 <span title="Signs in with an external provider" style={{
                   fontSize: 11, fontWeight: 600,
-                  color: colors.ACCENT_PURPLE, background: colors.ACCENT_PURPLE + '18',
+                  color: colors.ACCENT_PURPLE, background: tint(colors.ACCENT_PURPLE, 9),
                   padding: '0 4px', borderRadius: 4, fontFamily: 'var(--font-ui)',
                   flexShrink: 0,
                 }}>SSO</span>
@@ -296,9 +297,8 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
           title="Duplicate user with fresh credentials"
           aria-label={`Duplicate ${user.name} with fresh credentials`}
           onClick={() => void handleClone(user)}
-          style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0, flexShrink: 0 }}
-          onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
-          onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
+          className="dg-hover-reveal"
+          style={{ padding: '2px 4px', minWidth: 0, flexShrink: 0 }}
         />
       )}
       detail={detail}

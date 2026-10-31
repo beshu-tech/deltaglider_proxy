@@ -15,6 +15,7 @@ import { Fragment, type ReactNode } from 'react';
 import { CloudOutlined, DatabaseOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import type { BackendFact } from '../backendSummary';
+import { tint } from '../themeVars';
 
 export interface BackendPill {
   label: string;
@@ -67,8 +68,8 @@ function Pill({ pill }: { pill: BackendPill }) {
         height: 20,
         padding: '0 8px',
         borderRadius: 10,
-        border: `1px solid ${pill.color}55`,
-        background: `${pill.color}14`,
+        border: `1px solid ${tint(pill.color, 33)}`,
+        background: tint(pill.color, 8),
         color: pill.color,
         fontSize: 11,
         fontWeight: 600,
@@ -93,8 +94,8 @@ export default function BackendCard({ name, filesystem, kind, highlighted, pills
         marginTop: 12,
         padding: 'clamp(12px, 2.5vw, 16px)',
         borderRadius: 10,
-        border: `1px solid ${highlighted ? colors.ACCENT_BLUE + '66' : colors.BORDER}`,
-        background: highlighted ? colors.ACCENT_BLUE + '08' : colors.BG_ELEVATED,
+        border: `1px solid ${highlighted ? tint(colors.ACCENT_BLUE, 40) : colors.BORDER}`,
+        background: highlighted ? tint(colors.ACCENT_BLUE, 3) : colors.BG_ELEVATED,
       }}
     >
       <header className="dg-backend-card__head">
@@ -110,8 +111,8 @@ export default function BackendCard({ name, filesystem, kind, highlighted, pills
             justifyContent: 'center',
             fontSize: 16,
             color: colors.ACCENT_BLUE,
-            background: `${colors.ACCENT_BLUE}14`,
-            border: `1px solid ${colors.ACCENT_BLUE}22`,
+            background: tint(colors.ACCENT_BLUE, 8),
+            border: `1px solid ${tint(colors.ACCENT_BLUE, 13)}`,
           }}
         >
           {filesystem ? <DatabaseOutlined /> : <CloudOutlined />}
@@ -121,7 +122,7 @@ export default function BackendCard({ name, filesystem, kind, highlighted, pills
             <h3
               style={{
                 margin: 0,
-                fontSize: 15,
+                fontSize: 16,
                 fontWeight: 600,
                 fontFamily: 'var(--font-ui)',
                 color: colors.TEXT_PRIMARY,

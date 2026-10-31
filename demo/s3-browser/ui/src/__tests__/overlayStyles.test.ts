@@ -18,7 +18,7 @@ import type { useColors } from '../ThemeContext';
 const colors = { BG_ELEVATED: '#111', BORDER: '#333' } as unknown as ReturnType<typeof useColors>;
 
 test('constants', () => {
-  assert.deepEqual(OVERLAY_SHADOW, '0 8px 24px rgba(0,0,0,0.3)');
+  assert.deepEqual(OVERLAY_SHADOW, 'var(--dg-float-shadow)', 'the palette shadow, so it follows the theme');
   assert.deepEqual(Z_INDEX_OVERLAY, 99999);
   assert.deepEqual(BORDER_RADIUS, { xs: 4, sm: 6, md: 8 });
 });

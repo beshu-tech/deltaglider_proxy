@@ -1,4 +1,5 @@
 import { useColors } from '../ThemeContext';
+import { tint } from '../themeVars';
 
 /**
  * Card header: icon in its own column, title + description STACKED in a second
@@ -27,8 +28,8 @@ export default function SectionHeader({
           width: 32,
           height: 32,
           borderRadius: 8,
-          background: `linear-gradient(135deg, ${ACCENT_BLUE}18, ${ACCENT_BLUE}08)`,
-          border: `1px solid ${ACCENT_BLUE}22`,
+          background: `linear-gradient(135deg, ${tint(ACCENT_BLUE, 9)}, ${tint(ACCENT_BLUE, 3)})`,
+          border: `1px solid ${tint(ACCENT_BLUE, 13)}`,
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
@@ -45,7 +46,7 @@ export default function SectionHeader({
         <div
           style={{
             fontFamily: 'var(--font-ui)',
-            fontSize: 17,
+            fontSize: 16,
             fontWeight: 700,
             color: TEXT_PRIMARY,
             lineHeight: 1.25,

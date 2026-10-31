@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
 import { useColors } from '../ThemeContext';
+import { Z } from '../theme';
 
 interface Props {
   /** The content to display (img, svg, etc.) */
@@ -82,7 +83,7 @@ export default function Lightbox({ children, caption }: Props) {
           style={{
             position: 'fixed',
             inset: 0,
-            zIndex: 9999,
+            zIndex: Z.lightbox,
             background: 'rgba(0,0,0,0.85)',
             display: 'flex',
             flexDirection: 'column',

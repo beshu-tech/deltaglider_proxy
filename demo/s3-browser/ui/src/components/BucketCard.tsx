@@ -26,6 +26,7 @@ import { bucketNameError } from '../bucketName';
 import { Children, isValidElement, useEffect, useState, useId } from 'react';
 import type { ReactNode } from 'react';
 import { useIsNarrow } from '../useIsNarrow';
+import { BREAKPOINT } from './shared-styles';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
 import { Button, Collapse, Input, Modal, Progress, Radio, Select, Typography } from 'antd';
 import { DownOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
@@ -55,6 +56,7 @@ import type { BucketRule } from '../runsView';
 import { runsUrl } from './jobs/runsLink';
 import { WITNESS_CARD_ID } from './EncryptionWitnessCard';
 import TruncatedName from './TruncatedName';
+import { tint } from '../themeVars';
 
 const { Text } = Typography;
 
@@ -132,7 +134,7 @@ function Chip({ tone, children, title }: { tone: string; children: React.ReactNo
         borderRadius: 10,
         // A light tint (8%): the tone text keeps 4.5:1 on it in both
         // themes, also on the amber wash of a public bucket's card.
-        background: `${tone}14`,
+        background: tint(tone, 8),
         color: tone,
         whiteSpace: 'nowrap',
         cursor: title ? 'help' : undefined,
@@ -199,7 +201,7 @@ export default function BucketCard({
   const uid = useId();
   const colors = useColors();
   // Phone: all the chips took three or four lines under the name.
-  const phone = useIsNarrow(600);
+  const phone = useIsNarrow(BREAKPOINT.phone);
   const { navigate } = useNavigation();
   const witnessUrl = buildViewUrl('admin', 'system', { focus: WITNESS_CARD_ID });
   const [migrateOpen, setMigrateOpen] = useState(false);
@@ -269,8 +271,8 @@ export default function BucketCard({
     });
   }, [stagedQuota]);
 
-  const cardBorder = isPublic ? `${colors.ACCENT_AMBER}66` : colors.BORDER;
-  const cardBg = isPublic ? `${colors.ACCENT_AMBER}0a` : colors.BG_ELEVATED;
+  const cardBorder = isPublic ? tint(colors.ACCENT_AMBER, 40) : colors.BORDER;
+  const cardBg = isPublic ? tint(colors.ACCENT_AMBER, 4) : colors.BG_ELEVATED;
 
   // Re-routing an ALREADY-routed bucket orphans its objects (explicit route
   // wins; the old backend is never scanned) — confirm first. First-time set
@@ -619,11 +621,11 @@ export default function BucketCard({
               flexWrap: 'wrap',
               alignItems: 'center',
               gap: 8,
-              fontSize: 11.5,
+              fontSize: 12,
               fontWeight: 600,
               padding: '4px 12px',
               borderRadius: 10,
-              background: `${colors.ACCENT_RED}1a`,
+              background: tint(colors.ACCENT_RED, 10),
               color: colors.ACCENT_RED,
             }}
           >
@@ -702,8 +704,8 @@ export default function BucketCard({
                 marginTop: 12,
                 padding: '8px 12px',
                 borderRadius: 6,
-                border: `1px solid ${colors.ACCENT_BLUE}44`,
-                background: `${colors.ACCENT_BLUE}0a`,
+                border: `1px solid ${tint(colors.ACCENT_BLUE, 27)}`,
+                background: tint(colors.ACCENT_BLUE, 4),
                 fontSize: 12,
                 color: colors.TEXT_MUTED,
               }}

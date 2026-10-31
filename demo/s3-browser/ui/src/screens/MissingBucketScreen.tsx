@@ -24,7 +24,7 @@ export default function MissingBucketScreen({ bucket, buckets, onOpenBucket }: P
       style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: '64px 16px', textAlign: 'center' }}
     >
       <InboxOutlined aria-hidden="true" style={{ fontSize: 32, color: TEXT_MUTED }} />
-      <h1 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: 'var(--font-ui)', overflowWrap: 'anywhere' }}>
+      <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: 'var(--font-ui)', overflowWrap: 'anywhere' }}>
         No bucket named <code>{bucket}</code>
       </h1>
       <p style={{ margin: 0, maxWidth: 520, fontSize: 14, color: TEXT_SECONDARY, fontFamily: 'var(--font-ui)', lineHeight: 1.5 }}>

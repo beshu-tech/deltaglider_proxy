@@ -29,6 +29,7 @@ import { IAM_DIRTY_KEYS, confirmDiscardEdits, useDirtyFlag, useFormBaseline } fr
 import { useApplyHandler } from '../useDirtySection';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { confirmDialog } from '../confirmDialog';
+import { tint } from '../themeVars';
 
 const { Text } = Typography;
 
@@ -269,7 +270,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       {/* Identity providers */}
       <SectionHeader icon={<SafetyOutlined />} title="Identity providers" />
       {providers.length === 0 && !creating && (
-        <Text type="secondary" style={{ display: 'block', fontSize: 12.5, marginBottom: SPACE.lg }}>
+        <Text type="secondary" style={{ display: 'block', fontSize: 13, marginBottom: SPACE.lg }}>
           No provider is configured.{readOnly ? '' : ' Click New provider at the top right.'}
         </Text>
       )}
@@ -294,7 +295,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
                 display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
                 padding: `${SPACE.xs}px ${SPACE.sm}px`, cursor: 'pointer', borderRadius: 8,
                 border: `1px solid ${selectedProviderId === p.id ? colors.ACCENT_BLUE : colors.BORDER}`,
-                background: selectedProviderId === p.id ? colors.ACCENT_BLUE + '18' : 'transparent',
+                background: selectedProviderId === p.id ? tint(colors.ACCENT_BLUE, 9) : 'transparent',
                 marginBottom: SPACE.xs,
               }}
             >
@@ -691,7 +692,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
 
       {/* Callback URL */}
       {/* Same label look as the FormField labels above. */}
-      <div style={{ fontSize: 13.5, fontWeight: 600, color: colors.TEXT_PRIMARY, marginBottom: SPACE.xxs }}>
+      <div style={{ fontSize: 14, fontWeight: 600, color: colors.TEXT_PRIMARY, marginBottom: SPACE.xxs }}>
         Callback URL
       </div>
       <div style={{
@@ -711,12 +712,12 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
           onClick={() => { void copy(callbackUrl, { successMessage: 'Callback URL copied' }); }}
         />
       </div>
-      <div style={{ fontSize: 12.5, color: colors.TEXT_MUTED, marginBottom: 16, lineHeight: 1.4 }}>
+      <div style={{ fontSize: 13, color: colors.TEXT_MUTED, marginBottom: 16, lineHeight: 1.4 }}>
         Register this URL with your identity provider.
       </div>
 
       {/* Network policy */}
-      <div style={{ fontSize: 13.5, fontWeight: 600, color: colors.TEXT_PRIMARY, marginBottom: SPACE.xxs }}>Network</div>
+      <div style={{ fontSize: 14, fontWeight: 600, color: colors.TEXT_PRIMARY, marginBottom: SPACE.xxs }}>Network</div>
       <div style={{ display: 'flex', alignItems: 'center', gap: SPACE.xs, marginBottom: SPACE.xxs }}>
         <Switch
           checked={formAllowLocal}
@@ -727,7 +728,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
         />
         <Text style={{ fontSize: 13 }}>Allow http:// and private addresses</Text>
       </div>
-      <div style={{ fontSize: 12.5, color: colors.TEXT_MUTED, marginBottom: 16, lineHeight: 1.4 }}>
+      <div style={{ fontSize: 13, color: colors.TEXT_MUTED, marginBottom: 16, lineHeight: 1.4 }}>
         Turn this on only for an identity provider on your own network. The proxy then sends
         requests to any address that the issuer and its discovery document name, so a wrong
         issuer URL can reach internal services. Cloud metadata addresses stay refused.

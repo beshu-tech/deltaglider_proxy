@@ -5,6 +5,8 @@ import { useColors } from '../ThemeContext';
 import { useNavigation } from '../NavigationContext';
 import { readStorage, writeStorage } from '../safeStorage';
 import { useIsNarrow } from '../useIsNarrow';
+import { BREAKPOINT } from './shared-styles';
+import { tint } from '../themeVars';
 
 const STORAGE_KEY = 'dg-file-browser-session-tip-dismissed';
 
@@ -18,7 +20,7 @@ interface Props {
 export default function FileBrowserSessionTip({ visible, userKey = '' }: Props) {
   const colors = useColors();
   const { navigate } = useNavigation();
-  const narrow = useIsNarrow(600);
+  const narrow = useIsNarrow(BREAKPOINT.phone);
   const key = `${STORAGE_KEY}:${userKey}`;
   const [dismissed, setDismissed] = useState(() => readStorage(key) === '1');
 
@@ -65,11 +67,11 @@ export default function FileBrowserSessionTip({ visible, userKey = '' }: Props) 
         )
       }
       style={{
-        margin: narrow ? '0 12px 8px' : '0 20px 12px',
-        padding: narrow ? '6px 10px' : undefined,
+        margin: narrow ? '0 12px 8px' : '0 24px 12px',
+        padding: narrow ? '4px 12px' : undefined,
         borderRadius: 10,
         border: `1px solid ${colors.BORDER}`,
-        background: `${colors.ACCENT_BLUE}08`,
+        background: tint(colors.ACCENT_BLUE, 3),
       }}
     />
   );

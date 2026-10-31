@@ -4,14 +4,14 @@
  * lines, at every container width above 900px. (A "compact" collapse of
  * each span to half made rows of 9 columns and ragged edges.)
  *
- * Below ~900px the parent admin shell is already in Drawer mode;
+ * Below 900px (BREAKPOINT.shell) the parent admin shell is already in Drawer mode;
  * every panel goes to `span 12` (full width).
  */
 
-/* Below 900px — everything stacks. The outer container is already
+/* Below 900px (BREAKPOINT.shell) — everything stacks. The outer container is already
  * set to `maxWidth: min(100%, 2400px)` and to the viewport at this
  * size, so this just flattens the grid. */
-@media (max-width: 900px) {
+@media (max-width: 899px) {
   [data-density] > [data-colspan] {
     grid-column: span 12 !important;
   }
@@ -20,16 +20,6 @@
      * rows on mobile — they'd each be 3× tall for no reason. */
     grid-row: span 1 !important;
   }
-}
-
-/* Panel body gets edge-to-edge charts — compensate for the 16px (SPACE.md)
- * padding we set on PanelBody for chart-only panels by letting
- * consumers apply `.panel-chart-edge` on a wrapper. */
-.panel-chart-edge {
-  margin: -16px;
-  flex: 1;
-  min-height: 0;
-  min-width: 0;
 }
 
 /* Subtle pulse for the per-row "scanning" dot on the Analytics tab
@@ -50,23 +40,8 @@
   100% { opacity: 0.6; }
 }
 
-/* Diagonal drift on the saved-portion dot pattern — gives the
- * "absence" texture a faint sense of motion so the eye sticks on it
- * for a beat without being noisy. Translate at sub-pixel speed. */
-@keyframes dgBarGrain {
-  0%   { background-position: 0 0; }
-  100% { background-position: 60px 30px; }
-}
-
-/* Honour user setting: kill all dashboard-decoration animations when
- * the OS-level reduced-motion preference is on. Functional animations
- * (count-up via JS) gate themselves separately at the component layer. */
-@media (prefers-reduced-motion: reduce) {
-  .panel-chart-edge,
-  [data-dg-animated] {
-    animation: none !important;
-  }
-}
+/* Reduced motion: theme.css stops every animation of ours (the
+   prefers-reduced-motion block); the sheen is also hidden below. */
 
 /* ── Money-shot hero additions (visual-craft pass) ──────────────────── */
 

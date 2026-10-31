@@ -27,7 +27,7 @@ export default function BucketBackendBadge({ origin, style }: Props) {
         border: `1px solid ${BORDER}`,
         color: TEXT_MUTED,
         fontFamily: 'var(--font-mono)',
-        fontSize: 10,
+        fontSize: 11,
         lineHeight: '15px',
         overflow: 'hidden',
         textOverflow: 'ellipsis',

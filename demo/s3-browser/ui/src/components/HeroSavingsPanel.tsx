@@ -49,6 +49,8 @@ import { useFixedOverlayPosition } from '../useFixedOverlayPosition';
 import { readStorage, writeStorage } from '../safeStorage';
 import { activateOnKey } from '../keyboard';
 import { scanCallToAction } from '../scanQueue';
+import { tint } from '../themeVars';
+import { Z } from '../theme';
 
 /** Cost rate presets. */
 const COST_PRESETS = [
@@ -282,7 +284,7 @@ function HeroInner({
   // Sentence case, UI face: no letter-spaced capitals (D67).
   const monoLabel: React.CSSProperties = {
     fontFamily: 'var(--font-ui)',
-    fontSize: 11.5,
+    fontSize: 12,
     fontWeight: 600,
   };
 
@@ -321,7 +323,7 @@ function HeroInner({
           alignItems: 'center',
           gap: 12,
           position: 'relative',
-          zIndex: 1,
+          zIndex: Z.local,
           minWidth: 0,
         }}
       >
@@ -392,7 +394,7 @@ function HeroInner({
           display: 'flex',
           flexDirection: 'column',
           gap: 16,
-          zIndex: 1,
+          zIndex: Z.local,
           minWidth: 0,
         }}
       >
@@ -421,7 +423,7 @@ function HeroInner({
               borderRadius: 7,
               border: `1.5px dashed ${colors.TEXT_FAINT}`,
               opacity: 0.55,
-              background: `repeating-linear-gradient(45deg, ${colors.TEXT_FAINT}22 0 1px, transparent 1px 8px)`,
+              background: `repeating-linear-gradient(45deg, ${tint(colors.TEXT_FAINT, 13)} 0 1px, transparent 1px 8px)`,
             }}
             title={`Original: ${formatBytes(totalOriginal)}`}
           />
@@ -477,8 +479,7 @@ function HeroInner({
                 <span
                   style={{
                     ...monoLabel,
-                    color: 'rgba(255,255,255,0.92)',
-                    textShadow: '0 1px 2px rgba(0,0,0,0.25)',
+                    color: colors.ON_KEPT,
                     padding: '0 12px',
                     whiteSpace: 'nowrap',
                   }}
@@ -505,8 +506,7 @@ function HeroInner({
                 <span
                   style={{
                     ...monoLabel,
-                    color: 'rgba(255,255,255,0.95)',
-                    textShadow: '0 1px 2px rgba(0,0,0,0.3)',
+                    color: colors.ON_SAVED,
                     padding: '0 12px',
                     whiteSpace: 'nowrap',
                   }}
@@ -573,7 +573,7 @@ function HeroInner({
                   top: 5,
                   transform: t === 0 ? 'none' : t === 100 ? 'translateX(-100%)' : 'translateX(-50%)',
                   fontFamily: 'var(--font-mono)',
-                  fontSize: 9,
+                  fontSize: 11,
                   fontWeight: 500,
                   color: colors.TEXT_FAINT,
                   letterSpacing: '0.04em',
@@ -598,7 +598,7 @@ function HeroInner({
                 fontWeight: 600,
                 color: colors.TEXT_MUTED,
                 textDecoration: 'line-through',
-                textDecorationColor: `${colors.TEXT_MUTED}aa`,
+                textDecorationColor: tint(colors.TEXT_MUTED, 67),
                 textDecorationThickness: 2,
                 fontVariantNumeric: 'tabular-nums',
                 letterSpacing: '-0.02em',
@@ -625,7 +625,7 @@ function HeroInner({
           </span>
           {/* Saving — quiet, secondary. */}
           {targetDollars >= 0.01 && (
-            <span style={{ fontSize: 12.5, color: colors.TEXT_MUTED, fontWeight: 500 }}>
+            <span style={{ fontSize: 13, color: colors.TEXT_MUTED, fontWeight: 500 }}>
               save{' '}
               <span style={{ color: savedInk, fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>
                 $<m.span>{dollarDisplay}</m.span>/mo
@@ -645,6 +645,7 @@ function HeroInner({
           </span>
           <button
             ref={cogRef}
+            className="dg-hover-text"
             onClick={() => setShowCostConfig(v => !v)}
             aria-label="Pick cost rate"
             aria-expanded={showCostConfig}
@@ -661,8 +662,6 @@ function HeroInner({
               borderRadius: 4,
               transition: 'color 0.12s',
             }}
-            onMouseEnter={e => (e.currentTarget.style.color = colors.TEXT_PRIMARY)}
-            onMouseLeave={e => (e.currentTarget.style.color = colors.TEXT_MUTED)}
           >
             <SettingOutlined />
           </button>
@@ -678,7 +677,7 @@ function HeroInner({
                 top: pos.top,
                 left: popoverLeft,
                 width: POPOVER_WIDTH,
-                zIndex: 99999,
+                zIndex: Z.overlay,
                 padding: 12,
                 background: colors.BG_ELEVATED,
                 border: `1px solid ${colors.BORDER}`,
@@ -719,7 +718,7 @@ function HeroInner({
                     borderRadius: 4,
                     fontSize: 12,
                     color: costRate === p.rate ? colors.ACCENT_BLUE : colors.TEXT_PRIMARY,
-                    background: costRate === p.rate ? `${colors.ACCENT_BLUE}18` : 'transparent',
+                    background: costRate === p.rate ? tint(colors.ACCENT_BLUE, 9) : 'transparent',
                   }}
                 >
                   {p.label} — ${p.rate}/GiB
@@ -741,7 +740,7 @@ function HeroInner({
           fontSize: 11,
           color: colors.TEXT_MUTED,
           fontVariantNumeric: 'tabular-nums',
-          zIndex: 1,
+          zIndex: Z.local,
           borderTop: `1px solid ${colors.BORDER}`,
           paddingTop: 12,
           marginTop: -2,
@@ -776,10 +775,10 @@ function HeroInner({
             alignItems: 'center',
             flexWrap: 'wrap',
             gap: 12,
-            fontSize: 12.5,
+            fontSize: 13,
             lineHeight: 1.45,
             color: colors.TEXT_SECONDARY,
-            zIndex: 1,
+            zIndex: Z.local,
           }}
         >
           <span style={{ flex: '1 1 260px' }}>
@@ -861,7 +860,7 @@ function EmptyHero({
               fontSize: 14,
               fontWeight: 700,
               fontFamily: 'var(--font-ui)',
-              color: '#fff',
+              color: colors.ON_SAVED,
               background: colors.BAR_SAVED,
               boxShadow: `0 2px 12px ${colors.GLOW_GREEN}`,
             }}
@@ -888,20 +887,20 @@ function EmptyHero({
           Example
         </span>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <span style={{ fontSize: 11.5, fontWeight: 600, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
             Your current storage
           </span>
           <div
             style={{
               height: 22,
               borderRadius: 7,
-              background: `repeating-linear-gradient(45deg, ${colors.TEXT_FAINT}33 0 1px, transparent 1px 8px)`,
+              background: `repeating-linear-gradient(45deg, ${tint(colors.TEXT_FAINT, 20)} 0 1px, transparent 1px 8px)`,
               border: `1px solid ${colors.BORDER}`,
             }}
           />
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <span style={{ fontSize: 11.5, fontWeight: 600, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
             After DeltaGlider — run a scan to find out
           </span>
           <div
@@ -910,7 +909,7 @@ function EmptyHero({
               width: '7%',
               minWidth: 26,
               borderRadius: 7,
-              border: `1.5px dashed ${colors.ACCENT_GREEN}88`,
+              border: `1.5px dashed ${tint(colors.ACCENT_GREEN, 53)}`,
             }}
           />
         </div>

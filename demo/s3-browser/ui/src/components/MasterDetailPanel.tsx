@@ -1,4 +1,4 @@
-import { CONTENT_WIDE } from './shared-styles';
+import { CONTENT_WIDE, SPACE } from './shared-styles';
 import type { ReactNode } from 'react';
 import { Button, Typography, Input } from 'antd';
 import { PlusOutlined, SearchOutlined } from '@ant-design/icons';
@@ -7,6 +7,7 @@ import { ErrorState, LoadingState } from './StatePlaceholders';
 import PageActions from './PageActions';
 import './MasterDetailPanel.css';
 import { activateOnKey } from '../keyboard';
+import { tint } from '../themeVars';
 
 const { Text } = Typography;
 
@@ -111,7 +112,6 @@ export default function MasterDetailPanel<T>({
           width: '100%',
           maxWidth: CONTENT_WIDE,
           margin: '0 auto',
-          '--dg-md-border': colors.BORDER,
         } as React.CSSProperties
       }
     >
@@ -179,15 +179,13 @@ export default function MasterDetailPanel<T>({
               return (
                 <div
                   key={getId(item)}
-                  className={rowClassName}
+                  className={[rowClassName, selected ? undefined : 'dg-hover-surface'].filter(Boolean).join(' ')}
                   style={{
-                    background: selected ? colors.ACCENT_BLUE + '18' : 'transparent',
+                    background: selected ? tint(colors.ACCENT_BLUE, 9) : 'transparent',
                     borderLeft: selected ? `3px solid ${colors.ACCENT_BLUE}` : '3px solid transparent',
                     transition: 'all 0.15s ease',
                     position: 'relative',
                   }}
-                  onMouseEnter={e => { if (!selected) e.currentTarget.style.background = colors.BORDER + '40'; }}
-                  onMouseLeave={e => { if (!selected) e.currentTarget.style.background = 'transparent'; }}
                 >
                   <div
                     role="button"
@@ -195,7 +193,7 @@ export default function MasterDetailPanel<T>({
                     aria-current={selected || undefined}
                     onClick={() => onSelect(item)}
                     onKeyDown={activateOnKey(() => onSelect(item))}
-                    style={{ padding: rowPadding, paddingRight: actions ? 40 : undefined, cursor: 'pointer' }}
+                    style={{ padding: rowPadding, paddingRight: actions ? SPACE.xl + SPACE.xs : undefined, cursor: 'pointer' }}
                   >
                     {renderRowBody(item)}
                   </div>

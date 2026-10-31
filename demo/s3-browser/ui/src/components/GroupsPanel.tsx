@@ -268,9 +268,8 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
           title="Duplicate group"
           aria-label={`Duplicate group ${group.name}`}
           onClick={() => void handleClone(group)}
-          style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0 }}
-          onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
-          onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
+          className="dg-hover-reveal"
+          style={{ padding: '2px 4px', minWidth: 0 }}
         />
       )}
       detail={detail}
@@ -499,7 +498,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
                 </Text>
               </div>
               {!user.enabled && (
-                <Text type="secondary" style={{ fontSize: 10 }}>disabled</Text>
+                <Text type="secondary" style={{ fontSize: 11 }}>disabled</Text>
               )}
             </div>
           ))}

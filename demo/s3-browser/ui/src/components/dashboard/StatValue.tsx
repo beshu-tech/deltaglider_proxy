@@ -93,7 +93,7 @@ export default function StatValue({ value, unit, hint, tone = 'neutral', childre
       {hint && (
         <div
           style={{
-            fontSize: 11.5,
+            fontSize: 12,
             color: colors.TEXT_MUTED,
             fontFamily: 'var(--font-ui)',
             lineHeight: 1.4,

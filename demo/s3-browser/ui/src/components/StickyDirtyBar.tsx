@@ -20,6 +20,7 @@ import { Button, Space } from 'antd';
 import { ExclamationCircleFilled } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { Z_DIRTY_BAR } from '../theme';
+import { cssVar } from '../themeVars';
 
 interface Props {
   visible: boolean;
@@ -116,12 +117,12 @@ export default function StickyDirtyBar({
           borderRadius: 12,
           background: c.BG_ELEVATED,
           border: `1px solid ${hasErrors ? c.ACCENT_RED : c.BORDER}`,
-          boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
+          boxShadow: cssVar('FLOAT_SHADOW'),
           maxWidth: 'min(560px, calc(100vw - 24px))',
         }}
       >
         <ExclamationCircleFilled
-          style={{ color: hasErrors ? c.ACCENT_RED : c.ACCENT_AMBER, fontSize: 15 }}
+          style={{ color: hasErrors ? c.ACCENT_RED : c.ACCENT_AMBER, fontSize: 16 }}
         />
         <span style={{ fontSize: 13, color: c.TEXT_PRIMARY, whiteSpace: 'nowrap' }}>
           {hasErrors ? (

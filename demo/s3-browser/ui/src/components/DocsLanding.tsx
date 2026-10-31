@@ -3,7 +3,7 @@ import { themedShotSrc } from '../docsMarkdown';
 import type { DocsBundle, DocGroup } from '../docsBundle';
 import Lightbox from './Lightbox';
 import { useIsNarrow } from '../useIsNarrow';
-import { SPACE } from './shared-styles';
+import { SPACE, BREAKPOINT } from './shared-styles';
 
 interface Props {
   bundle: DocsBundle;
@@ -38,7 +38,7 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
   // Same breakpoint as the docs sidebar's `hide-mobile` (768px). With the
   // sidebar on screen, a card lists only where each group starts — the full
   // list would repeat the sidebar. Without it, the cards are the navigation.
-  const sidebarHidden = useIsNarrow(769);
+  const sidebarHidden = useIsNarrow(BREAKPOINT.tablet);
   const { docs: DOCS, groups: DOC_GROUPS, taglines: GROUP_TAGLINE } = bundle;
 
   const card = {
@@ -144,10 +144,13 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
             </div>
             {/* The landing page is itself the README; never offer it as a start. */}
             {(sidebarHidden ? docs : docs.filter((d) => d.id !== 'readme').slice(0, 1)).map((d) => (
-              <div
+              <button
                 key={d.id}
+                type="button"
+                className="btn-reset dg-hover-accent"
                 onClick={() => onSelectDoc(d.id)}
                 style={{
+                  width: '100%',
                   padding: `${SPACE.xxs}px 0`,
                   fontSize: 13,
                   color: colors.TEXT_SECONDARY,
@@ -155,11 +158,9 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
                   cursor: 'pointer',
                   transition: 'color 0.1s',
                 }}
-                onMouseEnter={(e) => (e.currentTarget.style.color = colors.ACCENT_BLUE)}
-                onMouseLeave={(e) => (e.currentTarget.style.color = colors.TEXT_SECONDARY)}
               >
                 {sidebarHidden ? d.title : `Start with: ${d.title} →`}
-              </div>
+              </button>
             ))}
           </div>
         ))}

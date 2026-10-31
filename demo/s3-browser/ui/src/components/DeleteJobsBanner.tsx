@@ -4,6 +4,7 @@ import { DeleteOutlined } from '@ant-design/icons';
 import { cancelDeleteJob } from '../adminApi';
 import { plainError } from '../plainError';
 import { type MaintenanceJobView, deleteJobText } from '../maintenanceStatus';
+import { noticeBand } from '../themeVars';
 
 interface Props {
   /** The bucket's running delete jobs (the bucket status `deletes`). */
@@ -45,8 +46,7 @@ export default function DeleteJobsBanner({ jobs, me, canCancel, onChanged }: Pro
         flexDirection: 'column',
         gap: 8,
         padding: '8px 16px',
-        background: 'rgba(37, 99, 235, 0.08)',
-        borderBottom: '1px solid rgba(37, 99, 235, 0.25)',
+        ...noticeBand('ACCENT_BLUE'),
       }}
     >
       {jobs.map((job) => {

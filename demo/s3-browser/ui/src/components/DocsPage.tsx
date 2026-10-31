@@ -16,9 +16,10 @@ import { useNavigation } from '../NavigationContext';
 import { buildViewUrl } from '../urlState';
 import DocsLanding from './DocsLanding';
 import { EmptyState, ErrorState, LoadingState } from './StatePlaceholders';
-import { SPACE } from './shared-styles';
+import { SPACE, BREAKPOINT } from './shared-styles';
 import '../docs.css';
 import { mermaidConfig, mermaidDisplayWidth } from '../mermaidTheme';
+import { tint } from '../themeVars';
 
 mermaid.initialize({
   startOnLoad: false,
@@ -272,7 +273,7 @@ function DocsNav({ docs, grouped, selectedId, onSelect }: DocsNavProps) {
             {groupDocs.map((doc) => (
               <button
                 key={doc.id}
-                className="btn-reset"
+                className={doc.id === selectedId ? 'btn-reset' : 'btn-reset dg-hover-text'}
                 aria-current={doc.id === selectedId ? 'page' : undefined}
                 onClick={() => onSelect(doc.id)}
                 style={{
@@ -286,17 +287,11 @@ function DocsNav({ docs, grouped, selectedId, onSelect }: DocsNavProps) {
                   // text on its tint was 4.4:1, D43), bold, with the teal edge.
                   color: doc.id === selectedId ? colors.TEXT_PRIMARY : colors.TEXT_SECONDARY,
                   fontWeight: doc.id === selectedId ? 600 : 400,
-                  background: doc.id === selectedId ? `${colors.ACCENT_BLUE}10` : 'transparent',
+                  background: doc.id === selectedId ? tint(colors.ACCENT_BLUE, 6) : 'transparent',
                   borderLeft: doc.id === selectedId ? `2px solid ${colors.ACCENT_BLUE}` : '2px solid transparent',
                   cursor: 'pointer',
                   // Colours only: an `all` transition animated the focus ring too.
                   transition: 'color 0.15s, background-color 0.15s',
-                }}
-                onMouseEnter={(e) => {
-                  if (doc.id !== selectedId) e.currentTarget.style.color = colors.TEXT_PRIMARY;
-                }}
-                onMouseLeave={(e) => {
-                  if (doc.id !== selectedId) e.currentTarget.style.color = colors.TEXT_SECONDARY;
                 }}
               >
                 {doc.title}
@@ -326,7 +321,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
   const { navigate } = useNavigation();
   // Same breakpoint as the landing and `hide-mobile`: below it the sidebar
   // and the right-rail TOC give way to a drawer and an in-flow TOC.
-  const narrow = useIsNarrow(769);
+  const narrow = useIsNarrow(BREAKPOINT.tablet);
   const [navOpen, setNavOpen] = useState(false);
 
   // Docs arrive at runtime from the session-gated /_/api/docs (see
@@ -608,7 +603,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
             {selectedDoc && !showLanding && !unknownDocId && <CopyPageButton doc={selectedDoc} />}
           </div>
         )}
-        <div style={{ display: 'flex', gap: SPACE.xl, maxWidth: 1200, margin: '0 auto', paddingTop: narrow ? 20 : 0 }}>
+        <div style={{ display: 'flex', gap: SPACE.xl, maxWidth: 1200, margin: '0 auto', paddingTop: narrow ? SPACE.lg : 0 }}>
           {/* Landing page for overview, markdown for everything else */}
           {!bundle ? (
             <div style={{ flex: 1, minWidth: 0, display: 'flex', justifyContent: 'center', padding: SPACE.xl }}>

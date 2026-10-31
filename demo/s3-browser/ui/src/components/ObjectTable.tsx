@@ -510,7 +510,7 @@ export default function ObjectTable({
               {isVirtualFolderPrefix(record.key.replace('folder:', ''), virtualFolders) ? (
                 <sup
                   title="Virtual folder from your permissions. It will become a real folder after upload."
-                  style={{ color: TEXT_MUTED, fontSize: 10, fontWeight: 600, lineHeight: 1, marginLeft: 2 }}
+                  style={{ color: TEXT_MUTED, fontSize: 11, fontWeight: 600, lineHeight: 1, marginLeft: 2 }}
                 >
                   (i)
                 </sup>

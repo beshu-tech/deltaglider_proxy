@@ -15,6 +15,7 @@ import { Button } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../../ThemeContext';
 import { SPACE } from '../shared-styles';
+import { tint } from '../../themeVars';
 
 export type RefreshCadence = 'off' | '5s' | '30s';
 
@@ -54,7 +55,7 @@ export default function DashboardToolbar({
         {meta && (
           <div
             style={{
-              fontSize: 11.5,
+              fontSize: 12,
               color: colors.TEXT_MUTED,
               fontFamily: 'var(--font-mono)',
             }}
@@ -217,7 +218,7 @@ function Segmented<T extends string>({ value, options, onChange, colors }: Segme
               border: 'none',
               borderRadius: 6,
               cursor: opt.disabled ? 'not-allowed' : 'pointer',
-              background: active ? `${colors.ACCENT_BLUE}22` : 'transparent',
+              background: active ? tint(colors.ACCENT_BLUE, 13) : 'transparent',
               color: active
                 ? colors.ACCENT_BLUE
                 : opt.disabled

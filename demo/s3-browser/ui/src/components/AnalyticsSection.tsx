@@ -494,7 +494,7 @@ export default function AnalyticsSection({ config }: Props) {
               <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE.sm }}>
                 <div
                   style={{
-                    fontSize: 22,
+                    fontSize: 24,
                     fontWeight: 800,
                     color: colors.ACCENT_AMBER,
                     fontFamily: 'var(--font-ui)',

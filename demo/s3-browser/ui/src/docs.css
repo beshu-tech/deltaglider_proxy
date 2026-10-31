@@ -386,7 +386,7 @@
   font-size: 13px;
   font-weight: 500;
   letter-spacing: 0;
-  color: var(--docs-muted, #8a93a6);
+  color: var(--docs-muted);
   opacity: 0;
   transform: translateY(1px);
   transition: opacity 0.15s ease;
@@ -404,9 +404,9 @@
   padding: 4px 10px;
   font-size: 12px;
   font-weight: 500;
-  color: var(--docs-muted, #8a93a6);
-  background: var(--docs-code-bg, rgba(127, 140, 170, 0.10));
-  border: 1px solid var(--docs-border, rgba(127, 140, 170, 0.22));
+  color: var(--docs-muted);
+  background: var(--docs-code-bg);
+  border: 1px solid var(--docs-border);
   border-radius: 999px;
   white-space: nowrap;
 }

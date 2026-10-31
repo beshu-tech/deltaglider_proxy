@@ -1,5 +1,6 @@
 import { useColors } from '../ThemeContext';
 import { SPACE } from './shared-styles';
+import { tint } from '../themeVars';
 
 /**
  * Centered tab header with icon, title, and description.
@@ -46,8 +47,8 @@ export default function TabHeader({ icon, title, description, actionsRef }: Prop
           width: 28,
           height: 28,
           borderRadius: 8,
-          background: `${colors.ACCENT_BLUE}12`,
-          border: `1px solid ${colors.ACCENT_BLUE}25`,
+          background: tint(colors.ACCENT_BLUE, 7),
+          border: `1px solid ${tint(colors.ACCENT_BLUE, 15)}`,
           fontSize: 14,
           color: colors.ACCENT_BLUE,
           flexShrink: 0,

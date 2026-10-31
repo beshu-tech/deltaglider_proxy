@@ -35,6 +35,7 @@ import { plainError } from '../plainError';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { useDeltaEfficiency, useTriggerDeltaEfficiencyScan } from '../queries/deltaEfficiency';
+import { tint } from '../themeVars';
 
 /**
  * Per-row verification state, keyed by prefix. Stored at the
@@ -207,7 +208,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
         <div
           id="delta-efficiency-min-deltas-error"
           role="alert"
-          style={{ color: colors.ACCENT_RED, fontSize: 12.5, marginTop: -SPACE.xs, marginBottom: SPACE.md }}
+          style={{ color: colors.ACCENT_RED, fontSize: 13, marginTop: -SPACE.xs, marginBottom: SPACE.md }}
         >
           {minDeltasField.error}
         </div>
@@ -389,8 +390,8 @@ function VerifyExplainer() {
         display: 'flex',
         gap: 12,
         padding: '12px 16px',
-        background: `${colors.ACCENT_BLUE}0c`,
-        border: `1px dashed ${colors.ACCENT_BLUE}55`,
+        background: tint(colors.ACCENT_BLUE, 5),
+        border: `1px dashed ${tint(colors.ACCENT_BLUE, 33)}`,
         borderRadius: 8,
         fontSize: 12,
         color: colors.TEXT_SECONDARY,
@@ -456,9 +457,9 @@ function HeroHeadline({
       style={{
         padding: '16px 24px',
         background: allHealthy
-          ? `${colors.ACCENT_BLUE}10`
-          : `${colors.ACCENT_RED}12`,
-        border: `1px solid ${allHealthy ? colors.ACCENT_BLUE : colors.ACCENT_RED}40`,
+          ? tint(colors.ACCENT_BLUE, 6)
+          : tint(colors.ACCENT_RED, 7),
+        border: `1px solid ${tint(allHealthy ? colors.ACCENT_BLUE : colors.ACCENT_RED, 25)}`,
         borderRadius: 10,
       }}
     >
@@ -896,11 +897,11 @@ function StoredCell({
       </div>
       {verified && <VerifiedStoredVsOriginal verified={verified} />}
       {verify?.status === 'loading' && (
-        <div style={{ fontSize: 10, color: colors.TEXT_MUTED }}>verifying…</div>
+        <div style={{ fontSize: 11, color: colors.TEXT_MUTED }}>verifying…</div>
       )}
       {verify?.status === 'error' && (
         <HoverHint hint={verify.message}>
-          <span style={{ fontSize: 10, color: colors.ACCENT_RED, cursor: 'help' }}>
+          <span style={{ fontSize: 11, color: colors.ACCENT_RED, cursor: 'help' }}>
             verify failed
           </span>
         </HoverHint>
@@ -965,13 +966,13 @@ function VerifiedStoredVsOriginal({ verified }: { verified: VerifyDeltaEfficienc
           marginTop: 2,
           padding: '2px 8px',
           borderRadius: 4,
-          background: `${savedColor}10`,
-          border: `1px solid ${savedColor}30`,
+          background: tint(savedColor, 6),
+          border: `1px solid ${tint(savedColor, 19)}`,
           cursor: 'help',
           lineHeight: 1.25,
         }}
       >
-        <div style={{ fontSize: 10, color: colors.TEXT_MUTED }}>
+        <div style={{ fontSize: 11, color: colors.TEXT_MUTED }}>
           orig {formatBytes(verified.total_original_bytes)}
         </div>
         <div
@@ -1109,7 +1110,7 @@ function RatioAxis({
             bottom: 0,
             left: 0,
             width: `${excellentPct}%`,
-            background: `${colors.ACCENT_GREEN}18`,
+            background: tint(colors.ACCENT_GREEN, 9),
           }}
         />
         <div
@@ -1119,7 +1120,7 @@ function RatioAxis({
             bottom: 0,
             left: `${cliffPct}%`,
             right: 0,
-            background: `${colors.ACCENT_RED}14`,
+            background: tint(colors.ACCENT_RED, 8),
           }}
         />
       </div>
@@ -1127,13 +1128,13 @@ function RatioAxis({
       {/* Threshold lines */}
       <AxisLine
         at={excellentPct}
-        color={`${colors.ACCENT_GREEN}80`}
+        color={tint(colors.ACCENT_GREEN, 50)}
         label="5%"
         labelColor={colors.TEXT_FAINT}
       />
       <AxisLine
         at={poorPct}
-        color={`${colors.TEXT_MUTED}60`}
+        color={tint(colors.TEXT_MUTED, 38)}
         label="50%"
         labelColor={colors.TEXT_FAINT}
       />
@@ -1163,7 +1164,7 @@ function RatioAxis({
             background: color,
             border: `1.5px solid ${colors.BG_CARD}`,
             borderRadius: 2,
-            boxShadow: `0 0 0 1px ${color}80`,
+            boxShadow: `0 0 0 1px ${tint(color, 50)}`,
             transition: 'left 0.4s ease',
           }}
           aria-hidden
@@ -1224,7 +1225,7 @@ function AxisLine({
             left: `${at}%`,
             bottom: -14,
             transform: 'translateX(-50%)',
-            fontSize: 9,
+            fontSize: 11,
             fontFamily: 'var(--font-mono)',
             color: labelColor,
             letterSpacing: 0.3,
@@ -1315,8 +1316,8 @@ function RatioHeaderHint() {
       <div
         style={{
           padding: '4px 8px',
-          background: `${colors.ACCENT_BLUE}10`,
-          border: `1px solid ${colors.ACCENT_BLUE}30`,
+          background: tint(colors.ACCENT_BLUE, 6),
+          border: `1px solid ${tint(colors.ACCENT_BLUE, 19)}`,
           borderRadius: 5,
           fontFamily: 'var(--font-mono)',
           fontSize: 11,

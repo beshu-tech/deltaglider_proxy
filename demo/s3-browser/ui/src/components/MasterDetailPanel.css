@@ -16,7 +16,7 @@
     min-width: 0 !important;
     max-height: 45vh;
     border-right: none !important;
-    border-bottom: 1px solid var(--dg-md-border, rgba(0, 0, 0, 0.08));
+    border-bottom: 1px solid var(--dg-border);
   }
   .dg-md-detail {
     /* Let the detail grow with its content. */

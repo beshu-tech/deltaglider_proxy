@@ -40,6 +40,7 @@ import { fmtLatencyBound, fmtRatioBound, histStats, histogramBars, nonZeroByLabe
 import './dashboard/dashboard.css';
 import { useNavigation } from '../NavigationContext';
 import { parseAdminQuery, buildViewUrl } from '../urlState';
+import { tint } from '../themeVars';
 
 
 function multiLabelValues(m: Map<string, ParsedMetric>, name: string): { labels: Record<string, string>; value: number }[] {
@@ -297,8 +298,8 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
                     <YAxis yAxisId="left" tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} allowDecimals={false} />
                     <YAxis yAxisId="right" orientation="right" tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} />
                     <RTooltip {...tt} />
-                    <Area yAxisId="left" type="stepAfter" dataKey="httpTotal" stroke={palette.primary} fill={`${palette.primary}33`} strokeWidth={2} name="Requests" />
-                    <Area yAxisId="right" type="stepAfter" dataKey="avgLatency" stroke={palette.secondary} fill={`${palette.secondary}22`} strokeWidth={2} name="Avg latency (ms)" />
+                    <Area yAxisId="left" type="stepAfter" dataKey="httpTotal" stroke={palette.primary} fill={tint(palette.primary, 20)} strokeWidth={2} name="Requests" />
+                    <Area yAxisId="right" type="stepAfter" dataKey="avgLatency" stroke={palette.secondary} fill={tint(palette.secondary, 13)} strokeWidth={2} name="Avg latency (ms)" />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
@@ -408,8 +409,8 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
                     <XAxis dataKey="t" tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} minTickGap={60} />
                     <YAxis tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} allowDecimals={false} />
                     <RTooltip {...tt} />
-                    <Area type="stepAfter" dataKey="cacheHits" stackId="1" stroke={palette.primary} fill={`${palette.primary}55`} strokeWidth={2} name="Hits" />
-                    <Area type="stepAfter" dataKey="cacheMisses" stackId="1" stroke={colors.ACCENT_RED} fill={`${colors.ACCENT_RED}55`} strokeWidth={2} name="Misses" />
+                    <Area type="stepAfter" dataKey="cacheHits" stackId="1" stroke={palette.primary} fill={tint(palette.primary, 33)} strokeWidth={2} name="Hits" />
+                    <Area type="stepAfter" dataKey="cacheMisses" stackId="1" stroke={colors.ACCENT_RED} fill={tint(colors.ACCENT_RED, 33)} strokeWidth={2} name="Misses" />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
@@ -602,9 +603,9 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
                           style={{
                             padding: `${SPACE.xxs}px ${SPACE.sm}px`, borderRadius: 8, fontSize: 12,
                             fontFamily: 'var(--font-mono)',
-                            background: `${colors.ACCENT_RED}22`,
+                            background: tint(colors.ACCENT_RED, 13),
                             color: colors.ACCENT_RED,
-                            border: `1px solid ${colors.ACCENT_RED}44`,
+                            border: `1px solid ${tint(colors.ACCENT_RED, 27)}`,
                           }}
                         >
                           {s.labels.reason}: {fmtNum(s.value)}

@@ -44,6 +44,7 @@ import ApplyDialog from './ApplyDialog';
 import StickyDirtyBar from './StickyDirtyBar';
 import { ErrorState, LoadingState } from './StatePlaceholders';
 import { CUSTOM_LOG_LEVEL, LOG_LEVEL_PRESETS, logLevelRadio } from './admin/logLevelPresets';
+import { tint } from '../themeVars';
 
 
 // ───────────────────────────────────────────────────────────
@@ -773,13 +774,13 @@ function SyncStatusPill({
 
   if (dirty && enabled) {
     dotColor = ACCENT_AMBER;
-    bg = 'rgba(251, 191, 36, 0.08)';
-    border = 'rgba(251, 191, 36, 0.28)';
+    bg = tint(ACCENT_AMBER, 8);
+    border = tint(ACCENT_AMBER, 28);
     label = 'Pending restart';
   } else if (enabled) {
     dotColor = ACCENT_BLUE;
-    bg = 'rgba(45, 212, 191, 0.08)';
-    border = 'rgba(45, 212, 191, 0.28)';
+    bg = tint(ACCENT_BLUE, 8);
+    border = tint(ACCENT_BLUE, 28);
     label = `Active · ${bucket}`;
   } else {
     dotColor = TEXT_MUTED;
@@ -815,7 +816,7 @@ function SyncStatusPill({
           height: 8,
           borderRadius: '50%',
           background: dotColor,
-          boxShadow: enabled && !dirty ? `0 0 6px ${dotColor}80` : 'none',
+          boxShadow: enabled && !dirty ? `0 0 6px ${tint(dotColor, 50)}` : 'none',
         }}
       />
       {label}

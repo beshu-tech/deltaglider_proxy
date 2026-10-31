@@ -19,7 +19,7 @@ import {
   type EventOutboxRecord,
   type EventOutboxStatus,
 } from '../adminApi';
-import { CARD_RADIUS, contentColumn, CONTENT_WIDE, SPACE } from './shared-styles';
+import { CARD_RADIUS, contentColumn, CONTENT_WIDE, SPACE, BREAKPOINT } from './shared-styles';
 import { EmptyState, LoadingState, QueryState } from './StatePlaceholders';
 import TruncatedName from './TruncatedName';
 import { plainError } from '../plainError';
@@ -34,6 +34,7 @@ import {
 } from '../queries/eventOutbox';
 import { relativeTime } from '../utils';
 import { countTone, endpointDeliverySummary, eventStatusTone } from '../statusTone';
+import { tint } from '../themeVars';
 
 const { Text } = Typography;
 const DEFAULT_PAGE_SIZE = 50;
@@ -86,7 +87,7 @@ function bulkLabel(label: string, count: number): string {
 export default function EventOutboxPanel({ onSessionExpired }: Props) {
   const colors = useColors();
   // Phone: hide the secondary columns; the table keeps its own scroller.
-  const narrow = useIsNarrow(600);
+  const narrow = useIsNarrow(BREAKPOINT.phone);
   const [filter, setFilter] = useState('');
   const [status, setStatus] = useState<StatusFilter>('all');
   const [page, setPage] = useState(1);
@@ -544,7 +545,7 @@ function CountPill({
         border: `1px solid ${active ? ACCENT_BLUE : BORDER}`,
         borderRadius: 999,
         padding: `${SPACE.xxs}px ${SPACE.sm}px`,
-        background: active ? `${ACCENT_BLUE}1f` : BG_CARD,
+        background: active ? tint(ACCENT_BLUE, 12) : BG_CARD,
         cursor: 'pointer',
         fontFamily: 'var(--font-ui)',
       }}

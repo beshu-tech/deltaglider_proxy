@@ -17,6 +17,7 @@ import { EmptyState, SkeletonState } from '../StatePlaceholders';
 import { useColors } from '../../ThemeContext';
 import { CARD_RADIUS, SPACE } from '../shared-styles';
 import type { ColorTokens } from '../../ThemeContext';
+import { Z } from '../../theme';
 
 type PanelSpan = 3 | 4 | 6 | 8 | 12;
 type PanelRows = 1 | 2 | 3;
@@ -60,8 +61,6 @@ export default function Panel({
   const colors = useColors();
 
   const accentHex = accent ? accentColor(colors, accent) : null;
-  // Light theme gets a machined top inner highlight; dark a faint one.
-  const isLight = colors.BG_CARD === '#ffffff';
   return (
     <div
       data-colspan={colSpan}
@@ -75,7 +74,7 @@ export default function Panel({
         background: colors.BG_CARD,
         border: `1px solid ${colors.BORDER}`,
         borderRadius: CARD_RADIUS,
-        boxShadow: `${colors.ELEV_SHADOW}, inset 0 1px 0 ${isLight ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.04)'}`,
+        boxShadow: `${colors.ELEV_SHADOW}, inset 0 1px 0 ${colors.CARD_HIGHLIGHT}`,
         padding: 0,
         display: 'flex',
         flexDirection: 'column',
@@ -99,7 +98,7 @@ export default function Panel({
             borderRadius: 2,
             background: `linear-gradient(90deg, transparent, ${accentHex} 18%, ${accentHex} 82%, transparent)`,
             opacity: 0.9,
-            zIndex: 1,
+            zIndex: Z.local,
           }}
         />
       )}

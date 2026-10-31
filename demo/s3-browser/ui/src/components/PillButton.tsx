@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import { useColors } from '../ThemeContext';
+import { tint } from '../themeVars';
 
 /**
  * A clickable pill. A real <button>, so it is focusable, activates with
@@ -25,8 +26,8 @@ export default function PillButton({ children, onClick, title, ariaLabel }: {
         fontSize: 12,
         padding: '2px 8px',
         margin: 0,
-        border: `1px solid ${c.ACCENT_BLUE}55`,
-        background: `${c.ACCENT_BLUE}14`,
+        border: `1px solid ${tint(c.ACCENT_BLUE, 33)}`,
+        background: tint(c.ACCENT_BLUE, 8),
         color: c.ACCENT_BLUE_LIGHT,
         fontFamily: 'var(--font-ui)',
         lineHeight: '20px',

@@ -139,7 +139,7 @@ export default function DocSearch({ docs, onSelect }: Props) {
             results.map(r => (
               <button
                 key={r.docId}
-                className="btn-reset"
+                className="btn-reset dg-hover-tint"
                 onClick={() => handleSelect(r.docId)}
                 style={{
                   display: 'block',
@@ -152,13 +152,11 @@ export default function DocSearch({ docs, onSelect }: Props) {
                   transition: 'background 0.1s',
                   background: 'transparent',
                 }}
-                onMouseEnter={e => e.currentTarget.style.background = `${colors.ACCENT_BLUE}10`}
-                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
               >
                 <div style={{ fontSize: 13, fontWeight: 600, color: colors.TEXT_PRIMARY, fontFamily: 'var(--font-ui)' }}>
                   {r.title}
                 </div>
-                <div style={{ fontSize: 10, color: colors.ACCENT_BLUE, fontFamily: 'var(--font-mono)', marginTop: 2 }}>
+                <div style={{ fontSize: 11, color: colors.ACCENT_BLUE, fontFamily: 'var(--font-mono)', marginTop: 2 }}>
                   {r.group}
                 </div>
                 <div style={{

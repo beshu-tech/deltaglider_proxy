@@ -96,10 +96,12 @@ function over(fg: string, bg: string, alpha: number): string {
 for (const [name, c] of [['dark', darkColors], ['light', lightColors]] as const) {
   test(`${name}: BucketCard chip text reaches 4.5:1 on its tint`, () => {
     const src = readFileSync(join(__dirname, '../components/BucketCard.tsx'), 'utf8');
-    const tint = /background: `\$\{tone\}([0-9a-f]{2})`/.exec(src);
-    assert.ok(tint, 'Chip background is `${tone}<alpha>`');
-    const alpha = parseInt(tint[1], 16) / 255;
-    const publicCard = over(c.ACCENT_AMBER, c.BG_ELEVATED, 0x0a / 255);
+    const tint = /background: tint\(tone, (\d+)\)/.exec(src);
+    assert.ok(tint, 'Chip background is tint(tone, <percent>)');
+    const alpha = Number(tint[1]) / 100;
+    const wash = /isPublic \? tint\(colors\.ACCENT_AMBER, (\d+)\) : colors\.BG_ELEVATED/.exec(src);
+    assert.ok(wash, 'Public card background is tint(colors.ACCENT_AMBER, <percent>)');
+    const publicCard = over(c.ACCENT_AMBER, c.BG_ELEVATED, Number(wash[1]) / 100);
     const fails: string[] = [];
     for (const [tn, tone] of Object.entries({
       TEXT_MUTED: c.TEXT_MUTED, ACCENT_BLUE: c.ACCENT_BLUE, ACCENT_GREEN: c.ACCENT_GREEN,
@@ -110,6 +112,29 @@ for (const [name, c] of [['dark', darkColors], ['light', lightColors]] as const)
         if (r < 4.5) fails.push(`${tn} on its tint on ${sn}: ${r.toFixed(2)}`);
       }
     }
+    assert.deepEqual(fails, []);
+  });
+}
+
+// Ink on fills: text drawn ON a coloured fill reaches 4.5:1 on every stop of
+// that fill (white on the dark-theme accents was 1.7-2.5:1 in ActionChips,
+// and white on the green saved bar 2:1 in the analytics hero).
+const stops = (gradient: string) => [...gradient.matchAll(/#[0-9a-f]{6}/gi)].map((m) => m[0]);
+for (const [name, c] of [['dark', darkColors], ['light', lightColors]] as const) {
+  test(`${name}: ON_ACCENT, ON_KEPT and ON_SAVED reach 4.5:1 on their fills`, () => {
+    const fails: string[] = [];
+    const check = (ink: string, inkName: string, fills: Record<string, string>) => {
+      for (const [fn, fill] of Object.entries(fills)) {
+        const r = ratio(ink, fill);
+        if (r < 4.5) fails.push(`${inkName} on ${fn} ${fill}: ${r.toFixed(2)}`);
+      }
+    };
+    check(c.ON_ACCENT, 'ON_ACCENT', {
+      ACCENT_BLUE: c.ACCENT_BLUE, ACCENT_GREEN: c.ACCENT_GREEN, ACCENT_RED: c.ACCENT_RED,
+      ACCENT_AMBER: c.ACCENT_AMBER, ACCENT_PURPLE: c.ACCENT_PURPLE,
+    });
+    check(c.ON_KEPT, 'ON_KEPT', Object.fromEntries(stops(c.BAR_KEPT).map((h, i) => [`BAR_KEPT[${i}]`, h])));
+    check(c.ON_SAVED, 'ON_SAVED', Object.fromEntries(stops(c.BAR_SAVED).map((h, i) => [`BAR_SAVED[${i}]`, h])));
     assert.deepEqual(fails, []);
   });
 }

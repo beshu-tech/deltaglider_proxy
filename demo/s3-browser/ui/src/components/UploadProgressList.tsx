@@ -19,6 +19,7 @@ import TruncatedName from './TruncatedName';
 import { plainError } from '../plainError';
 import { canRetry, fileState } from '../uploadOutcome';
 import { CARD_RADIUS, SPACE } from './shared-styles';
+import { tint } from '../themeVars';
 
 const { Text } = Typography;
 
@@ -191,8 +192,8 @@ const UploadRow = memo(function UploadRow({
             fontFamily: 'var(--font-ui)',
             fontSize: 11,
             color: isCompleting ? finalizingColor : textMuted,
-            border: `1px solid ${isCompleting ? `${finalizingColor}aa` : borderColor}`,
-            background: isCompleting ? `${finalizingColor}1f` : 'transparent',
+            border: `1px solid ${isCompleting ? tint(finalizingColor, 67) : borderColor}`,
+            background: isCompleting ? tint(finalizingColor, 12) : 'transparent',
             borderRadius: 999,
             padding: `1px ${SPACE.xs}px`,
             lineHeight: 1.6,
@@ -230,7 +231,7 @@ const UploadRow = memo(function UploadRow({
             width: '100%',
             height: 6,
             borderRadius: 4,
-            background: isCompleting ? `${finalizingColor}22` : `${accentBlue}22`,
+            background: isCompleting ? tint(finalizingColor, 13) : tint(accentBlue, 13),
             overflow: 'hidden',
           }}
         >
@@ -240,7 +241,7 @@ const UploadRow = memo(function UploadRow({
               height: '100%',
               borderRadius: 4,
               background: isCompleting
-                ? 'repeating-linear-gradient(135deg, #faad14, #faad14 8px, #ffd666 8px, #ffd666 16px)'
+                ? `repeating-linear-gradient(135deg, ${finalizingColor} 0 8px, ${tint(finalizingColor, 60)} 8px 16px)`
                 : accentBlue,
               transition: 'width 0.2s ease',
             }}

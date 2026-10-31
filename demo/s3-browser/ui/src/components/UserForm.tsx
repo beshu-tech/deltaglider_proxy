@@ -30,6 +30,7 @@ import { IAM_DIRTY_KEYS, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
 import { IAM_NAME_HELP, iamNameError, serverNameErrorText } from '../userName';
 import { firstUserSwitchText } from '../firstUser';
 import { useApplyHandler } from '../useDirtySection';
+import { tint } from '../themeVars';
 
 const { Text, Title } = Typography;
 
@@ -250,9 +251,9 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
               <span style={{
                 display: 'inline-flex', alignItems: 'center', gap: 4,
                 fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 10,
-                background: enabled ? `${colors.ACCENT_GREEN}18` : `${colors.TEXT_MUTED}10`,
+                background: enabled ? tint(colors.ACCENT_GREEN, 9) : tint(colors.TEXT_MUTED, 6),
                 color: enabled ? colors.ACCENT_GREEN : colors.TEXT_MUTED,
-                border: `1px solid ${enabled ? `${colors.ACCENT_GREEN}30` : `${colors.TEXT_MUTED}15`}`,
+                border: `1px solid ${enabled ? tint(colors.ACCENT_GREEN, 19) : tint(colors.TEXT_MUTED, 8)}`,
               }}>
                 {enabled
                   ? <><CheckCircleFilled style={{ fontSize: 10 }} /> Active</>
@@ -263,8 +264,8 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
                 <span style={{
                   display: 'inline-flex', alignItems: 'center', gap: 4,
                   fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 10,
-                  background: `${colors.ACCENT_AMBER}18`, color: colors.ACCENT_AMBER,
-                  border: `1px solid ${colors.ACCENT_AMBER}30`,
+                  background: tint(colors.ACCENT_AMBER, 9), color: colors.ACCENT_AMBER,
+                  border: `1px solid ${tint(colors.ACCENT_AMBER, 19)}`,
                 }}>
                   <CrownFilled style={{ fontSize: 10 }} /> Admin
                 </span>
@@ -349,7 +350,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
       )}
 
       <div style={{ marginBottom: SPACE.lg, display: 'flex', alignItems: 'center', gap: SPACE.sm }}>
-        <label htmlFor={`${uid}-enabled`} style={{ fontSize: 13.5, fontWeight: 600, color: colors.TEXT_PRIMARY }}>Enabled</label>
+        <label htmlFor={`${uid}-enabled`} style={{ fontSize: 14, fontWeight: 600, color: colors.TEXT_PRIMARY }}>Enabled</label>
         <Switch id={`${uid}-enabled`} checked={enabled} onChange={setEnabled} size="small" disabled={readOnly} />
       </div>
 

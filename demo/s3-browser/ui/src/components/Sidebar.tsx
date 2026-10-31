@@ -24,6 +24,7 @@ import {
 } from '../s3client';
 import type { BucketInfo } from '../types';
 import { useColors } from '../ThemeContext';
+import { tint } from '../themeVars';
 import BucketEncryptionIcon from './BucketEncryptionIcon';
 import TruncatedName from './TruncatedName';
 import BucketPublicIcon from './BucketPublicIcon';
@@ -419,7 +420,7 @@ export default function Sidebar({
     return (
       <li key={b.name} style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
         <button
-          className="btn-reset"
+          className={isCurrent || isUnavailable ? 'btn-reset' : 'btn-reset dg-hover-surface'}
           ref={isCurrent ? activeRowRef : undefined}
           onClick={() => { if (!isUnavailable) handleSelectBucket(b.name); }}
           disabled={isUnavailable}
@@ -435,16 +436,10 @@ export default function Sidebar({
             marginBottom: 2,
             cursor: isUnavailable ? 'not-allowed' : 'pointer',
             opacity: isUnavailable ? 0.5 : 1,
-            background: isCurrent ? `rgba(45, 212, 191, 0.1)` : 'transparent',
+            background: isCurrent ? tint(ACCENT_BLUE, 10) : 'transparent',
             color: isCurrent ? ACCENT_BLUE_LIGHT : TEXT_SECONDARY,
             transition: 'background-color 0.15s ease, color 0.15s ease',
             borderLeft: isCurrent ? `2px solid ${ACCENT_BLUE}` : '2px solid transparent',
-          }}
-          onMouseEnter={(e) => {
-            if (!isUnavailable && !isCurrent) e.currentTarget.style.background = 'var(--surface-hover)';
-          }}
-          onMouseLeave={(e) => {
-            if (!isCurrent) e.currentTarget.style.background = 'transparent';
           }}
         >
           {/* Cut in the middle: buckets often differ only at the end (-prod, -dr). */}
@@ -648,19 +643,17 @@ export default function Sidebar({
         {canUpload && (
           <div style={{ padding: '4px 0', borderTop: `1px solid ${token.colorBorderSecondary}`, marginTop: 4 }}>
             <button
-              className="btn-reset"
+              className={onUploadPage ? 'btn-reset' : 'btn-reset dg-hover-text'}
               onClick={onUploadClick}
               aria-current={onUploadPage ? 'page' : undefined}
               style={onUploadPage ? {
                 ...menuItemStyle,
                 borderRadius: 6,
-                background: 'rgba(45, 212, 191, 0.1)',
+                background: tint(ACCENT_BLUE, 10),
                 color: ACCENT_BLUE_LIGHT,
                 fontWeight: 600,
                 borderLeft: `2px solid ${ACCENT_BLUE}`,
               } : { ...menuItemStyle, borderLeft: '2px solid transparent' }}
-              onMouseEnter={(e) => { if (!onUploadPage) e.currentTarget.style.color = TEXT_PRIMARY; }}
-              onMouseLeave={(e) => { if (!onUploadPage) e.currentTarget.style.color = TEXT_SECONDARY; }}
             >
               <UploadOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
               <span>Upload files</span>

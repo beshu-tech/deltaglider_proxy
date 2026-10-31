@@ -2,6 +2,7 @@ import { Button } from 'antd';
 import { ArrowLeftOutlined, QuestionCircleOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { useIsNarrow } from '../useIsNarrow';
+import { BREAKPOINT } from './shared-styles';
 
 interface Props {
   title: string;
@@ -22,13 +23,13 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
   // On a phone the header holds the menu button, "Browser", help and the
   // account menu; the letter-spaced title then wraps onto two lines. The page
   // header below names the page, so the bar drops the title there.
-  const phone = useIsNarrow(600);
+  const phone = useIsNarrow(BREAKPOINT.phone);
   return (
     <div style={{
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'space-between',
-      padding: phone ? '0 8px' : '0 20px',
+      padding: phone ? '0 8px' : '0 24px',
       gap: 8,
       height: 52,
       borderBottom: `1px solid ${colors.BORDER}`,

@@ -1,5 +1,6 @@
 import { Progress, Spin } from 'antd';
 import { activePercent, browserBannerText, phaseLabel, type MaintenanceJobView } from '../maintenanceStatus';
+import { cssVar, noticeBand } from '../themeVars';
 
 /** The bucket's active maintenance job (re-encrypt, migrate, …) above the listing. */
 export default function BucketMaintenanceBanner({ job, writesBlocked }: { job: MaintenanceJobView; writesBlocked: boolean }) {
@@ -13,8 +14,7 @@ export default function BucketMaintenanceBanner({ job, writesBlocked }: { job: M
         gap: 14,
         padding: '10px 16px',
         // Amber while writes are refused; calm once they work again.
-        background: writesBlocked ? 'rgba(217, 119, 6, 0.10)' : 'rgba(37, 99, 235, 0.08)',
-        borderBottom: writesBlocked ? '1px solid rgba(217, 119, 6, 0.35)' : '1px solid rgba(37, 99, 235, 0.25)',
+        ...noticeBand(writesBlocked ? 'ACCENT_AMBER' : 'ACCENT_BLUE'),
       }}
     >
       <Spin size="small" />
@@ -28,7 +28,7 @@ export default function BucketMaintenanceBanner({ job, writesBlocked }: { job: M
           status="active"
           showInfo={activePercent(job) != null}
           size="small"
-          strokeColor="#d97706"
+          strokeColor={cssVar('ACCENT_AMBER')}
           style={{ margin: '4px 0 0', maxWidth: 420 }}
         />
       </div>

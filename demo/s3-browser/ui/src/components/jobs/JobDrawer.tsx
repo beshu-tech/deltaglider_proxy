@@ -492,7 +492,7 @@ export default function JobDrawer({
             padding: '8px 12px',
             borderRadius: 8,
             background: c.BG_ELEVATED,
-            fontSize: 12.5,
+            fontSize: 13,
           }}
         >
           <div style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
@@ -530,7 +530,7 @@ export default function JobDrawer({
             padding: '8px 12px',
             borderRadius: 8,
             background: c.BG_ELEVATED,
-            fontSize: 12.5,
+            fontSize: 13,
           }}
         >
           {inFlight.map((f) => (

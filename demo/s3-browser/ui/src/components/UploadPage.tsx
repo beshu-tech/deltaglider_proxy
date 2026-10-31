@@ -38,6 +38,7 @@ import {
 } from '../uploadOutcome';
 import TruncatedName from './TruncatedName';
 import { CARD_RADIUS, SPACE } from './shared-styles';
+import { Z } from '../theme';
 
 const { Text, Title } = Typography;
 
@@ -752,7 +753,7 @@ export default function UploadPage({
         <div
           aria-hidden="true"
           style={{
-            position: 'absolute', inset: SPACE.xs, zIndex: 5, pointerEvents: 'none',
+            position: 'absolute', inset: SPACE.xs, zIndex: Z.local, pointerEvents: 'none',
             border: `2px dashed ${ACCENT_BLUE}`, borderRadius: CARD_RADIUS,
             background: 'var(--drop-glow)',
             display: 'flex', alignItems: 'center', justifyContent: 'center',

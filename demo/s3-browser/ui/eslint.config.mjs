@@ -45,6 +45,31 @@ const ANTD_DEPRECATED = [
   ["JSXOpeningElement[name.name='Collapse'] > JSXAttribute[name.name='destroyInactivePanel']", 'use destroyOnHidden.'],
 ];
 
+/** Theme rules: colours from the palette, hover in CSS (see the CLAUDE.md styling section). */
+const THEME_SYNTAX_RULES = [
+    {
+      // Colours come from the palette (ThemeContext.tsx → useColors() / cssVar() /
+      // tint()), never from a literal: a literal skips the theme switch and the
+      // contrast tests. A real exception (a mock of another product's UI) goes
+      // in COLOR_LITERAL_FILES below with its reason.
+      selector:
+        ":matches(Literal[value=/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/], Literal[value=/(rgb|hsl)a?\\(/], TemplateElement[value.raw=/(rgb|hsl)a?\\(/], Literal[value=/(gradient|solid|dashed|inset|\\dpx) *[^#]*#[0-9a-fA-F]{3,8}\\b/], TemplateElement[value.raw=/(gradient|solid|dashed|inset|\\dpx) *[^#]*#[0-9a-fA-F]{3,8}\\b/])",
+      message: 'No colour literal: use a palette token (useColors(), cssVar(), tint() from src/themeVars.ts). New colour? Add it to ThemeContext.tsx for both themes.',
+    },
+    {
+      // `${color}22` builds a colour by string concatenation; it is invalid CSS for
+      // anything but #rrggbb, silently.
+      selector: "TemplateLiteral > TemplateElement[value.raw=/^[0-9a-fA-F]{2}(?![0-9a-zA-Z])/]:not(:first-child)",
+      message: 'No hex-alpha concatenation (`${color}22`): use tint(color, percent) from src/themeVars.ts.',
+    },
+    {
+      // A mouse handler that writes style misses keyboard focus and keeps a stale
+      // colour across a theme flip.
+      selector: "JSXAttribute[name.name=/^onMouse(Enter|Leave|Over|Out)$/] AssignmentExpression > MemberExpression.left[object.property.name='style']",
+      message: 'Hover styling belongs in CSS: use a dg-hover-* class from theme.css, not an onMouseEnter style write.',
+    },
+];
+
 const UI_RULES = {
   'no-restricted-imports': [
     'error',
@@ -106,6 +131,7 @@ const UI_RULES = {
         "JSXOpeningElement[name.name='Button'] JSXAttribute[name.name='style'] Property[key.name=/^(background|backgroundColor)$/]:matches([value.name=/^ACCENT_/], [value.property.name=/^ACCENT_/])",
       message: 'No ACCENT_* fill on <Button>: use type="primary" / danger, whose colours contrast.test.ts checks.',
     },
+    ...THEME_SYNTAX_RULES,
     // AntD 6 deprecated props: each one floods the dev console with a warning.
     ...ANTD_DEPRECATED.map(([selector, message]) => ({ selector, message: `AntD 6 deprecation: ${message}` })),
   ],
@@ -197,6 +223,22 @@ export default tseslint.config(
   {
     files: ['src/keyboard.ts'],
     rules: { 'no-restricted-syntax': 'off' },
+  },
+  // Colour literals are allowed only here, each for a stated reason:
+  //   the palette and AntD's own tokens; tests and the screenshot annotations;
+  //   the Slack mocks (they draw Slack's own UI, whose colours are not ours);
+  //   the media viewers (an image on black, an HTML page on white, a dark scrim);
+  //   the white sheen on the savings bars (the same in both themes).
+  {
+    files: [
+      'src/ThemeContext.tsx', 'src/theme.ts', 'src/__tests__/**', 'src/test/**', 'e2e/**',
+      'src/components/SlackSetupGuide.tsx', 'src/components/SlackConnectorCard.tsx',
+      'src/components/FilePreview.tsx', 'src/components/HtmlPreview.tsx', 'src/components/Lightbox.tsx',
+      'src/components/HeroSavingsPanel.tsx', 'src/components/BucketFleetList.tsx',
+    ],
+    rules: {
+      'no-restricted-syntax': ['error', ...UI_RULES['no-restricted-syntax'].slice(1).filter((r) => !THEME_SYNTAX_RULES.includes(r))],
+    },
   },
   // Tests stub the raw storage and clipboard APIs the wrappers guard.
   {

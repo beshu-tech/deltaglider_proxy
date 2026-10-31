@@ -20,6 +20,7 @@ import ActionChips from './ActionChips';
 import { grantSummary, reconcileActionsForScope, effectiveActions, isPrefixScoped } from './permissionActions';
 import ResourcePatternInput from './ResourcePatternInput';
 import ConditionPrefixInput from './ConditionPrefixInput';
+import { tint } from '../themeVars';
 
 const { Text } = Typography;
 
@@ -175,12 +176,12 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
 
         return (
           <div key={id} style={{
-            border: `1px solid ${isDeny ? `${colors.ACCENT_RED}40` : colors.BORDER}`,
+            border: `1px solid ${isDeny ? tint(colors.ACCENT_RED, 25) : colors.BORDER}`,
             borderLeft: isDeny ? `3px solid ${colors.ACCENT_RED}` : `1px solid ${colors.BORDER}`,
             borderRadius: 8,
             padding: 12,
             marginBottom: 8,
-            background: isDeny ? `${colors.ACCENT_RED}08` : colors.BG_BASE,
+            background: isDeny ? tint(colors.ACCENT_RED, 3) : colors.BG_BASE,
           }}>
             {/* Header: Allow/Deny + Conditions toggle + Remove */}
             <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
@@ -213,7 +214,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   style={{
                     opacity: conditionsVisible ? 1 : 0.75,
                     color: hasCond ? colors.ACCENT_PURPLE : undefined,
-                    borderColor: conditionsVisible ? `${colors.ACCENT_PURPLE}66` : undefined,
+                    borderColor: conditionsVisible ? tint(colors.ACCENT_PURPLE, 40) : undefined,
                   }}
                 >
                   Conditions
@@ -394,7 +395,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                       placeholder="e.g. 192.168.0.0/16, 10.0.0.0/8"
                       style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 12 }}
                     />
-                    <div style={{ fontSize: 10, color: colors.TEXT_MUTED, marginTop: 4 }}>
+                    <div style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 4 }}>
                       CIDR notation. Only requests from matching IPs will trigger this rule.
                     </div>
                   </div>

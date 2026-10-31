@@ -393,7 +393,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
             {recoveredHash?.kind === 'config_db_key' ? (
               <>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-                  <CheckCircleOutlined style={{ fontSize: 28, color: 'var(--accent-success)', flexShrink: 0 }} />
+                  <CheckCircleOutlined style={{ fontSize: 28, color: 'var(--dg-accent-green)', flexShrink: 0 }} />
                   <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
                     Database key found
                   </div>
@@ -410,7 +410,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               <>
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-                    <CheckCircleOutlined style={{ fontSize: 28, color: 'var(--accent-success)', flexShrink: 0 }} />
+                    <CheckCircleOutlined style={{ fontSize: 28, color: 'var(--dg-accent-green)', flexShrink: 0 }} />
                     <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
                       Database recovered
                     </div>
@@ -451,7 +451,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               <>
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-                    <WarningOutlined style={{ fontSize: 28, color: 'var(--accent-warning)', flexShrink: 0 }} />
+                    <WarningOutlined style={{ fontSize: 28, color: 'var(--dg-accent-amber)', flexShrink: 0 }} />
                     <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
                       Config database locked
                     </div>
@@ -500,7 +500,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   loading={recoveryLoading}
                   disabled={!recoveryPassword.trim()}
                   onClick={handleRecover}
-                  style={{ height: 48, borderRadius: 10, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 15, letterSpacing: '0.02em', marginTop: 4 }}
+                  style={{ height: 48, borderRadius: 10, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 16, letterSpacing: '0.02em', marginTop: 4 }}
                 >
                   Try key
                 </Button>

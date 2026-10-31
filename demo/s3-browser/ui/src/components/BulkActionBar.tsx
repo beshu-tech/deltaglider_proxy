@@ -13,6 +13,8 @@ import { type BulkTransferOutcome, bulkTransferOutcomeMessage } from '../bulkTra
 import { confirmDeletePlan } from './confirmDelete';
 import { pluralize } from '../utils';
 import { useIsNarrow } from '../useIsNarrow';
+import { cssVar } from '../themeVars';
+import { Z } from '../theme';
 
 /** Below this width the action buttons show their icon only (with a title):
  *  "N selected · Copy · Move · ZIP · Delete" did not fit a phone, and the
@@ -124,12 +126,12 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
         aria-label="Selection actions"
         style={{
           position: 'absolute', left: '50%', bottom: 56, transform: 'translateX(-50%)',
-          zIndex: 20, maxWidth: 'calc(100% - 32px)',
+          zIndex: Z.floating, maxWidth: 'calc(100% - 32px)',
           display: 'flex', alignItems: 'center', gap: SPACE.xs,
           padding: iconOnly ? `${SPACE.xs}px ${SPACE.sm}px` : `${SPACE.xs}px ${SPACE.sm}px ${SPACE.xs}px ${SPACE.md}px`,
           border: `1px solid ${colors.BORDER}`, borderRadius: 10,
           background: colors.BG_ELEVATED,
-          boxShadow: '0 8px 28px rgba(0, 0, 0, 0.35)',
+          boxShadow: cssVar('FLOAT_SHADOW'),
         }}
       >
         {shown ? (

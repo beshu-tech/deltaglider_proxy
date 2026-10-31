@@ -9,6 +9,7 @@ import { useAdminConfig } from '../queries/config';
 import { bucketPolicyFor } from '../bucketPolicyLookup';
 import { relativeTime } from '../utils';
 import { SPACE } from './shared-styles';
+import { tint } from '../themeVars';
 
 /**
  * O(1) bucket-size pill in the TopBar — the Ceph-style running counter
@@ -71,7 +72,7 @@ export default function BucketUsageChip({
           gap: SPACE.xxs,
           padding: `2px ${SPACE.xs}px`,
           borderRadius: 6,
-          border: `1px solid ${c.ACCENT_AMBER}66`,
+          border: `1px solid ${tint(c.ACCENT_AMBER, 40)}`,
           background: c.BG_ELEVATED,
           fontSize: 12,
           lineHeight: '18px',

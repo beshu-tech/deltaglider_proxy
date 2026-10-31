@@ -44,6 +44,7 @@ import type { AdmissionBlock } from '../adminApi';
 import { actionKind } from '../schemas/admissionSchema';
 import { useColors } from '../ThemeContext';
 import RowActionsMenu from './RowActionsMenu';
+import { tint } from '../themeVars';
 
 const { Text } = Typography;
 
@@ -265,7 +266,7 @@ function ActionBadge({ action }: { action: AdmissionBlock['action'] }) {
       ? `reject ${action.status}`
       : kind;
   return (
-    <Tag style={{ margin: 0, fontSize: 12, color: c, background: `${c}14`, borderColor: `${c}55` }}>
+    <Tag style={{ margin: 0, fontSize: 12, color: c, background: tint(c, 8), borderColor: tint(c, 33) }}>
       {label}
     </Tag>
   );

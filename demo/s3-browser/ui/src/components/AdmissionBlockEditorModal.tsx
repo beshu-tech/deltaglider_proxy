@@ -220,7 +220,7 @@ export default function AdmissionBlockEditorModal({
   // D67: a sentence-case group heading, not a letter-spaced eyebrow.
   const cardLabel: React.CSSProperties = {
     color: TEXT_PRIMARY,
-    fontSize: 13.5,
+    fontSize: 14,
     fontWeight: 600,
     marginBottom: SPACE.xs,
     fontFamily: 'var(--font-ui)',
@@ -268,7 +268,7 @@ export default function AdmissionBlockEditorModal({
       {/* Match: every condition in one card. Empty = matches everything. */}
       <div style={cardStyle}>
         <div style={cardLabel}>When a request matches</div>
-        <div style={{ color: TEXT_MUTED, fontSize: 12.5, marginTop: -SPACE.xxs, marginBottom: SPACE.sm }}>
+        <div style={{ color: TEXT_MUTED, fontSize: 13, marginTop: -SPACE.xxs, marginBottom: SPACE.sm }}>
           An empty condition matches any value.
         </div>
         <FormField label="HTTP methods" yamlPath="match.method" style={FIELD_GAP}>
@@ -437,7 +437,7 @@ export default function AdmissionBlockEditorModal({
           )}
         />
         {ACTION_HELP[kind] && (
-          <div data-testid="admission-action-help" style={{ color: TEXT_MUTED, fontSize: 12.5, marginTop: SPACE.xs }}>
+          <div data-testid="admission-action-help" style={{ color: TEXT_MUTED, fontSize: 13, marginTop: SPACE.xs }}>
             {ACTION_HELP[kind]}
           </div>
         )}

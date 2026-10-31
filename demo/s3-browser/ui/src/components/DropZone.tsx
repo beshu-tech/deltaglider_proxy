@@ -3,6 +3,7 @@ import { Typography, theme } from 'antd';
 import { CloudUploadOutlined } from '@ant-design/icons';
 import { collectDroppedFiles } from '../droppedFiles';
 import { SPACE } from './shared-styles';
+import { Z } from '../theme';
 
 const { Text, Title } = Typography;
 
@@ -68,7 +69,7 @@ export default function DropZone({ onDrop, prefix }: Props) {
       style={{
         position: 'fixed',
         inset: 0,
-        zIndex: 999,
+        zIndex: Z.dropTarget,
         background: 'var(--overlay-bg)',
         backdropFilter: 'blur(8px)',
         WebkitBackdropFilter: 'blur(8px)',

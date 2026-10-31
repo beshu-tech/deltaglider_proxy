@@ -115,7 +115,7 @@ export default function PasswordChangeCard() {
         >
           Change admin password
         </Button>
-        <div style={{ fontSize: 12.5, color: TEXT_MUTED, marginTop: -SPACE.xs }}>
+        <div style={{ fontSize: 13, color: TEXT_MUTED, marginTop: -SPACE.xs }}>
           This signs out every admin, you included. IAM users and their keys do not change.
         </div>
       </Space>

@@ -5,6 +5,7 @@ import { getCredentials } from '../s3client';
 import { MenuOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { useIsNarrow } from '../useIsNarrow';
+import { BREAKPOINT } from './shared-styles';
 import FullScreenHeader from './FullScreenHeader';
 import AdminSidebar from './AdminSidebar';
 import { ADMIN_IA } from './adminNavigation';
@@ -80,7 +81,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   // 220px sidebar is replaced with an AntD Drawer that slides in
   // from the left. Hamburger trigger lives in the header extra
   // slot. Auto-closes on navigation (see navigateAdmin below).
-  const isNarrow = useIsNarrow(900);
+  const isNarrow = useIsNarrow(BREAKPOINT.shell);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   // Derive canonical admin path (§3.2). Legacy flat URLs (`users`,

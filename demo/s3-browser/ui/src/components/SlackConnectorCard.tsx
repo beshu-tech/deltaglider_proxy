@@ -36,6 +36,7 @@ import { useColors } from '../ThemeContext';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import { SlackSetupGuideDrawer } from './SlackSetupGuide';
+import { SPACE } from './shared-styles';
 import { AdvancedDisclosure } from './ruleEditorFields';
 import MaskedSecretInput from './MaskedSecretInput';
 import {
@@ -361,7 +362,7 @@ export default function SlackConnectorCard({
           // Form takes the flexible left; the preview/help sits in a fixed-ish
           // right rail. Collapses to a single stacked column under ~900px.
           gridTemplateColumns: isNarrow ? '1fr' : 'minmax(0, 1fr) minmax(340px, 400px)',
-          gap: isNarrow ? 28 : 40,
+          gap: isNarrow ? SPACE.lg : SPACE.xl,
           alignItems: 'start',
         }}
       >

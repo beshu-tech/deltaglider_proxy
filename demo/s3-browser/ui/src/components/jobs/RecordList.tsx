@@ -1,5 +1,4 @@
 import { useEffect, useRef, type ReactNode } from 'react';
-import { useColors } from '../../ThemeContext';
 import './RecordList.css';
 import { activateOnKey } from '../../keyboard';
 
@@ -44,7 +43,6 @@ export default function RecordList<T>({
   /** Rows that are on their way out (a rule staged for removal): dimmed. */
   isDimmed?: (row: T) => boolean;
 }) {
-  const c = useColors();
   const listRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!highlightKey) return;
@@ -62,12 +60,6 @@ export default function RecordList<T>({
       role="table"
       style={
         {
-          '--rl-border': c.BORDER,
-          '--rl-text-secondary': c.TEXT_SECONDARY,
-          '--rl-text-muted': c.TEXT_MUTED,
-          '--rl-bg-card': c.BG_CARD,
-          '--rl-hover': c.BG_ELEVATED,
-          '--rl-highlight': `${c.ACCENT_BLUE}22`,
           '--rl-cols': wideTemplate,
         } as React.CSSProperties
       }

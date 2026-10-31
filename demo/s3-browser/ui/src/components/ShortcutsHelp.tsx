@@ -185,7 +185,7 @@ function KeyCombo({ keys }: { keys: string[] }) {
       {keys.map((k, i) => (
         <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
           <Kbd>{k}</Kbd>
-          {i < keys.length - 1 && <span style={{ fontSize: 10, color: TEXT_FAINT }}>+</span>}
+          {i < keys.length - 1 && <span style={{ fontSize: 11, color: TEXT_FAINT }}>+</span>}
         </span>
       ))}
     </span>

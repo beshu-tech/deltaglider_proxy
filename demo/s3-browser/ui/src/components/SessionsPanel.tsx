@@ -175,7 +175,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
         )}
       </QueryState>
       <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE.xs, maxWidth: 480, width: '100%' }}>
-        <label htmlFor="sessions-revoke-identity" style={{ fontSize: 13.5, fontWeight: 600 }}>
+        <label htmlFor="sessions-revoke-identity" style={{ fontSize: 14, fontWeight: 600 }}>
           Sign out every session of an identity
         </label>
         <div style={{ display: 'flex', gap: SPACE.xs }}>
@@ -191,7 +191,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
             Revoke key
           </Button>
         </div>
-        <Text id="sessions-revoke-identity-help" type="secondary" style={{ fontSize: 12.5 }}>
+        <Text id="sessions-revoke-identity-help" type="secondary" style={{ fontSize: 13 }}>
           An IAM user&apos;s access key ID, or provider:user-id for a user who signs in with an external provider.
           {multiInstance ? ' This also ends the sessions on the other instances.' : ''}
         </Text>
@@ -223,7 +223,7 @@ function SessionGroupCard({
       <div style={{ display: 'flex', alignItems: 'center', gap: SPACE.sm, flexWrap: 'wrap' }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 600, fontSize: 14, overflowWrap: 'anywhere' }}>{group.label}</div>
-          <div style={{ fontSize: 12.5, color: TEXT_MUTED }}>
+          <div style={{ fontSize: 13, color: TEXT_MUTED }}>
             {group.method} · {group.sessions.length} session{group.sessions.length === 1 ? '' : 's'}
           </div>
         </div>

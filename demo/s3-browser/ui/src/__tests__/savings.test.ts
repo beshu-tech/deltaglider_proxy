@@ -86,7 +86,11 @@ test('uploadCreatedBaseline: only the write response that says so', () => {
 
 describe('savings presentation (UX harvest D14, D15, D49)', () => {
   test('one green for every saving', () => {
-    expect(savingsColors({ ACCENT_GREEN: '#047857' })).toEqual({ text: '#047857', bg: '#04785714', border: '#04785740' });
+    expect(savingsColors({ ACCENT_GREEN: '#047857' })).toEqual({
+      text: '#047857',
+      bg: 'color-mix(in srgb, #047857 8%, transparent)',
+      border: 'color-mix(in srgb, #047857 25%, transparent)',
+    });
   });
   test('an estimate is neutral with ≈, a scanned total is green', () => {
     expect(heroPresentation(2)).toMatchObject({ estimated: true, prefix: '≈', tone: 'neutral' });

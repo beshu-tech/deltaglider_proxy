@@ -31,6 +31,7 @@ import type { ReactNode } from 'react';
 import { useColors } from '../ThemeContext';
 import { ADMIN_IA } from './adminNavigation';
 import { readStorage, writeStorage } from '../safeStorage';
+import { tint } from '../themeVars';
 
 const { Text } = Typography;
 
@@ -345,7 +346,7 @@ export default function CommandPalette({
             <div
               style={{
                 marginTop: 8,
-                fontSize: 12.5,
+                fontSize: 13,
                 color: nothingToRun ? colors.ACCENT_AMBER : colors.TEXT_MUTED,
                 fontWeight: nothingToRun ? 600 : 400,
               }}
@@ -458,7 +459,7 @@ function CommandRow({
         width: '100%',
         padding: '8px 12px',
         border: 'none',
-        background: active ? `${colors.ACCENT_BLUE}15` : 'transparent',
+        background: active ? tint(colors.ACCENT_BLUE, 8) : 'transparent',
         borderRadius: 8,
         cursor: 'pointer',
         textAlign: 'left',

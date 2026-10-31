@@ -1,4 +1,5 @@
 // Single source of truth for delta-compression savings math on the
+import { tint } from './themeVars';
 // client. Mirrors the Rust module at `src/deltaglider/savings.rs`.
 //
 // Why this file exists: pre-centralisation the SPA had THREE inline
@@ -180,7 +181,7 @@ export function parseCostRate(raw: string | null | undefined): number {
  * (4.5:1) in both themes.
  */
 export function savingsColors(colors: { ACCENT_GREEN: string }): { text: string; bg: string; border: string } {
-  return { text: colors.ACCENT_GREEN, bg: `${colors.ACCENT_GREEN}14`, border: `${colors.ACCENT_GREEN}40` };
+  return { text: colors.ACCENT_GREEN, bg: tint(colors.ACCENT_GREEN, 8), border: tint(colors.ACCENT_GREEN, 25) };
 }
 
 /**

@@ -3,6 +3,7 @@ import { Button, Input, Modal, Segmented, Spin } from 'antd';
 import { CheckCircleFilled, CloseCircleFilled, EyeOutlined, MinusCircleFilled } from '@ant-design/icons';
 import type { FilterPreview, FilterVerdict } from '../adminApi/jobs';
 import { useColors } from '../ThemeContext';
+import { cssVar } from '../themeVars';
 import { useFilterPreview } from '../queries/filterPreview';
 import { filterSummary, globReport, scopeLabel, splitAtPrefix, verdictText } from '../ruleFilterPreview';
 import FormField from './FormField';
@@ -160,7 +161,7 @@ function FilterEditors({
             status={l.error || l.draft.some((g) => globReport(preview, l.list, g)?.error) ? 'error' : undefined}
           />
           {l.error && (
-            <div role="alert" style={{ color: 'var(--ant-color-error, #ff4d4f)', fontSize: 12, marginTop: 4 }}>
+            <div role="alert" style={{ color: cssVar('ACCENT_RED'), fontSize: 12, marginTop: 4 }}>
               {l.error}
             </div>
           )}

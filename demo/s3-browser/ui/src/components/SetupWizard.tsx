@@ -74,6 +74,7 @@ import {
 import { useAdminConfig, useConfigSections } from '../queries/config';
 import { describeExistingSetup, settingsAtRisk } from '../setupDetect';
 import { ABSOLUTE_PATH_ERROR, isAbsolutePath } from '../utils';
+import { Z } from '../theme';
 
 const { Text, Paragraph } = Typography;
 
@@ -541,7 +542,7 @@ function PickBackendStep({
   const { cardStyle } = useCardStyles();
   return (
     <div style={cardStyle}>
-      <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 18 }}>
+      <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 20 }}>
         Where should data live?
       </h3>
       <Text
@@ -567,7 +568,7 @@ function PickBackendStep({
       >
         <Radio value="filesystem" style={{ alignItems: 'flex-start' }}>
           <div>
-            <div style={{ fontWeight: 600, fontSize: 15 }}>
+            <div style={{ fontWeight: 600, fontSize: 16 }}>
               Filesystem{' '}
               <span style={{ fontSize: 11, color: colors.TEXT_MUTED, fontWeight: 500 }}>
                 (good for homelab + local development)
@@ -581,7 +582,7 @@ function PickBackendStep({
         </Radio>
         <Radio value="s3" style={{ alignItems: 'flex-start' }}>
           <div>
-            <div style={{ fontWeight: 600, fontSize: 15 }}>
+            <div style={{ fontWeight: 600, fontSize: 16 }}>
               S3-compatible{' '}
               <span style={{ fontSize: 11, color: colors.TEXT_MUTED, fontWeight: 500 }}>
                 (recommended for production)
@@ -627,7 +628,7 @@ function ConfigureBackendStep({
       : !isAbsolutePath(state.fsPath) ? ABSOLUTE_PATH_ERROR : undefined;
     return (
       <div style={cardStyle}>
-        <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 18 }}>
+        <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 20 }}>
           Pick a data directory
         </h3>
         <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 4, marginBottom: 16 }}>
@@ -657,7 +658,7 @@ function ConfigureBackendStep({
   // S3
   return (
     <div style={cardStyle}>
-      <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 18 }}>
+      <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 20 }}>
         Connect to your S3-compatible store
       </h3>
       <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 4, marginBottom: 16 }}>
@@ -817,7 +818,7 @@ function CreateAdminStep({
       : (showErrors ? 'Enter the secret access key again.' : undefined);
   return (
     <div style={cardStyle}>
-      <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 18 }}>
+      <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 20 }}>
         Create your admin credentials
       </h3>
       <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 4, marginBottom: 16 }}>
@@ -889,8 +890,8 @@ function OptionalPublicBucketStep({
 }) {
   return (
     <div style={cardStyle}>
-      <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 18 }}>
-        A public bucket? <Text type="secondary" style={{ fontSize: 15, fontWeight: 400 }}>(optional)</Text>
+      <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 20 }}>
+        A public bucket? <Text type="secondary" style={{ fontSize: 16, fontWeight: 400 }}>(optional)</Text>
       </h3>
       <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 4, marginBottom: 16 }}>
         Do you want to let anyone read one of your buckets anonymously?
@@ -943,7 +944,7 @@ function ReviewStep({ yaml, cardStyle }: { yaml: string; cardStyle: React.CSSPro
   const { copy, copied } = useCopyToClipboard();
   return (
     <div style={cardStyle}>
-      <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 18 }}>
+      <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 20 }}>
         Review + apply
       </h3>
       <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 4, marginBottom: 16 }}>
@@ -960,7 +961,7 @@ function ReviewStep({ yaml, cardStyle }: { yaml: string; cardStyle: React.CSSPro
             position: 'absolute',
             top: 8,
             right: 8,
-            zIndex: 1,
+            zIndex: Z.local,
             borderRadius: 6,
           }}
         >

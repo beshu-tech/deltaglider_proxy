@@ -15,7 +15,12 @@ import type {
   ReasonCode,
   Remediation,
 } from './adminApi';
+import '@fontsource-variable/manrope';
+import '@fontsource-variable/jetbrains-mono';
 import './theme.css';
+import { installThemeVars } from './themeVars';
+
+installThemeVars();
 
 // The causes the fixtures below exercise — keeps the storyboard honest about
 // which remediation reasons get a visual once-over (typed by ReasonCode).
@@ -273,7 +278,7 @@ function Storyboard() {
               cursor: 'pointer',
               border: `1px solid ${idx === i ? c.ACCENT_BLUE : c.BORDER}`,
               background: idx === i ? c.ACCENT_BLUE : c.BG_ELEVATED,
-              color: idx === i ? '#fff' : c.TEXT_PRIMARY,
+              color: idx === i ? c.ON_ACCENT : c.TEXT_PRIMARY,
             }}
           >
             {fx.label}
