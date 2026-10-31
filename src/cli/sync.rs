@@ -177,6 +177,10 @@ pub async fn run(args: SyncArgs) -> i32 {
         exact_timestamps: args.exact_timestamps,
     };
 
+    crate::cli::aws_args::print_live_proxy_notice(
+        !args.dryrun && matches!(direction, Direction::LocalToS3 | Direction::S3ToS3),
+        args.quiet,
+    );
     match direction {
         Direction::Reject => {
             eprintln!("error: local→local sync is not supported");

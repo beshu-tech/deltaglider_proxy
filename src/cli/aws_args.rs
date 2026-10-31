@@ -49,6 +49,27 @@ pub(crate) const SECRET_FLAG_WARNING: &str = "warning: --secret-access-key is de
      other users on this host can read the command line (for example with `ps`). \
      Set AWS_SECRET_ACCESS_KEY or use a profile (--profile) instead.";
 
+/// NEW-06, the CLI contract: a write or delete verb must not run on
+/// prefixes that a live proxy writes. Each process holds its deltaspace
+/// locks in its own memory, so neither sees the other's writes in flight.
+pub(crate) const LIVE_PROXY_NOTICE: &str = "note: do not run this command on prefixes \
+     that a running DeltaGlider Proxy writes. The proxy and this command each lock a \
+     prefix only in their own process, so a delete here can remove a reference.bin that \
+     a delta which the proxy just stored needs. --quiet hides this note.";
+
+/// Pure: the notice that a verb prints to stderr before its first
+/// request: only when it writes or deletes objects and `--quiet` is off.
+pub(crate) fn live_proxy_notice(writes: bool, quiet: bool) -> Option<&'static str> {
+    (writes && !quiet).then_some(LIVE_PROXY_NOTICE)
+}
+
+/// Print [`live_proxy_notice`], if any.
+pub(crate) fn print_live_proxy_notice(writes: bool, quiet: bool) {
+    if let Some(notice) = live_proxy_notice(writes, quiet) {
+        eprintln!("{notice}");
+    }
+}
+
 /// The engine knobs a verb may override (the rest of [`CliEngineOpts`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EngineLimits {
@@ -173,6 +194,14 @@ mod tests {
             region: region.map(str::to_string),
             source: CredsSource::Flag,
         }
+    }
+
+    #[test]
+    fn only_a_loud_write_prints_the_live_proxy_notice() {
+        assert_eq!(live_proxy_notice(true, false), Some(LIVE_PROXY_NOTICE));
+        assert_eq!(live_proxy_notice(true, true), None);
+        assert_eq!(live_proxy_notice(false, false), None);
+        assert_eq!(live_proxy_notice(false, true), None);
     }
 
     #[test]

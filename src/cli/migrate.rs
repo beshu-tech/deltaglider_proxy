@@ -171,6 +171,7 @@ pub async fn run(args: MigrateArgs) -> i32 {
         }
     };
 
+    crate::cli::aws_args::print_live_proxy_notice(!args.dry_run, args.quiet);
     let (src_engine, dst_engine) = match build_engines_from_args(&args).await {
         Ok(e) => e,
         Err(code) => return code,

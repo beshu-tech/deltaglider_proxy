@@ -121,8 +121,14 @@ enum S3Command {
     /// List S3 buckets or objects (AWS-CLI-shaped output).
     Ls(deltaglider_proxy::cli::ls::LsArgs),
     /// Remove S3 objects (single-key or recursive prefix-delete).
+    ///
+    /// Do not run it on prefixes that a running proxy writes: each process
+    /// locks a prefix only in its own memory (see `docs/product/reference/cli.md`).
     Rm(deltaglider_proxy::cli::rm::RmArgs),
     /// Copy files between local paths and S3 with transparent delta compression.
+    ///
+    /// Do not run it on prefixes that a running proxy writes: each process
+    /// locks a prefix only in its own memory (see `docs/product/reference/cli.md`).
     Cp(deltaglider_proxy::cli::cp::CpArgs),
     /// Bucket statistics: original/stored bytes, savings %, deltaspace health.
     Stats(deltaglider_proxy::cli::stats::StatsArgs),
@@ -133,8 +139,14 @@ enum S3Command {
     /// Update a bucket's ACL (canned-ACL or grant-* flags).
     PutBucketAcl(deltaglider_proxy::cli::bucket_acl::PutArgs),
     /// Migrate a deltaspace between buckets / accounts via the engine.
+    ///
+    /// Do not run it on prefixes that a running proxy writes: each process
+    /// locks a prefix only in its own memory (see `docs/product/reference/cli.md`).
     Migrate(deltaglider_proxy::cli::migrate::MigrateArgs),
     /// Sync a directory between local and S3 (or between two S3 prefixes).
+    ///
+    /// Do not run it on prefixes that a running proxy writes: each process
+    /// locks a prefix only in its own memory (see `docs/product/reference/cli.md`).
     Sync(deltaglider_proxy::cli::sync::SyncArgs),
     /// Purge expired Python-toolchain rehydration cache entries
     /// (`.deltaglider/tmp/*` with past `dg-expires-at`).

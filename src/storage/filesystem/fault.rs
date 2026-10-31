@@ -57,6 +57,9 @@ pub(crate) enum FaultPoint {
     WriteConversionMarker,
     /// The key is `"bucket/prefix/"`: a delegated listing page.
     ListObjectsDelegated,
+    /// The key is `"bucket/prefix/"`: a delete of reference.bin (fenced or
+    /// not), before it deletes.
+    DeleteReference,
 }
 
 /// Work a test runs inside a storage call, before the call goes on: a
@@ -399,6 +402,10 @@ impl StorageBackend for FaultyFs {
         op: RefWrite<'_>,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
+        if matches!(op, RefWrite::Delete) {
+            self.armed(FaultPoint::DeleteReference, bucket, prefix, "")
+                .await?;
+        }
         self.inner.write_reference(bucket, prefix, op, proof).await
     }
 
@@ -410,6 +417,10 @@ impl StorageBackend for FaultyFs {
         _fence: &RefFence,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<RefFence, StorageError> {
+        if matches!(op, RefWrite::Delete) {
+            self.armed(FaultPoint::DeleteReference, bucket, prefix, "")
+                .await?;
+        }
         self.inner
             .write_reference_fenced(bucket, prefix, op, _fence, proof)
             .await

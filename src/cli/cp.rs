@@ -157,6 +157,10 @@ pub async fn run(args: CpArgs) -> i32 {
         }
     };
 
+    crate::cli::aws_args::print_live_proxy_notice(
+        !args.dryrun && direction != Direction::S3ToLocal,
+        args.quiet,
+    );
     let engine = match args
         .aws
         .engine(EngineLimits::from_flags(

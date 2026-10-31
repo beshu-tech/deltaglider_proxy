@@ -60,6 +60,7 @@ pub async fn run(args: RmArgs) -> i32 {
         }
     };
 
+    crate::cli::aws_args::print_live_proxy_notice(!args.dryrun, args.quiet);
     let engine = match args.aws.engine(EngineLimits::default()).await {
         Ok(e) => e,
         Err(code) => return code,
@@ -214,6 +215,79 @@ pub(crate) fn rm_targets<'a>(keys: &[&'a str], prefix: &str, filter: &Filter) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NEW-06, recorded and not fixed (D3: CLI write verbs next to a live
+    /// proxy are not supported; the CLI prints the rule instead). `rm`
+    /// deletes the last object of a prefix, finds only reference.bin left
+    /// and deletes it. A proxy stores a delta against that reference
+    /// between the check and the delete, and the delta loses its baseline.
+    /// The proxy is another process: its write takes none of this
+    /// process's locks, so the test writes its delta file directly (the
+    /// same delta, encoded by an engine on another directory against the
+    /// same reference).
+    #[tokio::test]
+    #[ignore = "manual: cargo test --lib -- --ignored a_live_proxy_delta_keeps_its_reference_during_rm (fails by design, D3: the CLI holds no lock that a live proxy sees; see docs/product/reference/cli.md)"]
+    async fn a_live_proxy_delta_keeps_its_reference_during_rm() {
+        use crate::storage::{DynStorageBackend, FaultPoint, FaultyFs, FilesystemBackend};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        async fn engine_on(dir: &std::path::Path) -> (DynEngine, crate::storage::Faults) {
+            let faulty = FaultyFs::new(FilesystemBackend::new(dir.to_path_buf()).await.unwrap());
+            let faults = faulty.faults.clone();
+            let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
+            let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+                Arc::new(backend),
+                &crate::config::Config::default(),
+                None,
+            );
+            engine.create_bucket("releases").await.unwrap();
+            (engine, faults)
+        }
+        let base: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut next = base.clone();
+        next[1000..1100].fill(9);
+        // The proxy's delta of app-2, against the same reference.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (proxy, _) = engine_on(elsewhere.path()).await;
+        for (key, body) in [("v1/app-1.zip", &base), ("v1/app-2.zip", &next)] {
+            proxy
+                .store("releases", key, body, None, HashMap::new())
+                .await
+                .unwrap();
+        }
+        let delta = "releases/deltaspaces/v1/app-2.zip.delta";
+        let peer_delta = elsewhere.path().join(delta);
+        assert!(peer_delta.exists(), "fixture: app-2 is a delta");
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, faults) = engine_on(dir.path()).await;
+        cli.store("releases", "v1/app-1.zip", &base, None, HashMap::new())
+            .await
+            .unwrap();
+        let target = dir.path().join(delta);
+        faults.hook(
+            FaultPoint::DeleteReference,
+            "releases/v1/",
+            Arc::new(move || {
+                let (from, to) = (peer_delta.clone(), target.clone());
+                Box::pin(async move {
+                    std::fs::copy(&from, &to).unwrap();
+                    let name = crate::storage::xattr_meta::XATTR_NAME;
+                    let meta = xattr::get(&from, name).unwrap().unwrap();
+                    xattr::set(&to, name, &meta).unwrap();
+                })
+            }),
+        );
+        let (deleted, failed) = delete_keys(&cli, "releases", &["v1/app-1.zip"], true).await;
+        assert_eq!((deleted, failed), (1, 0));
+        assert_eq!(faults.fired(FaultPoint::DeleteReference, "releases/v1/"), 1);
+        let read = cli.retrieve("releases", "v1/app-2.zip").await;
+        assert!(
+            matches!(&read, Ok(r) if r.0 == next),
+            "the proxy's delta lost its reference: {:?}",
+            read.map(|r| r.0.len())
+        );
+    }
 
     fn filter(inc: &[&str], exc: &[&str]) -> Filter {
         let inc: Vec<String> = inc.iter().map(|s| s.to_string()).collect();
