@@ -411,6 +411,11 @@ pub struct WalkConfig {
     pub conflict: ConflictPolicy,
     pub strict_content_diff: bool,
     pub replicate_deletes: bool,
+    /// The source and the destination are one storage (one real bucket).
+    /// Then a destination key inside the source scope is a SOURCE object,
+    /// never a delete candidate (NEW-09: the run start refuses a
+    /// destination that contains its source; this is the second guard).
+    pub same_storage: bool,
     pub include_globs: GlobSet,
     pub exclude_globs: GlobSet,
     pub regime: FactRegime,
@@ -1290,6 +1295,9 @@ impl WalkMachine {
                 if e.path.ends_with('/') || is_dg_internal(&abs_dest) {
                     return; // markers and DG internals are never candidates
                 }
+                if self.is_source_object(&abs_dest) {
+                    return; // the rule's own source, seen through the destination
+                }
                 // The rule's filters decide what it owns on the destination
                 // too: a key whose source key it excludes (or does not
                 // include) is never deleted (as rclone keeps excluded files).
@@ -1315,6 +1323,18 @@ impl WalkMachine {
                 task.delete_candidates.push(e.path);
             }
         }
+    }
+
+    /// The destination key `abs_dest` is an object of the rule's source:
+    /// one storage, inside the source prefix and the rule's filters.
+    fn is_source_object(&self, abs_dest: &str) -> bool {
+        self.cfg.same_storage
+            && abs_dest.starts_with(&self.cfg.src_prefix)
+            && crate::glob_filter::in_scope(
+                abs_dest,
+                &self.cfg.include_globs,
+                &self.cfg.exclude_globs,
+            )
     }
 
     fn discover_child(&mut self, parent_key: &str, child_rel: String, mode: DirMode) {
@@ -2341,6 +2361,7 @@ mod machine_tests {
                 conflict,
                 strict_content_diff: strict,
                 replicate_deletes,
+                same_storage: false,
                 include_globs: GlobSet::empty(),
                 exclude_globs: GlobSet::empty(),
                 regime: world.regime,
@@ -2423,6 +2444,7 @@ mod machine_tests {
                 conflict: ConflictPolicy::NewerWins,
                 strict_content_diff: false,
                 replicate_deletes: false,
+                same_storage: false,
                 include_globs: GlobSet::empty(),
                 exclude_globs: GlobSet::empty(),
                 regime: world.regime,
@@ -2454,6 +2476,86 @@ mod machine_tests {
         assert!(
             machine.truncated_by_budget(),
             "the run must stop, cursor kept"
+        );
+    }
+
+    /// A mirror run of one world, with explicit prefixes and storage.
+    fn run_mirror(world: &FakeWorld, src_prefix: &str, dest_prefix: &str, same: bool) -> Trace {
+        let mut machine = WalkMachine::new(
+            WalkConfig {
+                scope: "s|/|d|/".to_string(),
+                rule_name: RULE.to_string(),
+                src_prefix: src_prefix.to_string(),
+                dest_prefix: dest_prefix.to_string(),
+                conflict: ConflictPolicy::NewerWins,
+                strict_content_diff: false,
+                replicate_deletes: true,
+                same_storage: same,
+                include_globs: GlobSet::empty(),
+                exclude_globs: GlobSet::empty(),
+                regime: world.regime,
+                page_size: 3,
+                max_pages: 10_000,
+                max_requests: u64::MAX,
+                dir_workers: 2,
+                head_batch: 2,
+                max_child_dirs_per_dir: usize::MAX,
+                max_pending_dirs: 100_000,
+                action_buffer: 6,
+            },
+            None,
+        );
+        let mut sim = Sim {
+            world: world.clone(),
+            page_size: 3,
+            trace: Trace::default(),
+            queue: Vec::new(),
+            last_cursor: None,
+            head_keys: 0,
+        };
+        drive(&mut machine, &mut sim, &[0, 3, 1], None);
+        assert!(machine.is_done(), "expected clean completion");
+        sim.trace
+    }
+
+    /// NEW-09: `releases/builds/nightly/` -> `releases/builds/` with deletes.
+    /// The destination listing of `builds/` holds `nightly/`, the source
+    /// objects. Their source twins (`builds/nightly/nightly/..`) are absent,
+    /// so the walk made them delete candidates: it deleted the source. On
+    /// one storage a key inside the source scope is never a candidate; a
+    /// stale copy outside it still goes.
+    #[test]
+    fn a_mirror_never_deletes_its_own_source_through_the_destination() {
+        let mut world = simple_world(AUTH);
+        for name in ["a.zip", "b.zip", "sub/c.zip"] {
+            let src = world_obj(mk_meta(10, "sha", "etag", 1_000, false), true);
+            // The source object, as the destination listing of `builds/` sees it.
+            world.dest.insert(format!("nightly/{name}"), src.clone());
+            // Its copy.
+            world.dest.insert(name.to_string(), copied_from(&src, true));
+            world.src.insert(name.to_string(), src);
+        }
+        let stale = world_obj(mk_meta(10, "sha", "etag", 1_000, true), true);
+        world.dest.insert("old.zip".to_string(), stale);
+
+        let trace = run_mirror(&world, "builds/nightly/", "builds/", true);
+        let under_source: Vec<&String> = trace
+            .deletes
+            .iter()
+            .filter(|rel| format!("builds/{rel}").starts_with("builds/nightly/"))
+            .collect();
+        assert!(
+            under_source.is_empty(),
+            "source keys deleted: {under_source:?}"
+        );
+        assert!(trace.deletes.contains("old.zip"), "{:?}", trace.deletes);
+
+        // Two storages: the same keys are destination keys, and go.
+        let trace = run_mirror(&world, "builds/nightly/", "builds/", false);
+        assert!(
+            trace.deletes.contains("nightly/a.zip"),
+            "{:?}",
+            trace.deletes
         );
     }
 

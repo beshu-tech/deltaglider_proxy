@@ -1913,17 +1913,34 @@ pub fn replication_duplicate_rule_names(cfg: &ReplicationConfig) -> Vec<String> 
 /// duplicate rule name is fatal, but a config whose replication section is
 /// UNCHANGED from `old` is let through (so a pre-existing dup can't brick an
 /// unrelated edit — the operator fixes it on the next replication edit).
+///
+/// A rule whose destination contains its own source
+/// ([`replication_scope_overlap_errors`]) is fatal when the write makes it:
+/// a bucket edit (a new `alias`) can make one too, so this check compares
+/// the resolved errors of both configs, not the replication sections.
 pub fn replication_gate(
     old: &ReplicationConfig,
     new: &ReplicationConfig,
+    old_storage: StorageOf<'_>,
+    new_storage: StorageOf<'_>,
 ) -> Result<(), Vec<String>> {
-    if old == new {
-        return Ok(());
-    }
-    let mut errors: Vec<String> = replication_duplicate_rule_names(new)
+    let standing = replication_scope_overlap_errors(&old.rules, old_storage);
+    let mut errors: Vec<String> = replication_scope_overlap_errors(&new.rules, new_storage)
         .into_iter()
-        .map(|n| format!("replication rule name '{n}' is duplicated — rename one copy"))
+        .filter(|e| !standing.contains(e))
         .collect();
+    if old == new {
+        return if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        };
+    }
+    errors.extend(
+        replication_duplicate_rule_names(new)
+            .into_iter()
+            .map(|n| format!("replication rule name '{n}' is duplicated — rename one copy")),
+    );
     errors.extend(replication_nesting_errors(&new.rules));
     // A glob that does not compile fails every run of the rule: refuse it
     // now, as lifecycle does.
@@ -1937,6 +1954,48 @@ pub fn replication_gate(
     } else {
         Err(errors)
     }
+}
+
+/// Resolves a virtual bucket name to its storage ([`crate::config::Config::storage_key_of`]).
+pub type StorageOf<'a> = &'a dyn Fn(&str) -> crate::config::StorageKey;
+
+/// Rules whose destination contains their own source on one storage
+/// ([`crate::replication::destination_covers_source`]), one error each.
+/// Pure. The storage comes from `storage_of`, so two virtual names that
+/// alias one real bucket count as one storage. Every rule counts, also a
+/// disabled one: run-now runs it. Fatal in [`replication_gate`]; a warning
+/// in `Config::check`, so a config that already holds one still loads, and
+/// the worker refuses to run the rule.
+pub fn replication_scope_overlap_errors(
+    rules: &[ReplicationRule],
+    storage_of: StorageOf<'_>,
+) -> Vec<String> {
+    rules
+        .iter()
+        .filter_map(|r| replication_scope_overlap_error(r, storage_of))
+        .collect()
+}
+
+/// The error of one rule for [`replication_scope_overlap_errors`].
+pub fn replication_scope_overlap_error(
+    rule: &ReplicationRule,
+    storage_of: StorageOf<'_>,
+) -> Option<String> {
+    let src = storage_of(&rule.source.bucket);
+    let dest = storage_of(&rule.destination.bucket);
+    let src_prefix = crate::replication::normalize_prefix(&rule.source.prefix);
+    let dest_prefix = crate::replication::normalize_prefix(&rule.destination.prefix);
+    crate::replication::destination_covers_source(src == dest, &src_prefix, &dest_prefix).then(
+        || {
+            format!(
+                "replication rule '{}': the destination {}/{} contains the source {}/{} \
+                 (both are the storage {src}). The rule would find its own source objects \
+                 in the destination, and a mirror run would delete them. Use a destination \
+                 prefix outside the source, or another bucket.",
+                rule.name, rule.destination.bucket, dest_prefix, rule.source.bucket, src_prefix,
+            )
+        },
+    )
 }
 
 /// Enabled rules whose output is copied again with a LONGER key, without end:
@@ -2184,16 +2243,9 @@ pub fn validate_replication(cfg: &ReplicationConfig) -> Vec<String> {
             ));
         }
 
-        // Self-loop: source and destination reference the same
-        // bucket+prefix. Degenerate — the rule would copy objects
-        // back to themselves, pointlessly re-incrementing counters.
-        if rule.source.bucket == rule.destination.bucket && source_norm == dest_norm {
-            warnings.push(format!(
-                "replication rule '{}' is a self-loop \
-                 (source == destination); it will be skipped at runtime",
-                rule.name
-            ));
-        }
+        // A self-loop (source == destination) is a case of a destination
+        // that contains its source: `replication_scope_overlap_errors`,
+        // which needs the bucket routing (`Config::check`).
 
         // A glob that does not compile is fatal: `replication_gate`.
     }
@@ -2992,6 +3044,19 @@ mod tests {
     // Replication validation + cycle detection tests
     // ────────────────────────────────────────────────────────────────
 
+    /// Every bucket is its own storage on one backend.
+    fn plain(bucket: &str) -> crate::config::StorageKey {
+        crate::config::StorageKey {
+            backend: "default".into(),
+            real_bucket: bucket.into(),
+        }
+    }
+
+    /// [`replication_gate`] with no aliases on either side.
+    fn gate(old: &ReplicationConfig, new: &ReplicationConfig) -> Result<(), Vec<String>> {
+        replication_gate(old, new, &plain, &plain)
+    }
+
     fn rule(name: &str, src: (&str, &str), dst: (&str, &str), interval: &str) -> ReplicationRule {
         ReplicationRule {
             name: name.to_string(),
@@ -3065,14 +3130,14 @@ mod tests {
             ..Default::default()
         };
         // Self-nesting.
-        let err = replication_gate(
+        let err = gate(
             &clean,
             &nest(vec![rule("self", ("b", ""), ("b", "backup/"), "1h")]),
         )
         .expect_err("b/ -> b/backup/ must be fatal");
         assert!(err.iter().any(|e| e.contains("self")), "{err:?}");
         // Two rules that together grow the key: a/ -> c/x/, c/ -> a/y/.
-        assert!(replication_gate(
+        assert!(gate(
             &clean,
             &nest(vec![
                 rule("r1", ("a", ""), ("c", "x/"), "1h"),
@@ -3083,15 +3148,15 @@ mod tests {
         // An exclude glob that stops the recursion makes it safe.
         let mut guarded = rule("guarded", ("b", ""), ("b", "backup/"), "1h");
         guarded.exclude_globs.push("backup/**".into());
-        assert!(replication_gate(&clean, &nest(vec![guarded])).is_ok());
+        assert!(gate(&clean, &nest(vec![guarded])).is_ok());
         // Disjoint prefixes in one bucket are fine.
-        assert!(replication_gate(
+        assert!(gate(
             &clean,
             &nest(vec![rule("ok", ("b", "src/"), ("b", "dst/"), "1h")])
         )
         .is_ok());
         // A plain A<->B mirror does not grow keys: not fatal (still warned).
-        assert!(replication_gate(
+        assert!(gate(
             &clean,
             &nest(vec![
                 rule("ab", ("a", ""), ("b", ""), "1h"),
@@ -3102,7 +3167,7 @@ mod tests {
         // A disabled rule does not run: not fatal.
         let mut off = rule("off", ("b", ""), ("b", "backup/"), "1h");
         off.enabled = false;
-        assert!(replication_gate(&clean, &nest(vec![off])).is_ok());
+        assert!(gate(&clean, &nest(vec![off])).is_ok());
     }
 
     #[test]
@@ -3111,7 +3176,7 @@ mod tests {
         // failed. Lifecycle already refused it at config time.
         let mut bad = rule("r1", ("a", ""), ("b", ""), "1h");
         bad.exclude_globs.push("tmp/[".into());
-        let err = replication_gate(
+        let err = gate(
             &ReplicationConfig::default(),
             &ReplicationConfig {
                 rules: vec![bad],
@@ -3139,12 +3204,12 @@ mod tests {
             ..Default::default()
         };
         // Introducing a dup is FATAL.
-        assert!(replication_gate(&clean, &dup).is_err());
+        assert!(gate(&clean, &dup).is_err());
         // A clean config is fine.
-        assert!(replication_gate(&clean, &clean).is_ok());
+        assert!(gate(&clean, &clean).is_ok());
         // A PRE-EXISTING dup that is UNCHANGED downgrades (can't block an
         // unrelated edit) — old == new short-circuits to Ok.
-        assert!(replication_gate(&dup, &dup).is_ok());
+        assert!(gate(&dup, &dup).is_ok());
         // Each dup name reported once.
         assert_eq!(
             replication_duplicate_rule_names(&dup),
@@ -3199,28 +3264,77 @@ mod tests {
         assert!(warnings.iter().any(|w| w.contains("heartbeat_interval")));
     }
 
+    /// NEW-09: a destination that contains its source (equal, or a parent
+    /// prefix, on one storage) makes the walk find the source objects as
+    /// destination keys with no source twin, and a mirror deletes them.
+    /// Fatal in the gate, also through an alias and after normalization.
     #[test]
-    fn replication_validation_flags_self_loop() {
-        let cfg = ReplicationConfig {
-            rules: vec![rule("loop", ("a", "pfx"), ("a", "pfx"), "1h")],
+    fn replication_gate_rejects_a_destination_that_contains_its_source() {
+        let clean = ReplicationConfig::default();
+        let one = |r: ReplicationRule| ReplicationConfig {
+            rules: vec![r],
             ..Default::default()
         };
-        let warnings = validate_replication(&cfg);
-        assert!(warnings.iter().any(|w| w.contains("self-loop")));
+        for (src, dst) in [
+            (("releases", "builds/nightly/"), ("releases", "builds/")),
+            (("releases", "builds/"), ("releases", "")),
+            (("releases", "pfx"), ("releases", "pfx")),
+            (("releases", "/pfx//"), ("releases", "pfx/")),
+        ] {
+            let err = gate(&clean, &one(rule("loop", src, dst, "1h")))
+                .expect_err(&format!("{src:?} -> {dst:?} must be fatal"));
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("'loop'") && e.contains("contains the source")),
+                "{err:?}"
+            );
+        }
+        // Another bucket, or a destination inside the source, is not this case.
+        assert!(gate(
+            &clean,
+            &one(rule(
+                "ok",
+                ("releases", "builds/"),
+                ("downloads", "builds/"),
+                "1h"
+            ))
+        )
+        .is_ok());
+        // A disabled rule counts: run-now runs it.
+        let mut off = rule("off", ("releases", "a/"), ("releases", ""), "1h");
+        off.enabled = false;
+        assert!(gate(&clean, &one(off)).is_err());
     }
 
     #[test]
-    fn replication_validation_flags_self_loop_after_prefix_normalization() {
+    fn replication_gate_rejects_an_aliased_destination_that_contains_its_source() {
+        // `releases` and `downloads` both route to hetzner-fsn1/releases.
+        let aliased = |b: &str| crate::config::StorageKey {
+            backend: "hetzner-fsn1".into(),
+            real_bucket: if b == "downloads" {
+                "releases".into()
+            } else {
+                b.into()
+            },
+        };
         let cfg = ReplicationConfig {
-            rules: vec![rule("loop", ("a", "/pfx//"), ("a", "pfx/"), "1h")],
+            rules: vec![rule(
+                "alias",
+                ("releases", "builds/nightly/"),
+                ("downloads", "builds/"),
+                "1h",
+            )],
             ..Default::default()
         };
-        let warnings = validate_replication(&cfg);
-        assert!(
-            warnings.iter().any(|w| w.contains("self-loop")),
-            "expected normalized self-loop warning: {:?}",
-            warnings
-        );
+        let clean = ReplicationConfig::default();
+        assert!(replication_gate(&clean, &cfg, &plain, &aliased).is_err());
+        // Without the alias the two names are two storages.
+        assert!(replication_gate(&clean, &cfg, &plain, &plain).is_ok());
+        // An unchanged replication section with a NEW alias is still fatal:
+        // the bucket edit makes the overlap.
+        assert!(replication_gate(&cfg, &cfg, &plain, &aliased).is_err());
+        // A standing overlap does not block an unrelated edit.
+        assert!(replication_gate(&cfg, &cfg, &aliased, &aliased).is_ok());
     }
 
     #[test]
@@ -3284,7 +3398,7 @@ mod tests {
         };
         cfg.rules[0].include_globs = vec!["[badbracket".to_string()];
         // The gate refuses it (an error, not a warning).
-        assert!(replication_gate(&ReplicationConfig::default(), &cfg).is_err());
+        assert!(gate(&ReplicationConfig::default(), &cfg).is_err());
     }
 
     #[test]

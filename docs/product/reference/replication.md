@@ -26,7 +26,7 @@ The full reconcile is a directory-scoped tree walk instead of an up-front full l
 - At-least-once semantics. Conflict policies: `newer-wins` (default), `content-diff`, `skip-if-dest-exists`.
 - Optional delete replication (faithful mirror): the rule removes any destination object that is absent at the source. This requires a destination bucket dedicated to the rule.
 - Optional include / exclude glob filters per rule.
-- Static validation at config load: rule-name regex, humantime interval parsing, self-loop rejection, multi-hop cycle detection.
+- Static validation at config load: rule-name regex, humantime interval parsing, the refusal of a destination that contains its own source, multi-hop cycle detection.
 
 ## YAML shape
 
@@ -120,12 +120,13 @@ Warnings (surfaced at startup; do not block config load):
 - `tick_interval` below 5s (scheduler anti-thrash).
 - `batch_size` outside `[1, 10_000]`.
 - `dir_concurrency` outside `[1, 16]`.
-- Self-loop (source == destination).
+- A rule whose destination contains its own source, when the config already holds it (see the errors below). The proxy does not run such a rule: every run fails at its start with a failure entry, and the event consumer sends nothing for it.
 - Multi-hop cycles (A→B + B→A with overlapping prefixes). The warning shows the full cycle path.
 
 Errors (the config is refused):
 
 - An include or exclude glob that does not compile. The error names the rule and the glob.
+- A rule whose destination contains its own source. This is the case when both sides are on one storage and the destination prefix is equal to the source prefix, or is a parent of it. One storage means the same real bucket on the same backend, so two bucket names that alias one real bucket count as one storage. For example, the rule `releases/builds/nightly/` → `releases/builds/` lists `builds/nightly/` as a folder of the destination. The objects in it are the source objects, and they have no copy at the source side, so a mirror run would delete them. A change that makes such a rule is refused, also a change of the buckets (a new `alias`) that makes one.
 
 ## Transparency guarantees
 

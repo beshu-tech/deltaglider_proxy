@@ -107,6 +107,53 @@ fn coordination_backend_keeps_an_s3_singleton() {
     assert_eq!(cfg.coordination_backend(), Some(&cfg.backend));
 }
 
+#[test]
+fn storage_key_of_follows_backend_and_alias() {
+    let cfg = Config::from_yaml_str(
+        r#"
+storage:
+  backends:
+    - name: hetzner-fsn1
+      type: s3
+      endpoint: "http://127.0.0.1:1"
+      region: fsn1
+      access_key_id: x
+      secret_access_key: y
+    - name: local-disk
+      type: filesystem
+      path: /tmp/dgp-effective-backend
+  buckets:
+    releases: {}
+    db-archive: { backend: local-disk }
+    downloads: { backend: hetzner-fsn1, alias: releases }
+    inert: { alias: releases }
+"#,
+    )
+    .unwrap();
+    let key = |b: &str, r: &str| StorageKey {
+        backend: b.into(),
+        real_bucket: r.into(),
+    };
+    // Default backend, own name (with or without a policy).
+    assert_eq!(
+        cfg.storage_key_of("releases"),
+        key("hetzner-fsn1", "releases")
+    );
+    assert_eq!(cfg.storage_key_of("absent"), key("hetzner-fsn1", "absent"));
+    // Explicit backend; names are lowercase.
+    assert_eq!(
+        cfg.storage_key_of("DB-Archive"),
+        key("local-disk", "db-archive")
+    );
+    // An alias with a backend is the aliased storage.
+    assert_eq!(
+        cfg.storage_key_of("downloads"),
+        cfg.storage_key_of("releases")
+    );
+    // An alias without a backend does nothing (the routing rule).
+    assert_eq!(cfg.storage_key_of("inert"), key("hetzner-fsn1", "inert"));
+}
+
 /// Source guard: the "which backend is this bucket on" rule lives only
 /// in `Config::effective_backend_for_bucket`. Four hand-rolled copies
 /// once disagreed (the CAS gate, the health gate, migrate, the sync

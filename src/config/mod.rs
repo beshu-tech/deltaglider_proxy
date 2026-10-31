@@ -756,6 +756,19 @@ pub(crate) fn backend_encryption_env_names(backend_name: &str) -> (String, Strin
     }
 }
 
+/// Which storage a virtual bucket hits: see [`Config::storage_key_of`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StorageKey {
+    pub backend: String,
+    pub real_bucket: String,
+}
+
+impl std::fmt::Display for StorageKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.backend, self.real_bucket)
+    }
+}
+
 /// What [`Config::encryption_for_bucket`] resolves for one bucket.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BucketEncryption<'a> {
@@ -2059,12 +2072,31 @@ impl Config {
     /// question (gates, sync client, migrate) goes through here; the source
     /// test `effective_backend_rule_has_one_home` refuses hand-rolled copies.
     pub fn effective_backend_for_bucket(&self, bucket: &str) -> Option<(String, &BackendConfig)> {
-        let name = self
-            .buckets
+        let name = self.effective_backend_name(bucket);
+        self.backend_by_name(&name).map(|def| (name, def))
+    }
+
+    /// The backend name of [`Self::effective_backend_for_bucket`], also when
+    /// the route names an undefined backend.
+    fn effective_backend_name(&self, bucket: &str) -> String {
+        self.buckets
             .get(&bucket.to_ascii_lowercase())
             .and_then(|p| p.backend.clone())
-            .unwrap_or_else(|| self.default_backend_name());
-        self.backend_by_name(&name).map(|def| (name, def))
+            .unwrap_or_else(|| self.default_backend_name())
+    }
+
+    /// THE storage that the virtual bucket `bucket` hits by config: its
+    /// backend name and its real bucket name on that backend (lowercase).
+    /// Two virtual names with one key are one storage (an `alias`). Every
+    /// "is this the same storage" question (replication scope overlap,
+    /// migrate aliases, the replication-target marker) compares these keys.
+    pub fn storage_key_of(&self, bucket: &str) -> StorageKey {
+        let lower = bucket.to_ascii_lowercase();
+        let real = crate::maintenance::migrate::real_bucket_name(&self.buckets, &lower);
+        StorageKey {
+            backend: self.effective_backend_name(&lower),
+            real_bucket: real.to_ascii_lowercase(),
+        }
     }
 
     /// Backend that hosts `config_sync_bucket` (IAM sync, leases, reference

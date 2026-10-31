@@ -87,8 +87,13 @@ impl Config {
             crate::lifecycle::planner::lifecycle_gate(&old.lifecycle, &self.lifecycle)
                 .map_err(RuleGateRefusal::Lifecycle)?;
         // State, cursor and lease are keyed by rule name (#13).
-        crate::config_sections::replication_gate(&old.replication, &self.replication)
-            .map_err(RuleGateRefusal::Replication)?;
+        crate::config_sections::replication_gate(
+            &old.replication,
+            &self.replication,
+            &|b| old.storage_key_of(b),
+            &|b| self.storage_key_of(b),
+        )
+        .map_err(RuleGateRefusal::Replication)?;
         standing.extend(self.declarative_iam_gate(old)?);
         Ok(standing)
     }
@@ -248,27 +253,17 @@ impl Config {
         // its REAL (backend, bucket) storage; an unmarked second virtual name
         // resolving to the same real location reopens client writes to it.
         {
-            let resolved: Vec<(&String, String, String, bool)> = self
+            let resolved: Vec<(&String, StorageKey, bool)> = self
                 .buckets
                 .iter()
-                .map(|(name, p)| {
-                    (
-                        name,
-                        p.backend.clone().unwrap_or_default().to_ascii_lowercase(),
-                        p.alias
-                            .clone()
-                            .unwrap_or_else(|| name.clone())
-                            .to_ascii_lowercase(),
-                        p.replication_target_only,
-                    )
-                })
+                .map(|(name, p)| (name, self.storage_key_of(name), p.replication_target_only))
                 .collect();
-            for (name, backend, real, marked) in &resolved {
+            for (name, key, marked) in &resolved {
                 if !marked {
                     continue;
                 }
-                for (other, ob, oreal, omarked) in &resolved {
-                    if other != name && !omarked && ob == backend && oreal == real {
+                for (other, okey, omarked) in &resolved {
+                    if other != name && !omarked && okey == key {
                         warnings.push(format!(
                             "bucket '{other}' aliases the same storage as bucket '{name}' which is \
                              configured for replication targets only, but '{other}' is NOT marked — client \
@@ -286,14 +281,22 @@ impl Config {
         for i in 0..rules.len() {
             for j in (i + 1)..rules.len() {
                 let (a, b) = (&rules[i], &rules[j]);
-                if eq_bucket(&a.destination.bucket, &b.destination.bucket)
-                    && (a.destination.prefix.starts_with(&b.destination.prefix)
-                        || b.destination.prefix.starts_with(&a.destination.prefix))
-                {
+                let (ap, bp) = (
+                    crate::replication::normalize_prefix(&a.destination.prefix),
+                    crate::replication::normalize_prefix(&b.destination.prefix),
+                );
+                let same_storage = self.storage_key_of(&a.destination.bucket)
+                    == self.storage_key_of(&b.destination.bucket);
+                if same_storage && (ap.starts_with(&bp) || bp.starts_with(&ap)) {
                     warnings.push(format!(
-                        "replication rules '{}' and '{}' both write into bucket '{}' with \
-                         overlapping prefixes — give each rule a distinct destination prefix.",
-                        a.name, b.name, a.destination.bucket
+                        "replication rules '{}' and '{}' both write into the storage {} \
+                         (buckets '{}' and '{}') with overlapping prefixes — give each rule \
+                         a distinct destination prefix.",
+                        a.name,
+                        b.name,
+                        self.storage_key_of(&a.destination.bucket),
+                        a.destination.bucket,
+                        b.destination.bucket,
                     ));
                 }
             }
@@ -416,6 +419,12 @@ impl Config {
         // never has to deal with malformed rules at runtime.
         warnings.extend(crate::config_sections::validate_replication(
             &self.replication,
+        ));
+        // Fatal in `rule_gates` (on change); a warning here so a config that
+        // already holds one still loads. The worker refuses to run the rule.
+        warnings.extend(crate::config_sections::replication_scope_overlap_errors(
+            &self.replication.rules,
+            &|b| self.storage_key_of(b),
         ));
         warnings.extend(crate::config_sections::validate_lifecycle(&self.lifecycle));
         warnings.extend(self.bucket_encryption_warnings());

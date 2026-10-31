@@ -120,7 +120,7 @@ This is the same check at runtime, with the same message after `config refused:`
 
 - *"bucket 'X' is configured for replication targets only but no replication rule targets it"*: the marker has no effect, because writes are blocked and nothing replicates into the bucket. Add a rule or remove the marker.
 - *"lifecycle rule 'R' writes into bucket 'X' which is configured for replication targets only"*: lifecycle is a second internal writer, and it weakens the single-writer guarantee on non-CAS backends. This is safe on CAS backends. Reconsider it on B2.
-- *"replication rules 'A' and 'B' both write into bucket 'X' with overlapping prefixes"*: two writers into one destination prefix break the single-writer guarantee. Give each rule a distinct destination prefix.
+- *"replication rules 'A' and 'B' both write into the storage S (buckets 'X' and 'Y') with overlapping prefixes"*: two writers into one destination prefix break the single-writer guarantee. The check compares the real storage, so two bucket names that alias one real bucket count as one destination. Give each rule a distinct destination prefix.
 
 ### `FATAL: coordination bucket validation failed`
 

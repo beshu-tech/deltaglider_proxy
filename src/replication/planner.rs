@@ -133,6 +133,16 @@ pub fn normalize_prefix(prefix: &str) -> String {
     }
 }
 
+/// Pure: the rule's destination scope contains its own source scope. That
+/// is true when both sides are one storage and the (normalized) destination
+/// prefix is equal to, or a prefix of, the source prefix. The walk then
+/// lists the source objects as destination keys. They have no source twin,
+/// so a mirror deletes them, and the next run deletes the copies. A rule of
+/// this shape must never run.
+pub fn destination_covers_source(same_storage: bool, src_prefix: &str, dest_prefix: &str) -> bool {
+    same_storage && normalize_prefix(src_prefix).starts_with(&normalize_prefix(dest_prefix))
+}
+
 /// Errors from the planner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
@@ -374,6 +384,30 @@ mod tests {
     use super::*;
     use crate::config_sections::{ConflictPolicy, ReplicationEndpoint, ReplicationRule};
     use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn destination_covers_source_truth_table() {
+        // (same storage, src, dest) -> covers
+        let cases = [
+            (true, "builds/nightly/", "builds/", true),
+            (true, "builds/nightly/", "", true),
+            (true, "a/", "a/", true),
+            (true, "/a//", "a", true),
+            (true, "", "", true),
+            (true, "builds/", "builds/nightly/", false),
+            (true, "builds/", "build/", false),
+            (true, "a/", "b/", false),
+            (false, "builds/nightly/", "builds/", false),
+            (false, "", "", false),
+        ];
+        for (same, src, dest, want) in cases {
+            assert_eq!(
+                destination_covers_source(same, src, dest),
+                want,
+                "same={same} src={src:?} dest={dest:?}"
+            );
+        }
+    }
 
     fn make_meta(name: &str, size: u64, ts: chrono::DateTime<Utc>) -> FileMetadata {
         let mut m = FileMetadata::new_passthrough(

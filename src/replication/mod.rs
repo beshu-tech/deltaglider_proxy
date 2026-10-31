@@ -32,7 +32,8 @@ pub use crate::background::RunLease;
 pub use backend_gate::RunHealthGate;
 pub use parity::{parity_audit, parity_recheck_unresolved, ParityOutcome};
 pub use planner::{
-    normalize_prefix, plan_batch, rewrite_key, should_replicate, BatchPlan, Decision,
+    destination_covers_source, normalize_prefix, plan_batch, rewrite_key, should_replicate,
+    BatchPlan, Decision,
 };
 pub use remediation::{
     analyze_finding, ConditionalReason, FindingFacts, FixAction, NoReason, ReasonCode, Remediation,

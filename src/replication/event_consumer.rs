@@ -872,6 +872,26 @@ async fn drain_rules(
                 continue;
             }
         }
+        // A rule whose destination contains its source sends nothing (the
+        // walk refuses it too, NEW-09): a mirrored delete could remove a
+        // source object. Its events wait until the rule changes.
+        if replication
+            .rules
+            .iter()
+            .find(|r| r.name == *rule_name)
+            .is_some_and(|r| {
+                super::destination_covers_source(
+                    engine.same_storage(&r.source.bucket, &r.destination.bucket),
+                    &r.source.prefix,
+                    &r.destination.prefix,
+                )
+            })
+        {
+            debug!(
+                "event consumer: rule '{rule_name}' refused — its destination contains its source"
+            );
+            continue;
+        }
         let rule_cursor = cursors.get(*rule_name).copied().unwrap_or(global);
         let rows = {
             let dbg = db.lock().await;

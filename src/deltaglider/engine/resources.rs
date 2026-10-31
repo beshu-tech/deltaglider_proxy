@@ -230,6 +230,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage.lite_list_carries_logical_facts(bucket)
     }
 
+    /// True when the two virtual buckets store into one real bucket (the
+    /// router's storage identity: one name, or two names that alias one
+    /// real bucket on one backend).
+    pub fn same_storage(&self, a: &str, b: &str) -> bool {
+        self.storage.storage_identity(a) == self.storage.storage_identity(b)
+    }
+
     /// Why this node refuses writes to `bucket` now (the encryption
     /// witness), from memory; `None` when it writes.
     pub fn write_refusal(&self, bucket: &str) -> Option<String> {

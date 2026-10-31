@@ -501,7 +501,22 @@ pub async fn run_rule_gated(
         .max_job_pages
         .unwrap_or(MAX_JOB_PAGES);
     let dir_workers = concurrency.dir_concurrency.clamp(1, 16) as usize;
+    let same_storage = engine.same_storage(&rule.source.bucket, &rule.destination.bucket);
+    // NEW-09: a destination that contains its own source never runs. The
+    // config gate refuses the shape on change; a config that already held
+    // it still loads (with a warning), so the run refuses it here too.
+    let overlap = super::destination_covers_source(same_storage, &source_prefix, &dest_prefix)
+        .then(|| overlap_refusal(rule));
+    if let Some(msg) = &overlap {
+        warn!("{msg}");
+        let _ = log_failure(&db, &rule.name, run_id, "", "", msg, max_failures_retained).await;
+    }
     let mut machine = match compile_rule_globs(rule) {
+        _ if overlap.is_some() => {
+            totals.errors += 1;
+            flags.hit_fatal_error = true;
+            None
+        }
         Ok((include_globs, exclude_globs)) => Some(walk::WalkMachine::new(
             walk::WalkConfig {
                 scope,
@@ -511,6 +526,7 @@ pub async fn run_rule_gated(
                 conflict: rule.conflict,
                 strict_content_diff: rule.strict_content_diff,
                 replicate_deletes: rule.replicate_deletes,
+                same_storage,
                 include_globs,
                 exclude_globs,
                 regime,
@@ -1205,6 +1221,20 @@ async fn log_failure(
     )
 }
 
+/// The run-start refusal of a rule whose destination contains its source.
+fn overlap_refusal(rule: &ReplicationRule) -> String {
+    format!(
+        "replication rule '{}' refused: the destination {}/{} contains the source {}/{} \
+         on one storage, so a mirror run would delete the source objects. Change the \
+         destination prefix or bucket.",
+        rule.name,
+        rule.destination.bucket,
+        normalize_prefix(&rule.destination.prefix),
+        rule.source.bucket,
+        normalize_prefix(&rule.source.prefix),
+    )
+}
+
 /// Pure: when the rule is next due after this run.
 fn next_due_after(
     flags: &driver::RunFlags,
@@ -1535,6 +1565,88 @@ mod tests {
             renews < dirs as usize,
             "a run over {dirs} directories renewed the coordination lease {renews} times \
              (one S3 GET + PUT each) — the 60s heartbeat already keeps it"
+        );
+    }
+
+    /// NEW-09: `releases/builds/nightly/` -> `releases/builds/` with deletes
+    /// deleted the source objects (seen as destination keys) on run 1, then
+    /// the copies on run 2. A config that already holds the shape still
+    /// loads, so the run start refuses it: no copy, no delete, a note.
+    #[tokio::test]
+    async fn a_rule_whose_destination_contains_its_source_never_runs() {
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::default();
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
+            crate::storage::FilesystemBackend::new(data.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine = Arc::new(crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &config,
+            None,
+        ));
+        engine.create_bucket("releases").await.unwrap();
+        engine
+            .store(
+                "releases",
+                "builds/nightly/a.zip",
+                b"x",
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let mut rule = mk_rule();
+        rule.source = ReplicationEndpoint {
+            bucket: "releases".into(),
+            prefix: "builds/nightly/".into(),
+        };
+        rule.destination = ReplicationEndpoint {
+            bucket: "releases".into(),
+            prefix: "builds/".into(),
+        };
+        rule.replicate_deletes = true;
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
+        for _ in 0..2 {
+            let lease = Arc::new(CountingLease(
+                std::sync::atomic::AtomicUsize::new(0),
+                std::sync::atomic::AtomicUsize::new(0),
+            ));
+            let (_, outcome) = run_rule(
+                db.clone(),
+                &engine,
+                &rule,
+                10,
+                None,
+                0,
+                "scheduler",
+                None,
+                RunConcurrency::default(),
+                None,
+                DynCoordinationLease::from_arc(lease),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.status, "failed");
+            assert_eq!(outcome.totals.objects_copied, 0);
+            assert_eq!(outcome.totals.objects_deleted, 0);
+        }
+        engine
+            .head("releases", "builds/nightly/a.zip")
+            .await
+            .expect("the source object stays");
+        assert!(engine.head("releases", "builds/a.zip").await.is_err());
+        let notes = db
+            .lock()
+            .await
+            .replication_recent_failures("r", 10)
+            .unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.error_message.contains("contains the source")),
+            "{notes:?}"
         );
     }
 
