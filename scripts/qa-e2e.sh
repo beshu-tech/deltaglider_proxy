@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run the QA pass against a release binary: e2e/qa-regression.spec.ts and
-# every e2e/qa-jobs-*.spec.ts. Nightly CI runs this; it is not in the PR gate
+# Run the QA pass against a release binary: e2e/qa-regression.spec.ts,
+# e2e/qa-a11y.spec.ts (axe) and every e2e/qa-jobs-*.spec.ts. Nightly CI runs this; it is not in the PR gate
 # (it takes minutes and drives the whole admin UI).
 #
 # Each spec gets its OWN proxy with a fresh data dir, so the order of the
@@ -27,7 +27,7 @@ specs=()
 if [[ -n "${QA_SPECS:-}" ]]; then
   read -r -a specs <<< "$QA_SPECS"
 else
-  specs=(qa-regression)
+  specs=(qa-regression qa-a11y)
   for f in "$UI"/e2e/qa-jobs-*.spec.ts; do
     specs+=("$(basename "$f" .spec.ts)")
   done

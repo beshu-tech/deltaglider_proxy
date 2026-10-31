@@ -408,7 +408,7 @@ pub fn canned_policies() -> Vec<CannedPolicy> {
     }
     vec![
         CannedPolicy {
-            name: "Read Only",
+            name: "Read only",
             description: "List and download objects in every bucket",
             permissions: allow(&["read", "list"]),
         },
@@ -423,7 +423,7 @@ pub fn canned_policies() -> Vec<CannedPolicy> {
             permissions: allow(&["read", "write", "delete", "list"]),
         },
         CannedPolicy {
-            name: "Full Access (admin)",
+            name: "Full access (admin)",
             description: "Every operation, including bucket management and the admin API",
             permissions: allow(&["*"]),
         },
@@ -512,7 +512,7 @@ mod tests {
                 .any(|r| r.actions.iter().any(|a| a == "delete" || a == "*"));
             assert_eq!(
                 deletes,
-                !p.name.contains("no delete") && p.name != "Read Only",
+                !p.name.contains("no delete") && p.name != "Read only",
                 "{}: delete matches the name",
                 p.name
             );

@@ -598,7 +598,7 @@ export default function Sidebar({
           }}
           title={proxyBuildTime ? `Built ${formatBuildTime(proxyBuildTime)}` : undefined}
         >
-          <span style={{ fontWeight: 700, color: TEXT_SECONDARY }}>DeltaGlider</span>
+          <span className="dg-wordmark" style={{ fontSize: 12, color: TEXT_SECONDARY }}>DeltaGlider</span>
           {proxyVersion && <span style={{ fontVariantNumeric: 'tabular-nums' }}>v{proxyVersion}</span>}
         </div>
       </div>{/* end bottom group */}

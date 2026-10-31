@@ -112,9 +112,9 @@ test('a preset on a new form, or after another preset, applies without a confirm
   renderWithQuery(<UsersPanel />);
   await user.click(await screen.findByTestId('md-new-users'));
   await user.click(screen.getByRole('button', { name: 'Read/Write/Delete' }));
-  await user.click(screen.getByRole('button', { name: 'Read Only' }));
+  await user.click(screen.getByRole('button', { name: 'Read only' }));
   expect(screen.queryByRole('dialog')).toBeNull();
-  await user.click(screen.getByRole('button', { name: 'Full Access (admin)' }));
+  await user.click(screen.getByRole('button', { name: 'Full access (admin)' }));
   expect(screen.queryByRole('dialog')).toBeNull();
 });
 

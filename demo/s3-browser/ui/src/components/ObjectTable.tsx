@@ -405,6 +405,7 @@ export default function ObjectTable({
 
   const dataSource = sortedRows;
   const totalItems = dataSource.length;
+  const folderCount = dataSource.filter((r) => r._isFolder).length;
   const totalSelectable = totalItems;
   const allChecked = totalSelectable > 0 && selectedKeys.size === totalSelectable;
   const someChecked = selectedKeys.size > 0 && selectedKeys.size < totalSelectable;
@@ -716,7 +717,7 @@ export default function ObjectTable({
         <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
         <div role="status" aria-live="polite" style={{ minWidth: 0 }}>
           <Text style={{ fontSize: 12, color: TEXT_MUTED, fontFamily: 'var(--font-ui)', fontVariantNumeric: 'tabular-nums' }}>
-            {describeVisibleRange(totalItems, currentPage, pageSize)}
+            {describeVisibleRange(totalItems, currentPage, pageSize, folderCount)}
             {restListedAt !== null && (
               <span title="The automatic refresh updates the first 1,000 entries only. Refresh updates all of them.">
                 {` · entries after the first 1,000 as of ${new Date(restListedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`}

@@ -37,6 +37,7 @@ import {
 } from '../useDirtySection';
 import { ADMIN_IA, type SidebarEntry } from './adminNavigation';
 import { dirtyDotForEntry } from '../adminNavTree';
+import { buildViewUrl } from '../urlState';
 
 interface Props {
   /** Current sub-path under `/_/admin/`. */
@@ -91,8 +92,15 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
     const isDirty = dirtyDotForEntry(entry, dirty);
     return (
       <div key={entry.path}>
-        <button
-          onClick={() => onNavigate(entry.path)}
+        {/* A real link: middle-click, Ctrl/Cmd-click and "open in new tab"
+            work. A plain click stays in the app router. */}
+        <a
+          href={buildViewUrl('admin', entry.path)}
+          onClick={(e) => {
+            if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+            e.preventDefault();
+            onNavigate(entry.path);
+          }}
           // Full-width row in a scrolling nav: an outside ring is clipped.
           className="dg-focus-inset"
           aria-current={isActive ? 'page' : undefined}
@@ -113,6 +121,8 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
             cursor: 'pointer',
             fontFamily: 'var(--font-ui)',
             textAlign: 'left',
+            textDecoration: 'none',
+            boxSizing: 'border-box',
             transition: 'background-color 0.15s ease, color 0.15s ease',
           }}
         >
@@ -133,7 +143,7 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
               }}
             />
           )}
-        </button>
+        </a>
         {entry.children && entry.children.length > 0 && (
           <div>{entry.children.map((c) => renderEntry(c, depth + 1))}</div>
         )}

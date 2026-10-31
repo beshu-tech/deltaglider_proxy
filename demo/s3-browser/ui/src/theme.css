@@ -31,9 +31,16 @@ body {
      Inherited by every element, AntD tables and portals included. */
   word-spacing: 0.12em;
 }
-/* Monospace has a full-width space already. */
-code, kbd, pre, samp, .ant-typography code {
+/* Monospace has a full-width space already. Components set mono inline
+   (`fontFamily: 'var(--font-mono)'`), so match the inline style too; the
+   value is inherited, so input placeholders and children follow. */
+code, kbd, pre, samp, .ant-typography code,
+[style*="font-mono"], [style*="monospace"] {
   word-spacing: normal;
+}
+/* A UI-font child inside a mono element gets the UI spacing back. */
+[style*="font-mono"] [style*="font-ui"], [style*="monospace"] [style*="font-ui"] {
+  word-spacing: 0.12em;
 }
 
 /* ───── Theme-aware CSS custom properties ───── */
@@ -786,9 +793,9 @@ code, kbd, pre, samp, .ant-typography code {
 }
 
 /* ───── Heading case (D67): ONE eyebrow style ─────
-   Titles, headings, form labels and the brand are sentence case. Capitals
-   are only for this eyebrow: a small group label over a list (sidebar
-   groups, menu sections, table headers). One size, one weight, one
+   Titles, headings and form labels are sentence case. Capitals are only
+   for this eyebrow (a small group label over a list: sidebar groups, menu
+   sections, table headers) and for the brand wordmark (`.dg-wordmark`). One size, one weight, one
    spacing. */
 .dg-eyebrow {
   font-size: 11px;
@@ -943,6 +950,25 @@ code, kbd, pre, samp, .ant-typography code {
   background: color-mix(in srgb, var(--glass-bg) 68%, var(--focus-ring) 8%) !important;
 }
 
+/* ───── The DeltaGlider wordmark (brand identity) ─────
+   Capitals with wide tracking: the brand, not a heading. ONE look on the
+   login screen, the admin header lockup and the sidebar footer. The size
+   comes from the place; the letterforms do not change. */
+.dg-wordmark {
+  font-family: var(--font-ui);
+  font-weight: 800;
+  letter-spacing: 0.30em;
+  text-transform: uppercase;
+  line-height: 1;
+}
+.dg-wordmark-product {
+  font-family: var(--font-mono);
+  font-weight: 800;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  line-height: 1;
+}
+
 .dg-login-brand-block {
   display: grid;
   justify-items: start;
@@ -953,15 +979,17 @@ code, kbd, pre, samp, .ant-typography code {
 
 .dg-login-brand {
   color: var(--login-hero-text);
-  font: 800 clamp(28px, 6vw, 40px)/1 var(--font-ui);
-  letter-spacing: -0.02em;
+  font: 800 clamp(28px, 6vw, 40px)/0.9 var(--font-ui);
+  letter-spacing: 0.30em;
+  text-transform: uppercase;
   text-shadow: 0 0 18px color-mix(in srgb, var(--login-hero-text) 18%, transparent);
 }
 
 .dg-login-product {
   color: var(--focus-ring);
-  font: 700 clamp(20px, 4vw, 28px)/1 var(--font-ui);
-  letter-spacing: -0.01em;
+  font: 800 clamp(20px, 4vw, 28px)/0.9 var(--font-mono);
+  letter-spacing: 0.34em;
+  text-transform: uppercase;
   text-shadow: 0 0 18px color-mix(in srgb, var(--focus-ring) 30%, transparent);
 }
 
@@ -1087,6 +1115,13 @@ code, kbd, pre, samp, .ant-typography code {
     padding: 24px;
   }
 
+  .dg-login-brand {
+    letter-spacing: 0.18em;
+  }
+
+  .dg-login-product {
+    letter-spacing: 0.24em;
+  }
 }
 
 /* ───── FormField: YAML-path code chip reveals on hover ───── */

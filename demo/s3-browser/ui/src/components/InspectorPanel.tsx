@@ -734,8 +734,9 @@ export default function InspectorPanel({
                         <div style={{ fontSize: 12, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)" }}>{formatBytes(originalSize)}</div>
                       </div>
                     )}
-                    {/* ONE chip family with the table (D58); the baseline is neutral. */}
-                    <StorageTypeTag storageType={storageType || 'passthrough'} isBaseline={baselineHeadline} />
+                    {/* ONE chip family with the table (D58). The baseline caption
+                        already says "Baseline", so it gets no second chip. */}
+                    {!baselineHeadline && <StorageTypeTag storageType={storageType || 'passthrough'} />}
                     {storageType === 'delta' && (
                       <div style={{ fontSize: 11, color: TEXT_MUTED, marginTop: SPACE.sm, lineHeight: 1.5, textAlign: 'left', fontFamily: 'var(--font-ui)' }}>
                         {isBaseline

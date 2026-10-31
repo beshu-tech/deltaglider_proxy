@@ -164,10 +164,10 @@ The user form (**Access → Users**, `/_/admin/access/users`) shows four preset 
 
 | Preset | Permissions |
 |----------|-------------|
-| Read Only | `read`, `list` on every resource |
+| Read only | `read`, `list` on every resource |
 | Read/Write (no delete) | `read`, `write`, `list` on every resource |
 | Read/Write/Delete | `read`, `write`, `delete`, `list` on every resource |
-| Full Access (admin) | All actions on every resource |
+| Full access (admin) | All actions on every resource |
 
 ## Group resolution
 

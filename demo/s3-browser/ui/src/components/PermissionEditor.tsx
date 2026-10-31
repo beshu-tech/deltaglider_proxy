@@ -237,7 +237,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
               marginBottom: conditionsVisible ? 12 : 4,
             }}>
               <div style={{ flex: '1 1 280px', minWidth: 240 }}>
-                <Text type="secondary" style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.4 }}>WHERE</Text>
+                <Text type="secondary" style={{ fontSize: 12, fontWeight: 600 }}>Where</Text>
                 <ResourcePatternInput
                 value={row.resources}
                 onChange={value => {
@@ -290,7 +290,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
 
               <div style={{ flex: '1 1 360px', minWidth: 300 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 18 }}>
-                  <Text type="secondary" style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.4 }}>CAN DO</Text>
+                  <Text type="secondary" style={{ fontSize: 12, fontWeight: 600 }}>Can do</Text>
                   {effectiveActions(row.actions).size > 1 && (
                     <button
                       type="button"
@@ -363,7 +363,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   <div>
                     <div style={condLabelStyle}>
                       List prefix
-                      <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 8 }}>
+                      <span style={{ fontWeight: 400, marginLeft: 8 }}>
                         s3:prefix StringLike
                       </span>
                     </div>
@@ -381,7 +381,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   <div>
                     <label htmlFor={`${uid}-ip-${id}`} style={{ ...condLabelStyle, display: 'block' }}>
                       IP restriction
-                      <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 8 }}>
+                      <span style={{ fontWeight: 400, marginLeft: 8 }}>
                         IpAddress on aws:SourceIp
                       </span>
                     </label>
@@ -404,7 +404,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                     <div>
                       <div style={condLabelStyle}>
                         Other conditions
-                        <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 8 }}>
+                        <span style={{ fontWeight: 400, marginLeft: 8 }}>
                           set by the API or YAML, read-only here
                         </span>
                       </div>

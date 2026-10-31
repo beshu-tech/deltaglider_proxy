@@ -41,7 +41,7 @@ In the admin UI:
 1. In the sidebar, open **Access → Users** (`/_/admin/access/users`).
 2. Click **New user** at the top right of the page.
 3. In **Name**, type `ci-uploader`. Leave **Access key ID** and **Secret access key** empty, so that the proxy generates them.
-4. Set the permissions under **Permissions**. A new user starts with one rule that allows **List** and **Read** on every resource (`*`). For `ci-uploader`, keep **Allow**, type `releases/firmware/*` under **WHERE**, and turn on **List**, **Read** and **Write** under **CAN DO**.
+4. Set the permissions under **Permissions**. A new user starts with one rule that allows **List** and **Read** on every resource (`*`). For `ci-uploader`, keep **Allow**, type `releases/firmware/*` under **Where**, and turn on **List**, **Read** and **Write** under **Can do**.
 5. Click **Create user**.
 
    ![The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New user button at the top right, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create user button.](/_/screenshots/iam-users-new-form.webp)
@@ -58,7 +58,7 @@ To script the same step, send `POST /_/api/admin/users` with a `name`. The proxy
 
 ## 3. Choose the permissions
 
-Each rule in the permission editor has an effect (**Allow** or **Deny**), a list of resources under **WHERE**, and a set of actions under **CAN DO** (**List**, **Read**, **Write**, **Delete** and **Admin**). The buttons above the rules (**Read Only**, **Read/Write (no delete)**, **Read/Write/Delete** and **Full Access (admin)**) replace all rules with a preset. **Add permission rule** adds a rule. The admin API stores the same rules in this shape, and these are the shapes that you will use most often.
+Each rule in the permission editor has an effect (**Allow** or **Deny**), a list of resources under **Where**, and a set of actions under **Can do** (**List**, **Read**, **Write**, **Delete** and **Admin**). The buttons above the rules (**Read only**, **Read/Write (no delete)**, **Read/Write/Delete** and **Full access (admin)**) replace all rules with a preset. **Add permission rule** adds a rule. The admin API stores the same rules in this shape, and these are the shapes that you will use most often.
 
 A CI pipeline that may upload firmware builds and list its bucket, and do nothing else:
 
@@ -116,7 +116,7 @@ In the admin UI:
 
 1. In the sidebar, open **Access → Groups** (`/_/admin/access/groups`), and click **New group** at the top right of the page.
 2. In **Name**, type `Engineering`. A group name follows the same rule as a user name: 1 to 64 characters, each a letter, a digit, or one of `+ = , . @ _ -`. A **Description** is optional.
-3. Under **Permissions**, type `releases/*` under **WHERE**, and turn on **List** and **Read** under **CAN DO**.
+3. Under **Permissions**, type `releases/*` under **Where**, and turn on **List** and **Read** under **Can do**.
 4. Under **Members**, tick `dana` and `backup-bot`.
 5. Click **Create group**.
 

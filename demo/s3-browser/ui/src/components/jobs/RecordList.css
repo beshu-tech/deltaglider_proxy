@@ -158,9 +158,7 @@
   .dg-record-cell[data-label]::before {
     content: attr(data-label);
     display: block;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    font-size: 11px;
     color: var(--rl-text-muted);
     margin-bottom: 2px;
   }

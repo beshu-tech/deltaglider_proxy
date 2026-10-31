@@ -75,6 +75,23 @@
 - The breadcrumb always keeps the current folder visible. On a narrow screen, the folders in between become one "…" link.
 - Charts use the brand colours, and an empty chart says that it waits for data.
 
+### Changed — Interface, fifth pass
+
+- The DeltaGlider wordmark is back in capitals with wide letter spacing on the login screen, in the header of the admin settings and the docs, and at the foot of the bucket list. One style draws it everywhere.
+- Form labels are sentence case. Capitals stay only for the small group labels over lists and for the table headers.
+- The admin sidebar entries are links, so you can open a page in a new tab with a middle click or Ctrl+click.
+- The footer of the object list counts folders and objects ("2 folders and 10 objects") instead of "items".
+- The permission presets are named **Read only** and **Full access (admin)**, and the rule fields are named **Where** and **Can do**. The admin API returns the new preset names.
+- The help of a replication rule's **Enabled** switch is one sentence that names the **Run replication rules** switch.
+
+### Fixed — Interface, fifth pass
+
+- In a narrow column, such as the rule drawer, an empty band was between a field label and its input. The hidden YAML path wrapped to a second line there; it now stays on the label's line and is shortened.
+- Monospace text, for example times and sizes, had the extra word spacing of the interface font ("10h  ago").
+- The inspector of a baseline object said "Baseline" twice.
+- The example values under a form field were smaller than 24 × 24 px, the minimum touch target of WCAG 2.2.
+- The dashboard showed "0 B avg per entry" for an empty cache, and latencies without a space before the unit ("4.3ms").
+
 ### Changed — One error body for the admin API
 
 - An admin API error now always has the JSON body `{"error": <code>, "message": <text>}`. Before, an error had one of four bodies: plain text, `{"error": <text>}`, `{"error": <code>, "message": <text>}`, or an empty body for a server error. The `error` field now holds a stable machine code (for example `not_found`, `conflict` or `invalid_request`), and the text is in `message`. The codes that clients already matched on, such as `iam_declarative`, `admin_session_required` and `invalid_path`, stay in `error`. A script that showed `error` as the reason must now show `message`. See [Errors](docs/product/reference/admin-api.md#errors).

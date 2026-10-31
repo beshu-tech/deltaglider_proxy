@@ -59,7 +59,7 @@ export default function ReplicationRuleFields({
         <FormField
           label="Enabled"
           yamlPath="storage.replication.rules[].enabled"
-          helpText="Per-rule switch. The rule runs on its own only while replication is on for the proxy: the Run replication rules switch at the top of this page (storage.replication.enabled), which is on by default."
+          helpText="Per-rule switch. The rule runs only when “Run replication rules”, at the top of this page, is also on."
         >
           <Switch checked={rule.enabled} onChange={(enabled) => onChange({ enabled })} />
         </FormField>

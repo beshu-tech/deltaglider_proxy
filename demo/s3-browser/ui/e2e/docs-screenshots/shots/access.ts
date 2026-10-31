@@ -22,8 +22,8 @@ const TALL = { width: 1040, height: 1800 };
 const openOption = (page: Page, title: string) =>
   page.locator(`.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option[title="${title}"]`);
 
-/** The card of the n-th permission rule of the open form (its WHERE label, three levels up). */
-const ruleCard = (nth: number): Target => ({ css: `text="WHERE" >> nth=${nth} >> xpath=../../..` });
+/** The card of the n-th permission rule of the open form (its Where label, three levels up). */
+const ruleCard = (nth: number): Target => ({ css: `text="Where" >> nth=${nth} >> xpath=../../..` });
 
 /** Type a resource pattern into a rule row and leave the field (it normalizes on blur). */
 async function setResource(page: Page, nth: number, value: string): Promise<void> {
@@ -221,7 +221,7 @@ export const ACCESS_SHOTS: Shot[] = [
     annotations: [
       // Not nav(): an unsaved form adds a marker to the sidebar entry's name.
       {
-        target: { role: 'button', name: /(^|\s)Users\b/, within: { role: 'navigation', name: 'Admin navigation' } },
+        target: { role: 'link', name: /(^|\s)Users\b/, within: { role: 'navigation', name: 'Admin navigation' } },
         kind: 'box',
         label: '1',
         side: 'right',
@@ -320,7 +320,7 @@ export const ACCESS_SHOTS: Shot[] = [
     setup: async (page) => {
       await pick(page, 'dana');
       await page.getByRole('button', { name: 'Add permission rule' }).click();
-      const card = page.locator('text="WHERE" >> nth=1 >> xpath=../../..');
+      const card = page.locator('text="Where" >> nth=1 >> xpath=../../..');
       await card.getByText('Deny', { exact: true }).click();
       await setResource(page, 1, '*');
       await card.getByRole('checkbox', { name: 'List', exact: true }).click();

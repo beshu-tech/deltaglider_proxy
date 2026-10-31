@@ -82,7 +82,7 @@ describe('WHERE suggestion chips', () => {
     expect(chipsFocused).toContain('releases/nightly/*');
 
     // Leave the field, then wait past the 150 ms blur timer.
-    await user.click(screen.getByText('WHERE'));
+    await user.click(screen.getByText('Where'));
     await settle();
     expect(whereInput()).not.toHaveFocus();
 
@@ -96,7 +96,7 @@ describe('WHERE suggestion chips', () => {
     await screen.findByRole('button', { name: 'releases/*' });
     await user.type(whereInput(), 'releases/');
     await settle();
-    await user.click(screen.getByText('WHERE'));
+    await user.click(screen.getByText('Where'));
     await settle();
 
     await user.click(screen.getByRole('button', { name: 'releases/nightly/*' }));

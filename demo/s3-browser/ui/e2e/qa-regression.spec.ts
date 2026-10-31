@@ -513,7 +513,7 @@ test('5. IAM: create prefix-scoped user and a group, delete the last user → bo
   await page.getByLabel('Secret access key', { exact: true }).fill(SCOPED_SECRET);
   const resource = page.getByRole('combobox', { name: 'Resource pattern' });
   await resource.fill(`${BUCKET}/scoped/*`);
-  // Leaving the WHERE field must not move CAN DO: its suggestion chips used
+  // Leaving the Where field must not move Can do: its suggestion chips used
   // to collapse on blur and shift the action chips up under the pointer.
   const write = page.getByRole('checkbox', { name: 'Write' });
   const before = await write.boundingBox();

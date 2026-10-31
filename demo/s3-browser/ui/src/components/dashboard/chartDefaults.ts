@@ -85,9 +85,9 @@ export function axisTickStyle(colors: ColorTokens, mono = false) {
 
 export function fmtDuration(s: number): string {
   if (!isFinite(s) || s <= 0) return '—';
-  if (s < 0.001) return `${(s * 1e6).toFixed(0)}µs`;
-  if (s < 1) return `${(s * 1000).toFixed(1)}ms`;
-  return `${s.toFixed(2)}s`;
+  if (s < 0.001) return `${(s * 1e6).toFixed(0)} µs`;
+  if (s < 1) return `${(s * 1000).toFixed(1)} ms`;
+  return `${s.toFixed(2)} s`;
 }
 
 export function fmtPct(ratio: number): string {

@@ -28,10 +28,8 @@ interface Props {
 }
 
 const SECTION_TITLE: React.CSSProperties = {
-  fontSize: 12,
-  fontWeight: 700,
-  letterSpacing: 0.5,
-  textTransform: 'uppercase',
+  fontSize: 13,
+  fontWeight: 600,
 };
 
 /**

@@ -59,11 +59,9 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
         gap: 8,
         userSelect: 'none',
       }}>
-        <span className="hide-mobile" style={{
-          fontSize: 14,
-          fontWeight: 700,
+        <span className="hide-mobile dg-wordmark" style={{
+          fontSize: 13,
           color: colors.TEXT_MUTED,
-          fontFamily: 'var(--font-ui)',
         }}>
           DeltaGlider
         </span>
@@ -76,12 +74,10 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
           position: 'relative',
           top: 1,
         }} />
-        <span style={{
-          fontSize: 14,
-          fontWeight: 600,
+        <span className="dg-wordmark-product" style={{
+          fontSize: 13,
           whiteSpace: 'nowrap',
           color: colors.ACCENT_BLUE,
-          fontFamily: 'var(--font-ui)',
         }}>
           {title}
         </span>

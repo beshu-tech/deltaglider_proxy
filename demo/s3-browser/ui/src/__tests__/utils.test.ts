@@ -126,8 +126,8 @@ test('parentPrefix (keyboard "up a folder" navigation)', () => {
 // Browser-review item 15: the average divided the cache SIZE (the max), so a
 // 100 MB cache with one 2 MB baseline read "100 MB avg per entry".
 test('cacheEntrySubtitle averages the used bytes over the entries', () => {
-  assert.equal(cacheEntrySubtitle(2 * 1024 * 1024, 100 * 1024 * 1024, 1), '2.0 MiB avg per entry');
-  assert.equal(cacheEntrySubtitle(3 * 1024, 100 * 1024 * 1024, 2), '1.5 KiB avg per entry');
-  assert.equal(cacheEntrySubtitle(0, 100 * 1024 * 1024, 0), '0 B avg per entry');
+  assert.equal(cacheEntrySubtitle(2 * 1024 * 1024, 100 * 1024 * 1024, 1), '2.0 MiB average per entry');
+  assert.equal(cacheEntrySubtitle(3 * 1024, 100 * 1024 * 1024, 2), '1.5 KiB average per entry');
+  assert.equal(cacheEntrySubtitle(0, 100 * 1024 * 1024, 0), 'Empty');
   assert.equal(cacheEntrySubtitle(0, 0, 0), 'Cache disabled');
 });

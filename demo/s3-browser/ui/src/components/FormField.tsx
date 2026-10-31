@@ -243,13 +243,17 @@ export default function FormField({
           alignItems: 'center',
           gap: SPACE.xs,
           marginBottom: SPACE.xxs,
-          flexWrap: 'wrap',
+          // No wrap: in a narrow column the hidden (opacity 0) YAML chip
+          // wrapped to a second line and left an empty band between the
+          // label and its input. The chip truncates instead.
+          flexWrap: 'nowrap',
+          minWidth: 0,
         }}
       >
         <label
           id={labelId}
           htmlFor={envOverride ? undefined : controlId}
-          style={{ color: TEXT, fontSize: 13.5, fontWeight: 600, letterSpacing: '-0.005em' }}
+          style={{ color: TEXT, fontSize: 13.5, fontWeight: 600, letterSpacing: '-0.005em', flex: '0 0 auto', maxWidth: '100%' }}
         >
           {label}
         </label>
@@ -265,8 +269,14 @@ export default function FormField({
               borderRadius: 4,
               padding: `1px ${SPACE.xxs}px`,
               lineHeight: '18px',
+              // The label keeps its width; the chip gets only what is left.
+              flex: '0 1 auto',
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
             }}
-            title="YAML path for this field"
+            title={`YAML path for this field: ${yamlPath}`}
           >
             {yamlPath}
           </code>
@@ -281,6 +291,7 @@ export default function FormField({
               lineHeight: '16px',
               borderRadius: 4,
               background: BG_CARD,
+              flexShrink: 0,
             }}
           >
             {envBadge ?? ownerBadge}
@@ -357,6 +368,9 @@ export default function FormField({
                         background: 'none',
                         border: 'none',
                         padding: 0,
+                        // WCAG 2.5.8: a short value ("40") is still a 24 px target.
+                        minWidth: 24,
+                        minHeight: 24,
                         cursor: 'pointer',
                         color: ACCENT_BLUE,
                         fontFamily: 'var(--font-mono)',

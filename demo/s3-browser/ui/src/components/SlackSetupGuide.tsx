@@ -52,17 +52,15 @@ export function SlackSetupGuideDrawer({
           Set up a Slack app
           <span
             style={{
-              fontSize: 11,
-              fontWeight: 700,
-              letterSpacing: 0.5,
-              textTransform: 'uppercase',
+              fontSize: 12,
+              fontWeight: 600,
               color: c.TEXT_MUTED,
               border: `1px solid ${c.BORDER}`,
               borderRadius: 5,
               padding: '1px 8px',
             }}
           >
-            {mode === 'webhook' ? 'Incoming Webhook' : 'Bot token'}
+            {mode === 'webhook' ? 'Incoming webhook' : 'Bot token'}
           </span>
         </span>
       }

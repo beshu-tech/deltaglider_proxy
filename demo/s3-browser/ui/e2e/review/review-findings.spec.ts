@@ -149,14 +149,14 @@ test('a passthrough file on a compressing bucket does not claim compression is o
   await expect(page.locator('.ant-drawer-open').getByText(/compression is off/i)).toHaveCount(0);
 });
 
-test('dashboard "avg per entry" divides the used cache bytes, not the cache size', async ({ page }) => {
+test('dashboard "average per entry" divides the used cache bytes, not the cache size', async ({ page }) => {
   await signIn(page);
   await page.goto('/_/admin/dashboard');
   const util = page.getByText(/^[\d.,]+ (B|KiB|MiB|GiB) of [\d.,]+ (B|KiB|MiB|GiB)$/).first();
   await expect(util).toBeVisible({ timeout: 15_000 });
   const [used] = (await util.innerText()).split(' of ').map(parseBytes);
-  const avgText = await page.getByText(/avg per entry$/).first().innerText();
-  const avg = parseBytes(avgText.replace(/\s*avg per entry$/, ''));
+  const avgText = await page.getByText(/average per entry$/).first().innerText();
+  const avg = parseBytes(avgText.replace(/\s*average per entry$/, ''));
   // The count sits right above the "Active reference baselines" caption.
   const caption = page.getByText('Active reference baselines');
   const statText = await caption.locator('xpath=..').innerText();

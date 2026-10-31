@@ -27,12 +27,14 @@ test('texts that point at the backup name the System page', () => {
   expect(src('components/RecoveryPanel.tsx')).toContain('Download backup');
 });
 
-// No admin control sets storage.replication.enabled (default true), so the
-// rule's help must not send the operator to a "global scheduler" switch.
-test('replication Enabled help names the YAML-only switch', () => {
+// The page-level switch (storage.replication.enabled) is "Run replication
+// rules" at the top of the Replication page; the rule's help names it by its
+// label, not a "global scheduler".
+test('replication Enabled help names the page switch by its label', () => {
   const s = src('components/ReplicationRuleFields.tsx');
   expect(s).not.toContain('The global scheduler must also be enabled');
-  expect(s).toContain('storage.replication.enabled');
+  expect(s).toContain('Run replication rules');
+  expect(src('components/jobs/RulesPanel.tsx')).toContain('Run replication rules');
 });
 
 // BackendsPanel opens ReencryptProposalModal after an encryption apply, and

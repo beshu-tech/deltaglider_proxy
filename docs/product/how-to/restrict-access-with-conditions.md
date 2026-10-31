@@ -36,7 +36,7 @@ As an example, refuse every listing of `dana` whose prefix starts with a dot (fo
 In the admin UI:
 
 1. On **Access → Users**, click the `dana` row, and click **Add permission rule** below her rules.
-2. Select **Deny** at the top of the new rule. Type `*` under **WHERE**, and turn on **List** under **CAN DO**.
+2. Select **Deny** at the top of the new rule. Type `*` under **Where**, and turn on **List** under **Can do**.
 3. Click **Conditions**, and type `.*` in **List prefix**.
 4. Click **Save**.
 

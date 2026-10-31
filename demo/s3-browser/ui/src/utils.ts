@@ -20,8 +20,9 @@ function formatWithUnits(bytes: number, units: readonly string[]): string {
 /** Dashboard "Cache entries" subtitle: the USED bytes over the entry count. */
 export function cacheEntrySubtitle(usedBytes: number, maxBytes: number, entries: number): string {
   if (maxBytes <= 0) return 'Cache disabled';
-  // No entries: 0 B, not a division by zero (and not the cache size).
-  return `${formatBytes(entries > 0 ? usedBytes / entries : 0)} avg per entry`;
+  // No entries: say so, not "0 B average" (and not a division by zero).
+  if (entries === 0) return 'Empty';
+  return `${formatBytes(usedBytes / entries)} average per entry`;
 }
 
 /** Extract the display name from a full S3 key given the current prefix */

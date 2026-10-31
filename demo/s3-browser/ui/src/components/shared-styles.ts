@@ -65,10 +65,8 @@ export function useCardStyles() {
     };
     const labelStyle: React.CSSProperties = {
       color: TEXT_MUTED,
-      fontSize: 11,
+      fontSize: 12,
       fontWeight: 600,
-      letterSpacing: 0.5,
-      textTransform: 'uppercase' as const,
       marginBottom: 6,
       display: 'block',
       fontFamily: 'var(--font-ui)',
@@ -79,7 +77,7 @@ export function useCardStyles() {
 }
 
 /**
- * Uppercase form-label style object (spread onto a wrapper div) for panels that
+ * Form-label style object (sentence case) (spread onto a wrapper div) for panels that
  * render labels as plain divs rather than the <FormLabel> component — e.g.
  * AuthenticationPanel's provider/preview fields. Memoized for stable identity.
  */
@@ -87,10 +85,8 @@ export function useFormLabelStyle(): React.CSSProperties {
   const { TEXT_MUTED } = useColors();
   return useMemo(
     () => ({
-      fontSize: 11,
+      fontSize: 12,
       fontWeight: 600,
-      textTransform: 'uppercase' as const,
-      letterSpacing: 0.5,
       color: TEXT_MUTED,
       fontFamily: 'var(--font-ui)',
       marginBottom: 4,
@@ -108,10 +104,8 @@ export function usePermissionStyles() {
   const { TEXT_MUTED, TEXT_PRIMARY } = useColors();
   return useMemo(() => {
     const condLabelStyle: React.CSSProperties = {
-      fontSize: 10,
+      fontSize: 12,
       fontWeight: 600,
-      letterSpacing: 0.5,
-      textTransform: 'uppercase',
       color: TEXT_MUTED,
       fontFamily: 'var(--font-ui)',
     };

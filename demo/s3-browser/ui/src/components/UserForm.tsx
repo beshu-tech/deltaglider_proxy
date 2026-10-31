@@ -35,10 +35,10 @@ const { Text, Title } = Typography;
 
 // Fallback presets used if the API is unavailable
 const FALLBACK_PRESETS: Record<string, PermissionRow[]> = {
-  'Read Only': [{ effect: 'Allow', actions: ['read', 'list'], resources: ['*'] }],
+  'Read only': [{ effect: 'Allow', actions: ['read', 'list'], resources: ['*'] }],
   'Read/Write (no delete)': [{ effect: 'Allow', actions: ['read', 'write', 'list'], resources: ['*'] }],
   'Read/Write/Delete': [{ effect: 'Allow', actions: ['read', 'write', 'delete', 'list'], resources: ['*'] }],
-  'Full Access (admin)': [{ effect: 'Allow', actions: ['*'], resources: ['*'] }],
+  'Full access (admin)': [{ effect: 'Allow', actions: ['*'], resources: ['*'] }],
 };
 
 interface UserFormProps {

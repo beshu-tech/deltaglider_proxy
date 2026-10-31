@@ -283,7 +283,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
 
           {/* ── Row 2: HTTP time-series + error rate gauge ────────── */}
           <Panel
-            title="Request rate + latency"
+            title="Request rate and latency"
             subtitle="Per 5-second interval (in-memory window)"
             colSpan={8}
             rowSpan={2}
