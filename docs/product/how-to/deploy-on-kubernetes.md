@@ -164,6 +164,10 @@ operator](scale-out-with-the-kubernetes-operator.md).
 
 With config sync set up, replication rules elect one leader per rule through an S3-CAS lease in the sync bucket (default `lease_ttl: "300s"`, `heartbeat_interval: "60s"`); a dead leader's lease lapses and a peer takes over automatically. Lifecycle, maintenance, and parity audit jobs still use node-local database leases, so they may run on more than one pod. Their operations are idempotent, so this wastes work but does not corrupt data. Do not scale above one replica if each pod has its own independent `/data/deltaglider_config.db`. In that shape, each pod is an independent control plane. To run more than one instance, set up config sync and a shared `DGP_CONFIG_DB_KEY` first: [How to run multiple instances (HA)](run-multiple-instances.md).
 
+## Turn on encryption for buckets that hold objects
+
+When you add `aes256-gcm-proxy` to `config.inline` and run `helm upgrade`, the pod restarts with the new file, and no config write runs. After it starts, the proxy checks the first 100 objects of each bucket that encrypts. For a bucket that holds plaintext objects and that no proxy encrypted before, it opens the conversion window and queues the re-encrypt job, and the log names both. Clients read the plaintext history until the job converts it, and the job then closes the window. For any other bucket with plaintext, the log has a warning that names the request that starts the conversion. See [A conversion that a restart starts](../reference/encryption.md#a-conversion-that-a-restart-starts).
+
 ## Useful values
 
 | Value | Purpose |

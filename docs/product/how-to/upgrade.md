@@ -219,7 +219,7 @@ In earlier releases, a bucket that started to encrypt needed `plaintext_reads: s
 
 The changes that you can see:
 
-- **`plaintext_reads: serve` is deprecated.** This release still honours it: reads serve every object that is not encrypted. The proxy logs a deprecation warning at load, `config lint` prints it, and every apply returns it. The next release refuses the field, so a config file that still sets it will not load. `plaintext_reads: refuse` is accepted and has no effect.
+- **`plaintext_reads: serve` is deprecated.** This release still honours it: reads serve every object that is not encrypted. The proxy logs a deprecation warning at load, `config lint` prints it, a section or document apply returns it in `existing_warnings`, and `config apply` prints it. The next release refuses the field, so a config file that still sets it will not load. `plaintext_reads: refuse` is accepted and has no effect.
 - **The confirmation is gone.** The apply that started encryption on a bucket with objects no longer answers `422`. The header `X-DGP-Confirm-Plaintext-Refusal` is ignored, and `config apply --confirm-plaintext-refusal` is an unknown option, so a script that passes it fails. Remove both from your scripts.
 - **A new `409`.** The same apply is refused with `409` when another job, for example a migration, holds one of the buckets. Wait for that job, or cancel it, and apply again.
 - **The admin API.** `serves_plaintext` in the bucket list and in the backend summary is now `serves_plaintext_deprecated`. The bucket list reports the window in `effective_encryption.conversion`, and a config write reports the conversions that it started in `conversions` ([admin API](../reference/admin-api.md#starting-a-conversion)).
@@ -231,9 +231,11 @@ To leave `serve` before the next release, do these steps for each backend and ea
 2. In the admin UI, open **Storage → Backends** or **Storage → Buckets**. The card of each backend or bucket that sets `serve` shows the box **Unencrypted objects are served (deprecated setting)**. Click **Convert now**. The write removes the line, opens the conversion window of each bucket that holds objects, and starts their re-encrypt jobs. Without the admin UI, remove the line from the `encryption` block, and apply the file with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`.
 3. Follow the jobs until the windows close, as in [How to encrypt data at rest](encrypt-data-at-rest.md#6-encrypt-the-objects-that-the-backend-already-holds).
 
-Do not remove the line and restart instead of an apply. A restart starts no conversion, so after it every read of a plaintext object fails until you open the window with `POST /_/api/admin/jobs/reencrypt` and `{"buckets": ["<bucket>"], "open_window": true}`.
+Do not remove the line and restart instead of an apply. A bucket that had `serve` already holds objects that the proxy encrypted, so it holds a key claim. A restart starts a conversion only for a bucket without a key claim ([A conversion that a restart starts](../reference/encryption.md#a-conversion-that-a-restart-starts)), so after this restart every read of a plaintext object fails until you open the window with `POST /_/api/admin/jobs/reencrypt` and `{"buckets": ["<bucket>"], "open_window": true}`.
 
-With several instances, apply the change on every instance, and then let the job finish. An instance whose configuration does not encrypt the bucket yet writes plaintext into it, and the instances that encrypt refuse those objects after the cutoff.
+A restart does start the conversion of a bucket that never encrypted before. When you add `aes256-gcm-proxy` to the config file of a deployment that the Kubernetes operator, a Helm chart or a GitOps pipeline restarts, each bucket with plaintext objects, no key claim and no marker gets its window and its re-encrypt job at the start. The log names the run and the job.
+
+With several instances, apply the change on every instance, and then let the job finish. An instance whose configuration does not encrypt the bucket yet writes plaintext into it, and the instances that encrypt refuse those objects after the cutoff. While the job runs, stop client writes to the bucket on every instance, or send them all to the instance that runs the job: the write gate of the job holds only on its own instance ([A conversion on several instances](../reference/encryption.md#a-conversion-on-several-instances)).
 
 ## Common gotchas
 

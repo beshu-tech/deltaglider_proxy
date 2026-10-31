@@ -218,6 +218,25 @@ The rest of the multi-instance contract (the IAM merge, synchronisation lag, and
 ordering) is the same, and
 [How to run multiple instances (HA)](run-multiple-instances.md) describes it.
 
+## Turn on encryption for buckets that hold objects
+
+When you add `aes256-gcm-proxy` to `configYaml`, the operator restarts the pods with the
+new file, and no config write runs. Each pod checks the buckets after it starts. The
+first pod that finds plaintext objects in a bucket that no proxy encrypted before opens
+the conversion window of the bucket and queues the re-encrypt job. A pod that starts
+later finds the open window and queues no job of its own. Clients read the plaintext
+history of the bucket until the job converts it, and the job then closes the window
+([A conversion that a restart starts](../reference/encryption.md#a-conversion-that-a-restart-starts)).
+
+The write gate of the job holds only on the pod that runs it, and the router sends the
+writes of each directory of the bucket to a different pod. Another pod can therefore
+accept a write that the job then overwrites with the older object. Until the job ends,
+stop client writes to the bucket, for example with an admission block in `configYaml`
+that rejects writes to it, or schedule the change for a time when no client writes to
+the bucket. A pod that still runs the old file during the rollout writes plaintext,
+and the job reports such an object as adopted after the cutoff. See
+[A conversion on several instances](../reference/encryption.md#a-conversion-on-several-instances).
+
 ## Related
 
 - [Operator README](https://github.com/beshu-tech/deltaglider_proxy/tree/main/operator): the full spec reference and the development workflow

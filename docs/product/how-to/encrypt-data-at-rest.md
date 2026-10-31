@@ -73,7 +73,7 @@ After you edit the file, restart the proxy, or apply the file to the running pro
 
 An apply of this file through `POST /_/api/admin/config/apply` or `config apply` does what the admin UI does: it opens the conversion window of each bucket that holds objects and starts its re-encrypt job. The response lists them in `conversions` ([admin API](../reference/admin-api.md#starting-a-conversion)). To make the jobs delete the old plaintext versions on a versioned backend, send the header `X-DGP-Purge-Plaintext-Versions: true` with `POST /_/api/admin/config/apply`. The apply is refused with `409` while another job, for example a migration, is active on one of the buckets.
 
-A restart from an edited file starts no conversion. After the restart, every read of an old object fails until you open the conversion yourself:
+A restart from an edited file starts the conversion too, when no proxy encrypted the bucket before. After it starts, the proxy checks the first 100 objects of each bucket that encrypts. When it finds an object without encryption in a bucket that holds no key claim and no conversion marker, it opens the window of the bucket and queues the re-encrypt job, and the log names both ([A conversion that a restart starts](../reference/encryption.md#a-conversion-that-a-restart-starts)). The check runs in the background, so reads of old objects can fail for the first seconds after the start. For any other bucket, the proxy logs a warning instead, and every read of an old object fails until you open the conversion yourself:
 
 ```bash
 curl -b cookies.txt -X POST https://s3.acme.example/_/api/admin/jobs/reencrypt \
@@ -81,7 +81,7 @@ curl -b cookies.txt -X POST https://s3.acme.example/_/api/admin/jobs/reencrypt \
   -d '{"buckets": ["releases", "downloads"], "open_window": true}'
 ```
 
-The proxy also checks the first 100 objects of each such bucket after it starts. When one of them is not encrypted, it logs a warning that names the bucket, the object and this request. Apply the file to the running proxy instead of a restart, so that the old objects stay readable without a gap.
+The warning names the bucket, the object, the reason, and this request. Apply the file to the running proxy instead of a restart when you can, so that the old objects stay readable without a gap.
 
 ## 4. Or keep the key in an environment variable
 
@@ -117,7 +117,7 @@ storage:
         key_id: hetzner-2026-06    # optional: a stable name for this key generation
 ```
 
-A restart starts no conversion. When the buckets of the backend already hold objects, open their conversion right after the restart with the `open_window` request of the section above, because until then every read of an old object fails. `key_id` is the name under which the admin UI, the audit log and the jobs show the key. The objects store only a fingerprint of the key, not the id. When you leave `key_id` out, the id is `fp-` and the 16 hexadecimal characters of that fingerprint. A readable id helps later, when you rotate the key ([How to rotate or change encryption keys](rotate-encryption-keys.md)). While the variable is set, the encryption editor of the backend in the admin UI is read-only, and a note names the variable.
+After the restart, the proxy starts the conversion of each bucket that holds plaintext objects and was never encrypted, as the section above describes. For a bucket that it does not convert, the log has a warning: open its conversion with the `open_window` request of the section above, because until then every read of an old object fails. `key_id` is the name under which the admin UI, the audit log and the jobs show the key. The objects store only a fingerprint of the key, not the id. When you leave `key_id` out, the id is `fp-` and the 16 hexadecimal characters of that fingerprint. A readable id helps later, when you rotate the key ([How to rotate or change encryption keys](rotate-encryption-keys.md)). While the variable is set, the encryption editor of the backend in the admin UI is read-only, and a note names the variable.
 
 ## 5. Or use SSE-KMS or SSE-S3 on AWS
 
@@ -172,7 +172,7 @@ Encryption is **not retroactive**. The proxy encrypts only new writes, and the e
 In the admin UI:
 
 1. In the sidebar, open **Storage → Backends** (`/_/admin/storage/backends`). Under the counts of `hetzner-fsn1`, the card shows one line for each bucket that the job converts, for example "Encrypting the existing objects, 42%." The line of a bucket goes away when its job converted every object and closed the window.
-2. To see the job of a bucket, click **View run** on its line. The job opens on **Storage → Jobs**. While the job runs, writes to the bucket get `503 SlowDown`, and reads pass. The job survives restarts.
+2. To see the job of a bucket, click **View run** on its line. The job opens on **Storage → Jobs**. While the job runs, writes to the bucket get `503 SlowDown` on this instance, and reads pass. The job survives restarts. With several instances, the other instances still accept writes to the bucket, and the job can overwrite such a write: stop client writes to the bucket on every instance, or send them to this instance, until the job ends ([A conversion on several instances](../reference/encryption.md#a-conversion-on-several-instances)).
 3. When a line says that the encryption of the existing objects stopped with failures, open the **Failures** tab of the run, fix the cause, and click **Resume** on the line. The window stays open until the job converted every object, and **Resume** gives it a new deadline of 7 days.
 4. When a line names objects stored after the cutoff, click it. The run's **Failures** tab lists these objects. The job converted them, but clients could not read them before, because the backend stored them after the conversion started. Check that each of them is an object that you expect, for example an upload from an instance that did not encrypt yet. An object that nobody wrote through the proxy can be an object that someone planted on the backend.
 
@@ -188,11 +188,11 @@ The conversion is not configuration, so it has no YAML. The bucket list shows it
 curl -b cookies.txt https://s3.acme.example/_/api/admin/buckets
 ```
 
-**Resume** is the same request as a new job for the bucket. The job extends the window by itself:
+**Resume** is a new job for the bucket with `"open_window": true`. The request keeps the window of the bucket, with its run id and its cutoff, and gives the run id to the job. The job of that run then extends the deadline, and it closes the window when it converted every object. A job without `open_window` has no run id, so it neither extends nor closes a window:
 
 ```bash
 curl -b cookies.txt -X POST https://s3.acme.example/_/api/admin/jobs/reencrypt \
-  -H 'Content-Type: application/json' -d '{"buckets": ["releases"]}'
+  -H 'Content-Type: application/json' -d '{"buckets": ["releases"], "open_window": true}'
 ```
 
 ## Verify

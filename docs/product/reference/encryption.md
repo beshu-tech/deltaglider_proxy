@@ -440,32 +440,56 @@ A config write starts a conversion for a bucket when all of these are true:
 - Before the write, clients could read plaintext in the bucket: it stored plaintext, used SSE-KMS or SSE-S3, used a proxy mode without a key, or had `plaintext_reads: serve`.
 - The bucket holds at least one object. An empty bucket has no history.
 
-Every config write does this: a section PUT, `POST /_/api/admin/config/apply`, `config apply`, the backend and bucket endpoints, and a backup restore. A key rotation starts no conversion. The steps are:
+Every config write does this: a section PUT, a field PATCH (`PUT /_/api/admin/config`), `POST /_/api/admin/config/apply`, `config apply`, the backend and bucket endpoints, and a backup restore. A key rotation starts no conversion. The steps are:
 
 1. Before the config commits, the proxy refuses the write with `409` when a job other than a delete is active on the bucket. The message names the job. Wait for the job, or cancel it, and then apply again.
-2. The proxy opens the window, for up to 8 buckets at once. When the bucket already holds a marker of its own (from an earlier write, from another instance, or one whose deadline passed), the proxy reuses it, with its cutoff and its run id. When the bucket holds a marker that does not open, the write fails. When the proxy cannot write a marker, it removes the markers that this write created, and the write fails.
+2. The proxy opens the window, for up to 8 buckets at once. When the bucket already holds a marker that opens with its keys (from an earlier write, from another instance, a marker whose deadline passed, or one that a stopped conversion left behind), the proxy keeps the run id of that marker, but it writes a new cutoff and a new deadline into it, by identity. The cutoff must be new, because the bucket could store plaintext since the old cutoff, and an old cutoff would refuse those objects. When the bucket holds a marker that does not open, the write fails. When the proxy cannot write a marker, it removes the markers that this write created, and the write fails.
 3. The config commits.
-4. The proxy queues one re-encrypt job per bucket. When it cannot queue the job, because another job became active in the meantime, the write still succeeds, with a warning. The window is then open with no job, and **Resume** starts the job.
+4. The proxy queues one re-encrypt job per bucket. The job carries the run id of the marker. When the proxy cannot queue the job, because another job became active in the meantime, the write still succeeds, with a warning. The window is then open with no job, and **Resume** starts the job.
 
-The response of the write lists each conversion in `conversions` (see [the admin API reference](admin-api.md#starting-a-conversion)). A validate request lists each bucket that the write would convert, with its object count. The admin UI shows that count in its confirmation dialog.
+The response of the write lists each conversion in `conversions` (see [the admin API reference](admin-api.md#starting-a-conversion)). A validate request lists each bucket that the write would convert, with its object count. The admin UI shows that count in its confirmation dialog. The response does not add the general note "start the re-encrypt job" for a bucket that it lists in `conversions`, because the write queued that job already.
 
-A proxy that starts from an edited file starts no conversion. After it starts, the proxy lists the first 100 objects of each bucket that encrypts with a proxy key, has no open window and has no `plaintext_reads: serve`, and it sends a HEAD request for each of them. When the read rule refuses one of them because it is not encrypted, the proxy logs a warning. The warning names the bucket, the object, and the request that opens the window and starts the job: `POST /_/api/admin/jobs/reencrypt` with `{"buckets": ["<bucket>"], "open_window": true}`. The check runs in the background, so the start does not wait for it. `DGP_BOOT_PLAINTEXT_CHECK=false` turns it off.
+A config write that makes a bucket *stop* encrypting with a proxy key closes the marker of the bucket, whatever its run. The proxy removes the marker by identity, with the keys of the config that encrypted the bucket. A later write that encrypts the bucket again therefore starts a new window, with a new cutoff.
+
+#### A conversion that a restart starts
+
+An operator, a Helm chart or a GitOps pipeline often changes the config file and restarts the proxy, so no config write runs. The proxy therefore checks the buckets after it starts. It lists the first 100 objects of each bucket that encrypts with a proxy key, has no open window and has no `plaintext_reads: serve`, and it sends a HEAD request for each of them. The check runs in the background, so the start does not wait for it. `DGP_BOOT_PLAINTEXT_CHECK=false` turns it off.
+
+When the read rule refuses one of these objects because it is not encrypted, the proxy decides between two cases:
+
+- **The sample holds no encrypted object, the bucket has no key claim and no marker, and no job is active on it.** No proxy ever wrote encrypted objects to the bucket, because the first encrypted write creates the key claim. Its plaintext objects are therefore its history. The proxy checks the sampled objects as well as the claim, because a writer with access to the backend can delete the claim, whose body is not sealed. The proxy opens the window, as a config write does, and queues the re-encrypt job of its run. The audit log has `encryption_conversion_opened` with the user `boot`, and the log names the run and the job. Clients read the history while the job runs. When the job ends, the bucket holds a key claim and no marker, so the next restart starts nothing.
+- **Any other bucket.** The sample holds an encrypted object, or the bucket holds a key claim, a marker that is closed (past its deadline, or one that does not open), or an active job. Its plaintext objects can be plants, so the proxy does not decide for you. It logs a warning that names the bucket, the object, the reason, and the request that opens the window and starts the job: `POST /_/api/admin/jobs/reencrypt` with `{"buckets": ["<bucket>"], "open_window": true}`.
+
+When several instances start at the same moment, the first one creates the marker. An instance that finds the marker after its own check keeps the run id of the marker and writes a new cutoff into it, so both instances queue a job of one run.
 
 #### The re-encrypt job and the window
 
-At each start and each resume, the job reads the marker of its bucket and moves the deadline to 7 days after the backend's current time, by identity. The cutoff and the run id stay. This also applies to a marker whose deadline passed while no job ran, so a resume opens that window again.
+A job owns a marker only through its run id. A config write, a restart and `POST /_/api/admin/jobs/reencrypt` with `"open_window": true` store the run id of the marker in the job. A plain re-encrypt job (for example after a key rotation) has no run id: it never extends and never removes a marker.
 
-The job then converts the objects and the delta references, 8 objects of a page at once, and it saves its cursor after each page. An object that the job converts although a client could not read it is *adopted after the cutoff*:
+At each start and each resume, a job with a run id reads the marker of its bucket. When the marker carries the same run id, the job moves the deadline to 7 days after the backend's current time, by identity. The cutoff and the run id stay. This also applies to a marker whose deadline passed while no job ran, so a resume opens that window again. A marker with another run id, or one that does not open, stays as it is.
 
-- It is a row on the **Failures** tab of the run, with the prefix `adopted_after_cutoff`. The row is information, not a failure.
+The job then converts the objects and the delta references, 8 objects of a page at once, and it saves its cursor after each page. In a bucket that encrypts, an object or a delta reference that the job converts although a client could not read it is *adopted after the cutoff*. A client could not read it when the bucket has no open window of the job's run (no marker, a marker of another run, a marker that does not open, a job without a run id), or when the backend stored the object at or after the cutoff plus 300 seconds, or names no stored time. Only a bucket that serves plaintext (it stores plaintext, or has `plaintext_reads: serve`) converts such objects without a report. For each adopted object:
+
+- The job counts it in its job row. The admin API shows the count of the latest job of the bucket as `adopted_after_cutoff`.
+- The **Failures** tab of the run lists it with the prefix `adopted_after_cutoff`, for the first 100 adopted objects of the job. The row is information, not a failure. These rows never push a `rewrite_failed` row out of the 200 rows that the tab keeps.
 - The job writes the audit entry `encryption_conversion_adopted_after_cutoff` for it.
 - The job increments `deltaglider_conversion_adopted_after_cutoff_total`.
-- The run summary names the count, for example "3 object(s) adopted after the conversion's cutoff in this run".
+- The run summary names the count, for example "3 object(s) adopted after the conversion's cutoff".
 
-An object that the job could not convert is a `rewrite_failed` row. After the last phase, the job closes the window when no object failed: it removes the marker by identity. When objects failed, the window stays open, the run settles with errors, and **Resume** (or `POST /_/api/admin/jobs/reencrypt` for the bucket) runs the job again. When the marker is not the one of this run, or does not open, the job does not remove it. The run then settles with an error, and the audit log has `encryption_conversion_close_blocked`.
+An object that the job could not convert is a `rewrite_failed` row. After the last phase, a job with a run id closes the window when no object failed: it removes the marker of its run by identity. When objects failed, the window stays open, the run settles with errors, and **Resume** (`POST /_/api/admin/jobs/reencrypt` with `"open_window": true`) runs the job again with the same run id. When the marker is not the one of this run, or does not open, the job does not remove it. The run then settles with an error, and the audit log has `encryption_conversion_close_blocked`.
 
-While a bucket holds a conversion marker, the proxy refuses a metadata backfill of the bucket (`POST /_/api/admin/jobs/backfill-metadata`) with `409`, because the backfill would move the stored time of the plaintext objects past the cutoff. The backfill job checks this again before it starts.
+`POST /_/api/admin/jobs/reencrypt` with `"open_window": true` checks for an active job before it opens a window. When the bucket has an active job, the request opens nothing and returns the error. When the request created a marker and then cannot queue the job, it removes that marker by identity.
 
+While a bucket holds a conversion marker, the proxy refuses a metadata backfill of the bucket (`POST /_/api/admin/jobs/backfill-metadata`) with `409`, because the backfill would move the stored time of the plaintext objects past the cutoff. The proxy reads the marker on the backend, whatever the bucket's current config says, and it holds the config lock from this check until it creates the backfill job, so that a config write cannot open a window in between. The backfill job checks the marker again before it starts.
+
+#### A conversion on several instances
+
+The write gate of a re-encrypt job stops client writes to the bucket only on the instance that runs the job. Another instance still accepts a write to the bucket, and the job can then overwrite that write with the older object that it read before. While a conversion runs in a deployment with several instances, therefore do one of these two things until the job ends:
+
+- Stop client writes to the bucket on every instance (for example with an admission block that rejects writes to the bucket).
+- Send every write to the bucket to the instance that runs the job (for example with the directory-hash router of the Kubernetes operator, or a sticky route for the bucket).
+
+Each instance whose config write starts a conversion queues its own job, with the run id of the one shared marker. The jobs are idempotent: a job skips an object that is already encrypted with the right key, so a second job only reads the bucket again. The first job that converts every object closes the window. A job that ends later finds no marker and ends normally.
 #### Old versions on a versioned backend
 
 On an S3 backend whose bucket keeps old versions (versioning enabled or suspended), the job rewrites the current object of each key. The plaintext object becomes a noncurrent version, and it stays on the backend. The validate and the apply mark such a bucket with `versioned: true`, and the apply response has a warning for it.
@@ -491,9 +515,9 @@ The phase therefore keeps the versions of an object that a client deleted before
 |---|---|---|
 | `deltaglider_plaintext_reads_total{outcome}` | Counter | Client reads of objects without encryption in buckets that encrypt. `outcome` is `served_in_window` (history that an open window serves) or `refused`. |
 | `deltaglider_conversion_adopted_after_cutoff_total` | Counter | Objects that the re-encrypt job converted although clients could not read them. |
-| `encryption_conversion_opened` | Audit | A config write, or `POST /jobs/reencrypt` with `open_window`, opened a window. The target names the run id. |
+| `encryption_conversion_opened` | Audit | A config write, a restart (user `boot`), or `POST /jobs/reencrypt` with `open_window`, opened a window or wrote a new cutoff into one. The target names the run id. |
 | `encryption_conversion_extended` | Audit | A job start or a resume moved the deadline. The target names the run, the kept cutoff, and the old and the new deadline. |
-| `encryption_conversion_closed` | Audit | The job closed the window. The target names the count of objects adopted after the cutoff. |
+| `encryption_conversion_closed` | Audit | The job closed the window (the target names the count of objects adopted after the cutoff), or a config write removed a marker: the write that opened it failed, or the bucket stopped encrypting. |
 | `encryption_conversion_close_blocked` | Audit | The job did not close the window, because the marker is not the one of its run, or does not open. |
 | `encryption_conversion_adopted_after_cutoff` | Audit | The job converted an object that clients could not read. |
 | `encryption_conversion_versions_purged` | Audit | The `purge-versions` phase deleted noncurrent plaintext versions. The target names the job and the count. |
@@ -503,7 +527,7 @@ The phase therefore keeps the versions of an object that a client deleted before
 
 Earlier releases needed `plaintext_reads: serve` in the `encryption` block while a re-encrypt job converted a bucket. Under `serve`, the proxy serves every object without encryption in the bucket, whatever its stored time, so it also serves an object that someone planted during the conversion. The field exists only in `aes256-gcm-proxy` mode.
 
-This release still honours `serve`. The proxy logs a deprecation warning when it loads such a file, and `config lint` and every apply return one. A config write that *sets* `serve` starts no conversion: it keeps the earlier behaviour, and you run the job yourself. `refuse` is accepted and has no effect. The next release refuses the field.
+This release still honours `serve`. The proxy logs a deprecation warning when it loads such a file, and `config lint` prints one. A section or document apply returns it in `existing_warnings` while the running config holds the field, and `config apply` prints those warnings too. The field-level `PUT /_/api/admin/config` returns only the warnings of its own change. A config write that *sets* `serve` starts no conversion: it keeps the earlier behaviour, and you run the job yourself. `refuse` is accepted and has no effect. The next release refuses the field.
 
 To leave `serve`, remove the line. The write that removes it starts the conversion of each bucket that holds objects, as [How a conversion starts](#how-a-conversion-starts) describes. In the admin UI, the backend card and the bucket card show the box **Unencrypted objects are served (deprecated setting)** while the field is set, and its button **Convert now** removes the line. The admin API reports the field as `serves_plaintext_deprecated` ([admin API](admin-api.md#backends)).
 

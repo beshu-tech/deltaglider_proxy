@@ -156,7 +156,7 @@ A bucket can have its own key on a shared backend ([per-bucket encryption](../re
 
      Until the job is done, the objects that the backend key encrypted stay readable, because the proxy picks the key of each object by the key fingerprint that the object carries.
 
-   A restart from the edited file instead of an apply starts no conversion. For a bucket with plaintext objects, send the request above with `"open_window": true` right after the restart, because until then every read of an old object fails.
+   A restart from the edited file instead of an apply starts the conversion of a bucket with plaintext objects only when no proxy encrypted the bucket before (it holds no key claim and no marker). For any other bucket with plaintext objects, the start log has a warning: send the request above with `"open_window": true` right after the restart, because until then every read of an old object fails.
 
 ### Rotate the bucket key
 
