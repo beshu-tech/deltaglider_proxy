@@ -1,6 +1,7 @@
 import type { CSSProperties } from 'react';
 import { Alert } from 'antd';
 import type { PlainError } from '../adminApi';
+import { LinkifiedText } from './LinkifiedText';
 
 /**
  * An error Alert for a `PlainError` (see `plainError` in adminApi/core):
@@ -12,7 +13,8 @@ export default function PlainErrorAlert({ error, style }: { error: PlainError; s
     <Alert
       type="error"
       showIcon
-      title={error.text}
+      // A doc link in the sentence (a refusal names its how-to) is clickable.
+      title={<LinkifiedText text={error.text} />}
       description={
         error.details ? (
           <details>

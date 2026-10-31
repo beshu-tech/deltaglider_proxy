@@ -157,6 +157,10 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
     () => new Map((originsData?.buckets ?? []).map((o) => [o.name, o.backend_name ?? null] as const)),
     [originsData]
   );
+  const readOnlyByName = useMemo(
+    () => new Map((originsData?.buckets ?? []).map((o) => [o.name, o.read_only ?? null] as const)),
+    [originsData]
+  );
   const effectiveByName = useMemo(
     () => new Map((originsData?.buckets ?? []).map((o) => [o.name, o.effective_encryption ?? null] as const)),
     [originsData]
@@ -428,6 +432,7 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
                 defaultBackend={defaultBackend}
                 originBackend={originBackendByName.get(name) ?? null}
                 effectiveEncryption={effectiveByName.get(name) ?? null}
+                readOnly={readOnlyByName.get(name) ?? null}
                 // Only this bucket's own staged edits wait: the edits of
                 // other buckets survive the change (`rebaseBucketRows`).
                 encryptionBlockedReason={

@@ -31,7 +31,9 @@ import { useState } from 'react';
 import { Alert, Button, Checkbox, Input, Radio, Space, Tag, Typography, message } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
-import type { EffectiveEncryption, SectionApplyResponse } from '../adminApi';
+import type { BackendCapabilityVerdict, EffectiveEncryption, SectionApplyResponse } from '../adminApi';
+import { atomicWrites } from '../atomicWrites';
+import AtomicWritesNotice from './AtomicWritesNotice';
 import { ConfigConflictError, getSectionVersioned, validateSection } from '../adminApi';
 import { applySection, persistFailureText, sectionApplyErrorText } from '../applySection';
 import {
@@ -79,6 +81,10 @@ interface Props {
    *  so its job exists already (from the apply response, not a refetch: a
    *  small conversion can end before the refetch). */
   onApplied: (before: EffectiveEncryption, converting: boolean) => void;
+  /** The atomic-writes verdict of the bucket's backend (GET /backends
+   *  `capability`). Proxy encryption needs atomic writes: without them the
+   *  choices that encrypt with the proxy are disabled, with the reason. */
+  capability?: BackendCapabilityVerdict;
 }
 
 const CHOICE_TITLE: Record<BucketEncryptionChoice, string> = {
@@ -89,7 +95,7 @@ const CHOICE_TITLE: Record<BucketEncryptionChoice, string> = {
   off: 'Off for this bucket',
 };
 
-export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onApplied }: Props) {
+export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onApplied, capability }: Props) {
   const colors = useColors();
   const qc = useQueryClient();
   const [choice, setChoice] = useState<BucketEncryptionChoice | null>(null);
@@ -131,6 +137,12 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
   const rotateBlocked = choiceBlocked(eff, 'off'); // the same slot rule as any retirement
   const readOnly = !!eff.key_env;
   const desc = describeBucketEncryption(eff);
+  // Encryption needs atomic writes (N2): the choices that encrypt with the
+  // proxy are off on a backend without them. Off and the native modes stay.
+  const atomic = atomicWrites(capability);
+  const proxyChoice = (c: BucketEncryptionChoice) =>
+    c === 'bucket-key' || (c === 'inherit' && eff.inherited.mode === 'aes256-gcm-proxy');
+  const noAtomic = (c: BucketEncryptionChoice) => atomic.kind === 'missing' && proxyChoice(c) && c !== current;
 
   const cancel = () => {
     setChoice(null);
@@ -259,12 +271,6 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
       {offersPurge(dialog.response.conversion_preview) && (
         <PurgeVersionsBox checked={purge} onChange={setPurge} />
       )}
-      {(enabling || dialog.change.kind === 'bucket-key' || conversionText) && (
-        <Text type="warning" style={{ fontSize: 12 }}>
-          While the re-encrypt job runs on the bucket, reads keep working, but uploads and deletes
-          get a temporary 503 (S3 clients retry automatically).
-        </Text>
-      )}
       {isDowngrade(eff, dialog.change) && (
         <Text type="danger" style={{ fontSize: 12 }}>
           New writes to <code>{bucket}</code> are stored as plaintext.
@@ -307,6 +313,9 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           {blockedReason}
         </Text>
       )}
+      {(atomic.kind === 'missing' || (editing && proxyChoice(rotating ? 'bucket-key' : selected))) && (
+        <AtomicWritesNotice backend={eff.backend} capability={capability} />
+      )}
       <Radio.Group
         aria-label="Encryption of this bucket"
         value={selected}
@@ -319,7 +328,8 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         style={formRow(6, { flexDirection: 'column', alignItems: 'stretch' })}
       >
         {offeredChoices(eff).map((c) => {
-          const blocked = choiceBlocked(eff, c);
+          const blocked =
+            choiceBlocked(eff, c) ?? (noAtomic(c) ? `Needs atomic writes, which ${eff.backend} does not provide.` : null);
           const sub =
             c === 'inherit'
               ? `New writes follow backend ${eff.backend}.`
@@ -354,7 +364,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           size="small"
           icon={<ReloadOutlined />}
           style={{ marginTop: SPACE.xs }}
-          disabled={!!rotateBlocked || !!blockedReason}
+          disabled={!!rotateBlocked || !!blockedReason || atomic.kind === 'missing'}
           title={rotateBlocked ?? undefined}
           onClick={() => setRotating(true)}
         >

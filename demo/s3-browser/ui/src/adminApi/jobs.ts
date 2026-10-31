@@ -1,6 +1,6 @@
 // === Unified jobs API (replication / lifecycle / reencrypt / migrate) ===
-import { adminJson, adminRequest, confirmHeaderMap, safeJson } from './core';
-import type { ConfirmHeaders } from './core';
+import { adminJson, adminPostOrRefusal, adminRequest, confirmHeaderMap, safeJson } from './core';
+import type { AtomicWritesRefusal, ConfirmHeaders } from './core';
 import type { JobAction, JobRow } from '../jobsView';
 
 interface JobsOverview {
@@ -387,21 +387,29 @@ export async function previewLifecycleJob(id: string, fresh = false): Promise<Li
 export async function startReencrypt(
   buckets: string[],
   opts?: { purgePlaintextVersions?: boolean; openWindow?: boolean },
-): Promise<{
-  started: Array<{ bucket: string; job_id: number }>;
-  errors: Array<{ bucket: string; error: string }>;
-}> {
-  return adminJson('/api/admin/jobs/reencrypt', {
-    method: 'POST',
-    body: {
+): Promise<ReencryptStartResponse> {
+  // 409: nothing started because a backend has no atomic writes (N2).
+  // The body names each refused bucket in `errors`.
+  return adminPostOrRefusal<ReencryptStartResponse>(
+    '/api/admin/jobs/reencrypt',
+    {
       buckets,
       ...(opts?.purgePlaintextVersions ? { purge_plaintext_versions: true } : {}),
       // Resume: the job takes over the bucket's conversion window (run
       // ownership), so it extends the window and closes it on success.
       ...(opts?.openWindow ? { open_window: true } : {}),
     },
-    context: 'Start re-encryption',
-  });
+    (b) => Array.isArray(b.errors),
+    'Start re-encryption',
+  );
+}
+
+/** Answer of `POST /jobs/reencrypt`. */
+export interface ReencryptStartResponse {
+  started: Array<{ bucket: string; job_id: number }>;
+  /** `atomic_writes`: refused because the bucket's backend has no atomic
+   *  writes; `error` says it in plain words, with the doc link. */
+  errors: Array<{ bucket: string; error: string; atomic_writes?: AtomicWritesRefusal }>;
 }
 
 /** What the migrate does with objects already in the destination bucket:

@@ -28,6 +28,7 @@ import { useColors } from '../ThemeContext';
 import { useBucketOrigins } from '../queries/backends';
 import { plainError } from '../plainError';
 import { describeBucketEncryption, type ReencryptTransition } from '../bucketEncryption';
+import { LinkifiedText } from './LinkifiedText';
 
 const { Text } = Typography;
 
@@ -109,6 +110,13 @@ export default function ReencryptProposalModal({
   const [selected, setSelected] = useState<string[]>(buckets);
   const [starting, setStarting] = useState(false);
   const [messageApi, msgCtx] = message.useMessage();
+  /** Buckets refused for lack of atomic writes: shown in the dialog, with
+   *  the doc link (a toast cannot hold a link). */
+  const [refusals, setRefusals] = useState<Array<{ bucket: string; error: string }>>([]);
+  // A decrypt (or a job picked per bucket, which may decrypt) can keep the
+  // write gate on a backend without atomic writes; an encrypt never runs
+  // there.
+  const gateMayHold = pickBuckets || transition === 'decrypt';
 
   useEffect(() => {
     // Jobs-page mode starts with NOTHING selected (explicit opt-in);
@@ -116,6 +124,7 @@ export default function ReencryptProposalModal({
     if (open) {
       setSelected(pickBuckets ? [] : buckets);
       setSearch('');
+      setRefusals([]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, pickBuckets, candidates.join('|')]);
@@ -131,8 +140,9 @@ export default function ReencryptProposalModal({
         );
       }
       for (const e of res.errors) {
-        messageApi.error(`${e.bucket}: ${e.error}`);
+        if (!e.atomic_writes) messageApi.error(`${e.bucket}: ${e.error}`);
       }
+      setRefusals(res.errors.filter((e) => e.atomic_writes));
       qc.invalidateQueries({ queryKey: qk.jobs.list() });
       // Only the buckets that failed stay selected: a second Start must not
       // send the started ones again.
@@ -185,19 +195,43 @@ export default function ReencryptProposalModal({
           restarts.
         </Text>
       )}
+      {/* Encryption runs only on backends with atomic writes (N2): every
+          rewrite there is conditional, and the job keeps no write gate. Only
+          a decrypt on a backend without them keeps the gate. */}
       <Alert
-        type="warning"
+        type={gateMayHold ? 'warning' : 'info'}
         showIcon
         style={{ marginBottom: 12, borderRadius: 8 }}
         title="While a bucket is being processed"
         description={
-          <span style={{ fontSize: 12 }}>
-            Reads keep working; <strong>uploads and deletes get a temporary 503</strong> (S3
-            clients retry automatically). Rewritten objects keep their Last-Modified time and
-            their content, so sync tools do not download them again.
+          <span style={{ fontSize: 12 }} data-testid="reencrypt-while-running">
+            {gateMayHold ? (
+              <>
+                Reads keep working. On a backend without atomic writes, <strong>uploads and deletes
+                get a temporary 503</strong> while a decrypt runs (S3 clients retry automatically).{' '}
+              </>
+            ) : (
+              <>
+                Reads, uploads and deletes keep working: each rewrite is conditional on the object
+                the job read, so a client write is never overwritten.{' '}
+              </>
+            )}
+            Rewritten objects keep their Last-Modified time and their content, so sync tools do
+            not download them again.
           </span>
         }
       />
+      {refusals.map((r) => (
+        <Alert
+          key={r.bucket}
+          type="error"
+          showIcon
+          data-testid="reencrypt-atomic-refusal"
+          style={{ marginBottom: 12, borderRadius: 8 }}
+          title={`${r.bucket}: not started`}
+          description={<LinkifiedText text={r.error} />}
+        />
+      ))}
       {pickBuckets ? (
         <>
           <Input.Search

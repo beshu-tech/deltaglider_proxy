@@ -66,7 +66,8 @@ test('enabling a bucket key: the last 6 characters gate the apply; the body pins
 
   const dialog = await screen.findByRole('dialog');
   expect(dialog).toHaveTextContent(/Only new writes change/);
-  expect(dialog).toHaveTextContent(/uploads and deletes get a temporary 503/);
+  // Encryption runs only on backends with atomic writes (N2): no write gate, no 503.
+  expect(dialog).not.toHaveTextContent(/temporary 503/);
   const [validate] = http.callsTo('POST', VALIDATE);
   const body = validate.body as { buckets: Record<string, { backend?: string; encryption: Record<string, string> }> };
   expect(body.buckets['db-archive'].backend).toBe('hetzner-fsn1');

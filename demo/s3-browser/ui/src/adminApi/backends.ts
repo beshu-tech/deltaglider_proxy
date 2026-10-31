@@ -19,6 +19,9 @@ interface BucketOriginResponse {
   real_bucket?: string | null;
   /** Verbatim backend error when this bucket's backend couldn't be listed (503/throttle). */
   unavailable?: string | null;
+  /** Why the bucket is read-only (it encrypts with the proxy, and its
+   *  backend has no proven atomic writes). Absent when writable. */
+  read_only?: string | null;
   /** The server's answer to "how are this bucket's new writes encrypted".
    *  null only when the bucket routes to an undefined backend. */
   effective_encryption?: EffectiveEncryption | null;
@@ -162,6 +165,25 @@ export async function probeBackend(
   return adminJson(`/api/admin/backends/${encodeURIComponent(name)}/probe`, {
     method: 'POST',
     context: `Test connection to ${name}`,
+  });
+}
+
+/** Answer of `POST /backends/:name/capability-probe`. */
+export interface CapabilityProbeResult {
+  backend: string;
+  capability: import('./core').BackendCapabilityVerdict;
+  /** The verdict in plain words. */
+  probe_result: string;
+  read_only_buckets: string[];
+}
+
+/** "Check again": a fresh atomic-writes probe of one backend. The server
+ *  stores the verdict; a backend that proves atomic writes lifts the
+ *  read-only state of its encrypted buckets at once. */
+export async function probeBackendCapability(name: string): Promise<CapabilityProbeResult> {
+  return adminJson(`/api/admin/backends/${encodeURIComponent(name)}/capability-probe`, {
+    method: 'POST',
+    context: `Check atomic writes of ${name}`,
   });
 }
 

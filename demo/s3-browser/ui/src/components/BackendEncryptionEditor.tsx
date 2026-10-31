@@ -24,7 +24,9 @@ import {
   CheckCircleOutlined,
   ReloadOutlined,
 } from '@ant-design/icons';
-import type { BackendEncryptionSummary, BackendEncryptionMode } from '../adminApi';
+import type { BackendCapabilityVerdict, BackendEncryptionSummary, BackendEncryptionMode } from '../adminApi';
+import { atomicWrites } from '../atomicWrites';
+import AtomicWritesNotice from './AtomicWritesNotice';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import { generateAesKeyHex } from '../aesKeyGen';
@@ -84,6 +86,10 @@ interface Props {
   /** Which buckets take this setting (`backendBucketCountText`); shown
    *  under the status line. */
   usage?: string | null;
+  /** The backend's atomic-writes verdict (GET /backends `capability`).
+   *  Proxy AES needs atomic writes: without them the mode and the key
+   *  rotation are disabled, with the reason and "Check again". */
+  capability?: BackendCapabilityVerdict;
 }
 
 export default function BackendEncryptionEditor({
@@ -94,7 +100,10 @@ export default function BackendEncryptionEditor({
   onClearLegacy,
   conversions,
   usage,
+  capability,
 }: Props) {
+  const atomic = atomicWrites(capability);
+  const noAtomic = atomic.kind === 'missing';
   const uid = useId();
   const colors = useColors();
   const { cardStyle, inputRadius } = useCardStyles();
@@ -117,9 +126,14 @@ export default function BackendEncryptionEditor({
   // resulting warning surfaces in the Apply dialog. Keeping the
   // dropdown uniform keeps the UI shape predictable; the error
   // path is always specific.
-  const modeOptions: Array<{ value: BackendEncryptionMode; label: string }> = [
+  const modeOptions: Array<{ value: BackendEncryptionMode; label: string; disabled?: boolean }> = [
     { value: 'none', label: 'None (plaintext)' },
-    { value: 'aes256-gcm-proxy', label: 'AES-256-GCM (proxy-side)' },
+    {
+      value: 'aes256-gcm-proxy',
+      label: noAtomic ? 'AES-256-GCM (proxy-side) — needs atomic writes' : 'AES-256-GCM (proxy-side)',
+      // Encryption needs atomic writes (N2); the current mode stays shown.
+      disabled: noAtomic && current.mode !== 'aes256-gcm-proxy',
+    },
     { value: 'sse-kms', label: 'SSE-KMS (AWS KMS)' },
     { value: 'sse-s3', label: 'SSE-S3 (AWS-managed AES256)' },
   ];
@@ -281,7 +295,7 @@ export default function BackendEncryptionEditor({
                 size="small"
                 icon={<ReloadOutlined />}
                 onClick={() => startEdit('aes256-gcm-proxy')}
-                disabled={keyChangeBlocked}
+                disabled={keyChangeBlocked || noAtomic}
                 title={keyChangeBlocked ? keyChangeBlockedReason : undefined}
               >
                 Rotate key
@@ -310,6 +324,11 @@ export default function BackendEncryptionEditor({
         <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
           {keyChangeBlockedReason}
         </Text>
+      )}
+      {!readOnly && (noAtomic || pending?.mode === 'aes256-gcm-proxy') && (
+        <div style={{ marginTop: 8 }}>
+          <AtomicWritesNotice backend={backendName} capability={capability} />
+        </div>
       )}
       {current.shim_active && !pending && (
         <LegacyKeyBanner backendName={backendName} readOnly={readOnly} onClearLegacy={onClearLegacy} />

@@ -28,7 +28,9 @@ import type { ReactNode } from 'react';
 import { useIsNarrow } from '../useIsNarrow';
 import { BREAKPOINT } from './shared-styles';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
-import { Button, Collapse, Input, Modal, Progress, Radio, Select, Typography } from 'antd';
+import { Alert, Button, Collapse, Input, Modal, Progress, Radio, Select, Typography } from 'antd';
+import { readOnlyBadge } from '../atomicWrites';
+import { LinkifiedText } from './LinkifiedText';
 import { DownOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
 import type { BackendInfo, EffectiveEncryption } from '../adminApi';
 import { describeBucketEncryption } from '../bucketEncryption';
@@ -86,6 +88,9 @@ interface CardProps {
    *  (GET /api/admin/buckets `effective_encryption`). Undefined for a
    *  policy whose bucket does not exist. */
   effectiveEncryption?: EffectiveEncryption | null;
+  /** Why the bucket is read-only (GET /api/admin/buckets `read_only`): it
+   *  encrypts with the proxy, and its backend has no proven atomic writes. */
+  readOnly?: string | null;
   /** Why the Encryption group cannot apply now (unsaved staged edits). */
   encryptionBlockedReason?: string | null;
   /** After the Encryption group applied a change. */
@@ -181,6 +186,7 @@ export default function BucketCard({
   defaultBackend,
   originBackend = null,
   effectiveEncryption,
+  readOnly = null,
   encryptionBlockedReason = null,
   onEncryptionApplied,
   globalCompressionOn,
@@ -338,6 +344,14 @@ export default function BucketCard({
       >
         <SyncOutlined spin aria-hidden style={{ fontSize: 10 }} /> {writesBlocked ? 'Busy' : 'Job finishing'}
         {pct != null ? ` ${pct}%` : ''}
+      </Chip>
+    );
+  }
+  if (readOnly) {
+    // Encryption needs atomic writes (N2): reads work, writes are refused.
+    chips.push(
+      <Chip key="read-only" tone={colors.ACCENT_RED} title={readOnly}>
+        {readOnlyBadge(effectiveEncryption?.backend ?? originBackend ?? defaultName)}
       </Chip>
     );
   }
@@ -698,6 +712,16 @@ export default function BucketCard({
       {/* ── Expanded editor: Public access / Placement / Advanced ── */}
       {expanded && (
         <div style={{ padding: '0 12px 12px', borderTop: `1px solid ${colors.BORDER}` }}>
+          {readOnly && (
+            <Alert
+              type="error"
+              showIcon
+              data-testid="bucket-read-only"
+              style={{ marginTop: 12, borderRadius: 6, fontSize: 12 }}
+              title={readOnlyBadge(effectiveEncryption?.backend ?? originBackend ?? defaultName)}
+              description={<LinkifiedText text={readOnly} />}
+            />
+          )}
           {eff.replication_target_only && (
             <div
               style={{
@@ -790,6 +814,7 @@ export default function BucketCard({
             <BucketEncryptionGroup
               bucket={name}
               eff={effectiveEncryption}
+              capability={backends.find((b) => b.name === effectiveEncryption?.backend)?.capability}
               blockedReason={encryptionBlockedReason}
               onApplied={onEncryptionApplied}
             />

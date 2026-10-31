@@ -45,6 +45,8 @@ import { v } from '../validation';
 import FormField from './FormField';
 import { SPACE } from './shared-styles';
 import { encryptionWord } from '../backendFacts';
+import { atomicWrites } from '../atomicWrites';
+import AtomicWritesNotice from './AtomicWritesNotice';
 import { describeBucketEncryption, modeWord, newBucketEncryptionBlock, type NewBucketEncryption } from '../bucketEncryption';
 import { confirmDialog } from '../confirmDialog';
 import BucketKeySetup, { type BucketKeyValue } from './BucketKeySetup';
@@ -133,8 +135,14 @@ export default function CreateBucketModal({
   const modes = preview?.bucket_modes ?? [];
   const offerKey = modes.includes('aes256-gcm-proxy');
   const offerOff = modes.includes('none') && !!preview && preview.mode !== 'none';
+  // Encryption needs atomic writes (N2): on a backend without them the
+  // choices that encrypt with the proxy are off, with the reason.
+  const atomic = atomicWrites(backends.find((b) => b.name === targetName)?.capability);
+  const sameEncryptsProxy = preview?.mode === 'aes256-gcm-proxy';
+  const noAtomic = atomic.kind === 'missing';
   const choice: NewBucketEncryption['kind'] =
-    (encChoice === 'bucket-key' && !offerKey) || (encChoice === 'off' && !offerOff) ? 'same' : encChoice;
+    (encChoice === 'bucket-key' && (!offerKey || noAtomic)) || (encChoice === 'off' && !offerOff) ? 'same' : encChoice;
+  const choiceNeedsAtomic = choice === 'bucket-key' || (choice === 'same' && sameEncryptsProxy);
   const keyNotReady = choice === 'bucket-key' && !keyValue?.ready;
   const emptyName = !trimmedName;
   const nameMessage =
@@ -146,7 +154,8 @@ export default function CreateBucketModal({
           : null
         : nameError;
   const backendMissing = showPicker && !selectedBackend;
-  const formInvalid = emptyName || nameError !== null || backendMissing || keyNotReady || nameMessage !== null;
+  const formInvalid =
+    emptyName || nameError !== null || backendMissing || keyNotReady || nameMessage !== null || (noAtomic && choiceNeedsAtomic);
 
   const reset = () => {
     setName('');
@@ -205,7 +214,10 @@ export default function CreateBucketModal({
       // admin route answers 409.
       if (
         e instanceof ApiError &&
-        (e.status === 409 || e.code === 'BucketAlreadyOwnedByYou' || e.code === 'BucketAlreadyExists')
+        // A 409 for lack of atomic writes is not a taken name.
+        ((e.status === 409 && e.code !== 'atomic_writes_required') ||
+          e.code === 'BucketAlreadyOwnedByYou' ||
+          e.code === 'BucketAlreadyExists')
       ) {
         setTakenName(trimmed);
         inputRef.current?.focus();
@@ -317,18 +329,25 @@ export default function CreateBucketModal({
             <Text strong style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>
               Encryption
             </Text>
+            {(noAtomic || choiceNeedsAtomic) && targetName && (
+              <AtomicWritesNotice backend={targetName} capability={backends.find((b) => b.name === targetName)?.capability} />
+            )}
             <Radio.Group
               aria-label="Encryption of the new bucket"
               value={choice}
               onChange={(e) => setEncChoice(e.target.value)}
               style={{ display: 'flex', flexDirection: 'column', gap: 4 }}
             >
-              <Radio value="same">
+              <Radio value="same" disabled={noAtomic && sameEncryptsProxy}>
                 {preview.source === 'bucket'
                   ? `Keep the settings this name already has (${describeBucketEncryption(preview).label})`
                   : `Same as backend (${modeWord(preview.mode, preview.encrypts)})`}
               </Radio>
-              {offerKey && <Radio value="bucket-key">Encrypt with a bucket key</Radio>}
+              {offerKey && (
+                <Radio value="bucket-key" disabled={noAtomic}>
+                  Encrypt with a bucket key
+                </Radio>
+              )}
               {offerOff && <Radio value="off">Off for this bucket (plaintext)</Radio>}
             </Radio.Group>
             {choice === 'bucket-key' && name.trim() && !nameError && (

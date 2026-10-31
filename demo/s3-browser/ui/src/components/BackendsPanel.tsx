@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { LinkifiedText } from './LinkifiedText';
 import { CAPABILITY_DOC_URL } from '../linkifyDocUrl';
+import { readOnlyBadge } from '../atomicWrites';
+import { CheckAgainButton } from './AtomicWritesNotice';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, message } from 'antd';
@@ -636,7 +638,28 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               {/* Conditional-write verdict from the startup capability gate
                  (guard B). Absent = not assessed (single-instance, or no
                  client-writable buckets routed here). */}
-              {b.capability?.verdict === 'cas-verified' && (
+              {/* Encryption needs atomic writes (N2): its encrypted buckets
+                 serve reads only. */}
+              {(b.read_only_buckets ?? []).length > 0 && (
+                <Alert
+                  type="error"
+                  showIcon
+                  data-testid="backend-read-only"
+                  title={readOnlyBadge(b.name)}
+                  description={
+                    <>
+                      <LinkifiedText
+                        text={`Encrypted buckets ${(b.read_only_buckets ?? []).join(', ')} are read-only: reads work, writes are refused. Move them to a backend with atomic writes with a migrate job. See ${CAPABILITY_DOC_URL}`}
+                      />
+                      <div style={{ marginTop: 8 }}>
+                        <CheckAgainButton backend={b.name} />
+                      </div>
+                    </>
+                  }
+                  style={{ marginTop: 8, borderRadius: 6 }}
+                />
+              )}
+              {b.capability?.verdict === 'cas-verified' && b.capability.via === 'probe' && (
                 <Alert
                   type="success"
                   showIcon
@@ -654,7 +677,8 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       text={
                         'This backend cannot host the coordination bucket or multi-instance ' +
                         'client-writable buckets. It remains a safe replication target: mark its ' +
-                        `buckets replication_target_only. — see ${CAPABILITY_DOC_URL}`
+                        `buckets replication_target_only. Proxy encryption needs atomic writes too, ` +
+                        `so it is not offered here. — see ${CAPABILITY_DOC_URL}`
                       }
                     />
                   }
@@ -691,6 +715,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 conversions={backendConversions[b.name]}
                 readOnly={!!encryptionEnv(b)}
                 usage={backendBucketCountText(encryptionCounts[b.name])}
+                capability={b.capability}
               />
             </BackendCard>
           ))}

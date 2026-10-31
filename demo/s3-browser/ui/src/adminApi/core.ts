@@ -382,11 +382,15 @@ export interface BackendInfo {
   /** The modes that a bucket's own encryption block accepts on this
    *  backend (GET /backends only). */
   bucket_encryption_modes?: BackendEncryptionMode[];
+  /** Buckets on this backend that are read-only: they encrypt with the
+   *  proxy, and the backend has no proven atomic writes (omitted when
+   *  empty; GET /backends only). */
+  read_only_buckets?: string[];
 }
 
 /** Mirror of the server's coordination::CapabilityVerdict (kebab-case tag). */
-type BackendCapabilityVerdict =
-  | { verdict: 'cas-verified'; via: 'probe' }
+export type BackendCapabilityVerdict =
+  | { verdict: 'cas-verified'; via: 'probe' | 'local-filesystem' }
   | { verdict: 'non-cas' }
   | { verdict: 'unknown'; reason: string };
 
@@ -536,7 +540,36 @@ export async function refusalBody<T>(res: Response, isRefusal: (body: T) => bool
   return data !== null && typeof data === 'object' && isRefusal(data) ? data : null;
 }
 
+/** A change refused because the backend has no atomic writes (HTTP 409,
+ *  N2): encryption needs them. The `error` text says it in plain words. */
+export interface AtomicWritesRefusal {
+  code: 'atomic_writes_required';
+  backend: string;
+  probe: 'non-cas' | 'unknown';
+  /** The probe result in plain words. */
+  probe_result: string;
+  doc_url: string;
+}
+
+/** A JSON POST whose non-2xx answer is a result, not an error, when
+ *  `isRefusal` holds for its body (a 409 that names what it refused);
+ *  any other failure throws the usual ApiError. */
+export async function adminPostOrRefusal<T>(
+  path: string,
+  body: unknown,
+  isRefusal: (body: T) => boolean,
+  context: string,
+): Promise<T> {
+  const res = await adminFetch(path, 'POST', body);
+  const refused = await refusalBody<T>(res, isRefusal);
+  if (refused) return refused;
+  if (!res.ok) await throwApiError(res, context);
+  return safeJson<T>(res);
+}
+
 export interface ConfigApplyResponse {
+  /** Set on a refusal for lack of atomic writes. */
+  atomic_writes?: AtomicWritesRefusal;
   applied: boolean;
   persisted: boolean;
   requires_restart: boolean;
@@ -651,6 +684,8 @@ export type SectionName = 'admission' | 'access' | 'storage' | 'advanced';
  */
 export interface SectionApplyResponse {
   ok: boolean;
+  /** Set on a refusal for lack of atomic writes (409). */
+  atomic_writes?: AtomicWritesRefusal;
   /** Warnings this change introduces. */
   warnings?: string[];
   /** Warnings the current config already produces, unchanged by this apply. */
@@ -745,6 +780,10 @@ export async function putSection<T = unknown>(
   const path = `/api/admin/config/section/${section}`;
   const headers = { ...confirmHeaderMap(confirm), ...(ifMatch ? { 'If-Match': ifMatch } : {}) };
   const res = await adminFetch(path, 'PUT', body, undefined, Object.keys(headers).length > 0 ? headers : undefined);
+  // A 409 for lack of atomic writes is a refusal of the change, not a
+  // stale version: the caller shows its `error`.
+  const atomic = await refusalBody<SectionApplyResponse>(res, (b) => b.ok === false && !!b.atomic_writes);
+  if (atomic) return atomic;
   if (res.status === 409) {
     const data = (await res.json().catch(() => ({}))) as { error?: string };
     throw new ConfigConflictError(
