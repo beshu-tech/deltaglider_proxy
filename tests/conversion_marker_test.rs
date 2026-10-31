@@ -9,7 +9,7 @@
 use crate::common;
 
 use common::TestServer;
-use deltaglider_proxy::storage::encrypting::conversion::{ByIdentity, Window};
+use deltaglider_proxy::storage::encrypting::conversion::{ByIdentity, MarkerState, Window};
 use deltaglider_proxy::storage::{
     EncryptingBackend, EncryptionConfig, EncryptionKey, S3Backend, WitnessGate,
 };
@@ -284,4 +284,722 @@ async fn on_the_filesystem_no_client_key_reaches_the_marker_or_the_claim() {
     let reader = EncryptingBackend::new(fresh, Arc::new(arc_swap::ArcSwap::new(Arc::new(enc))))
         .with_witness("default", Arc::new(WitnessGate::default()));
     assert!(matches!(reader.window_of("releases").await, Window::Open { run: r, .. } if r == run));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// P3 + P4: clients read through the window, the re-encrypt job converts
+// and closes it. Filesystem unless the name ends in `_minio`.
+// ═══════════════════════════════════════════════════════════════════════
+
+const KEY_ID: &str = "conv-key-1";
+const KEY_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+const HISTORY: &[u8] = b"CONVERSION_HISTORY_0123456789";
+/// Each object of a job waits this long, so a test acts while it runs.
+const STALL: (&str, &str) = ("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "200");
+
+struct Conv {
+    server: TestServer,
+    admin: reqwest::Client,
+    bucket: String,
+}
+
+impl Conv {
+    /// A plaintext proxy with `n` plaintext objects `h-NN.txt`, then the
+    /// encryption turned on WITHOUT `plaintext_reads: serve`.
+    async fn start(bucket: &str, n: usize, env: &[(&str, &str)], minio: bool) -> Self {
+        let mut b = TestServer::builder().bucket(bucket);
+        if minio {
+            b = b.s3_endpoint(&common::minio_endpoint_url());
+        }
+        for (k, v) in env {
+            b = b.env(k, v);
+        }
+        let server = b.build().await;
+        let admin = common::admin_http_client(&server.endpoint()).await;
+        let conv = Self {
+            server,
+            admin,
+            bucket: bucket.to_string(),
+        };
+        for i in 0..n {
+            let (status, _) = conv.put(&format!("h-{i:02}.txt"), &body_of(i)).await;
+            assert_eq!(status, 200);
+        }
+        conv.encrypt(serde_json::json!({
+            "mode": "aes256-gcm-proxy", "key": TEST_KEY, "key_id": KEY_ID,
+        }))
+        .await;
+        conv
+    }
+
+    async fn encrypt(&self, body: serde_json::Value) {
+        let resp = self
+            .admin
+            .put(format!(
+                "{}/_/api/admin/config/section/storage",
+                self.server.endpoint()
+            ))
+            .header("X-DGP-Confirm-Plaintext-Refusal", "backend:default")
+            .json(&serde_json::json!({ "backend_encryption": body }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        assert!(
+            status.is_success(),
+            "{status} {}",
+            resp.text().await.unwrap()
+        );
+    }
+
+    fn url(&self, key: &str) -> String {
+        format!("{}/{}/{key}", self.server.endpoint(), self.bucket)
+    }
+
+    async fn put(&self, key: &str, body: &[u8]) -> (u16, String) {
+        let r = self
+            .server
+            .http()
+            .put(self.url(key))
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        (r.status().as_u16(), r.text().await.unwrap())
+    }
+
+    async fn get(&self, key: &str) -> (u16, Vec<u8>) {
+        let r = self.server.http().get(self.url(key)).send().await.unwrap();
+        (r.status().as_u16(), r.bytes().await.unwrap().to_vec())
+    }
+
+    async fn head(&self, key: &str) -> u16 {
+        let r = self.server.http().head(self.url(key)).send().await.unwrap();
+        r.status().as_u16()
+    }
+
+    async fn range(&self, key: &str, spec: &str) -> (u16, Vec<u8>) {
+        let r = self
+            .server
+            .http()
+            .get(self.url(key))
+            .header("range", spec)
+            .send()
+            .await
+            .unwrap();
+        (r.status().as_u16(), r.bytes().await.unwrap().to_vec())
+    }
+
+    async fn reencrypt(&self, open_window: bool) -> i64 {
+        let v: serde_json::Value = self
+            .admin
+            .post(format!(
+                "{}/_/api/admin/jobs/reencrypt",
+                self.server.endpoint()
+            ))
+            .json(&serde_json::json!({ "buckets": [self.bucket], "open_window": open_window }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v["started"][0]["job_id"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("no job: {v}"))
+    }
+
+    async fn job(&self, id: i64) -> serde_json::Value {
+        let v: serde_json::Value = self
+            .admin
+            .get(format!("{}/_/api/admin/jobs", self.server.endpoint()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == format!("maintenance:{id}"))
+            .cloned()
+            .unwrap_or_else(|| panic!("job {id}: {v}"))
+    }
+
+    async fn wait_done(&self) {
+        for _ in 0..1200 {
+            let v: serde_json::Value = self
+                .admin
+                .get(format!(
+                    "{}/_/api/admin/jobs/bucket/{}",
+                    self.server.endpoint(),
+                    self.bucket
+                ))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if v["active"].is_null() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the job on {} did not finish", self.bucket);
+    }
+
+    async fn failures(&self, id: i64) -> Vec<(String, String)> {
+        let v: serde_json::Value = self
+            .admin
+            .get(format!(
+                "{}/_/api/admin/jobs/maintenance:{id}/failures?limit=500",
+                self.server.endpoint()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["object_key"].as_str().unwrap().to_string(),
+                    f["error"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    async fn audit(&self, action: &str) -> Vec<String> {
+        let v: serde_json::Value = self
+            .admin
+            .get(format!(
+                "{}/_/api/admin/audit?limit=500",
+                self.server.endpoint()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v.get("entries")
+            .and_then(|e| e.as_array())
+            .or_else(|| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter(|e| e["action"] == action && e["bucket"] == self.bucket.as_str())
+            .map(|e| e["target"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// An encrypting wrapper on the proxy's own storage (another node of
+    /// the same backend), keyed like the proxy.
+    async fn node(&self, key_hex: &str) -> Node {
+        let mut enc = EncryptionConfig::default();
+        enc.key = Some(EncryptionKey::from_hex(key_hex).unwrap());
+        enc.key_id = Some(KEY_ID.into());
+        let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(enc)));
+        match self.server.data_dir() {
+            Some(root) => Node::Fs(
+                EncryptingBackend::new(
+                    deltaglider_proxy::storage::FilesystemBackend::new(root.to_path_buf())
+                        .await
+                        .unwrap(),
+                    cfg,
+                )
+                .with_witness("default", Arc::new(WitnessGate::default())),
+            ),
+            None => Node::S3(wrapper().await),
+        }
+    }
+
+    fn root(&self) -> std::path::PathBuf {
+        self.server.data_dir().expect("filesystem").to_path_buf()
+    }
+
+    fn marker_file(&self) -> std::path::PathBuf {
+        self.root().join(&self.bucket).join(".dg-conversion")
+    }
+
+    /// How many of `h-00..h-{n}` are still plaintext on disk.
+    fn plaintext_left(&self, n: usize) -> usize {
+        (0..n)
+            .filter(|i| {
+                std::fs::read(self.blob(&format!("h-{i:02}.txt")))
+                    .is_ok_and(|b| b.windows(HISTORY.len()).any(|w| w == HISTORY))
+            })
+            .count()
+    }
+
+    fn blob(&self, key: &str) -> std::path::PathBuf {
+        self.root().join(&self.bucket).join("deltaspaces").join(key)
+    }
+
+    /// A plaintext file written on the backend, past the proxy, stored at
+    /// `at`.
+    fn plant(&self, key: &str, body: &[u8], at: std::time::SystemTime) {
+        let path = self.blob(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+}
+
+enum Node {
+    Fs(EncryptingBackend<deltaglider_proxy::storage::FilesystemBackend>),
+    S3(EncryptingBackend<S3Backend>),
+}
+
+impl Node {
+    async fn open(&self, bucket: &str) -> [u8; 16] {
+        match self {
+            Node::Fs(w) => w.open_conversion(bucket, 7).await.unwrap(),
+            Node::S3(w) => w.open_conversion(bucket, 7).await.unwrap(),
+        }
+    }
+    async fn status(&self, bucket: &str) -> MarkerState {
+        match self {
+            Node::Fs(w) => w.conversion_status(bucket).await.unwrap(),
+            Node::S3(w) => w.conversion_status(bucket).await.unwrap(),
+        }
+    }
+}
+
+fn body_of(i: usize) -> Vec<u8> {
+    [HISTORY, format!(" object {i}").as_bytes()].concat()
+}
+
+fn ours(state: &MarkerState) -> Option<deltaglider_proxy::storage::encrypting::conversion::Fields> {
+    match state {
+        MarkerState::Ours { fields, .. } => Some(*fields),
+        _ => None,
+    }
+}
+
+/// (a) A bucket with plaintext history turns on encryption without
+/// `plaintext_reads: serve`: its history is refused until a conversion
+/// opens; then GET, HEAD and range reads of it succeed, before and during
+/// the job; the job converts everything and closes the window.
+#[tokio::test]
+async fn clients_read_the_history_through_the_window_while_the_job_converts() {
+    const N: usize = 24;
+    let c = Conv::start("convread", N, &[STALL], false).await;
+    let (status, _) = c.get("h-00.txt").await;
+    assert_eq!(status, 500, "no window: refused");
+
+    c.node(TEST_KEY).await.open(&c.bucket).await;
+    // The proxy cached the window as closed: the refusal reads it again.
+    assert_eq!(c.get("h-00.txt").await, (200, body_of(0)));
+    assert_eq!(c.head("h-01.txt").await, 200);
+    assert_eq!(
+        c.range("h-02.txt", "bytes=0-9").await,
+        (206, body_of(2)[..10].to_vec())
+    );
+    assert_eq!(
+        c.range("h-02.txt", "bytes=5-").await,
+        (206, body_of(2)[5..].to_vec())
+    );
+
+    let id = c.reencrypt(false).await;
+    // During the job: every object reads, plaintext or converted.
+    let mut seen_mid = false;
+    for round in 0..200 {
+        let left = c.plaintext_left(N);
+        if left == 0 {
+            break;
+        }
+        seen_mid |= left < N;
+        let i = round % N;
+        assert_eq!(
+            c.get(&format!("h-{i:02}.txt")).await,
+            (200, body_of(i)),
+            "{left} plaintext left"
+        );
+    }
+    assert!(seen_mid, "the reads ran while the job converted");
+    c.wait_done().await;
+    let job = c.job(id).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(c.plaintext_left(N), 0);
+    assert_eq!(
+        c.node(TEST_KEY).await.status(&c.bucket).await,
+        MarkerState::Absent
+    );
+    assert!(!c.marker_file().exists());
+    assert_eq!(c.audit("encryption_conversion_closed").await.len(), 1);
+    for i in 0..N {
+        assert_eq!(c.get(&format!("h-{i:02}.txt")).await, (200, body_of(i)));
+    }
+}
+
+/// (b) A plaintext object planted on the backend after the cutoff plus the
+/// grace (the real 300 s: its stored time is an hour ahead) is refused for
+/// clients while the history reads; the job converts it, and lists it as
+/// adopted after the cutoff (failure ring, run summary, audit), then
+/// closes the window.
+#[tokio::test]
+async fn a_plant_after_the_cutoff_is_refused_for_clients_and_adopted_by_the_job() {
+    const N: usize = 4;
+    let c = Conv::start("convplant", N, &[], false).await;
+    c.node(TEST_KEY).await.open(&c.bucket).await;
+    let planted = b"PLANTED_AFTER_THE_CUTOFF";
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    c.plant("planted.txt", planted, later);
+    // Inside the grace (stored 100 s after the cutoff): still history.
+    let inside = std::time::SystemTime::now() + std::time::Duration::from_secs(100);
+    c.plant("in-grace.txt", b"IN_GRACE", inside);
+
+    assert_eq!(c.get("h-00.txt").await, (200, body_of(0)));
+    assert_eq!(c.get("in-grace.txt").await, (200, b"IN_GRACE".to_vec()));
+    let (status, body) = c.get("planted.txt").await;
+    // A client sees a plain 500; the log has the refusal's text (its words
+    // are checked in `read_rule_tests.rs`).
+    assert_eq!(status, 500, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(c.head("planted.txt").await, 500);
+
+    let id = c.reencrypt(false).await;
+    c.wait_done().await;
+    let job = c.job(id).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(job["progress"]["failed"], 0, "{job}");
+    let note = job["last_error"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("1 object(s) adopted after the conversion's cutoff"),
+        "{job}"
+    );
+    let failures = c.failures(id).await;
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|(_, e)| e.starts_with("adopted_after_cutoff"))
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>(),
+        ["planted.txt"],
+        "{failures:?}"
+    );
+    assert_eq!(
+        c.audit("encryption_conversion_adopted_after_cutoff")
+            .await
+            .len(),
+        1
+    );
+    assert!(c.audit("encryption_conversion_closed").await[0].contains("1 object(s) adopted"));
+    // Converted: now sealed, and it reads.
+    assert_eq!(c.get("planted.txt").await, (200, planted.to_vec()));
+    assert!(!std::fs::read(c.blob("planted.txt"))
+        .unwrap()
+        .windows(planted.len())
+        .any(|w| w == planted));
+    assert_eq!(
+        c.node(TEST_KEY).await.status(&c.bucket).await,
+        MarkerState::Absent
+    );
+}
+
+/// (c) `open_window: true` opens the marker before the job; the job's
+/// success closes it. Re-planting the old marker body afterwards (a
+/// replay) opens the OLD window again, whose cutoff is in the past: a
+/// plaintext object planted now is still refused.
+#[tokio::test]
+async fn a_replayed_marker_does_not_serve_a_new_plant() {
+    const N: usize = 8;
+    let c = Conv::start(
+        "convreplay",
+        N,
+        &[STALL, ("DGP_TEST_CONVERSION_GRACE_SECS", "0")],
+        false,
+    )
+    .await;
+    let id = c.reencrypt(true).await;
+    // The marker is written before the job is queued.
+    let old_body = std::fs::read(c.marker_file()).expect("the marker of open_window");
+    assert_eq!(c.audit("encryption_conversion_opened").await.len(), 1);
+    c.wait_done().await;
+    assert_eq!(c.job(id).await["status"], "succeeded");
+    assert!(!c.marker_file().exists(), "closed on success");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    c.plant("late.txt", b"LATE_PLANT", std::time::SystemTime::now());
+    std::fs::write(c.marker_file(), &old_body).unwrap();
+    assert!(
+        ours(&c.node(TEST_KEY).await.status(&c.bucket).await).is_some(),
+        "the replayed marker opens"
+    );
+    let (status, _) = c.get("late.txt").await;
+    assert_eq!(status, 500, "stored after the replayed cutoff: refused");
+    // The converted history reads (sealed now).
+    assert_eq!(c.get("h-00.txt").await, (200, body_of(0)));
+}
+
+/// (d) A graceful stop mid-walk leaves the marker; clients still read the
+/// rest of the history while the job is down; the resume extends the
+/// deadline by identity (the cutoff stays) and finishes, then closes it.
+#[tokio::test]
+async fn a_stopped_job_keeps_the_window_and_the_resume_extends_it() {
+    const N: usize = 60;
+    let mut c = Conv::start("convresume", N, &[STALL], false).await;
+    let id = c.reencrypt(true).await;
+    let before = ours(&c.node(TEST_KEY).await.status(&c.bucket).await).expect("opened");
+    for _ in 0..400 {
+        if c.plaintext_left(N) < N {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    c.server.terminate();
+    let left = c.plaintext_left(N);
+    assert!(
+        left > 0 && left < N,
+        "stopped mid-walk ({left} of {N} left)"
+    );
+    let at_stop = ours(&c.node(TEST_KEY).await.status(&c.bucket).await).expect("kept");
+    assert_eq!(at_stop.cutoff, before.cutoff);
+    assert_eq!(at_stop.run, before.run);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // Boot without the stall: the job resumes and finishes. Clients read
+    // a plaintext object at once.
+    c.server
+        .respawn_with_env(&[
+            (STALL.0, "0"),
+            (
+                "DGP_BOOTSTRAP_PASSWORD_HASH",
+                common::TEST_BOOTSTRAP_PASSWORD_HASH,
+            ),
+        ])
+        .await;
+    c.admin = common::admin_http_client(&c.server.endpoint()).await;
+    c.wait_done().await;
+    let job = c.job(id).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(c.plaintext_left(N), 0);
+    let extended = c.audit("encryption_conversion_extended").await;
+    assert!(!extended.is_empty(), "the resume extended the deadline");
+    let cutoff = format!("cutoff {} kept", before.cutoff);
+    assert!(extended.iter().all(|t| t.contains(&cutoff)), "{extended:?}");
+    let last = extended[0]
+        .rsplit("-> ")
+        .next()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    assert!(
+        last > before.deadline,
+        "{extended:?} vs {}",
+        before.deadline
+    );
+    assert!(!c.marker_file().exists());
+    for i in 0..N {
+        assert_eq!(c.get(&format!("h-{i:02}.txt")).await, (200, body_of(i)));
+    }
+}
+
+/// (d') A cancel keeps the window: clients still read the history.
+#[tokio::test]
+async fn a_cancelled_job_keeps_the_window() {
+    const N: usize = 40;
+    let c = Conv::start("convcancel", N, &[STALL], false).await;
+    let id = c.reencrypt(true).await;
+    let resp = c
+        .admin
+        .post(format!(
+            "{}/_/api/admin/jobs/maintenance:{id}/cancel",
+            c.server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    c.wait_done().await;
+    assert_eq!(c.job(id).await["status"], "cancelled");
+    assert!(c.plaintext_left(N) > 0);
+    assert!(ours(&c.node(TEST_KEY).await.status(&c.bucket).await).is_some());
+    for i in 0..N {
+        assert_eq!(c.get(&format!("h-{i:02}.txt")).await, (200, body_of(i)));
+    }
+}
+
+/// (e) A foreign body PUT over the marker while the job runs: the close
+/// is blocked, audited, and the run does not report success.
+#[tokio::test]
+async fn a_foreign_re_put_blocks_the_close_and_the_run_reports_it() {
+    const N: usize = 24;
+    let c = Conv::start("convforeign", N, &[STALL], false).await;
+    let id = c.reencrypt(true).await;
+    for _ in 0..400 {
+        if c.plaintext_left(N) < N {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    std::fs::write(c.marker_file(), b"planted").unwrap();
+    c.wait_done().await;
+    let job = c.job(id).await;
+    assert_eq!(job["status"], "completed_with_errors", "{job}");
+    let failures = c.failures(id).await;
+    assert!(
+        failures
+            .iter()
+            .any(|(k, e)| k == ".dg/facts/!!conversion" && e.contains("did not close")),
+        "{failures:?}"
+    );
+    assert_eq!(
+        c.audit("encryption_conversion_close_blocked").await.len(),
+        1
+    );
+    assert_eq!(std::fs::read(c.marker_file()).unwrap(), b"planted");
+    assert_eq!(c.plaintext_left(N), 0, "the objects are converted anyway");
+}
+
+/// (f) A key rotation during the window keeps it (the marker opens with
+/// the keyring): history still reads, and the job closes it.
+#[tokio::test]
+async fn a_key_rotation_mid_window_keeps_it() {
+    const N: usize = 6;
+    let c = Conv::start("convrotate", N, &[], false).await;
+    c.node(TEST_KEY).await.open(&c.bucket).await;
+    assert_eq!(c.get("h-00.txt").await, (200, body_of(0)));
+    c.encrypt(serde_json::json!({
+        "mode": "aes256-gcm-proxy", "key": KEY_B, "key_id": "conv-key-2",
+        "legacy_key": TEST_KEY, "legacy_key_id": KEY_ID,
+    }))
+    .await;
+    // The apply rebuilt the engine (fresh cache): the window still opens.
+    assert_eq!(c.get("h-01.txt").await, (200, body_of(1)));
+    let id = c.reencrypt(false).await;
+    c.wait_done().await;
+    assert_eq!(c.job(id).await["status"], "succeeded");
+    assert!(!c.marker_file().exists());
+    for i in 0..N {
+        assert_eq!(c.get(&format!("h-{i:02}.txt")).await, (200, body_of(i)));
+    }
+}
+
+/// (g) A metadata backfill is refused while a marker exists (it would move
+/// the stored time of the history past the cutoff), and accepted after.
+#[tokio::test]
+async fn backfill_is_refused_while_a_marker_exists() {
+    let c = Conv::start("convbackfill", 2, &[], false).await;
+    let backfill = || async {
+        c.admin
+            .post(format!(
+                "{}/_/api/admin/jobs/backfill-metadata",
+                c.server.endpoint()
+            ))
+            .json(&serde_json::json!({ "buckets": [c.bucket] }))
+            .send()
+            .await
+            .unwrap()
+    };
+    c.node(TEST_KEY).await.open(&c.bucket).await;
+    let resp = backfill().await;
+    assert_eq!(resp.status().as_u16(), 409);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("being converted to encryption"), "{text}");
+    let id = c.reencrypt(false).await;
+    c.wait_done().await;
+    assert_eq!(c.job(id).await["status"], "succeeded");
+    let resp = backfill().await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+}
+
+/// A rewrite that fails keeps the window open (the run settles with
+/// errors, clients still read the object); the next run converts it and
+/// closes the window.
+#[tokio::test]
+async fn a_failed_rewrite_keeps_the_window() {
+    use std::os::unix::fs::PermissionsExt;
+    const N: usize = 4;
+    let c = Conv::start("convfail", N, &[], false).await;
+    let blocked = c.blob("h-01.txt");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&blocked).is_ok() {
+        // Root reads any file: this check cannot fail a rewrite here.
+        eprintln!("skipped: the test runs as root");
+        return;
+    }
+    let id = c.reencrypt(true).await;
+    c.wait_done().await;
+    let job = c.job(id).await;
+    assert_eq!(job["status"], "completed_with_errors", "{job}");
+    let failures = c.failures(id).await;
+    assert!(
+        failures
+            .iter()
+            .any(|(k, e)| k == "h-01.txt" && e.starts_with("rewrite_failed")),
+        "{failures:?}"
+    );
+    assert!(
+        ours(&c.node(TEST_KEY).await.status(&c.bucket).await).is_some(),
+        "kept open"
+    );
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(c.get("h-01.txt").await, (200, body_of(1)), "history reads");
+    let id = c.reencrypt(false).await;
+    c.wait_done().await;
+    assert_eq!(c.job(id).await["status"], "succeeded");
+    assert!(!c.marker_file().exists());
+}
+
+/// (a) + (b) on MinIO: the cutoff is MinIO's clock and `Last-Modified` the
+/// stored time (grace 0 here, so a plant one second later is past it).
+#[tokio::test]
+async fn history_reads_and_a_plant_is_adopted_minio() {
+    skip_unless_minio!();
+    let bucket = common::unique_bucket("convminio");
+    let c = Conv::start(&bucket, 4, &[("DGP_TEST_CONVERSION_GRACE_SECS", "0")], true).await;
+    assert_eq!(c.get("h-00.txt").await.0, 500, "no window");
+    // Times are whole seconds and the grace is 0: the history must be
+    // stored a second before the cutoff.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    c.node(TEST_KEY).await.open(&bucket).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    common::minio_client()
+        .await
+        .put_object()
+        .bucket(&bucket)
+        .key("planted.txt")
+        .body(b"PLANTED".to_vec().into())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(c.get("h-00.txt").await, (200, body_of(0)));
+    assert_eq!(c.head("h-01.txt").await, 200);
+    assert_eq!(
+        c.range("h-02.txt", "bytes=0-9").await,
+        (206, body_of(2)[..10].to_vec())
+    );
+    assert_eq!(c.get("planted.txt").await.0, 500, "after the cutoff");
+
+    let id = c.reencrypt(false).await;
+    c.wait_done().await;
+    let job = c.job(id).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let adopted: Vec<_> = c
+        .failures(id)
+        .await
+        .into_iter()
+        .filter(|(_, e)| e.starts_with("adopted_after_cutoff"))
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(adopted, ["planted.txt"]);
+    assert_eq!(c.get("planted.txt").await, (200, b"PLANTED".to_vec()));
+    assert_eq!(
+        c.node(TEST_KEY).await.status(&bucket).await,
+        MarkerState::Absent
+    );
 }

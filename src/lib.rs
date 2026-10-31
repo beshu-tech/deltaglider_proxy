@@ -1346,6 +1346,34 @@ mod source_guards {
         );
     }
 
+    /// Conversion marker P3: the job's read rule serves plaintext that a
+    /// client may not read. Only the re-encrypt job enters it: the proof
+    /// that opens the scope is made in `maintenance/worker.rs` alone, and
+    /// production code enters the scope nowhere else.
+    #[test]
+    fn only_the_conversion_job_reads_as_the_job() {
+        let made = ["ConversionReadProof", " { _private"].concat();
+        let entered = ["as_conversion", "_job("].concat();
+        let for_tests = ["ConversionReadProof::", "for_tests("].concat();
+        let mut bad = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            let code = crate::source_scan::prod_text(&text);
+            if code.contains(made.as_str()) && file != "src/maintenance/worker.rs" {
+                bad.push(format!("{file}: makes the proof"));
+            }
+            let enters = code.matches(entered.as_str()).count();
+            // The re-encrypt job (the definition has generics before `(`).
+            let allowed = usize::from(file == "src/maintenance/worker.rs");
+            if enters != allowed {
+                bad.push(format!("{file}: enters the job's scope {enters} time(s)"));
+            }
+            if code.contains(for_tests.as_str()) {
+                bad.push(format!("{file}: the test proof in production code"));
+            }
+        }
+        assert!(bad.is_empty(), "the conversion job's read rule: {bad:?}");
+    }
+
     /// Is `FileMetadata {` at `idx` a struct literal (not a type position
     /// such as `-> FileMetadata {`, `impl FileMetadata {`)?
     fn is_file_metadata_literal(line: &str, idx: usize) -> bool {

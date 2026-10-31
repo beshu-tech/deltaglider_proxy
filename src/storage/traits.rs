@@ -1397,6 +1397,19 @@ pub trait StorageBackend: Send + Sync {
         op: MarkerWrite<'_>,
     ) -> impl Future<Output = Result<ClaimOutcome, StorageError>> + Send;
 
+    /// The conversion of `bucket` (`storage/encrypting/conversion.rs`):
+    /// its stored marker, open, extend or close it. Only the encrypting
+    /// wrapper has one; a raw backend answers
+    /// [`ConversionReply::NotEncrypted`](crate::storage::encrypting::conversion::ConversionReply).
+    /// No default: a wrapper must forward it.
+    fn conversion(
+        &self,
+        bucket: &str,
+        op: crate::storage::encrypting::conversion::ConversionOp,
+    ) -> impl Future<
+        Output = Result<crate::storage::encrypting::conversion::ConversionReply, StorageError>,
+    > + Send;
+
     /// A name for the STORAGE behind `bucket`: two bucket names that store
     /// into the same real bucket (policy aliases) get the same identity, so
     /// the engine's deltaspace locks serialise them. An unrouted bucket is

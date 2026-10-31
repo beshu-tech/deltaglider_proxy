@@ -1410,6 +1410,14 @@ impl StorageBackend for RoutingBackend {
     ) -> Result<crate::storage::ClaimOutcome, StorageError> {
         route_existing!(self, bucket, write_conversion_marker, op)
     }
+    async fn conversion(
+        &self,
+        bucket: &str,
+        op: crate::storage::encrypting::conversion::ConversionOp,
+    ) -> Result<crate::storage::encrypting::conversion::ConversionReply, crate::storage::StorageError>
+    {
+        route_existing!(self, bucket, conversion, op)
+    }
 
     // === Multipart upload (Phase B) ===
 
@@ -1924,6 +1932,16 @@ mod tests {
             _: crate::storage::MarkerWrite<'_>,
         ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
             Ok(crate::storage::ClaimOutcome::Written)
+        }
+        async fn conversion(
+            &self,
+            _bucket: &str,
+            _op: crate::storage::encrypting::conversion::ConversionOp,
+        ) -> Result<
+            crate::storage::encrypting::conversion::ConversionReply,
+            crate::storage::StorageError,
+        > {
+            Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
         }
 
         async fn get_passthrough_metadata_for_rewrite(

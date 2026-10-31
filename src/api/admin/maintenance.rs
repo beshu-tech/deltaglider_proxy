@@ -88,6 +88,10 @@ impl From<MaintenanceJob> for MaintenanceJobView {
 #[derive(Debug, Deserialize)]
 pub struct ReencryptRequest {
     pub buckets: Vec<super::path_guard::AdminBucket>,
+    /// Open the bucket's conversion window first (or reuse the valid one):
+    /// clients read its plaintext history until the job closes it.
+    #[serde(default)]
+    pub open_window: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +175,18 @@ pub async fn start_reencrypt(
             });
             continue;
         }
+        if req.open_window {
+            let engine = state.s3_state.engine.load().clone();
+            if let Err(e) =
+                crate::maintenance::conversion::open_window(&engine, &key, "admin").await
+            {
+                errors.push(ReencryptError {
+                    bucket: bucket.to_string(),
+                    error: format!("could not open the conversion window: {e}"),
+                });
+                continue;
+            }
+        }
         let created = {
             let db = db.lock().await;
             let created = db.maintenance_create_job(
@@ -240,6 +256,25 @@ pub async fn start_backfill(
     AdminJson(req): AdminJson<BackfillRequest>,
 ) -> Result<Json<ReencryptResponse>, AdminError> {
     let (db, real, buckets) = check_job_request(&state, req.buckets).await?;
+
+    // A backfill moves the stored time of the objects it stamps: in a
+    // bucket in conversion it would push plaintext history past the cutoff.
+    let engine = state.s3_state.engine.load().clone();
+    for bucket in &buckets {
+        let key = bucket.to_ascii_lowercase();
+        if !real.contains(&key) {
+            continue;
+        }
+        match crate::maintenance::conversion::marker_exists(&engine, &key).await {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(AdminError::conflict(
+                    crate::maintenance::conversion::backfill_refusal(&key),
+                ))
+            }
+            Err(e) => return Err(AdminError::unavailable(e)),
+        }
+    }
 
     let params = serde_json::to_string(&crate::maintenance::backfill::BackfillParams {
         refresh_last_modified: req.refresh_last_modified,

@@ -558,6 +558,14 @@ impl FileMetadata {
         }
     }
 
+    /// `self` as a backend read with the stored time `at` (unix seconds)
+    /// would give it, for the read rule's unit tests.
+    #[cfg(test)]
+    pub(crate) fn stored_at_for_tests(mut self, at: Option<i64>) -> Self {
+        self.stored_last_modified = at.and_then(|s| DateTime::from_timestamp(s, 0));
+        self
+    }
+
     /// Convert metadata to a bare-key map (keys like `dg-tool`, `user-{key}`).
     /// This is the single source of truth for the metadata-to-map conversion.
     /// Used by the S3 backend for `x-amz-meta-*` headers

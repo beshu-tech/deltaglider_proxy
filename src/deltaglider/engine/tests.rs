@@ -204,6 +204,14 @@ impl crate::storage::StorageBackend for NullInner {
     ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
         Ok(crate::storage::ClaimOutcome::Written)
     }
+    async fn conversion(
+        &self,
+        _bucket: &str,
+        _op: crate::storage::encrypting::conversion::ConversionOp,
+    ) -> Result<crate::storage::encrypting::conversion::ConversionReply, crate::storage::StorageError>
+    {
+        Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
+    }
     async fn scan_deltaspace(
         &self,
         _: &str,

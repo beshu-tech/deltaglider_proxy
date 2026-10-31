@@ -45,6 +45,12 @@ pub struct TestSeams {
     /// `DGP_TEST_FORCE_NONCAS_BACKEND` (comma-separated): backends that get
     /// a forced NonCas capability verdict without a probe.
     pub force_noncas_backends: BTreeSet<String>,
+    /// `DGP_TEST_CONVERSION_GRACE_SECS`: the grace after a conversion's
+    /// cutoff (default 300 s), so a test can plant an object after it.
+    pub conversion_grace_secs: Option<i64>,
+    /// `DGP_TEST_CONVERSION_WINDOW_SECS`: the length of a conversion window
+    /// (default 7 days), so a test can see a deadline pass.
+    pub conversion_window_secs: Option<i64>,
 }
 
 impl TestSeams {
@@ -74,6 +80,10 @@ impl TestSeams {
                         .collect()
                 })
                 .unwrap_or_default(),
+            conversion_grace_secs: lookup_parse::<i64>(env, "DGP_TEST_CONVERSION_GRACE_SECS")
+                .filter(|n| *n >= 0),
+            conversion_window_secs: lookup_parse::<i64>(env, "DGP_TEST_CONVERSION_WINDOW_SECS")
+                .filter(|n| *n > 0),
         }
     }
 }
@@ -123,7 +133,11 @@ mod tests {
             ("DGP_TEST_READ_OTHER_FORM_STALL_MS", "400"),
             ("DGP_TEST_MAX_JOB_PAGES", "3"),
             ("DGP_TEST_FORCE_NONCAS_BACKEND", " b2sim, ,other "),
+            ("DGP_TEST_CONVERSION_GRACE_SECS", "0"),
+            ("DGP_TEST_CONVERSION_WINDOW_SECS", "30"),
         ]);
+        assert_eq!(t.conversion_grace_secs, Some(0));
+        assert_eq!(t.conversion_window_secs, Some(30));
         assert_eq!(t.complete_stall_ms, 1500);
         assert_eq!(t.fail_part_once, Some(2));
         assert_eq!(t.part_delay_ms, Some(150), "the default delay");
@@ -146,6 +160,8 @@ mod tests {
             ("DGP_TEST_PART_BARRIER", "0"),
             ("DGP_TEST_PART_DELAY_MS", "500"),
             ("DGP_TEST_MAX_JOB_PAGES", "0"),
+            ("DGP_TEST_CONVERSION_GRACE_SECS", "-1"),
+            ("DGP_TEST_CONVERSION_WINDOW_SECS", "0"),
         ]);
         assert_eq!(t, TestSeams::default());
     }

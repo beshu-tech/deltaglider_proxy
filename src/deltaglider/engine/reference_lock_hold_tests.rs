@@ -754,6 +754,14 @@ impl crate::storage::StorageBackend for FencingFs {
     ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
         self.inner.write_conversion_marker(b, op).await
     }
+    async fn conversion(
+        &self,
+        bucket: &str,
+        op: crate::storage::encrypting::conversion::ConversionOp,
+    ) -> Result<crate::storage::encrypting::conversion::ConversionReply, crate::storage::StorageError>
+    {
+        self.inner.conversion(bucket, op).await
+    }
     async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<Meta>, StorageError> {
         self.inner.scan_deltaspace(b, p).await
     }

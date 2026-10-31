@@ -597,6 +597,14 @@ impl StorageBackend for FaultyFs {
             .await?;
         self.inner.write_conversion_marker(bucket, op).await
     }
+    async fn conversion(
+        &self,
+        bucket: &str,
+        op: crate::storage::encrypting::conversion::ConversionOp,
+    ) -> Result<crate::storage::encrypting::conversion::ConversionReply, crate::storage::StorageError>
+    {
+        self.inner.conversion(bucket, op).await
+    }
 
     async fn scan_deltaspace(
         &self,

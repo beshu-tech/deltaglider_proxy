@@ -93,7 +93,9 @@ pub(super) enum MissDecision {
 /// THE listed-size decision for an entry without a listing token. Pure.
 ///
 /// * `stored_size`: the size the LIST reported.
-/// * `plaintext_ok`: the bucket's read rule serves unsealed objects. Then
+/// * `plaintext_ok`: the bucket's read rule serves unsealed objects (it
+///   writes plaintext, `plaintext_reads: serve`, or its conversion window
+///   is open: the wrapper treats an open window the same way). Then
 ///   a listed passthrough may be plaintext, and its stored size is its
 ///   size: inverting it would be wrong, and a HEAD per plaintext object
 ///   (a bucket that a re-encrypt job converts) would be a HEAD storm. Where

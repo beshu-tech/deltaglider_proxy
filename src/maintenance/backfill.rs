@@ -163,6 +163,18 @@ pub(crate) async fn execute_backfill_phases(
         .transpose()?
         .unwrap_or_default();
 
+    // A conversion opened after this job was queued: refuse here too (the
+    // admin start refuses it up front).
+    match super::conversion::marker_exists(&state.engine.load(), &job.bucket).await {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(super::worker::PhaseStop::Failed(
+                super::conversion::backfill_refusal(&job.bucket),
+            ))
+        }
+        Err(e) => return Err(super::worker::PhaseStop::FailedTransient(e)),
+    }
+
     // ── Drain in-flight writes admitted before the gate armed. ──
     drain_inflight_writes(state, &job.bucket).await?;
 

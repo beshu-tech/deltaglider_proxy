@@ -588,6 +588,16 @@ impl Metrics {
             .register(Box::new(crate::storage::LISTING_TOKEN_MISSES.clone()))
             .expect("duplicate metric name");
         registry
+            .register(Box::new(
+                crate::storage::encrypting::conversion::PLAINTEXT_READS.clone(),
+            ))
+            .expect("duplicate metric name");
+        registry
+            .register(Box::new(
+                crate::storage::encrypting::conversion::ADOPTED_AFTER_CUTOFF.clone(),
+            ))
+            .expect("duplicate metric name");
+        registry
             .register(Box::new(crate::s3_adapter_s3s::LEGACY_V2_TOKENS.clone()))
             .expect("duplicate metric name");
         // Event-outbox writer backpressure (a static: the append path has no

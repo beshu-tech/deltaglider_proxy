@@ -450,3 +450,152 @@ impl WindowCache {
         true
     }
 }
+
+// ── The conversion job's reads ──
+
+tokio::task_local! {
+    /// Set for the futures of the conversion job (`maintenance::worker`).
+    static JOB_READS: ();
+}
+
+/// Run `fut` with the conversion job's read rule
+/// (the job reader of `seal::read_verdict`): its reads in this task serve every
+/// unsealed object of an encrypting bucket. Only `maintenance::worker`
+/// makes the proof (source guard
+/// `only_the_conversion_job_reads_as_the_job`). A future spawned onto
+/// another task reads as a client.
+pub async fn as_conversion_job<F: std::future::Future>(
+    _proof: &crate::maintenance::worker::ConversionReadProof,
+    fut: F,
+) -> F::Output {
+    JOB_READS.scope((), fut).await
+}
+
+/// Who reads in the current task.
+pub(crate) fn reader() -> super::seal::Reader {
+    if JOB_READS.try_with(|_| ()).is_ok() {
+        super::seal::Reader::Job
+    } else {
+        super::seal::Reader::Client
+    }
+}
+
+/// The grace after a cutoff (`seal::CONVERSION_GRACE_SECS`; in a
+/// debug build the test seam `DGP_TEST_CONVERSION_GRACE_SECS` replaces it).
+pub fn grace_secs() -> i64 {
+    crate::config::test_seams::test_seams()
+        .conversion_grace_secs
+        .unwrap_or(super::seal::CONVERSION_GRACE_SECS)
+}
+
+/// The length of a conversion window, in seconds: 7 days (in a debug
+/// build the test seam `DGP_TEST_CONVERSION_WINDOW_SECS` replaces it).
+pub fn default_window_secs() -> i64 {
+    crate::config::test_seams::test_seams()
+        .conversion_window_secs
+        .unwrap_or(DEFAULT_WINDOW_SECS)
+}
+
+/// 7 days.
+pub const DEFAULT_WINDOW_SECS: i64 = 7 * 86_400;
+
+// ── Control through the storage trait ──
+
+/// A request about the conversion of one bucket
+/// ([`crate::storage::StorageBackend::conversion`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversionOp {
+    /// The marker as stored now (read fresh, not from the cache).
+    Status,
+    /// Open a conversion, or reuse the valid one
+    /// ([`super::EncryptingBackend::open_conversion_secs`]).
+    Open { window_secs: i64 },
+    /// Move the deadline of `run` to `deadline` by identity (a resume).
+    Extend { run: RunId, deadline: i64 },
+    /// Remove the marker of `run` by identity.
+    Close { run: RunId },
+}
+
+/// The stored marker of a bucket, as this proxy reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerState {
+    /// No marker.
+    Absent,
+    /// A marker that does not open with this bucket's keyring at its
+    /// storage identity.
+    Foreign,
+    /// A marker of this bucket; `server_now` is the backend's clock at the
+    /// read (the deadline may be past).
+    Ours { fields: Fields, server_now: i64 },
+}
+
+/// The answer to a [`ConversionOp`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversionReply {
+    /// The bucket writes plaintext, or the backend has no encrypting
+    /// wrapper: it has no conversion.
+    NotEncrypted,
+    Status(MarkerState),
+    Opened(RunId),
+    Changed(ByIdentity),
+}
+
+// ── Metrics ──
+
+/// Client reads of unsealed objects in buckets that encrypt, by outcome:
+/// [`SERVED_IN_WINDOW`] (plaintext history while a conversion is open) or
+/// [`REFUSED`].
+pub static PLAINTEXT_READS: std::sync::LazyLock<prometheus::IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "deltaglider_plaintext_reads_total",
+                "Client reads of unencrypted objects in buckets that encrypt, by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric")
+    });
+
+/// Objects that the conversion job converted although a client could not
+/// read them (stored after the cutoff, or no open window).
+pub static ADOPTED_AFTER_CUTOFF: std::sync::LazyLock<prometheus::IntCounter> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounter::new(
+            "deltaglider_conversion_adopted_after_cutoff_total",
+            "Unencrypted objects that the re-encrypt job converted although clients could not \
+             read them (stored after the conversion's cutoff)",
+        )
+        .expect("valid metric")
+    });
+
+/// The `outcome` label of [`PLAINTEXT_READS`].
+pub const SERVED_IN_WINDOW: &str = "served_in_window";
+/// The `outcome` label of [`PLAINTEXT_READS`].
+pub const REFUSED: &str = "refused";
+
+// ── Audit of markers that count as closed ──
+
+/// How often one bucket's ignored marker is audited.
+pub const IGNORED_AUDIT_EVERY: Duration = Duration::from_secs(600);
+
+/// Rate limit of the `encryption_marker_ignored` audit, per bucket.
+#[derive(Default)]
+pub struct IgnoredAudits {
+    last: parking_lot::Mutex<HashMap<String, Instant>>,
+}
+
+impl IgnoredAudits {
+    /// Audit the ignored marker of `bucket` at `now`? Yes once per
+    /// [`IGNORED_AUDIT_EVERY`]; a `true` records this one.
+    pub fn take(&self, bucket: &str, now: Instant) -> bool {
+        let mut last = self.last.lock();
+        let due = last
+            .get(bucket)
+            .is_none_or(|t| now.saturating_duration_since(*t) >= IGNORED_AUDIT_EVERY);
+        if due {
+            last.insert(bucket.to_string(), now);
+        }
+        due
+    }
+}

@@ -246,26 +246,86 @@ pub fn sealed_of(raw: &FileMetadata) -> Result<Option<Sealed>, StorageError> {
 /// What the read rule decides about an object without a seal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unsealed {
-    /// Plaintext that this bucket may serve.
+    /// Plaintext that this bucket serves (it writes plaintext, or
+    /// `plaintext_reads: serve`), or a folder marker.
     Serve,
+    /// Plaintext history: the bucket encrypts, its conversion window is
+    /// open, and the backend stored the object before the cutoff plus
+    /// [`CONVERSION_GRACE_SECS`].
+    ServeInWindow,
+    /// Only the conversion job reads it: plaintext that a client may not
+    /// read (stored at or after the cutoff plus the grace, no stored time,
+    /// or no open window). The job converts it and reports it as adopted
+    /// after the cutoff.
+    Adopted,
     /// Refused: an unknown marker, or plaintext where the bucket refuses it.
     Refuse,
 }
 
-/// THE read rule for an object without a seal (pure). `plaintext_ok`:
-/// the bucket writes plaintext, or encrypts with `plaintext_reads: serve`.
-/// A zero-byte key that ends in `/` (a folder marker) always passes.
-pub fn read_verdict(raw: &FileMetadata, key_is_folder: bool, plaintext_ok: bool) -> Unsealed {
+/// The slack after a conversion's cutoff in which the backend's write time
+/// of an unsealed object still counts as history: backend clock skew, and
+/// uploads in flight when the conversion opened.
+pub const CONVERSION_GRACE_SECS: i64 = 300;
+
+/// Who reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reader {
+    /// A client request (GET, HEAD, range, copy source), and every engine
+    /// path that is not the conversion job.
+    Client,
+    /// The re-encrypt job, inside the scope that only its
+    /// [`super::conversion::ConversionReadProof`] opens.
+    Job,
+}
+
+/// What a bucket allows for unsealed objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaintextRule<'a> {
+    /// The bucket writes plaintext, or encrypts with
+    /// `plaintext_reads: serve` (until that setting is removed).
+    Serves,
+    /// The bucket encrypts: plaintext only through its conversion window.
+    Encrypts(&'a super::conversion::Window),
+}
+
+/// THE read rule for an object without a seal (pure).
+///
+/// - An encryption marker without a seal is refused for every reader (an
+///   older release's object, or edited metadata).
+/// - A zero-byte key that ends in `/` (a folder marker) always passes.
+/// - The rule [`PlaintextRule::Serves`] serves it.
+/// - Otherwise the object is history when the window is open and the
+///   backend's own write time (`stored_last_modified`, never a cached or a
+///   client-chosen time) is before `cutoff + grace_secs`: served. A
+///   missing time is not history.
+/// - Not history: refused for a client, [`Unsealed::Adopted`] for the job.
+pub fn read_verdict(
+    raw: &FileMetadata,
+    key_is_folder: bool,
+    rule: PlaintextRule<'_>,
+    reader: Reader,
+    grace_secs: i64,
+) -> Unsealed {
     if raw.user_metadata.contains_key(ENCRYPTION_MARKER_KEY) {
         return Unsealed::Refuse;
     }
     if key_is_folder && raw.file_size == 0 {
         return Unsealed::Serve;
     }
-    if plaintext_ok {
-        Unsealed::Serve
-    } else {
-        Unsealed::Refuse
+    let window = match rule {
+        PlaintextRule::Serves => return Unsealed::Serve,
+        PlaintextRule::Encrypts(w) => w,
+    };
+    let history = match window {
+        super::conversion::Window::Open { cutoff, .. } => raw
+            .stored_last_modified
+            .is_some_and(|lm| lm.timestamp() < cutoff.saturating_add(grace_secs)),
+        super::conversion::Window::Closed => false,
+    };
+    match (history, reader) {
+        (true, _) => Unsealed::ServeInWindow,
+        (false, Reader::Job) => Unsealed::Adopted,
+        (false, Reader::Client) => Unsealed::Refuse,
     }
 }
 
@@ -286,9 +346,11 @@ pub fn refusal(at: &Location<'_>, raw: &FileMetadata) -> StorageError {
         enc_err(format!(
             "object '{what}' in bucket '{}' {PLAINTEXT_REFUSAL}: the proxy refuses it, because \
              a writer with access to the backend could have planted it (for example \
-             another proxy that does not have the bucket's key). Set \
-             encryption.plaintext_reads: serve while a re-encrypt job converts the bucket's \
-             history",
+             another proxy that does not have the bucket's key). Plaintext is served only \
+             while a conversion of the bucket is open, and only for objects that the backend \
+             stored before the conversion's cutoff: this object is newer, or no conversion is \
+             open. A re-encrypt job converts it. (Until the next release, \
+             encryption.plaintext_reads: serve also serves it.)",
             at.bucket
         ))
     }
@@ -584,12 +646,22 @@ mod tests {
             .insert(ENCRYPTION_MARKER_KEY.into(), "whatever".into());
         let folder =
             FileMetadata::new_passthrough("d/".into(), String::new(), String::new(), 0, None);
-        assert_eq!(read_verdict(&plain, false, true), Unsealed::Serve);
-        assert_eq!(read_verdict(&plain, false, false), Unsealed::Refuse);
-        assert_eq!(read_verdict(&marked, false, true), Unsealed::Refuse);
-        assert_eq!(read_verdict(&folder, true, false), Unsealed::Serve);
+        // The full table (windows, readers, grace) is in `read_rule_tests.rs`.
+        let closed = super::super::conversion::Window::Closed;
+        let v = |m: &FileMetadata, folder: bool, serves: bool| {
+            let rule = if serves {
+                PlaintextRule::Serves
+            } else {
+                PlaintextRule::Encrypts(&closed)
+            };
+            read_verdict(m, folder, rule, Reader::Client, CONVERSION_GRACE_SECS)
+        };
+        assert_eq!(v(&plain, false, true), Unsealed::Serve);
+        assert_eq!(v(&plain, false, false), Unsealed::Refuse);
+        assert_eq!(v(&marked, false, true), Unsealed::Refuse);
+        assert_eq!(v(&folder, true, false), Unsealed::Serve);
         assert_eq!(
-            read_verdict(&plain, true, false),
+            v(&plain, true, false),
             Unsealed::Refuse,
             "a folder key with bytes"
         );

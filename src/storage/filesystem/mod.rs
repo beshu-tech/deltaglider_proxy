@@ -2095,6 +2095,14 @@ impl StorageBackend for FilesystemBackend {
         self.write_bucket_file(bucket, CONVERSION_MARKER_FILE, marker_version, op)
             .await
     }
+    async fn conversion(
+        &self,
+        _bucket: &str,
+        _op: crate::storage::encrypting::conversion::ConversionOp,
+    ) -> Result<crate::storage::encrypting::conversion::ConversionReply, crate::storage::StorageError>
+    {
+        Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
+    }
 
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
         if let Some(b) = bucket {

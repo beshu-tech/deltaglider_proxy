@@ -41,6 +41,7 @@
 //! instance's DB, nothing more.
 
 pub mod backfill;
+pub mod conversion;
 pub mod delete;
 pub mod gate;
 pub mod live;

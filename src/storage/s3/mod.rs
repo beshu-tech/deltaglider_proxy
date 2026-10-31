@@ -1373,6 +1373,14 @@ impl StorageBackend for S3Backend {
     ) -> Result<crate::storage::ClaimOutcome, StorageError> {
         self.write_marker(bucket, op).await
     }
+    async fn conversion(
+        &self,
+        _bucket: &str,
+        _op: crate::storage::encrypting::conversion::ConversionOp,
+    ) -> Result<crate::storage::encrypting::conversion::ConversionReply, crate::storage::StorageError>
+    {
+        Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
+    }
 
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
         let buckets_to_scan = if let Some(b) = bucket {

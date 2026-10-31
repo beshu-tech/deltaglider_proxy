@@ -2946,6 +2946,16 @@ mod multipart_abort_tests {
         ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
             Ok(crate::storage::ClaimOutcome::Written)
         }
+        async fn conversion(
+            &self,
+            _bucket: &str,
+            _op: crate::storage::encrypting::conversion::ConversionOp,
+        ) -> Result<
+            crate::storage::encrypting::conversion::ConversionReply,
+            crate::storage::StorageError,
+        > {
+            Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
+        }
         async fn scan_deltaspace(
             &self,
             _: &str,
@@ -3203,6 +3213,16 @@ mod multipart_abort_tests {
             op: crate::storage::MarkerWrite<'_>,
         ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
             self.0.write_conversion_marker(b, op).await
+        }
+        async fn conversion(
+            &self,
+            bucket: &str,
+            op: crate::storage::encrypting::conversion::ConversionOp,
+        ) -> Result<
+            crate::storage::encrypting::conversion::ConversionReply,
+            crate::storage::StorageError,
+        > {
+            self.0.conversion(bucket, op).await
         }
         async fn scan_deltaspace(
             &self,

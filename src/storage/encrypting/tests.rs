@@ -562,6 +562,16 @@ mod wrapper_tests {
         ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
             Ok(crate::storage::ClaimOutcome::Written)
         }
+        async fn conversion(
+            &self,
+            _bucket: &str,
+            _op: crate::storage::encrypting::conversion::ConversionOp,
+        ) -> Result<
+            crate::storage::encrypting::conversion::ConversionReply,
+            crate::storage::StorageError,
+        > {
+            Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
+        }
         async fn get_passthrough_metadata_for_rewrite(
             &self,
             b: &str,
@@ -1514,8 +1524,14 @@ mod wrapper_tests {
             )
         };
         let read = |name, size| {
-            w.present_raw("b", "p", StoredObject::Passthrough(name), &raw(size))
-                .is_ok()
+            w.present_raw(
+                "b",
+                "p",
+                StoredObject::Passthrough(name),
+                &raw(size),
+                &super::conversion::Window::Closed,
+            )
+            .is_ok()
         };
         assert!(read("dir/", 0));
         assert!(read("", 0));
@@ -1526,8 +1542,14 @@ mod wrapper_tests {
             .user_metadata
             .insert(ENCRYPTION_MARKER_KEY.into(), seal::DISK_MARKER.into());
         assert!(
-            w.present_raw("b", "p", StoredObject::Passthrough("dir/"), &marked)
-                .is_err(),
+            w.present_raw(
+                "b",
+                "p",
+                StoredObject::Passthrough("dir/"),
+                &marked,
+                &super::conversion::Window::Closed
+            )
+            .is_err(),
             "a marker without a seal is refused, also on a folder"
         );
     }

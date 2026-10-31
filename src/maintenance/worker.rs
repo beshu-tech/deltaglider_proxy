@@ -66,6 +66,34 @@ const TRANSIENT_RETRY_SECS: i64 = 60;
 pub(crate) const PAGE_SIZE: u32 = 1000;
 const MAX_FAILURES_RETAINED: usize = 200;
 const DRAIN_POLL_MS: u64 = 250;
+/// Objects of a page that the re-encrypt job converts at once (the cursor
+/// is saved after the whole page).
+pub(crate) const REENCRYPT_CONCURRENCY: usize = 8;
+
+/// The conversion job's read rule (`storage/encrypting/conversion.rs`):
+/// its reads serve every unsealed object of the bucket, also those that a
+/// client may not read, and report them. A [`ConversionReadProof`] opens
+/// that scope, and only this module makes one (source guard
+/// `only_the_conversion_job_reads_as_the_job`).
+mod conversion_reads {
+    /// Proof that the reads in a scope are the re-encrypt job's.
+    #[derive(Debug)]
+    pub struct ConversionReadProof {
+        _private: (),
+    }
+
+    pub(super) const PROOF: &ConversionReadProof = &ConversionReadProof { _private: () };
+
+    impl ConversionReadProof {
+        /// For lib tests that drive the encrypting wrapper directly.
+        #[cfg(test)]
+        pub(crate) fn for_tests() -> &'static ConversionReadProof {
+            PROOF
+        }
+    }
+}
+
+pub use conversion_reads::ConversionReadProof;
 
 /// Who holds a job's lease, and its timing (`advanced.jobs`, read at
 /// claim). The claim, the keeper and the per-page heartbeat all renew
@@ -328,7 +356,15 @@ async fn run_job(
     let outcome = match job.kind.as_str() {
         _ if reserved.is_some() => Err(reserved.unwrap_or_default().into()),
         _ if gated.is_err() => gated,
-        "reencrypt" => execute_phases(config, db, state, holder, &job).await,
+        // The conversion job reads every unsealed object of its bucket
+        // (`storage/encrypting/conversion.rs`): only here.
+        "reencrypt" => {
+            crate::storage::encrypting::conversion::as_conversion_job(
+                conversion_reads::PROOF,
+                execute_phases(config, db, state, holder, &job),
+            )
+            .await
+        }
         "migrate" => super::migrate::execute_migrate_phases(mutator, db, state, holder, &job).await,
         super::backfill::KIND => {
             super::backfill::execute_backfill_phases(db, state, holder, &job).await
@@ -591,10 +627,18 @@ async fn execute_phases(
     // ── Drain in-flight writes admitted before the gate armed. ──
     drain_inflight_writes(state, bucket).await?;
 
+    // ── The conversion marker: a resume extends its deadline. ──
+    let marker = super::conversion::begin(&state.engine.load(), bucket)
+        .await
+        .map_err(PhaseStop::FailedTransient)?;
+    let adoptions = super::conversion::Adoptions::default();
+
     let mut visitor = Reencrypt {
         config,
         bucket,
         desired: None,
+        marker: &marker,
+        adoptions: &adoptions,
     };
     let walked = run_count_then_walk(db, state, holder, job, "rewrite", &mut visitor).await?;
     let mut c = walked.c;
@@ -629,7 +673,9 @@ async fn execute_phases(
             match rewrite_reference_if_needed(&engine, bucket, &prefix, &desired).await {
                 Ok(()) => {}
                 Err(e) => {
-                    record_failure(db, job.id, &format!("{prefix}/.dg/reference.bin"), &e).await?;
+                    let reason = format!("{}: {e}", super::conversion::REWRITE_FAILED);
+                    record_failure(db, job.id, &format!("{prefix}/.dg/reference.bin"), &reason)
+                        .await?;
                     c.failed += 1;
                 }
             }
@@ -637,6 +683,41 @@ async fn execute_phases(
         }
         // Final counters (the per-reference failure increments above).
         persist(db, job, "references", &c, None).await;
+    }
+
+    // ── Close the conversion: only when nothing failed, by identity. ──
+    let row = current_row(db, job).await;
+    let adopted = adoptions.count();
+    let closed = super::conversion::finish(
+        &state.engine.load(),
+        bucket,
+        &marker,
+        row.objects_failed,
+        adopted,
+    )
+    .await;
+    if let super::conversion::Closed::Blocked(why) = &closed {
+        // Never a silent success: the run settles with an error.
+        record_failure(db, job.id, super::conversion::MARKER_KEY, why).await?;
+        let mut c = Counters::of(&row);
+        c.failed += 1;
+        persist(db, job, &row.phase, &c, None).await;
+    }
+    if adopted > 0 {
+        // The run summary names the adoptions (the generic settle that
+        // follows leaves a settled row alone).
+        let row = current_row(db, job).await;
+        let (status, summary) =
+            super::settle_status(row.objects_done, row.objects_skipped, row.objects_failed);
+        let note = format!(
+            "{adopted} object(s) adopted after the conversion's cutoff in this run: clients \
+             could not read them, the job converted them (see the Failures tab){}",
+            summary.map(|s| format!("; {s}")).unwrap_or_default()
+        );
+        let db = db.lock().await;
+        if let Err(e) = db.maintenance_finish(job.id, status, Some(&note)) {
+            warn!("maintenance: failed to settle job #{}: {}", job.id, e);
+        }
     }
 
     Ok(())
@@ -648,9 +729,14 @@ struct Reencrypt<'a> {
     config: &'a SharedConfig,
     bucket: &'a str,
     desired: Option<DesiredEncryption>,
+    /// The bucket's conversion marker for this run.
+    marker: &'a super::conversion::JobMarker,
+    adoptions: &'a super::conversion::Adoptions,
 }
 
 impl ObjectVisitor for Reencrypt<'_> {
+    const CONCURRENCY: usize = REENCRYPT_CONCURRENCY;
+
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         // Re-resolve the desired state every page: a config apply mid-run
         // swaps the engine; the job must follow (or abort if the mode
@@ -672,12 +758,17 @@ impl ObjectVisitor for Reencrypt<'_> {
         let desired = self.desired.as_ref().expect("begin_page runs first");
         let (meta, forms) = match read_listed(engine, self.bucket, key, listed).await {
             Ok(read) => read,
+            Err(Visit::Failed(e)) => {
+                return Visit::Failed(format!("{}: {e}", super::conversion::REWRITE_FAILED))
+            }
             Err(visit) => return visit,
         };
         let meta = &meta;
         if !needs_rewrite(&meta.user_metadata, desired) {
             return Visit::Skipped;
         }
+        // Judged on this read (the backend's metadata, never a cache).
+        let adopted = super::conversion::adopted(self.marker, meta);
         let req = ObjectTransferRequest {
             source_bucket: self.bucket,
             source_key: key,
@@ -699,10 +790,16 @@ impl ObjectVisitor for Reencrypt<'_> {
             forms,
         };
         match copy_object_known(engine, req, Some(meta), Some(&prior)).await {
+            Ok(outcome) if adopted => {
+                self.adoptions.add();
+                Visit::Adopted {
+                    bytes: outcome.bytes_copied as i64,
+                }
+            }
             Ok(outcome) => Visit::Done {
                 bytes: outcome.bytes_copied as i64,
             },
-            Err(e) => Visit::Failed(e.to_string()),
+            Err(e) => Visit::Failed(format!("{}: {e}", super::conversion::REWRITE_FAILED)),
         }
     }
 }
@@ -710,6 +807,12 @@ impl ObjectVisitor for Reencrypt<'_> {
 /// What one object of an `objects` phase ended in.
 pub(crate) enum Visit {
     Done {
+        bytes: i64,
+    },
+    /// Converted, although clients could not read it (stored after the
+    /// conversion's cutoff): counted as done, and listed in the failure
+    /// ring as information.
+    Adopted {
         bytes: i64,
     },
     Skipped,
@@ -720,6 +823,8 @@ pub(crate) enum Visit {
 /// The per-object work of a count-then-walk job kind (reencrypt,
 /// backfill-metadata). [`run_count_then_walk`] owns the rest.
 pub(crate) trait ObjectVisitor {
+    /// Objects of a page in flight at once.
+    const CONCURRENCY: usize = PAGE_CONCURRENCY;
     /// Runs before each listing page.
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         Ok(())
@@ -727,7 +832,7 @@ pub(crate) trait ObjectVisitor {
     /// One user object, and the one stored form of it that the page's
     /// listing proved (`None`: not proved). The visitor reads the object
     /// ([`read_listed`], or a read that its write reuses). Up to
-    /// [`super::paged::PAGE_CONCURRENCY`] objects run at once.
+    /// [`ObjectVisitor::CONCURRENCY`] objects run at once.
     async fn visit(
         &self,
         engine: &Arc<crate::deltaglider::DynEngine>,
@@ -856,7 +961,7 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
             // page of large objects can take minutes.
             cancel_every: Some(CANCEL_CHECK_EVERY),
             budget_exhausted: &budget,
-            concurrency: PAGE_CONCURRENCY,
+            concurrency: V::CONCURRENCY,
         },
         &mut step,
     )
@@ -973,6 +1078,29 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
             Visit::Done { bytes } => {
                 self.c.done += 1;
                 self.c.bytes += bytes;
+            }
+            Visit::Adopted { bytes } => {
+                self.c.done += 1;
+                self.c.bytes += bytes;
+                record_failure(
+                    self.db,
+                    self.job.id,
+                    key,
+                    &format!(
+                        "{}: converted, but clients could not read it (the backend stored it \
+                         after the conversion's cutoff, or names no time)",
+                        super::conversion::ADOPTED_AFTER_CUTOFF
+                    ),
+                )
+                .await?;
+                crate::audit::audit_log(
+                    "encryption_conversion_adopted_after_cutoff",
+                    "system",
+                    &format!("job:{}", self.job.id),
+                    &axum::http::HeaderMap::new(),
+                    &self.job.bucket,
+                    key,
+                );
             }
             Visit::Skipped => self.c.skipped += 1,
             Visit::Failed(reason) => {

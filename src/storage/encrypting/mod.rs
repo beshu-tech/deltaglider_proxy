@@ -9,7 +9,9 @@
 //! read of a body or of metadata goes through THE read rule
 //! (`present_raw`): a sealed object opens with the key its fingerprint
 //! names; an object without a seal is served only where the bucket may
-//! serve plaintext (it writes plaintext, or `plaintext_reads: serve`).
+//! serve plaintext (it writes plaintext, or `plaintext_reads: serve`), or
+//! as history while the bucket's conversion window is open
+//! (`conversion.rs`); the re-encrypt job reads every one of them.
 //! Callers above the wrapper see the logical object, with the markers
 //! `dg-encrypted: v2` and `dg-encryption-key-id: <id>`; the raw stored
 //! metadata never leaves the wrapper.
@@ -27,6 +29,8 @@ pub mod conversion;
 #[cfg(test)]
 mod conversion_tests;
 mod format;
+#[cfg(test)]
+mod read_rule_tests;
 pub(crate) mod seal;
 mod sentinel;
 #[cfg(test)]
@@ -326,6 +330,8 @@ pub struct EncryptingBackend<B: StorageBackend> {
     healer: token_heal::TokenHealer,
     /// The conversion windows of this wrapper's buckets (`conversion.rs`).
     windows: conversion::WindowCache,
+    /// Rate limit of the `encryption_marker_ignored` audit.
+    ignored: conversion::IgnoredAudits,
 }
 
 impl<B: StorageBackend> EncryptingBackend<B> {
@@ -337,6 +343,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             sentinel: None,
             healer: Default::default(),
             windows: Default::default(),
+            ignored: Default::default(),
         }
     }
 
@@ -603,14 +610,21 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     /// [`conversion::TTL`], one marker read per bucket at a time, the
     /// deadline checked against the backend clock on every call. A failed
     /// read is a closed window (fail closed), cached for
-    /// [`conversion::FAILED_TTL`]. Not yet consulted by reads.
+    /// [`conversion::FAILED_TTL`]. The reads of unsealed objects consult
+    /// it (`present`).
     pub async fn window_of(&self, bucket: &str) -> conversion::Window {
+        self.window_and_freshness(bucket).await.0
+    }
+
+    /// [`Self::window_of`], and whether this call read the marker (`true`)
+    /// or found the window cached.
+    async fn window_and_freshness(&self, bucket: &str) -> (conversion::Window, bool) {
         let wall = || chrono::Utc::now().timestamp();
         if let Some(w) = self
             .windows
             .cached(bucket, std::time::Instant::now(), wall())
         {
-            return w;
+            return (w, false);
         }
         let flight = self.windows.flight(bucket);
         let _one = flight.lock().await;
@@ -618,9 +632,9 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             .windows
             .cached(bucket, std::time::Instant::now(), wall())
         {
-            return w;
+            return (w, false);
         }
-        self.read_window(bucket).await
+        (self.read_window(bucket).await, true)
     }
 
     /// Read the marker of `bucket` and cache its window. The caller holds
@@ -641,10 +655,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                             server_now,
                         );
                         if !w.is_open() {
-                            tracing::warn!(
-                                "encryption: the conversion marker of bucket '{bucket}' does not \
-                                 open here or is past its deadline; the window is closed"
-                            );
+                            self.marker_ignored(bucket, m, server_now);
                         }
                         w
                     }
@@ -678,6 +689,43 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         }
     }
 
+    /// A stored marker of `bucket` counts as closed: log it, and audit
+    /// `encryption_marker_ignored` at most once per
+    /// [`conversion::IGNORED_AUDIT_EVERY`] per bucket (a deadline that
+    /// passed while no job ran is audited this way too).
+    fn marker_ignored(&self, bucket: &str, marker: &super::ConversionMarker, server_now: i64) {
+        let cfg = self.config.load();
+        let why = match conversion::open_fields(
+            &marker.content,
+            cfg.ring(),
+            &self.conversion_identity(bucket),
+        ) {
+            Some(f) if server_now >= f.deadline => format!(
+                "the conversion (run {}) passed its deadline before it finished; resume the \
+                 re-encrypt job to extend it",
+                conversion::run_label(&f.run)
+            ),
+            Some(_) => "the conversion window is not open".to_string(),
+            None => "the marker does not open with this bucket's keys (another key, storage \
+                     or format, or an edited marker)"
+                .to_string(),
+        };
+        tracing::warn!(
+            "encryption: the conversion marker of bucket '{bucket}' is ignored, the window is \
+             closed: {why}"
+        );
+        if self.ignored.take(bucket, std::time::Instant::now()) {
+            crate::audit::audit_log(
+                "encryption_marker_ignored",
+                "system",
+                &why,
+                &axum::http::HeaderMap::new(),
+                bucket,
+                "",
+            );
+        }
+    }
+
     /// The window of `bucket` after a refused plaintext read: when the
     /// cached window is not open, read the marker again (one read per
     /// bucket at a time, at most once per [`conversion::REFUSAL_REFRESH`]),
@@ -706,10 +754,27 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         bucket: &str,
         window_days: u32,
     ) -> Result<conversion::RunId, StorageError> {
-        use conversion::OpenOutcome;
         if window_days == 0 || window_days > conversion::MAX_WINDOW_DAYS {
             return Err(StorageError::Other(format!(
                 "a conversion window is 1 to {} days, not {window_days}",
+                conversion::MAX_WINDOW_DAYS
+            )));
+        }
+        self.open_conversion_secs(bucket, i64::from(window_days) * 86_400)
+            .await
+    }
+
+    /// [`Self::open_conversion`] with the window in seconds (1 second to
+    /// [`conversion::MAX_WINDOW_DAYS`]).
+    pub async fn open_conversion_secs(
+        &self,
+        bucket: &str,
+        window_secs: i64,
+    ) -> Result<conversion::RunId, StorageError> {
+        use conversion::OpenOutcome;
+        if !(1..=i64::from(conversion::MAX_WINDOW_DAYS) * 86_400).contains(&window_secs) {
+            return Err(StorageError::Other(format!(
+                "a conversion window is 1 second to {} days, not {window_secs} seconds",
                 conversion::MAX_WINDOW_DAYS
             )));
         }
@@ -727,14 +792,8 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             backend: self.inner.as_ref(),
             bucket,
         };
-        let outcome = conversion::open_or_reuse(
-            &io,
-            cfg.ring(),
-            &site,
-            &identity,
-            i64::from(window_days) * 86_400,
-        )
-        .await?;
+        let outcome =
+            conversion::open_or_reuse(&io, cfg.ring(), &site, &identity, window_secs).await?;
         let (fields, version) = match outcome {
             OpenOutcome::Created(f, v) => {
                 tracing::info!(
@@ -829,6 +888,57 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             }
         }
         Ok(outcome)
+    }
+
+    /// The marker of `bucket` as stored now (a fresh read, not the cache),
+    /// expired or not.
+    pub async fn conversion_status(
+        &self,
+        bucket: &str,
+    ) -> Result<conversion::MarkerState, StorageError> {
+        let read = self.inner.read_conversion_marker(bucket).await?;
+        let Some(marker) = read.marker else {
+            return Ok(conversion::MarkerState::Absent);
+        };
+        let cfg = self.config.load();
+        Ok(
+            match conversion::open_fields(
+                &marker.content,
+                cfg.ring(),
+                &self.conversion_identity(bucket),
+            ) {
+                Some(fields) => conversion::MarkerState::Ours {
+                    fields,
+                    server_now: read
+                        .server_now
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                },
+                None => conversion::MarkerState::Foreign,
+            },
+        )
+    }
+
+    /// One [`conversion::ConversionOp`] on `bucket`; a bucket that writes
+    /// plaintext has no conversion.
+    async fn conversion_control(
+        &self,
+        bucket: &str,
+        op: conversion::ConversionOp,
+    ) -> Result<conversion::ConversionReply, StorageError> {
+        use conversion::{ConversionOp as Op, ConversionReply as Reply};
+        if self.writes_plaintext(bucket) {
+            return Ok(Reply::NotEncrypted);
+        }
+        Ok(match op {
+            Op::Status => Reply::Status(self.conversion_status(bucket).await?),
+            Op::Open { window_secs } => {
+                Reply::Opened(self.open_conversion_secs(bucket, window_secs).await?)
+            }
+            Op::Extend { run, deadline } => {
+                Reply::Changed(self.extend_conversion(bucket, &run, deadline).await?)
+            }
+            Op::Close { run } => Reply::Changed(self.close_conversion(bucket, &run).await?),
+        })
     }
 
     /// Cache the window that this node just wrote (`None`: closed).
@@ -950,6 +1060,8 @@ fn token_maker(
 struct Opened {
     meta: FileMetadata,
     sealed: Option<SealedBody>,
+    /// The read rule's verdict on an object without a seal.
+    unsealed: Option<seal::Unsealed>,
 }
 
 struct SealedBody {
@@ -1113,9 +1225,10 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         }
     }
 
-    /// May a read of `bucket` serve an object that is not encrypted? Yes
-    /// when the bucket writes plaintext, or encrypts with
-    /// `plaintext_reads: serve`.
+    /// Does `bucket` serve every object that is not encrypted? Yes when
+    /// the bucket writes plaintext, or encrypts with
+    /// `plaintext_reads: serve`. Otherwise only through its conversion
+    /// window ([`seal::read_verdict`]).
     fn plaintext_ok(&self, bucket: &str) -> bool {
         if self.writes_plaintext(bucket) {
             return true;
@@ -1124,6 +1237,62 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         cfg.buckets
             .get(bucket)
             .map_or(cfg.serve_plaintext, |b| b.serve_plaintext)
+    }
+
+    /// The plaintext rule of `bucket` with the conversion `window`.
+    fn plaintext_rule<'w>(
+        &self,
+        bucket: &str,
+        window: &'w conversion::Window,
+    ) -> seal::PlaintextRule<'w> {
+        if self.plaintext_ok(bucket) {
+            seal::PlaintextRule::Serves
+        } else {
+            seal::PlaintextRule::Encrypts(window)
+        }
+    }
+
+    /// THE read rule with the conversion window of `bucket`: the sync
+    /// [`Self::present_raw`] judged first with a closed window (no marker
+    /// read for a sealed object, nor where plaintext is served anyway);
+    /// only a refused unsealed object reads the window (cached), and, when
+    /// that window came closed from the cache, reads the marker again once
+    /// ([`Self::refresh_after_refusal`]), so a window that another node
+    /// opened takes effect at once. `raw` is always the backend's metadata
+    /// of this read, never the metadata cache's.
+    async fn present(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+        raw: &FileMetadata,
+    ) -> Result<Opened, StorageError> {
+        let closed = conversion::Window::Closed;
+        let first = self.present_raw(bucket, prefix, object, raw, &closed);
+        if !first.as_ref().is_err_and(seal::is_plaintext_refusal) {
+            return first;
+        }
+        let (mut window, fresh) = self.window_and_freshness(bucket).await;
+        let mut out = self.present_raw(bucket, prefix, object, raw, &window);
+        if out.is_err() && !window.is_open() && !fresh {
+            window = self.refresh_after_refusal(bucket).await;
+            out = self.present_raw(bucket, prefix, object, raw, &window);
+        }
+        match &out {
+            Ok(opened) if opened.unsealed == Some(seal::Unsealed::ServeInWindow) => {
+                conversion::PLAINTEXT_READS
+                    .with_label_values(&[conversion::SERVED_IN_WINDOW])
+                    .inc();
+            }
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!("encryption: refused plaintext {bucket}/{prefix} {object:?}");
+                conversion::PLAINTEXT_READS
+                    .with_label_values(&[conversion::REFUSED])
+                    .inc();
+            }
+        }
+        out
     }
 
     /// True when a bucket of this backend may hold sealed objects: a key
@@ -1136,14 +1305,17 @@ impl<B: StorageBackend> EncryptingBackend<B> {
 
     /// THE read rule: the presented metadata of the stored object `raw` at
     /// (`bucket`, `prefix`, `object`). A sealed object opens with the key
-    /// its fingerprint names, at its location; an object without a seal is
-    /// served only where the bucket may serve plaintext.
+    /// its fingerprint names, at its location; an object without a seal
+    /// follows [`seal::read_verdict`] with the conversion `window` and the
+    /// reader of this task ([`conversion::reader`]). Sync, so a LIST can
+    /// use it; the async reads go through [`Self::present`].
     fn present_raw(
         &self,
         bucket: &str,
         prefix: &str,
         object: StoredObject<'_>,
         raw: &FileMetadata,
+        window: &conversion::Window,
     ) -> Result<Opened, StorageError> {
         let at = seal::location(bucket, prefix, object);
         match seal::sealed_of(raw)? {
@@ -1163,17 +1335,22 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                         salt: sealed.salt,
                         len: seal::body_len(&facts),
                     }),
+                    unsealed: None,
                 })
             }
-            None => match seal::read_verdict(raw, is_folder(object), self.plaintext_ok(bucket)) {
-                seal::Unsealed::Serve => Ok(Opened {
+            None => match seal::read_verdict(
+                raw,
+                is_folder(object),
+                self.plaintext_rule(bucket, window),
+                conversion::reader(),
+                conversion::grace_secs(),
+            ) {
+                seal::Unsealed::Refuse => Err(seal::refusal(&at, raw)),
+                verdict => Ok(Opened {
                     meta: raw.clone(),
                     sealed: None,
+                    unsealed: Some(verdict),
                 }),
-                seal::Unsealed::Refuse => {
-                    tracing::warn!("encryption: refused {bucket}/{prefix} {object:?}");
-                    Err(seal::refusal(&at, raw))
-                }
             },
         }
     }
@@ -1194,7 +1371,8 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         if !raw.user_metadata.contains_key(seal::SEALED_KEY) {
             return raw;
         }
-        match self.present_raw(bucket, prefix, object, &raw) {
+        // Only a sealed entry reaches the rule here: no window needed.
+        match self.present_raw(bucket, prefix, object, &raw, &conversion::Window::Closed) {
             Ok(opened) => opened.meta,
             Err(e) => {
                 tracing::warn!("listing {bucket}/{prefix}: an entry does not open: {e}");
@@ -1528,7 +1706,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                     .inner
                     .get_passthrough_metadata(bucket, prefix, filename)
                     .await?;
-                let opened = self.present_raw(bucket, prefix, object, &raw)?;
+                let opened = self.present(bucket, prefix, object, &raw).await?;
                 if let Some(body) = opened.sealed {
                     return Err(StorageError::InvalidRange(format!(
                         "bytes {start}-{end} of an object of {} bytes",
@@ -1541,7 +1719,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             }
             Err(e) => return Err(e),
         };
-        let opened = self.present_raw(bucket, prefix, object, &read.metadata)?;
+        let opened = self.present(bucket, prefix, object, &read.metadata).await?;
         let Some(body) = opened.sealed else {
             drop(read.stream);
             return self
@@ -1637,7 +1815,11 @@ impl<B: StorageBackend + Send + Sync + 'static> EncryptingBackend<B> {
         how: ResolveListed,
     ) {
         use token_heal::{count, MissDecision};
-        let plaintext_ok = self.plaintext_ok(b);
+        // An open conversion window serves plaintext history: a listed
+        // passthrough may then be plaintext, as with `plaintext_reads:
+        // serve`. The window is read only when the page has a miss.
+        let plaintext_ok = self.plaintext_ok(b)
+            || (sizes.contains(&ListedSize::StoredOnly) && self.window_of(b).await.is_open());
         let mut budget = if how.caller_heads_misses {
             0
         } else {
@@ -1740,12 +1922,16 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
                 // The read rule and the caller's pin hold here too: a copy
                 // must not move an object the source bucket refuses, nor a
                 // version the caller never read.
-                let opened = self.present_raw(src.bucket, src.prefix, src_object, &raw)?;
+                let opened = self
+                    .present(src.bucket, src.prefix, src_object, &raw)
+                    .await?;
                 check_copy_pin(source, &opened.meta, &src)?;
                 without_markers(metadata)
             }
             (Some(sealed), Some(site)) if sealed.fp == site.fingerprint() => {
-                let opened = self.present_raw(src.bucket, src.prefix, src_object, &raw)?;
+                let opened = self
+                    .present(src.bucket, src.prefix, src_object, &raw)
+                    .await?;
                 check_copy_pin(source, &opened.meta, &src)?;
                 let at = seal::location(dst.bucket, dst.prefix, dst_object);
                 let keys = site.object(sealed.salt);
@@ -1869,7 +2055,9 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
         prefix: &str,
     ) -> Result<ReferenceSource, StorageError> {
         let mut source = self.inner.open_reference_source(bucket, prefix).await?;
-        let opened = self.present_raw(bucket, prefix, StoredObject::Reference, &source.metadata)?;
+        let opened = self
+            .present(bucket, prefix, StoredObject::Reference, &source.metadata)
+            .await?;
         let Some(body) = opened.sealed else {
             source.metadata = opened.meta;
             return Ok(source);
@@ -1898,7 +2086,7 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
         object: StoredObject<'_>,
     ) -> Result<ObjectRead, StorageError> {
         let read = self.inner.open_object(bucket, prefix, object).await?;
-        let opened = self.present_raw(bucket, prefix, object, &read.metadata)?;
+        let opened = self.present(bucket, prefix, object, &read.metadata).await?;
         if let Some(body) = &opened.sealed {
             v2::check_stored_len(read.stored_total, body.len)?;
         }
@@ -2053,12 +2241,14 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
             .inner
             .open_passthrough_range(bucket, prefix, filename, start, end)
             .await?;
-        let opened = self.present_raw(
-            bucket,
-            prefix,
-            StoredObject::Passthrough(filename),
-            &read.metadata,
-        )?;
+        let opened = self
+            .present(
+                bucket,
+                prefix,
+                StoredObject::Passthrough(filename),
+                &read.metadata,
+            )
+            .await?;
         Ok(RangeRead {
             stream: if start == 0 {
                 sniff_dge_magic(read.stream)
@@ -2090,7 +2280,7 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
         object: StoredObject<'_>,
     ) -> Result<FileMetadata, StorageError> {
         let raw = self.inner.head_object(b, p, object).await?;
-        Ok(self.present_raw(b, p, object, &raw)?.meta)
+        Ok(self.present(b, p, object, &raw).await?.meta)
     }
     async fn read_key_claim(&self, b: &str) -> Result<Option<super::KeyClaim>, StorageError> {
         self.inner.read_key_claim(b).await
@@ -2116,6 +2306,14 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
         self.check_write(b).await?;
         self.inner.write_conversion_marker(b, op).await
     }
+    async fn conversion(
+        &self,
+        bucket: &str,
+        op: crate::storage::encrypting::conversion::ConversionOp,
+    ) -> Result<crate::storage::encrypting::conversion::ConversionReply, crate::storage::StorageError>
+    {
+        self.conversion_control(bucket, op).await
+    }
     /// The presented metadata; the basis keeps the stored (raw) metadata,
     /// which the re-seal of the rewrite needs (its salt).
     async fn get_passthrough_metadata_for_rewrite(
@@ -2129,7 +2327,8 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
             .get_passthrough_metadata_for_rewrite(b, p, f)
             .await?;
         let meta = self
-            .present_raw(b, p, StoredObject::Passthrough(f), &raw)?
+            .present(b, p, StoredObject::Passthrough(f), &raw)
+            .await?
             .meta;
         if basis.stored.is_none() {
             basis.stored = Some(raw);
@@ -2163,7 +2362,11 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
     ) -> Result<(super::traits::RefFence, Option<FileMetadata>), StorageError> {
         let (fence, raw) = self.inner.reference_fence_with_metadata(b, p).await?;
         let meta = match raw {
-            Some(raw) => Some(self.present_raw(b, p, StoredObject::Reference, &raw)?.meta),
+            Some(raw) => Some(
+                self.present(b, p, StoredObject::Reference, &raw)
+                    .await?
+                    .meta,
+            ),
             None => None,
         };
         Ok((fence, meta))
