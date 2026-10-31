@@ -2963,3 +2963,103 @@ mod sealed_shape_tests {
         );
     }
 }
+
+/// `FileMetadata::stored_last_modified` on S3: the object's own
+/// `Last-Modified`, at both return points of `metadata_of_response` and in
+/// listing-derived metadata; `None` (never now) when the backend names none.
+#[cfg(test)]
+mod stored_last_modified_tests {
+    use super::*;
+    use crate::storage::fake_s3;
+    use crate::storage::s3::metadata::ObjectHeaders;
+    use chrono::TimeZone as _;
+
+    const OLD: i64 = 1_000_000_000; // 2001-09-09, never "now"
+
+    fn at(unix: i64) -> Option<DateTime<Utc>> {
+        Some(Utc.timestamp_opt(unix, 0).unwrap())
+    }
+
+    fn managed() -> FileMetadata {
+        FileMetadata::new_passthrough("a.txt".into(), "ab".repeat(32), "cd".repeat(16), 3, None)
+    }
+
+    #[tokio::test]
+    async fn a_head_carries_the_objects_last_modified() {
+        let (ep, fake) = fake_s3::start().await;
+        let s3 = test_support::for_test_endpoint(&ep);
+        s3.put_passthrough(
+            "b",
+            "",
+            "a.txt",
+            bytes::Bytes::from_static(b"abc"),
+            &managed(),
+        )
+        .await
+        .unwrap();
+        fake.set_modified("b/a.txt", OLD);
+        // DG metadata: the first return point.
+        let meta = s3.get_object_metadata("b", "a.txt").await.unwrap();
+        assert_eq!(meta.stored_last_modified, at(OLD));
+        // A foreign object without DG metadata: the fallback return point.
+        fake.insert_object("b/foreign.bin", b"xyz", &[]);
+        fake.set_modified("b/foreign.bin", OLD + 7);
+        let meta = s3.get_object_metadata("b", "foreign.bin").await.unwrap();
+        assert_eq!(meta.stored_last_modified, at(OLD + 7));
+    }
+
+    #[tokio::test]
+    async fn no_last_modified_is_none_at_both_return_points() {
+        let s3 = test_support::for_test_endpoint("http://127.0.0.1:9");
+        let dg = managed().to_bare_metadata_map();
+        let none = HashMap::new();
+        for user in [Some(&dg), Some(&none), None] {
+            let meta = s3
+                .metadata_of_response(
+                    "b",
+                    "a.txt",
+                    &ObjectHeaders {
+                        user,
+                        last_modified: None,
+                        e_tag: Some("\"e\""),
+                        content_length: None,
+                        content_type: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(meta.stored_last_modified, None, "{user:?}");
+        }
+        let lm = aws_sdk_s3::primitives::DateTime::from_secs(OLD);
+        for user in [Some(&dg), Some(&none)] {
+            let meta = s3
+                .metadata_of_response(
+                    "b",
+                    "a.txt",
+                    &ObjectHeaders {
+                        user,
+                        last_modified: Some(&lm),
+                        e_tag: Some("\"e\""),
+                        content_length: None,
+                        content_type: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(meta.stored_last_modified, at(OLD), "{user:?}");
+        }
+    }
+
+    /// A listing names `LastModified` per object (the fake: 2025-01-01).
+    #[tokio::test]
+    async fn listed_metadata_carries_the_listed_last_modified() {
+        let (ep, fake) = fake_s3::start().await;
+        let s3 = test_support::for_test_endpoint(&ep);
+        fake.insert_object("b/p/foreign.bin", b"xyz", &[]);
+        fake.insert_object("b/p/dir/", b"", &[]);
+        let listed = s3.bulk_list_objects("b", "p/").await.unwrap();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        let jan = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).single();
+        for (key, meta) in &listed {
+            assert_eq!(meta.stored_last_modified, jan, "{key}");
+        }
+    }
+}

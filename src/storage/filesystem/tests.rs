@@ -1807,3 +1807,82 @@ mod syscall_cost_tests {
         assert!(!tmp.path().join("releases").exists());
     }
 }
+
+/// `FileMetadata::stored_last_modified` on the filesystem: the file's
+/// mtime, for a managed (xattr) and an unmanaged file, on HEAD, GET and
+/// the stat-based listing entry. It survives the metadata cache.
+#[cfg(test)]
+mod stored_last_modified_tests {
+    use super::*;
+
+    const OLD: i64 = 1_000_000_000;
+
+    fn set_mtime(path: &Path, unix: i64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    fn old() -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::from_timestamp(OLD, 0)
+    }
+
+    #[tokio::test]
+    async fn every_read_carries_the_file_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        b.create_bucket("releases").await.unwrap();
+        let meta =
+            FileMetadata::new_passthrough("a.txt".into(), "0".repeat(64), "0".repeat(32), 1, None);
+        b.put_passthrough("releases", "p", "a.txt", Bytes::from_static(b"x"), &meta)
+            .await
+            .unwrap();
+        let managed = b.passthrough_path("releases", "p", "a.txt").unwrap();
+        set_mtime(&managed, OLD);
+        let foreign = managed.with_file_name("foreign.bin");
+        std::fs::write(&foreign, b"xyz").unwrap();
+        set_mtime(&foreign, OLD + 7);
+
+        let head = b
+            .head_object("releases", "p", StoredObject::Passthrough("a.txt"))
+            .await
+            .unwrap();
+        assert_eq!(head.stored_last_modified, old());
+        let read = b
+            .open_object("releases", "p", StoredObject::Passthrough("a.txt"))
+            .await
+            .unwrap();
+        assert_eq!(read.metadata.stored_last_modified, old());
+        let head = b
+            .head_object("releases", "p", StoredObject::Passthrough("foreign.bin"))
+            .await
+            .unwrap();
+        assert_eq!(
+            head.stored_last_modified,
+            chrono::DateTime::from_timestamp(OLD + 7, 0)
+        );
+        let listed = b.bulk_list_objects("releases", "p/").await.unwrap();
+        let foreign = listed.iter().find(|(k, _)| k == "p/foreign.bin").unwrap();
+        assert_eq!(
+            foreign.1.stored_last_modified,
+            chrono::DateTime::from_timestamp(OLD + 7, 0)
+        );
+
+        // The metadata cache keeps it (it is never stored, only cloned).
+        let cache = crate::metadata_cache::MetadataCache::new(1 << 20);
+        cache.insert("releases", "p/a.txt", head.clone());
+        assert_eq!(
+            cache
+                .get("releases", "p/a.txt")
+                .unwrap()
+                .stored_last_modified,
+            head.stored_last_modified
+        );
+    }
+}

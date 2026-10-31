@@ -46,6 +46,15 @@ fn key_filename(name: &str) -> &str {
     }
 }
 
+/// The file's mtime: the backend's own time of the last write of the
+/// stored object ([`FileMetadata::stored_last_modified`]). `None` when the
+/// filesystem does not report one.
+fn mtime_of(stat: &std::fs::Metadata) -> Option<chrono::DateTime<chrono::Utc>> {
+    stat.modified()
+        .ok()
+        .map(chrono::DateTime::<chrono::Utc>::from)
+}
+
 /// Metadata read by [`FilesystemBackend::object_metadata`], named for the
 /// key: the key's file name wins over what the xattr says (review D4); an
 /// unmanaged file's stat metadata is named already.
@@ -544,14 +553,16 @@ impl FilesystemBackend {
 
         let synthetic_etag = synthesise_unmanaged_etag(stat.len(), &modified);
 
-        Ok(FileMetadata::fallback(
+        let mut meta = FileMetadata::fallback(
             key_filename(filename).to_string(),
             stat.len(),
             synthetic_etag,
             modified,
             None,
             StorageInfo::Passthrough,
-        ))
+        );
+        meta.stored_last_modified = mtime_of(&stat);
+        Ok(meta)
     }
 
     /// The metadata of reference.bin for a read. An xattr that does not
@@ -577,7 +588,7 @@ impl FilesystemBackend {
             let found = file
                 .get_xattr(xattr_meta::XATTR_NAME)
                 .map_err(io_to_storage_error)?;
-            let meta = match found {
+            let mut meta = match found {
                 Some(json) if is_reference => (
                     Self::reference_metadata_or_stat(
                         serde_json::from_slice(&json).map_err(StorageError::from),
@@ -586,12 +597,14 @@ impl FilesystemBackend {
                     )?,
                     true,
                 ),
-                Some(json) => (serde_json::from_slice(&json)?, true),
+                Some(json) => (serde_json::from_slice::<FileMetadata>(&json)?, true),
                 None => (
                     Self::fallback_metadata_from_stat(&path, file.metadata().ok(), &name)?,
                     false,
                 ),
             };
+            // The open file's mtime: the same version as the metadata.
+            meta.0.stored_last_modified = file.metadata().ok().as_ref().and_then(mtime_of);
             Ok::<_, StorageError>((file, meta))
         })
         .await
@@ -625,7 +638,11 @@ impl FilesystemBackend {
     ) -> Result<(FileMetadata, bool), StorageError> {
         let (path, filename) = (path.to_path_buf(), filename.to_string());
         tokio::task::spawn_blocking(move || match fsio::metadata_xattr_blocking(&path)? {
-            fsio::StoredXattr::Value(json) => Ok((serde_json::from_slice(&json)?, true)),
+            fsio::StoredXattr::Value(json) => {
+                let mut meta: FileMetadata = serde_json::from_slice(&json)?;
+                meta.stored_last_modified = fsio::stat_blocking(&path)?.as_ref().and_then(mtime_of);
+                Ok((meta, true))
+            }
             fsio::StoredXattr::NoFile => Err(StorageError::NotFound(path.display().to_string())),
             fsio::StoredXattr::Missing => Ok((
                 Self::fallback_metadata_from_stat(&path, fsio::stat_blocking(&path)?, &filename)?,
@@ -691,7 +708,7 @@ impl FilesystemBackend {
             ObjectVariant::Delta => StorageInfo::delta_stub(stat.len()),
             ObjectVariant::Passthrough => StorageInfo::Passthrough,
         };
-        let meta = FileMetadata::fallback(
+        let mut meta = FileMetadata::fallback(
             key_filename.to_string(),
             stat.len(),
             synthesise_unmanaged_etag(stat.len(), &modified),
@@ -699,6 +716,7 @@ impl FilesystemBackend {
             None,
             kind,
         );
+        meta.stored_last_modified = mtime_of(&stat);
         Ok(Some((key_filename.to_string(), meta)))
     }
 

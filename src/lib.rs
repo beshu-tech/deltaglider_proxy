@@ -1289,6 +1289,63 @@ mod source_guards {
         );
     }
 
+    /// Conversion marker P1: `FileMetadata::stored_last_modified` is the
+    /// BACKEND's own time of the stored object (S3 `Last-Modified`, file
+    /// mtime). A read rule trusts it to tell history from a plant, so only
+    /// the backends' read paths set it, and the constructors start it at
+    /// `None`. A new assignment elsewhere (a write path, a test fixture, a
+    /// wrapper) could hand the rule a time that no backend reported.
+    #[test]
+    fn stored_last_modified_comes_from_the_backend() {
+        const ALLOWED: &[&str] = &[
+            "src/types.rs",
+            "src/storage/s3/metadata.rs",
+            "src/storage/s3/listing.rs",
+            "src/storage/filesystem/mod.rs",
+        ];
+        let field = ["stored_last", "_modified"].concat();
+        let assigns = |code: &str| -> bool {
+            code.match_indices(field.as_str()).any(|(i, _)| {
+                let rest = code[i + field.len()..].trim_start();
+                let before = code[..i].trim_end();
+                let assign = rest.starts_with('=') && !rest.starts_with("==");
+                // A struct-literal field init; not the declaration.
+                let init =
+                    rest.starts_with(':') && !rest.starts_with("::") && !before.ends_with("pub");
+                assign || init
+            })
+        };
+        for (line, hit) in [
+            (format!("m.{field} = Some(t);"), true),
+            (format!("{field}: None,"), true),
+            (format!("    pub {field}: Option<DateTime<Utc>>,"), false),
+            (format!("assert_eq!(m.{field}, x);"), false),
+            (format!("if m.{field} == x {{}}"), false),
+        ] {
+            assert_eq!(assigns(&line), hit, "{line}");
+        }
+        let mut bad = Vec::new();
+        for dir in ["src", "tests"] {
+            for path in rust_files(dir) {
+                let file = rel_path(&path);
+                if ALLOWED.contains(&file.as_str()) {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (n, line) in text.lines().enumerate() {
+                    let code = line.split("//").next().unwrap_or("");
+                    if assigns(code) {
+                        bad.push(format!("{file}:{}: {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "stored_last_modified set outside the backends' read paths: {bad:?}"
+        );
+    }
+
     /// Is `FileMetadata {` at `idx` a struct literal (not a type position
     /// such as `-> FileMetadata {`, `impl FileMetadata {`)?
     fn is_file_metadata_literal(line: &str, idx: usize) -> bool {

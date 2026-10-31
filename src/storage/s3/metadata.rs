@@ -359,6 +359,7 @@ impl S3Backend {
             user_metadata,
             storage_info,
             listing_token: Default::default(),
+            stored_last_modified: None,
         })
     }
 
@@ -453,14 +454,15 @@ impl S3Backend {
         // metadata). Without this, `headers_to_metadata` would synthesise
         // `Utc::now()` on every read, making replication's NewerWins re-copy the
         // object every tick forever. See docs/plan/rca-replication-recopy-2026-06-30.md.
-        let s3_last_modified = response
-            .last_modified
-            .and_then(|t| {
-                DateTime::parse_from_rfc3339(&t.to_string())
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            })
-            .unwrap_or_else(Utc::now);
+        // `stored_last_modified` keeps the backend's own time only: `None`
+        // when the response names none (the `created_at` fallback may use
+        // now, this field never does).
+        let stored_last_modified = response.last_modified.and_then(|t| {
+            DateTime::parse_from_rfc3339(&t.to_string())
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        });
+        let s3_last_modified = stored_last_modified.unwrap_or_else(Utc::now);
 
         // A `.delta` / `reference.bin` file is delta-machinery: missing DG
         // metadata on one of those genuinely breaks reconstruction and is worth
@@ -479,7 +481,8 @@ impl S3Backend {
         // from the HEAD response itself.
         if !headers.is_empty() {
             match Self::headers_to_metadata(&headers, s3_last_modified) {
-                Ok(meta) => {
+                Ok(mut meta) => {
+                    meta.stored_last_modified = stored_last_modified;
                     // No size, no facts: a wrong stored size would make the
                     // listing facts disagree with the object.
                     if let Some(stored_size) = stored_size {
@@ -554,14 +557,16 @@ impl S3Backend {
             .trim_matches('"')
             .to_string();
         let content_type = response.content_type.map(|s| s.to_string());
-        Ok(FileMetadata::fallback(
+        let mut meta = FileMetadata::fallback(
             key.rsplit('/').next().unwrap_or(key).to_string(),
             file_size,
             etag,
             last_modified,
             content_type,
             StorageInfo::Passthrough,
-        ))
+        );
+        meta.stored_last_modified = stored_last_modified;
+        Ok(meta)
     }
 }
 

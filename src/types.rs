@@ -326,6 +326,15 @@ pub struct FileMetadata {
     /// Never stored.
     #[serde(skip)]
     pub listing_token: ListingTokenMaker,
+
+    /// The backend's own time of the last write of the STORED object: S3
+    /// `Last-Modified`, the filesystem mtime. `None` when the backend did
+    /// not name one, never a synthesised "now". Unlike `created_at`, no
+    /// writer above the backend chooses it. Set only by the backends' read
+    /// paths (source guard `stored_last_modified_comes_from_the_backend`);
+    /// never stored, so a write ignores it.
+    #[serde(skip)]
+    pub stored_last_modified: Option<DateTime<Utc>>,
 }
 
 /// Makes the listing token of a sealed object from its stored key, stored
@@ -439,6 +448,7 @@ impl FileMetadata {
             user_metadata: HashMap::new(),
             storage_info: StorageInfo::Reference { source_name },
             listing_token: Default::default(),
+            stored_last_modified: None,
         }
     }
 
@@ -475,6 +485,7 @@ impl FileMetadata {
                 delta_cmd,
             },
             listing_token: Default::default(),
+            stored_last_modified: None,
         }
     }
 
@@ -498,6 +509,7 @@ impl FileMetadata {
             user_metadata: HashMap::new(),
             storage_info: StorageInfo::Passthrough,
             listing_token: Default::default(),
+            stored_last_modified: None,
         }
     }
 
@@ -524,6 +536,7 @@ impl FileMetadata {
             user_metadata: HashMap::new(),
             storage_info,
             listing_token: Default::default(),
+            stored_last_modified: None,
         }
     }
 
@@ -541,6 +554,7 @@ impl FileMetadata {
             user_metadata: HashMap::new(),
             storage_info: StorageInfo::Passthrough,
             listing_token: Default::default(),
+            stored_last_modified: None,
         }
     }
 
@@ -973,6 +987,22 @@ mod tests {
         assert!(ObjectKey::parse("b", "a//").validate_ingest().is_err());
         assert!(ObjectKey::parse("b", "../").validate_object().is_err());
         assert!(!ObjectKey::parse("b", "photos/a.jpg").is_directory_marker());
+    }
+
+    /// `stored_last_modified` is a read-side fact: neither the bare
+    /// metadata map (S3 `x-amz-meta-*`) nor the serialised form (filesystem
+    /// xattr) carries it, so no write stores it.
+    #[test]
+    fn stored_last_modified_is_never_stored() {
+        let plain =
+            FileMetadata::new_passthrough("a".into(), "0".repeat(64), "0".repeat(32), 1, None);
+        let mut read = plain.clone();
+        read.stored_last_modified = DateTime::from_timestamp(1_000_000_000, 0);
+        assert_eq!(read.to_bare_metadata_map(), plain.to_bare_metadata_map());
+        let json = serde_json::to_string(&read).unwrap();
+        assert_eq!(json, serde_json::to_string(&plain).unwrap());
+        let back: FileMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.stored_last_modified, None);
     }
 
     #[test]

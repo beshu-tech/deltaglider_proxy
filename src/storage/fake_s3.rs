@@ -196,6 +196,16 @@ impl FakeS3 {
         );
     }
 
+    /// Set the `Last-Modified` (unix seconds) of the stored `bucket/key`.
+    /// Panics when it is absent.
+    pub(crate) fn set_modified(&self, path: &str, unix: i64) {
+        self.objects
+            .lock()
+            .get_mut(path)
+            .expect("the object exists")
+            .modified = unix;
+    }
+
     /// Replace the bytes of the stored `bucket/key` and keep its metadata,
     /// as bit rot or a foreign overwrite would. Panics when it is absent.
     pub(crate) fn replace_body(&self, path: &str, body: &[u8]) {

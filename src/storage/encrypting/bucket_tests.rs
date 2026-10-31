@@ -407,3 +407,39 @@ fn every_write_method_checks_the_witness() {
     }
     assert!(missing.is_empty(), "{missing:?}");
 }
+
+/// Conversion marker P1: the presented metadata keeps the backend's
+/// `stored_last_modified` (the read rule of a later phase judges it), for
+/// a sealed object and for plaintext that the bucket serves.
+#[tokio::test]
+async fn presentation_keeps_the_stored_last_modified() {
+    let mut cfg = two_keys();
+    cfg.buckets
+        .insert("downloads".into(), BucketKeys::default());
+    let r = rig(cfg).await;
+    r.wrapper.create_bucket("downloads").await.unwrap();
+    r.put("releases", "x", b"sealed").await.unwrap();
+    r.put("downloads", "y", b"plain").await.unwrap();
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for (bucket, name) in [("releases", "x"), ("downloads", "y")] {
+        let path = r._dir.path().join(bucket).join("deltaspaces").join(name);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let shown = r
+            .wrapper
+            .get_passthrough_metadata(bucket, "", name)
+            .await
+            .unwrap();
+        assert_eq!(
+            shown.stored_last_modified,
+            chrono::DateTime::from_timestamp(1_000_000_000, 0),
+            "{bucket}"
+        );
+    }
+    assert_eq!(r.stamp("releases", "x").await.as_deref(), Some("local-a"));
+    assert_eq!(r.stamp("downloads", "y").await, None);
+}

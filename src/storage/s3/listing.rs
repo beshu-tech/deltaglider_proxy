@@ -131,7 +131,9 @@ impl S3Backend {
 
             // Directory marker: zero-byte key ending with '/'
             if obj.key.ends_with('/') && obj.size == 0 {
-                dir_markers.push((obj.key.clone(), FileMetadata::directory_marker(&obj.key)));
+                let mut marker = FileMetadata::directory_marker(&obj.key);
+                marker.stored_last_modified = obj.last_modified;
+                dir_markers.push((obj.key.clone(), marker));
                 continue;
             }
 
@@ -260,14 +262,16 @@ impl S3Backend {
         user_key: &str,
         storage_info: StorageInfo,
     ) -> FileMetadata {
-        FileMetadata::fallback(
+        let mut meta = FileMetadata::fallback(
             user_key.rsplit('/').next().unwrap_or(user_key).to_string(),
             obj.size,
             obj.etag.clone().unwrap_or_default(),
             obj.last_modified.unwrap_or_else(Utc::now),
             None,
             storage_info,
-        )
+        );
+        meta.stored_last_modified = obj.last_modified;
+        meta
     }
 
     /// LIST a deltaspace and return only the entries at the prefix level
@@ -391,14 +395,16 @@ impl S3Backend {
         } else {
             StorageInfo::Passthrough
         };
-        FileMetadata::fallback(
+        let mut meta = FileMetadata::fallback(
             original_name,
             obj.size,
             obj.etag.clone().unwrap_or_default(),
             obj.last_modified.unwrap_or_else(Utc::now),
             None,
             storage_info,
-        )
+        );
+        meta.stored_last_modified = obj.last_modified;
+        meta
     }
 
     /// List objects with a prefix in a specific bucket (keys only)
