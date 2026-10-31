@@ -341,10 +341,10 @@ function HeroInner({
           aria-label={`${estimated ? 'About ' : ''}${targetPercent.toFixed(1)} percent smaller on disk`}
           animate={settled ? { scale: [1, 1.015, 1] } : undefined}
           transition={{ duration: 0.32, ease: 'easeOut' }}
+          className="dg-display"
           style={{
             display: 'flex',
             alignItems: 'baseline',
-            fontWeight: 800,
             // Adaptive: sized for the FINAL string so "1%" renders huge
             // and "100,000%" still fits the column (heroNumberSize.ts).
             fontSize: heroFontSize,

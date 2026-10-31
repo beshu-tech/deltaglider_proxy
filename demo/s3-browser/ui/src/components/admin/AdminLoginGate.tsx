@@ -15,7 +15,7 @@ export function AdminAccessDenied({ onBack }: { onBack: () => void }) {
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, background: colors.BG_BASE }}>
       <div style={{ width: 380, padding: 32, textAlign: 'center' }}>
         <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_RED, marginBottom: 12 }} />
-        <div><Text strong style={{ fontSize: 20, fontFamily: 'var(--font-ui)' }}>Access Denied</Text></div>
+        <div><Text className="dg-display" style={{ fontSize: 20 }}>Access Denied</Text></div>
         <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 8, marginBottom: 24 }}>
           Your account has no admin rights, so Settings is not available to it. The file browser still works with
           your account&apos;s permissions. To change settings, ask an administrator to grant your account the
@@ -71,7 +71,7 @@ export function AdminLoginGate({ externalProviders, s3BrowserSessionOnly, initia
       <form onSubmit={e => { e.preventDefault(); handleLogin(); }} style={{ width: 380, padding: 32 }}>
         <div style={{ textAlign: 'center', marginBottom: 24 }}>
           <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_BLUE, marginBottom: 12 }} />
-          <div><Text strong style={{ fontSize: 20, fontFamily: 'var(--font-ui)' }}>Admin Login</Text></div>
+          <div><Text className="dg-display" style={{ fontSize: 20 }}>Admin Login</Text></div>
           <Text type="secondary" style={{ fontSize: 13 }}>
             {externalProviders.length > 0 ? 'Sign in to continue.' : 'Enter the admin password to continue.'}
           </Text>

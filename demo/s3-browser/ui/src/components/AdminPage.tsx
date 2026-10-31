@@ -3,7 +3,8 @@ import { Alert, Button, Spin, Drawer } from 'antd';
 import { checkSession, whoami, loginAs, isNotAdminDenial, type ExternalProviderInfo, type LoginAsResult } from '../adminApi';
 import { getCredentials } from '../s3client';
 import { MenuOutlined } from '@ant-design/icons';
-import { useColors } from '../ThemeContext';
+import { THEME_STYLES, useColors, useTheme } from '../ThemeContext';
+import { BgColorsOutlined } from '@ant-design/icons';
 import { useIsNarrow } from '../useIsNarrow';
 import { BREAKPOINT } from './shared-styles';
 import FullScreenHeader from './FullScreenHeader';
@@ -63,6 +64,7 @@ const DECLARATIVE_IMPORT_BLOCKED =
 
 export default function AdminPage({ onBack, onSessionExpired, subPath, search, accountMenu, canAdmin = false, onShowShortcuts, proxyVersion }: AdminPageProps) {
   const colors = useColors();
+  const { setStyle } = useTheme();
   const { navigate } = useNavigation();
   // Hook up the `● ` tab-title prefix + beforeunload guard for any
   // section with unsaved edits. Mounting at AdminPage is the single
@@ -270,8 +272,16 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
         icon: <LogoutOutlined />,
         onRun: () => onBack(),
       },
+      ...THEME_STYLES.map((s) => ({
+        id: `action:theme-style-${s.id}`,
+        label: `${s.label} style`,
+        hint: s.hint,
+        keywords: 'theme style look appearance colours fonts',
+        icon: <BgColorsOutlined />,
+        onRun: () => setStyle(s.id),
+      })),
     ],
-    [navigateAdmin, onBack, onShowShortcuts, openYamlModal]
+    [navigateAdmin, onBack, onShowShortcuts, openYamlModal, setStyle]
   );
 
   // Check existing session on mount, or auto-login for IAM admins

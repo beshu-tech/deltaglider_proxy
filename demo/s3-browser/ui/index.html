@@ -11,10 +11,12 @@
       // Prevent theme flash: set data-theme before first paint, with the rule
       // ThemeProvider uses (a saved choice wins, else the system setting).
       (function() {
-        var t = null;
-        try { t = localStorage.getItem('dg-theme'); } catch (e) {}
+        var t = null, s = null;
+        try { t = localStorage.getItem('dg-theme'); s = localStorage.getItem('dg-theme-style'); } catch (e) {}
         var dark = t ? t === 'dark' : !window.matchMedia || window.matchMedia('(prefers-color-scheme: dark)').matches;
         document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+        // The style (ThemeContext.tsx THEME_STYLES); ThemeProvider validates it.
+        document.documentElement.setAttribute('data-theme-style', s === 'editorial' ? 'editorial' : 'instrument');
       })();
     </script>
   </head>

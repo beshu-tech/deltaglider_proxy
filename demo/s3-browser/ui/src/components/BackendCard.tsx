@@ -120,11 +120,10 @@ export default function BackendCard({ name, filesystem, kind, highlighted, pills
         <div className="dg-backend-card__title" style={{ minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
             <h3
+              className="dg-display"
               style={{
                 margin: 0,
                 fontSize: 16,
-                fontWeight: 600,
-                fontFamily: 'var(--font-ui)',
                 color: colors.TEXT_PRIMARY,
                 overflowWrap: 'anywhere',
                 marginRight: 2,

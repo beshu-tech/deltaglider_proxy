@@ -7,8 +7,8 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { expect, test } from 'vitest';
-import { darkColors, lightColors } from '../ThemeContext';
-import { cssVarName, FONT_MONO, FONT_UI, paletteDeclarations, themeStylesheet, tint } from '../themeVars';
+import { darkColors, lightColors, PALETTES, parseThemeStyle, THEME_STYLES, type ThemeStyle } from '../ThemeContext';
+import { cssVarName, FONT_DISPLAY, FONT_MONO, FONT_UI, paletteDeclarations, themeSelector, themeStylesheet, tint } from '../themeVars';
 import { BREAKPOINT } from '../components/shared-styles';
 
 const SRC = join(__dirname, '..');
@@ -51,6 +51,25 @@ test('the palette publishes every token to CSS, in both themes', () => {
   expect(paletteDeclarations(darkColors)).toContain('--dg-bg-card: #111827;');
   expect(themeStylesheet()).toContain(`--font-ui: ${FONT_UI};`);
   expect(themeStylesheet()).toContain(`--font-mono: ${FONT_MONO};`);
+});
+
+test('every style publishes both palettes and its display face', () => {
+  const css = themeStylesheet();
+  for (const style of Object.keys(PALETTES) as ThemeStyle[]) {
+    for (const mode of ['dark', 'light'] as const) {
+      expect(css).toContain(`${themeSelector(style, mode)} { ${paletteDeclarations(PALETTES[style][mode])} }`);
+    }
+  }
+  expect(css).toContain('[data-theme-style="editorial"] { --font-display: ' + FONT_DISPLAY.editorial + '; }');
+  expect(themeSelector('instrument', 'dark')).toBe('[data-theme="dark"]');
+  expect(parseThemeStyle('editorial')).toBe('editorial');
+  expect(parseThemeStyle('neon')).toBe('instrument');
+  expect(parseThemeStyle(null)).toBe('instrument');
+});
+
+test('the pre-paint script in index.html knows every style', () => {
+  const html = read(join(SRC, '..', 'index.html'));
+  for (const s of THEME_STYLES.filter((x) => x.id !== 'instrument')) expect(html).toContain(`'${s.id}'`);
 });
 
 test('tint() works on every colour form', () => {
@@ -121,7 +140,7 @@ test('font families are named only in themeVars.ts', () => {
     .flatMap((f) =>
       stripComments(read(f))
         .split('\n')
-        .filter((l) => /['"](Manrope|JetBrains Mono|Fira Code)/.test(l) && !/^\s*(\*|\/\/)/.test(l))
+        .filter((l) => /['"](Manrope|JetBrains Mono|Fira Code|Fraunces)/.test(l) && !/^\s*(\*|\/\/)/.test(l))
         .map((l) => `${relative(SRC, f)}: ${l.trim()}`),
     );
   expect(found).toEqual([]);
@@ -155,7 +174,8 @@ const ALLOWED_STYLE_SNIFFS = [
 ];
 
 test('every class and keyframes a stylesheet defines is used', () => {
-  const code = CODE.map(read).join('\n') + read(join(SRC, '..', 'index.html'));
+  // Comments do not count as a use: a class named only in a comment is dead.
+  const code = CODE.map((f) => stripComments(read(f)).replace(/^\s*\/\/.*$/gm, '')).join('\n') + read(join(SRC, '..', 'index.html'));
   const dead: string[] = [];
   for (const f of CSS) {
     const css = stripComments(read(f)).replace(/url\([^)]*\)/g, '');

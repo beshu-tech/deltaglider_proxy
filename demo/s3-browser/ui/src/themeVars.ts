@@ -8,16 +8,21 @@
  *   BG_CARD → --dg-bg-card, TEXT_MUTED → --dg-text-muted, …
  *
  * The fonts live here too: FONT_UI / FONT_MONO feed AntD (theme.ts), mermaid
- * and `--font-ui` / `--font-mono`. The faces are bundled (@fontsource-variable,
+ * and `--font-ui` / `--font-mono`; FONT_DISPLAY gives each style its
+ * `--font-display`. The faces are bundled (@fontsource-variable,
  * imported by the entry points), never fetched from a CDN: the admin UI must
  * work on an air-gapped host and must not tell a third party who opens it.
  *
  * Pure (no CSS imports), so node unit tests can import it.
  */
-import { darkColors, lightColors, type ColorTokens } from './ThemeContext';
+import { DEFAULT_THEME_STYLE, PALETTES, type ColorTokens, type ThemeStyle } from './ThemeContext';
 
 export const FONT_UI = "'Manrope Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 export const FONT_MONO = "'JetBrains Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace";
+/** The serif of the Editorial style: headlines, panel titles, big numbers. Never body text. */
+const FONT_SERIF = "'Fraunces Variable', Georgia, 'Times New Roman', serif";
+/** `--font-display` of each style: the face of headings and display numbers (`.dg-display`). */
+export const FONT_DISPLAY: Record<ThemeStyle, string> = { instrument: 'var(--font-ui)', editorial: FONT_SERIF };
 
 /** Pure: the custom-property name of a palette token (`BG_CARD` → `--dg-bg-card`). */
 export function cssVarName(token: keyof ColorTokens | string): string {
@@ -54,12 +59,27 @@ export function paletteDeclarations(colors: ColorTokens): string {
     .join(' ');
 }
 
-/** Pure: the whole generated stylesheet (fonts + both palettes). */
+/**
+ * Pure: the CSS selector of one style and mode. The default style needs no
+ * `data-theme-style` (an old pre-paint script, a test); any other style adds
+ * it, which also makes its blocks win over the default ones.
+ */
+export function themeSelector(style: ThemeStyle, mode: 'dark' | 'light'): string {
+  const m = `[data-theme="${mode}"]`;
+  return style === DEFAULT_THEME_STYLE ? m : `[data-theme-style="${style}"]${m}`;
+}
+
+/** Pure: the whole generated stylesheet (fonts + every palette of every style). */
 export function themeStylesheet(): string {
+  const styles = Object.keys(PALETTES) as ThemeStyle[];
   return [
-    `:root { --font-ui: ${FONT_UI}; --font-mono: ${FONT_MONO}; }`,
-    `[data-theme="dark"] { ${paletteDeclarations(darkColors)} }`,
-    `[data-theme="light"] { ${paletteDeclarations(lightColors)} }`,
+    `:root { --font-ui: ${FONT_UI}; --font-mono: ${FONT_MONO}; --font-display: ${FONT_DISPLAY[DEFAULT_THEME_STYLE]}; }`,
+    ...styles
+      .filter((st) => st !== DEFAULT_THEME_STYLE)
+      .map((st) => `[data-theme-style="${st}"] { --font-display: ${FONT_DISPLAY[st]}; }`),
+    ...styles.flatMap((st) =>
+      (['dark', 'light'] as const).map((mode) => `${themeSelector(st, mode)} { ${paletteDeclarations(PALETTES[st][mode])} }`),
+    ),
   ].join('\n');
 }
 

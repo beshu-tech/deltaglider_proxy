@@ -61,3 +61,37 @@ test('a toggle turns transitions off until the new theme is painted', () => {
   act(() => frames.shift()!(0));
   expect(root.classList.contains('dg-theme-switching')).toBe(false);
 });
+
+// A theme is a style times a mode: the style is saved on its own and lands
+// on <html data-theme-style>, where the Editorial CSS blocks match.
+function StyleProbe() {
+  const { style, setStyle, colors } = useTheme();
+  return (
+    <button onClick={() => setStyle(style === 'editorial' ? 'instrument' : 'editorial')}>
+      {style} {colors.BG_BASE}
+    </button>
+  );
+}
+
+test('the style is saved, set on <html>, and picks the palette', () => {
+  prefer(false);
+  render(<ThemeProvider><StyleProbe /></ThemeProvider>);
+  const root = document.documentElement;
+  expect(screen.getByRole('button')).toHaveTextContent('instrument #f5f7fa');
+  expect(root.getAttribute('data-theme-style')).toBe('instrument');
+  act(() => screen.getByRole('button').click());
+  expect(screen.getByRole('button')).toHaveTextContent('editorial #fbf6ee');
+  expect(root.getAttribute('data-theme-style')).toBe('editorial');
+  expect(readStorage('dg-theme-style')).toBe('editorial');
+});
+
+test('a saved style is read at start; an unknown one falls back to the default', () => {
+  prefer(true);
+  window.localStorage.setItem('dg-theme-style', 'editorial');
+  const { unmount } = render(<ThemeProvider><StyleProbe /></ThemeProvider>);
+  expect(screen.getByRole('button')).toHaveTextContent('editorial #141311');
+  unmount();
+  window.localStorage.setItem('dg-theme-style', 'neon');
+  render(<ThemeProvider><StyleProbe /></ThemeProvider>);
+  expect(screen.getByRole('button')).toHaveTextContent('instrument');
+});

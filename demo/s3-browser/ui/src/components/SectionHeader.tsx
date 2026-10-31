@@ -44,10 +44,9 @@ export default function SectionHeader({
       </div>
       <div style={{ minWidth: 0, flex: 1 }}>
         <div
+          className="dg-display"
           style={{
-            fontFamily: 'var(--font-ui)',
             fontSize: 16,
-            fontWeight: 700,
             color: TEXT_PRIMARY,
             lineHeight: 1.25,
             letterSpacing: '-0.01em',

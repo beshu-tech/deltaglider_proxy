@@ -17,6 +17,8 @@ import type {
 } from './adminApi';
 import '@fontsource-variable/manrope';
 import '@fontsource-variable/jetbrains-mono';
+// Fraunces: the Editorial serif (all axes: opsz, SOFT). Fetched only when a style uses it.
+import '@fontsource-variable/fraunces/full.css';
 import './theme.css';
 import { installThemeVars } from './themeVars';
 

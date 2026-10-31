@@ -67,6 +67,12 @@ code, kbd, pre, samp, .ant-typography code,
   --hljs-comment: var(--dg-text-faint);
   --hljs-attr: var(--dg-accent-red);
   --hljs-title: var(--dg-accent-blue);
+  /* Frosted surfaces (menus, the login card); a style without glass sets none. */
+  --surface-blur: blur(12px);
+  --surface-blur-strong: blur(22px) saturate(1.12);
+  /* Display type (.dg-display, headings): the style sets weight and optical axes. */
+  --display-weight: 700;
+  --display-variation: normal;
 }
 
 /* ───── Theme-only tints ───── */
@@ -74,8 +80,8 @@ code, kbd, pre, samp, .ant-typography code,
   --scrollbar-track: rgba(255, 255, 255, 0.03);
   --scrollbar-thumb: rgba(255, 255, 255, 0.08);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.14);
-  --table-row-hover: rgba(45, 212, 191, 0.10);
-  --table-row-selected: rgba(45, 212, 191, 0.17);
+  --table-row-hover: color-mix(in srgb, var(--dg-accent-blue) 10%, transparent);
+  --table-row-selected: color-mix(in srgb, var(--dg-accent-blue) 17%, transparent);
   --glass-bg: rgba(15, 23, 42, 0.6);
   --glass-border: rgba(255, 255, 255, 0.06);
   --surface-hover: rgba(255, 255, 255, 0.04);
@@ -84,14 +90,14 @@ code, kbd, pre, samp, .ant-typography code,
   --group-border: rgba(255, 255, 255, 0.08);
   --group-header-bg: #131c2e;
   --group-rail: rgba(255, 255, 255, 0.10);
-  --drop-glow: rgba(45, 212, 191, 0.15);
+  --drop-glow: color-mix(in srgb, var(--dg-accent-blue) 15%, transparent);
   --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.04);
   --input-bg: rgba(255, 255, 255, 0.04);
   --dot-color: rgba(255, 255, 255, 0.035);
   --overlay-bg: rgba(8, 12, 20, 0.85);
   --login-shell-bg:
-    radial-gradient(circle at 20% 16%, rgba(45, 212, 191, 0.20), transparent 34%),
-    radial-gradient(circle at 82% 8%, rgba(167, 139, 250, 0.16), transparent 30%),
+    radial-gradient(circle at 20% 16%, color-mix(in srgb, var(--dg-accent-blue) 20%, transparent), transparent 34%),
+    radial-gradient(circle at 82% 8%, color-mix(in srgb, var(--dg-accent-purple) 16%, transparent), transparent 30%),
     linear-gradient(135deg, #071018 0%, #0b1120 42%, #101827 100%);
   --login-panel-bg: rgba(9, 15, 27, 0.74);
   --login-card-border: rgba(255, 255, 255, 0.10);
@@ -112,9 +118,9 @@ code, kbd, pre, samp, .ant-typography code,
   /* Docs */
   --docs-code-bg: var(--dg-bg-sidebar);
   --docs-code-inline-text: var(--dg-accent-blue-light);
-  --docs-code-inline-bg: rgba(45, 212, 191, 0.08);
-  --docs-code-inline-border: rgba(45, 212, 191, 0.15);
-  --docs-blockquote-bg: rgba(45, 212, 191, 0.04);
+  --docs-code-inline-bg: color-mix(in srgb, var(--dg-accent-blue) 8%, transparent);
+  --docs-code-inline-border: color-mix(in srgb, var(--dg-accent-blue) 15%, transparent);
+  --docs-blockquote-bg: color-mix(in srgb, var(--dg-accent-blue) 4%, transparent);
   --docs-table-stripe: rgba(11, 17, 32, 0.4);
   /* Syntax highlighting */
   --hljs-number: #fbbf24;
@@ -126,8 +132,8 @@ code, kbd, pre, samp, .ant-typography code,
   --scrollbar-track: rgba(0, 0, 0, 0.02);
   --scrollbar-thumb: rgba(0, 0, 0, 0.12);
   --scrollbar-thumb-hover: rgba(0, 0, 0, 0.2);
-  --table-row-hover: rgba(13, 148, 136, 0.09);
-  --table-row-selected: rgba(13, 148, 136, 0.15);
+  --table-row-hover: color-mix(in srgb, var(--dg-accent-blue) 9%, transparent);
+  --table-row-selected: color-mix(in srgb, var(--dg-accent-blue) 15%, transparent);
   --glass-bg: rgba(255, 255, 255, 0.7);
   --glass-border: rgba(0, 0, 0, 0.06);
   --surface-hover: rgba(0, 0, 0, 0.03);
@@ -135,14 +141,14 @@ code, kbd, pre, samp, .ant-typography code,
   --group-border: rgba(12, 22, 41, 0.10);
   --group-header-bg: #e3e8f0;
   --group-rail: rgba(12, 22, 41, 0.12);
-  --drop-glow: rgba(13, 148, 136, 0.1);
+  --drop-glow: color-mix(in srgb, var(--dg-accent-blue) 10%, transparent);
   --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 0 0 1px rgba(0, 0, 0, 0.04);
   --input-bg: rgba(0, 0, 0, 0.02);
   --dot-color: rgba(0, 0, 0, 0.04);
   --overlay-bg: rgba(245, 247, 250, 0.9);
   --login-shell-bg:
-    radial-gradient(circle at 18% 14%, rgba(13, 148, 136, 0.18), transparent 34%),
-    radial-gradient(circle at 86% 10%, rgba(124, 58, 237, 0.14), transparent 28%),
+    radial-gradient(circle at 18% 14%, color-mix(in srgb, var(--dg-accent-blue) 18%, transparent), transparent 34%),
+    radial-gradient(circle at 86% 10%, color-mix(in srgb, var(--dg-accent-purple) 14%, transparent), transparent 28%),
     linear-gradient(135deg, #f7fbfb 0%, #eef5f7 46%, #f7f1ff 100%);
   --login-panel-bg: rgba(255, 255, 255, 0.78);
   --login-card-border: rgba(12, 22, 41, 0.10);
@@ -152,20 +158,20 @@ code, kbd, pre, samp, .ant-typography code,
   --login-submit-blend: #60a5fa;
   /* Account menu */
   --menu-panel-bg: rgba(248, 252, 251, 0.94);
-  --menu-trigger-bg: rgba(13, 148, 136, 0.16);
+  --menu-trigger-bg: color-mix(in srgb, var(--dg-accent-blue) 16%, transparent);
   --menu-border: rgba(12, 22, 41, 0.12);
-  --menu-trigger-hover-border: rgba(13, 148, 136, 0.35);
+  --menu-trigger-hover-border: color-mix(in srgb, var(--dg-accent-blue) 35%, transparent);
   --menu-shadow: 0 10px 36px rgba(12, 22, 41, 0.12);
   --menu-item-text: var(--dg-text-primary);
-  --menu-item-hover: rgba(13, 148, 136, 0.16);
+  --menu-item-hover: color-mix(in srgb, var(--dg-accent-blue) 16%, transparent);
   --menu-avatar-bg: rgba(255, 255, 255, 0.65);
   --menu-avatar-text: var(--dg-accent-blue);
   /* Docs */
   --docs-code-bg: #f1f5f9;
-  --docs-code-inline-bg: rgba(13, 148, 136, 0.08);
-  --docs-code-inline-border: rgba(13, 148, 136, 0.18);
+  --docs-code-inline-bg: color-mix(in srgb, var(--dg-accent-blue) 8%, transparent);
+  --docs-code-inline-border: color-mix(in srgb, var(--dg-accent-blue) 18%, transparent);
   --docs-code-inline-text: #0d7367;
-  --docs-blockquote-bg: rgba(13, 148, 136, 0.04);
+  --docs-blockquote-bg: color-mix(in srgb, var(--dg-accent-blue) 4%, transparent);
   --docs-table-stripe: rgba(0, 0, 0, 0.02);
   --hljs-number: #b45309;
   --hljs-builtin: #2563eb;
@@ -245,7 +251,7 @@ code, kbd, pre, samp, .ant-typography code,
   bottom: 25%;
   width: 2px;
   border-radius: 1px;
-  background: var(--focus-ring);
+  background: var(--dg-accent-blue);
   opacity: 0;
   transition: opacity 0.15s ease;
 }
@@ -450,7 +456,7 @@ code, kbd, pre, samp, .ant-typography code,
 .dg-sidebar-resize-handle:hover::after,
 .dg-sidebar-resize-handle:focus-visible::after,
 .dg-col-resizing .dg-sidebar-resize-handle::after {
-  background: var(--focus-ring);
+  background: var(--dg-accent-blue);
 }
 /* During a drag: one cursor everywhere, no text selection, and no width
    transition on the sider (it would lag behind the pointer). */
@@ -513,7 +519,7 @@ code, kbd, pre, samp, .ant-typography code,
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--focus-ring);
+  background: var(--dg-accent-blue);
   flex-shrink: 0;
 }
 .dg-bucket-group-rows {
@@ -535,11 +541,6 @@ code, kbd, pre, samp, .ant-typography code,
 @keyframes slideInRight {
   from { opacity: 0; transform: translateX(12px); }
   to { opacity: 1; transform: translateX(0); }
-}
-
-@keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
 }
 
 @keyframes dropGlow {
@@ -574,8 +575,8 @@ code, kbd, pre, samp, .ant-typography code,
 /* ───── Glass morphism utility ───── */
 .glass-card {
   background: var(--glass-bg);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: var(--surface-blur);
+  -webkit-backdrop-filter: var(--surface-blur);
   border: 1px solid var(--glass-border);
   box-shadow: var(--card-shadow);
 }
@@ -606,8 +607,8 @@ code, kbd, pre, samp, .ant-typography code,
   border: 1px solid var(--menu-border);
   background: var(--menu-panel-bg);
   box-shadow: var(--menu-shadow);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: var(--surface-blur);
+  -webkit-backdrop-filter: var(--surface-blur);
   box-sizing: border-box;
   min-width: 244px;
 }
@@ -688,8 +689,8 @@ code, kbd, pre, samp, .ant-typography code,
   border-radius: 14px;
   border: 1px solid var(--menu-border);
   background: var(--menu-trigger-bg);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: var(--surface-blur);
+  -webkit-backdrop-filter: var(--surface-blur);
   box-sizing: border-box;
   cursor: pointer;
   text-align: left;
@@ -715,7 +716,7 @@ code, kbd, pre, samp, .ant-typography code,
   backdrop-filter: none;
 }
 .account-menu-wrap--compact .account-menu-trigger:hover .account-menu-avatar {
-  border-color: var(--focus-ring);
+  border-color: var(--dg-accent-blue);
 }
 
 .account-menu-avatar {
@@ -776,6 +777,100 @@ code, kbd, pre, samp, .ant-typography code,
   text-transform: uppercase;
   font-family: var(--font-ui);
   display: block;
+}
+
+/* ───── Display type: headings and big numbers ─────
+   Every heading and every `.dg-display` element (page and panel titles, stat
+   values, the hero figure) is set in the style's display face,
+   `--font-display` (themeVars.ts FONT_DISPLAY): the UI sans in Instrument,
+   Fraunces in Editorial. The size stays with the component (TYPE scale). */
+:is(h1, h2, h3, h4, .ant-typography:is(h1, h2, h3, h4, h5), .ant-modal-title, .ant-drawer-title, .ant-card-head-title, .dg-display) {
+  font-family: var(--font-display);
+  font-variation-settings: var(--display-variation);
+}
+.dg-display {
+  font-weight: var(--display-weight);
+}
+
+/* ───── Editorial style (data-theme-style="editorial") ─────
+   Paper, not glass: no blur, no glow, no gradient canvas. Cards are flat
+   paper with the palette's ELEV_SHADOW (a hairline foot and a long soft
+   drop). Coral is the primary (the --dg-accent-blue slot); the focus ring is
+   deep coral by day and sunflower by night. One serif (Fraunces), for
+   headlines and big numbers only. */
+[data-theme-style="editorial"] {
+  --display-weight: 600;
+  --display-variation: "opsz" 144, "SOFT" 50;
+  --surface-blur: none;
+  --surface-blur-strong: none;
+  --card-shadow: var(--dg-elev-shadow);
+  --glass-bg: var(--dg-bg-card);
+  --glass-border: transparent;
+  --overlay-bg: color-mix(in srgb, var(--dg-bg-base) 92%, transparent);
+  --group-header-bg: var(--dg-bg-sidebar);
+  --group-bg: transparent;
+  --group-border: var(--dg-border);
+  --docs-code-bg: var(--dg-bg-sidebar);
+  --login-shell-bg: var(--dg-bg-base);
+  --login-panel-bg: var(--dg-bg-card);
+  --login-card-border: transparent;
+  --login-shadow: var(--dg-float-shadow);
+  --login-hero-text: var(--dg-text-primary);
+  --login-submit-blend: var(--dg-accent-blue);
+  --menu-panel-bg: var(--dg-bg-card);
+  --menu-border: var(--dg-border);
+  --menu-shadow: var(--dg-float-shadow);
+  --menu-item-text: var(--dg-text-primary);
+  --menu-avatar-text: var(--dg-text-primary);
+  --menu-trigger-hover-border: var(--dg-text-primary);
+}
+[data-theme-style="editorial"][data-theme="light"] {
+  /* Blush: avatars, icon circles, nav hover. */
+  --menu-trigger-bg: #f7d9cb;
+  --menu-item-hover: #f7d9cb;
+  --menu-avatar-bg: #f7d9cb;
+  --hljs-number: var(--dg-accent-amber);
+  --hljs-builtin: #1f5fa8;
+}
+[data-theme-style="editorial"][data-theme="dark"] {
+  --focus-ring: var(--dg-accent-amber);
+  --menu-trigger-bg: var(--dg-bg-elevated);
+  --menu-item-hover: var(--dg-bg-elevated);
+  /* Peach avatar, ink initials. */
+  --menu-avatar-bg: #f0c3a8;
+  --menu-avatar-text: var(--dg-on-accent);
+  --hljs-number: var(--dg-accent-amber);
+  --hljs-builtin: #8ab4f8;
+}
+/* Headlines: the serif's weight with tight tracking (the soft, large optical
+   size comes from --display-variation). */
+[data-theme-style="editorial"] :is(h1, h2, h3, h4, .ant-typography:is(h1, h2, h3, h4, h5), .ant-modal-title, .ant-drawer-title, .ant-card-head-title, .dg-display) {
+  font-weight: var(--display-weight);
+  letter-spacing: -0.02em;
+}
+/* The wordmark keeps its capitals and tracking; Editorial sets it in the serif. */
+[data-theme-style="editorial"] :is(.dg-wordmark, .dg-login-brand) {
+  font-family: var(--font-display);
+  font-variation-settings: var(--display-variation);
+}
+[data-theme-style="editorial"] :is(.dg-login-brand, .dg-login-product) {
+  text-shadow: none;
+}
+[data-theme-style="editorial"] :is(.dg-login-orb, .dg-login-grid),
+[data-theme-style="editorial"] .dg-login-shell::before {
+  display: none;
+}
+/* The primary action: flat coral, no glow. */
+[data-theme-style="editorial"] .dg-login-submit {
+  box-shadow: none !important;
+}
+/* "Processing" tags: ink on the info paper, not the default style's blue. */
+[data-theme-style="editorial"] .ant-tag:not(.ant-tag-solid).ant-tag-processing {
+  color: var(--dg-text-primary) !important;
+}
+/* Paper cards: the drop, not a ring. */
+[data-theme-style="editorial"] .ant-card:not(.ant-card-bordered) {
+  box-shadow: var(--dg-elev-shadow);
 }
 
 /* ───── Ant Design 6 radio / checkbox shrink fix ─────
@@ -902,8 +997,8 @@ code, kbd, pre, samp, .ant-typography code,
   border-radius: 24px;
   background: var(--login-panel-bg);
   box-shadow: var(--login-shadow);
-  backdrop-filter: blur(22px) saturate(1.12);
-  -webkit-backdrop-filter: blur(22px) saturate(1.12);
+  backdrop-filter: var(--surface-blur-strong);
+  -webkit-backdrop-filter: var(--surface-blur-strong);
 }
 
 .dg-login-theme-toggle {
@@ -916,9 +1011,9 @@ code, kbd, pre, samp, .ant-typography code,
 }
 
 .dg-login-theme-toggle:hover {
-  color: var(--focus-ring) !important;
-  border-color: color-mix(in srgb, var(--focus-ring) 38%, var(--login-card-border)) !important;
-  background: color-mix(in srgb, var(--glass-bg) 68%, var(--focus-ring) 8%) !important;
+  color: var(--dg-accent-blue) !important;
+  border-color: color-mix(in srgb, var(--dg-accent-blue) 38%, var(--login-card-border)) !important;
+  background: color-mix(in srgb, var(--glass-bg) 68%, var(--dg-accent-blue) 8%) !important;
 }
 
 /* ───── The DeltaGlider wordmark (brand identity) ─────
@@ -957,11 +1052,11 @@ code, kbd, pre, samp, .ant-typography code,
 }
 
 .dg-login-product {
-  color: var(--focus-ring);
+  color: var(--dg-accent-blue);
   font: 800 clamp(20px, 4vw, 28px)/0.9 var(--font-mono);
   letter-spacing: 0.34em;
   text-transform: uppercase;
-  text-shadow: 0 0 18px color-mix(in srgb, var(--focus-ring) 30%, transparent);
+  text-shadow: 0 0 18px color-mix(in srgb, var(--dg-accent-blue) 30%, transparent);
 }
 
 .dg-login-sso-list {
@@ -980,7 +1075,7 @@ code, kbd, pre, samp, .ant-typography code,
   width: 100%;
   min-width: 0;
   padding: 0 16px;
-  border: 1px solid color-mix(in srgb, var(--focus-ring) 24%, var(--login-card-border));
+  border: 1px solid color-mix(in srgb, var(--dg-accent-blue) 24%, var(--login-card-border));
   border-radius: 16px;
   background: color-mix(in srgb, var(--glass-bg) 66%, transparent);
   color: var(--login-hero-text);
@@ -994,14 +1089,14 @@ code, kbd, pre, samp, .ant-typography code,
 }
 
 .dg-login-sso-button:hover {
-  border-color: color-mix(in srgb, var(--focus-ring) 58%, var(--login-card-border));
-  background: color-mix(in srgb, var(--glass-bg) 78%, var(--focus-ring) 10%);
+  border-color: color-mix(in srgb, var(--dg-accent-blue) 58%, var(--login-card-border));
+  background: color-mix(in srgb, var(--glass-bg) 78%, var(--dg-accent-blue) 10%);
   color: var(--login-hero-text);
   transform: translateY(-1px);
 }
 
 .dg-login-sso-button .anticon {
-  color: var(--focus-ring);
+  color: var(--dg-accent-blue);
 }
 
 .dg-login-secondary-action {
@@ -1055,17 +1150,17 @@ code, kbd, pre, samp, .ant-typography code,
   margin-top: 8px;
   border: 0 !important;
   border-radius: 16px !important;
-  background: linear-gradient(135deg, var(--focus-ring), color-mix(in srgb, var(--focus-ring) 72%, var(--login-submit-blend))) !important;
+  background: linear-gradient(135deg, var(--dg-accent-blue), color-mix(in srgb, var(--dg-accent-blue) 72%, var(--login-submit-blend))) !important;
   color: var(--dg-on-accent) !important;
   font: 800 16px/1 var(--font-ui) !important;
   letter-spacing: 0.01em !important;
   box-shadow:
-    0 18px 38px color-mix(in srgb, var(--focus-ring) 22%, transparent),
+    0 18px 38px color-mix(in srgb, var(--dg-accent-blue) 22%, transparent),
     inset 0 1px 0 color-mix(in srgb, var(--dg-on-accent) 30%, transparent) !important;
 }
 
 .dg-login-submit:disabled {
-  border: 1px solid color-mix(in srgb, var(--focus-ring) 22%, var(--login-card-border)) !important;
+  border: 1px solid color-mix(in srgb, var(--dg-accent-blue) 22%, var(--login-card-border)) !important;
   background: color-mix(in srgb, var(--glass-bg) 70%, transparent) !important;
   color: color-mix(in srgb, var(--login-hero-text) 34%, transparent) !important;
   box-shadow: none !important;

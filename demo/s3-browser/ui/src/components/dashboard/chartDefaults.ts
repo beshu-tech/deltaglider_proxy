@@ -28,10 +28,10 @@ export function chartPalette(colors: ColorTokens): { primary: string; secondary:
   return { primary: series[0], secondary: series[1], series };
 }
 
-/** HTTP status class → colour: success teal, redirect slate, client error amber, server error rose. */
+/** HTTP status class → colour: success green, redirect slate, client error amber, server error red. */
 export function statusColors(colors: ColorTokens): Record<string, string> {
   return {
-    '2xx': colors.ACCENT_BLUE,
+    '2xx': colors.ACCENT_GREEN,
     '3xx': colors.TEXT_MUTED,
     '4xx': colors.ACCENT_AMBER,
     '5xx': colors.ACCENT_RED,

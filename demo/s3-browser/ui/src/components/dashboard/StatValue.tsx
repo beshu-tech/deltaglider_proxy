@@ -60,13 +60,12 @@ export default function StatValue({ value, unit, hint, tone = 'neutral', childre
       }}
     >
       <div
+        className="dg-display"
         style={{
           display: 'flex',
           alignItems: 'baseline',
           gap: SPACE.xs,
           color,
-          fontFamily: 'var(--font-ui)',
-          fontWeight: 700,
           // Fluid typography — below 1280 → ~28px; above 2400 → 44px.
           // `clamp(28px, 1.6vw + 10px, 44px)` lands in the sweet spot
           // for our layout (panels average 220–380px wide).

@@ -163,10 +163,9 @@ export function EmptyState({
         </div>
       )}
       <div
+        className="dg-display"
         style={{
-          fontFamily: 'var(--font-ui)',
           fontSize: compact ? TYPE.base : TYPE.lg,
-          fontWeight: 600,
           color: TEXT_PRIMARY,
           lineHeight: 1.3,
         }}
@@ -230,7 +229,7 @@ export function ErrorState({
       }}
     >
       <ExclamationCircleOutlined aria-hidden style={{ fontSize: compact ? TYPE.xxl : DISPLAY_SIZES[0], color: ACCENT_RED, marginBottom: compact ? SPACE.xs : SPACE.sm }} />
-      <div style={{ fontFamily: 'var(--font-ui)', fontSize: compact ? TYPE.base : TYPE.lg, fontWeight: 600, color: TEXT_PRIMARY, lineHeight: 1.3 }}>
+      <div className="dg-display" style={{ fontSize: compact ? TYPE.base : TYPE.lg, color: TEXT_PRIMARY, lineHeight: 1.3 }}>
         Could not load {what}
       </div>
       <div style={{ fontFamily: 'var(--font-ui)', fontSize: 13, color: TEXT_MUTED, lineHeight: 1.45, marginTop: SPACE.xs, maxWidth: 460 }}>

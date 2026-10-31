@@ -5,8 +5,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { theme, type ThemeConfig } from 'antd';
 import { test } from 'vitest';
-import { darkColors, lightColors } from '../ThemeContext';
-import { darkTheme, lightTheme } from '../theme';
+import { ALL_THEMES } from '../test/themes';
 
 function luminance(hex: string): number {
   const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
@@ -18,7 +17,7 @@ function ratio(a: string, b: string): number {
   return (x + 0.05) / (y + 0.05);
 }
 
-for (const [name, c, t] of [['dark', darkColors, darkTheme], ['light', lightColors, lightTheme]] as const) {
+for (const { name, colors: c, antd: t } of ALL_THEMES) {
   test(`${name}: text tokens reach 4.5:1 on every surface`, () => {
     const surfaces = { BG_BASE: c.BG_BASE, BG_SIDEBAR: c.BG_SIDEBAR, BG_CARD: c.BG_CARD, BG_ELEVATED: c.BG_ELEVATED };
     const texts = {
@@ -42,7 +41,7 @@ for (const [name, c, t] of [['dark', darkColors, darkTheme], ['light', lightColo
 }
 
 // B37: links use the brand teal and reach 4.5:1 on every surface.
-for (const [name, c, t] of [['dark', darkColors, darkTheme], ['light', lightColors, lightTheme]] as const) {
+for (const { name, colors: c, antd: t } of ALL_THEMES) {
   test(`${name}: link colour is the brand teal and reaches 4.5:1`, () => {
     const link = (t.token as { colorLink?: string }).colorLink;
     assert.ok(link, 'colorLink is set (AntD default is blue #1677ff)');
@@ -64,10 +63,10 @@ function tagOverrides(mode: 'dark' | 'light'): Record<string, string> {
   return Object.fromEntries([...css.matchAll(re)].map((m) => [m[1], m[2]]));
 }
 
-for (const [name, t] of [['dark', darkTheme], ['light', lightTheme]] as const) {
+for (const { name, mode, antd: t } of ALL_THEMES) {
   test(`${name}: tag text reaches 4.5:1 on its tint`, () => {
     const tok = theme.getDesignToken(t as ThemeConfig) as unknown as Record<string, string>;
-    const overrides = tagOverrides(name);
+    const overrides = tagOverrides(mode);
     const fails: string[] = [];
     for (const p of PRESETS) {
       const text = overrides[p] ?? tok[`${p}7`];
@@ -93,7 +92,7 @@ function over(fg: string, bg: string, alpha: number): string {
     .join('');
 }
 
-for (const [name, c] of [['dark', darkColors], ['light', lightColors]] as const) {
+for (const { name, colors: c } of ALL_THEMES) {
   test(`${name}: BucketCard chip text reaches 4.5:1 on its tint`, () => {
     const src = readFileSync(join(__dirname, '../components/BucketCard.tsx'), 'utf8');
     const tint = /background: tint\(tone, (\d+)\)/.exec(src);
@@ -120,7 +119,7 @@ for (const [name, c] of [['dark', darkColors], ['light', lightColors]] as const)
 // that fill (white on the dark-theme accents was 1.7-2.5:1 in ActionChips,
 // and white on the green saved bar 2:1 in the analytics hero).
 const stops = (gradient: string) => [...gradient.matchAll(/#[0-9a-f]{6}/gi)].map((m) => m[0]);
-for (const [name, c] of [['dark', darkColors], ['light', lightColors]] as const) {
+for (const { name, colors: c } of ALL_THEMES) {
   test(`${name}: ON_ACCENT, ON_KEPT and ON_SAVED reach 4.5:1 on their fills`, () => {
     const fails: string[] = [];
     const check = (ink: string, inkName: string, fills: Record<string, string>) => {

@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { darkColors, lightColors, ThemeContext } from './ThemeContext';
+import { PALETTES, parseThemeStyle, ThemeContext, type ThemeStyle } from './ThemeContext';
 import { readStorage, writeStorage } from './safeStorage';
 import { installDialogTabWrap } from './dialogTabWrap';
 
 const DARK_QUERY = '(prefers-color-scheme: dark)';
 /** On `<html>` for the two frames of a theme flip (theme.css turns transitions off). */
 const THEME_SWITCHING_CLASS = 'dg-theme-switching';
+/** Storage key of the style (the mode stays under `dg-theme`); index.html reads both before the first paint. */
+const STYLE_KEY = 'dg-theme-style';
 
 function systemPrefersDark(): boolean {
   return typeof window !== 'undefined' && typeof window.matchMedia === 'function'
@@ -19,6 +21,7 @@ export default function ThemeProvider({ children }: { children: ReactNode }) {
   const [saved, setSaved] = useState(() => readStorage('dg-theme'));
   const [systemDark, setSystemDark] = useState(systemPrefersDark);
   const isDark = saved ? saved === 'dark' : systemDark;
+  const [style, setStyleState] = useState<ThemeStyle>(() => parseThemeStyle(readStorage(STYLE_KEY)));
 
   // AntD's modal focus trap lets Tab leave the page after the last control
   // (D4); the wrap keeps the cycle inside every open modal of the app.
@@ -42,7 +45,11 @@ export default function ThemeProvider({ children }: { children: ReactNode }) {
       return next;
     });
   }, []);
-  const colors = isDark ? darkColors : lightColors;
+  const setStyle = useCallback((next: ThemeStyle) => {
+    writeStorage(STYLE_KEY, next);
+    setStyleState(next);
+  }, []);
+  const colors = PALETTES[style][isDark ? 'dark' : 'light'];
 
   // One paint for the whole flip. AntD injects its new tokens during render;
   // a plain effect set `data-theme` (our CSS variables) after the paint, and
@@ -54,6 +61,7 @@ export default function ThemeProvider({ children }: { children: ReactNode }) {
   useLayoutEffect(() => {
     const root = document.documentElement;
     root.setAttribute('data-theme', isDark ? 'dark' : 'light');
+    root.setAttribute('data-theme-style', style);
     if (firstRun.current) {
       firstRun.current = false;
       return;
@@ -66,9 +74,12 @@ export default function ThemeProvider({ children }: { children: ReactNode }) {
       cancelAnimationFrame(frame);
       root.classList.remove(THEME_SWITCHING_CLASS);
     };
-  }, [isDark]);
+  }, [isDark, style]);
 
-  const value = useMemo(() => ({ isDark, toggleTheme, colors }), [isDark, toggleTheme, colors]);
+  const value = useMemo(
+    () => ({ isDark, toggleTheme, colors, style, setStyle }),
+    [isDark, toggleTheme, colors, style, setStyle],
+  );
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 }

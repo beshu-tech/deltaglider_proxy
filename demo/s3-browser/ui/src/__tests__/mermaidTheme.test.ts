@@ -1,13 +1,10 @@
 /** UX harvest D48: mermaid diagrams used the default palette and 9 px text. */
 import { describe, expect, test } from 'vitest';
-import { darkColors, lightColors } from '../ThemeContext';
+import { ALL_THEMES } from '../test/themes';
 import { mermaidConfig, mermaidDisplayWidth, mixHex } from '../mermaidTheme';
 
 describe('mermaidConfig', () => {
-  test.each([
-    ['light', lightColors, false],
-    ['dark', darkColors, true],
-  ] as const)('%s: brand colours and readable text', (_, colors, isDark) => {
+  test.each(ALL_THEMES.map((t) => [t.name, t.colors, t.mode === 'dark'] as const))('%s: brand colours and readable text', (_, colors, isDark) => {
     const c = mermaidConfig(colors, isDark);
     expect(c.theme).toBe('base');
     expect(parseInt(c.themeVariables.fontSize, 10)).toBeGreaterThanOrEqual(12);

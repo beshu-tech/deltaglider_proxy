@@ -65,11 +65,10 @@ export default function TabHeader({ icon, title, description, actionsRef }: Prop
         <div
           role="heading"
           aria-level={2}
+          className="dg-display"
           style={{
             fontSize: 16,
-            fontWeight: 700,
             color: colors.TEXT_PRIMARY,
-            fontFamily: 'var(--font-ui)',
             letterSpacing: '-0.01em',
             lineHeight: 1.15,
           }}

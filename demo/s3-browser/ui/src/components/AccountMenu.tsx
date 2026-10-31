@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { confirmDialog } from '../confirmDialog';
 import {
+  BgColorsOutlined,
   BookOutlined,
+  CheckOutlined,
   DownOutlined,
   EyeInvisibleOutlined,
   EyeOutlined,
@@ -12,7 +14,7 @@ import {
   SunOutlined,
   UpOutlined,
 } from '@ant-design/icons';
-import { useTheme } from '../ThemeContext';
+import { THEME_STYLES, useTheme } from '../ThemeContext';
 import TruncatedName from './TruncatedName';
 import { SPACE } from './shared-styles';
 
@@ -52,7 +54,7 @@ export default function AccountMenu({
   compact = false,
   avatarOnly = false,
 }: Props) {
-  const { isDark, toggleTheme } = useTheme();
+  const { isDark, toggleTheme, style: themeStyle, setStyle } = useTheme();
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const itemsRef = useRef<HTMLDivElement>(null);
@@ -217,6 +219,24 @@ export default function AccountMenu({
               )}
               <span>{isDark ? 'Switch to light mode' : 'Switch to dark mode'}</span>
             </button>
+            {THEME_STYLES.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                className="account-menu-item"
+                role="menuitemradio"
+                aria-checked={themeStyle === s.id}
+                title={s.hint}
+                onClick={() => setStyle(s.id)}
+              >
+                {themeStyle === s.id ? (
+                  <CheckOutlined aria-hidden style={iconStyle} />
+                ) : (
+                  <BgColorsOutlined aria-hidden style={iconStyle} />
+                )}
+                <span>{s.label} style</span>
+              </button>
+            ))}
             {onToggleHidden && (
               <button
                 type="button"

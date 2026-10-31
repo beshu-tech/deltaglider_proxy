@@ -141,11 +141,10 @@ function PanelHeader({
       {/* flex-basis keeps the title on the row until there's no room. */}
       <div style={{ minWidth: 0, flex: '1 1 180px' }}>
         <div
+          className="dg-display"
           style={{
             fontSize: 13,
-            fontWeight: 700,
             color: colors.TEXT_PRIMARY,
-            fontFamily: 'var(--font-ui)',
             letterSpacing: '-0.01em',
             whiteSpace: 'nowrap',
             overflow: 'hidden',
