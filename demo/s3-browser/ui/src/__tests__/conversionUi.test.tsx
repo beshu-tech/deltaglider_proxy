@@ -12,6 +12,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import BackendEncryptionEditor from '../components/BackendEncryptionEditor';
 import BackendsPanel from '../components/BackendsPanel';
 import BucketEncryptionGroup from '../components/BucketEncryptionGroup';
+import PurgeVersionsBox from '../components/PurgeVersionsBox';
 import type { ConversionView, EffectiveEncryption } from '../adminApi';
 import { NavigationContext } from '../NavigationContext';
 import { useBucketOrigins } from '../queries/backends';
@@ -111,9 +112,14 @@ const PURGE_HEADER = 'x-dgp-purge-plaintext-versions';
 
 test('a versioned bucket: the purge box is unchecked, and the apply asks for no purge', async () => {
   const { user, dialog } = await openBucketDialog(true);
-  const box = within(dialog).getByRole('checkbox', { name: 'Also delete the old unencrypted versions' });
+  const box = within(dialog).getByRole('checkbox', { name: /^Also delete the old unencrypted versions/ });
   expect(box).not.toBeChecked();
-  expect(dialog).toHaveTextContent(/deleted for good/);
+  // A destructive opt-in never takes the initial focus: one Space press
+  // must not tick a permanent delete.
+  expect(document.activeElement).not.toBe(box);
+  expect(dialog).toHaveTextContent(/This cannot be undone/);
+  // The versioning note is neutral; the box under it resolves it.
+  expect(within(dialog).getByTestId('conversion-versioned')).toHaveClass('ant-typography-secondary');
   await user.click(within(dialog).getByTestId('apply-dialog-confirm'));
   await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
   expect(http.callsTo('PUT', SECTION)[0].headers[PURGE_HEADER]).toBeUndefined();
@@ -121,15 +127,25 @@ test('a versioned bucket: the purge box is unchecked, and the apply asks for no 
 
 test('a versioned bucket: a ticked purge box sends the purge header with the apply', async () => {
   const { user, dialog } = await openBucketDialog(true);
-  await user.click(within(dialog).getByRole('checkbox', { name: 'Also delete the old unencrypted versions' }));
+  await user.click(within(dialog).getByRole('checkbox', { name: /^Also delete the old unencrypted versions/ }));
   await user.click(within(dialog).getByTestId('apply-dialog-confirm'));
   await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
   expect(http.callsTo('PUT', SECTION)[0].headers[PURGE_HEADER]).toBe('true');
 });
 
+test('the purge box never takes the focus when it mounts', () => {
+  // jsdom runs no dialog focus management, so the dialog tests above only
+  // show that focus is not on the box; this proves the box itself never
+  // asks for it (an autoFocus here fails).
+  renderWithQuery(<PurgeVersionsBox onChange={vi.fn()} />);
+  const box = screen.getByRole('checkbox', { name: /^Also delete the old unencrypted versions/ });
+  expect(box).not.toBeChecked();
+  expect(document.activeElement).not.toBe(box);
+});
+
 test('a bucket without versions offers no purge box', async () => {
   const { dialog } = await openBucketDialog(false);
-  expect(within(dialog).queryByRole('checkbox', { name: 'Also delete the old unencrypted versions' })).toBeNull();
+  expect(within(dialog).queryByRole('checkbox', { name: /^Also delete the old unencrypted versions/ })).toBeNull();
 });
 
 test('running: the progress of this node\'s job and a link to the run, no Resume', async () => {
@@ -300,8 +316,9 @@ test('a backend over a versioned bucket: the ticked purge box sends the purge he
   await user.click(screen.getByTestId('encryption-key-stored'));
   await user.click(screen.getByRole('button', { name: 'Apply encryption change' }));
   const dialog = await screen.findByRole('dialog');
-  const box = within(dialog).getByRole('checkbox', { name: 'Also delete the old unencrypted versions' });
+  const box = within(dialog).getByRole('checkbox', { name: /^Also delete the old unencrypted versions/ });
   expect(box).not.toBeChecked();
+  expect(document.activeElement).not.toBe(box);
   await user.click(box);
   await user.click(within(dialog).getByRole('button', { name: 'Encrypt' }));
   await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));

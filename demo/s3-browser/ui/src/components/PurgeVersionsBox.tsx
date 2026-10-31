@@ -6,9 +6,12 @@ const { Text } = Typography;
 
 /**
  * The box of a conversion dialog for a versioned bucket: ask the re-encrypt
- * job to delete the old unencrypted versions. Unchecked by default. Without
- * `checked`, the box keeps its own state (a confirm dialog's static content)
- * and reports each change through `onChange`.
+ * job to delete the old unencrypted versions. Unchecked by default, and
+ * never the dialog's initial focus (a Space press must not tick a
+ * permanent delete). Without `checked`, the box keeps its own state (a
+ * confirm dialog's static content) and reports each change through
+ * `onChange`. The label is the Checkbox's child (AntD's own gap); the help
+ * is a plain secondary line under it, with no offsets.
  */
 export default function PurgeVersionsBox({
   checked,
@@ -20,18 +23,18 @@ export default function PurgeVersionsBox({
   const [own, setOwn] = useState(false);
   const value = checked ?? own;
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+    <div data-testid="conversion-purge">
       <Checkbox
         checked={value}
-        data-testid="conversion-purge"
+        autoFocus={false}
         onChange={(e) => {
           setOwn(e.target.checked);
           onChange(e.target.checked);
         }}
       >
-        <span style={{ fontSize: 12 }}>{PURGE_LABEL}</span>
+        <Text style={{ fontSize: 12 }}>{PURGE_LABEL}</Text>
       </Checkbox>
-      <Text type="secondary" style={{ fontSize: 12, paddingLeft: 24 }}>
+      <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
         {PURGE_EXPLANATION}
       </Text>
     </div>

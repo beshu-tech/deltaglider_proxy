@@ -133,6 +133,10 @@ const KEY_MASK: Target = { css: 'textarea[readonly]' };
  * the real key).
  */
 async function exampleKeyShown(page: Page): Promise<void> {
+  // A real browser runs the dialog's focus management (jsdom does not): the
+  // destructive purge box must not hold the initial focus.
+  const focused = await page.getByTestId('conversion-purge').evaluate((el) => el.contains(document.activeElement));
+  if (focused) throw new Error('the purge box took the initial focus of the dialog');
   await page.locator('textarea[readonly]').evaluate((el) => {
     (el as HTMLTextAreaElement).value = '0123456789abcdef'.repeat(4);
   });

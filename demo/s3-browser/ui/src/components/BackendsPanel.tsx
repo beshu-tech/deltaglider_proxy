@@ -379,7 +379,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 <span data-testid="conversion-count">{text}</span>
                 {versionedWarnings(plan.conversion_preview).map((w) => (
-                  <Text key={w} type="warning" data-testid="conversion-versioned">
+                  <Text key={w} type="secondary" data-testid="conversion-versioned">
                     {w}
                   </Text>
                 ))}

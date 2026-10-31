@@ -243,7 +243,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         )
       )}
       {versioned.map((w) => (
-        <Text key={w} type="warning" style={{ fontSize: 12 }} data-testid="conversion-versioned">
+        <Text key={w} type="secondary" style={{ fontSize: 12 }} data-testid="conversion-versioned">
           {w}
         </Text>
       ))}

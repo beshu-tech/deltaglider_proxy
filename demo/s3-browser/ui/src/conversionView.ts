@@ -46,7 +46,7 @@ export const PURGE_LABEL = 'Also delete the old unencrypted versions';
 
 /** What the box does, in plain words: shown under it. */
 export const PURGE_EXPLANATION =
-  'When the job has encrypted every object, it deletes the old unencrypted versions of those objects from the backend. They are deleted for good: nobody can restore them afterwards. Encrypted versions and the current objects are never deleted.';
+  'Deletes the old unencrypted versions of these objects after the job encrypts them. This cannot be undone; encrypted versions and current objects are kept.';
 
 /** Does the dialog offer the purge box? Only for a versioned bucket. */
 export function offersPurge(previews: readonly ConversionPreview[] | undefined): boolean {
