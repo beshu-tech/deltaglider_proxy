@@ -464,11 +464,20 @@ fn request_resource(bucket: &str, key: &str) -> String {
     }
 }
 
+/// Does an Allow on `bucket/*` cover a bucket-level request (`key` empty)
+/// for `action`? Yes for every action but Admin: LIST, batch delete
+/// (`POST ?delete`) and form POST are bucket-level requests that a
+/// `bucket/*` user must make. CreateBucket and DeleteBucket (Admin) need
+/// the bucket itself, or `*`, in the resources.
+fn bucket_glob_covers_bucket(action: S3Action) -> bool {
+    action != S3Action::Admin
+}
+
 /// THE allow rule over one policy evaluator (`eval`: resource text after
 /// `arn:aws:s3:::` → iam-rs decision). An error fails closed. A
-/// bucket-level request that no rule matched is asked again as `bucket/`,
-/// so `bucket/*` can match a bucket-level LIST; an explicit Deny on the
-/// bucket itself is final.
+/// bucket-level request that no rule matched is asked again as `bucket/`
+/// when [`bucket_glob_covers_bucket`], so `bucket/*` can match it; an
+/// explicit Deny on the bucket itself is final.
 fn allowed_by(
     eval: impl Fn(&str) -> Result<Decision, iam_rs::EvaluationError>,
     action: S3Action,
@@ -480,7 +489,9 @@ fn allowed_by(
         Ok(Decision::Allow) => true,
         Ok(Decision::Deny) => false,
         Ok(Decision::NotApplicable) => {
-            key.is_empty() && matches!(eval(&format!("{bucket}/")), Ok(Decision::Allow))
+            key.is_empty()
+                && bucket_glob_covers_bucket(action)
+                && matches!(eval(&format!("{bucket}/")), Ok(Decision::Allow))
         }
         Err(e) => {
             tracing::warn!(
@@ -743,9 +754,18 @@ pub(crate) fn evaluate(
         }
     }
 
-    // Pass 2: Any Allow? Permit.
+    // Pass 2: Any Allow? Permit. The bucket-level match of `bucket/*`
+    // follows the same rule as the iam-rs path.
     for perm in permissions {
-        if perm.effect == "Allow" && matches_action_and_resource(perm, action_str, bucket, key) {
+        if perm.effect != "Allow" || !matches_action_and_resource(perm, action_str, bucket, key) {
+            continue;
+        }
+        let bucket_glob_only = key.is_empty()
+            && perm
+                .resources
+                .iter()
+                .all(|p| !matches_resource(p, bucket) || p.strip_suffix("/*") == Some(bucket));
+        if !bucket_glob_only || bucket_glob_covers_bucket(action) {
             return true;
         }
     }
@@ -3464,6 +3484,83 @@ mod review_b5_tests {
             assert!(
                 !evaluate_iam(&policies, S3Action::Read, "b", "k", &Context::new()),
                 "an unevaluable Deny let the read through"
+            );
+        }
+    }
+}
+
+/// SEC F-01-R: `bucket/*` covers a bucket-level request for every action
+/// but Admin (CreateBucket, DeleteBucket). Batch delete and form POST are
+/// bucket-level Delete and Write requests, so they keep the retry.
+#[cfg(test)]
+mod bucket_glob_admin_tests {
+    use super::*;
+    use crate::iam::compiled::CompiledPolicy;
+
+    fn perm(effect: &str, actions: &[&str], cond: Option<serde_json::Value>) -> Permission {
+        Permission {
+            id: 0,
+            effect: effect.into(),
+            actions: actions.iter().map(|s| s.to_string()).collect(),
+            resources: vec!["releases/*".into()],
+            conditions: cond,
+        }
+    }
+
+    /// Every evaluator of the request path: iam-rs, compiled, legacy.
+    fn allows(perms: &[Permission], action: S3Action, key: &str, ctx: &Context) -> [bool; 3] {
+        let policies: Vec<IAMPolicy> = perms.iter().map(permission_to_iam_policy).collect();
+        let compiled = CompiledPolicy::new(&policies);
+        [
+            evaluate_iam(&policies, action, "releases", key, ctx),
+            evaluate_compiled(&compiled, action, "releases", key, ctx),
+            evaluate(perms, action, "releases", key),
+        ]
+    }
+
+    #[test]
+    fn bucket_glob_gives_no_bucket_level_admin() {
+        let perms = [perm("Allow", &["*"], None)];
+        let ctx = Context::new();
+        assert_eq!(allows(&perms, S3Action::Admin, "", &ctx), [false; 3]);
+        for action in [
+            S3Action::List,
+            S3Action::Delete,
+            S3Action::Write,
+            S3Action::Read,
+        ] {
+            assert_eq!(allows(&perms, action, "", &ctx), [true; 3], "{action:?}");
+        }
+        // Object-level requests are unchanged.
+        assert_eq!(allows(&perms, S3Action::Admin, "k", &ctx), [true; 3]);
+    }
+
+    /// Pins the refutation of SEC F-01: a conditioned Deny on `bucket/*`
+    /// still wins on the bucket-level retry. Do not add a retry to
+    /// `denied_by`: that turns object Denies into bucket-wide 403s on LIST.
+    #[test]
+    fn conditioned_deny_wins_on_the_bucket_level_retry() {
+        let outside_office = serde_json::json!({"NotIpAddress": {"aws:SourceIp": ["10.0.0.0/8"]}});
+        let mut outside = Context::new();
+        insert_source_ip(&mut outside, Some("203.0.113.9".parse().unwrap()));
+        let mut office = Context::new();
+        insert_source_ip(&mut office, Some("10.1.2.3".parse().unwrap()));
+        for (action, verb) in [(S3Action::Admin, "admin"), (S3Action::List, "list")] {
+            let perms = [
+                perm("Allow", &[verb], None),
+                perm("Deny", &[verb], Some(outside_office.clone())),
+            ];
+            let policies: Vec<IAMPolicy> = perms.iter().map(permission_to_iam_policy).collect();
+            let compiled = CompiledPolicy::new(&policies);
+            assert!(!evaluate_compiled(
+                &compiled, action, "releases", "", &outside
+            ));
+            assert!(!evaluate_iam(&policies, action, "releases", "", &outside));
+            let expect_office = action != S3Action::Admin;
+            assert_eq!(
+                evaluate_compiled(&compiled, action, "releases", "", &office),
+                expect_office,
+                "{action:?}"
             );
         }
     }
