@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback, type ReactNode } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import mermaid from 'mermaid';
-import { Button, Drawer, Spin } from 'antd';
+import { Button, Drawer } from 'antd';
 import { CheckOutlined, CopyOutlined, FileSearchOutlined, MenuOutlined } from '@ant-design/icons';
 import { findDocByFilename, type DocEntry } from '../docsBundle';
 import { DOC_REHYPE_PLUGINS, DOC_REMARK_PLUGINS, classifyDocHref, splitMermaid, themedShotSrc } from '../docsMarkdown';
@@ -15,8 +15,10 @@ import Lightbox from './Lightbox';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl } from '../urlState';
 import DocsLanding from './DocsLanding';
-import { EmptyState } from './StatePlaceholders';
+import { EmptyState, ErrorState, LoadingState } from './StatePlaceholders';
+import { SPACE } from './shared-styles';
 import '../docs.css';
+import { mermaidConfig, mermaidDisplayWidth } from '../mermaidTheme';
 
 mermaid.initialize({
   startOnLoad: false,
@@ -32,26 +34,19 @@ function Mermaid({ chart, caption }: { chart: string; caption?: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [svg, setSvg] = useState('');
   const { isDark } = useTheme();
-  const { ACCENT_BLUE, TEXT_FAINT } = useColors();
+  const colors = useColors();
 
   useEffect(() => {
     let cancelled = false;
     const id = `mermaid-${Math.random().toString(36).slice(2, 8)}`;
-    // Re-apply theme-aware variables before each render so diagrams track
-    // the active light/dark theme instead of a frozen palette.
-    mermaid.initialize({
-      startOnLoad: false,
-      securityLevel: 'strict',
-      theme: isDark ? 'dark' : 'default',
-      themeVariables: { primaryColor: ACCENT_BLUE, lineColor: TEXT_FAINT },
-      flowchart: { useMaxWidth: false },
-      sequence: { useMaxWidth: false },
-    });
+    // Re-apply theme-aware variables before each render so diagrams track light/dark theme instead of a frozen palette.
+    // the active light/dark theme, in the brand palette (D48).
+    mermaid.initialize(mermaidConfig(colors, isDark));
     mermaid.render(id, chart).then(({ svg: rendered }) => {
       if (!cancelled) setSvg(rendered);
     }).catch(console.warn);
     return () => { cancelled = true; };
-  }, [chart, isDark, ACCENT_BLUE, TEXT_FAINT]);
+  }, [chart, isDark, colors]);
 
   // After SVG is in the DOM, try to tighten the viewBox to fit the
   // drawn content — Mermaid's default is often 2-3× too tall, which
@@ -82,6 +77,16 @@ function Mermaid({ chart, caption }: { chart: string; caption?: string }) {
     const parts = initialViewBox.split(/\s+/).map(Number);
     if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n))) return;
     const [, , initW, initH] = parts;
+    // Draw at a width that fits, but never so small that the text drops
+    // under 12 px: the box scrolls sideways instead (D48).
+    const size = (naturalW: number) => {
+      const containerW = ref.current?.clientWidth ?? 0;
+      if (containerW <= 0) return;
+      svgEl.style.width = `${mermaidDisplayWidth(naturalW, containerW)}px`;
+      svgEl.style.maxWidth = 'none';
+      svgEl.style.height = 'auto';
+    };
+    size(initW);
 
     try {
       const bb = svgEl.getBBox();
@@ -104,8 +109,7 @@ function Mermaid({ chart, caption }: { chart: string; caption?: string }) {
       svgEl.setAttribute('viewBox', `${bb.x - pad} ${bb.y - pad} ${w} ${h}`);
       svgEl.setAttribute('width', String(w));
       svgEl.setAttribute('height', String(h));
-      svgEl.style.maxWidth = '100%';
-      svgEl.style.height = 'auto';
+      size(w);
     } catch {
       // getBBox can fail if SVG is not visible — fine, keep Mermaid's defaults.
     }
@@ -258,11 +262,9 @@ function DocsNav({ docs, grouped, selectedId, onSelect }: DocsNavProps) {
           <div key={group} style={{ marginBottom: 16 }}>
             <div style={{
               padding: '4px 16px',
-              fontSize: 10,
-              fontWeight: 700,
-              textTransform: 'uppercase',
-              letterSpacing: 1.5,
-              color: colors.TEXT_FAINT,
+              fontSize: 12,
+              fontWeight: 600,
+              color: colors.TEXT_MUTED,
               fontFamily: 'var(--font-ui)',
             }}>
               {group}
@@ -277,14 +279,18 @@ function DocsNav({ docs, grouped, selectedId, onSelect }: DocsNavProps) {
                   display: 'block',
                   width: '100%',
                   textAlign: 'left',
-                  padding: '6px 16px 6px 20px',
+                  padding: `${SPACE.xxs}px ${SPACE.md}px ${SPACE.xxs}px ${SPACE.lg}px`,
                   fontSize: 13,
                   fontFamily: 'var(--font-ui)',
-                  color: doc.id === selectedId ? colors.ACCENT_BLUE : colors.TEXT_SECONDARY,
+                  // The current page: primary text (AA in both themes; the teal
+                  // text on its tint was 4.4:1, D43), bold, with the teal edge.
+                  color: doc.id === selectedId ? colors.TEXT_PRIMARY : colors.TEXT_SECONDARY,
+                  fontWeight: doc.id === selectedId ? 600 : 400,
                   background: doc.id === selectedId ? `${colors.ACCENT_BLUE}10` : 'transparent',
                   borderLeft: doc.id === selectedId ? `2px solid ${colors.ACCENT_BLUE}` : '2px solid transparent',
                   cursor: 'pointer',
-                  transition: 'all 0.15s',
+                  // Colours only: an `all` transition animated the focus ring too.
+                  transition: 'color 0.15s, background-color 0.15s',
                 }}
                 onMouseEnter={(e) => {
                   if (doc.id !== selectedId) e.currentTarget.style.color = colors.TEXT_PRIMARY;
@@ -326,7 +332,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
   // Docs arrive at runtime from the session-gated /_/api/docs (see
   // docsBundle.ts for why they are not in the bundle). Until they land,
   // DOCS is empty and the page shows a spinner instead of the landing.
-  const { data: bundle, error: docsError } = useDocs();
+  const { data: bundle, error: docsError, refetch: refetchDocs } = useDocs();
   const DOCS = bundle?.docs ?? EMPTY_DOCS;
   const DOC_GROUPS = bundle?.groups ?? EMPTY_GROUPS;
 
@@ -602,11 +608,15 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
             {selectedDoc && !showLanding && !unknownDocId && <CopyPageButton doc={selectedDoc} />}
           </div>
         )}
-        <div style={{ display: 'flex', gap: 40, maxWidth: 1200, margin: '0 auto', paddingTop: narrow ? 20 : 0 }}>
+        <div style={{ display: 'flex', gap: SPACE.xl, maxWidth: 1200, margin: '0 auto', paddingTop: narrow ? 20 : 0 }}>
           {/* Landing page for overview, markdown for everything else */}
           {!bundle ? (
-            <div style={{ flex: 1, minWidth: 0, display: 'flex', justifyContent: 'center', padding: 60, color: colors.TEXT_MUTED }}>
-              {docsError ? <span>Could not load the documentation: {docsError.message}</span> : <Spin />}
+            <div style={{ flex: 1, minWidth: 0, display: 'flex', justifyContent: 'center', padding: SPACE.xl }}>
+              {docsError ? (
+                <ErrorState error={docsError} what="the documentation" onRetry={() => refetchDocs()} />
+              ) : (
+                <LoadingState variant="inline" label="Loading the documentation" />
+              )}
             </div>
           ) : unknownDocId ? (
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -659,11 +669,9 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
               paddingTop: 8,
             }}>
               <div style={{
-                fontSize: 10,
-                fontWeight: 700,
-                textTransform: 'uppercase',
-                letterSpacing: 1.5,
-                color: colors.TEXT_FAINT,
+                fontSize: 12,
+                fontWeight: 600,
+                color: colors.TEXT_MUTED,
                 fontFamily: 'var(--font-ui)',
                 marginBottom: 8,
               }}>

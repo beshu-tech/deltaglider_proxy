@@ -138,7 +138,7 @@ async function restoreEngineering(api: APIRequestContext): Promise<void> {
 /**
  * The state before the reader adds the example rule of the page: the
  * seeded `deny-anonymous-writes-downloads` is removed from the page (not
- * applied), so that the Add rule form accepts its name.
+ * applied), so that the New rule form accepts its name.
  */
 async function withoutExampleRule(page: Page): Promise<void> {
   await page.getByRole('button', { name: 'More actions for rule deny-anonymous-writes-downloads' }).click();
@@ -148,7 +148,7 @@ async function withoutExampleRule(page: Page): Promise<void> {
 }
 
 async function fillExampleRule(page: Page): Promise<void> {
-  await page.getByRole('button', { name: 'Add rule' }).click();
+  await page.getByRole('button', { name: 'New rule' }).click();
   const dialog = page.getByRole('dialog');
   await dialog.getByPlaceholder('e.g. deny-known-bad-ips').fill('deny-anonymous-writes-downloads');
   // A click on the label: the checkbox state follows the form state one render later.
@@ -207,8 +207,8 @@ export const ACCESS_SHOTS: Shot[] = [
   {
     id: 'iam-users-new-form',
     route: '/_/admin/access/users',
-    alt: 'The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New button, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create user button.',
-    viewport: { width: 1040, height: 1200 },
+    alt: 'The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New user button at the top right, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create user button.',
+    viewport: { width: 1040, height: 1500 },
     setup: async (page) => {
       await withoutUser(page, 'ci-uploader');
       await page.getByRole('button', { name: 'New user' }).click();
@@ -266,7 +266,7 @@ export const ACCESS_SHOTS: Shot[] = [
   {
     id: 'iam-groups-new-form',
     route: '/_/admin/access/groups',
-    alt: 'The form of a new Engineering group; callout 1 marks the New button, callout 2 the Name field, callout 3 the rule that allows List and Read on releases/*, callout 4 the members dana and backup-bot, and callout 5 the Create group button.',
+    alt: 'The form of a new Engineering group; callout 1 marks the New group button at the top right, callout 2 the Name field, callout 3 the rule that allows List and Read on releases/*, callout 4 the members dana and backup-bot, and callout 5 the Create group button.',
     viewport: TALL,
     setup: async (page) => {
       await withoutEngineering(page);
@@ -281,7 +281,7 @@ export const ACCESS_SHOTS: Shot[] = [
       await calm(page);
     },
     teardown: restoreEngineering,
-    clip: { union: [{ css: '.dg-md-list >> text="Groups"' }, { role: 'button', name: 'Create group' }] },
+    clip: { union: [{ role: 'button', name: 'New group' }, { css: '.dg-md-list >> text="Groups"' }, { role: 'button', name: 'Create group' }] },
     clipPadding: 24,
     annotations: [
       { target: { role: 'button', name: 'New group' }, kind: 'callout', label: '1', side: 'left' },
@@ -302,7 +302,7 @@ export const ACCESS_SHOTS: Shot[] = [
     route: '/_/admin/access/users',
     alt: 'The rule of the backup-bot user with its conditions open; callout 1 marks the backup-bot row, callout 2 the Conditions button, callout 3 the IP restriction field with 203.0.113.0/24, and callout 4 the Save button.',
     setup: (page) => pick(page, 'backup-bot'),
-    viewport: TALL,
+    viewport: { width: 1040, height: 2000 },
     clip: { union: [{ css: '.dg-md-list' }, { role: 'button', name: 'Save user' }] },
     clipPadding: 24,
     annotations: [
@@ -316,7 +316,7 @@ export const ACCESS_SHOTS: Shot[] = [
     id: 'iam-conditions-list-prefix',
     route: '/_/admin/access/users',
     alt: 'A second rule of the dana user denies List on every bucket when the listed prefix matches .*; callout 1 marks Add permission rule, callout 2 the Deny setting, callout 3 the List prefix field, and callout 4 the Save button.',
-    viewport: { width: 1040, height: 2200 },
+    viewport: { width: 1040, height: 2500 },
     setup: async (page) => {
       await pick(page, 'dana');
       await page.getByRole('button', { name: 'Add permission rule' }).click();
@@ -361,27 +361,33 @@ export const ACCESS_SHOTS: Shot[] = [
   // ── how-to/manage-iam-as-code ──
   {
     id: 'iam-code-export-menu',
-    route: '/_/admin/access/users',
-    alt: 'The account menu is open; the box marks Export full IAM (YAML), which downloads the users, groups, providers and mapping rules with their live secrets.',
+    route: '/_/admin/system',
+    viewport: { width: 1040, height: 1200 },
+    alt: 'The Configuration as YAML card of the System page; the box marks Export full IAM (YAML), which downloads the users, groups, providers and mapping rules with their live secrets.',
     setup: async (page) => {
-      await page.getByRole('button', { name: /^Account menu/ }).click();
-      await page.getByRole('menuitem', { name: 'Export full IAM (YAML)' }).waitFor();
+      // The cards above it load on their own and change height: let them
+      // settle before the scroll, and the scroll before the shot.
+      await page.waitForLoadState('networkidle');
+      await page.getByText('Backup', { exact: true }).waitFor();
+      await page.waitForFunction(() => !document.querySelector('[aria-busy="true"], .ant-skeleton'));
+      await page.getByTestId('config-yaml-card').evaluate((el) => el.scrollIntoView({ block: 'center' }));
+      await page.waitForTimeout(500);
       await page.mouse.move(1, 1);
     },
-    clip: { css: '.account-menu-panel' },
+    clip: { css: '[data-testid="config-yaml-card"]' },
     clipPadding: 24,
-    annotations: [{ target: { role: 'menuitem', name: 'Export full IAM (YAML)' }, kind: 'box' }],
+    annotations: [{ target: { role: 'button', name: 'Export full IAM (YAML)' }, kind: 'box' }],
   },
   // ── how-to/set-up-sso ──
   {
     id: 'sso-add-provider',
     route: '/_/admin/access/external-auth',
-    alt: 'The External authentication page with the form of a new Okta provider; callout 1 marks the Add provider button, callout 2 the provider fields from Display name to Scopes, and callout 3 the Create button.',
+    alt: 'The External authentication page with the form of a new Okta provider; callout 1 marks the New provider button, callout 2 the provider fields from Display name to Scopes, and callout 3 the Create button.',
     viewport: TALL,
     setup: async (page) => {
       await removeProviders();
       await page.reload();
-      await page.getByRole('button', { name: 'Add provider' }).click();
+      await page.getByRole('button', { name: 'New provider' }).click();
       await page.getByLabel('Display name', { exact: true }).fill(OKTA.display_name);
       await page.getByLabel('Provider name', { exact: true }).fill(OKTA.name);
       await page.getByLabel('Issuer URL').fill(OKTA.issuer_url);
@@ -390,10 +396,10 @@ export const ACCESS_SHOTS: Shot[] = [
       await page.getByLabel('Scopes').fill(OKTA.scopes);
       await calm(page);
     },
-    clip: { union: [{ role: 'button', name: 'Add provider' }, { label: 'Scopes' }, { role: 'button', name: 'Test connection' }] },
+    clip: { union: [{ role: 'button', name: 'New provider' }, { label: 'Scopes' }, { role: 'button', name: 'Test connection' }] },
     clipPadding: 32,
     annotations: [
-      { target: { role: 'button', name: 'Add provider' }, kind: 'box', label: '1', side: 'bottom' },
+      { target: { role: 'button', name: 'New provider' }, kind: 'box', label: '1', side: 'bottom' },
       { target: { union: [{ text: 'Display name', exact: true }, { label: 'Scopes' }] }, kind: 'box', label: '2' },
       { target: { role: 'button', name: 'Create', exact: true }, kind: 'callout', label: '3', side: 'left' },
     ],
@@ -441,14 +447,14 @@ export const ACCESS_SHOTS: Shot[] = [
   {
     id: 'admission-add-rule',
     route: '/_/admin/access/admission',
-    alt: 'The Add request rule form holds the rule deny-anonymous-writes-downloads; callout 1 marks the Add rule button of the page, callout 2 the conditions, callout 3 the Deny (403) action under Then, and callout 4 the Add rule button of the form.',
+    alt: 'The Add request rule form holds the rule deny-anonymous-writes-downloads; callout 1 marks the New rule button of the page, callout 2 the conditions, callout 3 the Deny (403) action under Then, and callout 4 the Add rule button of the form.',
     viewport: { width: 1040, height: 1000 },
     setup: async (page) => {
       await withoutExampleRule(page);
       await fillExampleRule(page);
     },
     annotations: [
-      { target: { role: 'button', name: 'Add rule', nth: 0 }, kind: 'callout', label: '1', side: 'left' },
+      { target: { role: 'button', name: 'New rule' }, kind: 'callout', label: '1', side: 'left' },
       {
         target: { union: [{ text: /^When a request matches/ }, { role: 'radio', name: 'Anonymous only' }] },
         kind: 'box',
@@ -472,7 +478,7 @@ export const ACCESS_SHOTS: Shot[] = [
       },
       { target: { role: 'button', name: 'Review & apply' }, kind: 'box', label: '6', side: 'right' },
     ],
-    clip: { union: [{ text: 'Your rules', exact: true }, { role: 'button', name: 'Add rule' }, { role: 'button', name: 'Review & apply' }] },
+    clip: { union: [{ text: 'Your rules', exact: true }, { role: 'button', name: 'New rule' }, { role: 'button', name: 'Review & apply' }] },
     clipPadding: 56,
   },
   {

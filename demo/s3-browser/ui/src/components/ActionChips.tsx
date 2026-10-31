@@ -67,7 +67,7 @@ export default function ActionChips({ actions, onChange, prefixScoped, disabled 
   };
 
   return (
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
       {ACTION_CHIPS.map((chip) => {
         const on = held.has(chip.value);
         const adminBlocked = chip.value === 'admin' && prefixScoped;
@@ -86,8 +86,8 @@ export default function ActionChips({ actions, onChange, prefixScoped, disabled 
             style={{
               display: 'inline-flex',
               alignItems: 'center',
-              gap: 6,
-              padding: '3px 10px 3px 7px',
+              gap: 8,
+              padding: '4px 8px 4px 8px',
               height: 28,
               borderRadius: 7,
               fontSize: 12,

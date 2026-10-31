@@ -133,3 +133,16 @@ test('every mode defaults autoComplete to new-password (no password-manager fill
   render(<MaskedSecretInput mode="blank-keeps" value="" onChange={vi.fn()} />);
   expect(secretField()).toHaveAttribute('autocomplete', 'new-password');
 });
+
+// D3: the show/hide control is a real button with a name, not AntD's focusable span.
+test('the show/hide control is a named button that reveals the secret', async () => {
+  const user = userEvent.setup();
+  render(<MaskedSecretInput mode="new" value="s3cr3t" onChange={() => {}} />);
+  expect(secretField()).toHaveAttribute('type', 'password');
+  expect(document.querySelector('.ant-input-password-icon')).toBeNull();
+  const show = screen.getByRole('button', { name: 'Show secret' });
+  expect(show.tagName).toBe('BUTTON');
+  await user.click(show);
+  expect(secretField()).toHaveAttribute('type', 'text');
+  expect(screen.getByRole('button', { name: 'Hide secret' })).toHaveAttribute('aria-pressed', 'true');
+});

@@ -257,9 +257,9 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
 
   return (
     <div style={{ width: '100%' }}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: style?.marginTop }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: style?.marginTop }}>
         {rows.map((row) => (
-          <div key={row.id} style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%' }}>
+          <div key={row.id} style={{ display: 'flex', gap: 8, alignItems: 'center', width: '100%' }}>
             <div style={{ flex: 1, minWidth: 0 }} onFocusCapture={() => { setFocusedId(row.id); setLastFocusedId(row.id); }}>
               <SimpleAutoComplete
                 aria-label="Resource pattern"
@@ -294,12 +294,12 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
         onMouseDown={(e) => e.preventDefault()}
         onClick={addRow}
         block
-        style={{ marginTop: 6, borderRadius: 8 }}
+        style={{ marginTop: 8, borderRadius: 8 }}
       >
         Add resource
       </Button>
       {activeRow && (
-        <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+        <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
           {chipSuggestions.map((pattern) => (
             <Button
               key={pattern}
@@ -314,7 +314,7 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
           ))}
         </div>
       )}
-      <div style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 6, lineHeight: 1.45 }}>
+      <div style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 8, lineHeight: 1.45 }}>
         {knownBucket ? `Browsing prefixes in ${knownBucket}.` : buckets.length > 0 ? `${buckets.length} buckets available.` : 'Enter one resource pattern per row.'}
       </div>
     </div>

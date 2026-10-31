@@ -165,7 +165,7 @@ export default function DocSearch({ docs, onSelect }: Props) {
                   fontSize: 11,
                   color: colors.TEXT_MUTED,
                   fontFamily: 'var(--font-ui)',
-                  marginTop: 3,
+                  marginTop: 2,
                   lineHeight: 1.4,
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',

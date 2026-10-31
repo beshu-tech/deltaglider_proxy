@@ -21,6 +21,8 @@ import { formatBytes, relativeTime, noun } from '../utils';
 import { fmtNum } from './dashboard/chartDefaults';
 import type { BucketRow } from './AnalyticsSection';
 import { useIsNarrow } from '../useIsNarrow';
+import TruncatedName from './TruncatedName';
+import { savingsColors } from '../savings';
 
 interface Props {
   bucketRows: BucketRow[];
@@ -36,7 +38,7 @@ interface Props {
 /** Tier color for a savings percentage. */
 function tierColor(colors: ReturnType<typeof useColors>, pct: number, hasData: boolean): string {
   if (!hasData) return colors.TEXT_FAINT;
-  if (pct >= 50) return colors.SAVED_TEXT;
+  if (pct >= 50) return savingsColors(colors).text;
   if (pct >= 20) return colors.KEPT_TEXT;
   if (pct > 0) return colors.TEXT_SECONDARY;
   return colors.ACCENT_AMBER;
@@ -139,18 +141,18 @@ function FleetRow({
           ? {
               gridTemplateColumns: 'minmax(0, 1fr) auto 30px',
               gridTemplateAreas: '"name pct action" "bar bytes bytes"',
-              columnGap: 10,
-              rowGap: 6,
+              columnGap: 12,
+              rowGap: 8,
             }
           : {
               gridTemplateColumns:
                 '20px minmax(130px, 0.9fr) minmax(180px, 1.6fr) minmax(150px, auto) 58px 30px',
               gridTemplateAreas: '"rank name bar bytes pct action"',
-              gap: 14,
+              gap: 16,
             }),
         alignItems: 'center',
-        padding: '9px 10px',
-        margin: '0 -10px',
+        padding: '8px 12px',
+        margin: '0 -12px',
         borderRadius: 8,
         background: hover ? `${colors.TEXT_FAINT}14` : 'transparent',
         transition: 'background 120ms ease',
@@ -177,7 +179,7 @@ function FleetRow({
           style={{
             display: 'flex',
             alignItems: 'center',
-            gap: 6,
+            gap: 8,
             fontFamily: 'var(--font-mono)',
             fontSize: 12.5,
             fontWeight: 600,
@@ -186,7 +188,7 @@ function FleetRow({
             whiteSpace: 'nowrap',
           }}
         >
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{b.bucket}</span>
+          <TruncatedName text={b.bucket} />
           {b.scanning && (
             <span
               title="Live scan in progress"
@@ -209,7 +211,7 @@ function FleetRow({
                 color: colors.TEXT_MUTED,
                 border: `1px solid ${colors.BORDER}`,
                 borderRadius: 4,
-                padding: '1px 5px',
+                padding: '1px 4px',
                 fontFamily: 'var(--font-ui)',
                 letterSpacing: '0.04em',
                 textTransform: 'lowercase',
@@ -243,7 +245,7 @@ function FleetRow({
       </div>
 
       {/* ratio bar + footprint under-bar */}
-      <div style={{ gridArea: 'bar', display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
+      <div style={{ gridArea: 'bar', display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
         <div
           role="img"
           aria-label={

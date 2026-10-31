@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Typography, theme } from 'antd';
 import { CloudUploadOutlined } from '@ant-design/icons';
 import { collectDroppedFiles } from '../droppedFiles';
+import { SPACE } from './shared-styles';
 
 const { Text, Title } = Typography;
 
@@ -80,7 +81,7 @@ export default function DropZone({ onDrop, prefix }: Props) {
         style={{
           border: `2px dashed ${token.colorPrimary}`,
           borderRadius: 20,
-          padding: '64px',
+          padding: `${SPACE.xl * 2}px`,
           textAlign: 'center',
           maxWidth: 500,
           animation: 'dropGlow 2s ease-in-out infinite',

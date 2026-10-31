@@ -380,7 +380,6 @@ export default function App() {
     <AccountMenu
       identityLabel={who.name}
       identityDetail={who.detail}
-      canAdmin={canAdmin}
       onBrowserClick={view === 'browser' ? undefined : () => navigate(buildViewUrl('browser'))}
       onSettingsClick={view === 'admin' || topBarHasSettings ? undefined : openSettings}
       onDocsClick={view === 'docs' ? undefined : () => navigate(buildViewUrl('docs'))}
@@ -575,6 +574,8 @@ export default function App() {
               accountMenu={accountMenu(true, canAdmin)}
               onOpenSettings={canAdmin ? openSettings : undefined}
               deltaSummary={view === 'browser' ? s3.deltaSummary : null}
+              bucketMissing={bucketMissing}
+              onUpload={canUpload ? openUpload : undefined}
             />
           )}
 

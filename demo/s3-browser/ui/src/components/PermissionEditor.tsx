@@ -130,7 +130,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
 
   return (
     <>
-      <details style={{ marginBottom: 12, border: `1px solid ${colors.BORDER}`, borderRadius: 8, padding: '8px 10px', background: colors.BG_BASE }}>
+      <details style={{ marginBottom: 12, border: `1px solid ${colors.BORDER}`, borderRadius: 8, padding: '8px 8px', background: colors.BG_BASE }}>
         <summary
           title="Open permission examples and variable help"
           style={{
@@ -145,9 +145,9 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
         >
           Examples and variables
         </summary>
-        <div style={{ marginTop: 6, color: colors.TEXT_MUTED, fontSize: 12, lineHeight: 1.6 }}>
+        <div style={{ marginTop: 8, color: colors.TEXT_MUTED, fontSize: 12, lineHeight: 1.6 }}>
           Resources match objects: <span style={monoTextStyle}>bucket/*</span>, <span style={monoTextStyle}>bucket/releases/*</span>, or <span style={monoTextStyle}>*</span>. Prefix conditions filter LIST requests only, so pair <span style={monoTextStyle}>bucket/releases/*</span> with <span style={monoTextStyle}>releases/*</span> when users should only list that prefix.
-          <div style={{ marginTop: 6 }}>
+          <div style={{ marginTop: 8 }}>
             Variables: <span style={monoTextStyle}>{'${iam:username}'}</span> and <span style={monoTextStyle}>{'${iam:access_key_id}'}</span> expand per authenticated user.
           </div>
         </div>
@@ -178,15 +178,16 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
             border: `1px solid ${isDeny ? `${colors.ACCENT_RED}40` : colors.BORDER}`,
             borderLeft: isDeny ? `3px solid ${colors.ACCENT_RED}` : `1px solid ${colors.BORDER}`,
             borderRadius: 8,
-            padding: 14,
-            marginBottom: 10,
+            padding: 12,
+            marginBottom: 8,
             background: isDeny ? `${colors.ACCENT_RED}08` : colors.BG_BASE,
           }}>
             {/* Header: Allow/Deny + Conditions toggle + Remove */}
-            <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+            <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <span title="Deny rules override Allow rules">
                   <Segmented
+                    tabIndex={-1}
                     size="small"
                     value={row.effect || 'Allow'}
                     onChange={v => updateRow(id, { effect: v as string })}
@@ -231,7 +232,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
             <div style={{
               display: 'flex',
               flexWrap: 'wrap',
-              gap: 14,
+              gap: 12,
               alignItems: 'flex-start',
               marginBottom: conditionsVisible ? 12 : 4,
             }}>
@@ -253,7 +254,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                 <Alert
                   type="warning"
                   showIcon
-                  style={{ marginTop: 6 }}
+                  style={{ marginTop: 8 }}
                   title={
                     <span style={{ fontSize: 12 }}>
                       {bucketWarnings.map((w) => (
@@ -275,7 +276,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                 <Alert
                   type="error"
                   showIcon
-                  style={{ marginTop: 6 }}
+                  style={{ marginTop: 8 }}
                   title={
                     <span style={{ fontSize: 12 }}>
                       {patternErrors.map((msg, idx) => (
@@ -288,7 +289,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
               </div>
 
               <div style={{ flex: '1 1 360px', minWidth: 300 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 18 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 18 }}>
                   <Text type="secondary" style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.4 }}>CAN DO</Text>
                   {effectiveActions(row.actions).size > 1 && (
                     <button
@@ -311,7 +312,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                     </button>
                   )}
                 </div>
-                <div style={{ marginTop: 6 }}>
+                <div style={{ marginTop: 8 }}>
                   <ActionChips
                     actions={row.actions}
                     prefixScoped={isPrefixScoped(row.resources)}
@@ -320,7 +321,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   <div style={{
                     fontSize: 11,
                     color: row.actions.length === 0 && !pristine ? colors.ACCENT_AMBER : colors.TEXT_MUTED,
-                    marginTop: 6,
+                    marginTop: 8,
                     lineHeight: 1.45,
                   }}>
                     {pristine
@@ -350,9 +351,9 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
               <div style={{
                 borderTop: `1px solid ${colors.BORDER}`,
                 paddingTop: 12,
-                marginTop: 6,
+                marginTop: 8,
               }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
                   <FilterOutlined style={{ fontSize: 11, color: colors.ACCENT_PURPLE }} />
                   <Text style={{ fontSize: 12, fontWeight: 500, color: colors.ACCENT_PURPLE }}>Optional filters</Text>
                 </div>
@@ -362,7 +363,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   <div>
                     <div style={condLabelStyle}>
                       List prefix
-                      <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 6 }}>
+                      <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 8 }}>
                         s3:prefix StringLike
                       </span>
                     </div>
@@ -380,7 +381,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   <div>
                     <label htmlFor={`${uid}-ip-${id}`} style={{ ...condLabelStyle, display: 'block' }}>
                       IP restriction
-                      <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 6 }}>
+                      <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 8 }}>
                         IpAddress on aws:SourceIp
                       </span>
                     </label>
@@ -403,7 +404,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                     <div>
                       <div style={condLabelStyle}>
                         Other conditions
-                        <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 6 }}>
+                        <span style={{ fontWeight: 400, textTransform: 'none', marginLeft: 8 }}>
                           set by the API or YAML, read-only here
                         </span>
                       </div>
@@ -421,13 +422,13 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
 
             {isIncomplete && !pristine && (
               <div style={{
-                marginTop: 10,
+                marginTop: 8,
                 fontSize: 11,
                 fontWeight: 600,
                 color: colors.ACCENT_AMBER,
                 display: 'flex',
                 alignItems: 'center',
-                gap: 6,
+                gap: 8,
               }}>
                 <FilterOutlined style={{ transform: 'rotate(180deg)' }} />
                 {noResource && noActions

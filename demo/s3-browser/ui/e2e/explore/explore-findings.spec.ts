@@ -67,7 +67,7 @@ async function signIn(page: Page) {
   await page.getByLabel('Access key ID', { exact: true }).fill(ACCESS_KEY);
   await page.getByLabel('Secret access key', { exact: true }).fill(SECRET_KEY);
   await page.getByRole('button', { name: 'Sign in' }).click();
-  await expect(page.getByText('ADMIN SETTINGS', { exact: false })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText('Admin settings', { exact: true })).toBeVisible({ timeout: 30_000 });
 }
 
 async function httpStatus(p: Promise<unknown>): Promise<number> {

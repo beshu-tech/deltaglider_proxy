@@ -1,7 +1,7 @@
 // Regression: a change inside one rule showed the WHOLE rules array, before
 // and after, truncated at the same prefix: the change was invisible.
 import { expect, test } from 'vitest';
-import { expandDiff } from '../applyDiff';
+import { diffFields, expandDiff, formatDiffValue } from '../applyDiff';
 
 const rule = (name: string, over: Record<string, unknown> = {}) => ({
   name,
@@ -39,4 +39,36 @@ test('reordered rules and plain values pass through', () => {
     { path: 'lifecycle.enabled', kind: 'changed', before: false, after: true },
   ]);
   expect(expandDiff([['x.globs', { before: ['a'], after: ['b'] }]])[0].path).toBe('x.globs');
+});
+
+// UX harvest D37: the first lifecycle rule arrived as ONE line,
+// `lifecycle: null → {…whole section…}`, shown as JSON cut at 120 characters.
+test('a section created as a whole lists its fields and names its rules', () => {
+  const lines = expandDiff([
+    ['lifecycle', { before: null, after: { enabled: false, rules: [rule('qa-lc-rule')], tick_interval: '1h' } }],
+  ]);
+  expect(lines.map((l) => [l.kind, l.path])).toEqual([
+    ['added', 'lifecycle.enabled'],
+    ['added', 'lifecycle.rules["qa-lc-rule"]'],
+    ['added', 'lifecycle.tick_interval'],
+  ]);
+  // And removed as a whole: the rule is named, not "{…} → null".
+  const gone = expandDiff([['lifecycle', { before: { rules: [rule('qa-lc-rule')] }, after: null }]]);
+  expect(gone).toEqual([{ path: 'lifecycle.rules["qa-lc-rule"]', kind: 'removed', before: rule('qa-lc-rule') }]);
+});
+
+test('a rule reads as a field list, never cut', () => {
+  expect(diffFields(rule('a', { include_globs: ['*.zip', '*.tar'], exclude_globs: [] }))).toEqual([
+    { key: 'name', value: '"a"' },
+    { key: 'enabled', value: 'true' },
+    { key: 'source.bucket', value: '"releases"' },
+    { key: 'source.prefix', value: '""' },
+    { key: 'destination.bucket', value: '"downloads"' },
+    { key: 'destination.prefix', value: '""' },
+    { key: 'replicate_deletes', value: 'false' },
+    { key: 'include_globs', value: '"*.zip", "*.tar"' },
+    { key: 'exclude_globs', value: 'none' },
+  ]);
+  expect(diffFields('x')).toBeNull();
+  expect(formatDiffValue(null)).toBe('not set');
 });

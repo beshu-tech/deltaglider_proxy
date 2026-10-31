@@ -39,13 +39,27 @@ test('lists the entries and filters them client-side', async () => {
 test('an empty ring explains what gets recorded', async () => {
   http.on('GET', AUDIT, json({ entries: [] }));
   renderWithQuery(<AuditLogPanel />);
-  expect(await screen.findByText('No audit entries yet.')).toBeInTheDocument();
+  expect(await screen.findByText('No audit entries yet')).toBeInTheDocument();
 });
 
-test('a fetch failure shows an alert', async () => {
+test('a fetch failure shows ONE error state with Retry, and no empty state (UX harvest D17)', async () => {
   http.on('GET', AUDIT, json({ error: 'ring unavailable' }, 500));
   renderWithQuery(<AuditLogPanel />);
-  expect(await screen.findByText(/Failed to load audit entries: .*ring unavailable/)).toBeInTheDocument();
+  const alert = await screen.findByRole('alert');
+  expect(alert).toHaveTextContent('Could not load the audit log');
+  expect(alert).toHaveTextContent('Ring unavailable.');
+  expect(alert).not.toHaveTextContent('(500)');
+  expect(screen.getByRole('button', { name: /Retry/ })).toBeInTheDocument();
+  expect(screen.queryByText('No audit entries yet')).toBeNull();
+});
+
+test('a phone shows one card per entry instead of a sideways-scrolling table (UX harvest D40)', async () => {
+  vi.stubGlobal('innerWidth', 390);
+  http.on('GET', AUDIT, json({ entries: [entry('login', 'dana', 'releases')] }));
+  renderWithQuery(<AuditLogPanel />);
+  const list = await screen.findByRole('list', { name: 'Audit entries' });
+  expect(list).toHaveTextContent('dana · 10.0.0.7 · releases');
+  expect(screen.queryByText('Target / path')).toBeNull();
 });
 
 test('an expired session sends the user to sign in', async () => {
@@ -53,7 +67,7 @@ test('an expired session sends the user to sign in', async () => {
   const onSessionExpired = vi.fn();
   renderWithQuery(<AuditLogPanel onSessionExpired={onSessionExpired} />);
   await waitFor(() => expect(onSessionExpired).toHaveBeenCalled());
-  expect(screen.queryByText(/Failed to load audit entries/)).toBeNull();
+  expect(screen.queryByText(/Could not load/)).toBeNull();
 });
 
 test('auto-refresh polls every 3 s only while switched on', async () => {

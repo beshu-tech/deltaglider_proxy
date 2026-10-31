@@ -3,7 +3,6 @@ import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { listObjects, getBucket, setBucket, hasCredentials } from '../s3client';
 import type { BucketUsage } from '../adminApi';
-import { normalizeUiError } from '../errorHandling';
 import { virtualWritableChildren } from '../permissions';
 import type { S3Object } from '../types';
 import { mergeFirstPage } from '../listingRefresh';
@@ -43,7 +42,8 @@ export function useObjectListing({
   // that went past page 1), or null: the status bar says how old they are.
   const [restListedAt, setRestListedAt] = useState<number | null>(null);
   const [connected, setConnected] = useState(hasCredentials());
-  const [error, setError] = useState<string | null>(null);
+  // The failure as thrown: the screen words it through plainError.
+  const [error, setError] = useState<unknown>(null);
   const isInitialLoad = useRef(true);
 
   /** Clear objects, folders, head cache, and mark as initial load. */
@@ -163,7 +163,7 @@ export function useObjectListing({
       .catch((err) => {
         if (seq !== loadSeq.current) return; // stale error — drop silently
         // Keep stale data on error instead of clearing
-        setError(normalizeUiError(err, 'Failed to load objects'));
+        setError(err ?? new Error('The proxy could not list the objects.'));
         setConnected(false);
         setVirtualFolders([]);
       })

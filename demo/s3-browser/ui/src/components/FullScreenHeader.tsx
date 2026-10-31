@@ -56,16 +56,14 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
       {!phone && <div style={{
         display: 'flex',
         alignItems: 'baseline',
-        gap: 10,
+        gap: 8,
         userSelect: 'none',
       }}>
         <span className="hide-mobile" style={{
-          fontSize: 13,
+          fontSize: 14,
           fontWeight: 700,
-          letterSpacing: 3,
           color: colors.TEXT_MUTED,
           fontFamily: 'var(--font-ui)',
-          textTransform: 'uppercase',
         }}>
           DeltaGlider
         </span>
@@ -79,13 +77,11 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
           top: 1,
         }} />
         <span style={{
-          fontSize: 13,
+          fontSize: 14,
           fontWeight: 600,
-          letterSpacing: 2,
           whiteSpace: 'nowrap',
           color: colors.ACCENT_BLUE,
-          fontFamily: 'var(--font-mono)',
-          textTransform: 'uppercase',
+          fontFamily: 'var(--font-ui)',
         }}>
           {title}
         </span>

@@ -2,7 +2,7 @@ import { useRef, useState, useEffect } from 'react';
 import { flushSync } from 'react-dom';
 import { Layout, Space, Button, Input, theme } from 'antd';
 import type { InputRef } from 'antd';
-import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, QuestionCircleOutlined, SettingOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
+import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, QuestionCircleOutlined, SettingOutlined, SunOutlined, MoonOutlined, CloudUploadOutlined } from '@ant-design/icons';
 import { metaKeyLabel } from '../platform';
 import Breadcrumb from './Breadcrumb';
 import DeltaSavingsChip from './DeltaSavingsChip';
@@ -14,6 +14,7 @@ import { useDocumentEvent } from '../useDocumentEvent';
 import { isTypingTarget, anyOverlayOpen } from '../keyboard';
 import { useIsNarrow } from '../useIsNarrow';
 import { HEADER_STATS_MIN_VIEWPORT } from '../browser/layout';
+import { SPACE } from './shared-styles';
 
 const { Header } = Layout;
 
@@ -39,6 +40,12 @@ interface Props {
   onOpenSettings?: () => void;
   /** Aggregated delta savings for the current prefix view. Auto-hides when no deltas present. */
   deltaSummary?: DeltaSummary | null;
+  /** The URL's bucket does not exist (or the user cannot see it): the header
+   *  states no facts about it — no size, count, public marker or refresh (D12). */
+  bucketMissing?: boolean;
+  /** Open the upload page. On a phone the header has an upload icon: the
+   *  sidebar drawer was the only way there (D51). */
+  onUpload?: () => void;
 }
 
 function SearchInput({
@@ -83,7 +90,7 @@ function SearchInput({
         background: 'var(--input-bg)',
         borderColor: BORDER,
         color: TEXT_PRIMARY,
-        borderRadius: 8,
+        borderRadius: SPACE.xs,
         fontFamily: "var(--font-mono)",
         fontSize: 13,
         ...style,
@@ -92,7 +99,7 @@ function SearchInput({
   );
 }
 
-export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, onShowShortcuts, accountMenu, onOpenSettings, deltaSummary = null }: Props) {
+export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, onShowShortcuts, accountMenu, onOpenSettings, deltaSummary = null, bucketMissing = false, onUpload }: Props) {
   const { token } = theme.useToken();
   const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
   const { isDark, toggleTheme } = useTheme();
@@ -103,6 +110,7 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
   // Narrow window: the bucket totals move to the listing's footer
   // (BrowserScreen), and the savings chip keeps its place here.
   const statsInFooter = useIsNarrow(HEADER_STATS_MIN_VIEWPORT);
+  const bucketFacts = !!bucket && !bucketMissing;
   const inputRef = useRef<InputRef>(null);
   useEffect(() => {
     if (searchQuery) setSearchOpen(true);
@@ -138,8 +146,8 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
         alignItems: 'center',
         justifyContent: 'space-between',
         // The stats never run into the icon group.
-        gap: isMobile ? 8 : 24,
-        padding: isMobile ? '0 12px' : '0 20px',
+        gap: isMobile ? SPACE.xs : SPACE.lg,
+        padding: isMobile ? `0 ${SPACE.sm}px` : `0 ${SPACE.md}px`,
         height: 52,
         lineHeight: '52px',
         background: token.colorBgContainer,
@@ -149,7 +157,7 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
       {/* Left: hamburger + one-line breadcrumb on mobile, breadcrumb or search
           on desktop. overflow:hidden keeps anything here from ever covering
           the action icons on the right. */}
-      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 12, overflow: 'hidden' }}>
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: SPACE.sm, overflow: 'hidden' }}>
         {isMobile && (
           <>
             <Button type="text" icon={<MenuOutlined />} onClick={onMenuClick} size="small" aria-label="Open navigation menu" />
@@ -171,11 +179,14 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
                 style={{ flex: '1 1 240px', maxWidth: 360, minWidth: 160 }}
               />
             ) : (
-              <>
-                {bucket && <BucketPublicIcon bucket={bucket} canAdmin={canAdmin} prefix={prefix} label />}
-                {bucket && !statsInFooter && <BucketUsageChip bucket={bucket} canAdmin={canAdmin} inFolder={!!prefix} />}
-                <DeltaSavingsChip summary={deltaSummary} />
-              </>
+              // The facts give way before the breadcrumb (D6): a narrow header
+              // shows the savings percent only, and in the last resort this
+              // group is clipped, never the current folder.
+              <div style={{ display: 'flex', alignItems: 'center', gap: SPACE.sm, minWidth: 0, flex: '0 1000 auto', overflow: 'hidden' }}>
+                {bucketFacts && <BucketPublicIcon bucket={bucket} canAdmin={canAdmin} prefix={prefix} label={!statsInFooter} />}
+                {bucketFacts && !statsInFooter && <BucketUsageChip bucket={bucket} canAdmin={canAdmin} inFolder={!!prefix} />}
+                {!bucketMissing && <DeltaSavingsChip summary={deltaSummary} compact={statsInFooter} />}
+              </div>
             )}
           </>
         )}
@@ -204,7 +215,18 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
               onClick={() => setSearchOpen(!searchOpen)}
             />
         )}
-        {canRefresh && (
+        {isMobile && onUpload && bucketFacts && !searchOpen && (
+          <Button
+            type="text"
+            icon={<CloudUploadOutlined />}
+            size="small"
+            title="Upload files"
+            aria-label="Upload files"
+            onClick={onUpload}
+            style={{ color: TEXT_MUTED }}
+          />
+        )}
+        {canRefresh && !bucketMissing && (
           <Button
             type="text"
             icon={<ReloadOutlined spin={refreshing} />}

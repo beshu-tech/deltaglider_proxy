@@ -73,14 +73,14 @@ export default function RunDrawer({ run, onClose }: Props) {
         <OutcomeMeter {...rowMeterInput(run)} />
       </div>
       {facts.map(([k, v]) => (
-        <div key={k} style={{ display: 'flex', gap: 12, padding: '6px 0' }}>
+        <div key={k} style={{ display: 'flex', gap: 12, padding: '8px 0' }}>
           <Text type="secondary" style={{ width: 110, flexShrink: 0, fontSize: 12 }}>
             {k}
           </Text>
           <Text style={{ fontSize: 13, minWidth: 0, wordBreak: 'break-word' }}>{v}</Text>
         </div>
       ))}
-      <Title level={5} style={{ marginTop: 20 }}>
+      <Title level={5} style={{ marginTop: 16 }}>
         Failures of this run
       </Title>
       <FailuresList data={failures.data} />

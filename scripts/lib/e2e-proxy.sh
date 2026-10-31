@@ -132,6 +132,9 @@ YAML
     cd "$E2E_DIR"
     if [[ "$mode" == docs ]]; then
       export DGP_BACKEND_ALLOW_LOCAL=true
+      # The HA shots set a config sync bucket, which the proxy accepts only
+      # with a shared config DB key (a fixed test value, at least 32 chars).
+      export DGP_CONFIG_DB_KEY=docs-screenshots-config-db-key-0123456789
     else
       # Not for docs: RUST_LOG locks the Log level card of the System page.
       export RUST_LOG="${E2E_RUST_LOG:-deltaglider_proxy=info}"

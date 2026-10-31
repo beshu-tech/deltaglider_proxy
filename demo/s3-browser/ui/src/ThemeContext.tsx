@@ -26,15 +26,7 @@ export const darkColors = {
   INSET_SHADOW: 'inset 0 1px 3px rgba(0,0,0,0.45)',
   GLOW_GREEN: 'rgba(52,211,153,0.35)',
   ELEV_SHADOW: '0 1px 3px rgba(0,0,0,0.35), 0 8px 24px -12px rgba(0,0,0,0.5)',
-  SAVED_TEXT: '#34d399',
-  SAVED_TEXT_DEEP: '#6ee7b7',
   KEPT_TEXT: '#5eead4',
-  STORAGE_TYPE_COLORS: {
-    delta:     { bg: 'rgba(167, 139, 250, 0.1)', border: 'rgba(167, 139, 250, 0.25)', text: '#a78bfa' },
-    reference: { bg: 'rgba(56, 189, 248, 0.1)',  border: 'rgba(56, 189, 248, 0.25)',  text: '#38bdf8' },
-    passthrough: { bg: 'rgba(52, 211, 153, 0.1)',  border: 'rgba(52, 211, 153, 0.25)',  text: '#34d399' },
-  } as Record<string, { bg: string; border: string; text: string }>,
-  STORAGE_TYPE_DEFAULT: { bg: 'rgba(52, 211, 153, 0.1)', border: 'rgba(52, 211, 153, 0.25)', text: '#34d399' },
 };
 
 // Light colors — clean, high-contrast
@@ -63,15 +55,7 @@ export const lightColors = {
   INSET_SHADOW: 'inset 0 1px 2px rgba(12,22,41,0.08)',
   GLOW_GREEN: 'rgba(5,150,105,0.28)',
   ELEV_SHADOW: '0 1px 2px rgba(12,22,41,0.05), 0 4px 16px -8px rgba(12,22,41,0.10)',
-  SAVED_TEXT: '#059669',
-  SAVED_TEXT_DEEP: '#047857',
   KEPT_TEXT: '#0f766e',
-  STORAGE_TYPE_COLORS: {
-    delta:     { bg: '#f3e8ff', border: '#c084fc', text: '#7c3aed' },
-    reference: { bg: '#e0f2fe', border: '#38bdf8', text: '#0284c7' },
-    passthrough: { bg: '#d1fae5', border: '#34d399', text: '#047857' },
-  } as Record<string, { bg: string; border: string; text: string }>,
-  STORAGE_TYPE_DEFAULT: { bg: '#d1fae5', border: '#34d399', text: '#047857' },
 };
 
 export type ColorTokens = typeof darkColors;

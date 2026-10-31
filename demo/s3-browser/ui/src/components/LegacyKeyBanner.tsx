@@ -15,7 +15,7 @@ import type { LegacyKeyUsage } from '../adminApi';
 import { LEGACY_KEY_SCAN_LIMIT } from '../adminApi';
 import { useLegacyKeyUsage } from '../queries/backends';
 import { confirmDialog } from '../confirmDialog';
-import { normalizeUiError } from '../errorHandling';
+import { plainError } from '../plainError';
 
 const plural = (n: number, one: string, many: string) => `${n.toLocaleString('en-US')} ${n === 1 ? one : many}`;
 
@@ -86,7 +86,7 @@ export default function LegacyKeyBanner({
       style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }}
       title="Decrypt-only shim active"
       description={
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <span>
             A legacy key is configured on {bucket ? 'this bucket' : 'this backend'}. Objects written
             under that key still decrypt; new writes use the current mode. Clear the legacy key once
@@ -100,7 +100,7 @@ export default function LegacyKeyBanner({
             </span>
           )}
           {usage.isFetching && <span>Checking which objects still use the legacy key…</span>}
-          {usage.error && <span>{normalizeUiError(usage.error, 'The check failed')}</span>}
+          {usage.error && <span>{plainError(usage.error, 'Could not check for objects under the old key').text}</span>}
           {u && <span>{usageSummary(u)}</span>}
           {u && u.examples.length > 0 && (
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, overflowWrap: 'anywhere' }}>

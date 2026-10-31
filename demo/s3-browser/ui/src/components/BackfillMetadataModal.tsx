@@ -17,7 +17,7 @@ import { startBackfillMetadata } from '../adminApi';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
 import { useBucketOrigins } from '../queries/backends';
-import { normalizeUiError } from '../errorHandling';
+import { plainError } from '../plainError';
 
 const { Text } = Typography;
 
@@ -70,7 +70,7 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
       setSelected((cur) => cur.filter((b) => failed.has(b)));
       if (res.errors.length === 0) onClose();
     } catch (e) {
-      messageApi.error(normalizeUiError(e, 'Failed to start'));
+      messageApi.error(plainError(e, 'Could not start the metadata job').text);
     } finally {
       setStarting(false);
     }
@@ -140,7 +140,7 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
           {visible.length === 0 ? (
             <Text type="secondary">No bucket matches the search.</Text>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 280, overflowY: 'auto' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 280, overflowY: 'auto' }}>
               {visible.map(({ name: b, backend }) => (
                 <Checkbox
                   key={b}

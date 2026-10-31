@@ -32,12 +32,17 @@
  * password manager does not fill a saved login password into a credential
  * field (and then save or rotate it). Callers can override it.
  *
+ * The show/hide control is a real `<button>` named "Show secret" / "Hide
+ * secret" (aria-pressed), with the shared focus ring (UX harvest D3): AntD's
+ * Input.Password toggle is a focusable `span` with a ring of its own.
+ *
  * The font is the form's font, like every other input (a secret is not code);
  * a caller may pass its own `style`. The ARIA and `status` props that a
  * FormField gives its control (label, error link, invalid state) pass through.
  */
+import { useState, type CSSProperties } from 'react';
 import { Input } from 'antd';
-import type { CSSProperties } from 'react';
+import { EyeInvisibleOutlined, EyeOutlined } from '@ant-design/icons';
 
 // NOTE: the secret-mask sentinel itself (`__redacted__`, mirrored in
 // `src/config.rs` + `webhookDeliveryPayload.ts`) never appears here — this
@@ -62,6 +67,9 @@ interface BaseProps {
   reveal?: boolean;
   /** Forwarded to the input, so a FormField label names it. */
   id?: string;
+  disabled?: boolean;
+  autoFocus?: boolean;
+  onPressEnter?: () => void;
   'aria-label'?: string;
   'aria-labelledby'?: string;
   /** Set by FormField: the help text and the error under the field. */
@@ -117,10 +125,30 @@ export default function MaskedSecretInput(props: MaskedSecretInputProps) {
         ? NEW_PLACEHOLDER
         : BLANK_KEEPS_PLACEHOLDER);
 
-  const Field = reveal ? Input : Input.Password;
+  const [shown, setShown] = useState(false);
+  const toggle = reveal ? undefined : (
+    <button
+      type="button"
+      className="btn-reset dg-secret-toggle"
+      aria-label={shown ? 'Hide secret' : 'Show secret'}
+      aria-pressed={shown}
+      title={shown ? 'Hide secret' : 'Show secret'}
+      disabled={props.disabled}
+      onClick={() => setShown((v) => !v)}
+      style={{ padding: 2, borderRadius: 4, color: 'inherit', lineHeight: 1 }}
+    >
+      {shown ? <EyeInvisibleOutlined aria-hidden="true" /> : <EyeOutlined aria-hidden="true" />}
+    </button>
+  );
 
   return (
-    <Field
+    <Input
+      type={reveal || shown ? 'text' : 'password'}
+      suffix={toggle}
+      spellCheck={false}
+      disabled={props.disabled}
+      autoFocus={props.autoFocus}
+      onPressEnter={props.onPressEnter}
       value={shownValue}
       onChange={(e) => onChange(e.target.value)}
       placeholder={resolvedPlaceholder}

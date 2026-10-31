@@ -152,8 +152,7 @@ test('a row without facts shows the neutral tag, not a spinner', async () => {
   // The row is in the cache with no type: the table renders a tag for it.
   expect(cache['m/odd.zip']).toEqual({ storageType: undefined, storedSize: undefined });
   expect(cache['m/a.txt']).toEqual({ storageType: 'passthrough', storedSize: undefined });
-  const color = { bg: '', border: '', text: '' };
-  renderWithQuery(<StorageTypeTag storageType={undefined} colors={{}} fallback={color} />);
+  renderWithQuery(<StorageTypeTag storageType={undefined} />);
   expect(screen.getByText('—')).toBeTruthy();
   await settle();
   expect(heads()).toHaveLength(0);

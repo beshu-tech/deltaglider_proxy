@@ -1,16 +1,18 @@
 import { useState, useEffect } from 'react';
-import { Modal, Spin, Alert, Button, Typography } from 'antd';
+import { Modal, Alert, Button, Typography, message } from 'antd';
 import { DownloadOutlined, FileExclamationOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
 import { downloadObject, getDownloadUrl, getPresignedUrl } from '../s3client';
 import { formatBytes, getFileName, downloadFromUrl } from '../utils';
 import { useColors } from '../ThemeContext';
 import { getPreviewMode } from './filePreviewMode';
-import { normalizeUiError } from '../errorHandling';
+import { plainError } from '../plainError';
+import { EmptyState, ErrorState, LoadingState } from './StatePlaceholders';
+import { SPACE } from './shared-styles';
 
 const { Text } = Typography;
 
-const MAX_TEXT_PREVIEW = 512 * 1024; // 512 KB
+const MAX_TEXT_PREVIEW = 512 * 1024; // 512 KiB
 
 type MediaMode = 'image' | 'video' | 'audio';
 
@@ -30,7 +32,10 @@ interface FilePreviewProps {
 export default function FilePreview({ open, object, onClose }: FilePreviewProps) {
   const colors = useColors();
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+  // The failure as thrown: ErrorState words it (plainError), raw text in Details.
+  const [error, setError] = useState<unknown>(null);
+  // Bumped by Retry: the effect loads the file again.
+  const [attempt, setAttempt] = useState(0);
   const [textContent, setTextContent] = useState('');
   // Presigned URL for any binary media rendered inline (image / video / audio).
   const [mediaUrl, setMediaUrl] = useState('');
@@ -51,7 +56,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
     let cancelled = false;
 
     setLoading(true);
-    setError('');
+    setError(null);
     setTextContent('');
     setMediaUrl('');
     setUnreadable(null);
@@ -69,7 +74,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
             setTextContent(raw);
           }
         })
-        .catch(e => { if (!cancelled) setError(normalizeUiError(e, "Failed to load file")); })
+        .catch(e => { if (!cancelled) setError(e ?? new Error("The file could not be read.")); })
         .finally(() => { if (!cancelled) setLoading(false); });
     } else if (mode === 'image' || mode === 'video' || mode === 'audio') {
       // Stream the bytes straight from a presigned URL — the browser's native
@@ -77,7 +82,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
       // media never has to be buffered through JS.
       getPresignedUrl(object.key)
         .then(url => { if (!cancelled) setMediaUrl(url); })
-        .catch(e => { if (!cancelled) setError(normalizeUiError(e, "Failed to load media")); })
+        .catch(e => { if (!cancelled) setError(e ?? new Error("The file could not be read.")); })
         .finally(() => { if (!cancelled) setLoading(false); });
     } else {
       setLoading(false);
@@ -87,15 +92,16 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
     // `mode` and `tooLarge` are pure derivations of `object` (recomputed each
     // render), so they're redundant given `object` — but listed explicitly to
     // keep exhaustive-deps happy and to make the effect's read set self-evident.
-  }, [open, object, mode, tooLarge]);
+  }, [open, object, mode, tooLarge, attempt]);
 
   // Native, streamed download (see InspectorPanel): no page-memory Blob.
   const handleDownload = async () => {
     if (!object) return;
     try {
       downloadFromUrl(await getDownloadUrl(object.key, filename), filename);
-    } catch {
-      setError('Download failed');
+    } catch (e) {
+      // A failed download is not a failed preview: the preview stays.
+      void message.error(plainError(e, 'The download could not start. Try again.').text);
     }
   };
 
@@ -118,25 +124,23 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
         </div>
       }
     >
-      {loading && (
-        <div style={{ textAlign: 'center', padding: 48 }}><Spin size="large" /></div>
+      {loading && <LoadingState variant="inline" label="Loading the preview" />}
+
+      {error != null && (
+        <ErrorState error={error} what="the preview" onRetry={() => setAttempt((n) => n + 1)} />
       )}
 
-      {error && (
-        <Alert type="error" title={error} showIcon style={{ borderRadius: 8 }} />
-      )}
-
-      {!loading && !error && tooLarge && (
+      {!loading && error == null && tooLarge && (
         <Alert
           type="info"
           showIcon
           title={`File too large for preview (${formatBytes(object.size)})`}
-          description="Text preview is limited to 512 KB. Use the Download button to view the full file."
+          description="Text preview is limited to 512 KiB. Use the Download button to view the full file."
           style={{ borderRadius: 8 }}
         />
       )}
 
-      {!loading && !error && mode === null && (
+      {!loading && error == null && mode === null && (
         <Alert
           type="info"
           showIcon
@@ -146,12 +150,12 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
         />
       )}
 
-      {!loading && !error && textContent && (
+      {!loading && error == null && textContent && (
         <pre style={{
           background: colors.BG_BASE,
           border: `1px solid ${colors.BORDER}`,
           borderRadius: 8,
-          padding: 16,
+          padding: SPACE.md,
           margin: 0,
           maxHeight: 500,
           overflow: 'auto',
@@ -167,28 +171,15 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
       )}
 
       {unreadable && (
-        <div
-          role="status"
-          style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, padding: '48px 16px', textAlign: 'center' }}
-        >
-          <FileExclamationOutlined aria-hidden="true" style={{ fontSize: 32, color: colors.TEXT_MUTED }} />
-          <div style={{ fontSize: 15, fontWeight: 600, color: colors.TEXT_PRIMARY, fontFamily: 'var(--font-ui)' }}>
-            {UNREADABLE[unreadable].title}
-          </div>
-          <div style={{ fontSize: 13, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)', maxWidth: 420 }}>
-            {UNREADABLE[unreadable].hint}
-          </div>
-          <div style={{ fontSize: 12, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
-            {filename} · {formatBytes(object.size)}
-            {object.headers?.['content-type'] ? ` · ${object.headers['content-type']}` : ''}
-          </div>
-          <Button type="primary" icon={<DownloadOutlined />} onClick={handleDownload} style={{ marginTop: 8 }}>
-            Download
-          </Button>
-        </div>
+        <EmptyState
+          icon={<FileExclamationOutlined />}
+          title={UNREADABLE[unreadable].title}
+          hint={UNREADABLE[unreadable].hint}
+          action={<Button type="primary" icon={<DownloadOutlined />} onClick={handleDownload}>Download</Button>}
+        />
       )}
 
-      {!loading && !error && !unreadable && mediaUrl && mode === 'image' && (
+      {!loading && error == null && !unreadable && mediaUrl && mode === 'image' && (
         <div style={{ textAlign: 'center' }}>
           <img
             src={mediaUrl}
@@ -204,7 +195,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
         </div>
       )}
 
-      {!loading && !error && !unreadable && mediaUrl && mode === 'video' && (
+      {!loading && error == null && !unreadable && mediaUrl && mode === 'video' && (
         <div style={{ textAlign: 'center' }}>
           <video
             src={mediaUrl}
@@ -223,8 +214,8 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
         </div>
       )}
 
-      {!loading && !error && !unreadable && mediaUrl && mode === 'audio' && (
-        <div style={{ textAlign: 'center', padding: '24px 8px' }}>
+      {!loading && error == null && !unreadable && mediaUrl && mode === 'audio' && (
+        <div style={{ textAlign: 'center', padding: `${SPACE.lg}px ${SPACE.xs}px` }}>
           <audio
             src={mediaUrl}
             controls

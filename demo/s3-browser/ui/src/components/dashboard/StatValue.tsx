@@ -18,12 +18,13 @@
  */
 import type { ReactNode } from 'react';
 import { useColors } from '../../ThemeContext';
+import { SPACE } from '../shared-styles';
 
 type StatTone = 'neutral' | 'good' | 'warn' | 'bad';
 
 interface Props {
   value: string;
-  /** Optional trailing unit in smaller type (e.g. "%", "MB"). */
+  /** Optional trailing unit in smaller type (e.g. "%", "MiB"). */
   unit?: string;
   /** One-line secondary caption shown under the value. */
   hint?: string;
@@ -55,14 +56,14 @@ export default function StatValue({ value, unit, hint, tone = 'neutral', childre
         flexDirection: 'column',
         justifyContent: 'center',
         flex: 1,
-        gap: 4,
+        gap: SPACE.xxs,
       }}
     >
       <div
         style={{
           display: 'flex',
           alignItems: 'baseline',
-          gap: 6,
+          gap: SPACE.xs,
           color,
           fontFamily: 'var(--font-ui)',
           fontWeight: 700,
@@ -97,7 +98,7 @@ export default function StatValue({ value, unit, hint, tone = 'neutral', childre
             fontFamily: 'var(--font-ui)',
             lineHeight: 1.4,
             // Allow 2 lines before ellipsis — some hints carry
-            // multi-fact context ("45.6 GB original data (sampled)").
+            // multi-fact context ("45.6 GiB original data (sampled)").
             display: '-webkit-box',
             WebkitLineClamp: 2,
             WebkitBoxOrient: 'vertical',

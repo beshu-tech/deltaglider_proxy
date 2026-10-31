@@ -177,6 +177,18 @@ export default function BackendEncryptionEditor({
     }
   };
 
+  // A disabled Apply states its reason as text (never a silent grey button).
+  const applyBlockedReason = (): string | null => {
+    if (!pending || canApply()) return null;
+    if (pending.mode === 'aes256-gcm-proxy') {
+      return pending.key
+        ? 'Confirm that you stored the key safely to apply.'
+        : 'Generate or enter a key to apply.';
+    }
+    if (pending.mode === 'sse-kms') return 'Enter a KMS key id to apply.';
+    return null;
+  };
+
   const doApply = async () => {
     if (!pending || !canApply()) return;
     setApplying(true);
@@ -217,12 +229,12 @@ export default function BackendEncryptionEditor({
   // label says only "Encryption" (one fact, one place). While an edit is open
   // the Select is hidden, and the label names the current mode instead.
   const statusLine = (
-    <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)', color: colors.TEXT_MUTED }}>
+    <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)', color: colors.TEXT_PRIMARY }}>
       Encryption{pending && (
         <>: <strong style={{ color: tone }}>{modeLabel}</strong></>
       )}
       {detail && (
-        <span style={{ marginLeft: 6, fontFamily: 'var(--font-mono)', fontSize: 12, overflowWrap: 'anywhere' }}>
+        <span style={{ marginLeft: 4, fontFamily: 'var(--font-mono)', fontSize: 12, overflowWrap: 'anywhere' }}>
           ({detail})
         </span>
       )}
@@ -235,7 +247,7 @@ export default function BackendEncryptionEditor({
         ...cardStyle,
         marginTop: 8,
         marginBottom: 0,
-        padding: '10px 12px',
+        padding: '8px 12px',
         background: colors.BG_ELEVATED,
       }}
     >
@@ -291,7 +303,7 @@ export default function BackendEncryptionEditor({
          transition state, not an error. Points the operator at the
          follow-up action (clear legacy_key when objects are gone). */}
       {keyChangeBlocked && !pending && !readOnly && (
-        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 6 }}>
+        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
           {keyChangeBlockedReason}
         </Text>
       )}
@@ -308,7 +320,7 @@ export default function BackendEncryptionEditor({
 
       {/* Per-mode edit surface. Renders only when `pending` is set. */}
       {pending && (
-        <div style={{ marginTop: 10 }}>
+        <div style={{ marginTop: 12 }}>
           {/* The single most-misunderstood fact about at-rest encryption:
               enabling it does NOT rewrite existing objects. Say so up front. */}
           {pending.mode !== 'none' && (
@@ -482,6 +494,11 @@ export default function BackendEncryptionEditor({
               Apply
             </Button>
           </Space>
+          {applyBlockedReason() && (
+            <Text type="secondary" data-testid="encryption-apply-reason" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
+              {applyBlockedReason()}
+            </Text>
+          )}
         </div>
       )}
     </div>

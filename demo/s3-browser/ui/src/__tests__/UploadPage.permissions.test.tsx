@@ -59,10 +59,15 @@ test('a file over max_object_size or the remaining quota is refused before uploa
       onDone={() => {}}
     />,
   );
-  expect(await screen.findByText(/big\.bin: 200 B is over the 100 B object size limit/)).toBeInTheDocument();
-  expect(await screen.findByText(/mid\.bin: 60 B does not fit in the bucket quota/)).toBeInTheDocument();
+  // The refusal is on the file's own row, and the counts are of the files
+  // that CAN go (D25, D30): never "3 files ready" above "Upload 1 file".
+  expect(await screen.findByRole('listitem', { name: 'big.bin: refused' })).toHaveTextContent(/200 B is over the 100 B object size limit/);
+  expect(await screen.findByRole('listitem', { name: 'mid.bin: refused' })).toHaveTextContent(/60 B does not fit in the bucket quota/);
+  expect(screen.getByText(/^3 files staged · 1 can be uploaded \(10 B\) · 2 refused$/)).toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: /Upload 1 file to builds\// }));
   await waitFor(() => expect(uploadObject).toHaveBeenCalledTimes(1));
   expect(uploadObject.mock.calls[0][0]).toBe('builds/ok.bin');
+  // The refused files stay in the list with their reason.
+  expect(screen.getByRole('listitem', { name: 'big.bin: refused' })).toBeInTheDocument();
   vi.unstubAllGlobals();
 });

@@ -39,18 +39,41 @@ export const at = (ago: number) => Math.floor(Date.parse(process.env.DOCS_NOW ??
 
 const BACKENDS = '/_/api/admin/backends';
 const STORAGE = '/_/api/admin/config/section/storage';
+const BUCKETS = '/_/api/admin/buckets';
 
-/** The card of one backend on the Backends page (the innermost block with its name and its encryption editor). */
-const card = (name: string): Target => ({
-  css: `div:has(> div :text-is("${name}")):has([data-testid="encryption-mode-select"])`,
-  nth: -1,
-});
-const cardLoc = (page: Page, name: string) =>
-  page.locator(`div:has(> div :text-is("${name}")):has([data-testid="encryption-mode-select"])`).last();
+/** The card of one backend on the Backends page. */
+const card = (name: string): Target => ({ css: `[data-backend-card="${name}"]` });
+const cardLoc = (page: Page, name: string) => page.locator(`[data-backend-card="${name}"]`);
 
 /** The apply of an encryption change succeeds without reaching the proxy. */
 async function stubStoragePut(page: Page): Promise<void> {
   await fakeJson(page, STORAGE, 'PUT', { ok: true, warnings: [], requires_restart: false });
+}
+
+/**
+ * The bucket listing (`GET /buckets`, the source of the re-encrypt proposal)
+ * before and after a stubbed proxy-AES apply on hetzner-fsn1. The page offers
+ * the re-encrypt job only for buckets whose effective encryption changed, and
+ * the stubbed PUT changes nothing on the server, so this listing does:
+ * `from` is the key before the apply (null: plaintext), `to` the key after.
+ */
+async function hetznerBucketsAfterApply(page: Page, from: string | null, to: string): Promise<void> {
+  let applied = false;
+  await page.route(path(STORAGE), async (route: Route) => {
+    if (route.request().method() === 'PUT') applied = true;
+    return route.fallback();
+  });
+  await patchJson(page, BUCKETS, 'GET', (body) => {
+    for (const b of (body.buckets ?? []) as { effective_encryption?: Json | null }[]) {
+      const e = b.effective_encryption as Json | null | undefined;
+      if (!e || e.backend !== 'hetzner-fsn1' || e.source !== 'backend') continue;
+      const key = applied ? to : from;
+      b.effective_encryption = key === null
+        ? { ...e, mode: 'none', encrypts: false, has_key: false, key_id: undefined, reencrypt: true }
+        : { ...e, mode: 'aes256-gcm-proxy', encrypts: true, has_key: true, key_id: key, reencrypt: true };
+    }
+    return body;
+  });
 }
 
 /** GET /backends reports hetzner-fsn1 in proxy-AES mode (optionally with an active legacy shim). */
@@ -139,6 +162,8 @@ export const ENCRYPTION_SHOTS: Shot[] = [
     alt: 'After the apply, the dialog Encrypt existing objects? lists the buckets of hetzner-fsn1; the arrow points at Start now.',
     setup: async (page) => {
       await stubStoragePut(page);
+      // After the stub: the latest route sees the PUT first.
+      await hetznerBucketsAfterApply(page, null, 'hetzner-2026-06');
       await aesKeyReady(page);
       await page.getByTestId('encryption-apply').click();
       await page.getByRole('button', { name: /^Start now/ }).waitFor();
@@ -177,6 +202,7 @@ export const ENCRYPTION_SHOTS: Shot[] = [
     setup: async (page) => {
       await hetznerIsAes(page, false);
       await stubStoragePut(page);
+      await hetznerBucketsAfterApply(page, 'hetzner-2026-06', 'hetzner-2026-10');
       await cardLoc(page, 'hetzner-fsn1').getByRole('button', { name: 'Rotate key' }).click();
       await page.getByTestId('encryption-key-stored').check();
       await page.getByTestId('encryption-apply').click();

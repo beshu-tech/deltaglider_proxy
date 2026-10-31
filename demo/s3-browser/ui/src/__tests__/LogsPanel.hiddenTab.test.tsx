@@ -41,7 +41,7 @@ test('a hidden tab holds no stream; on return the backlog reloads and the tail r
   setHidden(false);
   renderWithQuery(<LogsPanel />);
   await waitFor(() => expect(api.backlogs).toBe(1));
-  fireEvent.click(screen.getByRole('switch'));
+  fireEvent.click(screen.getByRole('switch', { name: 'Follow' }));
   await waitFor(() => expect(api.opened).toBe(1));
   await waitFor(() => expect(api.backlogs).toBe(1));
 

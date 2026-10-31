@@ -6,7 +6,7 @@ import { useColors } from '../ThemeContext';
  * The icon is vertically centered against the title line. Title is the largest,
  * boldest thing in the card; description is clearly subordinate.
  *
- * Owns its own `marginBottom: 20` so the header→body gap is consistent across
+ * Owns its own `marginBottom: 16` so the header→body gap is consistent across
  * every panel — call sites should NOT add their own `marginTop` to the wrapper
  * that immediately follows a SectionHeader.
  */
@@ -21,7 +21,7 @@ export default function SectionHeader({
 }) {
   const { ACCENT_BLUE, TEXT_PRIMARY, TEXT_MUTED } = useColors();
   return (
-    <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start', marginBottom: 20 }}>
+    <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start', marginBottom: 16 }}>
       <div
         style={{
           width: 32,
@@ -60,7 +60,7 @@ export default function SectionHeader({
               fontFamily: 'var(--font-ui)',
               fontSize: 13,
               color: TEXT_MUTED,
-              marginTop: 3,
+              marginTop: 4,
               lineHeight: 1.45,
             }}
           >

@@ -31,7 +31,7 @@ test('open auth: bucket, upload, list, admin login, sign out, reconnect, object 
   await bucketRowBtn.click();
 
   // ── Upload page ─────────────────────────────────────────────────
-  await page.getByRole('button', { name: 'Upload files' }).click();
+  await page.getByRole('button', { name: 'Upload files', exact: true }).click();
   await expect(page.getByRole('heading', { name: new RegExp(`Upload to ${bucketName}`) })).toBeVisible({
     timeout: 30_000,
   });
@@ -48,7 +48,7 @@ test('open auth: bucket, upload, list, admin login, sign out, reconnect, object 
   await expect(page.getByText('Upload complete')).toBeVisible({ timeout: 60_000 });
   // (not ^-anchored: the button's icon prepends "check-circle" to its
   // accessible name)
-  await page.getByRole('button', { name: /Done — / }).click();
+  await page.getByRole('button', { name: /\bDone$/ }).click();
   await expect(page.getByText(uploadName)).toBeVisible({ timeout: 60_000 });
 
   // ── Admin (bootstrap password) ──────────────────────────────────

@@ -24,7 +24,9 @@ test('a failed connection test shows its error', async () => {
   await user.type(await screen.findByRole('textbox', { name: 'Access key ID' }), 'AKIAEXAMPLE');
   await user.type(screen.getByLabelText('Secret access key'), 'secret');
   await user.click(screen.getByRole('button', { name: /Test connection/ }));
-  expect(await screen.findByText(/upstream exploded/)).toBeInTheDocument();
+  // D17: the plain sentence first; the server text stays behind Details.
+  expect(await screen.findByText(/A gateway between you and the proxy dropped the request/)).toBeInTheDocument();
+  expect(screen.getByText(/upstream exploded/)).toBeInTheDocument();
   // C46: Next stays usable; a click says why the step is not done and stays.
   await user.click(screen.getByRole('button', { name: /Next/ }));
   expect(await screen.findByText('Test the connection. Next needs a test that passes.')).toBeInTheDocument();

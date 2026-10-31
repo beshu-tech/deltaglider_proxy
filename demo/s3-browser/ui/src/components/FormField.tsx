@@ -13,7 +13,7 @@
  * ```
  *  ┌── Label — Plain English name (not YAML key)  `yaml.path` (code chip)
  *  │     [       input (passed as children)       ]
- *  │     Help text below the input — one sentence. • example chip
+ *  │     Help text below the input — one sentence. Try: example, example
  *  └──
  *         ↑
  *    Amber left bar when `overrideActive` is true.
@@ -28,21 +28,24 @@
  * - **Placeholder ≠ value.** The `defaultPlaceholder` prop is a label
  *   shown when the field is empty; it does NOT pre-fill the field. The
  *   invariant "omitted = default" in the YAML is preserved this way.
- * - **Example chips are suggestions, not assignments.** Clicking one
- *   calls `onExampleClick(value)`; the caller decides whether to write
- *   it into the form state. That avoids FormField needing to know about
+ * - **Examples are suggestions, not assignments.** They render as links
+ *   ("Try: 256, 1024"), never as boxes that look like (disabled) inputs
+ *   (UX harvest D65). Clicking one calls `onExampleClick(value)`; the
+ *   caller decides whether to write it into the form state. Without
+ *   `onExampleClick` they are plain text ("For example: …"). That avoids FormField needing to know about
  *   the form controller (react-hook-form vs. uncontrolled input).
  */
 import { Children, Fragment, cloneElement, isValidElement, useId } from 'react';
 import type { CSSProperties, ReactElement, ReactNode } from 'react';
 import { Tag } from 'antd';
 import { useColors } from '../ThemeContext';
+import { SPACE } from './shared-styles';
 import { useEnvOverride } from '../queries/config';
 import { envOverrideHelp, envOverrideSource, envOverrideText } from '../envOverrides';
 
 interface FormFieldProps {
   /**
-   * Plain-English field name. E.g. "Reference-cache size (MB)".
+   * Plain-English field name. E.g. "Reference-cache size (MiB)".
    * Accepts ReactNode so callers can embed inline chips (e.g. a
    * "Restart required" badge) next to the text — the underlying
    * `<span>` renders whatever's passed.
@@ -152,7 +155,9 @@ export function ReadOnlyValue({ children, muted = false, testId }: { children: R
         background: BG_CARD,
         border: `1px dashed ${BORDER}`,
         borderRadius: 6,
-        padding: '5px 11px',
+        padding: `${SPACE.xxs}px ${SPACE.sm}px`,
+        minHeight: 32,
+        boxSizing: 'border-box',
         wordBreak: 'break-all',
         // As wide as the value (a short value is not a full-width bar),
         // never wider than the column.
@@ -187,7 +192,7 @@ export default function FormField({
   controlId: explicitControlId,
   error,
 }: FormFieldProps) {
-  const { TEXT_PRIMARY: TEXT, TEXT_MUTED, TEXT_FAINT, BG_CARD, BORDER, ACCENT_AMBER, ACCENT_RED } = useColors();
+  const { TEXT_PRIMARY: TEXT, TEXT_MUTED, TEXT_FAINT, BG_CARD, BORDER, ACCENT_AMBER, ACCENT_RED, ACCENT_BLUE } = useColors();
   // THE env rule: a field that a `DGP_*` variable controls shows the
   // effective value read-only with a "from env" badge, never an empty or
   // editable-looking input (an edit would be overridden again at restart).
@@ -236,8 +241,8 @@ export default function FormField({
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: 8,
-          marginBottom: 6,
+          gap: SPACE.xs,
+          marginBottom: SPACE.xxs,
           flexWrap: 'wrap',
         }}
       >
@@ -258,7 +263,7 @@ export default function FormField({
               background: BG_CARD,
               border: `1px solid ${BORDER}`,
               borderRadius: 4,
-              padding: '1px 6px',
+              padding: `1px ${SPACE.xxs}px`,
               lineHeight: '18px',
             }}
             title="YAML path for this field"
@@ -272,7 +277,7 @@ export default function FormField({
               fontSize: 10,
               fontFamily: 'var(--font-mono)',
               margin: 0,
-              padding: '0 6px',
+              padding: `0 ${SPACE.xxs}px`,
               lineHeight: '16px',
               borderRadius: 4,
               background: BG_CARD,
@@ -299,7 +304,7 @@ export default function FormField({
           id={errorId}
           role="alert"
           data-testid="field-error"
-          style={{ marginTop: 6, fontSize: 12.5, color: ACCENT_RED, lineHeight: 1.4 }}
+          style={{ marginTop: SPACE.xxs, fontSize: 12.5, color: ACCENT_RED, lineHeight: 1.4 }}
         >
           {error}
         </div>
@@ -307,20 +312,20 @@ export default function FormField({
       {/* Help text — clearly subordinate: smaller, fainter, tight line-height.
           Example chips share this row. */}
       {envOverride && (
-        <div style={{ marginTop: 6, fontSize: 12.5, color: TEXT_MUTED, lineHeight: 1.4 }}>
+        <div style={{ marginTop: SPACE.xxs, fontSize: 12.5, color: TEXT_MUTED, lineHeight: 1.4 }}>
           {envOverrideHelp(envOverride)}
         </div>
       )}
       {(helpText || (!envOverride && (defaultPlaceholder || (examples && examples.length > 0)))) && (
         <div
           style={{
-            marginTop: 6,
+            marginTop: SPACE.xxs,
             fontSize: 12.5,
             color: TEXT_MUTED,
             lineHeight: 1.4,
             display: 'flex',
             flexWrap: 'wrap',
-            gap: 8,
+            gap: SPACE.xs,
             alignItems: 'center',
           }}
         >
@@ -338,29 +343,37 @@ export default function FormField({
             </span>
           )}
           {!envOverride && examples && examples.length > 0 && (
-            <span style={{ display: 'inline-flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
-              {/* Says what the dashed chips are: without it they read as values. */}
-              <span>Examples:</span>
-              {examples.map((ex) => (
-                <button
-                  key={`ex-${ex}`}
-                  type="button"
-                  onClick={() => onExampleClick?.(ex)}
-                  disabled={!onExampleClick}
-                  style={{
-                    background: 'transparent',
-                    border: `1px dashed ${TEXT_MUTED}`,
-                    borderRadius: 4,
-                    padding: '1px 6px',
-                    cursor: onExampleClick ? 'pointer' : 'default',
-                    color: TEXT_MUTED,
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: 11,
-                  }}
-                  title={onExampleClick ? `Use "${ex}" as the value` : `Example value "${ex}"`}
-                >
-                  {ex}
-                </button>
+            <span data-testid="field-examples" style={{ display: 'inline-flex', columnGap: SPACE.xxs, flexWrap: 'wrap', alignItems: 'baseline' }}>
+              {/* D65: links, not dashed boxes (those read as disabled inputs). */}
+              <span>{onExampleClick ? 'Try:' : 'For example:'}</span>
+              {examples.map((ex, i) => (
+                <span key={`ex-${ex}`}>
+                  {onExampleClick ? (
+                    <button
+                      type="button"
+                      className="dg-example-link"
+                      onClick={() => onExampleClick(ex)}
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        padding: 0,
+                        cursor: 'pointer',
+                        color: ACCENT_BLUE,
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: 12,
+                        textDecoration: 'underline',
+                        textDecorationStyle: 'dotted',
+                        textUnderlineOffset: 3,
+                      }}
+                      title={`Use "${ex}" as the value`}
+                    >
+                      {ex}
+                    </button>
+                  ) : (
+                    <code style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: TEXT_MUTED }}>{ex}</code>
+                  )}
+                  {i < examples.length - 1 && <span aria-hidden>,</span>}
+                </span>
               ))}
             </span>
           )}

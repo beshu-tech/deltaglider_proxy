@@ -31,10 +31,26 @@ test('a failed scan shows its error after one poll, and the button starts a new 
   const scan = await screen.findByRole('button', { name: /Scan/ });
   await waitFor(() => expect(scan).toBeEnabled());
   await userEvent.click(scan);
-  expect(await screen.findByText('Scan failed: listing releases failed: SlowDown')).toBeInTheDocument();
+  expect(await screen.findByText('Could not load the scan result')).toBeInTheDocument();
+  expect(screen.getByRole('alert')).toHaveTextContent(/listing releases failed|slow/i);
   expect(http.calls.filter((c) => c.method === 'GET' && GET.test(c.path))).toHaveLength(1);
   expect(http.callsTo('POST', POST)).toHaveLength(0);
 
-  await userEvent.click(screen.getByRole('button', { name: /Scan/ }));
+  await userEvent.click(screen.getByRole('button', { name: /Retry/ }));
   await waitFor(() => expect(http.callsTo('POST', POST)).toHaveLength(1));
+});
+
+test('a minimum that is not a whole number from 1 to 1000 shows an error and is not clamped', async () => {
+  renderWithQuery(<DeltaEfficiencyPanel />);
+  const field = await screen.findByLabelText('Minimum deltas per folder');
+  await userEvent.clear(field);
+  await userEvent.type(field, '0');
+  await userEvent.tab();
+  expect(await screen.findByText('Enter a whole number between 1 and 1,000.')).toBeInTheDocument();
+  expect(field).toHaveValue('0');
+  expect(field).toHaveAttribute('aria-invalid', 'true');
+  // Scan does not run with an invalid minimum.
+  await userEvent.click(screen.getByRole('button', { name: /Scan/ }));
+  await new Promise((r) => setTimeout(r, 20));
+  expect(http.calls.filter((c) => c.method === 'GET' && GET.test(c.path))).toHaveLength(0);
 });

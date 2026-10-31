@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'vitest';
+import { describe, expect, test } from 'vitest';
 import {
   summarizeScopeSavings,
   summarizeObjectSavings,
@@ -10,6 +10,9 @@ import {
   parseCostRate,
   DEFAULT_COST_RATE,
   uploadCreatedBaseline,
+  savingsColors,
+  heroPresentation,
+  biggestSaveSentence,
 } from '../savings';
 
 test('summarizeScopeSavings', () => {
@@ -42,7 +45,7 @@ test('summarizeObjectSavings', () => {
 
 test('GiB quota conversion (BucketCard quota input)', () => {
   assert.equal(GIB, 1024 ** 3);
-  // 500 MiB must not read as 0 GB
+  // 500 MiB must not read as 0 GiB
   assert.equal(gibFromBytes(500 * 1024 ** 2), 0.488);
   assert.equal(gibFromBytes(2 * GIB), 2);
   assert.equal(gibFromBytes(1.5 * GIB), 1.5);
@@ -79,4 +82,19 @@ test('uploadCreatedBaseline: only the write response that says so', () => {
   assert.equal(uploadCreatedBaseline({ 'x-amz-storage-type': 'delta' }), false, 'a delta against an existing baseline');
   assert.equal(uploadCreatedBaseline({ 'x-amz-storage-type': 'passthrough' }), false);
   assert.equal(uploadCreatedBaseline({}), false, 'no facts: do not guess');
+});
+
+describe('savings presentation (UX harvest D14, D15, D49)', () => {
+  test('one green for every saving', () => {
+    expect(savingsColors({ ACCENT_GREEN: '#047857' })).toEqual({ text: '#047857', bg: '#04785714', border: '#04785740' });
+  });
+  test('an estimate is neutral with ≈, a scanned total is green', () => {
+    expect(heroPresentation(2)).toMatchObject({ estimated: true, prefix: '≈', tone: 'neutral' });
+    expect(heroPresentation(0)).toMatchObject({ estimated: false, prefix: '', tone: 'saved' });
+  });
+  test('the biggest saving has no minus sign', () => {
+    const s = biggestSaveSentence('releases', '7.6 MiB');
+    expect(s).toBe('releases saves the most: 7.6 MiB');
+    expect(s).not.toMatch(/[−-]\s*7/);
+  });
 });

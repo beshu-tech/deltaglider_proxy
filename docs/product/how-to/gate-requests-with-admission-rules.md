@@ -12,12 +12,12 @@ Acme's `downloads` bucket serves a public prefix, which attracts anonymous uploa
 
 In the admin UI:
 
-1. In the sidebar, open **Access → Request rules** (`/_/admin/access/admission`), and click **Add rule**.
+1. In the sidebar, open **Access → Request rules** (`/_/admin/access/admission`), and click **New rule** at the top right of the page.
 2. In the form **Add request rule**, type `deny-anonymous-writes-downloads` in **Name**. Under the conditions, tick `PUT`, `POST` and `DELETE` in **HTTP methods**, type `downloads` in **Bucket**, and select **Anonymous only** in **Signed request**. Leave **Source IPs** and **Object key pattern** empty, so that they match any value.
 3. Under **Then**, select **Deny (403)**.
 4. Click **Add rule** in the form.
 
-   ![The Add request rule form holds the rule deny-anonymous-writes-downloads; callout 1 marks the Add rule button of the page, callout 2 the conditions, callout 3 the Deny (403) action under Then, and callout 4 the Add rule button of the form.](/_/screenshots/admission-add-rule.webp)
+   ![The Add request rule form holds the rule deny-anonymous-writes-downloads; callout 1 marks the New rule button of the page, callout 2 the conditions, callout 3 the Deny (403) action under Then, and callout 4 the Add rule button of the form.](/_/screenshots/admission-add-rule.webp)
 
 5. The new rule is now at the end of **Your rules**. To move it, drag it by its handle (**Drag to reorder**) to its place in the list (see section 2).
 6. Click **Review & apply** in the bar at the bottom of the page.

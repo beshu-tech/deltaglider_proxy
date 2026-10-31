@@ -20,6 +20,8 @@ export const qk = {
 
   // ── Config ──────────────────────────────────────────────────────
   config: () => ['config'] as const,
+  /** One read of a config section, as a page-level load gate (System page). */
+  sectionGate: (section: string) => ['config-section-gate', section] as const,
 
   // ── IAM ─────────────────────────────────────────────────────────
   users: {

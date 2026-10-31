@@ -52,9 +52,17 @@ test('Remove rule is staged: no request, a "removing" row, the dirty bar; Keep u
   expect(screen.getByRole('button', { name: 'Review & apply' })).toBeEnabled();
   expect(http.calls.filter((c) => c.method === 'POST')).toHaveLength(0);
 
-  await user.click(within(rowOf('expire-nightly-dumps')).getByRole('button', { name: /^More actions for / }));
-  await user.click(await screen.findByRole('menuitem', { name: /Keep this rule/ }));
+  // A rule on its way out offers no Run now / Preview / Pause (D38): one
+  // "Keep this rule" button, and the row is dimmed.
+  const staged = rowOf('expire-nightly-dumps');
+  expect(staged).toHaveAttribute('data-dimmed', 'true');
+  expect(within(staged).queryByRole('button', { name: /^Run now/ })).toBeNull();
+  expect(within(staged).queryByRole('button', { name: /^Preview/ })).toBeNull();
+  await user.click(within(staged).getByRole('button', { name: 'Keep this rule: expire-nightly-dumps' }));
   await waitFor(() => expect(within(rowOf('expire-nightly-dumps')).queryByText('removing')).toBeNull());
+  // D39: the "staged for removal" toast leaves with the staged edit.
+  await waitFor(() => expect(screen.queryByText(/is staged for removal/)).toBeNull());
+  expect(screen.getByText('Rule expire-nightly-dumps is kept.')).toBeInTheDocument();
   await waitFor(() => expect(screen.queryByRole('button', { name: 'Review & apply' })).toBeNull());
 });
 

@@ -4,6 +4,8 @@ import { failuresCountText, groupFailureErrors } from '../../jobsView';
 import { useColors } from '../../ThemeContext';
 import TimeAgo from '../TimeAgo';
 import RecordList from './RecordList';
+import { CheckCircleOutlined } from '@ant-design/icons';
+import { EmptyState } from '../StatePlaceholders';
 
 const { Text } = Typography;
 
@@ -44,7 +46,7 @@ export default function FailuresList({
       <RecordList
         rows={failures}
         rowKey={(f) => String(f.id)}
-        empty="No recorded failures"
+        empty={<EmptyState compact icon={<CheckCircleOutlined />} title="No recorded failures" />}
         columns={[
           {
             key: 'when',
@@ -55,7 +57,7 @@ export default function FailuresList({
                 <TimeAgo ts={f.occurred_at} />
                 {f.trigger && (
                   <Tag
-                    style={{ marginLeft: 6, fontSize: 11 }}
+                    style={{ marginLeft: 4, fontSize: 11 }}
                     title={f.trigger === 'event' ? 'A live copy, made when the object changed' : 'A run of the rule'}
                   >
                     {f.trigger === 'event' ? 'live copy' : 'run'}

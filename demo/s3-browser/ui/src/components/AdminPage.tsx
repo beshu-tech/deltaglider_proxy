@@ -1,4 +1,4 @@
-import { cloneElement, isValidElement, useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Alert, Button, Spin, Drawer } from 'antd';
 import { checkSession, whoami, loginAs, isNotAdminDenial, type ExternalProviderInfo, type LoginAsResult } from '../adminApi';
 import { getCredentials } from '../s3client';
@@ -26,10 +26,8 @@ import { useBackupImportExport } from '../hooks/useBackupImportExport';
 import { YamlImportExportModal } from './YamlImportExportModal';
 import { FullIamYamlModal } from './FullIamYamlModal';
 import { useDirtyGlobalIndicators, requestApplyFirst } from '../useDirtySection';
-import type { SectionName } from '../adminApi';
-import type { AccountMenuConfigProps } from './AccountMenu';
 import { useAdminConfig } from '../queries/config';
-import { normalizeUiError } from '../errorHandling';
+import { plainError } from '../plainError';
 import { AdminRouteContent, type AdminRouteContext } from './admin/adminRoutes';
 import { AdminAccessDenied, AdminLoginGate } from './admin/AdminLoginGate';
 import RestoreBackupModal from './admin/RestoreBackupModal';
@@ -92,13 +90,11 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   // An unknown deep link: say so and link the nearest page, instead of the
   // dashboard under a URL that names something else.
   const unknownPath = isUnknownAdminPath(rawSubPath, isLeaf) ? rawSubPath : null;
-  const activeSection = sectionForPath(adminPath);
   // The sidebar marks no entry while the not-found view shows: `adminPath`
   // falls back to the dashboard, which is not the page on screen.
   const sidebarPath = unknownPath ? '' : adminPath;
   // The per-leaf dirty/apply key for ⌘S dispatch (panels register under this,
-  // not the coarse section). `activeSection` is still used for the avatar
-  // menu's section-YAML target (which IS section-scoped).
+  // not the coarse section).
   const activeApplyKeys = useMemo(() => applyKeysForPath(adminPath), [adminPath]);
   const navigateAdmin = useCallback(
     (path: string, query?: Record<string, string>) => {
@@ -325,7 +321,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
         const sk = creds.secretAccessKey;
         if (ak && sk) {
           const result = await loginAs(ak, sk).catch(
-            (e): LoginAsResult => ({ ok: false, status: 0, error: normalizeUiError(e, 'Network error') }),
+            (e): LoginAsResult => ({ ok: false, status: 0, error: plainError(e, 'The proxy does not answer. Check the network connection and try again.').text }),
           );
           if (cancelled) return;
           if (result.ok) {
@@ -368,6 +364,14 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
     clearPendingGroupId: () => setPendingGroupId(null),
     onExportBackup: backup.exportFullBackup,
     onImportBackup: backup.importFullBackup,
+    configYaml: {
+      onExportSettingsYaml: () => openYamlModal('export'),
+      onImportSettingsYaml: () => openYamlModal('import'),
+      onExportFullIam: () => openIamYamlModal('export'),
+      onImportFullIam: () => openIamYamlModal('import'),
+      // The server refuses the import in declarative mode (403 iam_declarative).
+      importFullIamBlocked: adminConfig.data?.iam_mode === 'declarative' ? DECLARATIVE_IMPORT_BLOCKED : undefined,
+    },
     search,
     proxyVersion,
   };
@@ -398,17 +402,6 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
     );
   }
 
-  const adminAccountMenu = canAdmin && isValidElement<AccountMenuConfigProps>(accountMenu)
-    ? cloneElement(accountMenu, {
-        configSection: activeSection,
-        onShowFullConfigYaml: () => openYamlModal('export'),
-        onImportFullConfigYaml: () => openYamlModal('import'),
-        onExportFullIam: () => openIamYamlModal('export'),
-        onImportFullIam: () => openIamYamlModal('import'),
-        // The server refuses the import in declarative mode (403 iam_declarative).
-        importFullIamBlocked: adminConfig.data?.iam_mode === 'declarative' ? DECLARATIVE_IMPORT_BLOCKED : undefined,
-      })
-    : accountMenu;
 
   return (
     <div style={{
@@ -418,7 +411,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
       background: colors.BG_BASE,
     }}>
       <FullScreenHeader
-        title="Admin Settings"
+        title="Admin settings"
         onBack={onBack}
         onShowShortcuts={onShowShortcuts}
         leading={
@@ -433,7 +426,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
             />
           ) : null
         }
-        accountMenu={adminAccountMenu}
+        accountMenu={accountMenu}
       />
       <YamlImportExportModal
         open={yamlModalMode !== null}
@@ -559,22 +552,6 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
       </div>
     </div>
   );
-}
-
-/**
- * Resolve which section a Configuration admin path edits — used by
- * the avatar menu's Config group to pick the section YAML target.
- * Returns undefined for Diagnostics pages and the first-run wizard
- * (no section scope).
- */
-function sectionForPath(path: string): SectionName | undefined {
-  // ORDER MATTERS: admission lives under access/ in the IA but maps to
-  // its own YAML section — match it before the access/ prefix.
-  if (path === 'access/admission') return 'admission';
-  if (path.startsWith('access/')) return 'access';
-  if (path.startsWith('storage/') || path === 'jobs') return 'storage';
-  if (path === 'system' || path.startsWith('integrations/')) return 'advanced';
-  return undefined;
 }
 
 /**

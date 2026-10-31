@@ -9,9 +9,9 @@ The example registers three backends: `hetzner-fsn1` (S3-compatible storage at H
 In the admin UI:
 
 1. In the sidebar, open **Storage → Backends** (`/_/admin/storage/backends`).
-2. Click **Add backend** below the list of backends.
+2. Click **New backend** at the top right of the page.
 
-   ![The Backends page with callout 1 at the Backends entry of the sidebar and callout 2 at the Add backend button below the backend list.](/_/screenshots/route-bucket-add-backend.webp)
+   ![The Backends page lists the configured backends; callout 1 marks Backends in the sidebar and callout 2 marks the New backend button at the top right.](/_/screenshots/route-bucket-add-backend.webp)
 
 3. In the **New backend** form, type `hetzner-fsn1` in **Name** and select **S3** in **Type**. Fill in **Endpoint** (`https://fsn1.your-objectstorage.com`), **Region** (`fsn1`), **Access key ID** and **Secret access key**. Select **Force path-style URLs**, because Hetzner is not AWS, and select **Set as default backend**.
 4. Click **Create backend**.
@@ -48,7 +48,7 @@ In the admin UI:
 
    ![The review dialog shows the storage diff that routes downloads to local-disk, and an arrow points at the Apply and Persist button.](/_/screenshots/route-bucket-apply-dialog.webp)
 
-If the bucket does not exist yet, open the menu next to **Create bucket** and select **Add settings for a bucket that does not exist yet**. Type the bucket name, and continue with step 3. Any bucket without an explicit backend goes to `default_backend`.
+If the bucket does not exist yet, click **Settings for a future bucket** at the top right of the page. A new settings row opens. Type the bucket name in it, and continue with step 3. Any bucket without an explicit backend goes to `default_backend`.
 
 A bucket with its own encryption block (see [How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md)) always keeps an explicit backend, because the block belongs to the storage that holds the bucket. The **Backend** list does not let you choose **Default** for such a bucket; set its **Encryption** group to **Inherit** first. A re-route moves no objects, and the objects on the old backend stay under their old keys. To move a bucket with its own key, run a migrate job: the bucket's block moves with it.
 

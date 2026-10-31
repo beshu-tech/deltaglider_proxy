@@ -24,19 +24,17 @@ import {
   Alert,
   Button,
   Input,
-  InputNumber,
   Radio,
   Space,
   Switch,
-  Tag,
   Typography,
 } from 'antd';
 import { ApiOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { SectionApplyResponse } from '../adminApi';
-import { DELIVERY_STATE, deliveryStateOf } from '../adminApi';
+import { deliveryStateOf } from '../adminApi';
 import { useEventOutboxSummary } from '../queries/eventOutbox';
 import { useCardStyles, contentColumn, CONTENT_WIDE } from './shared-styles';
-import { LoadingState } from './StatePlaceholders';
+import { ErrorState, LoadingState } from './StatePlaceholders';
 import { useIsNarrow } from '../useIsNarrow';
 import { useSectionEditor } from '../useSectionEditor';
 import { useNavigation } from '../NavigationContext';
@@ -46,6 +44,7 @@ import ApplyDialog from './ApplyDialog';
 import { AdvancedDisclosure } from './ruleEditorFields';
 import SlackConnectorCard from './SlackConnectorCard';
 import StickyDirtyBar from './StickyDirtyBar';
+import { useFieldValidation, v, type FieldValidation } from '../validation';
 import RowListEditor from './RowListEditor';
 import MaskedSecretInput from './MaskedSecretInput';
 import {
@@ -126,7 +125,8 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
     isDirty,
     discard,
     loading,
-    error,
+    loadError,
+    refresh,
     applyOpen,
     applyResponse,
     applying,
@@ -187,17 +187,31 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
     return res.ok ? [] : res.errors;
   }, [form, isDirty]);
 
+  // Field checks (validation framework): the number fields keep what was
+  // typed and say what is wrong (UX harvest D9); URLs and durations say it
+  // under the field (D10). The number errors never reach the form value, so
+  // the bar adds them to the payload errors; URL and duration errors are
+  // already among those.
+  const numbers = useFieldValidation();
+  const inline = useFieldValidation();
   const runApply = () => {
+    inline.submit();
+    const numbersOk = numbers.submit();
     const res = buildPayloadFromForm(form);
-    if (!res.ok) return; // errors already shown via liveErrors
+    if (!res.ok || !numbersOk) return; // errors already shown via liveErrors and the fields
     editorRunApply();
   };
+  const discardAll = () => {
+    discard();
+    numbers.reset();
+    inline.reset();
+  };
 
-  if (error) return <Alert type="error" showIcon title="Failed to load" description={error} />;
+  if (loadError) return <ErrorState error={loadError} what="the delivery settings" onRetry={refresh} />;
   if (loading)
     return (
       <PanelShell>
-        <LoadingState label="Loading delivery settings…" />
+        <LoadingState variant="form" label="Loading delivery settings" />
       </PanelShell>
     );
 
@@ -220,16 +234,16 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
         />
       )}
 
-      {outbox && (
+      {/* UX harvest D63: the strip speaks only when there is something to act
+          on (events waiting, failed or failing). It does not repeat the
+          "Enable delivery" switch below. */}
+      {outbox && (outbox.state === 'failing' || outbox.pending > 0 || outbox.failed > 0) && (
         <Alert
-          type={outbox.state === 'failing' ? 'error' : outbox.state === 'active' ? 'success' : 'info'}
+          type={outbox.state === 'failing' || outbox.failed > 0 ? 'error' : 'info'}
           showIcon
           title={
             <Space size="middle" wrap>
-              <span>
-                Delivery:{' '}
-                <Tag color={DELIVERY_STATE[outbox.state].color}>{DELIVERY_STATE[outbox.state].label}</Tag>
-              </span>
+              {outbox.state === 'failing' && <span>Delivery is failing.</span>}
               <span>{outbox.pending} pending</span>
               <span>{outbox.failed} failed</span>
               <Button
@@ -287,6 +301,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
         <div style={{ marginTop: 8 }}>
           <AdvancedDisclosure title="Delivery tuning" hint="Retry, retention, batching">
             <DurationField
+              fv={inline}
               label="Tick interval"
               yamlPath="advanced.event_delivery.tick_interval"
               help="How often the dispatcher wakes to deliver due events."
@@ -295,16 +310,17 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
               onChange={(v) => setField({ tick_interval: v })}
               inputRadius={inputRadius}
             />
-            <NumberField
-              label="Batch size"
-              yamlPath="advanced.event_delivery.batch_size"
-              help="Max events claimed per tick (clamped 1–500)."
-              value={form.batch_size}
-              min={1}
-              max={500}
-              onChange={(v) => setField({ batch_size: v })}
-            />
+            {numberField(numbers, {
+              label: 'Batch size',
+              yamlPath: 'advanced.event_delivery.batch_size',
+              help: 'Most events claimed per tick, from 1 to 500.',
+              value: form.batch_size,
+              min: 1,
+              max: 500,
+              onChange: (n) => setField({ batch_size: n }),
+            })}
             <DurationField
+              fv={inline}
               label="Request timeout"
               yamlPath="advanced.event_delivery.request_timeout"
               help="Per-endpoint HTTP timeout."
@@ -313,15 +329,16 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
               onChange={(v) => setField({ request_timeout: v })}
               inputRadius={inputRadius}
             />
-            <NumberField
-              label="Max attempts"
-              yamlPath="advanced.event_delivery.max_attempts"
-              help="Attempts before an event becomes permanently failed."
-              value={form.max_attempts}
-              min={1}
-              onChange={(v) => setField({ max_attempts: v })}
-            />
+            {numberField(numbers, {
+              label: 'Max attempts',
+              yamlPath: 'advanced.event_delivery.max_attempts',
+              help: 'Attempts before an event becomes permanently failed.',
+              value: form.max_attempts,
+              min: 1,
+              onChange: (n) => setField({ max_attempts: n }),
+            })}
             <DurationField
+              fv={inline}
               label="Retry base"
               yamlPath="advanced.event_delivery.retry_base"
               help="Initial retry delay; exponential backoff doubles it per attempt."
@@ -331,6 +348,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
               inputRadius={inputRadius}
             />
             <DurationField
+              fv={inline}
               label="Retry max"
               yamlPath="advanced.event_delivery.retry_max"
               help="Ceiling for the backoff delay."
@@ -340,6 +358,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
               inputRadius={inputRadius}
             />
             <DurationField
+              fv={inline}
               label="Stale claim after"
               yamlPath="advanced.event_delivery.stale_claim_after"
               help="In-progress claims older than this are reclaimable (crash recovery)."
@@ -349,6 +368,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
               inputRadius={inputRadius}
             />
             <DurationField
+              fv={inline}
               label="Delivered retention"
               yamlPath="advanced.event_delivery.delivered_retention"
               help="Delivered rows older than this are pruned. 0s keeps them until manually pruned."
@@ -357,22 +377,22 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
               onChange={(v) => setField({ delivered_retention: v })}
               inputRadius={inputRadius}
             />
-            <NumberField
-              label="Delivered max rows"
-              yamlPath="advanced.event_delivery.delivered_max_rows"
-              help="Cap on retained delivered rows (pending/failed never pruned by this)."
-              value={form.delivered_max_rows}
-              min={0}
-              onChange={(v) => setField({ delivered_max_rows: v })}
-            />
-            <NumberField
-              label="Prune batch"
-              yamlPath="advanced.event_delivery.prune_batch"
-              help="Max delivered rows pruned per tick."
-              value={form.prune_batch}
-              min={0}
-              onChange={(v) => setField({ prune_batch: v })}
-            />
+            {numberField(numbers, {
+              label: 'Delivered max rows',
+              yamlPath: 'advanced.event_delivery.delivered_max_rows',
+              help: 'Cap on retained delivered rows (pending/failed never pruned by this).',
+              value: form.delivered_max_rows,
+              min: 0,
+              onChange: (n) => setField({ delivered_max_rows: n }),
+            })}
+            {numberField(numbers, {
+              label: 'Prune batch',
+              yamlPath: 'advanced.event_delivery.prune_batch',
+              help: 'Max delivered rows pruned per tick.',
+              value: form.prune_batch,
+              min: 0,
+              onChange: (n) => setField({ prune_batch: n }),
+            })}
           </AdvancedDisclosure>
         </div>
       </div>
@@ -404,22 +424,33 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
                       No endpoints. Add one to start delivering.
                     </Text>
                   }
-                  renderRow={(row, update, remove) => (
-                    <Space.Compact style={{ width: '100%' }}>
-                      <Input
-                        aria-label="Endpoint URL"
-                        value={row.url}
-                        onChange={(e) => update({ url: e.target.value })}
-                        placeholder="https://hooks.example.com/deltaglider"
-                        style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 14 }}
-                      />
-                      <Button
-                        icon={<DeleteOutlined />}
-                        onClick={remove}
-                        title="Remove endpoint"
-                      />
-                    </Space.Compact>
-                  )}
+                  renderRow={(row, update, remove) => {
+                    const url = inline.text(`url:${row.id}`, row.url, (next) => update({ url: next }), v.url());
+                    return (
+                      <div>
+                        <Space.Compact style={{ width: '100%' }}>
+                          <Input
+                            {...url.inputProps}
+                            aria-label="Endpoint URL"
+                            aria-invalid={url.error ? true : undefined}
+                            status={url.error ? 'error' : undefined}
+                            placeholder="https://hooks.example.com/deltaglider"
+                            style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 14 }}
+                          />
+                          <Button
+                            icon={<DeleteOutlined />}
+                            onClick={remove}
+                            title="Remove endpoint"
+                          />
+                        </Space.Compact>
+                        {url.error && (
+                          <Text role="alert" type="danger" style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
+                            {url.error}
+                          </Text>
+                        )}
+                      </div>
+                    );
+                  }}
                 />
               </FormField>
 
@@ -515,8 +546,8 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
       <StickyDirtyBar
         visible={isDirty}
         applying={applying}
-        errorCount={liveErrors.length}
-        onDiscard={discard}
+        errorCount={liveErrors.length + numbers.issueCount}
+        onDiscard={discardAll}
         onApply={runApply}
       />
     </PanelShell>
@@ -524,6 +555,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
 }
 
 function DurationField(props: {
+  fv: FieldValidation;
   label: string;
   yamlPath: string;
   help: string;
@@ -532,15 +564,16 @@ function DurationField(props: {
   onChange: (v: string) => void;
   inputRadius: React.CSSProperties;
 }) {
+  const field = props.fv.text(props.yamlPath, props.value, props.onChange, v.optional(v.duration()));
   return (
     <FormField
       label={props.label}
       yamlPath={props.yamlPath}
       helpText={`${props.help} Format: 30s, 5m, 24h (compound like 1h30m ok).`}
+      error={field.error}
     >
       <Input
-        value={props.value}
-        onChange={(e) => props.onChange(e.target.value)}
+        {...field.inputProps}
         placeholder={props.placeholder}
         style={{ ...props.inputRadius, fontFamily: 'var(--font-mono)', fontSize: 14, maxWidth: 200 }}
       />
@@ -548,7 +581,11 @@ function DurationField(props: {
   );
 }
 
-function NumberField(props: {
+/** A whole-number field: a text input that keeps what was typed ("-1",
+ *  "abc") and says what is wrong, never a silent clamp (UX harvest D9).
+ *  A function, not a component: it binds in the panel's render, so the
+ *  dirty bar below reads the count of this render (`issueCount`). */
+function numberField(fv: FieldValidation, props: {
   label: string;
   yamlPath: string;
   help: string;
@@ -557,15 +594,15 @@ function NumberField(props: {
   max?: number;
   onChange: (v: number) => void;
 }) {
+  const field = fv.number(
+    props.yamlPath,
+    props.value,
+    (n) => props.onChange(n ?? props.min),
+    v.integer({ min: props.min, max: props.max }),
+  );
   return (
-    <FormField label={props.label} yamlPath={props.yamlPath} helpText={props.help}>
-      <InputNumber
-        value={props.value}
-        min={props.min}
-        max={props.max}
-        onChange={(v) => props.onChange(typeof v === 'number' ? v : props.min)}
-        style={{ maxWidth: 200 }}
-      />
+    <FormField key={props.yamlPath} label={props.label} yamlPath={props.yamlPath} helpText={props.help} error={field.error}>
+      <Input {...field.inputProps} style={{ maxWidth: 200 }} />
     </FormField>
   );
 }

@@ -1,4 +1,4 @@
-import { formatBytesIec as formatBytes } from './utils';
+import { formatBytes } from './utils';
 
 /** What the page knows of the server's write limits; null = unknown. */
 export interface UploadLimits {

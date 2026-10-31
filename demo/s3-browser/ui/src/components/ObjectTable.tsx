@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from 'react';
 import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, useId } from 'react';
-import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select, Tag } from 'antd';
+import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
 import { formatBytes, relativeTime } from '../utils';
@@ -15,8 +15,8 @@ import { canRequestPrefixUsageScan, isVirtualFolderPrefix } from '../permissions
 import { usePersistedPageSize } from '../usePersistedPageSize';
 import { describeVisibleRange } from '../paginationLabels';
 import StorageTypeTag from './StorageTypeTag';
-import MiddleEllipsis from '../browser/MiddleEllipsis';
-import { storageChip } from '../deltaSummary';
+import { SPACE } from './shared-styles';
+import TruncatedName from './TruncatedName';
 import { buildRows, sortRows, type BrowserRow, type SortColumn, type SortState } from '../browserNav';
 import { useIsNarrow } from '../useIsNarrow';
 
@@ -271,7 +271,7 @@ export default function ObjectTable({
   const onRowOrderChange = cursor?.onRowOrderChange;
   const uid = useId();
   const { token } = theme.useToken();
-  const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_AMBER, ACCENT_PURPLE, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT } = useColors();
+  const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_AMBER, ACCENT_PURPLE } = useColors();
 
   const [pageSize, setPageSize] = usePersistedPageSize(
     PAGE_SIZE_STORAGE_KEY,
@@ -505,7 +505,7 @@ export default function ObjectTable({
               style={{ fontWeight: 500, color: TEXT_PRIMARY, gap: 8, fontFamily: "var(--font-ui)", maxWidth: '100%', minWidth: 0 }}
             >
               <FolderOutlined aria-hidden="true" style={{ color: ACCENT_BLUE, fontSize: 15, flexShrink: 0 }} />
-              <MiddleEllipsis text={record.name} title={false} />
+              <TruncatedName text={record.name} title={false} />
               {isVirtualFolderPrefix(record.key.replace('folder:', ''), virtualFolders) ? (
                 <sup
                   title="Virtual folder from your permissions. It will become a real folder after upload."
@@ -522,7 +522,7 @@ export default function ObjectTable({
             <FileOutlined aria-hidden="true" style={{ color: fileIconColor(record.name), fontSize: 14, flexShrink: 0 }} />
             <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1, cursor: 'pointer' }}>
               {/* Cut in the middle: versions of one file differ at the end. */}
-              <MiddleEllipsis
+              <TruncatedName
                 text={record.name}
                 title={false}
                 style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: TEXT_PRIMARY }}
@@ -594,26 +594,10 @@ export default function ObjectTable({
         // From the listing; a row without facts shows the neutral tag. The
         // folder's baseline is "Baseline", as the inspector calls it.
         const facts = headCache[record.key];
-        const chip = storageChip(facts?.storageType, Boolean(facts?.isBaseline));
-        if (chip.label === 'Baseline') {
-          return (
-            <Tag
-              title={chip.title}
-              style={{
-                background: 'transparent', border: `1px solid ${token.colorBorder}`, color: TEXT_MUTED,
-                borderRadius: 6, fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 500,
-              }}
-            >
-              {chip.label}
-            </Tag>
-          );
-        }
+        // ONE chip family (D58): Delta in the savings green; Baseline,
+        // Original and unknown neutral.
         return (
-          <StorageTypeTag
-            storageType={facts?.storageType}
-            colors={STORAGE_TYPE_COLORS}
-            fallback={STORAGE_TYPE_DEFAULT}
-          />
+          <StorageTypeTag storageType={facts?.storageType} isBaseline={Boolean(facts?.isBaseline)} />
         );
       },
     },
@@ -723,8 +707,8 @@ export default function ObjectTable({
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          gap: 16,
-          padding: '8px 20px',
+          gap: SPACE.md,
+          padding: `${SPACE.xs}px ${SPACE.lg}px`,
           borderTop: `1px solid ${token.colorBorderSecondary}`,
           flexShrink: 0,
         }}

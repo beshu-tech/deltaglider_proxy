@@ -11,6 +11,7 @@
  *     they happen, matching the same filters.
  *   * Virtualized list (@tanstack/react-virtual) so a 2000-row + live-appending
  *     view stays smooth. Click a row (or press Enter on it) to wrap the whole
+ *     line (the caret on each row says so), or turn on "Wrap lines" for all;
  *     line and list its structured fields, one per line.
  *
  * Captured at INFO+ by default (DGP_LOG_RING_LEVEL). Read-only, per-instance,
@@ -19,17 +20,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useDebounced } from '../hooks/useDebounced';
 import { Typography, Input, Button, Tag, Select, Space, Switch } from 'antd';
-import { ReloadOutlined, SearchOutlined } from '@ant-design/icons';
+import { DownOutlined, ReloadOutlined, RightOutlined, SearchOutlined } from '@ant-design/icons';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useColors } from '../ThemeContext';
 import { noun, relativeTime } from '../utils';
-import { EmptyState } from './StatePlaceholders';
+import { EmptyState, ErrorState } from './StatePlaceholders';
 import { streamLogs, type LogEntry, type LogFilters } from '../adminApi';
 import { useLogBacklog } from '../queries/logs';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
-import { normalizeUiError } from '../errorHandling';
+import { isSessionExpired } from '../errorHandling';
 import { useDocumentVisible } from '../useVisiblePolling';
-import { contentColumn, CONTENT_WIDE } from './shared-styles';
+import { CARD_RADIUS, contentColumn, CONTENT_WIDE, SPACE } from './shared-styles';
 import { activateOnKey } from '../keyboard';
 
 const { Text } = Typography;
@@ -74,6 +75,9 @@ export default function LogsPanel({ onSessionExpired }: Props) {
   const unsubRef = useRef<(() => void) | null>(null);
   // Lines the user opened: the whole message wraps and the fields show.
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  // "Wrap lines": every line shows in full (UX harvest D61: a cut line
+  // had no visible way to read its end).
+  const [wrapAll, setWrapAll] = useState(false);
   const toggleLine = (key: string) =>
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -97,7 +101,8 @@ export default function LogsPanel({ onSessionExpired }: Props) {
   const { refetch: refetchBacklog } = backlog;
   const loadBacklog = () => void refetchBacklog();
   useSessionExpiredOn(backlog.error, onSessionExpired);
-  const error = backlog.error ? normalizeUiError(backlog.error, 'fetch failed') : null;
+  // No lines at all: ONE error state in the log box (UX harvest D17).
+  const failed = Boolean(backlog.error) && !isSessionExpired(backlog.error) && backlog.data === undefined;
 
   // Live-tail lines, prepended to the backlog they arrived on top of. A new
   // backlog already holds them, so a tail stamped with an older backlog
@@ -146,7 +151,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
         });
       },
       undefined,
-      () => setStreamError('log stream interrupted — retrying…'),
+      () => setStreamError('The live log stream stopped. The proxy reconnects…'),
     );
     return () => {
       unsubRef.current?.();
@@ -176,7 +181,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
         display: 'flex',
         flexDirection: 'column',
         height: '100%',
-        gap: 12,
+        gap: SPACE.sm,
       }}
     >
       <Space wrap style={{ flexShrink: 0 }}>
@@ -217,11 +222,14 @@ export default function LogsPanel({ onSessionExpired }: Props) {
           <Switch id="logs-follow" checked={follow} onChange={setFollow} />
           <label htmlFor="logs-follow"><Text type="secondary">Follow</Text></label>
         </Space>
+        <Space size={4}>
+          <Switch id="logs-wrap" checked={wrapAll} onChange={setWrapAll} />
+          <label htmlFor="logs-wrap"><Text type="secondary">Wrap lines</Text></label>
+        </Space>
         <Text type="secondary">{entries.length} {noun(entries.length, 'line')}</Text>
       </Space>
 
-      {error && <Text type="danger">{error}</Text>}
-      {streamError && <Text type="danger">{streamError}</Text>}
+      {streamError && <Text type="warning">{streamError}</Text>}
 
       <div
         ref={parentRef}
@@ -229,12 +237,13 @@ export default function LogsPanel({ onSessionExpired }: Props) {
           flex: 1,
           overflow: 'auto',
           border: `1px solid ${c.BORDER}`,
-          borderRadius: 6,
+          borderRadius: CARD_RADIUS,
           fontFamily: 'var(--font-mono)',
           fontSize: 12,
         }}
       >
         {/* A filter with no match left only an empty box (UX harvest C57). */}
+        {failed && <ErrorState error={backlog.error} what="the logs" onRetry={loadBacklog} />}
         {entries.length === 0 && backlog.isSuccess && (
           <EmptyState
             icon={<SearchOutlined />}
@@ -246,7 +255,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
             const e = entries[vi.index];
             const hasFields = e.fields && Object.keys(e.fields).length > 0;
             const key = lineKey(e);
-            const open = expanded.has(key);
+            const open = wrapAll || expanded.has(key);
             const fieldText = hasFields
               ? Object.entries(e.fields).map(([k, v]) => `${k}=${String(v)}`)
               : [];
@@ -258,9 +267,9 @@ export default function LogsPanel({ onSessionExpired }: Props) {
                 role="button"
                 tabIndex={0}
                 aria-expanded={open}
-                title={open ? 'Click to collapse' : 'Click to show the full line'}
-                onClick={() => toggleLine(key)}
-                onKeyDown={activateOnKey(() => toggleLine(key))}
+                title={wrapAll ? undefined : open ? 'Click to collapse' : 'Click to show the full line'}
+                onClick={() => !wrapAll && toggleLine(key)}
+                onKeyDown={activateOnKey(() => !wrapAll && toggleLine(key))}
                 style={{
                   position: 'absolute',
                   top: 0,
@@ -268,16 +277,20 @@ export default function LogsPanel({ onSessionExpired }: Props) {
                   width: '100%',
                   boxSizing: 'border-box',
                   transform: `translateY(${vi.start}px)`,
-                  padding: '4px 10px',
+                  padding: `${SPACE.xxs}px ${SPACE.sm}px`,
                   borderBottom: `1px solid ${c.BORDER}`,
                   display: 'flex',
-                  gap: 8,
+                  gap: SPACE.xs,
                   alignItems: 'baseline',
                   whiteSpace: open ? 'normal' : 'nowrap',
-                  cursor: 'pointer',
-                  background: open ? c.BG_ELEVATED : undefined,
+                  cursor: wrapAll ? 'default' : 'pointer',
+                  background: open && !wrapAll ? c.BG_ELEVATED : undefined,
                 }}
               >
+                {/* The visible affordance: this row opens. */}
+                {!wrapAll && (open
+                  ? <DownOutlined aria-hidden style={{ fontSize: 10, color: c.TEXT_MUTED, flexShrink: 0 }} />
+                  : <RightOutlined aria-hidden style={{ fontSize: 10, color: c.TEXT_MUTED, flexShrink: 0 }} />)}
                 <Tag color={levelColour(e.level)} style={{ margin: 0, minWidth: 48, textAlign: 'center' }}>
                   {e.level}
                 </Tag>

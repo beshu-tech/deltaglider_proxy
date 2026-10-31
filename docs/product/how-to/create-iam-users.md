@@ -39,12 +39,12 @@ Users live in the encrypted config database in `gui` mode, so the admin UI (or t
 In the admin UI:
 
 1. In the sidebar, open **Access → Users** (`/_/admin/access/users`).
-2. Click **New** above the user list.
+2. Click **New user** at the top right of the page.
 3. In **Name**, type `ci-uploader`. Leave **Access key ID** and **Secret access key** empty, so that the proxy generates them.
 4. Set the permissions under **Permissions**. A new user starts with one rule that allows **List** and **Read** on every resource (`*`). For `ci-uploader`, keep **Allow**, type `releases/firmware/*` under **WHERE**, and turn on **List**, **Read** and **Write** under **CAN DO**.
 5. Click **Create user**.
 
-   ![The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New button, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create user button.](/_/screenshots/iam-users-new-form.webp)
+   ![The Users page with the form of the new ci-uploader user; callout 1 marks Users in the sidebar, callout 2 the New user button at the top right, callout 3 the Name field, callout 4 the rule that allows List, Read and Write on releases/firmware/*, and callout 5 the Create user button.](/_/screenshots/iam-users-new-form.webp)
 
 A user name has 1 to 64 characters. Each character is a letter, a digit, or one of `+ = , . @ _ -`, so a name cannot contain a space. The name cannot be `.` or `..`. When a name breaks this rule, the form shows the reason under **Name**, and the admin API refuses the request with `400`.
 
@@ -114,13 +114,13 @@ Put rules that several users share on a group, and do not copy them onto each us
 
 In the admin UI:
 
-1. In the sidebar, open **Access → Groups** (`/_/admin/access/groups`), and click **New**.
+1. In the sidebar, open **Access → Groups** (`/_/admin/access/groups`), and click **New group** at the top right of the page.
 2. In **Name**, type `Engineering`. A group name follows the same rule as a user name: 1 to 64 characters, each a letter, a digit, or one of `+ = , . @ _ -`. A **Description** is optional.
 3. Under **Permissions**, type `releases/*` under **WHERE**, and turn on **List** and **Read** under **CAN DO**.
 4. Under **Members**, tick `dana` and `backup-bot`.
 5. Click **Create group**.
 
-   ![The form of a new Engineering group; callout 1 marks the New button, callout 2 the Name field, callout 3 the rule that allows List and Read on releases/*, callout 4 the members dana and backup-bot, and callout 5 the Create group button.](/_/screenshots/iam-groups-new-form.webp)
+   ![The form of a new Engineering group; callout 1 marks the New group button at the top right, callout 2 the Name field, callout 3 the rule that allows List and Read on releases/*, callout 4 the members dana and backup-bot, and callout 5 the Create group button.](/_/screenshots/iam-groups-new-form.webp)
 
 To start a group from an existing one, click **Duplicate group** (the copy icon) on its row. The copy gets the name `<name>-copy` and the same rules. When the group has members, the page asks whether the copy gets them too: click **Copy members** or **No members**.
 

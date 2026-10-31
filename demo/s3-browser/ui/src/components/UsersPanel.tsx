@@ -14,7 +14,9 @@ import UserForm from './UserForm';
 import CredentialsModal from './CredentialsModal';
 import IamSourceBanner from './IamSourceBanner';
 import { EmptyState } from './StatePlaceholders';
-import { normalizeUiError } from '../errorHandling';
+import TruncatedName from './TruncatedName';
+import { isSessionExpired } from '../errorHandling';
+import { plainError } from '../plainError';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
@@ -65,7 +67,10 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   const users = usersQuery.data ?? [];
   const loading = usersQuery.isLoading;
   const rawError = usersQuery.error;
-  const error = rawError ? (normalizeUiError(rawError, "Failed to load users")) : '';
+  // An expired session goes to sign-in; it is not an error state here.
+  const error = rawError && !isSessionExpired(rawError) ? rawError : null;
+  /** The list loaded, without error: only then may the page say "no users". */
+  const loaded = !loading && !error && usersQuery.data !== undefined;
   // The first create switches the proxy to IAM mode (UserForm confirms it).
   // Only when the list is known to be empty: a failed load says nothing.
   const isFirstUser = !loading && !rawError && usersQuery.data !== undefined && users.length === 0;
@@ -150,7 +155,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
       writeSelectionUrl(cloned.id);
       setNewCreds({ ak: cloned.access_key_id, sk: cloned.secret_access_key ?? '' });
     } catch (err) {
-      message.error(normalizeUiError(err, "Duplicate user failed"));
+      message.error(plainError(err, 'The proxy could not duplicate the user.').text);
     } finally {
       onSavingChange?.(false);
     }
@@ -200,13 +205,13 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
         />
       ) : (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-          {users.length === 0 ? (
+          {!loaded ? null : users.length === 0 ? (
             <EmptyState
               icon={<UserOutlined />}
-              title={readOnly ? 'No users declared' : 'Create the first user'}
-              hint={readOnly
+              title={iamMode === 'declarative' ? 'No users declared' : 'Create the first user'}
+              hint={iamMode === 'declarative'
                 ? 'Your YAML config has no users. Add them under access.iam_users and apply.'
-                : 'Click New to create a user with its own credentials and permissions. The first user switches sign-in from the admin password to IAM users.'}
+                : 'Click New user at the top right. A user has its own credentials and permissions. The first user switches sign-in from the admin password to IAM users.'}
             />
           ) : (
             <Text type="secondary" style={{ fontSize: 14 }}>
@@ -239,12 +244,11 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
       onSearchChange={setFilterText}
       loading={loading}
       error={error}
+      onRetry={() => void usersQuery.refetch()}
       // ONE empty state: with no users the detail pane explains, so the list
       // stays blank. It speaks only when the search hides every user.
       listEmptyState={users.length > 0 ? (
-        <div style={{ padding: 20, textAlign: 'center' }}>
-          <Text type="secondary" style={{ fontSize: 13 }}>No users match the search</Text>
-        </div>
+        <EmptyState compact title="No users match the search" hint="Clear the search to see every user." />
       ) : undefined}
       renderRowBody={user => {
         const isExternal = user.auth_source === 'external';
@@ -258,15 +262,15 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
                 background: user.enabled ? colors.ACCENT_GREEN : colors.TEXT_MUTED,
                 flexShrink: 0,
               }} />
-              <Text strong title={user.name} style={{ fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, fontFamily: 'var(--font-ui)' }}>
-                {user.name}
-              </Text>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <TruncatedName text={user.name} style={{ fontSize: 14, fontWeight: 600, fontFamily: 'var(--font-ui)', color: colors.TEXT_PRIMARY }} />
+              </div>
               {isExternal && (
-                <span style={{
-                  fontSize: 9, fontWeight: 700, letterSpacing: 0.5,
+                <span title="Signs in with an external provider" style={{
+                  fontSize: 11, fontWeight: 600,
                   color: colors.ACCENT_PURPLE, background: colors.ACCENT_PURPLE + '18',
-                  padding: '2px 6px', borderRadius: 4, fontFamily: 'var(--font-ui)',
-                  textTransform: 'uppercase', flexShrink: 0,
+                  padding: '0 4px', borderRadius: 4, fontFamily: 'var(--font-ui)',
+                  flexShrink: 0,
                 }}>SSO</span>
               )}
             </div>

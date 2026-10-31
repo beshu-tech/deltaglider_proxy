@@ -2,6 +2,32 @@ import { useMemo } from 'react';
 import { useColors } from '../ThemeContext';
 
 /**
+ * LAYOUT TOKENS — one grid, one rhythm (UX harvest D22).
+ *
+ * Every margin, gap and padding in an admin panel is a value of SPACE. The
+ * source test `layoutTokens.test.ts` refuses other numeric literals for
+ * margin / gap / padding in admin panels (files not yet migrated are on its
+ * allow-list).
+ *
+ *   SPACE.xxs 4   icon ↔ text, chip inner gap
+ *   SPACE.xs  8   controls in one row, label ↔ field
+ *   SPACE.sm  12  rows of a list, fields in a group
+ *   SPACE.md  16  fields in a form, a card's inner groups
+ *   SPACE.lg  24  between cards (CARD_GAP), card padding (CARD_PADDING)
+ *   SPACE.xl  32  between sections of a page
+ *
+ * One card shape: radius CARD_RADIUS (12), padding CARD_PADDING, CARD_GAP
+ * below it. Use `useCardStyles().cardStyle` rather than a hand-made card.
+ */
+export const SPACE = { xxs: 4, xs: 8, sm: 12, md: 16, lg: 24, xl: 32 } as const;
+/** The allowed values, for the source test (0 is always allowed). */
+export const SPACING_SCALE: readonly number[] = [0, ...Object.values(SPACE)];
+export const CARD_RADIUS = 12;
+/** 24 px on a desktop, down to 16 px on a phone. */
+export const CARD_PADDING = `clamp(${SPACE.md}px, 3vw, ${SPACE.lg}px)`;
+export const CARD_GAP = SPACE.lg;
+
+/**
  * Two shared content-column widths for admin section panels — replaces the
  * per-panel magic numbers (740/820/860/960/1100/1180). FORM suits single-column
  * forms and list+detail layouts (readable line length); WIDE suits data tables.
@@ -11,7 +37,7 @@ export const CONTENT_FORM = 880;
 export const CONTENT_WIDE = 1140;
 
 export function contentColumn(width: number): React.CSSProperties {
-  return { maxWidth: width, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' };
+  return { maxWidth: width, margin: '0 auto', padding: CARD_PADDING };
 }
 
 /**
@@ -33,9 +59,9 @@ export function useCardStyles() {
     const cardStyle: React.CSSProperties = {
       background: BG_CARD,
       border: `1px solid ${BORDER}`,
-      borderRadius: 12,
-      padding: 'clamp(16px, 3vw, 24px)',
-      marginBottom: 16,
+      borderRadius: CARD_RADIUS,
+      padding: CARD_PADDING,
+      marginBottom: CARD_GAP,
     };
     const labelStyle: React.CSSProperties = {
       color: TEXT_MUTED,

@@ -50,7 +50,9 @@ import {
 import { useColors } from '../../ThemeContext';
 import { useTweenedCount } from '../../hooks/useTweenedCount';
 import { relativeTime, noun } from '../../utils';
-import { normalizeUiError } from '../../errorHandling';
+import PlainErrorAlert from '../PlainErrorAlert';
+import { plainError } from '../../plainError';
+import { EmptyState } from '../StatePlaceholders';
 
 const { Text } = Typography;
 
@@ -207,19 +209,15 @@ export default function VerifyTab({ ruleName }: Props) {
   const banners = (
     <>
       {runNow.error && (
-        <Alert
-          type="error"
-          showIcon
-          title={normalizeUiError(runNow.error, 'Run now failed')}
-          style={{ borderRadius: 8, marginBottom: 12 }}
+        <PlainErrorAlert
+          error={plainError(runNow.error, 'The proxy could not start the run. Try again.')}
+          style={{ marginBottom: 12 }}
         />
       )}
       {start.error && (
-        <Alert
-          type="error"
-          showIcon
-          title={normalizeUiError(start.error, 'Could not start verification')}
-          style={{ borderRadius: 8, marginBottom: 12 }}
+        <PlainErrorAlert
+          error={plainError(start.error, 'The proxy could not start the verification. Try again.')}
+          style={{ marginBottom: 12 }}
         />
       )}
       {pendingReverify && (
@@ -312,7 +310,7 @@ export default function VerifyTab({ ruleName }: Props) {
     if (!outcome) {
       return (
         <div style={{ padding: '8px 4px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
             <SafetyCertificateOutlined style={{ fontSize: 18, color: c.ACCENT_BLUE }} />
             <Text strong style={{ fontSize: 15 }}>
               Audit replication parity
@@ -322,7 +320,7 @@ export default function VerifyTab({ ruleName }: Props) {
             A fast <strong>metadata audit</strong>: it checks that every source object exists on the
             destination and that their recorded checksums and sizes agree.
           </Text>
-          <Text type="secondary" style={{ display: 'block', fontSize: 12.5, marginBottom: 18 }}>
+          <Text type="secondary" style={{ display: 'block', fontSize: 12.5, marginBottom: 16 }}>
             No downloads — it does not re-read the destination's bytes. Runs in the background;
             the result is saved, so you can leave this page and come back.
           </Text>
@@ -415,7 +413,7 @@ function LoadingBlock({
           background: c.BG_ELEVATED,
           border: `1px solid ${c.BORDER}`,
           borderRadius: 14,
-          padding: '40px 24px 30px',
+          padding: '32px 24px 32px',
           textAlign: 'center',
           boxShadow: c.ELEV_SHADOW,
         }}
@@ -452,7 +450,7 @@ function LoadingBlock({
           </div>
         </div>
 
-        <div style={{ fontSize: 18, fontWeight: 700, color: c.TEXT_PRIMARY, marginBottom: 6 }}>
+        <div style={{ fontSize: 18, fontWeight: 700, color: c.TEXT_PRIMARY, marginBottom: 8 }}>
           {label}
         </div>
 
@@ -639,7 +637,7 @@ export function ParityResult({
         <Alert
           type={lastAttempt.kind === 'failed' ? 'error' : 'info'}
           showIcon
-          style={{ borderRadius: 8, marginBottom: 14 }}
+          style={{ borderRadius: 8, marginBottom: 12 }}
           title={
             lastAttempt.kind === 'failed'
               ? 'The last audit failed'
@@ -665,7 +663,7 @@ export function ParityResult({
           background: c.BG_ELEVATED,
           border: `1px solid ${c.BORDER}`,
           borderRadius: 14,
-          padding: '32px 24px 26px',
+          padding: '32px 24px 24px',
           textAlign: 'center',
           boxShadow: c.ELEV_SHADOW,
           opacity: reverifying ? 0.45 : 1,
@@ -757,7 +755,7 @@ export function ParityResult({
             regimes are metadata-only (no downloads); they differ in HOW the
             metadata was sourced, which is the honest distinction to surface. */}
         <div
-          style={{ fontSize: 12, color: c.TEXT_MUTED, marginTop: 18 }}
+          style={{ fontSize: 12, color: c.TEXT_MUTED, marginTop: 16 }}
           title={`Scanned at ${scannedAbsolute}`}
         >
           Checked {relativeTime(scannedDate)} ·{' '}
@@ -775,7 +773,7 @@ export function ParityResult({
             ReverifyBanner above owns the progress + Cancel. */}
         {!reverifying && (
           <>
-            <div style={{ marginTop: 18, display: 'flex', gap: 8, justifyContent: 'center', alignItems: 'center' }}>
+            <div style={{ marginTop: 16, display: 'flex', gap: 8, justifyContent: 'center', alignItems: 'center' }}>
               <Button
                 icon={<ReloadOutlined />}
                 onClick={onReverify}
@@ -817,7 +815,7 @@ export function ParityResult({
           <Alert
             type="warning"
             showIcon
-            style={{ borderRadius: 8, marginTop: 14 }}
+            style={{ borderRadius: 8, marginTop: 12 }}
             title={
               outcome.cap_hit
                 ? 'Only part of the mirror was checked'
@@ -864,7 +862,7 @@ export function ParityResult({
             <Alert
               type="info"
               showIcon
-              style={{ borderRadius: 8, marginTop: 14 }}
+              style={{ borderRadius: 8, marginTop: 12 }}
               title={`${outcome.unverifiable.toLocaleString()} ${noun(outcome.unverifiable, 'object matches', 'objects match')} on size, not checksum`}
               description="Their sizes match on both sides, but there was no comparable checksum to prove the bytes are identical — usually because they were written to the backend directly (not through the proxy), or the two sides store them differently. This is not a mismatch; re-write them through the proxy if you want full checksum parity."
             />
@@ -975,7 +973,7 @@ function UnreadObjectsNote({
           <summary style={{ cursor: 'pointer', fontSize: 12.5 }}>
             {recheckable === 1 ? 'The unread object' : `The unread objects (${recheckable.toLocaleString()})`}
           </summary>
-          <ul aria-label="Unread objects" style={{ margin: '6px 0 0', paddingInlineStart: 18 }}>
+          <ul aria-label="Unread objects" style={{ margin: '8px 0 0', paddingInlineStart: 16 }}>
             {listed.map((k) => (
               <li key={k.dest_key} style={{ fontFamily: 'var(--font-mono)', fontSize: 12, wordBreak: 'break-all' }}>
                 {k.dest_key}
@@ -997,7 +995,7 @@ function UnreadObjectsNote({
           onClick={onRecheck}
           disabled={!!blockedReason}
           title={blockedReason ?? undefined}
-          style={{ marginTop: 10 }}
+          style={{ marginTop: 12 }}
         >
           Re-check {recheckable === 1 ? 'this object' : `these ${recheckable.toLocaleString()} objects`}
         </Button>
@@ -1028,14 +1026,14 @@ function DeepVerifyAffordance({ c }: { c: ReturnType<typeof useColors> }) {
   return (
     <div
       style={{
-        marginTop: 14,
-        padding: '14px 16px',
+        marginTop: 12,
+        padding: '12px 16px',
         borderRadius: 12,
         background: c.BG_ELEVATED,
         border: `1px dashed ${c.BORDER}`,
         display: 'flex',
         alignItems: 'center',
-        gap: 14,
+        gap: 12,
       }}
     >
       <SafetyCertificateOutlined style={{ fontSize: 20, color: c.TEXT_MUTED, flexShrink: 0 }} />
@@ -1087,9 +1085,9 @@ function ReverifyBanner({
       style={{
         display: 'flex',
         alignItems: 'center',
-        gap: 14,
-        padding: '14px 16px',
-        marginBottom: 14,
+        gap: 12,
+        padding: '12px 16px',
+        marginBottom: 12,
         borderRadius: 12,
         background: c.BG_ELEVATED,
         border: `1px solid ${c.ACCENT_BLUE}40`,
@@ -1168,7 +1166,7 @@ function ActionableLine({
   if (parts.length === 0) return null;
   return (
     <div
-      style={{ fontSize: 13, color: c.TEXT_SECONDARY, marginTop: 14, lineHeight: 1.5 }}
+      style={{ fontSize: 13, color: c.TEXT_SECONDARY, marginTop: 12, lineHeight: 1.5 }}
       title="Counts cover the sampled findings shown below, not the exact totals."
     >
       {parts.join(' · ')}
@@ -1183,10 +1181,10 @@ function Chip({ color, text }: { color: string; text: string }) {
       style={{
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 6,
+        gap: 8,
         fontSize: 12.5,
         fontWeight: 600,
-        padding: '3px 11px',
+        padding: '4px 12px',
         borderRadius: 999,
         color,
         background: `${color}1a`,
@@ -1227,7 +1225,7 @@ function FindingsTable({
   ).length;
 
   return (
-    <div style={{ marginTop: 18 }}>
+    <div style={{ marginTop: 16 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8, flexWrap: 'wrap' }}>
         <Text strong style={{ fontSize: 13.5 }}>
           Differences
@@ -1254,7 +1252,7 @@ function FindingsTable({
       <RecordList<ParityFinding>
         rows={rows}
         rowKey={(f) => `${f.kind}:${f.key}`}
-        empty="No sampled differences"
+        empty={<EmptyState compact title="No sampled differences" />}
         columns={[
           {
             key: 'object',

@@ -22,11 +22,11 @@
   }
 }
 
-/* Panel body gets edge-to-edge charts — compensate for the 14px
+/* Panel body gets edge-to-edge charts — compensate for the 16px (SPACE.md)
  * padding we set on PanelBody for chart-only panels by letting
  * consumers apply `.panel-chart-edge` on a wrapper. */
 .panel-chart-edge {
-  margin: -14px;
+  margin: -16px;
   flex: 1;
   min-height: 0;
   min-width: 0;

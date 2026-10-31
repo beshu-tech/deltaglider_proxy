@@ -1,41 +1,25 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { confirmDialog } from '../confirmDialog';
 import {
   BookOutlined,
-  CopyOutlined,
   DownOutlined,
   EyeInvisibleOutlined,
   EyeOutlined,
-  FileTextOutlined,
   HomeOutlined,
-  ImportOutlined,
   LogoutOutlined,
   MoonOutlined,
-  SafetyCertificateOutlined,
   SettingOutlined,
   SunOutlined,
-  TeamOutlined,
   UpOutlined,
 } from '@ant-design/icons';
 import { useTheme } from '../ThemeContext';
-import type { SectionName } from '../adminApi';
-import { SectionYamlModal } from './CopySectionYamlButton';
+import TruncatedName from './TruncatedName';
+import { SPACE } from './shared-styles';
 
-export interface AccountMenuConfigProps {
-  configSection?: SectionName;
-  onShowFullConfigYaml?: () => void;
-  onImportFullConfigYaml?: () => void;
-  onExportFullIam?: () => void;
-  onImportFullIam?: () => void;
-  /** Why the full-IAM import is refused (declarative mode); the item is then disabled. */
-  importFullIamBlocked?: string;
-}
-
-interface Props extends AccountMenuConfigProps {
+interface Props {
   identityLabel: string;
   /** Second header line: role and auth mode (see identitySummary.ts). */
   identityDetail?: string;
-  canAdmin?: boolean;
   onBrowserClick?: () => void;
   onSettingsClick?: () => void;
   onDocsClick?: () => void;
@@ -47,6 +31,9 @@ interface Props extends AccountMenuConfigProps {
   avatarOnly?: boolean;
 }
 
+/** Keys whose native click on the trigger opens the menu from the keyboard. */
+const KEYS_THAT_CLICK = new Set(['Enter', ' ']);
+
 /** The focusable entries of the open menu, in order. */
 function menuItems(root: HTMLElement | null): HTMLElement[] {
   return root ? Array.from(root.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])')) : [];
@@ -55,7 +42,6 @@ function menuItems(root: HTMLElement | null): HTMLElement[] {
 export default function AccountMenu({
   identityLabel,
   identityDetail,
-  canAdmin,
   onBrowserClick,
   onSettingsClick,
   onDocsClick,
@@ -65,22 +51,14 @@ export default function AccountMenu({
   placement = 'up',
   compact = false,
   avatarOnly = false,
-  configSection,
-  onShowFullConfigYaml,
-  onImportFullConfigYaml,
-  onExportFullIam,
-  onImportFullIam,
-  importFullIamBlocked,
 }: Props) {
   const { isDark, toggleTheme } = useTheme();
   const [open, setOpen] = useState(false);
-  const [sectionYamlOpen, setSectionYamlOpen] = useState(false);
-  const idBase = useId();
   const menuRef = useRef<HTMLDivElement>(null);
   const itemsRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   // Which item gets focus when the menu opens (ArrowUp on the trigger opens at the last).
-  const focusOnOpenRef = useRef<'first' | 'last'>('first');
+  const focusOnOpenRef = useRef<'first' | 'last' | null>('first');
   const label = identityLabel.trim() || 'user';
   const avatarLetter = (() => {
     const ch = label.charAt(0);
@@ -114,9 +92,14 @@ export default function AccountMenu({
   // Opening the menu moves focus to its first item, so the arrow keys work.
   useEffect(() => {
     if (!open) return;
-    const items = menuItems(itemsRef.current);
-    (focusOnOpenRef.current === 'last' ? items[items.length - 1] : items[0])?.focus();
+    // A tap or a click opens the menu without moving focus: a focus moved by
+    // script after a tap kept a ring on the avatar (D57). The keyboard
+    // (Enter, Space, arrows) opens it with focus on an item, for the arrows.
+    const where = focusOnOpenRef.current;
     focusOnOpenRef.current = 'first';
+    if (where === null) return;
+    const items = menuItems(itemsRef.current);
+    (where === 'last' ? items[items.length - 1] : items[0])?.focus();
   }, [open]);
 
   const onMenuKeyDown = (event: React.KeyboardEvent) => {
@@ -129,6 +112,8 @@ export default function AccountMenu({
   };
 
   const onTriggerKeyDown = (event: React.KeyboardEvent) => {
+    // The native click of Enter / Space opens the menu: focus goes to an item.
+    if (KEYS_THAT_CLICK.has(event.key)) focusOnOpenRef.current = 'first';
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
     event.preventDefault();
     focusOnOpenRef.current = event.key === 'ArrowUp' ? 'last' : 'first';
@@ -140,26 +125,7 @@ export default function AccountMenu({
     }
   };
 
-  useEffect(() => {
-    if (!configSection) setSectionYamlOpen(false);
-  }, [configSection]);
-
   const close = () => setOpen(false);
-  const isAdmin = canAdmin === true;
-  const hasConfigActions =
-    isAdmin &&
-    Boolean(
-      configSection ||
-        onShowFullConfigYaml ||
-        onImportFullConfigYaml ||
-        onExportFullIam ||
-        onImportFullIam
-    );
-  const configLabel = configSection
-    ? `${configSection.charAt(0).toUpperCase()}${configSection.slice(1)} section YAML`
-    : 'Section YAML';
-  const settingsHelp = 'Just your settings — does not include users/groups or full backup bundles.';
-  const iamHelp = 'Full IAM (users, groups, providers, rules). Export includes LIVE secrets — handle like a password file.';
   const confirmLogout = async () => {
     if (await confirmDialog({ title: 'Sign out?', content: 'This clears your credentials and returns to the sign-in screen.', okText: 'Sign out' })) {
       onLogout?.();
@@ -179,11 +145,9 @@ export default function AccountMenu({
         <div className="account-menu-panel">
           {/* Who is signed in, and how. Outside the menu: it is text, not an item. */}
           <div
-            style={{ padding: '2px 4px 10px', marginBottom: 8, borderBottom: '1px solid color-mix(in srgb, currentColor 14%, transparent)' }}
+            style={{ padding: `2px ${SPACE.xxs}px ${SPACE.sm}px`, marginBottom: SPACE.xs, borderBottom: '1px solid color-mix(in srgb, currentColor 14%, transparent)' }}
           >
-            <div style={{ fontWeight: 700, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={label}>
-              {label}
-            </div>
+            <TruncatedName text={label} style={{ fontWeight: 700, fontSize: 13 }} />
             {identityDetail && (
               <div style={{ fontSize: 11, opacity: 0.7, marginTop: 2, lineHeight: 1.4, wordBreak: 'break-word' }}>
                 {identityDetail}
@@ -192,7 +156,7 @@ export default function AccountMenu({
           </div>
           <div ref={itemsRef} role="menu" aria-label="Account" onKeyDown={onMenuKeyDown}>
           <div className="account-menu-section account-menu-section--first" role="group" aria-label="Navigation">
-            <div className="account-menu-section-label" aria-hidden>Navigation</div>
+            <div className="account-menu-section-label dg-eyebrow" aria-hidden>Navigation</div>
             {/* Each view passes no handler for itself, so the menu never
                 offers the page you are already on. */}
             {onBrowserClick && (
@@ -238,93 +202,8 @@ export default function AccountMenu({
               </button>
             )}
           </div>
-          {hasConfigActions && (
-            <div className="account-menu-section" role="group" aria-label="Settings" aria-describedby={`${idBase}-settings-help`} title={settingsHelp}>
-              <div className="account-menu-section-label" aria-hidden>Settings</div>
-              <div className="account-menu-section-help" id={`${idBase}-settings-help`} aria-hidden>{settingsHelp}</div>
-              {configSection && (
-                <button
-                  type="button"
-                  className="account-menu-item"
-                  role="menuitem"
-                  title={settingsHelp}
-                  onClick={() => {
-                    close();
-                    setSectionYamlOpen(true);
-                  }}
-                >
-                  <CopyOutlined aria-hidden style={iconStyle} />
-                  <span>{configLabel}</span>
-                </button>
-              )}
-              {onShowFullConfigYaml && (
-                <button
-                  type="button"
-                  className="account-menu-item"
-                  role="menuitem"
-                  title={settingsHelp}
-                  onClick={() => {
-                    close();
-                    onShowFullConfigYaml();
-                  }}
-                >
-                  <FileTextOutlined aria-hidden style={iconStyle} />
-                  <span>Export settings YAML</span>
-                </button>
-              )}
-              {onImportFullConfigYaml && (
-                <button
-                  type="button"
-                  className="account-menu-item"
-                  role="menuitem"
-                  title={settingsHelp}
-                  onClick={() => {
-                    close();
-                    onImportFullConfigYaml();
-                  }}
-                >
-                  <ImportOutlined aria-hidden style={iconStyle} />
-                  <span>Import settings YAML</span>
-                </button>
-              )}
-              {(onExportFullIam || onImportFullIam) && (
-                <div className="account-menu-section-help" title={iamHelp} aria-hidden>{iamHelp}</div>
-              )}
-              {onExportFullIam && (
-                <button
-                  type="button"
-                  className="account-menu-item"
-                  role="menuitem"
-                  title={iamHelp}
-                  onClick={() => {
-                    close();
-                    onExportFullIam();
-                  }}
-                >
-                  <SafetyCertificateOutlined aria-hidden style={iconStyle} />
-                  <span>Export full IAM (YAML)</span>
-                </button>
-              )}
-              {onImportFullIam && (
-                <button
-                  type="button"
-                  className="account-menu-item"
-                  role="menuitem"
-                  title={importFullIamBlocked ?? iamHelp}
-                  disabled={importFullIamBlocked !== undefined}
-                  onClick={() => {
-                    close();
-                    onImportFullIam();
-                  }}
-                >
-                  <TeamOutlined aria-hidden style={iconStyle} />
-                  <span>Import full IAM (YAML)</span>
-                </button>
-              )}
-            </div>
-          )}
           <div className="account-menu-section" role="group" aria-label="Quick actions">
-            <div className="account-menu-section-label" aria-hidden>Quick actions</div>
+            <div className="account-menu-section-label dg-eyebrow" aria-hidden>Quick actions</div>
             <button
               type="button"
               className="account-menu-item"
@@ -359,7 +238,7 @@ export default function AccountMenu({
             <div className="account-menu-signout-section" role="group" aria-label="Account">
               <button
                 type="button"
-                className="account-menu-item account-menu-item--danger"
+                className="account-menu-item"
                 role="menuitem"
                 onClick={() => {
                   close();
@@ -381,6 +260,9 @@ export default function AccountMenu({
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={`Account menu: ${label}`}
+        onPointerDown={() => {
+          focusOnOpenRef.current = null;
+        }}
         onClick={() => setOpen((v) => !v)}
         onKeyDown={onTriggerKeyDown}
       >
@@ -400,11 +282,6 @@ export default function AccountMenu({
           </>
         )}
       </button>
-      <SectionYamlModal
-        section={configSection}
-        open={sectionYamlOpen}
-        onClose={() => setSectionYamlOpen(false)}
-      />
     </div>
   );
 }

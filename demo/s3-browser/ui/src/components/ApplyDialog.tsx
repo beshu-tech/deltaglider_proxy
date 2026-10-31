@@ -22,7 +22,8 @@ import { CheckCircleOutlined, WarningOutlined, SyncOutlined } from '@ant-design/
 import type { SectionApplyResponse, SectionName } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { BORDER_RADIUS } from './overlayStyles';
-import { expandDiff } from '../applyDiff';
+import { diffFields, expandDiff, formatDiffValue, type DiffLine } from '../applyDiff';
+import { SPACE } from './shared-styles';
 import { plainError } from '../adminApi';
 
 const { Text } = Typography;
@@ -54,7 +55,7 @@ export default function ApplyDialog({
   summary,
   step,
 }: Props) {
-  const { TEXT_PRIMARY: TEXT, TEXT_MUTED, BORDER, BG_CARD, ACCENT_RED, ACCENT_GREEN } = useColors();
+  const { TEXT_PRIMARY: TEXT, TEXT_MUTED, BORDER, BG_CARD } = useColors();
 
   if (!response) return null;
 
@@ -117,9 +118,9 @@ export default function ApplyDialog({
           description={
             <>
               <LinkifiedText text={reason.text} />
-              <div style={{ marginTop: 4 }}>Fix it in the form, then review again. Nothing was changed.</div>
+              <div style={{ marginTop: SPACE.xxs }}>Fix it in the form, then review again. Nothing was changed.</div>
               {reason.details && (
-                <details style={{ marginTop: 6 }}>
+                <details style={{ marginTop: SPACE.xs }}>
                   <summary style={{ cursor: 'pointer', fontSize: 12 }}>Details</summary>
                   <code style={{ display: 'block', marginTop: 4, fontSize: 11, overflowWrap: 'anywhere' }}>{reason.details}</code>
                 </details>
@@ -157,7 +158,7 @@ export default function ApplyDialog({
                   ? '1 warning that already existed before this change'
                   : `${existingWarnings.length} warnings that already existed before this change`}
               </summary>
-              <div style={{ marginTop: 6 }}>
+              <div style={{ marginTop: SPACE.xs }}>
                 <WarningList items={existingWarnings} />
               </div>
             </details>
@@ -179,16 +180,7 @@ export default function ApplyDialog({
               marginBottom: 12,
             }}
           >
-            <div
-              style={{
-                color: TEXT_MUTED,
-                fontSize: 11,
-                fontWeight: 600,
-                letterSpacing: 0.5,
-                textTransform: 'uppercase',
-                marginBottom: 8,
-              }}
-            >
+            <div style={{ color: TEXT_MUTED, fontSize: 12, fontWeight: 600, marginBottom: SPACE.xs }}>
               Changes ({diffRows.length})
             </div>
             {diffRows.length === 0 ? (
@@ -196,28 +188,21 @@ export default function ApplyDialog({
             ) : (
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
                 {diffRows.map((line) => (
-                  <div key={`${line.kind}:${line.path}`} style={{ marginBottom: 10, wordBreak: 'break-word' }}>
-                    <div style={{ color: TEXT, fontWeight: 600, marginBottom: 2 }}>
-                      {line.path}
-                      {line.kind !== 'changed' && (
-                        <Text type="secondary" style={{ fontWeight: 400, marginLeft: 8 }}>
-                          {line.kind === 'added' ? 'new' : 'removed'}
-                        </Text>
-                      )}
-                    </div>
-                    {line.kind !== 'added' && (
-                      <div style={{ color: ACCENT_RED, opacity: 0.9 }}>
-                        -&nbsp;{formatValue(line.before, line.kind === 'removed')}
-                      </div>
-                    )}
-                    {line.kind !== 'removed' && (
-                      <div style={{ color: ACCENT_GREEN, opacity: 0.9 }}>
-                        +&nbsp;{formatValue(line.after, line.kind === 'added')}
-                      </div>
-                    )}
-                  </div>
+                  <DiffRow key={`${line.kind}:${line.path}`} line={line} pathColor={TEXT} />
                 ))}
               </div>
+            )}
+            {/* The wire diff, whole, for a reader who wants every byte. */}
+            {diffRows.length > 0 && (
+              <details style={{ marginTop: SPACE.xs }}>
+                <summary style={{ cursor: 'pointer', fontSize: 12, color: TEXT_MUTED }}>Show the raw change</summary>
+                <pre
+                  data-testid="apply-dialog-raw"
+                  style={{ margin: `${SPACE.xs}px 0 0`, fontSize: 11, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: TEXT_MUTED }}
+                >
+                  {JSON.stringify(sectionDiff, null, 2)}
+                </pre>
+              </details>
             )}
           </div>
 
@@ -246,7 +231,7 @@ export default function ApplyDialog({
 
 function WarningList({ items }: { items: string[] }) {
   return (
-    <ul style={{ marginBottom: 0, paddingLeft: 20 }}>
+    <ul style={{ marginBottom: 0, paddingLeft: SPACE.md }}>
       {items.map((w, i) => (
         <li key={i}>
           <LinkifiedText text={w} />
@@ -256,19 +241,47 @@ function WarningList({ items }: { items: string[] }) {
   );
 }
 
-/** Format any JSON-ish value for diff display. Keeps JSON shape but
- *  collapses long arrays/objects to a single-line preview so the diff
- *  stays readable. */
-function formatValue(v: unknown, whole = false): string {
-  if (v === null || v === undefined) return 'null';
-  if (typeof v === 'string') return JSON.stringify(v);
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-  try {
-    const s = JSON.stringify(v);
-    // A whole added/removed rule is the change itself: show all of it.
-    if (whole || s.length <= 120) return s;
-    return s.slice(0, 117) + '...';
-  } catch {
-    return String(v);
-  }
+/**
+ * One change as a reader checks it (UX harvest D37): the field path, then
+ * the old value in red and the new one in green. A whole rule that is added
+ * or removed is a list of its fields, never a JSON line cut at the edge.
+ */
+function DiffRow({ line, pathColor }: { line: DiffLine; pathColor: string }) {
+  const { ACCENT_RED, ACCENT_GREEN } = useColors();
+  const side = (sign: '-' | '+', value: unknown, color: string) => {
+    const fields = diffFields(value);
+    if (!fields) {
+      return (
+        <div style={{ color, opacity: 0.9 }}>
+          {sign}&nbsp;{formatDiffValue(value)}
+        </div>
+      );
+    }
+    return (
+      <dl style={{ margin: 0, color, opacity: 0.9 }}>
+        {fields.map((f) => (
+          <div key={f.key} style={{ display: 'flex', gap: SPACE.xs }}>
+            <dt style={{ flexShrink: 0 }}>
+              {sign}&nbsp;{f.key}:
+            </dt>
+            <dd style={{ margin: 0, minWidth: 0 }}>{f.value}</dd>
+          </div>
+        ))}
+      </dl>
+    );
+  };
+  return (
+    <div style={{ marginBottom: SPACE.sm, wordBreak: 'break-word' }}>
+      <div style={{ color: pathColor, fontWeight: 600, marginBottom: 2 }}>
+        {line.path}
+        {line.kind !== 'changed' && (
+          <Text type="secondary" style={{ fontWeight: 400, marginLeft: SPACE.xs }}>
+            {line.kind === 'added' ? 'new' : 'removed'}
+          </Text>
+        )}
+      </div>
+      {line.kind !== 'added' && side('-', line.before, ACCENT_RED)}
+      {line.kind !== 'removed' && side('+', line.after, ACCENT_GREEN)}
+    </div>
+  );
 }

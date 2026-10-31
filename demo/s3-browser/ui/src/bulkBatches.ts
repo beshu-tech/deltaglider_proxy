@@ -7,7 +7,7 @@
  * (useS3Browser) owns the run; BulkActionBar shows its progress.
  */
 import type { ListingProgress } from './bulkSelection';
-import { normalizeUiError } from './errorHandling';
+import { plainError } from './plainError';
 import { noun } from './utils';
 
 export type BulkAction = 'delete' | 'copy' | 'move';
@@ -134,14 +134,19 @@ export function bulkProgressPercent(p: ShownBulkProgress): number | null {
  */
 export class BulkActionFailed extends Error {
   readonly cause: unknown;
+  /** The raw text of the cause (status, code, request id), for a "Details" disclosure. */
+  readonly details?: string;
 
   constructor(action: BulkAction, cause: unknown, done: number, total: number) {
     const tail =
       total === 0
         ? `Nothing was ${DONE[action]}.`
         : `${count(done)} of ${count(total)} ${noun(total, UNIT[action])} were ${DONE[action]} before the failure.`;
-    super(`${normalizeUiError(cause, `Bulk ${action} failed`).replace(/[.\s]+$/, '')}. ${tail}`);
+    // The plain sentence of the cause (plainError), never the wire text.
+    const plain = plainError(cause, `The ${action} failed.`);
+    super(`${plain.text.replace(/[.\s]+$/, '')}. ${tail}`);
     this.name = 'BulkActionFailed';
     this.cause = cause;
+    this.details = plain.details;
   }
 }

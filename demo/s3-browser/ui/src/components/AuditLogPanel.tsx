@@ -23,24 +23,27 @@
  * is a triage convenience, not a compliance substitute.
  */
 import { useMemo, useState } from 'react';
-import { Typography, Input, Button, Tag, Alert, Space, Switch } from 'antd';
+import { Typography, Input, Button, Tag, Space, Switch } from 'antd';
 import {
   ReloadOutlined,
   SearchOutlined,
   FileTextOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { useAuditLog } from '../queries/audit';
-import { LoadingState } from './StatePlaceholders';
+import { EmptyState, LoadingState, QueryState } from './StatePlaceholders';
 import { relativeTime } from '../utils';
-import { contentColumn, CONTENT_WIDE } from './shared-styles';
-import { normalizeUiError } from '../errorHandling';
+import { contentColumn, CONTENT_WIDE, SPACE } from './shared-styles';
 import { isSessionExpired } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
+import { useIsNarrow } from '../useIsNarrow';
+import TruncatedName from './TruncatedName';
 
 const { Text } = Typography;
 
-/** Single-line, ellipsis-on-overflow cell — shared by the user/ip/bucket/target columns. */
+/** Single-line, ellipsis-on-overflow cell for the IP column (user, bucket
+ *  and target are names: <TruncatedName> cuts them in the middle). */
 const CELL_TRUNCATE_STYLE = {
   overflow: 'hidden',
   textOverflow: 'ellipsis',
@@ -64,36 +67,12 @@ const AUDIT_ROW = {
   columnGap: 16,
 } as const;
 
-/** What the audit trail records, shown when the ring is empty. */
-const AUDITED_EVENTS = [
-  'Admin sign-ins and failed sign-in attempts.',
-  'Changes to users, groups, external identity providers and group mapping rules.',
-  'Configuration changes that you apply from these settings pages.',
-  'Job actions: pause, resume, run now, cancel, and one-off maintenance jobs.',
-  'Password changes, key rotations and session revocations.',
-  'Requests that the proxy refused because the caller did not have permission.',
-];
+/** The hint of the empty state: what gets recorded. */
+const AUDIT_EMPTY_HINT =
+  'The audit log records sign-ins, changes to users, groups and settings, job actions, key and password changes, and refused requests.';
 
-function AuditEmptyState() {
-  const colors = useColors();
-  return (
-    <div style={{ padding: '28px 24px', color: colors.TEXT_SECONDARY, fontSize: 13, lineHeight: 1.6 }}>
-      <div style={{ color: colors.TEXT_PRIMARY, fontWeight: 600, marginBottom: 6 }}>
-        No audit entries yet.
-      </div>
-      <div>The audit log records these events:</div>
-      <ul style={{ margin: '6px 0 10px', paddingLeft: 20 }}>
-        {AUDITED_EVENTS.map((line) => (
-          <li key={line}>{line}</li>
-        ))}
-      </ul>
-      <div style={{ color: colors.TEXT_MUTED }}>
-        The entries are kept in memory, so a restart of the proxy clears this list.
-        The same entries also go to the proxy log, which stays the long-term record.
-      </div>
-    </div>
-  );
-}
+/** Below this width the table becomes one card per entry (UX harvest D40). */
+const AUDIT_CARD_BREAKPOINT = 600;
 
 interface Props {
   onSessionExpired?: () => void;
@@ -116,8 +95,11 @@ function actionColour(action: string): string {
   return 'default';
 }
 
+type Entry = NonNullable<ReturnType<typeof useAuditLog>['data']>['entries'][number];
+
 export default function AuditLogPanel({ onSessionExpired }: Props) {
   const colors = useColors();
+  const narrow = useIsNarrow(AUDIT_CARD_BREAKPOINT);
   const [filter, setFilter] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(false);
   // Auto-refresh. 3s — quick enough for incident-debugging ("does my click show
@@ -125,15 +107,12 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
   // flight and pauses in a background tab.
   const audit = useAuditLog(autoRefresh ? 3000 : false);
   const entries = useMemo(() => audit.data?.entries ?? [], [audit.data]);
-  const loading = audit.isFetching;
   // `now` follows the last fetch so the relative-time column stays honest
   // without re-rendering the world every second.
   const now = useMemo(() => new Date(audit.dataUpdatedAt || Date.now()), [audit.dataUpdatedAt]);
   useSessionExpiredOn(audit.error, onSessionExpired);
-  const error =
-    audit.error && !isSessionExpired(audit.error)
-      ? `Failed to load audit entries: ${normalizeUiError(audit.error, 'unknown')}`
-      : null;
+  // An expired session goes to sign-in (above); it is not an error state here.
+  const view = { ...audit, error: audit.error && !isSessionExpired(audit.error) ? audit.error : null };
 
   // Client-side filter — free-text substring match across action,
   // user, target, ip, bucket, and path. Deliberately lenient:
@@ -149,6 +128,121 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
     });
   }, [entries, filter]);
 
+  const card = {
+    border: `1px solid ${colors.BORDER}`,
+    borderRadius: 12,
+    width: '100%',
+    minWidth: 0,
+    background: colors.BG_CARD,
+  } as const;
+
+  const actionTag = (e: Entry) => (
+    <Tag color={actionColour(e.action)} style={{ margin: 0, fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+      {e.action || '—'}
+    </Tag>
+  );
+  const time = (e: Entry) => (
+    <span title={new Date(e.timestamp).toLocaleString()} style={{ color: colors.TEXT_SECONDARY, fontSize: 11 }}>
+      {relativeTime(e.timestamp, { now })}
+    </span>
+  );
+
+  /** Phone: one card per entry — time + action on line 1, user · ip · bucket · target on line 2. */
+  const cards = (rows: Entry[]) => (
+    <div style={card} role="list" aria-label="Audit entries">
+      {rows.map((e, i) => (
+        <div
+          key={`${e.timestamp}-${i}`}
+          role="listitem"
+          style={{
+            padding: `${SPACE.sm}px ${SPACE.md}px`,
+            borderBottom: i < rows.length - 1 ? `1px solid ${colors.BORDER}` : 'none',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: SPACE.xxs,
+            minWidth: 0,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: SPACE.xs, flexWrap: 'wrap' }}>
+            {actionTag(e)}
+            {time(e)}
+          </div>
+          <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: colors.TEXT_SECONDARY, overflowWrap: 'anywhere' }}>
+            {[e.user, e.ip, e.bucket, e.path || e.target].filter(Boolean).join(' · ') || '—'}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+
+  /** Desktop: the table — ONE grid owns the column tracks; the header and
+   *  every row are subgrids of it, so all rows share the same widths. */
+  const table = (rows: Entry[]) => (
+    <div style={{ ...card, overflowX: 'auto', overflowY: 'hidden' }}>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: AUDIT_COLUMNS,
+          // Fill the card; below the sum of the column minimums the card
+          // scrolls sideways instead of squeezing the columns.
+          width: '100%',
+          minWidth: 720,
+        }}
+      >
+        <div
+          style={{
+            ...AUDIT_ROW,
+            padding: `${SPACE.sm}px ${SPACE.md}px`,
+            borderBottom: `1px solid ${colors.BORDER}`,
+            fontSize: 12,
+            fontWeight: 600,
+            color: colors.TEXT_MUTED,
+            fontFamily: 'var(--font-ui)',
+            background: colors.BG_ELEVATED,
+          }}
+        >
+          <div>Time</div>
+          <div>Action</div>
+          <div>User</div>
+          <div>IP</div>
+          <div>Bucket</div>
+          <div>Target / path</div>
+        </div>
+        {rows.map((e, i) => (
+          <div
+            key={`${e.timestamp}-${i}`}
+            style={{
+              ...AUDIT_ROW,
+              padding: `${SPACE.xs}px ${SPACE.md}px`,
+              borderBottom: i < rows.length - 1 ? `1px solid ${colors.BORDER}` : 'none',
+              fontSize: 12,
+              fontFamily: 'var(--font-mono)',
+              alignItems: 'center',
+            }}
+          >
+            <div>{time(e)}</div>
+            <div>{actionTag(e)}</div>
+            <div style={{ minWidth: 0, color: e.user ? colors.TEXT_PRIMARY : colors.TEXT_MUTED }}>
+              <TruncatedName text={e.user || '—'} title={e.user || false} />
+            </div>
+            <div style={{ ...CELL_TRUNCATE_STYLE, color: colors.TEXT_SECONDARY }} title={e.ua ? `${e.ip} · ${e.ua}` : e.ip}>
+              {e.ip || '—'}
+            </div>
+            <div style={{ minWidth: 0, color: colors.TEXT_SECONDARY }}>
+              <TruncatedName text={e.bucket || '—'} title={e.bucket || false} />
+            </div>
+            <div style={{ minWidth: 0, color: colors.TEXT_SECONDARY }}>
+              <TruncatedName
+                text={e.path || e.target || '—'}
+                title={e.path ? `${e.target} · ${e.path}` : e.target || false}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
   return (
     <div
       style={{
@@ -160,38 +254,9 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
         flexDirection: 'column',
         minWidth: 0,
         boxSizing: 'border-box',
-        gap: 16,
+        gap: SPACE.md,
       }}
     >
-      {/* One quiet line — TabHeader already titles the page "Audit log".
-          Stdout / your log pipeline stays authoritative for long-term audit. */}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          padding: '8px 12px',
-          borderLeft: `3px solid ${colors.ACCENT_BLUE}`,
-          background: colors.BG_ELEVATED,
-          borderRadius: 6,
-          fontSize: 12.5,
-          color: colors.TEXT_SECONDARY,
-          lineHeight: 1.5,
-        }}
-      >
-        <FileTextOutlined style={{ color: colors.ACCENT_BLUE, flexShrink: 0 }} aria-hidden />
-        <span>
-          This proxy keeps the most recent entries in memory (500 by default; set the number
-          with{' '}
-          <code style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: colors.TEXT_MUTED }}>
-            DGP_AUDIT_RING_SIZE
-          </code>
-          ). A restart clears them.
-        </span>
-      </div>
-
-      {error && <Alert type="error" showIcon title="Fetch failed" description={error} />}
-
       {/* Toolbar */}
       <Space size="middle" style={{ flexWrap: 'wrap' }}>
         <Input
@@ -201,18 +266,18 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
           prefix={<SearchOutlined style={{ color: colors.TEXT_MUTED }} />}
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          style={{ width: 360 }}
+          style={{ width: narrow ? '100%' : 360 }}
           allowClear
         />
         <Button
           size="middle"
           icon={<ReloadOutlined />}
           onClick={() => void audit.refetch()}
-          loading={loading && !autoRefresh}
+          loading={audit.isFetching && !autoRefresh}
         >
           Refresh
         </Button>
-        <Space size={8}>
+        <Space size={SPACE.xs}>
           <Switch
             size="small"
             checked={autoRefresh}
@@ -224,139 +289,45 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
           </Text>
         </Space>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          {/* The one count on the page (the banner repeated it). */}
+          {/* The one count on the page. */}
           {filter.trim()
             ? `${filtered.length} of ${entries.length} shown`
             : `${entries.length} ${entries.length === 1 ? 'entry' : 'entries'}`}
         </Text>
       </Space>
-
-      {/* Table — hand-rolled so we can tightly control the monospace
-          IP / action columns. ONE grid owns the column tracks; the header
-          and every row are subgrids of it, so all rows share the same
-          column widths and the header spans the full table width. */}
-      <div
-        style={{
-          border: `1px solid ${colors.BORDER}`,
-          borderRadius: 8,
-          // width-capped so the inner grid's max-content scrolls WITHIN the card
-          // instead of widening the whole page on narrow.
-          width: '100%',
-          minWidth: 0,
-          overflowX: 'auto',
-          overflowY: 'hidden',
-          background: colors.BG_CARD,
-        }}
+      {/* UX harvest D62: one quiet caption, the env var only on hover. */}
+      <Text
+        type="secondary"
+        style={{ fontSize: 12, marginTop: -SPACE.xs }}
+        title="Set the number of entries with DGP_AUDIT_RING_SIZE. The proxy log keeps the long-term record."
       >
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: AUDIT_COLUMNS,
-            // Fill the card; below the sum of the column minimums the card
-            // scrolls sideways instead of squeezing the columns.
-            width: '100%',
-            minWidth: 720,
-          }}
-        >
-          <div
-            style={{
-              ...AUDIT_ROW,
-              padding: '10px 14px',
-              borderBottom: `1px solid ${colors.BORDER}`,
-              fontSize: 11,
-              fontWeight: 700,
-              letterSpacing: 0.5,
-              textTransform: 'uppercase',
-              color: colors.TEXT_MUTED,
-              fontFamily: 'var(--font-ui)',
-              background: colors.BG_ELEVATED,
-            }}
-          >
-            <div>Time</div>
-            <div>Action</div>
-            <div>User</div>
-            <div>IP</div>
-            <div>Bucket</div>
-            <div>Target / Path</div>
+        The most recent entries, kept in memory. A restart clears them.{' '}
+        <InfoCircleOutlined aria-hidden />
+      </Text>
+
+      <QueryState
+        query={view}
+        what="the audit log"
+        loading={<div style={{ ...card, padding: `0 ${SPACE.md}px` }}><LoadingState variant="list" rows={6} label="Loading audit entries" /></div>}
+        isEmpty={(d) => d.entries.length === 0}
+        empty={
+          <div style={card}>
+            <EmptyState icon={<FileTextOutlined />} title="No audit entries yet" hint={AUDIT_EMPTY_HINT} />
           </div>
-          {filtered.length === 0 ? (
-            <div style={{ gridColumn: '1 / -1' }}>
-              {loading ? (
-                <LoadingState label="Loading audit entries…" />
-              ) : entries.length > 0 ? (
-                <div style={{ padding: 40, textAlign: 'center', color: colors.TEXT_MUTED, fontSize: 13 }}>
-                  No entries match this filter.
-                </div>
-              ) : (
-                <AuditEmptyState />
-              )}
+        }
+      >
+        {() =>
+          filtered.length === 0 ? (
+            <div style={card}>
+              <EmptyState compact title="No entries match this filter" hint="Change or clear the filter." />
             </div>
+          ) : narrow ? (
+            cards(filtered)
           ) : (
-            filtered.map((e, i) => (
-              <div
-                key={`${e.timestamp}-${i}`}
-                style={{
-                  ...AUDIT_ROW,
-                  padding: '8px 14px',
-                  borderBottom:
-                    i < filtered.length - 1
-                      ? `1px solid ${colors.BORDER}`
-                      : 'none',
-                  fontSize: 12,
-                  fontFamily: 'var(--font-mono)',
-                  alignItems: 'center',
-                }}
-              >
-                <div
-                  title={new Date(e.timestamp).toLocaleString()}
-                  style={{ color: colors.TEXT_SECONDARY, fontSize: 11 }}
-                >
-                  {relativeTime(e.timestamp, { now })}
-                </div>
-                <div>
-                  <Tag
-                    color={actionColour(e.action)}
-                    style={{
-                      margin: 0,
-                      fontFamily: 'var(--font-mono)',
-                      fontSize: 11,
-                    }}
-                  >
-                    {e.action || '—'}
-                  </Tag>
-                </div>
-                <div
-                  style={{
-                    ...CELL_TRUNCATE_STYLE,
-                    color: e.user ? colors.TEXT_PRIMARY : colors.TEXT_MUTED,
-                  }}
-                  title={e.user}
-                >
-                  {e.user || '—'}
-                </div>
-                <div
-                  style={{ ...CELL_TRUNCATE_STYLE, color: colors.TEXT_SECONDARY }}
-                  title={e.ua ? `${e.ip} · ${e.ua}` : e.ip}
-                >
-                  {e.ip || '—'}
-                </div>
-                <div
-                  style={{ ...CELL_TRUNCATE_STYLE, color: colors.TEXT_SECONDARY }}
-                  title={e.bucket}
-                >
-                  {e.bucket || '—'}
-                </div>
-                <div
-                  style={{ ...CELL_TRUNCATE_STYLE, color: colors.TEXT_SECONDARY }}
-                  title={e.path ? `${e.target} · ${e.path}` : e.target}
-                >
-                  {e.path || e.target || '—'}
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
+            table(filtered)
+          )
+        }
+      </QueryState>
     </div>
   );
 }

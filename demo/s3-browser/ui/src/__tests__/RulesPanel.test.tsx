@@ -120,7 +120,7 @@ describe('run-now', () => {
     const user = await mount();
     http.on('POST', RUN_NOW, json({ error: 'rule is already running' }, 409));
     await user.click(within(jobRow()).getByRole('button', { name: 'Run now: nightly-dr' }));
-    expect(await screen.findByText(/rule is already running/)).toBeInTheDocument();
+    expect(await screen.findByText('Rule is already running.')).toBeInTheDocument();
     expect(within(jobRow()).getByText('idle')).toBeInTheDocument();
   });
 

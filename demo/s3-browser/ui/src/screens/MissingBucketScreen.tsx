@@ -1,5 +1,6 @@
-import { Button, Space } from 'antd';
+import { Button } from 'antd';
 import { InboxOutlined } from '@ant-design/icons';
+import TruncatedName from '../components/TruncatedName';
 import { useColors } from '../ThemeContext';
 
 interface Props {
@@ -30,13 +31,18 @@ export default function MissingBucketScreen({ bucket, buckets, onOpenBucket }: P
         This bucket does not exist, or your account cannot see it. Check the link, or open one of your buckets.
       </p>
       {buckets.length > 0 && (
-        <Space size={8} wrap style={{ justifyContent: 'center', maxWidth: 640 }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center', maxWidth: 'min(640px, 100%)' }}>
           {buckets.map((b) => (
-            <Button key={b} onClick={() => onOpenBucket(b)} style={{ fontFamily: 'var(--font-mono)' }}>
-              {b}
+            // D12: a long bucket name stays inside the screen, cut in the middle.
+            <Button
+              key={b}
+              onClick={() => onOpenBucket(b)}
+              style={{ fontFamily: 'var(--font-mono)', maxWidth: '100%', minWidth: 0 }}
+            >
+              <TruncatedName text={b} />
             </Button>
           ))}
-        </Space>
+        </div>
       )}
     </div>
   );

@@ -117,7 +117,7 @@ test('the Runs tab reads again when last_run_at moves', async () => {
   expect(await screen.findByText('2 copied · 1 deleted · 1 already in sync')).toBeInTheDocument();
   // Runs rows say how long the run took and how much data it moved.
   expect(screen.getByText('15s')).toBeInTheDocument();
-  expect(screen.getByText('2.0 KB')).toBeInTheDocument();
+  expect(screen.getByText('2.0 KiB')).toBeInTheDocument();
 });
 
 // Regression: ?job=maintenance:3 for a job the list did not carry read

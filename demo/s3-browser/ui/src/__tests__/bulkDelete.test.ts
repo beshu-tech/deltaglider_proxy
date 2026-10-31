@@ -11,10 +11,8 @@ test('the message after the start, a cancel, or an empty selection', () => {
     type: 'info',
     text: 'Deleting 12,346 objects on the server. You can close this tab: the bucket shows the progress.',
   });
-  assert.deepEqual(deleteJobMessage({ total: 0, cancelled: true, failed: 0 }), {
-    type: 'info',
-    text: 'Delete cancelled. Nothing was deleted.',
-  });
+  // A cancelled confirmation shows no toast (UX harvest D19).
+  assert.equal(deleteJobMessage({ total: 0, cancelled: true, failed: 0 }), null);
   assert.deepEqual(deleteJobMessage({ total: 0, cancelled: false, failed: 0 }), {
     type: 'info',
     text: 'Nothing to delete.',

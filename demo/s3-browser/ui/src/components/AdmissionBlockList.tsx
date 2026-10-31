@@ -78,13 +78,8 @@ export default function AdmissionBlockList({
     onReorder(arrayMove(blocks, oldIndex, newIndex));
   };
 
-  if (blocks.length === 0) {
-    return (
-      <Text type="secondary" style={{ fontStyle: 'italic' }}>
-        No rules yet. Click <b>Add rule</b> to create the first one.
-      </Text>
-    );
-  }
+  // The empty list is AdmissionPanel's EmptyState.
+  if (blocks.length === 0) return null;
 
   return (
     <DndContext
@@ -139,7 +134,7 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
     border: `1px solid ${BORDER}`,
     background: BG_CARD,
     borderRadius: 8,
-    padding: '8px 10px',
+    padding: '8px 12px',
     // Flex with wrap, not a fixed grid: the text block keeps at least
     // RULE_TEXT_MIN_WIDTH, so on a phone the buttons move under it instead
     // of squeezing the rule name into a 60 px column.

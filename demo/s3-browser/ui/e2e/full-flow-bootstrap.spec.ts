@@ -34,7 +34,7 @@ test('bootstrap auth: sign in, bucket, upload, list, admin, sign out, sign in, o
   await bucketRowBtn.click();
 
   // ── Upload (signed by the session's S3 credentials) ──────────────
-  await page.getByRole('button', { name: 'Upload files' }).click();
+  await page.getByRole('button', { name: 'Upload files', exact: true }).click();
   await expect(page.getByRole('heading', { name: new RegExp(`Upload to ${bucketName}`) })).toBeVisible({
     timeout: 30_000,
   });
@@ -45,7 +45,7 @@ test('bootstrap auth: sign in, bucket, upload, list, admin, sign out, sign in, o
   });
   await page.getByRole('button', { name: /Upload \d+ files? to / }).click();
   await expect(page.getByText('Upload complete')).toBeVisible({ timeout: 60_000 });
-  await page.getByRole('button', { name: /Done — / }).click();
+  await page.getByRole('button', { name: /\bDone$/ }).click();
   await expect(page.getByText(uploadName)).toBeVisible({ timeout: 60_000 });
 
   // ── Admin: the same session reaches the admin API ─────────────────

@@ -1,17 +1,21 @@
-import { Alert, Button, Space, Spin } from 'antd';
-import { FolderOpenOutlined, InboxOutlined, SearchOutlined } from '@ant-design/icons';
-import { useColors } from '../ThemeContext';
+import { Button } from 'antd';
+import { CloudUploadOutlined, FolderOpenOutlined, InboxOutlined, SearchOutlined } from '@ant-design/icons';
 import DemoDataGenerator from '../components/DemoDataGenerator';
+import { EmptyState, ErrorState, LoadingState } from '../components/StatePlaceholders';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl } from '../urlState';
 import { parentPrefix } from '../utils';
+import { plainError } from '../plainError';
+import { SPACE } from '../components/shared-styles';
+import { useColors } from '../ThemeContext';
 
 interface Props {
   bucket: string;
   prefix: string;
   searchQuery: string;
   loading: boolean;
-  error: string | null;
+  /** The failure of the last listing (any error value), or null. */
+  error: unknown;
   /** Empty only because "Show system files" is off (the folder holds .dg/ etc.). */
   onlyHiddenEntries: boolean;
   /** The folder had rows a moment ago: the user emptied it (a delete or a move). */
@@ -30,8 +34,10 @@ interface Props {
 
 /**
  * What the browser shows instead of the table when the folder has no rows:
- * the first-load spinner, a failed listing, or the empty state with the
- * next step (upload, parent folder, create a bucket, demo data).
+ * the first-load skeleton, a failed listing, or the empty state with the
+ * next step. Actions follow the button taxonomy (PageActions): upload is the
+ * primary, the other way out the secondary; demo data is an admin's small
+ * extra under them, never the first offer in a real bucket (D56, D69).
  */
 export default function ListingPlaceholder({
   bucket,
@@ -51,136 +57,113 @@ export default function ListingPlaceholder({
   onCreateBucket,
 }: Props) {
   const { navigate } = useNavigation();
+  const { TEXT_MUTED } = useColors();
   const hasNoBuckets = bucketCount === 0;
   const isRootBucketEmpty = (bucketCount ?? 0) > 0 && prefix === '' && !searchQuery && !loading;
 
-  if (loading) {
-    return (
-      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', padding: '64px 0' }}>
-        <Spin description="Loading objects..." />
-      </div>
-    );
-  }
+  if (loading) return <LoadingState variant="list" rows={8} label="Loading objects" />;
 
   // An unrefreshed FAULT always outranks the friendly empty state: a failed
-  // listing must never render as "No objects yet — add demo data" (the
-  // beshu-b2 incident: a bucket whose backend was unreachable looked
-  // innocently empty).
+  // listing must never render as "No objects yet" (the beshu-b2 incident: a
+  // bucket whose backend was unreachable looked innocently empty).
   if (error) {
+    const plain = plainError(error, 'The proxy could not list the objects.');
+    const raw = `${plain.details ?? ''} ${plain.text}`;
+    const missingOnBackend = /NoSuchBucket|bucket does not exist/i.test(raw);
     return (
-      <div style={{ maxWidth: 560, margin: '48px auto', padding: '0 16px' }}>
-        <Alert
-          type="error"
-          showIcon
-          title={
-            /NoSuchBucket/i.test(error)
-              ? `Bucket '${bucket}' was not found on its storage backend`
-              : /ServiceUnavailable|unavailable|503/i.test(error)
-                ? `Bucket '${bucket}' is currently unavailable`
-                : 'Failed to load objects'
-          }
-          description={
-            <Space orientation="vertical" size={8}>
-              <span>{error}</span>
-              {/NoSuchBucket/i.test(error) && (
-                <span>
-                  The bucket exists in this proxy's configuration but not on the
-                  backend it routes to — check the bucket's backend under
-                  Settings → Storage → Buckets, or create it on that backend.
-                </span>
-              )}
-              <Button size="small" onClick={onReload}>
-                Retry
-              </Button>
-            </Space>
-          }
-          style={{ borderRadius: 8 }}
-        />
+      <div style={{ maxWidth: 560, margin: '0 auto', padding: `${SPACE.xl}px ${SPACE.md}px` }}>
+        <ErrorState error={error} what={`the objects of ${bucket}`} onRetry={onReload} />
+        {missingOnBackend && (
+          <p style={{ margin: 0, textAlign: 'center', fontSize: 12.5, lineHeight: 1.45, fontFamily: 'var(--font-ui)', color: TEXT_MUTED }}>
+            The bucket is in this proxy&apos;s configuration, but not on the backend it routes to. Check the
+            bucket&apos;s backend under Settings, Storage, Buckets, or create the bucket on that backend.
+          </p>
+        )}
       </div>
     );
   }
 
-  // An icon of the situation (search, folder, bucket), not AntD's stock
-  // illustration, which matched no other empty state in the app.
-  const Icon = searchQuery ? SearchOutlined : prefix || onlyHiddenEntries ? FolderOpenOutlined : InboxOutlined;
-  return (
-    <EmptyListing
-      icon={<Icon aria-hidden="true" />}
-      description={<span style={{ display: 'inline-block', maxWidth: 520 }}>{
-        searchQuery
-          ? `No objects or folders in ${bucket}/${prefix} match "${searchQuery}".`
-          : hasNoBuckets
-            ? 'Create a bucket before uploading objects or generating demo data.'
-            : onlyHiddenEntries
-              ? 'This folder holds only hidden system files. Turn on "Show system files" in the account menu to see them.'
-              : emptied
-              ? `${prefix ? `${bucket}/${prefix}` : bucket} is now empty.`
-              : prefix
-              // The proxy stores no folder markers: a folder exists
-              // only while it holds files, so an empty listing here
-              // is as likely a typo in the path as an empty folder.
-              ? `Nothing is stored under ${bucket}/${prefix}. A folder exists only while it holds files, so check the path for a typo${canUpload ? ', or upload files to create it' : ''}.`
-              : 'No objects yet. Upload files or generate demo data.'
-      }</span>}
-    >
-      {prefix && !searchQuery && (
-        <Space size={16} wrap style={{ justifyContent: 'center' }}>
-          {canUpload && (
-            <Button type="primary" onClick={onUpload}>
-              Upload files here
-            </Button>
-          )}
-          <Button onClick={() => onNavigate(parentPrefix(prefix))}>
-            {parentPrefix(prefix) ? 'Go to the parent folder' : `Go to ${bucket}`}
-          </Button>
-        </Space>
-      )}
-      {hasNoBuckets && (canCreateBucket || canAdmin) && (
-        <Space size={16} wrap style={{ justifyContent: 'center' }}>
-          {canCreateBucket && (
-            <Button type="link" onClick={onCreateBucket} style={{ paddingInline: 0 }}>
-              Create a bucket
-            </Button>
-          )}
-          {/* A fresh proxy: the wizard sets backend, admin and a bucket in one go. */}
-          {canAdmin && (
-            <Button type="link" onClick={() => navigate(buildViewUrl('admin', 'setup'))} style={{ paddingInline: 0 }}>
-              Run the setup wizard
-            </Button>
-          )}
-        </Space>
-      )}
-      {isRootBucketEmpty && canUpload && (
-        <Space orientation="vertical" size={4} align="center">
-          <DemoDataGenerator
-            onDone={onReload}
-            variant="empty-state"
-            label={`Add demo data to ${bucket}`}
-          />
-          <Button type="link" onClick={onUpload} style={{ paddingInline: 0 }}>
-            Upload from computer
-          </Button>
-        </Space>
-      )}
-    </EmptyListing>
-  );
-}
+  const location = prefix ? `${bucket}/${prefix}` : bucket;
+  const uploadHere = canUpload ? (
+    <Button type="primary" icon={<CloudUploadOutlined />} onClick={onUpload}>
+      Upload files here
+    </Button>
+  ) : undefined;
+  const goUp = prefix ? (
+    <Button onClick={() => onNavigate(parentPrefix(prefix))}>
+      {parentPrefix(prefix) ? 'Go to the parent folder' : `Go to ${bucket}`}
+    </Button>
+  ) : undefined;
 
-/** Icon, sentence, then the next steps, centred in the listing area. */
-function EmptyListing({ icon, description, children }: {
-  icon: React.ReactNode;
-  description: React.ReactNode;
-  children?: React.ReactNode;
-}) {
-  const { TEXT_MUTED, TEXT_SECONDARY } = useColors();
+  if (searchQuery) {
+    return (
+      <EmptyState
+        icon={<SearchOutlined />}
+        title="No matches"
+        hint={`No objects or folders in ${bucket}/${prefix} match "${searchQuery}".`}
+      />
+    );
+  }
+  if (hasNoBuckets) {
+    return (
+      <EmptyState
+        icon={<InboxOutlined />}
+        title="There are no buckets"
+        hint="Create a bucket before uploading objects or generating demo data."
+        action={canCreateBucket ? (
+          <Button type="primary" onClick={onCreateBucket}>Create a bucket</Button>
+        ) : undefined}
+        // A fresh proxy: the wizard sets backend, admin and a bucket in one go.
+        secondaryAction={canAdmin ? (
+          <Button onClick={() => navigate(buildViewUrl('admin', 'setup'))}>Run the setup wizard</Button>
+        ) : undefined}
+      />
+    );
+  }
+  if (onlyHiddenEntries) {
+    return (
+      <EmptyState
+        icon={<FolderOpenOutlined />}
+        title="Only system files"
+        hint='This folder holds only hidden system files. Turn on "Show system files" in the account menu to see them.'
+      />
+    );
+  }
+  if (emptied) {
+    return (
+      <EmptyState icon={<FolderOpenOutlined />} title={`${location} is now empty.`} action={uploadHere} secondaryAction={goUp} />
+    );
+  }
+  if (prefix) {
+    // The proxy stores no folder markers: a folder exists only while it
+    // holds files, so an empty listing here is as likely a typo in the path
+    // as an empty folder.
+    return (
+      <EmptyState
+        icon={<FolderOpenOutlined />}
+        title="Nothing is stored here"
+        hint={`Nothing is stored under ${bucket}/${prefix}. A folder exists only while it holds files, so check the path for a typo${canUpload ? ', or upload files to create it' : ''}.`}
+        action={uploadHere}
+        secondaryAction={goUp}
+      />
+    );
+  }
   return (
-    <div
-      role="status"
-      style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: '64px 16px', textAlign: 'center' }}
-    >
-      <span style={{ fontSize: 32, color: TEXT_MUTED, lineHeight: 1 }}>{icon}</span>
-      <div style={{ fontSize: 14, color: TEXT_SECONDARY, fontFamily: 'var(--font-ui)', lineHeight: 1.5 }}>{description}</div>
-      {children}
+    <div>
+      <EmptyState
+        icon={<InboxOutlined />}
+        title="No objects yet"
+        hint={canUpload ? `Upload files to ${bucket} to start.` : `${bucket} holds no objects.`}
+        action={isRootBucketEmpty && canUpload ? (
+          <Button type="primary" icon={<CloudUploadOutlined />} onClick={onUpload}>Upload files</Button>
+        ) : undefined}
+      />
+      {/* Fixture objects inside a real bucket: an administrator's extra, last. */}
+      {isRootBucketEmpty && canUpload && canAdmin && (
+        <div style={{ display: 'flex', justifyContent: 'center', marginTop: -SPACE.md }}>
+          <DemoDataGenerator onDone={onReload} label={`Add demo data to ${bucket}`} />
+        </div>
+      )}
     </div>
   );
 }

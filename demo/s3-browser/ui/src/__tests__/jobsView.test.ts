@@ -618,11 +618,10 @@ test('jobsPollInterval (idle floor: scheduled runs must still appear)', () => {
 });
 
 test('kindTone', () => {
-  assert.equal(kindTone('replication'), 'blue');
-  assert.equal(kindTone('lifecycle'), 'purple');
-  assert.equal(kindTone('reencrypt'), 'gold');
-  assert.equal(kindTone('migrate'), 'gold');
-  assert.equal(kindTone('backfill-metadata'), 'gold');
+  // D66: the kind is a label, never a warning colour.
+  for (const kind of ['replication', 'lifecycle', 'reencrypt', 'migrate', 'backfill-metadata', 'delete'] as const) {
+    assert.equal(kindTone(kind), 'default');
+  }
 });
 
 test('lifecycleRunLabel names the verb and the count', () => {

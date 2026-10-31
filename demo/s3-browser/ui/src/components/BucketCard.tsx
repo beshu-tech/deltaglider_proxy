@@ -27,7 +27,7 @@ import { Children, isValidElement, useEffect, useState, useId } from 'react';
 import type { ReactNode } from 'react';
 import { useIsNarrow } from '../useIsNarrow';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
-import { Button, Collapse, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
+import { Button, Collapse, Input, Modal, Progress, Radio, Select, Typography } from 'antd';
 import { DownOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
 import type { BackendInfo, EffectiveEncryption } from '../adminApi';
 import { describeBucketEncryption } from '../bucketEncryption';
@@ -36,7 +36,7 @@ import { useColors } from '../ThemeContext';
 import SimpleAutoComplete from './SimpleAutoComplete';
 import { formRow } from './ruleEditorHelpers';
 import type { BucketPolicyRow, PrefixEntry } from './bucketPolicyPayload';
-import { DEFAULT_ROW_FIELDS, freshId, hasOwnEncryption, isAllDefaultRow, normalizeExtension, parseQuotaGib, resetRowFields } from './bucketPolicyPayload';
+import { DEFAULT_ROW_FIELDS, freshId, hasOwnEncryption, isAllDefaultRow, normalizeExtension, parseDeltaRatio, parseQuotaGib, resetRowFields } from './bucketPolicyPayload';
 import PrefixListEditor from './PrefixListEditor';
 import MigrateBucketModal from './MigrateBucketModal';
 import type { JobRow } from '../jobsView';
@@ -45,7 +45,7 @@ import { runJobAction } from '../adminApi';
 import { useBucketMaintenance } from '../queries/maintenance';
 import { bucketWritesBlocked } from '../maintenanceStatus';
 import { cancelConfirmText } from '../jobsView';
-import { formatBytesIec } from '../utils';
+import { formatBytes } from '../utils';
 import { gibFromBytes } from '../savings';
 import { activateOnKey } from '../keyboard';
 import { confirmDialog } from '../confirmDialog';
@@ -54,13 +54,14 @@ import { buildViewUrl } from '../urlState';
 import type { BucketRule } from '../runsView';
 import { runsUrl } from './jobs/runsLink';
 import { WITNESS_CARD_ID } from './EncryptionWitnessCard';
+import TruncatedName from './TruncatedName';
 
 const { Text } = Typography;
 
 /** A radio beside a two-line (or taller) option: the dot sits on the
  *  title line, not centred on the whole block (it read as the radio of
  *  the prefix input below the title). */
-const RADIO_TOP = { icon: { alignSelf: 'flex-start', marginTop: 3 } } as const;
+const RADIO_TOP = { icon: { alignSelf: 'flex-start', marginTop: 4 } } as const;
 
 interface CardProps {
   /** The replication and lifecycle rules that read or write this bucket. */
@@ -228,14 +229,35 @@ export default function BucketCard({
     setQuotaDraft(text);
     if (parsed.ok && parsed.bytes !== eff.quota_bytes) onPatch({ quota_bytes: parsed.bytes });
   };
+  // The delta size cutoff: the same rule (keep the text, say what is wrong,
+  // stage only a valid value; never a silent clamp, UX harvest D9).
+  const [ratioDraft, setRatioDraft] = useState<string | null>(null);
+  const ratioText = ratioDraft ?? (eff.max_delta_ratio != null ? String(eff.max_delta_ratio) : '');
+  const ratioParsed = ratioDraft === null ? null : parseDeltaRatio(ratioDraft);
+  const ratioError = ratioParsed && !ratioParsed.ok ? ratioParsed.error : null;
+  const onRatioText = (text: string) => {
+    const parsed = parseDeltaRatio(text);
+    setRatioDraft(text);
+    if (parsed.ok && parsed.ratio !== eff.max_delta_ratio) onPatch({ max_delta_ratio: parsed.ratio });
+  };
+  const stagedRatio = eff.max_delta_ratio;
+  useEffect(() => {
+    setRatioDraft((cur) => {
+      if (cur === null) return cur;
+      const parsed = parseDeltaRatio(cur);
+      return parsed.ok && parsed.ratio !== stagedRatio ? null : cur;
+    });
+  }, [stagedRatio]);
+  const fieldError = quotaError ?? ratioError;
+
   // A removed card takes its error with it.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => () => onFieldError?.(null), []);
   useEffect(() => {
-    onFieldError?.(quotaError);
+    onFieldError?.(fieldError);
     // Report changes of the error only; the callback is a fresh closure.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [quotaError]);
+  }, [fieldError]);
   // A staged value that changes under a valid draft (Discard, Reset to
   // defaults, a rebase) wins over the text.
   const stagedQuota = eff.quota_bytes;
@@ -384,11 +406,19 @@ export default function BucketCard({
       </Chip>
     )
   );
-  if (eff.quota_bytes != null) {
+  if (quotaError) {
+    // The field holds text that is not a quota: the chip says so, instead
+    // of a size the user typed on the way (UX harvest D59).
+    chips.push(
+      <Chip key="quota" tone={colors.ACCENT_RED} title={quotaError}>
+        Quota: fix the value
+      </Chip>
+    );
+  } else if (eff.quota_bytes != null) {
     chips.push(
       // A quota is a normal setting, not a problem: neutral, not amber.
       <Chip key="quota" tone={colors.TEXT_MUTED} title="The bucket accepts uploads up to this total size">
-        Quota {formatBytesIec(eff.quota_bytes)}
+        Quota {formatBytes(eff.quota_bytes)}
       </Chip>
     );
   }
@@ -481,11 +511,10 @@ export default function BucketCard({
       : []),
   ];
 
+  // Group titles in sentence case (UX harvest D67: one heading system).
   const groupLabel: React.CSSProperties = {
-    fontSize: 11,
-    fontWeight: 700,
-    letterSpacing: 0.5,
-    textTransform: 'uppercase',
+    fontSize: 13,
+    fontWeight: 600,
     fontFamily: 'var(--font-ui)',
     display: 'block',
     marginBottom: 8,
@@ -498,7 +527,7 @@ export default function BucketCard({
         border: `1px solid ${cardBorder}`,
         borderRadius: 10,
         background: cardBg,
-        transition: 'all 0.15s',
+        transition: 'border-color 0.15s, background-color 0.15s',
       }}
     >
       {/* ── Collapsed status row: name + effective-state chips ── */}
@@ -517,9 +546,9 @@ export default function BucketCard({
           // Wrap on narrow so the chip group drops below the name instead of
           // overflowing (PRIVATE was clipped on mobile).
           flexWrap: 'wrap',
-          gap: 10,
-          rowGap: 6,
-          padding: '10px 14px',
+          gap: 12,
+          rowGap: 8,
+          padding: '12px 12px',
           cursor: 'pointer',
           minHeight: 42,
         }}
@@ -546,25 +575,19 @@ export default function BucketCard({
             )}
           </span>
         ) : (
-          // A long name is cut with an ellipsis inside the card (it ran past
+          // A long name is cut in the middle inside the card (it ran past
           // the card edge on a phone); the full name is in the title.
-          <Text
-            title={name}
+          <TruncatedName
+            text={name}
             style={{
               fontFamily: 'var(--font-mono)',
               fontSize: 13,
               fontWeight: 600,
               color: colors.TEXT_PRIMARY,
               flex: '0 1 auto',
-              minWidth: 0,
               maxWidth: 'calc(100% - 24px)',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
             }}
-          >
-            {name}
-          </Text>
+          />
         )}
         {/* Chips absorb remaining width and wrap internally; the group drops to
             the next line on a narrow row instead of overflowing. */}
@@ -573,7 +596,7 @@ export default function BucketCard({
             flex: '1 1 auto',
             minWidth: 0,
             display: 'flex',
-            gap: 6,
+            gap: 8,
             flexWrap: 'wrap',
             justifyContent: 'flex-end',
           }}
@@ -587,7 +610,7 @@ export default function BucketCard({
 
       {/* ── Encryption witness: its own line, outside the clickable row ── */}
       {witnessRefused && (
-        <div style={{ padding: '0 14px 10px' }}>
+        <div style={{ padding: '0 12px 12px' }}>
           <span
             data-testid="witness-refused-chip"
             title="Several instances share this cluster. This instance encrypts new writes to this bucket differently from the setting that the cluster published, so it refuses them. Reads keep working."
@@ -595,10 +618,10 @@ export default function BucketCard({
               display: 'inline-flex',
               flexWrap: 'wrap',
               alignItems: 'center',
-              gap: 6,
+              gap: 8,
               fontSize: 11.5,
               fontWeight: 600,
-              padding: '3px 10px',
+              padding: '4px 12px',
               borderRadius: 10,
               background: `${colors.ACCENT_RED}1a`,
               color: colors.ACCENT_RED,
@@ -622,7 +645,7 @@ export default function BucketCard({
 
       {/* ── Maintenance progress: visible on every render of the row ── */}
       {maintenanceJob && (
-        <div style={{ padding: '0 14px 10px', display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div style={{ padding: '0 12px 12px', display: 'flex', alignItems: 'center', gap: 12 }}>
           <Progress
             aria-label="Maintenance job progress"
             percent={maintenanceJob.percent ?? 100}
@@ -672,7 +695,7 @@ export default function BucketCard({
 
       {/* ── Expanded editor: Public access / Placement / Advanced ── */}
       {expanded && (
-        <div style={{ padding: '0 14px 14px', borderTop: `1px solid ${colors.BORDER}` }}>
+        <div style={{ padding: '0 12px 12px', borderTop: `1px solid ${colors.BORDER}` }}>
           {eff.replication_target_only && (
             <div
               style={{
@@ -704,7 +727,7 @@ export default function BucketCard({
             <Text style={{ ...groupLabel, color: isPublic ? colors.ACCENT_AMBER : colors.TEXT_MUTED }}>
               Public access
               {isPublic && (
-                <span style={{ fontSize: 11, marginLeft: 8, fontWeight: 500, letterSpacing: 0, textTransform: 'none' }}>
+                <span style={{ fontSize: 12, marginLeft: 8, fontWeight: 500 }}>
                   ⚠ readable without credentials
                 </span>
               )}
@@ -770,7 +793,7 @@ export default function BucketCard({
             />
           )}
           {!real && hasOwnEncryption(row) && (
-            <div style={{ marginTop: 14 }}>
+            <div style={{ marginTop: 12 }}>
               <Text style={{ ...groupLabel, color: colors.TEXT_MUTED }}>Encryption</Text>
               <Text type="secondary" style={{ fontSize: 12 }}>
                 These settings carry the bucket&apos;s own encryption ({String(row?.encryption?.mode ?? '')}
@@ -783,9 +806,9 @@ export default function BucketCard({
 
           {/* Placement — backend routing + the honest move. */}
           {backends.length > 0 && (
-            <div style={{ marginTop: 14 }}>
+            <div style={{ marginTop: 12 }}>
               <Text id={`${uid}-backend`} style={{ ...groupLabel, color: colors.TEXT_MUTED }}>Backend</Text>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
                 <Select
                   aria-labelledby={`${uid}-backend`}
                   value={eff.backend}
@@ -841,7 +864,7 @@ export default function BucketCard({
           {real && (
             <div style={{ paddingTop: 12 }}>
               <Text style={{ ...groupLabel, color: colors.TEXT_MUTED }}>Rules and runs</Text>
-              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginTop: 6, fontSize: 12 }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginTop: 8, fontSize: 12 }}>
                 {rules.length === 0 && <Text type="secondary" style={{ fontSize: 12 }}>No replication or lifecycle rule uses this bucket.</Text>}
                 {rules.map((r) => (
                   <Button
@@ -876,18 +899,18 @@ export default function BucketCard({
           <Collapse
             ghost
             size="small"
-            style={{ marginTop: 10, marginLeft: -8 }}
+            style={{ marginTop: 12, marginLeft: -8 }}
             defaultActiveKey={advancedActive ? ['adv'] : []}
             items={[
               {
                 key: 'adv',
                 label: (
-                  <Text style={{ fontSize: 11, fontWeight: 600, color: colors.TEXT_MUTED, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  <Text style={{ fontSize: 13, fontWeight: 600, color: colors.TEXT_MUTED }}>
                     Advanced{advancedActive ? ' · in use' : ''}
                   </Text>
                 ),
                 children: (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                     <div style={formRow(8, { flexWrap: 'wrap' })}>
                       <Text id={`${uid}-compression`} style={{ fontSize: 12, fontFamily: 'var(--font-ui)', color: colors.TEXT_MUTED, width: 150 }}>
                         Compression
@@ -916,17 +939,25 @@ export default function BucketCard({
                         <Text id={`${uid}-ratio`} style={{ fontSize: 12, color: colors.TEXT_MUTED, width: 150 }} title="A delta is kept only when delta-size / original-size is below this cutoff; otherwise the file is stored as-is.">
                           Delta size cutoff
                         </Text>
-                        <InputNumber
-                          aria-labelledby={`${uid}-ratio`}
-                          value={eff.max_delta_ratio ?? undefined}
-                          onChange={(v) => onPatch({ max_delta_ratio: v ?? null })}
-                          min={0}
-                          max={1}
-                          step={0.05}
-                          placeholder={`${globalRatio} — global default`}
-                          style={{ width: 170, ...inputRadius }}
-                          size="small"
-                        />
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+                          <Input
+                            aria-labelledby={`${uid}-ratio`}
+                            aria-invalid={ratioError ? true : undefined}
+                            aria-describedby={ratioError ? `${uid}-ratio-error` : undefined}
+                            status={ratioError ? 'error' : undefined}
+                            inputMode="decimal"
+                            value={ratioText}
+                            onChange={(e) => onRatioText(e.target.value)}
+                            placeholder={`${globalRatio} — global default`}
+                            style={{ width: 170, ...inputRadius }}
+                            size="small"
+                          />
+                          {ratioError && (
+                            <Text id={`${uid}-ratio-error`} role="alert" type="danger" style={{ fontSize: 12 }}>
+                              {ratioError}
+                            </Text>
+                          )}
+                        </div>
                       </div>
                     )}
                     {eff.compression !== false && (
@@ -934,12 +965,15 @@ export default function BucketCard({
                         <Text id={`${uid}-types`} style={{ fontSize: 12, color: colors.TEXT_MUTED, width: 150, paddingTop: 4 }}>
                           File types
                         </Text>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 260 }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minWidth: 260 }}>
+                          <Text aria-hidden style={{ fontSize: 12, color: colors.TEXT_SECONDARY }}>
+                            Also compress
+                          </Text>
                           <Select
                             mode="tags"
                             size="small"
                             aria-label="Also compress these file types"
-                            placeholder="Also compress, e.g. pkl"
+                            placeholder="For example pkl"
                             value={eff.delta_add}
                             onChange={(v: string[]) =>
                               onPatch({ delta_add: [...new Set(v.map(normalizeExtension).filter(Boolean))] })
@@ -948,11 +982,14 @@ export default function BucketCard({
                             suffixIcon={null}
                             style={{ width: '100%', ...inputRadius }}
                           />
+                          <Text aria-hidden style={{ fontSize: 12, color: colors.TEXT_SECONDARY }}>
+                            Store whole
+                          </Text>
                           <Select
                             mode="multiple"
                             size="small"
                             aria-label="Store these built-in file types whole"
-                            placeholder="Store whole, e.g. sql"
+                            placeholder="For example sql"
                             value={eff.delta_remove}
                             onChange={(v: string[]) => onPatch({ delta_remove: v })}
                             options={defaultDeltaExtensions.map((e) => ({ value: e, label: e }))}
@@ -1014,7 +1051,7 @@ export default function BucketCard({
 
           {/* Row-level actions. Reset stages defaults (reviewed on Apply). */}
           {(hasOverrides || onRemoveDraft || (onReencrypt && !maintenanceJob)) && (
-            <div style={{ marginTop: 10, display: 'flex', gap: 12, alignItems: 'center' }}>
+            <div style={{ marginTop: 12, display: 'flex', gap: 12, alignItems: 'center' }}>
               {onReencrypt && !maintenanceJob && (
                 <Button
                   size="small"

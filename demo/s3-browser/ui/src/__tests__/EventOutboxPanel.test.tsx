@@ -210,10 +210,11 @@ test('a 401 calls onSessionExpired and shows no error banner', async () => {
   expect(screen.queryByText('Fetch failed')).not.toBeInTheDocument();
 });
 
-test('a 500 shows the fetch error', async () => {
+test('a 500 shows ONE error state and no empty state (UX harvest D17)', async () => {
   http.on('GET', LIST, json({ error: 'db locked' }, 500));
   renderWithQuery(<EventOutboxPanel />);
-  expect(await screen.findByText('Fetch failed')).toBeInTheDocument();
+  expect(await screen.findByRole('alert')).toHaveTextContent('Could not load the event logDb locked.');
+  expect(screen.queryByText(/No object events have been recorded yet/)).toBeNull();
 });
 
 test('an empty log explains when events are recorded', async () => {

@@ -23,7 +23,7 @@ export default function PillButton({ children, onClick, title, ariaLabel }: {
         cursor: 'pointer',
         borderRadius: 10,
         fontSize: 12,
-        padding: '2px 10px',
+        padding: '2px 8px',
         margin: 0,
         border: `1px solid ${c.ACCENT_BLUE}55`,
         background: `${c.ACCENT_BLUE}14`,

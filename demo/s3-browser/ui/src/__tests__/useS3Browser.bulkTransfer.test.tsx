@@ -148,10 +148,8 @@ describe.each(['copy', 'move'] as const)('bulk %s', (op) => {
     held[0].answer();
     await waitFor(() => expect(held).toHaveLength(2));
     held[1].answer(json({ error: 'disk full' }, 500));
-    const label = op === 'copy' ? 'Bulk copy' : 'Bulk move';
-    await expect(run).rejects.toThrow(
-      `${label} failed (500): disk full. 500 of 1,201 objects were ${past[op]} before the failure.`,
-    );
+    // The plain sentence of the cause, without the status code (plainError).
+    await expect(run).rejects.toThrow(`Disk full. 500 of 1,201 objects were ${past[op]} before the failure.`);
     expect(http.callsTo('POST', PATH[op])).toHaveLength(2);
     await waitFor(() => expect(result.current.bulkRunning).toBe(false));
     expect(result.current.selectedKeys.size).toBe(1);

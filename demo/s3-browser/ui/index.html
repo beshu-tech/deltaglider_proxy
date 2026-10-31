@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>DeltaGlider Proxy</title>
-  </head>
-  <body>
     <script>
+      // In <head>, not <body>: it runs before the body exists, and its text
+      // is not the start of document.body.textContent.
       // Prevent theme flash: set data-theme before first paint, with the rule
       // ThemeProvider uses (a saved choice wins, else the system setting).
       (function() {
@@ -17,6 +17,8 @@
         document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
       })();
     </script>
+  </head>
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

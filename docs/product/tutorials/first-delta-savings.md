@@ -68,13 +68,14 @@ Now back in the browser:
 1. In the left sidebar, click the **+** button (**Create bucket**). Type `releases` in **Bucket name** and click **Create**. The bucket appears in the sidebar. Click it.
 2. Click **Upload files** in the sidebar.
 3. In the **Files will be uploaded to** box, type `firmware/widget-3000` as the destination path. The target readout above the field changes to `releases / firmware/widget-3000/`.
-4. Drop `fw-1.4.0.tar` onto the drop zone, or click **Select files** and pick it. The page lists the file as ready to upload.
+4. Drop `fw-1.4.0.tar` onto the drop zone, or click **Select files** and pick it. The page lists the file under the line **1 file ready to upload**. Nothing uploads yet, so you can still change the destination or add more files.
 5. Click **Upload 1 file to firmware/widget-3000/**.
+6. When the upload finishes, the page says **Upload complete**, and the row of the file reads **Uploaded**. Click **Done**. The browser opens the `firmware/widget-3000/` folder.
 
-When the upload finishes, navigate back into the bucket and open the `firmware/widget-3000/` folder. You should see one row:
+The folder shows one row:
 
 ```
-fw-1.4.0.tar    5.0 MB    just now    Baseline
+fw-1.4.0.tar    5.0 MiB    just now    Baseline
 ```
 
 This first upload became the folder's *reference baseline*. The baseline is one full copy, and the proxy stores every future version as a tiny diff against it. The proxy also stores the first file as a diff against the baseline, and that diff is almost empty, because the two are the same bytes. The row reads **Baseline** because the file and the baseline have the same SHA-256. The visible savings start with the *second* upload.
@@ -114,17 +115,17 @@ Nothing about that command knew that compression was happening, because the prox
 Back in the browser, refresh the `firmware/widget-3000/` folder. There are two rows now, and the new one is different:
 
 ```
-fw-1.4.0.tar    5.0 MB    2 minutes ago    Baseline
-fw-1.4.1.tar    5.0 MB    just now         Delta
+fw-1.4.0.tar    5.0 MiB    2 minutes ago    Baseline
+fw-1.4.1.tar    5.0 MiB    just now         Delta
 ```
 
 The new row is tagged **Delta**, because the proxy stores it as a diff against the folder's reference baseline, which is `fw-1.4.0.tar`.
 
 Click the `fw-1.4.1.tar` row. An inspector drawer slides in from the right with the object's details, and near the top is the number we came for, in the **Savings** panel:
 
-![The object inspector shows that fw-1.4.1.tar is stored as a delta of about 48 KB for a 3 MB file; the box marks the savings.](/_/screenshots/inspector-delta-savings.webp)
+![The object inspector shows that fw-1.4.1.tar is stored as a delta of about 48 KiB for a 3 MiB file; the box marks the savings.](/_/screenshots/inspector-delta-savings.webp)
 
-The screenshot comes from a proxy with a smaller example tarball, so its numbers differ from yours. In your run, you should see **100.0%** (the display rounds; the exact figure is a string of nines), and below it two comparison bars: **Original** at 5.0 MB, and **Stored** at a few hundred bytes (393 B in our run). That small number is the xdelta3 diff that the proxy wrote to disk.
+The screenshot comes from a proxy with a smaller example tarball, so its numbers differ from yours. In your run, you should see **100.0%** (the display rounds; the exact figure is a string of nines), and below it two comparison bars: **Original** at 5.0 MiB, and **Stored** at a few hundred bytes (393 B in our run). That small number is the xdelta3 diff that the proxy wrote to disk.
 
 The folder holds exactly one full copy, which is the reference baseline from step 3, and the proxy stores every version as a tiny diff against it. Two full releases take one release's worth of storage plus a few hundred bytes. The ratio improves with every version that you ship. ([How delta compression works](../explanation/delta-compression.md) has the whole story.)
 

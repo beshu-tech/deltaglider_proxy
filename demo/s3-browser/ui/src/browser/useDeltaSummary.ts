@@ -21,7 +21,16 @@ interface SummaryOptions {
  * the wire shape.
  */
 export function useDeltaSummary({ bucket, prefix, active, connected, adminSession, trigger }: SummaryOptions) {
-  const [deltaSummary, setDeltaSummary] = useState<DeltaSummary | null>(null);
+  // The summary with the folder it is about: a summary of another bucket or
+  // folder is never shown, not even while the new one loads (UX harvest D16:
+  // the previous bucket's "26% smaller" pill sat under the new bucket name).
+  const scope = `${bucket}\u0000${prefix}`;
+  const [state, setState] = useState<{ scope: string; summary: DeltaSummary | null }>({ scope, summary: null });
+  const setDeltaSummary = (update: DeltaSummary | null | ((prev: DeltaSummary | null) => DeltaSummary | null)) =>
+    setState((prev) => {
+      const base = prev.scope === scope ? prev.summary : null;
+      return { scope, summary: typeof update === 'function' ? update(base) : update };
+    });
   useEffect(() => {
     if (!connected || !active) return;
     // Use the URL-derived `bucket` (not the module-level getBucket()) so the
@@ -53,6 +62,8 @@ export function useDeltaSummary({ bucket, prefix, active, connected, adminSessio
         setDeltaSummary(null);
       });
     return () => request.abort();
+    // `setDeltaSummary` closes over `scope`, which bucket and prefix make.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, active, bucket, prefix, trigger, adminSession]);
-  return deltaSummary;
+  return state.scope === scope ? state.summary : null;
 }

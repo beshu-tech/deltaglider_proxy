@@ -22,7 +22,7 @@ export default function BucketBackendBadge({ origin, style }: Props) {
         display: 'inline-block',
         maxWidth: 96,
         height: 17,
-        padding: '0 6px',
+        padding: '0 8px',
         borderRadius: 4,
         border: `1px solid ${BORDER}`,
         color: TEXT_MUTED,

@@ -5,11 +5,12 @@
  */
 import { useQuery } from '@tanstack/react-query';
 import { fetchWithRelogin } from '../adminApi/core';
+import { throwApiError } from '../errorHandling';
 import { qk } from './keys';
 
 async function fetchMetricsText(): Promise<string> {
   const res = await fetchWithRelogin('/_/metrics', { credentials: 'include' });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Metrics scrape');
   return res.text();
 }
 

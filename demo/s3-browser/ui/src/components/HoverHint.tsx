@@ -86,7 +86,7 @@ export default function HoverHint({ hint, children, maxWidth = 280, role = 'tool
             top: pos.top,
             left: pos.left,
             maxWidth,
-            padding: '10px 12px',
+            padding: '8px 12px',
             fontSize: 12,
             lineHeight: 1.5,
             fontFamily: 'var(--font-ui)',

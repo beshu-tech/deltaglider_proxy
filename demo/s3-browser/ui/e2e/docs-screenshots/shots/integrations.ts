@@ -54,8 +54,9 @@ export const INTEGRATIONS_SHOTS: Shot[] = [
     route: ROUTE,
     alt: 'The Event delivery page with delivery off; callout 2 marks the Enable delivery switch, and Payload format is on Raw webhook.',
     // Cropped to the delivery card: the folder of screenshots has a size budget.
-    clip: { union: [{ css: '.ant-alert' }, { text: /^Raw posts the deltaglider/ }] },
-    clipPadding: 32,
+    // (The delivery strip shows only with pending or failed events.)
+    clip: { union: [{ role: 'switch', name: 'Enable delivery' }, { text: /^Raw posts the deltaglider/ }] },
+    clipPadding: 48,
     annotations: [{ target: { role: 'switch', name: 'Enable delivery' }, kind: 'box', label: '2', side: 'right' }],
   },
   {
@@ -78,6 +79,8 @@ export const INTEGRATIONS_SHOTS: Shot[] = [
     id: 'events-apply',
     route: ROUTE,
     alt: 'The review dialog shows the event_delivery change with the endpoint and the masked header; the arrow points at Apply and Persist.',
+    // The dialog is taller than the default screen.
+    viewport: { width: 1040, height: 1300 },
     setup: async (page) => {
       await fillWebhook(page);
       // dispatchEvent, not click: a click scrolls the page behind the dialog.
@@ -123,7 +126,7 @@ export const INTEGRATIONS_SHOTS: Shot[] = [
     clipPadding: 56,
     annotations: [
       { target: { css: 'label.ant-radio-button-wrapper:has-text("Bot token")' }, kind: 'box', label: '1', side: 'top' },
-      { target: { css: 'input[value^="xoxb-"]' }, kind: 'box', label: '2', side: 'right' },
+      { target: { placeholder: 'xoxb-…' }, kind: 'box', label: '2', side: 'right' },
       { target: { placeholder: '#deploys or C0123ABC' }, kind: 'box', label: '3', side: 'right' },
     ],
   },

@@ -63,15 +63,15 @@ test('shows the persisted totals and the buckets not measured yet', async () => 
 test('no scan yet shows the idle call to action', async () => {
   http.on('GET', STATUS, json({ buckets: {}, running: {} }));
   renderWithQuery(<BucketScanCard />);
-  expect(await screen.findByText(/No scans yet\./)).toBeInTheDocument();
-  expect(await screen.findByText('3 buckets ready to scan')).toBeInTheDocument();
+  expect(await screen.findByText('No scans yet')).toBeInTheDocument();
+  expect(await screen.findByText(/walk all 3 buckets/)).toBeInTheDocument();
 });
 
 test('a failed status read is not fatal', async () => {
   http.on('GET', STATUS, json({ error: 'scan store unreadable' }, 500));
   renderWithQuery(<BucketScanCard />);
   await waitFor(() => expect(http.callsTo('GET', STATUS)).toHaveLength(1));
-  expect(await screen.findByText(/No scans yet\./)).toBeInTheDocument();
+  expect(await screen.findByText('No scans yet')).toBeInTheDocument();
   expect(screen.queryByText(/scan store unreadable/)).toBeNull();
 });
 
@@ -107,7 +107,7 @@ test('Run full scan starts the first bucket; its end refreshes the totals', asyn
   expect(await screen.findByText('77')).toBeInTheDocument();
 });
 
-// UX harvest C52: "0 buckets ready to scan" showed before the data arrived.
+// UX harvest C52: "0 buckets ready to scan" showed before the data arrived (the idle hint names the bucket count).
 test('a skeleton, not zero figures, until the scans are read', async () => {
   let release!: () => void;
   const gate = new Promise<void>((r) => (release = r));
@@ -117,7 +117,7 @@ test('a skeleton, not zero figures, until the scans are read', async () => {
   });
   renderWithQuery(<BucketScanCard />);
   expect(await screen.findByRole('status', { name: 'Loading scans' })).toBeInTheDocument();
-  expect(screen.queryByText(/ready to scan/)).toBeNull();
+  expect(screen.queryByText(/walk all/)).toBeNull();
   release();
-  expect(await screen.findByText('3 buckets ready to scan')).toBeInTheDocument();
+  expect(await screen.findByText(/walk all 3 buckets/)).toBeInTheDocument();
 });

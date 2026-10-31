@@ -18,6 +18,13 @@ async function openBucket(page: Page, name: string): Promise<void> {
   await page.getByRole('button', { name: row, expanded: true }).waitFor();
 }
 
+/** Scroll the open bucket card so that its row header is at the top of the
+ *  screen: the card is taller than the screen, and a shot that marks the row
+ *  and a field of Advanced needs both. */
+async function rowToTop(page: Page, name: string): Promise<void> {
+  await page.getByRole('button', { name: new RegExp(`^${name} `), expanded: true }).evaluate((el) => el.scrollIntoView({ block: 'start' }));
+}
+
 /** Open the Advanced disclosure of the open bucket card (it stays open when a setting in it is in use). */
 async function openAdvanced(page: Page): Promise<void> {
   const quota = page.getByRole('textbox', { name: 'Quota' });
@@ -36,8 +43,8 @@ async function routeDownloadsToLocalDisk(page: Page): Promise<void> {
   await option(page, 'local-disk').click();
   await page.getByRole('button', { name: 'Review & apply' }).waitFor();
   // Reaching the option may scroll the page by a different amount on each
-  // run; put it back at the top, where the downloads row is.
-  await page.evaluate(() => window.scrollTo(0, 0));
+  // run: put the Backend list at the top, with the bar below it.
+  await backendSelect(page).evaluate((el) => el.scrollIntoView({ block: 'start' }));
 }
 
 async function openNewS3Backend(page: Page): Promise<void> {
@@ -58,7 +65,7 @@ export const STORAGE_SHOTS: Shot[] = [
   {
     id: 'route-bucket-add-backend',
     route: '/_/admin/storage/backends',
-    alt: 'The Backends page lists the configured backends; callout 1 marks Backends in the sidebar and callout 2 marks the Add backend button.',
+    alt: 'The Backends page lists the configured backends; callout 1 marks Backends in the sidebar and callout 2 marks the New backend button at the top right.',
     annotations: [
       { target: nav('Backends'), kind: 'callout', label: '1', side: 'right' },
       { target: { testId: 'backends-add' }, kind: 'box', label: '2' },
@@ -72,14 +79,14 @@ export const STORAGE_SHOTS: Shot[] = [
     // The form is taller than what is left of the screen under the list:
     // scroll it to the middle, then crop to it.
     viewport: { width: 1040, height: 900 },
-    clip: { union: [{ text: 'New backend', exact: true }, { testId: 'backend-create' }] },
+    clip: { union: [{ text: 'New backend', exact: true, nth: -1 }, { testId: 'backend-create' }] },
     clipPadding: 56,
     annotations: [
       {
         // From the Endpoint field down to the Secret access key field.
         target: {
           union: [
-            { text: 'Endpoint', exact: true },
+            { placeholder: 'https://fsn1.your-objectstorage.com' },
             { placeholder: 'us-east-1' }, // full width: sets the right edge
             { placeholder: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLE' },
           ],
@@ -135,12 +142,19 @@ export const STORAGE_SHOTS: Shot[] = [
   {
     id: 'route-bucket-alias',
     route: '/_/admin/storage/buckets',
+    // Cropped to the card: the folder of screenshots has a size budget.
+    clip: { union: [bucketRow('releases'), { role: 'textbox', name: 'Real name on backend' }] },
+    clipPadding: 48,
+    // The open card is taller than the default screen.
+    viewport: { width: 1040, height: 1200 },
     alt: 'The releases bucket is open with its Advanced settings; callout 1 marks the bucket row, callout 2 marks Advanced, and callout 3 marks Real name on backend, set to acme-prod-releases-fsn1.',
     setup: async (page) => {
       await openBucket(page, 'releases');
       // releases has a quota, so its Advanced part is open already.
       await openAdvanced(page);
       await page.getByRole('textbox', { name: 'Real name on backend' }).fill('acme-prod-releases-fsn1');
+      await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+      await rowToTop(page, 'releases');
     },
     annotations: [
       { target: bucketRow('releases'), kind: 'callout', label: '1' },
@@ -169,7 +183,7 @@ async function compressionOffOnDownloads(page: Page): Promise<void> {
   await page.getByRole('combobox', { name: 'Compression' }).click();
   await option(page, 'Off').click();
   await page.getByRole('button', { name: 'Review & apply' }).waitFor();
-  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.getByRole('combobox', { name: 'Compression' }).evaluate((el) => el.scrollIntoView({ block: 'center' }));
 }
 
 /** Set the public prefixes of downloads through the admin API (a storage merge-patch). */
@@ -189,8 +203,7 @@ async function reviewDialog(page: Page): Promise<void> {
 
 /** A new settings row for a bucket that the proxy does not see yet. */
 async function openDraft(page: Page): Promise<void> {
-  await page.getByRole('button', { name: 'More ways to add a bucket' }).click();
-  await page.getByText('Add settings for a bucket that does not exist yet').click();
+  await page.getByRole('button', { name: 'Settings for a future bucket' }).click();
   await page.getByPlaceholder('Bucket name').waitFor();
 }
 
@@ -205,6 +218,9 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
   {
     id: 'bucket-compression-off',
     route: '/_/admin/storage/buckets',
+    // Cropped to the card: the folder of screenshots has a size budget.
+    clip: { union: [{ text: /^Advanced/ }, { role: 'combobox', name: 'Compression' }, { role: 'textbox', name: 'Quota' }, { text: /^Reset to defaults/ }] },
+    clipPadding: 48,
     alt: 'The downloads bucket is open with its Advanced settings; callout 3 marks Advanced and callout 4 marks the Compression list, set to Off.',
     setup: compressionOffOnDownloads,
     annotations: [
@@ -225,29 +241,70 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
   {
     id: 'bucket-delta-cutoff',
     route: '/_/admin/storage/buckets',
+    // Cropped to the card: the folder of screenshots has a size budget.
+    clip: { union: [bucketRow('releases'), { role: 'textbox', name: 'Delta size cutoff' }] },
+    clipPadding: 48,
+    // The open card is taller than the default screen.
+    viewport: { width: 1040, height: 1200 },
     alt: 'The releases bucket is open with its Advanced settings; callout 1 marks the releases row and callout 2 marks Delta size cutoff, set to 0.5.',
     setup: async (page) => {
       await openBucket(page, 'releases');
       await openAdvanced(page);
-      await page.getByRole('spinbutton', { name: 'Delta size cutoff' }).fill('0.5');
+      await page.getByRole('textbox', { name: 'Delta size cutoff' }).fill('0.5');
       await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
-      await page.evaluate(() => window.scrollTo(0, 0));
+      await rowToTop(page, 'releases');
     },
     annotations: [
       { target: bucketRow('releases'), kind: 'callout', label: '1' },
-      { target: { role: 'spinbutton', name: 'Delta size cutoff' }, kind: 'box', label: '2', side: 'right' },
+      { target: { role: 'textbox', name: 'Delta size cutoff' }, kind: 'box', label: '2', side: 'right' },
+    ],
+  },
+  {
+    id: 'bucket-file-types',
+    route: '/_/admin/storage/buckets',
+    // Cropped to the card: the folder of screenshots has a size budget.
+    clip: { union: [{ text: /^Advanced/ }, { role: 'button', name: 'Review & apply' }, { css: '.ant-select:has([aria-label="Store these built-in file types whole"])' }] },
+    clipPadding: 48,
+    alt: 'The releases bucket is open with its Advanced settings; callout 2 marks Advanced, callout 3 marks the Also compress field, which holds pkl, callout 4 marks the Store whole field, which holds sql, and callout 5 marks Review & apply.',
+    viewport: { width: 1040, height: 1000 },
+    setup: async (page) => {
+      await openBucket(page, 'releases');
+      await openAdvanced(page);
+      const add = page.getByRole('combobox', { name: 'Also compress these file types' });
+      await add.click();
+      await add.pressSequentially('pkl');
+      await add.press('Enter');
+      const whole = page.getByRole('combobox', { name: 'Store these built-in file types whole' });
+      await whole.click();
+      await whole.pressSequentially('sql');
+      await whole.press('Enter');
+      await whole.press('Escape');
+      await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+      await page.getByRole('button', { name: 'Review & apply' }).waitFor();
+      await page.mouse.move(1, 1);
+    },
+    annotations: [
+      { target: { text: /^Advanced/ }, kind: 'callout', label: '2', side: 'right' },
+      { target: { css: '.ant-select:has([aria-label="Also compress these file types"])' }, kind: 'box', label: '3', side: 'right' },
+      { target: { css: '.ant-select:has([aria-label="Store these built-in file types whole"])' }, kind: 'box', label: '4', side: 'right' },
+      { target: { role: 'button', name: 'Review & apply' }, kind: 'callout', label: '5', side: 'top' },
     ],
   },
   {
     id: 'bucket-quota',
     route: '/_/admin/storage/buckets',
+    // Cropped to the card: the folder of screenshots has a size budget.
+    clip: { union: [bucketRow('db-archive'), { css: '.ant-input-affix-wrapper:has(input[placeholder="No quota"])' }] },
+    clipPadding: 48,
+    // The open card is taller than the default screen.
+    viewport: { width: 1040, height: 1200 },
     alt: 'The db-archive bucket is open with its Advanced settings; callout 1 marks the db-archive row, callout 2 marks Advanced, and callout 3 marks Quota, set to 500 GiB.',
     setup: async (page) => {
       await openBucket(page, 'db-archive');
       await openAdvanced(page);
       await page.getByRole('textbox', { name: 'Quota' }).fill('500');
       await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
-      await page.evaluate(() => window.scrollTo(0, 0));
+      await rowToTop(page, 'db-archive');
     },
     annotations: [
       { target: bucketRow('db-archive'), kind: 'callout', label: '1' },
@@ -280,6 +337,9 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
   {
     id: 'bucket-public-prefix',
     route: '/_/admin/storage/buckets',
+    // Cropped to the card: the folder of screenshots has a size budget.
+    clip: { union: [bucketRow('downloads'), { role: 'textbox', name: 'Public prefix' }] },
+    clipPadding: 48,
     alt: 'The downloads bucket is open; callout 3 marks the Specific prefixes public option and callout 4 marks the prefix field, which holds public/.',
     setup: (page) => openBucket(page, 'downloads'),
     annotations: [
@@ -290,21 +350,19 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
   {
     id: 'adopt-bucket-draft',
     route: '/_/admin/storage/buckets',
-    alt: 'The Buckets page with the menu next to Create bucket open; callout 1 marks Buckets in the sidebar, callout 2 marks the menu button, and callout 3 marks Add settings for a bucket that does not exist yet.',
+    alt: 'The Buckets page; callout 1 marks Buckets in the sidebar, and callout 2 marks Settings for a future bucket at the top right, next to New bucket.',
     setup: async (page) => {
-      await page.getByRole('button', { name: 'More ways to add a bucket' }).click();
-      await page.getByText('Add settings for a bucket that does not exist yet').waitFor();
+      await page.getByRole('button', { name: 'Settings for a future bucket' }).waitFor();
     },
     annotations: [
       { target: nav('Buckets'), kind: 'callout', label: '1', side: 'right' },
-      { target: { role: 'button', name: 'More ways to add a bucket' }, kind: 'callout', label: '2', side: 'right' },
-      { target: { text: 'Add settings for a bucket that does not exist yet' }, kind: 'callout', label: '3', side: 'right' },
+      { target: { role: 'button', name: 'Settings for a future bucket' }, kind: 'callout', label: '2', side: 'bottom' },
     ],
   },
   {
     id: 'adopt-bucket-alias',
     route: '/_/admin/storage/buckets',
-    alt: 'A new settings row is open; callout 4 marks the Bucket name field, callout 5 marks the Backend list, set to aws-dr, callout 6 marks Advanced, and callout 7 marks Real name on backend, set to acme-firmware.',
+    alt: 'A new settings row is open; callout 3 marks the Bucket name field, callout 4 marks the Backend list, set to aws-dr, callout 5 marks Advanced, and callout 6 marks Real name on backend, set to acme-firmware.',
     // The new row sits below the four buckets: a taller screen shows all of it.
     viewport: { width: 1040, height: 1000 },
     setup: async (page) => {
@@ -318,10 +376,10 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
       await page.mouse.move(1, 1);
     },
     annotations: [
-      { target: { placeholder: 'Bucket name' }, kind: 'callout', label: '4', side: 'right' },
-      { target: { role: 'combobox', name: 'Backend' }, kind: 'box', label: '5', side: 'right' },
-      { target: { text: /^Advanced/ }, kind: 'callout', label: '6', side: 'right' },
-      { target: { role: 'textbox', name: 'Real name on backend' }, kind: 'box', label: '7', side: 'right' },
+      { target: { placeholder: 'Bucket name' }, kind: 'callout', label: '3', side: 'right' },
+      { target: { role: 'combobox', name: 'Backend' }, kind: 'box', label: '4', side: 'right' },
+      { target: { text: /^Advanced/ }, kind: 'callout', label: '5', side: 'right' },
+      { target: { role: 'textbox', name: 'Real name on backend' }, kind: 'box', label: '6', side: 'right' },
     ],
   },
   {

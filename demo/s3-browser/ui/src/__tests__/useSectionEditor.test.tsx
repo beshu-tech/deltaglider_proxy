@@ -66,12 +66,13 @@ describe('fetch', () => {
     expect(result.current.error).toBeNull();
   });
 
-  test('a 500 sets an operator-facing error', async () => {
+  test('a 500 sets a plain error and keeps the raw one for <ErrorState>', async () => {
     http.on('GET', SECTION, json({ error: 'backend down' }, 500));
     const onSessionExpired = vi.fn();
     const { result } = mountEditor({ onSessionExpired, noun: 'caches' });
     await waitFor(() => expect(result.current.error).not.toBeNull());
-    expect(result.current.error).toMatch(/^Failed to load caches section: .*backend down/);
+    expect(result.current.error).toBe('Backend down.');
+    expect(result.current.loadError).toBeTruthy();
     expect(onSessionExpired).not.toHaveBeenCalled();
   });
 });
@@ -156,7 +157,7 @@ describe('dirty → validate → apply', () => {
     act(() => result.current.setValue((v) => ({ ...v, cache_size_mb: -1 })));
     await act(() => result.current.runApply());
     expect(result.current.applyOpen).toBe(false);
-    expect(await screen.findByText(/Validate failed: .*bad cache size/)).toBeInTheDocument();
+    expect(await screen.findByText('Bad cache size.')).toBeInTheDocument();
     expect(result.current.isDirty).toBe(true);
   });
 
@@ -191,7 +192,7 @@ describe('dirty → validate → apply', () => {
     expect(result.current.value.cache_size_mb).toBe(256);
     expect(result.current.isDirty).toBe(true);
     expect(http.callsTo('GET', SECTION)).toHaveLength(1);
-    expect(await screen.findByText(/Apply failed: .*boom/)).toBeInTheDocument();
+    expect(await screen.findByText('Boom.')).toBeInTheDocument();
   });
 
   test('runApply on a clean editor validates nothing and opens no dialog', async () => {

@@ -19,6 +19,7 @@ const session = (id: string, identity: string | null, current = false) => ({
 let http: ReturnType<typeof mockFetch>;
 beforeEach(() => {
   http = mockFetch();
+  http.on('GET', '/_/api/admin/config', json({ config_sync_bucket: 'dgp-sync' }));
 });
 afterEach(() => vi.unstubAllGlobals());
 
@@ -27,36 +28,66 @@ const lastDialog = async () => {
   return dialogs[dialogs.length - 1];
 };
 
-test('lists the live sessions and labels the caller’s own', async () => {
+test('lists the live sessions grouped by principal and labels the caller’s own', async () => {
   http.on('GET', LIST, json({ sessions: [session('s-mine', 'dana', true), session('s-ci', 'ci-uploader')] }));
   renderWithQuery(<SessionsPanel />);
-  expect(await screen.findByText('2 live sessions')).toBeInTheDocument();
-  expect(screen.getByText('you')).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'More actions for session s-ci' })).toBeInTheDocument();
-  // B32: every row keeps its menu, and the last column has a header.
-  expect(screen.getByRole('button', { name: 'More actions for session s-mine' })).toBeInTheDocument();
-  expect(screen.getByRole('columnheader', { name: 'Actions' })).toBeInTheDocument();
+  expect(await screen.findByText('2 live sessions · 2 signed-in principals')).toBeInTheDocument();
+  expect(screen.getByRole('region', { name: 'Sessions of dana' })).toHaveTextContent('This browser');
+  // D55: a direct "Sign out" button, not a one-item menu.
+  expect(screen.getByRole('button', { name: 'Sign out session s-ci' })).toHaveTextContent('Sign out');
+  // The caller's own session has no sign-out button here (the server refuses it).
+  expect(screen.queryByRole('button', { name: 'Sign out session s-mine' })).toBeNull();
 });
 
-test('the caller’s own session cannot be revoked from the menu, and it says why', async () => {
-  http.on('GET', LIST, json({ sessions: [session('s-mine', 'dana', true)] }));
+// D55: 22 sign-ins of one principal are one group, not 22 rows.
+test('sessions of one principal form one group with one sign-out for the others', async () => {
+  let rows = [
+    { ...session('s-mine', null, true), auth: 'bootstrap' },
+    ...Array.from({ length: 5 }, (_, i) => ({ ...session(`s-b${i}`, null), auth: 'bootstrap', age_secs: 100 + i })),
+  ];
+  http.on('GET', LIST, () => json({ sessions: rows }));
+  http.on('DELETE', /\/_\/api\/admin\/sessions\/s-b\d$/, (req) => {
+    rows = rows.filter((r) => !req.path.endsWith(r.id));
+    return new Response(null, { status: 204 });
+  });
   const user = userEvent.setup();
   renderWithQuery(<SessionsPanel />);
-  await user.click(await screen.findByRole('button', { name: 'More actions for session s-mine' }));
-  const item = await screen.findByRole('menuitem', { name: /use Sign out in the account menu/ });
-  expect(item).toHaveAttribute('aria-disabled', 'true');
+  const group = await screen.findByRole('region', { name: 'Sessions of Bootstrap admin' });
+  expect(screen.getAllByRole('region')).toHaveLength(1);
+  expect(within(group).getAllByRole('listitem')).toHaveLength(3);
+  await user.click(within(group).getByRole('button', { name: 'Show 3 more' }));
+  expect(within(group).getAllByRole('listitem')).toHaveLength(6);
+  await user.click(within(group).getByRole('button', { name: /Sign out 5 others/ }));
+  const dialog = await lastDialog();
+  expect(dialog).toHaveTextContent('Sign out your 5 other sessions?');
+  await user.click(within(dialog).getByRole('button', { name: 'Sign out' }));
+  await waitFor(() => expect(http.calls.filter((c) => c.method === 'DELETE')).toHaveLength(5));
+  expect(http.calls.some((c) => c.method === 'DELETE' && c.path.endsWith('s-mine'))).toBe(false);
+  expect(await screen.findByText('1 live session · 1 signed-in principal')).toBeInTheDocument();
+});
+
+// D71: sign-out is neutral, as in the account menu.
+test('the sign-out confirm is not a danger button', async () => {
+  http.on('GET', LIST, json({ sessions: [session('s-ci', 'ci-uploader')] }));
+  const user = userEvent.setup();
+  renderWithQuery(<SessionsPanel />);
+  await user.click(await screen.findByRole('button', { name: 'Sign out session s-ci' }));
+  const ok = within(await lastDialog()).getByRole('button', { name: 'Sign out' });
+  expect(ok.className).not.toMatch(/dangerous/);
 });
 
 test('no sessions reads as zero', async () => {
   http.on('GET', LIST, json({ sessions: [] }));
   renderWithQuery(<SessionsPanel />);
   expect(await screen.findByText('0 live sessions')).toBeInTheDocument();
+  expect(screen.getByText('Nobody is signed in')).toBeInTheDocument();
 });
 
-test('a load failure is reported', async () => {
+test('a load failure is one error state with Retry, not raw text', async () => {
   http.on('GET', LIST, json({ error: 'boom' }, 500));
   renderWithQuery(<SessionsPanel />);
-  expect(await screen.findByText(/boom/)).toBeInTheDocument();
+  expect(await screen.findByText('Could not load the sessions')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /Retry/ })).toBeInTheDocument();
 });
 
 test('an expired session sends the user to sign in', async () => {
@@ -75,11 +106,10 @@ test('force-logout of one session deletes it and refetches the list', async () =
   });
   const user = userEvent.setup();
   renderWithQuery(<SessionsPanel />);
-  await user.click(await screen.findByRole('button', { name: 'More actions for session s-ci' }));
-  await user.click(await screen.findByText('Sign out this session…'));
+  await user.click(await screen.findByRole('button', { name: 'Sign out session s-ci' }));
   await user.click(within(await lastDialog()).getByRole('button', { name: 'Sign out' }));
   await waitFor(() => expect(http.callsTo('DELETE', '/_/api/admin/sessions/s-ci')).toHaveLength(1));
-  expect(await screen.findByText('1 live session')).toBeInTheDocument();
+  expect(await screen.findByText('1 live session · 1 signed-in principal')).toBeInTheDocument();
   expect(http.callsTo('GET', LIST)).toHaveLength(2);
 });
 
@@ -90,7 +120,7 @@ test('revoke-user sends the identity after confirmation and refetches', async ()
   }));
   const user = userEvent.setup();
   renderWithQuery(<SessionsPanel />);
-  await screen.findByText('1 live session');
+  await screen.findByText(/^1 live session/);
   await user.type(screen.getByRole('textbox', { name: 'Sign out every session of an identity' }), ' ci-uploader ');
   await user.click(screen.getByRole('button', { name: 'Revoke key' }));
   await user.click(within(await lastDialog()).getByRole('button', { name: 'Sign out all sessions' }));
@@ -108,7 +138,7 @@ test('revoke-user warns when the revocation was not persisted', async () => {
   }));
   const user = userEvent.setup();
   renderWithQuery(<SessionsPanel />);
-  await screen.findByText('1 live session');
+  await screen.findByText(/^1 live session/);
   await user.type(screen.getByRole('textbox', { name: 'Sign out every session of an identity' }), 'backup-bot');
   await user.click(screen.getByRole('button', { name: 'Revoke key' }));
   await user.click(within(await lastDialog()).getByRole('button', { name: 'Sign out all sessions' }));
@@ -120,20 +150,37 @@ test('revoke-user of an unknown identity says no live session here uses it', asy
   http.on('GET', LIST, json({ sessions: [session('s-ci', 'ci-uploader')] }));
   const user = userEvent.setup();
   renderWithQuery(<SessionsPanel />);
-  await screen.findByText('1 live session');
+  await screen.findByText(/^1 live session/);
   await user.type(screen.getByRole('textbox', { name: 'Sign out every session of an identity' }), 'nonexistent-key');
   await user.click(screen.getByRole('button', { name: 'Revoke key' }));
   const dialog = await lastDialog();
   expect(dialog).toHaveTextContent('No live session on this instance uses "nonexistent-key"');
-  await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+  // The remote sign-out is the secondary action, not a call to action.
+  expect(within(dialog).getByRole('button', { name: 'Sign out on other instances' }).className).not.toMatch(/btn-primary/);
+  await user.click(within(dialog).getByRole('button', { name: 'Close' }));
   expect(http.callsTo('POST', REVOKE_USER)).toHaveLength(0);
 });
 
-// C40: an Identity column that is empty on every row is not shown.
-test('the identity column shows only when a session has an identity', async () => {
-  http.on('GET', LIST, json({ sessions: [session('s-boot', null)] }));
+// D11: one instance (no sync bucket) has no other instances to sign out on.
+test('revoke-user of an unknown identity on a single instance offers only Close', async () => {
+  http.on('GET', '/_/api/admin/config', json({ config_sync_bucket: null }));
+  http.on('GET', LIST, json({ sessions: [session('s-ci', 'ci-uploader')] }));
+  const user = userEvent.setup();
   renderWithQuery(<SessionsPanel />);
-  await screen.findByText('1 live session');
-  expect(screen.queryByRole('columnheader', { name: 'Identity' })).toBeNull();
-  expect(screen.getByRole('columnheader', { name: 'Age' })).toBeInTheDocument();
+  await screen.findByText(/^1 live session/);
+  await waitFor(() => expect(http.callsTo('GET', '/_/api/admin/config')).toHaveLength(1));
+  await user.type(screen.getByRole('textbox', { name: 'Sign out every session of an identity' }), 'nonexistent-key');
+  await user.click(screen.getByRole('button', { name: 'Revoke key' }));
+  const dialog = await lastDialog();
+  expect(dialog).toHaveTextContent('No live session uses "nonexistent-key"');
+  expect(within(dialog).queryByRole('button', { name: /other instances/ })).toBeNull();
+  expect(within(dialog).getAllByRole('button').map((b) => b.textContent)).toEqual(['Close']);
+});
+
+// C40: a session with no identity (bootstrap password) is named by its role.
+test('a session without an identity is named by how it signed in', async () => {
+  http.on('GET', LIST, json({ sessions: [{ ...session('s-boot', null), auth: 'open' }] }));
+  renderWithQuery(<SessionsPanel />);
+  await screen.findByText(/^1 live session/);
+  expect(screen.getByRole('region', { name: 'Sessions of Anonymous (open access)' })).toBeInTheDocument();
 });

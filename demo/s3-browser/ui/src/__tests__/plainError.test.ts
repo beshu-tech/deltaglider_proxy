@@ -72,3 +72,62 @@ test('backendHealthSentence', () => {
   );
   expect(backendHealthSentence('erroring', '503 SlowDown')).toBe('The backend answers, but with server errors.');
 });
+
+/** UX harvest D17, D24: S3 and HTTP failures read as one sentence; the
+ *  status, the error code and the request id stay in `details`. */
+describe('plainError: S3 requests', () => {
+  const s3 = (status: number, code: string, message: string) =>
+    Object.assign(new Error(message), { name: code, $metadata: { httpStatusCode: status, requestId: 'req-1' } });
+
+  test('a full bucket, from the operator-facing string of describeS3Error', () => {
+    const raw =
+      'Upload object qa-60k-b.bin failed (403) [AccessDenied]: Bucket quota exceeded: 59 KiB used + 59 KiB upload > 100 KiB limit (request-id: 49e72a4e)';
+    const out = plainError(raw, 'x');
+    expect(out.text).toBe(
+      'This bucket is full: 59 KiB is used of 100 KiB, and this file needs 59 KiB. Delete objects or ask an administrator to raise the quota.',
+    );
+    expect(out.details).toBe(raw);
+  });
+  test('a full bucket, from an ApiError of normalizeS3Error', () => {
+    const e = new ApiError('Upload failed (403) [AccessDenied]: x (request-id: r)', 403, 'AccessDenied', 'Bucket quota exceeded: 1 KiB used + 2 KiB upload > 2 KiB limit');
+    expect(plainError(e, 'x').text).toMatch(/^This bucket is full: 1 KiB is used of 2 KiB/);
+  });
+  test.each([
+    [s3(403, 'AccessDenied', 'Access Denied.'), 'You do not have permission to do this. Ask an administrator for access.'],
+    [s3(403, 'SignatureDoesNotMatch', 'sig'), 'The access key or the secret key is wrong. Sign in again with valid credentials.'],
+    [s3(413, 'EntityTooLarge', 'too big'), 'The file is larger than the proxy accepts. Upload a smaller file, or ask an administrator to raise the size limit.'],
+    [s3(503, 'SlowDown', 'Please reduce your request rate.'), 'The proxy is busy. Wait a moment and try again.'],
+    [s3(404, 'NoSuchBucket', 'The specified bucket does not exist'), 'The bucket does not exist.'],
+  ])('%s', (err, sentence) => {
+    const out = plainError(err, 'x');
+    expect(out.text).toBe(sentence);
+    expect(out.details).toMatch(/req-1/);
+  });
+  test("the proxy's own SlowDown reason is kept", () => {
+    const out = plainError(s3(503, 'SlowDown', 'bucket releases is busy: a migrate job runs'), 'x');
+    expect(out.text).toBe('Bucket releases is busy: a migrate job runs.');
+  });
+  test('no network', () => {
+    expect(plainError(new TypeError('Failed to fetch'), 'x').text).toBe(
+      'The proxy does not answer. Check the network connection and try again.',
+    );
+  });
+  test('an internal server error shows the fallback, never "boom"', () => {
+    const e = new ApiError('Section fetch (storage) failed (500) [internal]: boom', 500, 'internal', 'boom');
+    const out = plainError(e, 'The proxy could not load the bucket settings.');
+    expect(out.text).toBe('The proxy could not load the bucket settings.');
+    expect(out.details).toContain('boom');
+  });
+  test('a wrapped string with a status and code never shows them in the sentence', () => {
+    const out = plainError('Failed to load: Runs failed (500) [internal]: boom', 'The proxy could not load the runs.');
+    expect(out.text).toBe('The proxy could not load the runs.');
+    expect(out.text).not.toMatch(/500|internal|boom/);
+  });
+});
+
+test('a bare "HTTP 500" shows the fallback', () => {
+  expect(plainError(new Error('HTTP 500'), 'The proxy could not load the metrics.')).toEqual({
+    text: 'The proxy could not load the metrics.',
+    details: 'HTTP 500',
+  });
+});

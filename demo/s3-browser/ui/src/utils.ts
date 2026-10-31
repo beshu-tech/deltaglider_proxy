@@ -1,14 +1,10 @@
-/** Binary-unit byte label ("1.5 KB"). Sign-aware (a negative delta reads
- *  "-1.5 KB"); sub-byte input stays in B; the unit clamps at PB; non-finite
- *  input renders "—". */
+/** THE byte label of the UI ("1.5 KiB"): binary units with IEC labels,
+ *  because every server limit (quota, object size, cache size) is binary
+ *  (UX harvest D25). Sign-aware (a negative delta reads "-1.5 KiB");
+ *  sub-byte input stays in B; the unit clamps at PiB; non-finite input
+ *  renders "—". The source test `byteFormat.test.ts` refuses a second
+ *  formatter and decimal unit labels. */
 export function formatBytes(bytes: number): string {
-  return formatWithUnits(bytes, ['B', 'KB', 'MB', 'GB', 'TB', 'PB']);
-}
-
-/** `formatBytes` with IEC labels ("1.5 KiB"), for values an operator types
- *  in a 1024-based field (bucket quota, object size limit): the label then
- *  matches the field's unit. */
-export function formatBytesIec(bytes: number): string {
   return formatWithUnits(bytes, ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']);
 }
 

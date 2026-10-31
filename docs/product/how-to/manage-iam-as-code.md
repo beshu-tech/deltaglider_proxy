@@ -12,9 +12,9 @@ Seed the file from the live database.
 
 In the admin UI:
 
-1. Open the account menu in the top-right corner, and click **Export full IAM (YAML)**. The dialog **Export full IAM as YAML** shows the users, groups, providers and mapping rules as an `access:` section with `iam_mode: declarative` already set. **Download .yaml** saves it, and **Copy to clipboard** copies it.
+1. In the sidebar, open **System** (`/_/admin/system`). In the **Configuration as YAML** card, click **Export full IAM (YAML)**. The dialog **Export full IAM as YAML** shows the users, groups, providers and mapping rules as an `access:` section with `iam_mode: declarative` already set. **Download .yaml** saves it, and **Copy to clipboard** copies it.
 
-   ![The account menu is open; the box marks Export full IAM (YAML), which downloads the users, groups, providers and mapping rules with their live secrets.](/_/screenshots/iam-code-export-menu.webp)
+   ![The Configuration as YAML card of the System page; the box marks Export full IAM (YAML), which downloads the users, groups, providers and mapping rules with their live secrets.](/_/screenshots/iam-code-export-menu.webp)
 
 This export includes the **live secrets** of users and providers. Handle the file like a password file, and move the secrets into environment references (step 4) before you commit it.
 
@@ -56,7 +56,7 @@ access:
 
 If you start from an empty file instead, write this shape by hand. The full wire format is in the [declarative IAM reference](../reference/declarative-iam.md).
 
-**Import full IAM (YAML)** in the same account menu does the opposite: it reconciles a pasted IAM document into the database. It is for `gui` mode, for example to copy the IAM state to another instance. In declarative mode the menu item is disabled, because the YAML config owns IAM there, and the admin API refuses the import with `403`.
+**Import full IAM (YAML)** in the same card does the opposite: it reconciles a pasted IAM document into the database. It is for `gui` mode, for example to copy the IAM state to another instance. In declarative mode the button is disabled, and a line under it says why: the YAML config owns IAM there, and the admin API refuses the import with `403`.
 
 ## 2. Preview the diff
 
@@ -111,7 +111,7 @@ Set `access.iam_mode: gui` and apply. The switch changes nothing in the database
 ## Verify
 
 1. Re-apply the unchanged file: the preview reports `no IAM changes (idempotent apply)`, and no `iam_reconcile_*` audit entries appear. This shows that your YAML and the DB agree.
-2. Open **Access → Users** (`/_/admin/access/users`). The note at the top says that your YAML config owns the users, the list has no **New** button, and the form of each user starts with **View:** and has no **Save** button.
+2. Open **Access → Users** (`/_/admin/access/users`). The note at the top says that your YAML config owns the users, the page has no **New user** button, and the form of each user starts with **View:** and has no **Save** button.
 3. Send an IAM change to the admin API, for example `POST /_/api/admin/users`. Expect `403` with `{"error": "iam_declarative"}`.
 4. Sign a request as a YAML-defined user (`ci-uploader`). Expect normal IAM evaluation.
 

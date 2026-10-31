@@ -63,7 +63,7 @@ function Pill({ pill }: { pill: BackendPill }) {
       style={{
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 5,
+        gap: 4,
         height: 20,
         padding: '0 8px',
         borderRadius: 10,
@@ -117,7 +117,7 @@ export default function BackendCard({ name, filesystem, kind, highlighted, pills
           {filesystem ? <DatabaseOutlined /> : <CloudOutlined />}
         </div>
         <div className="dg-backend-card__title" style={{ minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
             <h3
               style={{
                 margin: 0,

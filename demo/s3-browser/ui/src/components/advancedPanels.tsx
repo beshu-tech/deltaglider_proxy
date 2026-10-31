@@ -23,7 +23,7 @@
  * ApplyDialog renders it as a blue banner.
  */
 import { useMemo, useState } from 'react';
-import { Alert, Input, InputNumber, Radio, Switch } from 'antd';
+import { Input, Radio, Switch } from 'antd';
 import {
   CloudServerOutlined,
   DatabaseOutlined,
@@ -38,12 +38,12 @@ import { useSectionEditor } from '../useSectionEditor';
 import type { UseSectionEditorResult } from '../useSectionEditor';
 import { undefinedToNullSubset } from './advancedPayload';
 import SectionHeader from './SectionHeader';
+import { useFieldValidation, v, type FieldValidation } from '../validation';
 import FormField, { ReadOnlyValue } from './FormField';
 import ApplyDialog from './ApplyDialog';
 import StickyDirtyBar from './StickyDirtyBar';
-import { LoadingState } from './StatePlaceholders';
+import { ErrorState, LoadingState } from './StatePlaceholders';
 import { CUSTOM_LOG_LEVEL, LOG_LEVEL_PRESETS, logLevelRadio } from './admin/logLevelPresets';
-import { normalizeUiError } from '../errorHandling';
 
 
 // ───────────────────────────────────────────────────────────
@@ -121,11 +121,9 @@ function RestartChip({ reason }: { reason: string }) {
       title={reason}
       style={{
         display: 'inline-block',
-        fontSize: 9,
-        fontWeight: 700,
-        letterSpacing: 0.5,
-        textTransform: 'uppercase',
-        padding: '1px 6px',
+        fontSize: 11,
+        fontWeight: 500,
+        padding: '2px 8px',
         borderRadius: 10,
         border: `1px solid ${BORDER}`,
         color: TEXT_MUTED,
@@ -190,14 +188,23 @@ type ApplyRailEditor = Pick<
   'isDirty' | 'applying' | 'discard' | 'runApply' | 'applyOpen' | 'applyResponse' | 'cancelApply' | 'confirmApply'
 >;
 
-function AdvancedApplyRail({ editor }: { editor: ApplyRailEditor }) {
+/** `form`: the panel's field validation. Its "N issues to fix" disables
+ *  Apply, Apply first shows every error (`submit`), and Discard forgets them. */
+function AdvancedApplyRail({ editor, form }: { editor: ApplyRailEditor; form?: FieldValidation }) {
   return (
     <>
       <StickyDirtyBar
         visible={editor.isDirty}
         applying={editor.applying}
-        onDiscard={editor.discard}
-        onApply={editor.runApply}
+        errorCount={form?.issueCount}
+        onDiscard={() => {
+          form?.reset();
+          editor.discard();
+        }}
+        onApply={() => {
+          if (form && !form.submit()) return;
+          editor.runApply();
+        }}
         inline
       />
       <ApplyDialog
@@ -227,10 +234,11 @@ function useStackCardStyle(): React.CSSProperties {
 }
 
 /** The shared "failed to load" / "loading" early return of every Advanced
- *  sub-panel; null once the data is there. */
-function loadGate({ loading, error }: { loading: boolean; error: string | null }): React.ReactNode | null {
-  if (error) return <Alert type="error" showIcon title="Failed to load" description={error} />;
-  if (loading) return <PanelShell><LoadingState /></PanelShell>;
+ *  sub-panel; null once the data is there. A card-shaped skeleton while
+ *  loading; ONE ErrorState with Retry on failure (UX harvest D16, D17). */
+function loadGate({ loading, loadError, refresh }: { loading: boolean; loadError: unknown; refresh: () => Promise<void> }): React.ReactNode | null {
+  if (loadError) return <ErrorState error={loadError} what="these settings" onRetry={refresh} />;
+  if (loading) return <LoadingState variant="card" label="Loading settings" />;
   return null;
 }
 
@@ -243,6 +251,7 @@ export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
   const cardStyle = useStackCardStyle();
   const subset = useAdvancedSubset(LISTENER_INITIAL, onSessionExpired, 'system/listener');
   const { value, setValue } = subset;
+  const form = useFieldValidation();
 
   const gate = loadGate(subset);
   if (gate) return gate;
@@ -252,12 +261,14 @@ export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
 
   const setListenAddr = (v: string) =>
     setValue({ ...value, listen_addr: v || undefined });
+  // UX harvest D10: "not an address" was accepted until the restart.
+  const listen = form.text('listen_addr', value.listen_addr ?? '', setListenAddr, v.optional(v.hostPort()));
   const setTls = (patch: Partial<NonNullable<AdvancedSectionBody['tls']>>) =>
     setValue({ ...value, tls: { ...tls, ...patch } });
 
   return (
     <PanelShell>
-      <AdvancedApplyRail editor={subset} />
+      <AdvancedApplyRail editor={subset} form={form} />
 
       <div style={cardStyle}>
         <SectionHeader
@@ -276,11 +287,11 @@ export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
             yamlPath="advanced.listen_addr"
             helpText="host:port. Default 0.0.0.0:9000."
             examples={['0.0.0.0:9000', '127.0.0.1:9001']}
-            onExampleClick={(v) => setListenAddr(String(v))}
+            onExampleClick={(x) => setListenAddr(String(x))}
+            error={listen.error}
           >
             <Input
-              value={value.listen_addr ?? ''}
-              onChange={(e) => setListenAddr(e.target.value)}
+              {...listen.inputProps}
               placeholder="0.0.0.0:9000"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
             />
@@ -363,12 +374,22 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
   const cardStyle = useStackCardStyle();
   const subset = useAdvancedSubset(CACHES_INITIAL, onSessionExpired, 'system/caches');
   const { value, setValue } = subset;
+  const form = useFieldValidation();
   const gate = loadGate(subset);
   if (gate) return gate;
 
+  // UX harvest D9: number fields keep the typed text and say what is wrong;
+  // "-1" no longer becomes 16 behind the user's back.
+  const numberField = (key: keyof typeof CACHES_INITIAL, min: number, max: number) =>
+    form.number(key, value[key], (n) => setValue({ ...value, [key]: n }), v.optional(v.integer({ min, max })));
+  const cacheSize = numberField('cache_size_mb', 16, 65536);
+  const metadataSize = numberField('metadata_cache_mb', 1, 65536);
+  const codec = numberField('codec_concurrency', 1, 1024);
+  const blocking = numberField('blocking_threads', 1, 8192);
+
   return (
     <PanelShell>
-      <AdvancedApplyRail editor={subset} />
+      <AdvancedApplyRail editor={subset} form={form} />
       <div style={cardStyle}>
         <SectionHeader
           icon={<DatabaseOutlined />}
@@ -377,39 +398,27 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
         />
         <div>
           <FormField
-            label="Reference cache size (MB)"
+            label="Reference cache size (MiB)"
             yamlPath="advanced.cache_size_mb"
-            helpText="LRU cache for delta-reconstruction reference files. Recommend ≥1024 MB for production."
+            helpText="LRU cache for delta-reconstruction reference files. Recommend ≥1024 MiB for production."
             defaultPlaceholder="100"
             examples={[256, 1024, 4096]}
-            onExampleClick={(v) => setValue({ ...value, cache_size_mb: Number(v) })}
+            onExampleClick={(x) => setValue({ ...value, cache_size_mb: Number(x) })}
+            error={cacheSize.error}
           >
-            <InputNumber
-              value={value.cache_size_mb ?? undefined}
-              onChange={(v) => setValue({ ...value, cache_size_mb: v ?? undefined })}
-              min={16}
-              placeholder="100"
-              style={{ width: 180, ...inputRadius }}
-              suffix="MB"
-            />
+            <Input {...cacheSize.inputProps} placeholder="100" style={{ width: 180, ...inputRadius }} suffix="MiB" />
           </FormField>
 
           <FormField
-            label="Metadata cache size (MB)"
+            label="Metadata cache size (MiB)"
             yamlPath="advanced.metadata_cache_mb"
             helpText="Object metadata cache for HEAD + LIST acceleration. Hot-reloadable."
             defaultPlaceholder="50"
             examples={[50, 200]}
-            onExampleClick={(v) => setValue({ ...value, metadata_cache_mb: Number(v) })}
+            onExampleClick={(x) => setValue({ ...value, metadata_cache_mb: Number(x) })}
+            error={metadataSize.error}
           >
-            <InputNumber
-              value={value.metadata_cache_mb ?? undefined}
-              onChange={(v) => setValue({ ...value, metadata_cache_mb: v ?? undefined })}
-              min={1}
-              placeholder="50"
-              style={{ width: 180, ...inputRadius }}
-              suffix="MB"
-            />
+            <Input {...metadataSize.inputProps} placeholder="50" style={{ width: 180, ...inputRadius }} suffix="MiB" />
           </FormField>
 
           <FormField
@@ -417,15 +426,10 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
             yamlPath="advanced.codec_concurrency"
             helpText="Maximum concurrent xdelta3 subprocesses. Leave empty to auto-detect from CPU count."
             examples={[16, 40]}
-            onExampleClick={(v) => setValue({ ...value, codec_concurrency: Number(v) })}
+            onExampleClick={(x) => setValue({ ...value, codec_concurrency: Number(x) })}
+            error={codec.error}
           >
-            <InputNumber
-              value={value.codec_concurrency ?? undefined}
-              onChange={(v) => setValue({ ...value, codec_concurrency: v ?? undefined })}
-              min={1}
-              placeholder="auto"
-              style={{ width: 180, ...inputRadius }}
-            />
+            <Input {...codec.inputProps} placeholder="auto" style={{ width: 180, ...inputRadius }} />
           </FormField>
 
           <FormField
@@ -438,15 +442,10 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
             yamlPath="advanced.blocking_threads"
             helpText="Size of the tokio blocking pool. 512 by default. Smaller is often fine."
             examples={[64, 128, 512]}
-            onExampleClick={(v) => setValue({ ...value, blocking_threads: Number(v) })}
+            onExampleClick={(x) => setValue({ ...value, blocking_threads: Number(x) })}
+            error={blocking.error}
           >
-            <InputNumber
-              value={value.blocking_threads ?? undefined}
-              onChange={(v) => setValue({ ...value, blocking_threads: v ?? undefined })}
-              min={1}
-              placeholder="512"
-              style={{ width: 180, ...inputRadius }}
-            />
+            <Input {...blocking.inputProps} placeholder="512" style={{ width: 180, ...inputRadius }} />
           </FormField>
         </div>
       </div>
@@ -466,12 +465,20 @@ export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
   const subset = useAdvancedSubset(SIZE_LIMIT_INITIAL, onSessionExpired, 'storage/buckets/limits');
   const { value, setValue } = subset;
+  const form = useFieldValidation();
   const gate = loadGate(subset);
   if (gate) return gate;
   const mb = value.max_object_size != null ? Math.round(value.max_object_size / MIB) : undefined;
+  // Up to 5 TiB, the largest S3 object.
+  const sizeField = form.number(
+    'max_object_size',
+    mb,
+    (n) => setValue({ ...value, max_object_size: n !== undefined ? n * MIB : undefined }),
+    v.optional(v.integer({ min: 1, max: 5 * 1024 * 1024 })),
+  );
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-      <AdvancedApplyRail editor={subset} />
+      <AdvancedApplyRail editor={subset} form={form} />
       <div style={cardStyle}>
         <SectionHeader
           icon={<ControlOutlined />}
@@ -484,13 +491,12 @@ export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
           helpText="Applies to every bucket. The YAML value is in bytes."
           defaultPlaceholder="100"
           examples={[100, 1024, 5120]}
-          onExampleClick={(v) => setValue({ ...value, max_object_size: Number(v) * MIB })}
+          onExampleClick={(x) => setValue({ ...value, max_object_size: Number(x) * MIB })}
+          error={sizeField.error}
         >
-          <InputNumber
+          <Input
             aria-label="Maximum object size (MiB)"
-            value={mb}
-            onChange={(v) => setValue({ ...value, max_object_size: v != null ? v * MIB : undefined })}
-            min={1}
+            {...sizeField.inputProps}
             placeholder="100"
             style={{ width: 180, ...inputRadius }}
             suffix="MiB"
@@ -509,11 +515,12 @@ export function LimitsPanel({ onSessionExpired }: PanelProps) {
   const cardStyle = useStackCardStyle();
   // Read-only env-var view of the running config (cached react-query read).
   // A 401 surfaces as `queryError`; useAdminConfig routes it to onSessionExpired.
-  const { data: config, error: queryError, isError } = useAdminConfig({ onSessionExpired });
+  const { data: config, error: queryError, isError, refetch } = useAdminConfig({ onSessionExpired });
 
   const gate = loadGate({
     loading: !config,
-    error: isError ? normalizeUiError(queryError, 'Failed to load') : null,
+    loadError: isError ? queryError : null,
+    refresh: async () => void (await refetch()),
   });
   if (gate || !config) return gate;
 
@@ -790,7 +797,7 @@ function SyncStatusPill({
         display: 'inline-flex',
         alignItems: 'center',
         gap: 8,
-        padding: '6px 12px',
+        padding: '4px 12px',
         background: bg,
         border: `1px solid ${border}`,
         borderRadius: 999,

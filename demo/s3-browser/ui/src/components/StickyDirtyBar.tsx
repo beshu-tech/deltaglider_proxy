@@ -111,8 +111,8 @@ export default function StickyDirtyBar({
           // Wrap so the message + Discard/Apply don't overflow a phone width.
           flexWrap: 'wrap',
           rowGap: 8,
-          gap: 14,
-          padding: '8px 12px 8px 14px',
+          gap: 12,
+          padding: '8px 12px 8px 12px',
           borderRadius: 12,
           background: c.BG_ELEVATED,
           border: `1px solid ${hasErrors ? c.ACCENT_RED : c.BORDER}`,

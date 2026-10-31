@@ -21,7 +21,7 @@ afterEach(() => vi.unstubAllGlobals());
 test('an empty name is marked on the field and nothing is sent', async () => {
   const user = userEvent.setup();
   renderWithQuery(<GroupsPanel />);
-  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.click(await screen.findByTestId('md-new-groups'));
   await user.click(screen.getByRole('button', { name: 'Create group' }));
   expect(await screen.findByRole('alert')).toHaveTextContent('Enter a name.');
   expect(screen.getByRole('textbox', { name: 'Name' })).toHaveAttribute('aria-invalid', 'true');
@@ -38,7 +38,7 @@ test('with no groups the page shows one empty state, not two', async () => {
 test('a name with spaces is refused on the field with the user-name rule', async () => {
   const user = userEvent.setup();
   renderWithQuery(<GroupsPanel />);
-  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.click(await screen.findByTestId('md-new-groups'));
   await user.type(screen.getByRole('textbox', { name: 'Name' }), 'qa group with spaces!');
   await user.click(screen.getByRole('button', { name: 'Create group' }));
   expect(await screen.findByRole('alert')).toHaveTextContent('Remove the spaces. Use letters, digits and + = , . @ _ - only.');
@@ -49,9 +49,19 @@ test('the server name refusal shows on the field', async () => {
   http.on('POST', '/_/api/admin/groups', json({ error: 'invalid_request', message: 'group name cannot start with \'$\'' }, 400));
   const user = userEvent.setup();
   renderWithQuery(<GroupsPanel />);
-  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.click(await screen.findByTestId('md-new-groups'));
   await user.type(screen.getByRole('textbox', { name: 'Name' }), 'developers');
   await user.click(screen.getByRole('button', { name: 'Create group' }));
   expect(await screen.findByRole('alert')).toHaveTextContent("Group name cannot start with '$'.");
   expect(screen.getByRole('textbox', { name: 'Name' })).toHaveAttribute('aria-invalid', 'true');
+});
+
+test('a bad group name shows its error on blur, like a user name (UX harvest D46)', async () => {
+  const user = userEvent.setup();
+  renderWithQuery(<GroupsPanel />);
+  await user.click(await screen.findByTestId('md-new-groups'));
+  await user.type(screen.getByTestId('group-name'), 'qa group with spaces!');
+  await user.tab();
+  expect(screen.getByTestId('group-name')).toHaveAttribute('aria-invalid', 'true');
+  expect(screen.getByText(/Remove the spaces/)).toBeInTheDocument();
 });

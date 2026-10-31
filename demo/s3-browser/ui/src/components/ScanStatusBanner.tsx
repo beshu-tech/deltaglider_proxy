@@ -62,7 +62,7 @@ export default function ScanStatusBanner({
         display: 'flex',
         alignItems: 'center',
         gap: 12,
-        padding: '10px 14px',
+        padding: '12px 16px',
         marginBottom: 12,
         background: colors.BG_CARD,
         border: `1px solid ${colors.BORDER}`,
@@ -87,7 +87,7 @@ export default function ScanStatusBanner({
           </>
         ) : cachedCount === 0 ? (
           <span>
-            No scans yet. Click <strong>{scanCallToAction(unscannedCount, bucketCount)}</strong>. The results are kept on disk and survive a restart.
+            No bucket is scanned. Click <strong>{scanCallToAction(unscannedCount, bucketCount)}</strong>. The results are kept on disk and survive a restart.
           </span>
         ) : (
           <>
@@ -129,7 +129,7 @@ export default function ScanStatusBanner({
           redoes buckets whose numbers are known), and "Re-scan all" only
           once a scan exists.
         */
-        <div style={{ display: 'flex', gap: 6 }}>
+        <div style={{ display: 'flex', gap: 8 }}>
           {unscannedCount > 0 && (
             <Button
               size="small"

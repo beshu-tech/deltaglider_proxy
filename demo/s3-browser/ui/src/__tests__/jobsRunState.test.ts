@@ -174,7 +174,7 @@ test('oneOffDefinition: parameters, counts, bytes, duration', () => {
   assert.equal(d['To backend'], 'aws-dr');
   assert.equal(d['Source copy'], 'kept after the switch');
   assert.equal(d['Objects'], '4,000 copied · 0 already on the target · 0 failed');
-  assert.equal(d['Data'], '2.0 MB');
+  assert.equal(d['Data'], '2.0 MiB');
   assert.equal(d['Took'], '1m');
   assert.equal(d['Phase'], undefined, 'a finished job shows no raw phase');
 

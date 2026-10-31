@@ -49,6 +49,9 @@ import ScanStatusBanner from './ScanStatusBanner';
 import { isScanStale } from './scanFreshness';
 import { SORT_LABELS, type TopBucketsSortKey } from './topBucketsSort';
 import { readStorage, writeStorage } from '../safeStorage';
+import TruncatedName from './TruncatedName';
+import { SPACE } from './shared-styles';
+import { ErrorState } from './StatePlaceholders';
 
 /** Row shape consumed by chart + table. Derived from cache + live progress. */
 export interface BucketRow {
@@ -339,6 +342,12 @@ export default function AnalyticsSection({ config }: Props) {
     .filter(Boolean)
     .join(' · ');
 
+  // Without the bucket list every figure below is a placeholder: ONE error
+  // for the page, never "No buckets yet" or a hero of zeros (D17).
+  if (bucketsQuery.isError && bucketsQuery.data === undefined) {
+    return <ErrorState error={bucketsQuery.error} what="the buckets" onRetry={() => bucketsQuery.refetch()} />;
+  }
+
   return (
     <>
       {/* The banner survives only as a live-scan strip — static scan
@@ -482,7 +491,7 @@ export default function AnalyticsSection({ config }: Props) {
             accent={opportunities.length > 0 ? 'amber' : undefined}
           >
             {opportunities.length > 0 ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE.sm }}>
                 <div
                   style={{
                     fontSize: 22,
@@ -494,7 +503,7 @@ export default function AnalyticsSection({ config }: Props) {
                   }}
                 >
                   est. +${opportunityDollars.toFixed(2)}/mo
-                  <span style={{ fontSize: 13, fontWeight: 500, color: colors.TEXT_MUTED, marginLeft: 8 }}>
+                  <span style={{ fontSize: 13, fontWeight: 500, color: colors.TEXT_MUTED, marginLeft: SPACE.xs }}>
                     if these buckets compressed at the fleet ratio
                   </span>
                 </div>
@@ -504,16 +513,16 @@ export default function AnalyticsSection({ config }: Props) {
                     style={{
                       display: 'flex',
                       justifyContent: 'space-between',
-                      gap: 12,
+                      gap: SPACE.sm,
                       fontFamily: 'var(--font-mono)',
                       fontSize: 12,
                       color: colors.TEXT_PRIMARY,
                       borderTop: `1px solid ${colors.BORDER}`,
-                      paddingTop: 8,
+                      paddingTop: SPACE.xs,
                     }}
                   >
-                    <span>{b.bucket}</span>
-                    <span style={{ color: colors.TEXT_MUTED }}>
+                    <TruncatedName text={b.bucket} />
+                    <span style={{ color: colors.TEXT_MUTED, flexShrink: 0 }}>
                       {formatBytes(b.totalOriginal)} · est. +$
                       {monthlyCost(b.totalOriginal * fleetRatio, costRate).toFixed(2)}/mo
                     </span>
@@ -530,11 +539,11 @@ export default function AnalyticsSection({ config }: Props) {
                   display: 'flex',
                   flexDirection: 'column',
                   justifyContent: 'center',
-                  gap: 8,
+                  gap: SPACE.xs,
                   fontFamily: 'var(--font-ui)',
                 }}
               >
-                <div style={{ fontSize: 16, fontWeight: 700, color: colors.SAVED_TEXT }}>
+                <div style={{ fontSize: 16, fontWeight: 700, color: colors.ACCENT_GREEN }}>
                   Nothing left on the table
                 </div>
                 <div style={{ fontSize: 12, color: colors.TEXT_MUTED, maxWidth: 480, lineHeight: 1.5 }}>
@@ -597,7 +606,7 @@ function CoverageStrip({
     { label: 'not scanned', count: unscannedCount, color: colors.TEXT_FAINT },
   ];
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 14, fontFamily: 'var(--font-ui)' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE.md, fontFamily: 'var(--font-ui)' }}>
       <div
         style={{
           display: 'flex',
@@ -619,11 +628,11 @@ function CoverageStrip({
             ),
         )}
       </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE.xs }}>
         {rows.map(r => (
           <div
             key={r.label}
-            style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: colors.TEXT_SECONDARY }}
+            style={{ display: 'flex', alignItems: 'center', gap: SPACE.xs, fontSize: 12, color: colors.TEXT_SECONDARY }}
           >
             <span
               style={{ width: 8, height: 8, borderRadius: 2, background: r.color, opacity: r.label === 'not scanned' ? 0.45 : 0.85 }}
@@ -644,7 +653,7 @@ function CoverageStrip({
             )}
           </>
         ) : (
-          'No scans yet'
+          'No bucket is scanned'
         )}
       </div>
     </div>

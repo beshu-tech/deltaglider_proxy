@@ -23,7 +23,8 @@ import { useQueryClient } from '@tanstack/react-query';
 import { createMigrateJob } from '../adminApi';
 import { qk } from '../queries/keys';
 import { useBackends, useBucketOrigins } from '../queries/backends';
-import { ApiError, normalizeUiError } from '../errorHandling';
+import { ApiError } from '../errorHandling';
+import { plainError } from '../plainError';
 import {
   MIRROR_OPTION_LABEL,
   encryptionWord,
@@ -111,7 +112,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
       if (e instanceof ApiError && e.status >= 400 && e.status < 500 && e.detail) {
         setStartError(migrateErrorInModalWords(e.detail));
       } else {
-        messageApi.error(normalizeUiError(e, 'Failed to start migration'));
+        messageApi.error(plainError(e, 'Could not start the migration').text);
       }
     } finally {
       setStarting(false);
@@ -150,7 +151,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
       />
       {bucket === null && (
         <div style={{ marginBottom: 12 }}>
-          <Text id="migrate-bucket-label" strong style={{ fontSize: 13, display: 'block', marginBottom: 6 }}>
+          <Text id="migrate-bucket-label" strong style={{ fontSize: 13, display: 'block', marginBottom: 4 }}>
             Bucket
           </Text>
           <Select
@@ -172,11 +173,11 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
         </div>
       )}
       <div style={{ marginBottom: 12 }}>
-        <Text id="migrate-target-label" strong style={{ fontSize: 13, display: 'block', marginBottom: 6 }}>
+        <Text id="migrate-target-label" strong style={{ fontSize: 13, display: 'block', marginBottom: 4 }}>
           Target backend
         </Text>
         {source && (
-          <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 6 }}>
+          <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
             Now on <Text code>{source.name}</Text> ({describeBucketEncryption(sourceEnc).label}).
             {sourceEnc?.source === 'bucket' ? ' The bucket\'s own encryption moves with it.' : ''}
           </Text>
@@ -226,7 +227,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
           title={`Objects will be stored unencrypted at rest on ${targetInfo.name}`}
           description={
             <div style={{ fontSize: 12 }}>
-              <div style={{ marginBottom: 6 }}>
+              <div style={{ marginBottom: 4 }}>
                 The bucket is encrypted at rest now ({describeBucketEncryption(sourceEnc).label}).
                 It takes its encryption from its backend, and the target backend{' '}
                 <Text code>{targetInfo.name}</Text> does not encrypt, so every copied object is

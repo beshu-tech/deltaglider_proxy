@@ -22,6 +22,7 @@ vi.mock('../s3client', () => ({
 }));
 
 import InspectorPanel from '../components/InspectorPanel';
+import { installDialogTabWrap } from '../dialogTabWrap';
 
 const OBJ: S3Object = { key: 'docs/README.txt', size: 5, lastModified: '2026-01-01T00:00:00Z' } as S3Object;
 
@@ -78,7 +79,10 @@ test('the second click of a double-click keeps the drawer open for an object wit
 
 // UX harvest C11: Tab from the last control stopped once on <body> before
 // the focus lock pulled it back. Tab now wraps inside the drawer.
+// The app-wide dialogTabWrap (ThemeProvider installs it) covers the drawer:
+// it shows its mask, so it traps focus.
 test('Tab from the last control goes to the first one, Shift+Tab back', async () => {
+  const uninstall = installDialogTabWrap();
   setup();
   const close = await screen.findByRole('button', { name: 'Close inspector' });
   const del = screen.getByRole('button', { name: /Delete object/ });
@@ -87,4 +91,19 @@ test('Tab from the last control goes to the first one, Shift+Tab back', async ()
   expect(document.activeElement).toBe(close);
   fireEvent.keyDown(close, { key: 'Tab', shiftKey: true });
   expect(document.activeElement).toBe(del);
+  uninstall();
+});
+
+// UX harvest D1: the share link sat in a fixed-height box that cut its last
+// line in half with no scrollbar. It now wraps at any character in a box
+// that scrolls (with a visible scrollbar) past its height.
+test('the share link box wraps the whole URL and scrolls', async () => {
+  setup();
+  fireEvent.click(await screen.findByRole('button', { name: /share|copy link/i }));
+  const options = await screen.findAllByRole('menuitem').catch(() => []);
+  if (options.length > 0) fireEvent.click(options[options.length - 1]);
+  const box = await screen.findByRole('textbox', { name: 'Share URL' });
+  expect(box).toHaveTextContent('http://example/presigned');
+  expect(box).toHaveStyle({ overflowY: 'auto', overflowWrap: 'anywhere' });
+  expect(box).toHaveAttribute('tabindex', '0');
 });

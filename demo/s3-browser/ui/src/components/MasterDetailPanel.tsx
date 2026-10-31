@@ -1,9 +1,10 @@
 import { CONTENT_WIDE } from './shared-styles';
 import type { ReactNode } from 'react';
-import { Button, Typography, Alert, Input } from 'antd';
+import { Button, Typography, Input } from 'antd';
 import { PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
-import { LoadingState } from './StatePlaceholders';
+import { ErrorState, LoadingState } from './StatePlaceholders';
+import PageActions from './PageActions';
 import './MasterDetailPanel.css';
 import { activateOnKey } from '../keyboard';
 
@@ -58,7 +59,10 @@ interface MasterDetailPanelProps<T> {
   onSearchChange: (value: string) => void;
 
   loading: boolean;
-  error: string;
+  /** The load failure (any error value): ONE ErrorState in the list,
+   *  with Retry when `onRetry` is given. */
+  error: unknown;
+  onRetry?: () => unknown;
   /**
    * Rendered in the list area when there are zero items and not loading/error.
    * Leave it out when the detail pane already shows the empty state, so the
@@ -88,6 +92,7 @@ export default function MasterDetailPanel<T>({
   onSearchChange,
   loading,
   error,
+  onRetry,
   listEmptyState,
   detail,
 }: MasterDetailPanelProps<T>) {
@@ -129,21 +134,22 @@ export default function MasterDetailPanel<T>({
           }}
         >
           <div style={{ padding: '16px 16px 12px', borderBottom: `1px solid ${colors.BORDER}` }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <div style={{ marginBottom: 8 }}>
               <Text strong style={{ fontSize: 14 }}>{title}</Text>
-              {!readOnly && (
+            </div>
+            {/* The page's primary action goes in the page header (PageActions). */}
+            {!readOnly && (
+              <PageActions>
                 <Button
                   data-testid={`md-new-${title.toLowerCase().replace(/\s+/g, '-')}`}
-                  aria-label={`New ${(title.replace(/s$/, '') || title).toLowerCase()}`}
                   type="primary"
-                  size="small"
                   icon={<PlusOutlined />}
                   onClick={onCreate}
                 >
-                  New
+                  New {(title.replace(/s$/, '') || title).toLowerCase()}
                 </Button>
-              )}
-            </div>
+              </PageActions>
+            )}
             <Input
               aria-label={searchPlaceholder || 'Search'}
               prefix={<SearchOutlined style={{ color: colors.TEXT_MUTED }} />}
@@ -157,9 +163,14 @@ export default function MasterDetailPanel<T>({
           </div>
 
           <div style={{ flex: 1, overflow: 'auto', padding: '4px 0' }}>
-            {loading && items.length === 0 && <LoadingState />}
-            {error && (
-              <Alert type="error" title={error} showIcon style={{ margin: 8, borderRadius: 8 }} />
+            {/* Exactly one of loading / error / empty (UX harvest D16, D17). */}
+            {loading && items.length === 0 && (
+              <div style={{ padding: '0 16px' }}>
+                <LoadingState variant="list" rows={4} label={`Loading ${title.toLowerCase()}`} />
+              </div>
+            )}
+            {!loading && Boolean(error) && items.length === 0 && (
+              <ErrorState compact error={error} what={`the ${title.toLowerCase()}`} onRetry={onRetry} />
             )}
             {!loading && items.length === 0 && !error && listEmptyState}
             {items.map(item => {

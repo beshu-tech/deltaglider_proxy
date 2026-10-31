@@ -36,6 +36,8 @@ import {
   ReloadOutlined,
   ClockCircleOutlined,
 } from '@ant-design/icons';
+import TruncatedName from './TruncatedName';
+import { SPACE } from './shared-styles';
 import { useColors } from '../ThemeContext';
 import { formatBytes, relativeTime } from '../utils';
 import { summarizeScopeSavings } from '../savings';
@@ -43,7 +45,7 @@ import { fmtNum } from './dashboard/chartDefaults';
 import type { BucketScanResult } from '../adminApi';
 import { useBucketScans, useInvalidateBucketScans, useScannableBuckets } from '../queries/bucketScans';
 import { useBucketScanQueue } from '../hooks/useBucketScanQueue';
-import { SkeletonState } from './StatePlaceholders';
+import { EmptyState, SkeletonState } from './StatePlaceholders';
 
 interface Props {
   /**
@@ -180,7 +182,6 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
       onRenderActions(
         <Button
           size="small"
-          type={Object.keys(scans).length === 0 ? 'primary' : 'default'}
           icon={
             Object.keys(scans).length === 0 ? (
               <PlayCircleOutlined />
@@ -217,18 +218,21 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
     // The truthful counters are right next to it.
     return (
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+        {/* Sentence case: an uppercase transform changed the bucket name (D67). */}
         <div
           style={{
-            fontSize: 11,
-            fontWeight: 700,
-            letterSpacing: '0.06em',
-            textTransform: 'uppercase',
+            display: 'flex',
+            gap: SPACE.xxs,
+            minWidth: 0,
+            fontSize: 12,
+            fontWeight: 600,
             color: colors.TEXT_MUTED,
-            marginBottom: 4,
+            marginBottom: SPACE.xxs,
           }}
         >
-          Scanning {headBucket}
-          {queuedRemaining > 0 ? ` (${queuedRemaining} queued)` : ''}
+          <span style={{ flexShrink: 0 }}>Scanning</span>
+          <TruncatedName text={headBucket} style={{ fontFamily: 'var(--font-mono)' }} />
+          {queuedRemaining > 0 && <span style={{ flexShrink: 0 }}>({queuedRemaining} queued)</span>}
         </div>
         <div
           style={{
@@ -247,8 +251,8 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
           style={{
             fontSize: 12,
             color: colors.TEXT_SECONDARY,
-            marginTop: 4,
-            marginBottom: 10,
+            marginTop: SPACE.xxs,
+            marginBottom: SPACE.sm,
           }}
         >
           {formatBytes(liveProgress.original_bytes)} so far ·{' '}
@@ -338,10 +342,10 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
             stale numbers without realising it. */}
         <div
           style={{
-            marginTop: 10,
+            marginTop: SPACE.sm,
             display: 'flex',
             alignItems: 'center',
-            gap: 6,
+            gap: SPACE.xs,
             fontSize: 11,
             color: colors.TEXT_MUTED,
           }}
@@ -390,34 +394,14 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
     );
   }
 
-  // 3. Idle state — nothing scanned yet. Big honest CTA.
+  // 3. Idle state — nothing scanned yet. The card header holds the
+  // "Run full scan" action (a secondary: the dashboard has no page primary).
   return (
-    <div
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        justifyContent: 'center',
-        alignItems: 'flex-start',
-        gap: 10,
-        height: '100%',
-      }}
-    >
-      <div
-        style={{
-          fontSize: 14,
-          color: colors.TEXT_SECONDARY,
-          lineHeight: 1.5,
-        }}
-      >
-        No scans yet.
-        <br />
-        Click <strong>Run full scan</strong> to walk every bucket and
-        compute honest totals. Safe to run in the background — results
-        persist across restarts.
-      </div>
-      <div style={{ fontSize: 11, color: colors.TEXT_MUTED }}>
-        {allBuckets.length} bucket{allBuckets.length === 1 ? '' : 's'} ready to scan
-      </div>
-    </div>
+    <EmptyState
+      compact
+      icon={<ClockCircleOutlined />}
+      title="No scans yet"
+      hint={`Click Run full scan to walk ${allBuckets.length === 1 ? 'the bucket' : `all ${allBuckets.length} buckets`} and compute exact totals. The scan runs in the background, and the results survive a restart.`}
+    />
   );
 }

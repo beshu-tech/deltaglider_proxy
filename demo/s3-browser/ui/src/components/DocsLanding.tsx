@@ -3,6 +3,7 @@ import { themedShotSrc } from '../docsMarkdown';
 import type { DocsBundle, DocGroup } from '../docsBundle';
 import Lightbox from './Lightbox';
 import { useIsNarrow } from '../useIsNarrow';
+import { SPACE } from './shared-styles';
 
 interface Props {
   bundle: DocsBundle;
@@ -44,7 +45,7 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
     background: colors.BG_CARD,
     border: `1px solid ${colors.BORDER}`,
     borderRadius: 10,
-    padding: 20,
+    padding: SPACE.lg,
     transition: 'border-color 0.15s, box-shadow 0.15s',
   };
 
@@ -60,7 +61,7 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
   return (
     <div style={{ maxWidth: 1000, margin: '0 auto' }}>
       {/* Hero */}
-      <div style={{ textAlign: 'center', padding: '40px 0 32px' }}>
+      <div style={{ textAlign: 'center', padding: `${SPACE.xl}px 0` }}>
         <div style={{
           fontSize: 36,
           fontWeight: 800,
@@ -98,7 +99,7 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
       {/* Hero screenshots */}
       <div
         className="responsive-grid-2"
-        style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 40 }}
+        style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: SPACE.md, marginBottom: SPACE.xl }}
       >
         <Lightbox caption="The object browser: each firmware build is stored as a delta.">
           <img
@@ -119,17 +120,15 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
       {/* 5-group task-oriented cards, in journey order */}
       <div
         className="responsive-grid-2"
-        style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 40 }}
+        style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: SPACE.md, marginBottom: SPACE.xl }}
       >
         {Array.from(grouped.entries()).map(([group, docs]) => (
           <div key={group} style={{ ...card, cursor: 'default' }}>
             <div style={{
-              fontSize: 10,
-              fontWeight: 700,
-              textTransform: 'uppercase',
-              letterSpacing: 1.5,
+              fontSize: 12,
+              fontWeight: 600,
               color: colors.ACCENT_BLUE,
-              fontFamily: 'var(--font-mono)',
+              fontFamily: 'var(--font-ui)',
               marginBottom: 4,
             }}>
               {group}
@@ -149,7 +148,7 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
                 key={d.id}
                 onClick={() => onSelectDoc(d.id)}
                 style={{
-                  padding: '6px 0',
+                  padding: `${SPACE.xxs}px 0`,
                   fontSize: 13,
                   color: colors.TEXT_SECONDARY,
                   fontFamily: 'var(--font-ui)',

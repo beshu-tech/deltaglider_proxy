@@ -1,5 +1,7 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
+import { Input, type InputProps } from 'antd';
 import { useColors } from '../ThemeContext';
+import { parseTypedInteger } from './jobs/ruleFieldErrors';
 
 /**
  * Shared React primitives for the storage sub-panels (Lifecycle / Replication /
@@ -61,5 +63,37 @@ export function AdvancedDisclosure({
         {children}
       </div>
     </details>
+  );
+}
+
+/**
+ * A whole-number field of a rule: a text input that stores what was typed
+ * (see `parseTypedInteger`), so "-3" stays "-3" with an error under it
+ * instead of turning into 1. The text stays as typed until the value
+ * changes from outside (Discard, a clone).
+ */
+export function RuleNumberInput({
+  value,
+  onChange,
+  ...rest
+}: Omit<InputProps, 'value' | 'onChange'> & {
+  value: number | null | undefined;
+  onChange: (value: number | undefined) => void;
+}) {
+  const [draft, setDraft] = useState<{ text: string; base: number | undefined } | null>(null);
+  const stored = value ?? undefined;
+  const text =
+    draft && Object.is(draft.base, stored) ? draft.text : stored === undefined || Number.isNaN(stored) ? '' : String(stored);
+  return (
+    <Input
+      {...rest}
+      inputMode="numeric"
+      value={text}
+      onChange={(e) => {
+        const next = parseTypedInteger(e.target.value);
+        setDraft({ text: e.target.value, base: next });
+        onChange(next);
+      }}
+    />
   );
 }

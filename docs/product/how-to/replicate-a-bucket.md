@@ -22,9 +22,9 @@ In the admin UI:
 
    ![The Definition tab of the releases-to-dr replication rule; callout 3 marks Rule name, callout 4 marks Enabled, callout 5 marks Source, set to releases, and callout 6 marks Destination, set to releases-dr.](/_/screenshots/replicate-rule-fields.webp)
 
-7. In **Which objects**, leave **Exclude** at `.deltaglider/**`. Then click **Advanced rule behavior**. In **Interval**, type `1h`. Leave **Conflict policy** at **Newer wins — safest default**, and leave **Delete replication** off. Sections 3 to 5 explain these choices.
+7. In **Which objects**, leave **Exclude** at `.deltaglider/**`. In **Interval**, type `1h`, and leave **Delete replication** off. Then click **Advanced**, which holds the conflict policy and the batch size. Leave **Conflict policy** at **Newer wins — safest default**. Sections 3 to 5 explain these choices.
 
-   ![The Advanced rule behavior part of the releases-to-dr rule is open; the box marks the Conflict policy choices, and the arrow points at the Delete replication switch.](/_/screenshots/replicate-rule-advanced.webp)
+   ![The Advanced part of the releases-to-dr rule is open; one box marks Batch size, and the other box marks the Conflict policy choices.](/_/screenshots/replicate-rule-advanced.webp)
 
 8. Click **Review & apply** in the bar at the bottom of the page. The dialog lists each changed field and a **Replication plan** with every rule. Check it, and then click **Apply and Persist**.
 

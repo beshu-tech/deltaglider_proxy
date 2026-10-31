@@ -1,7 +1,8 @@
 /**
  * In `iam_mode: declarative` the YAML config owns IAM, and the server refuses
- * `declarative-iam-apply` (403 iam_declarative). The account menu's
- * "Import full IAM (YAML)" is then disabled, with a title that says why.
+ * `declarative-iam-apply` (403 iam_declarative). The System page's
+ * "Import full IAM (YAML)" is then disabled, and a line says why (D72: the
+ * import and export moved from the account menu to the System page).
  */
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -22,32 +23,40 @@ function setup(iamMode: 'gui' | 'declarative') {
   }));
   http.on('GET', '/_/api/admin/session', json({ valid: true, admin_gui: true }));
   http.on('GET', '/_/api/admin/config', json({ iam_mode: iamMode, env_overrides: [] }));
+  http.on('GET', '/_/api/admin/config/section/advanced', json({}));
 }
 
-async function openMenu() {
+function mount() {
   renderWithQuery(
     <AdminPage
       onBack={() => {}}
       onShowShortcuts={() => {}}
-      subPath="dashboard"
+      subPath="system"
       canAdmin
-      accountMenu={<AccountMenu identityLabel="dana" canAdmin />}
+      accountMenu={<AccountMenu identityLabel="dana" />}
     />,
   );
-  const user = userEvent.setup();
-  await user.click(await screen.findByRole('button', { name: /dana/ }));
-  return screen.findByRole('menuitem', { name: /Import full IAM \(YAML\)/ });
+  return screen.findByRole('button', { name: /Import full IAM \(YAML\)/ });
 }
 
 test('declarative mode disables "Import full IAM (YAML)" and says why', async () => {
   setup('declarative');
-  const item = await openMenu();
-  await waitFor(() => expect(item).toBeDisabled());
-  expect(item).toHaveAttribute('title', expect.stringMatching(/declarative.*edit the YAML config/i));
+  const button = await mount();
+  await waitFor(() => expect(button).toBeDisabled());
+  expect(screen.getByTestId('iam-import-blocked')).toHaveTextContent(/declarative.*edit the YAML config/i);
 });
 
 test('gui mode keeps "Import full IAM (YAML)" enabled', async () => {
   setup('gui');
-  const item = await openMenu();
-  expect(item).toBeEnabled();
+  const button = await mount();
+  expect(button).toBeEnabled();
+  expect(screen.queryByTestId('iam-import-blocked')).toBeNull();
+});
+
+test('the account menu holds no import or export', async () => {
+  setup('gui');
+  await mount();
+  await userEvent.setup().click(screen.getByRole('button', { name: /Account menu: dana/ }));
+  await screen.findByRole('menu', { name: 'Account' });
+  expect(screen.queryByRole('menuitem', { name: /YAML|IAM/ })).toBeNull();
 });

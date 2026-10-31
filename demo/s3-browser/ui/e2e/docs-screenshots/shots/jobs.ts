@@ -249,15 +249,15 @@ export const JOBS_SHOTS: Shot[] = [
   {
     id: 'replicate-rule-advanced',
     route: `${REPLICATION}?job=replication:releases-to-dr&tab=definition`,
-    alt: 'The Advanced rule behavior part of the releases-to-dr rule is open; the box marks the Conflict policy choices, and the arrow points at the Delete replication switch.',
+    alt: 'The Advanced part of the releases-to-dr rule is open; one box marks Batch size, and the other box marks the Conflict policy choices.',
     setup: async (page) => {
-      await inDrawer(page).getByText('Advanced rule behavior').click();
+      await inDrawer(page).locator('summary', { hasText: /^Advanced/ }).click();
       await inDrawer(page).getByText('Newer wins — safest default').scrollIntoViewIfNeeded();
       await calm(page);
     },
     annotations: [
-      { target: { union: [{ text: 'Conflict policy', exact: true, within: drawer }, { text: /^Content diff/, within: drawer }, { text: 'Skip existing destination objects', within: drawer }] }, kind: 'box' },
-      { target: { role: 'switch', within: { css: '.dg-field:has(:text-is("Delete replication"))' } }, kind: 'arrow', side: 'right' },
+      { target: { union: [{ text: 'Batch size', exact: true, within: drawer }, { text: /^Objects per listing page/, within: drawer }] }, kind: 'box' },
+      { target: { union: [{ text: 'Conflict policy', exact: true, within: drawer }, { text: 'Skip existing destination objects', within: drawer }, { text: /^What the rule does when/, within: drawer }] }, kind: 'box' },
     ],
   },
   {
@@ -267,7 +267,6 @@ export const JOBS_SHOTS: Shot[] = [
     route: `${REPLICATION}?job=replication:releases-to-dr&tab=definition`,
     alt: 'The review dialog lists the changed fields of the releases-to-dr rule and the Replication plan; the arrow points at Apply and Persist.',
     setup: async (page) => {
-      await inDrawer(page).getByText('Advanced rule behavior').click();
       // The rule exists in the seed, so the diff shows the one field that the how-to sets differently.
       await inDrawer(page).locator('.dg-field:has(:text-is("Interval")) input').fill('1h');
       await page.getByRole('button', { name: 'Review & apply' }).dispatchEvent('click');

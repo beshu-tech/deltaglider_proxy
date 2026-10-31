@@ -53,10 +53,12 @@ test('an empty ring reads as zero lines', async () => {
   expect(await screen.findByText('0 lines')).toBeInTheDocument();
 });
 
-test('a backlog failure is shown', async () => {
+test('a backlog failure is ONE error state with the plain sentence', async () => {
   http.on('GET', LOGS, json({ error: 'log ring disabled' }, 500));
   renderWithQuery(<LogsPanel />);
-  expect(await screen.findByText(/log ring disabled/)).toBeInTheDocument();
+  const alert = await screen.findByRole('alert');
+  expect(alert).toHaveTextContent('Could not load the logs');
+  expect(alert).toHaveTextContent('Log ring disabled.');
 });
 
 test('an expired session sends the user to sign in', async () => {
@@ -72,13 +74,13 @@ test('tail lines prepend; a refetched backlog replaces them', async () => {
   const user = userEvent.setup();
   renderWithQuery(<LogsPanel />);
   await screen.findByText('1 line');
-  await user.click(screen.getByRole('switch'));
+  await user.click(screen.getByRole('switch', { name: 'Follow' }));
   await waitFor(() => expect(tail.push).not.toBeNull());
   act(() => tail.push!(line('live')));
   expect(screen.getByText('2 lines')).toBeInTheDocument();
 
   backlog = [line('b'), line('live'), line('a')];
-  await user.click(screen.getByRole('switch'));
+  await user.click(screen.getByRole('switch', { name: 'Follow' }));
   await user.click(screen.getByRole('button', { name: /Refresh/ }));
   // 3, not 4: the tail line is in the new backlog.
   expect(await screen.findByText('3 lines')).toBeInTheDocument();

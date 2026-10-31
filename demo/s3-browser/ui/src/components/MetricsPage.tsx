@@ -11,18 +11,18 @@
  *   - /_/stats fetched every 60s (expensive scan)
  *   - /_/api/admin/config fetched once on mount
  *
- * The Prometheus parser, histogram helpers, and Snapshot ring all
- * stayed byte-for-byte identical — the rewrite is JSX-only. See
- * dashboard/README or the design notes in dashboard/Panel.tsx for
- * the grid semantics.
+ * The Prometheus parser and histogram helpers live in
+ * dashboard/prometheus.ts (pure, unit-tested). Chart colours come from
+ * `chartPalette` (theme tokens). See dashboard/Panel.tsx for the grid
+ * semantics.
  */
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { Typography, Progress } from 'antd';
+import { Progress } from 'antd';
 import { useColors } from '../ThemeContext';
 import { cacheEntrySubtitle, formatBytes, noun } from '../utils';
 import { usePrometheusMetrics } from '../queries/metrics';
-import { LoadingState } from './StatePlaceholders';
-import { CONTENT_WIDE, contentColumn } from './shared-styles';
+import { ErrorState, LoadingState } from './StatePlaceholders';
+import { CONTENT_WIDE, SPACE, contentColumn } from './shared-styles';
 import { cacheMissSeverity, serverErrorSeverity } from '../statusTone';
 import AnalyticsSection from './AnalyticsSection';
 import BucketScanCard from './BucketScanCard';
@@ -35,106 +35,12 @@ import DashboardGrid from './dashboard/DashboardGrid';
 import Panel from './dashboard/Panel';
 import StatValue from './dashboard/StatValue';
 import DashboardToolbar, { type RefreshCadence } from './dashboard/DashboardToolbar';
-import { CHART_PALETTE, STATUS_COLORS, chartTooltipStyle, axisTickStyle, fmtDuration, fmtNum, fmtPct } from './dashboard/chartDefaults';
+import { chartPalette, statusColors, chartTooltipStyle, axisTickStyle, fmtDuration, fmtNum, fmtPct } from './dashboard/chartDefaults';
+import { fmtLatencyBound, fmtRatioBound, histStats, histogramBars, nonZeroByLabel, parsePrometheus, val, type ParsedMetric } from './dashboard/prometheus';
 import './dashboard/dashboard.css';
-import { normalizeUiError } from '../errorHandling';
 import { useNavigation } from '../NavigationContext';
 import { parseAdminQuery, buildViewUrl } from '../urlState';
 
-const { Text } = Typography;
-
-/* ═══════════════════════════════════════════════════════════
-   Prometheus parser
-   ═══════════════════════════════════════════════════════════ */
-
-interface ParsedMetric {
-  name: string;
-  help: string;
-  type: string;
-  samples: { labels: Record<string, string>; value: number }[];
-}
-
-function parsePrometheus(text: string): Map<string, ParsedMetric> {
-  const metrics = new Map<string, ParsedMetric>();
-  let current: ParsedMetric | null = null;
-  const finalize = () => { if (current && current.samples.length > 0) metrics.set(current.name, current); current = null; };
-  for (const line of text.split('\n')) {
-    if (line.startsWith('# HELP ')) {
-      finalize();
-      const rest = line.slice(7), sp = rest.indexOf(' ');
-      current = { name: rest.slice(0, sp), help: rest.slice(sp + 1), type: 'untyped', samples: [] };
-    } else if (line.startsWith('# TYPE ')) {
-      const rest = line.slice(7), sp = rest.indexOf(' ');
-      if (current) current.type = rest.slice(sp + 1);
-    } else if (line && !line.startsWith('#')) {
-      const braceIdx = line.indexOf('{');
-      let name: string, valueStr: string;
-      const labels: Record<string, string> = {};
-      if (braceIdx >= 0) {
-        name = line.slice(0, braceIdx);
-        const closeIdx = line.indexOf('}', braceIdx);
-        for (const m of line.slice(braceIdx + 1, closeIdx).matchAll(/(\w+)="([^"]*)"/g)) labels[m[1]] = m[2];
-        valueStr = line.slice(closeIdx + 2);
-      } else { const sp = line.indexOf(' '); name = line.slice(0, sp); valueStr = line.slice(sp + 1); }
-      const value = parseFloat(valueStr);
-      if (current && (name === current.name || name.startsWith(current.name + '_'))) {
-        current.samples.push({ labels, value });
-      } else {
-        const existing = metrics.get(name);
-        if (existing) existing.samples.push({ labels, value });
-        else metrics.set(name, { name, help: '', type: 'untyped', samples: [{ labels, value }] });
-      }
-    }
-  }
-  finalize();
-  return metrics;
-}
-
-/* ═══════════════════════════════════════════════════════════
-   Metric access helpers
-   ═══════════════════════════════════════════════════════════ */
-
-function val(m: Map<string, ParsedMetric>, name: string): number {
-  const metric = m.get(name);
-  if (!metric?.samples.length) return 0;
-  const simple = metric.samples.find(s => Object.keys(s.labels).length === 0);
-  return simple?.value ?? metric.samples[0].value;
-}
-
-function histStats(m: Map<string, ParsedMetric>, name: string) {
-  const metric = m.get(name);
-  if (!metric) return { sum: 0, count: 0, avg: 0 };
-  const nonBucket = metric.samples.filter(s => !('le' in s.labels));
-  const sum = nonBucket[0]?.value ?? 0, count = nonBucket[1]?.value ?? 0;
-  return { sum, count, avg: count > 0 ? sum / count : 0 };
-}
-
-function histBuckets(m: Map<string, ParsedMetric>, name: string): { le: string; count: number }[] {
-  const metric = m.get(name);
-  if (!metric) return [];
-  return metric.samples
-    .filter(s => 'le' in s.labels && s.labels.le !== '+Inf')
-    .map(s => ({ le: s.labels.le, count: s.value }));
-}
-
-function histDifferential(buckets: { le: string; count: number }[]): { range: string; count: number }[] {
-  const result: { range: string; count: number }[] = [];
-  let prev = 0;
-  for (const b of buckets) {
-    const diff = b.count - prev;
-    if (diff > 0) result.push({ range: b.le, count: diff });
-    prev = b.count;
-  }
-  return result;
-}
-
-function labeledValues(m: Map<string, ParsedMetric>, name: string, labelKey: string): Record<string, number> {
-  const metric = m.get(name);
-  if (!metric) return {};
-  const result: Record<string, number> = {};
-  for (const s of metric.samples) { const k = s.labels[labelKey] || 'unknown'; result[k] = (result[k] ?? 0) + s.value; }
-  return result;
-}
 
 function multiLabelValues(m: Map<string, ParsedMetric>, name: string): { labels: Record<string, string>; value: number }[] {
   const metric = m.get(name);
@@ -162,6 +68,9 @@ const WAITING_FOR_DATA = {
   title: 'Waiting for data',
   hint: 'The chart starts after two samples, a few seconds after you open the dashboard.',
 };
+
+/** The placeholder of a chart that has samples, all of them zero. */
+const noData = (title: string, hint: string) => ({ title, hint });
 
 interface Props {
   search?: string;
@@ -192,6 +101,11 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
   const prevRef = useRef<{ hits: number; misses: number; http: number; latencySum: number; latencyCount: number } | null>(null);
 
   const tt = chartTooltipStyle(colors);
+  const palette = chartPalette(colors);
+  const STATUS_COLORS = statusColors(colors);
+  // The telemetry charts mount when the section opens: a chart measured
+  // inside a closed <details> had no size and drew no bars (D42).
+  const [telemetryOpen, setTelemetryOpen] = useState(false);
 
   // `/_/stats` is no longer fetched here — the new BucketScanCard
   // backs onto the persistent bucket-scan engine, which has its own
@@ -208,7 +122,10 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
   const metricsMap = useMemo(() => parsePrometheus(metrics.data ?? ''), [metrics.data]);
   const loading = metrics.isPending;
   const refreshing = metrics.isFetching;
-  const error = metrics.error ? normalizeUiError(metrics.error, 'Failed to fetch') : null;
+  // No scrape at all: ONE error state instead of tiles that state "0" and
+  // "Cache disabled" as facts (UX harvest D17). A failed refetch keeps the
+  // last figures on screen.
+  const failed = Boolean(metrics.error) && metrics.data === undefined;
   const fetchMetrics = () => void metrics.refetch();
 
   // One history point per successful scrape (counters → per-interval deltas).
@@ -236,7 +153,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [metrics.dataUpdatedAt]);
 
-  if (loading) return <LoadingState label="Loading metrics..." />;
+  if (loading) return <div style={contentColumn(CONTENT_WIDE)}><LoadingState variant="card" rows={6} label="Loading metrics" /></div>;
 
   const m = metricsMap;
 
@@ -250,11 +167,10 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
   const encodeStats = histStats(m, 'deltaglider_delta_encode_duration_seconds');
   const decodeStats = histStats(m, 'deltaglider_delta_decode_duration_seconds');
   const compressionHist = histStats(m, 'deltaglider_delta_compression_ratio');
-  const decisions = labeledValues(m, 'deltaglider_delta_decisions_total', 'decision');
+  const decisions = nonZeroByLabel(m, 'deltaglider_delta_decisions_total', 'decision');
   const codecAvail = val(m, 'deltaglider_codec_semaphore_available');
 
-  const compressionBuckets = histDifferential(histBuckets(m, 'deltaglider_delta_compression_ratio'))
-    .map(b => ({ range: `${(parseFloat(b.range) * 100).toFixed(0)}%`, count: b.count }));
+  const compressionBuckets = histogramBars(m, 'deltaglider_delta_compression_ratio', fmtRatioBound);
 
   const httpByOp: Record<string, number> = {};
   const httpByStatus: Record<string, number> = {};
@@ -265,7 +181,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
     const status = s.labels.status?.[0] + 'xx' || 'unknown';
     httpByStatus[status] = (httpByStatus[status] ?? 0) + s.value;
   }
-  const httpChartData = Object.entries(httpByOp).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
+  const httpChartData = Object.entries(httpByOp).filter(([, value]) => value > 0).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
   const totalHttp = httpChartData.reduce((a, d) => a + d.value, 0);
   // The headline and its colour both use server errors (5xx) only: S3
   // clients answer many requests with a 4xx as a normal step (see
@@ -280,11 +196,11 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
   const reqSizeStats = histStats(m, 'deltaglider_http_request_size_bytes');
   const resSizeStats = histStats(m, 'deltaglider_http_response_size_bytes');
 
-  const latencyBuckets = histDifferential(histBuckets(m, 'deltaglider_http_request_duration_seconds'))
-    .map(b => {
-      const v = parseFloat(b.range);
-      return { range: v < 1 ? `${(v * 1000).toFixed(0)}ms` : `${v}s`, count: b.count };
-    });
+  const latencyBuckets = histogramBars(m, 'deltaglider_http_request_duration_seconds', fmtLatencyBound);
+  // A window of samples that are all zero draws a flat line on the axis:
+  // show a placeholder instead (D42).
+  const anyRequests = history.some(h => h.httpTotal > 0);
+  const anyLookups = history.some(h => h.cacheHits + h.cacheMisses > 0);
 
   const peakRss = val(m, 'process_peak_rss_bytes');
   const uptime = val(m, 'process_start_time_seconds');
@@ -328,14 +244,10 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
         loading={refreshing}
       />
 
-      {error && (
-        <div style={{ padding: '10px 14px', marginBottom: 12, background: colors.BG_CARD, border: `1px solid ${colors.ACCENT_RED}`, borderRadius: 8 }}>
-          <Text style={{ color: colors.ACCENT_RED, fontSize: 13 }}>Failed to load metrics: {error}</Text>
-        </div>
-      )}
-
       {activeView === 'analytics' ? (
         <AnalyticsSection config={adminConfig} />
+      ) : failed ? (
+        <ErrorState error={metrics.error} what="the metrics" onRetry={fetchMetrics} />
       ) : (
         <DashboardGrid>
           {/* ── Row 1: KPI strip ───────────────────────────────────── */}
@@ -365,7 +277,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
           <Panel title="Peak memory" colSpan={4}>
             <StatValue
               value={formatBytes(peakRss)}
-              hint="Process RSS high-water mark"
+              hint="The most memory the proxy used since it started"
             />
           </Panel>
 
@@ -375,18 +287,18 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             subtitle="Per 5-second interval (in-memory window)"
             colSpan={8}
             rowSpan={2}
-            empty={history.length < 2 ? WAITING_FOR_DATA : undefined}
+            empty={history.length < 2 ? WAITING_FOR_DATA : !anyRequests ? noData('No requests in this window', 'The chart shows S3 requests as they arrive.') : undefined}
           >
-            {history.length >= 2 && (
+            {history.length >= 2 && anyRequests && (
               <div style={{ flex: 1, minHeight: 0 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={history} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                  <AreaChart data={history} margin={{ top: SPACE.xs, right: SPACE.xs, bottom: 0, left: 0 }}>
                     <XAxis dataKey="t" tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} minTickGap={40} />
                     <YAxis yAxisId="left" tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} allowDecimals={false} />
                     <YAxis yAxisId="right" orientation="right" tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} />
                     <RTooltip {...tt} />
-                    <Area yAxisId="left" type="stepAfter" dataKey="httpTotal" stroke={CHART_PALETTE[1]} fill={`${CHART_PALETTE[1]}33`} strokeWidth={2} name="Requests" />
-                    <Area yAxisId="right" type="stepAfter" dataKey="avgLatency" stroke={CHART_PALETTE[3]} fill={`${CHART_PALETTE[3]}22`} strokeWidth={2} name="Avg latency (ms)" />
+                    <Area yAxisId="left" type="stepAfter" dataKey="httpTotal" stroke={palette.primary} fill={`${palette.primary}33`} strokeWidth={2} name="Requests" />
+                    <Area yAxisId="right" type="stepAfter" dataKey="avgLatency" stroke={palette.secondary} fill={`${palette.secondary}22`} strokeWidth={2} name="Avg latency (ms)" />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
@@ -406,7 +318,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             />
             {totalHttp > 0 && Object.keys(httpByStatus).length > 0 && (
               <div style={{ marginTop: 'auto' }}>
-                <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: colors.TEXT_MUTED, marginBottom: 6 }}>Status breakdown</div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: colors.TEXT_MUTED, marginBottom: SPACE.xs }}>Status breakdown</div>
                 <ResponsiveContainer width="100%" height={36}>
                   <BarChart data={statusStacked} layout="vertical" margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
                     <XAxis type="number" hide />
@@ -417,9 +329,9 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
                     ))}
                   </BarChart>
                 </ResponsiveContainer>
-                <div style={{ display: 'flex', gap: 10, marginTop: 6, flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', gap: SPACE.sm, marginTop: SPACE.xs, flexWrap: 'wrap' }}>
                   {['2xx', '3xx', '4xx', '5xx'].filter(s => httpByStatus[s] > 0).map(s => (
-                    <span key={s} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11, fontFamily: 'var(--font-mono)', color: colors.TEXT_SECONDARY }}>
+                    <span key={s} style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE.xxs, fontSize: 11, fontFamily: 'var(--font-mono)', color: colors.TEXT_SECONDARY }}>
                       <span style={{ width: 8, height: 8, borderRadius: 2, background: STATUS_COLORS[s] }} />
                       {s}: {fmtNum(httpByStatus[s])}
                     </span>
@@ -447,7 +359,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
                 size="small"
                 strokeColor={cacheUtil > 0.9 ? colors.ACCENT_RED : cacheUtil > 0.7 ? colors.ACCENT_AMBER : colors.ACCENT_GREEN}
                 showInfo={false}
-                style={{ marginTop: 10 }}
+                style={{ marginTop: SPACE.sm }}
               />
             </StatValue>
           </Panel>
@@ -464,7 +376,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
               tone={cacheSeverity}
               hint={
                 cacheTotal === 0
-                  ? 'No cache lookups yet'
+                  ? 'No lookups since the proxy started'
                   : cacheSeverity === 'neutral'
                   ? 'Too few lookups to judge the cache yet'
                   : cacheSeverity === 'bad'
@@ -487,17 +399,17 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             subtitle="Per 5-second interval, stacked"
             colSpan={12}
             rowSpan={2}
-            empty={history.length < 2 ? WAITING_FOR_DATA : undefined}
+            empty={history.length < 2 ? WAITING_FOR_DATA : !anyLookups ? noData('No cache lookups in this window', 'A lookup happens when a request reads a delta object.') : undefined}
           >
-            {history.length >= 2 && (
+            {history.length >= 2 && anyLookups && (
               <div style={{ flex: 1, minHeight: 0 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={history} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                  <AreaChart data={history} margin={{ top: SPACE.xs, right: SPACE.xs, bottom: 0, left: 0 }}>
                     <XAxis dataKey="t" tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} minTickGap={60} />
                     <YAxis tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} allowDecimals={false} />
                     <RTooltip {...tt} />
-                    <Area type="stepAfter" dataKey="cacheHits" stackId="1" stroke={CHART_PALETTE[0]} fill={`${CHART_PALETTE[0]}55`} strokeWidth={2} name="Hits" />
-                    <Area type="stepAfter" dataKey="cacheMisses" stackId="1" stroke={CHART_PALETTE[4]} fill={`${CHART_PALETTE[4]}55`} strokeWidth={2} name="Misses" />
+                    <Area type="stepAfter" dataKey="cacheHits" stackId="1" stroke={palette.primary} fill={`${palette.primary}55`} strokeWidth={2} name="Hits" />
+                    <Area type="stepAfter" dataKey="cacheMisses" stackId="1" stroke={colors.ACCENT_RED} fill={`${colors.ACCENT_RED}55`} strokeWidth={2} name="Misses" />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
@@ -507,14 +419,14 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
       )}
 
       {activeView === 'monitoring' && (
-        <details className="dg-telemetry-details">
+        <details className="dg-telemetry-details" onToggle={(e) => setTelemetryOpen(e.currentTarget.open)}>
           <summary
             className="dg-telemetry-summary"
             style={{
               display: 'inline-flex',
               alignItems: 'center',
-              padding: '8px 14px',
-              marginBottom: 12,
+              padding: `${SPACE.xs}px ${SPACE.md}px`,
+              marginBottom: SPACE.sm,
               border: `1px solid ${colors.BORDER}`,
               borderRadius: 8,
               fontFamily: 'var(--font-ui)',
@@ -525,7 +437,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
           >
             Detailed telemetry
           </summary>
-          <DashboardGrid>
+          {telemetryOpen && <DashboardGrid>
           {/* ── Row 5: Delta codec stats (4× 3-col) ───────────────── */}
           <Panel title="Avg encode" subtitle={`${fmtNum(encodeStats.count)} total encodes`} colSpan={3}>
             <StatValue value={encodeStats.count > 0 ? fmtDuration(encodeStats.avg) : '—'} hint="xdelta3 encode wall time" />
@@ -535,7 +447,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
           </Panel>
           <Panel
             title="Avg compression"
-            subtitle={compressionHist.count > 0 ? `Across ${fmtNum(compressionHist.count)} deltas` : 'No deltas yet'}
+            subtitle={compressionHist.count > 0 ? `Across ${fmtNum(compressionHist.count)} deltas` : 'No deltas since the proxy started'}
             colSpan={3}
           >
             <StatValue
@@ -564,16 +476,16 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             subtitle="Lower bucket = better savings"
             colSpan={6}
             rowSpan={2}
-            empty={compressionBuckets.length === 0 || compressionHist.count === 0 ? { title: 'No deltas yet', hint: 'Upload versioned archives into the same prefix to see compression ratios.' } : undefined}
+            empty={compressionBuckets.length === 0 || compressionHist.count === 0 ? noData('No deltas yet', 'Upload versioned archives into the same prefix to see compression ratios.') : undefined}
           >
             {compressionBuckets.length > 0 && compressionHist.count > 0 && (
               <div style={{ flex: 1, minHeight: 0 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={compressionBuckets} margin={{ top: 8, right: 8, bottom: 0, left: -24 }}>
-                    <XAxis dataKey="range" tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} />
+                  <BarChart data={compressionBuckets} margin={{ top: SPACE.xs, right: SPACE.xs, bottom: 0, left: 0 }}>
+                    <XAxis dataKey="range" tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} interval="preserveStartEnd" />
                     <YAxis tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} allowDecimals={false} />
                     <RTooltip {...tt} />
-                    <Bar dataKey="count" name="Deltas" radius={[4, 4, 0, 0]} fill={CHART_PALETTE[2]} />
+                    <Bar dataKey="count" name="Deltas" radius={[4, 4, 0, 0]} fill={palette.primary} isAnimationActive={false} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -584,22 +496,22 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             subtitle="Delta vs passthrough vs reference"
             colSpan={6}
             rowSpan={2}
-            empty={Object.keys(decisions).length === 0 ? { title: 'No decisions recorded' } : undefined}
+            empty={decisions.length === 0 ? noData('No storage decisions yet', 'Each upload records one: delta, passthrough or reference.') : undefined}
           >
-            {Object.keys(decisions).length > 0 && (
+            {decisions.length > 0 && (
               <div style={{ flex: 1, minHeight: 0 }}>
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart
-                    data={Object.entries(decisions).sort(([, a], [, b]) => b - a).map(([name, value]) => ({ name, value }))}
+                    data={decisions}
                     layout="vertical"
-                    margin={{ top: 8, right: 16, bottom: 0, left: 8 }}
+                    margin={{ top: SPACE.xs, right: SPACE.md, bottom: 0, left: SPACE.xs }}
                   >
                     <XAxis type="number" hide />
                     <YAxis type="category" dataKey="name" width={96} tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} />
                     <RTooltip {...tt} />
-                    <Bar dataKey="value" name="Count" radius={[0, 4, 4, 0]}>
-                      {Object.keys(decisions).sort((a, b) => decisions[b] - decisions[a]).map((_, i) => (
-                        <Cell key={i} fill={CHART_PALETTE[i % CHART_PALETTE.length]} />
+                    <Bar dataKey="value" name="Count" radius={[0, 4, 4, 0]} isAnimationActive={false}>
+                      {decisions.map((d, i) => (
+                        <Cell key={d.name} fill={palette.series[i % palette.series.length]} />
                       ))}
                     </Bar>
                   </BarChart>
@@ -614,16 +526,16 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             subtitle="Request duration buckets"
             colSpan={6}
             rowSpan={2}
-            empty={latencyBuckets.length === 0 || latencyStats.count === 0 ? { title: 'No requests recorded' } : undefined}
+            empty={latencyBuckets.length === 0 || latencyStats.count === 0 ? noData('No requests yet', 'The chart shows how long S3 requests take.') : undefined}
           >
             {latencyBuckets.length > 0 && latencyStats.count > 0 && (
               <div style={{ flex: 1, minHeight: 0 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={latencyBuckets} margin={{ top: 8, right: 8, bottom: 0, left: -24 }}>
-                    <XAxis dataKey="range" tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} />
-                    <YAxis tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} allowDecimals={false} />
+                  <BarChart data={latencyBuckets} margin={{ top: SPACE.xs, right: SPACE.xs, bottom: 0, left: 0 }}>
+                    <XAxis dataKey="range" tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={48} allowDecimals={false} />
                     <RTooltip {...tt} />
-                    <Bar dataKey="count" name="Requests" radius={[4, 4, 0, 0]} fill={CHART_PALETTE[1]} />
+                    <Bar dataKey="count" name="Requests" radius={[4, 4, 0, 0]} fill={palette.primary} isAnimationActive={false} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -634,18 +546,17 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             subtitle="Top S3 operations by count"
             colSpan={6}
             rowSpan={2}
-            empty={httpChartData.length === 0 ? { title: 'No requests yet' } : undefined}
+            empty={httpChartData.length === 0 ? noData('No requests yet', 'The chart counts S3 requests by operation.') : undefined}
           >
             {httpChartData.length > 0 && (
               <div style={{ flex: 1, minHeight: 0 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={httpChartData} layout="vertical" margin={{ top: 8, right: 16, bottom: 0, left: 8 }}>
+                  <BarChart data={httpChartData} layout="vertical" margin={{ top: SPACE.xs, right: SPACE.md, bottom: 0, left: SPACE.xs }}>
                     <XAxis type="number" hide />
                     <YAxis type="category" dataKey="name" width={112} tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} />
                     <RTooltip {...tt} />
-                    <Bar dataKey="value" name="Requests" radius={[0, 4, 4, 0]}>
-                      {httpChartData.map((_, i) => <Cell key={i} fill={CHART_PALETTE[i % CHART_PALETTE.length]} />)}
-                    </Bar>
+                    {/* One series (request counts): one colour. */}
+                    <Bar dataKey="value" name="Requests" radius={[0, 4, 4, 0]} fill={palette.primary} isAnimationActive={false} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -668,28 +579,28 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
               colSpan={12}
               accent={totalAuthFails > 0 ? 'red' : undefined}
             >
-              <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'center' }}>
+              <div style={{ display: 'flex', gap: SPACE.lg, flexWrap: 'wrap', alignItems: 'center' }}>
                 <div style={{ minWidth: 160 }}>
-                  <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: colors.TEXT_MUTED, marginBottom: 4 }}>Authenticated</div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: colors.TEXT_MUTED, marginBottom: SPACE.xxs }}>Authenticated</div>
                   <div style={{ fontSize: 24, fontWeight: 700, color: colors.ACCENT_GREEN, fontFamily: 'var(--font-ui)' }}>
                     {fmtNum(authAttempts - totalAuthFails)}
                   </div>
                 </div>
                 <div style={{ minWidth: 160 }}>
-                  <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: colors.TEXT_MUTED, marginBottom: 4 }}>Rejected</div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: colors.TEXT_MUTED, marginBottom: SPACE.xxs }}>Rejected</div>
                   <div style={{ fontSize: 24, fontWeight: 700, color: totalAuthFails > 0 ? colors.ACCENT_RED : colors.TEXT_PRIMARY, fontFamily: 'var(--font-ui)' }}>
                     {fmtNum(totalAuthFails)}
                   </div>
                 </div>
                 {authFailures.length > 0 && totalAuthFails > 0 && (
                   <div style={{ flex: 1, minWidth: 200 }}>
-                    <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: colors.TEXT_MUTED, marginBottom: 6 }}>Failure reasons</div>
-                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: colors.TEXT_MUTED, marginBottom: SPACE.xxs }}>Failure reasons</div>
+                    <div style={{ display: 'flex', gap: SPACE.xs, flexWrap: 'wrap' }}>
                       {authFailures.filter(s => s.value > 0).map(s => (
                         <span
                           key={s.labels.reason}
                           style={{
-                            padding: '4px 10px', borderRadius: 8, fontSize: 12,
+                            padding: `${SPACE.xxs}px ${SPACE.sm}px`, borderRadius: 8, fontSize: 12,
                             fontFamily: 'var(--font-mono)',
                             background: `${colors.ACCENT_RED}22`,
                             color: colors.ACCENT_RED,
@@ -705,7 +616,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
               </div>
             </Panel>
           )}
-          </DashboardGrid>
+          </DashboardGrid>}
         </details>
       )}
     </div>

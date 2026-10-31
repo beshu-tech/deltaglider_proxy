@@ -45,7 +45,7 @@ import { ConfigConflictError, getSectionVersioned, validateSection } from './adm
 import { SECTION_CONFLICT_TITLE, applySection, persistFailureText } from './applySection';
 import { onSectionVersionAdvanced } from './sectionVersionBus';
 import { useApplyHandler, useDirtySection } from './useDirtySection';
-import { normalizeUiError } from './errorHandling';
+import { plainError } from './plainError';
 import { isSessionExpired } from './errorHandling';
 
 interface UseSectionEditorOptions<Wire, Local = Wire> {
@@ -109,8 +109,12 @@ export interface UseSectionEditorResult<Local, Wire = Local> {
   baseline: Local;
   /** Loading = first GET hasn't resolved yet. */
   loading: boolean;
-  /** Error string if the first GET failed (non-401). */
+  /** @deprecated Read `loadError` and render <ErrorState error={loadError}>.
+   *  The plain sentence of a failed first GET (non-401), for callers that
+   *  still print a string. */
   error: string | null;
+  /** The error value itself, for <ErrorState error=…> (plain sentence + Details). */
+  loadError: unknown;
   /** ApplyDialog state — pass directly to <ApplyDialog /> props. */
   applyOpen: boolean;
   applyResponse: SectionApplyResponse | null;
@@ -162,6 +166,7 @@ export function useSectionEditor<Wire, Local = Wire>(
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<unknown>(null);
   const queryClient = useQueryClient();
   const { value, isDirty, baseline, setValue, discard, markApplied, resetWith, rebase } =
     useDirtySection<Local>(dirtyKey, initial);
@@ -224,12 +229,14 @@ export function useSectionEditor<Wire, Local = Wire>(
       versionRef.current = version;
       resetWithRef.current(toLocal(body));
       setError(null);
+      setLoadError(null);
     } catch (e) {
       if (isSessionExpired(e)) {
         onSessionExpired?.();
         return;
       }
-      setError(`Failed to load ${noun} section: ${normalizeUiError(e, 'unknown')}`);
+      setError(plainError(e, `The proxy could not load the ${noun} settings. Try again.`).text);
+      setLoadError(e);
     } finally {
       setLoading(false);
     }
@@ -284,7 +291,7 @@ export function useSectionEditor<Wire, Local = Wire>(
       setPendingBody(snapshot);
       setApplyOpen(true);
     } catch (e) {
-      message.error(`Validate failed: ${normalizeUiError(e, 'unknown')}`);
+      message.error(plainError(e, 'The proxy could not check the changes. Try again.').text);
     }
   }, [section, buildPayload, value, isDirty]);
 
@@ -330,7 +337,7 @@ export function useSectionEditor<Wire, Local = Wire>(
         try {
           versionRef.current = (await getSectionVersioned<Wire>(section)).version;
         } catch (e) {
-          message.error(`Reload failed: ${normalizeUiError(e, 'unknown')}`);
+          message.error(plainError(e, 'The proxy could not reload the section. Try again.').text);
           return;
         }
         await runApplyRef.current();
@@ -372,7 +379,7 @@ export function useSectionEditor<Wire, Local = Wire>(
       // with server truth, silently discarding the edits they were trying to
       // save (including any made while the request was in-flight). Leave the
       // local edits intact so the operator can fix and retry.
-      message.error(`Apply failed: ${normalizeUiError(e, 'unknown')}`);
+      message.error(plainError(e, 'The proxy could not apply the changes. Your edits are still here; try again.').text);
       setApplyOpen(false);
       setPendingBody(null);
       return false;
@@ -394,6 +401,7 @@ export function useSectionEditor<Wire, Local = Wire>(
     baseline,
     loading,
     error,
+    loadError,
     applyOpen,
     applyResponse,
     applying,

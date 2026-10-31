@@ -2,10 +2,14 @@
  * Job detail drawer: Definition (editable for rule kinds via the parent's
  * section editors; read-only parameters for one-offs), Runs, Failures.
  */
-import { useEffect, useRef, useMemo, useState } from 'react';
+import { useEffect, useRef, useMemo, useState, type CSSProperties } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Alert, Button, Drawer, Empty, Modal, Tabs, Tag, Typography } from 'antd';
-import { StopOutlined } from '@ant-design/icons';
+import { Alert, Button, Drawer, Modal, Tabs, Tag, Typography } from 'antd';
+import { HistoryOutlined, QuestionCircleOutlined, StopOutlined } from '@ant-design/icons';
+import { EmptyState, LoadingState } from '../StatePlaceholders';
+import { lifecycleRuleErrors, replicationRuleErrors, type RuleFieldErrors } from './ruleFieldErrors';
+import type { ErrorGate } from './useErrorGate';
+import { ruleUid } from '../../ruleUid';
 import RowActionsMenu from '../RowActionsMenu';
 import { draftRemoveAction } from './draftRemoveAction';
 import { cloneRuleAction } from './cloneRuleAction';
@@ -49,6 +53,7 @@ import { sameScopeRule } from '../ruleClone';
 import VerifyTab from './VerifyTab';
 import LifecyclePreviewTab from './LifecyclePreviewTab';
 import { useBucketNames } from '../../queries/backends';
+import TruncatedName from '../TruncatedName';
 
 const { Text } = Typography;
 
@@ -59,6 +64,16 @@ export interface RuleEditor<C> {
   value: C;
   saved: C;
   onChange: (fn: (cur: C) => C) => void;
+  /** When a field error shows (keys `<rule uid>:<field>`); the page owns it
+   *  so its dirty bar counts the errors on screen. */
+  gate?: ErrorGate;
+}
+
+/** The errors of one rule that its gate shows now. */
+function shownErrors(all: RuleFieldErrors, uid: string, gate: ErrorGate | undefined): RuleFieldErrors {
+  const out: RuleFieldErrors = {};
+  for (const [field, error] of Object.entries(all)) if (error && (gate?.show(`${uid}:${field}`) ?? true)) out[field] = error;
+  return out;
 }
 
 interface Props {
@@ -96,6 +111,9 @@ function stopEscapeFromOpenDropdown(e: React.KeyboardEvent) {
   const t = e.target as HTMLElement | null;
   if (t?.getAttribute('aria-expanded') === 'true') e.stopPropagation();
 }
+
+/** The drawer title: one line; a long rule name is cut in the middle (D5). */
+const TITLE_ROW: CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 };
 
 export default function JobDrawer({
   jobId,
@@ -184,6 +202,7 @@ export default function JobDrawer({
     if (replEditor && replication && replIndex >= 0) {
       const rule = replication.rules[replIndex];
       const twin = sameScopeRule('replication', replication.rules, replIndex);
+      const uid = ruleUid(rule);
       return (
         <>
           {twin && <SameScopeAlert twin={twin} what="source, destination and filters" />}
@@ -191,6 +210,8 @@ export default function JobDrawer({
             rule={rule}
             buckets={bucketNames}
             inputRadius={inputRadius}
+            errors={shownErrors(replicationRuleErrors(rule, replication.rules), uid, replEditor.gate)}
+            onFieldBlur={(field) => replEditor.gate?.touch(`${uid}:${field}`)}
             onChange={(patch) =>
               replEditor.onChange((cur) => ({
                 ...cur,
@@ -210,6 +231,7 @@ export default function JobDrawer({
     if (lcEditor && lifecycle && lcIndex >= 0) {
       const rule = lifecycle.rules[lcIndex];
       const twin = sameScopeRule('lifecycle', lifecycle.rules, lcIndex);
+      const uid = ruleUid(rule);
       return (
         <>
           {twin && <SameScopeAlert twin={twin} what="bucket, prefix, action and filters" />}
@@ -217,6 +239,8 @@ export default function JobDrawer({
             rule={rule}
             buckets={bucketNames}
             inputRadius={inputRadius}
+            errors={shownErrors(lifecycleRuleErrors(rule, lifecycle.rules), uid, lcEditor.gate)}
+            onFieldBlur={(field) => lcEditor.gate?.touch(`${uid}:${field}`)}
             onChange={(patch) =>
               lcEditor.onChange((cur) => ({
                 ...cur,
@@ -271,7 +295,7 @@ export default function JobDrawer({
             )}
           </div>
           {entries.map(([k, v]) => (
-            <div key={k} style={{ display: 'flex', gap: 12, padding: '6px 0' }}>
+            <div key={k} style={{ display: 'flex', gap: 12, padding: '8px 0' }}>
               <Text type="secondary" style={{ width: 110, flexShrink: 0, fontSize: 12 }}>
                 {k}
               </Text>
@@ -291,20 +315,34 @@ export default function JobDrawer({
       );
     }
     if (isOneOffId) {
-      return fetched.isLoading ? null : <Empty description="This job does not exist on this proxy." />;
+      return fetched.isLoading ? (
+        <LoadingState variant="form" label="Loading the job" />
+      ) : (
+        <EmptyState
+          icon={<QuestionCircleOutlined />}
+          title="This job does not exist on this proxy"
+          hint="The proxy keeps a limited history of one-off jobs. Close this panel to see the jobs it knows."
+        />
+      );
     }
     // A rule-kind jobId that resolves to NEITHER a live editor rule NOR a server
     // row is a stale draft reference (the draft was discarded or renamed while
     // the drawer pointed at it). Don't auto-close: show "this job no longer
     // exists" on a shared/deep-linked URL instead of a silent close.
-    return <Empty description="This job no longer exists — it may have been removed or already applied. Close this panel." />;
+    return (
+      <EmptyState
+        icon={<QuestionCircleOutlined />}
+        title="This rule no longer exists"
+        hint="It was removed, or its unsaved draft was discarded. Close this panel."
+      />
+    );
   })();
 
   const runsTable = (
     <RecordList
       rows={liveRuns}
       rowKey={(r) => String(r.id)}
-      empty="No runs yet"
+      empty={<EmptyState compact icon={<HistoryOutlined />} title="No runs yet" hint="A run shows here when the rule runs on its schedule or with Run now." />}
       columns={[
         {
           key: 'started',
@@ -421,23 +459,26 @@ export default function JobDrawer({
       }
       title={
         serverRow ? (
-          <span>
-            {kindLabel(serverRow.kind)} · <span style={{ fontFamily: 'var(--font-mono)' }}>{serverRow.name}</span>{' '}
-            <Tag color={jobStatusTone(serverRow)} style={{ marginLeft: 8 }}>
+          <span style={TITLE_ROW}>
+            <span style={{ flexShrink: 0 }}>{kindLabel(serverRow.kind)} ·</span>
+            <TruncatedName text={serverRow.name} style={{ fontFamily: 'var(--font-mono)' }} />
+            <Tag color={jobStatusTone(serverRow)} style={{ margin: 0, flexShrink: 0 }}>
               {jobStatusLabel(serverRow)}
             </Tag>
           </span>
         ) : parsed && ruleKind ? (
-          <span>
-            {kindLabel(ruleKind)} · <span style={{ fontFamily: 'var(--font-mono)' }}>{draftLabel}</span>{' '}
-            <Tag color="warning" style={{ marginLeft: 8 }}>
+          <span style={TITLE_ROW}>
+            <span style={{ flexShrink: 0 }}>{kindLabel(ruleKind)} ·</span>
+            <TruncatedName text={draftLabel} style={{ fontFamily: 'var(--font-mono)' }} />
+            <Tag color="warning" style={{ margin: 0, flexShrink: 0 }}>
               draft
             </Tag>
           </span>
         ) : (
           parsed && (
-            <span>
-              Job · <span style={{ fontFamily: 'var(--font-mono)' }}>{parsed.key}</span>
+            <span style={TITLE_ROW}>
+              <span style={{ flexShrink: 0 }}>Job ·</span>
+              <TruncatedName text={parsed.key} style={{ fontFamily: 'var(--font-mono)' }} />
             </span>
           )
         )
@@ -458,12 +499,7 @@ export default function JobDrawer({
             <Typography.Text type="secondary" style={{ whiteSpace: 'nowrap' }}>
               scanning
             </Typography.Text>
-            <Typography.Text
-              style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}
-              ellipsis
-            >
-              {walk.scanning ?? '…'}
-            </Typography.Text>
+            <TruncatedName text={walk.scanning ?? '…'} style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }} />
           </div>
           <div style={{ marginTop: 2 }}>
             <Typography.Text type="secondary">
@@ -477,7 +513,7 @@ export default function JobDrawer({
             style={{
               position: 'relative',
               height: 3,
-              marginTop: 6,
+              marginTop: 8,
               borderRadius: 2,
               overflow: 'hidden',
               background: c.BORDER,
@@ -500,9 +536,7 @@ export default function JobDrawer({
           {inFlight.map((f) => (
             <div key={f.key} style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
               <Typography.Text type="secondary">copying</Typography.Text>
-              <Typography.Text style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }} ellipsis>
-                {f.key}
-              </Typography.Text>
+              <TruncatedName text={f.key} style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }} />
               <Typography.Text type="secondary" style={{ whiteSpace: 'nowrap' }}>
                 {formatBytes(f.size)} · <TimeAgo ts={f.started_unix} />
               </Typography.Text>

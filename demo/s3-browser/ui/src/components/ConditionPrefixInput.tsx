@@ -244,9 +244,9 @@ export default function ConditionPrefixInput({ value, onChange, bucket = '', sty
           (empty prefix)
         </span>
       </Checkbox>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
         {rows.map((row) => (
-          <div key={row.id} style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%' }}>
+          <div key={row.id} style={{ display: 'flex', gap: 8, alignItems: 'center', width: '100%' }}>
             <div style={{ flex: 1, minWidth: 0 }} onFocusCapture={() => setFocusedId(row.id)}>
               <SimpleAutoComplete
                 aria-label="Prefix pattern"
@@ -282,12 +282,12 @@ export default function ConditionPrefixInput({ value, onChange, bucket = '', sty
         onMouseDown={(e) => e.preventDefault()}
         onClick={addRow}
         block
-        style={{ marginTop: 6, borderRadius: 8 }}
+        style={{ marginTop: 8, borderRadius: 8 }}
       >
         Add prefix
       </Button>
       {focusedId !== null && (
-        <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+        <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
           {chipSuggestions.map((pattern) => (
             <Button
               key={pattern}
@@ -302,7 +302,7 @@ export default function ConditionPrefixInput({ value, onChange, bucket = '', sty
           ))}
         </div>
       )}
-      <div style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 6, lineHeight: 1.45 }}>
+      <div style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 8, lineHeight: 1.45 }}>
         {bucket ? `Browsing prefixes in ${bucket}.` : 'Choose a concrete resource bucket for live suggestions.'}
       </div>
     </div>

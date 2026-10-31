@@ -35,8 +35,8 @@ export default function OAuthProviderList({ providers, nextUrl, height, fontSize
             aria-label={`Sign in with ${label}`}
             className={isHero ? 'dg-login-sso-button' : undefined}
             style={isHero ? { ...(height ? { height } : {}), fontSize } : {
-              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
-              width: '100%', padding: '10px 16px', marginBottom: 8,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+              width: '100%', padding: '8px 16px', marginBottom: 8,
               borderRadius: 10, border: `1px solid ${colors.BORDER}`,
               background: 'var(--input-bg)', color: colors.TEXT_PRIMARY,
               fontSize, fontWeight: 600, fontFamily: 'var(--font-ui)',

@@ -147,8 +147,11 @@ test('a rename applies as the new name, with no client id in the body; the drawe
   );
   expect(client.getQueryData(qk.jobs.verify('nightly'))).toBeUndefined();
 
-  // The drawer moves to the server id of the renamed rule: its Runs tab shows.
-  await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('tab', { name: 'Runs' })).toBeInTheDocument());
-  expect(within(screen.getByRole('dialog')).getAllByText('nightly-eu').length).toBeGreaterThan(0);
-  expect((await nameInput()).value).toBe('nightly-eu');
+  // UX harvest D53: the apply closes the drawer and points at the row of
+  // the renamed rule, by its new name.
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  await waitFor(() => {
+    const highlighted = document.querySelector('[role="row"][data-highlight]');
+    expect(highlighted?.textContent).toMatch(/^nightly-eu/);
+  });
 });

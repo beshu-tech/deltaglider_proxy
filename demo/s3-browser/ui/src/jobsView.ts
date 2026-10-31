@@ -357,15 +357,11 @@ export function kindLabel(kind: JobKind): string {
 }
 
 /** AntD tag color for a job kind chip: rules blue/purple, one-offs gold. */
-export function kindTone(kind: JobKind): string {
-  switch (kind) {
-    case 'replication':
-      return 'blue';
-    case 'lifecycle':
-      return 'purple';
-    default:
-      return 'gold';
-  }
+/** The tag colour of a job kind: neutral for every kind. The kind is a
+ *  label, not a state; a gold "Delete" next to a green "succeeded" read as
+ *  a warning (UX harvest D66). Colour is for the status tag. */
+export function kindTone(_kind: JobKind): string {
+  return 'default';
 }
 
 export function triggerLabel(trigger: string): string {

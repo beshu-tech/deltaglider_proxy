@@ -210,7 +210,7 @@ export default function SimpleAutoComplete({
           style={{
             width: '100%',
             height: 36,
-            padding: '0 10px',
+            padding: '0 8px',
             border: `1px solid ${focused ? colors.ACCENT_BLUE : colors.BORDER}`,
             borderRadius: BORDER_RADIUS.sm,
             background: colors.BG_ELEVATED,
@@ -243,7 +243,7 @@ export default function SimpleAutoComplete({
                   borderRadius: 8,
                   border: `1px solid ${stripe.borderColor}`,
                   background: stripe.background,
-                  padding: '12px 10px 10px',
+                  padding: '12px 8px 8px',
                 }
               : { padding: '0 0' };
 
@@ -274,7 +274,7 @@ export default function SimpleAutoComplete({
                   <div
                     style={{
                       ...headerPad,
-                      marginBottom: 10,
+                      marginBottom: 12,
                       fontSize: 11,
                       lineHeight: 1.5,
                       color: colors.TEXT_MUTED,
@@ -301,7 +301,7 @@ export default function SimpleAutoComplete({
                       }}
                       title={`Use ${entry.value}`}
                       style={{
-                        padding: '7px 8px',
+                        padding: '8px 8px',
                         cursor: 'pointer',
                         borderRadius: 6,
                         margin: useSectionPanels

@@ -13,7 +13,7 @@
  * destructive operation we don't want one-click.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { Typography, Button, Tag, Alert, Space, Select, InputNumber, Spin } from 'antd';
+import { Typography, Button, Tag, Alert, Space, Select, Input, Spin } from 'antd';
 import { ReloadOutlined, ThunderboltOutlined, CopyOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { clamp, formatBytes, noun } from '../utils';
@@ -27,9 +27,11 @@ import {
 import { useBucketNames } from '../queries/backends';
 import HoverHint from './HoverHint';
 import FormLabel from './FormLabel';
-import { EmptyState } from './StatePlaceholders';
-import { contentColumn, CONTENT_WIDE } from './shared-styles';
-import { normalizeUiError } from '../errorHandling';
+import { EmptyState, ErrorState, LoadingState } from './StatePlaceholders';
+import TruncatedName from './TruncatedName';
+import { useFieldValidation, v } from '../validation';
+import { contentColumn, CONTENT_WIDE, SPACE } from './shared-styles';
+import { plainError } from '../plainError';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { useDeltaEfficiency, useTriggerDeltaEfficiencyScan } from '../queries/deltaEfficiency';
@@ -85,9 +87,20 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
   const response: DeltaEfficiencyResponse | null = data && !('scanning' in data) ? data : null;
   const rawError = active && !trigger.isPending ? (trigger.error ?? scan.error) : null;
   useSessionExpiredOn(rawError, onSessionExpired);
-  const error = rawError ? `Scan failed: ${normalizeUiError(rawError, String(rawError))}` : null;
+  const error = rawError ?? null;
   const scanning = !rawError && !!data && 'scanning' in data;
   const loading = active && (scan.isFetching || trigger.isPending);
+  // A text field: "0" or "abc" shows its error under the field and the scan
+  // keeps the last valid minimum (an InputNumber clamped it silently, D9).
+  const form = useFieldValidation();
+  const minDeltasField = form.number(
+    'minDeltas',
+    minDeltas,
+    (n) => {
+      if (n !== undefined) setMinDeltas(n);
+    },
+    v.integer({ min: 1, max: 1000 }),
+  );
 
   /**
    * The first scan may answer from the server's 5-minute cache (200), or
@@ -157,12 +170,12 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
               <FormLabel text="Minimum deltas per folder" htmlFor="delta-efficiency-min-deltas" />
             </span>
           </HoverHint>
-          <InputNumber
+          <Input
             id="delta-efficiency-min-deltas"
-            min={1}
-            max={1000}
-            value={minDeltas}
-            onChange={v => setMinDeltas(typeof v === 'number' ? v : 3)}
+            {...minDeltasField.inputProps}
+            status={minDeltasField.error ? 'error' : undefined}
+            aria-invalid={minDeltasField.error ? true : undefined}
+            aria-describedby={minDeltasField.error ? 'delta-efficiency-min-deltas-error' : undefined}
             style={{ width: 96 }}
           />
         </div>
@@ -174,7 +187,9 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
         <Button
           type="primary"
           icon={response ? <ReloadOutlined /> : <ThunderboltOutlined />}
-          onClick={() => runScan(response !== null || error !== null)}
+          onClick={() => {
+            if (form.submit()) runScan(response !== null || error !== null);
+          }}
           loading={loading && !scanning}
           disabled={!bucket}
           title={response ? 'Scan this bucket again now, ignoring the 5-minute cache' : undefined}
@@ -188,6 +203,15 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
           </Space>
         )}
       </div>
+      {minDeltasField.error && (
+        <div
+          id="delta-efficiency-min-deltas-error"
+          role="alert"
+          style={{ color: colors.ACCENT_RED, fontSize: 12.5, marginTop: -SPACE.xs, marginBottom: SPACE.md }}
+        >
+          {minDeltasField.error}
+        </div>
+      )}
 
       {!response && !error && !loading && !scanning && (
         <EmptyState
@@ -197,15 +221,9 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
         />
       )}
 
-      {error && (
-        <Alert
-          type="error"
-          title="Error"
-          description={error}
-          style={{ marginBottom: 16 }}
-          showIcon
-        />
-      )}
+      {loading && !response && !error && !scanning && <LoadingState variant="list" label="Loading the scan result" />}
+
+      {error && <ErrorState error={error} what="the scan result" onRetry={() => runScan(true)} />}
 
       {response && summary && (
         <>
@@ -299,7 +317,7 @@ function EfficiencyDashboard({
         const result = await verifyDeltaEfficiency(bucket, prefix);
         setVerifyState((prev) => new Map(prev).set(key, { status: 'ok', result }));
       } catch (e) {
-        const message = normalizeUiError(e, String(e));
+        const message = plainError(e, 'The proxy could not verify this folder.').text;
         setVerifyState((prev) =>
           new Map(prev).set(key, { status: 'error', message }),
         );
@@ -337,7 +355,7 @@ function EfficiencyDashboard({
           Showing {visibleReports.length.toLocaleString()} of{' '}
           {totalReported.toLocaleString()} prefixes
         </span>
-        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
           <input
             type="checkbox"
             checked={regressionsOnly}
@@ -369,8 +387,8 @@ function VerifyExplainer() {
     <div
       style={{
         display: 'flex',
-        gap: 10,
-        padding: '10px 14px',
+        gap: 12,
+        padding: '12px 16px',
         background: `${colors.ACCENT_BLUE}0c`,
         border: `1px dashed ${colors.ACCENT_BLUE}55`,
         borderRadius: 8,
@@ -436,7 +454,7 @@ function HeroHeadline({
   return (
     <div
       style={{
-        padding: '18px 22px',
+        padding: '16px 24px',
         background: allHealthy
           ? `${colors.ACCENT_BLUE}10`
           : `${colors.ACCENT_RED}12`,
@@ -449,7 +467,7 @@ function HeroHeadline({
           fontSize: 20,
           fontWeight: 600,
           color: allHealthy ? colors.ACCENT_BLUE : colors.ACCENT_RED,
-          marginBottom: 6,
+          marginBottom: 8,
           letterSpacing: -0.2,
         }}
       >
@@ -461,7 +479,7 @@ function HeroHeadline({
           <HoverHint hint={`Scan completed at ${scannedAt}. Cached for 5 min — click Re-scan for fresh data.`}>
             <Tag
               color="blue"
-              style={{ marginLeft: 8, fontSize: 11, padding: '0 6px', lineHeight: '18px' }}
+              style={{ marginLeft: 8, fontSize: 11, padding: '0 8px', lineHeight: '18px' }}
             >
               cached
             </Tag>
@@ -558,7 +576,7 @@ function DistributionStackBar({
         }}
       >
         {VERDICT_ORDER.filter((e) => counts[e] > 0).map((e) => (
-          <span key={e} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <span key={e} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
             <span
               style={{
                 width: 10,
@@ -615,12 +633,10 @@ function RankedRatioRows({
           display: 'grid',
           gridTemplateColumns: '1fr 260px 80px 130px 48px',
           gap: 12,
-          padding: '10px 14px',
+          padding: '12px 16px',
           borderBottom: `1px solid ${colors.BORDER}`,
-          fontSize: 11,
-          fontWeight: 700,
-          letterSpacing: 0.5,
-          textTransform: 'uppercase',
+          fontSize: 12,
+          fontWeight: 600,
           color: colors.TEXT_MUTED,
           background: colors.BG_ELEVATED,
         }}
@@ -725,7 +741,7 @@ function RatioRow({
         // Extra bottom padding so the axis labels (5% / 50% / 100%)
         // don't collide with the next row, and so the Stored block
         // (when verified) doesn't crowd the next row's marker.
-        padding: '10px 14px 16px',
+        padding: '12px 16px 16px',
         borderBottom: `1px solid ${colors.BORDER}`,
         fontSize: 13,
       }}
@@ -737,14 +753,15 @@ function RatioRow({
         style={{
           fontFamily: 'var(--font-mono)',
           color: colors.TEXT_PRIMARY,
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
+          display: 'flex',
+          alignItems: 'baseline',
+          gap: SPACE.xxs,
+          minWidth: 0,
         }}
         title={`s3://${r.bucket}/${r.prefix}/ — ${r.deltas.toLocaleString()} deltas`}
       >
-        {r.prefix || '(root)'}{' '}
-        <span style={{ color: colors.TEXT_MUTED, fontSize: 11 }}>
+        <TruncatedName text={r.prefix || '(root)'} title={false} />
+        <span style={{ color: colors.TEXT_MUTED, fontSize: 11, flexShrink: 0 }}>
           ({r.deltas.toLocaleString()})
         </span>
       </div>
@@ -946,7 +963,7 @@ function VerifiedStoredVsOriginal({ verified }: { verified: VerifyDeltaEfficienc
           flexDirection: 'column',
           alignItems: 'flex-end',
           marginTop: 2,
-          padding: '2px 6px',
+          padding: '2px 8px',
           borderRadius: 4,
           background: `${savedColor}10`,
           border: `1px solid ${savedColor}30`,
@@ -1297,7 +1314,7 @@ function RatioHeaderHint() {
       {/* Formula */}
       <div
         style={{
-          padding: '6px 8px',
+          padding: '4px 8px',
           background: `${colors.ACCENT_BLUE}10`,
           border: `1px solid ${colors.ACCENT_BLUE}30`,
           borderRadius: 5,
@@ -1305,14 +1322,14 @@ function RatioHeaderHint() {
           fontSize: 11,
           color: colors.TEXT_PRIMARY,
           textAlign: 'center',
-          marginBottom: 10,
+          marginBottom: 12,
         }}
       >
         median(delta) ÷ reference
       </div>
 
       {/* Scale chips */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {rows.map((row) => (
           <div
             key={row.range}
@@ -1350,7 +1367,7 @@ function RatioHeaderHint() {
           bytes?" question this metric can't answer alone. */}
       <div
         style={{
-          marginTop: 10,
+          marginTop: 12,
           paddingTop: 8,
           borderTop: `1px dashed ${colors.BORDER}`,
           fontSize: 11,

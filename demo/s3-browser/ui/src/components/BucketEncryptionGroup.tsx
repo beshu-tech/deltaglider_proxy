@@ -27,7 +27,7 @@ import { Alert, Button, Checkbox, Input, Radio, Space, Tag, Typography, message 
 import { ReloadOutlined } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
 import type { EffectiveEncryption, SectionApplyResponse } from '../adminApi';
-import { getSectionVersioned, validateSection } from '../adminApi';
+import { ConfigConflictError, getSectionVersioned, validateSection } from '../adminApi';
 import { applySection, persistFailureText, sectionApplyErrorText } from '../applySection';
 import {
   bucketEncryptionBody,
@@ -43,7 +43,8 @@ import {
   type BucketEncryptionChoice,
 } from '../bucketEncryption';
 import { confirmDialog } from '../confirmDialog';
-import { normalizeUiError } from '../errorHandling';
+import { plainError, type PlainError } from '../plainError';
+import PlainErrorAlert from './PlainErrorAlert';
 import { useColors } from '../ThemeContext';
 import ApplyDialog from './ApplyDialog';
 import BucketKeySetup, { type BucketKeyValue } from './BucketKeySetup';
@@ -56,7 +57,7 @@ const { Text } = Typography;
 /** A radio beside a two-line (or taller) option: the dot sits on the
  *  title line, not centred on the whole block (it read as the radio of
  *  the prefix input below the title). */
-const RADIO_TOP = { icon: { alignSelf: 'flex-start', marginTop: 3 } } as const;
+const RADIO_TOP = { icon: { alignSelf: 'flex-start', marginTop: 4 } } as const;
 
 interface Props {
   bucket: string;
@@ -87,13 +88,12 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
   const [bucketKeyEnabled, setBucketKeyEnabled] = useState(true);
   const [dialog, setDialog] = useState<{ response: SectionApplyResponse; change: BucketEncryptionChange } | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<PlainError | null>(null);
 
+  // Sentence case, like the other group titles of the bucket card (D67).
   const groupLabel: React.CSSProperties = {
-    fontSize: 10,
-    fontWeight: 700,
-    letterSpacing: 0.5,
-    textTransform: 'uppercase',
+    fontSize: 13,
+    fontWeight: 600,
     fontFamily: 'var(--font-ui)',
     display: 'block',
     marginBottom: 8,
@@ -102,7 +102,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
 
   if (!eff) {
     return (
-      <div style={{ marginTop: 14 }}>
+      <div style={{ marginTop: 12 }}>
         <Text style={groupLabel}>Encryption</Text>
         <Text type="secondary" style={{ fontSize: 12 }}>
           {describeBucketEncryption(eff).tooltip}
@@ -169,7 +169,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
       const response = await validateSection('storage', bucketEncryptionBody(bucket, eff, change), confirmFor(bucket, eff, change));
       setDialog({ response, change });
     } catch (e) {
-      setError(normalizeUiError(e, 'The proxy refused the change'));
+      setError(plainError(e, 'The proxy refused the change.'));
     } finally {
       setBusy(false);
     }
@@ -182,7 +182,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
       const { version } = await getSectionVersioned('storage');
       const resp = await applySection(qc, 'storage', bucketEncryptionBody(bucket, eff, change), version, confirmFor(bucket, eff, change));
       if (!resp.ok) {
-        setError(resp.error || 'The proxy refused the change');
+        setError(plainError(resp.error || '', 'The proxy refused the change.'));
         return false;
       }
       const lost = persistFailureText(resp);
@@ -192,7 +192,12 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
       onApplied(eff);
       return true;
     } catch (e) {
-      setError(sectionApplyErrorText(e, 'Failed to apply the encryption change'));
+      // A version conflict has its own sentence; any other failure is plain words.
+      setError(
+        e instanceof ConfigConflictError
+          ? { text: sectionApplyErrorText(e, '') }
+          : plainError(e, 'The proxy could not apply the encryption change. Try again.'),
+      );
       return false;
     } finally {
       setBusy(false);
@@ -237,28 +242,28 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
   );
 
   return (
-    <div style={{ marginTop: 14 }} data-testid="bucket-encryption-group">
+    <div style={{ marginTop: 12 }} data-testid="bucket-encryption-group">
       <Text style={groupLabel}>
         Encryption
         {/* Marks the one immediate control of a card whose other fields are
             staged, before the user touches it. */}
         <Tag
           title="An encryption change is not staged with the other settings: it has its own Review & apply, and applies at once."
-          style={{ fontSize: 10, margin: '0 0 0 8px', padding: '0 6px', lineHeight: '16px', textTransform: 'none', letterSpacing: 0, fontWeight: 500 }}
+          style={{ fontSize: 10, margin: '0 0 0 8px', padding: '0 8px', lineHeight: '16px', textTransform: 'none', letterSpacing: 0, fontWeight: 500 }}
         >
           applies at once
         </Tag>
         {eff.key_env && (
-          <Tag style={{ fontSize: 10, fontFamily: 'var(--font-mono)', margin: '0 0 0 8px', padding: '0 6px', lineHeight: '16px', textTransform: 'none', letterSpacing: 0 }}>
+          <Tag style={{ fontSize: 10, fontFamily: 'var(--font-mono)', margin: '0 0 0 8px', padding: '0 8px', lineHeight: '16px', textTransform: 'none', letterSpacing: 0 }}>
             from env {eff.key_env}
           </Tag>
         )}
       </Text>
-      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 6 }}>
+      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
         Now: {desc.label}.
       </Text>
       {blockedReason && !readOnly && (
-        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 6 }}>
+        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
           {blockedReason}
         </Text>
       )}
@@ -338,7 +343,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
       )}
 
       {editing && (
-        <div style={{ marginTop: 10, paddingLeft: 4 }}>
+        <div style={{ marginTop: 12, paddingLeft: 4 }}>
           {(rotating || selected === 'bucket-key') && (
             <BucketKeySetup
               bucket={bucket}
@@ -357,7 +362,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
                 placeholder="arn:aws:kms:eu-central-1:123456789012:key/abcd-efgh"
                 style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}
               />
-              <Checkbox checked={bucketKeyEnabled} onChange={(e) => setBucketKeyEnabled(e.target.checked)} style={{ marginTop: 6 }}>
+              <Checkbox checked={bucketKeyEnabled} onChange={(e) => setBucketKeyEnabled(e.target.checked)} style={{ marginTop: 8 }}>
                 <Text style={{ fontSize: 12 }}>Enable S3 bucket keys (fewer KMS requests)</Text>
               </Checkbox>
             </>
@@ -371,8 +376,8 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
               description="Objects that are already encrypted stay readable. Run the re-encrypt job afterwards to decrypt them."
             />
           )}
-          {error && <Alert type="error" showIcon style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }} title={error} />}
-          <Space style={{ marginTop: 10 }}>
+          {error && <PlainErrorAlert error={error} style={{ marginTop: 8 }} />}
+          <Space style={{ marginTop: 12 }}>
             <Button size="small" onClick={cancel} disabled={busy}>
               Cancel
             </Button>
@@ -391,7 +396,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           </Space>
         </div>
       )}
-      {!editing && error && <Alert type="error" showIcon style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }} title={error} />}
+      {!editing && error && <PlainErrorAlert error={error} style={{ marginTop: 8 }} />}
 
       <ApplyDialog
         open={dialog !== null}
@@ -406,7 +411,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           // Staged edits appeared while the dialog was open: do not apply.
           if (blockedReason) {
             setDialog(null);
-            setError(blockedReason);
+            setError({ text: blockedReason });
             return;
           }
           void apply(c).then(() => setDialog(null));

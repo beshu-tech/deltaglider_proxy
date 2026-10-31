@@ -47,12 +47,15 @@ import {
   TeamOutlined,
 } from '@ant-design/icons';
 import { removeBootstrapCredentials, type IamMode } from '../adminApi';
-import { ApiError, normalizeUiError } from '../errorHandling';
+import { ApiError } from '../errorHandling';
+import { plainError, type PlainError } from '../plainError';
+import PlainErrorAlert from './PlainErrorAlert';
+import { ErrorState, LoadingState } from './StatePlaceholders';
 import { confirmDialog } from '../confirmDialog';
 import { docsUrlToInAppHref } from '../linkifyDocUrl';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
-import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
+import { useCardStyles, contentColumn, CONTENT_FORM, CARD_GAP, SPACE } from './shared-styles';
 import { useSectionEditor } from '../useSectionEditor';
 import { useAdminConfig, useEnvOverride } from '../queries/config';
 import { envOverrideHelp } from '../envOverrides';
@@ -110,7 +113,8 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
     discard,
     isDirty,
     loading,
-    error,
+    loadError,
+    refresh,
     applyOpen,
     applyResponse,
     applying,
@@ -127,7 +131,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
   });
   const qc = useQueryClient();
   const [removing, setRemoving] = useState(false);
-  const [removeError, setRemoveError] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState<PlainError | null>(null);
   const [removeWarnings, setRemoveWarnings] = useState<string[]>([]);
 
   // The RUNNING auth state (env variables included), so the page never
@@ -228,8 +232,8 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
     } catch (e) {
       setRemoveError(
         e instanceof ApiError && (e.status === 404 || e.status === 405)
-          ? 'This proxy cannot remove the bootstrap credentials from the GUI. Remove access.access_key_id and access.secret_access_key from the YAML config instead.'
-          : normalizeUiError(e, 'Could not remove the bootstrap credentials'),
+          ? { text: 'This proxy cannot remove the bootstrap credentials from the GUI. Remove access.access_key_id and access.secret_access_key from the YAML config instead.' }
+          : plainError(e, 'The proxy could not remove the bootstrap credentials.'),
       );
     } finally {
       setRemoving(false);
@@ -237,13 +241,13 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
   };
   const setSecretKey = (v: string) => setForm((prev) => ({ ...prev, secret_access_key: v || undefined }));
 
-  if (error) {
-    return <Alert type="error" showIcon title="Failed to load" description={error} />;
+  if (loadError) {
+    return <ErrorState error={loadError} what="the access settings" onRetry={() => void refresh()} />;
   }
   if (loading) {
     return (
-      <div style={{ padding: 48, textAlign: 'center' }}>
-        <Text type="secondary">Loading access configuration...</Text>
+      <div style={contentColumn(CONTENT_FORM)}>
+        <LoadingState variant="card" label="Loading the access settings" />
       </div>
     );
   }
@@ -265,7 +269,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
         ...contentColumn(CONTENT_FORM),
         display: 'flex',
         flexDirection: 'column',
-        gap: 16,
+        gap: CARD_GAP,
       }}
     >
       {/* IAM mode card — the architectural choice */}
@@ -273,20 +277,19 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
         <SectionHeader
           icon={<TeamOutlined />}
           title="IAM mode"
-          description="Who owns the user directory: this admin GUI + DB, or your YAML config?"
+          description="Where users, groups and providers are managed."
         />
         <div>
           <Radio.Group
             value={form.iam_mode ?? 'gui'}
             onChange={(e) => setIamMode(e.target.value as IamMode)}
-            style={{ display: 'flex', flexDirection: 'column', gap: 10 }}
+            style={{ display: 'flex', flexDirection: 'column', gap: SPACE.sm }}
           >
             <Radio value="gui" style={{ alignItems: 'flex-start' }}>
               <div>
                 <div style={{ fontWeight: 600 }}>GUI-managed (default)</div>
                 <Text type="secondary" style={{ fontSize: 12, lineHeight: 1.5 }}>
-                  Manage users here in the admin GUI. Any users in your
-                  YAML config are ignored. Best for solo and GUI-first setups.
+                  You manage users on the Users page. The YAML config holds no users.
                 </Text>
               </div>
             </Radio>
@@ -294,14 +297,14 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
               <div>
                 {/* A disabled radio greys its label to about 2.5:1; the title
                     keeps full contrast and the lock tag says it is off. */}
-                <div style={{ fontWeight: 600, color: colors.TEXT_PRIMARY, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div style={{ fontWeight: 600, color: colors.TEXT_PRIMARY, display: 'flex', alignItems: 'center', gap: SPACE.xs }}>
                   Declarative (YAML-authoritative)
                   {declarativeBlocked && (
                     <span
                       data-testid="declarative-unavailable"
                       style={{
                         display: 'inline-flex', alignItems: 'center', gap: 4,
-                        fontSize: 11, fontWeight: 600, padding: '0 6px', borderRadius: 4,
+                        fontSize: 11, fontWeight: 600, padding: `0 ${SPACE.xs}px`, borderRadius: 4,
                         color: colors.TEXT_SECONDARY, border: `1px solid ${colors.BORDER}`,
                       }}
                     >
@@ -310,24 +313,24 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
                   )}
                 </div>
                 <Text type="secondary" style={{ fontSize: 12, lineHeight: 1.5 }}>
-                  Your YAML config is the source of truth. The user
-                  management panels turn read-only, and every time you
-                  apply your config DeltaGlider updates users, groups,
-                  and providers to match it. Recommended for GitOps teams.
+                  The YAML config lists the users, and each apply makes the user database match it.
                 </Text>
               </div>
             </Radio>
             {declarativeBlocked && (
-              <Text type="secondary" style={{ fontSize: 12, lineHeight: 1.5, marginLeft: 24, marginTop: -4 }}>
-                Why it is not available: your YAML config has no users yet, and the proxy refuses a
-                switch that would empty the user database. Apply a full YAML document that lists
-                your users in <code>access.iam_users</code> and sets <code>iam_mode: declarative</code>.
-                See{' '}
-                <a href={docsUrlToInAppHref('https://deltaglider.com/docs/how-to/manage-iam-as-code') ?? undefined}>
-                  How to manage IAM as code
-                </a>
-                .
-              </Text>
+              // D64: the reason folds away; the "Not available" tag says enough at a glance.
+              <details style={{ fontSize: 12, lineHeight: 1.5, marginLeft: SPACE.lg, color: colors.TEXT_MUTED }}>
+                <summary style={{ cursor: 'pointer', width: 'fit-content' }}>Why is it not available?</summary>
+                <div style={{ marginTop: SPACE.xxs }}>
+                  The YAML config has no users, and a switch would empty the user database. Apply a YAML
+                  document that lists the users in <code>access.iam_users</code> and sets{' '}
+                  <code>iam_mode: declarative</code>. See{' '}
+                  <a href={docsUrlToInAppHref('https://deltaglider.com/docs/how-to/manage-iam-as-code') ?? undefined}>
+                    How to manage IAM as code
+                  </a>
+                  .
+                </div>
+              </details>
             )}
           </Radio.Group>
           {declarativeActive && (
@@ -335,12 +338,11 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
               type="warning"
               showIcon
               icon={<LockOutlined />}
-              style={{ marginTop: 12, borderRadius: 8 }}
+              style={{ marginTop: SPACE.sm }}
               title="Declarative mode is active after Apply"
               description={
                 <span style={{ fontSize: 12 }}>
-                  The Users / Groups / External authentication panels
-                  become read-only. Edit your YAML and Apply instead.
+                  The Users, Groups and External authentication pages become read-only.
                 </span>
               }
             />
@@ -353,13 +355,13 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
         <SectionHeader
           icon={<SafetyOutlined />}
           title="S3 authentication mode"
-          description="Whether clients must sign their requests with SigV4."
+          description="Whether S3 clients must sign their requests."
         />
         {runtimeConfig && (
           <Alert
             type={runtimeConfig.auth_enabled ? 'success' : 'warning'}
             showIcon
-            style={{ marginBottom: 16, borderRadius: 8 }}
+            style={{ marginBottom: SPACE.md }}
             title={
               runtimeConfig.auth_enabled
                 ? 'SigV4 authentication is on. Every S3 request must be signed.'
@@ -369,7 +371,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
         )}
         <div>
           {authEnv && (
-            <Text type="secondary" data-testid="auth-mode-env-note" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+            <Text type="secondary" data-testid="auth-mode-env-note" style={{ fontSize: 12, display: 'block', marginBottom: SPACE.xs }}>
               {envOverrideHelp(authEnv)}
             </Text>
           )}
@@ -377,14 +379,13 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
             value={authMode}
             disabled={authEnv !== null}
             onChange={(e) => setAuthMode(e.target.value as AuthMode)}
-            style={{ display: 'flex', flexDirection: 'column', gap: 10 }}
+            style={{ display: 'flex', flexDirection: 'column', gap: SPACE.sm }}
           >
             <Radio value="auto" style={{ alignItems: 'flex-start' }}>
               <div>
                 <div style={{ fontWeight: 600 }}>Auto-detect (recommended)</div>
                 <Text type="secondary" style={{ fontSize: 12 }}>
-                  Clients must sign their requests when IAM users or
-                  bootstrap credentials exist.
+                  Signing is required when IAM users or bootstrap credentials exist.
                 </Text>
               </div>
             </Radio>
@@ -394,12 +395,8 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
                   Open access <span style={{ color: colors.ACCENT_AMBER, fontSize: 11 }}>(dev only)</span>
                 </div>
                 <Text type="secondary" style={{ fontSize: 12 }}>
-                  Explicitly disable SigV4 verification for every
-                  request. Equivalent to{' '}
-                  <code style={{ fontFamily: 'var(--font-mono)' }}>
-                    authentication: &quot;none&quot;
-                  </code>{' '}
-                  in YAML.
+                  No request is checked. In YAML:{' '}
+                  <code style={{ fontFamily: 'var(--font-mono)' }}>authentication: &quot;none&quot;</code>.
                 </Text>
               </div>
             </Radio>
@@ -412,9 +409,9 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
         <SectionHeader
           icon={<KeyOutlined />}
           title="Bootstrap SigV4 credentials"
-          description="Used before any IAM users exist, and by legacy scripted clients. Not the same as the admin GUI password."
+          description="One S3 key pair that works before IAM users exist. It is not the admin password."
         />
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE.sm }}>
           <FormField
             label="Access key ID"
             yamlPath="access.access_key_id"
@@ -464,9 +461,9 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
               </Button>
             </div>
           )}
-          {removeError && <Alert type="error" showIcon title={removeError} style={{ borderRadius: 8 }} />}
+          {removeError && <PlainErrorAlert error={removeError} />}
           {removeWarnings.map((w) => (
-            <Alert key={w} type="warning" showIcon title={w} style={{ borderRadius: 8 }} />
+            <Alert key={w} type="warning" showIcon title={w} />
           ))}
         </div>
       </div>

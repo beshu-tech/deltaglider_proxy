@@ -34,7 +34,7 @@ Wire that into CI so that the review catches drift. Full field reference: [Confi
 
 ### 2. Pin a storage backend
 
-Decide where the bytes live and say so explicitly. Do not take the filesystem default into production. In the admin UI, add the backend on **Storage → Backends** with **Add backend**, and select **Set as default backend**. [How to route a bucket to a different backend](route-a-bucket-to-a-backend.md) shows every step with screenshots. The backend is saved when you create it, so this step has no **Review & apply**.
+Decide where the bytes live and say so explicitly. Do not take the filesystem default into production. In the admin UI, add the backend on **Storage → Backends** with **New backend** at the top right of the page, and select **Set as default backend**. [How to route a bucket to a different backend](route-a-bucket-to-a-backend.md) shows every step with screenshots. The backend is saved when you create it, so this step has no **Review & apply**.
 
 In YAML, the backend goes into the `storage` section ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)). Keep the credentials out of the file with `${env:NAME}` references:
 
@@ -83,15 +83,15 @@ Decide per backend, before real data lands: `none`, proxy-side AES-256-GCM, SSE-
 
 ### 8. Size the caches
 
-Raise the reference cache (the LRU of reference baselines) to 1024 MB or more, because hot-read workloads benefit most from it. Raise the metadata cache to 200 MB or more if you list large prefixes repeatedly. The startup log warns with a `[cache]` prefix if you forgot. Both sizes apply at once, because the proxy rebuilds its caches when you apply a new size. The rebuilt caches start empty.
+Raise the reference cache (the LRU of reference baselines) to 1024 MiB or more, because hot-read workloads benefit most from it. Raise the metadata cache to 200 MiB or more if you list large prefixes repeatedly. The startup log warns with a `[cache]` prefix if you forgot. Both sizes apply at once, because the proxy rebuilds its caches when you apply a new size. The rebuilt caches start empty.
 
 In the admin UI:
 
 1. In the sidebar, open **System → System** (`/_/admin/system`), and scroll to the **Caches** card.
-2. Type `1024` in **Reference cache size (MB)** and `200` in **Metadata cache size (MB)**.
+2. Type `1024` in **Reference cache size (MiB)** and `200` in **Metadata cache size (MiB)**.
 3. Click **Review & apply** in the bar above the card, check the diff, and click **Apply and Persist**.
 
-   ![The Caches card of the System page holds a reference cache of 1024 MB and a metadata cache of 200 MB; callout 1 marks the two cache fields and callout 2 marks Review & apply.](/_/screenshots/production-caches.webp)
+   ![The Caches card of the System page holds a reference cache of 1024 MiB and a metadata cache of 200 MiB; callout 1 marks the two cache fields and callout 2 marks Review & apply.](/_/screenshots/production-caches.webp)
 
 The environment variables `DGP_CACHE_MB` and `DGP_METADATA_CACHE_MB` override these fields. When one of them is set, the admin UI shows the field as read-only with a from env badge. While you're there, check the largest object size (`max_object_size`, default 100 MiB) against your largest artefacts. The admin UI shows it as **Maximum object size (MiB)** on **Storage → Buckets**, and `DGP_MAX_OBJECT_SIZE` overrides it. The proxy writes the temporary files of delta objects larger than 16 MiB to the spool directory (`DGP_SPOOL_DIR`, default `<system temp>/dgp-spool`), so make sure that this directory is writable and has space. The spool settings exist only as environment variables. Remaining knobs: [Configuration](../reference/configuration.md).
 

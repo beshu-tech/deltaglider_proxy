@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Alert } from 'antd';
 import type { WhoamiResponse } from '../adminApi';
 import type { BrowserCapabilities } from '../browserCapabilities';
@@ -13,6 +13,7 @@ import { BULK_BAR_RESERVE, HEADER_STATS_MIN_VIEWPORT } from '../browser/layout';
 import { useIsNarrow } from '../useIsNarrow';
 import BucketMaintenanceBanner from './BucketMaintenanceBanner';
 import ListingPlaceholder from './ListingPlaceholder';
+import { plainError } from '../plainError';
 
 /** The active bucket's server-side jobs (GET /jobs/bucket/:bucket). */
 interface BucketJobs {
@@ -67,11 +68,18 @@ export default function BrowserScreen({
   const statsInFooter = useIsNarrow(HEADER_STATS_MIN_VIEWPORT) && !isMobile;
   // The folder last seen with rows. An empty listing of THAT folder means
   // the user emptied it (a delete or a move), not a mistyped path.
+  // Rows count as this folder's only from the second render at it: on the
+  // first, they can still be the previous folder's (the listing resets after
+  // the render), and a new bucket then read "is now empty" (UX harvest D13).
   const location = `${bucket}\u0000${s3.prefix}`;
   const [filledLocation, setFilledLocation] = useState<string | null>(null);
+  const lastRenderedLocation = useRef<string | null>(null);
   useEffect(() => {
-    if (!isEmpty) setFilledLocation(location);
-  }, [isEmpty, location]);
+    const settled = lastRenderedLocation.current === location;
+    lastRenderedLocation.current = location;
+    if (!isEmpty && settled) setFilledLocation(location);
+    // Every new listing (a new array) is a render that may settle the rows.
+  }, [isEmpty, location, s3.objects, s3.folders]);
   const emptied = isEmpty && filledLocation === location;
   return (
     <>
@@ -104,13 +112,13 @@ export default function BrowserScreen({
       <div style={{ flex: 1, overflow: 'auto' }}>
         {/* With stale rows on hand, a failed refresh shows them under a
             warning banner instead of the error placeholder. */}
-        {s3.error && !isEmpty && (
+        {s3.error != null && !isEmpty && (
           <Alert
             type="warning"
             showIcon
             banner
-            title="Showing a stale listing — the last refresh failed"
-            description={s3.error}
+            title="This list can be out of date: the last refresh failed"
+            description={plainError(s3.error, 'The proxy could not list the objects.').text}
             style={{ borderRadius: 0 }}
           />
         )}

@@ -40,3 +40,12 @@ test('a failed outbox read hides the strip and keeps the settings', async () => 
   expect(screen.queryByText(/pending$/)).toBeNull();
   expect(screen.queryByText(/jobs db locked/)).toBeNull();
 });
+
+test('with nothing to act on the strip is hidden: it does not repeat the switch (UX harvest D63)', async () => {
+  http.on('GET', OUTBOX, json({ ...counts(0, 0), delivery_enabled: false, delivery_active: false, delivery_state: 'disabled' }));
+  renderWithQuery(<WebhookDeliveryPanel />);
+  expect(await screen.findByText('Enable delivery')).toBeInTheDocument();
+  await waitFor(() => expect(http.callsTo('GET', OUTBOX)).toHaveLength(1));
+  expect(screen.queryByText('0 pending')).toBeNull();
+  expect(screen.queryByText(/View event log/)).toBeNull();
+});

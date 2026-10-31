@@ -136,7 +136,7 @@ describe.each([
     const { result } = await mountBrowser();
     selectFileAndFolder(result);
     await act(async () => {
-      await expect(result.current[op]('archive', 'old/')).rejects.toThrow(/backend down/);
+      await expect(result.current[op]('archive', 'old/')).rejects.toThrow(/backend down/i);
     });
     expect(result.current.selectedKeys.size).toBe(2);
   });

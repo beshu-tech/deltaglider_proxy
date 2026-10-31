@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Button, Empty, Input, Modal, Segmented, Spin } from 'antd';
+import { Button, Input, Modal, Segmented, Spin } from 'antd';
 import { CheckCircleFilled, CloseCircleFilled, EyeOutlined, MinusCircleFilled } from '@ant-design/icons';
 import type { FilterPreview, FilterVerdict } from '../adminApi/jobs';
 import { useColors } from '../ThemeContext';
 import { useFilterPreview } from '../queries/filterPreview';
 import { filterSummary, globReport, scopeLabel, splitAtPrefix, verdictText } from '../ruleFilterPreview';
 import FormField from './FormField';
+import { EmptyState, LoadingState } from './StatePlaceholders';
 import GlobListTextArea from './GlobListTextArea';
 
 interface Props {
@@ -57,9 +58,9 @@ export default function RuleFilterFields(props: Props) {
   const scope = scopeLabel(bucket, prefix);
 
   return (
-    <section aria-label="Which objects" style={{ marginTop: 20 }}>
+    <section aria-label="Which objects" style={{ marginTop: 24 }}>
       <div style={{ ...SECTION_TITLE, color: colors.TEXT_SECONDARY }}>Which objects</div>
-      <p style={{ margin: '6px 0 12px', fontSize: 12, color: colors.TEXT_MUTED, maxWidth: 760 }}>
+      <p style={{ margin: '4px 0 12px', fontSize: 12, color: colors.TEXT_MUTED, maxWidth: 760 }}>
         Globs match the whole key from the bucket root, so the prefix is part of it. <code>*</code> also
         matches <code>/</code>, and <code>**</code> matches any depth. An exclude wins over an include.
       </p>
@@ -72,7 +73,7 @@ export default function RuleFilterFields(props: Props) {
           alignItems: 'center',
           gap: 12,
           marginTop: 12,
-          padding: '10px 14px',
+          padding: '8px 16px',
           border: `1px solid ${colors.BORDER}`,
           borderRadius: 8,
           background: colors.BG_ELEVATED,
@@ -196,12 +197,12 @@ function GlobReports({
   const colors = useColors();
   if (globs.length === 0 || !preview) return null;
   return (
-    <ul aria-label={`${list} glob matches`} style={{ listStyle: 'none', margin: '6px 0 0', padding: 0, fontSize: 12 }}>
+    <ul aria-label={`${list} glob matches`} style={{ listStyle: 'none', margin: '4px 0 0', padding: 0, fontSize: 12 }}>
       {globs.map((g) => {
         const r = globReport(preview, list, g);
         if (!r) return null;
         return (
-          <li key={g} style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: 6, padding: '2px 0' }}>
+          <li key={g} style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: 8, padding: '2px 0' }}>
             <code style={{ color: colors.TEXT_PRIMARY }}>{g}</code>
             {r.error ? (
               <span style={{ color: colors.ACCENT_RED }}>is not a valid glob: {r.error}</span>
@@ -323,7 +324,7 @@ function FilterPreviewModal({
           </div>
         </div>
         <div style={{ minWidth: 0 }}>
-          <div style={{ marginBottom: 14 }}>
+          <div style={{ marginBottom: 16 }}>
             <label htmlFor="filter-probe" style={{ fontSize: 13, fontWeight: 600 }}>
               Test a key
             </label>
@@ -343,8 +344,11 @@ function FilterPreviewModal({
               )}
             </div>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
+            {/* tabIndex -1 on the root: AntD Segmented makes the root AND its
+                radio Tab stops; the radio keeps the keyboard (UX harvest D3). */}
             <Segmented<Tab>
+              tabIndex={-1}
               value={tab}
               onChange={setTab}
               options={[
@@ -374,11 +378,11 @@ function FilterPreviewModal({
             }}
           >
             {rows.length === 0 ? (
-              <Empty
-                image={Empty.PRESENTED_IMAGE_SIMPLE}
-                description={preview ? 'No object in this group.' : 'Counting the objects under the prefix…'}
-                style={{ marginTop: 48 }}
-              />
+              preview ? (
+                <EmptyState compact title="No objects in this group" />
+              ) : (
+                <LoadingState variant="inline" label="Counting the objects under the prefix…" />
+              )
             ) : (
               rows.map((k) => {
                 const [pre, rest] = splitAtPrefix(k.key, props.prefix);
@@ -390,7 +394,7 @@ function FilterPreviewModal({
                       display: 'flex',
                       alignItems: 'center',
                       gap: 12,
-                      padding: '6px 12px',
+                      padding: '8px 12px',
                       borderBottom: `1px solid ${colors.BORDER}`,
                       fontSize: 12,
                     }}
@@ -412,7 +416,7 @@ function FilterPreviewModal({
             )}
           </div>
           {shownNote && (
-            <div style={{ marginTop: 6, fontSize: 12, color: colors.TEXT_MUTED }}>{shownNote}</div>
+            <div style={{ marginTop: 4, fontSize: 12, color: colors.TEXT_MUTED }}>{shownNote}</div>
           )}
         </div>
       </div>

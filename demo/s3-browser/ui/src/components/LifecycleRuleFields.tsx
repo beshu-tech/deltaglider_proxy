@@ -1,14 +1,14 @@
-import { Alert, Input, InputNumber, Select, Switch, Typography } from 'antd';
+import { Alert, Input, Select, Switch, Typography } from 'antd';
 import type { LifecycleAction, LifecycleRuleConfig } from '../adminApi';
 import BucketPrefixInput from './BucketPrefixInput';
 import FormField from './FormField';
-import { AdvancedDisclosure } from './ruleEditorFields';
+import { AdvancedDisclosure, RuleNumberInput } from './ruleEditorFields';
 import RuleFilterFields from './RuleFilterFields';
 import { ruleFolderPrefix } from '../ruleFilterPreview';
 import { actionKind } from './lifecyclePayload';
 import { ruleGlobError } from './jobs/lifecycleText';
-import { lifecycleRuleFieldErrors } from './jobs/humanDuration';
-import { useErrorGate } from './jobs/useErrorGate';
+import type { RuleFieldErrors } from './jobs/ruleFieldErrors';
+import { SPACE } from './shared-styles';
 
 const { Text } = Typography;
 
@@ -16,9 +16,15 @@ type RetainAction = Extract<LifecycleAction, { type: 'retain-newest' }>;
 type TransitionAction = Extract<LifecycleAction, { type: 'transition' | 'archive' }>;
 
 
+const GRID = (min: number) => ({ display: 'grid', gridTemplateColumns: `repeat(auto-fit, minmax(${min}px, 1fr))`, gap: SPACE.md });
+
 /**
  * Per-rule field editor body for the Lifecycle panel. Passed as the
  * Definition-tab content of the Jobs drawer; the parent owns state.
+ *
+ * `errors` are the field errors to SHOW now (the parent checks every field
+ * with `lifecycleRuleErrors` and shows an error once its field lost focus,
+ * or after Review & apply); `onFieldBlur` tells the parent a field lost focus.
  */
 export default function RuleEditor({
   rule,
@@ -26,13 +32,18 @@ export default function RuleEditor({
   inputRadius,
   onChange,
   onRename,
+  errors = {},
+  onFieldBlur = () => {},
 }: {
   rule: LifecycleRuleConfig;
   buckets: string[];
   inputRadius: { borderRadius: number };
   onChange: (patch: Partial<LifecycleRuleConfig>) => void;
   onRename: (nextName: string) => void;
+  errors?: RuleFieldErrors;
+  onFieldBlur?: (field: string) => void;
 }) {
+  const blur = (field: string) => () => onFieldBlur(field);
   const kind = actionKind(rule.action);
   const transitionAction =
     kind === 'transition' && typeof rule.action === 'object'
@@ -60,22 +71,21 @@ export default function RuleEditor({
   };
 
   const includeError = ruleGlobError(rule.name, rule.include_globs);
-  const fieldErrors = lifecycleRuleFieldErrors(rule);
-  const gate = useErrorGate();
-  const errorOf = (key: keyof typeof fieldErrors) => (gate.show(key) ? (fieldErrors[key] ?? undefined) : undefined);
   const excludeError = ruleGlobError(rule.name, rule.exclude_globs);
 
   return (
     <div>
-      <div style={{ marginTop: 16, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
+      <div style={{ marginTop: SPACE.md, ...GRID(260) }}>
         <FormField
           label="Rule name"
           yamlPath="storage.lifecycle.rules[].name"
-          helpText="Unique identifier for this rule. ASCII letters, digits, dot, dash, underscore; max 64 chars."
+          helpText="A name that is unique on this page: letters, digits, dots, dashes and underscores, 64 characters at most."
+          error={errors.name}
         >
           <Input
             value={rule.name}
-            onChange={(e) => onRename(e.target.value.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64))}
+            onChange={(e) => onRename(e.target.value)}
+            onBlur={blur('name')}
             style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
           />
         </FormField>
@@ -90,24 +100,27 @@ export default function RuleEditor({
           label="Scope"
           yamlPath="storage.lifecycle.rules[].bucket"
           helpText="Bucket and optional prefix to scan for expired objects. An empty prefix scans the whole bucket."
+          error={errors.bucket}
         >
-          <BucketPrefixInput
-            value={{ bucket: rule.bucket, prefix: rule.prefix }}
-            onChange={(scope) => onChange({ bucket: scope.bucket, prefix: scope.prefix })}
-            buckets={buckets}
-            bucketPlaceholder="prod-artifacts"
-            prefixPlaceholder="builds/releases/"
-          />
+          <div onBlur={blur('bucket')}>
+            <BucketPrefixInput
+              value={{ bucket: rule.bucket, prefix: rule.prefix }}
+              onChange={(scope) => onChange({ bucket: scope.bucket, prefix: scope.prefix })}
+              buckets={buckets}
+              bucketPlaceholder="prod-artifacts"
+              prefixPlaceholder="builds/releases/"
+            />
+          </div>
         </FormField>
         {kind !== 'retain-newest' && (
           <FormField
             label="Expire after"
             yamlPath="storage.lifecycle.rules[].expire_after"
             helpText="Objects whose creation time is older than this age become candidates. The proxy stamps the creation time when it stores an object. For an object that was written without the proxy (a restore, a copy straight to the disk or the backend), it uses the file's modification time instead. A duration such as 12h, 30d or 90d."
-            error={errorOf('expire_after')}
+            error={errors.expire_after}
           >
             <Input
-              {...gate.props('expire_after')}
+              onBlur={blur('expire_after')}
               value={rule.expire_after || ''}
               onChange={(e) => onChange({ expire_after: e.target.value })}
               placeholder="30d"
@@ -162,35 +175,33 @@ export default function RuleEditor({
             showIcon
             title="Keep the newest N — count-based retention"
             description="Ranks objects newest-first and keeps the latest N qualifying ones; the rest are deleted. The qualify filters below are an eligibility gate, not a delete guard: a file that fails them is ignored entirely — never counted toward N, never deleted — so an accidental empty or half-written file can't push a real backup out of the keep set."
-            style={{ marginTop: 14 }}
+            style={{ marginTop: SPACE.md }}
           />
-          <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
+          <div style={{ marginTop: SPACE.md, ...GRID(260) }}>
             <FormField
               label="Keep newest"
               yamlPath="storage.lifecycle.rules[].action.count"
-              helpText="How many of the newest qualifying objects to keep. Everything else is deleted. Must be at least 1."
+              helpText="How many of the newest qualifying objects to keep, from 1 to 100,000. Everything else is deleted."
+              error={errors.count}
             >
-              <InputNumber
+              <RuleNumberInput
                 value={retainAction.count}
-                onChange={(count) => updateRetain({ count: Math.max(1, Math.floor(Number(count) || 1)) })}
-                min={1}
-                max={100000}
+                onChange={(count) => updateRetain({ count: count as number })}
+                onBlur={blur('count')}
                 style={{ width: '100%', ...inputRadius }}
               />
             </FormField>
             <FormField
               label="Ignore objects smaller than"
               yamlPath="storage.lifecycle.rules[].action.qualify.min_size_bytes"
-              helpText="Bytes. Objects below this ORIGINAL size are ignored — never kept, never deleted — so empty/truncated junk can't anchor the keep set. Leave 0 for no size filter."
+              helpText="Bytes. Objects below this ORIGINAL size are ignored — never kept, never deleted — so empty/truncated junk can't anchor the keep set. Leave it empty for no size filter."
+              error={errors.min_size_bytes}
             >
-              <InputNumber
-                value={retainAction.qualify?.min_size_bytes ?? 0}
-                onChange={(v) => {
-                  const n = Math.max(0, Math.floor(Number(v) || 0));
-                  updateQualify({ min_size_bytes: n > 0 ? n : undefined });
-                }}
-                min={0}
-                step={1048576}
+              <RuleNumberInput
+                value={retainAction.qualify?.min_size_bytes}
+                onChange={(n) => updateQualify({ min_size_bytes: n })}
+                onBlur={blur('min_size_bytes')}
+                placeholder="0"
                 style={{ width: '100%', ...inputRadius }}
                 suffix="bytes"
               />
@@ -199,10 +210,10 @@ export default function RuleEditor({
               label="Ignore objects younger than"
               yamlPath="storage.lifecycle.rules[].action.qualify.min_age"
               helpText="A duration such as 1h. The rule ignores objects younger than this, because they can still be uploading. Leave it empty for no age filter."
-              error={errorOf('min_age')}
+              error={errors.min_age}
             >
               <Input
-                {...gate.props('min_age')}
+                onBlur={blur('min_age')}
                 value={retainAction.qualify?.min_age || ''}
                 onChange={(e) => updateQualify({ min_age: e.target.value || undefined })}
                 placeholder="1h"
@@ -210,15 +221,15 @@ export default function RuleEditor({
               />
             </FormField>
           </div>
-          <AdvancedDisclosure title="Delete-side guard" hint="Never delete objects younger than an age" hasError={!!fieldErrors.protect_younger_than}>
+          <AdvancedDisclosure title="Delete-side guard" hint="Never delete objects younger than an age" hasError={!!errors.protect_younger_than}>
             <FormField
               label="Don't delete anything younger than"
               yamlPath="storage.lifecycle.rules[].action.protect_younger_than"
               helpText="A duration such as 1h. This run does not delete a selected object that is younger than this. The filters above are different: they remove objects from the count. Most rules leave this empty."
-              error={errorOf('protect_younger_than')}
+              error={errors.protect_younger_than}
             >
               <Input
-                {...gate.props('protect_younger_than')}
+                onBlur={blur('protect_younger_than')}
                 value={retainAction.protect_younger_than || ''}
                 onChange={(e) => updateRetain({ protect_younger_than: e.target.value || undefined })}
                 placeholder="7d"
@@ -230,12 +241,14 @@ export default function RuleEditor({
       )}
 
       {transitionAction && (
-        <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
+        <div style={{ marginTop: SPACE.md, ...GRID(260) }}>
           <FormField
             label="Destination"
             yamlPath="storage.lifecycle.rules[].action.destination"
             helpText="Bucket and prefix that archived objects are copied into."
+            error={errors.destination}
           >
+            <div onBlur={blur('destination')}>
             <BucketPrefixInput
               value={{
                 bucket: transitionAction.destination?.bucket || '',
@@ -246,6 +259,7 @@ export default function RuleEditor({
               bucketPlaceholder="archive-artifacts"
               prefixPlaceholder="archive/releases/"
             />
+            </div>
           </FormField>
           <FormField
             label="Delete source after copy"
@@ -274,18 +288,19 @@ export default function RuleEditor({
         inputRadius={inputRadius}
       />
 
-      <AdvancedDisclosure title="Batch size" hint="Objects per page of a run">
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 }}>
+      <AdvancedDisclosure title="Batch size" hint="Objects per page of a run" hasError={!!errors.batch_size}>
+        <div style={GRID(240)}>
           <FormField
             label="Batch size"
             yamlPath="storage.lifecycle.rules[].batch_size"
-            helpText="Objects per listing page / worker batch. Default 100."
+            helpText="Objects per listing page and worker batch, from 1 to 10,000. The default is 100."
+            error={errors.batch_size}
           >
-            <InputNumber
+            <RuleNumberInput
               value={rule.batch_size}
-              onChange={(batch_size) => onChange({ batch_size: Number(batch_size) || 100 })}
-              min={1}
-              max={10000}
+              onChange={(batch_size) => onChange({ batch_size: batch_size as number })}
+              onBlur={blur('batch_size')}
+              placeholder="100"
               style={{ width: '100%', ...inputRadius }}
             />
           </FormField>

@@ -28,12 +28,12 @@ export default function PermissionSummarySection({ user, permissions, userGroups
 
   return (
     <div style={{ marginBottom: 24 }}>
-      <Divider style={{ margin: '20px 0 12px' }}>Groups &amp; Inherited Access</Divider>
+      <Divider style={{ margin: '16px 0 12px' }}>Groups &amp; Inherited Access</Divider>
 
       {/* Group memberships — clickable */}
       {memberGroups.length > 0 ? (
         <div style={{ marginBottom: 16 }}>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
             {memberGroups.map(g => (
               onNavigateToGroup ? (
                 <PillButton key={g.id} onClick={() => onNavigateToGroup(g.id)} title={`Open group ${g.name}`}>
@@ -43,7 +43,7 @@ export default function PermissionSummarySection({ user, permissions, userGroups
                   </span>
                 </PillButton>
               ) : (
-                <Tag key={g.id} color="blue" style={{ borderRadius: 8, fontSize: 12, padding: '3px 12px', margin: 0 }}>
+                <Tag key={g.id} color="blue" style={{ borderRadius: 8, fontSize: 12, padding: '4px 12px', margin: 0 }}>
                   {g.name}
                   <span style={{ marginLeft: 4, fontSize: 10 }}>
                     {g.permissions.length} rule{g.permissions.length !== 1 ? 's' : ''} · {g.member_ids.length} member{g.member_ids.length !== 1 ? 's' : ''}
@@ -69,12 +69,12 @@ export default function PermissionSummarySection({ user, permissions, userGroups
               disabled={!onNavigateToGroup}
               onClick={() => onNavigateToGroup?.(g.id)}
               style={{
-                display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, padding: 0,
+                display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, padding: 0,
                 background: 'none', border: 'none', font: 'inherit',
                 cursor: onNavigateToGroup ? 'pointer' : 'default',
               }}
             >
-              <Text style={{ fontSize: 11, fontWeight: 700, color: colors.ACCENT_BLUE, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+              <Text style={{ fontSize: 12, fontWeight: 600, color: colors.ACCENT_BLUE }}>
                 From {g.name}
               </Text>
               <span aria-hidden="true" style={{ fontSize: 10, color: colors.TEXT_MUTED }}>↗</span>
@@ -108,10 +108,10 @@ export default function PermissionSummarySection({ user, permissions, userGroups
           background: `${colors.ACCENT_BLUE}08`, border: `1px solid ${colors.ACCENT_BLUE}20`,
         }}>
           <Text style={{
-            fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.5,
+            fontSize: 12, fontWeight: 600,
             color: colors.ACCENT_BLUE, display: 'block', marginBottom: 8,
           }}>
-            Effective Permissions ({directPerms.length} direct + {inheritedPerms.length} inherited)
+            Effective permissions ({directPerms.length} direct + {inheritedPerms.length} inherited)
           </Text>
           {allPerms.map((perm, i) => {
             const isDeny = perm.effect === 'Deny';

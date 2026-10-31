@@ -26,7 +26,7 @@ import { startReencrypt } from '../adminApi';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
 import { useBucketOrigins } from '../queries/backends';
-import { normalizeUiError } from '../errorHandling';
+import { plainError } from '../plainError';
 import { describeBucketEncryption, type ReencryptTransition } from '../bucketEncryption';
 
 const { Text } = Typography;
@@ -140,7 +140,7 @@ export default function ReencryptProposalModal({
       setSelected((cur) => cur.filter((b) => failed.has(b)));
       if (res.errors.length === 0) onClose();
     } catch (e) {
-      messageApi.error(normalizeUiError(e, 'Failed to start'));
+      messageApi.error(plainError(e, 'Could not start the re-encrypt job').text);
     } finally {
       setStarting(false);
     }
@@ -219,7 +219,7 @@ export default function ReencryptProposalModal({
               {pickRows.length === 0 ? 'No bucket has objects that the job can change.' : 'No bucket matches the search.'}
             </Text>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 320, overflowY: 'auto' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 320, overflowY: 'auto' }}>
               {visibleRows.map((r) => (
                 <Checkbox
                   key={r.bucket}
@@ -245,7 +245,7 @@ export default function ReencryptProposalModal({
       ) : candidates.length === 0 ? (
         <Text type="secondary">No buckets available.</Text>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           {candidates.map((b) => (
             <Checkbox
               key={b}

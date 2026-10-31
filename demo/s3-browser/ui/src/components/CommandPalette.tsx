@@ -299,7 +299,7 @@ export default function CommandPalette({
         },
       }}
     >
-      <div style={{ padding: '14px 16px', borderBottom: `1px solid ${colors.BORDER}` }}>
+      <div style={{ padding: '12px 16px', borderBottom: `1px solid ${colors.BORDER}` }}>
         <Input
           aria-label="Search pages and actions"
           ref={inputRef}
@@ -334,7 +334,7 @@ export default function CommandPalette({
         style={{
           overflowY: 'auto',
           flex: 1,
-          padding: 6,
+          padding: 8,
         }}
       >
         {items.length === 0 ? (
@@ -344,7 +344,7 @@ export default function CommandPalette({
             </div>
             <div
               style={{
-                marginTop: 6,
+                marginTop: 8,
                 fontSize: 12.5,
                 color: nothingToRun ? colors.ACCENT_AMBER : colors.TEXT_MUTED,
                 fontWeight: nothingToRun ? 600 : 400,
@@ -409,8 +409,8 @@ export default function CommandPalette({
 
 /**
  * Section heading rendered between groups in the empty-query view.
- * Non-interactive — Arrow keys skip over it. Styled as all-caps
- * micro-text to match the sidebar group labels.
+ * Non-interactive — Arrow keys skip over it. Sentence case, muted
+ * (UX harvest D67: one heading system).
  */
 function SectionHeading({ label }: { label: string }) {
   const { TEXT_MUTED } = useColors();
@@ -418,12 +418,10 @@ function SectionHeading({ label }: { label: string }) {
     <div
       role="presentation"
       style={{
-        fontSize: 10,
-        fontWeight: 700,
-        letterSpacing: 0.8,
-        textTransform: 'uppercase',
+        fontSize: 12,
+        fontWeight: 600,
         color: TEXT_MUTED,
-        padding: '10px 12px 4px',
+        padding: '8px 12px 4px',
         fontFamily: 'var(--font-ui)',
       }}
     >
@@ -458,7 +456,7 @@ function CommandRow({
         alignItems: 'center',
         gap: 12,
         width: '100%',
-        padding: '10px 12px',
+        padding: '8px 12px',
         border: 'none',
         background: active ? `${colors.ACCENT_BLUE}15` : 'transparent',
         borderRadius: 8,

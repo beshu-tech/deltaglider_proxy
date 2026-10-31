@@ -13,7 +13,7 @@ export default function FormLabel({ text, hint, htmlFor }: { text: string; hint?
       <label htmlFor={htmlFor}>
         <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>{text}</Text>
       </label>
-      {hint && <Text type="secondary" style={{ fontSize: 10, fontWeight: 400, marginLeft: 6 }}>{hint}</Text>}
+      {hint && <Text type="secondary" style={{ fontSize: 10, fontWeight: 400, marginLeft: 8 }}>{hint}</Text>}
     </div>
   );
 }

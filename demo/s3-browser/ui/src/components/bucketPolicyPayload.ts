@@ -242,6 +242,16 @@ export function parseQuotaGib(text: string): { ok: true; bytes: number | null } 
   return { ok: true, bytes: bytesFromGib(gib) };
 }
 
+/** Pure: the typed delta size cutoff. Empty = the global default (null);
+ *  else a number from 0 to 1. Never clamped (UX harvest D9). */
+export function parseDeltaRatio(text: string): { ok: true; ratio: number | null } | { ok: false; error: string } {
+  const t = text.trim();
+  if (!t) return { ok: true, ratio: null };
+  const n = /^(\d+(\.\d*)?|\.\d+)$/.test(t) ? Number(t) : Number.NaN;
+  if (!(n >= 0 && n <= 1)) return { ok: false, error: 'Enter a number from 0 to 1, such as 0.75, or leave it empty for the global default.' };
+  return { ok: true, ratio: n };
+}
+
 /** A typed file extension in the server's form: trimmed, lowercase, no
  *  leading dot. `''` when nothing is left. The server validates the rest. */
 export function normalizeExtension(raw: string): string {

@@ -9,29 +9,34 @@
 import type { ColorTokens } from '../../ThemeContext';
 
 /**
- * Ordered palette for multi-series panels. Start from ACCENT_BLUE
- * (teal, the product's primary) and fan out across a harmonic set
- * tuned to work on both dark and light backgrounds. Exported as an
- * array so callers can slice + cycle by index.
+ * THE chart colours (UX harvest D21): every series comes from the theme
+ * tokens, so a chart matches the rest of the admin in light AND dark.
+ * Teal (the brand primary) first, amber second; then slate, green, rose,
+ * violet. No AntD default blue: it was the only blue element on the page.
+ * A single-series chart uses `primary` for every bar; `series` is for
+ * charts whose bars are different things (one colour per category).
  */
-export const CHART_PALETTE = [
-  '#2dd4bf', // teal   — primary, "default series"
-  '#60a5fa', // blue   — secondary
-  '#a78bfa', // purple — tertiary
-  '#fbbf24', // amber  — warning / ratio
-  '#fb7185', // rose   — error / deny
-  '#34d399', // green  — success / allow
-  '#f472b6', // pink   — spill for 7+ series
-  '#818cf8', // indigo — spill for 8+ series
-] as const;
+export function chartPalette(colors: ColorTokens): { primary: string; secondary: string; series: string[] } {
+  const series = [
+    colors.ACCENT_BLUE, // teal — the primary series
+    colors.ACCENT_AMBER, // amber — the secondary series
+    colors.TEXT_MUTED, // slate
+    colors.ACCENT_GREEN,
+    colors.ACCENT_RED,
+    colors.ACCENT_PURPLE,
+  ];
+  return { primary: series[0], secondary: series[1], series };
+}
 
-/** Status-code colour map — used on HTTP panels. */
-export const STATUS_COLORS: Record<string, string> = {
-  '2xx': '#2dd4bf',
-  '3xx': '#60a5fa',
-  '4xx': '#fbbf24',
-  '5xx': '#fb7185',
-};
+/** HTTP status class → colour: success teal, redirect slate, client error amber, server error rose. */
+export function statusColors(colors: ColorTokens): Record<string, string> {
+  return {
+    '2xx': colors.ACCENT_BLUE,
+    '3xx': colors.TEXT_MUTED,
+    '4xx': colors.ACCENT_AMBER,
+    '5xx': colors.ACCENT_RED,
+  };
+}
 
 /**
  * Build the shared tooltip style from the active theme. Recharts
@@ -70,7 +75,7 @@ export function chartTooltipStyle(colors: ColorTokens) {
 /** Tick style for axis labels. Small, muted, mono for numbers. */
 export function axisTickStyle(colors: ColorTokens, mono = false) {
   return {
-    fontSize: 10,
+    fontSize: 11,
     fill: colors.TEXT_MUTED,
     fontFamily: mono ? 'var(--font-mono)' : 'var(--font-ui)',
   };

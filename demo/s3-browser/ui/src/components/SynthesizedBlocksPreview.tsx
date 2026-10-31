@@ -78,7 +78,7 @@ export default function SynthesizedBlocksPreview({
             border: `1px solid ${BORDER}`,
             background: BG_CARD,
             borderRadius: 8,
-            padding: '8px 10px',
+            padding: '8px 8px',
             display: 'flex',
             flexWrap: 'wrap',
             columnGap: 12,

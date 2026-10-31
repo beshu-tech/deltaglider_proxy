@@ -16,9 +16,9 @@ Use this route when the existing data can stay where it is. In the example, the 
 In the admin UI:
 
 1. In the sidebar, open **Storage → Backends** (`/_/admin/storage/backends`).
-2. Click **Add backend** below the list of backends.
+2. Click **New backend** at the top right of the page.
 
-   ![The Backends page lists the configured backends; callout 1 marks Backends in the sidebar and callout 2 marks the Add backend button.](/_/screenshots/route-bucket-add-backend.webp)
+   ![The Backends page lists the configured backends; callout 1 marks Backends in the sidebar and callout 2 marks the New backend button at the top right.](/_/screenshots/route-bucket-add-backend.webp)
 
 3. In the **New backend** form, type `aws-dr` in **Name** and select **S3** in **Type**. Leave **Endpoint** empty, type `eu-west-1` in **Region**, and leave **Force path-style URLs** off, because AWS needs `false`. Fill in **Access key ID** and **Secret access key** with a key that can read and write `acme-firmware`.
 4. Click **Create backend**. The page tests the connection first, and it does not create a backend that fails the test.
@@ -30,19 +30,18 @@ In the admin UI:
 The proxy does not list `releases` yet, because the real bucket on AWS has another name. So you add the settings for a bucket that the proxy does not see yet. In the admin UI:
 
 1. In the sidebar, open **Storage → Buckets** (`/_/admin/storage/buckets`).
-2. Click **More ways to add a bucket**, the arrow next to **Create bucket**.
-3. Click **Add settings for a bucket that does not exist yet**. A new, open settings row appears at the end of the list.
+2. Click **Settings for a future bucket** at the top right of the page, next to **New bucket**. A new, open settings row appears at the end of the list.
 
-   ![The Buckets page with the menu next to Create bucket open; callout 1 marks Buckets in the sidebar, callout 2 marks the menu button, and callout 3 marks Add settings for a bucket that does not exist yet.](/_/screenshots/adopt-bucket-draft.webp)
+   ![The Buckets page; callout 1 marks Buckets in the sidebar, and callout 2 marks Settings for a future bucket at the top right, next to New bucket.](/_/screenshots/adopt-bucket-draft.webp)
 
-4. Type `releases` in **Bucket name**.
-5. In **Backend**, select `aws-dr`.
-6. Click **Advanced** inside the row.
-7. Type `acme-firmware` in **Real name on backend**.
+3. Type `releases` in **Bucket name**.
+4. In **Backend**, select `aws-dr`.
+5. Click **Advanced** inside the row.
+6. Type `acme-firmware` in **Real name on backend**.
 
-   ![A new settings row is open; callout 4 marks the Bucket name field, callout 5 marks the Backend list, set to aws-dr, callout 6 marks Advanced, and callout 7 marks Real name on backend, set to acme-firmware.](/_/screenshots/adopt-bucket-alias.webp)
+   ![A new settings row is open; callout 3 marks the Bucket name field, callout 4 marks the Backend list, set to aws-dr, callout 5 marks Advanced, and callout 6 marks Real name on backend, set to acme-firmware.](/_/screenshots/adopt-bucket-alias.webp)
 
-8. Click **Review & apply** in the bar at the bottom of the page. Check the diff in the dialog, and then click **Apply and Persist**.
+7. Click **Review & apply** in the bar at the bottom of the page. Check the diff in the dialog, and then click **Apply and Persist**.
 
 If you type the name of a bucket that the proxy already lists, the row does not take the name. The page opens the settings of that bucket in the list instead.
 

@@ -71,7 +71,7 @@ export default function BucketPrefixInput({
 
   return (
     <div style={{ ...style }}>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
       <div>
         <Text id={`${uid}-bucket`} type="secondary" style={{ display: 'block', fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
           {bucketLabel}
@@ -128,7 +128,7 @@ export default function BucketPrefixInput({
           >
             Examples and path rules
           </summary>
-          <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: '6px 8px', alignItems: 'center' }}>
+          <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: '8px 8px', alignItems: 'center' }}>
             {pathExamples.map((example) => (
               <Button
                 key={example.label}
@@ -138,7 +138,7 @@ export default function BucketPrefixInput({
                 title={`Use ${example.label}: ${example.desc}`}
                 style={{
                   height: 24,
-                  padding: '0 7px',
+                  padding: '0 8px',
                   border: `1px solid ${colors.BORDER}`,
                   borderRadius: 5,
                   background: 'var(--input-bg)',
@@ -151,7 +151,7 @@ export default function BucketPrefixInput({
               </Button>
             ))}
           </div>
-          <div style={{ marginTop: 6, color: colors.TEXT_MUTED, fontSize: 11, lineHeight: 1.5 }}>
+          <div style={{ marginTop: 4, color: colors.TEXT_MUTED, fontSize: 11, lineHeight: 1.5 }}>
             Prefixes are literal paths. The UI normalizes duplicate slashes and stores prefixes with a trailing slash; it does not expand variables.
           </div>
         </details>

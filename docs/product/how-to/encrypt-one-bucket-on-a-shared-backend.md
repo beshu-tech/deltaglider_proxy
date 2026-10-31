@@ -56,14 +56,14 @@ While `plaintext_reads: serve` is set, the proxy trusts every plaintext object i
 
 To create a new bucket with its own key, choose the encryption in the create dialog. The dialog sends the bucket's encryption block with the create request, and the proxy writes the route, the block and the bucket in one step. No object is ever written in the backend's mode first. The proxy refuses a name that already exists, and it changes nothing for it.
 
-1. On **Storage → Buckets**, click **Create bucket**.
+1. On **Storage → Buckets**, click **New bucket** at the top right of the page.
 2. Type the bucket name. In the backend list, each backend names its encryption, for example `s3 · plaintext`.
 3. Under **Encryption**, select **Encrypt with a bucket key**. The default is **Same as backend (plaintext)**, which writes no block.
 4. Follow steps 4 to 7 of section 1, and then click **Create**.
 
    ![The Create bucket dialog with the Encryption choice; the arrow points at Encrypt with a bucket key.](/_/screenshots/create-bucket-encryption.webp)
 
-The default option names what the bucket gets without a choice. For a name that already has settings (a bucket that you prepared with **Add settings for a bucket that does not exist yet**), it is **Keep the settings this name already has**. **Off for this bucket** on an encrypting backend asks you to confirm plaintext before the dialog sends the request.
+The default option names what the bucket gets without a choice. For a name that already has settings (a bucket that you prepared with **Settings for a future bucket**), it is **Keep the settings this name already has**. **Off for this bucket** on an encrypting backend asks you to confirm plaintext before the dialog sends the request.
 
 If the proxy refuses the request, or the create fails, the proxy keeps nothing of it, and the dialog shows the reason. Settings with a key for a bucket that does not exist (for example from a release before this one) show as **bucket not found** on the Buckets page. To drop them, open the row, select **Remove these settings…** in the **⋯** menu, and confirm. No object can use the key of a bucket that does not exist, so the proxy removes it without a key check.
 

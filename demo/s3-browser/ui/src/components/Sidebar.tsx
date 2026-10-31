@@ -22,7 +22,7 @@ import {
 import type { BucketInfo } from '../types';
 import { useColors } from '../ThemeContext';
 import BucketEncryptionIcon from './BucketEncryptionIcon';
-import MiddleEllipsis from '../browser/MiddleEllipsis';
+import TruncatedName from './TruncatedName';
 import BucketPublicIcon from './BucketPublicIcon';
 import SidebarResizeHandle from './SidebarResizeHandle';
 import { describeBackend } from '../bucketBackend';
@@ -50,6 +50,7 @@ import { ApiError } from '../errorHandling';
 import CreateBucketModal from './CreateBucketModal';
 import { useNavigation } from '../NavigationContext';
 import { bucketSettingsUrl, parseViewLocation } from '../urlState';
+import { SPACE } from './shared-styles';
 
 const { Sider } = Layout;
 const { Text } = Typography;
@@ -356,8 +357,8 @@ export default function Sidebar({
   // Backend names come with the admin bucket-origins data only.
   const groups = useMemo(() => (canAdmin ? groupBucketsByBackend(buckets) : null), [buckets, canAdmin]);
   const menuItemStyle: React.CSSProperties = {
-    gap: 10,
-    padding: '8px 6px',
+    gap: SPACE.sm,
+    padding: `${SPACE.xs}px ${SPACE.xxs}px`,
     color: TEXT_SECONDARY,
     fontSize: 13,
     width: '100%',
@@ -367,10 +368,9 @@ export default function Sidebar({
 
   const renderBucketRow = (b: BucketInfo) => {
     const isUnavailable = Boolean(b.unavailable);
-    const isActive = b.name === activeBucket;
-    // On the upload page the bucket is the target, not the current entry:
-    // it keeps its accent text and edge, the fill goes to "Upload files".
-    const isCurrent = isActive && !onUploadPage;
+    // On the upload page "Upload files" is the one current entry (D32): the
+    // bucket row then looks like any other row (the page title names it).
+    const isCurrent = b.name === activeBucket && !onUploadPage;
     // The full name first: a long one is cut with an ellipsis in the row.
     const hoverText = [
       b.name,
@@ -389,15 +389,15 @@ export default function Sidebar({
             flex: 1,
             minWidth: 0,
             gap: 8,
-            padding: '7px 10px',
+            padding: `${SPACE.xs}px ${SPACE.sm}px`,
             borderRadius: 6,
             marginBottom: 2,
             cursor: isUnavailable ? 'not-allowed' : 'pointer',
             opacity: isUnavailable ? 0.5 : 1,
             background: isCurrent ? `rgba(45, 212, 191, 0.1)` : 'transparent',
-            color: isActive ? ACCENT_BLUE_LIGHT : TEXT_SECONDARY,
-            transition: 'all 0.15s ease',
-            borderLeft: isActive ? `2px solid ${ACCENT_BLUE}` : '2px solid transparent',
+            color: isCurrent ? ACCENT_BLUE_LIGHT : TEXT_SECONDARY,
+            transition: 'background-color 0.15s ease, color 0.15s ease',
+            borderLeft: isCurrent ? `2px solid ${ACCENT_BLUE}` : '2px solid transparent',
           }}
           onMouseEnter={(e) => {
             if (!isUnavailable && !isCurrent) e.currentTarget.style.background = 'var(--surface-hover)';
@@ -407,14 +407,14 @@ export default function Sidebar({
           }}
         >
           {/* Cut in the middle: buckets often differ only at the end (-prod, -dr). */}
-          <MiddleEllipsis
+          <TruncatedName
             text={b.name}
             title={false}
             style={{
               lineHeight: '20px',
               fontFamily: "var(--font-mono)",
               fontSize: 13,
-              fontWeight: isActive ? 600 : 400,
+              fontWeight: isCurrent ? 600 : 400,
             }}
           />
           <BucketPublicIcon bucket={b.name} canAdmin={canAdmin} />
@@ -423,8 +423,8 @@ export default function Sidebar({
             <span
               title={b.unavailable}
               style={{
-                flexShrink: 0, marginLeft: 'auto', fontSize: 9, fontWeight: 700, letterSpacing: 0.5,
-                textTransform: 'uppercase', padding: '1px 5px', borderRadius: 4,
+                flexShrink: 0, marginLeft: 'auto', fontSize: 11, fontWeight: 600,
+                padding: `0 ${SPACE.xxs}px`, borderRadius: 4,
                 color: token.colorWarning,
                 border: `1px solid ${token.colorWarning}`,
               }}
@@ -484,12 +484,11 @@ export default function Sidebar({
           } as React.CSSProperties}
         >
           <RightOutlined aria-hidden="true" className="dg-bucket-group-chevron" />
-          <span style={{
-            flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-            fontFamily: 'var(--font-mono)', fontSize: 12, fontWeight: 600,
-          }}>
-            {label}
-          </span>
+          <TruncatedName
+            text={label}
+            title={false}
+            style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 12, fontWeight: 600 }}
+          />
           <span style={{ flexShrink: 0, fontSize: 11, color: TEXT_FAINT, fontVariantNumeric: 'tabular-nums' }}>
             {group.buckets.length}
           </span>
@@ -508,10 +507,10 @@ export default function Sidebar({
       {/* BUCKETS */}
       <nav
         aria-label="Bucket list"
-        style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: '20px 16px 0' }}
+        style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: `${SPACE.lg}px ${SPACE.md}px 0` }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-          <Text style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1.5, textTransform: 'uppercase', color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: SPACE.sm }}>
+          <Text className="dg-eyebrow" style={{ color: TEXT_MUTED }}>
             Buckets ({buckets.length})
           </Text>
           {canCreateBucket && (
@@ -531,7 +530,7 @@ export default function Sidebar({
           <div
             role="alert"
             style={{
-              margin: '0 0 10px', padding: '10px 12px', borderRadius: 6,
+              margin: `0 0 ${SPACE.sm}px`, padding: SPACE.sm, borderRadius: 6,
               border: `1px solid ${token.colorErrorBorder}`,
               background: token.colorErrorBg, fontSize: 12, lineHeight: 1.4,
             }}

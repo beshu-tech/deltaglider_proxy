@@ -1,12 +1,14 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Drawer, Button, Modal, message, Tag, Skeleton, Input, Spin, theme } from 'antd';
+import { Drawer, Button, Modal, message, Skeleton, Spin, theme } from 'antd';
 import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CheckOutlined, CopyOutlined, LoadingOutlined, EyeOutlined } from '@ant-design/icons';
 import { deleteObject, getDownloadUrl, getPresignedUrl, getObjectUrl, headObject, getBucket } from '../s3client';
 import { GlobalOutlined } from '@ant-design/icons';
 import { formatBytes, getFileName, downloadFromUrl, relativeTime } from '../utils';
-import { normalizeUiError } from '../errorHandling';
+import { plainError } from '../plainError';
+import StorageTypeTag from './StorageTypeTag';
+import { CARD_RADIUS, SPACE } from './shared-styles';
 import { useRestoreFocus } from '../hooks/useRestoreFocus';
-import { isBaselineObject, summarizeObjectSavings } from '../savings';
+import { isBaselineObject, savingsColors, summarizeObjectSavings } from '../savings';
 import { bucketPolicyFor } from '../bucketPolicyLookup';
 import type { S3Object } from '../types';
 import { useColors } from '../ThemeContext';
@@ -36,28 +38,11 @@ function withBreakHints(text: string): React.ReactNode[] {
   return parts.flatMap((part, i) => (i === 0 ? [part] : [<wbr key={i} />, part]));
 }
 
-/** The elements that Tab reaches inside `root`, in DOM order. */
-const TABBABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
-
-/**
- * Tab from the last control goes to the first one, Shift+Tab from the first
- * to the last. The drawer's focus lock only pulls focus back after it left
- * the page, so every round stopped once on <body> (UX harvest C11).
- */
-function wrapTab(e: React.KeyboardEvent<HTMLElement>) {
-  if (e.key !== 'Tab') return;
-  const list = Array.from(e.currentTarget.querySelectorAll<HTMLElement>(TABBABLE))
-    .filter((el) => !el.closest('[aria-hidden="true"]'));
-  if (list.length === 0) return;
-  const first = list[0];
-  const last = list[list.length - 1];
-  if (!e.shiftKey && document.activeElement === last) {
-    e.preventDefault();
-    first.focus();
-  } else if (e.shiftKey && document.activeElement === first) {
-    e.preventDefault();
-    last.focus();
-  }
+/** A file name wraps after a `-` or `_` only: never inside its extension
+ *  (`…linux-amd64.tar.` / `gz`, D45). */
+function fileNameBreakHints(text: string): React.ReactNode[] {
+  const parts = text.match(/[^_-]*[_-]|[^_-]+$/g) ?? [text];
+  return parts.flatMap((part, i) => (i === 0 ? [part] : [<wbr key={i} />, part]));
 }
 
 /** Centered vertical stack used by every loading/result modal body. */
@@ -102,15 +87,13 @@ function getUserMetadata(headers: Record<string, string>): [string, string][] {
 function InspectorSection({ title, children }: { title: string; children: React.ReactNode }) {
   const { TEXT_MUTED } = useColors();
   return (
-    <section style={{ marginBottom: 20 }} aria-label={title}>
+    <section style={{ marginBottom: SPACE.lg }} aria-label={title}>
+      {/* Sentence case (D67): a section title, not a capitals eyebrow. */}
       <h3 style={{
-        fontSize: 10,
-        fontWeight: 700,
-        letterSpacing: 1.5,
-        textTransform: 'uppercase',
+        fontSize: 13,
+        fontWeight: 600,
         color: TEXT_MUTED,
-        marginBottom: 10,
-        margin: '0 0 10px',
+        margin: `0 0 ${SPACE.xs}px`,
         fontFamily: "var(--font-ui)",
       }}>
         {title}
@@ -124,7 +107,7 @@ function InspectorSection({ title, children }: { title: string; children: React.
 function InfoRow({ label, value, title }: { label: string; value: string; title?: string }) {
   const { BG_SIDEBAR, TEXT_MUTED, TEXT_PRIMARY } = useColors();
   return (
-    <div style={{ padding: '8px 12px', background: BG_SIDEBAR, borderRadius: 8, marginBottom: 4 }}>
+    <div style={{ padding: `${SPACE.xs}px ${SPACE.sm}px`, background: BG_SIDEBAR, borderRadius: SPACE.xs, marginBottom: SPACE.xxs }}>
       <div style={{ fontSize: 11, color: TEXT_MUTED, marginBottom: 2, fontFamily: "var(--font-ui)", fontWeight: 500 }}>{label}</div>
       <div title={title} style={{ fontSize: 13, color: TEXT_PRIMARY, overflowWrap: 'anywhere', fontFamily: "var(--font-mono)" }}>{withBreakHints(value)}</div>
     </div>
@@ -169,7 +152,7 @@ function ShareDurationButton({
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          gap: 6,
+          gap: SPACE.xs,
           ...primary,
           border: 'none',
           borderRadius: '10px 0 0 10px',
@@ -222,7 +205,7 @@ function ShareDurationButton({
             overflow: 'hidden',
           }}
         >
-          <div style={{ padding: '10px 14px 6px', fontSize: 12, fontWeight: 600, color: textMuted, fontFamily: 'var(--font-ui)' }}>
+          <div style={{ padding: `${SPACE.sm}px ${SPACE.md}px ${SPACE.xs}px`, fontSize: 12, fontWeight: 600, color: textMuted, fontFamily: 'var(--font-ui)' }}>
             Link expires after
           </div>
           {durations.map((d) => {
@@ -238,14 +221,14 @@ function ShareDurationButton({
               onClick={() => { onSelect(d.seconds); setOpen(false); }}
               onKeyDown={activateOnKey(() => { onSelect(d.seconds); setOpen(false); })}
               style={{
-                padding: '10px 14px',
+                padding: `${SPACE.sm}px ${SPACE.md}px`,
                 cursor: 'pointer',
                 fontSize: 13,
                 fontFamily: 'var(--font-ui)',
                 color: textPrimary,
                 display: 'flex',
                 alignItems: 'center',
-                gap: 10,
+                gap: SPACE.sm,
                 fontWeight: isDefault ? 600 : 400,
                 borderTop: `1px solid ${border}`,
               }}
@@ -274,10 +257,13 @@ export default function InspectorPanel({
   canRead = true,
   hasAdminSession = true,
 }: Props) {
+  const colors = useColors();
+  // THE savings colour (wave 2, §8): the same green as the header pill and the Delta chip.
+  const SAVED = savingsColors(colors).text;
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_MUTED, TEXT_FAINT,
-    ACCENT_BLUE, ACCENT_GREEN, ACCENT_RED, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT,
-  } = useColors();
+    ACCENT_BLUE, ACCENT_RED,
+  } = colors;
   const [messageApi, contextHolder] = message.useMessage();
   // Escape / Back closes the drawer through the URL: give focus back to the
   // row (or the main region) instead of <body>.
@@ -447,12 +433,6 @@ export default function InspectorPanel({
   const showSizeBars = !baselineHeadline
     && effectiveStored != null
     && formatBytes(effectiveStored) !== formatBytes(originalSize);
-  // The baseline is neither a saving nor a delta: neutral colours, not the
-  // success green and the Delta palette.
-  const neutralChip = { bg: 'transparent', border: BORDER, text: TEXT_MUTED };
-  const storageTypeColor = baselineHeadline
-    ? neutralChip
-    : STORAGE_TYPE_COLORS[storageType || 'passthrough'] || STORAGE_TYPE_DEFAULT;
   // Once the HEAD resolves, an object stored as `passthrough` (e.g. a `.sha512`
   // checksum sidecar, an already-compressed asset, or any non-delta-eligible
   // file) has NO compression to report — stored == original. Showing a
@@ -492,7 +472,7 @@ export default function InspectorPanel({
     } catch (e) {
       // The proxy's message says why (quota, maintenance, a replication
       // mirror, access denied); a bare "failed" hid it.
-      messageApi.error(normalizeUiError(e, 'Failed to delete object'));
+      messageApi.error(plainError(e, 'The object could not be deleted.').text);
     }
   };
 
@@ -507,7 +487,7 @@ export default function InspectorPanel({
       downloadFromUrl(url, fileName);
     } catch (e) {
       if (latestKeyRef.current !== reqKey) return;
-      messageApi.error(`Download failed: ${normalizeUiError(e, 'unknown error')}`);
+      messageApi.error(plainError(e, 'The download could not start. Try again.').text);
     }
   };
 
@@ -533,7 +513,7 @@ export default function InspectorPanel({
       setModalState({ mode: 'share', phase: 'ready', url, expiresAt });
     } catch (e) {
       if (latestKeyRef.current !== reqKey) return;
-      setModalState({ mode: 'share', phase: 'error', error: String(e) });
+      setModalState({ mode: 'share', phase: 'error', error: plainError(e, 'The proxy could not sign a link. Try again.').text });
     }
   };
 
@@ -561,10 +541,12 @@ export default function InspectorPanel({
           header: { display: 'none' },
         }}
       >
-        <div className="animate-slide-in" onKeyDown={wrapTab} style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+        {/* Tab wraps inside the masked drawer through the app-wide
+            dialogTabWrap (installed by ThemeProvider). */}
+        <div className="animate-slide-in" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
           {/* Header */}
           <div style={{
-            padding: '16px 20px',
+            padding: `${SPACE.md}px ${SPACE.lg}px`,
             borderBottom: `1px solid ${BORDER}`,
             display: 'flex',
             alignItems: 'flex-start',
@@ -573,7 +555,7 @@ export default function InspectorPanel({
             <div style={{
               width: 40,
               height: 40,
-              borderRadius: 10,
+              borderRadius: CARD_RADIUS,
               background: `linear-gradient(135deg, ${ACCENT_BLUE}15, ${ACCENT_BLUE}08)`,
               border: `1px solid ${ACCENT_BLUE}22`,
               display: 'flex',
@@ -584,8 +566,8 @@ export default function InspectorPanel({
               <FileOutlined aria-hidden="true" style={{ fontSize: 20, color: ACCENT_BLUE }} />
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <h2 style={{ fontSize: 15, fontWeight: 600, color: TEXT_PRIMARY, overflowWrap: 'anywhere', margin: 0, fontFamily: "var(--font-ui)" }}>
-                {withBreakHints(fileName)}
+              <h2 style={{ fontSize: 15, fontWeight: 600, color: TEXT_PRIMARY, overflowWrap: 'break-word', margin: 0, fontFamily: "var(--font-ui)" }}>
+                {fileNameBreakHints(fileName)}
               </h2>
               <div style={{ fontSize: 11, color: TEXT_MUTED, marginTop: 2, overflowWrap: 'anywhere', fontFamily: "var(--font-mono)" }}>
                 {withBreakHints(object.key)}
@@ -602,7 +584,7 @@ export default function InspectorPanel({
           </div>
 
           {/* Content */}
-          <div style={{ flex: 1, overflow: 'auto', padding: '16px 20px' }}>
+          <div style={{ flex: 1, overflow: 'auto', padding: `${SPACE.md}px ${SPACE.lg}px` }}>
             {/* Preview button (only for previewable files) */}
             {canReadObject && onPreview && object && getPreviewMode(object.key) && (
               <Button
@@ -612,7 +594,7 @@ export default function InspectorPanel({
                 onClick={() => onPreview(object)}
                 style={{
                   fontWeight: 600,
-                  borderRadius: 10,
+                  borderRadius: CARD_RADIUS,
                   fontFamily: "var(--font-ui)",
                   marginBottom: 8,
                 }}
@@ -623,7 +605,7 @@ export default function InspectorPanel({
 
             {/* Download & Share buttons */}
             {canReadObject && (
-              <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
+              <div style={{ display: 'flex', gap: 8, marginBottom: SPACE.lg }}>
                 <Button
                   type="primary"
                   size="large"
@@ -632,7 +614,7 @@ export default function InspectorPanel({
                   style={{
                     flex: 1,
                     fontWeight: 600,
-                    borderRadius: 10,
+                    borderRadius: CARD_RADIUS,
                     fontFamily: "var(--font-ui)",
                   }}
                 >
@@ -655,7 +637,7 @@ export default function InspectorPanel({
             {/* PUBLIC ACCESS BADGE */}
             {isPublic && (
               <div style={{
-                display: 'flex', alignItems: 'center', gap: 6,
+                display: 'flex', alignItems: 'center', gap: SPACE.xs,
                 padding: '8px 12px', marginBottom: 12,
                 background: `${ACCENT_BLUE}10`, border: `1px solid ${ACCENT_BLUE}30`,
                 borderRadius: 8, fontSize: 12, color: ACCENT_BLUE,
@@ -670,10 +652,10 @@ export default function InspectorPanel({
             {bucketPolicyLoading ? (
               <InspectorSection title="Storage">
                 <div style={{
-                  background: BG_SIDEBAR, borderRadius: 10, padding: '24px 16px',
+                  background: BG_SIDEBAR, borderRadius: CARD_RADIUS, padding: '24px 16px',
                   display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
                 }}>
-                  <LoadingSpinner size={28} color={ACCENT_GREEN} />
+                  <LoadingSpinner size={28} color={ACCENT_BLUE} />
                   <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
                     Loading bucket policy…
                   </div>
@@ -687,10 +669,10 @@ export default function InspectorPanel({
                    * storedSize/storageType, render immediately instead of
                    * spinning behind an in-flight HEAD that may be slow. */
                   <div style={{
-                    background: BG_SIDEBAR, borderRadius: 10, padding: '24px 16px',
+                    background: BG_SIDEBAR, borderRadius: CARD_RADIUS, padding: '24px 16px',
                     display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
                   }}>
-                    <LoadingSpinner size={28} color={ACCENT_GREEN} />
+                    <LoadingSpinner size={28} color={ACCENT_BLUE} />
                     <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
                       Loading compression stats...
                     </div>
@@ -698,18 +680,18 @@ export default function InspectorPanel({
                 ) : (
                   <div data-testid="inspector-savings" style={{
                     background: BG_SIDEBAR,
-                    borderRadius: 10,
+                    borderRadius: CARD_RADIUS,
                     padding: '16px',
                     textAlign: 'center',
                   }}>
-                    <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1, color: TEXT_MUTED, textTransform: 'uppercase', marginBottom: 4, fontFamily: "var(--font-ui)" }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, marginBottom: SPACE.xxs, fontFamily: "var(--font-ui)" }}>
                       {baselineHeadline ? 'Baseline' : 'Savings'}
                     </div>
                     <div
                       data-testid="inspector-headline"
                       style={baselineHeadline
                         ? { fontSize: 24, fontWeight: 700, color: TEXT_PRIMARY, lineHeight: 1.2, fontFamily: 'var(--font-ui)' }
-                        : { fontSize: 32, fontWeight: 800, color: ACCENT_GREEN, lineHeight: 1.1, fontFamily: 'var(--font-mono)' }}
+                        : { fontSize: 32, fontWeight: 800, color: SAVED, lineHeight: 1.1, fontFamily: 'var(--font-mono)' }}
                     >
                       {headline.title}
                     </div>
@@ -720,8 +702,8 @@ export default function InspectorPanel({
                         screen. The baseline is the file plus a near-empty delta,
                         so its "Stored" read one rounding step over "Original". */}
                     {showSizeBars ? (<>
-                    <div style={{ marginBottom: 10 }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <div style={{ marginBottom: SPACE.sm }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: SPACE.xxs }}>
                         <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Original</div>
                         <div style={{ fontSize: 12, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)" }}>{formatBytes(originalSize)}</div>
                       </div>
@@ -741,29 +723,21 @@ export default function InspectorPanel({
                           height: '100%',
                           borderRadius: 3,
                           width: `${effectiveStored != null && originalSize > 0 ? Math.min(100, Math.max(2, (effectiveStored / originalSize) * 100)) : 100}%`,
-                          background: baselineHeadline ? `${TEXT_MUTED}99` : ACCENT_GREEN,
+                          background: baselineHeadline ? `${TEXT_MUTED}99` : SAVED,
                           transition: 'width 0.4s ease-out',
                         }} />
                       </div>
                     </div>
                     </>) : (
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: SPACE.sm }}>
                         <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Size</div>
                         <div style={{ fontSize: 12, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)" }}>{formatBytes(originalSize)}</div>
                       </div>
                     )}
-                    <Tag style={{
-                      background: storageTypeColor.bg,
-                      border: `1px solid ${storageTypeColor.border}`,
-                      color: storageTypeColor.text,
-                      fontSize: 12,
-                      borderRadius: 6,
-                      fontFamily: "var(--font-mono)",
-                    }}>
-                      {headline.chip}
-                    </Tag>
+                    {/* ONE chip family with the table (D58); the baseline is neutral. */}
+                    <StorageTypeTag storageType={storageType || 'passthrough'} isBaseline={baselineHeadline} />
                     {storageType === 'delta' && (
-                      <div style={{ fontSize: 11, color: TEXT_MUTED, marginTop: 10, lineHeight: 1.5, textAlign: 'left', fontFamily: 'var(--font-ui)' }}>
+                      <div style={{ fontSize: 11, color: TEXT_MUTED, marginTop: SPACE.sm, lineHeight: 1.5, textAlign: 'left', fontFamily: 'var(--font-ui)' }}>
                         {isBaseline
                           ? 'This file is stored in full once. Later versions in this folder are stored as deltas against it, so they take little space.'
                           : 'This figure is for this file alone. It does not include the baseline that all versions in this folder share, so bucket and folder totals are lower.'}
@@ -776,7 +750,7 @@ export default function InspectorPanel({
               /* Compression off for the bucket, or a passthrough object — simple size info */
               <InspectorSection title="Storage">
                 <div style={{
-                  background: BG_SIDEBAR, borderRadius: 10, padding: '16px', textAlign: 'center',
+                  background: BG_SIDEBAR, borderRadius: CARD_RADIUS, padding: '16px', textAlign: 'center',
                 }}>
                   <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: 'var(--font-ui)', marginBottom: 4 }}>Size</div>
                   <div style={{ fontSize: 28, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: 'var(--font-mono)', lineHeight: 1.2 }}>
@@ -835,7 +809,7 @@ export default function InspectorPanel({
               ) : (
                 <>
                   {userMeta.length === 0 ? (
-                    <div style={{ fontSize: 12, color: TEXT_FAINT, display: 'flex', alignItems: 'center', gap: 6, fontFamily: "var(--font-ui)" }}>
+                    <div style={{ fontSize: 12, color: TEXT_FAINT, display: 'flex', alignItems: 'center', gap: SPACE.xs, fontFamily: "var(--font-ui)" }}>
                       No custom metadata
                     </div>
                   ) : (
@@ -850,7 +824,7 @@ export default function InspectorPanel({
                         size="small"
                         aria-expanded={showInternalMeta}
                         onClick={() => setShowInternalMeta((v) => !v)}
-                        style={{ paddingInline: 0, marginTop: 6, fontSize: 12 }}
+                        style={{ paddingInline: 0, marginTop: SPACE.xs, fontSize: 12 }}
                       >
                         {showInternalMeta ? 'Hide' : 'Show'} DeltaGlider internal metadata ({dgMeta.length})
                       </Button>
@@ -863,14 +837,14 @@ export default function InspectorPanel({
 
             {/* TAGS */}
             <InspectorSection title="Tags">
-              <div style={{ fontSize: 12, color: TEXT_FAINT, display: 'flex', alignItems: 'center', gap: 6, fontFamily: "var(--font-ui)" }}>
+              <div style={{ fontSize: 12, color: TEXT_FAINT, display: 'flex', alignItems: 'center', gap: SPACE.xs, fontFamily: "var(--font-ui)" }}>
                 No tags available
               </div>
             </InspectorSection>
           </div>
 
           {canDelete && (
-            <div style={{ padding: '16px 20px', borderTop: `1px solid ${BORDER}` }}>
+            <div style={{ padding: `${SPACE.md}px ${SPACE.lg}px`, borderTop: `1px solid ${BORDER}` }}>
               <Button
                 block
                 icon={<DeleteOutlined />}
@@ -879,7 +853,7 @@ export default function InspectorPanel({
                   background: 'transparent',
                   borderColor: BORDER,
                   color: ACCENT_RED,
-                  borderRadius: 10,
+                  borderRadius: CARD_RADIUS,
                   fontFamily: "var(--font-ui)",
                   fontWeight: 600,
                 }}
@@ -908,7 +882,7 @@ export default function InspectorPanel({
               <div style={MODAL_CENTER_STACK}>
                 <LoadingSpinner size={40} color={ACCENT_BLUE} />
                 <div>
-                  <div style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, marginBottom: 6, fontFamily: "var(--font-ui)" }}>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, marginBottom: SPACE.xs, fontFamily: "var(--font-ui)" }}>
                     Generating signed link…
                   </div>
                   <div style={{ fontSize: 13, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
@@ -930,27 +904,46 @@ export default function InspectorPanel({
                       <>, on {new Date(modalState.expiresAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}</>
                     )}
                   </div>
-                  {/* The whole link is visible (expiry and signature
-                      included); a very long one scrolls inside the box. */}
-                  <Input.TextArea
+                  {/* The whole link wraps at any character and the box
+                      scrolls past ~14 lines, with a visible scrollbar: no line
+                      is ever cut through the middle (UX harvest D1). Focusable,
+                      so a keyboard user can scroll it and select the text. */}
+                  <div
+                    role="textbox"
+                    aria-readonly="true"
+                    aria-multiline="true"
                     aria-label="Share URL"
-                    value={modalState.url}
-                    readOnly
-                    autoSize={{ minRows: 2, maxRows: 14 }}
+                    tabIndex={0}
+                    data-testid="share-url"
                     style={{
-                      fontFamily: "var(--font-mono)",
+                      fontFamily: 'var(--font-mono)',
                       fontSize: 12,
-                      borderRadius: 8,
-                      marginBottom: 12,
+                      lineHeight: 1.5,
+                      textAlign: 'left',
+                      overflowWrap: 'anywhere',
+                      wordBreak: 'break-all',
+                      whiteSpace: 'pre-wrap',
+                      userSelect: 'all',
+                      maxHeight: 'min(320px, 50vh)',
+                      overflowY: 'auto',
+                      scrollbarGutter: 'stable',
+                      padding: `${SPACE.xs}px ${SPACE.sm}px`,
+                      border: `1px solid ${BORDER}`,
+                      borderRadius: SPACE.xs,
+                      background: BG_SIDEBAR,
+                      color: TEXT_PRIMARY,
+                      marginBottom: SPACE.sm,
                     }}
-                  />
+                  >
+                    {modalState.url}
+                  </div>
                   <Button
                     type="primary"
                     icon={<CopyOutlined />}
                     onClick={handleCopyUrl}
                     style={{
                       fontWeight: 600,
-                      borderRadius: 10,
+                      borderRadius: CARD_RADIUS,
                       fontFamily: "var(--font-ui)",
                       minWidth: 180,
                     }}
@@ -964,7 +957,7 @@ export default function InspectorPanel({
               <div style={MODAL_CENTER_STACK}>
                 <DeleteOutlined style={{ fontSize: 40, color: ACCENT_RED }} />
                 <div>
-                  <div style={{ fontSize: 16, fontWeight: 600, color: ACCENT_RED, marginBottom: 6, fontFamily: "var(--font-ui)" }}>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: ACCENT_RED, marginBottom: SPACE.xs, fontFamily: "var(--font-ui)" }}>
                     Failed to generate link
                   </div>
                   <div style={{ fontSize: 13, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>

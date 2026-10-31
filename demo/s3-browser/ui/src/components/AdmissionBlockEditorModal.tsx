@@ -15,9 +15,9 @@
  *     inputs. `config_flag` shows only when a rule already has one (no flag
  *     can be switched on yet, so such a rule never matches).
  *   * Action radio group at the bottom with a conditional Reject
- *     sub-form (status + optional message). Destructive actions
- *     (deny, reject) get a muted reminder bar: "This will 403/5xx
- *     all matching requests."
+ *     sub-form (status + optional message). One line of plain help
+ *     under the radios says what the chosen action does (UX harvest
+ *     D18, D52: a static explanation is not a yellow warning box).
  *
  * ## Validation
  *
@@ -32,12 +32,10 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import {
   Modal,
   Input,
-  InputNumber,
   Checkbox,
   Radio,
   Select,
   Button,
-  Alert,
   Space,
   Typography,
 } from 'antd';
@@ -51,13 +49,15 @@ import {
 import { useColors } from '../ThemeContext';
 import FormField from './FormField';
 import { sourceIpMatch, sourceIpProblem, sourceIpText } from '../sourceIpField';
+import { v, useFieldValidation } from '../validation';
+import { SPACE } from './shared-styles';
 
 /** Tighter field rhythm than FormField's page default: keeps the modal short. */
-const FIELD_GAP: React.CSSProperties = { marginBottom: 16 };
+const FIELD_GAP: React.CSSProperties = { marginBottom: SPACE.md };
 const TWO_COLUMNS: React.CSSProperties = {
   display: 'grid',
   gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-  columnGap: 16,
+  columnGap: SPACE.md,
 };
 
 const { Text } = Typography;
@@ -76,6 +76,14 @@ interface Props {
   onSave: (block: AdmissionBlock) => void;
 }
 
+/** What each action does, in one plain sentence under the radios. */
+const ACTION_HELP: Record<string, string> = {
+  'allow-anonymous': 'A matching request skips sign-in and runs as the anonymous user.',
+  deny: 'A matching request gets a 403 Access Denied response.',
+  reject: 'A matching request gets the status code and the message below.',
+  continue: 'A matching request goes on to sign-in, and the later rules are not checked.',
+};
+
 /** Default empty-block form state. */
 const EMPTY: AdmissionBlockForm = {
   name: '',
@@ -90,7 +98,7 @@ export default function AdmissionBlockEditorModal({
   onCancel,
   onSave,
 }: Props) {
-  const { BORDER, BG_CARD, TEXT_MUTED } = useColors();
+  const { BORDER, BG_CARD, TEXT_MUTED, TEXT_PRIMARY } = useColors();
   const defaults = useMemo<AdmissionBlockForm>(() => {
     if (!initial) return EMPTY;
     return {
@@ -150,8 +158,22 @@ export default function AdmissionBlockEditorModal({
   const ipProblem = sourceIpProblem(ipText);
   const configFlag = watch('match.config_flag');
 
+  // The Reject status is a text field checked on blur (D9: an InputNumber
+  // clamped 99 to 400 without a word). An invalid text keeps the last valid status.
+  const fields = useFieldValidation();
+  const rejectAction = typeof currentAction === 'string' ? null : currentAction;
+  const statusField = fields.number(
+    'status',
+    rejectAction?.status,
+    (n) => {
+      if (rejectAction) setValue('action', { ...rejectAction, status: n ?? 503 });
+    },
+    v.all(v.required('a status code'), v.integer({ min: 400, max: 599 })),
+  );
+
   const onSubmit = (data: AdmissionBlockForm) => {
     if (ipProblem) return;
+    if (kind === 'reject' && !fields.submit()) return;
     // Duplicate-name check (case-insensitive, excluding the block
     // we're currently editing). Surface as an RHF field error so
     // the operator sees it inline under the Name input rather than
@@ -191,17 +213,16 @@ export default function AdmissionBlockEditorModal({
   const cardStyle: React.CSSProperties = {
     border: `1px solid ${BORDER}`,
     borderRadius: 8,
-    padding: 12,
-    marginBottom: 12,
+    padding: SPACE.sm,
+    marginBottom: SPACE.sm,
     background: BG_CARD,
   };
+  // D67: a sentence-case group heading, not a letter-spaced eyebrow.
   const cardLabel: React.CSSProperties = {
-    color: TEXT_MUTED,
-    fontSize: 10,
-    fontWeight: 700,
-    letterSpacing: 0.5,
-    textTransform: 'uppercase' as const,
-    marginBottom: 8,
+    color: TEXT_PRIMARY,
+    fontSize: 13.5,
+    fontWeight: 600,
+    marginBottom: SPACE.xs,
     fontFamily: 'var(--font-ui)',
   };
 
@@ -246,7 +267,10 @@ export default function AdmissionBlockEditorModal({
 
       {/* Match: every condition in one card. Empty = matches everything. */}
       <div style={cardStyle}>
-        <div style={cardLabel}>When a request matches — leave a condition empty to match any value</div>
+        <div style={cardLabel}>When a request matches</div>
+        <div style={{ color: TEXT_MUTED, fontSize: 12.5, marginTop: -SPACE.xxs, marginBottom: SPACE.sm }}>
+          An empty condition matches any value.
+        </div>
         <FormField label="HTTP methods" yamlPath="match.method" style={FIELD_GAP}>
           <Controller
             control={control}
@@ -361,14 +385,14 @@ export default function AdmissionBlockEditorModal({
           />
         </FormField>
 
-        {/* No flag can be switched on yet (the evaluator treats every flag as
-            off), so the field is shown only to clear one a rule already has. */}
+        {/* The evaluator treats every flag as off for now, so the field is
+            shown only to clear one a rule already has. */}
         {configFlag && (
           <FormField
             label="Config flag"
             yamlPath="match.config_flag"
             helpText="No flag can be switched on yet, so a rule with a flag never matches. Clear it to make the rule work."
-            style={{ marginTop: 16, marginBottom: 0 }}
+            style={{ marginTop: SPACE.md, marginBottom: 0 }}
           >
             <Controller
               control={control}
@@ -412,24 +436,18 @@ export default function AdmissionBlockEditorModal({
             </Radio.Group>
           )}
         />
-        {(kind === 'deny' || kind === 'reject') && (
-          <Alert
-            type="warning"
-            showIcon
-            style={{ marginTop: 12 }}
-            title={
-              kind === 'deny'
-                ? 'Every matching request gets a 403 Access Denied response.'
-                : 'Every matching request gets the status code below.'
-            }
-          />
+        {ACTION_HELP[kind] && (
+          <div data-testid="admission-action-help" style={{ color: TEXT_MUTED, fontSize: 12.5, marginTop: SPACE.xs }}>
+            {ACTION_HELP[kind]}
+          </div>
         )}
         {kind === 'reject' && typeof currentAction !== 'string' && (
-          <div style={{ marginTop: 12 }}>
+          <div style={{ marginTop: SPACE.sm }}>
             <FormField
               label="Status code"
               yamlPath="action.status"
               helpText="A 4xx or 5xx status code."
+              error={statusField.error}
               examples={[503, 429, 401]}
               onExampleClick={(v) =>
                 setValue('action', {
@@ -438,18 +456,7 @@ export default function AdmissionBlockEditorModal({
                 })
               }
             >
-              <InputNumber
-                min={400}
-                max={599}
-                value={currentAction.status}
-                onChange={(v) =>
-                  setValue('action', {
-                    ...(currentAction as { type: 'reject'; status: number; message?: string }),
-                    status: Number(v ?? 503),
-                  })
-                }
-                style={{ width: 120 }}
-              />
+              <Input {...statusField.inputProps} style={{ width: 120 }} />
             </FormField>
             <FormField
               label="Response message"

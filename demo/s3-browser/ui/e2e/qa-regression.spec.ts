@@ -185,7 +185,7 @@ async function uploadViaUi(
   files: { name: string; mimeType: string; buffer: Buffer }[],
 ) {
   await openBucket(bucket);
-  await page.getByRole('button', { name: 'Upload files' }).click();
+  await page.getByRole('button', { name: 'Upload files', exact: true }).click();
   await expect(page.getByRole('heading', { name: new RegExp(`Upload to ${bucket}`) })).toBeVisible({ timeout: 30_000 });
   if (dest) {
     const input = page.getByRole('combobox', { name: /Destination path prefix/ });
@@ -194,7 +194,7 @@ async function uploadViaUi(
   await page.locator('input[type=file]').first().setInputFiles(files);
   await page.getByRole('button', { name: /Upload \d+ files? to / }).click();
   await expect(page.getByText('Upload complete')).toBeVisible({ timeout: 60_000 });
-  await page.getByRole('button', { name: /Done — / }).click();
+  await page.getByRole('button', { name: /\bDone$/ }).click();
 }
 
 // ── 1. Login, bucket, upload, inspector, preview, download, delete ──────
@@ -311,7 +311,7 @@ function toolbar() {
 /** Run Copy/Move from the selection bar into `bucket`/`dest`. */
 async function bulkTo(op: 'Copy' | 'Move', bucket: string, dest: string) {
   await toolbar().getByRole('button', { name: new RegExp(`^${op} \\d+ selected`) }).click();
-  const dlg = page.getByRole('dialog').filter({ hasText: 'Destination Bucket' });
+  const dlg = page.getByRole('dialog').filter({ hasText: 'Destination bucket' });
   await expect(dlg).toBeVisible();
   const preview = dlg.getByText(/^Preview:/);
   if (!(await preview.textContent())?.includes(`${bucket}/`)) {
@@ -370,7 +370,7 @@ test('3. bulk copy, move, ZIP, delete; refusals for move-into-source and path es
 
   // Path escape in the destination is refused in the picker, before any request.
   await toolbar().getByRole('button', { name: /^Copy \d+ selected/ }).click();
-  const picker = page.getByRole('dialog').filter({ hasText: 'Destination Bucket' });
+  const picker = page.getByRole('dialog').filter({ hasText: 'Destination bucket' });
   await picker.getByPlaceholder('/ (bucket root)').fill('../escape/');
   await expect(picker.getByRole('alert')).toContainText('cannot be "." or ".."');
   await expect(picker.locator('.ant-modal-footer .ant-btn-primary')).toBeDisabled();
@@ -388,13 +388,13 @@ test('3. bulk copy, move, ZIP, delete; refusals for move-into-source and path es
 
   // Upload to a '..' destination: refused on the page, no request is sent.
   await page.goto(`/_/browse/${BUCKET}/`);
-  await page.getByRole('button', { name: 'Upload files' }).click();
+  await page.getByRole('button', { name: 'Upload files', exact: true }).click();
   await page.getByRole('combobox', { name: /Destination path prefix/ }).fill('../up-escape/');
   await expect(page.getByRole('alert').filter({ hasText: 'cannot be "." or ".."' })).toBeVisible();
   await page.locator('input[type=file]').first().setInputFiles({ name: 'esc.txt', mimeType: 'text/plain', buffer: Buffer.from('x') });
   // The file is staged, but the Upload button stays disabled while the
-  // destination is invalid.
-  await expect(page.getByRole('button', { name: /Upload 1 file to / })).toBeDisabled();
+  // destination is invalid, and its label does not name the invalid path (D29).
+  await expect(page.getByRole('button', { name: /Upload 1 file$/ })).toBeDisabled();
   await expect(page.getByRole('list', { name: 'Upload queue' })).toHaveCount(0);
   // "New folder" refuses '..' too.
   await page.getByRole('combobox', { name: /Destination path prefix/ }).fill('');
@@ -576,9 +576,9 @@ test('5. IAM: create prefix-scoped user and a group, delete the last user → bo
 
 // ── 6. Config: export, section edit + apply, YAML import env rules ─────
 
-async function accountMenu(item: string) {
-  await page.getByRole('button', { name: /Account menu/ }).click();
-  await page.getByRole('menuitem', { name: item }).click();
+/** The import and export live in the System page's "Configuration as YAML" card (D72). */
+async function configYamlCard(item: string) {
+  await page.getByTestId('config-yaml-card').getByRole('button', { name: item }).click();
 }
 
 function yamlModal(kind: 'Export' | 'Import') {
@@ -586,7 +586,7 @@ function yamlModal(kind: 'Export' | 'Import') {
 }
 
 async function exportYaml(): Promise<string> {
-  await accountMenu('Export settings YAML');
+  await configYamlCard('Export settings YAML');
   const dlg = yamlModal('Export');
   const text = dlg.locator('textarea');
   await expect(text).toHaveValue(/storage:/, { timeout: 30_000 });
@@ -598,7 +598,7 @@ async function exportYaml(): Promise<string> {
 
 /** Paste `yaml` into the import dialog and press Validate. */
 async function importYaml(yaml: string) {
-  await accountMenu('Import settings YAML');
+  await configYamlCard('Import settings YAML');
   const dlg = yamlModal('Import');
   await dlg.locator('textarea').fill(yaml);
   await dlg.getByRole('button', { name: 'Validate' }).click();
@@ -623,7 +623,7 @@ test('6. config: export YAML, edit + Review & apply, persisted; env refs in YAML
   expect(exported).not.toContain(SECRET_KEY);
 
   // Edit a hot-reloadable field and apply it through the ApplyDialog.
-  const mdCache = page.locator('.dg-field').filter({ hasText: 'advanced.metadata_cache_mb' }).getByRole('spinbutton');
+  const mdCache = page.locator('.dg-field').filter({ hasText: 'advanced.metadata_cache_mb' }).getByRole('textbox');
   await expect(mdCache).toBeVisible();
   const newValue = String(60 + (Date.now() % 30));
   await mdCache.fill(newValue);

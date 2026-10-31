@@ -1,6 +1,6 @@
 import { useId, useState } from 'react';
-import { Button, Typography, Input, Alert, Switch, Divider, Spin, message } from 'antd';
-import { PlusOutlined, SearchOutlined, CopyOutlined, SafetyOutlined, CheckCircleOutlined, CloseCircleOutlined, SyncOutlined } from '@ant-design/icons';
+import { Button, Typography, Input, Alert, Switch, Divider, message } from 'antd';
+import { PlusOutlined, SearchOutlined, CopyOutlined, SafetyOutlined, CheckCircleOutlined, CloseCircleOutlined, SyncOutlined, UserOutlined } from '@ant-design/icons';
 import {
   testAuthProvider, previewMapping, syncMemberships,
   type AuthProvider, type ProviderTestForm, type ProviderTestResult,
@@ -11,7 +11,11 @@ import { useGroupMappingRules, useCreateMappingRule, useUpdateMappingRule, useDe
 import { useExternalIdentities } from '../queries/externalIdentities';
 import { useGroups } from '../queries/groups';
 import { useColors } from '../ThemeContext';
-import { useFormLabelStyle, contentColumn, CONTENT_FORM } from './shared-styles';
+import { useFormLabelStyle, useCardStyles, contentColumn, CONTENT_FORM, SPACE, CARD_GAP } from './shared-styles';
+import PageActions from './PageActions';
+import { EmptyState, ErrorState, LoadingState } from './StatePlaceholders';
+import { v, useFieldValidation } from '../validation';
+import { plainError } from '../plainError';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import IamSourceBanner from './IamSourceBanner';
@@ -19,7 +23,7 @@ import MappingRuleRow from './MappingRuleRow';
 import MaskedSecretInput from './MaskedSecretInput';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
-import { ApiError, normalizeUiError } from '../errorHandling';
+import { ApiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { IAM_DIRTY_KEYS, confirmDiscardEdits, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
 import { useApplyHandler } from '../useDirtySection';
@@ -52,7 +56,9 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
     providersQuery.isLoading || rulesQuery.isLoading || identitiesQuery.isLoading || groupsQuery.isLoading;
   const rawError =
     providersQuery.error ?? rulesQuery.error ?? identitiesQuery.error ?? groupsQuery.error;
-  const error = rawError ? (normalizeUiError(rawError, 'Failed to load data')) : '';
+  const retryLoad = () => {
+    for (const q of [providersQuery, rulesQuery, identitiesQuery, groupsQuery]) if (q.error) void q.refetch();
+  };
 
   // Bubble a 401 up so the login screen can take over. Effect, not render-body:
   // react-query keeps `error` populated across renders, so navigating in render
@@ -111,7 +117,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       const result = await testAuthProvider(id, form);
       setTestResult(result);
     } catch (e) {
-      setTestResult({ success: false, error: normalizeUiError(e, 'Test failed') });
+      setTestResult({ success: false, error: plainError(e, 'The proxy could not run the test.').text });
     } finally {
       setTesting(false);
     }
@@ -126,7 +132,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       // Don't masquerade a request failure as "no matching rules" (an empty
       // group list) — surface it so the operator can tell the two apart.
       setPreviewGroups([]);
-      message.error(normalizeUiError(e, 'Mapping preview failed'));
+      message.error(plainError(e, 'The proxy could not run the preview.').text);
     }
   };
 
@@ -140,7 +146,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       qc.invalidateQueries({ queryKey: qk.users.list() });
       qc.invalidateQueries({ queryKey: qk.groups.list() });
     } catch (e) {
-      message.error(normalizeUiError(e, 'Sync failed'));
+      message.error(plainError(e, 'The proxy could not sync the groups.').text);
     } finally {
       setSyncing(false);
     }
@@ -189,7 +195,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       await flushPendingRules();
       message.success('Mapping rules saved');
     } catch (e) {
-      message.error(normalizeUiError(e, 'Save failed'));
+      message.error(plainError(e, 'The proxy could not save the rules.').text);
     } finally {
       setRulesSaving(false);
     }
@@ -200,8 +206,36 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
 
   const label = useFormLabelStyle();
 
-  if (loading) return <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div>;
-  if (error) return <Alert type="error" title={error} style={{ margin: 16 }} />;
+  const { cardStyle } = useCardStyles();
+
+  if (loading) {
+    return (
+      <div style={contentColumn(CONTENT_FORM)}>
+        <LoadingState variant="form" label="Loading the external authentication settings" />
+      </div>
+    );
+  }
+  if (rawError) {
+    return <ErrorState error={rawError} what="the external authentication settings" onRetry={retryLoad} />;
+  }
+
+  // D36: the page's create action is ONE primary in the page header.
+  const newProvider = !readOnly && (
+    <PageActions>
+      <Button
+        type="primary"
+        icon={<PlusOutlined />}
+        onClick={async () => {
+          if (creating) return;
+          if (!(await confirmDiscardEdits(IAM_DIRTY_KEYS.providers))) return;
+          setCreating(true);
+          setSelectedProviderId(null);
+        }}
+      >
+        New provider
+      </Button>
+    </PageActions>
+  );
 
   // Nothing configured yet: ONE empty state with ONE next step. The rule
   // editor, the preview, and "Sync groups" all need a provider first, so
@@ -212,22 +246,16 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
     return (
       <div style={contentColumn(CONTENT_FORM)}>
         <IamSourceBanner iamMode={iamMode} loadError={iamLoadError} resource="OAuth providers + mapping rules" />
-        <div style={{ textAlign: 'center', padding: '48px 24px', color: colors.TEXT_MUTED }}>
-          <SafetyOutlined style={{ fontSize: 36, marginBottom: 12 }} />
-          <div style={{ fontSize: 15, fontWeight: 600, color: colors.TEXT_PRIMARY }}>
-            No identity providers yet
-          </div>
-          <div style={{ fontSize: 13, maxWidth: 440, margin: '8px auto 20px', lineHeight: 1.5 }}>
-            {readOnly
+        {newProvider}
+        <EmptyState
+          icon={<SafetyOutlined />}
+          title="No identity providers yet"
+          hint={
+            readOnly
               ? 'Your YAML config declares no providers. Add them under access.auth_providers and apply.'
-              : 'Add an OAuth or OIDC provider, for example Google, so people can sign in with it. Then choose who may sign in and which group each person gets.'}
-          </div>
-          {!readOnly && (
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreating(true)}>
-              Add provider
-            </Button>
-          )}
-        </div>
+              : 'Add an OAuth or OIDC provider, for example Google, so people can sign in with it. Click New provider at the top right.'
+          }
+        />
       </div>
     );
   }
@@ -237,45 +265,37 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       {/* IAM source-of-truth banner — OAuth providers + mapping rules
           live in the encrypted IAM DB, not YAML, in GUI mode. */}
       <IamSourceBanner iamMode={iamMode} loadError={iamLoadError} resource="OAuth providers + mapping rules" />
+      {newProvider}
       {/* Identity providers */}
       <SectionHeader icon={<SafetyOutlined />} title="Identity providers" />
       {providers.length === 0 && !creating && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 24 }}>
-          <Text type="secondary" style={{ fontSize: 12.5 }}>No providers configured.</Text>
-          {!readOnly && (
-            <Button icon={<PlusOutlined />} size="small" onClick={() => setCreating(true)}>
-              Add provider
-            </Button>
-          )}
-        </div>
+        <Text type="secondary" style={{ display: 'block', fontSize: 12.5, marginBottom: SPACE.lg }}>
+          No provider is configured.{readOnly ? '' : ' Click New provider at the top right.'}
+        </Text>
       )}
-      <div style={{ display: 'flex', gap: 16, marginBottom: 24, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: SPACE.md, marginBottom: SPACE.lg, flexWrap: 'wrap' }}>
         {/* Left: provider list — only when there is a list to show; the
             first provider's form takes the full width (no empty column).
             Stacks above the detail when the row wraps. */}
         {providers.length > 0 && (
-        <div style={{ width: 220, flexShrink: 0, flexGrow: 1, maxWidth: '100%' }}>
-          {!readOnly && (
-            <Button icon={<PlusOutlined />} block size="small" onClick={async () => {
-              if (!(await confirmDiscardEdits(IAM_DIRTY_KEYS.providers))) return;
-              setCreating(true); setSelectedProviderId(null);
-            }} style={{ marginBottom: 8 }}>
-              Add provider
-            </Button>
-          )}
+        <div role="list" aria-label="Identity providers" style={{ width: 220, flexShrink: 0, flexGrow: 1, maxWidth: '100%' }}>
           {providers.map(p => (
-            <div
+            <button
+              type="button"
+              role="listitem"
               key={p.id}
+              aria-current={selectedProviderId === p.id && !creating ? 'true' : undefined}
               onClick={async () => {
                 if (p.id === selectedProviderId && !creating) return;
                 if (!(await confirmDiscardEdits(IAM_DIRTY_KEYS.providers))) return;
                 setSelectedProviderId(p.id); setCreating(false);
               }}
               style={{
-                padding: '10px 12px', cursor: 'pointer', borderRadius: 8,
+                display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
+                padding: `${SPACE.xs}px ${SPACE.sm}px`, cursor: 'pointer', borderRadius: 8,
                 border: `1px solid ${selectedProviderId === p.id ? colors.ACCENT_BLUE : colors.BORDER}`,
                 background: selectedProviderId === p.id ? colors.ACCENT_BLUE + '18' : 'transparent',
-                marginBottom: 6,
+                marginBottom: SPACE.xs,
               }}
             >
               <div style={{ fontSize: 13, fontWeight: 600, color: colors.TEXT_PRIMARY, fontFamily: 'var(--font-ui)' }}>
@@ -284,7 +304,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
               <div style={{ fontSize: 11, color: colors.TEXT_MUTED }}>
                 {p.provider_type} {p.enabled ? '' : '(disabled)'}
               </div>
-            </div>
+            </button>
           ))}
         </div>
         )}
@@ -313,19 +333,19 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
               onTest={handleTest}
             />
           ) : providers.length === 0 ? null : (
-            <div style={{ color: colors.TEXT_MUTED, fontSize: 13, padding: 20 }}>
+            <div style={{ color: colors.TEXT_MUTED, fontSize: 13, padding: SPACE.md }}>
               {readOnly
                 ? 'Select a provider to view its configuration. Providers are declared in your YAML config.'
-                : 'Select a provider or create a new one to configure external authentication.'}
+                : 'Select a provider to edit it.'}
             </div>
           )}
         </div>
       </div>
 
-      <Divider style={{ margin: '16px 0' }} />
+      <Divider style={{ margin: `${SPACE.lg}px 0` }} />
 
       {/* Allowed users and group assignment */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: SPACE.sm }}>
         <SectionHeader icon={<SafetyOutlined />} title="Allowed users and group assignment" />
         {!readOnly && (
           <Button
@@ -363,7 +383,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
             : 'No rules configured. Add allowed email patterns (e.g. *@company.com) and assign them to groups.'}
         </Text>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 16 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE.xs, marginBottom: SPACE.md }}>
           {mergedRules.map((rule) => (
             <MappingRuleRow
               key={rule.id}
@@ -395,7 +415,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
                     return next;
                   });
                 } catch (e) {
-                  message.error(normalizeUiError(e, 'Delete failed'));
+                  message.error(plainError(e, 'The proxy could not delete the rule.').text);
                 }
               }}
             />
@@ -408,7 +428,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
           type="primary"
           loading={rulesSaving}
           onClick={saveRules}
-          style={{ borderRadius: 8, fontWeight: 600, marginBottom: 16 }}
+          style={{ fontWeight: 600, marginBottom: SPACE.md }}
           block
         >
           Save rules
@@ -416,12 +436,9 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       )}
 
       {/* Preview */}
-      <div style={{
-        background: colors.BG_CARD, border: `1px solid ${colors.BORDER}`, borderRadius: 8,
-        padding: 16, marginBottom: 24,
-      }}>
-        <label htmlFor="mapping-preview-email" style={{ ...label, display: 'block', marginBottom: 8 }}>Preview</label>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+      <div style={{ ...cardStyle, padding: SPACE.md, marginBottom: CARD_GAP }}>
+        <label htmlFor="mapping-preview-email" style={{ ...label, display: 'block', marginBottom: SPACE.xs }}>Preview</label>
+        <div style={{ display: 'flex', gap: SPACE.xs, alignItems: 'center' }}>
           <Input
             id="mapping-preview-email"
             prefix={<SearchOutlined style={{ color: colors.TEXT_MUTED }} />}
@@ -439,21 +456,21 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
           <Button onClick={handlePreview} disabled={!previewEmail}>Check</Button>
         </div>
         {previewGroups.length > 0 && (
-          <div style={{ marginTop: 8, fontSize: 13, color: colors.TEXT_SECONDARY }}>
+          <div style={{ marginTop: SPACE.xs, fontSize: 13, color: colors.TEXT_SECONDARY }}>
             Would be assigned to: <strong>{previewGroups.join(', ')}</strong>
           </div>
         )}
         {previewEmail && previewGroups.length === 0 && (
-          <div style={{ marginTop: 8, fontSize: 13, color: colors.TEXT_MUTED }}>
+          <div style={{ marginTop: SPACE.xs, fontSize: 13, color: colors.TEXT_MUTED }}>
             No matching groups for this email.
           </div>
         )}
       </div>
 
-      <Divider style={{ margin: '16px 0' }} />
+      <Divider style={{ margin: `${SPACE.lg}px 0` }} />
 
       {/* Login activity */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: SPACE.sm }}>
         <SectionHeader icon={<SafetyOutlined />} title={`Login activity (${identities.length})`} />
         {/* Sync writes group memberships to the DB, which declarative mode
             refuses (403); the YAML owns IAM there. */}
@@ -465,15 +482,20 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       </div>
 
       {identities.length === 0 ? (
-        <Text type="secondary" style={{ fontSize: 12 }}>No external users have logged in yet. Users matching the rules above will be auto-provisioned on first login.</Text>
+        <EmptyState
+          compact
+          icon={<UserOutlined />}
+          title="No external sign-ins yet"
+          hint="A person who matches a rule above gets a user at the first sign-in."
+        />
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE.xxs }}>
           {identities.map(id => {
             const provider = providers.find(p => p.id === id.provider_id);
             return (
               <div key={id.id} style={{
-                display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px',
-                background: colors.BG_CARD, border: `1px solid ${colors.BORDER}`, borderRadius: 6,
+                display: 'flex', alignItems: 'center', gap: SPACE.sm, padding: `${SPACE.xs}px ${SPACE.sm}px`,
+                background: colors.BG_CARD, border: `1px solid ${colors.BORDER}`, borderRadius: 8,
               }}>
                 <SafetyOutlined style={{ color: colors.ACCENT_BLUE, fontSize: 14 }} />
                 <div style={{ flex: 1 }}>
@@ -520,6 +542,7 @@ interface ProviderFormProps {
 
 function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDeleted, onCancel, onTest }: ProviderFormProps) {
   const colors = useColors();
+  const { cardStyle } = useCardStyles();
   const fid = useId();
   const isEdit = provider !== null;
 
@@ -554,21 +577,18 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
     formAllowLocal, formCaCertPath,
   });
   useDirtyFlag(IAM_DIRTY_KEYS.providers, isDirty && !readOnly);
-  // Field errors show after the first Create/Save or Test, then follow each
-  // keystroke. The buttons stay enabled: a disabled button does not say why.
-  const [checked, setChecked] = useState<'save' | 'test' | null>(null);
-  const required = (v: string, what: string) => (v.trim() ? undefined : `Enter the ${what}.`);
-  const fieldErrors = {
-    name: checked === 'save' ? required(formName, 'provider name') : undefined,
-    issuer: checked ? required(formIssuerUrl, 'issuer URL') : undefined,
-    clientId: checked ? required(formClientId, 'client ID') : undefined,
-  };
-  const canSave = Boolean(formName.trim() && formClientId.trim() && formIssuerUrl.trim());
-  const canTest = Boolean(formClientId.trim() && formIssuerUrl.trim());
+  // Field errors show when a field loses focus (D10) or after Create/Save,
+  // then follow each keystroke. The buttons stay enabled: a disabled button
+  // does not say why.
+  const form = useFieldValidation();
+  const nameField = form.text('name', formName, setFormName, v.required('the provider name'));
+  const issuerValidator = v.all(v.required('the issuer URL'), v.url());
+  const issuerField = form.text('issuer', formIssuerUrl, setFormIssuerUrl, issuerValidator);
+  const clientIdValidator = v.required('the client ID');
+  const clientIdField = form.text('clientId', formClientId, setFormClientId, clientIdValidator);
 
   const handleSave = async () => {
-    setChecked('save');
-    if (!canSave) return;
+    if (!form.submit()) return;
     setSaving(true);
     setSaveRefusal(null);
     const extraConfig = withNetworkPolicy(provider?.extra_config, formAllowLocal, formCaCertPath);
@@ -606,7 +626,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       onSaved();
     } catch (e) {
       if (e instanceof ApiError && e.status === 422 && e.detail) setSaveRefusal(e.detail);
-      else message.error(normalizeUiError(e, 'Save failed'));
+      else message.error(plainError(e, 'The proxy could not save the provider.').text);
     } finally {
       setSaving(false);
     }
@@ -627,26 +647,26 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       message.success('Provider deleted');
       onDeleted?.();
     } catch (e) {
-      message.error(normalizeUiError(e, 'Delete failed'));
+      message.error(plainError(e, 'The proxy could not delete the provider.').text);
     }
   };
 
   return (
-    <div style={{ background: colors.BG_CARD, border: `1px solid ${colors.BORDER}`, borderRadius: 10, padding: 20 }}>
+    <div style={{ ...cardStyle, padding: SPACE.md }}>
       <FormField label="Display name" helpText="The sign-in button shows this name." style={{ marginBottom: 16 }}>
         <Input value={formDisplayName} onChange={e => setFormDisplayName(e.target.value)} placeholder="Google Workspace" disabled={readOnly} />
       </FormField>
 
-      <FormField label="Provider name" helpText="A unique identifier, for example google-corp." error={fieldErrors.name} style={{ marginBottom: 16 }}>
-        <Input value={formName} onChange={e => setFormName(e.target.value)} placeholder="google-corp" disabled={readOnly} />
+      <FormField label="Provider name" helpText="A unique identifier, for example google-corp." error={nameField.error} style={{ marginBottom: 16 }}>
+        <Input {...nameField.inputProps} placeholder="google-corp" disabled={readOnly} />
       </FormField>
 
-      <FormField label="Issuer URL" error={fieldErrors.issuer} style={{ marginBottom: 16 }}>
-        <Input value={formIssuerUrl} onChange={e => setFormIssuerUrl(e.target.value)} placeholder="https://accounts.google.com" disabled={readOnly} />
+      <FormField label="Issuer URL" error={issuerField.error} style={{ marginBottom: 16 }}>
+        <Input {...issuerField.inputProps} placeholder="https://accounts.google.com" disabled={readOnly} />
       </FormField>
 
-      <FormField label="Client ID" error={fieldErrors.clientId} style={{ marginBottom: 16 }}>
-        <Input value={formClientId} onChange={e => setFormClientId(e.target.value)} placeholder="123456.apps.googleusercontent.com" disabled={readOnly} />
+      <FormField label="Client ID" error={clientIdField.error} style={{ marginBottom: 16 }}>
+        <Input {...clientIdField.inputProps} placeholder="123456.apps.googleusercontent.com" disabled={readOnly} />
       </FormField>
 
       {!readOnly && (
@@ -671,12 +691,12 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
 
       {/* Callback URL */}
       {/* Same label look as the FormField labels above. */}
-      <div style={{ fontSize: 13.5, fontWeight: 600, color: colors.TEXT_PRIMARY, marginBottom: 6 }}>
+      <div style={{ fontSize: 13.5, fontWeight: 600, color: colors.TEXT_PRIMARY, marginBottom: SPACE.xxs }}>
         Callback URL
       </div>
       <div style={{
-        display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6,
-        background: colors.BG_BASE, border: `1px solid ${colors.BORDER}`, borderRadius: 6, padding: '8px 12px',
+        display: 'flex', alignItems: 'center', gap: SPACE.xs, marginBottom: SPACE.xxs,
+        background: colors.BG_BASE, border: `1px solid ${colors.BORDER}`, borderRadius: 8, padding: `${SPACE.xs}px ${SPACE.sm}px`,
       }}>
         {/* Break only after a "/" (a <wbr> each), never inside a word. */}
         <code style={{ fontSize: 12, color: colors.TEXT_SECONDARY, flex: 1, overflowWrap: 'anywhere' }}>
@@ -696,8 +716,8 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       </div>
 
       {/* Network policy */}
-      <div style={{ fontSize: 13.5, fontWeight: 600, color: colors.TEXT_PRIMARY, marginBottom: 6 }}>Network</div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+      <div style={{ fontSize: 13.5, fontWeight: 600, color: colors.TEXT_PRIMARY, marginBottom: SPACE.xxs }}>Network</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: SPACE.xs, marginBottom: SPACE.xxs }}>
         <Switch
           checked={formAllowLocal}
           onChange={setFormAllowLocal}
@@ -731,7 +751,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
           showIcon
           title="The provider was not saved"
           description={saveRefusal}
-          style={{ marginBottom: 12, borderRadius: 8 }}
+          style={{ marginBottom: SPACE.sm }}
         />
       )}
 
@@ -751,11 +771,11 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
             : `Failed: ${testResult.error}`}
           showIcon
           icon={testResult.success ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
-          style={{ marginBottom: 12, borderRadius: 8 }}
+          style={{ marginBottom: SPACE.sm }}
         />
       )}
 
-      <div style={{ display: 'flex', gap: 8 }}>
+      <div style={{ display: 'flex', gap: SPACE.xs, flexWrap: 'wrap' }}>
         {!readOnly && (
           <Button
             type="primary"
@@ -767,8 +787,10 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
         )}
         <Button
           onClick={() => {
-            setChecked((c) => c ?? 'test');
-            if (!canTest) return;
+            // A test needs the issuer and the client ID only: show their errors.
+            issuerField.inputProps.onBlur();
+            clientIdField.inputProps.onBlur();
+            if (issuerValidator(formIssuerUrl) || clientIdValidator(formClientId)) return;
             onTest(provider?.id ?? null, {
             client_id: formClientId,
             client_secret: formClientSecret,

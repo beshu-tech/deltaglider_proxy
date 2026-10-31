@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Button, ConfigProvider, Input, Typography, Space, Alert, Spin, message } from 'antd';
-import { WarningOutlined, CheckCircleOutlined, CopyOutlined, SunOutlined, MoonOutlined, EyeOutlined, EyeInvisibleOutlined } from '@ant-design/icons';
+import { WarningOutlined, CheckCircleOutlined, CopyOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession, getBucket } from '../s3client';
 import { adminLogin, loginAs, isNotAdminDenial, whoami, isConfigDbLocked, recoverDb, browserSessionConnect, openBrowserConnect } from '../adminApi';
 import type { ExternalProviderInfo, WhoamiResponse } from '../adminApi';
@@ -9,7 +9,10 @@ import { buildViewUrl } from '../urlState';
 import OAuthProviderList from './OAuthProviderList';
 import { detectDefaultEndpoint } from '../utils';
 import { useColors, useTheme } from '../ThemeContext';
-import { normalizeUiError } from '../errorHandling';
+import { plainError, type PlainError } from '../plainError';
+import PlainErrorAlert from './PlainErrorAlert';
+import MaskedSecretInput from './MaskedSecretInput';
+import { SPACE } from './shared-styles';
 import { readStorage, removeStorage, writeStorage } from '../safeStorage';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 
@@ -46,51 +49,14 @@ const LOGIN_INPUT_THEME = {
   },
 };
 
-/** A secret field whose show/hide control is a real button (AntD's
- *  Input.Password renders a focusable `span`), named for what it does. */
-function SecretInput({ id, value, onChange, onPressEnter, autoFocus, style, autoComplete }: {
-  id: string;
-  value: string;
-  onChange: (v: string) => void;
-  onPressEnter: () => void;
-  autoFocus?: boolean;
-  style: React.CSSProperties;
-  autoComplete: string;
-}) {
-  const [shown, setShown] = useState(false);
-  return (
-    <Input
-      id={id}
-      type={shown ? 'text' : 'password'}
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      onPressEnter={onPressEnter}
-      autoFocus={autoFocus}
-      autoComplete={autoComplete}
-      spellCheck={false}
-      size="large"
-      style={style}
-      suffix={
-        <button
-          type="button"
-          className="btn-reset dg-login-reveal"
-          aria-label={shown ? 'Hide' : 'Show'}
-          aria-pressed={shown}
-          title={shown ? 'Hide' : 'Show'}
-          onClick={() => setShown((v) => !v)}
-          style={{ padding: 4, borderRadius: 6, color: 'inherit', cursor: 'pointer', lineHeight: 1 }}
-        >
-          {shown ? <EyeInvisibleOutlined aria-hidden="true" /> : <EyeOutlined aria-hidden="true" />}
-        </button>
-      }
-    />
-  );
-}
-
 interface Props {
   onConnect: (outcome: ConnectOutcome) => void;
   showError?: boolean;
 }
+
+/** The card's drop shadow only: the theme's extra white inset line read as a
+ *  light-theme frame on the dark card (D70). */
+const LOGIN_CARD_SHADOW = 'var(--login-shadow)';
 
 export default function ConnectPage({ onConnect, showError }: Props) {
   const { BORDER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, ACCENT_BLUE } = useColors();
@@ -107,9 +73,12 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   // The server's request id of the last failure: in the hover text of the
   // error, for support, never in the sentence itself.
   const [errorRequestId, setErrorRequestId] = useState<string | undefined>();
-  const setError = useCallback((text: string, requestId?: string) => {
+  // The raw text of an unexpected failure (status, code), behind "Details".
+  const [errorDetails, setErrorDetails] = useState<string | undefined>();
+  const setError = useCallback((text: string, requestId?: string, details?: string) => {
     setErrorText(text);
     setErrorRequestId(requestId);
+    setErrorDetails(details);
   }, []);
   const [authMode, setAuthMode] = useState<WhoamiResponse['mode'] | null>(null);
   const [externalProviders, setExternalProviders] = useState<ExternalProviderInfo[]>([]);
@@ -120,7 +89,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const [showRecovery, setShowRecovery] = useState(false);
   const [recoveryPassword, setRecoveryPassword] = useState('');
   const [recoveryLoading, setRecoveryLoading] = useState(false);
-  const [recoveryError, setRecoveryError] = useState('');
+  const [recoveryError, setRecoveryError] = useState<PlainError | null>(null);
   // Seeded from sessionStorage once on mount and intentionally NOT refetched when
   // `showRecovery` later flips true: a successful recovery survives a page refresh
   // (whoami() still reports config_db_mismatch until the operator updates the server
@@ -325,7 +294,8 @@ export default function ConnectPage({ onConnect, showError }: Props) {
 
       finishConnect(onConnect, iamOutcome);
     } catch (e) {
-      setError(normalizeUiError(e, "Connection failed"));
+      const plain = plainError(e, 'Could not connect. Try again.');
+      setError(plain.text, undefined, plain.details);
     } finally {
       loginInFlight.current = false;
       setLoading(false);
@@ -353,7 +323,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const handleRecover = async () => {
     if (!recoveryPassword.trim()) return;
     setRecoveryLoading(true);
-    setRecoveryError('');
+    setRecoveryError(null);
     try {
       const result = await recoverDb(recoveryPassword);
       if (result.success && (result.correct_hash || result.key_kind === 'config_db_key')) {
@@ -365,10 +335,10 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         setRecoveredHash(recovered);
         writeStorage('dg-recovered-hash', JSON.stringify(recovered), 'session');
       } else {
-        setRecoveryError(result.error || 'The key does not open the database');
+        setRecoveryError(plainError(result.error ?? '', 'The key does not open the database.'));
       }
     } catch (e) {
-      setRecoveryError(normalizeUiError(e, 'Recovery failed'));
+      setRecoveryError(plainError(e, 'The recovery failed. Try again.'));
     } finally {
       setRecoveryLoading(false);
     }
@@ -418,7 +388,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   if (showRecovery) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100dvh', padding: 24, boxSizing: 'border-box' }}>
-        <div className="dg-login-card animate-fade-in" style={{ borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 520 }}>
+        <div className="dg-login-card animate-fade-in" style={{ boxShadow: LOGIN_CARD_SHADOW, borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 520 }}>
           <Space orientation="vertical" size="large" style={{ width: '100%' }}>
             {recoveredHash?.kind === 'config_db_key' ? (
               <>
@@ -507,9 +477,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     <code style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: TEXT_SECONDARY }}>.db.bak</code> in case the key turns up.
                   </div>
                 </div>
-                {recoveryError && <Alert type="error" title={recoveryError} showIcon />}
+                {recoveryError && <PlainErrorAlert error={recoveryError} />}
                 <div>
-                  <label htmlFor="recovery-key" style={{ fontSize: 13, fontWeight: 600, color: TEXT_SECONDARY, fontFamily: "var(--font-ui)", marginBottom: 6, display: 'block' }}>
+                  <label htmlFor="recovery-key" style={{ fontSize: 13, fontWeight: 600, color: TEXT_SECONDARY, fontFamily: "var(--font-ui)", marginBottom: SPACE.xs, display: 'block' }}>
                     Config DB key or legacy password hash
                   </label>
                   <Input.TextArea
@@ -548,7 +518,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       <div className="dg-login-orb dg-login-orb-two" />
       <div className="dg-login-grid" />
 
-      <section className="dg-login-card animate-fade-in" aria-label="DeltaGlider sign in">
+      <section className="dg-login-card animate-fade-in" aria-label="DeltaGlider sign in" style={{ boxShadow: LOGIN_CARD_SHADOW }}>
         <ConfigProvider theme={LOGIN_INPUT_THEME}>
         <Space orientation="vertical" size={22} style={{ width: '100%' }}>
           <div className="dg-login-brand-block">
@@ -586,6 +556,16 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               type="error"
               showIcon
               title={<span title={errorRequestId ? `Request ID: ${errorRequestId}` : undefined}>{error}</span>}
+              description={
+                errorDetails ? (
+                  <details>
+                    <summary style={{ cursor: 'pointer', fontSize: 12 }}>Details</summary>
+                    <code style={{ display: 'block', marginTop: SPACE.xxs, fontSize: 11, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
+                      {errorDetails}
+                    </code>
+                  </details>
+                ) : undefined
+              }
             />
           )}
 
@@ -634,7 +614,10 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 /* Bootstrap mode: password only */
                 <div>
                   <label htmlFor="connect-admin-password" className="dg-login-label">Admin password</label>
-                  <SecretInput
+                  <MaskedSecretInput
+                    mode="new"
+                    size="large"
+                    placeholder=""
                     id="connect-admin-password"
                     value={adminPassword}
                     onChange={setAdminPassword}
@@ -666,7 +649,10 @@ export default function ConnectPage({ onConnect, showError }: Props) {
 
                   <div>
                     <label htmlFor="connect-secret-key" className="dg-login-label">Secret access key</label>
-                    <SecretInput
+                    <MaskedSecretInput
+                      mode="new"
+                      size="large"
+                      placeholder=""
                       id="connect-secret-key"
                       value={secretKey}
                       onChange={setSecretKey}

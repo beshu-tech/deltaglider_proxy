@@ -26,7 +26,7 @@ export function folderSizeBound(entry: ScanFlags, child?: { sizes_estimated?: bo
   return entry.truncated ? 'atLeast' : 'exact';
 }
 
-/** Cell text: `≈ 12 MB`, `≥ 12 MB`, or the size. */
+/** Cell text: `≈ 12 MiB`, `≥ 12 MiB`, or the size. */
 export function folderSizeText(formattedSize: string, bound: FolderSizeBound = 'exact'): string {
   if (bound === 'about') return `≈ ${formattedSize}`;
   if (bound === 'atLeast') return `≥ ${formattedSize}`;

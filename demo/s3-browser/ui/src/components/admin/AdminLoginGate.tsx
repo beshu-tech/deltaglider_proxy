@@ -13,7 +13,7 @@ export function AdminAccessDenied({ onBack }: { onBack: () => void }) {
   const colors = useColors();
   return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, background: colors.BG_BASE }}>
-      <div style={{ width: 380, padding: 40, textAlign: 'center' }}>
+      <div style={{ width: 380, padding: 32, textAlign: 'center' }}>
         <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_RED, marginBottom: 12 }} />
         <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Access Denied</Text></div>
         <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 8, marginBottom: 24 }}>
@@ -68,7 +68,7 @@ export function AdminLoginGate({ externalProviders, s3BrowserSessionOnly, initia
 
   return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, background: colors.BG_BASE }}>
-      <form onSubmit={e => { e.preventDefault(); handleLogin(); }} style={{ width: 380, padding: 40 }}>
+      <form onSubmit={e => { e.preventDefault(); handleLogin(); }} style={{ width: 380, padding: 32 }}>
         <div style={{ textAlign: 'center', marginBottom: 24 }}>
           <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_BLUE, marginBottom: 12 }} />
           <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Admin Login</Text></div>

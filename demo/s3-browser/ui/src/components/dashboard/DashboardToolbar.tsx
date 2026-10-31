@@ -14,6 +14,7 @@ import type { ReactNode } from 'react';
 import { Button } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../../ThemeContext';
+import { SPACE } from '../shared-styles';
 
 export type RefreshCadence = 'off' | '5s' | '30s';
 
@@ -44,8 +45,8 @@ export default function DashboardToolbar({
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
-        gap: 16,
-        marginBottom: 14,
+        gap: SPACE.md,
+        marginBottom: SPACE.md,
         flexWrap: 'wrap',
       }}
     >
@@ -69,7 +70,7 @@ export default function DashboardToolbar({
         )}
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: SPACE.md, flexWrap: 'wrap' }}>
       <ControlGroup label="View" colors={colors}>
         <Segmented
           value={view}
@@ -131,7 +132,7 @@ function ControlGroup({
   children: ReactNode;
 }) {
   return (
-    <div role="group" aria-label={label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+    <div role="group" aria-label={label} style={{ display: 'flex', alignItems: 'center', gap: SPACE.xs }}>
       <span style={{ fontSize: 12, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>{label}</span>
       {children}
     </div>
@@ -164,7 +165,7 @@ function LivePulse({
         height: 7,
         borderRadius: '50%',
         background: color,
-        marginLeft: 10,
+        marginLeft: SPACE.xs,
         marginBottom: 2,
         verticalAlign: 'middle',
         boxShadow: active ? `0 0 6px ${color}` : 'none',
@@ -209,7 +210,7 @@ function Segmented<T extends string>({ value, options, onChange, colors }: Segme
             disabled={opt.disabled}
             title={opt.hint}
             style={{
-              padding: '4px 10px',
+              padding: `${SPACE.xxs}px ${SPACE.sm}px`,
               fontSize: 12,
               fontWeight: 600,
               fontFamily: 'var(--font-ui)',

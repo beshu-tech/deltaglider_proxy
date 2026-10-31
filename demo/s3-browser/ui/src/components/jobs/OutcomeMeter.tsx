@@ -6,7 +6,11 @@ import './OutcomeMeter.css';
  *  [label]. All the decision logic is the pure `deriveMeter` (in jobsView, with
  *  the other job-display helpers + its regression test); this component only
  *  maps that view to DOM + injects theme colors as CSS custom properties. */
-export default function OutcomeMeter(props: OutcomeMeterInput) {
+export default function OutcomeMeter({ bar = true, ...props }: OutcomeMeterInput & {
+  /** The proportional track. Off: only the dot and the words (a settled
+   *  run in a list, where a full bar for one object says nothing). */
+  bar?: boolean;
+}) {
   const c = useColors();
   const m = deriveMeter(props);
   const indeterminate = (m.state === 'running' && props.percent == null) || m.state === 'cancelling';
@@ -14,6 +18,7 @@ export default function OutcomeMeter(props: OutcomeMeterInput) {
     <div
       className="dg-meter"
       data-state={m.state}
+      data-bar={bar ? undefined : 'off'}
       title={m.aria}
       role="img"
       aria-label={m.aria}
@@ -31,11 +36,13 @@ export default function OutcomeMeter(props: OutcomeMeterInput) {
       }
     >
       <span className="dg-meter-dot" data-dot={m.dot} aria-hidden="true" />
-      <span className="dg-meter-track" aria-hidden="true">
-        {m.greenPct > 0 && <span className="dg-meter-seg dg-meter-green" />}
-        {m.redPct > 0 && <span className="dg-meter-seg dg-meter-red" />}
-        {indeterminate && <span className="dg-meter-indeterminate" />}
-      </span>
+      {bar && (
+        <span className="dg-meter-track" aria-hidden="true">
+          {m.greenPct > 0 && <span className="dg-meter-seg dg-meter-green" />}
+          {m.redPct > 0 && <span className="dg-meter-seg dg-meter-red" />}
+          {indeterminate && <span className="dg-meter-indeterminate" />}
+        </span>
+      )}
       <span className="dg-meter-label">{m.label}</span>
     </div>
   );

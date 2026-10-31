@@ -99,7 +99,7 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
           style={{
             display: 'flex',
             alignItems: 'center',
-            gap: 10,
+            gap: 8,
             width: '100%',
             padding: `8px 20px 8px ${20 + depth * 16}px`,
             border: 'none',
@@ -113,7 +113,7 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
             cursor: 'pointer',
             fontFamily: 'var(--font-ui)',
             textAlign: 'left',
-            transition: 'all 0.15s ease',
+            transition: 'background-color 0.15s ease, color 0.15s ease',
           }}
         >
           <span style={{ display: 'inline-flex', width: 16, justifyContent: 'center' }}>
@@ -159,17 +159,7 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
     >
       {ADMIN_IA.map((group) => (
         <div key={group.group} style={{ marginBottom: 12 }}>
-          <div
-            style={{
-              fontSize: 10,
-              fontWeight: 600,
-              letterSpacing: 0.5,
-              textTransform: 'uppercase',
-              color: TEXT_MUTED,
-              padding: '0 20px 6px',
-              fontFamily: 'var(--font-ui)',
-            }}
-          >
+          <div className="dg-eyebrow" style={{ color: TEXT_MUTED, padding: '0 16px 8px' }}>
             {group.group}
           </div>
           <div>{group.entries.map((e) => renderEntry(e, 0))}</div>

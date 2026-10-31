@@ -1,12 +1,15 @@
 import { useState, useId } from 'react';
-import { Input, Switch, Button, Alert, Space, Divider, Typography } from 'antd';
+import { Input, Switch, Button, Space, Divider, Typography } from 'antd';
 import { ThunderboltOutlined, CheckCircleFilled, MinusCircleFilled, CrownFilled } from '@ant-design/icons';
 import type { IamUser, IamPermission, CreateUserRequest, UpdateUserRequest } from '../adminApi';
 import { useCreateUser, useUpdateUser, useDeleteUser, useRotateUserKeys } from '../queries/users';
 import { useCannedPolicies } from '../queries/cannedPolicies';
 import { useGroups } from '../queries/groups';
 import { setCredentials, getCredentials } from '../s3client';
-import { useCardStyles } from './shared-styles';
+import { useCardStyles, SPACE } from './shared-styles';
+import { useFieldValidation } from '../validation';
+import { plainError, type PlainError } from '../plainError';
+import PlainErrorAlert from './PlainErrorAlert';
 import FormField from './FormField';
 import MaskedSecretInput from './MaskedSecretInput';
 import { useColors } from '../ThemeContext';
@@ -22,7 +25,7 @@ import CredentialsModal from './CredentialsModal';
 import PillButton from './PillButton';
 import { confirmDialog } from '../confirmDialog';
 import { generateId, generateSecret } from '../credentialGeneration';
-import { ApiError, normalizeUiError } from '../errorHandling';
+import { ApiError } from '../errorHandling';
 import { IAM_DIRTY_KEYS, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
 import { IAM_NAME_HELP, iamNameError, serverNameErrorText } from '../userName';
 import { firstUserSwitchText } from '../firstUser';
@@ -88,9 +91,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   const [permissions, setPermissions] = useState<PermissionRow[]>(initialPermissions);
   const [saving, setSavingState] = useState(false);
   const [deleting, setDeletingState] = useState(false);
-  const [error, setError] = useState('');
-  // Field errors show after the first submit, then follow each keystroke.
-  const [showFieldErrors, setShowFieldErrors] = useState(false);
+  const [error, setError] = useState<PlainError | null>(null);
   // The server's refusal of the name (400), shown on the field.
   const [serverNameError, setServerNameError] = useState<string | null>(null);
   const [savedCredentials, setSavedCredentials] = useState<{ ak: string; sk: string } | null>(null);
@@ -117,17 +118,23 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   });
   useDirtyFlag(IAM_DIRTY_KEYS.users, isDirty && !readOnly);
 
+  // The name error shows on blur or after the first submit, then follows
+  // each keystroke: the same path as the group form (useFieldValidation).
   // A name that is not changed stays valid: an OAuth user keeps the display
   // name its identity provider gave it (the server accepts it unchanged).
-  const nameChanged = !isEdit || name.trim() !== user.name;
-  const nameRuleError = nameChanged ? iamNameError(name.trim()) : null;
-  const nameError = (showFieldErrors ? nameRuleError : null) ?? serverNameError;
+  const form = useFieldValidation();
+  const nameField = form.text(
+    'name',
+    name,
+    (t) => { setName(t); setServerNameError(null); },
+    (t) => (!isEdit || t.trim() !== user.name ? iamNameError(t.trim()) : null),
+  );
+  const nameError = nameField.error ?? serverNameError;
 
   const handleSave = async () => {
-    setShowFieldErrors(true);
-    if (nameRuleError) return;
+    if (!form.submit()) return;
     setSaving(true);
-    setError('');
+    setError(null);
     setServerNameError(null);
     setSavedCredentials(null);
     try {
@@ -174,7 +181,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
       const detail = e instanceof ApiError && e.status === 400 ? e.detail ?? '' : '';
       const fieldError = serverNameErrorText('user', detail);
       if (fieldError) setServerNameError(fieldError);
-      else setError(normalizeUiError(e, 'Operation failed'));
+      else setError(plainError(e, isEdit ? 'The proxy could not save the user.' : 'The proxy could not create the user.'));
     } finally {
       setSaving(false);
     }
@@ -187,7 +194,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
       await deleteUserMutation.mutateAsync(user.id);
       onDeleted?.();
     } catch (e) {
-      setError(normalizeUiError(e, 'Delete failed'));
+      setError(plainError(e, 'The proxy could not delete the user.'));
     } finally {
       setDeleting(false);
     }
@@ -231,9 +238,9 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   useApplyHandler(IAM_DIRTY_KEYS.users, () => { if (!saving) void submit(); }, isDirty && !readOnly);
 
   return (
-    <div style={{ padding: '24px 28px', maxWidth: 600, overflow: 'auto', height: '100%' }}>
-      <div style={{ marginBottom: 20 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+    <div style={{ padding: `${SPACE.lg}px`, maxWidth: 600, overflow: 'auto', height: '100%' }}>
+      <div style={{ marginBottom: SPACE.lg }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: SPACE.xs, flexWrap: 'wrap' }}>
           {/* h3: the page title above is an h2 (TabHeader). */}
           <Title level={3} style={{ margin: 0, fontFamily: 'var(--font-ui)', fontSize: 16 }}>
             {isEdit ? `${readOnly ? 'View' : 'Edit'}: ${user?.name}` : 'New user'}
@@ -281,19 +288,18 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
         />
       )}
 
-      {error && <Alert type="error" title={error} showIcon closable={{ onClose: () => setError('') }} style={{ marginBottom: 16, borderRadius: 8 }} />}
+      {error && <PlainErrorAlert error={error} style={{ marginBottom: SPACE.md }} />}
 
       <FormField
         label="Name"
         helpText={readOnly ? undefined : IAM_NAME_HELP}
         error={nameError ?? undefined}
-        style={{ marginBottom: 20 }}
+        style={{ marginBottom: SPACE.lg }}
       >
         <Input
           data-testid="user-name"
           autoFocus={!isEdit}
-          value={name}
-          onChange={e => { setName(e.target.value); setServerNameError(null); }}
+          {...nameField.inputProps}
           placeholder="e.g. ci-bot"
           disabled={readOnly}
           style={{ ...inputRadius }}
@@ -304,7 +310,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
         label="Access key ID"
         helpText={isEdit || readOnly ? undefined : 'Leave empty to generate one.'}
         controlId={`${uid}-akid`}
-        style={{ marginBottom: 20 }}
+        style={{ marginBottom: SPACE.lg }}
       >
         <Space.Compact style={{ width: '100%' }}>
           <Input
@@ -326,7 +332,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
           label="Secret access key"
           helpText={isEdit ? 'Leave empty to keep the current secret.' : 'Leave empty to generate one.'}
           controlId={`${uid}-secret`}
-          style={{ marginBottom: 20 }}
+          style={{ marginBottom: SPACE.lg }}
         >
           <Space.Compact style={{ width: '100%' }}>
             <MaskedSecretInput
@@ -342,16 +348,16 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
         </FormField>
       )}
 
-      <div style={{ marginBottom: 20, display: 'flex', alignItems: 'center', gap: 12 }}>
+      <div style={{ marginBottom: SPACE.lg, display: 'flex', alignItems: 'center', gap: SPACE.sm }}>
         <label htmlFor={`${uid}-enabled`} style={{ fontSize: 13.5, fontWeight: 600, color: colors.TEXT_PRIMARY }}>Enabled</label>
         <Switch id={`${uid}-enabled`} checked={enabled} onChange={setEnabled} size="small" disabled={readOnly} />
       </div>
 
-      <Divider style={{ margin: '20px 0 12px' }}>Permissions</Divider>
+      <Divider style={{ margin: `${SPACE.lg}px 0 ${SPACE.sm}px` }}>Permissions</Divider>
 
       {/* Presets as compact pill buttons (hidden in read-only — nothing to apply). */}
       {!readOnly && (
-        <div style={{ marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        <div style={{ marginBottom: SPACE.sm, display: 'flex', flexWrap: 'wrap', gap: SPACE.xs }}>
           {presets.map(policy => {
             return (
                 <PillButton

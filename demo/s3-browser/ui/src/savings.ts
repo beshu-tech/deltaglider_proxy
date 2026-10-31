@@ -142,7 +142,7 @@ export function uploadCreatedBaseline(writeFacts: Record<string, string | undefi
 }
 
 /** Bytes in one GiB. The quota field labels it "GiB"; the analytics cost
- *  rate still says "GB" (like `formatBytes`) for the same unit. */
+ *  analytics cost rate is per GiB too (D25: one binary convention). */
 export const GIB = 1024 ** 3;
 
 /** Bytes → GiB for an editable quota field: 3 decimals, so 500 MiB reads
@@ -157,13 +157,13 @@ export function bytesFromGib(gib: number): number {
   return Math.round(gib * GIB);
 }
 
-/** Monthly storage bill for `bytes` at `ratePerGbMonth` ($/GB/mo, GB = GiB):
+/** Monthly storage bill for `bytes` at `ratePerGbMonth` ($/GiB/mo):
  *  (bytes / GiB) × rate. The one cost formula for the analytics surfaces. */
 export function monthlyCost(bytes: number, ratePerGbMonth: number): number {
   return (bytes / GIB) * ratePerGbMonth;
 }
 
-/** Default storage price in $/GB/mo when none is persisted. */
+/** Default storage price in $/GiB/mo when none is persisted. */
 export const DEFAULT_COST_RATE = 0.00524;
 
 /** Parse a persisted cost rate. Missing, non-numeric, non-finite or negative
@@ -171,4 +171,32 @@ export const DEFAULT_COST_RATE = 0.00524;
 export function parseCostRate(raw: string | null | undefined): number {
   const n = raw ? Number(raw) : NaN;
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_COST_RATE;
+}
+
+/**
+ * THE colours of a saving (UX harvest D14): the browser's savings pill, the
+ * Delta chip of an object row and the analytics hero all use the success
+ * green, so "saved" has one colour everywhere. `ACCENT_GREEN` is text-grade
+ * (4.5:1) in both themes.
+ */
+export function savingsColors(colors: { ACCENT_GREEN: string }): { text: string; bg: string; border: string } {
+  return { text: colors.ACCENT_GREEN, bg: `${colors.ACCENT_GREEN}14`, border: `${colors.ACCENT_GREEN}40` };
+}
+
+/**
+ * Pure: how the savings hero presents its number (UX harvest D49). While a
+ * bucket is not scanned the totals come from live usage counters: an
+ * estimate, shown in a neutral colour with "≈". After every bucket has a
+ * scan, the figure is a fact and turns green.
+ */
+export function heroPresentation(unscannedCount: number): { estimated: boolean; prefix: string; tone: 'neutral' | 'saved'; label: string } {
+  const estimated = unscannedCount > 0;
+  return estimated
+    ? { estimated, prefix: '≈', tone: 'neutral', label: 'Estimated saving' }
+    : { estimated, prefix: '', tone: 'saved', label: 'Storage saved' };
+}
+
+/** Pure: the footer fact of the bucket that saves the most (D15: a saving has no minus sign). */
+export function biggestSaveSentence(bucket: string, savedText: string): string {
+  return `${bucket} saves the most: ${savedText}`;
 }

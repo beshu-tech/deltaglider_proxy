@@ -221,7 +221,7 @@ export default function SlackConnectorCard({
       )}
 
       {/* Mode sub-toggle */}
-      <div style={{ marginTop: 20 }}>
+      <div style={{ marginTop: 16 }}>
         <FormField
           label="How to connect"
           helpText="Incoming Webhook is the quickest. Use a bot token when you need multiple channels or @mentions."
@@ -326,7 +326,7 @@ export default function SlackConnectorCard({
       style={{
         display: 'flex',
         flexDirection: 'column',
-        gap: 20,
+        gap: 16,
         // On wide viewports the preview tracks the operator as they scroll the
         // (taller) form column; on narrow it just flows after the form.
         position: isNarrow ? 'static' : 'sticky',
@@ -394,16 +394,16 @@ function SetupHelpCard({
         border: `1px solid ${colors.BORDER}`,
         borderRadius: 12,
         background: colors.BG_ELEVATED,
-        padding: 18,
+        padding: 16,
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
         <SlackOutlined style={{ color: '#611f69', fontSize: 18 }} />
         <span style={{ fontSize: 14, fontWeight: 600, color: colors.TEXT_PRIMARY }}>
           Need a Slack app?
         </span>
       </div>
-      <div style={{ fontSize: 13, color: colors.TEXT_MUTED, lineHeight: 1.6, marginBottom: 14 }}>
+      <div style={{ fontSize: 13, color: colors.TEXT_MUTED, lineHeight: 1.6, marginBottom: 12 }}>
         One-time setup, ~2 minutes. We&apos;ll walk you through creating the app and grabbing the{' '}
         {mode === 'webhook' ? 'webhook URL' : 'bot token'} — with screenshots.
       </div>
@@ -447,7 +447,7 @@ function WebhookModeFields({
         <Space orientation="vertical" style={{ width: '100%' }}>
           {form.urlRows.length === 0 && (
             <Text type="secondary" style={{ fontSize: 13 }}>
-              No webhook URL yet. Add the one Slack gave you.
+              Add the webhook URL that Slack gave you.
             </Text>
           )}
           {form.urlRows.map((row: WebhookUrlRow, i: number) => (
@@ -624,7 +624,7 @@ function ChannelRoutingEditor({
 }) {
   return (
     <div>
-      <Text type="secondary" style={{ fontSize: 13, display: 'block', marginBottom: 14, lineHeight: 1.6 }}>
+      <Text type="secondary" style={{ fontSize: 13, display: 'block', marginBottom: 12, lineHeight: 1.6 }}>
         Send different buckets or prefixes to different channels. An event posts
         to every route it matches; the channel above is the fallback for
         unmatched events.
@@ -651,10 +651,10 @@ function ChannelRoutingEditor({
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'space-between',
-                marginBottom: 10,
+                marginBottom: 12,
               }}
             >
-              <Text style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: colors.TEXT_MUTED }}>
+              <Text style={{ fontSize: 13, fontWeight: 600, color: colors.TEXT_MUTED }}>
                 Route {i + 1}
               </Text>
               <Button
@@ -787,21 +787,19 @@ function LivePreview({
         border: `1px solid ${colors.BORDER}`,
         borderRadius: 12,
         background: colors.BG_ELEVATED,
-        padding: 18,
+        padding: 16,
       }}
     >
       <Text
         type="secondary"
         style={{
-          fontSize: 11,
-          fontWeight: 700,
-          letterSpacing: 0.5,
-          textTransform: 'uppercase',
+          fontSize: 13,
+          fontWeight: 600,
           display: 'block',
           marginBottom: 12,
         }}
       >
-        Live preview — what lands in the channel
+        Live preview: what lands in the channel
       </Text>
 
       {/* One sample event input (bot mode) → resolved-channel chips. */}
@@ -809,12 +807,12 @@ function LivePreview({
         <div
           style={{
             marginBottom: 16,
-            padding: 14,
+            padding: 12,
             border: `1px dashed ${colors.BORDER}`,
             borderRadius: 8,
           }}
         >
-          <Text style={{ fontSize: 13, color: colors.TEXT_MUTED, display: 'block', marginBottom: 10 }}>
+          <Text style={{ fontSize: 13, color: colors.TEXT_MUTED, display: 'block', marginBottom: 12 }}>
             Try a sample event{routed ? '' : ' (add routes to send buckets to different channels)'}:
           </Text>
           <Space.Compact style={{ width: '100%', marginBottom: 12 }}>
@@ -929,9 +927,9 @@ function SlackMessagePreview({
         background: '#ffffff',
         border: `1px solid ${colors.BORDER}`,
         borderRadius: 10,
-        padding: 14,
+        padding: 12,
         display: 'flex',
-        gap: 10,
+        gap: 12,
         fontFamily:
           'Slack-Lato, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
         color: '#1d1c1d',
@@ -957,7 +955,7 @@ function SlackMessagePreview({
         📦
       </div>
       <div style={{ minWidth: 0, flex: 1 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
           <span style={{ fontWeight: 700, fontSize: 13 }}>{appName}</span>
           <span
             style={{
@@ -992,7 +990,7 @@ function SlackMessagePreview({
               {sampleKey}
             </code>
           </div>
-          <div style={{ color: '#616061', fontSize: 12, marginTop: 2 }}>2.4 MB · application/gzip</div>
+          <div style={{ color: '#616061', fontSize: 12, marginTop: 2 }}>2.4 MiB · application/gzip</div>
         </div>
       </div>
     </div>

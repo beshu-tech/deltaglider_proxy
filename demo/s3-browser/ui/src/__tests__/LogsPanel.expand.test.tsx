@@ -61,3 +61,15 @@ test('Enter opens a line from the keyboard', async () => {
   await user.keyboard('{Enter}');
   expect(row).toHaveAttribute('aria-expanded', 'true');
 });
+
+// UX harvest D61: a cut line had no visible way to read its end.
+test('"Wrap lines" shows every line in full', async () => {
+  const user = userEvent.setup();
+  renderWithQuery(<LogsPanel />);
+  const row = await screen.findByRole('button', { name: /a very long message/ });
+  expect(row).toHaveStyle({ whiteSpace: 'nowrap' });
+  await user.click(screen.getByRole('switch', { name: 'Wrap lines' }));
+  expect(row).toHaveStyle({ whiteSpace: 'normal' });
+  expect(row).toHaveAttribute('aria-expanded', 'true');
+  expect(screen.getByText('bucket=releases')).toBeInTheDocument();
+});

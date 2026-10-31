@@ -1,4 +1,5 @@
 import { useColors } from '../ThemeContext';
+import { SPACE } from './shared-styles';
 
 /**
  * Centered tab header with icon, title, and description.
@@ -9,6 +10,9 @@ interface Props {
   icon: React.ReactNode;
   title: string;
   description: string;
+  /** Receives the node at the right of the header that <PageActions>
+   *  portals the page's primary action into. */
+  actionsRef?: (node: HTMLDivElement | null) => void;
 }
 
 /**
@@ -17,7 +21,7 @@ interface Props {
  * own actions (#92 item 13). Each staged editor's dirty bar carries a
  * "Review & apply" button instead; immediate buttons say what they do.
  */
-export default function TabHeader({ icon, title, description }: Props) {
+export default function TabHeader({ icon, title, description, actionsRef }: Props) {
   const colors = useColors();
 
   return (
@@ -26,14 +30,12 @@ export default function TabHeader({ icon, title, description }: Props) {
         display: 'flex',
         alignItems: 'center',
         flexWrap: 'wrap',
-        gap: 10,
-        rowGap: 6,
-        padding: '12px 20px',
+        gap: SPACE.sm,
+        rowGap: SPACE.xs,
+        padding: `${SPACE.sm}px ${SPACE.lg}px`,
         borderBottom: `1px solid ${colors.BORDER}`,
         marginBottom: 0,
       }}
-      role="heading"
-      aria-level={2}
     >
       <div
         aria-hidden="true"
@@ -60,6 +62,8 @@ export default function TabHeader({ icon, title, description }: Props) {
         }}
       >
         <div
+          role="heading"
+          aria-level={2}
           style={{
             fontSize: 16,
             fontWeight: 700,
@@ -84,6 +88,8 @@ export default function TabHeader({ icon, title, description }: Props) {
           {description}
         </div>
       </div>
+      {/* The page's ONE primary action (see PageActions). */}
+      {actionsRef && <div ref={actionsRef} data-testid="page-actions" style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }} />}
     </div>
   );
 }

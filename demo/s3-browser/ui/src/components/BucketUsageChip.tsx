@@ -4,10 +4,11 @@ import { getBucketUsage, refreshBucketUsage } from '../adminApi';
 import { useBucketOrigins } from '../queries/backends';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
-import { formatBytes, formatBytesIec, noun } from '../utils';
+import { formatBytes, noun } from '../utils';
 import { useAdminConfig } from '../queries/config';
 import { bucketPolicyFor } from '../bucketPolicyLookup';
 import { relativeTime } from '../utils';
+import { SPACE } from './shared-styles';
 
 /**
  * O(1) bucket-size pill in the TopBar — the Ceph-style running counter
@@ -67,8 +68,8 @@ export default function BucketUsageChip({
         style={{
           display: 'inline-flex',
           alignItems: 'center',
-          gap: 6,
-          padding: '2px 8px',
+          gap: SPACE.xxs,
+          padding: `2px ${SPACE.xs}px`,
           borderRadius: 6,
           border: `1px solid ${c.ACCENT_AMBER}66`,
           background: c.BG_ELEVATED,
@@ -108,7 +109,7 @@ export default function BucketUsageChip({
     ? ''
     : quota === 0
       ? ' Quota 0: the bucket takes no new writes.'
-      : ` Quota: ${formatBytes(data.stored_bytes)} stored of ${formatBytesIec(quota)} (writes that pass the quota are refused).`;
+      : ` Quota: ${formatBytes(data.stored_bytes)} stored of ${formatBytes(quota)} (writes that pass the quota are refused).`;
 
   // Plain text after the breadcrumb, not a box: a framed pill the height of
   // the header read as a second breadcrumb tab. The Header's 52px line
@@ -119,7 +120,7 @@ export default function BucketUsageChip({
       style={{
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 6,
+        gap: SPACE.xxs,
         fontSize: 12,
         lineHeight: '18px',
         color: c.TEXT_SECONDARY,
@@ -147,7 +148,7 @@ export default function BucketUsageChip({
           <span data-testid="bucket-quota" style={{ color: quotaTone, fontVariantNumeric: 'tabular-nums' }}>
             {quota === 0
               ? 'Frozen (quota 0)'
-              : `${Math.min(999, Math.round((quotaShare ?? 0) * 100))}% of ${formatBytesIec(quota)} quota`}
+              : `${Math.min(999, Math.round((quotaShare ?? 0) * 100))}% of ${formatBytes(quota)} quota`}
           </span>
         </>
       )}

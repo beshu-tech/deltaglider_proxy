@@ -1,8 +1,8 @@
-import { Alert, Table, Typography } from 'antd';
+import { Table, Typography } from 'antd';
 import type { LifecyclePreview } from '../../adminApi';
 import { formatBytes } from '../../utils';
 import { approxTimeUntil } from '../../jobsView';
-import { LoadingState } from '../StatePlaceholders';
+import { ErrorState, LoadingState } from '../StatePlaceholders';
 import { lifecycleActionCounts, lifecycleActionLabel, lifecycleSkipText, previewAgeText } from './lifecycleText';
 
 const { Text } = Typography;
@@ -11,7 +11,8 @@ interface Props {
   preview: LifecyclePreview | undefined;
   loading: boolean;
   error: unknown;
-  errorText: string;
+  /** Computes the preview again (the error state's Retry). */
+  onRetry?: () => void;
   /** When the GUI received the preview (ms since the epoch): shown only when the proxy
    *  did not say when its walk ended (`computed_at`). */
   receivedAt?: number;
@@ -32,9 +33,9 @@ function dueText(nextDueAt: string): string {
  * list, so the table says when it shows fewer keys than the total. When
  * nothing matches, it says when the first object becomes due instead.
  */
-export default function LifecyclePreviewList({ preview, loading, error, errorText, receivedAt, nowMs }: Props) {
-  if (error) return <Alert type="error" showIcon title={errorText} />;
-  if (loading || !preview) return <LoadingState label="Computing the preview…" />;
+export default function LifecyclePreviewList({ preview, loading, error, onRetry, receivedAt, nowMs }: Props) {
+  if (error) return <ErrorState compact error={error} what="the preview" onRetry={onRetry} />;
+  if (loading || !preview) return <LoadingState variant="inline" label="Computing the preview…" />;
   const shown = preview.candidates.length;
   const scannedAt = preview.computed_at ? Date.parse(preview.computed_at) : receivedAt;
   const secondary = { display: 'block', marginBottom: 8, fontSize: 12 } as const;

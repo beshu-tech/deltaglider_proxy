@@ -9,7 +9,7 @@
  * pending deletes laid over them.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Alert, Button, Input, Space, Spin, Switch, Tag, Typography, message } from 'antd';
+import { Alert, Button, Input, Space, Switch, Tag, Typography, message } from 'antd';
 import {
   CaretRightOutlined,
   DeleteOutlined,
@@ -17,6 +17,7 @@ import {
   PauseOutlined,
   PlayCircleOutlined,
   PlusOutlined,
+  ScheduleOutlined,
   StopOutlined,
   ThunderboltOutlined,
   UndoOutlined,
@@ -97,16 +98,15 @@ import {
 } from '../lifecyclePayload';
 import ReplicationApplySummary from '../ReplicationApplySummary';
 import { LifecycleApplySummary } from '../LifecycleSummary';
-import { normalizeUiError } from '../../errorHandling';
+import { plainError } from '../../plainError';
 import FormField from '../FormField';
+import PageActions from '../PageActions';
+import { EmptyState, ErrorState, LoadingState } from '../StatePlaceholders';
 import { runsUrl } from './runsLink';
-import {
-  durationError,
-  firstRuleFieldError,
-  lifecycleRuleFieldErrors,
-  replicationRuleFieldErrors,
-} from './humanDuration';
+import { durationError } from './humanDuration';
+import { lifecycleRuleErrors, replicationRuleErrors, type RuleFieldErrors } from './ruleFieldErrors';
 import { useErrorGate } from './useErrorGate';
+import TruncatedName from '../TruncatedName';
 
 const { Text } = Typography;
 
@@ -130,8 +130,8 @@ interface RuleKindSpec<C extends RulesConfig<R>, R extends { name: string; enabl
   normalize: (body: StorageSectionBody) => C;
   build: (value: C) => PayloadResult;
   emptyRule: (existing: R[]) => R;
-  /** The duration errors of one rule, by field (shown in the drawer). */
-  fieldErrors: (rule: R) => Partial<Record<string, string>>;
+  /** The errors of one rule, by field (shown under the fields in the drawer). */
+  fieldErrors: (rule: R, rules: readonly R[]) => RuleFieldErrors;
   /** The editor value inside a pending PUT body. */
   pending: (body: StorageSectionBody | null) => C | undefined;
   applySummary: (value: C) => ReactNode;
@@ -141,7 +141,8 @@ interface RuleKindSpec<C extends RulesConfig<R>, R extends { name: string; enabl
     lifecycle?: RuleEditor<LifecycleConfig>;
   };
   newLabel: string;
-  empty: string;
+  /** The empty state of the list: what a rule of this kind does. */
+  empty: { title: string; hint: string };
   /** The master switch and the tick, as page settings. */
   settings: {
     switchLabel: string;
@@ -163,12 +164,15 @@ const REPLICATION_SPEC: RuleKindSpec<ReplicationConfig, ReplicationRuleConfig> =
   normalize: (body) => normalizeReplication(body.replication),
   build: buildReplicationPayload,
   emptyRule: emptyReplicationRule,
-  fieldErrors: replicationRuleFieldErrors,
+  fieldErrors: replicationRuleErrors,
   pending: (body) => body?.replication,
   applySummary: (value) => <ReplicationApplySummary replication={value} />,
   drawer: (editor) => ({ replication: editor }),
   newLabel: 'New replication rule',
-  empty: 'No replication rules yet. A replication rule copies a bucket, or a folder of it, to another bucket.',
+  empty: {
+    title: 'No replication rules yet',
+    hint: 'A replication rule copies a bucket, or a folder of it, to another bucket. Click New replication rule at the top right.',
+  },
   settings: {
     switchLabel: 'Run replication rules',
     switchPath: 'storage.replication.enabled',
@@ -191,12 +195,15 @@ const LIFECYCLE_SPEC: RuleKindSpec<LifecycleConfig, LifecycleRuleConfig> = {
   // A new rule is on: a user who writes a rule expects it to run. Whether
   // the scheduler runs it is the page switch, and the page says so.
   emptyRule: (existing) => ({ ...emptyLifecycleRule(existing), enabled: true }),
-  fieldErrors: lifecycleRuleFieldErrors,
+  fieldErrors: lifecycleRuleErrors,
   pending: (body) => body?.lifecycle,
   applySummary: (value) => <LifecycleApplySummary lifecycle={value} />,
   drawer: (editor) => ({ lifecycle: editor }),
   newLabel: 'New lifecycle rule',
-  empty: 'No lifecycle rules yet. A lifecycle rule deletes or archives objects by age or by count.',
+  empty: {
+    title: 'No lifecycle rules yet',
+    hint: 'A lifecycle rule deletes or archives objects by age or by count. Click New lifecycle rule at the top right.',
+  },
   settings: {
     switchLabel: 'Run lifecycle rules on schedule',
     switchPath: 'storage.lifecycle.enabled',
@@ -425,10 +432,22 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
   // Stage the removal of a saved rule: it leaves the editor value, so the
   // list shows it as "removing" and Apply deletes it. The other unsaved
   // edits stay.
+  // Its toast is keyed: Keep and Discard take it away (UX harvest D39).
+  const stagedToasts = useRef(new Set<string>());
+  const stagedToastKey = (name: string) => `rules-staged-remove:${name}`;
+  const dropStagedToast = (name: string) => {
+    messageApi.destroy(stagedToastKey(name));
+    stagedToasts.current.delete(name);
+  };
   const stageRemove = (row: Pick<JobRow, 'id' | 'name'>) => {
     ed.setValue((cur) => ({ ...cur, rules: cur.rules.filter((r) => r.name !== row.name) }));
     if (drawerJobId === row.id) handleDrawerClose();
-    messageApi.info(`Rule ${row.name} is staged for removal. Review and apply to remove it.`);
+    stagedToasts.current.add(row.name);
+    void messageApi.open({
+      key: stagedToastKey(row.name),
+      type: 'info',
+      content: `Rule ${row.name} is staged for removal. Review and apply to remove it.`,
+    });
   };
   // A saved rule that the edits remove (Remove rule, or a rename). Not the
   // same as the row's `pendingDelete`: before the section loads, every
@@ -450,6 +469,8 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
       const at = Math.min(ed.baseline.rules.indexOf(saved), cur.rules.length);
       return { ...cur, rules: [...cur.rules.slice(0, at), saved, ...cur.rules.slice(at)] };
     });
+    dropStagedToast(row.name);
+    messageApi.info(`Rule ${row.name} is kept.`);
   };
 
   // Clone a rule into a new draft and open it, so the operator points it at
@@ -479,7 +500,13 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
     if (drawerJobId === row.id) handleDrawerClose();
   };
 
-  const discardEditor = () => ed.discard();
+  // Discard takes back every staged edit: the errors it showed, and the
+  // "staged for removal" toasts of the rules it keeps.
+  const discardEditor = () => {
+    ed.discard();
+    gate.reset();
+    for (const name of [...stagedToasts.current]) dropStagedToast(name);
+  };
 
   // Rules with unapplied edits (and drafts): only THESE block Run now /
   // Preview and show the "edited" marker.
@@ -488,18 +515,30 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
     [kind, ed.value.rules, ed.baseline.rules],
   );
 
-  // A wrong duration is refused here, with the rule and the field named:
-  // the server's answer was a parser message in the review dialog.
-  const tickGate = useErrorGate();
+  // Every field is checked here (`ruleFieldErrors`): an error shows under
+  // its field once the field lost focus, or after Review & apply, and the
+  // dirty bar counts the errors on screen. ONE gate for the page and every
+  // rule: keys `tick` and `<rule uid>:<field>` (UX harvest D9, D10).
+  const gate = useErrorGate();
   const tickError = durationError(ed.value.tick_interval, { min: spec.settings.tickMin });
-  const ruleFieldError = firstRuleFieldError(ed.value.rules, spec.fieldErrors);
+  const ruleErrors = ed.value.rules.map((r) => spec.fieldErrors(r, ed.value.rules));
   const errorCount =
-    (tickError ? 1 : 0) +
-    ed.value.rules.filter((r) => Object.values(spec.fieldErrors(r)).some(Boolean)).length;
+    (tickError && gate.show('tick') ? 1 : 0) +
+    ruleErrors.reduce(
+      (sum, errs, i) =>
+        sum + Object.entries(errs).filter(([field, e]) => e && gate.show(`${ruleUid(ed.value.rules[i])}:${field}`)).length,
+      0,
+    );
+  const firstBadRule = ruleErrors.findIndex((errs) => Object.values(errs).some(Boolean));
   const startApply = useCallback(async () => {
-    const fieldError = tickError ? `${spec.settings.tickLabel}: ${tickError}` : ruleFieldError;
-    if (fieldError) {
-      messageApi.error(fieldError);
+    if (tickError || firstBadRule >= 0) {
+      // Show every error under its field, and the first rule with one.
+      gate.submit();
+      if (firstBadRule >= 0) {
+        const rule = ed.value.rules[firstBadRule];
+        const id = editorRuleJobId(kind, rule, ed.baseline.rules);
+        if (drawerJobId !== id) openDrawer(id);
+      }
       return;
     }
     const r = spec.build(ed.value);
@@ -508,26 +547,43 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
       return;
     }
     await ed.runApply();
-  }, [spec, ed, messageApi, tickError, ruleFieldError]);
+    // `drawerJobId` and `openDrawer` are declared below; they are read when
+    // the handler runs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spec, ed, messageApi, tickError, firstBadRule, gate, kind]);
   useApplyHandler(spec.path, startApply, ed.isDirty);
+
+  // The row of a rule that the user just applied: it flashes once.
+  const [highlightId, setHighlightId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!highlightId) return;
+    const t = window.setTimeout(() => setHighlightId(null), 3000);
+    return () => window.clearTimeout(t);
+  }, [highlightId]);
 
   const confirmApply = useCallback(async () => {
     // Before the apply moves the snapshot: the saved rules it deletes or
     // changes, and the rules whose runs the scheduler starts within a second.
     const staleVerify = kind === 'replication' ? savedRulesChangedByApply(ed.value.rules, ed.baseline.rules) : [];
     const changed = ruleIdsChangedByApply(kind, ed.value.rules, ed.baseline.rules);
-    const waitsOnScheduler =
-      kind === 'lifecycle' && !ed.value.enabled && ed.value.rules.some((r) => r.enabled);
+    // The rule in the drawer: after the apply it is a saved rule, known by its name.
+    const shown = drawerRule.current ? ed.value.rules.find((r) => ruleUid(r) === drawerRule.current?.uid) : undefined;
     if (await ed.confirmApply()) {
-      if (waitsOnScheduler) {
-        messageApi.warning(`Applied. The rules do not run until “${spec.settings.switchLabel}” is on.`, 8);
-      }
+      // ONE toast (the editor's "Applied"): a scheduler that is off is a
+      // fact of the page, and its banner says so (UX harvest D20).
       watchJobs(changed);
+      gate.reset();
+      for (const name of [...stagedToasts.current]) dropStagedToast(name);
       // A deleted, renamed or changed rule's parity result is not the new rule's.
       for (const name of staleVerify) qc.removeQueries({ queryKey: qk.jobs.verify(name) });
+      // Done with the rule: close its drawer and point at its row (D53).
+      if (drawerJobId) handleDrawerClose();
+      if (shown) setHighlightId(`${kind}:${shown.name}`);
     }
     qc.invalidateQueries({ queryKey: qk.jobs.list() });
-  }, [kind, ed, qc, watchJobs, messageApi, spec.settings.switchLabel]);
+    // `drawerRule`, `drawerJobId` and `handleDrawerClose` are declared below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kind, ed, qc, watchJobs, gate]);
 
   // ── Display rows: server rows + drafts/pending-deletes overlay. ──
   const displayRows: JobDisplayRow[] = useMemo(() => {
@@ -669,7 +725,7 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
       // A run changes the objects that the cached preview lists.
       if (action === 'run-now') qc.invalidateQueries({ queryKey: qk.jobs.preview(row.id) });
     } catch (e) {
-      messageApi.error(normalizeUiError(e, `${action} failed`));
+      messageApi.error(plainError(e, `${ACTION_META[action].label} did not work. Try again.`).text);
     } finally {
       setActionBusy(null);
     }
@@ -691,15 +747,12 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
       track: 'minmax(180px,2fr)',
       render: (d) => (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-          <Text
-            strong
-            // AntD tooltips are hidden globally (theme.css): native title.
-            ellipsis
-            title={d.row.name}
-            style={{ fontFamily: 'var(--font-mono)', fontSize: 13, minWidth: 0 }}
-          >
-            {d.row.name}
-          </Text>
+          {/* Cut in the middle: rule names often differ only at the end. */}
+          <TruncatedName
+            text={d.row.name}
+            className="dg-rule-name"
+            style={{ fontFamily: 'var(--font-mono)', fontSize: 13, fontWeight: 600 }}
+          />
           {d.draft && <Tag color="warning" style={{ margin: 0, flexShrink: 0 }}>draft</Tag>}
           {d.edited && (
             <Tag
@@ -730,13 +783,9 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
       render: (d) => {
         const scope = scopeText(d.row.scope);
         return (
-          <Text
-            type="secondary"
-            className="dg-cell-truncate"
-            title={scope}
-            style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}
-          >
-            {scope || '—'}
+          // Cut in the middle: bucket/prefix scopes differ at the end (D5).
+          <Text type="secondary" style={{ display: 'flex', minWidth: 0, fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+            <TruncatedName text={scope || '—'} />
           </Text>
         );
       },
@@ -826,7 +875,21 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
       align: 'end',
       hideLabelOnNarrow: true,
       render: (d) =>
-        d.draft ? (
+        // Staged for removal: no Pause / Preview / Run now on a rule that
+        // is about to go; the one action is to keep it (UX harvest D38).
+        d.pendingDelete && !d.draft && stagedForRemoval(d.row.name) ? (
+          <Button
+            size="small"
+            icon={<UndoOutlined />}
+            aria-label={`Keep this rule: ${d.row.name}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              keepRule(d.row);
+            }}
+          >
+            Keep this rule
+          </Button>
+        ) : d.draft ? (
           <Space size={2} onClick={(e) => e.stopPropagation()}>
             <RowActionsMenu
               label={`More actions for ${d.row.name}`}
@@ -902,10 +965,41 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
     },
   ];
 
-  if (jobsQuery.isLoading) {
+  const pageActions = (
+    <PageActions>
+      <Button type="primary" icon={<PlusOutlined />} onClick={newRule}>
+        {spec.newLabel}
+      </Button>
+    </PageActions>
+  );
+  const what = kind === 'replication' ? 'the replication rules' : 'the lifecycle rules';
+  // One state for the page: no settings and no rows before the rules load,
+  // and an error with Retry instead of a list (UX harvest D16, D17).
+  if (jobsQuery.isPending || (ed.loading && !ed.loadError)) {
     return (
-      <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}>
-        <Spin />
+      // No "New rule" before the rules load: a draft made now would be lost
+      // when the section arrives.
+      <div style={contentColumn(CONTENT_WIDE)}>
+        <div style={cardStyle}>
+          <LoadingState variant="list" rows={4} label={`Loading ${what}`} />
+        </div>
+      </div>
+    );
+  }
+  const loadError = (!jobsQuery.data && jobsQuery.error) || ed.loadError;
+  if (loadError) {
+    return (
+      <div style={contentColumn(CONTENT_WIDE)}>
+        <div style={cardStyle}>
+          <ErrorState
+            error={loadError}
+            what={what}
+            onRetry={() => {
+              void jobsQuery.refetch();
+              void ed.refresh();
+            }}
+          />
+        </div>
       </div>
     );
   }
@@ -917,12 +1011,10 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
     kind === 'lifecycle' && !ed.loading && !ed.value.enabled && ed.value.rules.some((r) => r.enabled)
       ? `No lifecycle rule runs while “${st.switchLabel}” is off. Turn it on, then review and apply.`
       : null;
-  // The list's empty state carries the "New rule" button; a failed list has
-  // no empty state, so the header keeps it then.
-  const showHeader = displayRows.length > 0 || !!jobsQuery.error;
   return (
     <div style={contentColumn(CONTENT_WIDE)}>
       {msgCtx}
+      {pageActions}
       <LifecycleRunConfirm
         row={confirmRun}
         onCancel={() => setConfirmRun(null)}
@@ -934,7 +1026,7 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
       <JobDrawer
         jobId={drawerJobId}
         rows={serverRows}
-        {...spec.drawer({ value: ed.value, saved: ed.baseline, onChange: ed.setValue })}
+        {...spec.drawer({ value: ed.value, saved: ed.baseline, onChange: ed.setValue, gate })}
         onRemoveDraft={removeDraft}
         onCloneRule={cloneRuleRow}
         lifecycleVerbOf={ruleVerb}
@@ -957,26 +1049,17 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
       />
 
       <div style={cardStyle}>
-        {/* With no rules, the list's empty state says so (once) and carries
-            the one call to action; the header row shows only with rules. */}
-        {showHeader && (
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-            <Text type="secondary" style={{ fontSize: 13, minWidth: 0 }}>
-              {displayRows.length === 0
-                ? ''
-                : `${displayRows.length} rule${displayRows.length === 1 ? '' : 's'} — select one for its definition, runs, and failures.`}
-            </Text>
-            <Button type="primary" icon={<PlusOutlined />} onClick={newRule}>
-              {spec.newLabel}
-            </Button>
-          </div>
+        {displayRows.length > 0 && (
+          <Text type="secondary" style={{ display: 'block', fontSize: 13, marginBottom: 16 }}>
+            {`${displayRows.length} rule${displayRows.length === 1 ? '' : 's'}. Select one for its definition, runs and failures.`}
+          </Text>
         )}
 
         <FormField
           label={st.switchLabel}
           yamlPath={st.switchPath}
           helpText={st.switchHelp}
-          style={{ marginTop: showHeader ? 16 : 0, marginBottom: 0 }}
+          style={{ marginBottom: 0 }}
         >
           <Switch
             checked={ed.value.enabled}
@@ -997,11 +1080,11 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
           label={st.tickLabel}
           yamlPath={st.tickPath}
           helpText={st.tickHelp}
-          error={tickGate.show('tick') && !ed.loading ? (tickError ?? undefined) : undefined}
+          error={gate.show('tick') && !ed.loading ? (tickError ?? undefined) : undefined}
           style={{ marginTop: 12, marginBottom: 0, maxWidth: 360 }}
         >
           <Input
-            {...tickGate.props('tick')}
+            {...gate.props('tick')}
             value={ed.value.tick_interval}
             disabled={ed.loading}
             placeholder={st.tickPlaceholder}
@@ -1010,31 +1093,19 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
           />
         </FormField>
 
-        {jobsQuery.error ? (
-          <Alert
-            type="error"
-            showIcon
-            style={{ marginTop: 16, borderRadius: 8 }}
-            title={normalizeUiError(jobsQuery.error, 'Failed to load the rules')}
+        <div style={{ marginTop: 16 }}>
+          <RecordList
+            rows={displayRows}
+            columns={columns}
+            rowKey={(d) => d.row.id}
+            onRowClick={(d) => openDrawer(d.row.id)}
+            highlightKey={highlightId}
+            isDimmed={(d) => !!d.pendingDelete && !d.draft && stagedForRemoval(d.row.name)}
+            // The page header carries "New … rule": the empty state names it
+            // instead of repeating the button (PageActions).
+            empty={<EmptyState icon={<ScheduleOutlined />} title={spec.empty.title} hint={spec.empty.hint} />}
           />
-        ) : (
-          <div style={{ marginTop: 16 }}>
-            <RecordList
-              rows={displayRows}
-              columns={columns}
-              rowKey={(d) => d.row.id}
-              onRowClick={(d) => openDrawer(d.row.id)}
-              empty={
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
-                  <span>{spec.empty}</span>
-                  <Button type="primary" icon={<PlusOutlined />} onClick={newRule}>
-                    {spec.newLabel}
-                  </Button>
-                </div>
-              }
-            />
-          </div>
-        )}
+        </div>
       </div>
 
       {/* With the drawer open the bar sits in its footer (above). */}

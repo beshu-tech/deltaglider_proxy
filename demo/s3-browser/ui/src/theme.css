@@ -149,11 +149,11 @@ code, kbd, pre, samp, .ant-typography code {
   --docs-link: #0f766e;
   --docs-heading: #0c1629;
   --hljs-keyword: #7c3aed;
-  --hljs-string: #059669;
-  --hljs-number: #d97706;
+  --hljs-string: #047857;
+  --hljs-number: #b45309;
   --hljs-comment: #5f6c80;
   --hljs-builtin: #2563eb;
-  --hljs-attr: #e11d48;
+  --hljs-attr: #be123c;
   --hljs-title: #0f766e;
   /* Semantic status */
   --accent-success: #389e0d;
@@ -233,7 +233,7 @@ code, kbd, pre, samp, .ant-typography code {
 .ant-table-wrapper .ant-table-thead > tr > th {
   font-family: 'Manrope', sans-serif !important;
   font-weight: 600 !important;
-  letter-spacing: 0.02em !important;
+  letter-spacing: 0.06em !important;
   text-transform: uppercase !important;
   font-size: 11px !important;
 }
@@ -311,10 +311,11 @@ code, kbd, pre, samp, .ant-typography code {
    2 px of --focus-ring, 2 px outside the element. `!important` because AntD
    draws its own (3 px colorPrimaryBorder, or currentColor on text buttons)
    with a higher specificity; a second focus-visible rule elsewhere is a
-   regression. Exceptions: text fields keep AntD's border + glow (Chrome
-   matches them :focus-visible on every click, so a ring would double the
-   cue), and [tabindex='-1'] elements are focused by script (the main
-   region, a dialog body), not by Tab. */
+   regression. Text fields get the same ring through their AntD wrapper
+   (see "Text fields" below), and [tabindex='-1'] elements are focused by
+   script (the main region, a dialog body), not by Tab.
+   The ring never animates: a transition on `outline` showed a grey ring
+   that turned teal only later on a fast Tab (D3). */
 :root {
   --focus-ring-width: 2px;
   --focus-ring-offset: 2px;
@@ -322,6 +323,36 @@ code, kbd, pre, samp, .ant-typography code {
 :focus-visible:not(input, textarea, select, [tabindex='-1']) {
   outline: var(--focus-ring-width) solid var(--focus-ring, #2dd4bf) !important;
   outline-offset: var(--focus-ring-offset) !important;
+}
+/* Text fields (D2): the focused <input> of an AntD field sits inside a
+   wrapper (affix wrapper, select, input number), so the ring goes on the
+   element the user sees as the field. A text field shows its ring on a
+   click too: that is where the caret is. */
+.ant-input:not(.ant-input-affix-wrapper .ant-input, .ant-input-number .ant-input):focus,
+.ant-input-affix-wrapper-focused,
+.ant-input-number-focused,
+.ant-select-focused:not(.ant-select-disabled),
+.ant-picker-focused,
+:is(input, textarea, select):focus-visible:not([class*="ant-"], [type='checkbox'], [type='radio'], [tabindex='-1']) {
+  outline: var(--focus-ring-width) solid var(--focus-ring, #2dd4bf) !important;
+  outline-offset: 1px !important;
+}
+/* Segmented (D3): rc-segmented makes BOTH its root and the radio of the
+   selected item Tab stops. Call sites pass tabIndex={-1} to the root, so
+   the radio is the one stop; its ring goes on the visible item (the radio
+   itself has opacity 0, so its own ring never shows). */
+.ant-segmented-item:has(> .ant-segmented-item-input:focus-visible),
+.ant-segmented-item-focused {
+  outline: var(--focus-ring-width) solid var(--focus-ring) !important;
+  outline-offset: 0 !important;
+}
+/* No outline animation anywhere: an element whose `transition` lists
+   `all` or `outline` otherwise fades its ring in from currentColor. */
+*:focus-visible,
+.ant-input-affix-wrapper-focused,
+.ant-input-number-focused,
+.ant-select-focused {
+  transition-property: none !important;
 }
 /* AntD checkbox, radio: the focused element is a hidden <input>; the ring
    goes on the box that is drawn next to it. */
@@ -630,25 +661,11 @@ code, kbd, pre, samp, .ant-typography code {
 .account-menu-section-label {
   margin: 0 0 8px 2px;
   color: color-mix(in srgb, var(--docs-toc-text) 80%, transparent);
-  font: 800 10px/1 var(--font-ui);
-  letter-spacing: 0.14em;
+  font: 600 11px/1 var(--font-ui);
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 }
-.account-menu-section-help {
-  margin: -4px 2px 8px;
-  color: color-mix(in srgb, var(--docs-toc-text) 68%, transparent);
-  font-size: 11px;
-  line-height: 1.35;
-}
 
-[data-theme="dark"] .account-menu-item--danger:hover {
-  color: #fda4af;
-  background: rgba(251, 113, 133, 0.14);
-}
-[data-theme="light"] .account-menu-item--danger:hover {
-  color: #e11d48;
-  background: rgba(225, 29, 72, 0.1);
-}
 
 /* Dropdown trigger: do NOT use `.btn-reset` (`all: unset` breaks Ant Design trigger ref + layout). */
 .account-menu-trigger {
@@ -693,6 +710,17 @@ code, kbd, pre, samp, .ant-typography code {
   justify-content: center;
   padding: 0;
   border-radius: 999px;
+}
+/* D57: in the compact header the avatar IS the button. The trigger's own
+   tinted pill around it read as a focus ring that never went away; the
+   real ring is the shared :focus-visible outline. */
+[data-theme] .account-menu-wrap--compact .account-menu-trigger {
+  background: transparent;
+  border-color: transparent;
+  backdrop-filter: none;
+}
+[data-theme] .account-menu-wrap--compact .account-menu-trigger:hover .account-menu-avatar {
+  border-color: var(--focus-ring);
 }
 
 .account-menu-avatar {
@@ -757,13 +785,18 @@ code, kbd, pre, samp, .ant-typography code {
   color: rgba(28, 38, 52, 0.75);
 }
 
-/* ───── Section label utility ───── */
-.section-label {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 1.5px;
+/* ───── Heading case (D67): ONE eyebrow style ─────
+   Titles, headings, form labels and the brand are sentence case. Capitals
+   are only for this eyebrow: a small group label over a list (sidebar
+   groups, menu sections, table headers). One size, one weight, one
+   spacing. */
+.dg-eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
-  font-family: 'Manrope', sans-serif;
+  font-family: var(--font-ui);
   display: block;
 }
 
@@ -791,16 +824,16 @@ code, kbd, pre, samp, .ant-typography code {
   flex-shrink: 0;
 }
 
-/* ───── Ant Design input focus override ───── */
+/* ───── Ant Design input focus: the border; the ring is the focus-ring rule ───── */
 .ant-input:focus,
 .ant-input-focused,
 .ant-input-affix-wrapper:focus,
 .ant-input-affix-wrapper-focused,
-.ant-select-focused .ant-select-selector,
+.ant-select-focused,
 .ant-input-number:focus,
 .ant-input-number-focused {
   border-color: var(--focus-ring, #2dd4bf) !important;
-  box-shadow: 0 0 0 2px rgba(45, 212, 191, 0.12) !important;
+  box-shadow: none !important;
 }
 
 /* ───── Custom selection color ───── */
@@ -839,6 +872,12 @@ code, kbd, pre, samp, .ant-typography code {
   border: 1px solid color-mix(in srgb, var(--login-card-border) 58%, transparent);
   border-radius: 28px;
   pointer-events: none;
+}
+
+/* The frame is a light-theme ornament: on the dark shell it read as a
+   light component (D70). */
+[data-theme="dark"] .dg-login-shell::before {
+  display: none;
 }
 
 .dg-login-grid {
@@ -884,7 +923,7 @@ code, kbd, pre, samp, .ant-typography code {
   border: 1px solid color-mix(in srgb, var(--login-card-border) 84%, transparent);
   border-radius: 24px;
   background: var(--login-panel-bg);
-  box-shadow: var(--login-shadow), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  box-shadow: var(--login-shadow);
   backdrop-filter: blur(22px) saturate(1.12);
   -webkit-backdrop-filter: blur(22px) saturate(1.12);
 }
@@ -914,17 +953,15 @@ code, kbd, pre, samp, .ant-typography code {
 
 .dg-login-brand {
   color: var(--login-hero-text);
-  font: 800 clamp(28px, 6vw, 40px)/0.9 var(--font-ui);
-  letter-spacing: 0.30em;
-  text-transform: uppercase;
+  font: 800 clamp(28px, 6vw, 40px)/1 var(--font-ui);
+  letter-spacing: -0.02em;
   text-shadow: 0 0 18px color-mix(in srgb, var(--login-hero-text) 18%, transparent);
 }
 
 .dg-login-product {
   color: var(--focus-ring);
-  font: 800 clamp(20px, 4vw, 28px)/0.9 var(--font-mono);
-  letter-spacing: 0.34em;
-  text-transform: uppercase;
+  font: 700 clamp(20px, 4vw, 28px)/1 var(--font-ui);
+  letter-spacing: -0.01em;
   text-shadow: 0 0 18px color-mix(in srgb, var(--focus-ring) 30%, transparent);
 }
 
@@ -990,9 +1027,7 @@ code, kbd, pre, samp, .ant-typography code {
   display: block;
   margin-bottom: 8px;
   color: color-mix(in srgb, var(--login-hero-text) 70%, transparent);
-  font: 800 10px/1 var(--font-mono);
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  font: 600 13px/1.3 var(--font-ui);
 }
 
 .dg-login-hint {
@@ -1052,13 +1087,6 @@ code, kbd, pre, samp, .ant-typography code {
     padding: 24px;
   }
 
-  .dg-login-brand {
-    letter-spacing: 0.18em;
-  }
-
-  .dg-login-product {
-    letter-spacing: 0.24em;
-  }
 }
 
 /* ───── FormField: YAML-path code chip reveals on hover ───── */

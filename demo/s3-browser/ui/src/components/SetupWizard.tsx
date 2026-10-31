@@ -61,7 +61,8 @@ import { useColors } from '../ThemeContext';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import FormField from './FormField';
-import { normalizeUiError } from '../errorHandling';
+import MaskedSecretInput from './MaskedSecretInput';
+import { plainError } from '../plainError';
 import { useNavigation } from '../NavigationContext';
 import { parseAdminQuery, buildViewUrl } from '../urlState';
 import {
@@ -129,6 +130,9 @@ interface Props {
   search?: string;
 }
 
+
+/** A connection test result; a thrown test keeps the raw text for Details. */
+type TestOutcome = TestS3Response & { details?: string };
 export default function SetupWizard({ onComplete, onCancel, search }: Props) {
   const colors = useColors();
   const { cardStyle, inputRadius } = useCardStyles();
@@ -200,7 +204,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
     setStep(Number.isNaN(n) ? 0 : Math.max(0, Math.min(n, MAX_STEP)));
   }, [search]);
   const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<TestS3Response | null>(null);
+  const [testResult, setTestResult] = useState<TestOutcome | null>(null);
   const [applying, setApplying] = useState(false);
   // Warnings from a successful apply stay on screen until the admin continues.
   const [appliedWarnings, setAppliedWarnings] = useState<string[] | null>(null);
@@ -270,7 +274,8 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
     } catch (e) {
       // A thrown test (network error, 5xx) is a failed test: show it, and
       // keep Next blocked.
-      setTestResult({ success: false, error: normalizeUiError(e, 'Connection test failed') });
+      const plain = plainError(e, 'The connection test failed. Try again.');
+      setTestResult({ success: false, error: plain.text, details: plain.details });
     } finally {
       setTesting(false);
     }
@@ -281,7 +286,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
     try {
       const resp = await applyConfigYaml(generatedYaml);
       if (!resp.applied) {
-        message.error(resp.error || 'Apply failed');
+        message.error(resp.error || 'The proxy did not apply the setup and gave no reason.');
         return;
       }
       if (resp.warnings && resp.warnings.length > 0) {
@@ -291,8 +296,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
       message.success('Setup complete!');
       onComplete();
     } catch (e) {
-      message.error(
-        `Apply failed: ${normalizeUiError(e, 'unknown')}`);
+      message.error(plainError(e, 'The proxy could not apply the setup. Try again.').text);
     } finally {
       setApplying(false);
     }
@@ -369,14 +373,12 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
       <header style={{ marginBottom: 8 }}>
         <Text
           style={{
-            fontSize: 11,
-            fontWeight: 700,
-            letterSpacing: 1.5,
-            textTransform: 'uppercase',
+            fontSize: 13,
+            fontWeight: 600,
             color: colors.ACCENT_BLUE,
             fontFamily: 'var(--font-ui)',
             display: 'block',
-            marginBottom: 6,
+            marginBottom: 8,
           }}
         >
           First-run setup
@@ -397,7 +399,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
           type="secondary"
           style={{
             fontSize: 14,
-            marginTop: 6,
+            marginTop: 8,
             marginBottom: 0,
             lineHeight: 1.5,
           }}
@@ -408,7 +410,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
       </header>
 
       {!existing && !checkFailed ? (
-        <div style={{ display: 'flex', justifyContent: 'center', padding: 48 }}>
+        <div style={{ display: 'flex', justifyContent: 'center', padding: 32 }}>
           <Spin description="Checking the current configuration…"><div style={{ padding: 24 }} /></Spin>
         </div>
       ) : (existing?.configured || checkFailed) && !overwriteConfirmed ? (
@@ -426,8 +428,8 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
                   </>
                 ) : (
                   <>
-                    {normalizeUiError(checkError, 'The configuration did not load').replace(/\.$/, '')}, so
-                    the wizard cannot tell what would be lost.{' '}
+                    {plainError(checkError, 'The current configuration did not load.').text} The wizard
+                    cannot tell what would be lost.{' '}
                   </>
                 )}
                 Settings from environment variables and the objects in your buckets are not touched.
@@ -467,7 +469,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
           title={`The configuration is applied, with ${appliedWarnings.length} warning${appliedWarnings.length === 1 ? '' : 's'}`}
           description={
             <>
-              <ul style={{ margin: '4px 0 12px', paddingLeft: 18 }}>
+              <ul style={{ margin: '4px 0 12px', paddingLeft: 16 }}>
                 {appliedWarnings.map((w) => <li key={w}>{w}</li>)}
               </ul>
               <Button type="primary" onClick={onComplete}>Continue</Button>
@@ -544,7 +546,7 @@ function PickBackendStep({
       </h3>
       <Text
         type="secondary"
-        style={{ fontSize: 13, display: 'block', marginTop: 4, marginBottom: 20 }}
+        style={{ fontSize: 13, display: 'block', marginTop: 4, marginBottom: 16 }}
       >
         This proxy needs a backing store. Pick the one that matches your
         infrastructure. You can always change this later.
@@ -561,7 +563,7 @@ function PickBackendStep({
         value={value}
         disabled={envKind !== null}
         onChange={(e) => onChange(e.target.value)}
-        style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
+        style={{ display: 'flex', flexDirection: 'column', gap: 12 }}
       >
         <Radio value="filesystem" style={{ alignItems: 'flex-start' }}>
           <div>
@@ -612,7 +614,7 @@ function ConfigureBackendStep({
   state: WizardState;
   update: (patch: Partial<WizardState>) => void;
   testing: boolean;
-  testResult: TestS3Response | null;
+  testResult: TestOutcome | null;
   onTest: () => void;
   /** Next was clicked on this incomplete step: mark what is missing. */
   showErrors: boolean;
@@ -714,9 +716,11 @@ function ConfigureBackendStep({
           yamlPath="storage.backend.secret_access_key"
           helpText="Secret paired with the access key ID. Stored in the backend config; never exposed to S3 clients."
         >
-          <Input.Password
+          <MaskedSecretInput
+            mode="new"
+            placeholder=""
             value={state.s3SecretKey}
-            onChange={(e) => update({ s3SecretKey: e.target.value })}
+            onChange={(v) => update({ s3SecretKey: v })}
             autoComplete="new-password"
             style={{ ...inputRadius }}
           />
@@ -758,8 +762,20 @@ function ConfigureBackendStep({
           }
           description={
             testResult.success
-              ? testResult.buckets?.slice(0, 10).join(', ') || 'No buckets yet — that\'s fine; we\'ll create them as needed.'
-              : testResult.error
+              ? testResult.buckets?.slice(0, 10).join(', ') || 'The backend has no buckets. The proxy creates them when you need them.'
+              : (
+                  <>
+                    {testResult.error}
+                    {testResult.details && (
+                      <details>
+                        <summary style={{ cursor: 'pointer', fontSize: 12 }}>Details</summary>
+                        <code style={{ display: 'block', fontSize: 11, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
+                          {testResult.details}
+                        </code>
+                      </details>
+                    )}
+                  </>
+                )
           }
         />
       )}
@@ -835,18 +851,22 @@ function CreateAdminStep({
         }
         error={secretError}
       >
-        <Input.Password
+        <MaskedSecretInput
+          mode="new"
+          placeholder=""
           value={state.adminSecretKey}
-          onChange={(e) => update({ adminSecretKey: e.target.value })}
+          onChange={(v) => update({ adminSecretKey: v })}
           autoComplete="new-password"
           style={{ ...inputRadius }}
         />
       </FormField>
       {!env.adminSecretKey && (
       <FormField label="Confirm secret access key" helpText="Paste it again to catch typos." error={confirmError}>
-        <Input.Password
+        <MaskedSecretInput
+          mode="new"
+          placeholder=""
           value={state.adminSecretKeyConfirm}
-          onChange={(e) => update({ adminSecretKeyConfirm: e.target.value })}
+          onChange={(v) => update({ adminSecretKeyConfirm: v })}
           autoComplete="new-password"
           style={{ ...inputRadius }}
         />
@@ -880,7 +900,7 @@ function OptionalPublicBucketStep({
       <Radio.Group
         value={state.enablePublicBucket ? 'yes' : 'no'}
         onChange={(e) => update({ enablePublicBucket: e.target.value === 'yes' })}
-        style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 }}
+        style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}
       >
         <Radio value="no">
           <span style={{ fontWeight: 600 }}>No, skip this step</span>
@@ -970,7 +990,7 @@ function ReviewStep({ yaml, cardStyle }: { yaml: string; cardStyle: React.CSSPro
         style={{ marginTop: 12, borderRadius: 8 }}
         title="What happens next"
         description={
-          <ul style={{ margin: 0, paddingLeft: 20, fontSize: 13, lineHeight: 1.6 }}>
+          <ul style={{ margin: 0, paddingLeft: 16, fontSize: 13, lineHeight: 1.6 }}>
             <li>The YAML is applied in-memory and persisted to disk.</li>
             <li>S3 clients can immediately sign with the bootstrap key you set.</li>
             <li>You land on the admin Dashboard.</li>

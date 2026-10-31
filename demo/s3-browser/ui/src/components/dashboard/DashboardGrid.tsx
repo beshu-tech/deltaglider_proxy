@@ -31,6 +31,7 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
+import { SPACE } from '../shared-styles';
 
 type GridDensity = 'comfortable' | 'compact';
 
@@ -42,7 +43,7 @@ interface Props {
   padBottom?: number;
 }
 
-export default function DashboardGrid({ children, density, padBottom = 24 }: Props) {
+export default function DashboardGrid({ children, density, padBottom = SPACE.lg }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [auto, setAuto] = useState<GridDensity>('comfortable');
 
@@ -72,7 +73,7 @@ export default function DashboardGrid({ children, density, padBottom = 24 }: Pro
         display: 'grid',
         gridTemplateColumns: 'repeat(12, minmax(0, 1fr))',
         gridAutoRows: 'minmax(120px, auto)',
-        gap: effective === 'comfortable' ? 12 : 10,
+        gap: effective === 'comfortable' ? SPACE.md : SPACE.sm,
         width: '100%',
         // Outer content cap. Above 2400px we center with auto
         // margins — dashboards stop getting wider; panels get

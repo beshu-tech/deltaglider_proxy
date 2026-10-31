@@ -7,8 +7,7 @@
  * page — a heavy cost for a single button, and it broke
  * responsive layout on viewports under ~1400px.
  *
- * The admin shell opens `SectionYamlModal` from the avatar menu's
- * Settings group.
+ * The System page's "Configuration as YAML" card opens `SectionYamlModal`.
  */
 import { useEffect, useRef, useState } from 'react';
 import { Alert, Button, Input, Modal, Space } from 'antd';
@@ -18,7 +17,8 @@ import { getSectionYaml } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { isRedactedEmptyAccessYaml } from '../yamlUtils';
-import { normalizeUiError } from '../errorHandling';
+import { plainError, type PlainError } from '../plainError';
+import PlainErrorAlert from './PlainErrorAlert';
 
 const ACCESS_EMPTY_YAML_EXPLAINER = `# -----------------------------------------------------------------------------
 # Why this block looks empty (expected)
@@ -41,7 +41,7 @@ export function SectionYamlModal({ section, open, onClose }: SectionYamlModalPro
   const colors = useColors();
   const [yaml, setYaml] = useState('');
   const [accessEmptyExplainer, setAccessEmptyExplainer] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<PlainError | null>(null);
   const [loading, setLoading] = useState(false);
   const { copy, copied } = useCopyToClipboard();
   const mountedRef = useRef(true);
@@ -73,7 +73,7 @@ export function SectionYamlModal({ section, open, onClose }: SectionYamlModalPro
       .catch((e) => {
         if (cancelled || !mountedRef.current) return;
         setYaml('');
-        setError(normalizeUiError(e, "Copy failed"));
+        setError(plainError(e, `Could not load the ${section} section YAML`));
       })
       .finally(() => {
         if (!cancelled && mountedRef.current) setLoading(false);
@@ -122,7 +122,7 @@ export function SectionYamlModal({ section, open, onClose }: SectionYamlModalPro
       }
     >
       <Space orientation="vertical" size="small" style={{ width: '100%' }}>
-        {error && <Alert type="error" title="Section YAML fetch failed" description={error} showIcon />}
+        {error && <PlainErrorAlert error={error} />}
         {accessEmptyExplainer && !error && (
           <Alert
             type="info"

@@ -209,3 +209,31 @@ test('a rule-array change names the rule and field, and a queued dialog says its
   expect(within(dialog).getByText('replication.rules["mirror-2"]')).toBeInTheDocument();
   expect(within(dialog).getByText('new')).toBeInTheDocument();
 });
+
+// UX harvest D37: the first lifecycle rule showed as `lifecycle − null +
+// {"enabled":false,…,"rules":[{"action":"delete",…"enable…` — raw JSON cut
+// at 120 characters. Now: one line per field, the rule as a field list, and
+// the whole JSON behind "Show the raw change".
+test('a section created as a whole reads field by field, with the raw JSON folded away', async () => {
+  const qaRule = { name: 'qa-lc-rule', action: 'delete', bucket: 'releases', prefix: 'qa-many/', expire_after: '30d', enabled: true };
+  render(
+    <ApplyDialog
+      open
+      section="storage"
+      response={{ ok: true, diff: { storage: { lifecycle: { before: null, after: { enabled: false, rules: [qaRule] } } } } }}
+      onApply={() => {}}
+      onCancel={() => {}}
+    />,
+  );
+  const dialog = screen.getByRole('dialog');
+  expect(within(dialog).getByText('Changes (2)')).toBeInTheDocument();
+  expect(within(dialog).getByText('lifecycle.enabled')).toBeInTheDocument();
+  expect(within(dialog).getByText('lifecycle.rules["qa-lc-rule"]')).toBeInTheDocument();
+  expect(within(dialog).getByText('"qa-many/"')).toBeInTheDocument();
+  expect(within(dialog).getByText('"30d"')).toBeInTheDocument();
+  expect(dialog.textContent).not.toMatch(/\.\.\.|…/);
+  const raw = within(dialog).getByTestId('apply-dialog-raw');
+  expect(raw.closest('details')).not.toHaveAttribute('open');
+  await userEvent.setup().click(within(dialog).getByText('Show the raw change'));
+  expect(raw.textContent).toContain('"expire_after": "30d"');
+});

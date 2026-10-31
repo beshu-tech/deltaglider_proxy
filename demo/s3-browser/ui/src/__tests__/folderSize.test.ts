@@ -18,9 +18,9 @@ test('folderSizeBound: sizes_estimated/truncated decide exact vs atLeast vs abou
 });
 
 test('folderSizeText: bound prefix', () => {
-  assert.equal(folderSizeText('3.0 MB', 'exact'), '3.0 MB');
-  assert.equal(folderSizeText('3.0 MB', 'atLeast'), '≥ 3.0 MB');
-  assert.equal(folderSizeText('3.0 MB', 'about'), '≈ 3.0 MB');
+  assert.equal(folderSizeText('3.0 MiB', 'exact'), '3.0 MiB');
+  assert.equal(folderSizeText('3.0 MiB', 'atLeast'), '≥ 3.0 MiB');
+  assert.equal(folderSizeText('3.0 MiB', 'about'), '≈ 3.0 MiB');
 });
 
 test('folderSizeTitle: hover text wording', () => {

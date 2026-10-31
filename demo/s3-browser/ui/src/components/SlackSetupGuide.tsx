@@ -47,7 +47,7 @@ export function SlackSetupGuideDrawer({
       onClose={onClose}
       size={Math.min(640, typeof window !== 'undefined' ? window.innerWidth - 32 : 640)}
       title={
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10, fontSize: 16 }}>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 12, fontSize: 16 }}>
           <SlackOutlined style={{ color: '#611f69', fontSize: 20 }} />
           Set up a Slack app
           <span
@@ -59,14 +59,14 @@ export function SlackSetupGuideDrawer({
               color: c.TEXT_MUTED,
               border: `1px solid ${c.BORDER}`,
               borderRadius: 5,
-              padding: '1px 7px',
+              padding: '1px 8px',
             }}
           >
             {mode === 'webhook' ? 'Incoming Webhook' : 'Bot token'}
           </span>
         </span>
       }
-      styles={{ body: { padding: '24px 28px 40px' } }}
+      styles={{ body: { padding: '24px 24px 32px' } }}
     >
       <Text style={{ fontSize: 13, color: c.TEXT_MUTED, display: 'block', marginBottom: 24, lineHeight: 1.6 }}>
         One-time, ~2 minutes. No OAuth callback — you create the app in Slack and paste a
@@ -113,10 +113,10 @@ function StepCard({
         >
           {n}
         </div>
-        <div style={{ flex: 1, width: 2, background: c.BORDER, marginTop: 6 }} />
+        <div style={{ flex: 1, width: 2, background: c.BORDER, marginTop: 4 }} />
       </div>
       <div style={{ flex: 1, minWidth: 0, paddingBottom: 4 }}>
-        <div style={{ fontSize: 15, fontWeight: 600, color: c.TEXT_PRIMARY, marginBottom: 6 }}>
+        <div style={{ fontSize: 15, fontWeight: 600, color: c.TEXT_PRIMARY, marginBottom: 4 }}>
           {title}
         </div>
         {children && (
@@ -137,17 +137,17 @@ function CopyChip({ value, c }: { value: string; c: ReturnType<typeof useColors>
       style={{
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 6,
+        gap: 8,
         fontFamily: 'var(--font-mono)',
         fontSize: 13,
-        padding: '4px 10px',
+        padding: '4px 8px',
         borderRadius: 6,
         border: `1px solid ${c.BORDER}`,
         background: c.BG_CARD,
         color: c.ACCENT_BLUE,
         cursor: 'pointer',
         marginRight: 8,
-        marginTop: 6,
+        marginTop: 4,
       }}
     >
       {value}
@@ -158,7 +158,7 @@ function CopyChip({ value, c }: { value: string; c: ReturnType<typeof useColors>
 
 function CreateAppButton() {
   return (
-    <a href={SLACK_APPS_URL} target="_blank" rel="noreferrer" style={{ display: 'inline-block', marginTop: 10 }}>
+    <a href={SLACK_APPS_URL} target="_blank" rel="noreferrer" style={{ display: 'inline-block', marginTop: 12 }}>
       <Button icon={<SlackOutlined />}>Open Slack app builder ↗</Button>
     </a>
   );
@@ -193,17 +193,17 @@ function SlackScreen({
         style={{
           background: '#3f0e40',
           color: '#fff',
-          padding: '8px 14px',
+          padding: '8px 16px',
           fontSize: 12,
           fontWeight: 600,
           display: 'flex',
           alignItems: 'center',
-          gap: 7,
+          gap: 8,
         }}
       >
         <SlackOutlined style={{ fontSize: 13 }} /> {title}
       </div>
-      <div style={{ padding: 14 }}>{children}</div>
+      <div style={{ padding: 16 }}>{children}</div>
     </div>
   );
 }
@@ -234,10 +234,10 @@ function ScopeRow({ name }: { name: string }) {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
-        padding: '7px 10px',
+        padding: '8px 8px',
         borderRadius: 4,
         background: '#f8f8f8',
-        marginBottom: 6,
+        marginBottom: 4,
         fontSize: 13,
       }}
     >
@@ -284,7 +284,7 @@ function WebhookFlow({ c }: { c: ReturnType<typeof useColors> }) {
             style={{
               border: '1px solid #ddd',
               borderRadius: 4,
-              padding: '5px 8px',
+              padding: '4px 8px',
               fontSize: 12,
               color: '#1d1c1d',
               marginBottom: 8,
@@ -386,7 +386,7 @@ function BotFlow({ c }: { c: ReturnType<typeof useColors> }) {
               background: '#f8f8f8',
               border: '1px solid #ddd',
               borderRadius: 4,
-              padding: '5px 8px',
+              padding: '4px 8px',
               color: '#1d1c1d',
             }}
           >

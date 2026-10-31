@@ -85,3 +85,36 @@ test('the figures are not an estimate when every bucket is scanned', () => {
   expect(screen.getByText('Storage saved')).toBeInTheDocument();
   expect(screen.queryByText('Estimated saving')).toBeNull();
 });
+
+// UX harvest D49: an estimate was sold in green at 96 px.
+test('an estimate shows "≈" and no gradient ink; a scanned figure does not', () => {
+  renderHero(4);
+  const lead = screen.getByLabelText(/percent smaller on disk/);
+  expect(lead.textContent?.startsWith('≈')).toBe(true);
+  expect(lead.style.backgroundClip).toBe('');
+  expect(screen.getByText(/^≈.* saved$/)).toBeInTheDocument();
+});
+
+// UX harvest D15: a saving had a minus sign.
+test('the biggest saving reads as a saving', () => {
+  writeStorage('dgp-hero-animated', '1', 'session');
+  render(
+    <HeroSavingsPanel
+      totalOriginal={100 * 1024 ** 2}
+      totalStored={50 * 1024 ** 2}
+      savingsPercent={50}
+      monthlySavings={0}
+      costRate={0.023}
+      onChangeCostRate={() => {}}
+      totalObjects={2}
+      bucketCount={1}
+      biggestSave={{ bucket: 'releases', bytes: 7.6 * 1000 * 1000 }}
+      referenceShare={null}
+      unscannedCount={0}
+      onScanMissing={() => {}}
+      liveScanning={false}
+    />,
+  );
+  expect(screen.getByText(/^releases saves the most: /)).toBeInTheDocument();
+  expect(document.body.textContent).not.toMatch(/−\s*7/);
+});

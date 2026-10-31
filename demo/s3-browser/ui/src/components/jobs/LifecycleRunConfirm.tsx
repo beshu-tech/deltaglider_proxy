@@ -4,7 +4,6 @@ import { ReloadOutlined } from '@ant-design/icons';
 import type { JobRow } from '../../jobsView';
 import { lifecycleRunLabel } from '../../jobsView';
 import { useLifecyclePreview, useRefreshLifecyclePreview } from '../../queries/jobs';
-import { normalizeUiError } from '../../errorHandling';
 import { useNow } from '../../hooks/useNow';
 import LifecyclePreviewList from './LifecyclePreviewList';
 import LifecyclePreviewScanning from './LifecyclePreviewScanning';
@@ -85,7 +84,7 @@ export default function LifecycleRunConfirm({ row, onRun, onCancel }: Props) {
         preview={data}
         loading={preview.isLoading || (refresh.isPending && !data)}
         error={error}
-        errorText={normalizeUiError(error, 'Preview failed')}
+        onRetry={() => refresh.mutate()}
         receivedAt={preview.dataUpdatedAt}
         nowMs={now}
       />

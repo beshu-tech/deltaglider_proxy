@@ -99,7 +99,9 @@ test('replication: create a rule, watch it run, verify the mirror', async ({ pag
   // No poll lands while it runs (see the header), so wait for the outcome.
   await expect(row).toContainText(/succeeded/i, { timeout: 60_000 });
   await expect(row).toContainText(/\d[\d,]* copied/, { timeout: 15_000 });
-  // The drawer of the new rule stays open through the apply.
+  // The drawer closes after the apply (the row flashes); reopen it.
+  await expect(drawer).toBeHidden();
+  await row.click();
   await expect(drawer).toBeVisible();
   await drawer.getByRole('tab', { name: /Runs/ }).click();
   await expect(drawer.getByText(new RegExp(`${OBJECTS.toLocaleString('en-US')} copied`)).first()).toBeVisible({

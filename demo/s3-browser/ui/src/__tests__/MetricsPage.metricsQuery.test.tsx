@@ -38,10 +38,14 @@ test('renders the scraped build info', async () => {
   expect(await screen.findByText(/v9\.9\.9 · filesystem backend/)).toBeInTheDocument();
 });
 
-test('a failed scrape is shown', async () => {
-  http.on('GET', '/_/metrics', text('nope', 500));
+test('a failed scrape is ONE error state with Retry, and no tiles that state zeros (UX harvest D17)', async () => {
+  http.on('GET', '/_/metrics', text('', 500));
   renderWithQuery(<MetricsPage />);
-  expect(await screen.findByText('Failed to load metrics: HTTP 500')).toBeInTheDocument();
+  const alert = await screen.findByRole('alert');
+  expect(alert).toHaveTextContent('Could not load the metrics');
+  expect(alert).not.toHaveTextContent('500');
+  expect(screen.getByRole('button', { name: /Retry/ })).toBeInTheDocument();
+  expect(screen.queryByText('Cache disabled')).toBeNull();
 });
 
 test('scrapes every 5 s by default, and on Refresh now', async () => {
@@ -72,4 +76,25 @@ test('too few cache lookups show no hit rate, in correct plurals', async () => {
   expect(await screen.findByText('1 hit · 0 misses')).toBeInTheDocument();
   expect(screen.getByText('Too few lookups to judge the cache yet')).toBeInTheDocument();
   expect(screen.queryByText('100.0%')).toBeNull();
+});
+
+// UX harvest D42: charts with only zero values drew axes and labels and no bars.
+test('a chart whose values are all zero shows a placeholder', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  http.on('GET', '/_/metrics', text([
+    '# HELP deltaglider_delta_decisions_total decisions',
+    '# TYPE deltaglider_delta_decisions_total counter',
+    'deltaglider_delta_decisions_total{decision="delta"} 0',
+    'deltaglider_delta_decisions_total{decision="passthrough"} 0',
+    '',
+  ].join('\n')));
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  renderWithQuery(<MetricsPage />);
+  await act(() => vi.advanceTimersByTimeAsync(5_100));
+  await waitFor(() => expect(scrapes()).toHaveLength(2));
+  expect(await screen.findByText('No requests in this window')).toBeInTheDocument();
+  expect(screen.getByText('No cache lookups in this window')).toBeInTheDocument();
+  await user.click(screen.getByText('Detailed telemetry'));
+  expect(await screen.findByText('No storage decisions yet')).toBeInTheDocument();
+  expect(screen.queryByText('passthrough')).toBeNull();
 });

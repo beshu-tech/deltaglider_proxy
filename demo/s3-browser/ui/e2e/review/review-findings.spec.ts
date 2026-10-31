@@ -45,15 +45,15 @@ async function signIn(page: Page) {
   await page.getByLabel('Access key ID', { exact: true }).fill(ACCESS_KEY);
   await page.getByLabel('Secret access key', { exact: true }).fill(SECRET_KEY);
   await page.getByRole('button', { name: 'Sign in' }).click();
-  await expect(page.getByText('ADMIN SETTINGS', { exact: false })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText('Admin settings', { exact: true })).toBeVisible({ timeout: 30_000 });
 }
 
-/** Parses "13.1 MB" / "256.0 MB" / "0 B" (formatBytes output, 1024 base). */
+/** Parses "13.1 MiB" / "256.0 MiB" / "0 B" (formatBytes output, 1024 base). */
 function parseBytes(s: string): number {
-  const m = s.trim().match(/^([\d.,]+)\s*(B|KB|MB|GB|TB)$/);
+  const m = s.trim().match(/^([\d.,]+)\s*(B|KiB|MiB|GiB|TiB)$/);
   if (!m) throw new Error(`cannot parse size: ${s}`);
   const n = parseFloat(m[1].replace(/,/g, ''));
-  const pow = ['B', 'KB', 'MB', 'GB', 'TB'].indexOf(m[2]);
+  const pow = ['B', 'KiB', 'MiB', 'GiB', 'TiB'].indexOf(m[2]);
   return n * 1024 ** pow;
 }
 
@@ -152,7 +152,7 @@ test('a passthrough file on a compressing bucket does not claim compression is o
 test('dashboard "avg per entry" divides the used cache bytes, not the cache size', async ({ page }) => {
   await signIn(page);
   await page.goto('/_/admin/dashboard');
-  const util = page.getByText(/^[\d.,]+ (B|KB|MB|GB) of [\d.,]+ (B|KB|MB|GB)$/).first();
+  const util = page.getByText(/^[\d.,]+ (B|KiB|MiB|GiB) of [\d.,]+ (B|KiB|MiB|GiB)$/).first();
   await expect(util).toBeVisible({ timeout: 15_000 });
   const [used] = (await util.innerText()).split(' of ').map(parseBytes);
   const avgText = await page.getByText(/avg per entry$/).first().innerText();
@@ -174,8 +174,8 @@ test('analytics hero never says more than 100% smaller', async ({ page }) => {
   await expect(label).toBeVisible();
   // Wait for the count-up animation to settle.
   await page.waitForTimeout(2_500);
-  const hero = await page.locator('text=STORAGE SAVED').locator('xpath=..').innerText();
-  const lead = parseInt(hero.replace(/,/g, '').match(/(\d+)\s*%/)![1], 10);
+  const hero = (await page.getByLabel(/percent smaller on disk/).first().getAttribute('aria-label')) ?? '';
+  const lead = parseInt(hero.replace(/,/g, '').match(/(\d+)(?:\.\d+)?\s*(?:%|percent)/)![1], 10);
   expect(lead, `hero reads "${lead}% smaller on disk"`).toBeLessThanOrEqual(100);
 });
 

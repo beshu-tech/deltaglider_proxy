@@ -29,7 +29,9 @@ import {
   type WitnessState,
 } from '../encryptionWitness';
 import { confirmDialog } from '../confirmDialog';
-import { normalizeUiError } from '../errorHandling';
+import { plainError, type PlainError } from '../plainError';
+import PlainErrorAlert from './PlainErrorAlert';
+import { ErrorState } from './StatePlaceholders';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
@@ -68,7 +70,7 @@ export default function EncryptionWitnessCard() {
   const witness = useEncryptionWitness();
   const { data: cfg } = useAdminConfig();
   const publish = usePublishEncryptionWitness();
-  const [publishError, setPublishError] = useState<string | null>(null);
+  const [publishError, setPublishError] = useState<PlainError | null>(null);
   const ref = useRef<HTMLDivElement>(null);
 
   const shown = witness.data != null;
@@ -109,7 +111,7 @@ export default function EncryptionWitnessCard() {
       const res = await publish.mutateAsync(plan);
       message.success(`Published this instance's setting. The witness now reports: ${res.status}.`);
     } catch (e) {
-      setPublishError(normalizeUiError(e, 'The publish failed'));
+      setPublishError(plainError(e, 'The proxy could not publish the setting. Try again.'));
     }
   };
 
@@ -133,7 +135,7 @@ export default function EncryptionWitnessCard() {
           )}
         </div>
         {witness.error && !status && (
-          <Alert type="error" showIcon title={normalizeUiError(witness.error, 'Could not load the witness status')} />
+          <ErrorState compact error={witness.error} what="the witness status" onRetry={() => void witness.refetch()} />
         )}
         {text && <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>{text.body}</Text>}
         {status?.error && (
@@ -148,7 +150,7 @@ export default function EncryptionWitnessCard() {
                 style={{
                   border: `1px solid ${colors.ACCENT_AMBER}55`,
                   borderRadius: 8,
-                  padding: '10px 12px',
+                  padding: '8px 12px',
                   display: 'flex',
                   flexWrap: 'wrap',
                   alignItems: 'center',
@@ -197,7 +199,7 @@ export default function EncryptionWitnessCard() {
           </div>
         )}
         {publishError && (
-          <Alert type="error" showIcon title={publishError} style={{ marginTop: 12 }} />
+          <PlainErrorAlert error={publishError} style={{ marginTop: 12 }} />
         )}
       </div>
     </div>

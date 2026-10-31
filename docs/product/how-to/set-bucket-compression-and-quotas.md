@@ -4,7 +4,7 @@ This guide shows you how to turn delta compression off for a bucket, how to make
 
 The example turns compression off for `downloads`, keeps only good deltas in `releases`, and caps `db-archive` at 500 GiB.
 
-To set these options on a new bucket, click **Create bucket**, type the name, and click **Create and configure…** instead of **Create**. The dialog creates the bucket and then opens its row on the Buckets page, so you can continue with the steps below. **Create and configure…** shows only to an admin.
+To set these options on a new bucket, click **New bucket** at the top right of the Buckets page, type the name, and click **Create and configure…** instead of **Create**. The dialog creates the bucket and then opens its row on the Buckets page, so you can continue with the steps below. **Create and configure…** shows only to an admin.
 
 ## 1. Turn compression off for a bucket
 
@@ -72,7 +72,9 @@ The proxy tries a delta only for the file types in its built-in list, such as `z
 2. Open **Advanced**. The **File types** field shows how many types the built-in list has.
 3. To try deltas for another type, type its extension in **Also compress**, for example `pkl`, and press Enter.
 4. To store a built-in type whole, select it in **Store whole**, for example `sql`.
-5. Select **Review & apply**.
+5. Click **Review & apply** in the bar at the bottom of the page, and then click **Apply and Persist**.
+
+   ![The releases bucket is open with its Advanced settings; callout 2 marks Advanced, callout 3 marks the Also compress field, which holds pkl, callout 4 marks the Store whole field, which holds sql, and callout 5 marks Review & apply.](/_/screenshots/bucket-file-types.webp)
 
 The row shows a **file types +1 −1** chip while the bucket changes the list. When an object is stored whole, its inspector in the file browser says why: compression is off, the bucket does not try deltas for its type, or the delta was not small enough.
 

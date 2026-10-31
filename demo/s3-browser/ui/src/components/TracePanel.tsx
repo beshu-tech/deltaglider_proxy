@@ -38,7 +38,10 @@ import {
   CloseCircleOutlined,
 } from '@ant-design/icons';
 import { traceAdmission } from '../adminApi';
-import { isSessionExpired, normalizeUiError } from '../errorHandling';
+import { isSessionExpired } from '../errorHandling';
+import { plainError } from '../plainError';
+import PlainErrorAlert from './PlainErrorAlert';
+import { useFieldValidation, v } from '../validation';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { buildTraceBody, describeAnonymousGrant, type AnonymousGrant } from '../traceRequest';
 import { useColors } from '../ThemeContext';
@@ -89,18 +92,20 @@ export default function TracePanel({ onSessionExpired }: Props) {
   const [authenticated, setAuthenticated] = useState(false);
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<TraceResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const { copy } = useCopyToClipboard();
   // The server reads any string as a path ("not-a-path" became the bucket
   // "not-a-path" and the answer "continue"), so a bad path is refused here,
   // before a result that looks like an answer (UX harvest C61).
-  const [submitted, setSubmitted] = useState(false);
-  const pathError = tracePathError(path);
-  const shownPathError = submitted || path.trim() !== '' ? pathError : undefined;
+  // Every field through the validation framework: an error shows on blur
+  // or on Test request, never a result that looks like an answer.
+  const form = useFieldValidation();
+  const pathField = form.text('path', path, setPath, (t) => tracePathError(t) ?? null);
+  // UX harvest D10: "999.1.1.1" was sent and answered as if it were an address.
+  const ipField = form.text('sourceIp', sourceIp, setSourceIp, v.optional(v.ip()));
 
   const run = async () => {
-    setSubmitted(true);
-    if (pathError) {
+    if (!form.submit()) {
       setResult(null);
       setError(null);
       return;
@@ -113,7 +118,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
       setResult(await traceAdmission<TraceResponse>(body));
     } catch (e) {
       if (isSessionExpired(e)) onSessionExpired?.();
-      setError(normalizeUiError(e, 'unknown error'));
+      setError(e);
     } finally {
       setRunning(false);
     }
@@ -154,12 +159,11 @@ export default function TracePanel({ onSessionExpired }: Props) {
             label="Path"
             helpText="The full request path, starting with /. The first segment is the bucket and the rest is the object key. Leave the key empty for a bucket-level request."
             examples={['/releases/builds/v1.zip', '/docs/readme.md', '/api/']}
-            onExampleClick={(v) => setPath(String(v))}
-            error={shownPathError}
+            onExampleClick={(x) => setPath(String(x))}
+            error={pathField.error}
           >
             <Input
-              value={path}
-              onChange={(e) => setPath(e.target.value)}
+              {...pathField.inputProps}
               placeholder="/my-bucket/some/key"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
             />
@@ -183,11 +187,11 @@ export default function TracePanel({ onSessionExpired }: Props) {
             label="Source IP"
             helpText="Leave empty to test without a source IP. Rules that need a source IP will not match."
             examples={['203.0.113.5', '198.51.100.42', '2001:db8::1']}
-            onExampleClick={(v) => setSourceIp(String(v))}
+            onExampleClick={(x) => setSourceIp(String(x))}
+            error={ipField.error}
           >
             <Input
-              value={sourceIp}
-              onChange={(e) => setSourceIp(e.target.value)}
+              {...ipField.inputProps}
               placeholder="No source IP"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
             />
@@ -223,9 +227,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
       </div>
 
       {/* Error */}
-      {error && (
-        <Alert type="error" showIcon title="Test failed" description={error} />
-      )}
+      {error != null && <PlainErrorAlert error={plainError(error, 'The proxy could not test the request.')} />}
 
       {/* Result */}
       {result && (
@@ -243,8 +245,8 @@ export default function TracePanel({ onSessionExpired }: Props) {
           />
           <DecisionSummary result={result} />
           {result.admission.decision === 'allow-anonymous' && (
-            <div style={{ marginTop: 16, borderTop: `1px solid ${colors.BORDER}`, paddingTop: 14 }}>
-              <Text style={subHeaderStyle(colors.TEXT_MUTED)}>Anonymous access</Text>
+            <div style={{ marginTop: 16, borderTop: `1px solid ${colors.BORDER}`, paddingTop: 16 }}>
+              <Text style={subHeaderStyle(colors.TEXT_SECONDARY)}>Anonymous access</Text>
               <Alert
                 type={result.anonymous_grant ? 'success' : 'warning'}
                 showIcon
@@ -252,12 +254,12 @@ export default function TracePanel({ onSessionExpired }: Props) {
               />
             </div>
           )}
-          <div style={{ marginTop: 16, borderTop: `1px solid ${colors.BORDER}`, paddingTop: 14 }}>
-            <Text style={subHeaderStyle(colors.TEXT_MUTED)}>Reason path</Text>
+          <div style={{ marginTop: 16, borderTop: `1px solid ${colors.BORDER}`, paddingTop: 16 }}>
+            <Text style={subHeaderStyle(colors.TEXT_SECONDARY)}>Reason path</Text>
             <ReasonPath result={result} />
           </div>
-          <div style={{ marginTop: 16, borderTop: `1px solid ${colors.BORDER}`, paddingTop: 14 }}>
-            <Text style={subHeaderStyle(colors.TEXT_MUTED)}>Resolved request</Text>
+          <div style={{ marginTop: 16, borderTop: `1px solid ${colors.BORDER}`, paddingTop: 16 }}>
+            <Text style={subHeaderStyle(colors.TEXT_SECONDARY)}>Resolved request</Text>
             <ResolvedRequest resolved={result.resolved} />
           </div>
           <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
@@ -303,13 +305,12 @@ export default function TracePanel({ onSessionExpired }: Props) {
 
 // ─── Helpers ─────────────────────────────────────────
 
-/** Shared uppercase eyebrow style for the result sub-section headers. */
+/** The sub-heading of a result section: sentence case, one heading system
+ *  with the page (D67: no letter-spaced capitals). */
 function subHeaderStyle(color: string): React.CSSProperties {
   return {
-    fontSize: 10,
-    fontWeight: 700,
-    letterSpacing: 0.5,
-    textTransform: 'uppercase',
+    fontSize: 13,
+    fontWeight: 600,
     color,
     fontFamily: 'var(--font-ui)',
     display: 'block',
@@ -331,7 +332,7 @@ function decisionTag(decision: string, action?: TraceDecision) {
       ? `reject ${action.status}`
       : decision;
   return (
-    <Tag color={colour} style={{ fontSize: 13, padding: '2px 10px', fontWeight: 600 }}>
+    <Tag color={colour} style={{ fontSize: 13, padding: '2px 12px', fontWeight: 600 }}>
       {label}
     </Tag>
   );
@@ -350,7 +351,7 @@ function DecisionSummary({ result }: { result: TraceResponse }) {
         borderRadius: 10,
         display: 'flex',
         alignItems: 'center',
-        gap: 14,
+        gap: 16,
         flexWrap: 'wrap',
       }}
     >
@@ -373,7 +374,7 @@ function DecisionSummary({ result }: { result: TraceResponse }) {
         <div
           style={{
             width: '100%',
-            marginTop: 6,
+            marginTop: 8,
             fontSize: 12,
             color: colors.TEXT_SECONDARY,
             fontStyle: 'italic',
@@ -429,7 +430,7 @@ function ReasonPath({ result }: { result: TraceResponse }) {
     <pre
       style={{
         margin: 0,
-        padding: 14,
+        padding: 16,
         background: colors.BG_ELEVATED,
         border: `1px solid ${colors.BORDER}`,
         borderRadius: 8,
@@ -473,7 +474,7 @@ function ResolvedRequest({ resolved }: { resolved: TraceResolved }) {
       style={{
         display: 'grid',
         gridTemplateColumns: 'auto 1fr',
-        gap: '6px 14px',
+        gap: '8px 16px',
         fontFamily: 'var(--font-mono)',
         fontSize: 12,
       }}

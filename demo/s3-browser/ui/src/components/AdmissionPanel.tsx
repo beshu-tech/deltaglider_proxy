@@ -25,15 +25,14 @@
  */
 import { useState } from 'react';
 import { Button, Typography } from 'antd';
-import {
-  PlusOutlined,
-
-} from '@ant-design/icons';
+import { PlusOutlined, SafetyOutlined } from '@ant-design/icons';
 import type { AdmissionBlock } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
 import { useColors } from '../ThemeContext';
 import { useSectionEditor } from '../useSectionEditor';
-import { contentColumn, CONTENT_FORM } from './shared-styles';
+import { contentColumn, CONTENT_FORM, CARD_GAP, SPACE } from './shared-styles';
+import PageActions from './PageActions';
+import { EmptyState, ErrorState, LoadingState } from './StatePlaceholders';
 import AdmissionBlockList from './AdmissionBlockList';
 import AdmissionBlockEditorModal from './AdmissionBlockEditorModal';
 import SynthesizedBlocksPreview from './SynthesizedBlocksPreview';
@@ -72,6 +71,8 @@ export default function AdmissionPanel({
     discard,
     isDirty,
     loading,
+    loadError,
+    refresh,
     applyOpen,
     applyResponse,
     applying,
@@ -140,15 +141,25 @@ export default function AdmissionPanel({
     .filter((b) => b.name !== editingName)
     .map((b) => b.name);
 
+  if (loadError) {
+    return <ErrorState error={loadError} what="the request rules" onRetry={() => void refresh()} />;
+  }
+
   return (
     <div
       style={{
         ...contentColumn(CONTENT_FORM),
         display: 'flex',
         flexDirection: 'column',
-        gap: 16,
+        gap: CARD_GAP,
       }}
     >
+      {/* D36: the page's create action is the header primary. */}
+      <PageActions>
+        <Button type="primary" icon={<PlusOutlined />} onClick={openAdd} disabled={loading}>
+          New rule
+        </Button>
+      </PageActions>
       {/* Operator-authored blocks */}
       <section>
         <header
@@ -156,8 +167,8 @@ export default function AdmissionPanel({
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            paddingBottom: 8,
-            marginBottom: 12,
+            paddingBottom: SPACE.xs,
+            marginBottom: SPACE.sm,
             borderBottom: `1px solid ${BORDER}`,
           }}
         >
@@ -170,16 +181,24 @@ export default function AdmissionPanel({
               public-access rules below.
             </Text>
           </div>
-          <Button icon={<PlusOutlined />} onClick={openAdd} disabled={loading}>
-            Add rule
-          </Button>
         </header>
-        <AdmissionBlockList
-          blocks={blocks}
-          onReorder={setBlocks}
-          onEdit={openEdit}
-          onDelete={handleDelete}
-        />
+        {loading ? (
+          <LoadingState variant="list" rows={3} label="Loading the request rules" />
+        ) : blocks.length === 0 ? (
+          <EmptyState
+            compact
+            icon={<SafetyOutlined />}
+            title="No request rules yet"
+            hint="Every request goes on to the public-access rules and then to sign-in. Click New rule at the top right to allow, deny or reject requests before that."
+          />
+        ) : (
+          <AdmissionBlockList
+            blocks={blocks}
+            onReorder={setBlocks}
+            onEdit={openEdit}
+            onDelete={handleDelete}
+          />
+        )}
       </section>
 
       {/* Synthesised blocks preview */}
@@ -189,8 +208,8 @@ export default function AdmissionPanel({
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            paddingBottom: 8,
-            marginBottom: 12,
+            paddingBottom: SPACE.xs,
+            marginBottom: SPACE.sm,
             borderBottom: `1px solid ${BORDER}`,
           }}
         >

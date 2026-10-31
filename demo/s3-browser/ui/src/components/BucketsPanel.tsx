@@ -24,10 +24,10 @@
  * beforeunload, and Cmd/Ctrl+S behave like the rest of Configuration.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Space, Typography, message } from 'antd';
-import Dropdown from './KeyboardDropdown';
-import { DownOutlined, PlusOutlined } from '@ant-design/icons';
-import { LoadingState } from './StatePlaceholders';
+import { Button, Typography, message } from 'antd';
+import { PlusOutlined, SettingOutlined } from '@ant-design/icons';
+import { ErrorState, LoadingState } from './StatePlaceholders';
+import PageActions from './PageActions';
 import type { AdminConfig } from '../adminApi';
 import { useQueryClient } from '@tanstack/react-query';
 import { useAdminConfig } from '../queries/config';
@@ -103,7 +103,8 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
     cancelApply,
     confirmApply,
     loading,
-    error,
+    loadError,
+    refresh,
     rebase,
     baseline,
   } = useSectionEditor<BucketWire, BucketPolicyRow[]>({
@@ -363,59 +364,50 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
   const orphanRows = rows.filter((r) => !r.name || !realBuckets.includes(r.name));
   const overrideCount = rows.filter((r) => r.name && realBuckets.includes(r.name)).length;
 
-  if (error) {
-    return <Alert type="error" showIcon title="Failed to load" description={error} />;
-  }
+  // The page's actions sit in the page header (PageActions): "New bucket"
+  // is the primary; settings for a bucket that does not exist yet is the
+  // secondary (it was the second item of a split button, UX harvest D36).
+  const pageActions = (
+    <PageActions>
+      <Button icon={<SettingOutlined />} onClick={addDraft} disabled={loading}>
+        Settings for a future bucket
+      </Button>
+      <Button type="primary" data-testid="buckets-create" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>
+        New bucket
+      </Button>
+    </PageActions>
+  );
+
+  // ONE state for the list: a skeleton until both the settings and the
+  // bucket list are in (never rows with placeholder chips), and one error
+  // with Retry (UX harvest D16, D17).
+  const listError = loadError ?? (!originsData ? originsQuery.error : null);
+  const listLoading = !listError && (loading || !originsData);
 
   return (
-    <div
-      style={{
-        ...contentColumn(CONTENT_FORM),
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 16,
-      }}
-    >
+    <div style={contentColumn(CONTENT_FORM)}>
+      {pageActions}
       <div style={cardStyle}>
-        {/* The page TabHeader carries the "Buckets" title, so the header row
-            is the count line and ONE call to action. The action sits here,
-            not after the list: below an expanded card it read as that card's
-            save button. Pre-provisioning (settings for a bucket that does not
-            exist yet) is its secondary option. */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-          <Text type="secondary" style={{ fontSize: 13 }}>
-            {loading
-              ? 'Loading buckets…'
-              : `${sortedReal.length} bucket${sortedReal.length === 1 ? '' : 's'}` +
-                (overrideCount > 0
-                  ? ` · ${overrideCount} with custom settings`
-                  : ' — all on defaults') +
-                '. Click a bucket to edit its settings.'}
-          </Text>
-          <Space.Compact>
-            <Button
-              data-testid="buckets-create"
-              aria-label="Create bucket"
-              onClick={() => setCreateOpen(true)}
-              icon={<PlusOutlined />}
-            >
-              Create bucket
-            </Button>
-            <Dropdown
-              menu={{
-                items: [
-                  { key: 'draft', label: 'Add settings for a bucket that does not exist yet' },
-                ],
-                onClick: () => addDraft(),
-              }}
-            >
-              <Button icon={<DownOutlined />} aria-label="More ways to add a bucket" />
-            </Dropdown>
-          </Space.Compact>
-        </div>
+        {listError ? (
+          <ErrorState
+            error={listError}
+            what="the buckets"
+            onRetry={() => {
+              if (loadError) void refresh();
+              void originsQuery.refetch();
+            }}
+          />
+        ) : listLoading ? (
+          <LoadingState variant="list" rows={4} label="Loading the buckets" />
+        ) : (
+          <>
+        <Text type="secondary" style={{ display: 'block', fontSize: 13 }}>
+          {`${sortedReal.length} bucket${sortedReal.length === 1 ? '' : 's'}` +
+            (overrideCount > 0 ? ` · ${overrideCount} with custom settings` : ', all on defaults') +
+            '. Click a bucket to edit its settings.'}
+        </Text>
 
         <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {loading && sortedReal.length === 0 && <LoadingState />}
           {sortedReal.map((name) => {
             const row = rowByName.get(name) ?? null;
             const key = `real:${name}`;
@@ -494,6 +486,8 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
           ))}
 
         </div>
+          </>
+        )}
 
         {/* The bar belongs to the bucket list, so it sticks to the bottom of
             THIS card: it floats over the list while the list scrolls, and

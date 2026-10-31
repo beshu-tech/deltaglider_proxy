@@ -206,10 +206,8 @@
 .docs-content .docs-toc-inline > summary {
   padding: 10px 0;
   cursor: pointer;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 1.2px;
-  text-transform: uppercase;
+  font-size: 13px;
+  font-weight: 600;
   color: var(--docs-toc-text);
 }
 .docs-content .docs-toc-inline .docs-toc { padding-bottom: 10px; }
@@ -242,9 +240,7 @@
 .docs-content th {
   background: var(--docs-code-bg);
   font-weight: 600;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font-size: 12.5px;
   text-align: left;
   padding: 10px 12px;
   border: 1px solid var(--docs-border);
@@ -313,11 +309,13 @@
 .mermaid-diagram {
   text-align: center;
   min-width: 300px;
+  /* A wide diagram keeps 12 px text and scrolls (DocsPage sizes the svg). */
+  overflow-x: auto;
 }
 .mermaid-diagram svg {
   display: block;
   margin: 0 auto;
-  width: 100%;
+  max-width: 100%;
   height: auto;
 }
 .docs-content .mermaid-diagram {

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { withKeyboardSort } from '../tableSort';
 import { confirmDialog } from '../confirmDialog';
-import { Alert, Button, Input, message, Select, Space, Switch, Table, Tag, Typography } from 'antd';
+import { Button, Input, message, Select, Space, Switch, Table, Tag, Typography } from 'antd';
 import {
   DeleteOutlined,
   InboxOutlined,
@@ -19,10 +19,11 @@ import {
   type EventOutboxRecord,
   type EventOutboxStatus,
 } from '../adminApi';
-import { contentColumn, CONTENT_WIDE } from './shared-styles';
-import { EmptyState } from './StatePlaceholders';
+import { CARD_RADIUS, contentColumn, CONTENT_WIDE, SPACE } from './shared-styles';
+import { EmptyState, LoadingState, QueryState } from './StatePlaceholders';
+import TruncatedName from './TruncatedName';
+import { plainError } from '../plainError';
 import { useIsNarrow } from '../useIsNarrow';
-import { normalizeUiError } from '../errorHandling';
 import { isSessionExpired } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import {
@@ -110,10 +111,8 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
   const loading = outbox.isFetching;
   const refresh = () => outbox.refetch();
   useSessionExpiredOn(outbox.error, onSessionExpired);
-  const error =
-    outbox.error && !isSessionExpired(outbox.error)
-      ? normalizeUiError(outbox.error, 'Failed to load the event log')
-      : null;
+  // An expired session goes to sign-in (above); it is not an error state here.
+  const view = { ...outbox, error: outbox.error && !isSessionExpired(outbox.error) ? outbox.error : null };
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -209,12 +208,8 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       sortOrder: sort === 'key' ? (order === 'asc' ? 'ascend' : 'descend') : null,
       render: (_: string, row) => (
         <div title={`${row.bucket}/${row.key}`} style={{ minWidth: 0 }}>
-          <Text code style={{ display: 'block', maxWidth: 226, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {row.bucket}
-          </Text>
-          <Text style={{ display: 'block', maxWidth: 226, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {row.key || '—'}
-          </Text>
+          <TruncatedName text={row.bucket} title={false} style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }} />
+          <TruncatedName text={row.key || '—'} title={false} style={{ fontSize: 12 }} />
         </div>
       ),
     },
@@ -282,6 +277,45 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
     },
   ];
 
+  /** Phone (UX harvest D40): ONE column that stacks an event as a card, so
+   *  the table fits 390 px with no sideways scroll and keeps its sort
+   *  (by time) and pagination. */
+  const narrowColumns: ColumnsType<EventOutboxRecord> = [
+    {
+      title: 'Event',
+      dataIndex: 'occurred_at',
+      key: 'occurred_at',
+      sorter: true,
+      sortOrder: sort === 'occurred_at' ? (order === 'asc' ? 'ascend' : 'descend') : null,
+      render: (_: number, row) => (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE.xxs, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: SPACE.xs, flexWrap: 'wrap' }}>
+            <Tag color={eventStatusTone(row.status, row.attempts)} style={{ marginInlineEnd: 0 }}>{row.status}</Tag>
+            <Text type="secondary" style={{ fontSize: 11 }}>
+              {fmtRelative(row.occurred_at)} · {nextStep(row)}
+            </Text>
+          </div>
+          <TruncatedName text={`${row.bucket}/${row.key || ''}`} style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }} />
+          <Text type="secondary" style={{ fontSize: 11 }}>{row.kind}</Text>
+          {row.last_error && (
+            <Text type="danger" style={{ fontSize: 11, overflowWrap: 'anywhere' }}>{row.last_error}</Text>
+          )}
+          {row.status === 'failed' && (
+            <Button
+              size="small"
+              icon={<SyncOutlined />}
+              loading={requeueing === row.id}
+              onClick={() => void requeueOne(row.id)}
+              style={{ alignSelf: 'flex-start' }}
+            >
+              Requeue
+            </Button>
+          )}
+        </div>
+      ),
+    },
+  ];
+
   const requeueOne = async (id: number) => {
     try {
       setRequeueing(id);
@@ -292,7 +326,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         onSessionExpired?.();
         return;
       }
-      message.error(normalizeUiError(e, "Failed to requeue event"));
+      message.error(plainError(e, 'The proxy could not requeue the event.').text);
     } finally {
       setRequeueing(null);
     }
@@ -309,7 +343,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         onSessionExpired?.();
         return;
       }
-      message.error(normalizeUiError(e, "Failed to requeue failed events"));
+      message.error(plainError(e, 'The proxy could not requeue the failed events.').text);
     } finally {
       setRequeueing(null);
     }
@@ -333,17 +367,15 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         onSessionExpired?.();
         return;
       }
-      message.error(normalizeUiError(e, "Failed to purge failed events"));
+      message.error(plainError(e, 'The proxy could not delete the failed events.').text);
     } finally {
       setRequeueing(null);
     }
   };
 
   return (
-    <div style={{ ...contentColumn(CONTENT_WIDE), padding: 'clamp(12px, 2vw, 18px)', display: 'flex', flexDirection: 'column', gap: 10 }}>
-      {error && <Alert type="error" showIcon title="Fetch failed" description={error} />}
-
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+    <div style={{ ...contentColumn(CONTENT_WIDE), display: 'flex', flexDirection: 'column', gap: SPACE.sm }}>
+      <div style={{ display: 'flex', gap: SPACE.xs, alignItems: 'center', flexWrap: 'wrap' }}>
         <Input
           aria-label="Search loaded rows"
           placeholder="Search loaded rows..."
@@ -411,7 +443,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       </div>
 
       {/* A grid, not a wrapping row: four counters on a phone wrapped 3 + 1. */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: SPACE.xs }}>
         <CountPill label="Pending" value={counts.pending} colour="default" active={status === 'pending'} onClick={() => { setStatus('pending'); setPage(1); }} />
         <CountPill label="In progress" value={counts.in_progress} colour={countTone(counts.in_progress, 'processing')} active={status === 'in_progress'} onClick={() => { setStatus('in_progress'); setPage(1); }} />
         <CountPill label="Failed" value={counts.failed} colour={countTone(counts.failed, 'error')} active={status === 'failed'} onClick={() => { setStatus('failed'); setPage(1); }} />
@@ -423,18 +455,24 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         )}
       </div>
 
-      {/* ponytail: dense server-paginated/sorted diagnostic table — scrolls
-          horizontally on mobile (clipped wrapper); card-stack would drop sort+pagination. */}
-      <div style={{ border: `1px solid ${colors.BORDER}`, borderRadius: 8, overflow: 'hidden', background: colors.BG_CARD }}>
+      {/* Server-paginated, sorted table. On a phone it has ONE stacked
+          column (narrowColumns), so nothing scrolls sideways. */}
+      <div style={{ border: `1px solid ${colors.BORDER}`, borderRadius: CARD_RADIUS, overflow: 'hidden', background: colors.BG_CARD }}>
+        <QueryState
+          query={view}
+          what="the event log"
+          loading={<div style={{ padding: `0 ${SPACE.md}px` }}><LoadingState variant="list" rows={6} label="Loading the event log" /></div>}
+        >
+        {() => (
         <Table<EventOutboxRecord>
-          columns={withKeyboardSort(columns)}
+          columns={withKeyboardSort(narrow ? narrowColumns : columns)}
           dataSource={filtered}
           rowKey="id"
           loading={loading && !autoRefresh}
           size="small"
           tableLayout="fixed"
           showSorterTooltip={false}
-          scroll={{ x: narrow ? 'max-content' : 1040 }}
+          scroll={narrow ? undefined : { x: 1040 }}
           onChange={onTableChange}
           expandable={{
             // Per-endpoint delivery state: which webhook URL or Slack channel
@@ -470,6 +508,8 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
             showTotal: (value, range) => `${range[0]}-${range[1]} of ${value}`,
           }}
         />
+        )}
+        </QueryState>
       </div>
     </div>
   );
@@ -500,16 +540,16 @@ function CountPill({
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
-        gap: 6,
+        gap: SPACE.xs,
         border: `1px solid ${active ? ACCENT_BLUE : BORDER}`,
         borderRadius: 999,
-        padding: '5px 9px',
+        padding: `${SPACE.xxs}px ${SPACE.sm}px`,
         background: active ? `${ACCENT_BLUE}1f` : BG_CARD,
         cursor: 'pointer',
         fontFamily: 'var(--font-ui)',
       }}
     >
-      <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.4 }}>{label}</Text>
+      <Text type="secondary" style={{ fontSize: 12 }}>{label}</Text>
       <Tag color={colour} style={{ marginInlineEnd: 0 }}>{value}</Tag>
     </button>
   );

@@ -28,7 +28,7 @@ export default function StrategyBand({ mix }: { mix: StrategyMix | null }) {
         display: 'flex',
         flexWrap: 'wrap',
         alignItems: 'baseline',
-        gap: '4px 10px',
+        gap: '4px 12px',
         fontSize: 12,
         lineHeight: 1.4,
         color: c.TEXT_MUTED,
@@ -38,7 +38,7 @@ export default function StrategyBand({ mix }: { mix: StrategyMix | null }) {
       {mix.segments.map((s, i) => (
         <span key={s.key} style={{ display: 'inline-flex', alignItems: 'baseline', gap: 4 }}>
           {i > 0 && (
-            <span aria-hidden="true" style={{ color: c.BORDER, marginRight: 6 }}>
+            <span aria-hidden="true" style={{ color: c.BORDER, marginRight: 8 }}>
               ·
             </span>
           )}

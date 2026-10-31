@@ -1,11 +1,15 @@
 import { useColors } from '../ThemeContext';
 import { formatBytes } from '../utils';
-import { summarizeScopeSavings } from '../savings';
+import { savingsColors, summarizeScopeSavings } from '../savings';
+import { SPACE } from './shared-styles';
 import { useTweenedCount } from '../hooks/useTweenedCount';
 import type { DeltaSummary } from '../deltaSummary';
 
 interface Props {
   summary: DeltaSummary | null;
+  /** A narrow header: the percent only (the full figures stay in the hover
+   *  text), so the breadcrumb keeps the current folder (UX harvest D6). */
+  compact?: boolean;
 }
 
 /**
@@ -14,9 +18,11 @@ interface Props {
  * deltas are present so the breadcrumb area stays clean on unmanaged
  * buckets.
  */
-export default function DeltaSavingsChip({ summary }: Props) {
-  const { STORAGE_TYPE_COLORS, TEXT_MUTED } = useColors();
-  const palette = STORAGE_TYPE_COLORS['delta'];
+export default function DeltaSavingsChip({ summary, compact = false }: Props) {
+  const colors = useColors();
+  const { TEXT_MUTED } = colors;
+  // THE savings colour (D14): the same green as the Delta chip and the hero.
+  const palette = savingsColors(colors);
 
   // Smooth count-up so the savings tick into place rather than snap.
   const target =
@@ -48,8 +54,8 @@ export default function DeltaSavingsChip({ summary }: Props) {
     ? ` (incl. ${formatBytes(summary.referenceBytes)} reference)`
     : '';
   const tooltip = summary.loading
-    ? `Scanning prefix…`
-    : `${summary.deltaCount} delta${summary.deltaCount === 1 ? '' : 's'} of ${summary.totalCount} object${summary.totalCount === 1 ? '' : 's'} · ` +
+    ? 'Reading the savings of this folder…'
+    : `${compact ? `${formatBytes(target)} saved · ` : ''}${summary.deltaCount} delta${summary.deltaCount === 1 ? '' : 's'} of ${summary.totalCount} object${summary.totalCount === 1 ? '' : 's'} · ` +
       `${formatBytes(summary.originalBytes)} → ${formatBytes(summary.storedBytes)}${refDetail}` +
       (summary.truncated ? ' · scope truncated (>100k objects)' : '') +
       (summary.estimated ? ' · estimated: the original size of some objects is not known' : '');
@@ -62,16 +68,15 @@ export default function DeltaSavingsChip({ summary }: Props) {
       style={{
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 6,
+        gap: SPACE.xs,
         height: 22,
-        padding: '0 8px',
-        marginLeft: 12,
+        padding: `0 ${SPACE.xs}px`,
         borderRadius: 11,
         background: palette.bg,
         border: `1px solid ${palette.border}`,
         color: palette.text,
-        // The UI face and the Delta chip's palette: the pill is a summary of
-        // the Delta rows below it, not a code value.
+        // The UI face and the savings green: the pill is a summary of the
+        // Delta rows below it, not a code value.
         fontFamily: 'var(--font-ui)',
         fontSize: 12,
         fontWeight: 600,
@@ -101,8 +106,12 @@ export default function DeltaSavingsChip({ summary }: Props) {
       <span>
         {summary.estimated ? '≈' : ''}{pct}% smaller{summary.truncated ? '+' : ''}
       </span>
-      <span style={{ color: TEXT_MUTED, fontWeight: 400 }}>·</span>
-      <span>{savedLabel} saved</span>
+      {!compact && (
+        <>
+          <span style={{ color: TEXT_MUTED, fontWeight: 400 }}>·</span>
+          <span>{savedLabel} saved</span>
+        </>
+      )}
       {summary.loading && (
         <span style={{ color: TEXT_MUTED, fontWeight: 400, marginLeft: 2 }}>…</span>
       )}

@@ -80,7 +80,9 @@ test('a failed delete keeps the drawer open and reports why', async () => {
   const { onClose, onDeleted } = inspector();
   const confirm = await openConfirm(user);
   await user.click(within(confirm).getByRole('button', { name: 'Delete' }));
-  expect(await screen.findByText(why)).toBeInTheDocument();
+  // The reason as a plain sentence, without status, code or request id (plainError).
+  expect(await screen.findByText('You do not have permission to do this. Ask an administrator for access.')).toBeInTheDocument();
+  expect(screen.queryByText(/\(403\)|AccessDenied/)).toBeNull();
   expect(onClose).not.toHaveBeenCalled();
   expect(onDeleted).not.toHaveBeenCalled();
 });

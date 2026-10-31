@@ -56,9 +56,10 @@ describe('delete', () => {
       ),
     ).toBeInTheDocument();
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
-    expect(await screen.findByText('Delete cancelled. Nothing was deleted.')).toBeInTheDocument();
-    expect(deleted).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    // Cancel needs no toast: the closed dialog says it (UX harvest D19).
+    expect(screen.queryByText(/cancelled|Nothing was deleted/)).toBeNull();
+    expect(deleted).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole('button', { name: 'Delete 2 selected objects' }));
     await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete' }));
@@ -146,9 +147,8 @@ describe('delete', () => {
     await confirmDeleteWith(async () => {
       throw new Error('Bulk delete failed (500): disk full. 500 of 1,201 objects were deleted before the failure.');
     });
-    expect(
-      await screen.findByText('Bulk delete failed (500): disk full. 500 of 1,201 objects were deleted before the failure.'),
-    ).toBeInTheDocument();
+    // The plain sentence, without the status code (plainError).
+    expect(await screen.findByText('Disk full. 500 of 1,201 objects were deleted before the failure.')).toBeInTheDocument();
   });
 
   test('an expired session during a delete hands off instead of showing an error', async () => {
@@ -206,7 +206,8 @@ describe('copy / move destination', () => {
   test('a valid path is normalized and sent; success is reported', async () => {
     const handler = vi.fn<Op>(async () => transferred('move'));
     const { user, dialog, path, ok } = await openPicker('Move', handler);
-    expect(within(dialog).getByText('Source files will be deleted after successful copy.')).toBeInTheDocument();
+    expect(within(dialog).getByText(/deletes the source object once its copy succeeded/)).toBeInTheDocument();
+    expect(within(dialog).queryByRole('alert')).toBeNull();
     await user.clear(path);
     await user.type(path, '/old//builds/');
     expect(within(dialog).getByText('releases/old/builds/')).toBeInTheDocument();

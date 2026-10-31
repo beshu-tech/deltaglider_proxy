@@ -41,7 +41,9 @@ import type { BackendInfo } from '../adminApi';
 import { ApiError } from '../errorHandling';
 import { plainError, type PlainError } from '../adminApi';
 import PlainErrorAlert from './PlainErrorAlert';
-import { bucketNameError } from '../bucketName';
+import { v } from '../validation';
+import FormField from './FormField';
+import { SPACE } from './shared-styles';
 import { encryptionWord } from '../backendFacts';
 import { describeBucketEncryption, modeWord, newBucketEncryptionBlock, type NewBucketEncryption } from '../bucketEncryption';
 import { confirmDialog } from '../confirmDialog';
@@ -117,7 +119,7 @@ export default function CreateBucketModal({
   }, [open, canAdmin, presetBackend]);
 
   const showPicker = canAdmin && backends.length > 1;
-  const nameError = bucketNameError(name.trim());
+  const nameError = v.bucketName()(name.trim());
   // The backend the bucket lands on: the picked one, else the default
   // (a name, not an encryption: the server answers that below).
   const targetName = selectedBackend ?? defaultBackend ?? backends[0]?.name;
@@ -125,7 +127,7 @@ export default function CreateBucketModal({
   const preview = useQuery({
     queryKey: ['bucket-encryption-preview', trimmedName, targetName],
     queryFn: () => getBucketEncryptionPreview(trimmedName, targetName!),
-    enabled: open && canAdmin && !!targetName && !!trimmedName && bucketNameError(trimmedName) === null,
+    enabled: open && canAdmin && !!targetName && !!trimmedName && v.bucketName()(trimmedName) === null,
     retry: false,
   }).data;
   const modes = preview?.bucket_modes ?? [];
@@ -251,28 +253,30 @@ export default function CreateBucketModal({
         }}
         destroyOnHidden
       >
-        <Input
-          ref={inputRef}
-          data-testid="bucket-name"
-          placeholder="Bucket name"
-          aria-label="Bucket name"
-          value={name}
-          // Keep what the user typed and say what is wrong: a silent rewrite
-          // ("My_Bucket" → "mybucket") creates a bucket nobody asked for.
-          onChange={(e) => {
-            setName(e.target.value);
-            setCreateError(null);
-          }}
-          onPressEnter={() => void handleCreate()}
-          status={nameMessage ? 'error' : undefined}
-          aria-invalid={nameMessage ? true : undefined}
-          style={{ fontFamily: 'var(--font-mono)' }}
-        />
-        {nameMessage && (
-          <Text role="alert" type="danger" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>
-            {nameMessage}
-          </Text>
-        )}
+        {/* A visible label, like every other form (UX harvest D60);
+            FormField gives the error its sentence, icon colour and
+            aria-invalid. */}
+        <FormField
+          label="Bucket name"
+          helpText="Lowercase letters, digits, dots and hyphens, 3 to 63 characters."
+          error={nameMessage ?? undefined}
+          style={{ marginBottom: 0 }}
+        >
+          <Input
+            ref={inputRef}
+            data-testid="bucket-name"
+            placeholder="releases"
+            value={name}
+            // Keep what the user typed and say what is wrong: a silent rewrite
+            // ("My_Bucket" → "mybucket") creates a bucket nobody asked for.
+            onChange={(e) => {
+              setName(e.target.value);
+              setCreateError(null);
+            }}
+            onPressEnter={() => void handleCreate()}
+            style={{ fontFamily: 'var(--font-mono)' }}
+          />
+        </FormField>
         {showPicker && (
           <div style={{ marginTop: 12 }} data-testid="bucket-backend-select">
             <Select
@@ -299,11 +303,11 @@ export default function CreateBucketModal({
               size="middle"
             />
             {tried && backendMissing && (
-              <Text role="alert" type="danger" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>
+              <Text role="alert" type="danger" style={{ display: 'block', marginTop: SPACE.xs, fontSize: 12 }}>
                 Choose a backend.
               </Text>
             )}
-            <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 6 }}>
+            <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: SPACE.xs }}>
               Created on the selected backend. Changing it later requires migrating data.
             </Text>
           </div>
@@ -333,17 +337,17 @@ export default function CreateBucketModal({
               </div>
             )}
             {tried && keyNotReady && name.trim() && !nameError && (
-              <Text role="alert" type="danger" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>
+              <Text role="alert" type="danger" style={{ display: 'block', marginTop: SPACE.xs, fontSize: 12 }}>
                 Confirm that you saved the key: type its last 6 characters.
               </Text>
             )}
             {choice === 'bucket-key' && (!name.trim() || nameError) && (
-              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 6 }}>
+              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: SPACE.xs }}>
                 Type the bucket name first: the key id starts with it.
               </Text>
             )}
             {choice === 'off' && (
-              <Text type="warning" style={{ display: 'block', fontSize: 11, marginTop: 6 }}>
+              <Text type="warning" style={{ display: 'block', fontSize: 11, marginTop: SPACE.xs }}>
                 New writes to this bucket are stored as plaintext, although {preview.backend} encrypts. You confirm this when you click Create.
               </Text>
             )}

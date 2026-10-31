@@ -30,6 +30,7 @@ import {
   suggestKeyId,
 } from '../bucketEncryption';
 import { useColors } from '../ThemeContext';
+import MaskedSecretInput from './MaskedSecretInput';
 
 const { Text } = Typography;
 
@@ -92,7 +93,7 @@ export default function BucketKeySetup({ bucket, backend, usedKeyIds = [], onCha
 
   const envVar = suggestKeyEnvVar(bucket);
   const yaml = bucketKeyYaml({ bucket, backend, keyId, envVar });
-  const label = { fontSize: 11, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 10 } as const;
+  const label = { fontSize: 11, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 12 } as const;
 
   return (
     <div data-testid="bucket-key-setup">
@@ -119,7 +120,7 @@ export default function BucketKeySetup({ bucket, backend, usedKeyIds = [], onCha
           setTail('');
         }}
         size="small"
-        style={{ marginTop: 10 }}
+        style={{ marginTop: 12 }}
       >
         <Radio.Button value="generate">Generate a key</Radio.Button>
         <Radio.Button value="paste">Paste a key</Radio.Button>
@@ -158,7 +159,7 @@ export default function BucketKeySetup({ bucket, backend, usedKeyIds = [], onCha
             rows={2}
             style={{ fontFamily: 'var(--font-mono)', fontSize: 11, letterSpacing: 0.5 }}
           />
-          <Space wrap style={{ marginTop: 6 }}>
+          <Space wrap style={{ marginTop: 4 }}>
             <Button size="small" onClick={() => void copy(generated, { successMessage: 'Key copied to clipboard' })}>
               Copy
             </Button>
@@ -184,7 +185,7 @@ export default function BucketKeySetup({ bucket, backend, usedKeyIds = [], onCha
             </Button>
           </Space>
           {staleFile && (
-            <Text type="danger" role="alert" style={{ fontSize: 11, display: 'block', marginTop: 6 }}>
+            <Text type="danger" role="alert" style={{ fontSize: 11, display: 'block', marginTop: 4 }}>
               The key file that you downloaded names another bucket or key id. Download it again.
             </Text>
           )}
@@ -212,13 +213,16 @@ export default function BucketKeySetup({ bucket, backend, usedKeyIds = [], onCha
           <label htmlFor={`${uid}-paste`} style={label}>
             Key (64 hexadecimal characters)
           </label>
-          <Input.Password
+          <MaskedSecretInput
+            mode="new"
+            placeholder=""
             id={`${uid}-paste`}
             aria-label="Pasted key"
             size="small"
             value={pasted}
-            onChange={(e) => setPasted(e.target.value)}
+            onChange={setPasted}
             status={pasted && !keyOk ? 'error' : undefined}
+            aria-invalid={pasted && !keyOk ? true : undefined}
             style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}
           />
           {pasted && !keyOk && (
@@ -229,13 +233,13 @@ export default function BucketKeySetup({ bucket, backend, usedKeyIds = [], onCha
         </>
       )}
 
-      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 10 }}>
+      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 12 }}>
         When you apply here, the proxy writes the key into the config file. To keep it out of the
         file, set it in an environment variable and reference it from the YAML instead:
       </Text>
       <pre
         data-testid="bucket-key-yaml"
-        style={{ fontSize: 11, background: colors.BG_CARD, padding: 8, borderRadius: 6, margin: '6px 0 0', overflowX: 'auto' }}
+        style={{ fontSize: 11, background: colors.BG_CARD, padding: 8, borderRadius: 6, margin: '4px 0 0', overflowX: 'auto' }}
       >
         {`${envVar}=<the key>\n\n${yaml}`}
       </pre>

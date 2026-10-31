@@ -1,9 +1,10 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { LinkifiedText } from './LinkifiedText';
 import { CAPABILITY_DOC_URL } from '../linkifyDocUrl';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
-import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, message } from 'antd';
+import { Button, Input, Radio, Switch, Typography, Space, Alert, message } from 'antd';
+import { ErrorState, LoadingState } from './StatePlaceholders';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
 import type { BackendEncryptionMode, BackendHealthEntry, BackendInfo, ConfirmHeaders, CreateBackendRequest } from '../adminApi';
 import { confirmDialog } from '../confirmDialog';
@@ -27,6 +28,7 @@ import {
 import { useColors } from '../ThemeContext';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import SectionHeader from './SectionHeader';
+import PageActions from './PageActions';
 import FormField from './FormField';
 import BackendEncryptionEditor, { type BackendEncryptionPatch } from './BackendEncryptionEditor';
 import {
@@ -132,13 +134,18 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const loadError = backendsQuery.error;
   // Effect, not render-body: react-query keeps `error` populated across renders.
   useSessionExpiredOn(loadError, onSessionExpired);
-  const error =
-    loadError && !isSessionExpired(loadError)
-      ? plainError(loadError, 'The proxy did not send the backends.').text
-      : null;
+  // A failed first load is the page's one state (ErrorState with Retry);
+  // a failed background refetch keeps the rows it has.
+  const listError = loadError && !isSessionExpired(loadError) && !backendsQuery.data ? loadError : null;
 
   // New backend form
   const [showForm, setShowForm] = useState(false);
+  // The "New backend" button is in the page header, far above the form:
+  // bring the form into view when it opens.
+  const formRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (showForm) formRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+  }, [showForm]);
   const [formName, setFormName] = useState('');
   const [formType, setFormType] = useState<'filesystem' | 's3'>('filesystem');
   // No prefill: a relative path such as ./data resolves against the proxy's
@@ -437,8 +444,18 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     );
   };
 
-  if (loading) {
-    return <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}><Spin /></div>;
+  if (loading || listError) {
+    return (
+      <div style={contentColumn(CONTENT_FORM)}>
+        {listError ? (
+          <div style={cardStyle}>
+            <ErrorState error={listError} what="the backends" onRetry={() => void backendsQuery.refetch()} />
+          </div>
+        ) : (
+          <LoadingState variant="card" rows={4} label="Loading the backends" />
+        )}
+      </div>
+    );
   }
 
   return (
@@ -466,9 +483,6 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
 
         {saveResult && (
           <Alert type={saveResult.ok ? 'success' : 'error'} title={saveResult.message} showIcon closable={{ onClose: () => setSaveResult(null) }} style={{ borderRadius: 8, marginBottom: 12 }} />
-        )}
-        {error && (
-          <Alert type="error" title={error} showIcon style={{ borderRadius: 8, marginBottom: 12 }} />
         )}
 
         {/* Storage backends — the page's subject, first. */}
@@ -633,16 +647,17 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
             </BackendCard>
           ))}
 
-          {!showForm && (
-            <Button data-testid="backends-add" aria-label="Add backend" icon={<PlusOutlined />} onClick={() => setShowForm(true)} style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }} block type="dashed">
-              Add backend
+          {/* The page's primary action, in the page header (PageActions). */}
+          <PageActions>
+            <Button data-testid="backends-add" type="primary" icon={<PlusOutlined />} disabled={showForm} onClick={() => setShowForm(true)}>
+              New backend
             </Button>
-          )}
+          </PageActions>
         </div>
 
         {/* New backend form */}
         {showForm && (
-          <div style={cardStyle}>
+          <div style={cardStyle} ref={formRef}>
             <SectionHeader icon={<PlusOutlined />} title="New backend" />
             <div>
               <FormField label="Name" yamlPath="storage.backends[].name">
@@ -690,7 +705,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   <FormField label="Region" yamlPath="storage.backends[].region">
                     <Input value={formRegion} onChange={(e) => setFormRegion(e.target.value)} placeholder="us-east-1" style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
                   </FormField>
-                  <div style={{ marginBottom: 20 }}>
+                  <div style={{ marginBottom: 24 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <Switch id="backend-force-path-style" checked={formForcePathStyle} onChange={setFormForcePathStyle} size="small" />
                       <label htmlFor="backend-force-path-style" style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>Force path-style URLs</label>

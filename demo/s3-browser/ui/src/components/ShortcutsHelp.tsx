@@ -115,14 +115,12 @@ export default function ShortcutsHelp({ open, onClose }: Props) {
           style={{ maxHeight: '70vh', overflowY: 'auto', paddingRight: 4 }}
         >
           {groups.map((group) => (
-            <div key={group.title} style={{ marginBottom: 18 }}>
+            <div key={group.title} style={{ marginBottom: 16 }}>
               <Text
                 style={{
                   display: 'block',
-                  fontSize: 11,
+                  fontSize: 12,
                   fontWeight: 600,
-                  letterSpacing: '0.04em',
-                  textTransform: 'uppercase',
                   color: colors.TEXT_MUTED,
                   marginBottom: 4,
                 }}

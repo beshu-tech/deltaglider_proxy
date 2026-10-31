@@ -61,20 +61,22 @@ test('progress text and percent, per phase and action', () => {
 test('a failure names how many objects went before it, and keeps its cause', () => {
   const disk = new Error('Bulk delete failed (500): disk full');
   const failed = new BulkActionFailed('delete', disk, 3400, 9800);
-  assert.equal(failed.message, 'Bulk delete failed (500): disk full. 3,400 of 9,800 objects were deleted before the failure.');
+  // The plain sentence of the cause; the wire text stays in `details`.
+  assert.equal(failed.message, 'Disk full. 3,400 of 9,800 objects were deleted before the failure.');
+  assert.equal(failed.details, 'Bulk delete failed (500): disk full');
   assert.equal(failed.cause, disk);
   // The first batch failed: none confirmed, but the run had started.
   assert.equal(
     new BulkActionFailed('delete', new Error('Bulk delete failed (500): denied'), 0, 3).message,
-    'Bulk delete failed (500): denied. 0 of 3 objects were deleted before the failure.',
+    'Denied. 0 of 3 objects were deleted before the failure.',
   );
   assert.equal(
     new BulkActionFailed('copy', new Error('Bulk copy failed (502): bad gateway'), 500, 1201).message,
-    'Bulk copy failed (502): bad gateway. 500 of 1,201 objects were copied before the failure.',
+    'A gateway between you and the proxy dropped the request. Try again; if it fails again, check the reverse-proxy time and size limits. 500 of 1,201 objects were copied before the failure.',
   );
   assert.equal(
     new BulkActionFailed('move', new Error('Bulk move failed (502): bad gateway'), 1, 2).message,
-    'Bulk move failed (502): bad gateway. 1 of 2 objects were moved before the failure.',
+    'A gateway between you and the proxy dropped the request. Try again; if it fails again, check the reverse-proxy time and size limits. 1 of 2 objects were moved before the failure.',
   );
   // The listing failed: no request was sent.
   assert.equal(

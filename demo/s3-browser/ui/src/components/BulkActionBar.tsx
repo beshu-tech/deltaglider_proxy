@@ -3,7 +3,9 @@ import { Button, Progress, Spin, message } from 'antd';
 import { DeleteOutlined, CopyOutlined, ScissorOutlined, DownloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import DestinationPickerModal from './DestinationPickerModal';
-import { isSessionExpired, normalizeUiError } from '../errorHandling';
+import { isSessionExpired } from '../errorHandling';
+import { plainError } from '../plainError';
+import { SPACE } from './shared-styles';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
 import { type BulkProgress, bulkProgressPercent, bulkProgressText } from '../bulkBatches';
 import { type DeleteJobOutcome, type DeletePlanSummary, bulkDeleteConfirm, deleteJobMessage } from '../bulkDelete';
@@ -70,7 +72,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
       message[type](text);
     } catch (e) {
       if (isSessionExpired(e) && onSessionExpired) onSessionExpired();
-      else message.error(normalizeUiError(e, `${op} failed`));
+      else message.error(plainError(e, `The ${op} failed.`).text);
     } finally {
       setOperating(false);
     }
@@ -83,7 +85,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
       await onDownloadZip();
     } catch (e) {
       if (isSessionExpired(e) && onSessionExpired) onSessionExpired();
-      else message.error(normalizeUiError(e, 'Download failed'));
+      else message.error(plainError(e, 'The download failed.').text);
     } finally {
       setDownloading(false);
     }
@@ -96,11 +98,11 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
     try {
       // A started job is progress, not a result: an info toast, never the
       // success green (the objects are still being deleted).
-      const { text } = deleteJobMessage(await onDelete((plan) => confirmDeletePlan(bulkDeleteConfirm(plan))));
-      message.info(text);
+      const shown = deleteJobMessage(await onDelete((plan) => confirmDeletePlan(bulkDeleteConfirm(plan))));
+      if (shown) message.info(shown.text);
     } catch (e) {
       if (isSessionExpired(e) && onSessionExpired) onSessionExpired();
-      else message.error(normalizeUiError(e, 'Delete failed'));
+      else message.error(plainError(e, 'The delete failed.').text);
     }
   };
 
@@ -123,8 +125,8 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
         style={{
           position: 'absolute', left: '50%', bottom: 56, transform: 'translateX(-50%)',
           zIndex: 20, maxWidth: 'calc(100% - 32px)',
-          display: 'flex', alignItems: 'center', gap: iconOnly ? 6 : 8,
-          padding: iconOnly ? '8px 10px' : '8px 12px 8px 16px',
+          display: 'flex', alignItems: 'center', gap: SPACE.xs,
+          padding: iconOnly ? `${SPACE.xs}px ${SPACE.sm}px` : `${SPACE.xs}px ${SPACE.sm}px ${SPACE.xs}px ${SPACE.md}px`,
           border: `1px solid ${colors.BORDER}`, borderRadius: 10,
           background: colors.BG_ELEVATED,
           boxShadow: '0 8px 28px rgba(0, 0, 0, 0.35)',
@@ -160,10 +162,10 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
           </>
         ) : (
           <>
-            <span style={{ ...statusStyle, marginRight: iconOnly ? 0 : 8 }}>
+            <span style={{ ...statusStyle, marginRight: iconOnly ? 0 : SPACE.xs }}>
               {selectedCount} selected
               {hint ? (
-                <span style={{ display: 'block', marginTop: 4, fontSize: 12, color: colors.TEXT_MUTED }}>
+                <span style={{ display: 'block', marginTop: SPACE.xxs, fontSize: 12, color: colors.TEXT_MUTED }}>
                   {hint}
                 </span>
               ) : null}

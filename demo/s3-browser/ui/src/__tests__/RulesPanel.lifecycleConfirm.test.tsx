@@ -70,7 +70,7 @@ test('run-now on a lifecycle rule confirms with the candidate list before it run
   const dialog = await screen.findByRole('dialog');
   expect(await within(dialog).findByText('nightly/app-0.9.tar')).toBeInTheDocument();
   expect(within(dialog).getByText('nightly/app-0.8.tar')).toBeInTheDocument();
-  expect(within(dialog).getByText(/3(\.0)? MB/)).toBeInTheDocument();
+  expect(within(dialog).getByText(/3(\.0)? MiB/)).toBeInTheDocument();
   expect(http.callsTo('POST', RUN_NOW)).toHaveLength(0);
 
   await user.click(within(dialog).getByRole('button', { name: 'Run: delete 2 objects' }));

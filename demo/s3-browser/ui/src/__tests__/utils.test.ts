@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import { clamp, formatDuration, relativeTime, formatBytes, formatBytesIec, getFileName, pluralize, noun, parentPrefix, isAbsolutePath, cacheEntrySubtitle } from '../utils';
+import { clamp, formatDuration, relativeTime, formatBytes, getFileName, pluralize, noun, parentPrefix, isAbsolutePath, cacheEntrySubtitle } from '../utils';
 
 test('isAbsolutePath (backend data directory, issue #92 comment item 3)', () => {
   assert.equal(isAbsolutePath('/var/lib/deltaglider'), true);
@@ -71,26 +71,23 @@ test('formatDuration + relativeTime (the ONE relative-time vocabulary)', () => {
 test('formatBytes (regression guard for the shared analytics formatter)', () => {
   assert.equal(formatBytes(0), '0 B');
   assert.equal(formatBytes(512), '512 B');
-  assert.equal(formatBytes(1536), '1.5 KB');
+  assert.equal(formatBytes(1536), '1.5 KiB');
   // sign-aware: a negative delta (stored > original) must not render "NaN undefined"
   assert.equal(formatBytes(-5), '-5 B');
-  assert.equal(formatBytes(-1536), '-1.5 KB');
+  assert.equal(formatBytes(-1536), '-1.5 KiB');
   // fractional sub-byte input clamps to the B unit instead of units[-1]
   assert.equal(formatBytes(0.5), '1 B');
-  // PB exists, and the unit index clamps at the largest unit
-  assert.equal(formatBytes(2 * 1024 ** 5), '2.0 PB');
-  assert.equal(formatBytes(2048 * 1024 ** 5), '2048.0 PB');
+  // PiB exists, and the unit index clamps at the largest unit
+  assert.equal(formatBytes(2 * 1024 ** 5), '2.0 PiB');
+  assert.equal(formatBytes(2048 * 1024 ** 5), '2048.0 PiB');
   // non-finite input never reaches the log math
   assert.equal(formatBytes(NaN), '—');
   assert.equal(formatBytes(Infinity), '—');
 });
 
-test('formatBytesIec labels the 1024 base with IEC units (quota, size limits)', () => {
-  assert.equal(formatBytesIec(0), '0 B');
-  assert.equal(formatBytesIec(1536), '1.5 KiB');
-  assert.equal(formatBytesIec(10 * 1024 ** 3), '10.0 GiB');
-  assert.equal(formatBytesIec(-1536), '-1.5 KiB');
-  assert.equal(formatBytesIec(NaN), '—');
+test('formatBytes labels the 1024 base with IEC units (D25: one convention)', () => {
+  assert.equal(formatBytes(10 * 1024 ** 3), '10.0 GiB');
+  assert.equal(formatBytes(100 * 1024 ** 2), '100.0 MiB');
 });
 
 test('getFileName (shared filename extraction for Inspector + Preview)', () => {
@@ -129,8 +126,8 @@ test('parentPrefix (keyboard "up a folder" navigation)', () => {
 // Browser-review item 15: the average divided the cache SIZE (the max), so a
 // 100 MB cache with one 2 MB baseline read "100 MB avg per entry".
 test('cacheEntrySubtitle averages the used bytes over the entries', () => {
-  assert.equal(cacheEntrySubtitle(2 * 1024 * 1024, 100 * 1024 * 1024, 1), '2.0 MB avg per entry');
-  assert.equal(cacheEntrySubtitle(3 * 1024, 100 * 1024 * 1024, 2), '1.5 KB avg per entry');
+  assert.equal(cacheEntrySubtitle(2 * 1024 * 1024, 100 * 1024 * 1024, 1), '2.0 MiB avg per entry');
+  assert.equal(cacheEntrySubtitle(3 * 1024, 100 * 1024 * 1024, 2), '1.5 KiB avg per entry');
   assert.equal(cacheEntrySubtitle(0, 100 * 1024 * 1024, 0), '0 B avg per entry');
   assert.equal(cacheEntrySubtitle(0, 0, 0), 'Cache disabled');
 });

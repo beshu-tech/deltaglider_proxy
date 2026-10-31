@@ -37,10 +37,10 @@ test('the reveal control is a button that toggles the secret', async () => {
   mount();
   const secret = await screen.findByLabelText('Secret access key');
   expect(secret).toHaveAttribute('type', 'password');
-  const reveal = screen.getByRole('button', { name: 'Show' });
+  const reveal = screen.getByRole('button', { name: 'Show secret' });
   await user.click(reveal);
   expect(secret).toHaveAttribute('type', 'text');
-  expect(screen.getByRole('button', { name: 'Hide' })).toHaveAttribute('aria-pressed', 'true');
+  expect(screen.getByRole('button', { name: 'Hide secret' })).toHaveAttribute('aria-pressed', 'true');
 });
 
 test('Sign in is enabled while empty and says what is missing', async () => {

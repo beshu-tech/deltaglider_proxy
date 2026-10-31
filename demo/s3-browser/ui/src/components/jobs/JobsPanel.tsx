@@ -9,8 +9,8 @@
  * ?bucket, ?rule, ?noop, ?job).
  */
 import { useEffect, useMemo, useState } from 'react';
-import { Alert, Button, Segmented, Select, Space, Spin, Switch, Tag, Typography, message } from 'antd';
-import { CloseOutlined, DeleteOutlined, PlusOutlined, StopOutlined, ThunderboltOutlined } from '@ant-design/icons';
+import { Button, Segmented, Select, Space, Switch, Tag, Typography, message } from 'antd';
+import { CloseOutlined, DeleteOutlined, FilterOutlined, HistoryOutlined, PlusOutlined, StopOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
 import Dropdown from '../KeyboardDropdown';
 import type { RunEntry, RunFilters } from '../../adminApi';
@@ -46,7 +46,9 @@ import { useNavigation } from '../../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../../urlState';
 import { useOverlayClose } from '../../hooks/useOverlayClose';
 import { useNow } from '../../hooks/useNow';
-import { normalizeUiError } from '../../errorHandling';
+import { plainError } from '../../plainError';
+import PageActions from '../PageActions';
+import { EmptyState, ErrorState, LoadingState } from '../StatePlaceholders';
 import { useCardStyles, contentColumn, CONTENT_WIDE } from '../shared-styles';
 import TimeAgo from '../TimeAgo';
 import RowActionsMenu from '../RowActionsMenu';
@@ -57,6 +59,7 @@ import RecordList, { type RecordColumn } from './RecordList';
 import OutcomeMeter from './OutcomeMeter';
 import JobDrawer from './JobDrawer';
 import RunDrawer from './RunDrawer';
+import TruncatedName from '../TruncatedName';
 
 const { Text } = Typography;
 
@@ -184,7 +187,7 @@ export default function JobsPanel({ search }: Props) {
       if (action === 'remove' && openJob === run.id) closeDrawer();
       refresh(run);
     } catch (e) {
-      messageApi.error(normalizeUiError(e, `${ACTION_UI[action].label} failed`));
+      messageApi.error(plainError(e, `${ACTION_UI[action].label} did not work. Try again.`).text);
     } finally {
       setBusy(null);
     }
@@ -229,14 +232,10 @@ export default function JobsPanel({ search }: Props) {
               <Tag color={kindTone(r.kind)} style={{ margin: 0, flexShrink: 0 }}>
                 {kindLabel(r.kind)}
               </Tag>
-              <Text
-                strong
-                ellipsis
-                title={runTitle(r)}
-                style={{ fontFamily: 'var(--font-mono)', fontSize: 13, minWidth: 0 }}
-              >
-                {runTitle(r)}
-              </Text>
+              <TruncatedName
+                text={runTitle(r)}
+                style={{ fontFamily: 'var(--font-mono)', fontSize: 13, fontWeight: 600 }}
+              />
             </div>
             {subject && (
               <Text type="secondary" className="dg-cell-truncate" title={subject} style={{ display: 'block', fontSize: 12 }}>
@@ -265,8 +264,9 @@ export default function JobsPanel({ search }: Props) {
       render: (r) => {
         const scope = scopeText(r.scope);
         return (
-          <Text type="secondary" className="dg-cell-truncate" title={scope} style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
-            {scope || '—'}
+          // Cut in the middle: bucket/prefix scopes differ at the end (D5).
+          <Text type="secondary" style={{ display: 'flex', minWidth: 0, fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+            <TruncatedName text={scope || '—'} />
           </Text>
         );
       },
@@ -281,7 +281,9 @@ export default function JobsPanel({ search }: Props) {
           <Tag color={jobStatusTone(r)} style={{ margin: '0 0 4px' }}>
             {jobStatusLabel(r)}
           </Tag>
-          <OutcomeMeter {...rowMeterInput(r)} />
+          {/* A bar only while the run moves: a finished run's bar was a
+              full green track for one object (UX harvest D66). */}
+          <OutcomeMeter {...rowMeterInput(r)} bar={isActiveJobStatus(r.status)} />
           {r.progress.failed > 0 && (
             <Button
               type="link"
@@ -372,18 +374,27 @@ export default function JobsPanel({ search }: Props) {
             if (!run) return;
             return runJobAction(run.job_id, 'cancel')
               .then(() => refresh(run))
-              .catch((e) => messageApi.error(normalizeUiError(e, 'Cancel failed')));
+              .catch((e) => messageApi.error(plainError(e, 'The proxy could not cancel the job. Try again.').text));
           }}
           inputRadius={inputRadius}
           onClose={closeDrawer}
         />
       )}
 
+      {/* The page's primary action, in the page header (PageActions). */}
+      <PageActions>
+        <Dropdown menu={newMenu} trigger={['click']} open={newMenuOpen} onOpenChange={setNewMenuOpen}>
+          <Button type="primary" icon={<PlusOutlined />}>
+            New job
+          </Button>
+        </Dropdown>
+      </PageActions>
+
       <div style={cardStyle}>
-        {/* The filters wrap on their own; "New job" stays top right. */}
-        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
-          <Space wrap size={8} style={{ flex: 1, minWidth: 0 }}>
+        <div>
+          <Space wrap size={8} align="center" style={{ minWidth: 0 }}>
             <Segmented
+              tabIndex={-1}
               aria-label="Status"
               value={filters.status ?? 'all'}
               options={[
@@ -424,7 +435,8 @@ export default function JobsPanel({ search }: Props) {
                 {kindLabel(ruleLabel.subsystem)} rule <span style={{ fontFamily: 'var(--font-mono)' }}>{ruleLabel.key}</span>
               </Tag>
             )}
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+            {/* As tall as the selects beside it (D68). */}
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, height: 32, fontSize: 13 }}>
               <Switch
                 size="small"
                 checked={!!filters.noop}
@@ -434,23 +446,13 @@ export default function JobsPanel({ search }: Props) {
               Show runs that changed nothing
             </label>
           </Space>
-          <Dropdown menu={newMenu} trigger={['click']} open={newMenuOpen} onOpenChange={setNewMenuOpen}>
-            <Button type="primary" icon={<PlusOutlined />} style={{ flexShrink: 0 }}>
-              New job
-            </Button>
-          </Dropdown>
         </div>
 
-        {list.error ? (
-          <Alert
-            type="error"
-            showIcon
-            style={{ marginTop: 16, borderRadius: 8 }}
-            title={normalizeUiError(list.error, 'Failed to load the runs')}
-          />
-        ) : list.isLoading ? (
-          <div style={{ display: 'flex', justifyContent: 'center', padding: 48 }}>
-            <Spin />
+        {list.error && !list.data ? (
+          <ErrorState error={list.error} what="the runs" onRetry={() => void list.refetch()} />
+        ) : list.isPending ? (
+          <div style={{ marginTop: 16 }}>
+            <LoadingState variant="list" rows={5} label="Loading the runs" />
           </div>
         ) : (
           <div style={{ marginTop: 16 }}>
@@ -460,9 +462,23 @@ export default function JobsPanel({ search }: Props) {
               rowKey={(r) => r.id}
               onRowClick={openDrawer}
               empty={
-                filtered
-                  ? 'No run matches these filters.'
-                  : 'No runs yet. Rules run on their schedule; a bulk delete in the file browser, or "New job", starts a one-off.'
+                filtered ? (
+                  <EmptyState
+                    icon={<FilterOutlined />}
+                    title="No run matches these filters"
+                    secondaryAction={
+                      <Button onClick={() => setFilters({ status: undefined, kind: undefined, bucket: undefined, rule: undefined })}>
+                        Clear the filters
+                      </Button>
+                    }
+                  />
+                ) : (
+                  <EmptyState
+                    icon={<HistoryOutlined />}
+                    title="No runs yet"
+                    hint="Rules run on their schedule. A bulk delete in the file browser, or New job at the top right, starts a one-off job."
+                  />
+                )
               }
             />
             {list.hasNextPage && (

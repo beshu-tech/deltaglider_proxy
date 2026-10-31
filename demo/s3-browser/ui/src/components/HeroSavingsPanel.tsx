@@ -44,7 +44,7 @@ import { SettingOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { formatBytes, clamp, noun } from '../utils';
 import { heroFontPx } from '../heroNumberSize';
-import { monthlyCost } from '../savings';
+import { biggestSaveSentence, heroPresentation, monthlyCost, savingsColors } from '../savings';
 import { useFixedOverlayPosition } from '../useFixedOverlayPosition';
 import { readStorage, writeStorage } from '../safeStorage';
 import { activateOnKey } from '../keyboard';
@@ -258,8 +258,12 @@ function HeroInner({
   const keptPct = 100 - targetSavedWidth;
   const yearlySavings = targetDollars * 12;
   // Totals of a bucket without a scan come from its usage counters: an
-  // estimate, so the hero says so until every bucket is scanned.
-  const estimated = unscannedCount > 0;
+  // estimate, so the hero is neutral with "≈" until every bucket is scanned
+  // (D49), and green after.
+  const hero = heroPresentation(unscannedCount);
+  const estimated = hero.estimated;
+  const saved = savingsColors(colors);
+  const savedInk = estimated ? colors.TEXT_PRIMARY : saved.text;
   const keptLabel = `kept ${formatBytes(totalStored)}`;
   const savedLabel = `saved ${formatBytes(savedBytes)}`;
   // Before the bar is measured, fall back to the share thresholds.
@@ -275,12 +279,11 @@ function HeroInner({
   const fmtBill = (v: number) =>
     v > 0 && v < 0.01 ? '<$0.01' : `$${v.toFixed(2)}`;
 
+  // Sentence case, UI face: no letter-spaced capitals (D67).
   const monoLabel: React.CSSProperties = {
-    fontFamily: 'var(--font-mono)',
-    fontSize: 10,
+    fontFamily: 'var(--font-ui)',
+    fontSize: 11.5,
     fontWeight: 600,
-    letterSpacing: '0.08em',
-    textTransform: 'uppercase',
   };
 
   return (
@@ -297,8 +300,8 @@ function HeroInner({
         fontFamily: 'var(--font-ui)',
       }}
     >
-      {/* Green haze behind the numeral. */}
-      <div
+      {/* Green haze behind the numeral: only for a scanned (exact) figure. */}
+      {!estimated && <div
         aria-hidden
         style={{
           position: 'absolute',
@@ -307,7 +310,7 @@ function HeroInner({
           background: `radial-gradient(120% 90% at 14% 35%, ${colors.GLOW_GREEN.replace(/[\d.]+\)$/, '0.10)')} 0%, transparent 62%)`,
           animation: 'dgHeroHazePulse 6s ease-in-out infinite',
         }}
-      />
+      />}
 
       {/* ── LEFT: the multiplier ─────────────────────────────────── */}
       <div
@@ -316,7 +319,7 @@ function HeroInner({
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'center',
-          gap: 10,
+          gap: 12,
           position: 'relative',
           zIndex: 1,
           minWidth: 0,
@@ -324,14 +327,12 @@ function HeroInner({
       >
         <div
           style={{
-            fontSize: 11,
-            fontWeight: 800,
-            letterSpacing: '0.16em',
-            textTransform: 'uppercase',
-            color: estimated ? colors.ACCENT_AMBER : colors.SAVED_TEXT,
+            fontSize: 13,
+            fontWeight: 600,
+            color: estimated ? colors.TEXT_MUTED : saved.text,
           }}
         >
-          {estimated ? 'Estimated saving' : 'Storage saved'}
+          {hero.label}
         </div>
         <m.div
           aria-live="polite"
@@ -348,34 +349,39 @@ function HeroInner({
             lineHeight: 0.95,
             letterSpacing: '-0.045em',
             fontVariantNumeric: 'tabular-nums',
-            background: colors.HERO_NUM_GRADIENT,
-            backgroundSize: '200% 200%',
-            WebkitBackgroundClip: 'text',
-            backgroundClip: 'text',
-            color: 'transparent',
-            animation: 'dgNumSheen 8s ease-in-out infinite',
+            ...(estimated
+              ? { color: colors.TEXT_PRIMARY }
+              : {
+                  background: colors.HERO_NUM_GRADIENT,
+                  backgroundSize: '200% 200%',
+                  WebkitBackgroundClip: 'text',
+                  backgroundClip: 'text',
+                  color: 'transparent',
+                  animation: 'dgNumSheen 8s ease-in-out infinite',
+                }),
           }}
         >
+          {hero.prefix && <span style={{ fontSize: '0.5em', fontWeight: 700, marginRight: 4 }}>{hero.prefix}</span>}
           <m.span>{percentLead}</m.span>
           <span style={{ fontSize: '0.38em', fontWeight: 800, marginLeft: 4 }}>%</span>
         </m.div>
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
           <div style={{ fontSize: 14, fontWeight: 600, color: colors.TEXT_SECONDARY }}>
             smaller on disk
           </div>
           <div
             style={{
-              padding: '4px 14px',
+              padding: '4px 12px',
               borderRadius: 999,
               fontSize: 13,
               fontWeight: 700,
               fontVariantNumeric: 'tabular-nums',
-              color: colors.SAVED_TEXT_DEEP,
-              background: `${colors.ACCENT_GREEN}14`,
-              border: `1px solid ${colors.ACCENT_GREEN}3a`,
+              color: estimated ? colors.TEXT_SECONDARY : saved.text,
+              background: estimated ? 'transparent' : saved.bg,
+              border: `1px solid ${estimated ? colors.BORDER : saved.border}`,
             }}
           >
-            {formatBytes(savedBytes)} saved
+            {hero.prefix}{formatBytes(savedBytes)} saved
           </div>
         </div>
       </div>
@@ -385,13 +391,13 @@ function HeroInner({
         style={{
           display: 'flex',
           flexDirection: 'column',
-          gap: 14,
+          gap: 16,
           zIndex: 1,
           minWidth: 0,
         }}
       >
         {/* WITHOUT — dashed ghost, always full width. */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
             <span style={{ ...monoLabel, color: colors.TEXT_FAINT }}>Without DeltaGlider</span>
             <span
@@ -422,7 +428,7 @@ function HeroInner({
         </div>
 
         {/* WITH — kept slice (dense teal) + saved field (luminous green). */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
             <span style={{ ...monoLabel, color: colors.KEPT_TEXT }}>With DeltaGlider</span>
             <span
@@ -601,13 +607,13 @@ function HeroInner({
               {fmtBill(regularBill)}
             </span>
           )}
-          {/* Compressed bill — the green headline (what you actually pay). */}
+          {/* Compressed bill — the headline (what you actually pay); green once scanned. */}
           <span
             aria-label={`With DeltaGlider: ${fmtBill(currentBill)} per month`}
             style={{
               fontSize: 'clamp(24px, 2vw, 34px)',
               fontWeight: 800,
-              color: colors.SAVED_TEXT,
+              color: savedInk,
               fontVariantNumeric: 'tabular-nums',
               letterSpacing: '-0.03em',
             }}
@@ -621,13 +627,13 @@ function HeroInner({
           {targetDollars >= 0.01 && (
             <span style={{ fontSize: 12.5, color: colors.TEXT_MUTED, fontWeight: 500 }}>
               save{' '}
-              <span style={{ color: colors.SAVED_TEXT_DEEP, fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>
+              <span style={{ color: savedInk, fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>
                 $<m.span>{dollarDisplay}</m.span>/mo
               </span>
               {yearlySavings >= 1 && (
                 <>
                   {' · '}
-                  <span style={{ color: colors.SAVED_TEXT_DEEP, fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>
+                  <span style={{ color: savedInk, fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>
                     ${yearlySavings >= 100 ? Math.round(yearlySavings).toLocaleString() : yearlySavings.toFixed(2)}/yr
                   </span>
                 </>
@@ -635,7 +641,7 @@ function HeroInner({
             </span>
           )}
           <span style={{ fontSize: 12, color: colors.TEXT_MUTED, fontWeight: 500 }}>
-            at ${costRate}/GB
+            at ${costRate}/GiB
           </span>
           <button
             ref={cogRef}
@@ -666,14 +672,14 @@ function HeroInner({
             <div
               ref={setPopoverEl}
               role="listbox"
-              aria-label="Cost per GB/month"
+              aria-label="Cost per GiB/month"
               style={{
                 position: 'fixed',
                 top: pos.top,
                 left: popoverLeft,
                 width: POPOVER_WIDTH,
                 zIndex: 99999,
-                padding: 10,
+                padding: 12,
                 background: colors.BG_ELEVATED,
                 border: `1px solid ${colors.BORDER}`,
                 borderRadius: 8,
@@ -685,15 +691,13 @@ function HeroInner({
             >
               <div
                 style={{
-                  fontSize: 10,
-                  fontWeight: 700,
+                  fontSize: 12,
+                  fontWeight: 600,
                   color: colors.TEXT_MUTED,
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.06em',
-                  marginBottom: 6,
+                  marginBottom: 8,
                 }}
               >
-                Cost per GB/month
+                Cost per GiB/month
               </div>
               {COST_PRESETS.map(p => (
                 <div
@@ -710,7 +714,7 @@ function HeroInner({
                     setShowCostConfig(false);
                   })}
                   style={{
-                    padding: '6px 8px',
+                    padding: '4px 8px',
                     cursor: 'pointer',
                     borderRadius: 4,
                     fontSize: 12,
@@ -718,7 +722,7 @@ function HeroInner({
                     background: costRate === p.rate ? `${colors.ACCENT_BLUE}18` : 'transparent',
                   }}
                 >
-                  {p.label} — ${p.rate}/GB
+                  {p.label} — ${p.rate}/GiB
                 </div>
               ))}
             </div>,
@@ -733,13 +737,13 @@ function HeroInner({
           display: 'flex',
           alignItems: 'center',
           flexWrap: 'wrap',
-          gap: 6,
+          gap: 8,
           fontSize: 11,
           color: colors.TEXT_MUTED,
           fontVariantNumeric: 'tabular-nums',
           zIndex: 1,
           borderTop: `1px solid ${colors.BORDER}`,
-          paddingTop: 10,
+          paddingTop: 12,
           marginTop: -2,
         }}
       >
@@ -750,7 +754,7 @@ function HeroInner({
           <>
             <Dot colors={colors} />
             <FooterFact
-              text={`biggest single save: ${biggestSave.bucket} −${formatBytes(biggestSave.bytes)}`}
+              text={biggestSaveSentence(biggestSave.bucket, formatBytes(biggestSave.bytes))}
             />
           </>
         )}
@@ -771,7 +775,7 @@ function HeroInner({
             display: 'flex',
             alignItems: 'center',
             flexWrap: 'wrap',
-            gap: 10,
+            gap: 12,
             fontSize: 12.5,
             lineHeight: 1.45,
             color: colors.TEXT_SECONDARY,
@@ -850,7 +854,7 @@ function EmptyHero({
             style={{
               alignSelf: 'flex-start',
               height: 40,
-              padding: '0 22px',
+              padding: '0 24px',
               borderRadius: 8,
               border: 'none',
               cursor: 'pointer',
@@ -873,20 +877,18 @@ function EmptyHero({
             position: 'absolute',
             top: -22,
             right: 0,
-            fontSize: 9,
-            fontWeight: 800,
-            letterSpacing: '0.12em',
-            textTransform: 'uppercase',
-            color: colors.TEXT_FAINT,
+            fontSize: 11,
+            fontWeight: 600,
+            color: colors.TEXT_MUTED,
             border: `1px solid ${colors.BORDER}`,
             borderRadius: 4,
-            padding: '2px 7px',
+            padding: '2px 8px',
           }}
         >
           Example
         </span>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <span style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', color: colors.TEXT_FAINT, fontFamily: 'var(--font-mono)' }}>
+          <span style={{ fontSize: 11.5, fontWeight: 600, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
             Your current storage
           </span>
           <div
@@ -899,7 +901,7 @@ function EmptyHero({
           />
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <span style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', color: colors.TEXT_FAINT, fontFamily: 'var(--font-mono)' }}>
+          <span style={{ fontSize: 11.5, fontWeight: 600, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
             After DeltaGlider — run a scan to find out
           </span>
           <div

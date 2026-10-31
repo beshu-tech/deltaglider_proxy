@@ -41,7 +41,7 @@ const lastDialog = async () => {
 test('a name with spaces is refused on the field and nothing is sent', async () => {
   const user = userEvent.setup();
   renderWithQuery(<UsersPanel />);
-  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.click(await screen.findByTestId('md-new-users'));
   const name = screen.getByRole('textbox', { name: 'Name' });
   await user.type(name, 'bad name with spaces!!');
   await user.click(screen.getByRole('button', { name: 'Create user' }));
@@ -59,7 +59,7 @@ test('a name with spaces is refused on the field and nothing is sent', async () 
 test('an empty name is marked on the field, not in a banner', async () => {
   const user = userEvent.setup();
   renderWithQuery(<UsersPanel />);
-  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.click(await screen.findByTestId('md-new-users'));
   await user.click(screen.getByRole('button', { name: 'Create user' }));
   expect(await screen.findByRole('alert')).toHaveTextContent('Enter a name.');
   expect(screen.getByRole('textbox', { name: 'Name' })).toHaveAttribute('aria-invalid', 'true');
@@ -69,7 +69,7 @@ test('the server refusal of a name shows on the field', async () => {
   http.on('POST', '/_/api/admin/users', json({ error: 'invalid_request', message: 'user name cannot start with \'$\'' }, 400));
   const user = userEvent.setup();
   renderWithQuery(<UsersPanel />);
-  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.click(await screen.findByTestId('md-new-users'));
   // Only the server knows this one: a name the GUI rule passes.
   await user.type(screen.getByRole('textbox', { name: 'Name' }), 'ok-name');
   await user.click(screen.getByRole('button', { name: 'Create user' }));
@@ -82,7 +82,7 @@ test('the first user asks before it switches sign-in, and the credentials dialog
   users = [];
   const user = userEvent.setup();
   renderWithQuery(<UsersPanel />);
-  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.click(await screen.findByTestId('md-new-users'));
   await user.type(screen.getByRole('textbox', { name: 'Name' }), 'ci-uploader');
   await user.click(screen.getByRole('button', { name: 'Create user' }));
   const confirm = await lastDialog();
@@ -99,7 +99,7 @@ test('the first user asks before it switches sign-in, and the credentials dialog
 test('a later user does not ask about the switch', async () => {
   const user = userEvent.setup();
   renderWithQuery(<UsersPanel />);
-  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.click(await screen.findByTestId('md-new-users'));
   await user.type(screen.getByRole('textbox', { name: 'Name' }), 'ci-uploader');
   await user.click(screen.getByRole('button', { name: 'Create user' }));
   const creds = await screen.findByRole('dialog', { name: /save these credentials/i });
@@ -110,7 +110,7 @@ test('a later user does not ask about the switch', async () => {
 test('a preset on a new form, or after another preset, applies without a confirm', async () => {
   const user = userEvent.setup();
   renderWithQuery(<UsersPanel />);
-  await user.click(await screen.findByRole('button', { name: /new/i }));
+  await user.click(await screen.findByTestId('md-new-users'));
   await user.click(screen.getByRole('button', { name: 'Read/Write/Delete' }));
   await user.click(screen.getByRole('button', { name: 'Read Only' }));
   expect(screen.queryByRole('dialog')).toBeNull();

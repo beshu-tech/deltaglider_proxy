@@ -42,10 +42,19 @@ function mount() {
 const row = (name: string) => screen.getByTestId(`object-row-${name}`).closest('.ant-table-row')!;
 
 test('a long name keeps its end as a part that is never cut, and the full name as the title', () => {
-  mount();
-  const cell = screen.getByTestId(`object-row-${LONG}`);
-  expect(cell).toHaveAttribute('title', LONG);
-  expect(screen.getByText('-linux-amd64.tar.gz', { exact: false })).toHaveStyle({ flexShrink: '0' });
+  // TruncatedName splits a name only while it overflows: make every element
+  // overflow (jsdom has no layout), then drop the overrides.
+  Object.defineProperty(HTMLElement.prototype, 'scrollWidth', { configurable: true, get: () => 500 });
+  Object.defineProperty(HTMLElement.prototype, 'clientWidth', { configurable: true, get: () => 100 });
+  try {
+    mount();
+    const cell = screen.getByTestId(`object-row-${LONG}`);
+    expect(cell).toHaveAttribute('title', LONG);
+    expect(screen.getByText('-linux-amd64.tar.gz', { exact: false })).toHaveStyle({ flexShrink: '0' });
+  } finally {
+    delete (HTMLElement.prototype as { scrollWidth?: number }).scrollWidth;
+    delete (HTMLElement.prototype as { clientWidth?: number }).clientWidth;
+  }
 });
 
 test('a ticked row is aria-selected, an unticked one is not', () => {

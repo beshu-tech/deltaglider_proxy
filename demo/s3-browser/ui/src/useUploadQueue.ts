@@ -9,7 +9,7 @@ import {
   type UploadRetryAdvice,
   type UploadStatus,
 } from './uploadTelemetry';
-import { ApiError, normalizeUiError } from './errorHandling';
+import { ApiError } from './errorHandling';
 import { createUploadQueueStore } from './uploadQueueStore';
 
 export interface UploadQueueItem {
@@ -38,7 +38,9 @@ export interface UploadQueueItem {
   storedSize?: number;
   /** Set when this upload became its folder's baseline (see uploadStats.ts). */
   baselineKey?: string;
-  error?: string;
+  /** The failure as thrown (an `ApiError`, an SDK error): the row renders it
+   *  through `plainError`, so the raw wire text stays behind "Details". */
+  error?: unknown;
   /** What to offer after a failure (see `uploadRetryAdvice`). */
   retry?: UploadRetryAdvice;
 }
@@ -202,7 +204,7 @@ export default function useUploadQueue(destination: string) {
         patch(item.id, (entry) => ({
           ...entry,
           status: 'error',
-          error: normalizeUiError(err, 'Upload failed'),
+          error: err,
           retry: err instanceof ApiError
             ? uploadRetryAdvice(err.status, err.code, err.detail)
             : 'retry',
@@ -292,6 +294,12 @@ export default function useUploadQueue(destination: string) {
     pump();
   }, [patch, store, pump]);
 
+  /** Take a settled (done, failed, cancelled) file off the list. */
+  const removeUpload = useCallback((id: string) => {
+    store.remove((item) => item.id === id && item.status !== 'queued' && item.status !== 'uploading' && item.status !== 'completing');
+    scheduleFlush();
+  }, [store, scheduleFlush]);
+
   const pendingCount = queue.filter(
     (i) => i.status === 'queued' || i.status === 'uploading' || i.status === 'completing',
   ).length;
@@ -311,5 +319,6 @@ export default function useUploadQueue(destination: string) {
     clearCompleted,
     cancelUpload,
     retryUpload,
+    removeUpload,
   };
 }

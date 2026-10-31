@@ -34,7 +34,8 @@ import {
 } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCopyToClipboard } from '../useCopyToClipboard';
-import { normalizeUiError } from '../errorHandling';
+import { plainError, type PlainError } from '../plainError';
+import PlainErrorAlert from './PlainErrorAlert';
 import { persistFailureText } from '../applySection';
 
 const { Text, Paragraph } = Typography;
@@ -54,7 +55,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
   const colors = useColors();
   const [yaml, setYaml] = useState('');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<PlainError | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const { copy, copied } = useCopyToClipboard();
   const [validated, setValidated] = useState(false);
@@ -79,7 +80,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
         })
         .catch((e) => {
           if (cancelled) return;
-          setError(normalizeUiError(e, "YAML operation failed"));
+          setError(plainError(e, 'The proxy could not export the configuration. Try again.'));
           setLoading(false);
         });
     } else {
@@ -100,7 +101,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
     setWarnings([]);
     setValidated(false);
     if (!yaml.trim()) {
-      setError('Paste or type some YAML first.');
+      setError({ text: 'Paste or type some YAML first.' });
       return;
     }
     setLoading(true);
@@ -110,10 +111,10 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
       if (resp.ok) {
         setValidated(true);
       } else if (resp.error) {
-        setError(resp.error);
+        setError({ text: resp.error });
       }
     } catch (e) {
-      setError(normalizeUiError(e, "YAML operation failed"));
+      setError(plainError(e, 'The proxy could not validate the YAML. Try again.'));
     } finally {
       setLoading(false);
     }
@@ -126,12 +127,12 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
       const resp = await applyConfigYaml(yaml);
       setApplyResult(resp);
       if (!resp.applied) {
-        setError(resp.error || 'Apply failed with no error message');
+        setError({ text: resp.error || 'The proxy did not apply the YAML and gave no reason.' });
       } else if (onApplied) {
         onApplied();
       }
     } catch (e) {
-      setError(normalizeUiError(e, "YAML operation failed"));
+      setError(plainError(e, 'The proxy could not apply the YAML. Try again.'));
     } finally {
       setLoading(false);
     }
@@ -177,7 +178,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
             point the server at it with{' '}
             <Text code>--config</Text>, and restart.
           </Paragraph>
-          {error && <Alert type="error" title={error} showIcon />}
+          {error && <PlainErrorAlert error={error} />}
           <Input.TextArea
             ref={textAreaRef}
             aria-label="Exported YAML"
@@ -245,7 +246,17 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
             <Alert
               type="error"
               title="Validation error"
-              description={<LinkifiedText text={error} />}
+              description={
+                <>
+                  <LinkifiedText text={error.text} />
+                  {error.details && (
+                    <details>
+                      <summary style={{ cursor: 'pointer', fontSize: 12 }}>Details</summary>
+                      <code style={{ display: 'block', fontSize: 11, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>{error.details}</code>
+                    </details>
+                  )}
+                </>
+              }
               showIcon
             />
           )}
@@ -254,7 +265,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
               type="warning"
               title={`${warnings.length} warning${warnings.length === 1 ? '' : 's'}`}
               description={
-                <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
+                <ul style={{ margin: '4px 0', paddingLeft: 16 }}>
                   {warnings.map((w, i) => (
                     <li key={i} style={{ fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12 }}>
                       <LinkifiedText text={w} />

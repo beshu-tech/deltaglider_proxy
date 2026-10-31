@@ -60,6 +60,21 @@
 - One focus ring for the whole interface. Toasts no longer cover the header. The theme switch repaints in one step.
 - Pages show placeholders while data loads, instead of zeros.
 
+### Changed — Interface, fourth pass
+
+- One set of states on every page: a loading skeleton in the shape of the page, an empty state with one sentence and its action, and an error with a plain sentence, **Retry** and **Details**. A page never shows an error and an empty state together.
+- Every error goes through one mapper, which turns S3 and admin API errors into a sentence that you can act on. Status codes, error codes and request ids are under **Details**.
+- Fields check their value when you leave them and when you apply. Number fields keep what you type and say what is wrong, instead of changing the value in silence.
+- The upload page tracks one state for each file. The final message is green only when every file arrived, failed files show a plain reason, and **Retry** shows only for errors that a retry can fix.
+- The review dialog lists the changed fields with their old and new values. The raw change is under **Show the raw change**.
+- After you apply a rule, its drawer closes and its row flashes once.
+- Each list page has one primary "New …" button in the page header, for example **New bucket**, **New user** and **New rule**.
+- Sizes use binary units everywhere (KiB, MiB, GiB), the same as the limits on the server.
+- YAML import and export moved from the account menu to the **Configuration as YAML** card on the System page.
+- Sessions are grouped by user, and each session has its own **Sign out** button.
+- The breadcrumb always keeps the current folder visible. On a narrow screen, the folders in between become one "…" link.
+- Charts use the brand colours, and an empty chart says that it waits for data.
+
 ### Changed — One error body for the admin API
 
 - An admin API error now always has the JSON body `{"error": <code>, "message": <text>}`. Before, an error had one of four bodies: plain text, `{"error": <text>}`, `{"error": <code>, "message": <text>}`, or an empty body for a server error. The `error` field now holds a stable machine code (for example `not_found`, `conflict` or `invalid_request`), and the text is in `message`. The codes that clients already matched on, such as `iam_declarative`, `admin_session_required` and `invalid_path`, stay in `error`. A script that showed `error` as the reason must now show `message`. See [Errors](docs/product/reference/admin-api.md#errors).

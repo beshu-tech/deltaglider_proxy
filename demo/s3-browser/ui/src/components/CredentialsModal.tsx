@@ -33,7 +33,7 @@ export default function CredentialsModal({ accessKey, secretKey, title, note, on
       footer={<Button type="primary" onClick={onClose}>I have copied it</Button>}
     >
       {note && <Alert type="info" showIcon title={note} style={{ marginBottom: 16, borderRadius: 8 }} />}
-      <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase' }}>Access key</Text>
+      <Text type="secondary" style={{ fontSize: 12.5, fontWeight: 600, display: 'block', marginBottom: 4 }}>Access key</Text>
       <Space.Compact block style={{ marginBottom: 12, alignItems: 'center' }}>
         <Text code style={{ fontFamily: 'var(--font-mono)', flex: 1, wordBreak: 'break-all' }}>{accessKey}</Text>
         <Button
@@ -42,7 +42,7 @@ export default function CredentialsModal({ accessKey, secretKey, title, note, on
           onClick={() => void copy(accessKey, { successMessage: 'Access key copied' })}
         />
       </Space.Compact>
-      <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase' }}>Secret key</Text>
+      <Text type="secondary" style={{ fontSize: 12.5, fontWeight: 600, display: 'block', marginBottom: 4 }}>Secret key</Text>
       <Space.Compact block style={{ alignItems: 'center' }}>
         <Text code style={{ fontFamily: 'var(--font-mono)', flex: 1, wordBreak: 'break-all' }}>{secretKey}</Text>
         <Button

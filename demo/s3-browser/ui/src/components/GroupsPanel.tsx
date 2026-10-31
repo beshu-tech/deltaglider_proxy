@@ -8,14 +8,17 @@ import { useUsers } from '../queries/users';
 import { useCardStyles } from './shared-styles';
 import FormField from './FormField';
 import { EmptyState } from './StatePlaceholders';
+import TruncatedName from './TruncatedName';
 import { useColors } from '../ThemeContext';
 import PermissionEditor from './PermissionEditor';
 import { permissionsToRows, rowsToPermissions, freshPermissionRowId, type PermissionRow } from './permissionRows';
 import { groupPermissionSummary, filterItems } from '../masterDetailFilter';
 import MasterDetailPanel from './MasterDetailPanel';
 import IamSourceBanner from './IamSourceBanner';
-import { ApiError, normalizeUiError } from '../errorHandling';
+import { ApiError, isSessionExpired } from '../errorHandling';
+import { plainError } from '../plainError';
 import { IAM_NAME_HELP, iamNameError, serverNameErrorText } from '../userName';
+import { useFieldValidation } from '../validation';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
@@ -63,7 +66,10 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   const users = useMemo(() => usersQuery.data ?? [], [usersQuery.data]);
   const loading = groupsQuery.isLoading || usersQuery.isLoading;
   const rawError = groupsQuery.error ?? usersQuery.error;
-  const error = rawError ? (normalizeUiError(rawError, "Failed to load data")) : '';
+  // An expired session goes to sign-in; it is not an error state here.
+  const error = rawError && !isSessionExpired(rawError) ? rawError : null;
+  /** Both lists loaded, without error: only then may the page say "no groups". */
+  const loaded = !loading && !error && groupsQuery.data !== undefined;
 
   // Bubble a 401 up so the login screen can take over. Must run as an effect,
   // not in the render body: react-query keeps `error` populated across renders,
@@ -171,7 +177,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       setSelectedId(cloned.id);
       writeSelectionUrl(cloned.id);
     } catch (err) {
-      message.error(normalizeUiError(err, "Duplicate group failed"));
+      message.error(plainError(err, 'The proxy could not duplicate the group.').text);
     } finally {
       onSavingChange?.(false);
     }
@@ -198,13 +204,13 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
     />
   ) : (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-      {groups.length === 0 ? (
+      {!loaded ? null : groups.length === 0 ? (
         <EmptyState
           icon={<TeamOutlined />}
-          title={readOnly ? 'No groups declared' : 'Create the first group'}
-          hint={readOnly
+          title={iamMode === 'declarative' ? 'No groups declared' : 'Create the first group'}
+          hint={iamMode === 'declarative'
             ? 'Your YAML config has no groups. Add them under access.iam_groups and apply.'
-            : 'Click New to create the first group. Users inherit every permission of their groups.'}
+            : 'Click New group at the top right. Users inherit every permission of their groups.'}
         />
       ) : (
         <Text type="secondary" style={{ fontSize: 14 }}>
@@ -231,22 +237,21 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       onSearchChange={setFilterText}
       loading={loading}
       error={error}
+      onRetry={() => { void groupsQuery.refetch(); void usersQuery.refetch(); }}
       // ONE empty state: with no groups the detail pane explains, so the
       // list stays blank. It speaks only when the search hides every group.
       listEmptyState={groups.length > 0 ? (
-        <div style={{ padding: 20, textAlign: 'center' }}>
-          <Text type="secondary" style={{ fontSize: 13 }}>No groups match the search</Text>
-        </div>
+        <EmptyState compact title="No groups match the search" hint="Clear the search to see every group." />
       ) : undefined}
       renderRowBody={group => (
         <>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <TeamOutlined style={{ color: colors.TEXT_MUTED, flexShrink: 0 }} />
-            <Text strong title={group.name} style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-              {group.name}
-            </Text>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <TruncatedName text={group.name} style={{ fontSize: 13, fontWeight: 600, color: colors.TEXT_PRIMARY }} />
+            </div>
           </div>
-          <div style={{ marginLeft: 22, marginTop: 2 }}>
+          <div style={{ marginLeft: 24, marginTop: 2 }}>
             <Text type="secondary" style={{ fontSize: 11 }}>
               {group.member_ids.length} member{group.member_ids.length !== 1 ? 's' : ''}
               {' · '}
@@ -319,15 +324,20 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
   const [saving, setSavingState] = useState(false);
   const [deleting, setDeletingState] = useState(false);
   const [error, setError] = useState('');
-  // The name error shows after the first submit, then follows each keystroke.
+  // The name error shows on blur or after the first submit, then follows
+  // each keystroke (UX harvest D46: it was submit-only, unlike users).
   // The rule is THE IAM name rule (the same as for users, and the server's).
   // A name that is not changed stays valid: a group from declarative YAML or
   // from before the rule keeps its name (the server accepts it unchanged).
-  const [showFieldErrors, setShowFieldErrors] = useState(false);
+  const form = useFieldValidation();
   const [serverNameError, setServerNameError] = useState<string | null>(null);
-  const nameChanged = !isEdit || name.trim() !== group.name;
-  const nameRuleError = nameChanged ? iamNameError(name.trim()) : null;
-  const nameError = (showFieldErrors ? nameRuleError : null) ?? serverNameError ?? undefined;
+  const nameField = form.text(
+    'name',
+    name,
+    (t) => { setName(t); setServerNameError(null); },
+    (t) => (!isEdit || t.trim() !== group.name ? iamNameError(t.trim()) : null),
+  );
+  const nameError = nameField.error ?? serverNameError ?? undefined;
 
   const setSaving = (v: boolean) => { setSavingState(v); onSavingChange?.(v); };
   const setDeleting = (v: boolean) => { setDeletingState(v); onSavingChange?.(v); };
@@ -339,8 +349,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
   useDirtyFlag(IAM_DIRTY_KEYS.groups, isDirty && !readOnly);
 
   const handleSave = async () => {
-    setShowFieldErrors(true);
-    if (nameRuleError) return;
+    if (!form.submit()) return;
     setSaving(true);
     setError('');
     setServerNameError(null);
@@ -397,7 +406,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
       const detail = e instanceof ApiError && e.status === 400 ? e.detail ?? '' : '';
       const fieldError = serverNameErrorText('group', detail);
       if (fieldError) setServerNameError(fieldError);
-      else setError(normalizeUiError(e, "Operation failed"));
+      else setError(plainError(e, 'The proxy could not save the group.').text);
     } finally {
       setSaving(false);
     }
@@ -410,7 +419,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
       await deleteGroupMutation.mutateAsync(group.id);
       onDeleted?.();
     } catch (e) {
-      setError(normalizeUiError(e, "Delete failed"));
+      setError(plainError(e, 'The proxy could not delete the group.').text);
     } finally {
       setDeleting(false);
     }
@@ -428,19 +437,19 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
   };
 
   return (
-    <div style={{ padding: '24px 28px', maxWidth: 600, overflow: 'auto', height: '100%' }}>
+    <div style={{ padding: 24, maxWidth: 600, overflow: 'auto', height: '100%' }}>
       {/* h3: the page title above is an h2 (TabHeader). */}
-      <Title level={3} style={{ margin: '0 0 20px', fontFamily: 'var(--font-ui)', fontSize: 16 }}>
+      <Title level={3} style={{ margin: '0 0 24px', fontFamily: 'var(--font-ui)', fontSize: 16 }}>
         {isEdit ? `${readOnly ? 'View' : 'Edit'}: ${group?.name}` : 'New group'}
       </Title>
 
       {error && <Alert type="error" title={error} showIcon closable={{ onClose: () => setError('') }} style={{ marginBottom: 16, borderRadius: 8 }} />}
 
-      <FormField label="Name" helpText={readOnly ? undefined : IAM_NAME_HELP} error={nameError} style={{ marginBottom: 20 }}>
-        <Input data-testid="group-name" autoFocus={!isEdit} value={name} onChange={e => { setName(e.target.value); setServerNameError(null); }} placeholder="e.g. developers" disabled={readOnly} style={{ ...inputRadius }} />
+      <FormField label="Name" helpText={readOnly ? undefined : IAM_NAME_HELP} error={nameError} style={{ marginBottom: 24 }}>
+        <Input data-testid="group-name" autoFocus={!isEdit} {...nameField.inputProps} placeholder="e.g. developers" disabled={readOnly} style={{ ...inputRadius }} />
       </FormField>
 
-      <FormField label="Description" style={{ marginBottom: 20 }}>
+      <FormField label="Description" style={{ marginBottom: 24 }}>
         <Input value={description} onChange={e => setDescription(e.target.value)} placeholder="e.g. Development team access" disabled={readOnly} style={{ ...inputRadius }} />
       </FormField>
 
@@ -475,8 +484,8 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                gap: 10,
-                padding: '6px 4px',
+                gap: 12,
+                padding: '8px 4px',
                 borderRadius: 6,
                 cursor: readOnly ? 'default' : 'pointer',
               }}

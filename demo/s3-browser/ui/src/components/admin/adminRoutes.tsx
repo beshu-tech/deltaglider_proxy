@@ -5,7 +5,8 @@
  * `<AdminRouteContent>`; a panel's wiring lives here, next to its siblings,
  * instead of in a chain of `if (adminPath === …)` blocks.
  */
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
+import { PageActionsSlot } from '../../pageActionsSlot';
 import MetricsPage from '../MetricsPage';
 import SetupWizard from '../SetupWizard';
 import TracePanel from '../TracePanel';
@@ -24,6 +25,7 @@ import BucketsPanel from '../BucketsPanel';
 import JobsPanel from '../jobs/JobsPanel';
 import { LifecycleRulesPanel, ReplicationRulesPanel } from '../jobs/RulesPanel';
 import SystemPanel from '../SystemPanel';
+import type { ConfigYamlActions } from '../ConfigYamlCard';
 import WebhookDeliveryPanel from '../WebhookDeliveryPanel';
 import TabHeader from '../TabHeader';
 import { headerForPath } from '../adminNavigation';
@@ -40,6 +42,7 @@ export interface AdminRouteContext {
   clearPendingGroupId: () => void;
   onExportBackup: () => void;
   onImportBackup: () => void;
+  configYaml: ConfigYamlActions;
   search?: string;
   proxyVersion?: string;
 }
@@ -142,6 +145,7 @@ const ADMIN_ROUTES: Record<string, AdminRoute> = {
         onSessionExpired={c.onSessionExpired}
         onExportBackup={c.onExportBackup}
         onImportBackup={c.onImportBackup}
+        configYaml={c.configYaml}
       />
     ),
   },
@@ -155,12 +159,15 @@ const ADMIN_ROUTES: Record<string, AdminRoute> = {
 export function AdminRouteContent({ path, ctx }: { path: string; ctx: AdminRouteContext }) {
   const route = ADMIN_ROUTES[path] ?? ADMIN_ROUTES.dashboard;
   const meta = route.header === false ? undefined : headerForPath(path);
+  // The header's action node, for <PageActions> (state, so the panel
+  // re-renders into it once it exists).
+  const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null);
   return (
-    <>
+    <PageActionsSlot.Provider value={meta ? actionsSlot : null}>
       {meta && (
-        <TabHeader icon={meta.icon} title={meta.title} description={meta.description} />
+        <TabHeader icon={meta.icon} title={meta.title} description={meta.description} actionsRef={setActionsSlot} />
       )}
       {route.render(ctx)}
-    </>
+    </PageActionsSlot.Provider>
   );
 }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { darkColors, lightColors, ThemeContext } from './ThemeContext';
 import { readStorage, writeStorage } from './safeStorage';
+import { installDialogTabWrap } from './dialogTabWrap';
 
 const DARK_QUERY = '(prefers-color-scheme: dark)';
 /** On `<html>` for the two frames of a theme flip (theme.css turns transitions off). */
@@ -18,6 +19,10 @@ export default function ThemeProvider({ children }: { children: ReactNode }) {
   const [saved, setSaved] = useState(() => readStorage('dg-theme'));
   const [systemDark, setSystemDark] = useState(systemPrefersDark);
   const isDark = saved ? saved === 'dark' : systemDark;
+
+  // AntD's modal focus trap lets Tab leave the page after the last control
+  // (D4); the wrap keeps the cycle inside every open modal of the app.
+  useEffect(() => installDialogTabWrap(), []);
 
   useEffect(() => {
     if (typeof window.matchMedia !== 'function') return;

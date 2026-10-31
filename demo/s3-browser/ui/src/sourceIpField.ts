@@ -17,11 +17,11 @@ export function parseSourceIpLines(text: string): string[] {
 const V4_OCTET = '(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)';
 const V4 = new RegExp(`^${V4_OCTET}(\\.${V4_OCTET}){3}$`);
 
-function isIpv4(s: string): boolean {
+export function isIpv4(s: string): boolean {
   return V4.test(s);
 }
 
-function isIpv6(s: string): boolean {
+export function isIpv6(s: string): boolean {
   if (!s.includes(':') || !/^[0-9a-fA-F:.]+$/.test(s)) return false;
   // The URL parser implements the full IPv6 grammar (::, embedded IPv4).
   try {
@@ -33,7 +33,7 @@ function isIpv6(s: string): boolean {
 }
 
 /** Why one entry is not an IP address or a network (CIDR), or null. */
-function sourceIpEntryError(entry: string): string | null {
+export function sourceIpEntryError(entry: string): string | null {
   if (entry.length > 64) return 'is longer than 64 characters';
   const [addr, prefix, extra] = entry.split('/');
   const v4 = isIpv4(addr);

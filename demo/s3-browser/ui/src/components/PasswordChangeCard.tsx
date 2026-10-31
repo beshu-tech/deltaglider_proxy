@@ -1,15 +1,15 @@
 import { useState } from 'react';
-import { Button, Input, Space, Alert, Typography } from 'antd';
-import { LockOutlined, WarningOutlined } from '@ant-design/icons';
+import { Button, Space, Alert } from 'antd';
+import { LockOutlined } from '@ant-design/icons';
 import { changeAdminPassword } from '../adminApi';
-import { normalizeUiError } from '../errorHandling';
-import { useCardStyles } from './shared-styles';
+import { plainError, type PlainError } from '../plainError';
+import PlainErrorAlert from './PlainErrorAlert';
+import { useCardStyles, SPACE } from './shared-styles';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
+import MaskedSecretInput from './MaskedSecretInput';
 import { CodeTokenText } from './CodeTokenText';
 import { useColors } from '../ThemeContext';
-
-const { Text } = Typography;
 
 export default function PasswordChangeCard() {
   const { cardStyle, inputRadius } = useCardStyles();
@@ -18,7 +18,7 @@ export default function PasswordChangeCard() {
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [changing, setChanging] = useState(false);
-  const [result, setResult] = useState<{ ok: boolean; error?: string } | null>(null);
+  const [result, setResult] = useState<{ ok: true } | { ok: false; error: PlainError } | null>(null);
   // The button is always usable; a click checks the fields and marks the
   // empty or short one (the same rule as the server: 12 to 128 characters).
   // After the first click the errors follow each keystroke.
@@ -39,14 +39,14 @@ export default function PasswordChangeCard() {
     setResult(null);
     try {
       const res = await changeAdminPassword(currentPassword, newPassword);
-      setResult(res);
+      setResult(res.ok ? { ok: true } : { ok: false, error: { text: res.error || 'The proxy refused the password change.' } });
       if (res.ok) {
         setCurrentPassword('');
         setNewPassword('');
         setShowFieldErrors(false);
       }
     } catch (e) {
-      setResult({ ok: false, error: normalizeUiError(e, 'The password change failed') });
+      setResult({ ok: false, error: plainError(e, 'The proxy could not change the password.') });
     } finally {
       setChanging(false);
     }
@@ -61,36 +61,30 @@ export default function PasswordChangeCard() {
           description="Unlocks this admin GUI. It is not the S3 SigV4 secret above."
         />
 
-        <div style={{ fontSize: 13, color: TEXT_MUTED, lineHeight: 1.6 }}>
-          <Text style={{ color: TEXT_MUTED, fontSize: 13 }}>
-            The admin password does two things:
-          </Text>
-          <ul style={{ margin: '8px 0', paddingLeft: 20 }}>
-            <li><strong>Signs admin session cookies</strong>: it authenticates your browser session for this settings panel.</li>
-            <li><strong>Gates admin access</strong>: before IAM users exist, you need this password to open settings.</li>
+        {/* D64: what the password does and how to reset it fold away; the
+            card shows only the fields and the one fact that matters now. */}
+        <details style={{ fontSize: 13, color: TEXT_MUTED, lineHeight: 1.6 }}>
+          <summary style={{ cursor: 'pointer', width: 'fit-content' }}>How the admin password works</summary>
+          <ul style={{ margin: `${SPACE.xs}px 0`, paddingLeft: SPACE.md }}>
+            <li>It signs the admin session cookies.</li>
+            <li>Before IAM users exist, it is the only way to open the admin settings.</li>
+            <li>
+              It does not encrypt the IAM database. The database key is <code>DGP_CONFIG_DB_KEY</code>, or the
+              file <code>deltaglider_config.db.key</code> next to the database.
+            </li>
+            <li>
+              <CodeTokenText text="If you forget it, reset it with the CLI flag --set-bootstrap-password. The reset keeps the IAM database." />
+            </li>
           </ul>
-          <Text style={{ color: TEXT_MUTED, fontSize: 13 }}>
-            It does not encrypt the IAM database. The database has its own key: <code>DGP_CONFIG_DB_KEY</code>, or the key
-            file <code>deltaglider_config.db.key</code> next to the database.
-          </Text>
-        </div>
-
-        <Alert
-          type="warning"
-          icon={<WarningOutlined />}
-          showIcon
-          title="Changing this password signs you and every other admin out"
-          description={
-            <CodeTokenText text="All active admin sessions end. IAM users and their credentials stay as they are. If you forget this password, reset it with the CLI flag --set-bootstrap-password. The reset keeps the IAM database." />
-          }
-          style={{ borderRadius: 8 }}
-        />
+        </details>
 
         <input type="text" autoComplete="username" defaultValue="admin" aria-hidden="true" style={{ display: 'none' }} />
         <FormField label="Current admin password" error={showFieldErrors ? currentError : undefined}>
-          <Input.Password
+          <MaskedSecretInput
+            mode="new"
+            placeholder=""
             value={currentPassword}
-            onChange={(e) => setCurrentPassword(e.target.value)}
+            onChange={(v) => setCurrentPassword(v)}
             autoComplete="current-password"
             style={inputRadius}
           />
@@ -100,22 +94,18 @@ export default function PasswordChangeCard() {
           helpText="12 to 128 characters."
           error={showFieldErrors ? newError : undefined}
         >
-          <Input.Password
+          <MaskedSecretInput
+            mode="new"
+            placeholder=""
             value={newPassword}
-            onChange={(e) => setNewPassword(e.target.value)}
+            onChange={(v) => setNewPassword(v)}
             autoComplete="new-password"
             style={inputRadius}
           />
         </FormField>
 
-        {result && (
-          <Alert
-            type={result.ok ? 'success' : 'error'}
-            title={result.ok ? 'Admin password changed. All sessions invalidated.' : <CodeTokenText text={result.error || 'Failed'} />}
-            showIcon
-            style={{ borderRadius: 8 }}
-          />
-        )}
+        {result?.ok && <Alert type="success" showIcon title="The admin password is changed. Every admin session is signed out." />}
+        {result && !result.ok && <PlainErrorAlert error={result.error} />}
 
         <Button
           htmlType="submit"
@@ -125,6 +115,9 @@ export default function PasswordChangeCard() {
         >
           Change admin password
         </Button>
+        <div style={{ fontSize: 12.5, color: TEXT_MUTED, marginTop: -SPACE.xs }}>
+          This signs out every admin, you included. IAM users and their keys do not change.
+        </div>
       </Space>
     </form>
   );

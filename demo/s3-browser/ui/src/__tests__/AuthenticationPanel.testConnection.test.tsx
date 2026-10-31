@@ -70,7 +70,7 @@ test('Test connection works on the create form', async () => {
   );
   const user = userEvent.setup();
   renderWithQuery(<AuthenticationPanel />);
-  await user.click(await screen.findByRole('button', { name: /Add provider/ }));
+  await user.click(await screen.findByRole('button', { name: /New provider/ }));
   await user.type(await screen.findByLabelText('Client ID'), 'new-cid');
   await user.click(screen.getByRole('button', { name: /Test connection/ }));
   await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/ext-auth/providers/test')).toHaveLength(1));
@@ -85,7 +85,7 @@ test('B20: Create is never a silent disabled button; missing fields are named on
   http.on('GET', '/_/api/admin/ext-auth/providers', json([]));
   const user = userEvent.setup();
   renderWithQuery(<AuthenticationPanel />);
-  await user.click(await screen.findByRole('button', { name: /Add provider/ }));
+  await user.click(await screen.findByRole('button', { name: /New provider/ }));
   const create = await screen.findByRole('button', { name: 'Create' });
   expect(create).toBeEnabled();
   await user.click(create);
@@ -93,4 +93,28 @@ test('B20: Create is never a silent disabled button; missing fields are named on
   expect(screen.getByText('Enter the client ID.')).toBeInTheDocument();
   expect(screen.getByLabelText('Client ID')).toHaveAttribute('aria-invalid', 'true');
   expect(http.callsTo('POST', '/_/api/admin/ext-auth/providers')).toHaveLength(0);
+});
+
+// D10: the issuer URL is checked when the field loses focus, not only at submit.
+test('a malformed issuer URL errors on blur and blocks Save', async () => {
+  const user = userEvent.setup();
+  renderWithQuery(<AuthenticationPanel />);
+  await user.click(await screen.findByText('Corp SSO'));
+  const issuer = await screen.findByLabelText('Issuer URL');
+  await user.clear(issuer);
+  await user.type(issuer, 'not a url');
+  await user.tab();
+  expect(await screen.findByText('Enter a full URL that starts with https://.')).toBeInTheDocument();
+  expect(issuer).toHaveAttribute('aria-invalid', 'true');
+  await user.click(screen.getByRole('button', { name: 'Save' }));
+  expect(http.callsTo('PUT', '/_/api/admin/ext-auth/providers/7')).toHaveLength(0);
+});
+
+// D17: a failed load is one error state with Retry, not a bare pink box.
+test('a load failure shows one error state with Retry', async () => {
+  http.on('GET', '/_/api/admin/ext-auth/providers', json({ error: 'boom' }, 500));
+  renderWithQuery(<AuthenticationPanel />);
+  expect(await screen.findByText('Could not load the external authentication settings')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /Retry/ })).toBeInTheDocument();
+  expect(screen.queryByText(/boom/)).toBeNull();
 });

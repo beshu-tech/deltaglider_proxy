@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { Alert, Input, Modal, Typography } from 'antd';
+import { Input, Modal, Typography } from 'antd';
 import { adminLogin, loginAs, whoami } from '../adminApi';
 import type { WhoamiResponse } from '../adminApi';
 import { signInChoices } from '../signInChoices';
-import { normalizeUiError } from '../errorHandling';
+import { plainError, type PlainError } from '../plainError';
+import PlainErrorAlert from './PlainErrorAlert';
+import MaskedSecretInput from './MaskedSecretInput';
 import { registerReloginHandler } from '../sessionRelogin';
 
 type Mode = WhoamiResponse['mode'];
@@ -19,7 +21,7 @@ export default function ReloginModal() {
   const [password, setPassword] = useState('');
   const [accessKey, setAccessKey] = useState('');
   const [secretKey, setSecretKey] = useState('');
-  const [error, setError] = useState('');
+  const [error, setError] = useState<PlainError | null>(null);
   const [busy, setBusy] = useState(false);
   const resolveRef = useRef<((ok: boolean) => void) | null>(null);
 
@@ -28,7 +30,7 @@ export default function ReloginModal() {
       () =>
         new Promise<boolean>((resolve) => {
           resolveRef.current = resolve;
-          setError('');
+          setError(null);
           setPassword('');
           setSecretKey('');
           setOpen(true);
@@ -51,14 +53,14 @@ export default function ReloginModal() {
 
   const signIn = async () => {
     setBusy(true);
-    setError('');
+    setError(null);
     try {
       const keys = signInChoices(mode).primary === 'keys';
       const result = keys ? await loginAs(accessKey.trim(), secretKey) : await adminLogin(password);
       if (result.ok) finish(true);
-      else setError(result.error ?? 'Sign-in failed');
+      else setError(plainError(result.error ?? '', 'Sign-in failed. Check the credentials and try again.'));
     } catch (e) {
-      setError(normalizeUiError(e, 'Sign-in failed'));
+      setError(plainError(e, 'Sign-in failed. Check the credentials and try again.'));
     } finally {
       setBusy(false);
     }
@@ -85,18 +87,18 @@ export default function ReloginModal() {
             <label htmlFor="relogin-ak" style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>Access key ID</label>
             <Input id="relogin-ak" value={accessKey} onChange={(e) => setAccessKey(e.target.value)} autoComplete="username" style={{ marginBottom: 12 }} />
             <label htmlFor="relogin-sk" style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>Secret access key</label>
-            <Input.Password id="relogin-sk" value={secretKey} onChange={(e) => setSecretKey(e.target.value)} autoComplete="current-password" />
+            <MaskedSecretInput mode="new" placeholder="" id="relogin-sk" value={secretKey} onChange={setSecretKey} autoComplete="current-password" />
           </>
         ) : (
           <>
             <label htmlFor="relogin-pw" style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>Admin password</label>
-            <Input.Password id="relogin-pw" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" autoFocus />
+            <MaskedSecretInput mode="new" placeholder="" id="relogin-pw" value={password} onChange={setPassword} autoComplete="current-password" autoFocus />
           </>
         )}
         {/* Enter submits the form. */}
         <button type="submit" hidden aria-hidden="true" tabIndex={-1} />
       </form>
-      {error && <Alert type="error" showIcon title={error} style={{ marginTop: 12 }} />}
+      {error && <PlainErrorAlert error={error} style={{ marginTop: 12 }} />}
     </Modal>
   );
 }

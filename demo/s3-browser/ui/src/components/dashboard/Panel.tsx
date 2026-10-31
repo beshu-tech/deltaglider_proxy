@@ -15,6 +15,7 @@ import { useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
 import { EmptyState, SkeletonState } from '../StatePlaceholders';
 import { useColors } from '../../ThemeContext';
+import { CARD_RADIUS, SPACE } from '../shared-styles';
 import type { ColorTokens } from '../../ThemeContext';
 
 type PanelSpan = 3 | 4 | 6 | 8 | 12;
@@ -73,7 +74,7 @@ export default function Panel({
         // One card chrome for every tile: the accent is only the top stripe.
         background: colors.BG_CARD,
         border: `1px solid ${colors.BORDER}`,
-        borderRadius: 12,
+        borderRadius: CARD_RADIUS,
         boxShadow: `${colors.ELEV_SHADOW}, inset 0 1px 0 ${isLight ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.04)'}`,
         padding: 0,
         display: 'flex',
@@ -92,8 +93,8 @@ export default function Panel({
           style={{
             position: 'absolute',
             top: 0,
-            left: 14,
-            right: 14,
+            left: SPACE.md,
+            right: SPACE.md,
             height: 2,
             borderRadius: 2,
             background: `linear-gradient(90deg, transparent, ${accentHex} 18%, ${accentHex} 82%, transparent)`,
@@ -130,9 +131,9 @@ function PanelHeader({
         // Wrap so the actions toolbar drops below the title instead of
         // overflowing on narrow (Re-scan-all was clipped on mobile).
         flexWrap: 'wrap',
-        gap: 12,
-        rowGap: 8,
-        padding: '10px 14px',
+        gap: SPACE.sm,
+        rowGap: SPACE.xs,
+        padding: `${SPACE.sm}px ${SPACE.md}px`,
         borderBottom: `1px solid ${colors.BORDER}`,
         background: 'transparent',
         flexShrink: 0,
@@ -162,7 +163,7 @@ function PanelHeader({
               color: colors.TEXT_MUTED,
               fontFamily: 'var(--font-ui)',
               lineHeight: 1.4,
-              marginTop: 1,
+              marginTop: 0,
               whiteSpace: 'nowrap',
               overflow: 'hidden',
               textOverflow: 'ellipsis',
@@ -175,7 +176,7 @@ function PanelHeader({
       {actions && (
         // `flexShrink: 0` sized the toolbar to its content, so on a phone it
         // ran past the card edge instead of wrapping its own buttons.
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', flex: '0 1 auto', minWidth: 0, maxWidth: '100%' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: SPACE.xs, flexWrap: 'wrap', flex: '0 1 auto', minWidth: 0, maxWidth: '100%' }}>
           {actions}
         </div>
       )}
@@ -222,10 +223,10 @@ function PanelBody({
         flex: 1,
         minHeight: 0,
         position: 'relative',
-        padding: 14,
+        padding: SPACE.md,
         display: 'flex',
         flexDirection: 'column',
-        gap: 8,
+        gap: SPACE.xs,
       }}
     >
       {children}

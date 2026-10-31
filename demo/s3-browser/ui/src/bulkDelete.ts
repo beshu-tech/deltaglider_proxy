@@ -62,9 +62,10 @@ export interface DeleteJobOutcome {
   jobId?: number;
 }
 
-/** The message after a delete was started, or not. */
-export function deleteJobMessage(o: DeleteJobOutcome): { type: 'info'; text: string } {
-  if (o.cancelled) return { type: 'info', text: 'Delete cancelled. Nothing was deleted.' };
+/** The message after a delete was started, or not; null after the user
+ *  cancelled the confirmation: the closed dialog says it (UX harvest D19). */
+export function deleteJobMessage(o: DeleteJobOutcome): { type: 'info'; text: string } | null {
+  if (o.cancelled) return null;
   if (o.total === 0 || o.jobId === undefined) return { type: 'info', text: 'Nothing to delete.' };
   // A started job is progress, not a result: never the success green.
   return {

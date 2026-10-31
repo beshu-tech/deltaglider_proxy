@@ -28,7 +28,7 @@ test('a PUT that applied but did not persist says the change is lost at restart'
   }, 500));
   const user = userEvent.setup();
   renderWithQuery(<ObjectSizeLimitCard />);
-  const input = await screen.findByRole('spinbutton', { name: 'Maximum object size (MiB)' });
+  const input = await screen.findByRole('textbox', { name: 'Maximum object size (MiB)' });
   await waitFor(() => expect(input).toHaveValue('100'));
   await user.clear(input);
   await user.type(input, '250');

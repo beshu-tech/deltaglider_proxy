@@ -14,8 +14,8 @@ test('the baseline is "Stored whole" with a Baseline chip, never "0.0%" and "Del
 });
 
 test('a delta shows its savings and the Delta chip', () => {
-  const h = objectStorageHeadline({ storageType: 'delta', isBaseline: false, savingsPct: 98.25, savedBytesText: '1.8 MB' });
-  assert.deepEqual(h, { kind: 'savings', title: '98.3%', detail: '1.8 MB saved', chip: 'Delta' });
+  const h = objectStorageHeadline({ storageType: 'delta', isBaseline: false, savingsPct: 98.25, savedBytesText: '1.8 MiB' });
+  assert.deepEqual(h, { kind: 'savings', title: '98.3%', detail: '1.8 MiB saved', chip: 'Delta' });
   assert.equal(objectStorageHeadline({ storageType: undefined, isBaseline: false, savingsPct: 0, savedBytesText: '0 B' }).chip, 'Original');
 });
 

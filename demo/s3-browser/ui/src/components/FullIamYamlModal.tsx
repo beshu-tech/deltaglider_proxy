@@ -43,7 +43,8 @@ import {
 } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCopyToClipboard } from '../useCopyToClipboard';
-import { normalizeUiError } from '../errorHandling';
+import { plainError, type PlainError } from '../plainError';
+import PlainErrorAlert from './PlainErrorAlert';
 
 const { Text, Paragraph } = Typography;
 
@@ -75,7 +76,7 @@ function SummaryTags({ s }: { s: IamImportSummary }) {
   const row = (label: string, created: number, updated: number, deleted: number) => {
     if (created === 0 && updated === 0 && deleted === 0) return null;
     return (
-      <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         <Text strong style={{ minWidth: 78, display: 'inline-block' }}>{label}</Text>
         {created > 0 && <Tag color="green">{created} created</Tag>}
         {updated > 0 && <Tag color="blue">{updated} updated</Tag>}
@@ -89,13 +90,13 @@ function SummaryTags({ s }: { s: IamImportSummary }) {
       {row('Groups', s.groups_created, s.groups_updated, s.groups_deleted)}
       {row('Providers', s.providers_created, s.providers_updated, s.providers_deleted)}
       {s.mapping_rules_replaced > 0 && (
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <Text strong style={{ minWidth: 78, display: 'inline-block' }}>Rules</Text>
           <Tag color="purple">{s.mapping_rules_replaced} mapping rule{s.mapping_rules_replaced === 1 ? '' : 's'} replaced</Tag>
         </div>
       )}
       {s.external_identities_applied > 0 && (
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <Text strong style={{ minWidth: 78, display: 'inline-block' }}>Logins</Text>
           <Tag color="cyan">
             {s.external_identities_applied} OAuth login binding{s.external_identities_applied === 1 ? '' : 's'} added or changed
@@ -110,7 +111,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
   const colors = useColors();
   const [yaml, setYaml] = useState('');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<PlainError | null>(null);
   const { copy, copied } = useCopyToClipboard();
   const [preview, setPreview] = useState<IamImportSummary | null>(null);
   const [applied, setApplied] = useState<IamImportSummary | null>(null);
@@ -133,7 +134,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
         })
         .catch((e) => {
           if (cancelled) return;
-          setError(normalizeUiError(e, "YAML operation failed"));
+          setError(plainError(e, 'The proxy could not export the IAM YAML. Try again.'));
           setLoading(false);
         });
     } else {
@@ -166,14 +167,14 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
     setPreview(null);
     setApplied(null);
     if (!yaml.trim()) {
-      setError('Paste or type some IAM YAML first.');
+      setError({ text: 'Paste or type some IAM YAML first.' });
       return;
     }
     setLoading(true);
     try {
       setPreview(await validateFullIamYaml(yaml));
     } catch (e) {
-      setError(normalizeUiError(e, "YAML operation failed"));
+      setError(plainError(e, 'The proxy could not validate the IAM YAML. Try again.'));
     } finally {
       setLoading(false);
     }
@@ -187,7 +188,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
       setApplied(res);
       onApplied?.();
     } catch (e) {
-      setError(normalizeUiError(e, "YAML operation failed"));
+      setError(plainError(e, 'The proxy could not apply the IAM YAML. Try again.'));
     } finally {
       setLoading(false);
     }
@@ -230,7 +231,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
             group-mapping rules — as declarative <Text code>access:</Text> YAML.
             Re-import it on another instance via <Text strong>Import full IAM</Text>.
           </Paragraph>
-          {error && <Alert type="error" title={error} showIcon />}
+          {error && <PlainErrorAlert error={error} />}
           <Input.TextArea
             aria-label="Exported IAM YAML"
             value={yaml}
@@ -283,7 +284,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
             disabled={loading}
           />
 
-          {error && <Alert type="error" title="Import error" description={error} showIcon />}
+          {error && <PlainErrorAlert error={error} />}
 
           {preview && !applied && (
             <Alert

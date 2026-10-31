@@ -63,7 +63,8 @@ test('a destination with ".." shows the error and blocks the staged upload', asy
   await user.clear(destInput());
   await user.type(destInput(), 'builds/../etc/');
   expect(screen.getByRole('alert')).toHaveTextContent('Folder names cannot be "." or "..".');
-  const blocked = screen.getByRole('button', { name: /Upload 1 file to/ });
+  // The invalid path is not echoed as the target (D29).
+  const blocked = screen.getByRole('button', { name: /Upload 1 file$/ });
   expect(blocked).toBeDisabled();
   await user.click(blocked);
   expect(uploadObject).not.toHaveBeenCalled();

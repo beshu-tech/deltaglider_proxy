@@ -31,7 +31,7 @@ export function LifecycleApplySummary({ lifecycle }: { lifecycle: LifecycleConfi
       <Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
         Scheduler {lifecycle.enabled ? 'enabled' : 'disabled'} · tick {lifecycle.tick_interval} · {lifecycle.rules.length} rule{lifecycle.rules.length === 1 ? '' : 's'}
       </Text>
-      <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
         {lifecycle.rules.length === 0 ? (
           <Text type="secondary" style={{ fontSize: 12 }}>No rules configured.</Text>
         ) : lifecycle.rules.map((rule) => (

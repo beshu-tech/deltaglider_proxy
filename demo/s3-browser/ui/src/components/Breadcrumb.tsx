@@ -1,3 +1,4 @@
+import { useLayoutEffect, useRef, useState } from 'react';
 import { HomeFilled } from '@ant-design/icons';
 import { prefixSegments } from '../utils';
 import { useColors } from '../ThemeContext';
@@ -7,6 +8,9 @@ import BucketBackendBadge from './BucketBackendBadge';
 import BucketEncryptionIcon from './BucketEncryptionIcon';
 import { showBackendChips } from '../bucketBackend';
 import type { BucketBackendOrigin } from '../types';
+import TruncatedName from './TruncatedName';
+import { SPACE } from './shared-styles';
+import { crumbSegments } from '../browser/crumbs';
 
 interface Props {
   /** The active bucket. Passed from the URL-derived source of truth — NOT read
@@ -25,12 +29,38 @@ interface Props {
   compact?: boolean;
 }
 
+/** The current folder keeps at least this many characters before anything
+ *  else gives way (UX harvest D6). */
+const CURRENT_MIN_CHARS = 16;
+/** The bucket keeps at least this many characters once the middle is gone. */
+const BUCKET_MIN_CHARS = 6;
+
+/** The floor of a crumb's width: `chars` characters of its label (plus the separator). */
+function floorWidth(label: string, chars: number, separator: boolean): string {
+  const n = Math.min(Array.from(label).length, chars);
+  return separator ? `calc(${n}ch + 20px)` : `${n}ch`;
+}
+
+/** The widest a bucket crumb gets; a longer name is cut there even with room to spare. */
+const BUCKET_MAX_PX = 160;
+
+/** Is the bucket or the current folder cut because the header lacks room?
+ *  (A bucket name over BUCKET_MAX_PX is cut anyway: that does not count.) */
+function priorityNameSqueezed(ol: Element): boolean {
+  return Array.from(ol.querySelectorAll<HTMLElement>('[data-crumb-priority]')).some((li) => {
+    const max = Number(li.dataset.crumbPriority) || Infinity;
+    if (li.clientWidth >= max - 1) return false;
+    return Array.from(li.querySelectorAll<HTMLElement>('span')).some((s) => s.scrollWidth > s.clientWidth + 1);
+  });
+}
+
 const segmentBase: React.CSSProperties = {
   fontSize: 13,
   fontWeight: 500,
   whiteSpace: 'nowrap',
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
+  // A name is cut in the middle by <TruncatedName>: the end stays visible.
+  display: 'flex',
+  minWidth: 0,
   fontFamily: "var(--font-ui)",
   textDecoration: 'none',
   background: 'none',
@@ -41,12 +71,35 @@ const segmentBase: React.CSSProperties = {
 
 export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = false, compact = false }: Props) {
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_FAINT, ACCENT_BLUE } = useColors();
-  const separatorStyle: React.CSSProperties = { color: TEXT_FAINT, margin: '0 6px', fontSize: 12, flexShrink: 0, userSelect: 'none' };
+  const separatorStyle: React.CSSProperties = { color: TEXT_FAINT, margin: `0 ${SPACE.xs}px`, fontSize: 12, flexShrink: 0, userSelect: 'none' };
   const allSegments = prefixSegments(prefix);
-  // Compact: "bucket › … › current". The "…" opens the parent folder.
-  const segments: { label: string; prefix: string; collapsed?: boolean }[] = compact && allSegments.length > 1
-    ? [{ ...allSegments[allSegments.length - 2], label: '…', collapsed: true }, allSegments[allSegments.length - 1]]
-    : allSegments;
+  // Priority when the header is narrow (D6): the current folder, then the
+  // bucket, then the folders between them. The middle collapses to "…"
+  // first (always on a phone, and on a wider screen as soon as the bucket or
+  // the current folder would be cut); the bucket shrinks next; the current
+  // folder keeps CURRENT_MIN_CHARS characters.
+  const where = `${bucket}\u0000${prefix}`;
+  const [collapsedAt, setCollapsedAt] = useState<{ where: string; width: number } | null>(null);
+  const collapseMiddle = compact || collapsedAt?.where === where;
+  const segments = crumbSegments(allSegments, collapseMiddle);
+  const listRef = useRef<HTMLOListElement>(null);
+  useLayoutEffect(() => {
+    const ol = listRef.current;
+    if (!ol || compact || allSegments.length < 2) return;
+    const check = () => {
+      if (collapsedAt?.where !== where) {
+        if (ol.scrollWidth > ol.clientWidth + 1 || priorityNameSqueezed(ol)) setCollapsedAt({ where, width: ol.clientWidth });
+      } else if (ol.clientWidth > collapsedAt.width + 48) {
+        // Wider again: try the full path; the check above collapses it again if it still does not fit.
+        setCollapsedAt(null);
+      }
+    };
+    check();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(check);
+    observer.observe(ol);
+    return () => observer.disconnect();
+  }, [where, compact, allSegments.length, collapsedAt]);
 
   // Backend-origin chip (admin-only — origins API is admin-gated). react-query
   // dedupes this with the Backends panel's useBucketOrigins(); `enabled` keeps
@@ -78,8 +131,8 @@ export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = fals
   };
 
   return (
-    <nav aria-label="Breadcrumb" style={{ minWidth: 0 }}>
-      <ol style={{ display: 'flex', alignItems: 'center', minWidth: 0, overflow: 'hidden', listStyle: 'none', margin: 0, padding: 0 }}>
+    <nav aria-label="Breadcrumb" style={{ minWidth: 0, flex: '0 1 auto' }}>
+      <ol ref={listRef} style={{ display: 'flex', alignItems: 'center', minWidth: 0, overflow: 'hidden', listStyle: 'none', margin: 0, padding: 0, fontSize: 13 }}>
         {/* Home */}
         {!compact && <li>
           <a
@@ -95,24 +148,33 @@ export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = fals
         {!compact && <li aria-hidden="true" style={separatorStyle}>&rsaquo;</li>}
 
         {/* Bucket name */}
-        <li style={{ display: 'flex', minWidth: 0, flexShrink: compact ? 1 : 0 }}>
+        <li
+          data-crumb-priority={prefix ? BUCKET_MAX_PX : ''}
+          style={{
+            display: 'flex',
+            // The bucket gives way before the current folder (a larger shrink
+            // weight), but keeps a few characters.
+            flexShrink: 4,
+            minWidth: prefix ? floorWidth(bucket, BUCKET_MIN_CHARS, false) : 0,
+          }}
+        >
           {prefix ? (
             <a
               href={hrefFor('')}
               onClick={onCrumbClick('')}
-              style={{ ...segmentBase, color: TEXT_SECONDARY, maxWidth: 140, transition: 'color 0.15s' }}
+              style={{ ...segmentBase, color: TEXT_SECONDARY, maxWidth: BUCKET_MAX_PX, transition: 'color 0.15s' }}
             >
-              {bucket}
+              <TruncatedName text={bucket} />
             </a>
           ) : (
-            <span style={{ ...segmentBase, color: TEXT_PRIMARY, maxWidth: 140, fontWeight: 600 }} aria-current="location">
-              {bucket}
+            <span style={{ ...segmentBase, color: TEXT_PRIMARY, fontWeight: 600 }} aria-current="location">
+              <TruncatedName text={bucket} />
             </span>
           )}
         </li>
 
         {!compact && canAdmin && bucket && activeOrigin && (
-          <li style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginLeft: 6 }}>
+          <li style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE.xs, marginLeft: SPACE.xs }}>
             <BucketEncryptionIcon origin={activeOrigin} />
             <BucketBackendBadge origin={activeOrigin} />
           </li>
@@ -122,14 +184,25 @@ export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = fals
         {segments.map((seg, i) => {
           const isLast = i === segments.length - 1;
           return (
-            <li key={seg.prefix} style={{ display: 'flex', alignItems: 'center', minWidth: 0, flexShrink: isLast ? 1 : 0 }}>
+            <li
+              key={seg.prefix}
+              data-crumb-priority={isLast ? '' : undefined}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                // The current folder never goes below its floor; a middle
+                // folder keeps its natural width until the middle collapses.
+                minWidth: isLast ? floorWidth(seg.label, CURRENT_MIN_CHARS, true) : undefined,
+                flexShrink: isLast ? 1 : 0,
+              }}
+            >
               <span aria-hidden="true" style={separatorStyle}>&rsaquo;</span>
               {isLast ? (
                 <span
                   style={{ ...segmentBase, color: TEXT_PRIMARY, fontWeight: 600 }}
                   aria-current="location"
                 >
-                  {seg.label}
+                  <TruncatedName text={seg.label} />
                 </span>
               ) : (
                 <a
@@ -138,7 +211,7 @@ export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = fals
                   aria-label={seg.collapsed ? 'Parent folder' : undefined}
                   style={{ ...segmentBase, color: TEXT_SECONDARY, maxWidth: 140, transition: 'color 0.15s' }}
                 >
-                  {seg.label}
+                  {seg.collapsed ? seg.label : <TruncatedName text={seg.label} />}
                 </a>
               )}
             </li>

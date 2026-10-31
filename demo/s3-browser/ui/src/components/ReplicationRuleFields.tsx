@@ -1,19 +1,26 @@
-import { Alert, Input, InputNumber, Modal, Radio, Switch, Typography } from 'antd';
+import { Input, Modal, Radio, Switch, Typography } from 'antd';
 import type { ReplicationRuleConfig } from '../adminApi';
 import BucketPrefixInput from './BucketPrefixInput';
 import FormField from './FormField';
-import { AdvancedDisclosure } from './ruleEditorFields';
+import { AdvancedDisclosure, RuleNumberInput } from './ruleEditorFields';
 import RuleFilterFields from './RuleFilterFields';
 import { ruleFolderPrefix } from '../ruleFilterPreview';
-import { replicationRuleFieldErrors } from './jobs/humanDuration';
-import { useErrorGate } from './jobs/useErrorGate';
+import type { RuleFieldErrors } from './jobs/ruleFieldErrors';
+import { SPACE } from './shared-styles';
 
 const { Text } = Typography;
 
+const GRID = (min: number) => ({ display: 'grid', gridTemplateColumns: `repeat(auto-fit, minmax(${min}px, 1fr))`, gap: SPACE.md });
+
 /**
- * Per-rule field editor body (name / enabled / source / destination + advanced
- * behaviour). Extracted verbatim from ReplicationPanel; the parent renders it
- * inside the Jobs drawer's Definition tab; the parent owns all state.
+ * Per-rule field editor body (name / enabled / source / destination /
+ * interval / delete replication, then batch size and conflicts under
+ * Advanced). The parent renders it inside the rule drawer's Definition tab
+ * and owns all state.
+ *
+ * `errors` are the field errors to SHOW now (the parent checks every field
+ * with `replicationRuleErrors` and shows an error once its field lost focus,
+ * or after Review & apply); `onFieldBlur` tells the parent a field lost focus.
  */
 export default function ReplicationRuleFields({
   rule,
@@ -21,26 +28,31 @@ export default function ReplicationRuleFields({
   inputRadius,
   onChange,
   onRename,
+  errors = {},
+  onFieldBlur = () => {},
 }: {
   rule: ReplicationRuleConfig;
   buckets: string[];
   inputRadius: { borderRadius: number };
   onChange: (patch: Partial<ReplicationRuleConfig>) => void;
   onRename: (nextName: string) => void;
+  errors?: RuleFieldErrors;
+  onFieldBlur?: (field: string) => void;
 }) {
-  const fieldErrors = replicationRuleFieldErrors(rule);
-  const gate = useErrorGate();
+  const blur = (field: string) => () => onFieldBlur(field);
   return (
     <div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
+      <div style={GRID(260)}>
         <FormField
           label="Rule name"
           yamlPath="storage.replication.rules[].name"
-          helpText="Unique identifier for this rule. ASCII letters, digits, dot, dash, underscore; max 64 chars."
+          helpText="A name that is unique on this page: letters, digits, dots, dashes and underscores, 64 characters at most."
+          error={errors.name}
         >
           <Input
             value={rule.name}
-            onChange={(e) => onRename(e.target.value.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64))}
+            onChange={(e) => onRename(e.target.value)}
+            onBlur={blur('name')}
             style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
           />
         </FormField>
@@ -55,27 +67,75 @@ export default function ReplicationRuleFields({
           label="Source"
           yamlPath="storage.replication.rules[].source"
           helpText="Bucket and optional prefix to copy objects from."
+          error={errors.source}
         >
-          <BucketPrefixInput
-            value={rule.source}
-            onChange={(source) => onChange({ source })}
-            buckets={buckets}
-            bucketPlaceholder="prod-artifacts"
-            prefixPlaceholder="builds/releases/"
-          />
+          <div onBlur={blur('source')}>
+            <BucketPrefixInput
+              value={rule.source}
+              onChange={(source) => onChange({ source })}
+              buckets={buckets}
+              bucketPlaceholder="prod-artifacts"
+              prefixPlaceholder="builds/releases/"
+            />
+          </div>
         </FormField>
         <FormField
           label="Destination"
           yamlPath="storage.replication.rules[].destination"
           helpText="Bucket and optional prefix to copy objects into. An empty prefix mirrors the source key path."
+          error={errors.destination}
         >
-          <BucketPrefixInput
-            value={rule.destination}
-            onChange={(destination) => onChange({ destination })}
-            buckets={buckets}
-            bucketPlaceholder="backup-artifacts"
-            prefixPlaceholder="mirror/releases/"
+          <div onBlur={blur('destination')}>
+            <BucketPrefixInput
+              value={rule.destination}
+              onChange={(destination) => onChange({ destination })}
+              buckets={buckets}
+              bucketPlaceholder="backup-artifacts"
+              prefixPlaceholder="mirror/releases/"
+            />
+          </div>
+        </FormField>
+        <FormField
+          label="Interval"
+          yamlPath="storage.replication.rules[].interval"
+          helpText="How often the full sweep of this rule runs. Events copy changes as they happen; the sweep copies what an event missed. A duration such as 6h or 24h (the default). The minimum is 30s."
+          error={errors.interval}
+        >
+          <Input
+            value={rule.interval}
+            onChange={(e) => onChange({ interval: e.target.value })}
+            onBlur={blur('interval')}
+            placeholder="24h"
+            style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
           />
+        </FormField>
+        <FormField
+          label="Delete replication"
+          yamlPath="storage.replication.rules[].replicate_deletes"
+          helpText="On makes the destination a mirror: a run deletes each destination object that is not on the source, also one that another tool wrote. Objects that the rule's filters exclude stay. Give the destination to this rule only, or exclude what it must keep."
+        >
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE.xs, cursor: 'pointer' }}>
+            <Switch
+              aria-label="Delete objects on the destination that are not on the source"
+              checked={rule.replicate_deletes}
+              onChange={(on) => {
+                // Turning it off is safe; turning it on can delete data on
+                // the destination, so it asks first.
+                if (!on) {
+                  onChange({ replicate_deletes: false });
+                  return;
+                }
+                Modal.confirm({
+                  title: 'Delete objects on the destination?',
+                  content: `When this rule runs, it deletes every object under ${rule.destination.bucket || 'the destination'}${rule.destination.prefix ? '/' + rule.destination.prefix : ''} that is not on the source, also objects that other tools wrote there. Objects that the rule's filters exclude stay.`,
+                  okText: 'Turn on delete replication',
+                  okButtonProps: { danger: true },
+                  onOk: () => onChange({ replicate_deletes: true }),
+                });
+              }}
+            />
+            <span>{rule.replicate_deletes ? 'On: the destination mirrors deletes' : 'Off: deletes are not copied'}</span>
+          </label>
         </FormField>
       </div>
 
@@ -91,88 +151,41 @@ export default function ReplicationRuleFields({
         inputRadius={inputRadius}
       />
 
-      <AdvancedDisclosure title="Advanced rule behavior" hint="Interval, batch size, conflicts, delete replication" hasError={!!fieldErrors.interval}>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 }}>
-          <FormField
-            label="Interval"
-            yamlPath="storage.replication.rules[].interval"
-            helpText="How often the full reconcile sweep runs for this rule. Events replicate changes as they happen; the sweep catches anything an event missed. A duration such as 6h or 24h (the default). The minimum is 30s."
-            error={gate.show('interval') ? fieldErrors.interval : undefined}
-          >
-            <Input
-              {...gate.props('interval')}
-              value={rule.interval}
-              onChange={(e) => onChange({ interval: e.target.value })}
-              style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
-            />
-          </FormField>
+      <AdvancedDisclosure title="Advanced" hint="Batch size and conflicts" hasError={!!errors.batch_size}>
+        <div style={GRID(240)}>
           <FormField
             label="Batch size"
             yamlPath="storage.replication.rules[].batch_size"
-            helpText="Objects per listing page / copy batch. Larger values copy faster but use more memory. Default 100."
+            helpText="Objects per listing page and copy batch, from 1 to 10,000. Larger values copy faster but use more memory. The default is 100."
+            error={errors.batch_size}
           >
-            <InputNumber
+            <RuleNumberInput
               value={rule.batch_size}
-              onChange={(batch_size) => onChange({ batch_size: batch_size || 100 })}
-              min={1}
-              max={10000}
+              onChange={(batch_size) => onChange({ batch_size: batch_size as number })}
+              onBlur={blur('batch_size')}
+              placeholder="100"
               style={{ width: '100%', ...inputRadius }}
             />
           </FormField>
           <FormField
             label="Conflict policy"
             yamlPath="storage.replication.rules[].conflict"
-            helpText="How to resolve when the destination object already exists."
+            helpText="What the rule does when the destination object already exists."
           >
             <Radio.Group
               value={rule.conflict}
               onChange={(e) => onChange({ conflict: e.target.value })}
-              style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
+              style={{ display: 'flex', flexDirection: 'column', gap: SPACE.xs }}
             >
               <Radio value="newer-wins">Newer wins — safest default</Radio>
               <Radio value="content-diff">Content diff — mirror (copy only when bytes differ)</Radio>
               <Radio value="skip-if-dest-exists">Skip existing destination objects</Radio>
             </Radio.Group>
           </FormField>
-          <FormField
-            label="Delete replication"
-            yamlPath="storage.replication.rules[].replicate_deletes"
-            helpText="Make the destination a faithful mirror: an object that is not on the source is deleted, unless the rule's filters exclude it."
-          >
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
-              <Switch
-                aria-label="Delete objects on the destination that are not on the source"
-                checked={rule.replicate_deletes}
-                onChange={(on) => {
-                  // Turning it off is safe; turning it on can delete data on
-                  // the destination, so it asks first.
-                  if (!on) {
-                    onChange({ replicate_deletes: false });
-                    return;
-                  }
-                  Modal.confirm({
-                    title: 'Delete objects on the destination?',
-                    content: `When this rule runs, it deletes every object under ${rule.destination.bucket || 'the destination'}${rule.destination.prefix ? '/' + rule.destination.prefix : ''} that is not on the source, also objects that other tools wrote there. Objects that the rule's filters exclude stay.`,
-                    okText: 'Turn on delete replication',
-                    okButtonProps: { danger: true },
-                    onOk: () => onChange({ replicate_deletes: true }),
-                  });
-                }}
-              />
-              <span>{rule.replicate_deletes ? 'On: the destination mirrors deletes' : 'Off: deletes are not copied'}</span>
-            </label>
-            <Alert
-              type="warning"
-              showIcon
-              title="Deletes are destructive"
-              description="When enabled, the destination is a faithful mirror of the source: a destination object absent at source is deleted, also one that another tool wrote. Only objects that the rule's filters exclude stay. Dedicate the destination to this rule, or exclude what it must keep."
-              style={{ marginTop: 8 }}
-            />
-          </FormField>
         </div>
       </AdvancedDisclosure>
 
-      <Text type="secondary" style={{ display: 'block', marginTop: 12, fontSize: 11 }}>
+      <Text type="secondary" style={{ display: 'block', marginTop: SPACE.sm, fontSize: 11 }}>
         Replication rules target bucket names. Bucket policies decide backend routing and encryption.
       </Text>
     </div>

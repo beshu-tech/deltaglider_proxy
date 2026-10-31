@@ -35,8 +35,8 @@ async function fillTls(page: Page): Promise<void> {
 }
 
 async function fillCaches(page: Page): Promise<void> {
-  await page.getByRole('spinbutton', { name: /Reference cache size/ }).fill('1024');
-  await page.getByRole('spinbutton', { name: 'Metadata cache size (MB)' }).fill('200');
+  await page.getByRole('textbox', { name: /Reference cache size/ }).fill('1024');
+  await page.getByRole('textbox', { name: 'Metadata cache size (MiB)' }).fill('200');
   await blur(page);
   await page.getByRole('button', { name: 'Review & apply' }).waitFor();
   await center(page.getByText('Caches', { exact: true }));
@@ -126,9 +126,9 @@ export const SYSTEM_SHOTS: Shot[] = [
   {
     id: 'production-caches',
     route: '/_/admin/system',
-    alt: 'The Caches card of the System page holds a reference cache of 1024 MB and a metadata cache of 200 MB; callout 1 marks the two cache fields and callout 2 marks Review & apply.',
+    alt: 'The Caches card of the System page holds a reference cache of 1024 MiB and a metadata cache of 200 MiB; callout 1 marks the two cache fields and callout 2 marks Review & apply.',
     setup: fillCaches,
-    clip: { union: [reviewApply, { text: 'Caches', exact: true }, { role: 'spinbutton', name: /Tokio blocking threads/ }] },
+    clip: { union: [reviewApply, { text: 'Caches', exact: true }, { role: 'textbox', name: /Tokio blocking threads/ }] },
     clipPadding: 40,
     annotations: [
       {

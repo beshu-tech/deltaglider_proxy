@@ -69,12 +69,24 @@
    not per-cell squares with gutters between them. */
 .dg-record-row[data-clickable] { cursor: pointer; }
 .dg-record-row[data-clickable]:hover { background: var(--rl-hover); }
+/* The empty state is an <EmptyState>: it brings its own padding and type. */
 .dg-record-empty {
-  padding: 32px 16px;
-  text-align: center;
-  color: var(--rl-text-muted, #8494ab);
-  font-size: 13px;
+  display: flex;
+  justify-content: center;
 }
+
+/* A row the user just saved: a short flash of the accent, then normal. */
+@keyframes dg-record-flash {
+  from { background: var(--rl-highlight); }
+  to { background: transparent; }
+}
+.dg-record-row[data-highlight] { animation: dg-record-flash 2.4s ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .dg-record-row[data-highlight] { animation: none; background: var(--rl-highlight); }
+}
+/* A row on its way out (staged for removal): dimmed, the name struck. */
+.dg-record-row[data-dimmed] > .dg-record-cell:not([data-col='actions']) { opacity: 0.55; }
+.dg-record-row[data-dimmed] [data-col='rule'] .dg-rule-name { text-decoration: line-through; }
 
 /* Wide table: action buttons are icon-only (label lives in the tooltip),
    so the row breathes instead of being dominated by Pause/Run now/Delete

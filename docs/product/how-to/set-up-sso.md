@@ -50,11 +50,11 @@ In the default IAM mode (`gui`), providers live in the encrypted config database
 
 In the admin UI:
 
-1. In the sidebar, open **Access → External authentication** (`/_/admin/access/external-auth`), and click **Add provider**.
+1. In the sidebar, open **Access → External authentication** (`/_/admin/access/external-auth`), and click **New provider** at the top right of the page.
 2. Fill in the form. **Display name** is the label of the sign-in button (`Okta` gives **Sign in with Okta**). **Provider name** is the unique name in URLs and in YAML (`okta`). **Issuer URL**, **Client ID** and **Client secret** come from step 1. **Scopes** needs at least `openid email`; add `profile`, and `groups` when you map on groups. Leave **Enabled** on.
 3. Click **Create**.
 
-   ![The External authentication page with the form of a new Okta provider; callout 1 marks the Add provider button, callout 2 the provider fields from Display name to Scopes, and callout 3 the Create button.](/_/screenshots/sso-add-provider.webp)
+   ![The External authentication page with the form of a new Okta provider; callout 1 marks the New provider button, callout 2 the provider fields from Display name to Scopes, and callout 3 the Create button.](/_/screenshots/sso-add-provider.webp)
 
 The form shows the **Callback URL** below **Scopes**, with a button that copies it. It is the URL of step 1.
 

@@ -30,7 +30,7 @@ export const BROWSER_SHOTS: Shot[] = [
   {
     id: 'inspector-delta-savings',
     route: `${FW}?object=firmware/widget-3000/fw-1.4.1.tar`,
-    alt: 'The object inspector shows that fw-1.4.1.tar is stored as a delta of about 48 KB for a 3 MB file; the box marks the savings.',
+    alt: 'The object inspector shows that fw-1.4.1.tar is stored as a delta of about 48 KiB for a 3 MiB file; the box marks the savings.',
     annotations: [{ target: { testId: 'inspector-savings' }, kind: 'box' }],
     mask: [{ text: /^\d{1,2}\/\d{1,2}\/\d{4}, / }],
   },

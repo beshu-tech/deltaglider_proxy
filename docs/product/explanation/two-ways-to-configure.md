@@ -15,7 +15,7 @@ The file that the proxy writes is the file that it loaded at startup. When `DGP_
 When you edit the file instead, the running proxy does not notice the edit by itself. You apply the file in one of three ways:
 
 - Restart the proxy, which reads the file again.
-- Send the whole document to `POST /_/api/admin/config/apply`, or paste it into **Import settings YAML** in the account menu of the admin UI.
+- Send the whole document to `POST /_/api/admin/config/apply`, or paste it into **Import settings YAML** in the **Configuration as YAML** card of the **System** page of the admin UI.
 - Run `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example` from your workstation or from CI. The CLI signs in with the bootstrap password from `DGP_BOOTSTRAP_PASSWORD` and sends the document to the same endpoint.
 
 The apply endpoint and the GUI use the same validation and the same write path. An apply that fails validation changes nothing. An apply that succeeds is persisted to the config file in the same way as a GUI change.
@@ -61,7 +61,7 @@ The proxy says so in three places. `GET /_/api/admin/config` reports `config_fil
 
 Users, groups, OAuth providers and group-mapping rules do not live in the config file by default. They live in the encrypted config database, and the setting `access.iam_mode` decides who owns them.
 
-With `iam_mode: gui`, which is the default, the database is the source of truth. You create and change users and groups on the **Users**, **Groups** and **External authentication** pages, and each change goes straight to the database. These pages have no **Review & apply** step. An export of the settings does not include the users, which is why the Users page says that users live in the encrypted database and not in YAML. To copy the IAM state, use **Export full IAM (YAML)** in the account menu, or a full backup.
+With `iam_mode: gui`, which is the default, the database is the source of truth. You create and change users and groups on the **Users**, **Groups** and **External authentication** pages, and each change goes straight to the database. These pages have no **Review & apply** step. An export of the settings does not include the users, which is why the Users page says that users live in the encrypted database and not in YAML. To copy the IAM state, use **Export full IAM (YAML)** in the **Configuration as YAML** card of the **System** page, or a full backup.
 
 With `iam_mode: declarative`, the YAML file is the source of truth. You list users under `access.iam_users`, groups under `access.iam_groups`, and providers and rules next to them. On every apply, a reconciler compares the YAML with the database by name, validates the whole set, and then creates, updates and deletes rows in one database transaction. If validation fails, the database does not change. Because names and not ids identify the rows, a user keeps its database id when you rotate its access key. The IAM pages of the GUI become read-only and say that the YAML config owns the users, and the admin API refuses IAM changes with `403 iam_declarative`.
 
@@ -105,7 +105,7 @@ The two ways also combine. Many operators start with the GUI and move to a file 
 A GUI change can go back into your repository without any retyping:
 
 1. Make the change in the GUI and apply it with **Review & apply**.
-2. Open the account menu in the page header and select **Export settings YAML**, or send `GET /_/api/admin/config/export`. Add `?section=storage` to export one section.
+2. In the sidebar, open **System**, and click **Export settings YAML** in the **Configuration as YAML** card, or send `GET /_/api/admin/config/export`. Add `?section=storage` to export one section.
 3. Commit the exported document, and apply it from the repository from then on.
 
 The export removes every secret, for example the secret keys of the bootstrap credentials and of each backend, the encryption keys, the bootstrap password hash, and the values of webhook headers. It keeps the access key ids, because the operator must see which key is configured, and it keeps every `${env:NAME}` reference, because a reference is not a secret. When you apply the exported document again, the proxy fills each missing secret from the running configuration, so an export, edit and apply cycle does not clear a credential. **Export full IAM (YAML)** is different: it includes live secrets, so handle its output like a password file.
