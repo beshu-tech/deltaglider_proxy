@@ -1123,6 +1123,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        if let Some(warning) =
+            deltaglider_proxy::api::admin::external_auth::oauth_public_url_warning(
+                manager.has_providers(),
+                config.public_url.as_deref(),
+            )
+        {
+            tracing::warn!("{warning}");
+        }
         // Periodic cleanup for expired pending OAuth flows (every 60s)
         spawn_periodic("oauth-pending-cleanup", Duration::from_secs(60), {
             let mgr = manager.clone();

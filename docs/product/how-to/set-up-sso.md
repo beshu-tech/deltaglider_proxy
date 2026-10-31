@@ -4,7 +4,7 @@
 
 ## Prerequisites
 
-- The proxy reachable at a URL the identity provider can redirect to, for example `https://s3.acme.example` in production. `http://localhost:9000` works for testing against providers that accept localhost callbacks.
+- The proxy reachable at a URL the identity provider can redirect to, for example `https://s3.acme.example` in production. `http://localhost:9000` works for testing against providers that accept localhost callbacks. In production, set `advanced.public_url` to that URL, so that the callback URL does not depend on the `Host` header of a request (see the [configuration reference](../reference/configuration.md#public_url)).
 - Admin access to the UI (bootstrap password or an IAM admin like `dana`).
 - An IAM group to map people into. This guide uses `Engineering` (see [How to create IAM users and groups](create-iam-users.md)).
 
@@ -168,7 +168,7 @@ Every successful OAuth login shows as `external_login` in **Observability → Au
 
 These three failures come from the provider side:
 
-1. **`invalid_redirect_uri` at the provider.** The registered URI does not match `https://s3.acme.example/_/api/admin/oauth/callback` byte for byte. Check trailing slashes and `http` versus `https`. If a reverse proxy fronts DeltaGlider, also confirm it forwards the same `Host` header the user sees. The proxy builds the callback URL from the `Host` header. It uses `X-Forwarded-Host` and `X-Forwarded-Proto` only when `DGP_TRUST_PROXY_HEADERS=true` and the request comes from a network in `DGP_TRUSTED_PROXY_CIDRS`, because otherwise any client could choose the host that receives the authorization code.
+1. **`invalid_redirect_uri` at the provider.** The registered URI does not match `https://s3.acme.example/_/api/admin/oauth/callback` byte for byte. Check trailing slashes and `http` versus `https`. If a reverse proxy fronts DeltaGlider, also confirm it forwards the same `Host` header the user sees. When `advanced.public_url` (or `DGP_PUBLIC_URL`) is set, the proxy builds the callback URL from that value only, so the URL is always `<public_url>/_/api/admin/oauth/callback`. Without it, the proxy builds the callback URL from the `Host` header. It uses `X-Forwarded-Host` and `X-Forwarded-Proto` only when `DGP_TRUST_PROXY_HEADERS=true` and the request comes from a network in `DGP_TRUSTED_PROXY_CIDRS`, because otherwise any client could choose the host that receives the authorization code.
 2. **Azure `groups` claim missing.** Azure AD omits groups by default; in the app registration go to Token configuration → Add groups claim, then retry the flow.
 3. **"Code exchange failed" on the error page, or a failed Test connection.** The proxy could not reach the provider. Read the error first: it names the cause (DNS, a refused connection, a refused private address, or a TLS error such as `UnknownIssuer`). A `curl` from the proxy container is not a reliable check. `curl` trusts the operating system's certificate store and connects to private addresses, but the proxy does neither unless you set `ca_cert_path` and `allow_local` (see [An identity provider in a private network](#an-identity-provider-in-a-private-network)). So `curl` can succeed while the proxy fails. If `curl` fails too, fix DNS, the network, or the certificate first, because the problem is not in OAuth.
 

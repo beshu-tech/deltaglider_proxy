@@ -354,6 +354,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         example: "/etc/ssl/private/proxy-key.pem",
         category: "TLS",
     },
+    EnvVarEntry {
+        name: "DGP_PUBLIC_URL",
+        description: "Public base URL of the proxy (advanced.public_url). Pins the OAuth callback URI; the request's Host and X-Forwarded-* headers are then ignored",
+        example: "https://s3.acme.example",
+        category: "Server",
+    },
     // ── Config DB Sync ─────────────────────────────────────
     EnvVarEntry {
         name: "DGP_CONFIG_SYNC_BUCKET",

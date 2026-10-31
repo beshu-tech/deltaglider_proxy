@@ -1574,6 +1574,10 @@ pub struct AdvancedSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sync_object_key: Option<String>,
 
+    /// Public base URL of the proxy; pins the OAuth callback URI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
 
@@ -1794,6 +1798,7 @@ config_projection! {
         blocking_threads,
         config_sync_bucket,
         config_sync_object_key,
+        public_url,
         tls,
         bootstrap_password_hash,
         event_delivery,

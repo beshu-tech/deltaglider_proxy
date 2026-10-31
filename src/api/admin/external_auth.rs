@@ -191,7 +191,7 @@ pub async fn oauth_authorize(
     };
 
     // Build redirect URI from the request's Host header
-    let redirect_uri = build_callback_uri(&req_headers);
+    let redirect_uri = build_callback_uri(&state, &req_headers).await;
 
     let client_ip =
         rate_limiter::extract_client_ip_with_peer(&req_headers, connect_info.map(|ci| ci.0.ip()));
@@ -392,7 +392,7 @@ pub async fn oauth_callback(
     };
 
     // Exchange code for identity
-    let redirect_uri = build_callback_uri(&req_headers);
+    let redirect_uri = build_callback_uri(&state, &req_headers).await;
     let identity = match provider.exchange_code(code, &redirect_uri, &pending).await {
         Ok(id) => id,
         Err(e) => {
@@ -1266,16 +1266,44 @@ fn validate_mapping_rule(match_type: &str, match_value: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// Build the OAuth callback URI from request headers.
-fn build_callback_uri(headers: &HeaderMap) -> String {
-    // The same trust rule as every proxy header: a trusted proxy's peer.
-    build_callback_uri_with(headers, crate::rate_limiter::from_trusted_proxy(None))
+/// Pure: the boot warning for OAuth providers without
+/// `advanced.public_url`. The callback URI then follows the request's
+/// `Host` header, and only the IdP's redirect registration bounds it.
+pub fn oauth_public_url_warning(has_providers: bool, public_url: Option<&str>) -> Option<String> {
+    (has_providers && public_url.is_none()).then(|| {
+        "OAuth providers are configured, but advanced.public_url (DGP_PUBLIC_URL) is not \
+         set: the OAuth callback URI follows the Host header of each request. Set it to the \
+         public URL of the proxy (for example https://s3.acme.example), so that the callback \
+         always goes to that host."
+            .to_string()
+    })
 }
 
-/// Pure core. X-Forwarded-Proto/-Host count only from a trusted proxy
-/// (S23): otherwise any client picks the redirect_uri host, and the IdP (if
-/// it allows that URI) sends the authorization code there.
-fn build_callback_uri_with(headers: &HeaderMap, trust_proxy: bool) -> String {
+/// Build the OAuth callback URI: from `advanced.public_url` when set,
+/// else from the request headers.
+async fn build_callback_uri(state: &AdminState, headers: &HeaderMap) -> String {
+    let public_url = state.config.read().await.public_url.clone();
+    // The same trust rule as every proxy header: a trusted proxy's peer.
+    build_callback_uri_with(
+        public_url.as_deref(),
+        headers,
+        crate::rate_limiter::from_trusted_proxy(None),
+    )
+}
+
+/// Pure core. A `public_url` pins the URI (SEC F-03): `Host` and
+/// `X-Forwarded-*` are then ignored. Without it, X-Forwarded-Proto/-Host
+/// count only from a trusted proxy (S23): otherwise any client picks the
+/// redirect_uri host, and the IdP (if it allows that URI) sends the
+/// authorization code there.
+fn build_callback_uri_with(
+    public_url: Option<&str>,
+    headers: &HeaderMap,
+    trust_proxy: bool,
+) -> String {
+    if let Some(base) = public_url {
+        return format!("{}/_/api/admin/oauth/callback", base.trim_end_matches('/'));
+    }
     let fwd = |name: &str| {
         trust_proxy
             .then(|| headers.get(name))
@@ -1535,13 +1563,32 @@ mod tests {
         h.insert("x-forwarded-host", "evil.example".parse().unwrap());
         h.insert("x-forwarded-proto", "http".parse().unwrap());
         assert_eq!(
-            super::build_callback_uri_with(&h, false),
+            super::build_callback_uri_with(None, &h, false),
             "https://s3.acme.example/_/api/admin/oauth/callback"
         );
         assert_eq!(
-            super::build_callback_uri_with(&h, true),
+            super::build_callback_uri_with(None, &h, true),
             "http://evil.example/_/api/admin/oauth/callback"
         );
+        // SEC F-03: a public_url pins the URI, whatever the headers say.
+        let mut evil = HeaderMap::new();
+        evil.insert(axum::http::header::HOST, "evil.example".parse().unwrap());
+        evil.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        for trust in [false, true] {
+            for base in ["https://s3.acme.example", "https://s3.acme.example/"] {
+                assert_eq!(
+                    super::build_callback_uri_with(Some(base), &evil, trust),
+                    "https://s3.acme.example/_/api/admin/oauth/callback"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oauth_without_public_url_warns() {
+        assert!(super::oauth_public_url_warning(true, None).is_some());
+        assert!(super::oauth_public_url_warning(true, Some("https://s3.acme.example")).is_none());
+        assert!(super::oauth_public_url_warning(false, None).is_none());
     }
 
     #[test]

@@ -231,6 +231,13 @@ pub struct Config {
     #[serde(default)]
     pub config_sync_object_key: Option<String>,
 
+    /// The public base URL of the proxy (`https://s3.acme.example`). When
+    /// set, the OAuth callback URI uses it and ignores the request's
+    /// `Host` and `X-Forwarded-*` headers (SEC F-03). `DGP_PUBLIC_URL`
+    /// overrides it.
+    #[serde(default)]
+    pub public_url: Option<String>,
+
     /// TLS configuration (optional).
     /// When enabled, both the S3 port and the demo UI port serve HTTPS.
     #[serde(default)]
@@ -1076,6 +1083,7 @@ impl Default for Config {
             log_level: default_log_level(),
             config_sync_bucket: None,
             config_sync_object_key: None,
+            public_url: None,
             tls: None,
             buckets: std::collections::BTreeMap::new(),
             backends: Vec::new(),

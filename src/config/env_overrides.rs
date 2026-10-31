@@ -208,6 +208,13 @@ pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
         Some
     ),
     bind!(
+        "DGP_PUBLIC_URL",
+        "advanced.public_url",
+        NonBlankText,
+        public_url,
+        Some
+    ),
+    bind!(
         "DGP_CONFIG_SYNC_KEY",
         "advanced.config_sync_object_key",
         NonBlankText,
@@ -865,7 +872,7 @@ storage:
             );
             bound += 1;
         }
-        assert_eq!(bound, 18);
+        assert_eq!(bound, 19);
     }
 
     /// Drift guard: a variable the overrides read must be shown to the GUI or

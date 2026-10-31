@@ -291,6 +291,10 @@ storage:
 #   codec_concurrency: 16           # xdelta3 processes at once
 #   blocking_threads: 512
 #
+#   # Public URL of the proxy: the OAuth callback URL uses it and ignores
+#   # the request's Host header. Set it when OAuth providers exist.
+#   public_url: "https://s3.acme.example"
+#
 #   # One lease setting for maintenance jobs, lifecycle rules, parity audits
 #   # and rule deletes. Unset: each kind's default (60s / 5m / 30m / 60s).
 #   # Replication keeps storage.replication.lease_ttl.

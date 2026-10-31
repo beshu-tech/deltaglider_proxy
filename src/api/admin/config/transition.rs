@@ -196,6 +196,7 @@ pub(super) fn engine_affecting_fields_changed(
             bootstrap_password_hash,
             log_level,
             config_sync_object_key,
+            public_url,
             replication,
             lifecycle,
             event_delivery,

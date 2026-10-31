@@ -135,6 +135,23 @@ advanced:
   listen_addr: "0.0.0.0:8080"
 ```
 
+### `public_url`
+
+The public base URL of the proxy, as users and the identity provider reach it. When it is set, the proxy builds the OAuth callback URL as `<public_url>/_/api/admin/oauth/callback`, and it ignores the `Host`, `X-Forwarded-Host` and `X-Forwarded-Proto` headers of the request. When it is not set, the proxy builds the callback URL from the `Host` header, so a client can choose the host in that URL, and only the redirect registration at the identity provider limits it. For this reason, the proxy logs a warning at startup when an OAuth provider exists and `public_url` is not set.
+
+| | |
+|---|---|
+| **Env var** | `DGP_PUBLIC_URL` |
+| **YAML** | `advanced.public_url` (sectioned) or root `public_url:` (flat) |
+| **Default** | not set (the callback URL follows the `Host` header) |
+| **Hot-reload** | Yes (read on each OAuth request) |
+
+```yaml
+# validate
+advanced:
+  public_url: "https://s3.acme.example"
+```
+
 ### `log_level`
 
 Tracing filter string (`tracing-subscriber` syntax). `RUST_LOG` overrides it when set. You can change it at runtime in the admin GUI (the **Logging** card of **System → System**), which hot-reloads the filter through the apply pipeline. When `RUST_LOG` or `DGP_LOG_LEVEL` is set, that variable decides the level, so the Logging card shows its value read-only and names the variable. An apply cannot replace that level, because the environment variable wins over the file at every apply, not only at startup.
@@ -1118,6 +1135,7 @@ The server reads these variables when it starts, and again when an admin apply r
 |----------|---------|-------------|
 | `DGP_CONFIG` | auto | Path to the YAML config file (`.yaml` / `.yml`) |
 | `DGP_LISTEN_ADDR` | `0.0.0.0:9000` | HTTP listen address |
+| `DGP_PUBLIC_URL` | not set | Public base URL of the proxy (`advanced.public_url`). The OAuth callback URL uses it and ignores the request headers |
 | `DGP_LOG_LEVEL` | `deltaglider_proxy=info,tower_http=info` | Tracing filter (overridden by `RUST_LOG`) |
 | `DGP_LOG_FORMAT` | `text` | Stdout log format: `text` or `json` (one JSON object per line) |
 | `DGP_LOG_RING_SIZE` | `2000` | In-memory operational-log ring capacity (admin Logs viewer) |
