@@ -96,6 +96,8 @@ You manage everything from a web UI on the same port as the S3 API, without extr
 - Audit logging: the proxy logs every access with the user, IP, action, and resource
 - TLS support: optional, and it auto-detects secure cookies
 
+To report a vulnerability, or to verify the provenance of a release, read [SECURITY.md](SECURITY.md).
+
 ## Quick start
 
 The proxy refuses to start without credentials, so that a deployment is never open by accident. Supply credentials, or explicitly opt into open access:

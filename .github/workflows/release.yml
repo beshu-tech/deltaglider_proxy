@@ -727,10 +727,3 @@ jobs:
             echo "::warning::DockerHub description sync returned HTTP $HTTP_CODE"
             cat /tmp/dh-resp
           fi
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
-        timeout-minutes: 10
-        continue-on-error: true
-        with:
-          subject-path: "artifacts/*.tar.gz"

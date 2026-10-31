@@ -42,9 +42,11 @@ single binary and upgrades are drop-in within a major version).
 
 ## Verifying what you run
 
-Every release ships with a SHA-256 checksum file, a CycloneDX/SPDX
-SBOM, and Sigstore-backed build provenance. Verify a downloaded
-artifact with:
+Every GitHub release ships with a SHA-256 checksum file
+(`SHA256SUMS.txt`), an SPDX SBOM (`sbom-spdx.json`), and Sigstore-backed
+build provenance. The provenance covers the binary archives,
+`SHA256SUMS.txt` and the SBOM. The Docker images carry no provenance or
+SBOM attestation. Verify a downloaded artifact with:
 
 ```
 gh attestation verify deltaglider_proxy-<target>.tar.gz \
