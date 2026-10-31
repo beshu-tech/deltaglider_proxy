@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { Checkbox, Typography } from 'antd';
 import { PURGE_EXPLANATION, PURGE_LABEL } from '../conversionView';
 
@@ -11,7 +11,7 @@ const { Text } = Typography;
  * permanent delete). Without `checked`, the box keeps its own state (a
  * confirm dialog's static content) and reports each change through
  * `onChange`. The label is the Checkbox's child (AntD's own gap); the help
- * is a plain secondary line under it, with no offsets.
+ * is a plain secondary line under it, and the box's accessible description.
  */
 export default function PurgeVersionsBox({
   checked,
@@ -21,12 +21,13 @@ export default function PurgeVersionsBox({
   onChange: (purge: boolean) => void;
 }) {
   const [own, setOwn] = useState(false);
+  const helpId = useId();
   const value = checked ?? own;
   return (
     <div data-testid="conversion-purge">
       <Checkbox
         checked={value}
-        autoFocus={false}
+        aria-describedby={helpId}
         onChange={(e) => {
           setOwn(e.target.checked);
           onChange(e.target.checked);
@@ -34,7 +35,7 @@ export default function PurgeVersionsBox({
       >
         <Text style={{ fontSize: 12 }}>{PURGE_LABEL}</Text>
       </Checkbox>
-      <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
+      <Text id={helpId} type="secondary" style={{ fontSize: 12, display: 'block' }}>
         {PURGE_EXPLANATION}
       </Text>
     </div>

@@ -131,6 +131,33 @@ test('after enabling a bucket key, the page offers the re-encrypt job for that b
   await waitFor(() => expect(screen.getAllByText('Encrypted · bucket key db-archive-2026-10').length).toBeGreaterThan(0));
 });
 
+/** Review of 2026-10-31, finding 8: a small conversion closes in about a
+ *  second, so the refetched list shows no conversion; the apply response
+ *  says that the apply started it, and the page offers no second job. */
+test('a conversion that the apply started and that already closed: no re-encrypt offer', async () => {
+  http.on('PUT', SECTION, () => {
+    applied = true;
+    return json({
+      ok: true,
+      conversions: [{ bucket: 'db-archive', run: 'a'.repeat(32), reused: false, job_id: 9, versioned: false, purge_plaintext_versions: false }],
+    });
+  });
+  renderWithQuery(<BucketsPanel />);
+  const user = await expand('db-archive');
+  await user.click(await screen.findByText('Encrypt with a bucket key'));
+  const key = (screen.getByLabelText('Generated key') as HTMLTextAreaElement).value;
+  await user.type(screen.getByLabelText('Last 6 characters of the key'), key.slice(-6));
+  await user.click(screen.getByRole('button', { name: 'Review & apply' }));
+  const dialog = await screen.findByRole('dialog');
+  await user.click(within(dialog).getByRole('button', { name: /Apply/ }));
+  // The card shows the server's new answer (the refetch ran) ...
+  await waitFor(() => expect(screen.getAllByText('Encrypted · bucket key db-archive-2026-10').length).toBeGreaterThan(0));
+  await waitFor(() => expect(http.callsTo('GET', '/_/api/admin/buckets').length).toBeGreaterThan(1));
+  // ... and offers no job: the apply started one.
+  await new Promise((r) => setTimeout(r, 50));
+  expect(screen.queryByText('Encrypt existing objects?')).toBeNull();
+});
+
 /** Review P2, defect 4: an open editor cannot apply while staged edits wait. */
 test('review & apply waits for staged edits', async () => {
   renderWithQuery(<BucketsPanel />);

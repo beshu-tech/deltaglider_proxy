@@ -28,7 +28,7 @@ import {
   type ReencryptTransition,
 } from '../bucketEncryption';
 import { useColors } from '../ThemeContext';
-import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
+import { useCardStyles, contentColumn, CONTENT_FORM, SPACE } from './shared-styles';
 import SectionHeader from './SectionHeader';
 import PageActions from './PageActions';
 import FormField from './FormField';
@@ -47,6 +47,49 @@ import RowActionsMenu, { type RowActionConfirm } from './RowActionsMenu';
 import { backendEncryptionEnvPath, envOverrideHelp, envOverrideSource, findEnvOverride } from '../envOverrides';
 
 const { Text } = Typography;
+
+/**
+ * A storage write that may start conversions (turning on proxy AES, or
+ * Convert now): validate it, and when it starts any over existing
+ * objects, name how many and ask first, with the purge box for a
+ * versioned bucket. Returns the confirmation headers to apply with, or
+ * `null` when the operator cancelled.
+ */
+async function reviewConversions(
+  title: string,
+  okText: string,
+  body: unknown,
+  confirm: ConfirmHeaders | undefined,
+): Promise<ConfirmHeaders | undefined | null> {
+  const plan = await validateSection('storage', body, confirm);
+  const text = conversionCountText(plan.conversion_preview);
+  if (!plan.ok || !text) return confirm;
+  // The dialog's content is static: the box reports into a local.
+  let purge = false;
+  const ok = await confirmDialog({
+    title,
+    content: (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE.xs }}>
+        <span data-testid="conversion-count">{text}</span>
+        {versionedWarnings(plan.conversion_preview).map((w) => (
+          <Text key={w} type="secondary" data-testid="conversion-versioned">
+            {w}
+          </Text>
+        ))}
+        {offersPurge(plan.conversion_preview) && (
+          <PurgeVersionsBox
+            onChange={(v) => {
+              purge = v;
+            }}
+          />
+        )}
+      </div>
+    ),
+    okText,
+  });
+  if (!ok) return null;
+  return purge ? { ...confirm, purgePlaintextVersions: true } : confirm;
+}
 
 /** Plain-language one-liner for a health verdict (badge + Test result). */
 function healthLabel(h: BackendHealthEntry): string {
@@ -368,38 +411,12 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       // Turning on proxy AES over buckets that hold objects starts their
       // conversion on the server: say how many objects, and ask first.
       if (patch.mode === 'aes256-gcm-proxy') {
-        const plan = await validateSection('storage', body, confirm);
-        const text = conversionCountText(plan.conversion_preview);
-        if (plan.ok && text) {
-          // The dialog's content is static: the box reports into a local.
-          let purge = false;
-          const ok = await confirmDialog({
-            title: `Encrypt backend ${backendName}?`,
-            content: (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                <span data-testid="conversion-count">{text}</span>
-                {versionedWarnings(plan.conversion_preview).map((w) => (
-                  <Text key={w} type="secondary" data-testid="conversion-versioned">
-                    {w}
-                  </Text>
-                ))}
-                {offersPurge(plan.conversion_preview) && (
-                  <PurgeVersionsBox
-                    onChange={(v) => {
-                      purge = v;
-                    }}
-                  />
-                )}
-              </div>
-            ),
-            okText: 'Encrypt',
-          });
-          if (!ok) {
-            resultSet = true;
-            throw new Error('cancelled');
-          }
-          if (purge) confirm = { ...confirm, purgePlaintextVersions: true };
+        const reviewed = await reviewConversions(`Encrypt backend ${backendName}?`, 'Encrypt', body, confirm);
+        if (reviewed === null) {
+          resultSet = true;
+          throw new Error('cancelled');
         }
+        confirm = reviewed;
       }
       const result = await applySection(qc, 'storage', body, version, confirm);
       if (!result.ok) {
@@ -470,7 +487,11 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const handleConvertNow = async (backendName: string): Promise<void> => {
     try {
       const { body: storage, version } = await getSectionVersioned<StorageSectionBackends>('storage');
-      const result = await applySection(qc, 'storage', buildConvertNowSectionBody(backendName, storage), version);
+      const body = buildConvertNowSectionBody(backendName, storage);
+      // Like turning encryption on: name the objects and ask first.
+      const confirm = await reviewConversions(`Convert the buckets of backend ${backendName}?`, 'Convert', body, undefined);
+      if (confirm === null) return;
+      const result = await applySection(qc, 'storage', body, version, confirm);
       if (!result.ok) {
         setSaveResult({ ok: false, message: result.error || 'Failed to change the backend' });
         return;

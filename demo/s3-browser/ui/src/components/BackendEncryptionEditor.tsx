@@ -269,10 +269,12 @@ export default function BackendEncryptionEditor({
                 {usage}
               </Text>
             )}
-            {/* The conversions of its buckets: part of the status block. */}
+            {/* The conversions of its buckets: part of the status block.
+               Resume is a job request, not a config write: offered also
+               when an env var makes the encryption read-only. */}
             {!pending &&
               (conversions ?? []).map((c) => (
-                <ConversionStatusLine key={c.bucket} bucket={c.bucket} view={c.view} readOnly={readOnly} />
+                <ConversionStatusLine key={c.bucket} bucket={c.bucket} view={c.view} />
               ))}
           </div>
         </div>

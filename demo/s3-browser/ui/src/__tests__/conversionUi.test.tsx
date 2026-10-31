@@ -15,7 +15,6 @@ import BucketEncryptionGroup from '../components/BucketEncryptionGroup';
 import PurgeVersionsBox from '../components/PurgeVersionsBox';
 import type { ConversionView, EffectiveEncryption } from '../adminApi';
 import { NavigationContext } from '../NavigationContext';
-import { useBucketOrigins } from '../queries/backends';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 import { bucketKeyEff, eff } from '../test/encryption';
@@ -80,7 +79,7 @@ test('the dialog names the objects the job encrypts, that they stay readable, an
     'The 1,204 objects already in bucket db-archive are not encrypted yet. After you apply, a re-encrypt job encrypts them in the background. They stay readable while the job runs.',
   );
   expect(within(dialog).getByTestId('conversion-versioned')).toHaveTextContent(
-    /keeps old versions of bucket db-archive.*noncurrent versions/,
+    /keeps old versions of bucket db-archive.*old unencrypted versions stay/,
   );
   // The old "refuse after the job" advice is gone.
   expect(dialog).not.toHaveTextContent(/Refuse unencrypted objects/);
@@ -158,8 +157,8 @@ test('running: the progress of this node\'s job and a link to the run, no Resume
   // On the state line, as its continuation: one block, one hierarchy.
   expect(screen.getByText(/^Now:/)).toContainElement(row);
   expect(screen.getByText(/^Now:/)).toHaveTextContent(/^Now: .* · encrypting the existing objects, 42% · View run$/);
-  expect(within(row).queryByRole('button', { name: 'Resume' })).toBeNull();
-  await user.click(within(row).getByRole('button', { name: 'View run' }));
+  expect(within(row).queryByRole('button', { name: /^Resume/ })).toBeNull();
+  await user.click(within(row).getByRole('button', { name: 'View the run of db-archive' }));
   expect(navigate).toHaveBeenCalledWith('/_/admin/jobs?job=maintenance%3A7');
 });
 
@@ -173,8 +172,8 @@ test('no job on this node: Resume starts the re-encrypt job of the bucket', asyn
   renderGroup(bucketKeyEff({ conversion: view() }));
   const row = screen.getByTestId('conversion-status');
   expect(row).toHaveAttribute('data-state', 'resume');
-  expect(row).toHaveTextContent(/no job runs on this instance/);
-  await user.click(within(row).getByRole('button', { name: 'Resume' }));
+  expect(row).toHaveTextContent(/this proxy runs no re-encrypt job/);
+  await user.click(within(row).getByRole('button', { name: 'Resume the conversion of db-archive' }));
   await waitFor(() => expect(http.callsTo('POST', REENCRYPT)).toHaveLength(1));
   expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'] });
 });
@@ -184,7 +183,7 @@ test('a failed job offers Resume', () => {
   const row = screen.getByTestId('conversion-status');
   expect(row).toHaveAttribute('data-state', 'resume');
   expect(row).toHaveTextContent(/stopped with failures/);
-  expect(within(row).getByRole('button', { name: 'Resume' })).toBeInTheDocument();
+  expect(within(row).getByRole('button', { name: 'Resume the conversion of db-archive' })).toBeInTheDocument();
 });
 
 test('deadline passed: a warning that the conversion stopped before it finished, and Resume', () => {
@@ -195,7 +194,7 @@ test('deadline passed: a warning that the conversion stopped before it finished,
   expect(row).toHaveAttribute('data-state', 'stopped');
   expect(row).toHaveTextContent('the conversion stopped before it finished');
   expect(row.querySelector('.ant-typography-warning')).not.toBeNull();
-  expect(within(row).getByRole('button', { name: 'Resume' })).toBeInTheDocument();
+  expect(within(row).getByRole('button', { name: 'Resume the conversion of db-archive' })).toBeInTheDocument();
 });
 
 test('objects stored after the cutoff are counted, with a link to the run\'s failures', async () => {
@@ -206,7 +205,7 @@ test('objects stored after the cutoff are counted, with a link to the run\'s fai
     }),
   );
   const row = screen.getByTestId('conversion-status');
-  await user.click(within(row).getByRole('button', { name: '3 objects stored after the cutoff' }));
+  await user.click(within(row).getByRole('button', { name: '3 objects were stored after encryption started; they were encrypted too (see the run)' }));
   expect(navigate).toHaveBeenCalledWith('/_/admin/jobs?job=maintenance%3A7&tab=failures');
 });
 
@@ -216,12 +215,14 @@ test('no marker: no row', () => {
 });
 
 test('a bucket with the deprecated serve: Convert now removes the line', async () => {
+  http.on('POST', VALIDATE, json({ ok: true, diff: { storage: { 'buckets.db-archive.encryption.plaintext_reads': { before: 'serve', after: null } } } }));
   const user = userEvent.setup();
   renderGroup(bucketKeyEff({ conversion: view({ run: undefined, open: false, serves_plaintext_deprecated: true }) }));
   expect(screen.queryByTestId('conversion-status')).toBeNull();
   const notice = screen.getByTestId('serve-deprecation-notice');
   expect(notice).toHaveTextContent(/next release no longer accepts/);
   await user.click(within(notice).getByRole('button', { name: 'Convert now' }));
+  await user.click(within(await screen.findByRole('dialog')).getByTestId('apply-dialog-confirm'));
   await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
   expect(http.callsTo('PUT', SECTION)[0].body).toEqual({
     buckets: { 'db-archive': { encryption: { plaintext_reads: null } } },
@@ -326,28 +327,197 @@ test('a backend over a versioned bucket: the ticked purge box sends the purge he
 });
 
 /** The visual review's bug: a job that finished left "encrypting…" on the
- *  card until a reload. The bucket list refetches while a conversion runs,
- *  so the state follows the job, and goes away when the window closes. */
-test('a running conversion follows the job to its close with no reload', async () => {
-  let calls = 0;
-  http.on('GET', '/_/api/admin/buckets', () => {
-    calls += 1;
-    const conversion = calls === 1 ? view({ job_on_this_node: { id: 7, status: 'running', percent: null } }) : undefined;
-    return json({
-      buckets: [{ name: 'db-archive', backend_name: 'hetzner-fsn1', effective_encryption: bucketKeyEff({ conversion }) }],
-    });
-  });
-  function Harness() {
-    const origins = useBucketOrigins();
-    const e = origins.data?.buckets[0]?.effective_encryption;
-    return e ? <BucketEncryptionGroup bucket="db-archive" eff={e} onApplied={vi.fn()} /> : null;
-  }
-  renderWithQuery(<Harness />);
-  expect(await screen.findByTestId('conversion-status')).toHaveAttribute('data-state', 'running');
-  await waitFor(() => expect(screen.queryByTestId('conversion-status')).toBeNull(), { timeout: 6_000 });
+ *  card until a reload. The refetch itself runs on fake timers in
+ *  useBucketOrigins.polling.test.tsx; here, the card follows a new
+ *  answer: the status goes away when the conversion ends. */
+test('a running conversion goes away from the card when the list says it ended', () => {
+  const running = bucketKeyEff({ conversion: view({ job_on_this_node: { id: 7, status: 'running', percent: null } }) });
+  const { rerender } = renderWithQuery(
+    <NavigationContext.Provider value={{ navigate: vi.fn(), subPath: '' } as never}>
+      <BucketEncryptionGroup bucket="db-archive" eff={running} onApplied={vi.fn()} />
+    </NavigationContext.Provider>,
+  );
+  expect(screen.getByTestId('conversion-status')).toHaveAttribute('data-state', 'running');
+  rerender(
+    <NavigationContext.Provider value={{ navigate: vi.fn(), subPath: '' } as never}>
+      <BucketEncryptionGroup bucket="db-archive" eff={bucketKeyEff()} onApplied={vi.fn()} />
+    </NavigationContext.Provider>,
+  );
+  expect(screen.queryByTestId('conversion-status')).toBeNull();
   expect(screen.getByText(/^Now:/)).toHaveTextContent(/^Now: .*\.$/);
-  const after = calls;
-  // Closed: no more polling.
-  await new Promise((r) => setTimeout(r, 3_500));
-  expect(calls).toBe(after);
-}, 15_000);
+});
+
+// ---------------------------------------------------------------------------
+// Review of 2026-10-31 (one test per confirmed finding).
+
+/** The date as the UI writes it ("readable until <date>"). */
+function untilDate(seconds: number): string {
+  return new Date(seconds * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+/** Finding 1: an env var sets the key, so the encryption is read-only; a
+ *  Resume is a job request, not a config write, and stays. */
+test('review 1: a bucket whose key comes from an env var keeps Resume', () => {
+  renderGroup(bucketKeyEff({ key_env: 'DGP_BUCKET_DB_ARCHIVE_KEY', conversion: view({ open: false }) }));
+  expect(screen.getByTestId('conversion-status')).toHaveAttribute('data-state', 'stopped');
+  expect(screen.getByRole('button', { name: /^Resume/ })).toBeInTheDocument();
+});
+
+test('review 1: a backend whose key comes from an env var keeps Resume', () => {
+  renderWithQuery(
+    <BackendEncryptionEditor
+      backendName="hetzner-fsn1"
+      current={{ mode: 'aes256-gcm-proxy', has_key: true, key_id: 'k', shim_active: false }}
+      onApply={vi.fn()}
+      readOnly
+      conversions={[{ bucket: 'releases', view: view() }]}
+    />,
+  );
+  expect(screen.getByRole('button', { name: /^Resume/ })).toBeInTheDocument();
+});
+
+/** Finding 2: Resume of a versioned bucket asks about the old versions
+ *  and sends the choice; elsewhere it stays one click. */
+test('review 2: Resume of a versioned bucket asks about the old versions and sends the choice', async () => {
+  const user = userEvent.setup();
+  renderGroup(bucketKeyEff({ conversion: view({ versioned: true }) }));
+  await user.click(screen.getByRole('button', { name: /^Resume/ }));
+  const dialog = await screen.findByRole('dialog');
+  const box = within(dialog).getByRole('checkbox', { name: /^Also delete the old unencrypted versions/ });
+  expect(box).not.toBeChecked();
+  expect(document.activeElement).not.toBe(box);
+  expect(http.callsTo('POST', REENCRYPT)).toHaveLength(0);
+  await user.click(box);
+  await user.click(within(dialog).getByRole('button', { name: 'Resume' }));
+  await waitFor(() => expect(http.callsTo('POST', REENCRYPT)).toHaveLength(1));
+  expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'], purge_plaintext_versions: true });
+});
+
+test('review 2: Resume of a bucket without versions is one click', async () => {
+  const user = userEvent.setup();
+  renderGroup(bucketKeyEff({ conversion: view({ versioned: false }) }));
+  await user.click(screen.getByRole('button', { name: /^Resume/ }));
+  await waitFor(() => expect(http.callsTo('POST', REENCRYPT)).toHaveLength(1));
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'] });
+});
+
+/** Finding 3: Convert now starts a conversion like turning encryption on,
+ *  so it goes through the same validate and review. */
+test('review 3: bucket Convert now validates, shows the review dialog, then applies', async () => {
+  http.on('POST', VALIDATE, json({
+    ok: true,
+    diff: { storage: { 'buckets.db-archive.encryption.plaintext_reads': { before: 'serve', after: null } } },
+    conversion_preview: [{ bucket: 'db-archive', objects: 3, more: false, versioned: true }],
+  }));
+  const user = userEvent.setup();
+  renderGroup(bucketKeyEff({ conversion: view({ run: undefined, open: false, serves_plaintext_deprecated: true }) }));
+  await user.click(within(screen.getByTestId('serve-deprecation-notice')).getByRole('button', { name: 'Convert now' }));
+  const dialog = await screen.findByRole('dialog');
+  expect(http.callsTo('POST', VALIDATE)).toHaveLength(1);
+  expect(http.callsTo('PUT', SECTION)).toHaveLength(0);
+  expect(within(dialog).getByTestId('conversion-count')).toHaveTextContent(/^The 3 objects already in bucket db-archive/);
+  await user.click(within(dialog).getByRole('checkbox', { name: /^Also delete the old unencrypted versions/ }));
+  await user.click(within(dialog).getByTestId('apply-dialog-confirm'));
+  await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
+  expect(http.callsTo('PUT', SECTION)[0].body).toEqual({ buckets: { 'db-archive': { encryption: { plaintext_reads: null } } } });
+  expect(http.callsTo('PUT', SECTION)[0].headers['x-dgp-purge-plaintext-versions']).toBe('true');
+});
+
+test('review 3: backend Convert now validates and asks first; Cancel sends nothing', async () => {
+  const backend = {
+    name: 'hetzner-fsn1', backend_type: 's3', path: null, endpoint: 'https://fsn1.example', region: 'eu-central-1',
+    force_path_style: true, has_credentials: true,
+    encryption: { mode: 'aes256-gcm-proxy', has_key: true, key_id: 'k', shim_active: false, serves_plaintext_deprecated: true },
+  };
+  http.on('GET', '/_/api/admin/config', json({ env_overrides: [], max_delta_ratio: 0.75 }));
+  http.on('GET', '/_/api/admin/backends', json({ backends: [backend], default_backend: 'hetzner-fsn1' }));
+  http.on('GET', '/_/api/admin/buckets', json({ buckets: [] }));
+  http.on('GET', SECTION, json({ backends: [{ name: 'hetzner-fsn1', type: 's3', encryption: { mode: 'aes256-gcm-proxy', plaintext_reads: 'serve' } }] }));
+  http.on('GET', '/_/api/admin/jobs', json({ jobs: [] }));
+  http.on('POST', VALIDATE, json({ ok: true, conversion_preview: [{ bucket: 'releases', objects: 5, more: false, versioned: false }] }));
+  const user = userEvent.setup();
+  renderWithQuery(<BackendsPanel />);
+  await user.click(within(await screen.findByTestId('serve-deprecation-notice')).getByRole('button', { name: 'Convert now' }));
+  const dialog = await screen.findByRole('dialog');
+  expect(http.callsTo('POST', VALIDATE)).toHaveLength(1);
+  expect(within(dialog).getByTestId('conversion-count')).toHaveTextContent(/^The 5 objects already in bucket releases/);
+  await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(http.callsTo('PUT', SECTION)).toHaveLength(0);
+});
+
+/** Finding 4: the versioning note shows once, in plain words. */
+test('review 4: the bucket dialog shows the versioning note once, with no header name', async () => {
+  const server =
+    "bucket 'db-archive' keeps old versions on its backend (versioning is enabled or suspended): the job converts the current objects, and their plaintext versions stay on the backend as noncurrent versions, unless the write asks the job to delete them (the header X-DGP-Purge-Plaintext-Versions: true, or the box in the admin UI's dialog). A deleted version cannot be restored";
+  http.on('POST', VALIDATE, json({
+    ok: true,
+    warnings: [server, 'another warning'],
+    diff: { storage: { 'buckets.db-archive.encryption.mode': { before: 'none', after: 'aes256-gcm-proxy' } } },
+    conversion_preview: [{ bucket: 'db-archive', objects: 3, more: false, versioned: true }],
+  }));
+  const user = userEvent.setup();
+  renderGroup(eff());
+  await user.click(screen.getByText('Encrypt with a bucket key'));
+  const key = (screen.getByLabelText('Generated key') as HTMLTextAreaElement).value;
+  await user.type(screen.getByLabelText('Last 6 characters of the key'), key.slice(-6));
+  const review = screen.getByRole('button', { name: 'Review & apply' });
+  await waitFor(() => expect(review).toBeEnabled());
+  await user.click(review);
+  const dialog = await screen.findByRole('dialog');
+  expect(within(dialog).getAllByText(/keeps old versions/)).toHaveLength(1);
+  expect(dialog).not.toHaveTextContent(/X-DGP-/);
+  // Other warnings stay.
+  expect(dialog).toHaveTextContent('another warning');
+});
+
+/** Finding 6: a cancelled job is not a failure; the count of objects
+ *  stored after the start shows also when the job ran on another node. */
+test('review 6: a cancelled job reads as cancelled, not as failures', () => {
+  renderGroup(bucketKeyEff({ conversion: view({ job_on_this_node: { id: 7, status: 'cancelled', percent: 40 } }) }));
+  const row = screen.getByTestId('conversion-status');
+  expect(row).toHaveTextContent(/re-encrypt job was cancelled/);
+  expect(row).not.toHaveTextContent(/failures/);
+});
+
+test('review 6: objects stored after encryption started are counted when the job ran elsewhere', () => {
+  renderGroup(bucketKeyEff({ conversion: view({ adopted_after_cutoff: 5 }) }));
+  const row = screen.getByTestId('conversion-status');
+  expect(row).toHaveTextContent('5 objects were stored after encryption started; they were encrypted too');
+  // No run here to link to.
+  expect(within(row).queryByRole('button', { name: /stored after/ })).toBeNull();
+});
+
+/** Finding 7: unique names for per-bucket buttons, the date in the text,
+ *  plain words, and the purge box's help tied to it. */
+test('review 7: per-bucket buttons on the backend card have unique accessible names', () => {
+  renderWithQuery(
+    <BackendEncryptionEditor
+      backendName="hetzner-fsn1"
+      current={{ mode: 'aes256-gcm-proxy', has_key: true, key_id: 'k', shim_active: false }}
+      onApply={vi.fn()}
+      conversions={[
+        { bucket: 'releases', view: view({ job_on_this_node: { id: 3, status: 'failed', percent: 10 } }) },
+        { bucket: 'downloads', view: view({ job_on_this_node: { id: 4, status: 'failed', percent: 10 } }) },
+      ]}
+    />,
+  );
+  expect(screen.getByRole('button', { name: 'Resume the conversion of releases' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Resume the conversion of downloads' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'View the run of releases' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'View the run of downloads' })).toBeInTheDocument();
+});
+
+test('review 7: the deadline is in the visible text, with no jargon', () => {
+  renderGroup(bucketKeyEff({ conversion: view() }));
+  const row = screen.getByTestId('conversion-status');
+  expect(row).toHaveTextContent(`unencrypted objects stay readable until ${untilDate(1_793_604_800)}`);
+  expect(row).not.toHaveTextContent(/window|cutoff|this instance/);
+});
+
+test('review 7: the purge box help is its description', () => {
+  renderWithQuery(<PurgeVersionsBox onChange={vi.fn()} />);
+  const box = screen.getByRole('checkbox', { name: /^Also delete the old unencrypted versions/ });
+  expect(box).toHaveAccessibleDescription(/This cannot be undone/);
+});

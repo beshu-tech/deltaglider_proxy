@@ -381,14 +381,19 @@ export async function previewLifecycleJob(id: string, fresh = false): Promise<Li
   return (await runJobAction(id, 'preview', fresh ? '?fresh=true' : '')) as LifecyclePreview;
 }
 
-/** Queue re-encryption jobs for the given buckets. */
-export async function startReencrypt(buckets: string[]): Promise<{
+/** Queue re-encryption jobs for the given buckets. `purgePlaintextVersions`:
+ *  after a run that encrypts every object, the job deletes the old
+ *  unencrypted versions (a versioned backend); sent only when true. */
+export async function startReencrypt(
+  buckets: string[],
+  opts?: { purgePlaintextVersions?: boolean },
+): Promise<{
   started: Array<{ bucket: string; job_id: number }>;
   errors: Array<{ bucket: string; error: string }>;
 }> {
   return adminJson('/api/admin/jobs/reencrypt', {
     method: 'POST',
-    body: { buckets },
+    body: opts?.purgePlaintextVersions ? { buckets, purge_plaintext_versions: true } : { buckets },
     context: 'Start re-encryption',
   });
 }

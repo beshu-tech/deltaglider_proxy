@@ -87,7 +87,7 @@ interface CardProps {
   /** Why the Encryption group cannot apply now (unsaved staged edits). */
   encryptionBlockedReason?: string | null;
   /** After the Encryption group applied a change. */
-  onEncryptionApplied?: (before: EffectiveEncryption) => void;
+  onEncryptionApplied?: (before: EffectiveEncryption, converting: boolean) => void;
   /** Global compression default — for resolved labels. */
   globalCompressionOn: boolean;
   globalRatio: number;

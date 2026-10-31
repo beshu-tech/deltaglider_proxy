@@ -306,13 +306,15 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
   // An encryption change of one bucket applied at once (its own section
   // PUT): re-read the section and the origins, then offer the re-encrypt
   // job when the server's answer for the bucket changed.
-  const onEncryptionApplied = async (bucket: string, before: EffectiveEncryption) => {
+  const onEncryptionApplied = async (bucket: string, before: EffectiveEncryption, converting: boolean) => {
     // Rebase, not reset: staged edits (if any appeared meanwhile) survive.
     await rebase();
     const res = await originsQuery.refetch();
-    const after = res.data?.buckets.find((o) => o.name === bucket)?.effective_encryption ?? null;
     // The apply started the conversion (window + job): nothing to offer.
-    if (after?.conversion?.run) return;
+    // The apply response says so; the refetch cannot (a small conversion
+    // ends in about a second, before the refetch).
+    const after = res.data?.buckets.find((o) => o.name === bucket)?.effective_encryption ?? null;
+    if (converting || after?.conversion?.run) return;
     const changed = bucketsWhoseEncryptionChanged(
       [{ name: bucket, effective_encryption: before }],
       [{ name: bucket, effective_encryption: after }]
@@ -433,7 +435,7 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
                     ? `Apply or discard the unsaved changes of ${name} first: an encryption change applies at once.`
                     : null
                 }
-                onEncryptionApplied={(before) => void onEncryptionApplied(name, before)}
+                onEncryptionApplied={(before, converting) => void onEncryptionApplied(name, before, converting)}
                 globalCompressionOn={globalCompressionOn}
                 globalRatio={globalRatio}
                 defaultDeltaExtensions={defaultDeltaExtensions}

@@ -56,9 +56,10 @@ import BucketKeySetup, { type BucketKeyValue } from './BucketKeySetup';
 import LegacyKeyBanner from './LegacyKeyBanner';
 import { ConversionStatusInline } from './ConversionStatus';
 import ServeDeprecationNotice from './ServeDeprecationNotice';
-import { conversionCountText, conversionRowState, offersPurge, versionedWarnings } from '../conversionView';
+import { conversionCountText, conversionRowState, offersPurge, versionedWarnings, withoutVersionedNotes } from '../conversionView';
 import PurgeVersionsBox from './PurgeVersionsBox';
 import { formRow } from './ruleEditorHelpers';
+import { SPACE } from './shared-styles';
 
 const { Text } = Typography;
 
@@ -74,8 +75,11 @@ interface Props {
   /** Set while the card's staged edits are unsaved: an encryption change
    *  applies at once, so it waits for those to be applied or discarded. */
   blockedReason?: string | null;
-  /** After a successful apply: the parent refreshes and offers re-encrypt. */
-  onApplied: (before: EffectiveEncryption) => void;
+  /** After a successful apply: the parent refreshes and offers re-encrypt.
+   *  `converting`: the apply started (or reused) the bucket's conversion,
+   *  so its job exists already (from the apply response, not a refetch: a
+   *  small conversion can end before the refetch). */
+  onApplied: (before: EffectiveEncryption, converting: boolean) => void;
 }
 
 const CHOICE_TITLE: Record<BucketEncryptionChoice, string> = {
@@ -106,13 +110,13 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
     fontWeight: 600,
     fontFamily: 'var(--font-ui)',
     display: 'block',
-    marginBottom: 8,
+    marginBottom: SPACE.xs,
     color: colors.TEXT_MUTED,
   };
 
   if (!eff) {
     return (
-      <div style={{ marginTop: 12 }}>
+      <div style={{ marginTop: SPACE.sm }}>
         <Text style={groupLabel}>Encryption</Text>
         <Text type="secondary" style={{ fontSize: 12 }}>
           {describeBucketEncryption(eff).tooltip}
@@ -203,7 +207,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         message.success(`Encryption of ${bucket} updated. A re-encrypt job encrypts its existing objects in the background.`);
       else message.success(`Encryption of ${bucket} updated`);
       cancel();
-      onApplied(eff);
+      onApplied(eff, (resp.conversions ?? []).some((c) => c.bucket === bucket));
       return true;
     } catch (e) {
       // A version conflict has its own sentence; any other failure is plain words.
@@ -221,6 +225,12 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
   const change = editing ? pendingChange() : null;
   const conversionText = conversionCountText(dialog?.response.conversion_preview);
   const versioned = versionedWarnings(dialog?.response.conversion_preview);
+  // The summary says the versioning note in its own words: the dialog's
+  // warning list drops the server's copy (it names an HTTP header).
+  const dialogResponse = dialog && {
+    ...dialog.response,
+    warnings: withoutVersionedNotes(dialog.response.warnings, dialog.response.conversion_preview),
+  };
   const enabling = change ? !eff.encrypts && change.kind !== 'off' && change.kind !== 'clear-legacy' && (change.kind !== 'inherit' || eff.inherited.encrypts) : false;
   const summary = dialog && (
     <Space orientation="vertical" size={6} style={{ width: '100%', fontSize: 12 }}>
@@ -250,7 +260,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
       {offersPurge(dialog.response.conversion_preview) && (
         <PurgeVersionsBox checked={purge} onChange={setPurge} />
       )}
-      {(enabling || dialog.change.kind === 'bucket-key') && (
+      {(enabling || dialog.change.kind === 'bucket-key' || conversionText) && (
         <Text type="warning" style={{ fontSize: 12 }}>
           While the re-encrypt job runs on the bucket, reads keep working, but uploads and deletes
           get a temporary 503 (S3 clients retry automatically).
@@ -265,7 +275,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
   );
 
   return (
-    <div style={{ marginTop: 12 }} data-testid="bucket-encryption-group">
+    <div style={{ marginTop: SPACE.sm }} data-testid="bucket-encryption-group">
       <Text style={groupLabel}>
         Encryption
         {/* Marks the one immediate control of a card whose other fields are
@@ -282,17 +292,19 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           </Tag>
         )}
       </Text>
-      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: SPACE.xs }}>
         Now: {desc.label}
         {/* The conversion continues the state line; no separate block. */}
         {!editing && conversionRowState(eff.conversion) ? (
-          <ConversionStatusInline bucket={bucket} view={eff.conversion} readOnly={readOnly} />
+          // Resume is a job request, not a config write: offered also
+          // when an env var makes the encryption read-only.
+          <ConversionStatusInline bucket={bucket} view={eff.conversion} />
         ) : (
           '.'
         )}
       </Text>
       {blockedReason && !readOnly && (
-        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: SPACE.xs }}>
           {blockedReason}
         </Text>
       )}
@@ -342,7 +354,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         <Button
           size="small"
           icon={<ReloadOutlined />}
-          style={{ marginTop: 8 }}
+          style={{ marginTop: SPACE.xs }}
           disabled={!!rotateBlocked || !!blockedReason}
           title={rotateBlocked ?? undefined}
           onClick={() => setRotating(true)}
@@ -355,7 +367,9 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         <ServeDeprecationNotice
           subject="bucket"
           disabled={readOnly || !!blockedReason || busy}
-          onConvert={() => apply({ kind: 'convert-now' })}
+          // Like turning encryption on: validate, then the review dialog
+          // (object count, versioning note, purge box), then apply.
+          onConvert={() => review({ kind: 'convert-now' })}
         />
       )}
 
@@ -371,7 +385,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
       )}
 
       {editing && (
-        <div style={{ marginTop: 12, paddingLeft: 4 }}>
+        <div style={{ marginTop: SPACE.sm, paddingLeft: SPACE.xxs }}>
           {(rotating || selected === 'bucket-key') && (
             <BucketKeySetup
               bucket={bucket}
@@ -390,7 +404,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
                 placeholder="arn:aws:kms:eu-central-1:123456789012:key/abcd-efgh"
                 style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}
               />
-              <Checkbox checked={bucketKeyEnabled} onChange={(e) => setBucketKeyEnabled(e.target.checked)} style={{ marginTop: 8 }}>
+              <Checkbox checked={bucketKeyEnabled} onChange={(e) => setBucketKeyEnabled(e.target.checked)} style={{ marginTop: SPACE.xs }}>
                 <Text style={{ fontSize: 12 }}>Enable S3 bucket keys (fewer KMS requests)</Text>
               </Checkbox>
             </>
@@ -404,8 +418,8 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
               description="Objects that are already encrypted stay readable. Run the re-encrypt job afterwards to decrypt them."
             />
           )}
-          {error && <PlainErrorAlert error={error} style={{ marginTop: 8 }} />}
-          <Space style={{ marginTop: 12 }}>
+          {error && <PlainErrorAlert error={error} style={{ marginTop: SPACE.xs }} />}
+          <Space style={{ marginTop: SPACE.sm }}>
             <Button size="small" onClick={cancel} disabled={busy}>
               Cancel
             </Button>
@@ -424,12 +438,12 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           </Space>
         </div>
       )}
-      {!editing && error && <PlainErrorAlert error={error} style={{ marginTop: 8 }} />}
+      {!editing && error && <PlainErrorAlert error={error} style={{ marginTop: SPACE.xs }} />}
 
       <ApplyDialog
         open={dialog !== null}
         section="storage"
-        response={dialog?.response ?? null}
+        response={dialogResponse ?? null}
         summary={summary}
         loading={busy}
         onCancel={() => setDialog(null)}

@@ -10,7 +10,7 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { getBackends, getBucketOrigins, getLegacyKeyUsage } from '../adminApi';
 import { qk } from './keys';
-import { CONVERSION_POLL_MS, conversionNeedsPolling } from '../conversionView';
+import { conversionPollMs } from '../conversionView';
 
 /**
  * The server re-probes every backend every 30 s and marks one unhealthy as
@@ -38,9 +38,12 @@ export function useBucketOrigins(opts?: { enabled?: boolean }) {
     queryKey: qk.backends.origins(),
     queryFn: getBucketOrigins,
     enabled: opts?.enabled ?? true,
-    // While a conversion runs or waits for Resume, follow it: the job ends
-    // (the row goes away) or progresses without a click on this page.
-    refetchInterval: (query) => (conversionNeedsPolling(query.state.data?.buckets) ? CONVERSION_POLL_MS : false),
+    // Follow a conversion that changes without a click: a running job
+    // (3 s), or a deadline that passes (`conversionPollMs`). The interval
+    // is per observer, but every query update re-arms all of them, so the
+    // observers of this one query share one cadence
+    // (useBucketOrigins.polling.test.tsx).
+    refetchInterval: (query) => conversionPollMs(query.state.data?.buckets, Date.now()),
   });
 }
 

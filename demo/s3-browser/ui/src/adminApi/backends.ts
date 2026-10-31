@@ -75,6 +75,10 @@ export interface ConversionView {
   job_on_this_node: { id: number; status: string; percent: number | null } | null;
   /** The bucket (or its backend) sets the deprecated `plaintext_reads: serve`. */
   serves_plaintext_deprecated: boolean;
+  /** The backend keeps old versions of the bucket: Resume asks whether
+   *  the job deletes the old unencrypted ones. Absent = unknown (Resume
+   *  asks nothing). */
+  versioned?: boolean;
 }
 
 interface BucketOriginListResponse {

@@ -31,14 +31,27 @@ export function conversionCountText(previews: readonly ConversionPreview[] | und
   return `${objects} already in ${where} ${verb} not encrypted yet. After you apply, a re-encrypt job encrypts them in the background. They stay readable while the job runs.`;
 }
 
-/** The versioning warning of each versioned bucket in `previews`. */
+/** The versioning note of each versioned bucket in `previews`, in plain words. */
 export function versionedWarnings(previews: readonly ConversionPreview[] | undefined): string[] {
   return (previews ?? [])
     .filter((p) => p.versioned)
     .map(
       (p) =>
-        `The backend keeps old versions of bucket ${p.bucket}. The job encrypts the current objects, and their plaintext versions stay on the backend as noncurrent versions.`,
+        `The backend keeps old versions of bucket ${p.bucket}. The job encrypts the current objects; their old unencrypted versions stay on the backend.`,
     );
+}
+
+/**
+ * The server's warnings without its versioning note of each versioned
+ * bucket in `previews`: the dialog says it once, in its own words (the
+ * server's text names an HTTP header, for API clients).
+ */
+export function withoutVersionedNotes(
+  warnings: readonly string[] | undefined,
+  previews: readonly ConversionPreview[] | undefined,
+): string[] {
+  const notes = (previews ?? []).filter((p) => p.versioned).map((p) => `bucket '${p.bucket}' keeps old versions`);
+  return (warnings ?? []).filter((w) => !notes.some((n) => w.startsWith(n)));
 }
 
 /** The label of the box that asks the job to delete the plaintext versions. */
@@ -57,8 +70,9 @@ export function offersPurge(previews: readonly ConversionPreview[] | undefined):
 export type ConversionRowState =
   /** The job of this node runs: progress. */
   | { kind: 'running'; jobId: number; percent: number | null }
-  /** The window is open and no job runs here (none, or it ended): Resume. */
-  | { kind: 'resume'; jobId: number | null; failed: boolean }
+  /** The window is open and no job runs here: Resume. `ended` is how the
+   *  latest job of this node ended (`none`: no job here, or it completed). */
+  | { kind: 'resume'; jobId: number | null; ended: 'none' | 'failed' | 'cancelled'; deadline: number | null }
   /** The deadline passed before the job finished: clients get errors. */
   | { kind: 'stopped'; jobId: number | null };
 
@@ -70,7 +84,22 @@ export function conversionRowState(view: ConversionView | null | undefined): Con
   const job = view.job_on_this_node ?? null;
   if (!view.open) return { kind: 'stopped', jobId: job?.id ?? null };
   if (job && ACTIVE.has(job.status)) return { kind: 'running', jobId: job.id, percent: job.percent ?? null };
-  return { kind: 'resume', jobId: job?.id ?? null, failed: !!job && job.status !== 'completed' };
+  const ended = !job || job.status === 'completed' ? 'none' : job.status === 'cancelled' ? 'cancelled' : 'failed';
+  return { kind: 'resume', jobId: job?.id ?? null, ended, deadline: view.deadline ?? null };
+}
+
+/** A deadline (unix seconds) as the UI writes it ("Nov 7, 2026, 10:00 AM"
+ *  in the browser's locale). */
+export function deadlineText(seconds: number): string {
+  return new Date(seconds * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+/** The objects the job encrypted although they were stored after
+ *  encryption started (clients could not read them as plaintext). */
+export function adoptedText(n: number): string {
+  return n === 1
+    ? '1 object was stored after encryption started; it was encrypted too'
+    : `${n.toLocaleString('en-US')} objects were stored after encryption started; they were encrypted too`;
 }
 
 /**
@@ -84,10 +113,17 @@ export function conversionPhrase(state: ConversionRowState): string {
       return state.percent === null
         ? 'starting to encrypt the existing objects…'
         : `encrypting the existing objects, ${state.percent}%`;
-    case 'resume':
-      return state.failed
-        ? 'the encryption of the existing objects stopped with failures; they stay readable until the window closes'
-        : 'not every existing object is encrypted, and no job runs on this instance; they stay readable until the window closes';
+    case 'resume': {
+      const what =
+        state.ended === 'failed'
+          ? 'the re-encrypt job stopped with failures'
+          : state.ended === 'cancelled'
+            ? 'the re-encrypt job was cancelled'
+            : // Job state is per proxy: another proxy of a cluster may run it.
+              'some existing objects are not encrypted yet, and this proxy runs no re-encrypt job for them';
+      const until = state.deadline === null ? '' : ` until ${deadlineText(state.deadline)}`;
+      return `${what}; unencrypted objects stay readable${until}`;
+    }
     case 'stopped':
       return 'the conversion stopped before it finished; objects that are not encrypted yet fail to read';
   }
@@ -99,20 +135,43 @@ export function sentence(phrase: string): string {
   return /[.…]$/.test(s) ? s : `${s}.`;
 }
 
-/** Does a view in `buckets` need a refetch to follow its conversion? A
- *  running or resumable conversion changes without a click here (the job
- *  ends, or another tab resumes it); a stopped one does not. */
-export function conversionNeedsPolling(
-  buckets: ReadonlyArray<{ effective_encryption?: { conversion?: ConversionView } | null }> | undefined,
-): boolean {
-  return (buckets ?? []).some((b) => {
-    const s = conversionRowState(b.effective_encryption?.conversion);
-    return s !== null && s.kind !== 'stopped';
-  });
-}
-
-/** How often the bucket list refetches while a conversion runs. */
+/** How often the bucket list refetches while a conversion job runs. */
 export const CONVERSION_POLL_MS = 3_000;
+
+/** The refetch of a conversion whose deadline passed on this clock but
+ *  not yet on the backend's (the backend clock decides). */
+const DEADLINE_RETRY_MS = 60_000;
+const DAY_MS = 86_400_000;
+
+/**
+ * When the bucket list refetches on its own, in ms; `false` = never.
+ *
+ *   * A job runs here: every 3 s (its progress, then the close).
+ *   * The conversion waits for Resume: once, just after the earliest
+ *     deadline, when it turns into "stopped". Nothing else changes it
+ *     without a click: Resume refetches the list, another tab refetches
+ *     on window focus, and a job on another proxy is not visible here
+ *     (job state is per proxy). A 3 s poll for up to 7 days per admin
+ *     tab bought nothing.
+ *   * Stopped, or no conversion: never.
+ */
+export function conversionPollMs(
+  buckets: ReadonlyArray<{ effective_encryption?: { conversion?: ConversionView } | null }> | undefined,
+  nowMs: number,
+): number | false {
+  let next: number | false = false;
+  for (const b of buckets ?? []) {
+    const s = conversionRowState(b.effective_encryption?.conversion);
+    if (s?.kind === 'running') return CONVERSION_POLL_MS;
+    if (s?.kind === 'resume' && s.deadline !== null) {
+      const ms = s.deadline * 1000 - nowMs + 1_000;
+      // A day at most: setInterval overflows past 2^31 ms (about 24 days).
+      const at = ms > 0 ? Math.min(Math.max(ms, CONVERSION_POLL_MS), DAY_MS) : DEADLINE_RETRY_MS;
+      next = next === false ? at : Math.min(next, at);
+    }
+  }
+  return next;
+}
 
 /** The id of a re-encrypt job in the Jobs page (`?job=`). */
 export function runId(jobId: number): string {
