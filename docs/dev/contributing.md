@@ -216,6 +216,10 @@ The PR #24 convergence pass added three more (use these instead of re-rolling):
 `qk.*`) own reads + per-record mutations and invalidate `qk.*` on success — the
 old `loadData()`-after-every-mutation + prop→state-mirror idiom is gone.
 
+## Restore from a backup
+
+The disaster-recovery scripts restore a proxy from a `GET /_/api/admin/backup` zip: `scripts/run-from-backup-dir.sh` runs the binary from an unpacked zip, `scripts/restore-full-backup-zip.sh` posts the zip into a running proxy, and `scripts/restart-local-with-prod-backup.sh` restarts a local instance from a fresh restore.
+
 ## Submitting Changes
 
 1. Fork the repo and create a branch from `main`
@@ -234,7 +238,8 @@ read the repository and write comments only; it cannot edit files or push commit
 
 ## Reporting Issues
 
-Open an issue on GitHub. If it's a bug, include:
+Open an issue on GitHub with the bug report template. Report a security
+vulnerability privately, as [SECURITY.md](../../SECURITY.md) says. If it's a bug, include:
 
 - What you expected vs. what happened
 - Steps to reproduce
