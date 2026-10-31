@@ -167,16 +167,24 @@ impl Adoptions {
     }
 }
 
-/// One audit entry of the conversion, by `user`.
+/// THE audit entry of the conversion (job, apply, boot, admin), by
+/// `user`, about `bucket` and its object `key` (empty: the bucket), with
+/// the request `headers` when a request asked for it.
+pub(crate) fn audit_with(
+    action: &str,
+    user: &str,
+    target: &str,
+    bucket: &str,
+    key: &str,
+    headers: Option<&axum::http::HeaderMap>,
+) {
+    let none = axum::http::HeaderMap::new();
+    crate::audit::audit_log(action, user, target, headers.unwrap_or(&none), bucket, key);
+}
+
+/// [`audit_with`] about the bucket, without a request.
 pub(crate) fn audit(action: &str, user: &str, target: &str, bucket: &str) {
-    crate::audit::audit_log(
-        action,
-        user,
-        target,
-        &axum::http::HeaderMap::new(),
-        bucket,
-        "",
-    );
+    audit_with(action, user, target, bucket, "", None);
 }
 
 /// The marker of `bucket` at the start of a run of a job with `run`. Only

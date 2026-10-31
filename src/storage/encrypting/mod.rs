@@ -386,18 +386,11 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             )));
         }
         let cfg = self.built_config();
-        let (write_mode, key) = match cfg.buckets.get(bucket) {
-            Some(b) => (b.write_mode, &b.key),
-            None => (cfg.write_mode, &cfg.key),
-        };
-        let site = match (write_mode, key) {
-            (WriteMode::Encrypt, Some(k)) => cfg.site_of(k),
-            _ => {
-                return Err(StorageError::Encryption(format!(
-                    "bucket '{bucket}' does not encrypt with a proxy key: it has no conversion \
-                     to open"
-                )))
-            }
+        let Some(site) = proxy_site(&cfg, bucket) else {
+            return Err(StorageError::Encryption(format!(
+                "bucket '{bucket}' does not encrypt with a proxy key: it has no conversion to \
+                 open"
+            )));
         };
         let identity = self.conversion_identity(bucket);
         let flight = self.windows.flight(bucket);
@@ -423,6 +416,21 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             );
         }
         Ok(outcome)
+    }
+
+    /// Test seam: store a marker of `bucket` with `fields` (for example a
+    /// deadline in the past), sealed as this wrapper's opens do, without a
+    /// clock. Fails when a marker exists.
+    #[cfg(test)]
+    pub(crate) async fn plant_marker_for_tests(&self, bucket: &str, fields: conversion::Fields) {
+        let site = proxy_site(&self.built_config(), bucket).expect("the bucket encrypts");
+        let body = conversion::seal(&site, &self.conversion_identity(bucket), &fields).unwrap();
+        let written = self
+            .inner
+            .write_conversion_marker(bucket, super::MarkerWrite::Create(&body))
+            .await
+            .unwrap();
+        assert_eq!(written, super::ClaimOutcome::Written);
     }
 
     /// Open the conversion of `bucket` for `window_secs` (1 second to
@@ -1035,6 +1043,19 @@ impl<B: StorageBackend> EncryptingBackend<B> {
 }
 
 /// Where a stored object lives, for its seal.
+/// The site key that `cfg` encrypts `bucket` with, when it encrypts with a
+/// proxy key: the key of the conversion marker.
+fn proxy_site(cfg: &EncryptionConfig, bucket: &str) -> Option<Arc<v2::SiteKey>> {
+    let (mode, key) = match cfg.buckets.get(bucket) {
+        Some(b) => (b.write_mode, &b.key),
+        None => (cfg.write_mode, &cfg.key),
+    };
+    match (mode, key) {
+        (WriteMode::Encrypt, Some(k)) => Some(cfg.site_of(k)),
+        _ => None,
+    }
+}
+
 fn object_of<'a>(variant: super::traits::ObjectVariant, filename: &'a str) -> StoredObject<'a> {
     match variant {
         super::traits::ObjectVariant::Delta => StoredObject::Delta(filename),

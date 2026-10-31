@@ -575,9 +575,9 @@ pub(crate) async fn enqueue(
     let results =
         crate::maintenance::conversion::queue_reencrypt(app, db, &requests, "config", headers)
             .await;
+    // The response says "purge" only for a job that will do it (`open`
+    // starts every entry with `false`).
     for ((s, r), q) in started.iter_mut().zip(results).zip(&requests) {
-        // The response says "purge" only for a job that will do it.
-        s.purge_plaintext_versions = false;
         match r {
             Ok(id) => {
                 s.job_id = Some(id);
@@ -605,7 +605,7 @@ fn no_job_warning(bucket: &str, why: &str) -> String {
 }
 
 fn audit(action: &str, target: &str, bucket: &str, headers: &HeaderMap) {
-    crate::audit::audit_log(action, "admin", target, headers, bucket, "");
+    crate::maintenance::conversion::audit_with(action, "admin", target, bucket, "", Some(headers));
 }
 
 #[cfg(test)]

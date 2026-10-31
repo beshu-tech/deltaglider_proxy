@@ -529,13 +529,14 @@ async fn a_refused_read_picks_up_a_window_opened_elsewhere() {
 async fn an_expired_window_refuses_until_a_resume_extends_it() {
     let rig = Rig::new().await;
     let w = rig.wrapper(encrypting(false)).await;
-    let run = w.open_conversion_secs("releases", 1).await.unwrap();
-    let conversion::MarkerState::Ours { fields, .. } =
-        w.conversion_status("releases").await.unwrap()
-    else {
-        panic!("ours")
+    let now = chrono::Utc::now().timestamp();
+    let fields = conversion::Fields {
+        cutoff: now - 60,
+        deadline: now - 10,
+        run: [3; 16],
     };
-    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let run = fields.run;
+    w.plant_marker_for_tests("releases", fields).await;
     let fresh = rig.wrapper(encrypting(false)).await;
     assert!(refused(head(&fresh, "old.txt").await), "past the deadline");
     let ext = fresh

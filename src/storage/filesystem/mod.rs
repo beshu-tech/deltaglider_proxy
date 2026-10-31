@@ -1273,12 +1273,11 @@ const CONVERSION_MARKER_FILE: &str = ".dg-conversion";
 
 /// A file of a bucket-level object read longer than this is read as empty
 /// (which no reader accepts).
-const MAX_BUCKET_FILE: u64 = 4096;
+const MAX_BUCKET_FILE: u64 = crate::storage::MAX_BUCKET_OBJECT_BYTES;
 
 /// The version of a key claim file: its label, as the claim reads it.
 fn claim_version(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    crate::security::str_prefix(&text, 64).trim().to_string()
+    crate::storage::claim_label(body)
 }
 
 /// The version of a conversion marker file: its content.
@@ -2051,19 +2050,7 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         op: crate::storage::ClaimWrite<'_>,
     ) -> Result<crate::storage::ClaimOutcome, StorageError> {
-        use crate::storage::{ClaimWrite, MarkerWrite};
-        let op = match op {
-            ClaimWrite::Create(fp) => MarkerWrite::Create(fp.as_bytes()),
-            ClaimWrite::Replace {
-                fingerprint,
-                version,
-            } => MarkerWrite::Replace {
-                body: fingerprint.as_bytes(),
-                version,
-            },
-            ClaimWrite::Remove { version } => MarkerWrite::Remove { version },
-        };
-        self.write_bucket_file(bucket, KEY_CLAIM_FILE, claim_version, op)
+        self.write_bucket_file(bucket, KEY_CLAIM_FILE, claim_version, op.into())
             .await
     }
 

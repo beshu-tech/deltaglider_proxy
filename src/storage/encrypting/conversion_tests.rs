@@ -831,8 +831,17 @@ async fn the_cached_status_follows_this_nodes_writes_and_keeps_an_expired_marker
 
     // A marker past its deadline keeps its fields: the view says "stopped".
     let c = rig.wrapper("local-disk", None).await;
-    let run = c.open_conversion_secs("releases", 1).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let now = chrono::Utc::now().timestamp();
+    let run = [9; 16];
+    c.plant_marker_for_tests(
+        "releases",
+        Fields {
+            cutoff: now - 100,
+            deadline: now - 10,
+            run,
+        },
+    )
+    .await;
     let fresh = rig.wrapper("local-disk", None).await;
     let MarkerState::Ours { fields, server_now } = cached_status(&fresh).await else {
         panic!("an expired marker of this bucket still has fields")

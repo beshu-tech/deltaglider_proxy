@@ -293,6 +293,37 @@ pub enum MarkerWrite<'a> {
     Remove { version: &'a str },
 }
 
+/// A key claim is a small bucket-level object too: its body is the
+/// fingerprint label.
+impl<'a> From<ClaimWrite<'a>> for MarkerWrite<'a> {
+    fn from(op: ClaimWrite<'a>) -> Self {
+        match op {
+            ClaimWrite::Create(fp) => MarkerWrite::Create(fp.as_bytes()),
+            ClaimWrite::Replace {
+                fingerprint,
+                version,
+            } => MarkerWrite::Replace {
+                body: fingerprint.as_bytes(),
+                version,
+            },
+            ClaimWrite::Remove { version } => MarkerWrite::Remove { version },
+        }
+    }
+}
+
+/// A bucket-level object (key claim, conversion marker) longer than this
+/// is read as an empty body, which no reader accepts: a planted large
+/// object must not cost the memory of its size. Every backend uses it.
+pub const MAX_BUCKET_OBJECT_BYTES: u64 = 4096;
+
+/// THE label of a stored key claim body: its first 64 bytes (a claim body
+/// longer than that is not a fingerprint label), trimmed. Every backend
+/// reads a claim with it.
+pub fn claim_label(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    crate::security::str_prefix(&text, 64).trim().to_string()
+}
+
 /// One range read of a passthrough object
 /// ([`StorageBackend::open_passthrough_range`]).
 /// A listing token, and the stored object it was kept for.

@@ -17,13 +17,8 @@ use crate::storage::{
     ClaimOutcome, ClaimWrite, ConversionMarker, KeyClaim, MarkerRead, MarkerWrite, StorageError,
 };
 
-/// A claim body longer than this is not a fingerprint label.
-const MAX_CLAIM_LEN: usize = 64;
-
-/// A bucket-level object longer than this is read as an empty body (which
-/// no reader accepts): a planted large object must not cost the memory of
-/// its size.
-const MAX_SMALL_OBJECT: i64 = 4096;
+/// A bucket-level object longer than this is read as an empty body.
+const MAX_SMALL_OBJECT: i64 = crate::storage::MAX_BUCKET_OBJECT_BYTES as i64;
 
 /// One read of a small bucket-level object.
 struct SmallRead {
@@ -147,10 +142,8 @@ impl S3Backend {
         let Some((body, version)) = self.read_small(bucket, KEY_CLAIM_KEY).await?.found else {
             return Ok(None);
         };
-        let text = String::from_utf8_lossy(&body);
-        let text = crate::security::str_prefix(&text, MAX_CLAIM_LEN);
         Ok(Some(KeyClaim {
-            fingerprint: text.trim().to_string(),
+            fingerprint: crate::storage::claim_label(&body),
             version,
         }))
     }
@@ -160,18 +153,7 @@ impl S3Backend {
         bucket: &str,
         op: ClaimWrite<'_>,
     ) -> Result<ClaimOutcome, StorageError> {
-        let op = match op {
-            ClaimWrite::Create(fp) => MarkerWrite::Create(fp.as_bytes()),
-            ClaimWrite::Replace {
-                fingerprint,
-                version,
-            } => MarkerWrite::Replace {
-                body: fingerprint.as_bytes(),
-                version,
-            },
-            ClaimWrite::Remove { version } => MarkerWrite::Remove { version },
-        };
-        self.write_small(bucket, KEY_CLAIM_KEY, op).await
+        self.write_small(bucket, KEY_CLAIM_KEY, op.into()).await
     }
 
     pub(super) async fn read_marker(&self, bucket: &str) -> Result<MarkerRead, StorageError> {

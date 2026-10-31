@@ -803,16 +803,14 @@ async fn purge_plaintext_versions(
             })?;
         cursor.deleted += page.deleted;
         if page.deleted > 0 {
-            crate::audit::audit_log(
+            super::conversion::audit(
                 "encryption_conversion_versions_purged",
                 "system",
                 &format!(
                     "job:{}: {} noncurrent plaintext version(s) deleted",
                     job.id, page.deleted
                 ),
-                &axum::http::HeaderMap::new(),
                 &job.bucket,
-                "",
             );
         }
         let Some(next) = page.next else {
@@ -1524,13 +1522,13 @@ async fn record_adoption(
             job.id, e
         );
     }
-    crate::audit::audit_log(
+    super::conversion::audit_with(
         "encryption_conversion_adopted_after_cutoff",
         "system",
         &format!("job:{}", job.id),
-        &axum::http::HeaderMap::new(),
         &job.bucket,
         key,
+        None,
     );
     Ok(())
 }
