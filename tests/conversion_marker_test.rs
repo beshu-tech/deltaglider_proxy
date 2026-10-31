@@ -1180,9 +1180,18 @@ async fn a_restart_with_encryption_in_the_file_starts_the_conversion() {
     for i in 0..N {
         assert_eq!(c.get(&format!("h-{i:02}.txt")).await, (200, body_of(i)));
     }
-    // A second restart: the bucket is claimed and converted, no new window.
+    // A backend writer plants plaintext and deletes the key claim (its
+    // body is not sealed). The next restart still opens no window: the
+    // bucket holds encrypted objects, so the plant is not history.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    c.plant("planted.txt", b"PLANTED", old);
+    let claim = c.marker_file().with_file_name(".dg-key-claim");
+    assert!(claim.exists(), "the job's writes claimed the bucket");
+    std::fs::remove_file(&claim).unwrap();
     c.server.respawn_with_env(&[]).await;
     c.admin = common::admin_http_client(&c.server.endpoint()).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(!c.marker_file().exists(), "idempotent across restarts");
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(!c.marker_file().exists(), "no window over a plant");
+    assert_eq!(c.get("planted.txt").await.0, 500);
+    assert_eq!(c.audit("encryption_conversion_opened").await.len(), 0);
 }

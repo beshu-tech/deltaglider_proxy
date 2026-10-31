@@ -587,3 +587,20 @@ fn the_keys_of_a_bucket_that_does_not_exist_can_leave() {
         .dropped_bucket_keys(&old, &[], &["releases".to_string()])
         .is_empty());
 }
+
+/// `plaintext_reads` is deprecated in the JSON schema (`config schema`,
+/// the admin editor), and its description names no issue number.
+#[test]
+fn the_schema_marks_plaintext_reads_deprecated() {
+    let schema = serde_json::to_value(schemars::schema_for!(BackendEncryptionConfig)).unwrap();
+    let text = schema.to_string();
+    let field = schema["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|v| v["properties"].get("plaintext_reads"))
+        .expect("the proxy-AES variant has the field");
+    assert_eq!(field["deprecated"], true, "{field}");
+    assert!(!text.contains("issue #120"), "{field}");
+    assert!(!text.contains("example config"), "{field}");
+}

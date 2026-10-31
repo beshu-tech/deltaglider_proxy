@@ -396,6 +396,17 @@ impl PlaintextReads {
     }
 }
 
+/// The JSON schema of `encryption.plaintext_reads`: [`PlaintextReads`],
+/// marked deprecated, so that editors (Monaco, `config schema`) show it so.
+/// The field's doc comment is its description.
+fn plaintext_reads_schema(
+    generator: &mut schemars::gen::SchemaGenerator,
+) -> schemars::schema::Schema {
+    let mut schema = generator.subschema_for::<PlaintextReads>().into_object();
+    schema.metadata().deprecated = true;
+    schema.into()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 // A misspelled field (`kms_key`) is a load error, not a silent default.
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
@@ -437,14 +448,15 @@ pub enum BackendEncryptionConfig {
         legacy_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         legacy_key_id: Option<String>,
-        /// DEPRECATED (issue #120; the next release rejects it). What a
-        /// read does with an object that is not encrypted. `refuse`
-        /// (default, accepted and ignored): it fails outside a conversion
-        /// window. `serve`: it is served, still honoured in this release
-        /// with a warning. A bucket that starts to encrypt now converts its
+        /// Deprecated: the next release rejects it. What a read does with
+        /// an object that is not encrypted. `refuse` (the default, accepted
+        /// and ignored): the read fails outside a conversion window.
+        /// `serve`: the object is served, still honoured in this release
+        /// with a warning. A bucket that starts to encrypt converts its
         /// history through a conversion window and a re-encrypt job that
-        /// the apply starts. The example config does not show it.
+        /// the apply starts.
         #[serde(default, skip_serializing_if = "PlaintextReads::is_refuse")]
+        #[schemars(schema_with = "plaintext_reads_schema")]
         plaintext_reads: PlaintextReads,
     },
 

@@ -507,9 +507,10 @@ pub enum BootConversion {
 
 /// The boot's conversion of a bucket that a restart made encrypt
 /// (operator, Helm, GitOps: no apply ran). When the sample of `sample`
-/// objects holds one that a client cannot read, the bucket has NO key
-/// claim (no proxy ever wrote encrypted data there, so its plaintext is
-/// history, not a plant) and NO marker, and no job is active on it: open
+/// objects holds one that a client cannot read and none that is encrypted,
+/// the bucket has NO key claim (no proxy ever wrote encrypted data there,
+/// so its plaintext is history, not a plant) and NO marker, and no job is
+/// active on it: open
 /// the window in [`OpenMode::Refresh`] (a marker that another node wrote
 /// meanwhile and that opens here keeps its run, with a new cutoff) and
 /// queue the re-encrypt job of its run, by `boot`. Idempotent across
@@ -524,10 +525,12 @@ pub async fn start_at_boot(
     if window_open(&engine, bucket).await {
         return Ok(BootConversion::WindowOpen);
     }
-    let key = match engine.first_refused_plaintext(bucket, sample).await {
-        Ok(Some(key)) => key,
-        Ok(None) => return Ok(BootConversion::NoPlaintext),
-        Err(e) => return Err(e.to_string()),
+    let found = engine
+        .plaintext_sample(bucket, sample)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(key) = found.first_refused else {
+        return Ok(BootConversion::NoPlaintext);
     };
     let refused = |why: &str| {
         Ok(BootConversion::Refused {
@@ -535,6 +538,14 @@ pub async fn start_at_boot(
             why: why.to_string(),
         })
     };
+    if found.encrypted {
+        // A key claim that a backend writer deleted must not turn plants
+        // into history.
+        return refused(
+            "the bucket holds encrypted objects too, so its plaintext objects may not be \
+             history",
+        );
+    }
     match engine.storage().read_key_claim(bucket).await {
         Ok(None) => {}
         Ok(Some(_)) => {
