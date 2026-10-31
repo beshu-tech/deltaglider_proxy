@@ -571,6 +571,21 @@ pub async fn run_rule_gated(
             was_resumed,
         };
         driver::drive_walk(&scope, machine, &mut totals, &mut flags).await;
+        let held = machine.stats().deletes_held;
+        if held > 0 {
+            let note = deletes_held_note(rule, held);
+            warn!("{note}");
+            let _ = log_failure(
+                &db,
+                &rule.name,
+                run_id,
+                "",
+                "",
+                &note,
+                max_failures_retained,
+            )
+            .await;
+        }
     }
 
     // Unconditional flush: covers EVERY break path (kill, pause, lease,
@@ -1221,6 +1236,19 @@ async fn log_failure(
     )
 }
 
+/// The run note of a run whose mirror deletes [`walk::deletes_held`] kept.
+fn deletes_held_note(rule: &ReplicationRule, held: u64) -> String {
+    format!(
+        "replication rule '{}': deletes held — the source {}/{} listed no objects, \
+         so the run deleted none of the {held} destination object(s) that it would \
+         have deleted. Check the route of the source bucket. When the source is \
+         empty on purpose, delete the destination objects by hand.",
+        rule.name,
+        rule.source.bucket,
+        normalize_prefix(&rule.source.prefix),
+    )
+}
+
 /// The run-start refusal of a rule whose destination contains its source.
 fn overlap_refusal(rule: &ReplicationRule) -> String {
     format!(
@@ -1646,6 +1674,70 @@ mod tests {
             notes
                 .iter()
                 .any(|n| n.error_message.contains("contains the source")),
+            "{notes:?}"
+        );
+    }
+
+    /// NEW-11: a source that lists empty holds every mirror delete, and the
+    /// run says so in the failure ring.
+    #[tokio::test]
+    async fn an_empty_source_holds_the_deletes_with_a_note() {
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::default();
+        let backend: Box<crate::storage::DynStorageBackend<'static>> = DynStorageBackend::new_box(
+            crate::storage::FilesystemBackend::new(data.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine = Arc::new(crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &config,
+            None,
+        ));
+        engine.create_bucket("a").await.unwrap();
+        engine.create_bucket("b").await.unwrap();
+        for k in ["x.txt", "d/y.txt"] {
+            engine
+                .store("b", k, b"copy", None, Default::default())
+                .await
+                .unwrap();
+        }
+        let mut rule = mk_rule();
+        rule.replicate_deletes = true;
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
+        let lease = Arc::new(CountingLease(
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let (_, outcome) = run_rule(
+            db.clone(),
+            &engine,
+            &rule,
+            10,
+            None,
+            0,
+            "scheduler",
+            None,
+            RunConcurrency::default(),
+            None,
+            DynCoordinationLease::from_arc(lease),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.totals.objects_deleted, 0);
+        for k in ["x.txt", "d/y.txt"] {
+            engine.head("b", k).await.expect("the copy stays");
+        }
+        let notes = db
+            .lock()
+            .await
+            .replication_recent_failures("r", 10)
+            .unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.error_message.contains("deletes held")
+                    && n.error_message.contains("2 destination object")),
             "{notes:?}"
         );
     }

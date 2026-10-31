@@ -393,6 +393,25 @@ pub struct WalkStats {
     /// deletes (a key the cache answered is refunded).
     pub requests_used: u64,
     pub truncated_by_budget: bool,
+    /// Entries the source and destination listings returned (objects and
+    /// folders, DG internals excluded), counted on receipt.
+    pub src_entries: u64,
+    pub dest_entries: u64,
+    /// Delete candidates kept because [`deletes_held`] said so.
+    pub deletes_held: u64,
+}
+
+/// Pure: hold every mirror delete of the run. True when the source listed
+/// no entry at all while the destination holds some. A source that lists
+/// empty is more often a wrong route, another node's config or a client
+/// bug than an emptied bucket, and one such run would delete the whole
+/// copy. The deletes wait; the run says so (NEW-11). A resumed run lists
+/// from its resume token, so it can count zero source entries while the
+/// part before the token holds some: it holds too. That only defers the
+/// deletes, because the next run after a completed pass starts fresh and
+/// lists the whole source.
+pub fn deletes_held(src_entries: u64, dest_entries: u64) -> bool {
+    src_entries == 0 && dest_entries > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,6 +1029,7 @@ impl WalkMachine {
         let Some(stream) = stream else { return };
         stream.inflight = None;
 
+        let mut listed = 0u64;
         for e in page.entries {
             // Drop the dir's own marker object and anything not strictly
             // increasing (cross-page prefix repeats, start_after re-emission).
@@ -1024,6 +1044,11 @@ impl WalkMachine {
                 continue;
             }
             stream.last_seen = Some(e.path.clone());
+            let counts = match e.kind {
+                EntryKind::Dir => !skip_dir(&e.path),
+                EntryKind::Obj(_) => !e.path.ends_with('/') && !is_dg_internal(&e.path),
+            };
+            listed += u64::from(counts);
             stream.buf.push_back(e);
         }
         if page.truncated && page.next_token.is_some() {
@@ -1031,6 +1056,10 @@ impl WalkMachine {
         } else {
             stream.exhausted = true;
             stream.token = None;
+        }
+        match side {
+            Side::Src => self.stats.src_entries += listed,
+            Side::Dest => self.stats.dest_entries += listed,
         }
 
         self.advance_dir(dir);
@@ -1574,6 +1603,7 @@ impl WalkMachine {
 
         if !task.deletes_flushed {
             let clean = task.copy_errors == 0 && !self.stats.truncated_by_budget;
+            let held = deletes_held(self.stats.src_entries, self.stats.dest_entries);
             let candidates = {
                 let Some(task) = self.active.get_mut(key) else {
                     return;
@@ -1582,7 +1612,10 @@ impl WalkMachine {
                 std::mem::take(&mut task.delete_candidates)
             };
             for rel in candidates {
-                if clean && self.drained.is_none() {
+                if held {
+                    self.stats.deletes_held += 1;
+                }
+                if clean && !held && self.drained.is_none() {
                     let item_id = self.next_id;
                     self.next_id += 1;
                     self.routes.insert(
@@ -2167,7 +2200,11 @@ mod machine_tests {
         }
 
         let mut deletes = BTreeSet::new();
-        if replicate_deletes {
+        // NEW-11: a source whose listing has no entry holds every delete.
+        // The root listing shows one entry per first segment; only the
+        // `.deltaglider/` folder is not counted.
+        let src_listed = world.src.keys().any(|k| !k.starts_with(".deltaglider/"));
+        if replicate_deletes && src_listed {
             // Faithful mirror: EVERY dest-only key is a delete, regardless of
             // provenance (markers/internals excepted).
             for k in world.dest.keys() {
@@ -2518,6 +2555,62 @@ mod machine_tests {
         sim.trace
     }
 
+    /// NEW-11: a source that lists empty (a wrong route, another node's
+    /// config, a client bug) made one run delete the whole copy, because
+    /// every key's re-check confirms "absent". The run holds every delete
+    /// and counts them; one source object is enough to mirror again.
+    #[test]
+    fn an_empty_source_holds_every_mirror_delete() {
+        let mut world = simple_world(AUTH);
+        for i in 0..1000 {
+            let copy = world_obj(mk_meta(10, "sha", "etag", 1_000, true), true);
+            world.dest.insert(format!("d{}/k{i:04}", i % 7), copy);
+        }
+        let mut machine = mk_machine(
+            &world,
+            ConflictPolicy::NewerWins,
+            false,
+            true,
+            50,
+            10_000,
+            2,
+            8,
+            usize::MAX,
+            None,
+        );
+        let mut sim = Sim {
+            world: world.clone(),
+            page_size: 50,
+            trace: Trace::default(),
+            queue: Vec::new(),
+            last_cursor: None,
+            head_keys: 0,
+        };
+        drive(&mut machine, &mut sim, &[0, 2, 1], None);
+        assert!(machine.is_done(), "the run completes");
+        assert!(
+            sim.trace.deletes.is_empty(),
+            "{} deleted",
+            sim.trace.deletes.len()
+        );
+        assert_eq!(machine.stats().deletes_held, 1000);
+
+        // One source object: a normal mirror, nothing held.
+        let src = world_obj(mk_meta(10, "sha", "etag", 1_000, false), true);
+        world.src.insert("d0/k0000".to_string(), src);
+        let (trace, stats) = run_full(&world, ConflictPolicy::NewerWins, true);
+        assert_eq!(trace.deletes.len(), 999);
+        assert_eq!(stats.deletes_held, 0);
+    }
+
+    #[test]
+    fn deletes_held_truth_table() {
+        assert!(deletes_held(0, 1));
+        assert!(!deletes_held(0, 0));
+        assert!(!deletes_held(1, 1000));
+        assert!(!deletes_held(1, 0));
+    }
+
     /// NEW-09: `releases/builds/nightly/` -> `releases/builds/` with deletes.
     /// The destination listing of `builds/` holds `nightly/`, the source
     /// objects. Their source twins (`builds/nightly/nightly/..`) are absent,
@@ -2694,6 +2787,10 @@ mod machine_tests {
             w.dest
                 .insert(k.into(), world_obj(mk_meta(1, "s", "e", 100, true), true));
         }
+        // A source with an object: an empty one holds every delete (NEW-11).
+        let kept = world_obj(mk_meta(1, "s", "e", 100, false), true);
+        w.dest.insert("kept.zip".into(), copied_from(&kept, true));
+        w.src.insert("kept.zip".into(), kept);
         let globs = |g: &[&str]| {
             crate::glob_filter::compile(&g.iter().map(|s| s.to_string()).collect::<Vec<_>>())
                 .unwrap()
@@ -3171,8 +3268,24 @@ mod machine_tests {
 
             let union_copies: BTreeSet<String> =
                 sim.trace.copies.union(&sim2.trace.copies).cloned().collect();
-            let union_deletes: BTreeSet<String> =
+            let mut union_deletes: BTreeSet<String> =
                 sim.trace.deletes.union(&sim2.trace.deletes).cloned().collect();
+            // A resumed run lists from its token: it may see no source entry
+            // and hold its deletes (NEW-11). The next, fresh pass does them.
+            if resumed.stats().deletes_held > 0 {
+                let mut fresh = mk_machine(&w, policy, false, deletes, 2, 10_000, 2, 2, usize::MAX, None);
+                let mut sim3 = Sim {
+                    world: sim2.world.clone(),
+                    page_size: 2,
+                    trace: Trace::default(),
+                    queue: Vec::new(),
+                    last_cursor: None,
+                    head_keys: 0,
+                };
+                drive(&mut fresh, &mut sim3, &seed, None);
+                prop_assert!(fresh.is_done(), "the fresh pass must complete");
+                union_deletes.extend(sim3.trace.deletes);
+            }
             prop_assert_eq!(&union_copies, &ref_copies, "resume lost or invented copies");
             prop_assert_eq!(&union_deletes, &ref_deletes, "resume lost or invented deletes");
         }
