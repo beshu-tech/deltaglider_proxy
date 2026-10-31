@@ -219,10 +219,7 @@ export type BucketEncryptionChange =
   | { kind: 'bucket-key'; key: string; keyId: string }
   | { kind: 'sse-kms'; kmsKeyId: string; bucketKeyEnabled: boolean }
   | { kind: 'sse-s3' }
-  | { kind: 'clear-legacy' }
-  /** Remove the deprecated `plaintext_reads: serve`: the server opens the
-   *  conversion window and starts the re-encrypt job. */
-  | { kind: 'convert-now' };
+  | { kind: 'clear-legacy' };
 
 /** One bucket's merge-patch for a change. */
 export function bucketEncryptionBody(
@@ -252,10 +249,6 @@ export function bucketEncryptionBody(
     case 'clear-legacy':
       encryption = { legacy_key: null, legacy_key_id: null };
       break;
-    case 'convert-now':
-      // Merge-patch null removes the line (the field takes its default).
-      encryption = { plaintext_reads: null };
-      break;
   }
   const policy: Record<string, unknown> = { encryption };
   // A bucket's own block needs a fixed backend: pin the one that holds the
@@ -272,7 +265,6 @@ function encryptsAfter(eff: EffectiveEncryption, change: BucketEncryptionChange)
     case 'off':
       return false;
     case 'clear-legacy':
-    case 'convert-now':
       return eff.encrypts;
     default:
       return true;

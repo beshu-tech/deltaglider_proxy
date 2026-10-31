@@ -5,7 +5,6 @@ import {
   aesKeyPatch,
   buildClearLegacySectionBody,
   buildEncryptionSectionBody,
-  buildConvertNowSectionBody,
   encryptionKeyEnvVar,
 } from '../backendEncryptionPayload';
 
@@ -148,41 +147,13 @@ test('encryptionKeyEnvVar matches the server env-var names', () => {
   assert.equal(encryptionKeyEnvVar('aws.dr'), 'DGP_BACKEND_AWS_DR_ENCRYPTION_KEY');
 });
 
-test('a key change drops the deprecated plaintext_reads: the server converts (#120)', () => {
-  const storage = {
-    backends: [
-      {
-        name: 'local-disk',
-        encryption: { mode: 'aes256-gcm-proxy', key_id: 'old', plaintext_reads: 'serve' },
-      },
-    ],
-  };
-  const body = buildEncryptionSectionBody('local-disk', aesKeyPatch('a'.repeat(64), { mode: 'aes256-gcm-proxy', key_id: 'old' }), storage) as {
-    backends: Array<{ encryption: Record<string, unknown> }>;
-  };
-  assert.equal(body.backends[0].encryption.plaintext_reads, undefined);
-});
-
-test('convert now removes only plaintext_reads of a backend (#120)', () => {
-  assert.deepEqual(buildConvertNowSectionBody('default', {}), {
-    backend_encryption: { plaintext_reads: null },
-  });
-  const storage = {
-    backends: [{ name: 'local-disk', encryption: { mode: 'aes256-gcm-proxy', key_id: 'k', plaintext_reads: 'serve' } }],
-  };
-  assert.deepEqual(buildConvertNowSectionBody('local-disk', storage), {
-    backends: [{ name: 'local-disk', encryption: { mode: 'aes256-gcm-proxy', key_id: 'k' } }],
-  });
-});
-
-// The three builders share one target rule (`withBackendEncryption`):
+// The builders share one target rule (`withBackendEncryption`):
 // singleton → `backend_encryption`; named → the section's own list with only
 // the target's block changed; a missing name → an error; no input mutation.
 type Build = (name: string, storage: { backends?: Array<Record<string, unknown>> }) => Record<string, unknown>;
 const builders: Array<[string, Build]> = [
   ['encryption', (n, s) => buildEncryptionSectionBody(n, { mode: 'sse-s3' }, s)],
   ['clear legacy', (n, s) => buildClearLegacySectionBody(n, s)],
-  ['convert now', (n, s) => buildConvertNowSectionBody(n, s)],
 ];
 
 test('every builder follows the same target rule', () => {

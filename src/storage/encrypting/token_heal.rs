@@ -24,7 +24,8 @@
 //! * A delta past that budget, and the ETag of an inverted passthrough,
 //!   are healed in the background: one HEAD keeps the token, bounded as
 //!   the S3 facts healer is (`storage::s3::heal::admit`).
-//! * A passthrough in a bucket that serves plaintext (it may be plaintext)
+//! * A passthrough in a bucket that writes plaintext or has an open
+//!   conversion window (it may be plaintext)
 //!   and a size that no DGE2 body has (it is not a ciphertext) list the
 //!   stored size, with no request.
 //!
@@ -94,8 +95,8 @@ pub(super) enum MissDecision {
 ///
 /// * `stored_size`: the size the LIST reported.
 /// * `plaintext_ok`: the bucket's read rule serves unsealed objects (it
-///   writes plaintext, `plaintext_reads: serve`, or its conversion window
-///   is open: the wrapper treats an open window the same way). Then
+///   writes plaintext, or its conversion window is open: the wrapper
+///   treats an open window the same way). Then
 ///   a listed passthrough may be plaintext, and its stored size is its
 ///   size: inverting it would be wrong, and a HEAD per plaintext object
 ///   (a bucket that a re-encrypt job converts) would be a HEAD storm. Where

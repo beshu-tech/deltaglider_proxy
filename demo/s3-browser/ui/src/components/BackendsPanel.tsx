@@ -36,7 +36,6 @@ import BackendEncryptionEditor, { type BackendEncryptionPatch } from './BackendE
 import {
   buildClearLegacySectionBody,
   buildEncryptionSectionBody,
-  buildConvertNowSectionBody,
   type StorageSectionBackends,
 } from '../backendEncryptionPayload';
 import MaskedSecretInput from './MaskedSecretInput';
@@ -49,8 +48,8 @@ import { backendEncryptionEnvPath, envOverrideHelp, envOverrideSource, findEnvOv
 const { Text } = Typography;
 
 /**
- * A storage write that may start conversions (turning on proxy AES, or
- * Convert now): validate it, and when it starts any over existing
+ * A storage write that may start conversions (turning on proxy AES):
+ * validate it, and when it starts any over existing
  * objects, name how many and ask first, with the purge box for a
  * versioned bucket. Returns the confirmation headers to apply with, or
  * `null` when the operator cancelled.
@@ -152,8 +151,6 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     () => backendBucketCounts(originsQuery.data?.buckets ?? []),
     [originsQuery.data]
   );
-  // Per backend: the buckets that take its encryption (and so its
-  // `plaintext_reads`); a bucket with its own block keeps its own.
   // The open conversions of the buckets that follow each backend's
   // encryption (the backend card shows one status row each).
   const backendConversions = useMemo(() => {
@@ -482,35 +479,6 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     }
   };
 
-  /** "Convert now": remove a backend's deprecated `plaintext_reads: serve`
-   *  (#120); the server starts the conversion of its buckets. */
-  const handleConvertNow = async (backendName: string): Promise<void> => {
-    try {
-      const { body: storage, version } = await getSectionVersioned<StorageSectionBackends>('storage');
-      const body = buildConvertNowSectionBody(backendName, storage);
-      // Like turning encryption on: name the objects and ask first.
-      const confirm = await reviewConversions(`Convert the buckets of backend ${backendName}?`, 'Convert', body, undefined);
-      if (confirm === null) return;
-      const result = await applySection(qc, 'storage', body, version, confirm);
-      if (!result.ok) {
-        setSaveResult({ ok: false, message: result.error || 'Failed to change the backend' });
-        return;
-      }
-      setSaveResult({
-        ok: true,
-        message: [
-          `Backend '${backendName}' no longer serves every unencrypted object. Re-encrypt jobs convert the existing objects in the background`,
-          persistFailureText(result),
-        ]
-          .filter(Boolean)
-          .join('. '),
-      });
-      await refresh();
-    } catch (e) {
-      setSaveResult({ ok: false, message: sectionApplyErrorText(e, 'Failed to change the backend') });
-    }
-  };
-
   const globalCompressionOn = (config?.max_delta_ratio ?? 0.75) > 0;
   // DGP_MAX_DELTA_RATIO controls the switch's field: show it read-only.
   const ratioEnv = findEnvOverride(config?.env_overrides, 'advanced.max_delta_ratio');
@@ -720,7 +688,6 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 current={b.encryption}
                 onApply={(patch) => handleEncryptionApply(b.name, b.encryption.mode, patch)}
                 onClearLegacy={() => handleClearLegacy(b.name)}
-                onConvertNow={() => handleConvertNow(b.name)}
                 conversions={backendConversions[b.name]}
                 readOnly={!!encryptionEnv(b)}
                 usage={backendBucketCountText(encryptionCounts[b.name])}

@@ -795,19 +795,22 @@ mod wrapper_tests {
         assert_eq!(ranges[0].0, v2::wire_offset_of_frame(63));
     }
 
-    /// The configs whose reads may serve plaintext: a bucket without a key,
-    /// and an encrypting one with `plaintext_reads: serve`.
+    /// The configs whose reads serve plaintext: a bucket without a key,
+    /// and one that writes plaintext but keeps its key to read its history
+    /// (the decrypt-only shim of a change to native SSE).
     fn plaintext_serving() -> [(&'static str, EncryptionConfig); 2] {
         [
             ("no key", EncryptionConfig::default()),
-            (
-                "serve",
-                EncryptionConfig {
-                    serve_plaintext: true,
-                    ..keyed(key(1), "kid-1")
-                },
-            ),
+            ("key kept", writes_plaintext(keyed(key(1), "kid-1"))),
         ]
+    }
+
+    /// `cfg` with its writes stored plaintext and its keys kept for reads.
+    fn writes_plaintext(cfg: EncryptionConfig) -> EncryptionConfig {
+        EncryptionConfig {
+            write_mode: WriteMode::PassThrough,
+            ..cfg
+        }
     }
 
     /// Strip the markers (and the seal) of the stored object, as a backup
@@ -872,8 +875,9 @@ mod wrapper_tests {
     }
 
     /// The range path refuses a stripped body too. On a backend with a key
-    /// it does so at every offset: under `serve` the first bytes are read
-    /// as well, and without `serve` an unmarked object is refused anyway.
+    /// it does so at every offset: where plaintext is served the first
+    /// bytes are read as well, and elsewhere an unmarked object is refused
+    /// anyway.
     /// On a backend without any key only a range from byte 0 sees the
     /// magic: nothing there can decrypt it, and a second read per range is
     /// not worth it for bytes that carry no plaintext.
@@ -883,8 +887,8 @@ mod wrapper_tests {
             vec![("no key", EncryptionConfig::default(), 0)];
         for start in [0, 100, 70_000] {
             cases.push(("refuse", keyed(key(1), "kid-1"), start));
-            let [_, (_, serve)] = plaintext_serving();
-            cases.push(("serve", serve, start));
+            let [_, (_, kept)] = plaintext_serving();
+            cases.push(("key kept", kept, start));
         }
         for (label, cfg, start) in cases {
             let (w, _) = counting(cfg, key(1), 2 * F).await;
@@ -1065,14 +1069,11 @@ mod wrapper_tests {
     }
 
     /// A plaintext object stays plaintext on a metadata rewrite, also in an
-    /// encrypting bucket, and a caller's markers are dropped.
+    /// encrypting bucket (history in its conversion window), and a caller's
+    /// markers are dropped.
     #[tokio::test]
     async fn a_plaintext_object_stays_plaintext_on_a_metadata_rewrite() {
-        let r = fs(EncryptionConfig {
-            serve_plaintext: true,
-            ..keyed(key(1), "kid-1")
-        })
-        .await;
+        let r = fs(keyed(key(1), "kid-1")).await;
         r.w.inner
             .put_passthrough(
                 "b",
@@ -1083,6 +1084,7 @@ mod wrapper_tests {
             )
             .await
             .unwrap();
+        r.w.open_conversion_secs("b", 7 * 86_400).await.unwrap();
         let mut m = pmeta("plain", b"plain");
         m.user_metadata
             .insert(ENCRYPTION_MARKER_KEY.into(), "v2".into());
@@ -1439,9 +1441,9 @@ mod wrapper_tests {
 
     /// Issue #120: an object without a seal in a bucket that encrypts is
     /// refused on every read (a writer with backend access could have
-    /// planted it), unless the config says `plaintext_reads: serve`.
+    /// planted it), unless the bucket writes plaintext.
     #[tokio::test]
-    async fn an_unmarked_object_in_an_encrypting_bucket_is_refused_unless_serve() {
+    async fn an_unmarked_object_in_an_encrypting_bucket_is_refused() {
         let r = fs(keyed(key(1), "kid-1")).await;
         let data = body_of(F + 10);
         let w = &r.w;
@@ -1497,12 +1499,10 @@ mod wrapper_tests {
         }
         for (i, res) in reads(w).await.into_iter().enumerate() {
             let err = res.expect_err("plaintext served in an encrypting bucket");
-            assert!(err.to_string().contains("plaintext_reads"), "{i}: {err}");
+            assert!(seal::is_plaintext_refusal(&err), "{i}: {err}");
         }
-        r.cfg.store(Arc::new(EncryptionConfig {
-            serve_plaintext: true,
-            ..keyed(key(1), "kid-1")
-        }));
+        r.cfg
+            .store(Arc::new(writes_plaintext(keyed(key(1), "kid-1"))));
         for (i, res) in reads(w).await.into_iter().enumerate() {
             res.unwrap_or_else(|e| panic!("{i}: {e}"));
         }
@@ -1948,10 +1948,9 @@ mod wrapper_tests {
             format!("\"{}-3\"", hex::encode([3u8; 16]))
         );
 
-        // A bucket that serves plaintext may hold a plaintext object of
+        // A bucket that writes plaintext may hold a plaintext object of
         // that size: the stored size stands.
-        let mut serving = keyed(key(0xa1), "kid-a");
-        serving.serve_plaintext = true;
+        let serving = writes_plaintext(keyed(key(0xa1), "kid-a"));
         let w = EncryptingBackend::new(CountingBackend::new(), shared(serving));
         let mut objects = listing();
         let sizes = w
@@ -2163,11 +2162,16 @@ mod read_request_tests {
     use super::*;
     use crate::storage::fake_s3;
 
-    fn cfg(key: Option<EncryptionKey>, serve: bool) -> Arc<ArcSwap<EncryptionConfig>> {
+    /// `plaintext`: the bucket writes plaintext and keeps `key` to read.
+    fn cfg(key: Option<EncryptionKey>, plaintext: bool) -> Arc<ArcSwap<EncryptionConfig>> {
         shared(EncryptionConfig {
             key_id: key.as_ref().map(|_| "kid-1".to_string()),
             key,
-            serve_plaintext: serve,
+            write_mode: if plaintext {
+                WriteMode::PassThrough
+            } else {
+                WriteMode::Encrypt
+            },
             ..Default::default()
         })
     }
@@ -2178,7 +2182,7 @@ mod read_request_tests {
 
     async fn wrapped(
         key: Option<EncryptionKey>,
-        serve: bool,
+        plaintext: bool,
     ) -> (
         EncryptingBackend<crate::storage::S3Backend>,
         Arc<fake_s3::FakeS3>,
@@ -2186,7 +2190,7 @@ mod read_request_tests {
     ) {
         let (ep, fake) = fake_s3::start().await;
         let s3 = crate::storage::s3::test_support::for_test_endpoint(&ep);
-        (EncryptingBackend::new(s3, cfg(key, serve)), fake, ep)
+        (EncryptingBackend::new(s3, cfg(key, plaintext)), fake, ep)
     }
 
     /// The object reads, not the background listing-token writes.
@@ -2303,12 +2307,17 @@ mod read_request_tests {
     }
 
     /// The forms a keyed bucket can hold: sealed (buffered or chunked
-    /// write), and plaintext, which is served only under `serve`. A sealed
-    /// body whose markers were stripped is refused, never served.
+    /// write), and plaintext, which is served only where the bucket writes
+    /// plaintext (a reader that keeps the key). A sealed body whose
+    /// markers were stripped is refused, never served.
     #[tokio::test]
     async fn keyed_range_reads_serve_every_stored_form() {
-        for serve in [false, true] {
-            let (w, _fake, _) = wrapped(Some(k()), serve).await;
+        for plaintext in [false, true] {
+            let (w, _fake, ep) = wrapped(Some(k()), false).await;
+            let reader = EncryptingBackend::new(
+                crate::storage::s3::test_support::for_test_endpoint(&ep),
+                cfg(Some(k()), plaintext),
+            );
             let body = body_of(1000);
             w.put_passthrough(
                 "b",
@@ -2340,9 +2349,9 @@ mod read_request_tests {
                 .unwrap();
             for name in ["buffered", "chunked", "plain"] {
                 for (start, end) in [(0, u64::MAX - 1), (0, 9), (500, 600)] {
-                    let got = read_range(&w, "b", "p", name, start, end).await;
-                    if name == "plain" && !serve {
-                        assert!(got.is_err(), "plaintext served without serve");
+                    let got = read_range(&reader, "b", "p", name, start, end).await;
+                    if name == "plain" && !plaintext {
+                        assert!(got.is_err(), "plaintext served in an encrypting bucket");
                         continue;
                     }
                     let e = end.min(body.len() as u64 - 1) as usize;
@@ -2371,8 +2380,10 @@ mod read_request_tests {
                 .unwrap();
             for (start, end) in [(0, 99), (500, 600), (70_000, 70_100)] {
                 assert!(
-                    read_range(&w, "b", "p", "c.bin", start, end).await.is_err(),
-                    "serve {serve}: stripped ciphertext served {start}-{end}"
+                    read_range(&reader, "b", "p", "c.bin", start, end)
+                        .await
+                        .is_err(),
+                    "plaintext {plaintext}: stripped ciphertext served {start}-{end}"
                 );
             }
         }
@@ -2529,8 +2540,8 @@ mod pinned_follow_up_tests {
     }
 
     /// A keyed range read takes the object's metadata from its first GET.
-    /// A sealed object needs no second request. A plaintext one (under
-    /// `serve`) does: when another version replaced the object between the
+    /// A sealed object needs no second request. A plaintext one (a bucket
+    /// that writes plaintext and keeps its key) does: when another version replaced the object between the
     /// two, the read fails with a retryable 503 SlowDown, so the bytes of
     /// one version never go out with the metadata of another.
     #[tokio::test]
@@ -2548,17 +2559,18 @@ mod pinned_follow_up_tests {
             let (ep, fake) = fake_s3::start().await;
             let mk = || crate::storage::s3::test_support::for_test_endpoint(&ep);
             let plain = EncryptingBackend::new(mk(), shared(EncryptionConfig::default()));
+            let sealer = EncryptingBackend::new(mk(), shared(keyed(k.clone(), "kid-a")));
             let keyed = EncryptingBackend::new(
                 mk(),
                 shared(EncryptionConfig {
-                    serve_plaintext: true,
+                    write_mode: WriteMode::PassThrough,
                     ..keyed(k.clone(), "kid-a")
                 }),
             );
             for (form, name, data) in [(from, "x.bin", &a), (to, "y.bin", &b)] {
                 let w = match form {
                     Form::Plain => &plain,
-                    Form::Sealed => &keyed,
+                    Form::Sealed => &sealer,
                 };
                 w.put_passthrough(
                     "b",
@@ -2635,14 +2647,18 @@ mod range_matrix_tests {
         key: Option<EncryptionKey>,
         kid: Option<&str>,
         legacy: Option<(EncryptionKey, &str)>,
-        serve: bool,
+        plaintext: bool,
     ) -> Arc<ArcSwap<EncryptionConfig>> {
         shared(EncryptionConfig {
             key,
             key_id: kid.map(str::to_string),
             legacy_key: legacy.as_ref().map(|l| l.0.clone()),
             legacy_key_id: legacy.map(|l| l.1.to_string()),
-            serve_plaintext: serve,
+            write_mode: if plaintext {
+                WriteMode::PassThrough
+            } else {
+                WriteMode::Encrypt
+            },
             ..Default::default()
         })
     }
@@ -2770,7 +2786,8 @@ mod range_matrix_tests {
         mismatches
     }
 
-    /// Every stored form behind a keyed reader (plaintext under `serve`,
+    /// Every stored form behind a keyed reader (plaintext in a bucket that
+    /// writes plaintext,
     /// sealed chunked and buffered writes, with and without a key id, and
     /// under the previous key) answers every range shape exactly as an
     /// unkeyed read of the plaintext twin: the same length, bytes and

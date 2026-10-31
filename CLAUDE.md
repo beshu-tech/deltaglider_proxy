@@ -108,7 +108,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                              conversion.rs = the marker (`.dg/facts/!!conversion` / `.dg-conversion`: AES-GCM-SIV seal of cutoff/deadline/run,
                              AD = storage identity; written by identity with If-Match; 60 s window cache); the apply opens it
                              (`api/admin/config/conversion_start.rs`), the job extends/closes it (`maintenance/conversion.rs`, optional
-                             `purge-versions` phase). `plaintext_reads: serve` is deprecated (honoured one release, warns); mod.rs = the wrapper (`witness.rs` = the
+                             `purge-versions` phase). `plaintext_reads` is REMOVED: a config with it fails to load (`config::removed_encryption_field`; guard `no_plaintext_reads_remains`); mod.rs = the wrapper (`witness.rs` = the
                              witness gate): every metadata-returning method presents, raw metadata never leaves it (source guards
                              `the_seal_key_is_named_only_where_a_sealed_shape_is_handled`, `no_v1_encryption_format_remains`). S3 lists
                              logical facts of sealed objects from `!!2` tokens (`FileMetadata::listing_token` → `put` path; in-process

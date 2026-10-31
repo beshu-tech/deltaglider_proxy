@@ -296,7 +296,6 @@ fn test_wrap_backend_with_aes_mode_accepts_hex_key() {
             key_id: Some("abc".into()),
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -319,7 +318,6 @@ fn test_wrap_backend_with_aes_mode_rejects_malformed_hex() {
             key_id: None,
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -353,7 +351,6 @@ fn test_key_id_collision_detected_at_construction() {
             key_id: Some("shared-id".into()),
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -367,7 +364,6 @@ fn test_key_id_collision_detected_at_construction() {
             key_id: Some("shared-id".into()),
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -398,7 +394,6 @@ fn test_key_id_collision_allowed_with_same_key() {
             key_id: Some("portable".into()),
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -412,7 +407,6 @@ fn test_key_id_collision_allowed_with_same_key() {
             key_id: Some("portable".into()),
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -475,7 +469,6 @@ fn test_native_encryption_for_maps_modes_correctly() {
             key_id: None,
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         }),
         N::None
     ));
@@ -526,7 +519,6 @@ fn test_resolve_legacy_shim_absent_is_none_none() {
             key_id: None,
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         },
     )
     .unwrap();
@@ -669,7 +661,6 @@ fn test_resolve_legacy_shim_rejects_bad_hex() {
             key_id: None,
             legacy_key: Some("not-hex".into()),
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         },
     );
     // EncryptionKey doesn't impl Debug (to prevent key leakage
@@ -826,7 +817,6 @@ async fn a_proxy_backend_without_a_key_refuses_writes_and_keeps_reads() {
             key_id: None,
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         },
         &[],
         &mut coll,
@@ -862,29 +852,9 @@ async fn a_proxy_backend_without_a_key_refuses_writes_and_keeps_reads() {
         !tmp.path().join("b").join("new.bin").exists(),
         "no plaintext object may reach the disk"
     );
-    // The bucket encrypts, so its plaintext history is refused (#120)...
+    // The bucket encrypts, so its plaintext history is refused (#120)
+    // outside a conversion window (`read_rule_tests`).
     assert!(wrapped.get_passthrough("b", "", "old.bin").await.is_err());
-    // ...unless the config serves it while a re-encrypt job converts it.
-    let serving = wrap_backend_with_encryption(
-        "keyless",
-        DynStorageBackend::new_box(
-            crate::storage::FilesystemBackend::new(tmp.path().to_path_buf())
-                .await
-                .unwrap(),
-        ),
-        &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
-            key: None,
-            key_id: None,
-            legacy_key: None,
-            legacy_key_id: None,
-            plaintext_reads: crate::config::PlaintextReads::Serve,
-        },
-        &[],
-        &mut KeyIdCollisionCheck::new(),
-    )
-    .unwrap();
-    let got = serving.get_passthrough("b", "", "old.bin").await.unwrap();
-    assert_eq!(got, b"old");
 }
 
 /// Final review: the refusal of a native SSE bucket on a filesystem

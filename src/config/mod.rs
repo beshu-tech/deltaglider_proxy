@@ -377,39 +377,17 @@ pub struct Config {
 /// A key with no explicit `key_id` gets the id `fp-<hex>` from its v2
 /// fingerprint (`storage::encrypting::fingerprint_label`): the same key
 /// has the same id everywhere, and a backend rename changes nothing.
-/// What a read does with an unencrypted object in a bucket that encrypts
-/// (`encryption.plaintext_reads`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum PlaintextReads {
-    /// The read fails (500): an unencrypted object may be planted.
-    #[default]
-    Refuse,
-    /// The object is served: the plaintext history of a bucket that starts
-    /// to encrypt, until a re-encrypt job converts it.
-    Serve,
-}
-
-impl PlaintextReads {
-    pub fn is_refuse(&self) -> bool {
-        *self == Self::Refuse
-    }
-}
-
-/// The JSON schema of `encryption.plaintext_reads`: [`PlaintextReads`],
-/// marked deprecated, so that editors (Monaco, `config schema`) show it so.
-/// The field's doc comment is its description.
-fn plaintext_reads_schema(
-    generator: &mut schemars::gen::SchemaGenerator,
-) -> schemars::schema::Schema {
-    let mut schema = generator.subschema_for::<PlaintextReads>().into_object();
-    schema.metadata().deprecated = true;
-    schema.into()
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 // A misspelled field (`kms_key`) is a load error, not a silent default.
-#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
+// `remote = "Self"`: the derives are inherent fns; the trait impls below add
+// the refusal of removed fields ([`removed_encryption_field`]).
+#[serde(
+    remote = "Self",
+    tag = "mode",
+    rename_all = "kebab-case",
+    deny_unknown_fields
+)]
+#[schemars(rename = "BackendEncryptionConfig")]
 pub enum BackendEncryptionConfig {
     /// Objects stored plaintext on this backend.
     ///
@@ -448,16 +426,6 @@ pub enum BackendEncryptionConfig {
         legacy_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         legacy_key_id: Option<String>,
-        /// Deprecated: the next release rejects it. What a read does with
-        /// an object that is not encrypted. `refuse` (the default, accepted
-        /// and ignored): the read fails outside a conversion window.
-        /// `serve`: the object is served, still honoured in this release
-        /// with a warning. A bucket that starts to encrypt converts its
-        /// history through a conversion window and a re-encrypt job that
-        /// the apply starts.
-        #[serde(default, skip_serializing_if = "PlaintextReads::is_refuse")]
-        #[schemars(schema_with = "plaintext_reads_schema")]
-        plaintext_reads: PlaintextReads,
     },
 
     /// S3 native SSE-KMS. Proxy does not wrap; AWS encrypts on write.
@@ -492,6 +460,39 @@ pub enum BackendEncryptionConfig {
     },
 }
 
+/// The error of an `encryption` block that holds a field this release
+/// removed, or `None`. Pure: the deserializer of [`BackendEncryptionConfig`]
+/// calls it for every config surface (file, apply, section PUT, CLI).
+pub(crate) fn removed_encryption_field(block: &serde_yaml::Mapping) -> Option<String> {
+    const REMOVED: &str = "plaintext_reads";
+    block.contains_key(REMOVED).then(|| {
+        format!(
+            "encryption.{REMOVED} was removed: delete this line from the config. \
+             A bucket that starts to encrypt converts its existing plaintext objects \
+             through its conversion window and the re-encrypt job (Storage > Jobs)"
+        )
+    })
+}
+
+impl Serialize for BackendEncryptionConfig {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, s)
+    }
+}
+
+impl<'de> Deserialize<'de> for BackendEncryptionConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        // A tagged enum buffers its input anyway; this buffer lets the
+        // removed-field check see the block first.
+        let v = serde_yaml::Value::deserialize(d)?;
+        if let Some(msg) = v.as_mapping().and_then(removed_encryption_field) {
+            return Err(D::Error::custom(msg));
+        }
+        Self::deserialize(v).map_err(D::Error::custom)
+    }
+}
+
 /// `skip_serializing_if` helper: backends with encryption `None` (and
 /// no legacy shim) omit the field entirely in canonical YAML. A
 /// `None { legacy_key: Some(...) }` DOES serialise so the shim stays
@@ -517,18 +518,6 @@ impl Default for BackendEncryptionConfig {
 }
 
 impl BackendEncryptionConfig {
-    /// `plaintext_reads: serve` of a proxy-AES config (issue #120): an
-    /// unencrypted object may be served. THE one reading of the flag.
-    pub fn serves_plaintext(&self) -> bool {
-        matches!(
-            self,
-            Self::Aes256GcmProxy {
-                plaintext_reads: PlaintextReads::Serve,
-                ..
-            }
-        )
-    }
-
     /// Short machine-readable tag for the mode, used by admin API
     /// summaries and diff renderers. Matches the YAML `mode:` tag.
     pub fn mode_tag(&self) -> &'static str {

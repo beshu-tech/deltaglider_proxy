@@ -39,8 +39,8 @@ pub struct EffectiveEncryption {
     /// New writes are stored encrypted. Proxy mode without a key is
     /// false: the proxy refuses those writes.
     pub encrypts: bool,
-    /// The bucket's conversion to encryption (a marker in the bucket), or
-    /// its deprecated `plaintext_reads: serve`; `None` when neither.
+    /// The bucket's conversion to encryption (a marker in the bucket);
+    /// `None` without one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversion: Option<ConversionView>,
     /// A re-encrypt job can change objects of this bucket: it encrypts
@@ -80,9 +80,6 @@ pub struct ConversionView {
     /// The latest re-encrypt job of the bucket on this node (job ids are
     /// node-local).
     pub job_on_this_node: Option<ConversionJob>,
-    /// The bucket's own block, or its backend's, sets the deprecated
-    /// `plaintext_reads: serve`.
-    pub serves_plaintext_deprecated: bool,
     /// The backend keeps old versions of the bucket's objects, so a Resume
     /// can also ask to purge the old unencrypted versions. Read only for a
     /// bucket with a marker; a failed read counts as not versioned.
@@ -193,10 +190,7 @@ pub fn effective_encryption(
         kms_key_id,
         key_env,
         encrypts,
-        conversion: e.config.serves_plaintext().then(|| ConversionView {
-            serves_plaintext_deprecated: true,
-            ..Default::default()
-        }),
+        conversion: None,
         reencrypt,
         pinned: cfg.bucket_storage(&name).is_some(),
         bucket_modes: cfg.bucket_encryption_modes(&e.backend),

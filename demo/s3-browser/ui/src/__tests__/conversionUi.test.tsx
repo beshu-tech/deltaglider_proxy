@@ -3,8 +3,7 @@
  * turning on proxy AES over objects names how many the job encrypts and
  * that they stay readable; the bucket and backend cards show one row per
  * open conversion (running %, Resume, deadline passed, objects stored
- * after the cutoff); a bucket or backend with the deprecated
- * `plaintext_reads: serve` offers Convert now.
+ * after the cutoff).
  */
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -32,7 +31,6 @@ function view(over: Partial<ConversionView> = {}): ConversionView {
     run: RUN,
     adopted_after_cutoff: 0,
     job_on_this_node: null,
-    serves_plaintext_deprecated: false,
     ...over,
   };
 }
@@ -214,30 +212,12 @@ test('no marker: no row', () => {
   expect(screen.queryByTestId('conversion-status')).toBeNull();
 });
 
-test('a bucket with the deprecated serve: Convert now removes the line', async () => {
-  http.on('POST', VALIDATE, json({ ok: true, diff: { storage: { 'buckets.db-archive.encryption.plaintext_reads': { before: 'serve', after: null } } } }));
-  const user = userEvent.setup();
-  renderGroup(bucketKeyEff({ conversion: view({ run: undefined, open: false, serves_plaintext_deprecated: true }) }));
-  expect(screen.queryByTestId('conversion-status')).toBeNull();
-  const notice = screen.getByTestId('serve-deprecation-notice');
-  expect(notice).toHaveTextContent(/next release no longer accepts/);
-  await user.click(within(notice).getByRole('button', { name: 'Convert now' }));
-  await user.click(within(await screen.findByRole('dialog')).getByTestId('apply-dialog-confirm'));
-  await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
-  expect(http.callsTo('PUT', SECTION)[0].body).toEqual({
-    buckets: { 'db-archive': { encryption: { plaintext_reads: null } } },
-  });
-});
-
-test('a backend card: one row per bucket in conversion, and Convert now for a deprecated serve', async () => {
-  const onConvertNow = vi.fn(async () => {});
-  const user = userEvent.setup();
+test('a backend card: one row per bucket in conversion', () => {
   renderWithQuery(
     <BackendEncryptionEditor
       backendName="hetzner-fsn1"
-      current={{ mode: 'aes256-gcm-proxy', has_key: true, key_id: 'k', shim_active: false, serves_plaintext_deprecated: true }}
+      current={{ mode: 'aes256-gcm-proxy', has_key: true, key_id: 'k', shim_active: false }}
       onApply={vi.fn()}
-      onConvertNow={onConvertNow}
       conversions={[
         { bucket: 'releases', view: view({ job_on_this_node: { id: 3, status: 'running', percent: 10 } }) },
         { bucket: 'downloads', view: view({ open: false }) },
@@ -251,8 +231,6 @@ test('a backend card: one row per bucket in conversion, and Convert now for a de
   expect(rows[0]).toHaveTextContent(/^releasesEncrypting the existing objects, 10%\./);
   expect(within(rows[1]).getByText('downloads').tagName).toBe('CODE');
   expect(rows[1]).toHaveTextContent(/^downloadsThe conversion stopped before it finished; .*\./);
-  await user.click(within(screen.getByTestId('serve-deprecation-notice')).getByRole('button', { name: 'Convert now' }));
-  expect(onConvertNow).toHaveBeenCalledTimes(1);
 });
 
 test('turning on a backend key over objects names the count first; Cancel sends nothing', async () => {
@@ -400,51 +378,6 @@ test('review 2: Resume of a bucket without versions is one click', async () => {
   await waitFor(() => expect(http.callsTo('POST', REENCRYPT)).toHaveLength(1));
   expect(screen.queryByRole('dialog')).toBeNull();
   expect(http.callsTo('POST', REENCRYPT)[0].body).toEqual({ buckets: ['db-archive'], open_window: true });
-});
-
-/** Finding 3: Convert now starts a conversion like turning encryption on,
- *  so it goes through the same validate and review. */
-test('review 3: bucket Convert now validates, shows the review dialog, then applies', async () => {
-  http.on('POST', VALIDATE, json({
-    ok: true,
-    diff: { storage: { 'buckets.db-archive.encryption.plaintext_reads': { before: 'serve', after: null } } },
-    conversion_preview: [{ bucket: 'db-archive', objects: 3, more: false, versioned: true }],
-  }));
-  const user = userEvent.setup();
-  renderGroup(bucketKeyEff({ conversion: view({ run: undefined, open: false, serves_plaintext_deprecated: true }) }));
-  await user.click(within(screen.getByTestId('serve-deprecation-notice')).getByRole('button', { name: 'Convert now' }));
-  const dialog = await screen.findByRole('dialog');
-  expect(http.callsTo('POST', VALIDATE)).toHaveLength(1);
-  expect(http.callsTo('PUT', SECTION)).toHaveLength(0);
-  expect(within(dialog).getByTestId('conversion-count')).toHaveTextContent(/^The 3 objects already in bucket db-archive/);
-  await user.click(within(dialog).getByRole('checkbox', { name: /^Also delete the old unencrypted versions/ }));
-  await user.click(within(dialog).getByTestId('apply-dialog-confirm'));
-  await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
-  expect(http.callsTo('PUT', SECTION)[0].body).toEqual({ buckets: { 'db-archive': { encryption: { plaintext_reads: null } } } });
-  expect(http.callsTo('PUT', SECTION)[0].headers['x-dgp-purge-plaintext-versions']).toBe('true');
-});
-
-test('review 3: backend Convert now validates and asks first; Cancel sends nothing', async () => {
-  const backend = {
-    name: 'hetzner-fsn1', backend_type: 's3', path: null, endpoint: 'https://fsn1.example', region: 'eu-central-1',
-    force_path_style: true, has_credentials: true,
-    encryption: { mode: 'aes256-gcm-proxy', has_key: true, key_id: 'k', shim_active: false, serves_plaintext_deprecated: true },
-  };
-  http.on('GET', '/_/api/admin/config', json({ env_overrides: [], max_delta_ratio: 0.75 }));
-  http.on('GET', '/_/api/admin/backends', json({ backends: [backend], default_backend: 'hetzner-fsn1' }));
-  http.on('GET', '/_/api/admin/buckets', json({ buckets: [] }));
-  http.on('GET', SECTION, json({ backends: [{ name: 'hetzner-fsn1', type: 's3', encryption: { mode: 'aes256-gcm-proxy', plaintext_reads: 'serve' } }] }));
-  http.on('GET', '/_/api/admin/jobs', json({ jobs: [] }));
-  http.on('POST', VALIDATE, json({ ok: true, conversion_preview: [{ bucket: 'releases', objects: 5, more: false, versioned: false }] }));
-  const user = userEvent.setup();
-  renderWithQuery(<BackendsPanel />);
-  await user.click(within(await screen.findByTestId('serve-deprecation-notice')).getByRole('button', { name: 'Convert now' }));
-  const dialog = await screen.findByRole('dialog');
-  expect(http.callsTo('POST', VALIDATE)).toHaveLength(1);
-  expect(within(dialog).getByTestId('conversion-count')).toHaveTextContent(/^The 5 objects already in bucket releases/);
-  await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
-  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
-  expect(http.callsTo('PUT', SECTION)).toHaveLength(0);
 });
 
 /** Finding 4: the versioning note shows once, in plain words. */

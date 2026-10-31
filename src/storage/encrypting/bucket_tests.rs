@@ -165,15 +165,20 @@ async fn a_retired_bucket_key_still_reads_from_the_keyring() {
     assert_eq!((len, body.as_slice()), (3, &b"und"[..]));
 }
 
-/// A bucket with its own override decides with its own
-/// `plaintext_reads`, not the backend's: an unsealed object is served only
-/// where the bucket's rule says `serve`.
+/// A bucket with its own override decides with its own write policy, not
+/// the backend's: an unsealed object is served only where the bucket
+/// writes plaintext.
 #[tokio::test]
 async fn a_bucket_override_decides_whether_plaintext_is_served() {
     for (backend_serves, bucket_serves) in [(false, false), (true, false), (false, true)] {
         let mut cfg = two_keys();
-        cfg.serve_plaintext = backend_serves;
-        cfg.buckets.get_mut("db-archive").unwrap().serve_plaintext = bucket_serves;
+        if backend_serves {
+            (cfg.key, cfg.key_id) = (None, None);
+        }
+        if bucket_serves {
+            let b = cfg.buckets.get_mut("db-archive").unwrap();
+            (b.key, b.key_id) = (None, None);
+        }
         let r = rig(cfg).await;
         for b in ["releases", "db-archive"] {
             r.wrapper

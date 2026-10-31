@@ -210,7 +210,7 @@ Restore the old key as `legacy_key`, with any `legacy_key_id`, so that the objec
 
 ### Reads return 500 with "is not encrypted, but the bucket encrypts"
 
-The full message is "object '…' in bucket '…' is not encrypted, but the bucket encrypts: the proxy refuses it, because a writer with access to the backend could have planted it (for example another proxy that does not have the bucket's key). Plaintext is served only while a conversion of the bucket is open, and only for objects that the backend stored before the conversion's cutoff: this object is newer, or no conversion is open. A re-encrypt job converts it. (Until the next release, encryption.plaintext_reads: serve also serves it.)" The bucket encrypts, and the object has no encryption at all. The counter `deltaglider_plaintext_reads_total{outcome="refused"}` counts these reads.
+The full message is "object '…' in bucket '…' is not encrypted, but the bucket encrypts: the proxy refuses it, because a writer with access to the backend could have planted it (for example another proxy that does not have the bucket's key). Plaintext is served only while a conversion of the bucket is open, and only for objects that the backend stored before the conversion's cutoff: this object is newer, or no conversion is open. A re-encrypt job converts it." The bucket encrypts, and the object has no encryption at all. The counter `deltaglider_plaintext_reads_total{outcome="refused"}` counts these reads.
 
 A bucket that encrypts serves an object without encryption only while its conversion window is open, and only when the backend stored the object before the cutoff of the conversion, plus 300 seconds ([the read rule](../reference/encryption.md#the-read-rule)). To find out which case applies, look at `effective_encryption.conversion` of the bucket in `GET /_/api/admin/buckets`, or at the state line of the bucket on **Storage → Buckets**:
 
@@ -250,9 +250,9 @@ The full message is "bucket '…' has an active reencrypt job (maintenance:…, 
 
 The bucket holds a conversion marker. A backfill would give its plaintext objects a new stored time after the cutoff, and clients could then no longer read them. Let the re-encrypt job finish and close the window, and then start the backfill.
 
-### The log warns that "`encryption.plaintext_reads: serve` is deprecated"
+### The proxy does not start: "encryption.plaintext_reads was removed"
 
-The configuration still sets `plaintext_reads: serve` on a backend or a bucket. This release honours it: reads serve every object that is not encrypted, also one that someone put directly on the storage. The next release refuses the field. Remove the line. In the admin UI, click **Convert now** in the box **Unencrypted objects are served (deprecated setting)** on the backend card or the bucket card. The write that removes the line opens a conversion window and starts the re-encrypt job, so the plaintext history stays readable while the job converts it. See [How to upgrade](upgrade.md).
+The configuration file still has the field in an `encryption` block, on a backend or on a bucket. This release removed the field, so the proxy refuses to load the file, and `config lint`, `config apply` and the admin API refuse it too. Delete the line from each `encryption` block. A bucket that still holds plaintext objects needs its conversion window after the start, because without the window the proxy refuses to read those objects. [How to upgrade](upgrade.md#the-conversion-window-replaces-a-read-setting-the-release-after-2023) gives the steps.
 
 ### Reads return 500 with "carries an encryption marker but no valid sealed metadata"
 

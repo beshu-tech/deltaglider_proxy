@@ -20,7 +20,11 @@ const PLAINTEXT_MARKER: &[u8] = b"MAINT_PLAINTEXT_MARKER_0123456789";
 
 // ── Admin API helpers ──────────────────────────────────────────────────────
 
-async fn put_storage_encryption(admin: &reqwest::Client, endpoint: &str, body: serde_json::Value) {
+async fn put_storage_encryption(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
     let resp = admin
         .put(format!("{endpoint}/_/api/admin/config/section/storage"))
         // A disable is a downgrade: confirmed (issue #116 P3). The header
@@ -30,28 +34,28 @@ async fn put_storage_encryption(admin: &reqwest::Client, endpoint: &str, body: s
         .send()
         .await
         .expect("section PUT failed");
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
     assert!(
-        resp.status().is_success(),
-        "storage section PUT failed: {} {}",
-        resp.status(),
-        resp.text().await.unwrap_or_default()
+        status.is_success(),
+        "storage section PUT failed: {status} {text}"
     );
+    serde_json::from_str(&text).unwrap_or_default()
 }
 
-/// Enable encryption for a bucket with plaintext history with the
-/// deprecated `plaintext_reads: serve` (issue #120): still honoured for one
-/// release, unchanged, so the apply starts no conversion and these tests
-/// start the re-encrypt job themselves.
-async fn enable_encryption(admin: &reqwest::Client, endpoint: &str) {
-    put_storage_encryption(
+/// Turn on proxy AES for the default backend (issue #120). A bucket with
+/// plaintext objects starts its conversion: the apply opens the bucket's
+/// conversion window (clients read the history) and queues the re-encrypt
+/// job. Returns those jobs in the shape of [`start_reencrypt`]
+/// (`started[].bucket`, `started[].job_id`); none for empty buckets.
+async fn enable_encryption(admin: &reqwest::Client, endpoint: &str) -> serde_json::Value {
+    let v = put_storage_encryption(
         admin,
         endpoint,
-        serde_json::json!({
-            "mode": "aes256-gcm-proxy", "key": KEY, "key_id": KEY_ID,
-            "plaintext_reads": "serve",
-        }),
+        serde_json::json!({ "mode": "aes256-gcm-proxy", "key": KEY, "key_id": KEY_ID }),
     )
     .await;
+    serde_json::json!({ "started": v["conversions"].as_array().cloned().unwrap_or_default() })
 }
 
 async fn start_reencrypt(
@@ -243,8 +247,7 @@ async fn test_gate_state_hidden_from_unauthenticated_writers() {
             .expect("seed PUT");
     }
     let admin = admin_http_client(&endpoint).await;
-    enable_encryption(&admin, &endpoint).await;
-    let res = start_reencrypt(&admin, &endpoint, bucket).await;
+    let res = enable_encryption(&admin, &endpoint).await;
     assert_eq!(
         res["started"][0]["bucket"], bucket,
         "job should start: {res}"
@@ -294,10 +297,9 @@ async fn test_reencrypt_full_cycle() {
     assert!(outbox_before >= 42, "the seed's events are recorded");
 
     // Flip the backend to proxy-AES. New writes encrypt; the 42 seeded
-    // objects are still plaintext on disk.
-    enable_encryption(&admin, &endpoint).await;
-
-    let res = start_reencrypt(&admin, &endpoint, bucket).await;
+    // objects are still plaintext on disk, and the apply starts the job
+    // that converts them.
+    let res = enable_encryption(&admin, &endpoint).await;
     assert_eq!(
         res["started"][0]["bucket"], bucket,
         "job should start: {res}"
@@ -533,8 +535,7 @@ async fn test_reencrypt_validation_errors() {
     let http = server.http();
     let _ = seed_bucket(&http, &endpoint, bucket, 30).await;
     let admin2 = admin_http_client(&endpoint).await;
-    enable_encryption(&admin2, &endpoint).await;
-    let first = start_reencrypt(&admin2, &endpoint, bucket).await;
+    let first = enable_encryption(&admin2, &endpoint).await;
     assert_eq!(first["started"][0]["bucket"], bucket, "{first}");
     assert_bucket_busy(&admin2, &endpoint, bucket).await;
     let dup = start_reencrypt(&admin2, &endpoint, bucket).await;
@@ -557,8 +558,7 @@ async fn test_cancel_releases_gate() {
     let admin = admin_http_client(&endpoint).await;
 
     let _ = seed_bucket(&http, &endpoint, bucket, 60).await;
-    enable_encryption(&admin, &endpoint).await;
-    let res = start_reencrypt(&admin, &endpoint, bucket).await;
+    let res = enable_encryption(&admin, &endpoint).await;
     let job_id = res["started"][0]["job_id"].as_i64().expect("job id");
 
     let cancel = admin
@@ -849,8 +849,8 @@ async fn test_reencrypt_resumes_after_restart() {
         .await;
     }
 
-    enable_encryption(&admin, &endpoint).await;
-    start_reencrypt(&admin, &endpoint, bucket).await;
+    let res = enable_encryption(&admin, &endpoint).await;
+    assert_eq!(res["started"][0]["bucket"], bucket, "{res}");
 
     // Give the job a beat to start chewing pages, then kill + restart mid-run.
     // Re-inject the bootstrap hash: a prior storage section-PUT re-persists the
@@ -938,8 +938,8 @@ async fn test_reencrypt_resumes_after_graceful_shutdown() {
         )
         .await;
     }
-    enable_encryption(&admin, &endpoint).await;
-    start_reencrypt(&admin, &endpoint, bucket).await;
+    let res = enable_encryption(&admin, &endpoint).await;
+    assert_eq!(res["started"][0]["bucket"], bucket, "{res}");
 
     // Wait until the rewrite is visibly mid-page on disk, then SIGTERM.
     let data_dir = server.data_dir().unwrap().to_path_buf();
@@ -1011,8 +1011,7 @@ async fn review2_busy_bucket(bucket: &str) -> (TestServer, reqwest::Client) {
             .expect("seed PUT");
     }
     let admin = admin_http_client(&endpoint).await;
-    enable_encryption(&admin, &endpoint).await;
-    let res = start_reencrypt(&admin, &endpoint, bucket).await;
+    let res = enable_encryption(&admin, &endpoint).await;
     assert_eq!(
         res["started"][0]["bucket"], bucket,
         "job should start: {res}"
@@ -1406,8 +1405,7 @@ async fn test_reencrypt_cancels_mid_page_and_a_new_job_finishes_the_rest() {
         )
         .await;
     }
-    enable_encryption(&admin, &endpoint).await;
-    let job_id = start_reencrypt(&admin, &endpoint, bucket).await["started"][0]["job_id"]
+    let job_id = enable_encryption(&admin, &endpoint).await["started"][0]["job_id"]
         .as_i64()
         .expect("job id");
 
@@ -1445,7 +1443,19 @@ async fn test_reencrypt_cancels_mid_page_and_a_new_job_finishes_the_rest() {
     );
 
     // A new job rewrites the rest and skips what the cancelled one did.
-    start_reencrypt(&admin, &endpoint, bucket).await;
+    // It takes over the conversion window (Resume), so the rest is
+    // history, not adopted.
+    let resumed = admin
+        .post(format!("{endpoint}/_/api/admin/jobs/reencrypt"))
+        .json(&serde_json::json!({ "buckets": [bucket], "open_window": true }))
+        .send()
+        .await
+        .expect("resume POST failed");
+    assert!(
+        resumed.status().is_success(),
+        "resume: {}",
+        resumed.status()
+    );
     wait_job_done(&admin, &endpoint, bucket).await;
     let job = newest_job(&admin, &endpoint).await;
     assert_eq!(job["status"], "succeeded", "{job}");

@@ -45,8 +45,7 @@ export interface EffectiveEncryption {
   key_env?: string;
   /** New writes are stored encrypted. */
   encrypts: boolean;
-  /** The bucket's conversion to encryption, or its deprecated
-   *  `plaintext_reads: serve`; absent when neither. */
+  /** The bucket's conversion to encryption; absent without one. */
   conversion?: ConversionView;
   /** A re-encrypt job can change objects of this bucket. */
   reencrypt: boolean;
@@ -73,8 +72,6 @@ export interface ConversionView {
   adopted_after_cutoff: number;
   /** The latest re-encrypt job of the bucket on this node. */
   job_on_this_node: { id: number; status: string; percent: number | null } | null;
-  /** The bucket (or its backend) sets the deprecated `plaintext_reads: serve`. */
-  serves_plaintext_deprecated: boolean;
   /** The backend keeps old versions of the bucket: Resume asks whether
    *  the job deletes the old unencrypted ones. Absent = unknown (Resume
    *  asks nothing). */

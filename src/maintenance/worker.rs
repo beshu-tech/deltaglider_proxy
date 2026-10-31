@@ -829,8 +829,8 @@ struct Reencrypt<'a> {
     config: &'a SharedConfig,
     bucket: &'a str,
     desired: Option<DesiredEncryption>,
-    /// The bucket's rule serves plaintext (it writes plaintext, or the
-    /// deprecated `serve`): its unsealed objects are never adopted.
+    /// The bucket's rule serves plaintext (it writes plaintext): its
+    /// unsealed objects are never adopted.
     serves: bool,
     /// The bucket's conversion marker for this run.
     marker: &'a super::conversion::JobMarker,

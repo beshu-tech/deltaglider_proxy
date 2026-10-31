@@ -98,7 +98,6 @@ fn proxy(key: Option<&str>, legacy: Option<&str>) -> E {
         key_id: None,
         legacy_key: legacy.map(str::to_string),
         legacy_key_id: None,
-        plaintext_reads: Default::default(),
     }
 }
 
@@ -241,7 +240,6 @@ fn key_id_follows_the_rule_only_with_its_own_key() {
         key_id: Some("k-explicit".into()),
         legacy_key: None,
         legacy_key_id: None,
-        plaintext_reads: Default::default(),
     };
     let kid = |e: &E| match e {
         E::Aes256GcmProxy { key_id, .. } => key_id.clone(),
@@ -253,7 +251,6 @@ fn key_id_follows_the_rule_only_with_its_own_key() {
             key_id: key_id.map(str::to_string),
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         };
         preserve_backend_encryption_secrets("b", &mut new, &old, p).map(|_| new)
     };
@@ -310,14 +307,12 @@ fn absent_key_id_is_kept_with_an_unchanged_key() {
         key_id: Some("k-explicit".into()),
         legacy_key: Some(HEX32_B.into()),
         legacy_key_id: Some("k-old".into()),
-        plaintext_reads: Default::default(),
     };
     let mut new = E::Aes256GcmProxy {
         key: None,
         key_id: None,
         legacy_key: None,
         legacy_key_id: None,
-        plaintext_reads: Default::default(),
     };
     preserve_backend_encryption_secrets("b", &mut new, &old, BackendKeyPresence::default())
         .unwrap();
@@ -348,7 +343,6 @@ fn rotation_with_explicit_old_key_id_keeps_that_id() {
         key_id: Some("k-old".into()),
         legacy_key: None,
         legacy_key_id: None,
-        plaintext_reads: Default::default(),
     };
     let mut new = proxy(Some(HEX32_B), None);
     preserve_backend_encryption_secrets("b", &mut new, &old, BackendKeyPresence::default())
@@ -365,14 +359,12 @@ fn rotation_that_keeps_the_key_id_is_refused() {
         key_id: Some("k1".into()),
         legacy_key: None,
         legacy_key_id: None,
-        plaintext_reads: Default::default(),
     };
     let mut new = E::Aes256GcmProxy {
         key: Some(HEX32_B.into()),
         key_id: Some("k1".into()),
         legacy_key: None,
         legacy_key_id: None,
-        plaintext_reads: Default::default(),
     };
     let err =
         preserve_backend_encryption_secrets("b", &mut new, &old, BackendKeyPresence::default())
@@ -420,7 +412,6 @@ fn unchanged_key_keeps_the_existing_legacy_pair() {
         key_id: None,
         legacy_key: Some(HEX32.into()),
         legacy_key_id: Some("k-old".into()),
-        plaintext_reads: Default::default(),
     };
     // Named-list PUT: the whole encryption object is replaced, key and
     // legacy_key_id absent.

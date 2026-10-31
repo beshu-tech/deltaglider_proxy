@@ -161,7 +161,7 @@ A config write that makes a bucket store new objects in plaintext where it encry
 | `kms_key_id` | The KMS key of SSE-KMS (an identifier, not a secret). |
 | `key_env` | The environment variable that supplies the bucket's own key (`key: ${env:NAME}`). The admin UI shows the bucket's encryption read-only then. |
 | `encrypts` | New writes are stored encrypted. A proxy mode without a key is `false`: the proxy refuses those writes. |
-| `conversion` | The conversion of the bucket to encryption. Absent when the bucket has no conversion marker and no `plaintext_reads: serve`. The fields are in the next table. |
+| `conversion` | The conversion of the bucket to encryption. Absent when the bucket has no conversion marker. The fields are in the next table. |
 | `reencrypt` | A re-encrypt job can change objects of this bucket: it encrypts with a proxy key, or it is plaintext and can still read an older key. |
 | `pinned` | The config fixes the bucket's backend (`backend:`, or a single backend). A bucket's own block needs it, so a change that adds a block to a bucket where this is `false` also sets `backend:`. |
 | `bucket_modes` | The modes that the bucket's own block accepts. |
@@ -176,10 +176,9 @@ The fields of `conversion`:
 | `run` | The run id of the marker, in hexadecimal. Absent without a marker. |
 | `adopted_after_cutoff` | The objects that the latest re-encrypt job of the bucket on this instance converted although clients could not read them. |
 | `job_on_this_node` | `{id, status, percent}` of the latest re-encrypt job of the bucket on this instance, or `null`. Job ids are local to an instance. |
-| `serves_plaintext_deprecated` | The bucket's block, or its backend's block, has the deprecated `plaintext_reads: serve`. |
 | `versioned` | The backend keeps old versions of the bucket's objects. The proxy reads this only for a bucket that has a conversion marker, and a failed read counts as `false`. |
 
-The proxy reads each marker through a cache of 60 seconds, so a window that another instance closed can show as open for up to a minute. The response never carries a key. `GET /_/api/admin/backends` also lists, per backend, `bucket_encryption_modes`: the modes that a bucket's own block accepts on that backend. The `encryption` summary of each backend has `serves_plaintext_deprecated`, which is `true` when the backend's own block has the deprecated `plaintext_reads: serve`.
+The proxy reads each marker through a cache of 60 seconds, so a window that another instance closed can show as open for up to a minute. The response never carries a key. `GET /_/api/admin/backends` also lists, per backend, `bucket_encryption_modes`: the modes that a bucket's own block accepts on that backend.
 
 A change of a bucket's encryption is a storage-section update (`PUT /_/api/admin/config/section/storage`) with a merge-patch of the bucket, for example `{"buckets": {"db-archive": {"backend": "hetzner-fsn1", "encryption": {"mode": "aes256-gcm-proxy", "key": "<64 hex>", "key_id": "db-archive-2026-10"}}}}`. When the operator confirms that new writes of a bucket that is set to encrypt become plaintext, the admin UI sends the header `X-DGP-Confirm-Encryption-Downgrade: <bucket>` (comma-separated for several buckets) on such a request and on its validate request, and on the migrate start of a bucket that moves to a plaintext backend. When the operator turns off the encryption of a backend, the token is `backend:<name>`, which covers the buckets that inherit from that backend.
 

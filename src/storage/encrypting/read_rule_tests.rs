@@ -5,7 +5,8 @@
 //! (`docs/plan/encryption-conversion-marker.md`, P3): the truth table, a
 //! proptest against an independent model, and the wrapper on a filesystem
 //! (client reads inside and outside the window, the job's reads, sealed
-//! objects, `plaintext_reads: serve`, a window opened on another node).
+//! objects, a bucket that writes plaintext, a window opened on another
+//! node).
 
 use super::conversion::{self, Window};
 use super::seal::{read_verdict, PlaintextRule, Reader, Unsealed, CONVERSION_GRACE_SECS};
@@ -169,7 +170,7 @@ fn read_verdict_truth_table() {
             Job,
             Adopted,
         ),
-        // The bucket writes plaintext, or `plaintext_reads: serve`.
+        // The bucket writes plaintext.
         (
             "serves, after",
             plain(after, 3),
@@ -312,11 +313,10 @@ fn key(byte: u8) -> EncryptionKey {
     EncryptionKey([byte; 32])
 }
 
-fn encrypting(serve: bool) -> EncryptionConfig {
+fn encrypting() -> EncryptionConfig {
     EncryptionConfig {
         key: Some(key(0xaa)),
         key_id: Some("releases-2026".into()),
-        serve_plaintext: serve,
         ..Default::default()
     }
 }
@@ -408,7 +408,7 @@ fn reads(outcome: &str) -> u64 {
 #[tokio::test]
 async fn clients_read_plaintext_history_only_inside_the_window() {
     let rig = Rig::new().await;
-    let w = rig.wrapper(encrypting(false)).await;
+    let w = rig.wrapper(encrypting()).await;
     // No window: refused, with the conversion named.
     let e = head(&w, "old.txt").await.unwrap_err();
     assert!(seal::is_plaintext_refusal(&e), "{e}");
@@ -461,7 +461,7 @@ async fn clients_read_plaintext_history_only_inside_the_window() {
 #[tokio::test]
 async fn the_job_reads_every_plaintext_object_without_a_window() {
     let rig = Rig::new().await;
-    let w = rig.wrapper(encrypting(false)).await;
+    let w = rig.wrapper(encrypting()).await;
     let proof = crate::maintenance::worker::ConversionReadProof::for_tests();
     conversion::as_conversion_job(proof, async {
         assert!(head(&w, "old.txt").await.is_ok());
@@ -470,21 +470,23 @@ async fn the_job_reads_every_plaintext_object_without_a_window() {
     .await;
 }
 
+/// A bucket that writes plaintext serves every unsealed object, with no
+/// window; a bucket that encrypts does not, outside its window.
 #[tokio::test]
-async fn serve_still_serves_every_plaintext_object() {
+async fn only_a_bucket_that_writes_plaintext_serves_every_plaintext_object() {
     let rig = Rig::new().await;
-    let w = rig.wrapper(encrypting(true)).await;
-    assert!(head(&w, "old.txt").await.is_ok());
-    assert!(head(&w, "new.txt").await.is_ok());
-    // A bucket that writes plaintext, too.
     let p = rig.wrapper(EncryptionConfig::default()).await;
+    assert!(head(&p, "old.txt").await.is_ok());
     assert!(head(&p, "new.txt").await.is_ok());
+    let w = rig.wrapper(encrypting()).await;
+    assert!(refused(head(&w, "old.txt").await));
+    assert!(refused(head(&w, "new.txt").await));
 }
 
 #[tokio::test]
 async fn sealed_objects_do_not_depend_on_the_window() {
     let rig = Rig::new().await;
-    let w = rig.wrapper(encrypting(false)).await;
+    let w = rig.wrapper(encrypting()).await;
     let body = b"sealed body".to_vec();
     let meta = FileMetadata::new_passthrough(
         "s.txt".into(),
@@ -513,8 +515,8 @@ async fn sealed_objects_do_not_depend_on_the_window() {
 #[tokio::test]
 async fn a_refused_read_picks_up_a_window_opened_elsewhere() {
     let rig = Rig::new().await;
-    let a = rig.wrapper(encrypting(false)).await;
-    let b = rig.wrapper(encrypting(false)).await;
+    let a = rig.wrapper(encrypting()).await;
+    let b = rig.wrapper(encrypting()).await;
     assert!(refused(head(&b, "old.txt").await), "caches Closed");
     a.open_conversion_secs("releases", 7 * 86_400)
         .await
@@ -528,7 +530,7 @@ async fn a_refused_read_picks_up_a_window_opened_elsewhere() {
 #[tokio::test]
 async fn an_expired_window_refuses_until_a_resume_extends_it() {
     let rig = Rig::new().await;
-    let w = rig.wrapper(encrypting(false)).await;
+    let w = rig.wrapper(encrypting()).await;
     let now = chrono::Utc::now().timestamp();
     let fields = conversion::Fields {
         cutoff: now - 60,
@@ -537,7 +539,7 @@ async fn an_expired_window_refuses_until_a_resume_extends_it() {
     };
     let run = fields.run;
     w.plant_marker_for_tests("releases", fields).await;
-    let fresh = rig.wrapper(encrypting(false)).await;
+    let fresh = rig.wrapper(encrypting()).await;
     assert!(refused(head(&fresh, "old.txt").await), "past the deadline");
     let ext = fresh
         .extend_conversion("releases", &run, chrono::Utc::now().timestamp() + 600)

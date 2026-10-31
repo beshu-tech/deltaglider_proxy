@@ -125,22 +125,6 @@ export function buildClearLegacySectionBody(
   return buildEncryptionFieldsSectionBody(backendName, { legacy_key: null, legacy_key_id: null }, storage);
 }
 
-/** "Convert now": the payload that removes a backend's deprecated
- *  `plaintext_reads: serve` (#120); the rest of the block stays. The server
- *  then opens the conversion windows of its buckets and starts their
- *  re-encrypt jobs. The singleton is a merge-patch (`null` removes the
- *  line); a named entry keeps its own block without the field. */
-export function buildConvertNowSectionBody(
-  backendName: string,
-  storage: StorageSectionBackends,
-): Record<string, unknown> {
-  return withBackendEncryption(backendName, storage, { plaintext_reads: null }, (b) => {
-    const rest = { ...((b.encryption as Record<string, unknown> | undefined) ?? {}) };
-    delete rest.plaintext_reads;
-    return rest;
-  });
-}
-
 /** Change only `fields` of a backend's encryption block: a merge-patch on
  *  the singleton; the entry's own block with `fields` on a named backend. */
 function buildEncryptionFieldsSectionBody(

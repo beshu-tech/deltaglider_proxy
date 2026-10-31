@@ -193,7 +193,6 @@ fn encryption_for_bucket_follows_the_effective_backend() {
         key_id: Some("local-2026".into()),
         legacy_key: None,
         legacy_key_id: None,
-        plaintext_reads: Default::default(),
     };
     let e = cfg.encryption_for_bucket("db-archive").unwrap();
     assert_eq!(e.backend, "local-disk");

@@ -20,7 +20,6 @@ A backend with no `encryption` block has `mode: none`. `Config::check` rejects `
 | `mode` | all | `none` \| `aes256-gcm-proxy` \| `sse-kms` \| `sse-s3` |
 | `key` | `aes256-gcm-proxy` | 32-byte hex AES-256 key. Treated as an infrastructure secret: stripped from canonical exports (`/config/export`). |
 | `key_id` | `aes256-gcm-proxy` | The name of the key. The admin UI, the audit log, the encryption witness and the legacy-key scan show the key under this name. On a backend, optional: without it, the id is `fp-` and the 16 hexadecimal characters of the key's fingerprint (see [Key IDs](#key-ids)). On a bucket, required. |
-| `plaintext_reads` | `aes256-gcm-proxy` | Deprecated. `serve` makes reads serve every object that is not encrypted. This release still honours it, with a warning, and the next release refuses it. `refuse` is accepted and has no effect. See [The deprecated `plaintext_reads: serve`](#the-deprecated-plaintext_reads-serve). |
 | `kms_key_id` | `sse-kms` | The KMS key: a key ARN or alias ARN (`arn:aws:kms:<region>:<account>:key/<id>`), an alias name (`alias/<name>`), a key id (a UUID) or a multi-Region key id (`mrk-<32 hex digits>`). On MinIO, write a key name as `arn:aws:kms:<key name>`. The proxy refuses to start with an empty or malformed value, on a backend and on a bucket, because every write would fail with an S3 error. |
 | `bucket_key_enabled` | `sse-kms` | S3 Bucket Keys; reduces per-request KMS cost. |
 | `legacy_key`, `legacy_key_id` | any mode | Decrypt-only shim for objects written under a previous proxy-AES key. Valid under every mode, including `none`. |
@@ -367,7 +366,7 @@ An object can have no listing token. This happens when the write of its token fa
 
 - **An object stored as it is, in a bucket that serves no plaintext.** Every object that this bucket can serve is encrypted, and the stored size of an encrypted body is exactly `76 + plaintext size + 16 × number of frames`. The proxy therefore computes the exact plaintext size from the stored size, with no extra request. The ETag in this first listing is still the ETag of the stored ciphertext, so it differs from the ETag of a `HEAD` request. In the background, the proxy sends one `HEAD` request for the object and writes its listing token again. After that, every LIST request shows the size and the ETag of the object.
 - **A delta.** The stored size of a delta does not tell the size of the object, so the proxy sends a `HEAD` request for the delta while it answers the LIST request. It sends at most 8 such requests for one listing page, all at the same time. The `HEAD` request gives the size and the ETag of the object, and the proxy writes the listing token again, so the next LIST request needs no `HEAD` request. A delta beyond those 8 is listed with the size of the delta once, and the proxy writes its token in the background.
-- **An object stored as it is, in a bucket that serves plaintext** (the bucket writes plaintext, its conversion window is open, or it has the deprecated `plaintext_reads: serve`). The object can be a plaintext object, whose stored size is its size. The proxy therefore lists the stored size and the stored ETag, and it sends no request for the object.
+- **An object stored as it is, in a bucket that serves plaintext** (the bucket writes plaintext, or its conversion window is open). The object can be a plaintext object, whose stored size is its size. The proxy therefore lists the stored size and the stored ETag, and it sends no request for the object.
 
 When the key of an object is too long for a token object, the proxy keeps the token only in its own memory, so the other proxies and a restarted proxy send the `HEAD` request for a delta again. The counter `deltaglider_listing_token_misses_total` counts these objects (see [Metrics](metrics.md)).
 
@@ -396,7 +395,7 @@ The proxy has no reader for the earlier formats `aes-256-gcm-v1` and `aes-256-gc
 
 A writer with access to the backend can put a plaintext object into a bucket that encrypts. Its bytes look the same as the plaintext history of the bucket. The proxy therefore serves an object without encryption in a bucket that encrypts only as the history of the bucket, and it judges that by time: a *conversion window* names a cutoff, and only objects that the backend stored before the cutoff are history. Outside an open window, and for every object stored later, a read fails with `500 InternalError`, and the log says:
 
-> object 'nightly/2026-10-14.dump' in bucket 'db-archive' is not encrypted, but the bucket encrypts: the proxy refuses it, because a writer with access to the backend could have planted it (for example another proxy that does not have the bucket's key). Plaintext is served only while a conversion of the bucket is open, and only for objects that the backend stored before the conversion's cutoff: this object is newer, or no conversion is open. A re-encrypt job converts it. (Until the next release, encryption.plaintext_reads: serve also serves it.)
+> object 'nightly/2026-10-14.dump' in bucket 'db-archive' is not encrypted, but the bucket encrypts: the proxy refuses it, because a writer with access to the backend could have planted it (for example another proxy that does not have the bucket's key). Plaintext is served only while a conversion of the bucket is open, and only for objects that the backend stored before the conversion's cutoff: this object is newer, or no conversion is open. A re-encrypt job converts it.
 
 The threat model of the window is in [About the encryption threat model](../explanation/encryption-threat-model.md#the-conversion-window).
 
@@ -436,8 +435,8 @@ For both readers, an object that carries `dg-encrypted` but no valid sealed meta
 
 A config write starts a conversion for a bucket when all of these are true:
 
-- The write makes the bucket encrypt with a usable proxy key: `aes256-gcm-proxy` with a key, and without `plaintext_reads: serve`.
-- Before the write, clients could read plaintext in the bucket: it stored plaintext, used SSE-KMS or SSE-S3, used a proxy mode without a key, or had `plaintext_reads: serve`.
+- The write makes the bucket encrypt with a usable proxy key: `aes256-gcm-proxy` with a key.
+- Before the write, clients could read plaintext in the bucket: it stored plaintext, used SSE-KMS or SSE-S3, or used a proxy mode without a key.
 - The bucket holds at least one object. An empty bucket has no history.
 
 Every config write does this: a section PUT, a field PATCH (`PUT /_/api/admin/config`), `POST /_/api/admin/config/apply`, `config apply`, the backend and bucket endpoints, and a backup restore. A key rotation starts no conversion. The steps are:
@@ -453,7 +452,7 @@ A config write that makes a bucket *stop* encrypting with a proxy key closes the
 
 #### A conversion that a restart starts
 
-An operator, a Helm chart or a GitOps pipeline often changes the config file and restarts the proxy, so no config write runs. The proxy therefore checks the buckets after it starts. It lists the first 100 objects of each bucket that encrypts with a proxy key, has no open window and has no `plaintext_reads: serve`, and it sends a HEAD request for each of them. The check runs in the background, so the start does not wait for it. `DGP_BOOT_PLAINTEXT_CHECK=false` turns it off.
+An operator, a Helm chart or a GitOps pipeline often changes the config file and restarts the proxy, so no config write runs. The proxy therefore checks the buckets after it starts. It lists the first 100 objects of each bucket that encrypts with a proxy key and has no open window, and it sends a HEAD request for each of them. The check runs in the background, so the start does not wait for it. `DGP_BOOT_PLAINTEXT_CHECK=false` turns it off.
 
 When the read rule refuses one of these objects because it is not encrypted, the proxy decides between two cases:
 
@@ -468,7 +467,7 @@ A job owns a marker only through its run id. A config write, a restart and `POST
 
 At each start and each resume, a job with a run id reads the marker of its bucket. When the marker carries the same run id, the job moves the deadline to 7 days after the backend's current time, by identity. The cutoff and the run id stay. This also applies to a marker whose deadline passed while no job ran, so a resume opens that window again. A marker with another run id, or one that does not open, stays as it is.
 
-The job then converts the objects and the delta references, 8 objects of a page at once, and it saves its cursor after each page. In a bucket that encrypts, an object or a delta reference that the job converts although a client could not read it is *adopted after the cutoff*. A client could not read it when the bucket has no open window of the job's run (no marker, a marker of another run, a marker that does not open, a job without a run id), or when the backend stored the object at or after the cutoff plus 300 seconds, or names no stored time. Only a bucket that serves plaintext (it stores plaintext, or has `plaintext_reads: serve`) converts such objects without a report. For each adopted object:
+The job then converts the objects and the delta references, 8 objects of a page at once, and it saves its cursor after each page. In a bucket that encrypts, an object or a delta reference that the job converts although a client could not read it is *adopted after the cutoff*. A client could not read it when the bucket has no open window of the job's run (no marker, a marker of another run, a marker that does not open, a job without a run id), or when the backend stored the object at or after the cutoff plus 300 seconds, or names no stored time. Only a bucket that stores plaintext converts such objects without a report. For each adopted object:
 
 - The job counts it in its job row. The admin API shows the count of the latest job of the bucket as `adopted_after_cutoff`.
 - The **Failures** tab of the run lists it with the prefix `adopted_after_cutoff`, for the first 100 adopted objects of the job. The row is information, not a failure. These rows never push a `rewrite_failed` row out of the 200 rows that the tab keeps.
@@ -522,14 +521,6 @@ The phase therefore keeps the versions of an object that a client deleted before
 | `encryption_conversion_adopted_after_cutoff` | Audit | The job converted an object that clients could not read. |
 | `encryption_conversion_versions_purged` | Audit | The `purge-versions` phase deleted noncurrent plaintext versions. The target names the job and the count. |
 | `encryption_marker_ignored` | Audit | A marker of the bucket does not open on this instance (at most one entry per bucket every 10 minutes). |
-
-#### The deprecated `plaintext_reads: serve`
-
-Earlier releases needed `plaintext_reads: serve` in the `encryption` block while a re-encrypt job converted a bucket. Under `serve`, the proxy serves every object without encryption in the bucket, whatever its stored time, so it also serves an object that someone planted during the conversion. The field exists only in `aes256-gcm-proxy` mode.
-
-This release still honours `serve`. The proxy logs a deprecation warning when it loads such a file, and `config lint` prints one. A section or document apply returns it in `existing_warnings` while the running config holds the field, and `config apply` prints those warnings too. The field-level `PUT /_/api/admin/config` returns only the warnings of its own change. A config write that *sets* `serve` starts no conversion: it keeps the earlier behaviour, and you run the job yourself. `refuse` is accepted and has no effect. The next release refuses the field.
-
-To leave `serve`, remove the line. The write that removes it starts the conversion of each bucket that holds objects, as [How a conversion starts](#how-a-conversion-starts) describes. In the admin UI, the backend card and the bucket card show the box **Unencrypted objects are served (deprecated setting)** while the field is set, and its button **Convert now** removes the line. The admin API reports the field as `serves_plaintext_deprecated` ([admin API](admin-api.md#backends)).
 
 ### Copies outside the proxy
 

@@ -55,7 +55,6 @@ import ApplyDialog from './ApplyDialog';
 import BucketKeySetup, { type BucketKeyValue } from './BucketKeySetup';
 import LegacyKeyBanner from './LegacyKeyBanner';
 import { ConversionStatusInline } from './ConversionStatus';
-import ServeDeprecationNotice from './ServeDeprecationNotice';
 import { conversionCountText, conversionRowState, offersPurge, versionedWarnings, withoutVersionedNotes } from '../conversionView';
 import PurgeVersionsBox from './PurgeVersionsBox';
 import { formRow } from './ruleEditorHelpers';
@@ -361,16 +360,6 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         >
           Rotate key
         </Button>
-      )}
-
-      {eff.source === 'bucket' && eff.conversion?.serves_plaintext_deprecated && !editing && (
-        <ServeDeprecationNotice
-          subject="bucket"
-          disabled={readOnly || !!blockedReason || busy}
-          // Like turning encryption on: validate, then the review dialog
-          // (object count, versioning note, purge box), then apply.
-          onConvert={() => review({ kind: 'convert-now' })}
-        />
       )}
 
       {eff.source === 'bucket' && eff.legacy_key_id && !editing && (

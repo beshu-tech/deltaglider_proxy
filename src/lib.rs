@@ -598,7 +598,12 @@ storage:
                     .collect();
                 let derived = prod.contains(&format!("JsonSchema)]\npub enum {ty} "))
                     || prod.contains(&format!("JsonSchema)]\npub struct {ty} "));
-                let own = all.contains(&format!("JsonSchema for {ty} "));
+                // `#[serde(remote = "Self")]`: the derived deserializer is the
+                // inherent fn that the trait impl calls after a check that
+                // only refuses input, so the derived schema describes it.
+                let own = all.contains(&format!("JsonSchema for {ty} "))
+                    || prod.contains(&format!("#[schemars(rename = \"{ty}\")]\npub enum {ty} "))
+                        && prod.contains("remote = \"Self\"");
                 if derived || !own {
                     offenders.push(format!("{rel}: {ty}"));
                 }
@@ -728,6 +733,95 @@ mod source_guards {
             }
         }
         assert!(bad.is_empty(), "v1 encryption code: {bad:?}");
+    }
+
+    /// N3 (`docs/plan/encryption-needs-atomic-writes.md`): the removed
+    /// read-policy field of an encryption block and its `serve` plumbing
+    /// stay gone. No identifier of them in `src/`, the UI source, or
+    /// `docs/product`. The exceptions: the one config error that names
+    /// the field (and the tests that assert it), the troubleshooting entry
+    /// of that error, and the release history (upgrade guide, changelog). The metric
+    /// `deltaglider_plaintext_reads_total` is another identifier.
+    #[test]
+    fn no_plaintext_reads_remains() {
+        use crate::source_scan::{files, root};
+        // Built at runtime, so that this file does not match itself.
+        let removed: Vec<String> = [
+            ("plaintext", "_reads"),
+            ("serve", "_plaintext"),
+            ("serves", "_plaintext"),
+            ("serves", "_plaintext_deprecated"),
+            ("Plaintext", "Reads"),
+            ("ServeDeprecation", "Notice"),
+        ]
+        .iter()
+        .map(|(a, b)| format!("{a}{b}"))
+        .collect();
+        let allowed = |rel: &str, line: &str| match rel {
+            "src/config/mod.rs" => line.contains("const REMOVED: &str"),
+            "src/config/tests/bucket_encryption_tests.rs" => true,
+            "docs/product/how-to/upgrade.md" | "docs/product/changelog.md" => true,
+            // The entry for the error, by its words.
+            "docs/product/how-to/troubleshooting.md" => line.contains("was removed"),
+            _ => false,
+        };
+        let mut bad = Vec::new();
+        let mut scanned = 0;
+        for (dir, exts) in [
+            ("src", &["rs"][..]),
+            ("demo/s3-browser/ui/src", &["ts", "tsx"][..]),
+            ("docs/product", &["md"][..]),
+        ] {
+            for ext in exts {
+                for path in files(dir, ext) {
+                    scanned += 1;
+                    let rel = path
+                        .strip_prefix(root())
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for (n, line) in text.lines().enumerate() {
+                        if names_any(line, &removed) && !allowed(&rel, line) {
+                            bad.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(scanned > 500, "the scan found the sources ({scanned})");
+        assert!(
+            bad.is_empty(),
+            "the field is removed (N3), name none of it:\n{}",
+            bad.join("\n")
+        );
+        // The matcher sees each removed name as a whole identifier only.
+        for name in &removed {
+            for line in [
+                format!("{name}: serve"),
+                format!("cfg.{name} = true;"),
+                format!("e.config.{name}()"),
+                format!("`encryption.{name}`"),
+            ] {
+                assert!(names_any(&line, &removed), "{line}");
+            }
+            for line in [format!("deltaglider_{name}_total"), format!("rule_{name}(")] {
+                assert!(!names_any(&line, &removed), "{line}");
+            }
+        }
+    }
+
+    /// Does `line` name one of `names` as a whole identifier (not as part
+    /// of a longer one)?
+    fn names_any(line: &str, names: &[String]) -> bool {
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        names.iter().any(|name| {
+            line.match_indices(name.as_str()).any(|(at, _)| {
+                let before = line[..at].chars().next_back();
+                let after = line[at + name.len()..].chars().next();
+                !before.is_some_and(ident) && !after.is_some_and(ident)
+            })
+        })
     }
 
     /// Review B1: what S3 does with no IAM user has ONE derivation
@@ -1249,12 +1343,8 @@ mod source_guards {
         );
         let example =
             std::fs::read_to_string(root().join("deltaglider_proxy.example.yaml")).unwrap();
-        // Deprecated fields that the example must not teach (still parsed
-        // for one release, with a warning).
-        const DEPRECATED: [&str; 1] = ["plaintext_reads"];
         let missing: Vec<&String> = names
             .iter()
-            .filter(|n| !DEPRECATED.contains(&n.as_str()))
             .filter(|n| !example.contains(&format!("{n}:")))
             .collect();
         assert!(

@@ -548,7 +548,6 @@ fn test_canonical_yaml_strips_infra_secrets() {
             key_id: Some("singleton-kid".into()),
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         },
         ..Config::default()
     };
@@ -581,7 +580,6 @@ fn test_redact_all_secrets_full_paranoia() {
             key_id: None,
             legacy_key: Some("legacy-deadbeef-should-also-redact".into()),
             legacy_key_id: Some("legacy-kid".into()),
-            plaintext_reads: Default::default(),
         },
         backend: BackendConfig::S3 {
             session_token: None,
@@ -610,7 +608,6 @@ fn test_redact_all_secrets_full_paranoia() {
             key_id: Some("hetzner-kid".into()),
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         },
     });
 
@@ -959,7 +956,6 @@ fn test_check_warns_aes_without_key() {
                 key_id: None,
                 legacy_key: None,
                 legacy_key_id: None,
-                plaintext_reads: Default::default(),
             },
         }],
         ..Config::default()
@@ -1192,7 +1188,6 @@ fn test_check_detects_key_id_collision_with_different_keys() {
                     key_id: Some("shared".into()),
                     legacy_key: None,
                     legacy_key_id: None,
-                    plaintext_reads: Default::default(),
                 },
             },
             NamedBackendConfig {
@@ -1205,7 +1200,6 @@ fn test_check_detects_key_id_collision_with_different_keys() {
                     key_id: Some("shared".into()),
                     legacy_key: None,
                     legacy_key_id: None,
-                    plaintext_reads: Default::default(),
                 },
             },
         ],
@@ -1237,7 +1231,6 @@ fn test_check_allows_shared_key_id_with_same_key() {
                     key_id: Some("portable".into()),
                     legacy_key: None,
                     legacy_key_id: None,
-                    plaintext_reads: Default::default(),
                 },
             },
             NamedBackendConfig {
@@ -1250,7 +1243,6 @@ fn test_check_allows_shared_key_id_with_same_key() {
                     key_id: Some("portable".into()),
                     legacy_key: None,
                     legacy_key_id: None,
-                    plaintext_reads: Default::default(),
                 },
             },
         ],
@@ -1279,7 +1271,6 @@ fn test_check_rejects_invalid_key_id_charset() {
                 key_id: Some("has space!".into()),
                 legacy_key: None,
                 legacy_key_id: None,
-                plaintext_reads: Default::default(),
             },
         }],
         ..Config::default()
@@ -2340,7 +2331,6 @@ fn test_persist_to_file_preserves_yaml_stored_encryption_keys() {
                     "0202020202020202020202020202020202020202020202020202020202020202".into(),
                 ),
                 legacy_key_id: Some("test-legacy-kid".into()),
-                plaintext_reads: Default::default(),
             },
         }],
         ..Config::default()

@@ -246,8 +246,7 @@ pub fn sealed_of(raw: &FileMetadata) -> Result<Option<Sealed>, StorageError> {
 /// What the read rule decides about an object without a seal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unsealed {
-    /// Plaintext that this bucket serves (it writes plaintext, or
-    /// `plaintext_reads: serve`), or a folder marker.
+    /// Plaintext in a bucket that writes plaintext, or a folder marker.
     Serve,
     /// Plaintext history: the bucket encrypts, its conversion window is
     /// open, and the backend stored the object before the cutoff plus
@@ -281,8 +280,7 @@ pub enum Reader {
 /// What a bucket allows for unsealed objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaintextRule<'a> {
-    /// The bucket writes plaintext, or encrypts with
-    /// `plaintext_reads: serve` (until that setting is removed).
+    /// The bucket writes plaintext: every unsealed object is its own.
     Serves,
     /// The bucket encrypts: plaintext only through its conversion window.
     Encrypts(&'a super::conversion::Window),
@@ -349,8 +347,7 @@ pub fn refusal(at: &Location<'_>, raw: &FileMetadata) -> StorageError {
              another proxy that does not have the bucket's key). Plaintext is served only \
              while a conversion of the bucket is open, and only for objects that the backend \
              stored before the conversion's cutoff: this object is newer, or no conversion is \
-             open. A re-encrypt job converts it. (Until the next release, \
-             encryption.plaintext_reads: serve also serves it.)",
+             open. A re-encrypt job converts it.",
             at.bucket
         ))
     }

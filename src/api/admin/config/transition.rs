@@ -1135,7 +1135,6 @@ mod keyless_proxy_gate_tests {
             key_id: None,
             legacy_key: None,
             legacy_key_id: None,
-            plaintext_reads: Default::default(),
         }
     }
 

@@ -1918,7 +1918,7 @@ pub(crate) fn spawn_plaintext_refusal_check(state: &Arc<AppState>, config: &Conf
                 matches!(
                     e.config,
                     deltaglider_proxy::config::BackendEncryptionConfig::Aes256GcmProxy { .. }
-                ) && !e.config.serves_plaintext()
+                )
             })
         });
         use deltaglider_proxy::maintenance::conversion::{start_at_boot, BootConversion};

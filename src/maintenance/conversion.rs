@@ -16,7 +16,7 @@
 //!   job's run, or stored at or after the cutoff plus the grace, or with
 //!   no stored time. It is counted in the job row, sampled in the failure
 //!   ring (never evicting a rewrite failure), audited. Only a bucket that
-//!   serves plaintext adopts silently.
+//!   writes plaintext adopts silently.
 //! - When the run converted everything (no `rewrite_failed`), the job
 //!   closes the marker of its run by identity. A marker that changed under
 //!   it (another run, a body that does not open) is `close_blocked`:
@@ -498,8 +498,8 @@ pub async fn window_open(engine: &DynEngine, bucket: &str) -> bool {
     )
 }
 
-/// What the boot did about a bucket that encrypts with a proxy key and
-/// does not serve plaintext ([`start_at_boot`]).
+/// What the boot did about a bucket that encrypts with a proxy key
+/// ([`start_at_boot`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootConversion {
     /// Its conversion window is open: nothing to do.

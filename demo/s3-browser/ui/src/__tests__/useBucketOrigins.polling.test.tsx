@@ -33,7 +33,6 @@ function view(over: Partial<ConversionView> = {}): ConversionView {
     run: 'a'.repeat(32),
     adopted_after_cutoff: 0,
     job_on_this_node: null,
-    serves_plaintext_deprecated: false,
     ...over,
   };
 }

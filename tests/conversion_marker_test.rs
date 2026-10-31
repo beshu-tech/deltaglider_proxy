@@ -605,9 +605,8 @@ fn ours(state: &MarkerState) -> Option<deltaglider_proxy::storage::encrypting::c
     }
 }
 
-/// (a) A bucket with plaintext history turns on encryption without
-/// `plaintext_reads: serve`: its history is refused until a conversion
-/// opens; then GET, HEAD and range reads of it succeed, before and during
+/// (a) A bucket with plaintext history turns on encryption: its history
+/// is refused until a conversion opens; then GET, HEAD and range reads of it succeed, before and during
 /// the job; the job converts everything and closes the window.
 #[tokio::test]
 async fn clients_read_the_history_through_the_window_while_the_job_converts() {

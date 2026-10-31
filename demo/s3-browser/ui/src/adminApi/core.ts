@@ -309,9 +309,6 @@ export interface BackendEncryptionSummary {
   key_id?: string;
   kms_key_id?: string;
   shim_active: boolean;
-  /** The deprecated `plaintext_reads: serve` (#120): reads also serve
-   *  unencrypted objects. The next release rejects it. */
-  serves_plaintext_deprecated?: boolean;
 }
 
 /** A bucket whose conversion an apply would start (validate). */

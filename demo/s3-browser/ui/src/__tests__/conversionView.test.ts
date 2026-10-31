@@ -1,9 +1,7 @@
 /**
  * #120, conversion marker: the pure words and states of a bucket's
- * conversion, and the source guard that no UI path writes a read policy
- * (`plaintext_reads: serve` or `refuse`) any more. Removing the
- * deprecated line (`plaintext_reads: null`, "Convert now") is the one
- * write that names the field.
+ * conversion, and the source guard that no UI source names the removed
+ * read-policy field: the server refuses a config that has it.
  */
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
@@ -29,7 +27,6 @@ function view(over: Partial<ConversionView> = {}): ConversionView {
     run: 'ab'.repeat(16),
     adopted_after_cutoff: 0,
     job_on_this_node: null,
-    serves_plaintext_deprecated: false,
     ...over,
   };
 }
@@ -84,7 +81,7 @@ test('objects stored after encryption started: one, many', () => {
 
 test('the row state of every conversion', () => {
   assert.equal(conversionRowState(undefined), null);
-  assert.equal(conversionRowState(view({ run: undefined, serves_plaintext_deprecated: true })), null);
+  assert.equal(conversionRowState(view({ run: undefined })), null);
   for (const status of ['queued', 'running', 'cancelling']) {
     assert.deepEqual(conversionRowState(view({ job_on_this_node: { id: 4, status, percent: 30 } })), {
       kind: 'running',
@@ -148,7 +145,7 @@ test('the polling rule of the bucket list', () => {
   const running = view({ deadline: DEADLINE, job_on_this_node: { id: 1, status: 'running', percent: 3 } });
   assert.equal(conversionPollMs(undefined, now), false);
   assert.equal(conversionPollMs([row()], now), false);
-  assert.equal(conversionPollMs([row(view({ run: undefined, serves_plaintext_deprecated: true }))], now), false);
+  assert.equal(conversionPollMs([row(view({ run: undefined }))], now), false);
   assert.equal(conversionPollMs([row(view({ open: false }))], now), false, 'stopped changes only on a click');
   assert.equal(conversionPollMs([row(view())], now), false, 'resume with no deadline known: never');
   assert.equal(conversionPollMs([row(view({ deadline: DEADLINE }))], now), 601_000, 'resume: once, after the deadline');
@@ -169,13 +166,12 @@ function sourceFiles(dir: string): string[] {
   });
 }
 
-test('no UI path writes a read policy (plaintext_reads: serve or refuse)', () => {
+test('no UI source names the removed read-policy field', () => {
+  // Built at runtime, so that this file does not match itself.
+  const removed = ['plaintext', 'reads'].join('_');
   const bad: string[] = [];
   for (const file of sourceFiles(SRC)) {
-    const code = readFileSync(file, 'utf8');
-    for (const m of code.matchAll(/plaintext_reads['"]?\s*[:=]\s*['"](serve|refuse)['"]/g)) {
-      bad.push(`${relative(SRC, file)}: ${m[0]}`);
-    }
+    if (readFileSync(file, 'utf8').includes(removed)) bad.push(relative(SRC, file));
   }
-  assert.deepEqual(bad, [], 'the server converts the history; only Convert now names the field, with null');
+  assert.deepEqual(bad, [], 'the server refuses a config with the field; the conversion window replaces it');
 });

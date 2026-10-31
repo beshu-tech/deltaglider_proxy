@@ -588,19 +588,55 @@ fn the_keys_of_a_bucket_that_does_not_exist_can_leave() {
         .is_empty());
 }
 
-/// `plaintext_reads` is deprecated in the JSON schema (`config schema`,
-/// the admin editor), and its description names no issue number.
+/// The removed `encryption.plaintext_reads` fails every load, on a
+/// backend and on a bucket, from YAML and from JSON (a section body), with
+/// an error that names the field and says what to do. The schema no longer
+/// offers it.
 #[test]
-fn the_schema_marks_plaintext_reads_deprecated() {
+fn a_removed_plaintext_reads_fails_the_load_and_says_what_to_do() {
+    let key = "a".repeat(64);
+    let says_what_to_do = |msg: &str| {
+        assert!(
+            msg.contains("encryption.plaintext_reads was removed"),
+            "{msg}"
+        );
+        assert!(msg.contains("delete this line"), "{msg}");
+        assert!(msg.contains("re-encrypt job"), "{msg}");
+    };
+    for value in ["serve", "refuse"] {
+        let block =
+            format!("{{ mode: aes256-gcm-proxy, key: \"{key}\", plaintext_reads: {value} }}");
+        let backend = format!(
+            "storage:\n  backends:\n    - name: local-disk\n      type: filesystem\n      path: /tmp/x\n      encryption: {block}\n"
+        );
+        let bucket = format!(
+            "storage:\n  filesystem: /tmp/x\n  buckets:\n    db-archive:\n      encryption: {block}\n"
+        );
+        for doc in [backend, bucket] {
+            let err = Config::from_yaml_str(&doc).expect_err(&doc).to_string();
+            says_what_to_do(&err);
+            // The file load (boot, `config lint`) is the same parse.
+            let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+            std::fs::write(file.path(), &doc).unwrap();
+            let err = Config::from_file(file.path().to_str().unwrap()).expect_err(&doc);
+            says_what_to_do(&err.to_string());
+        }
+        let json = serde_json::json!({
+            "mode": "aes256-gcm-proxy", "key": key, "plaintext_reads": value
+        });
+        let err = serde_json::from_value::<BackendEncryptionConfig>(json).unwrap_err();
+        says_what_to_do(&err.to_string());
+    }
+    // Any mode: the field is gone, not misplaced.
+    let err =
+        serde_yaml::from_str::<BackendEncryptionConfig>("{ mode: none, plaintext_reads: serve }")
+            .unwrap_err();
+    says_what_to_do(&err.to_string());
+    // Other unknown fields keep serde's own error.
+    let err = serde_yaml::from_str::<BackendEncryptionConfig>("{ mode: sse-kms, kms_key: x }")
+        .unwrap_err();
+    assert!(err.to_string().contains("unknown field `kms_key`"), "{err}");
     let schema = serde_json::to_value(schemars::schema_for!(BackendEncryptionConfig)).unwrap();
-    let text = schema.to_string();
-    let field = schema["oneOf"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find_map(|v| v["properties"].get("plaintext_reads"))
-        .expect("the proxy-AES variant has the field");
-    assert_eq!(field["deprecated"], true, "{field}");
-    assert!(!text.contains("issue #120"), "{field}");
-    assert!(!text.contains("example config"), "{field}");
+    assert!(!schema.to_string().contains("plaintext_reads"));
+    assert_eq!(schema["title"], "BackendEncryptionConfig");
 }

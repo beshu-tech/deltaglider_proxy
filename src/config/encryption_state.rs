@@ -236,29 +236,16 @@ fn change_kind(before: &WriteEncryption, after: &WriteEncryption) -> Option<Encr
     }
 }
 
-/// Pure: does a bucket whose read form goes from `before` to `after`
-/// start a conversion? A read form is the write encryption and whether
-/// it serves every unencrypted object (`plaintext_reads: serve`, still
-/// honoured for one release); `None` = the old config does not resolve
-/// the bucket. Yes when `after` encrypts with a usable proxy key and does
-/// not serve plaintext (it refuses unsealed objects outside a conversion
-/// window), and `before` could have stored plaintext that a client reads:
-/// any other mode (plaintext, native SSE, a proxy mode with no key), or a
-/// proxy key that served plaintext. A key rotation starts none, and an
-/// `after` that serves plaintext keeps the behaviour of that deprecated
-/// setting unchanged (no marker, no job; the operator runs the job).
-pub fn starts_conversion(
-    before: Option<(&WriteEncryption, bool)>,
-    after: (&WriteEncryption, bool),
-) -> bool {
+/// Pure: does a bucket whose write encryption goes from `before` to
+/// `after` start a conversion? `None` = the old config does not resolve
+/// the bucket. Yes when `after` encrypts with a usable proxy key (it
+/// refuses unsealed objects outside a conversion window), and `before`
+/// could have stored plaintext that a client reads: any other mode
+/// (plaintext, native SSE, a proxy mode with no key). A key rotation
+/// starts none.
+pub fn starts_conversion(before: Option<&WriteEncryption>, after: &WriteEncryption) -> bool {
     let proxy_key = |w: &WriteEncryption| w.mode == "aes256-gcm-proxy" && !w.refuses_writes();
-    if !proxy_key(after.0) || after.1 {
-        return false;
-    }
-    match before {
-        Some((w, served)) if proxy_key(w) => served,
-        _ => true,
-    }
+    proxy_key(after) && !before.is_some_and(proxy_key)
 }
 
 /// Pure: does a bucket stop encrypting with a proxy key from `before` to
@@ -374,19 +361,18 @@ impl Config {
         old: &Config,
         listed: &[(String, Option<String>)],
     ) -> Vec<String> {
-        let read_form = |c: &Config, name: &str, held: Option<&str>| {
+        let write = |c: &Config, name: &str, held: Option<&str>| {
             c.encryption_for_listed_bucket(name, held)
-                .map(|e| (e.write_encryption(), e.config.serves_plaintext()))
+                .map(|e| e.write_encryption())
         };
         listed
             .iter()
             .filter(|(name, _)| !name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX))
             .filter(|(name, held)| {
-                let Some(after) = read_form(self, name, held.as_deref()) else {
+                let Some(after) = write(self, name, held.as_deref()) else {
                     return false;
                 };
-                let before = read_form(old, name, held.as_deref());
-                starts_conversion(before.as_ref().map(|(w, s)| (w, *s)), (&after.0, after.1))
+                starts_conversion(write(old, name, held.as_deref()).as_ref(), &after)
             })
             .map(|(name, _)| name.to_ascii_lowercase())
             .collect()
@@ -414,28 +400,6 @@ impl Config {
                 )
             })
             .map(|(name, _)| name.to_ascii_lowercase())
-            .collect()
-    }
-
-    /// One deprecation warning per encryption site that sets
-    /// `plaintext_reads: serve` (load, `config lint`, apply). The setting
-    /// is still honoured in this release; the next one rejects it.
-    pub fn plaintext_reads_deprecations(&self) -> Vec<String> {
-        self.encryption_sites()
-            .into_iter()
-            .filter(|(site, _)| !(*site == EncryptionSite::Singleton && !self.backends.is_empty()))
-            .filter(|(_, enc)| enc.serves_plaintext())
-            .map(|(site, _)| {
-                format!(
-                    "{}: `encryption.plaintext_reads: serve` is deprecated, and the next release \
-                     rejects it. It is still honoured: reads serve every object that is not \
-                     encrypted, also one that someone put directly on the storage. Remove the \
-                     line (admin UI: Convert now): the apply then opens a conversion window, so \
-                     the plaintext history stays readable, and starts the re-encrypt job that \
-                     converts it",
-                    site.label()
-                )
-            })
             .collect()
     }
 
@@ -684,8 +648,7 @@ mod tests {
     }
 
     /// The truth table of [`starts_conversion`]: only a change to a usable
-    /// proxy key that does not serve plaintext, from a form that a client
-    /// could read plaintext in.
+    /// proxy key, from a form that a client could read plaintext in.
     #[test]
     fn a_conversion_starts_where_plaintext_history_becomes_unreadable() {
         let aes = w("aes256-gcm-proxy", Some("a"));
@@ -694,25 +657,15 @@ mod tests {
         let none = w("none", None);
         let sse = w("sse-s3", None);
         // Plaintext, native SSE, a keyless proxy, or nothing before.
-        for before in [
-            Some((&none, false)),
-            Some((&sse, false)),
-            Some((&keyless, false)),
-            None,
-        ] {
-            assert!(starts_conversion(before, (&aes, false)), "{before:?}");
-            // `serve` after: the deprecated setting keeps its behaviour.
-            assert!(!starts_conversion(before, (&aes, true)), "{before:?}");
+        for before in [Some(&none), Some(&sse), Some(&keyless), None] {
+            assert!(starts_conversion(before, &aes), "{before:?}");
         }
         // A rotation, and the same key again, start none.
-        assert!(!starts_conversion(Some((&aes, false)), (&aes_b, false)));
-        assert!(!starts_conversion(Some((&aes, false)), (&aes, false)));
-        // `serve` removed ("Convert now"), with or without a rotation.
-        assert!(starts_conversion(Some((&aes, true)), (&aes, false)));
-        assert!(starts_conversion(Some((&aes, true)), (&aes_b, false)));
+        assert!(!starts_conversion(Some(&aes), &aes_b));
+        assert!(!starts_conversion(Some(&aes), &aes));
         // After: no usable proxy key.
         for after in [&none, &sse, &keyless] {
-            assert!(!starts_conversion(Some((&none, false)), (after, false)));
+            assert!(!starts_conversion(Some(&none), after));
         }
     }
 
@@ -737,8 +690,8 @@ mod tests {
     }
 
     /// The listed buckets that an apply converts: an own block, an
-    /// inherited backend change, an unnamed bucket on the default backend,
-    /// `serve` removed; not a rotation, not a bucket that keeps `serve`.
+    /// inherited backend change, an unnamed bucket on the default backend;
+    /// not a rotation.
     #[test]
     fn the_buckets_starting_conversion_follow_their_effective_encryption() {
         let listed: Vec<(String, Option<String>)> = [
@@ -775,20 +728,6 @@ mod tests {
             own.buckets_starting_conversion(&plain, &listed),
             ["db-archive"]
         );
-        // `serve` on the backend: unchanged behaviour; removing it converts.
-        let serve = cfg(
-            &format!(
-                "      encryption: {{ mode: aes256-gcm-proxy, key: \"{KA}\", key_id: local-a, plaintext_reads: serve }}\n"
-            ),
-            names,
-        );
-        assert!(serve
-            .buckets_starting_conversion(&plain, &listed)
-            .is_empty());
-        assert_eq!(
-            backend.buckets_starting_conversion(&serve, &listed),
-            ["releases", "db-archive", "unnamed"]
-        );
         // A bucket's `mode: none` block removed: it starts to inherit.
         let off = cfg(
             &local_aes(KA, "local-a"),
@@ -798,32 +737,6 @@ mod tests {
             backend.buckets_starting_conversion(&off, &listed),
             ["releases"]
         );
-    }
-
-    #[test]
-    fn serve_is_deprecated_at_every_site_that_sets_it() {
-        let c = cfg(
-            &format!(
-                "      encryption: {{ mode: aes256-gcm-proxy, key: \"{KA}\", key_id: local-a, plaintext_reads: serve }}\n"
-            ),
-            &format!(
-                "    db-archive: {{ backend: hetzner-fsn1, encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: db, plaintext_reads: serve }} }}\n    releases: {{ backend: local-disk }}\n"
-            ),
-        );
-        let w = c.plaintext_reads_deprecations();
-        assert_eq!(w.len(), 2, "{w:?}");
-        assert!(w[0].starts_with("backend 'local-disk'"), "{w:?}");
-        assert!(w[1].starts_with("bucket 'db-archive'"), "{w:?}");
-        assert!(w.iter().all(|m| m.contains("deprecated")));
-        assert!(cfg("", "    releases: { backend: local-disk }\n")
-            .plaintext_reads_deprecations()
-            .is_empty());
-        // The load warnings carry it (load, `config lint`, apply).
-        let mut loaded = c.clone();
-        assert!(loaded
-            .check()
-            .iter()
-            .any(|m| m.contains("plaintext_reads: serve` is deprecated")));
     }
 
     #[test]

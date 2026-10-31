@@ -89,8 +89,9 @@ async fn test_config_apply_happy_path() {
 }
 
 /// Review X4: `config apply` prints the warnings that the running config
-/// already produces (`existing_warnings`), so the `plaintext_reads: serve`
-/// deprecation shows on every apply, also one that changes nothing.
+/// already produces (`existing_warnings`), so a standing warning (here a
+/// `legacy_key_id` without its key) shows on every apply, also one that
+/// changes nothing.
 #[tokio::test]
 async fn test_config_apply_prints_the_existing_warnings() {
     let server = TestServer::builder()
@@ -105,7 +106,7 @@ async fn test_config_apply_prints_the_existing_warnings() {
             "mode": "aes256-gcm-proxy",
             "key": "11".repeat(32),
             "key_id": "cli-warn",
-            "plaintext_reads": "serve",
+            "legacy_key_id": "cli-retired",
         }}))
         .send()
         .await
@@ -137,9 +138,63 @@ async fn test_config_apply_prints_the_existing_warnings() {
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
     assert!(
         stderr.contains("warning (already in the running config): ")
-            && stderr.contains("plaintext_reads: serve` is deprecated"),
-        "the deprecation of the running config is printed: {stderr}"
+            && stderr.contains("sets encryption.legacy_key_id but no legacy_key"),
+        "the standing warning of the running config is printed: {stderr}"
     );
+}
+
+/// N3: `config lint` and `config apply` refuse a file that still has the
+/// removed `encryption.plaintext_reads`, with an error that names the
+/// field and says what to do; the apply sends nothing to the server.
+#[tokio::test]
+async fn test_config_lint_and_apply_refuse_the_removed_plaintext_reads() {
+    let server = TestServer::builder()
+        .auth("CLIREMK", "CLIREMS")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let yaml_path = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        yaml_path.path(),
+        format!(
+            "storage:\n  filesystem: /tmp/dgp-cli-removed\n  backend_encryption:\n    mode: aes256-gcm-proxy\n    key: \"{}\"\n    plaintext_reads: serve\n",
+            "22".repeat(32)
+        ),
+    )
+    .unwrap();
+    let path = yaml_path.path().to_str().unwrap();
+    for args in [
+        vec!["config", "lint", path],
+        vec!["config", "apply", path, "--server", &endpoint],
+    ] {
+        let output = Command::new(BIN)
+            .current_dir(std::env::temp_dir())
+            .args(&args)
+            .env("DGP_BOOTSTRAP_PASSWORD", TEST_PASSWORD)
+            .output()
+            .unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_ne!(output.status.code(), Some(0), "{args:?}: {all}");
+        assert!(
+            all.contains("encryption.plaintext_reads was removed")
+                && all.contains("delete this line"),
+            "{args:?}: {all}"
+        );
+    }
+    let admin = common::admin_http_client(&endpoint).await;
+    let config: serde_json::Value = admin
+        .get(format!("{endpoint}/_/api/admin/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!config.to_string().contains("aes256-gcm-proxy"), "{config}");
 }
 
 #[tokio::test]

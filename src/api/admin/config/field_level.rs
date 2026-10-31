@@ -130,9 +130,6 @@ pub struct BackendEncryptionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kms_key_id: Option<String>,
     pub shim_active: bool,
-    /// The deprecated `plaintext_reads: serve` (issue #120): reads also
-    /// serve objects that are not encrypted. The next release rejects it.
-    pub serves_plaintext_deprecated: bool,
 }
 
 impl BackendEncryptionSummary {
@@ -149,13 +146,11 @@ impl BackendEncryptionSummary {
                 key_id: None,
                 kms_key_id: None,
                 shim_active: legacy_key.is_some(),
-                serves_plaintext_deprecated: false,
             },
             E::Aes256GcmProxy {
                 key,
                 key_id,
                 legacy_key,
-                plaintext_reads,
                 ..
             } => {
                 // Surface the same id the engine stamps on written
@@ -174,8 +169,6 @@ impl BackendEncryptionSummary {
                     key_id: resolved_kid,
                     kms_key_id: None,
                     shim_active: legacy_key.is_some(),
-                    serves_plaintext_deprecated: *plaintext_reads
-                        == crate::config::PlaintextReads::Serve,
                 }
             }
             E::SseKms {
@@ -188,7 +181,6 @@ impl BackendEncryptionSummary {
                 key_id: None,
                 kms_key_id: Some(kms_key_id.clone()),
                 shim_active: legacy_key.is_some(),
-                serves_plaintext_deprecated: false,
             },
             E::SseS3 { legacy_key, .. } => Self {
                 mode: "sse-s3".into(),
@@ -196,7 +188,6 @@ impl BackendEncryptionSummary {
                 key_id: None,
                 kms_key_id: None,
                 shim_active: legacy_key.is_some(),
-                serves_plaintext_deprecated: false,
             },
         }
     }

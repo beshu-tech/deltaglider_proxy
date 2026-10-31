@@ -6,8 +6,8 @@
 //! commits, the job is queued after it, and the response names both. An
 //! empty bucket starts nothing; an active job refuses the apply and
 //! leaves no marker; a failed open removes the markers the apply wrote;
-//! a marker that is there is reused; `plaintext_reads: serve` is still
-//! served, with a deprecation warning.
+//! a marker that is there is reused; the removed read-policy field fails
+//! every apply with an error that says what to do.
 
 use crate::common;
 
@@ -256,7 +256,6 @@ async fn an_apply_opens_the_window_and_queues_the_job_of_a_bucket_with_objects()
     assert_eq!(view["open"], true, "{view}");
     assert_eq!(view["run"], run.as_str(), "{view}");
     assert_eq!(view["job_on_this_node"]["id"], job_id, "{view}");
-    assert_eq!(view["serves_plaintext_deprecated"], false, "{view}");
     assert!(
         view["deadline"].as_i64() > view["cutoff"].as_i64(),
         "{view}"
@@ -404,45 +403,70 @@ async fn an_existing_marker_is_reused() {
     assert!(!env.marker_file("applyreuse").exists(), "the job closed it");
 }
 
-/// `plaintext_reads: serve` is still honoured (no marker, no job, every
-/// unencrypted object served) with a deprecation warning; removing the
-/// line ("Convert now") starts the conversion.
+/// N3: `plaintext_reads` is removed. A section PUT, its validate and a
+/// whole-document apply that carry it fail (400) with an error that names
+/// the field and says what to do; nothing changes: no marker, the history
+/// stays as it is, and the running config does not encrypt.
 #[tokio::test]
-async fn serve_is_still_served_with_a_deprecation_warning() {
-    let env = Env::new("applyserve", &[]).await;
-    env.put("applyserve", "a.txt").await;
-    let mut serve = aes();
-    serve["plaintext_reads"] = json!("serve");
-    let (code, v) = env
-        .storage(json!({ "backend_encryption": serve }), false)
-        .await;
-    assert_eq!(code, 200, "{v}");
-    assert!(v.get("conversions").is_none(), "{v}");
-    assert!(
-        v["warnings"].as_array().unwrap().iter().any(|w| w
-            .as_str()
-            .unwrap()
-            .contains("plaintext_reads: serve` is deprecated")),
-        "{v}"
-    );
-    assert!(!env.marker_file("applyserve").exists());
-    assert_eq!(env.get("applyserve", "a.txt").await, (200, BODY.to_vec()));
-    let view = env.conversion_of("applyserve").await;
-    assert_eq!(view["serves_plaintext_deprecated"], true, "{view}");
-    assert_eq!(view["open"], false, "{view}");
-
-    // Convert now: the line goes, the conversion starts.
-    let (code, v) = env
-        .storage(
-            json!({ "backend_encryption": { "plaintext_reads": null } }),
-            false,
-        )
-        .await;
-    assert_eq!(code, 200, "{v}");
-    assert!(v["conversions"][0]["job_id"].is_i64(), "{v}");
-    env.wait_done("applyserve").await;
-    assert!(!env.plaintext("applyserve", "a.txt"));
-    assert_eq!(env.get("applyserve", "a.txt").await, (200, BODY.to_vec()));
+async fn an_apply_with_the_removed_plaintext_reads_fails_and_says_what_to_do() {
+    let env = Env::new("applyremoved", &[]).await;
+    env.put("applyremoved", "a.txt").await;
+    let says_what_to_do = |v: &Value| {
+        let text = v.to_string();
+        assert!(
+            text.contains("encryption.plaintext_reads was removed")
+                && text.contains("delete this line")
+                && text.contains("re-encrypt job"),
+            "{v}"
+        );
+    };
+    for value in ["serve", "refuse"] {
+        let mut block = aes();
+        block["plaintext_reads"] = json!(value);
+        for validate in [true, false] {
+            let (code, v) = env
+                .storage(json!({ "backend_encryption": block.clone() }), validate)
+                .await;
+            assert_eq!(code, 400, "validate {validate}: {v}");
+            says_what_to_do(&v);
+        }
+    }
+    let export = env
+        .admin
+        .get(format!(
+            "{}/_/api/admin/config/export",
+            env.server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&export).unwrap();
+    doc["storage"]["backend_encryption"] = serde_yaml::from_str(&format!(
+        "{{ mode: aes256-gcm-proxy, key: {KEY}, key_id: {KEY_ID}, plaintext_reads: serve }}"
+    ))
+    .unwrap();
+    let yaml = serde_yaml::to_string(&doc).unwrap();
+    let resp = env
+        .admin
+        .post(format!(
+            "{}/_/api/admin/config/apply",
+            env.server.endpoint()
+        ))
+        .json(&json!({ "yaml": yaml }))
+        .send()
+        .await
+        .unwrap();
+    let code = resp.status().as_u16();
+    let v: Value = resp.json().await.unwrap_or_default();
+    assert_eq!(code, 400, "{v}");
+    says_what_to_do(&v);
+    assert!(!env.marker_file("applyremoved").exists());
+    assert!(env.plaintext("applyremoved", "a.txt"));
+    assert_eq!(env.get("applyremoved", "a.txt").await, (200, BODY.to_vec()));
+    assert!(env.conversion_of("applyremoved").await.is_null());
 }
 
 /// A versioned MinIO bucket that holds `a.txt` (a plain object) and

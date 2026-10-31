@@ -32,7 +32,6 @@ import { useCopyToClipboard } from '../useCopyToClipboard';
 import { aesKeyPatch, encryptionKeyEnvVar } from '../backendEncryptionPayload';
 import LegacyKeyBanner from './LegacyKeyBanner';
 import { ConversionStatusLine } from './ConversionStatus';
-import ServeDeprecationNotice from './ServeDeprecationNotice';
 import type { ConversionView } from '../adminApi';
 
 const { Text } = Typography;
@@ -79,8 +78,6 @@ interface Props {
    * still needs the key. Resolves on success.
    */
   onClearLegacy?: () => Promise<void>;
-  /** "Convert now": remove the deprecated `plaintext_reads: serve`. */
-  onConvertNow?: () => Promise<void>;
   /** The conversions of the buckets that take this backend's setting:
    *  one status row each. */
   conversions?: ReadonlyArray<{ bucket: string; view: ConversionView }>;
@@ -95,7 +92,6 @@ export default function BackendEncryptionEditor({
   onApply,
   readOnly,
   onClearLegacy,
-  onConvertNow,
   conversions,
   usage,
 }: Props) {
@@ -314,9 +310,6 @@ export default function BackendEncryptionEditor({
         <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
           {keyChangeBlockedReason}
         </Text>
-      )}
-      {current.serves_plaintext_deprecated && !pending && (
-        <ServeDeprecationNotice subject="backend" onConvert={readOnly ? undefined : onConvertNow} />
       )}
       {current.shim_active && !pending && (
         <LegacyKeyBanner backendName={backendName} readOnly={readOnly} onClearLegacy={onClearLegacy} />

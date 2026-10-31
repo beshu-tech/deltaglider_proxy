@@ -476,7 +476,6 @@ pub(super) fn resolve_encryption_config(
         legacy_key_id: legacy_kid_opt,
         buckets: bucket_keys,
         keyring,
-        serve_plaintext: enc.serves_plaintext(),
         ..Default::default()
     })
 }
@@ -576,7 +575,6 @@ pub(super) fn resolve_bucket_keys(
         // override that is not native gets no SSE headers on a backend
         // whose own mode is native.
         keys.native = native_encryption_for(o.config);
-        keys.serve_plaintext = o.config.serves_plaintext();
         if let Some(slot) = site.legacy {
             let crate::config::SiteKey { key, key_id: kid } =
                 slot.map_err(StorageError::Encryption)?;

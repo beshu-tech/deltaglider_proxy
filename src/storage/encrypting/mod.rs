@@ -8,9 +8,9 @@
 //! the facts bound to the object's location, no hashes in clear). Every
 //! read of a body or of metadata goes through THE read rule
 //! (`present_raw`): a sealed object opens with the key its fingerprint
-//! names; an object without a seal is served only where the bucket may
-//! serve plaintext (it writes plaintext, or `plaintext_reads: serve`), or
-//! as history while the bucket's conversion window is open
+//! names; an object without a seal is served only where the bucket
+//! writes plaintext, or as history while the bucket's conversion window
+//! is open
 //! (`conversion.rs`); the re-encrypt job reads every one of them.
 //! Callers above the wrapper see the logical object, with the markers
 //! `dg-encrypted: v2` and `dg-encryption-key-id: <id>`; the raw stored
@@ -166,9 +166,6 @@ pub struct EncryptionConfig {
     /// reads its history under the backend's key, a rotated key, or a
     /// removed override.
     pub keyring: std::collections::HashMap<String, EncryptionKey>,
-    /// `plaintext_reads: serve` of the backend's own encryption: a read of
-    /// a bucket without an override may serve an unencrypted object.
-    pub serve_plaintext: bool,
     /// Every key above, by fingerprint (built on first use).
     pub(crate) ring: std::sync::OnceLock<seal::Keyring>,
 }
@@ -257,8 +254,6 @@ pub struct BucketKeys {
     pub write_mode: WriteMode,
     /// The bucket's decrypt-only key id, if any (its key is in the keyring).
     pub legacy_key_id: Option<String>,
-    /// `plaintext_reads: serve` of the bucket's override.
-    pub serve_plaintext: bool,
     /// The native SSE headers of the bucket's writes (an S3 backend reads
     /// them per request through [`EncryptionConfig::native_for`]).
     /// `None` for a proxy-AES or plaintext override.
@@ -1317,27 +1312,13 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         }
     }
 
-    /// Does `bucket` serve every object that is not encrypted? Yes when
-    /// the bucket writes plaintext, or encrypts with
-    /// `plaintext_reads: serve`. Otherwise only through its conversion
-    /// window ([`seal::read_verdict`]).
-    fn plaintext_ok(&self, bucket: &str) -> bool {
-        if self.writes_plaintext(bucket) {
-            return true;
-        }
-        let cfg = self.config.load();
-        cfg.buckets
-            .get(bucket)
-            .map_or(cfg.serve_plaintext, |b| b.serve_plaintext)
-    }
-
     /// The plaintext rule of `bucket` with the conversion `window`.
     fn plaintext_rule<'w>(
         &self,
         bucket: &str,
         window: &'w conversion::Window,
     ) -> seal::PlaintextRule<'w> {
-        if self.plaintext_ok(bucket) {
+        if self.writes_plaintext(bucket) {
             seal::PlaintextRule::Serves
         } else {
             seal::PlaintextRule::Encrypts(window)
@@ -1908,9 +1889,9 @@ impl<B: StorageBackend + Send + Sync + 'static> EncryptingBackend<B> {
     ) {
         use token_heal::{count, MissDecision};
         // An open conversion window serves plaintext history: a listed
-        // passthrough may then be plaintext, as with `plaintext_reads:
-        // serve`. The window is read only when the page has a miss.
-        let plaintext_ok = self.plaintext_ok(b)
+        // passthrough may then be plaintext, as in a bucket that writes
+        // plaintext. The window is read only when the page has a miss.
+        let plaintext_ok = self.writes_plaintext(b)
             || (sizes.contains(&ListedSize::StoredOnly) && self.window_of(b).await.is_open());
         let mut budget = if how.caller_heads_misses {
             0

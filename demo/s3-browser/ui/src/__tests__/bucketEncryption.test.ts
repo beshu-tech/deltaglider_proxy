@@ -104,11 +104,6 @@ describe('the wire body is one bucket merge-patch', () => {
       },
     });
   });
-  test('convert now removes only the deprecated plaintext_reads line (#120)', () => {
-    expect(bucketEncryptionBody('db-archive', bucketKey, { kind: 'convert-now' })).toEqual({
-      buckets: { 'db-archive': { encryption: { plaintext_reads: null } } },
-    });
-  });
   test('a pinned bucket keeps its route untouched', () => {
     expect(bucketEncryptionBody('db-archive', bucketKey, { kind: 'off' })).toEqual({
       buckets: { 'db-archive': { encryption: { mode: 'none' } } },
