@@ -296,6 +296,37 @@ arms the write gate. Deviations from v2, from the commits:
   the bucket card's "Now:" line and on the backend card's status block,
   and the bucket list polls every 3 s while a conversion runs.
 
+### After the four-way review (2026-10-31)
+
+- **Run ownership.** The apply, the boot and `open_window` store the
+  marker's run id in the job's params (`ReencryptParams::run`). Only a job
+  with that run extends and closes the marker; a job without a run
+  (rotation, plain re-encrypt) never writes a marker.
+- **Adoption.** In a bucket that encrypts, every unsealed object and
+  reference that a client could not read is adopted and reported, also
+  with no marker of the job's run (deleted, foreign, another run's,
+  expired). Only a bucket whose rule is Serves adopts silently. The job
+  row counts adoptions (`maintenance_jobs.objects_adopted`, a jobs-only
+  column added at open without a schema bump); the failure ring keeps
+  at most 100 adoption samples, outside the 200-row failure bound.
+- **Open modes.** `OpenMode::Refresh` (apply, boot): a marker that opens
+  keeps its run id and gets cutoff = server now and a new deadline, by
+  identity. `OpenMode::Resume` (`open_window`): the marker is kept as it
+  is, also past its deadline. A create whose read-back or answer failed is
+  still `Created` (the run id that the call generated identifies it). An
+  apply that stops encrypting a bucket closes its marker (any run) with
+  the old engine's keyring. `ConversionOp::Open` always uses the built
+  config and no witness check; `Expired` and `OpenedAsBuilt` are gone.
+- **Boot (restart-based deployments).** For a bucket that encrypts, has
+  plaintext in the 100-object sample, no encrypted object in it, no key
+  claim, no marker and no active job, the boot opens the window (Refresh)
+  and queues the job of its run (`maintenance::conversion::start_at_boot`).
+- **Multi-instance.** Each node's apply queues its own job of the shared
+  run (idempotent); the write gate is per node, so the docs require
+  stopping client writes on every node, or routing them to the job's
+  node, until the job ends. P8 stays a separate plan.
+- **Backfill.** The check reads the raw marker and holds the config read
+  lock until the job exists.
 ## Review log (v1 -> v2)
 
 | Finding | Source | v2 decision |

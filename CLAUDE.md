@@ -119,7 +119,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                              (inline or by the bounded background healer). The read rule
                              gates GET/HEAD/copy/range only: a LIST shows an entry whose seal does not open as stored
                              (`FileMetadata::is_unopened_seal`, never cached), a DELETE removes it (`resolve_forms_to_delete`),
-                             and boot warns about plaintext in an encrypting bucket with no open window (`startup::spawn_plaintext_refusal_check`)
+                             and boot opens the window + queues the job of a never-encrypted bucket with plaintext (no claim, no marker, no sealed object in the sample), else warns (`maintenance::conversion::start_at_boot`)
   → storage/routing.rs      Multi-backend routing (virtual bucket → real backend)
   → glob_filter.rs          THE include/exclude glob matcher of replication, lifecycle and Slack (`compile`, `verdict`, `in_scope`; a glob matches the whole key from the bucket root, `*` crosses `/`, exclude wins). A replication rule's filters bound its copies, its mirror deletes (walk + event consumer, via `planner::dest_key_in_scope`) AND Verify; `POST /jobs/filter-preview` (api/admin/filter_preview.rs) runs it on a sample for the editor's Which-objects preview
   → security.rs             Pure security primitives (validate_bucket_name, bucket_name_is_ip_like, outbound-URL SSRF policy) — unit + proptest, shared by CLI URL parser
