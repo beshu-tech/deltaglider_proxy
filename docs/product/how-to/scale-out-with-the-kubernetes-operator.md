@@ -231,7 +231,7 @@ history of the bucket until the job converts it, and the job then closes the win
 The write gate of the job holds only on the pod that runs it, and the router sends the
 writes of each directory of the bucket to a different pod. Another pod can therefore
 accept a write that the job then overwrites with the older object. Until the job ends,
-stop client writes to the bucket, for example with an admission block in `configYaml`
+stop client writes to the bucket, for example with a request rule in `configYaml`
 that rejects writes to it, or schedule the change for a time when no client writes to
 the bucket. A pod that still runs the old file during the rollout writes plaintext,
 and the job reports such an object as adopted after the cutoff. See

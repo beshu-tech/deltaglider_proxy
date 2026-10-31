@@ -486,7 +486,7 @@ While a bucket holds a conversion marker, the proxy refuses a metadata backfill 
 
 The write gate of a re-encrypt job stops client writes to the bucket only on the instance that runs the job. Another instance still accepts a write to the bucket, and the job can then overwrite that write with the older object that it read before. While a conversion runs in a deployment with several instances, therefore do one of these two things until the job ends:
 
-- Stop client writes to the bucket on every instance (for example with an admission block that rejects writes to the bucket).
+- Stop client writes to the bucket on every instance (for example with a request rule that rejects writes to the bucket).
 - Send every write to the bucket to the instance that runs the job (for example with the directory-hash router of the Kubernetes operator, or a sticky route for the bucket).
 
 Each instance whose config write starts a conversion queues its own job, with the run id of the one shared marker. The jobs are idempotent: a job skips an object that is already encrypted with the right key, so a second job only reads the bucket again. The first job that converts every object closes the window. A job that ends later finds no marker and ends normally.
