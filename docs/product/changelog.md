@@ -8,7 +8,105 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-10-30_
+_Last updated: 2026-10-31_
+
+## v2.0.21 — 2026-10-31
+
+### Added — More file types are stored as deltas, and a bucket can change the list
+
+- The proxy now tries a delta for disk and firmware images (`.bin`, `.img`, `.raw`, `.vmdk`, `.qcow2` and more), executables and libraries (`.exe`, `.dll`, `.so`, `.dylib`, `.wasm`), model weights (`.safetensors`, `.gguf`, `.onnx`, `.ckpt`, `.pt`, `.pth`, `.h5`, `.npy`, `.npz`), ZIP-based packages (`.apk`, `.aab`, `.ipa`, `.whl`, `.nupkg`, `.vsix`, `.xpi`) and database files (`.sqlite`, `.db`). Before, only `zip`, `tar`, `jar`, `war`, `ear`, `dmg`, `iso`, `sql`, `dump`, `bak` and `backup` were tried, so firmware and model files were always stored whole. A delta that is not small enough (`max_delta_ratio`) is still stored whole, so a new type costs encode time, never space. See [Delta-eligible file types](reference/configuration.md#delta-eligible-file-types).
+- A bucket adds or removes types with `delta_extensions: {add: [...], remove: [...]}`, also in the **File types** field of the bucket's **Advanced** settings. `GET /_/api/admin/config` returns the built-in list as `delta_extensions_default`.
+- The object inspector says why an object is stored whole: compression is off for the bucket, the bucket does not try deltas for its type, or the delta was not small enough. For an admin, it links to the bucket's settings.
+
+### Changed — An eligible object larger than `max_object_size` is stored whole
+
+- A CopyObject, a replication or lifecycle copy, a `deltaglider_proxy s3` upload and a large PutObject to a delta-eligible key refused an object larger than `max_object_size` (`400 EntityTooLarge` or `TooLarge`), while a multipart upload of the same object stored it whole. Every path now stores such an object whole, up to `max_passthrough_object_size` (and 5 GiB for CopyObject). A single PutObject body is still limited to `max_object_size`, because the proxy holds it in memory to check its signature.
+
+### Fixed — Interface and website
+
+- The file browser's keyboard cursor had no visible style: the row styles named table rows, and the browser draws its list with `div` rows. The cursor row now has a ring, and hover and selection show again.
+- The file browser's list is a grid for screen readers: rows and cells have their roles, the sorted column says so, and Tab reaches the cursor row. When a row has the focus, the focus follows the arrow keys.
+- Enter on a focused button of the file browser presses the button. Before, with a cursor row, Enter opened that row instead.
+- The **Change Admin Password** button had a contrast of 2.89:1 in the light theme, and the **Download** button of the inspector was white on mint in the dark theme. Both use the theme's primary button now, and a lint rule refuses a hand-picked accent fill on a button.
+- The page no longer starts with `class="dark"` on `<html>` while the theme is light: the first paint sets `data-theme` with the same rule as the app.
+- The docs index showed `//api/admin/` for `/_/api/admin/*`, and page descriptions dropped the `_` of names such as `config_sync_bucket`. A summary now keeps the text of code spans.
+- The upload page no longer says that every file is compressed.
+
+### Changed — A user name follows one rule
+
+- A user name has 1 to 64 characters: letters, digits and `+ = , . @ _ -`, and it is not `.` or `..`. Create, clone and rename refuse another name with `400 invalid_request`, and the form shows the error on the field. Before, any name was accepted, for example `bad name with spaces!!`. An existing user keeps its name, and a rename to the same name still passes.
+- A clone without a name is named `<name>-copy`, then `<name>-copy2`, and so on.
+- When no IAM user exists, **Create user** asks before it continues. The first user switches sign-in from the bootstrap password to IAM users, and the bootstrap key becomes the user `legacy-admin`.
+
+### Fixed — Interface, second pass
+
+- A bucket edit that was waiting for **Review & apply** could open the review of another section with 0 changes. A hidden dirty bar kept its layout box and its buttons. A hidden bar is now hidden for the pointer, the keyboard and screen readers, and a review opens only for a section with changes.
+- After an encryption change on one bucket, the next staged apply of another bucket sent a stale copy of the first bucket. The staged edits now rebase onto the server's new rows, bucket by bucket.
+- With a rule drawer open, the dirty bar is in the drawer's footer. Before, the drawer covered a third of it.
+- Field errors show on the field, with `aria-invalid` and `aria-describedby`, in the user, group, provider and backend forms. A secret input links its error too.
+- The login page no longer scrolls at 900 px high. A wrong key or secret says so in one sentence; the request id is in the hover text.
+- The reference baseline of a folder shows "Stored whole" and a neutral **Baseline** chip, not a green 0.0 % and a **Delta** chip.
+- Small text gets a little more word spacing: at 12 px the UI font drew a space 2 px wide, so "2h 45m ago" read "2h45mago".
+- Links use the brand colour and are underlined in running text. Tags and bucket chips reach 4.5:1 contrast in both themes.
+- Public buckets show a globe in the browser sidebar. A bucket with a quota shows its usage against the quota in the header.
+- On a phone, the object list shows the size under the name, the session and event tables hide minor columns, bucket rows show two chips and "+N", and the analytics hero stacks.
+- The dashboard cards share one style and one grid. System logs expand a row on click. Unknown docs addresses and unknown admin pages show a clear message.
+- Labels and buttons use sentence case, and the browser says "objects" for objects.
+
+### Changed — Interface, third pass
+
+- The upload page no longer uploads when you pick or drop files. The files go into a list that you can review, and **Upload N files to …** sends them. Before, the upload started before you could set the folder.
+- **Remove rule…** of a replication or lifecycle rule is now a staged change like every other rule edit: **Review & apply** removes the rule, and **Keep this rule** or **Discard** undoes it. A new lifecycle rule starts enabled.
+- Group names follow the same rule as user names, in the GUI and on the server (`400 invalid_request`). A duplicated group is named `<name>-copy`.
+- A filesystem-backend LIST with `metadata=true` marks the reference baseline of a folder with `x-amz-meta-dg-baseline: true`, and the file browser shows it as **Baseline**. An S3-backend LIST does not send this fact yet.
+
+### Fixed — Interface, third pass
+
+- Creating a bucket with the name of an existing bucket said that the bucket was created. It now says that the name is taken.
+- Durations, the bucket quota and the request rule tester check the value on the field and refuse to stage an invalid value. Before, `-5` and `abc` became a quota of 0, and an invalid rule opened a review that said both "Validation failed" and "No changes detected".
+- Backend errors and YAML import errors are plain sentences. YAML import names the setting and the value that it got.
+- Long object names are cut in the middle, so the end of the name (often the version) stays visible.
+- A link to a bucket that does not exist says so, instead of opening another bucket.
+- One focus ring for the whole interface. Toasts no longer cover the header. The theme switch repaints in one step.
+- Pages show placeholders while data loads, instead of zeros.
+
+### Changed — Interface, fourth pass
+
+- One set of states on every page: a loading skeleton in the shape of the page, an empty state with one sentence and its action, and an error with a plain sentence, **Retry** and **Details**. A page never shows an error and an empty state together.
+- Every error goes through one mapper, which turns S3 and admin API errors into a sentence that you can act on. Status codes, error codes and request ids are under **Details**.
+- Fields check their value when you leave them and when you apply. Number fields keep what you type and say what is wrong, instead of changing the value in silence.
+- The upload page tracks one state for each file. The final message is green only when every file arrived, failed files show a plain reason, and **Retry** shows only for errors that a retry can fix.
+- The review dialog lists the changed fields with their old and new values. The raw change is under **Show the raw change**.
+- After you apply a rule, its drawer closes and its row flashes once.
+- Each list page has one primary "New …" button in the page header, for example **New bucket**, **New user** and **New rule**.
+- Sizes use binary units everywhere (KiB, MiB, GiB), the same as the limits on the server.
+- YAML import and export moved from the account menu to the **Configuration as YAML** card on the System page.
+- Sessions are grouped by user, and each session has its own **Sign out** button.
+- The breadcrumb always keeps the current folder visible. On a narrow screen, the folders in between become one "…" link.
+- Charts use the brand colours, and an empty chart says that it waits for data.
+
+### Changed — Interface, fifth pass
+
+- The DeltaGlider wordmark is back in capitals with wide letter spacing on the login screen, in the header of the admin settings and the docs, and at the foot of the bucket list. One style draws it everywhere.
+- Form labels are sentence case. Capitals stay only for the small group labels over lists and for the table headers.
+- The admin sidebar entries are links, so you can open a page in a new tab with a middle click or Ctrl+click.
+- The footer of the object list counts folders and objects ("2 folders and 10 objects") instead of "items".
+- The permission presets are named **Read only** and **Full access (admin)**, and the rule fields are named **Where** and **Can do**. The admin API returns the new preset names.
+- The help of a replication rule's **Enabled** switch is one sentence that names the **Run replication rules** switch.
+
+### Fixed — Interface, fifth pass
+
+- In a narrow column, such as the rule drawer, an empty band was between a field label and its input. The hidden YAML path wrapped to a second line there; it now stays on the label's line and is shortened.
+- Monospace text, for example times and sizes, had the extra word spacing of the interface font ("10h  ago").
+- The inspector of a baseline object said "Baseline" twice.
+- The example values under a form field were smaller than 24 × 24 px, the minimum touch target of WCAG 2.2.
+- The dashboard showed "0 B avg per entry" for an empty cache, and latencies without a space before the unit ("4.3ms").
+
+### Changed — One error body for the admin API
+
+- An admin API error now always has the JSON body `{"error": <code>, "message": <text>}`. Before, an error had one of four bodies: plain text, `{"error": <text>}`, `{"error": <code>, "message": <text>}`, or an empty body for a server error. The `error` field now holds a stable machine code (for example `not_found`, `conflict` or `invalid_request`), and the text is in `message`. The codes that clients already matched on, such as `iam_declarative`, `admin_session_required` and `invalid_path`, stay in `error`. A script that showed `error` as the reason must now show `message`. See [Errors](reference/admin-api.md#errors).
+- A server error never sends the text of the underlying failure. The body is `{"error": "internal", "message": …}` with a generic message, and the detail goes to the server log. Before, some endpoints sent database or storage error text.
+- The config write endpoints keep their own bodies (`{success: false, error}`, `{ok: false, error}`, `{applied: false, error}`), and `error` still holds the text there.
 
 ## v2.0.20 — 2026-10-30
 

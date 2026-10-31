@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.21 — 2026-10-31
+
 ### Added — More file types are stored as deltas, and a bucket can change the list
 
 - The proxy now tries a delta for disk and firmware images (`.bin`, `.img`, `.raw`, `.vmdk`, `.qcow2` and more), executables and libraries (`.exe`, `.dll`, `.so`, `.dylib`, `.wasm`), model weights (`.safetensors`, `.gguf`, `.onnx`, `.ckpt`, `.pt`, `.pth`, `.h5`, `.npy`, `.npz`), ZIP-based packages (`.apk`, `.aab`, `.ipa`, `.whl`, `.nupkg`, `.vsix`, `.xpi`) and database files (`.sqlite`, `.db`). Before, only `zip`, `tar`, `jar`, `war`, `ear`, `dmg`, `iso`, `sql`, `dump`, `bak` and `backup` were tried, so firmware and model files were always stored whole. A delta that is not small enough (`max_delta_ratio`) is still stored whole, so a new type costs encode time, never space. See [Delta-eligible file types](docs/product/reference/configuration.md#delta-eligible-file-types).
