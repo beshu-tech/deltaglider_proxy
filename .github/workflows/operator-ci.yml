@@ -29,11 +29,51 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
+  # One CR on a kind cluster with the real deploy/ manifests (RBAC included):
+  # wait for Ready, then change spec.image and wait for the rollout. A unit
+  # test cannot see a ClusterRole that the API server refuses; this job can.
+  cluster-smoke:
+    needs: operator
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Read operator version
+        id: ver
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' operator/Cargo.toml | head -1)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+      # The image name that deploy/operator.yaml pins, built from this commit
+      # and loaded into kind, so the cluster never pulls from Docker Hub.
+      - uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: operator
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          tags: beshultd/deltaglider-operator:${{ steps.ver.outputs.version }}
+          cache-from: |
+            type=gha,scope=operator
+            type=gha,scope=operator-smoke
+          cache-to: type=gha,scope=operator-smoke,mode=max
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.33.0
+          cluster_name: dgp-smoke
+      - name: Load the operator image into kind
+        run: kind load docker-image --name dgp-smoke "beshultd/deltaglider-operator:${{ steps.ver.outputs.version }}"
+      - name: Smoke (Ready, then a spec.image rollout)
+        run: ./operator/scripts/kind-smoke.sh
+
   # Publish beshultd/deltaglider-operator — but ONLY when the version in
   # operator/Cargo.toml has no tag on Docker Hub yet. Rust builds are expensive;
   # docs-only pushes and re-runs of an already-published version skip everything.
   publish:
-    needs: operator
+    needs: [operator, cluster-smoke]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
