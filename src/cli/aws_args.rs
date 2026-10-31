@@ -32,7 +32,9 @@ pub struct AwsArgs {
     #[arg(long, value_name = "ID")]
     pub access_key_id: Option<String>,
 
-    /// Override `AWS_SECRET_ACCESS_KEY`.
+    /// Override `AWS_SECRET_ACCESS_KEY`. Deprecated: other users on the
+    /// host can read the command line (`ps`). Use the environment or a
+    /// profile.
     #[arg(long, value_name = "KEY")]
     pub secret_access_key: Option<String>,
 
@@ -40,6 +42,12 @@ pub struct AwsArgs {
     #[arg(long)]
     pub force_path_style: bool,
 }
+
+/// Printed when `--secret-access-key` is used (NEW-08). The flag goes in
+/// the next major release.
+pub(crate) const SECRET_FLAG_WARNING: &str = "warning: --secret-access-key is deprecated: \
+     other users on this host can read the command line (for example with `ps`). \
+     Set AWS_SECRET_ACCESS_KEY or use a profile (--profile) instead.";
 
 /// The engine knobs a verb may override (the rest of [`CliEngineOpts`]).
 #[derive(Debug, Clone, Copy, Default)]
@@ -71,9 +79,18 @@ impl AwsArgs {
         }
     }
 
+    /// Pure: the warning for a secret given on the command line, or
+    /// `None` when the flag is not used.
+    pub(crate) fn secret_flag_warning(&self) -> Option<&'static str> {
+        self.secret_access_key.as_ref().map(|_| SECRET_FLAG_WARNING)
+    }
+
     /// Resolve credentials (flag → env → profile file). On failure,
     /// print the reason and return the exit code.
     pub fn resolve(&self) -> Result<ResolvedCreds, i32> {
+        if let Some(warning) = self.secret_flag_warning() {
+            eprintln!("{warning}");
+        }
         aws_creds::resolve(self.creds_inputs()).map_err(|e| {
             eprintln!("error: {e}");
             cli_exit::EXIT_AUTH
@@ -156,6 +173,22 @@ mod tests {
             region: region.map(str::to_string),
             source: CredsSource::Flag,
         }
+    }
+
+    #[test]
+    fn only_the_secret_flag_warns() {
+        assert_eq!(AwsArgs::default().secret_flag_warning(), None);
+        let flagged = AwsArgs {
+            access_key_id: Some("AKCI".into()),
+            secret_access_key: Some("s".into()),
+            ..Default::default()
+        };
+        assert_eq!(flagged.secret_flag_warning(), Some(SECRET_FLAG_WARNING));
+        let key_only = AwsArgs {
+            access_key_id: Some("AKCI".into()),
+            ..Default::default()
+        };
+        assert_eq!(key_only.secret_flag_warning(), None);
     }
 
     #[test]

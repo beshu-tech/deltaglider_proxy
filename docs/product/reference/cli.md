@@ -106,7 +106,7 @@ Exit codes `8` (not found), `9` (integrity), and `10` (partial) are specific to 
 
 ### Credentials
 
-The `s3` verbs read credentials in this order: the `--access-key-id` and `--secret-access-key` flags, then the `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` environment variables, then the profile in `~/.aws/credentials` (selected by `--profile`, then `AWS_PROFILE`, then `default`). A session token from the environment or from the profile's `aws_session_token` is sent with every request, so temporary (STS) credentials work.
+The `s3` verbs read credentials in this order: the `--access-key-id` and `--secret-access-key` flags, then the `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` environment variables, then the profile in `~/.aws/credentials` (selected by `--profile`, then `AWS_PROFILE`, then `default`). A session token from the environment or from the profile's `aws_session_token` is sent with every request, so temporary (STS) credentials work. The `--secret-access-key` flag is deprecated, because other users on the same host can read a command line (for example with `ps`). When you use the flag, the verb prints a warning to stderr. The next major release removes the flag, so set `AWS_SECRET_ACCESS_KEY` or use a profile instead.
 
 ### Recursive prefixes
 
