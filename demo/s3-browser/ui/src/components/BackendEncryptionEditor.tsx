@@ -31,7 +31,9 @@ import { generateAesKeyHex } from '../aesKeyGen';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { aesKeyPatch, encryptionKeyEnvVar } from '../backendEncryptionPayload';
 import LegacyKeyBanner from './LegacyKeyBanner';
-import ServesPlaintextBanner from './ServesPlaintextBanner';
+import ConversionStatusRow from './ConversionStatusRow';
+import ServeDeprecationNotice from './ServeDeprecationNotice';
+import type { ConversionView } from '../adminApi';
 
 const { Text } = Typography;
 
@@ -52,7 +54,6 @@ export interface BackendEncryptionPatch {
   bucket_key_enabled?: boolean;
   legacy_key?: string | null;
   legacy_key_id?: string | null;
-  plaintext_reads?: 'serve' | 'refuse';
 }
 
 interface Props {
@@ -78,11 +79,11 @@ interface Props {
    * still needs the key. Resolves on success.
    */
   onClearLegacy?: () => Promise<void>;
-  /** Stop serving unencrypted objects (`plaintext_reads: refuse`). */
-  onRefusePlaintext?: () => Promise<void>;
-  /** The buckets that take this backend's setting: the refuse-plaintext
-   *  confirmation shows their last re-encrypt job. */
-  buckets?: readonly string[];
+  /** "Convert now": remove the deprecated `plaintext_reads: serve`. */
+  onConvertNow?: () => Promise<void>;
+  /** The conversions of the buckets that take this backend's setting:
+   *  one status row each. */
+  conversions?: ReadonlyArray<{ bucket: string; view: ConversionView }>;
   /** Which buckets take this setting (`backendBucketCountText`); shown
    *  under the status line. */
   usage?: string | null;
@@ -94,8 +95,8 @@ export default function BackendEncryptionEditor({
   onApply,
   readOnly,
   onClearLegacy,
-  onRefusePlaintext,
-  buckets,
+  onConvertNow,
+  conversions,
   usage,
 }: Props) {
   const uid = useId();
@@ -307,12 +308,12 @@ export default function BackendEncryptionEditor({
           {keyChangeBlockedReason}
         </Text>
       )}
-      {current.serves_plaintext && !pending && (
-        <ServesPlaintextBanner
-          subject="backend"
-          buckets={buckets ?? []}
-          onRefuse={readOnly ? undefined : onRefusePlaintext}
-        />
+      {!pending &&
+        (conversions ?? []).map((c) => (
+          <ConversionStatusRow key={c.bucket} bucket={c.bucket} view={c.view} showBucket readOnly={readOnly} />
+        ))}
+      {current.serves_plaintext_deprecated && !pending && (
+        <ServeDeprecationNotice subject="backend" onConvert={readOnly ? undefined : onConvertNow} />
       )}
       {current.shim_active && !pending && (
         <LegacyKeyBanner backendName={backendName} readOnly={readOnly} onClearLegacy={onClearLegacy} />

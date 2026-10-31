@@ -5,7 +5,7 @@ import {
   aesKeyPatch,
   buildClearLegacySectionBody,
   buildEncryptionSectionBody,
-  buildRefusePlaintextSectionBody,
+  buildConvertNowSectionBody,
   encryptionKeyEnvVar,
 } from '../backendEncryptionPayload';
 
@@ -107,12 +107,11 @@ test('a proxy-AES key patch on a proxy-AES backend names the retired key id', ()
     key_id: null,
     legacy_key_id: 'old-id',
   });
-  // Enabling from another mode: nothing to retire, and the objects already
-  // there are plaintext: keep serving them until the re-encrypt job (#120).
+  // Enabling from another mode: nothing to retire; the server converts
+  // the plaintext history (#120), so the patch names no read policy.
   assert.deepEqual(aesKeyPatch('NEW', { mode: 'none' }), {
     mode: 'aes256-gcm-proxy',
     key: 'NEW',
-    plaintext_reads: 'serve',
   });
 });
 
@@ -149,7 +148,7 @@ test('encryptionKeyEnvVar matches the server env-var names', () => {
   assert.equal(encryptionKeyEnvVar('aws.dr'), 'DGP_BACKEND_AWS_DR_ENCRYPTION_KEY');
 });
 
-test('a key change keeps the backend plaintext_reads (#120)', () => {
+test('a key change drops the deprecated plaintext_reads: the server converts (#120)', () => {
   const storage = {
     backends: [
       {
@@ -161,22 +160,18 @@ test('a key change keeps the backend plaintext_reads (#120)', () => {
   const body = buildEncryptionSectionBody('local-disk', aesKeyPatch('a'.repeat(64), { mode: 'aes256-gcm-proxy', key_id: 'old' }), storage) as {
     backends: Array<{ encryption: Record<string, unknown> }>;
   };
-  assert.equal(body.backends[0].encryption.plaintext_reads, 'serve');
-  const off = buildEncryptionSectionBody('local-disk', { mode: 'none' }, storage) as {
-    backends: Array<{ encryption: Record<string, unknown> }>;
-  };
-  assert.equal(off.backends[0].encryption.plaintext_reads, undefined, 'mode none has no such field');
+  assert.equal(body.backends[0].encryption.plaintext_reads, undefined);
 });
 
-test('refusing plaintext changes only plaintext_reads of a backend (#120)', () => {
-  assert.deepEqual(buildRefusePlaintextSectionBody('default', {}), {
-    backend_encryption: { plaintext_reads: 'refuse' },
+test('convert now removes only plaintext_reads of a backend (#120)', () => {
+  assert.deepEqual(buildConvertNowSectionBody('default', {}), {
+    backend_encryption: { plaintext_reads: null },
   });
   const storage = {
     backends: [{ name: 'local-disk', encryption: { mode: 'aes256-gcm-proxy', key_id: 'k', plaintext_reads: 'serve' } }],
   };
-  assert.deepEqual(buildRefusePlaintextSectionBody('local-disk', storage), {
-    backends: [{ name: 'local-disk', encryption: { mode: 'aes256-gcm-proxy', key_id: 'k', plaintext_reads: 'refuse' } }],
+  assert.deepEqual(buildConvertNowSectionBody('local-disk', storage), {
+    backends: [{ name: 'local-disk', encryption: { mode: 'aes256-gcm-proxy', key_id: 'k' } }],
   });
 });
 
@@ -187,7 +182,7 @@ type Build = (name: string, storage: { backends?: Array<Record<string, unknown>>
 const builders: Array<[string, Build]> = [
   ['encryption', (n, s) => buildEncryptionSectionBody(n, { mode: 'sse-s3' }, s)],
   ['clear legacy', (n, s) => buildClearLegacySectionBody(n, s)],
-  ['refuse plaintext', (n, s) => buildRefusePlaintextSectionBody(n, s)],
+  ['convert now', (n, s) => buildConvertNowSectionBody(n, s)],
 ];
 
 test('every builder follows the same target rule', () => {

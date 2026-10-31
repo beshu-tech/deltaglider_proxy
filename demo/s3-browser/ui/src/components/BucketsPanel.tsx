@@ -311,6 +311,8 @@ export default function BucketsPanel({ onSessionExpired, search }: Props) {
     await rebase();
     const res = await originsQuery.refetch();
     const after = res.data?.buckets.find((o) => o.name === bucket)?.effective_encryption ?? null;
+    // The apply started the conversion (window + job): nothing to offer.
+    if (after?.conversion?.run) return;
     const changed = bucketsWhoseEncryptionChanged(
       [{ name: bucket, effective_encryption: before }],
       [{ name: bucket, effective_encryption: after }]

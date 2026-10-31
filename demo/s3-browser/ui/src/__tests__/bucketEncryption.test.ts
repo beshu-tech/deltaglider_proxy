@@ -98,15 +98,15 @@ describe('the wire body is one bucket merge-patch', () => {
       buckets: {
         'db-archive': {
           backend: 'hetzner-fsn1',
-          // The bucket did not encrypt: its history stays readable (#120).
-          encryption: { mode: 'aes256-gcm-proxy', key: KEY, key_id: 'db-archive-2026-10', plaintext_reads: 'serve' },
+          // No read policy: the server converts the history (#120).
+          encryption: { mode: 'aes256-gcm-proxy', key: KEY, key_id: 'db-archive-2026-10' },
         },
       },
     });
   });
-  test('refusing plaintext patches only plaintext_reads (#120)', () => {
-    expect(bucketEncryptionBody('db-archive', bucketKey, { kind: 'refuse-plaintext' })).toEqual({
-      buckets: { 'db-archive': { encryption: { plaintext_reads: 'refuse' } } },
+  test('convert now removes only the deprecated plaintext_reads line (#120)', () => {
+    expect(bucketEncryptionBody('db-archive', bucketKey, { kind: 'convert-now' })).toEqual({
+      buckets: { 'db-archive': { encryption: { plaintext_reads: null } } },
     });
   });
   test('a pinned bucket keeps its route untouched', () => {

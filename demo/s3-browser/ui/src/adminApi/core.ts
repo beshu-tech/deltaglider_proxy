@@ -309,9 +309,32 @@ export interface BackendEncryptionSummary {
   key_id?: string;
   kms_key_id?: string;
   shim_active: boolean;
-  /** `plaintext_reads: serve` (#120): reads also serve unencrypted objects.
-   *  Absent on an older server. */
-  serves_plaintext?: boolean;
+  /** The deprecated `plaintext_reads: serve` (#120): reads also serve
+   *  unencrypted objects. The next release rejects it. */
+  serves_plaintext_deprecated?: boolean;
+}
+
+/** A bucket whose conversion an apply would start (validate). */
+export interface ConversionPreview {
+  bucket: string;
+  /** Objects counted, at most 10,000. */
+  objects: number;
+  /** The bucket holds more than `objects`. */
+  more: boolean;
+  /** The backend keeps old versions of the bucket. */
+  versioned: boolean;
+}
+
+/** A conversion that an apply started. */
+interface ConversionStarted {
+  bucket: string;
+  /** The run id of the conversion marker (hex). */
+  run: string;
+  /** The marker was there before the apply. */
+  reused: boolean;
+  /** The re-encrypt job on this node; null when none was queued. */
+  job_id: number | null;
+  versioned: boolean;
 }
 
 export interface BackendInfo {
@@ -647,6 +670,10 @@ export interface SectionApplyResponse {
    * bodies return `ok: false` without a diff.
    */
   diff?: Record<string, Record<string, { before: unknown; after: unknown }>>;
+  /** Validate: the buckets whose conversion the apply would start. */
+  conversion_preview?: ConversionPreview[];
+  /** Apply: the conversions the apply started, with their jobs. */
+  conversions?: ConversionStarted[];
 }
 
 /**

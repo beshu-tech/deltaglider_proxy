@@ -6,9 +6,10 @@ import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, message } from 'antd';
 import { ErrorState, LoadingState } from './StatePlaceholders';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
-import type { BackendEncryptionMode, BackendHealthEntry, BackendInfo, ConfirmHeaders, CreateBackendRequest } from '../adminApi';
+import type { BackendEncryptionMode, BackendHealthEntry, BackendInfo, ConfirmHeaders, ConversionView, CreateBackendRequest } from '../adminApi';
+import { conversionCountText, versionedWarnings } from '../conversionView';
 import { confirmDialog } from '../confirmDialog';
-import { backendHealthSentence, createBackend, deleteBackend, plainError, probeBackend, testS3Connection, updateAdminConfig, getSectionVersioned } from '../adminApi';
+import { backendHealthSentence, createBackend, deleteBackend, plainError, probeBackend, testS3Connection, updateAdminConfig, getSectionVersioned, validateSection } from '../adminApi';
 import type { PlainError } from '../adminApi';
 import PlainErrorAlert from './PlainErrorAlert';
 import { applySection, persistFailureText, sectionApplyErrorText } from '../applySection';
@@ -34,7 +35,7 @@ import BackendEncryptionEditor, { type BackendEncryptionPatch } from './BackendE
 import {
   buildClearLegacySectionBody,
   buildEncryptionSectionBody,
-  buildRefusePlaintextSectionBody,
+  buildConvertNowSectionBody,
   type StorageSectionBackends,
 } from '../backendEncryptionPayload';
 import MaskedSecretInput from './MaskedSecretInput';
@@ -109,11 +110,15 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   );
   // Per backend: the buckets that take its encryption (and so its
   // `plaintext_reads`); a bucket with its own block keeps its own.
-  const inheritingBuckets = useMemo(() => {
-    const out: Record<string, string[]> = {};
+  // The open conversions of the buckets that follow each backend's
+  // encryption (the backend card shows one status row each).
+  const backendConversions = useMemo(() => {
+    const out: Record<string, Array<{ bucket: string; view: ConversionView }>> = {};
     for (const o of originsQuery.data?.buckets ?? []) {
       const e = o.effective_encryption;
-      if (e && e.source !== 'bucket') (out[e.backend] ??= []).push(o.name);
+      if (e && e.source !== 'bucket' && e.conversion?.run) {
+        (out[e.backend] ??= []).push({ bucket: o.name, view: e.conversion });
+      }
     }
     return out;
   }, [originsQuery.data]);
@@ -358,6 +363,32 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       // Turning a backend's encryption off confirms the downgrade for the
       // buckets that inherit from it (`backend:<name>`).
       const confirm = patch.mode === 'none' && prevMode !== 'none' ? { backendDowngrades: [backendName] } : undefined;
+      // Turning on proxy AES over buckets that hold objects starts their
+      // conversion on the server: say how many objects, and ask first.
+      if (patch.mode === 'aes256-gcm-proxy') {
+        const plan = await validateSection('storage', body, confirm);
+        const text = conversionCountText(plan.conversion_preview);
+        if (plan.ok && text) {
+          const ok = await confirmDialog({
+            title: `Encrypt backend ${backendName}?`,
+            content: (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <span data-testid="conversion-count">{text}</span>
+                {versionedWarnings(plan.conversion_preview).map((w) => (
+                  <Text key={w} type="warning" data-testid="conversion-versioned">
+                    {w}
+                  </Text>
+                ))}
+              </div>
+            ),
+            okText: 'Encrypt',
+          });
+          if (!ok) {
+            resultSet = true;
+            throw new Error('cancelled');
+          }
+        }
+      }
       const result = await applySection(qc, 'storage', body, version, confirm);
       if (!result.ok) {
         setSaveResult({
@@ -367,9 +398,18 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
         resultSet = true;
         throw new Error(result.error || 'Apply failed');
       }
+      const started = result.conversions ?? [];
       setSaveResult({
         ok: true,
-        message: [`Encryption updated on backend '${backendName}'`, persistFailureText(result)].filter(Boolean).join('. '),
+        message: [
+          `Encryption updated on backend '${backendName}'`,
+          started.length > 0
+            ? `Re-encrypt jobs encrypt the existing objects of ${started.map((c) => c.bucket).join(', ')} in the background`
+            : null,
+          persistFailureText(result),
+        ]
+          .filter(Boolean)
+          .join('. '),
       });
       // Existing objects keep their OLD at-rest state. Propose the canned
       // re-encrypt job for the buckets whose effective encryption (the
@@ -378,7 +418,9 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       const before = originsQuery.data?.buckets ?? [];
       await refresh();
       const after = (await originsQuery.refetch()).data?.buckets ?? [];
-      const changed = bucketsWhoseEncryptionChanged(before, after);
+      // A bucket whose conversion the apply started has its job already.
+      const converting = new Set(started.map((c) => c.bucket));
+      const changed = bucketsWhoseEncryptionChanged(before, after).filter((c) => !converting.has(c.bucket));
       if (changed.length > 0) {
         setReencryptProposal({
           transition: dominantTransition(changed),
@@ -411,18 +453,24 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     }
   };
 
-  /** Stop serving unencrypted objects on a backend (#120). */
-  const handleRefusePlaintext = async (backendName: string): Promise<void> => {
+  /** "Convert now": remove a backend's deprecated `plaintext_reads: serve`
+   *  (#120); the server starts the conversion of its buckets. */
+  const handleConvertNow = async (backendName: string): Promise<void> => {
     try {
       const { body: storage, version } = await getSectionVersioned<StorageSectionBackends>('storage');
-      const result = await applySection(qc, 'storage', buildRefusePlaintextSectionBody(backendName, storage), version);
+      const result = await applySection(qc, 'storage', buildConvertNowSectionBody(backendName, storage), version);
       if (!result.ok) {
         setSaveResult({ ok: false, message: result.error || 'Failed to change the backend' });
         return;
       }
       setSaveResult({
         ok: true,
-        message: [`Backend '${backendName}' now refuses unencrypted objects`, persistFailureText(result)].filter(Boolean).join('. '),
+        message: [
+          `Backend '${backendName}' no longer serves every unencrypted object. Re-encrypt jobs convert the existing objects in the background`,
+          persistFailureText(result),
+        ]
+          .filter(Boolean)
+          .join('. '),
       });
       await refresh();
     } catch (e) {
@@ -639,8 +687,8 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 current={b.encryption}
                 onApply={(patch) => handleEncryptionApply(b.name, b.encryption.mode, patch)}
                 onClearLegacy={() => handleClearLegacy(b.name)}
-                onRefusePlaintext={() => handleRefusePlaintext(b.name)}
-                buckets={inheritingBuckets[b.name]}
+                onConvertNow={() => handleConvertNow(b.name)}
+                conversions={backendConversions[b.name]}
                 readOnly={!!encryptionEnv(b)}
                 usage={backendBucketCountText(encryptionCounts[b.name])}
               />

@@ -21,6 +21,11 @@
  * `X-DGP-Confirm-Encryption-Downgrade`; clearing a legacy key needs a
  * per-bucket scan that found no object under it and carries
  * `X-DGP-Confirm-Key-Removal`.
+ *
+ * Turning on proxy AES for a bucket that holds objects starts their
+ * conversion on the server (window + re-encrypt job): the dialog names
+ * the object count from the validate, and the conversion row shows its
+ * state afterwards (ConversionStatusRow).
  */
 import { useState } from 'react';
 import { Alert, Button, Checkbox, Input, Radio, Space, Tag, Typography, message } from 'antd';
@@ -49,7 +54,9 @@ import { useColors } from '../ThemeContext';
 import ApplyDialog from './ApplyDialog';
 import BucketKeySetup, { type BucketKeyValue } from './BucketKeySetup';
 import LegacyKeyBanner from './LegacyKeyBanner';
-import ServesPlaintextBanner from './ServesPlaintextBanner';
+import ConversionStatusRow from './ConversionStatusRow';
+import ServeDeprecationNotice from './ServeDeprecationNotice';
+import { conversionCountText, versionedWarnings } from '../conversionView';
 import { formRow } from './ruleEditorHelpers';
 
 const { Text } = Typography;
@@ -187,6 +194,8 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
       }
       const lost = persistFailureText(resp);
       if (lost) message.warning(lost, 10);
+      else if (resp.conversions?.length)
+        message.success(`Encryption of ${bucket} updated. A re-encrypt job encrypts its existing objects in the background.`);
       else message.success(`Encryption of ${bucket} updated`);
       cancel();
       onApplied(eff);
@@ -205,6 +214,8 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
   };
 
   const change = editing ? pendingChange() : null;
+  const conversionText = conversionCountText(dialog?.response.conversion_preview);
+  const versioned = versionedWarnings(dialog?.response.conversion_preview);
   const enabling = change ? !eff.encrypts && change.kind !== 'off' && change.kind !== 'clear-legacy' && (change.kind !== 'inherit' || eff.inherited.encrypts) : false;
   const summary = dialog && (
     <Space orientation="vertical" size={6} style={{ width: '100%', fontSize: 12 }}>
@@ -214,19 +225,23 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           {rotating || ownKey ? ' The current key stays as a decrypt-only legacy key.' : ''}
         </Text>
       )}
-      {(enabling || dialog.change.kind === 'bucket-key') && (
-        <Text style={{ fontSize: 12 }}>
-          Only new writes change. Objects already in the bucket stay as they are on disk until the
-          re-encrypt job rewrites them; after you apply, the proxy offers that job.
+      {conversionText ? (
+        <Text style={{ fontSize: 12 }} data-testid="conversion-count">
+          {conversionText}
         </Text>
+      ) : (
+        (enabling || dialog.change.kind === 'bucket-key') && (
+          <Text style={{ fontSize: 12 }}>
+            Only new writes change. Objects already in the bucket stay as they are on disk until the
+            re-encrypt job rewrites them; after you apply, the proxy offers that job.
+          </Text>
+        )
       )}
-      {enabling && dialog.change.kind === 'bucket-key' && (
-        <Text style={{ fontSize: 12 }}>
-          The objects already in the bucket are not encrypted. The proxy keeps serving them until the
-          re-encrypt job converts them. After the job, choose <b>Refuse unencrypted objects</b>, so that the
-          proxy refuses an unencrypted object that someone puts directly on the storage.
+      {versioned.map((w) => (
+        <Text key={w} type="warning" style={{ fontSize: 12 }} data-testid="conversion-versioned">
+          {w}
         </Text>
-      )}
+      ))}
       {(enabling || dialog.change.kind === 'bucket-key') && (
         <Text type="warning" style={{ fontSize: 12 }}>
           While the re-encrypt job runs on the bucket, reads keep working, but uploads and deletes
@@ -322,12 +337,13 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         </Button>
       )}
 
-      {eff.source === 'bucket' && eff.serves_plaintext && !editing && (
-        <ServesPlaintextBanner
+      {!editing && <ConversionStatusRow bucket={bucket} view={eff.conversion} readOnly={readOnly} />}
+
+      {eff.source === 'bucket' && eff.conversion?.serves_plaintext_deprecated && !editing && (
+        <ServeDeprecationNotice
           subject="bucket"
-          buckets={[bucket]}
           disabled={readOnly || !!blockedReason || busy}
-          onRefuse={() => apply({ kind: 'refuse-plaintext' })}
+          onConvert={() => apply({ kind: 'convert-now' })}
         />
       )}
 

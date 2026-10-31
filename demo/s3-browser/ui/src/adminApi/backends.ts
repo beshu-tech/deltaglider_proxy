@@ -45,10 +45,9 @@ export interface EffectiveEncryption {
   key_env?: string;
   /** New writes are stored encrypted. */
   encrypts: boolean;
-  /** Proxy mode with `plaintext_reads: serve`: reads also serve objects
-   *  that are not encrypted (the history of a bucket that started to
-   *  encrypt). Absent on an older server. */
-  serves_plaintext?: boolean;
+  /** The bucket's conversion to encryption, or its deprecated
+   *  `plaintext_reads: serve`; absent when neither. */
+  conversion?: ConversionView;
   /** A re-encrypt job can change objects of this bucket. */
   reencrypt: boolean;
   /** The config fixes the bucket's backend; an edit that adds the bucket's
@@ -58,6 +57,24 @@ export interface EffectiveEncryption {
   bucket_modes: BackendEncryptionMode[];
   /** What "Inherit" gives the bucket: the backend's own encryption. */
   inherited: { mode: BackendEncryptionMode; encrypts: boolean; key_id?: string };
+}
+
+/** A bucket's conversion to encryption (a marker in the bucket). */
+export interface ConversionView {
+  /** The window is open: clients read the plaintext history. */
+  open: boolean;
+  /** Unix seconds on the backend clock; absent without a marker. */
+  cutoff?: number;
+  deadline?: number;
+  /** The run id (hex); absent without a marker. With `open: false` the
+   *  deadline passed: the conversion stopped before it finished. */
+  run?: string;
+  /** Objects the latest job converted that clients could not read. */
+  adopted_after_cutoff: number;
+  /** The latest re-encrypt job of the bucket on this node. */
+  job_on_this_node: { id: number; status: string; percent: number | null } | null;
+  /** The bucket (or its backend) sets the deprecated `plaintext_reads: serve`. */
+  serves_plaintext_deprecated: boolean;
 }
 
 interface BucketOriginListResponse {

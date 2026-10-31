@@ -220,7 +220,9 @@ export type BucketEncryptionChange =
   | { kind: 'sse-kms'; kmsKeyId: string; bucketKeyEnabled: boolean }
   | { kind: 'sse-s3' }
   | { kind: 'clear-legacy' }
-  | { kind: 'refuse-plaintext' };
+  /** Remove the deprecated `plaintext_reads: serve`: the server opens the
+   *  conversion window and starts the re-encrypt job. */
+  | { kind: 'convert-now' };
 
 /** One bucket's merge-patch for a change. */
 export function bucketEncryptionBody(
@@ -237,10 +239,9 @@ export function bucketEncryptionBody(
       encryption = { mode: 'none' };
       break;
     case 'bucket-key':
+      // A bucket that starts to encrypt with objects in it: the server
+      // opens a conversion window and starts the re-encrypt job.
       encryption = { mode: 'aes256-gcm-proxy', key: change.key, key_id: change.keyId };
-      // A bucket that starts to encrypt holds plaintext objects: keep
-      // serving them until the re-encrypt job converts them (#120).
-      if (!eff.encrypts || eff.serves_plaintext) encryption.plaintext_reads = 'serve';
       break;
     case 'sse-kms':
       encryption = { mode: 'sse-kms', kms_key_id: change.kmsKeyId, bucket_key_enabled: change.bucketKeyEnabled };
@@ -251,8 +252,9 @@ export function bucketEncryptionBody(
     case 'clear-legacy':
       encryption = { legacy_key: null, legacy_key_id: null };
       break;
-    case 'refuse-plaintext':
-      encryption = { plaintext_reads: 'refuse' };
+    case 'convert-now':
+      // Merge-patch null removes the line (the field takes its default).
+      encryption = { plaintext_reads: null };
       break;
   }
   const policy: Record<string, unknown> = { encryption };
@@ -270,7 +272,7 @@ function encryptsAfter(eff: EffectiveEncryption, change: BucketEncryptionChange)
     case 'off':
       return false;
     case 'clear-legacy':
-    case 'refuse-plaintext':
+    case 'convert-now':
       return eff.encrypts;
     default:
       return true;
