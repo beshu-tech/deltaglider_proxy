@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.22 — 2026-10-31
+
 ### Changed — The bucket list with many backends
 
 - Each backend is one card in the bucket list. Its header shows the backend type, its name and its number of buckets, and it stays at the top of the list while you scroll through its buckets. The buckets are indented under the header.
