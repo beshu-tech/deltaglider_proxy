@@ -85,6 +85,8 @@ export function useObjectListing({
   // replaces it: the tick's rows after page 1 come from the listing before the
   // change, so a file uploaded onto page 2 would vanish until the next reload.
   const fullLoadSeq = useRef(0);
+  // The seq of the listing in flight (0 = none): `removeObject` supersedes it.
+  const inFlightSeq = useRef(0);
   const queryClient = useQueryClient();
 
   const load = useCallback(() => {
@@ -124,6 +126,7 @@ export function useObjectListing({
     if (pageOne && fullLoadSeq.current !== 0) return;
     const seq = ++loadSeq.current;
     fullLoadSeq.current = pageOne ? 0 : seq;
+    inFlightSeq.current = seq;
 
     // On initial load or prefix/bucket change, show full loading spinner.
     // On background refresh, show subtle refreshing indicator.
@@ -170,6 +173,7 @@ export function useObjectListing({
       .finally(() => {
         if (seq !== loadSeq.current) return; // stale settle — newer load owns the spinners
         fullLoadSeq.current = 0;
+        inFlightSeq.current = 0;
         isInitialLoad.current = false;
         setLoading(false);
         setRefreshing(false);
@@ -223,10 +227,15 @@ export function useObjectListing({
    * After a single delete (the inspector): drop the row and take it off the
    * bucket's size/count pill, with no new listing. The 60 s refresh
    * reconciles both with the backend.
+   *
+   * A listing in flight may have read the folder before the DELETE: its
+   * answer would put the row back until the next tick. List again instead;
+   * the newer load drops the older answer (loadSeq).
    */
   const removeObject = useCallback((key: string) => {
     const gone = objectsRef.current.find((o) => o.key === key);
     if (!gone) return;
+    if (inFlightSeq.current !== 0) refresh();
     const rest = objectsRef.current.filter((o) => o.key !== key);
     setObjects(rest);
     reconcile(rest, folders);
@@ -241,7 +250,7 @@ export function useObjectListing({
           }
         : usage,
     );
-  }, [bucket, folders, queryClient, reconcile]);
+  }, [bucket, folders, queryClient, reconcile, refresh]);
 
   const reconnect = useCallback(() => {
     resetBrowseState();

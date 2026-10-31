@@ -8,15 +8,23 @@ import { json, mockFetch } from '../test/fetchMock';
 import { renderHookWithQuery } from '../test/render';
 import { qk } from '../queries/keys';
 
-const s3 = vi.hoisted(() => ({ lists: 0 }));
+const s3 = vi.hoisted(() => ({
+  lists: 0,
+  /** The folder as the backend lists it now. */
+  keys: [] as string[],
+  /** When set, a listing reads the folder, then waits for this. */
+  gate: null as null | Promise<void>,
+}));
 vi.mock('../s3client', () => ({
   hasCredentials: () => true,
   getBucket: () => 'releases',
   setBucket: () => {},
   listObjects: async () => {
     s3.lists++;
+    const snap = [...s3.keys];
+    if (s3.gate) await s3.gate;
     return {
-      objects: ['a.zip', 'b.zip', 'c.zip'].map((k) => ({
+      objects: snap.map((k) => ({
         key: `builds/${k}`, size: 100, lastModified: '', etag: '', storageType: 'delta', storedSize: 10, headers: {},
       })),
       folders: [],
@@ -29,6 +37,8 @@ import useS3Browser from '../useS3Browser';
 
 beforeEach(() => {
   s3.lists = 0;
+  s3.keys = ['a.zip', 'b.zip', 'c.zip'];
+  s3.gate = null;
   mockFetch().on('GET', '/_/api/admin/deltaspace/savings', json({ totals: {}, savings_percentage: null }));
   Object.defineProperty(document, 'hidden', { configurable: true, value: false });
 });
@@ -53,4 +63,30 @@ test('the row goes and the pill counts one object less, with no new listing', as
     await new Promise((r) => setTimeout(r, 50));
   });
   expect(s3.lists).toBe(1);
+});
+
+// A listing read before the DELETE but answered after it still has the key.
+// It used to commit over the local removal, and the deleted row came back
+// until the next 60 s tick (QA pass, step 1: "five.txt" stayed shown).
+test('a listing in flight when the row goes does not bring it back', async () => {
+  const view = renderHookWithQuery(() =>
+    useS3Browser({ bucket: 'releases', prefix: 'builds/', q: '', object: '', navigateUrl: () => {}, adminSession: true }),
+  );
+  await waitFor(() => expect(view.result.current.objects).toHaveLength(3));
+
+  let release!: () => void;
+  s3.gate = new Promise<void>((r) => { release = r; });
+  act(() => view.result.current.mutate()); // reads a, b, c; answers later
+  await waitFor(() => expect(s3.lists).toBe(2));
+
+  s3.keys = ['a.zip', 'c.zip']; // the DELETE
+  s3.gate = null;
+  act(() => view.result.current.removeObject('builds/b.zip'));
+  await act(async () => {
+    release();
+    await new Promise((r) => setTimeout(r, 50));
+  });
+
+  expect(view.result.current.objects.map((o) => o.key)).toEqual(['builds/a.zip', 'builds/c.zip']);
+  expect(view.result.current.refreshing).toBe(false);
 });
