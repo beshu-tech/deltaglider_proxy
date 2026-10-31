@@ -108,6 +108,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Verify tests/*.rs map to CI --test flags
         run: ./scripts/check-integration-tests-in-ci.sh
+      # macOS resolves imports case-insensitively; a pair such as
+      # htmlPreview.ts + HtmlPreview.tsx breaks tsc in the macOS release builds.
+      - name: No module paths that differ only in case
+        run: ./scripts/check-module-case-collisions.sh
       # A committed gitlink (an agent worktree added by mistake) breaks
       # checkout on every later run of a reused workspace.
       - name: No gitlinks in the tree

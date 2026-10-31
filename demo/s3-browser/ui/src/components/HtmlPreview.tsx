@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { Segmented, Switch, Typography } from 'antd';
 import { useColors } from '../ThemeContext';
 import { SPACE } from './shared-styles';
-import { buildPreviewDocument, sandboxFlags, type HtmlPreviewOptions } from './htmlPreview';
+import { buildPreviewDocument, sandboxFlags, type HtmlPreviewOptions } from './htmlPreviewRules';
 
 const { Text } = Typography;
 
@@ -14,7 +14,7 @@ interface HtmlPreviewProps {
 }
 
 /**
- * An HTML object rendered in a sandboxed iframe (rules in `htmlPreview.ts`),
+ * An HTML object rendered in a sandboxed iframe (rules in `htmlPreviewRules.ts`),
  * with its source one click away. Scripts and remote content are off until
  * the user turns them on for this preview.
  */

@@ -1,4 +1,4 @@
-import { isHtmlKey } from './htmlPreview';
+import { isHtmlKey } from './htmlPreviewRules';
 
 const TEXT_EXTENSIONS = new Set([
   'txt', 'md', 'json', 'yaml', 'yml', 'xml', 'csv', 'log',

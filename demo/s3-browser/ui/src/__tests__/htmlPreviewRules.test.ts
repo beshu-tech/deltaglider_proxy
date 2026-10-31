@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { buildPreviewDocument, isHtmlKey, previewCsp, sandboxFlags } from '../components/htmlPreview';
+import { buildPreviewDocument, isHtmlKey, previewCsp, sandboxFlags } from '../components/htmlPreviewRules';
 
 const ALL = [
   { scripts: false, remote: false },

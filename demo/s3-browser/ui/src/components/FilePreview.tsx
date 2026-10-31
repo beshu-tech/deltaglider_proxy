@@ -10,7 +10,7 @@ import { plainError } from '../plainError';
 import { EmptyState, ErrorState, LoadingState } from './StatePlaceholders';
 import { SPACE } from './shared-styles';
 import HtmlPreview from './HtmlPreview';
-import { MAX_HTML_PREVIEW } from './htmlPreview';
+import { MAX_HTML_PREVIEW } from './htmlPreviewRules';
 
 const { Text } = Typography;
 
