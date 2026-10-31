@@ -8,8 +8,8 @@ pub use bucket_encryption::{BucketOverride, EncryptionSite};
 mod encryption_state;
 pub(crate) use encryption_state::{confirmed_downgrades, confirmed_subjects};
 pub use encryption_state::{
-    key_check_value, EncryptionChange, EncryptionChangeKind, WriteEncryption,
-    CONFIRM_ENCRYPTION_DOWNGRADE_HEADER, CONFIRM_PLAINTEXT_REFUSAL_HEADER, DEFAULT_ROUTE_SUBJECT,
+    key_check_value, starts_conversion, EncryptionChange, EncryptionChangeKind, WriteEncryption,
+    CONFIRM_ENCRYPTION_DOWNGRADE_HEADER, DEFAULT_ROUTE_SUBJECT,
 };
 mod keys;
 pub(crate) use keys::*;
@@ -437,11 +437,13 @@ pub enum BackendEncryptionConfig {
         legacy_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         legacy_key_id: Option<String>,
-        /// What a read does with an object that is not encrypted (issue
-        /// #120). `refuse` (default): it fails, because a backend writer
-        /// could have planted it. `serve`: it is served, for the time a
-        /// re-encrypt job converts the plaintext history of a bucket that
-        /// starts to encrypt.
+        /// DEPRECATED (issue #120; the next release rejects it). What a
+        /// read does with an object that is not encrypted. `refuse`
+        /// (default, accepted and ignored): it fails outside a conversion
+        /// window. `serve`: it is served, still honoured in this release
+        /// with a warning. A bucket that starts to encrypt now converts its
+        /// history through a conversion window and a re-encrypt job that
+        /// the apply starts. The example config does not show it.
         #[serde(default, skip_serializing_if = "PlaintextReads::is_refuse")]
         plaintext_reads: PlaintextReads,
     },

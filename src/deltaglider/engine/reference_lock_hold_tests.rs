@@ -762,6 +762,9 @@ impl crate::storage::StorageBackend for FencingFs {
     {
         self.inner.conversion(bucket, op).await
     }
+    async fn bucket_versioning(&self, bucket: &str) -> Option<bool> {
+        self.inner.bucket_versioning(bucket).await
+    }
     async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<Meta>, StorageError> {
         self.inner.scan_deltaspace(b, p).await
     }

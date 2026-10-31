@@ -26,11 +26,6 @@ async fn put_storage_encryption(admin: &reqwest::Client, endpoint: &str, body: s
         // A disable is a downgrade: confirmed (issue #116 P3). The header
         // changes nothing for a change that is not one.
         .header("X-DGP-Confirm-Encryption-Downgrade", "backend:default")
-        // An enable on a bucket that exists refuses its plaintext history
-        // unless confirmed (issue #120). The tests that keep plaintext
-        // history set `plaintext_reads: serve` ([`enable_encryption`]); the
-        // others enable on an empty bucket, so the confirmation is true.
-        .header("X-DGP-Confirm-Plaintext-Refusal", "backend:default")
         .json(&serde_json::json!({ "backend_encryption": body }))
         .send()
         .await
@@ -43,9 +38,10 @@ async fn put_storage_encryption(admin: &reqwest::Client, endpoint: &str, body: s
     );
 }
 
-/// Enable encryption the documented way for a bucket with plaintext
-/// history (issue #120): `plaintext_reads: serve`, so the old objects stay
-/// readable and the re-encrypt job can read them.
+/// Enable encryption for a bucket with plaintext history with the
+/// deprecated `plaintext_reads: serve` (issue #120): still honoured for one
+/// release, unchanged, so the apply starts no conversion and these tests
+/// start the re-encrypt job themselves.
 async fn enable_encryption(admin: &reqwest::Client, endpoint: &str) {
     put_storage_encryption(
         admin,

@@ -514,6 +514,15 @@ pub enum ConversionOp {
     Extend { run: RunId, deadline: i64 },
     /// Remove the marker of `run` by identity.
     Close { run: RunId },
+    /// [`Self::Open`] with the config that the wrapper was BUILT with, not
+    /// the published one: the apply opens the conversion before it
+    /// publishes the engine that encrypts the bucket. A marker whose
+    /// deadline passed, and one that does not open, are answers here
+    /// ([`OpenOutcome`]), not errors.
+    OpenAsBuilt { window_secs: i64 },
+    /// [`Self::Close`] with the keyring of the built config: the apply's
+    /// compensation, also after a rollback published another config.
+    CloseAsBuilt { run: RunId },
 }
 
 /// The stored marker of a bucket, as this proxy reads it.
@@ -538,6 +547,7 @@ pub enum ConversionReply {
     Status(MarkerState),
     Opened(RunId),
     Changed(ByIdentity),
+    OpenedAsBuilt(OpenOutcome),
 }
 
 // ── Metrics ──

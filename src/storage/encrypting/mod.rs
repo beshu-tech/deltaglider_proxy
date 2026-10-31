@@ -332,6 +332,10 @@ pub struct EncryptingBackend<B: StorageBackend> {
     windows: conversion::WindowCache,
     /// Rate limit of the `encryption_marker_ignored` audit.
     ignored: conversion::IgnoredAudits,
+    /// The config this wrapper's engine publishes when it is installed
+    /// (`None`: the slot's value). The apply opens a conversion with it
+    /// before the publish ([`conversion::ConversionOp::OpenAsBuilt`]).
+    built: Option<Arc<EncryptionConfig>>,
 }
 
 impl<B: StorageBackend> EncryptingBackend<B> {
@@ -344,7 +348,96 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             healer: Default::default(),
             windows: Default::default(),
             ignored: Default::default(),
+            built: None,
         }
+    }
+
+    /// The config that this wrapper's engine publishes when installed.
+    pub fn with_built(mut self, built: Arc<EncryptionConfig>) -> Self {
+        self.built = Some(built);
+        self
+    }
+
+    /// The built config, else the published one.
+    fn built_config(&self) -> Arc<EncryptionConfig> {
+        self.built
+            .clone()
+            .unwrap_or_else(|| self.config.load_full())
+    }
+
+    /// Open the conversion of `bucket` with the BUILT config (the apply's
+    /// pre-commit step): reuse a valid marker, or create one. An expired
+    /// marker of this bucket and a foreign one are reported, never
+    /// overwritten. No witness check: the witness judges the PUBLISHED
+    /// config (the apply is how a disagreeing node converges), and the
+    /// marker is sealed with the new config's key; a node without that key
+    /// reads it as a closed window (availability only).
+    async fn open_as_built(
+        &self,
+        bucket: &str,
+        window_secs: i64,
+    ) -> Result<conversion::OpenOutcome, StorageError> {
+        if !(1..=i64::from(conversion::MAX_WINDOW_DAYS) * 86_400).contains(&window_secs) {
+            return Err(StorageError::Other(format!(
+                "a conversion window is 1 second to {} days, not {window_secs} seconds",
+                conversion::MAX_WINDOW_DAYS
+            )));
+        }
+        let cfg = self.built_config();
+        let (mode, key) = match cfg.buckets.get(bucket) {
+            Some(b) => (b.write_mode, &b.key),
+            None => (cfg.write_mode, &cfg.key),
+        };
+        let site = match (mode, key) {
+            (WriteMode::Encrypt, Some(k)) => cfg.site_of(k),
+            _ => {
+                return Err(StorageError::Encryption(format!(
+                    "bucket '{bucket}' does not encrypt with a proxy key in the new config: it \
+                     has no conversion to open"
+                )))
+            }
+        };
+        let identity = self.conversion_identity(bucket);
+        let flight = self.windows.flight(bucket);
+        let _one = flight.lock().await;
+        let io = conversion::OnBackend {
+            backend: self.inner.as_ref(),
+            bucket,
+        };
+        let outcome =
+            conversion::open_or_reuse(&io, cfg.ring(), &site, &identity, window_secs).await?;
+        if let conversion::OpenOutcome::Created(f, v) | conversion::OpenOutcome::Reused(f, v) =
+            &outcome
+        {
+            self.cache_written(bucket, Some((*f, v.clone())));
+        }
+        Ok(outcome)
+    }
+
+    /// Remove the marker of `run` by identity with the BUILT config's
+    /// keyring (the apply's compensation).
+    async fn close_as_built(
+        &self,
+        bucket: &str,
+        run: &conversion::RunId,
+    ) -> Result<conversion::ByIdentity, StorageError> {
+        let cfg = self.built_config();
+        let identity = self.conversion_identity(bucket);
+        let flight = self.windows.flight(bucket);
+        let _one = flight.lock().await;
+        let io = conversion::OnBackend {
+            backend: self.inner.as_ref(),
+            bucket,
+        };
+        let outcome =
+            conversion::by_identity(&io, cfg.ring(), None, &identity, run, |_| None).await?;
+        if matches!(
+            outcome,
+            conversion::ByIdentity::Done(..) | conversion::ByIdentity::Absent
+        ) {
+            self.cache_written(bucket, None);
+        }
+        Ok(outcome)
     }
 
     /// Refuse writes to a bucket that holds objects sealed with a key that
@@ -926,6 +1019,18 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         op: conversion::ConversionOp,
     ) -> Result<conversion::ConversionReply, StorageError> {
         use conversion::{ConversionOp as Op, ConversionReply as Reply};
+        // The apply's steps judge the bucket by the built config.
+        match op {
+            Op::OpenAsBuilt { window_secs } => {
+                return Ok(Reply::OpenedAsBuilt(
+                    self.open_as_built(bucket, window_secs).await?,
+                ))
+            }
+            Op::CloseAsBuilt { run } => {
+                return Ok(Reply::Changed(self.close_as_built(bucket, &run).await?))
+            }
+            _ => {}
+        }
         if self.writes_plaintext(bucket) {
             return Ok(Reply::NotEncrypted);
         }
@@ -938,6 +1043,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                 Reply::Changed(self.extend_conversion(bucket, &run, deadline).await?)
             }
             Op::Close { run } => Reply::Changed(self.close_conversion(bucket, &run).await?),
+            Op::OpenAsBuilt { .. } | Op::CloseAsBuilt { .. } => unreachable!("answered above"),
         })
     }
 
@@ -2313,6 +2419,9 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
     ) -> Result<crate::storage::encrypting::conversion::ConversionReply, crate::storage::StorageError>
     {
         self.conversion_control(bucket, op).await
+    }
+    async fn bucket_versioning(&self, bucket: &str) -> Option<bool> {
+        self.inner.bucket_versioning(bucket).await
     }
     /// The presented metadata; the basis keeps the stored (raw) metadata,
     /// which the re-seal of the rewrite needs (its salt).

@@ -130,9 +130,9 @@ pub struct BackendEncryptionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kms_key_id: Option<String>,
     pub shim_active: bool,
-    /// `plaintext_reads: serve` (issue #120): reads also serve objects that
-    /// are not encrypted.
-    pub serves_plaintext: bool,
+    /// The deprecated `plaintext_reads: serve` (issue #120): reads also
+    /// serve objects that are not encrypted. The next release rejects it.
+    pub serves_plaintext_deprecated: bool,
 }
 
 impl BackendEncryptionSummary {
@@ -149,7 +149,7 @@ impl BackendEncryptionSummary {
                 key_id: None,
                 kms_key_id: None,
                 shim_active: legacy_key.is_some(),
-                serves_plaintext: false,
+                serves_plaintext_deprecated: false,
             },
             E::Aes256GcmProxy {
                 key,
@@ -174,7 +174,8 @@ impl BackendEncryptionSummary {
                     key_id: resolved_kid,
                     kms_key_id: None,
                     shim_active: legacy_key.is_some(),
-                    serves_plaintext: *plaintext_reads == crate::config::PlaintextReads::Serve,
+                    serves_plaintext_deprecated: *plaintext_reads
+                        == crate::config::PlaintextReads::Serve,
                 }
             }
             E::SseKms {
@@ -187,7 +188,7 @@ impl BackendEncryptionSummary {
                 key_id: None,
                 kms_key_id: Some(kms_key_id.clone()),
                 shim_active: legacy_key.is_some(),
-                serves_plaintext: false,
+                serves_plaintext_deprecated: false,
             },
             E::SseS3 { legacy_key, .. } => Self {
                 mode: "sse-s3".into(),
@@ -195,7 +196,7 @@ impl BackendEncryptionSummary {
                 key_id: None,
                 kms_key_id: None,
                 shim_active: legacy_key.is_some(),
-                serves_plaintext: false,
+                serves_plaintext_deprecated: false,
             },
         }
     }
@@ -349,6 +350,9 @@ pub struct ConfigUpdateResponse {
     success: bool,
     warnings: Vec<String>,
     requires_restart: bool,
+    /// The conversions that the patch started, with their jobs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conversions: Vec<super::ConversionStarted>,
 }
 
 /// Compare the runtime config against the config file on disk at `path` —
@@ -643,11 +647,12 @@ pub async fn update_config(
 fn shape_patch(result: WriteResult) -> axum::response::Response {
     use axum::http::StatusCode;
     let WriteResult { outcome, refs } = result;
-    let reply = |warnings, requires_restart| {
+    let reply = |warnings, requires_restart, conversions| {
         let body = ConfigUpdateResponse {
             success: true,
             warnings,
             requires_restart,
+            conversions,
         };
         write::respond(StatusCode::OK, body, &refs, None)
     };
@@ -671,6 +676,7 @@ fn shape_patch(result: WriteResult) -> axum::response::Response {
             warnings: w,
             restart,
             persist,
+            conversions,
             ..
         } => {
             // Persist failure is a warning, not a rollback: the runtime
@@ -683,11 +689,13 @@ fn shape_patch(result: WriteResult) -> axum::response::Response {
                 .into_iter()
                 .chain(persist_warning)
                 .collect();
-            reply(warnings, !restart.is_empty())
+            reply(warnings, !restart.is_empty(), conversions)
         }
-        Outcome::Validated { .. } => {
-            reply(vec!["internal: a PATCH ran as a dry run".into()], false)
-        }
+        Outcome::Validated { .. } => reply(
+            vec!["internal: a PATCH ran as a dry run".into()],
+            false,
+            Vec::new(),
+        ),
     }
 }
 

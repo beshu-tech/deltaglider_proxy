@@ -605,6 +605,9 @@ impl StorageBackend for FaultyFs {
     {
         self.inner.conversion(bucket, op).await
     }
+    async fn bucket_versioning(&self, bucket: &str) -> Option<bool> {
+        self.inner.bucket_versioning(bucket).await
+    }
 
     async fn scan_deltaspace(
         &self,

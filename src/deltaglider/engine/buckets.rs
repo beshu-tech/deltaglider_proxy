@@ -71,8 +71,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Issue #120: the first object of `bucket`, among the first `sample`
     /// that a listing gives, that the read rule refuses because it is not
     /// encrypted. The boot check warns with it about a bucket that encrypts
-    /// with `plaintext_reads: refuse` and still holds plaintext objects
-    /// (a restart from an edited file passes no apply gate). One listing
+    /// with a proxy key, has no open conversion window and still holds
+    /// plaintext objects (a restart from an edited file starts no conversion). One listing
     /// page and one HEAD per sampled object.
     pub async fn first_refused_plaintext(
         &self,

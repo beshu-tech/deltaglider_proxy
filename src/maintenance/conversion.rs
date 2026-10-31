@@ -306,6 +306,17 @@ pub async fn marker_exists(engine: &DynEngine, bucket: &str) -> Result<bool, Str
     }
 }
 
+/// Is the conversion window of `bucket` open now (a marker of this bucket
+/// whose deadline is after the backend's clock)? A read failure counts
+/// as closed.
+pub async fn window_open(engine: &DynEngine, bucket: &str) -> bool {
+    matches!(
+        engine.storage().conversion(bucket, ConversionOp::Status).await,
+        Ok(ConversionReply::Status(MarkerState::Ours { fields, server_now }))
+            if server_now < fields.deadline
+    )
+}
+
 /// The refusal of a metadata backfill on a bucket in conversion.
 pub fn backfill_refusal(bucket: &str) -> String {
     format!(

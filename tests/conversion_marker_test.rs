@@ -304,8 +304,10 @@ struct Conv {
 }
 
 impl Conv {
-    /// A plaintext proxy with `n` plaintext objects `h-NN.txt`, then the
-    /// encryption turned on WITHOUT `plaintext_reads: serve`.
+    /// A plaintext proxy with `n` plaintext objects `h-NN.txt`, then a
+    /// restart with the encryption in the config file: no apply, so no
+    /// conversion window and no job (an apply opens both, see
+    /// `tests/conversion_apply_test.rs`).
     async fn start(bucket: &str, n: usize, env: &[(&str, &str)], minio: bool) -> Self {
         let mut b = TestServer::builder().bucket(bucket);
         if minio {
@@ -316,7 +318,7 @@ impl Conv {
         }
         let server = b.build().await;
         let admin = common::admin_http_client(&server.endpoint()).await;
-        let conv = Self {
+        let mut conv = Self {
             server,
             admin,
             bucket: bucket.to_string(),
@@ -325,10 +327,15 @@ impl Conv {
             let (status, _) = conv.put(&format!("h-{i:02}.txt"), &body_of(i)).await;
             assert_eq!(status, 200);
         }
-        conv.encrypt(serde_json::json!({
-            "mode": "aes256-gcm-proxy", "key": TEST_KEY, "key_id": KEY_ID,
-        }))
-        .await;
+        let path = conv.server.config_path().to_path_buf();
+        let mut doc = std::fs::read_to_string(&path).unwrap();
+        doc.push_str(&format!(
+            "backend_encryption:\n  mode: aes256-gcm-proxy\n  key: \"{TEST_KEY}\"\n  \
+             key_id: {KEY_ID}\n"
+        ));
+        std::fs::write(&path, doc).unwrap();
+        conv.server.respawn_with_env(&[]).await;
+        conv.admin = common::admin_http_client(&conv.server.endpoint()).await;
         conv
     }
 
@@ -339,7 +346,6 @@ impl Conv {
                 "{}/_/api/admin/config/section/storage",
                 self.server.endpoint()
             ))
-            .header("X-DGP-Confirm-Plaintext-Refusal", "backend:default")
             .json(&serde_json::json!({ "backend_encryption": body }))
             .send()
             .await

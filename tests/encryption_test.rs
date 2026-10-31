@@ -1361,10 +1361,10 @@ async fn a_key_mismatch_on_get_names_the_key_and_logs_its_cause() {
     );
 }
 
-/// Issue #120: a restart from a file that encrypts a bucket with
-/// `plaintext_reads: refuse` passes no apply gate. The boot check samples
-/// the bucket and logs a warning that names a plaintext object, because
-/// every read of it now fails.
+/// Issue #120: a restart from a file that encrypts a bucket starts no
+/// conversion (only an apply does). The boot check samples the bucket and
+/// logs a warning that names a plaintext object, because every read of
+/// it now fails.
 #[tokio::test]
 async fn boot_warns_about_plaintext_objects_in_a_bucket_that_refuses_them() {
     let mut server = encrypted_builder().build().await;
@@ -1386,7 +1386,7 @@ async fn boot_warns_about_plaintext_objects_in_a_bucket_that_refuses_them() {
         .await;
 
     let admin = common::admin_http_client(&server.endpoint()).await;
-    let wanted = format!("bucket '{BUCKET}' encrypts with plaintext_reads: refuse");
+    let wanted = format!("bucket '{BUCKET}' encrypts with a proxy key, but holds objects");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let text = loop {
         let logs: serde_json::Value = admin

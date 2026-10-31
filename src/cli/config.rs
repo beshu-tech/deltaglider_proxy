@@ -473,9 +473,6 @@ pub struct ApplyConfirmations {
     /// Subjects (bucket names, `backend:<name>`) that the apply may make
     /// store plaintext (`--confirm-encryption-downgrade`).
     pub encryption_downgrade: Vec<String>,
-    /// Subjects that start to encrypt and may refuse their plaintext
-    /// history (`--confirm-plaintext-refusal`, issue #120).
-    pub plaintext_refusal: Vec<String>,
 }
 
 pub fn apply(input: &str, opts: AdminClientOpts, confirm: &ApplyConfirmations) -> i32 {
@@ -537,12 +534,6 @@ async fn apply_async(
             confirm.encryption_downgrade.join(","),
         );
     }
-    if !confirm.plaintext_refusal.is_empty() {
-        req = req.header(
-            crate::config::CONFIRM_PLAINTEXT_REFUSAL_HEADER,
-            confirm.plaintext_refusal.join(","),
-        );
-    }
     let resp = req
         .send()
         .await
@@ -562,6 +553,23 @@ async fn apply_async(
             if let Some(s) = w.as_str() {
                 eprintln!("warning: {s}");
             }
+        }
+    }
+    // Buckets that start to encrypt with objects in them: the server opened
+    // their conversion windows and queued the re-encrypt jobs.
+    for c in body
+        .get("conversions")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let bucket = c.get("bucket").and_then(|v| v.as_str()).unwrap_or("?");
+        let run = c.get("run").and_then(|v| v.as_str()).unwrap_or("?");
+        match c.get("job_id").and_then(|v| v.as_i64()) {
+            Some(id) => eprintln!(
+                "conversion: bucket '{bucket}' (run {run}): re-encrypt job maintenance:{id} queued"
+            ),
+            None => eprintln!("conversion: bucket '{bucket}' (run {run}): no job queued"),
         }
     }
 

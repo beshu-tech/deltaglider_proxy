@@ -153,9 +153,6 @@ pub struct EncryptionChange {
     pub before: WriteEncryption,
     pub after: WriteEncryption,
     pub kind: EncryptionChangeKind,
-    /// The new config serves the plaintext history
-    /// (`plaintext_reads: serve`).
-    pub serves_plaintext: bool,
     /// A bucket subject that inherits the encryption of one backend in
     /// both configs: that backend. The backend's own subject covers it.
     pub follows_backend: Option<String>,
@@ -201,11 +198,6 @@ pub const DEFAULT_ROUTE_SUBJECT: &str = "route:default";
 /// `config apply --confirm-encryption-downgrade <subject>` sends it.
 pub const CONFIRM_ENCRYPTION_DOWNGRADE_HEADER: &str = "x-dgp-confirm-encryption-downgrade";
 
-/// The request header that confirms that a subject which starts to encrypt
-/// may refuse its plaintext history (`plaintext_reads: refuse`): subjects,
-/// comma-separated. `config apply --confirm-plaintext-refusal <subject>`.
-pub const CONFIRM_PLAINTEXT_REFUSAL_HEADER: &str = "x-dgp-confirm-plaintext-refusal";
-
 /// Pure: the subjects that `headers` confirm in `header`.
 pub(crate) fn confirmed_subjects(
     headers: Option<&axum::http::HeaderMap>,
@@ -229,7 +221,6 @@ pub(crate) fn confirmed_downgrades(headers: Option<&axum::http::HeaderMap>) -> V
 /// The encryption of one backend's own site.
 struct BackendSite {
     write: WriteEncryption,
-    serves_plaintext: bool,
 }
 
 /// Pure: the kind of a change from `before` to `after`, `None` when equal.
@@ -245,23 +236,32 @@ fn change_kind(before: &WriteEncryption, after: &WriteEncryption) -> Option<Encr
     }
 }
 
-impl Config {
-    /// The buckets of `listed` whose reads refuse an unencrypted object:
-    /// they encrypt with `aes256-gcm-proxy` and do not set
-    /// `plaintext_reads: serve`. The boot check samples them.
-    pub fn buckets_refusing_plaintext<'a>(&self, listed: &'a [String]) -> Vec<&'a str> {
-        listed
-            .iter()
-            .filter(|b| {
-                self.encryption_for_bucket(b).is_some_and(|e| {
-                    matches!(e.config, BackendEncryptionConfig::Aes256GcmProxy { .. })
-                        && !e.config.serves_plaintext()
-                })
-            })
-            .map(String::as_str)
-            .collect()
+/// Pure: does a bucket whose read form goes from `before` to `after`
+/// start a conversion? A read form is the write encryption and whether
+/// it serves every unencrypted object (`plaintext_reads: serve`, still
+/// honoured for one release); `None` = the old config does not resolve
+/// the bucket. Yes when `after` encrypts with a usable proxy key and does
+/// not serve plaintext (it refuses unsealed objects outside a conversion
+/// window), and `before` could have stored plaintext that a client reads:
+/// any other mode (plaintext, native SSE, a proxy mode with no key), or a
+/// proxy key that served plaintext. A key rotation starts none, and an
+/// `after` that serves plaintext keeps the behaviour of that deprecated
+/// setting unchanged (no marker, no job; the operator runs the job).
+pub fn starts_conversion(
+    before: Option<(&WriteEncryption, bool)>,
+    after: (&WriteEncryption, bool),
+) -> bool {
+    let proxy_key = |w: &WriteEncryption| w.mode == "aes256-gcm-proxy" && !w.refuses_writes();
+    if !proxy_key(after.0) || after.1 {
+        return false;
     }
+    match before {
+        Some((w, served)) if proxy_key(w) => served,
+        _ => true,
+    }
+}
 
+impl Config {
     /// The write encryption of a configured bucket name, or `None` when it
     /// routes to an undefined backend.
     pub fn write_encryption_for_bucket(&self, bucket: &str) -> Option<WriteEncryption> {
@@ -284,7 +284,6 @@ impl Config {
                 let keys = resolve_site_keys(KeyScope::Backend(&name), enc);
                 let site = BackendSite {
                     write: WriteEncryption::of(enc, &keys),
-                    serves_plaintext: enc.serves_plaintext(),
                 };
                 Some((name, site))
             })
@@ -308,7 +307,6 @@ impl Config {
                     before: b.write.clone(),
                     after: a.write.clone(),
                     kind,
-                    serves_plaintext: a.serves_plaintext,
                     follows_backend: None,
                 });
             }
@@ -325,7 +323,6 @@ impl Config {
                         before: b.write.clone(),
                         after: a.write.clone(),
                         kind,
-                        serves_plaintext: a.serves_plaintext,
                         follows_backend: None,
                     });
                 }
@@ -352,7 +349,6 @@ impl Config {
                     before: wb,
                     after: wa,
                     kind,
-                    serves_plaintext: a.config.serves_plaintext(),
                     follows_backend,
                 });
             }
@@ -360,61 +356,54 @@ impl Config {
         out
     }
 
-    /// The plaintext-refusal gate (issue #120): one error per subject that
-    /// starts to encrypt with proxy AES and `plaintext_reads: refuse`. Its
-    /// objects written before are plaintext, and the read rule then refuses
-    /// them. The change needs `plaintext_reads: serve` (and a re-encrypt job
-    /// to convert the history), or the subject in `confirmed` (the bucket
-    /// holds no plaintext that anyone needs). A bucket in `absent` (no
-    /// backend lists it yet) has no history. A bucket that follows one
-    /// backend in both configs is covered by the backend's subject; a
-    /// bucket that starts to inherit an encrypting backend is its own
-    /// subject. `None` = not gated.
-    pub fn unconfirmed_plaintext_refusals(
+    /// The listed buckets (`(name, backend that holds it)`) whose stored
+    /// objects may be plaintext that `self` no longer serves: an apply
+    /// from `old` to `self` starts their conversion (marker + re-encrypt
+    /// job, `docs/plan/encryption-conversion-marker.md` section 4). See
+    /// [`starts_conversion`]. Migrate's transient routes are internal.
+    pub fn buckets_starting_conversion(
         &self,
         old: &Config,
-        confirmed: Option<&[String]>,
-        absent: &[String],
+        listed: &[(String, Option<String>)],
     ) -> Vec<String> {
-        let Some(confirmed) = confirmed else {
-            return Vec::new();
+        let read_form = |c: &Config, name: &str, held: Option<&str>| {
+            c.encryption_for_listed_bucket(name, held)
+                .map(|e| (e.write_encryption(), e.config.serves_plaintext()))
         };
-        let starts_to_refuse = |c: &EncryptionChange| {
-            !c.before.encrypts()
-                && c.after.mode == "aes256-gcm-proxy"
-                && !c.after.refuses_writes()
-                && !c.serves_plaintext
-        };
-        let changes = self.encryption_changes(old);
-        let mut errors = Vec::new();
-        for c in changes.iter().filter(|c| starts_to_refuse(c)) {
-            if c.confirmed_by(confirmed) || c.covered_by(&changes, starts_to_refuse) {
-                continue;
-            }
-            let what = match &c.subject {
-                Subject::Bucket(b) => {
-                    if absent.iter().any(|a| a.eq_ignore_ascii_case(b)) {
-                        continue;
-                    }
-                    format!("bucket '{b}'")
-                }
-                Subject::DefaultRoute => "every bucket that the config does not name".to_string(),
-                Subject::Backend(name) => {
-                    format!("every bucket on backend '{name}' without its own encryption block")
-                }
-            };
-            errors.push(format!(
-                "this change makes {what} encrypt, but the objects stored there before are \
-                 plaintext, and with `plaintext_reads: refuse` (the default) the proxy refuses \
-                 to read them. Set encryption.plaintext_reads: serve and run a re-encrypt job \
-                 (POST /_/api/admin/jobs/reencrypt) to convert them, then set it back. If the \
-                 subject holds no plaintext that anyone needs, confirm with the header \
-                 `X-DGP-Confirm-Plaintext-Refusal: {}` (`config apply \
-                 --confirm-plaintext-refusal {}`)",
-                c.subject, c.subject
-            ));
-        }
-        errors
+        listed
+            .iter()
+            .filter(|(name, _)| !name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX))
+            .filter(|(name, held)| {
+                let Some(after) = read_form(self, name, held.as_deref()) else {
+                    return false;
+                };
+                let before = read_form(old, name, held.as_deref());
+                starts_conversion(before.as_ref().map(|(w, s)| (w, *s)), (&after.0, after.1))
+            })
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect()
+    }
+
+    /// One deprecation warning per encryption site that sets
+    /// `plaintext_reads: serve` (load, `config lint`, apply). The setting
+    /// is still honoured in this release; the next one rejects it.
+    pub fn plaintext_reads_deprecations(&self) -> Vec<String> {
+        self.encryption_sites()
+            .into_iter()
+            .filter(|(site, _)| !(*site == EncryptionSite::Singleton && !self.backends.is_empty()))
+            .filter(|(_, enc)| enc.serves_plaintext())
+            .map(|(site, _)| {
+                format!(
+                    "{}: `encryption.plaintext_reads: serve` is deprecated, and the next release \
+                     rejects it. It is still honoured: reads serve every object that is not \
+                     encrypted, also one that someone put directly on the storage. Remove the \
+                     line (admin UI: Convert now): the apply then opens a conversion window, so \
+                     the plaintext history stays readable, and starts the re-encrypt job that \
+                     converts it",
+                    site.label()
+                )
+            })
+            .collect()
     }
 
     /// The downgrade gate: one error per change from `old` that makes a
@@ -494,26 +483,6 @@ mod tests {
 
     fn local_aes(key: &str, id: &str) -> String {
         format!("      encryption: {}\n", aes(key, id))
-    }
-
-    /// The boot check samples exactly the buckets that refuse plaintext:
-    /// proxy AES without `serve`, inherited or their own.
-    #[test]
-    fn buckets_refusing_plaintext_are_the_proxy_aes_ones_without_serve() {
-        let c = cfg(
-            &local_aes(KA, "ka"),
-            &format!(
-                "    releases: {{ backend: local-disk }}\n    db-archive: {{ backend: local-disk, encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: kb, plaintext_reads: serve }} }}\n    downloads: {{ backend: hetzner-fsn1 }}\n"
-            ),
-        );
-        let listed: Vec<String> = ["releases", "db-archive", "downloads", "unnamed"]
-            .map(String::from)
-            .to_vec();
-        // `unnamed` is on the default backend, local-disk, which encrypts.
-        assert_eq!(
-            c.buckets_refusing_plaintext(&listed),
-            ["releases", "unnamed"]
-        );
     }
 
     #[test]
@@ -671,6 +640,137 @@ mod tests {
         assert_ne!(wa, wb);
         assert_eq!(wa.kcv.as_deref().map(str::len), Some(16));
         assert!(!wa.kcv.as_deref().unwrap().contains(&KA[..16]));
+    }
+
+    fn w(mode: &str, key_id: Option<&str>) -> WriteEncryption {
+        WriteEncryption {
+            mode: mode.into(),
+            key_id: key_id.map(str::to_string),
+            kcv: None,
+        }
+    }
+
+    /// The truth table of [`starts_conversion`]: only a change to a usable
+    /// proxy key that does not serve plaintext, from a form that a client
+    /// could read plaintext in.
+    #[test]
+    fn a_conversion_starts_where_plaintext_history_becomes_unreadable() {
+        let aes = w("aes256-gcm-proxy", Some("a"));
+        let aes_b = w("aes256-gcm-proxy", Some("b"));
+        let keyless = w("aes256-gcm-proxy", None);
+        let none = w("none", None);
+        let sse = w("sse-s3", None);
+        // Plaintext, native SSE, a keyless proxy, or nothing before.
+        for before in [
+            Some((&none, false)),
+            Some((&sse, false)),
+            Some((&keyless, false)),
+            None,
+        ] {
+            assert!(starts_conversion(before, (&aes, false)), "{before:?}");
+            // `serve` after: the deprecated setting keeps its behaviour.
+            assert!(!starts_conversion(before, (&aes, true)), "{before:?}");
+        }
+        // A rotation, and the same key again, start none.
+        assert!(!starts_conversion(Some((&aes, false)), (&aes_b, false)));
+        assert!(!starts_conversion(Some((&aes, false)), (&aes, false)));
+        // `serve` removed ("Convert now"), with or without a rotation.
+        assert!(starts_conversion(Some((&aes, true)), (&aes, false)));
+        assert!(starts_conversion(Some((&aes, true)), (&aes_b, false)));
+        // After: no usable proxy key.
+        for after in [&none, &sse, &keyless] {
+            assert!(!starts_conversion(Some((&none, false)), (after, false)));
+        }
+    }
+
+    /// The listed buckets that an apply converts: an own block, an
+    /// inherited backend change, an unnamed bucket on the default backend,
+    /// `serve` removed; not a rotation, not a bucket that keeps `serve`.
+    #[test]
+    fn the_buckets_starting_conversion_follow_their_effective_encryption() {
+        let listed: Vec<(String, Option<String>)> = [
+            ("releases", "local-disk"),
+            ("db-archive", "local-disk"),
+            ("downloads", "hetzner-fsn1"),
+            ("unnamed", "local-disk"),
+        ]
+        .iter()
+        .map(|(b, h)| (b.to_string(), Some(h.to_string())))
+        .collect();
+        let names = "    releases: { backend: local-disk }\n    db-archive: { backend: local-disk }\n    downloads: { backend: hetzner-fsn1 }\n";
+        let plain = cfg("", names);
+        // The backend starts to encrypt: every bucket on it that inherits.
+        let backend = cfg(&local_aes(KA, "local-a"), names);
+        assert_eq!(
+            backend.buckets_starting_conversion(&plain, &listed),
+            ["releases", "db-archive", "unnamed"]
+        );
+        // A rotation of the backend key: none.
+        let rotated = cfg(&local_aes(KB, "local-b"), names);
+        assert!(rotated
+            .buckets_starting_conversion(&backend, &listed)
+            .is_empty());
+        // One bucket's own block, on a plaintext backend.
+        let own = cfg(
+            "",
+            &format!(
+                "    releases: {{ backend: local-disk }}\n    db-archive: {{ backend: local-disk, encryption: {} }}\n    downloads: {{ backend: hetzner-fsn1 }}\n",
+                aes(KB, "db")
+            ),
+        );
+        assert_eq!(
+            own.buckets_starting_conversion(&plain, &listed),
+            ["db-archive"]
+        );
+        // `serve` on the backend: unchanged behaviour; removing it converts.
+        let serve = cfg(
+            &format!(
+                "      encryption: {{ mode: aes256-gcm-proxy, key: \"{KA}\", key_id: local-a, plaintext_reads: serve }}\n"
+            ),
+            names,
+        );
+        assert!(serve
+            .buckets_starting_conversion(&plain, &listed)
+            .is_empty());
+        assert_eq!(
+            backend.buckets_starting_conversion(&serve, &listed),
+            ["releases", "db-archive", "unnamed"]
+        );
+        // A bucket's `mode: none` block removed: it starts to inherit.
+        let off = cfg(
+            &local_aes(KA, "local-a"),
+            "    releases: { backend: local-disk, encryption: { mode: none } }\n    db-archive: { backend: local-disk }\n    downloads: { backend: hetzner-fsn1 }\n",
+        );
+        assert_eq!(
+            backend.buckets_starting_conversion(&off, &listed),
+            ["releases"]
+        );
+    }
+
+    #[test]
+    fn serve_is_deprecated_at_every_site_that_sets_it() {
+        let c = cfg(
+            &format!(
+                "      encryption: {{ mode: aes256-gcm-proxy, key: \"{KA}\", key_id: local-a, plaintext_reads: serve }}\n"
+            ),
+            &format!(
+                "    db-archive: {{ backend: hetzner-fsn1, encryption: {{ mode: aes256-gcm-proxy, key: \"{KB}\", key_id: db, plaintext_reads: serve }} }}\n    releases: {{ backend: local-disk }}\n"
+            ),
+        );
+        let w = c.plaintext_reads_deprecations();
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].starts_with("backend 'local-disk'"), "{w:?}");
+        assert!(w[1].starts_with("bucket 'db-archive'"), "{w:?}");
+        assert!(w.iter().all(|m| m.contains("deprecated")));
+        assert!(cfg("", "    releases: { backend: local-disk }\n")
+            .plaintext_reads_deprecations()
+            .is_empty());
+        // The load warnings carry it (load, `config lint`, apply).
+        let mut loaded = c.clone();
+        assert!(loaded
+            .check()
+            .iter()
+            .any(|m| m.contains("plaintext_reads: serve` is deprecated")));
     }
 
     #[test]

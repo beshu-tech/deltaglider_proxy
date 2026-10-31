@@ -1249,8 +1249,12 @@ mod source_guards {
         );
         let example =
             std::fs::read_to_string(root().join("deltaglider_proxy.example.yaml")).unwrap();
+        // Deprecated fields that the example must not teach (still parsed
+        // for one release, with a warning).
+        const DEPRECATED: [&str; 1] = ["plaintext_reads"];
         let missing: Vec<&String> = names
             .iter()
+            .filter(|n| !DEPRECATED.contains(&n.as_str()))
             .filter(|n| !example.contains(&format!("{n}:")))
             .collect();
         assert!(

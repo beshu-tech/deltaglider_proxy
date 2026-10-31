@@ -331,6 +331,7 @@ jobs:
               cli_s3_verify_test::
               config_sync_ha_test::
               config_sync_test::
+              conversion_apply_test::
               conversion_marker_test::
               coordination_lease_test::
               encryption_test::

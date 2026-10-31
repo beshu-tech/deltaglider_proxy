@@ -1056,25 +1056,28 @@ async fn a_downgrade_needs_confirmation_and_every_change_is_audited() {
         "{cleared:?}"
     );
 
-    // Back to encrypting: `plain.txt` is plaintext history, so `refuse`
-    // (the default) needs a confirmation (issue #120); `serve` keeps it
-    // readable and needs none. The change is a `set`.
-    let (code, v) = env
-        .storage_patch(
+    // Back to encrypting: `plain.txt` is plaintext history, so the apply
+    // opens the conversion window and queues the re-encrypt job (the
+    // response names both); the history stays readable. The change is a
+    // `set`.
+    let v = env
+        .storage_patch_ok(
             json!({ "buckets": { "releases": { "encryption": override_json(KA, "releases-a") } } }),
         )
         .await;
+    let conv = &v["conversions"][0];
+    assert_eq!(conv["bucket"], "releases", "{v}");
     assert!(
-        code == 422
-            && v.to_string()
-                .contains("X-DGP-Confirm-Plaintext-Refusal: releases"),
-        "{code} {v}"
+        conv["job_id"].is_i64() && conv["run"].as_str().is_some_and(|r| r.len() == 32),
+        "{v}"
     );
-    let mut serve = override_json(KA, "releases-a");
-    serve["plaintext_reads"] = json!("serve");
-    env.storage_patch_ok(json!({ "buckets": { "releases": { "encryption": serve } } }))
-        .await;
+    wait_job_done(&env.admin, &endpoint, "releases").await;
     assert_eq!(env.get("releases", "plain.txt").await, b"now plaintext");
+    assert_eq!(
+        env.at_rest("releases", "plain.txt").await.as_deref(),
+        Some(KA),
+        "the job converted the history"
+    );
     let set = audit_targets(&env, "bucket_encryption_set").await;
     assert!(
         set.iter()
@@ -1415,15 +1418,19 @@ async fn the_witness_makes_a_disagreeing_instance_refuse_writes_minio() {
     // A is not affected.
     assert_eq!(a.raw_put(&data, "a2.txt", b"A again").await.0, 200);
 
-    // Converge: B applies A's encryption. B refused every write, so the
-    // bucket holds no plaintext: B confirms that (issue #120's gate).
+    // Converge: B applies A's encryption. B stored the bucket in plaintext
+    // before, so the apply starts a conversion there (the objects are
+    // sealed already: the job converts nothing). The witness, which
+    // refused B's writes, does not stop the conversion marker: it is
+    // sealed with the key that B now agrees on.
     let (code, v) = b
-        .storage_patch_with(
+        .storage_patch(
             json!({ "buckets": { data.as_str(): { "encryption": override_json(KB, "ha-b") } } }),
-            &[("X-DGP-Confirm-Plaintext-Refusal", data.as_str())],
         )
         .await;
     assert_eq!(code, 200, "{v}");
+    assert_eq!(v["conversions"][0]["bucket"], data.as_str(), "{v}");
+    wait_job_done(&b.admin, &b.server.endpoint(), &data).await;
     b.wait_witness("agree").await;
     let (code, body) = b.raw_put(&data, "b.txt", b"written by B").await;
     assert_eq!(code, 200, "{body}");
@@ -1940,18 +1947,16 @@ async fn settings_of_a_bucket_that_does_not_exist_can_be_removed() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
     assert!(policy(&env, "ghost").await.is_null());
-    // An existing bucket keeps the gate. It is empty: its plaintext
-    // history is confirmed away (issue #120's gate).
+    // An existing bucket keeps the gate. It is empty: the apply starts no
+    // conversion.
     let (code, v) = env
-        .storage_patch_with(
-            json!({ "buckets": { "releases": {
-                "backend": "local-disk",
-                "encryption": override_json(KA, "releases-2026-10"),
-            } } }),
-            &[("X-DGP-Confirm-Plaintext-Refusal", "releases")],
-        )
+        .storage_patch(json!({ "buckets": { "releases": {
+            "backend": "local-disk",
+            "encryption": override_json(KA, "releases-2026-10"),
+        } } }))
         .await;
     assert_eq!(code, 200, "{v}");
+    assert!(v.get("conversions").is_none(), "{v}");
     let (code, v) = env
         .storage_patch(json!({ "buckets": { "releases": null } }))
         .await;

@@ -24,6 +24,7 @@
 //! `document_level::config_defaults`) agree on the wire-level name
 //! spelling and 404 message.
 
+mod conversion_start;
 pub mod document_level;
 pub mod field_level;
 pub mod password;
@@ -32,6 +33,7 @@ pub mod trace;
 mod transition;
 mod version;
 mod write;
+pub use conversion_start::{ConversionPreview, ConversionStarted};
 #[cfg(test)]
 use transition::engine_affecting_fields_changed;
 use transition::requires_restart_warnings;

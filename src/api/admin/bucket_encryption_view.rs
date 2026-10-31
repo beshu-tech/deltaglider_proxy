@@ -39,9 +39,10 @@ pub struct EffectiveEncryption {
     /// New writes are stored encrypted. Proxy mode without a key is
     /// false: the proxy refuses those writes.
     pub encrypts: bool,
-    /// Proxy mode with `plaintext_reads: serve` (issue #120): reads also
-    /// serve objects that are not encrypted (the bucket's history).
-    pub serves_plaintext: bool,
+    /// The bucket's conversion to encryption (a marker in the bucket), or
+    /// its deprecated `plaintext_reads: serve`; `None` when neither.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversion: Option<ConversionView>,
     /// A re-encrypt job can change objects of this bucket: it encrypts
     /// with a proxy key, or it is plaintext and can still read an older key.
     pub reencrypt: bool,
@@ -55,6 +56,41 @@ pub struct EffectiveEncryption {
     /// "Inherit" gives the bucket (equal to the top-level fields when
     /// `source` is `backend`).
     pub inherited: InheritedEncryption,
+}
+
+/// The conversion state of a bucket, as the bucket card shows it
+/// (`docs/plan/encryption-conversion-marker.md` section 6).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ConversionView {
+    /// A marker of this bucket whose deadline is ahead: clients read the
+    /// plaintext history.
+    pub open: bool,
+    /// The marker's times (unix seconds, backend clock) and run id; `None`
+    /// without a marker. A marker with `open: false` passed its deadline:
+    /// the conversion stopped before it finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cutoff: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    /// Objects that the latest re-encrypt job on this node converted
+    /// although clients could not read them (stored after the cutoff).
+    pub adopted_after_cutoff: i64,
+    /// The latest re-encrypt job of the bucket on this node (job ids are
+    /// node-local).
+    pub job_on_this_node: Option<ConversionJob>,
+    /// The bucket's own block, or its backend's, sets the deprecated
+    /// `plaintext_reads: serve`.
+    pub serves_plaintext_deprecated: bool,
+}
+
+/// A re-encrypt job, as the conversion row shows it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConversionJob {
+    pub id: i64,
+    pub status: String,
+    pub percent: Option<u8>,
 }
 
 /// The backend's own encryption, as a bucket without its own block gets it.
@@ -153,11 +189,94 @@ pub fn effective_encryption(
         kms_key_id,
         key_env,
         encrypts,
-        serves_plaintext: e.config.serves_plaintext(),
+        conversion: e.config.serves_plaintext().then(|| ConversionView {
+            serves_plaintext_deprecated: true,
+            ..Default::default()
+        }),
         reencrypt,
         pinned: cfg.bucket_storage(&name).is_some(),
         bucket_modes: cfg.bucket_encryption_modes(&e.backend),
     })
+}
+
+/// Fill in the conversion state of each bucket in `rows` that encrypts
+/// with a proxy key: its marker (one fresh read per bucket, 8 at once)
+/// and its latest re-encrypt job on this node.
+pub async fn attach_conversions(
+    engine: &crate::deltaglider::DynEngine,
+    jobs_db: Option<&std::sync::Arc<tokio::sync::Mutex<crate::config_db::JobsDb>>>,
+    rows: &mut [(&str, &mut Option<EffectiveEncryption>)],
+) {
+    let wanted: Vec<String> = rows
+        .iter()
+        .filter(|(_, e)| {
+            e.as_ref()
+                .is_some_and(|e| e.mode == "aes256-gcm-proxy" && e.encrypts)
+        })
+        .map(|(b, _)| b.to_ascii_lowercase())
+        .collect();
+    let mut markers = std::collections::HashMap::new();
+    for chunk in wanted.chunks(8) {
+        let states = futures::future::join_all(chunk.iter().map(|b| marker_state(engine, b))).await;
+        markers.extend(chunk.iter().cloned().zip(states));
+    }
+    let db = match jobs_db {
+        Some(db) if !markers.is_empty() => Some(db.lock().await),
+        _ => None,
+    };
+    for (bucket, eff) in rows.iter_mut() {
+        let Some(eff) = eff.as_mut() else { continue };
+        let key = bucket.to_ascii_lowercase();
+        let Some(Some((fields, server_now))) = markers.get(&key) else {
+            continue;
+        };
+        let job = db
+            .as_ref()
+            .and_then(|db| db.maintenance_latest_job_for_bucket(&key, "reencrypt").ok())
+            .flatten();
+        let adopted = match (&db, &job) {
+            (Some(db), Some(j)) => db
+                .maintenance_count_failures_with_prefix(
+                    j.id,
+                    crate::maintenance::conversion::ADOPTED_AFTER_CUTOFF,
+                )
+                .unwrap_or(0),
+            _ => 0,
+        };
+        let view = eff.conversion.get_or_insert_with(Default::default);
+        view.open = *server_now < fields.deadline;
+        view.cutoff = Some(fields.cutoff);
+        view.deadline = Some(fields.deadline);
+        view.run = Some(crate::storage::encrypting::conversion::run_label(
+            &fields.run,
+        ));
+        view.adopted_after_cutoff = adopted;
+        view.job_on_this_node = job.map(|j| ConversionJob {
+            percent: crate::maintenance::display_percent(&j),
+            id: j.id,
+            status: j.status,
+        });
+    }
+}
+
+/// The marker of `bucket` with the backend's time, when it is this
+/// bucket's (a foreign or unreadable marker shows nothing here).
+async fn marker_state(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+) -> Option<(crate::storage::encrypting::conversion::Fields, i64)> {
+    use crate::storage::encrypting::conversion::{ConversionOp, ConversionReply, MarkerState};
+    use crate::storage::StorageBackend;
+    match engine
+        .storage()
+        .conversion(bucket, ConversionOp::Status)
+        .await
+    {
+        Ok(ConversionReply::Status(MarkerState::Ours { fields, server_now })) => {
+            Some((fields, server_now))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

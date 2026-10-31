@@ -15,6 +15,9 @@
 //!    replication gates → section diff.
 //! 4. dry run: stop (the section validate adds the declarative-IAM preview).
 //! 5. apply: [`super::apply_config_transition`] → persist → audit.
+//! 6. after the write lock is released: the re-encrypt jobs of the
+//!    conversions that the transition opened
+//!    ([`super::conversion_start::enqueue`]).
 //!
 //! The surfaces differ only where their wire contract differs; every
 //! difference is one row of [`Steps`], never a copied step.
@@ -33,6 +36,7 @@ use axum::Json;
 use tokio::sync::RwLockWriteGuard;
 
 use super::super::AdminState;
+use super::conversion_start::{ConversionPreview, ConversionStarted};
 use super::{SectionName, TransitionCtx};
 use crate::config::Config;
 
@@ -206,6 +210,8 @@ pub(super) enum Outcome {
         /// One line per changed restart-required field; empty = none.
         restart: Vec<String>,
         diff: Option<serde_json::Value>,
+        /// The buckets whose conversion the apply would start.
+        conversions: Vec<ConversionPreview>,
     },
     /// Applied in memory; `persist` is the file write.
     Applied {
@@ -216,6 +222,8 @@ pub(super) enum Outcome {
         persist: Result<String, (String, String)>,
         /// The version after the write (of the section, for a section PUT).
         version: String,
+        /// The conversions the write started, with their jobs.
+        conversions: Vec<ConversionStarted>,
     },
 }
 
@@ -267,16 +275,32 @@ pub(super) async fn run(
                     warnings: Box::new(p.warnings),
                     diff: p.diff,
                 }),
-                Ok(()) => {
-                    if write.surface.section().is_some() {
-                        p.warnings.preview = declarative_preview(state, &old, &p.new_cfg).await;
-                    }
-                    Outcome::Validated {
-                        warnings: p.warnings,
-                        restart: p.restart,
+                Ok(()) => match preview_conversions(state, &old, &p.new_cfg).await {
+                    Err((status, error)) => Outcome::Rejected(Rejection {
+                        stage: Stage::Transition,
+                        status,
+                        error,
+                        warnings: Box::new(p.warnings),
                         diff: p.diff,
+                    }),
+                    Ok(conversions) => {
+                        if write.surface.section().is_some() {
+                            p.warnings.preview = declarative_preview(state, &old, &p.new_cfg).await;
+                        }
+                        p.warnings.check_new.extend(
+                            conversions
+                                .iter()
+                                .filter(|c| c.versioned)
+                                .map(|c| super::conversion_start::versioning_warning(&c.bucket)),
+                        );
+                        Outcome::Validated {
+                            warnings: p.warnings,
+                            restart: p.restart,
+                            diff: p.diff,
+                            conversions,
+                        }
                     }
-                }
+                },
             },
         };
         return WriteResult { outcome, refs };
@@ -295,10 +319,44 @@ pub(super) async fn run(
     }
     drop(cfg);
     run_discoveries(discoveries).await;
-    if matches!(outcome, Outcome::Applied { .. }) {
+    let mut outcome = outcome;
+    if let Outcome::Applied {
+        conversions,
+        warnings,
+        ..
+    } = &mut outcome
+    {
         reconcile_job_rules(state).await;
+        let no_headers = HeaderMap::new();
+        super::conversion_start::enqueue(
+            &state.s3_state,
+            conversions,
+            &mut warnings.transition,
+            write.headers.unwrap_or(&no_headers),
+        )
+        .await;
     }
     WriteResult { outcome, refs }
+}
+
+/// The dry run's conversion step: what the apply would start (with the
+/// RUNNING engine's listing and an object count for the dialog), and the
+/// same active-job refusal. `Err`: the status and the message.
+async fn preview_conversions(
+    state: &Arc<AdminState>,
+    old: &Config,
+    new: &Config,
+) -> Result<Vec<ConversionPreview>, (StatusCode, String)> {
+    let engine = state.s3_state.engine.load_full();
+    let planned =
+        super::conversion_start::plan(&engine, old, new, super::conversion_start::COUNT_CAP)
+            .await
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let buckets: Vec<&str> = planned.iter().map(|p| p.bucket.as_str()).collect();
+    super::conversion_start::refuse_active_jobs(&state.s3_state, &buckets, false)
+        .await
+        .map_err(|e| (e.status, e.message))?;
+    Ok(planned)
 }
 
 /// Drop the runtime rows of the job rules that the applied config no
@@ -395,8 +453,8 @@ async fn apply_locked(
         Err(e) => {
             return Outcome::Rejected(Rejection {
                 stage: Stage::Transition,
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                error: e,
+                status: e.status,
+                error: e.message,
                 warnings: Box::new(warnings),
                 diff,
             });
@@ -413,6 +471,7 @@ async fn apply_locked(
         diff,
         persist: persist(state, cfg),
         version,
+        conversions: report.conversions,
     }
 }
 
@@ -641,6 +700,8 @@ pub(crate) struct InternalApplied {
     /// `Ok(path)`, or `Err((path, error))` when the file write failed (the
     /// config is live in memory either way).
     pub persist: Result<String, (String, String)>,
+    /// The conversions the write started, with their jobs.
+    pub conversions: Vec<ConversionStarted>,
 }
 
 /// Why [`run_internal`] changed nothing.
@@ -794,26 +855,40 @@ where
             break 'locked Err(HeldRefusal::Edit(e));
         }
         let scrub = |s: String| crate::config::scrub_env_values(&s, &refs);
-        let (warnings, persist) = match outcome {
+        let (warnings, persist, conversions) = match outcome {
             Outcome::Applied {
-                warnings, persist, ..
-            } => (warnings, persist),
+                warnings,
+                persist,
+                conversions,
+                ..
+            } => (warnings, persist, conversions),
             Outcome::Rejected(r) => {
                 break 'locked Err(HeldRefusal::Pipeline(match r.stage {
                     Stage::EnvReapply => InternalRefusal::EnvReapply(scrub(r.error)),
+                    // A 409 (an active job) keeps its status.
+                    Stage::Transition if r.status == StatusCode::CONFLICT => {
+                        InternalRefusal::Invalid {
+                            status: r.status,
+                            error: scrub(r.error),
+                        }
+                    }
                     Stage::Transition => InternalRefusal::Transition(scrub(r.error)),
                     _ => InternalRefusal::Invalid {
                         status: r.status,
                         error: scrub(r.error),
                     },
-                }))
+                }));
             }
             Outcome::Conflict { .. } | Outcome::Validated { .. } => {
                 unreachable!("an internal write is an apply without If-Match")
             }
         };
+        // The engine that opened this write's conversions: a roll back
+        // removes the markers it wrote.
+        let opened_by = state.s3_state.engine.load_full();
         if let (Err((path, error)), OnPersistError::RollBack) = (&persist, write.on_persist_error) {
             roll_back(state, &mut cfg, write.headers, old, false, &mut discoveries).await;
+            super::conversion_start::compensate(&opened_by, &conversions, write.headers).await;
             break 'locked Err(HeldRefusal::Persist {
                 path: path.clone(),
                 error: scrub(error.clone()),
@@ -829,6 +904,7 @@ where
                 &mut discoveries,
             )
             .await;
+            super::conversion_start::compensate(&opened_by, &conversions, write.headers).await;
             break 'locked Err(HeldRefusal::Edit(e));
         }
         let (Ok(path) | Err((path, _))) = &persist;
@@ -839,11 +915,22 @@ where
         Ok(InternalApplied {
             warnings: all.into_iter().map(scrub).collect(),
             persist: persist.map_err(|(p, e)| (p, scrub(e))),
+            conversions,
         })
     };
     // OIDC discovery is network I/O: after the guard (review A8).
     drop(cfg);
     run_discoveries(discoveries).await;
+    let mut result = result;
+    if let Ok(applied) = &mut result {
+        super::conversion_start::enqueue(
+            &state.s3_state,
+            &mut applied.conversions,
+            &mut applied.warnings,
+            write.headers,
+        )
+        .await;
+    }
     result
 }
 

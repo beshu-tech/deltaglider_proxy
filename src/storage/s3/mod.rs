@@ -1381,6 +1381,16 @@ impl StorageBackend for S3Backend {
     {
         Ok(crate::storage::encrypting::conversion::ConversionReply::NotEncrypted)
     }
+    async fn bucket_versioning(&self, bucket: &str) -> Option<bool> {
+        let out = self
+            .client
+            .get_bucket_versioning()
+            .bucket(bucket)
+            .send()
+            .await
+            .ok()?;
+        Some(out.status().is_some())
+    }
 
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
         let buckets_to_scan = if let Some(b) = bucket {

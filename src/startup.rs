@@ -1891,11 +1891,13 @@ pub async fn shutdown_signal() {
 // The ones covered below are called from main.rs on every boot; a bug
 // here is a boot-path regression that nothing else would catch.
 // ─────────────────────────────────────────────────────────────────────
-/// Issue #120: the apply gate stops an admin apply from turning on
-/// encryption over a bucket's plaintext history with
-/// `plaintext_reads: refuse`, but a restart from an edited file passes no
-/// gate. In the background (boot does not wait), sample each such bucket
-/// and log a warning that names the first object the read rule refuses.
+/// Issue #120: an admin apply that turns on encryption over a bucket's
+/// plaintext history opens a conversion window and starts the re-encrypt
+/// job, but a restart from an edited file does neither. In the
+/// background (boot does not wait), sample each bucket that encrypts with
+/// a proxy key, does not serve plaintext and has no open conversion
+/// window, and log a warning that names the first object the read rule
+/// refuses.
 pub(crate) fn spawn_plaintext_refusal_check(state: &Arc<AppState>, config: &Config) {
     const SAMPLE: u32 = 100;
     let state = state.clone();
@@ -1909,13 +1911,26 @@ pub(crate) fn spawn_plaintext_refusal_check(state: &Arc<AppState>, config: &Conf
                 return;
             }
         };
-        for bucket in config.buckets_refusing_plaintext(&buckets) {
+        let refusing = buckets.iter().filter(|b| {
+            config.encryption_for_bucket(b).is_some_and(|e| {
+                matches!(
+                    e.config,
+                    deltaglider_proxy::config::BackendEncryptionConfig::Aes256GcmProxy { .. }
+                ) && !e.config.serves_plaintext()
+            })
+        });
+        for bucket in refusing {
+            // An open window serves the history while the job converts it.
+            if deltaglider_proxy::maintenance::conversion::window_open(&engine, bucket).await {
+                continue;
+            }
             match engine.first_refused_plaintext(bucket, SAMPLE).await {
                 Ok(Some(key)) => warn!(
-                    "bucket '{bucket}' encrypts with plaintext_reads: refuse, but holds objects \
-                     that are not encrypted (for example '{key}'): every read of them fails \
-                     with 500. Set encryption.plaintext_reads: serve and run a re-encrypt job, \
-                     then set it back to refuse"
+                    "bucket '{bucket}' encrypts with a proxy key, but holds objects that are \
+                     not encrypted (for example '{key}'): every read of them fails with 500. \
+                     Convert them: POST /_/api/admin/jobs/reencrypt with \
+                     {{\"buckets\": [\"{bucket}\"], \"open_window\": true}} opens a \
+                     conversion window (the history stays readable) and starts the job"
                 ),
                 Ok(None) => {}
                 Err(e) => warn!("plaintext check of bucket '{bucket}' failed: {e}"),

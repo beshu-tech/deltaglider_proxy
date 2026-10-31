@@ -116,6 +116,14 @@ pub struct SectionApplyResponse {
     /// editors directly, not by this endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<serde_json::Value>,
+    /// Validate only: the buckets whose conversion the apply would start
+    /// (they start to encrypt and hold objects), with an object count.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conversion_preview: Vec<super::ConversionPreview>,
+    /// Apply only: the conversions the apply started, with their
+    /// re-encrypt jobs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conversions: Vec<super::ConversionStarted>,
 }
 
 /// Build an early-return rejection response for the section endpoints.
@@ -140,6 +148,8 @@ fn reject(status: StatusCode, error: impl Into<String>) -> Response {
             persist_error: None,
             error: Some(error.into()),
             diff: None,
+            conversion_preview: Vec::new(),
+            conversions: Vec::new(),
         }),
     )
         .into_response()
@@ -329,6 +339,8 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
                 persist_error: None,
                 error: Some(error),
                 diff,
+                conversion_preview: Vec::new(),
+                conversions: Vec::new(),
             };
             write::respond(r.status, body, &refs, None)
         }
@@ -336,6 +348,7 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
             warnings: w,
             restart,
             diff,
+            conversions,
         } => {
             let body = SectionApplyResponse {
                 ok: true,
@@ -347,6 +360,8 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
                 persist_error: None,
                 error: None,
                 diff,
+                conversion_preview: conversions,
+                conversions: Vec::new(),
             };
             write::respond(StatusCode::OK, body, &refs, None)
         }
@@ -356,6 +371,7 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
             diff,
             persist,
             version,
+            conversions,
         } => {
             // The persist outcome is the HTTP status (200 vs. 500), the
             // warning text, and `persist_error` for the GUI.
@@ -388,6 +404,8 @@ fn shape_section(section: SectionName, result: WriteResult) -> Response {
                 persist_error,
                 error: None,
                 diff,
+                conversion_preview: Vec::new(),
+                conversions,
             };
             let etag = super::version::etag(&version);
             write::respond(status, body, &refs, Some(etag))

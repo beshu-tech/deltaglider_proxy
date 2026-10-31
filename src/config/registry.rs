@@ -141,7 +141,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_BOOT_PLAINTEXT_CHECK",
-        description: "At boot, in the background, list the first 100 objects of each bucket that encrypts with plaintext_reads: refuse, send a HEAD for each, and log a warning that names the first object that is not encrypted (every read of it fails). false turns the check off (default: true)",
+        description: "At boot, in the background, list the first 100 objects of each bucket that encrypts with a proxy key and has no open conversion window, send a HEAD for each, and log a warning that names the first object that is not encrypted (every read of it fails). false turns the check off (default: true)",
         example: "false",
         category: "Storage",
     },

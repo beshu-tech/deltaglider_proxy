@@ -281,6 +281,41 @@ impl JobsDb {
         Ok(job)
     }
 
+    /// The newest job of `kind` on `bucket` (any status), if any.
+    pub fn maintenance_latest_job_for_bucket(
+        &self,
+        bucket: &str,
+        kind: &str,
+    ) -> Result<Option<MaintenanceJob>, ConfigDbError> {
+        let job = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {JOB_COLUMNS} FROM maintenance_jobs
+                     WHERE bucket = ? AND kind = ? ORDER BY id DESC LIMIT 1"
+                ),
+                params![bucket, kind],
+                row_to_job,
+            )
+            .optional()?;
+        Ok(job)
+    }
+
+    /// How many failure-ring rows of `job_id` start with `prefix` (the
+    /// ring is bounded, so this counts the retained rows).
+    pub fn maintenance_count_failures_with_prefix(
+        &self,
+        job_id: i64,
+        prefix: &str,
+    ) -> Result<i64, ConfigDbError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM maintenance_failures
+              WHERE job_id = ? AND substr(error, 1, length(?2)) = ?2",
+            params![job_id, prefix],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Load one job by id (any status).
     pub fn maintenance_job_by_id(&self, id: i64) -> Result<Option<MaintenanceJob>, ConfigDbError> {
         let job = self

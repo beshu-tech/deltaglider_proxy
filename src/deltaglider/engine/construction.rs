@@ -76,6 +76,7 @@ impl DynEngine {
             refuse_native_overrides_off_s3("default", &config.backend, &on("default"))?;
             let slot_key = policy_slot_key("default", &config.backend, &config.backend_encryption);
             let slot = policies.slot(&slot_key, cfg, &mut published);
+            let built = built_of(&published);
             let raw = build_raw_backend_native(
                 "default",
                 &config.backend,
@@ -84,6 +85,7 @@ impl DynEngine {
             .await?;
             DynStorageBackend::new_box(
                 crate::storage::EncryptingBackend::new(raw, slot)
+                    .with_built(built)
                     .with_witness("default", policies.witness_gate())
                     .with_sentinel(policies.sentinel(&slot_key)),
             )
@@ -104,6 +106,7 @@ impl DynEngine {
                 refuse_native_overrides_off_s3(&named.name, &named.backend, &on(&named.name))?;
                 let slot_key = policy_slot_key(&named.name, &named.backend, &named.encryption);
                 let slot = policies.slot(&slot_key, cfg, &mut published);
+                let built = built_of(&published);
                 let raw = build_raw_backend_native(
                     &named.name,
                     &named.backend,
@@ -112,6 +115,7 @@ impl DynEngine {
                 .await?;
                 let wrapped = DynStorageBackend::new_box(
                     crate::storage::EncryptingBackend::new(raw, slot)
+                        .with_built(built)
                         .with_witness(&named.name, policies.witness_gate())
                         .with_sentinel(policies.sentinel(&slot_key)),
                 );
@@ -139,6 +143,15 @@ impl DynEngine {
         };
         Ok(engine)
     }
+}
+
+/// The config of the slot that `published` got last: what the wrapper
+/// built with it publishes.
+fn built_of(published: &[crate::storage::PolicySlot]) -> Arc<crate::storage::EncryptionConfig> {
+    published
+        .last()
+        .map(|(_, _, cfg)| cfg.clone())
+        .expect("policies.slot pushed the slot")
 }
 
 /// The key of a raw backend's policy slot: its name AND a fingerprint of

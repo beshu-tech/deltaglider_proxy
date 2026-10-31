@@ -96,9 +96,48 @@ impl TransitionCtx<'_> {
     }
 }
 
+/// Why a transition changed nothing: the HTTP status of the refusal and
+/// its message.
+#[derive(Debug)]
+pub(crate) struct TransitionError {
+    pub status: axum::http::StatusCode,
+    pub message: String,
+}
+
+impl TransitionError {
+    /// A refusal that the state of another resource causes (409).
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for TransitionError {
+    /// A refused change (422).
+    fn from(message: String) -> Self {
+        Self {
+            status: axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for TransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// What a successful transition reports.
 pub(crate) struct TransitionReport {
     pub warnings: Vec<String>,
+    /// The conversions this transition opened (or reused): the caller
+    /// queues their re-encrypt jobs after it releases the config write
+    /// lock ([`super::conversion_start::enqueue`]), or removes the
+    /// markers it wrote when it rolls the change back.
+    pub conversions: Vec<super::conversion_start::ConversionStarted>,
     /// OIDC discovery of a provider set the reconcile published. Network
     /// I/O: the caller runs it after it drops the config write guard
     /// (review A8).
@@ -203,7 +242,7 @@ pub(crate) async fn apply_config_transition(
     ctx: TransitionCtx<'_>,
     cfg: &mut RwLockWriteGuard<'_, Config>,
     new_cfg: Config,
-) -> Result<TransitionReport, String> {
+) -> Result<TransitionReport, TransitionError> {
     let old_cfg: &Config = cfg;
     // ── Phase 1: pre-commit (fallible, no side effect) ───────────────────
     if let TransitionCtx::Background { .. } = ctx {
@@ -212,7 +251,8 @@ pub(crate) async fn apply_config_transition(
             return Err(format!(
                 "a background config change cannot run: {} (change it through the admin API)",
                 skipped.join(", ")
-            ));
+            )
+            .into());
         }
     }
     transition_gates(&ctx, old_cfg, &new_cfg).await?;
@@ -229,16 +269,40 @@ pub(crate) async fn apply_config_transition(
     } else {
         None
     };
+    // A forward admin change that makes buckets with objects encrypt opens
+    // their conversion windows now, with the config the new engine is
+    // built with (docs/plan/encryption-conversion-marker.md section 4).
+    // Its Err leaves no marker of its own behind.
+    let conversions = match (&new_engine, admin) {
+        (Some(engine), Some((_, headers, false))) => {
+            start_conversions(ctx.app(), engine, old_cfg, &new_cfg, headers).await?
+        }
+        _ => Vec::new(),
+    };
 
     // ── Phase 2: commit ──────────────────────────────────────────────────
     // The only fallible commit step; it runs before every publish below.
     let (mut warnings, discovery) = match admin {
         Some((state, headers, restoring)) => {
-            commit_iam(state, old_cfg, &new_cfg, headers, restoring).await?
+            match commit_iam(state, old_cfg, &new_cfg, headers, restoring).await {
+                Ok(done) => done,
+                Err(e) => {
+                    if let Some(engine) = &new_engine {
+                        super::conversion_start::compensate(engine, &conversions, headers).await;
+                    }
+                    return Err(e.into());
+                }
+            }
         }
         None => (Vec::new(), None),
     };
     // Nothing below returns Err.
+    warnings.extend(
+        conversions
+            .iter()
+            .filter(|c| c.versioned)
+            .map(|c| super::conversion_start::versioning_warning(&c.bucket)),
+    );
 
     // Log-level hot reload. An invalid filter is a warning: the old filter
     // stays, the config change goes through.
@@ -361,7 +425,24 @@ pub(crate) async fn apply_config_transition(
     Ok(TransitionReport {
         warnings,
         discovery,
+        conversions,
     })
+}
+
+/// The pre-commit conversion step of a forward admin transition: plan
+/// with the new engine, refuse when a job is active on a planned bucket,
+/// then open the windows.
+async fn start_conversions(
+    app: &AppState,
+    engine: &crate::deltaglider::DynEngine,
+    old_cfg: &Config,
+    new_cfg: &Config,
+    headers: &HeaderMap,
+) -> Result<Vec<super::conversion_start::ConversionStarted>, TransitionError> {
+    let planned = super::conversion_start::plan(engine, old_cfg, new_cfg, 1).await?;
+    let buckets: Vec<&str> = planned.iter().map(|p| p.bucket.as_str()).collect();
+    super::conversion_start::refuse_active_jobs(app, &buckets, true).await?;
+    Ok(super::conversion_start::open(engine, &planned, headers).await?)
 }
 
 /// The audit entries of a transition's encryption changes.
@@ -396,8 +477,6 @@ pub(super) struct GateInputs {
     pub key_removals: Vec<String>,
     /// The confirmed downgrade subjects; `None` = not gated.
     pub downgrades: Option<Vec<String>>,
-    /// The confirmed plaintext-refusal subjects; `None` = not gated.
-    pub refusals: Option<Vec<String>>,
     /// The configured buckets (old ∪ new) that no backend lists.
     pub absent: Vec<String>,
 }
@@ -405,7 +484,7 @@ pub(super) struct GateInputs {
 impl GateInputs {
     /// THE builder. `headers` = the request's (`None` for a background
     /// change). `forward` = a forward admin write: only it judges the
-    /// downgrade and plaintext-refusal gates (a rollback puts back a config
+    /// downgrade gate (a rollback puts back a config
     /// that was live; a background change was confirmed when it started).
     pub(super) async fn gather(
         app: &AppState,
@@ -414,17 +493,13 @@ impl GateInputs {
         headers: Option<&HeaderMap>,
         forward: bool,
     ) -> Self {
-        use crate::config::{
-            confirmed_subjects, CONFIRM_ENCRYPTION_DOWNGRADE_HEADER,
-            CONFIRM_PLAINTEXT_REFUSAL_HEADER,
-        };
+        use crate::config::{confirmed_subjects, CONFIRM_ENCRYPTION_DOWNGRADE_HEADER};
         let judged = |header: &str| forward.then(|| confirmed_subjects(headers, header));
         let mut absent = absent_buckets(app, old_cfg).await;
         absent.extend(absent_buckets(app, new_cfg).await);
         Self {
             key_removals: confirmed_subjects(headers, CONFIRM_KEY_REMOVAL_HEADER),
             downgrades: judged(CONFIRM_ENCRYPTION_DOWNGRADE_HEADER),
-            refusals: judged(CONFIRM_PLAINTEXT_REFUSAL_HEADER),
             absent,
         }
     }
@@ -451,13 +526,6 @@ pub(super) fn static_transition_gates(
     // A bucket that would store plaintext where it encrypted needs an
     // explicit confirmation (issue #116 P3).
     fatal.extend(new_cfg.unconfirmed_encryption_downgrades(old_cfg, inputs.downgrades.as_deref()));
-    // A subject that starts to encrypt refuses its plaintext history
-    // unless it serves it (issue #120): explicit confirmation, or `serve`.
-    fatal.extend(new_cfg.unconfirmed_plaintext_refusals(
-        old_cfg,
-        inputs.refusals.as_deref(),
-        absent_buckets,
-    ));
     // A webhook URL that every delivery would refuse: refuse the apply that
     // adds it, instead of failing (and retrying) every event later.
     fatal.extend(
@@ -1042,15 +1110,12 @@ mod keyless_proxy_gate_tests {
     use super::{static_transition_gates, GateInputs};
     use crate::config::{BackendEncryptionConfig, Config};
 
-    /// A forward admin write that confirms `refusals` (`None` = not gated),
-    /// with `absent` buckets and no other confirmation.
-    fn inputs(absent: &[&str], refusals: Option<&[&str]>) -> GateInputs {
-        let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    /// A forward admin write with `absent` buckets and no confirmation.
+    fn inputs(absent: &[&str]) -> GateInputs {
         GateInputs {
             key_removals: Vec::new(),
             downgrades: Some(Vec::new()),
-            refusals: refusals.map(owned),
-            absent: owned(absent),
+            absent: absent.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -1072,7 +1137,7 @@ mod keyless_proxy_gate_tests {
         let old = Config::default();
         let mut keyless = old.clone();
         keyless.backend_encryption = proxy(None);
-        let err = static_transition_gates(&old, &keyless, &inputs(&[], None))
+        let err = static_transition_gates(&old, &keyless, &inputs(&[]))
             .expect_err("a keyless proxy backend must be refused");
         assert!(
             err.contains("backend 'default'") && err.contains("DGP_ENCRYPTION_KEY"),
@@ -1081,99 +1146,12 @@ mod keyless_proxy_gate_tests {
 
         let mut keyed = old.clone();
         keyed.backend_encryption = proxy(Some(&"ab".repeat(32)));
-        static_transition_gates(&old, &keyed, &inputs(&[], None))
-            .expect("a keyed proxy backend applies");
+        static_transition_gates(&old, &keyed, &inputs(&[])).expect("a keyed proxy backend applies");
 
         let mut unrelated = keyless.clone();
         unrelated.log_level = "warn".into();
-        static_transition_gates(&keyless, &unrelated, &inputs(&[], None))
+        static_transition_gates(&keyless, &unrelated, &inputs(&[]))
             .expect("a backend that was keyless before does not block another edit");
-    }
-
-    /// #120: a subject that starts to encrypt with `plaintext_reads: refuse`
-    /// needs a confirmation, unless it serves its plaintext history or the
-    /// bucket does not exist yet.
-    #[test]
-    fn a_bucket_that_starts_to_encrypt_must_serve_or_confirm_its_history() {
-        let yaml =
-            |enc: &str| format!("storage:\n  filesystem: /tmp/x\n  buckets:\n    releases:\n{enc}");
-        let old = Config::from_yaml_str(&yaml("      compression: true\n")).unwrap();
-        let block = |extra: &str| {
-            format!(
-                "      encryption:\n        mode: aes256-gcm-proxy\n        key: \"{}\"\n        \
-                 key_id: releases-2026\n{extra}",
-                "ab".repeat(32)
-            )
-        };
-        let refuse = Config::from_yaml_str(&yaml(&block(""))).unwrap();
-        let err = static_transition_gates(&old, &refuse, &inputs(&[], Some(&[])))
-            .expect_err("the history would be refused");
-        assert!(
-            err.contains("bucket 'releases'") && err.contains("X-DGP-Confirm-Plaintext-Refusal"),
-            "{err}"
-        );
-        static_transition_gates(&old, &refuse, &inputs(&[], Some(&["releases"])))
-            .expect("confirmed");
-        static_transition_gates(&old, &refuse, &inputs(&["releases"], Some(&[])))
-            .expect("a bucket that does not exist has no history");
-        let serve =
-            Config::from_yaml_str(&yaml(&block("        plaintext_reads: serve\n"))).unwrap();
-        static_transition_gates(&old, &serve, &inputs(&[], Some(&[])))
-            .expect("the history is served");
-    }
-
-    /// #120 review: a bucket that drops its `mode: none` block and so
-    /// starts to INHERIT an encrypting backend is gated by its own name
-    /// (the backend did not change, so no backend subject covers it). A
-    /// bucket that follows a backend which starts to encrypt is covered by
-    /// the backend's subject.
-    #[test]
-    fn a_bucket_that_starts_to_inherit_encryption_must_serve_or_confirm_its_history() {
-        let yaml = |backend_enc: &str, bucket_enc: &str| {
-            Config::from_yaml_str(&format!(
-                "storage:\n  backends:\n    - name: local-disk\n      type: filesystem\n      \
-                 path: /tmp/x\n{backend_enc}  default_backend: local-disk\n  buckets:\n    \
-                 downloads: {{ backend: local-disk{bucket_enc} }}\n"
-            ))
-            .unwrap()
-        };
-        let aes = |extra: &str| {
-            format!(
-                "      encryption: {{ mode: aes256-gcm-proxy, key: \"{}\", key_id: local-2026{extra} }}\n",
-                "ab".repeat(32)
-            )
-        };
-        let own_none = ", encryption: { mode: none }";
-        let old = yaml(&aes(""), own_none);
-        let new = yaml(&aes(""), "");
-        let err = static_transition_gates(&old, &new, &inputs(&[], Some(&[])))
-            .expect_err("the inheriting bucket's history would be refused");
-        assert!(
-            err.contains("bucket 'downloads'")
-                && err.contains("X-DGP-Confirm-Plaintext-Refusal: downloads"),
-            "{err}"
-        );
-        static_transition_gates(&old, &new, &inputs(&[], Some(&["downloads"])))
-            .expect("confirmed by the bucket's name");
-        static_transition_gates(&old, &new, &inputs(&["downloads"], Some(&[])))
-            .expect("a bucket that does not exist has no history");
-        let (old_s, new_s) = (
-            yaml(&aes(", plaintext_reads: serve"), own_none),
-            yaml(&aes(", plaintext_reads: serve"), ""),
-        );
-        static_transition_gates(&old_s, &new_s, &inputs(&[], Some(&[])))
-            .expect("the backend serves the history");
-
-        // The backend starts to encrypt: its subject covers the bucket.
-        let (plain, enc) = (yaml("", ""), yaml(&aes(""), ""));
-        let err = static_transition_gates(&plain, &enc, &inputs(&[], Some(&[])))
-            .expect_err("the backend's history would be refused");
-        assert!(
-            err.contains("backend:local-disk") && !err.contains("bucket 'downloads'"),
-            "{err}"
-        );
-        static_transition_gates(&plain, &enc, &inputs(&[], Some(&["backend:local-disk"])))
-            .expect("the backend's confirmation covers its inheriting bucket");
     }
 
     /// The documented shape keeps working: the YAML names the mode, the

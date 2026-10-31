@@ -110,8 +110,6 @@ storage:
   #   key_id: releases-2026
   #   legacy_key: "..."
   #   legacy_key_id: releases-2025
-  #   plaintext_reads: refuse         # serve: also serve unencrypted objects
-  #                                   # while a re-encrypt job converts them
   #
   # Named backends (instead of `s3:` / `filesystem:`): each bucket routes
   # to one with `buckets.<name>.backend`; the rest go to default_backend.

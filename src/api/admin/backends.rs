@@ -82,12 +82,20 @@ pub struct CreateBackendRequest {
     pub set_default: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct BackendMutationResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub requires_restart: bool,
+    /// The write's warnings (a conversion without a job, a versioned
+    /// bucket).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    /// The conversions that the write started (buckets that start to
+    /// encrypt and hold objects), with their re-encrypt jobs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conversions: Vec<super::config::ConversionStarted>,
 }
 
 fn build_backend_config(req: &CreateBackendRequest) -> Result<BackendConfig, String> {
@@ -250,7 +258,7 @@ pub async fn list_bucket_origins(
     // The coordination bucket is not a client bucket.
     let registry = engine.bucket_policy_registry();
     let cfg = state.config.read().await;
-    let buckets = bucket_list
+    let mut buckets: Vec<BucketBackendOriginResponse> = bucket_list
         .into_iter()
         .filter(|bucket| !registry.is_reserved(&bucket.name))
         .map(|bucket| {
@@ -280,6 +288,13 @@ pub async fn list_bucket_origins(
             }
         })
         .collect();
+    drop(cfg);
+    let mut rows: Vec<(&str, &mut Option<_>)> = buckets
+        .iter_mut()
+        .map(|b| (b.name.as_str(), &mut b.effective_encryption))
+        .collect();
+    super::bucket_encryption_view::attach_conversions(&engine, state.jobs_db.as_ref(), &mut rows)
+        .await;
 
     Ok(Json(BucketOriginListResponse { buckets }))
 }
@@ -471,6 +486,7 @@ fn mutation(
             success: error.is_none(),
             error,
             requires_restart: false,
+            ..Default::default()
         }),
     )
 }
@@ -508,7 +524,10 @@ async fn apply_backend_edit(
             if let Err((path, e)) = a.persist {
                 tracing::warn!("Failed to persist config to {}: {}", path, e);
             }
-            mutation(ok, None)
+            let (status, Json(mut body)) = mutation(ok, None);
+            body.warnings = a.warnings;
+            body.conversions = a.conversions;
+            (status, Json(body))
         }
         Err(HeldRefusal::Edit((status, error))) => mutation(status, Some(error)),
         Err(HeldRefusal::Pipeline(InternalRefusal::Transition(e))) => mutation(
@@ -539,6 +558,7 @@ pub async fn create_backend(
                 success: false,
                 error: Some("Backend name cannot be empty".into()),
                 requires_restart: false,
+                ..Default::default()
             }),
         );
     }
@@ -552,6 +572,7 @@ pub async fn create_backend(
                     success: false,
                     error: Some(e),
                     requires_restart: false,
+                    ..Default::default()
                 }),
             );
         }
@@ -580,6 +601,7 @@ pub async fn create_backend(
                         verdict.cause()
                     )),
                     requires_restart: false,
+                    ..Default::default()
                 }),
             );
         }

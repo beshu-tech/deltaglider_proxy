@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Changed — Turning on encryption converts the objects that a bucket already holds
+
+- A config change that makes an existing bucket with objects encrypt with a proxy key (`aes256-gcm-proxy`) now starts the conversion of those objects by itself. This applies to every config write: a section `PUT` (the admin UI), `POST /_/api/admin/config/apply`, `config apply`, and the backend and bucket edits. Before the change commits, the proxy opens a conversion window in the bucket. While the window is open, clients read the objects that were stored before the change, because they are the history of the bucket. After the change commits, the proxy queues one re-encrypt job for each bucket, and the job closes the window when it has converted every object. An empty bucket starts nothing.
+- The response of the write names each conversion in `conversions`: the bucket, the run id of the window, whether the window was already open (`reused`), and the id of the re-encrypt job (`job_id`). The validate endpoints return `conversion_preview` with the number of objects in each bucket (counted up to 10,000), so the admin UI can say how many objects the job encrypts.
+- A job other than a delete that is active on such a bucket refuses the write with `409`, and the error names the job, because the conversion needs a re-encrypt job of its own. When the window of one bucket cannot be opened, the write fails, and the proxy removes the windows that the same write opened. A window that another instance opened is reused.
+- On a backend that keeps old versions of a bucket (versioning enabled or suspended, for example Backblaze B2), the write warns that the plaintext versions stay on the backend as noncurrent versions after the job.
+- When another job becomes active on the bucket between the check and the queue, the write succeeds with a warning, and the window stays open with no job. The bucket card then shows **Resume**, which is `POST /_/api/admin/jobs/reencrypt` for the bucket.
+- The bucket list (`GET /_/api/admin/buckets`) reports `effective_encryption.conversion`: whether the window is open, its cutoff and deadline, its run id, the re-encrypt job of the bucket on this instance with its progress, and the number of objects that the job converted although clients could not read them (stored after the cutoff). The bucket card and the backend card show one status row for each conversion: the progress, **Resume** when no job runs, and a warning when the deadline passed before the job finished.
+
+### Removed — The plaintext-refusal confirmation
+
+- The `422` refusal of a change that makes a bucket with plaintext history encrypt is gone, together with the `X-DGP-Confirm-Plaintext-Refusal` header and the `config apply --confirm-plaintext-refusal` option. A script that sends the header or the option must drop it: the option is an unknown argument now.
+- The admin UI no longer offers **Refuse unencrypted objects**, and it no longer writes `plaintext_reads: serve` or `refuse`.
+
+### Deprecated — `plaintext_reads: serve`
+
+- `encryption.plaintext_reads: serve` still works in this release: reads serve every object that is not encrypted, and a change that sets it starts no conversion. The proxy logs a deprecation warning at load, `config lint` prints it, and an apply returns it. The next release rejects the field. `plaintext_reads: refuse` is the default, and it is accepted and ignored until then.
+- The admin UI shows a notice on a bucket or backend that sets `serve`, with **Convert now**. That button removes the line, so the write opens the conversion windows and starts the re-encrypt jobs.
+- The bucket and backend views report `serves_plaintext_deprecated` instead of `serves_plaintext`.
+- The boot check, which warns about plaintext objects in a bucket that encrypts, skips a bucket whose conversion window is open.
+
 ### Fixed — Encrypted objects without a listing token list their real size
 
 - On an encrypted S3 backend, the proxy lists an object with the size and the ETag from its listing token. An object without a token was listed with its stored size. For an object stored as it is, that was the size of the ciphertext, and for a delta it was the size of the delta, so a 4 GB object could show as 46 bytes. A tool that compares sizes, such as `rclone sync`, then copied the object again. An object has no token when the write of its token failed, when it was stored before listing tokens existed, or when its key is longer than about 900 bytes.

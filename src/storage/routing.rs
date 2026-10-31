@@ -1418,6 +1418,9 @@ impl StorageBackend for RoutingBackend {
     {
         route_existing!(self, bucket, conversion, op)
     }
+    async fn bucket_versioning(&self, bucket: &str) -> Option<bool> {
+        route_existing!(self, bucket, bucket_versioning)
+    }
 
     // === Multipart upload (Phase B) ===
 

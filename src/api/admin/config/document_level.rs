@@ -63,6 +63,10 @@ pub struct ConfigValidateResponse {
     pub existing_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The buckets whose conversion the apply would start (they start to
+    /// encrypt and hold objects).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conversions: Vec<super::ConversionPreview>,
 }
 
 #[derive(Serialize)]
@@ -96,6 +100,9 @@ pub struct ConfigApplyResponse {
     /// (`<path>: <error>`); the GUI explains that the change is lost at restart.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persist_error: Option<String>,
+    /// The conversions that the apply started, with their re-encrypt jobs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conversions: Vec<super::ConversionStarted>,
 }
 
 /// Query params shared by `/config/export` and `/config/defaults`.
@@ -448,6 +455,7 @@ fn shape_validate(result: WriteResult) -> Response {
             warnings,
             existing_warnings: Vec::new(),
             error: Some(error),
+            conversions: Vec::new(),
         };
         write::respond(status, body, &refs, None)
     };
@@ -455,12 +463,17 @@ fn shape_validate(result: WriteResult) -> Response {
         Outcome::Rejected(r) => {
             refused(r.status, r.error, rejection_warnings(r.stage, *r.warnings))
         }
-        Outcome::Validated { warnings: w, .. } => {
+        Outcome::Validated {
+            warnings: w,
+            conversions,
+            ..
+        } => {
             let body = ConfigValidateResponse {
                 ok: true,
                 warnings: [w.check_new, w.preserve, w.env].concat(),
                 existing_warnings: w.existing,
                 error: None,
+                conversions,
             };
             write::respond(StatusCode::OK, body, &refs, None)
         }
@@ -556,6 +569,7 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
         current_version: None,
         persisted_path: None,
         persist_error: None,
+        conversions: Vec::new(),
     };
     match outcome {
         Outcome::Conflict { current } => {
@@ -582,6 +596,7 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
             warnings: w,
             restart,
             persist,
+            conversions,
             ..
         } => {
             // `persist_to_file` is atomic (tempfile + rename); the write can
@@ -614,6 +629,7 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
                 current_version: None,
                 persisted_path,
                 persist_error,
+                conversions,
             };
             (status, resp)
         }

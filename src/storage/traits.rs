@@ -1410,6 +1410,18 @@ pub trait StorageBackend: Send + Sync {
         Output = Result<crate::storage::encrypting::conversion::ConversionReply, StorageError>,
     > + Send;
 
+    /// Does the backend keep old versions of `bucket` (S3
+    /// `GetBucketVersioning` answers `Enabled` or `Suspended`)? `None`:
+    /// the backend has no versions (filesystem) or did not answer. The
+    /// apply that starts a conversion warns with it: the plaintext
+    /// versions stay as noncurrent versions. A wrapper forwards it.
+    fn bucket_versioning(&self, bucket: &str) -> impl Future<Output = Option<bool>> + Send {
+        async move {
+            let _ = bucket;
+            None
+        }
+    }
+
     /// A name for the STORAGE behind `bucket`: two bucket names that store
     /// into the same real bucket (policy aliases) get the same identity, so
     /// the engine's deltaspace locks serialise them. An unrouted bucket is
