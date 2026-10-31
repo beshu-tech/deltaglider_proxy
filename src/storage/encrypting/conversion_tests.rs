@@ -77,6 +77,11 @@ fn open_truth_table() {
         Window::Closed
     );
     assert_eq!(open(&m, &ring_a, "releases", 1_500), Window::Closed);
+    // An identity of the same length (only the bytes differ).
+    assert_eq!(
+        open(&m, &ring_a, "hetzner-fsn2\u{0}releases", 1_500),
+        Window::Closed
+    );
     // A key that the ring lacks (unknown fingerprint).
     let (ring_b, _) = ring(&[("other", 0xbb)]);
     assert_eq!(open(&m, &ring_b, RELEASES, 1_500), Window::Closed);
