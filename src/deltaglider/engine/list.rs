@@ -50,51 +50,62 @@ pub(crate) struct InterleavedPage<O> {
 /// and requires lexicographic ordering across both sets. This function is the
 /// single source of truth for that logic (used by engine, S3 backend, and
 /// filesystem backend).
+///
+/// Order: by key; on equal keys an object comes before a prefix, and equal
+/// keys of one kind keep their input order (a stable sort of objects then
+/// prefixes). Cost: entries at or below the token are dropped first, each
+/// side is sorted only when it is not sorted already (backends list in key
+/// order), then a two-way merge moves at most `max_keys + 1` entries. No key
+/// is cloned except the next continuation token.
 pub(crate) fn interleave_and_paginate<O>(
-    objects: Vec<(String, O)>,
-    common_prefixes: Vec<String>,
+    mut objects: Vec<(String, O)>,
+    mut common_prefixes: Vec<String>,
     max_keys: u32,
     continuation_token: Option<&str>,
 ) -> InterleavedPage<O> {
-    enum Entry<T> {
-        Obj(String, T),
-        Prefix(String),
-    }
-
-    let mut entries: Vec<(String, Entry<O>)> =
-        Vec::with_capacity(objects.len() + common_prefixes.len());
-    for (key, obj) in objects {
-        entries.push((key.clone(), Entry::Obj(key, obj)));
-    }
-    for cp in common_prefixes {
-        entries.push((cp.clone(), Entry::Prefix(cp)));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // Apply continuation_token: skip entries <= token.
     if let Some(token) = continuation_token {
-        entries.retain(|e| e.0.as_str() > token);
+        objects.retain(|(key, _)| key.as_str() > token);
+        common_prefixes.retain(|cp| cp.as_str() > token);
+    }
+    // Stable per side + objects-first merge = the stable sort of the union.
+    if !objects.is_sorted_by(|a, b| a.0 <= b.0) {
+        objects.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    if !common_prefixes.is_sorted() {
+        common_prefixes.sort();
     }
 
     let max = max_keys as usize;
-    let is_truncated = entries.len() > max;
-    if entries.len() > max {
-        entries.truncate(max);
+    let mut objs = objects.into_iter().peekable();
+    let mut cps = common_prefixes.into_iter().peekable();
+    let mut final_objects = Vec::new();
+    let mut final_prefixes = Vec::new();
+    // Which list holds the last kept entry: true = objects.
+    let mut last_is_object = None;
+    for _ in 0..max {
+        let take_object = match (objs.peek(), cps.peek()) {
+            (Some((key, _)), Some(cp)) => key <= cp,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_object {
+            final_objects.extend(objs.next());
+        } else {
+            final_prefixes.extend(cps.next());
+        }
+        last_is_object = Some(take_object);
     }
+    let is_truncated = objs.peek().is_some() || cps.peek().is_some();
     let next_token = if is_truncated {
-        entries.last().map(|(key, _)| key.clone())
+        match last_is_object {
+            Some(true) => final_objects.last().map(|(key, _)| key.clone()),
+            Some(false) => final_prefixes.last().cloned(),
+            None => None,
+        }
     } else {
         None
     };
-
-    let mut final_objects = Vec::new();
-    let mut final_prefixes = Vec::new();
-    for (_, entry) in entries {
-        match entry {
-            Entry::Obj(key, obj) => final_objects.push((key, obj)),
-            Entry::Prefix(p) => final_prefixes.push(p),
-        }
-    }
 
     InterleavedPage {
         objects: final_objects,
@@ -645,5 +656,114 @@ mod stored_size_only_tests {
             vec!["b".to_string()]
         );
         assert!(stored_size_only_keys(&objects, &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod interleave_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// The implementation before the merge rewrite: clone every key, stable
+    /// sort of the union, filter by token, truncate. The oracle.
+    fn reference_interleave<O>(
+        objects: Vec<(String, O)>,
+        common_prefixes: Vec<String>,
+        max_keys: u32,
+        continuation_token: Option<&str>,
+    ) -> InterleavedPage<O> {
+        enum Entry<T> {
+            Obj(String, T),
+            Prefix(String),
+        }
+        let mut entries: Vec<(String, Entry<O>)> = Vec::new();
+        for (key, obj) in objects {
+            entries.push((key.clone(), Entry::Obj(key, obj)));
+        }
+        for cp in common_prefixes {
+            entries.push((cp.clone(), Entry::Prefix(cp)));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some(token) = continuation_token {
+            entries.retain(|e| e.0.as_str() > token);
+        }
+        let max = max_keys as usize;
+        let is_truncated = entries.len() > max;
+        entries.truncate(max);
+        let next_token = if is_truncated {
+            entries.last().map(|(key, _)| key.clone())
+        } else {
+            None
+        };
+        let mut final_objects = Vec::new();
+        let mut final_prefixes = Vec::new();
+        for (_, entry) in entries {
+            match entry {
+                Entry::Obj(key, obj) => final_objects.push((key, obj)),
+                Entry::Prefix(p) => final_prefixes.push(p),
+            }
+        }
+        InterleavedPage {
+            objects: final_objects,
+            common_prefixes: final_prefixes,
+            is_truncated,
+            next_continuation_token: next_token,
+        }
+    }
+
+    /// Small alphabet so keys collide across kinds and within a kind.
+    fn key() -> impl Strategy<Value = String> {
+        "[ab/]{0,3}"
+    }
+
+    fn assert_same(
+        objects: Vec<(String, usize)>,
+        prefixes: Vec<String>,
+        max_keys: u32,
+        token: Option<&str>,
+    ) -> Result<(), TestCaseError> {
+        let want = reference_interleave(objects.clone(), prefixes.clone(), max_keys, token);
+        let got = interleave_and_paginate(objects, prefixes, max_keys, token);
+        prop_assert_eq!(got.objects, want.objects);
+        prop_assert_eq!(got.common_prefixes, want.common_prefixes);
+        prop_assert_eq!(got.is_truncated, want.is_truncated);
+        prop_assert_eq!(got.next_continuation_token, want.next_continuation_token);
+        Ok(())
+    }
+
+    proptest! {
+        /// Same output as the old clone-and-sort implementation for sorted
+        /// and unsorted inputs, keys shared by both kinds, duplicate keys
+        /// within a kind (the payload is the input index, so order shows),
+        /// with and without a token, `max_keys` 0..50.
+        #[test]
+        fn matches_the_reference(
+            obj_keys in proptest::collection::vec(key(), 0..30),
+            mut prefixes in proptest::collection::vec(key(), 0..30),
+            sort_objects in any::<bool>(),
+            sort_prefixes in any::<bool>(),
+            token in proptest::option::of(key()),
+            max_keys in 0u32..50,
+        ) {
+            let mut objects: Vec<(String, usize)> =
+                obj_keys.into_iter().enumerate().map(|(i, k)| (k, i)).collect();
+            if sort_objects {
+                objects.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            if sort_prefixes {
+                prefixes.sort();
+            }
+            assert_same(objects, prefixes, max_keys, token.as_deref())?;
+        }
+    }
+
+    #[test]
+    fn object_before_prefix_on_equal_key() {
+        let page =
+            interleave_and_paginate(vec![("a/".to_string(), 0)], vec!["a/".to_string()], 1, None);
+        assert_eq!(page.objects, vec![("a/".to_string(), 0)]);
+        assert!(page.common_prefixes.is_empty());
+        assert!(page.is_truncated);
+        assert_eq!(page.next_continuation_token.as_deref(), Some("a/"));
     }
 }
