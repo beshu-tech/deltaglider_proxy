@@ -474,7 +474,7 @@ impl S3Backend {
         // `metadata=true` listing (25k+ lines observed on a build-artifact
         // bucket), so it goes to DEBUG. This is the level gate, computed once.
         let is_delta_file = key.ends_with(".delta");
-        let is_reference = key.ends_with("reference.bin");
+        let is_reference = crate::types::is_reference_key(key);
         let delta_critical = is_delta_file || is_reference;
 
         // Try parsing DG metadata from headers. If headers are empty or

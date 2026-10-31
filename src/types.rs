@@ -105,6 +105,16 @@ pub struct ObjectKey {
     pub filename: String,
 }
 
+/// The reserved file name of a deltaspace's delta baseline.
+pub const REFERENCE_FILE_NAME: &str = "reference.bin";
+
+/// THE rule for "this key is a delta baseline": its last path segment is
+/// exactly [`REFERENCE_FILE_NAME`]. A client key such as
+/// `docs/api-reference.bin` only ends with the same text.
+pub fn is_reference_key(key: &str) -> bool {
+    key.rsplit('/').next() == Some(REFERENCE_FILE_NAME)
+}
+
 /// The page that lists every reserved or normalised object key; every
 /// reserved-key refusal links it.
 pub const RESERVED_KEYS_DOC_URL: &str =
@@ -185,7 +195,7 @@ impl ObjectKey {
         }
         // Reject filenames that collide with DeltaGlider internal storage
         // files. The message names the rule: the client cannot see why.
-        if self.filename == "reference.bin" {
+        if self.filename == REFERENCE_FILE_NAME {
             return Err(KeyValidationError(format!(
                 "Object key '{}' is refused: the file name 'reference.bin' is reserved, \
                  because the proxy stores the delta baseline of each prefix under it. \

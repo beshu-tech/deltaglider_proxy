@@ -77,7 +77,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
             None => {
                 // No DG metadata — try streaming as an unmanaged passthrough object
-                if key.ends_with(".delta") || key.contains("reference.bin") {
+                if key.ends_with(".delta") || crate::types::is_reference_key(key) {
                     warn!(
                         "PATHOLOGICAL | {}/{} has no DG metadata but looks like a delta/reference file. \
                          Delta reconstruction disabled. Re-upload through the proxy or re-copy with --metadata.",

@@ -174,13 +174,26 @@ pub(crate) mod source_scan {
             .join("\n")
     }
 
-    /// Files declared as `#[cfg(test)] mod NAME;` (test module in its own file).
+    /// Files declared as `#[cfg(test)] mod NAME;` (test module in its own
+    /// file), also with a `#[path = "FILE.rs"]` line between the two.
     pub(crate) fn out_of_line_test_modules(files: &[PathBuf]) -> Vec<PathBuf> {
         let mut out = Vec::new();
         for file in files {
             let text = std::fs::read_to_string(file).unwrap();
             let lines: Vec<&str> = text.lines().collect();
-            for w in lines.windows(2) {
+            for (i, w) in lines.windows(2).enumerate() {
+                if let Some(path) = w[1]
+                    .trim()
+                    .strip_prefix("#[path = \"")
+                    .and_then(|p| p.strip_suffix("\"]"))
+                {
+                    if w[0].trim() == "#[cfg(test)]"
+                        && lines.get(i + 2).is_some_and(|l| l.trim().ends_with(';'))
+                    {
+                        out.push(file.parent().unwrap().join(path));
+                    }
+                    continue;
+                }
                 let decl = w[1].trim();
                 let decl = decl.strip_prefix("pub(crate) ").unwrap_or(decl);
                 if w[0].trim() != "#[cfg(test)]"
@@ -242,6 +255,12 @@ pub(crate) mod source_scan {
         assert!(files.len() > 100, "scan found the sources");
         let tests = out_of_line_test_modules(&files);
         assert!(!tests.is_empty(), "found the out-of-line test modules");
+        assert!(
+            tests
+                .iter()
+                .any(|t| rel(t) == "src/s3_adapter_s3s/copy_cost_tests.rs"),
+            "a `#[path]` test module counts"
+        );
         assert!(prod_sources("src")
             .iter()
             .all(|(rel, _)| { !tests.iter().any(|t| crate::source_scan::rel(t) == *rel) }));
@@ -705,6 +724,35 @@ mod source_guards {
             }
         }
         assert!(bad.is_empty(), "the seal key outside its places: {bad:?}");
+    }
+
+    /// NEW-07: a key is a delta baseline only when its last segment IS
+    /// `reference.bin` (`types::is_reference_key`). A text match on the
+    /// whole key (`ends_with`, `contains`) also takes `api-reference.bin`:
+    /// `s3 sync --delete` deleted such client files.
+    #[test]
+    fn reference_keys_are_matched_by_the_one_rule() {
+        let text_match = |code: &str| {
+            ["ends_with(", "contains("]
+                .iter()
+                .any(|m| code.contains(&format!("{m}\"reference.bin")))
+        };
+        assert!(text_match(r#"k.ends_with("reference.bin")"#));
+        assert!(text_match(r#"k.contains("reference.bin")"#));
+        assert!(!text_match("crate::types::is_reference_key(k)"));
+        let mut bad = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                if text_match(line.split("//").next().unwrap_or("")) {
+                    bad.push(format!("{file}:{n}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "use types::is_reference_key: {bad:?}");
+        assert!(crate::types::is_reference_key("releases/v1/reference.bin"));
+        assert!(crate::types::is_reference_key("reference.bin"));
+        assert!(!crate::types::is_reference_key("docs/api-reference.bin"));
+        assert!(!crate::types::is_reference_key("reference.bin/x"));
     }
 
     /// #120: the v1 at-rest formats have no reader and no writer. Their

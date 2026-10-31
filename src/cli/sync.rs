@@ -605,9 +605,10 @@ async fn collect_s3_entries(
             })?;
         for (key, meta) in page.objects {
             // Always skip internal deltaspace artifacts — they'd be
-            // double-counted otherwise. `.deltaglider/` namespace,
-            // `reference.bin` sentinel.
-            if key.starts_with(".deltaglider/") || key.ends_with("reference.bin") {
+            // double-counted otherwise. `.deltaglider/` namespace, the
+            // reserved `reference.bin` file name (not every key that ends
+            // in that text).
+            if key.starts_with(".deltaglider/") || crate::types::is_reference_key(&key) {
                 continue;
             }
             let Some(rel) = rel_under(&key, &dir).map(str::to_string) else {
@@ -746,6 +747,41 @@ async fn build_engine_from_args(args: &SyncArgs) -> Result<DynEngine, i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NEW-07: only the reserved `reference.bin` file name is internal. A
+    /// client key such as `docs/api-reference.bin` ends with the same text;
+    /// left out of the source listing, `--delete` removed the local copy.
+    #[tokio::test]
+    async fn a_key_that_ends_in_reference_bin_is_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<crate::storage::DynStorageBackend<'static>> =
+            crate::storage::DynStorageBackend::new_box(
+                crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            std::sync::Arc::new(backend),
+            &crate::config::Config::default(),
+            None,
+        );
+        engine.create_bucket("releases").await.unwrap();
+        engine
+            .store(
+                "releases",
+                "docs/api-reference.bin",
+                b"api",
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let filter = Filter::build(&[], &[]).unwrap();
+        let listed = collect_s3_entries(&engine, "releases", "docs", &filter)
+            .await
+            .unwrap();
+        assert!(listed.contains_key("api-reference.bin"), "{listed:?}");
+    }
 
     #[test]
     fn direction_dispatch_handles_all_four_quadrants() {
