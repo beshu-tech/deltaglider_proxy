@@ -251,6 +251,38 @@ pub enum ClaimOutcome {
     Lost,
 }
 
+/// The stored conversion marker of a bucket
+/// (`storage/encrypting/conversion.rs`): its raw body, which only the
+/// encrypting wrapper opens, and the version that a conditional replace or
+/// remove names (S3: the ETag; filesystem: the content).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversionMarker {
+    pub content: Vec<u8>,
+    pub version: String,
+}
+
+/// A read of a bucket's conversion marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerRead {
+    /// The marker, or `None` when there is none.
+    pub marker: Option<ConversionMarker>,
+    /// The backend's clock at the read (unix seconds): the S3 `Date` of
+    /// the GET response, the local clock on the filesystem. `None` when
+    /// the response named no time.
+    pub server_now: Option<i64>,
+}
+
+/// A conditional write of a bucket's conversion marker.
+#[derive(Debug, Clone, Copy)]
+pub enum MarkerWrite<'a> {
+    /// Create the marker; lost when one exists (`If-None-Match: *`).
+    Create(&'a [u8]),
+    /// Replace the marker at `version`; lost when it changed (`If-Match`).
+    Replace { body: &'a [u8], version: &'a str },
+    /// Remove the marker at `version`; lost when it changed (`If-Match`).
+    Remove { version: &'a str },
+}
+
 /// One range read of a passthrough object
 /// ([`StorageBackend::open_passthrough_range`]).
 /// A listing token, and the stored object it was kept for.
@@ -1343,6 +1375,26 @@ pub trait StorageBackend: Send + Sync {
         &self,
         bucket: &str,
         op: ClaimWrite<'_>,
+    ) -> impl Future<Output = Result<ClaimOutcome, StorageError>> + Send;
+
+    /// The conversion marker of `bucket`
+    /// (`storage/encrypting/conversion.rs`), with the backend's clock at
+    /// the read. A raw backend keeps it where listings do not show it and
+    /// client requests cannot name it; the encrypting wrapper and the
+    /// router forward. No default: a wrapper must forward it.
+    fn read_conversion_marker(
+        &self,
+        bucket: &str,
+    ) -> impl Future<Output = Result<MarkerRead, StorageError>> + Send;
+
+    /// Write the conversion marker of `bucket` with the condition of `op`
+    /// ([`ClaimOutcome::Lost`]: the condition failed, read it again). A
+    /// backend without conditional writes writes without the condition, as
+    /// for the key claim. No default: a wrapper must forward it.
+    fn write_conversion_marker(
+        &self,
+        bucket: &str,
+        op: MarkerWrite<'_>,
     ) -> impl Future<Output = Result<ClaimOutcome, StorageError>> + Send;
 
     /// A name for the STORAGE behind `bucket`: two bucket names that store

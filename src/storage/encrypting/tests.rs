@@ -546,6 +546,22 @@ mod wrapper_tests {
         ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
             Ok(crate::storage::ClaimOutcome::Written)
         }
+        async fn read_conversion_marker(
+            &self,
+            _: &str,
+        ) -> Result<crate::storage::MarkerRead, crate::storage::StorageError> {
+            Ok(crate::storage::MarkerRead {
+                marker: None,
+                server_now: None,
+            })
+        }
+        async fn write_conversion_marker(
+            &self,
+            _: &str,
+            _: crate::storage::MarkerWrite<'_>,
+        ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
+            Ok(crate::storage::ClaimOutcome::Written)
+        }
         async fn get_passthrough_metadata_for_rewrite(
             &self,
             b: &str,

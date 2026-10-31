@@ -188,6 +188,22 @@ impl crate::storage::StorageBackend for NullInner {
     ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
         Ok(crate::storage::ClaimOutcome::Written)
     }
+    async fn read_conversion_marker(
+        &self,
+        _: &str,
+    ) -> Result<crate::storage::MarkerRead, crate::storage::StorageError> {
+        Ok(crate::storage::MarkerRead {
+            marker: None,
+            server_now: None,
+        })
+    }
+    async fn write_conversion_marker(
+        &self,
+        _: &str,
+        _: crate::storage::MarkerWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
+        Ok(crate::storage::ClaimOutcome::Written)
+    }
     async fn scan_deltaspace(
         &self,
         _: &str,

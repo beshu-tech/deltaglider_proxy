@@ -52,10 +52,11 @@ pub use traits::{
     open_object_by_parts, open_passthrough_range_by_parts, open_reference_source_by_parts,
     reference_fence_lost, same_stored_generation, unfenced_reference_fence,
     unfenced_reference_fence_with_metadata, unfenced_reference_write, BucketListing, BulkListing,
-    ByteStream, ClaimOutcome, ClaimWrite, CopyOutcome, DelegatedListResult, DynStorageBackend,
-    KeyClaim, ListedForms, ListedToken, MultipartUpload, ObjectAt, ObjectRead, ObjectVariant,
-    PutBody, RangeRead, RefFence, RefWrite, ReferenceSource, RewriteBasis, StorageBackend,
-    StorageBackendExt, StorageError, StoredObject, StoredWrite, UploadedPart,
+    ByteStream, ClaimOutcome, ClaimWrite, ConversionMarker, CopyOutcome, DelegatedListResult,
+    DynStorageBackend, KeyClaim, ListedForms, ListedToken, MarkerRead, MarkerWrite,
+    MultipartUpload, ObjectAt, ObjectRead, ObjectVariant, PutBody, RangeRead, RefFence, RefWrite,
+    ReferenceSource, RewriteBasis, StorageBackend, StorageBackendExt, StorageError, StoredObject,
+    StoredWrite, UploadedPart,
 };
 
 tokio::task_local! {

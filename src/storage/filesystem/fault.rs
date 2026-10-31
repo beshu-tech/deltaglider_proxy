@@ -51,6 +51,10 @@ pub(crate) enum FaultPoint {
     ReadKeyClaim,
     /// The key is `"bucket//"`: a write of the bucket's key claim.
     WriteKeyClaim,
+    /// The key is `"bucket//"`: the read of the bucket's conversion marker.
+    ReadConversionMarker,
+    /// The key is `"bucket//"`: a write of the bucket's conversion marker.
+    WriteConversionMarker,
     /// The key is `"bucket/prefix/"`: a delegated listing page.
     ListObjectsDelegated,
 }
@@ -575,6 +579,23 @@ impl StorageBackend for FaultyFs {
         self.armed(FaultPoint::WriteKeyClaim, bucket, "", "")
             .await?;
         self.inner.write_key_claim(bucket, op).await
+    }
+    async fn read_conversion_marker(
+        &self,
+        bucket: &str,
+    ) -> Result<crate::storage::MarkerRead, crate::storage::StorageError> {
+        self.armed(FaultPoint::ReadConversionMarker, bucket, "", "")
+            .await?;
+        self.inner.read_conversion_marker(bucket).await
+    }
+    async fn write_conversion_marker(
+        &self,
+        bucket: &str,
+        op: crate::storage::MarkerWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
+        self.armed(FaultPoint::WriteConversionMarker, bucket, "", "")
+            .await?;
+        self.inner.write_conversion_marker(bucket, op).await
     }
 
     async fn scan_deltaspace(

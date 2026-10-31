@@ -59,6 +59,15 @@
 //!
 //! Deterministic: the same facts of the same stored object give the same
 //! token (a marker is an object name, so a rewrite must be a no-op).
+//!
+//! # Conversion marker (`conversion.rs`)
+//!
+//! ```text
+//! Kconv = Expand(PRK, "DGE2 conversion", 32)
+//! seal  = nonce (12, random) | AES-256-GCM-SIV(Kconv, nonce, fields, AD)
+//! ```
+//!
+//! `conversion.rs` owns the fields and the AD; this file owns the key.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -311,6 +320,50 @@ impl SiteKey {
             etag_digest: pt[8..24].try_into().ok()?,
             parts: u16::from_be_bytes(pt[24..26].try_into().ok()?),
         })
+    }
+}
+
+impl SiteKey {
+    fn conversion_cipher(&self) -> aes_gcm_siv::Aes256GcmSiv {
+        let mut k = Zeroizing::new([0u8; 32]);
+        expand(&self.prk, &[b"DGE2 conversion"], k.as_mut());
+        <aes_gcm_siv::Aes256GcmSiv as aes_gcm_siv::aead::KeyInit>::new_from_slice(k.as_ref())
+            .expect("32-byte key")
+    }
+
+    /// Seal the fields `pt` of a conversion marker under `ad` (see the
+    /// module doc): a fresh random nonce, then the ciphertext.
+    pub fn seal_conversion(&self, ad: &[u8], pt: &[u8]) -> Result<Vec<u8>, StorageError> {
+        use aes_gcm_siv::aead::Aead as _;
+        let mut nonce = [0u8; NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let ct = self
+            .conversion_cipher()
+            .encrypt(
+                aes_gcm_siv::Nonce::from_slice(&nonce),
+                aes_gcm_siv::aead::Payload { msg: pt, aad: ad },
+            )
+            .map_err(|e| enc_err(format!("conversion marker: {e}")))?;
+        let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    /// Open a seal of [`Self::seal_conversion`] under `ad`. `None` when it
+    /// does not open (another key, another AD, an edited byte).
+    pub fn open_conversion(&self, ad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+        use aes_gcm_siv::aead::Aead as _;
+        if sealed.len() < NONCE_LEN + TAG_LEN {
+            return None;
+        }
+        let (nonce, ct) = sealed.split_at(NONCE_LEN);
+        self.conversion_cipher()
+            .decrypt(
+                aes_gcm_siv::Nonce::from_slice(nonce),
+                aes_gcm_siv::aead::Payload { msg: ct, aad: ad },
+            )
+            .ok()
     }
 }
 

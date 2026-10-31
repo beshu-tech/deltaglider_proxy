@@ -1013,6 +1013,7 @@ mod tests {
         for key in [
             ".dg/facts/x!!1.e.1.2.e",
             crate::storage::listing_facts::KEY_CLAIM_KEY,
+            crate::storage::listing_facts::CONVERSION_MARKER_KEY,
         ] {
             let k = ObjectKey::parse("b", key);
             assert!(k.validate_object().is_err(), "{key}");

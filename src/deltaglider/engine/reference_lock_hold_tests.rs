@@ -741,6 +741,19 @@ impl crate::storage::StorageBackend for FencingFs {
     ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
         Ok(crate::storage::ClaimOutcome::Written)
     }
+    async fn read_conversion_marker(
+        &self,
+        b: &str,
+    ) -> Result<crate::storage::MarkerRead, crate::storage::StorageError> {
+        self.inner.read_conversion_marker(b).await
+    }
+    async fn write_conversion_marker(
+        &self,
+        b: &str,
+        op: crate::storage::MarkerWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
+        self.inner.write_conversion_marker(b, op).await
+    }
     async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<Meta>, StorageError> {
         self.inner.scan_deltaspace(b, p).await
     }

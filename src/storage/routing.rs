@@ -36,7 +36,15 @@ struct BucketRoute {
 /// to a backend is never the same storage as the same name on another one.
 fn route_identity(bucket: &str, route: &BucketRoute) -> String {
     let real = route.real_bucket.as_deref().unwrap_or(bucket);
-    format!("{}\u{0}{real}", route.backend_name)
+    backend_storage_identity(&route.backend_name, real)
+}
+
+/// Pure: THE storage identity of the real bucket `real` on the backend
+/// named `backend` (`backend \0 real`). The router names a routed bucket
+/// by it; the encrypting wrapper, which sits below the router and sees the
+/// real bucket, binds a conversion marker to it.
+pub(crate) fn backend_storage_identity(backend: &str, real: &str) -> String {
+    format!("{backend}\u{0}{real}")
 }
 
 /// Pure: the identity of the previous release, when it differs. It was the
@@ -1388,6 +1396,21 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, write_key_claim, op)
     }
 
+    async fn read_conversion_marker(
+        &self,
+        bucket: &str,
+    ) -> Result<crate::storage::MarkerRead, StorageError> {
+        route_existing!(self, bucket, read_conversion_marker)
+    }
+
+    async fn write_conversion_marker(
+        &self,
+        bucket: &str,
+        op: crate::storage::MarkerWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, StorageError> {
+        route_existing!(self, bucket, write_conversion_marker, op)
+    }
+
     // === Multipart upload (Phase B) ===
 
     async fn create_multipart_upload(
@@ -1883,6 +1906,22 @@ mod tests {
             &self,
             _: &str,
             _: crate::storage::ClaimWrite<'_>,
+        ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
+            Ok(crate::storage::ClaimOutcome::Written)
+        }
+        async fn read_conversion_marker(
+            &self,
+            _: &str,
+        ) -> Result<crate::storage::MarkerRead, crate::storage::StorageError> {
+            Ok(crate::storage::MarkerRead {
+                marker: None,
+                server_now: None,
+            })
+        }
+        async fn write_conversion_marker(
+            &self,
+            _: &str,
+            _: crate::storage::MarkerWrite<'_>,
         ) -> Result<crate::storage::ClaimOutcome, crate::storage::StorageError> {
             Ok(crate::storage::ClaimOutcome::Written)
         }

@@ -56,6 +56,12 @@ pub const FACTS_ROOT: &str = ".dg/facts/";
 /// and the GC leave it alone.
 pub const KEY_CLAIM_KEY: &str = ".dg/facts/!!key-claim";
 
+/// The conversion marker of the bucket (`storage/encrypting/conversion.rs`):
+/// the sealed window in which a bucket that starts to encrypt still serves
+/// its plaintext history. Like [`KEY_CLAIM_KEY`], listings hide it, client
+/// requests cannot name it, and the scans and the GC do not parse it.
+pub const CONVERSION_MARKER_KEY: &str = ".dg/facts/!!conversion";
+
 /// Ends the encoded stored key inside a facts key.
 const TERMINATOR: &str = "!!";
 
@@ -792,6 +798,19 @@ mod tests {
         assert!(PAST_FACTS < ".dg/reference.bin" && PAST_FACTS < "zz/a.txt");
         assert_eq!(skip_past_facts(".dg/reference.bin"), None);
         assert_eq!(skip_past_facts("a.txt"), None);
+    }
+
+    /// The bucket-level objects in the namespace (key claim, conversion
+    /// marker) are facts keys, so listings hide them, but no scan and no
+    /// GC parses them: the GC keeps what it cannot parse.
+    #[test]
+    fn bucket_level_objects_are_hidden_and_never_parsed() {
+        for key in [KEY_CLAIM_KEY, CONVERSION_MARKER_KEY] {
+            assert!(is_facts_key(key), "{key}");
+            assert!(parse_marker(key).is_none(), "{key}");
+            assert!(parse_facts_key(key).is_none(), "{key}");
+            assert!(parse_token_key(key).is_none(), "{key}");
+        }
     }
 
     #[test]

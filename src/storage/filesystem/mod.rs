@@ -1268,17 +1268,124 @@ impl FilesystemBackend {
 /// The file of a bucket's key claim, in the bucket's directory.
 const KEY_CLAIM_FILE: &str = ".dg-key-claim";
 
-/// A synced private temp file holding `body`, for a claim write: unique
-/// per process and call.
-async fn claim_temp_file(dir: &Path, body: &str) -> std::io::Result<PathBuf> {
+/// The file of a bucket's conversion marker, in the bucket's directory.
+const CONVERSION_MARKER_FILE: &str = ".dg-conversion";
+
+/// A file of a bucket-level object read longer than this is read as empty
+/// (which no reader accepts).
+const MAX_BUCKET_FILE: u64 = 4096;
+
+/// The version of a key claim file: its label, as the claim reads it.
+fn claim_version(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    crate::security::str_prefix(&text, 64).trim().to_string()
+}
+
+/// The version of a conversion marker file: its content.
+fn marker_version(body: &[u8]) -> String {
+    String::from_utf8_lossy(body).into_owned()
+}
+
+/// A synced private temp file holding `body`, for a write of the
+/// bucket-level file `name`: unique per process and call.
+async fn bucket_file_temp(dir: &Path, name: &str, body: &[u8]) -> std::io::Result<PathBuf> {
     use tokio::io::AsyncWriteExt;
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!("{KEY_CLAIM_FILE}.{}.{n}.tmp", std::process::id()));
+    let tmp = dir.join(format!("{name}.{}.{n}.tmp", std::process::id()));
     let mut f = fs::File::create(&tmp).await?;
-    f.write_all(body.as_bytes()).await?;
+    f.write_all(body).await?;
     f.sync_all().await?;
     Ok(tmp)
+}
+
+impl FilesystemBackend {
+    /// The bucket-level file `name` (key claim, conversion marker) in the
+    /// bucket's directory, beside `deltaspaces/`: listings do not see it,
+    /// and DeleteBucket prunes it with the other residue. `None`: absent.
+    async fn read_bucket_file(
+        &self,
+        bucket: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let path = self.bucket_dir(bucket).join(name);
+        match fsio::stat(&path).await? {
+            None => return Ok(None),
+            Some(stat) if stat.len() > MAX_BUCKET_FILE => return Ok(Some(Vec::new())),
+            Some(_) => {}
+        }
+        match fsio::read(&path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write the bucket-level file `name` with the condition of `op`: a
+    /// replace or remove holds when the file's `version_of` is the named
+    /// version.
+    async fn write_bucket_file(
+        &self,
+        bucket: &str,
+        name: &str,
+        version_of: fn(&[u8]) -> String,
+        op: crate::storage::MarkerWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, StorageError> {
+        use crate::storage::{ClaimOutcome, MarkerWrite};
+        let dir = self.bucket_dir(bucket);
+        if !fsio::exists(&dir).await? {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let path = dir.join(name);
+        // A Replace or Remove compares the version and then writes: one at
+        // a time in this process. (Two processes on one directory can still
+        // interleave them; a Create cannot.)
+        static WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _one = WRITES.lock().await;
+        let current = self.read_bucket_file(bucket, name).await?;
+        let version_is = |v: &str| current.as_deref().map(version_of).as_deref() == Some(v);
+        let outcome = match op {
+            MarkerWrite::Create(body) => {
+                // The file appears whole or not at all: write a synced
+                // private file, then hard-link it into place. `link` fails
+                // when the file exists, which is the condition (one
+                // creator wins).
+                let tmp = bucket_file_temp(&dir, name, body).await?;
+                let linked = fs::hard_link(&tmp, &path).await;
+                let _ = fsio::remove_file(&tmp).await;
+                match linked {
+                    Ok(()) => ClaimOutcome::Written,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Ok(ClaimOutcome::Lost)
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            MarkerWrite::Replace { body, version } => {
+                if !version_is(version) {
+                    return Ok(ClaimOutcome::Lost);
+                }
+                let tmp = bucket_file_temp(&dir, name, body).await?;
+                fs::rename(&tmp, &path).await?;
+                ClaimOutcome::Written
+            }
+            MarkerWrite::Remove { version } => {
+                if !version_is(version) {
+                    return Ok(ClaimOutcome::Lost);
+                }
+                match fsio::remove_file(&path).await {
+                    Ok(()) => ClaimOutcome::Written,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(ClaimOutcome::Lost)
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        };
+        // The new directory entry survives a crash.
+        fsio::open(&dir).await?.sync_all().await?;
+        Ok(outcome)
+    }
 }
 
 impl StorageBackend for FilesystemBackend {
@@ -1920,26 +2027,23 @@ impl StorageBackend for FilesystemBackend {
         .await
     }
 
-    /// The key claim is a file in the bucket's directory, beside
-    /// `deltaspaces/`: listings do not see it, and DeleteBucket prunes it
-    /// with the other residue. Its version is its content.
+    /// The key claim is a bucket-level file (`read_bucket_file`).
+    /// Its version is its label.
     async fn read_key_claim(
         &self,
         bucket: &str,
     ) -> Result<Option<crate::storage::KeyClaim>, StorageError> {
-        match fsio::read(&self.bucket_dir(bucket).join(KEY_CLAIM_FILE)).await {
-            Ok(bytes) => {
+        Ok(self
+            .read_bucket_file(bucket, KEY_CLAIM_FILE)
+            .await?
+            .map(|bytes| {
                 // A claim is a short label; anything longer is not one.
-                let text = String::from_utf8_lossy(&bytes);
-                let fingerprint = crate::security::str_prefix(&text, 64).trim().to_string();
-                Ok(Some(crate::storage::KeyClaim {
+                let fingerprint = claim_version(&bytes);
+                crate::storage::KeyClaim {
                     version: fingerprint.clone(),
                     fingerprint,
-                }))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+                }
+            }))
     }
 
     async fn write_key_claim(
@@ -1947,63 +2051,49 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         op: crate::storage::ClaimWrite<'_>,
     ) -> Result<crate::storage::ClaimOutcome, StorageError> {
-        use crate::storage::{ClaimOutcome, ClaimWrite};
-        let dir = self.bucket_dir(bucket);
-        if !fsio::exists(&dir).await? {
-            return Err(StorageError::BucketNotFound(bucket.to_string()));
-        }
-        let path = dir.join(KEY_CLAIM_FILE);
-        // A Replace or Remove compares the version and then writes: one at
-        // a time in this process. (Two processes on one directory can still
-        // interleave them; a Create cannot.)
-        static CLAIM_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _one = CLAIM_WRITES.lock().await;
-        let current = self.read_key_claim(bucket).await?;
-        let version_is = |v: &str| current.as_ref().map(|c| c.version.as_str()) == Some(v);
-        let outcome = match op {
-            ClaimWrite::Create(fp) => {
-                // The claim appears whole or not at all: write a synced
-                // private file, then hard-link it into place. `link` fails
-                // when the claim exists, which is the condition (one
-                // creator wins).
-                let tmp = claim_temp_file(&dir, fp).await?;
-                let linked = fs::hard_link(&tmp, &path).await;
-                let _ = fsio::remove_file(&tmp).await;
-                match linked {
-                    Ok(()) => ClaimOutcome::Written,
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        return Ok(ClaimOutcome::Lost)
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
+        use crate::storage::{ClaimWrite, MarkerWrite};
+        let op = match op {
+            ClaimWrite::Create(fp) => MarkerWrite::Create(fp.as_bytes()),
             ClaimWrite::Replace {
                 fingerprint,
                 version,
-            } => {
-                if !version_is(version) {
-                    return Ok(ClaimOutcome::Lost);
-                }
-                let tmp = claim_temp_file(&dir, fingerprint).await?;
-                fs::rename(&tmp, &path).await?;
-                ClaimOutcome::Written
-            }
-            ClaimWrite::Remove { version } => {
-                if !version_is(version) {
-                    return Ok(ClaimOutcome::Lost);
-                }
-                match fsio::remove_file(&path).await {
-                    Ok(()) => ClaimOutcome::Written,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(ClaimOutcome::Lost)
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
+            } => MarkerWrite::Replace {
+                body: fingerprint.as_bytes(),
+                version,
+            },
+            ClaimWrite::Remove { version } => MarkerWrite::Remove { version },
         };
-        // The new directory entry survives a crash.
-        fsio::open(&dir).await?.sync_all().await?;
-        Ok(outcome)
+        self.write_bucket_file(bucket, KEY_CLAIM_FILE, claim_version, op)
+            .await
+    }
+
+    /// The conversion marker is a bucket-level file; its version is its
+    /// content, and the clock is this host's (a filesystem backend is one
+    /// node).
+    async fn read_conversion_marker(
+        &self,
+        bucket: &str,
+    ) -> Result<crate::storage::MarkerRead, StorageError> {
+        let marker = self
+            .read_bucket_file(bucket, CONVERSION_MARKER_FILE)
+            .await?
+            .map(|body| crate::storage::ConversionMarker {
+                version: marker_version(&body),
+                content: body,
+            });
+        Ok(crate::storage::MarkerRead {
+            marker,
+            server_now: Some(chrono::Utc::now().timestamp()),
+        })
+    }
+
+    async fn write_conversion_marker(
+        &self,
+        bucket: &str,
+        op: crate::storage::MarkerWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, StorageError> {
+        self.write_bucket_file(bucket, CONVERSION_MARKER_FILE, marker_version, op)
+            .await
     }
 
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {

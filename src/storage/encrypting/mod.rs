@@ -23,6 +23,9 @@
 
 #[cfg(test)]
 mod bucket_tests;
+pub mod conversion;
+#[cfg(test)]
+mod conversion_tests;
 mod format;
 pub(crate) mod seal;
 mod sentinel;
@@ -321,6 +324,8 @@ pub struct EncryptingBackend<B: StorageBackend> {
     sentinel: Option<Arc<KeySentinel>>,
     /// Heals listing-token misses (`token_heal.rs`).
     healer: token_heal::TokenHealer,
+    /// The conversion windows of this wrapper's buckets (`conversion.rs`).
+    windows: conversion::WindowCache,
 }
 
 impl<B: StorageBackend> EncryptingBackend<B> {
@@ -331,6 +336,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             witness: None,
             sentinel: None,
             healer: Default::default(),
+            windows: Default::default(),
         }
     }
 
@@ -577,9 +583,273 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     }
 
     /// Refuse the writes that the witness gate names for raw backend `name`.
+    /// `name` is also the backend in the storage identity of a conversion
+    /// marker.
     pub fn with_witness(mut self, name: &str, gate: Arc<WitnessGate>) -> Self {
         self.witness = Some((name.to_string(), gate));
         self
+    }
+
+    /// The storage identity that a conversion marker of the real bucket
+    /// `bucket` binds: `backend \0 bucket`, with this raw backend's name
+    /// (the name that [`Self::with_witness`] gave; `default`, the name of
+    /// the singleton backend, without one).
+    fn conversion_identity(&self, bucket: &str) -> String {
+        let backend = self.witness.as_ref().map_or("default", |(n, _)| n.as_str());
+        crate::storage::routing::backend_storage_identity(backend, bucket)
+    }
+
+    /// The conversion window of `bucket` (`conversion.rs`): cached for
+    /// [`conversion::TTL`], one marker read per bucket at a time, the
+    /// deadline checked against the backend clock on every call. A failed
+    /// read is a closed window (fail closed), cached for
+    /// [`conversion::FAILED_TTL`]. Not yet consulted by reads.
+    pub async fn window_of(&self, bucket: &str) -> conversion::Window {
+        let wall = || chrono::Utc::now().timestamp();
+        if let Some(w) = self
+            .windows
+            .cached(bucket, std::time::Instant::now(), wall())
+        {
+            return w;
+        }
+        let flight = self.windows.flight(bucket);
+        let _one = flight.lock().await;
+        if let Some(w) = self
+            .windows
+            .cached(bucket, std::time::Instant::now(), wall())
+        {
+            return w;
+        }
+        self.read_window(bucket).await
+    }
+
+    /// Read the marker of `bucket` and cache its window. The caller holds
+    /// the bucket's flight lock.
+    async fn read_window(&self, bucket: &str) -> conversion::Window {
+        let wall = chrono::Utc::now().timestamp();
+        let now = std::time::Instant::now();
+        match self.inner.read_conversion_marker(bucket).await {
+            Ok(read) => {
+                let server_now = read.server_now.unwrap_or(wall);
+                let window = match &read.marker {
+                    Some(m) => {
+                        let cfg = self.config.load();
+                        let w = conversion::open(
+                            m,
+                            cfg.ring(),
+                            &self.conversion_identity(bucket),
+                            server_now,
+                        );
+                        if !w.is_open() {
+                            tracing::warn!(
+                                "encryption: the conversion marker of bucket '{bucket}' does not \
+                                 open here or is past its deadline; the window is closed"
+                            );
+                        }
+                        w
+                    }
+                    None => conversion::Window::Closed,
+                };
+                self.windows.store(
+                    bucket,
+                    window.clone(),
+                    now,
+                    wall,
+                    read.server_now,
+                    conversion::TTL,
+                );
+                window
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "encryption: the conversion marker of bucket '{bucket}' could not be read, \
+                     the window counts as closed: {e}"
+                );
+                self.windows.store(
+                    bucket,
+                    conversion::Window::Closed,
+                    now,
+                    wall,
+                    None,
+                    conversion::FAILED_TTL,
+                );
+                conversion::Window::Closed
+            }
+        }
+    }
+
+    /// The window of `bucket` after a refused plaintext read: when the
+    /// cached window is not open, read the marker again (one read per
+    /// bucket at a time, at most once per [`conversion::REFUSAL_REFRESH`]),
+    /// so a window that another node opened takes effect at once.
+    pub async fn refresh_after_refusal(&self, bucket: &str) -> conversion::Window {
+        let flight = self.windows.flight(bucket);
+        let one = flight.lock().await;
+        if self
+            .windows
+            .take_refusal_refresh(bucket, std::time::Instant::now())
+        {
+            return self.read_window(bucket).await;
+        }
+        drop(one);
+        self.window_of(bucket).await
+    }
+
+    /// Open the conversion of `bucket` for `window_days`: reuse a valid
+    /// marker (idempotent: its cutoff is kept), else create one whose
+    /// cutoff is the backend's clock (the S3 `Date` of the read just before
+    /// the create). Returns the run id. Refused for a bucket that does not
+    /// encrypt, a marker that this proxy cannot open, and a marker past its
+    /// deadline (a resume extends it: [`Self::extend_conversion`]).
+    pub async fn open_conversion(
+        &self,
+        bucket: &str,
+        window_days: u32,
+    ) -> Result<conversion::RunId, StorageError> {
+        use conversion::OpenOutcome;
+        if window_days == 0 || window_days > conversion::MAX_WINDOW_DAYS {
+            return Err(StorageError::Other(format!(
+                "a conversion window is 1 to {} days, not {window_days}",
+                conversion::MAX_WINDOW_DAYS
+            )));
+        }
+        self.check_write(bucket).await?;
+        let Some(site) = self.write_key(bucket)? else {
+            return Err(StorageError::Encryption(format!(
+                "bucket '{bucket}' writes plaintext: it has no conversion to open"
+            )));
+        };
+        let identity = self.conversion_identity(bucket);
+        let cfg = self.config.load_full();
+        let flight = self.windows.flight(bucket);
+        let _one = flight.lock().await;
+        let io = conversion::OnBackend {
+            backend: self.inner.as_ref(),
+            bucket,
+        };
+        let outcome = conversion::open_or_reuse(
+            &io,
+            cfg.ring(),
+            &site,
+            &identity,
+            i64::from(window_days) * 86_400,
+        )
+        .await?;
+        let (fields, version) = match outcome {
+            OpenOutcome::Created(f, v) => {
+                tracing::info!(
+                    "encryption: opened the conversion of bucket '{bucket}' (run {}, cutoff {}, \
+                     deadline {})",
+                    conversion::run_label(&f.run),
+                    f.cutoff,
+                    f.deadline
+                );
+                (f, v)
+            }
+            OpenOutcome::Reused(f, v) => (f, v),
+            OpenOutcome::Expired(f) => {
+                return Err(StorageError::Encryption(format!(
+                    "the conversion of bucket '{bucket}' (run {}) passed its deadline; resume \
+                     it to extend the deadline, which keeps its cutoff",
+                    conversion::run_label(&f.run)
+                )))
+            }
+            OpenOutcome::Foreign => {
+                return Err(StorageError::Encryption(format!(
+                    "bucket '{bucket}' holds a conversion marker that this proxy cannot open \
+                     (another key or format, or an edited marker); the proxy does not \
+                     overwrite it"
+                )))
+            }
+        };
+        self.cache_written(bucket, Some((fields, version)));
+        Ok(fields.run)
+    }
+
+    /// Close the conversion `run` of `bucket` by identity: remove the
+    /// marker only if it is still this run's (`If-Match` on the version
+    /// just read).
+    pub async fn close_conversion(
+        &self,
+        bucket: &str,
+        run: &conversion::RunId,
+    ) -> Result<conversion::ByIdentity, StorageError> {
+        self.check_write_unless(bucket, true).await?;
+        self.change_conversion(bucket, run, |_| None).await
+    }
+
+    /// Move the deadline of the conversion `run` of `bucket` to
+    /// `deadline` by identity (a resume). The cutoff and the run id stay.
+    pub async fn extend_conversion(
+        &self,
+        bucket: &str,
+        run: &conversion::RunId,
+        deadline: i64,
+    ) -> Result<conversion::ByIdentity, StorageError> {
+        self.check_write(bucket).await?;
+        self.change_conversion(bucket, run, |f| {
+            Some(conversion::Fields {
+                deadline: deadline.max(f.cutoff.saturating_add(1)),
+                ..*f
+            })
+        })
+        .await
+    }
+
+    async fn change_conversion(
+        &self,
+        bucket: &str,
+        run: &conversion::RunId,
+        change: impl Fn(&conversion::Fields) -> Option<conversion::Fields>,
+    ) -> Result<conversion::ByIdentity, StorageError> {
+        // A rewrite seals with the key that writes the bucket now (a
+        // rotation moves the marker to the new key); a close needs none.
+        let site = self.write_key(bucket).ok().flatten();
+        let identity = self.conversion_identity(bucket);
+        let cfg = self.config.load_full();
+        let flight = self.windows.flight(bucket);
+        let _one = flight.lock().await;
+        let io = conversion::OnBackend {
+            backend: self.inner.as_ref(),
+            bucket,
+        };
+        let outcome =
+            conversion::by_identity(&io, cfg.ring(), site.as_deref(), &identity, run, change)
+                .await?;
+        match &outcome {
+            conversion::ByIdentity::Done(fields, version) => {
+                self.cache_written(bucket, fields.map(|f| (f, version.clone())));
+            }
+            conversion::ByIdentity::Absent => self.cache_written(bucket, None),
+            conversion::ByIdentity::NotOurs | conversion::ByIdentity::Blocked => {
+                tracing::warn!(
+                    "encryption: the conversion marker of bucket '{bucket}' was not changed: \
+                     {outcome:?}"
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Cache the window that this node just wrote (`None`: closed).
+    fn cache_written(&self, bucket: &str, written: Option<(conversion::Fields, String)>) {
+        let window = match written {
+            Some((f, version)) => conversion::Window::Open {
+                cutoff: f.cutoff,
+                deadline: f.deadline,
+                run: f.run,
+                version,
+            },
+            None => conversion::Window::Closed,
+        };
+        self.windows.store(
+            bucket,
+            window,
+            std::time::Instant::now(),
+            chrono::Utc::now().timestamp(),
+            None,
+            conversion::TTL,
+        );
     }
 }
 
@@ -1831,6 +2101,20 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
         op: super::ClaimWrite<'_>,
     ) -> Result<super::ClaimOutcome, StorageError> {
         self.inner.write_key_claim(b, op).await
+    }
+    async fn read_conversion_marker(&self, b: &str) -> Result<super::MarkerRead, StorageError> {
+        self.inner.read_conversion_marker(b).await
+    }
+    /// The raw write, for a caller that seals its own body; the wrapper's
+    /// own conversion writes go to the inner backend through
+    /// `conversion.rs`.
+    async fn write_conversion_marker(
+        &self,
+        b: &str,
+        op: super::MarkerWrite<'_>,
+    ) -> Result<super::ClaimOutcome, StorageError> {
+        self.check_write(b).await?;
+        self.inner.write_conversion_marker(b, op).await
     }
     /// The presented metadata; the basis keeps the stored (raw) metadata,
     /// which the re-seal of the rewrite needs (its salt).

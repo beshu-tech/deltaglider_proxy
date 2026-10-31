@@ -1359,6 +1359,21 @@ impl StorageBackend for S3Backend {
         self.write_claim(bucket, op).await
     }
 
+    async fn read_conversion_marker(
+        &self,
+        bucket: &str,
+    ) -> Result<crate::storage::MarkerRead, StorageError> {
+        self.read_marker(bucket).await
+    }
+
+    async fn write_conversion_marker(
+        &self,
+        bucket: &str,
+        op: crate::storage::MarkerWrite<'_>,
+    ) -> Result<crate::storage::ClaimOutcome, StorageError> {
+        self.write_marker(bucket, op).await
+    }
+
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
         let buckets_to_scan = if let Some(b) = bucket {
             vec![b.to_string()]
