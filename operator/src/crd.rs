@@ -100,6 +100,12 @@ pub struct RouterSpec {
     /// 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 and fc00::/7. Narrow it
     /// to your pod CIDR, because any pod in these ranges can name a client.
     pub trusted_proxy_cidrs: Option<Vec<String>>,
+    /// Create a NetworkPolicy `<name>-proxy` that admits ingress to the proxy
+    /// pods only from this resource's router pods, on the proxy port (default
+    /// false). Turn it on only after you check what else connects to the
+    /// pods: the policy also blocks a Prometheus that scrapes them directly.
+    /// Turning it off deletes the policy.
+    pub network_policy: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default)]
@@ -170,6 +176,13 @@ impl DeltaGliderProxy {
             .filter(|c| !c.is_empty())
             .map(|c| c.join(","))
             .unwrap_or_else(|| DEFAULT_TRUSTED_PROXY_CIDRS.into())
+    }
+    pub fn network_policy(&self) -> bool {
+        self.spec
+            .router
+            .as_ref()
+            .and_then(|r| r.network_policy)
+            .unwrap_or(false)
     }
     pub fn service_type(&self) -> String {
         self.spec

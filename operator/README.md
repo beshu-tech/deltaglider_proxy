@@ -192,6 +192,7 @@ spec:
     replicas: 2                # number of HAProxy pods (default 2; they are stateless)
     image: haproxy:3.0-alpine  # default
     trustedProxyCidrs: ["10.42.0.0/16"]  # the pod network (default: every private range)
+    networkPolicy: true        # proxy pods accept only router connections (default false)
   service:
     type: LoadBalancer         # default ClusterIP
   resources:                   # resources of the proxy container
@@ -208,6 +209,16 @@ problems that stop a scale-up, or the error of a failed reconcile.
 `spec.storage` cannot change after you create the resource. A StatefulSet refuses a
 change to its volume claim templates, so the API server refuses the change to the
 resource first. To change the volume size or class, create a new resource.
+
+`spec.router.networkPolicy: true` makes the operator create a NetworkPolicy
+`<name>-proxy`. The policy lets the proxy pods accept connections only from the router
+pods of the same resource, on port 9000. A client in the cluster then cannot bypass the
+router, and so it cannot break the per-directory pinning that multipart uploads need.
+The policy also blocks every other connection to the pods, for example a Prometheus that
+scrapes the pods directly, so it is off by default. The policy has no egress rules, so
+the pods can still reach their storage backend. When you set the field back to false,
+the operator deletes the policy. The policy has an effect only when the cluster's
+network plugin enforces NetworkPolicy.
 
 ## TLS
 

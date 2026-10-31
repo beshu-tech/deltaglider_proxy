@@ -413,6 +413,38 @@ pub fn router_deployment(cr: &DeltaGliderProxy, proxy_replicas: i32) -> Value {
     })
 }
 
+/// The name of the opt-in proxy NetworkPolicy (`spec.router.networkPolicy`).
+pub fn proxy_network_policy_name(cr: &DeltaGliderProxy) -> String {
+    format!("{}-proxy", cr_name(cr))
+}
+
+/// Opt-in NetworkPolicy: the proxy pods accept connections only from this
+/// resource's router pods, on the proxy port. The selectors are the
+/// StatefulSet and router Deployment selectors. Ingress only, no egress rules:
+/// the pods must still reach their storage backend.
+pub fn proxy_network_policy(cr: &DeltaGliderProxy) -> Value {
+    let name = cr_name(cr);
+    json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": meta(cr, &proxy_network_policy_name(cr), "proxy"),
+        "spec": {
+            "podSelector": { "matchLabels": {
+                "app.kubernetes.io/instance": name,
+                "app.kubernetes.io/component": "proxy",
+            }},
+            "policyTypes": ["Ingress"],
+            "ingress": [{
+                "from": [{ "podSelector": { "matchLabels": {
+                    "app.kubernetes.io/instance": name,
+                    "app.kubernetes.io/component": "router",
+                }}}],
+                "ports": [{ "protocol": "TCP", "port": PROXY_PORT }],
+            }],
+        },
+    })
+}
+
 /// PDB: a node drain must never take every router down (the routers ARE the entrypoint).
 pub fn router_pdb(cr: &DeltaGliderProxy) -> Value {
     let name = cr_name(cr);
@@ -453,6 +485,7 @@ mod tests {
                     replicas: Some(2),
                     image: None,
                     trusted_proxy_cidrs: None,
+                    network_policy: None,
                 }),
                 service: None,
                 resources: None,
@@ -692,5 +725,56 @@ mod tests {
         let ring =
             |v: &Value| v["spec"]["template"]["metadata"]["labels"]["dgp.beshu.tech/ring"].clone();
         assert_ne!(ring(&a), ring(&b));
+    }
+
+    #[test]
+    fn network_policy_admits_only_this_instances_routers() {
+        use k8s_openapi::api::networking::v1::NetworkPolicy;
+        let c = cr(2);
+        let np: NetworkPolicy = serde_json::from_value(proxy_network_policy(&c)).unwrap();
+        assert_eq!(np.metadata.name.as_deref(), Some("dgp-proxy"));
+        assert_eq!(np.metadata.owner_references.as_ref().unwrap().len(), 1);
+        let spec = np.spec.unwrap();
+
+        // The policy selects exactly the StatefulSet's pods.
+        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&c, 2)).unwrap();
+        let sts_selector = sts.spec.unwrap().selector.match_labels.unwrap();
+        assert_eq!(
+            spec.pod_selector.unwrap().match_labels.unwrap(),
+            sts_selector
+        );
+        assert_eq!(spec.policy_types.unwrap(), vec!["Ingress".to_string()]);
+
+        // One ingress rule: from the router Deployment's pods, to the proxy port.
+        let dep: Deployment = serde_json::from_value(router_deployment(&c, 2)).unwrap();
+        let router_selector = dep.spec.unwrap().selector.match_labels.unwrap();
+        let ingress = spec.ingress.unwrap();
+        assert_eq!(ingress.len(), 1);
+        let from = ingress[0].from.as_ref().unwrap();
+        assert_eq!(from.len(), 1);
+        assert!(from[0].namespace_selector.is_none(), "same namespace only");
+        assert_eq!(
+            from[0]
+                .pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap(),
+            &router_selector
+        );
+        let ports = ingress[0].ports.as_ref().unwrap();
+        assert_eq!(
+            serde_json::to_value(&ports[0].port).unwrap(),
+            serde_json::json!(PROXY_PORT)
+        );
+    }
+
+    #[test]
+    fn network_policy_is_opt_in() {
+        let mut c = cr(1);
+        assert!(!c.network_policy());
+        c.spec.router.as_mut().unwrap().network_policy = Some(true);
+        assert!(c.network_policy());
     }
 }

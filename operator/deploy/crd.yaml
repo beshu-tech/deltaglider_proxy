@@ -102,6 +102,15 @@ spec:
                     description: Router image (default haproxy:3.0-alpine).
                     nullable: true
                     type: string
+                  networkPolicy:
+                    description: |-
+                      Create a NetworkPolicy `<name>-proxy` that admits ingress to the proxy
+                      pods only from this resource's router pods, on the proxy port (default
+                      false). Turn it on only after you check what else connects to the
+                      pods: the policy also blocks a Prometheus that scrapes them directly.
+                      Turning it off deletes the policy.
+                    nullable: true
+                    type: boolean
                   replicas:
                     description: |-
                       Router pod count (default 2). Routers are stateless; the hash ring is

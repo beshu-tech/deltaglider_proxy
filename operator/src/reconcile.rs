@@ -8,6 +8,7 @@ use crate::resources;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
+use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
@@ -61,6 +62,12 @@ pub const RBAC_USED: &[Grant] = &[
     // get + create for a new Secret; patch adds a missing dbKey (merge patch).
     ("", "secrets", &["get", "create", "patch"]),
     ("policy", "poddisruptionbudgets", &["create", "patch"]),
+    // Opt-in spec.router.networkPolicy: apply when on; get + delete when off.
+    (
+        "networking.k8s.io",
+        "networkpolicies",
+        &["get", "create", "patch", "delete"],
+    ),
 ];
 
 /// The resource that each typed `Api<K>` in this file talks to. The source
@@ -75,6 +82,7 @@ pub const KIND_RESOURCES: &[(&str, &str)] = &[
     ("ConfigMap", "configmaps"),
     ("Secret", "secrets"),
     ("PodDisruptionBudget", "poddisruptionbudgets"),
+    ("NetworkPolicy", "networkpolicies"),
 ];
 
 pub struct Ctx {
@@ -188,6 +196,34 @@ async fn ensure_bootstrap_secret(
     }
 }
 
+/// Apply the opt-in proxy NetworkPolicy, or delete it when the field is off.
+/// Delete only our own policy (the managed-by label), never a hand-made one.
+async fn reconcile_network_policy(
+    client: &Client,
+    ns: &str,
+    cr: &DeltaGliderProxy,
+) -> Result<(), Error> {
+    if cr.network_policy() {
+        return apply::<NetworkPolicy>(client, ns, &resources::proxy_network_policy(cr)).await;
+    }
+    let name = resources::proxy_network_policy_name(cr);
+    let api: Api<NetworkPolicy> = Api::namespaced(client.clone(), ns);
+    let ours = api.get_opt(&name).await?.is_some_and(|np| {
+        np.labels()
+            .get("app.kubernetes.io/managed-by")
+            .map(String::as_str)
+            == Some(resources::MANAGER)
+    });
+    if ours {
+        match api.delete(&name, &Default::default()).await {
+            Ok(_) => tracing::info!(%name, %ns, "deleted the proxy NetworkPolicy"),
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 pub async fn reconcile(cr: Arc<DeltaGliderProxy>, ctx: Arc<Ctx>) -> Result<Action, Error> {
     let ns = cr.namespace().ok_or(Error::NoNamespace)?;
     let client = &ctx.client;
@@ -222,6 +258,7 @@ pub async fn reconcile(cr: Arc<DeltaGliderProxy>, ctx: Arc<Ctx>) -> Result<Actio
     apply::<StatefulSet>(client, &ns, &resources::proxy_statefulset(&cr, replicas)).await?;
     apply::<Deployment>(client, &ns, &resources::router_deployment(&cr, replicas)).await?;
     apply::<PodDisruptionBudget>(client, &ns, &resources::router_pdb(&cr)).await?;
+    reconcile_network_policy(client, &ns, &cr).await?;
 
     // Status from the children's own status stanzas.
     let dep: Api<Deployment> = Api::namespaced(client.clone(), &ns);
