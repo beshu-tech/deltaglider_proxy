@@ -223,7 +223,7 @@ export default function JobsPanel({ search }: Props) {
       key: 'job',
       label: 'Job',
       hideLabelOnNarrow: true,
-      track: 'minmax(200px,2fr)',
+      track: 'minmax(200px,1.5fr)',
       render: (r) => {
         const subject = runSubject(r);
         return (
@@ -260,7 +260,7 @@ export default function JobsPanel({ search }: Props) {
     {
       key: 'scope',
       label: 'Scope',
-      track: 'minmax(140px,1.2fr)',
+      track: 'minmax(140px,1fr)',
       render: (r) => {
         const scope = scopeText(r.scope);
         return (
@@ -275,15 +275,15 @@ export default function JobsPanel({ search }: Props) {
       key: 'status',
       label: 'Status',
       hideLabelOnNarrow: true,
-      track: 'minmax(0,1fr)',
+      track: 'minmax(240px,1.6fr)',
       render: (r) => (
         <div>
-          <Tag color={jobStatusTone(r)} style={{ margin: '0 0 4px' }}>
-            {jobStatusLabel(r)}
-          </Tag>
-          {/* A bar only while the run moves: a finished run's bar was a
-              full green track for one object (UX harvest D66). */}
-          <OutcomeMeter {...rowMeterInput(r)} bar={isActiveJobStatus(r.status)} />
+          <div className="dg-status-line">
+            <Tag color={jobStatusTone(r)}>{jobStatusLabel(r)}</Tag>
+            {/* A bar only while the run moves: a finished run's bar was a
+                full green track for one object (UX harvest D66). */}
+            <OutcomeMeter {...rowMeterInput(r)} bar={isActiveJobStatus(r.status)} />
+          </div>
           {r.progress.failed > 0 && (
             <Button
               type="link"

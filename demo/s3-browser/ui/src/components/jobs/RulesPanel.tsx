@@ -817,12 +817,12 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
         return (
           // OutcomeMeter.css grows this wrapper to the column width.
           <div>
-            {view.tag && (
-              <Tag color={jobStatusTone(d.row)} style={{ margin: view.meter ? '0 0 4px' : 0 }}>
-                {jobStatusLabel(d.row)}
-              </Tag>
+            {(view.tag || view.meter) && (
+              <div className="dg-status-line">
+                {view.tag && <Tag color={jobStatusTone(d.row)}>{jobStatusLabel(d.row)}</Tag>}
+                {view.meter && <OutcomeMeter {...rowMeterInput(d.row, ruleVerb(d.row))} />}
+              </div>
             )}
-            {view.meter && <OutcomeMeter {...rowMeterInput(d.row, ruleVerb(d.row))} />}
             {liveCopies && (
               // Event-driven copies write no run row: this is where they show.
               <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>

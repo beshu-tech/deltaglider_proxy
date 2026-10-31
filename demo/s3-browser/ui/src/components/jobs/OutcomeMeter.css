@@ -1,8 +1,9 @@
-/* Outcome meter: [dot] [proportional track] [label]. Colours are the palette
+/* Outcome meter: [proportional track] [label]. No dot: the status tag beside
+   it carries the colour. Colours are the palette
    vars (--dg-*, themeVars.ts); the two widths come inline from the data. */
 .dg-meter {
   display: grid;
-  grid-template-columns: auto minmax(28px, 1fr) auto;
+  grid-template-columns: minmax(28px, 1fr) auto;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -22,21 +23,23 @@
   min-width: 0;
 }
 
-/* No track (a settled run in a list): the dot, then the words. */
+/* No track (a settled run in a list): only the words. */
 .dg-meter[data-bar='off'] {
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
 }
 
-.dg-meter-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
+/* A status cell: the status tag and the meter on ONE line. The tag keeps its
+   width; the meter takes the rest and its words end with an ellipsis (the
+   full text is the meter's title). Nothing wraps. */
+.dg-status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: nowrap;
 }
-.dg-meter-dot[data-dot='green'] { background: var(--dg-accent-green); }
-.dg-meter-dot[data-dot='red'] { background: var(--dg-accent-red); }
-.dg-meter-dot[data-dot='amber'] { background: var(--dg-accent-amber); }
-.dg-meter-dot[data-dot='muted'] { background: var(--dg-border); }
+.dg-status-line > .ant-tag { flex: none; margin: 0; }
+.dg-status-line > .dg-meter { flex: 1 1 0; min-width: 0; }
 
 .dg-meter-track {
   position: relative;
@@ -93,21 +96,14 @@
   color: var(--dg-text-primary);
 }
 
-/* Narrow cell: the label goes on its own line under the bar and wraps,
-   instead of being cut ("running · 1,998 copie…"). */
+/* Narrow cell: the bar on top, the label under it on ONE line. The label
+   never wraps (owner, 2026-11-01): it ends with an ellipsis, and the full
+   text is the meter's title and aria-label. */
 @container meter (max-width: 320px) {
-  .dg-meter { grid-template-columns: auto minmax(28px, 1fr); row-gap: 2px; }
-  .dg-meter-label {
-    grid-column: 1 / -1;
-    white-space: normal;
-    overflow: visible;
-    overflow-wrap: anywhere;
-  }
+  .dg-meter-label { grid-column: 1 / -1; }
 }
 
-/* Extreme narrow: drop the track, keep dot + label so the number still reads. */
+/* Extreme narrow: drop the track, keep the label so the number still reads. */
 @container meter (max-width: 120px) {
-  .dg-meter { grid-template-columns: auto 1fr; }
   .dg-meter-track { display: none; }
-  .dg-meter-label { grid-column: auto; }
 }

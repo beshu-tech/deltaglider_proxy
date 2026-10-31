@@ -1,12 +1,12 @@
 import { deriveMeter, type OutcomeMeterInput } from '../../jobsView';
 import './OutcomeMeter.css';
 
-/** A run's outcome as a calm-by-default meter: [dot] [proportional track]
- *  [label]. All the decision logic is the pure `deriveMeter` (in jobsView, with
+/** A run's outcome as a calm-by-default meter: [proportional track] [label].
+ *  No status dot: the status tag beside it already carries the colour. All the decision logic is the pure `deriveMeter` (in jobsView, with
  *  the other job-display helpers + its regression test); this component only
  *  maps that view to DOM (colours: the palette vars in OutcomeMeter.css). */
 export default function OutcomeMeter({ bar = true, ...props }: OutcomeMeterInput & {
-  /** The proportional track. Off: only the dot and the words (a settled
+  /** The proportional track. Off: only the words (a settled
    *  run in a list, where a full bar for one object says nothing). */
   bar?: boolean;
 }) {
@@ -27,7 +27,6 @@ export default function OutcomeMeter({ bar = true, ...props }: OutcomeMeterInput
         } as React.CSSProperties
       }
     >
-      <span className="dg-meter-dot" data-dot={m.dot} aria-hidden="true" />
       {bar && (
         <span className="dg-meter-track" aria-hidden="true">
           {m.greenPct > 0 && <span className="dg-meter-seg dg-meter-green" />}

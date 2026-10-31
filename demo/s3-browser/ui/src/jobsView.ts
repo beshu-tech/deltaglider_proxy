@@ -1047,7 +1047,6 @@ export interface MeterView {
   state: MeterState;
   greenPct: number;
   redPct: number;
-  dot: 'green' | 'red' | 'amber' | 'muted';
   label: string;
   aria: string;
 }
@@ -1092,7 +1091,7 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
     `; status ${jobStatusLabel({ status })}`;
 
   if (status === 'queued') {
-    return { state: 'waiting', greenPct: 0, redPct: 0, dot: 'muted', label: 'waiting to start', aria };
+    return { state: 'waiting', greenPct: 0, redPct: 0, label: 'waiting to start', aria };
   }
   if (status === 'cancelling') {
     const so = parts(false);
@@ -1100,7 +1099,6 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
       state: 'cancelling',
       greenPct: 0,
       redPct: 0,
-      dot: 'amber',
       label: so.length > 0 ? `cancelling · ${so.join(' · ')}` : 'cancelling',
       aria,
     };
@@ -1112,7 +1110,6 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
       state: 'running',
       greenPct: known ? Math.max(0, Math.min(100, percent)) : 0,
       redPct: 0,
-      dot: 'amber',
       label: [head, ...parts(true)].join(' · ') + (known ? '' : '…'),
       aria,
     };
@@ -1126,20 +1123,18 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
       state: 'idle',
       greenPct: 0,
       redPct: 0,
-      dot: 'muted',
       label: so.length > 0 ? `${word} · ${so.join(' · ')}` : word,
       aria,
     };
   }
   if (status === 'failed' && acted === 0) {
-    return { state: 'errors', greenPct: 0, redPct: 100, dot: 'red', label: 'failed', aria };
+    return { state: 'errors', greenPct: 0, redPct: 100, label: 'failed', aria };
   }
   if (acted === 0) {
     return {
       state: 'in-sync',
       greenPct: 0,
       redPct: 0,
-      dot: 'muted',
       label:
         scanned === 0
           ? 'no objects'
@@ -1153,12 +1148,12 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
   const redPct = (errors / acted) * 100;
   const label = parts(false).join(' · ');
   if (errors > 0 && copied + deleted > 0) {
-    return { state: 'mixed', greenPct, redPct, dot: 'red', label, aria };
+    return { state: 'mixed', greenPct, redPct, label, aria };
   }
   if (errors > 0) {
-    return { state: 'errors', greenPct, redPct, dot: 'red', label, aria };
+    return { state: 'errors', greenPct, redPct, label, aria };
   }
-  return { state: 'copied', greenPct, redPct, dot: 'green', label, aria };
+  return { state: 'copied', greenPct, redPct, label, aria };
 }
 
 /**

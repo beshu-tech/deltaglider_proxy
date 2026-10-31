@@ -10,7 +10,6 @@ const m = (over: Partial<OutcomeMeterInput>) => deriveMeter({ ...base, ...over }
 test('in-sync: everything skipped (the dominant, calm case) — NOT saturated green', () => {
   const v = m({ scanned: 11, skipped: 11, status: 'succeeded' });
   assert.equal(v.state, 'in-sync');
-  assert.equal(v.dot, 'muted');
   assert.equal(v.label, 'in sync · 11 checked');
   assert.equal(v.greenPct, 0, 'in-sync must not paint green');
 });
@@ -24,7 +23,6 @@ test('empty: nothing scanned at all', () => {
 test('copied only', () => {
   const v = m({ scanned: 8, copied: 8, skipped: 0, status: 'succeeded' });
   assert.equal(v.state, 'copied');
-  assert.equal(v.dot, 'green');
   assert.equal(v.greenPct, 100);
   assert.equal(v.redPct, 0);
   assert.equal(v.label, '8 copied');
@@ -33,7 +31,6 @@ test('copied only', () => {
 test('errors only', () => {
   const v = m({ scanned: 5, errors: 5, status: 'succeeded' });
   assert.equal(v.state, 'errors');
-  assert.equal(v.dot, 'red');
   assert.equal(v.redPct, 100);
   assert.equal(v.label, '5 failed');
 });
@@ -41,7 +38,6 @@ test('errors only', () => {
 test('mixed: errors own the dot, proportions honest', () => {
   const v = m({ scanned: 100, copied: 75, errors: 25, status: 'succeeded' });
   assert.equal(v.state, 'mixed');
-  assert.equal(v.dot, 'red', 'errors own the attention dot');
   assert.equal(v.greenPct, 75);
   assert.equal(v.redPct, 25);
   assert.equal(v.label, '75 copied · 25 failed');
@@ -62,7 +58,6 @@ test('failed but with a real error count → uses the error label/proportions', 
 test('running, known percent → green fill + amber dot', () => {
   const v = m({ scanned: 50, copied: 20, status: 'running', percent: 40 });
   assert.equal(v.state, 'running');
-  assert.equal(v.dot, 'amber');
   assert.equal(v.greenPct, 40);
   assert.equal(v.label, 'running · 20 copied');
 });
@@ -79,7 +74,6 @@ test('queued waits, cancelling says so — neither reads as running', () => {
   const q = m({ status: 'queued' });
   assert.equal(q.state, 'waiting');
   assert.equal(q.label, 'waiting to start');
-  assert.equal(q.dot, 'muted');
   const c = m({ status: 'cancelling', copied: 20_001, scanned: 20_001 });
   assert.equal(c.state, 'cancelling');
   assert.equal(c.label, 'cancelling · 20,001 copied');
@@ -89,7 +83,6 @@ test('queued waits, cancelling says so — neither reads as running', () => {
 test('cancelled → calm muted', () => {
   const v = m({ scanned: 10, copied: 3, status: 'cancelled' });
   assert.equal(v.state, 'idle');
-  assert.equal(v.dot, 'muted');
   assert.equal(v.label, 'cancelled · 3 copied', 'says how far the run got');
   assert.equal(m({ status: 'cancelled' }).label, 'cancelled');
   assert.equal(m({ status: 'paused', copied: 2, scanned: 2 }).label, 'stopped · 2 copied', 'a pause keeps the cursor: not "cancelled"');
