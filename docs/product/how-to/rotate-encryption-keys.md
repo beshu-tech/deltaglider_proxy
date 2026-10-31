@@ -143,15 +143,20 @@ A bucket can have its own key on a shared backend ([per-bucket encryption](../re
            key_id: db-archive-2026
    ```
 
-3. Apply the file with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`, or restart the proxy. The response of the apply has a warning for `db-archive`: new writes use the key id `db-archive-2026`, and the objects stored before keep their old form. When `local-disk` stores plaintext, the old objects of `db-archive` are plaintext, and the proxy refuses them under the new block. In that case, add `plaintext_reads: serve` to the block until the re-encrypt job of step 4 succeeded. Without that line, the apply is refused, unless you confirm with `--confirm-plaintext-refusal db-archive` that the bucket holds no plaintext that anyone needs ([How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md#2-encrypt-the-objects-that-the-bucket-already-holds)).
-4. Rewrite the old objects under the new key with the re-encrypt job:
+3. Apply the file with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`. New writes use the key id `db-archive-2026`, and the objects stored before keep their old form.
+4. Rewrite the old objects under the new key with the re-encrypt job. What you do depends on the old objects:
 
-   ```bash
-   curl -b cookies.txt -X POST https://s3.acme.example/_/api/admin/jobs/reencrypt \
-     -H 'Content-Type: application/json' -d '{"buckets": ["db-archive"]}'
-   ```
+   - When `local-disk` stores plaintext and `db-archive` holds objects, the old objects are plaintext. The apply of step 3 already opened the conversion window of `db-archive` and started its re-encrypt job, and its response lists the bucket in `conversions`. Clients read the old objects while the job converts them. Follow the job as in [How to encrypt one bucket on a shared backend](encrypt-one-bucket-on-a-shared-backend.md#2-encrypt-the-objects-that-the-bucket-already-holds).
+   - When `local-disk` encrypts with its own key, the response of the apply has a warning for `db-archive` that names the re-encrypt job. Start it yourself:
 
-   Until the job is done, the objects that the backend key encrypted stay readable, because the proxy picks the key of each object by the key fingerprint that the object carries.
+     ```bash
+     curl -b cookies.txt -X POST https://s3.acme.example/_/api/admin/jobs/reencrypt \
+       -H 'Content-Type: application/json' -d '{"buckets": ["db-archive"]}'
+     ```
+
+     Until the job is done, the objects that the backend key encrypted stay readable, because the proxy picks the key of each object by the key fingerprint that the object carries.
+
+   A restart from the edited file instead of an apply starts no conversion. For a bucket with plaintext objects, send the request above with `"open_window": true` right after the restart, because until then every read of an old object fails.
 
 ### Rotate the bucket key
 
@@ -193,9 +198,11 @@ The proxy refuses an apply that removes the key that a bucket writes with, becau
 2. Run the re-encrypt job for the bucket. Under `mode: none`, it decrypts the old objects.
 3. Check the scan, as in step 4 of the rotation. When `safe_to_clear` is `true`, remove the bucket's `encryption` block, and apply with `--confirm-key-removal` and the old key id, as in step 5 of the rotation. The bucket then uses the encryption of its backend again.
 
-## Two questions that come up
+## Questions that come up
 
 **What if I lose only the `legacy_key` after I clear it?** Nothing changes. This is the same state as "the shim was never set". If the re-encrypt job already rewrote everything, no object references the old generation, and nothing is lost. If some objects still do, those objects are unrecoverable, like after any other key loss.
+
+**What if I rotate a key while a bucket is still being converted to encryption?** The conversion goes on. The conversion window of the bucket is sealed under a key of the bucket, and the proxy opens it with any key of the bucket's keyring, so the old key in `legacy_key` keeps the window open. The rotation does not open a new window and does not move the cutoff. The running re-encrypt job takes the new key from its next page on, so the objects that it converts after the rotation use the new key. Run the job once more after the conversion closed, so that it rewrites the objects that it converted under the old key. Clear the old key only after that run, as in step 4 of recipe A.
 
 **How do I audit who decrypts?** Under SSE-KMS, turn on CloudTrail for the KMS key. Every `Decrypt` and `GenerateDataKey` request logs the principal, the IP address and the time. Proxy-side AES has no equivalent. The key never leaves the proxy, so there is no event for each decrypt, and only the access logs of the proxy exist.
 

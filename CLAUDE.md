@@ -101,7 +101,14 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                              header + 64 KiB GCM frames, exact stored_len, AES-GCM-SIV listing tokens; pure), seal.rs = sealed metadata
                              (`dg-sealed`: facts bound to bucket/folder/variant/name, no hashes in clear, identity tokens, stored marker
                              `aes-256-gcm-chunked-v1` on purpose so older releases fail closed), the keyring by fingerprint and THE read rule
-                             (unsealed objects only where the bucket writes plaintext or `plaintext_reads: serve`); mod.rs = the wrapper (`witness.rs` = the
+                             `seal::read_verdict` (pure, two readers): unsealed objects serve where the bucket writes plaintext; in a bucket
+                             that encrypts, a CLIENT gets one only while the conversion window is open AND the backend's own
+                             `stored_last_modified` < cutoff + 300 s (missing = refuse); the re-encrypt JOB reads all (scope opened only by
+                             `ConversionReadProof`, made in maintenance::worker) and post-cutoff ones are `adopted_after_cutoff`.
+                             conversion.rs = the marker (`.dg/facts/!!conversion` / `.dg-conversion`: AES-GCM-SIV seal of cutoff/deadline/run,
+                             AD = storage identity; written by identity with If-Match; 60 s window cache); the apply opens it
+                             (`api/admin/config/conversion_start.rs`), the job extends/closes it (`maintenance/conversion.rs`, optional
+                             `purge-versions` phase). `plaintext_reads: serve` is deprecated (honoured one release, warns); mod.rs = the wrapper (`witness.rs` = the
                              witness gate): every metadata-returning method presents, raw metadata never leaves it (source guards
                              `the_seal_key_is_named_only_where_a_sealed_shape_is_handled`, `no_v1_encryption_format_remains`). S3 lists
                              logical facts of sealed objects from `!!2` tokens (`FileMetadata::listing_token` → `put` path; in-process
@@ -112,7 +119,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                              (inline or by the bounded background healer). The read rule
                              gates GET/HEAD/copy/range only: a LIST shows an entry whose seal does not open as stored
                              (`FileMetadata::is_unopened_seal`, never cached), a DELETE removes it (`resolve_forms_to_delete`),
-                             and boot warns about plaintext in a `refuse` bucket (`startup::spawn_plaintext_refusal_check`)
+                             and boot warns about plaintext in an encrypting bucket with no open window (`startup::spawn_plaintext_refusal_check`)
   → storage/routing.rs      Multi-backend routing (virtual bucket → real backend)
   → glob_filter.rs          THE include/exclude glob matcher of replication, lifecycle and Slack (`compile`, `verdict`, `in_scope`; a glob matches the whole key from the bucket root, `*` crosses `/`, exclude wins). A replication rule's filters bound its copies, its mirror deletes (walk + event consumer, via `planner::dest_key_in_scope`) AND Verify; `POST /jobs/filter-preview` (api/admin/filter_preview.rs) runs it on a sample for the editor's Which-objects preview
   → security.rs             Pure security primitives (validate_bucket_name, bucket_name_is_ip_like, outbound-URL SSRF policy) — unit + proptest, shared by CLI URL parser

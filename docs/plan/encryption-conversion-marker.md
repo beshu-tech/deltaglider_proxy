@@ -1,8 +1,9 @@
 # Plan: replace `plaintext_reads: serve` with a conversion marker
 
-Status: v2 (2026-10-31), after two adversarial reviews (Fable, DeepSeek V4.1
-Flash). Section "Review log" at the end lists every finding and what v2 did
-with it.
+Status: implemented (2026-10-31). Design v2, after two adversarial reviews
+(Fable, DeepSeek V4.1 Flash). Section "As built" lists the deviations from
+v2; section "Review log" at the end lists every finding and what v2 did with
+it.
 
 ## Goal
 
@@ -229,6 +230,71 @@ encryption_test, maintenance_reencrypt_test).
 | P6b | Optional purge of noncurrent plaintext versions | MinIO versioned-bucket test |
 | P7 | Docs (threat model incl. honest limits, encryption reference, how-tos), CHANGELOG | docs checks |
 | P8 (separate plan) | Drop the write gate: conditional `put_passthrough` + CAS probe; non-CAS keeps the gate | race test: a client overwrite during a rewrite is never lost |
+
+## As built
+
+Phases P1-P7 and P6b are on `main` (P7 = the product docs and the
+CHANGELOG). P8 (drop the write gate) is not done: the re-encrypt job still
+arms the write gate. Deviations from v2, from the commits:
+
+- **Filesystem marker.** The file `.dg-conversion` in the bucket directory,
+  beside `.dg-key-claim`; no client key reaches it (object keys map under
+  `deltaspaces/`). The key claim and the marker share one small-object CAS
+  helper (`s3/claim.rs`), which reads at most 4 KiB.
+- **Seal key.** Derived from the site key (`v2::SiteKey::seal_conversion`),
+  AES-256-GCM-SIV; body `dgc1.` hex(fp) `.` b64url(nonce | seal).
+- **Trait shape.** `read_conversion_marker` / `write_conversion_marker`
+  (raw I/O) plus one `conversion(bucket, ConversionOp)` (status, open,
+  extend, close, as-built open/close, cached status), no defaults.
+  Identity writes retry 3 times; outcomes Done / Absent / NotOurs / Blocked.
+- **Window length.** Fixed at 7 days (`DEFAULT_WINDOW_SECS`); no config
+  field. The internal open takes 1 to 365 days. A resume sets
+  `max(deadline, server_now + 7 days)`, also on an expired marker.
+- **As-built open/close skip the witness gate.** The apply is how a
+  disagreeing node converges, and the marker is sealed with the new key.
+  The apply opens with the config the new engine is BUILT with
+  (`OpenAsBuilt`); a later `commit_iam` or held-commit/persist rollback
+  removes the markers that the write created (`CloseAsBuilt`, by identity).
+- **Cache.** 60 s per bucket; it keeps the marker's fields also past the
+  deadline, for the UI's "stopped" state. This node's apply, job and
+  Resume write through it. The admin bucket list reads through it
+  (`ConversionOp::CachedStatus`), not a backend GET per bucket per list.
+  The refresh after a refusal runs at most once per 5 s per bucket.
+- **Apply rule.** `starts_conversion` (pure): after = proxy key without
+  serve; before = anything a client could read plaintext in (plaintext,
+  native SSE, proxy mode without a key) or a key WITH serve. So an apply
+  that SETS serve starts no conversion (old behaviour kept), and removing
+  serve (UI **Convert now**) starts one. Backup restore starts
+  conversions too.
+- **Validate count.** Capped at 10,000 objects (`more: true` beyond). The
+  section validate names the list `conversion_preview`; the document
+  validate (`POST /config/validate`) names the same list `conversions`.
+- **Versioning.** `StorageBackend::bucket_versioning` (S3
+  `GetBucketVersioning`, Enabled or Suspended).
+- **Admin endpoint.** `POST /jobs/reencrypt` takes `open_window: true`
+  (helper `maintenance::conversion::open_window`); the boot check names it
+  in its warning and skips buckets with an open window.
+- **Job.** 8 objects of a page at once (other maintenance kinds stay at 4).
+  `close_blocked` is a failure-ring row under the marker key and settles
+  the run with an error. `encryption_marker_ignored` is rate-limited to
+  once per 10 min per bucket.
+- **Purge (P6b).** The rule is "noncurrent versions without
+  `dg-encrypted`, of keys whose current object is encrypted in every
+  stored form (object, delta, reference); never a current or encrypted
+  version, never `.dg/facts/`", NOT an in-memory list of the keys that the
+  run converted, so it survives a crash-resume (cursor + count saved per
+  page). An object key needs a current form (a client-deleted object keeps
+  its history); a `reference.bin` is internal, so its plaintext history
+  goes also when the reference was removed (no current plaintext one). It runs only when `objects_failed == 0`. Enabled per job: the
+  job's `params` JSON (`ReencryptParams`), set by
+  `purge_plaintext_versions` on `POST /jobs/reencrypt`, by the request
+  header `X-DGP-Purge-Plaintext-Versions: true` on a config write (only
+  for versioned buckets), and by the UI dialog's box. Audit
+  `encryption_conversion_versions_purged` per page with deletions.
+- **UI.** No path writes `plaintext_reads` any more; a key change on a
+  backend no longer copies `serve` forward. The conversion state sits on
+  the bucket card's "Now:" line and on the backend card's status block,
+  and the bucket list polls every 3 s while a conversion runs.
 
 ## Review log (v1 -> v2)
 

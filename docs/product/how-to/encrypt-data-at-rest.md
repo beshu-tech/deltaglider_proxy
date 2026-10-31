@@ -40,15 +40,19 @@ In the admin UI:
 
    ![The encryption editor of hetzner-fsn1 holds a generated key, which is hidden here; callout 4 marks Copy to clipboard, callout 5 marks the I have stored this key safely checkbox, and callout 6 marks Apply.](/_/screenshots/encrypt-key.webp)
 
-**Apply** sends a `storage` section update at once; it has no separate **Review & apply** step. New writes to the buckets of `hetzner-fsn1` that have no encryption block of their own are encrypted from this moment. A bucket with its own block keeps its own setting.
+7. When the buckets of `hetzner-fsn1` already hold objects, the dialog **Encrypt backend hetzner-fsn1?** opens. It says how many objects the buckets hold that are not encrypted yet, and that a re-encrypt job encrypts them in the background while they stay readable. For a bucket whose backend keeps old versions, the dialog also has the box **Also delete the old unencrypted versions**. Leave it clear, unless the old plaintext versions must go: the job then deletes them for good, and they cannot be restored ([details](../reference/encryption.md#old-versions-on-a-versioned-backend)). Click **Encrypt**.
 
-The objects that the buckets already hold stay plaintext. In a bucket that encrypts, the proxy refuses a plaintext object by default, because it cannot tell the history of the bucket from an object that someone planted on the backend ([why](../explanation/encryption-at-rest.md#why-enabling-isnt-retroactive)). When a backend starts to encrypt, the admin UI therefore also sets `plaintext_reads: serve`, so that the existing objects stay readable until a re-encrypt job converts them. [Section 6](#6-encrypt-the-objects-that-the-backend-already-holds) converts them and then turns `serve` off.
+   ![The dialog Encrypt backend hetzner-fsn1? says that 1,241 objects in releases and downloads are not encrypted yet and stay readable while a re-encrypt job encrypts them, and warns that the backend keeps old versions of releases; a box marks the unchecked Also delete the old unencrypted versions, and the arrow points at Encrypt.](/_/screenshots/encrypt-conversion-dialog.webp)
+
+**Apply** (or **Encrypt** in the dialog) sends a `storage` section update at once; it has no separate **Review & apply** step. New writes to the buckets of `hetzner-fsn1` that have no encryption block of their own are encrypted from this moment. A bucket with its own block keeps its own setting.
+
+The objects that the buckets already hold are still plaintext. In a bucket that encrypts, the proxy refuses a plaintext object, because it cannot tell the history of the bucket from an object that someone planted on the backend ([why](../explanation/encryption-at-rest.md#why-enabling-isnt-retroactive)). The apply therefore opens a *conversion window* for each bucket that holds objects, and it starts a re-encrypt job for each of these buckets. While the window is open, clients read the objects that the backend stored before the apply, and the job encrypts them. When the job converted every object, it closes the window. [Section 6](#6-encrypt-the-objects-that-the-backend-already-holds) shows how to follow the jobs.
 
 The proxy stores a key from the admin UI **in the config file, in plain text**, as the `key` field of the backend. The proxy writes the file with no access for other users (mode `0600` for a new file), and it never returns the key: `GET /_/api/admin/config/export` and the section reads leave it out, and a full backup keeps it in `secrets.json`. Anyone who can read the config file can still read the key. To keep the key out of the file, use an environment variable instead (section 4).
 
 ## The same change in YAML
 
-The steps above write this configuration into the `storage` section of `deltaglider_proxy.yaml` ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)). The key here is an example value; the file holds the key that the browser generated. The admin UI writes `plaintext_reads: serve` because the backend did not encrypt before:
+The steps above write this configuration into the `storage` section of `deltaglider_proxy.yaml` ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)). The key here is an example value; the file holds the key that the browser generated:
 
 ```yaml
 # validate
@@ -63,12 +67,21 @@ storage:
       encryption:
         mode: aes256-gcm-proxy
         key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef   # 64 hex characters
-        plaintext_reads: serve      # section 6 turns this off after the re-encrypt job
 ```
 
 After you edit the file, restart the proxy, or apply the file to the running proxy with `POST /_/api/admin/config/apply` or with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`.
 
-An apply that makes a backend with buckets start to encrypt without `plaintext_reads: serve` is refused, because the existing objects would become unreadable. When the buckets hold no plaintext that anyone needs, leave the line out and confirm instead: `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example --confirm-plaintext-refusal backend:hetzner-fsn1`, or the header `X-DGP-Confirm-Plaintext-Refusal: backend:hetzner-fsn1` with `POST /_/api/admin/config/apply`. A restart from an edited file runs no such check. Instead, the proxy samples the first 100 objects of each bucket that refuses plaintext after it starts. When one of them is not encrypted, the proxy logs a warning that names the bucket and the object, because every read of that object now fails.
+An apply of this file through `POST /_/api/admin/config/apply` or `config apply` does what the admin UI does: it opens the conversion window of each bucket that holds objects and starts its re-encrypt job. The response lists them in `conversions` ([admin API](../reference/admin-api.md#starting-a-conversion)). To make the jobs delete the old plaintext versions on a versioned backend, send the header `X-DGP-Purge-Plaintext-Versions: true` with `POST /_/api/admin/config/apply`. The apply is refused with `409` while another job, for example a migration, is active on one of the buckets.
+
+A restart from an edited file starts no conversion. After the restart, every read of an old object fails until you open the conversion yourself:
+
+```bash
+curl -b cookies.txt -X POST https://s3.acme.example/_/api/admin/jobs/reencrypt \
+  -H 'Content-Type: application/json' \
+  -d '{"buckets": ["releases", "downloads"], "open_window": true}'
+```
+
+The proxy also checks the first 100 objects of each such bucket after it starts. When one of them is not encrypted, it logs a warning that names the bucket, the object and this request. Apply the file to the running proxy instead of a restart, so that the old objects stay readable without a gap.
 
 ## 4. Or keep the key in an environment variable
 
@@ -104,7 +117,7 @@ storage:
         key_id: hetzner-2026-06    # optional: a stable name for this key generation
 ```
 
-Add `plaintext_reads: serve` to the block when the buckets of the backend already hold objects, as in the section above. `key_id` is the name under which the admin UI, the audit log and the jobs show the key. The objects store only a fingerprint of the key, not the id. When you leave `key_id` out, the id is `fp-` and the 16 hexadecimal characters of that fingerprint. A readable id helps later, when you rotate the key ([How to rotate or change encryption keys](rotate-encryption-keys.md)). While the variable is set, the encryption editor of the backend in the admin UI is read-only, and a note names the variable.
+A restart starts no conversion. When the buckets of the backend already hold objects, open their conversion right after the restart with the `open_window` request of the section above, because until then every read of an old object fails. `key_id` is the name under which the admin UI, the audit log and the jobs show the key. The objects store only a fingerprint of the key, not the id. When you leave `key_id` out, the id is `fp-` and the 16 hexadecimal characters of that fingerprint. A readable id helps later, when you rotate the key ([How to rotate or change encryption keys](rotate-encryption-keys.md)). While the variable is set, the encryption editor of the backend in the admin UI is read-only, and a note names the variable.
 
 ## 5. Or use SSE-KMS or SSE-S3 on AWS
 
@@ -154,46 +167,32 @@ The environment variable `DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID` overrides `kms_key_
 
 ## 6. Encrypt the objects that the backend already holds
 
-Encryption is **not retroactive**. The proxy encrypts only new writes, and the existing objects stay plaintext until a re-encrypt job rewrites them. While `plaintext_reads: serve` is set, the proxy trusts every plaintext object in these buckets as it is, and the re-encrypt job seals it as part of the bucket's history. Keep that window short.
+Encryption is **not retroactive**. The proxy encrypts only new writes, and the existing objects stay plaintext until a re-encrypt job rewrites them. When the apply of section 3 found objects in a bucket, it already started that job, and the conversion window keeps the old objects readable while the job runs. You follow the jobs, and you act only when a job stops.
 
 In the admin UI:
 
-1. After the **Apply** of section 3, the Backends page shows the dialog **Encrypt existing objects?**. Check the list of buckets. The dialog preselects only the buckets whose encryption changed. A bucket with its own encryption block is not listed, because a change of the backend does not change it.
-2. Click **Start now**. The proxy starts one re-encrypt job for each selected bucket.
+1. In the sidebar, open **Storage → Backends** (`/_/admin/storage/backends`). Under the counts of `hetzner-fsn1`, the card shows one line for each bucket that the job converts, for example "Encrypting the existing objects, 42%." The line of a bucket goes away when its job converted every object and closed the window.
+2. To see the job of a bucket, click **View run** on its line. The job opens on **Storage → Jobs**. While the job runs, writes to the bucket get `503 SlowDown`, and reads pass. The job survives restarts.
+3. When a line says that the encryption of the existing objects stopped with failures, open the **Failures** tab of the run, fix the cause, and click **Resume** on the line. The window stays open until the job converted every object, and **Resume** gives it a new deadline of 7 days.
+4. When a line names objects stored after the cutoff, click it. The run's **Failures** tab lists these objects. The job converted them, but clients could not read them before, because the backend stored them after the conversion started. Check that each of them is an object that you expect, for example an upload from an instance that did not encrypt yet. An object that nobody wrote through the proxy can be an object that someone planted on the backend.
 
-   ![After the apply, the dialog Encrypt existing objects? lists the buckets of hetzner-fsn1; the arrow points at Start now.](/_/screenshots/encrypt-reencrypt-proposal.webp)
-
-   If you click **Later**, start the jobs when you are ready from **Storage → Jobs** with **New job** → **Re-encrypt buckets… — one-off rewrite**. While the job of a bucket runs, writes to that bucket get `503 SlowDown`, and reads pass. The job survives restarts.
-
-3. Open **Storage → Jobs** (`/_/admin/jobs`), and wait until every re-encrypt job shows `succeeded`, with no rows on its **Failures** tab. To see only these jobs, select **Re-encrypt** in **Every kind**.
-4. Back on **Storage → Backends**, the encryption editor of `hetzner-fsn1` shows the box **Unencrypted objects are served**. Click **Refuse unencrypted objects**. From now on, the proxy refuses every object in these buckets that it did not encrypt.
+The same lines show on **Storage → Buckets**, in the state line of each bucket. When a line says that the conversion stopped before it finished, the window passed its deadline: reads of the objects that are not encrypted yet fail. Click **Resume** to open the window again and to continue the job. A resume keeps the original cutoff, so it never serves an object that the backend stored after the first apply.
 
 The re-encrypt job does not handle the SSE modes: on an SSE-KMS or SSE-S3 backend, use the migrate job ([recipe C](rotate-encryption-keys.md#recipe-c-migrate-from-proxy-aes-to-sse-kms)). [How to rotate or change encryption keys](rotate-encryption-keys.md) explains the mechanics of the job.
 
-### The same change in YAML
+### The same steps with the admin API
 
-Step 4 removes `plaintext_reads: serve` from the backend's block (the default is `refuse`), so the block is the one of section 4 again ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)):
+The conversion is not configuration, so it has no YAML. The bucket list shows its state in `effective_encryption.conversion` ([admin API](../reference/admin-api.md#backends)):
 
-```yaml
-# validate
-storage:
-  default_backend: hetzner-fsn1
-  backends:
-    - name: hetzner-fsn1
-      type: s3
-      endpoint: https://fsn1.your-objectstorage.com
-      region: fsn1
-      force_path_style: true
-      encryption:
-        mode: aes256-gcm-proxy
-        key_id: hetzner-2026-06
+```bash
+curl -b cookies.txt https://s3.acme.example/_/api/admin/buckets
 ```
 
-Remove the line only after every job succeeded, and apply the file with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`. The jobs themselves are not configuration: start them in the admin UI or with the admin API:
+**Resume** is the same request as a new job for the bucket. The job extends the window by itself:
 
 ```bash
 curl -b cookies.txt -X POST https://s3.acme.example/_/api/admin/jobs/reencrypt \
-  -H 'Content-Type: application/json' -d '{"buckets": ["releases", "downloads"]}'
+  -H 'Content-Type: application/json' -d '{"buckets": ["releases"]}'
 ```
 
 ## Verify
@@ -220,8 +219,8 @@ curl -b cookies.txt -X POST https://s3.acme.example/_/api/admin/jobs/reencrypt \
 
    The SSE modes stamp `dg-encrypted-native: sse-kms` (or `sse-s3`) instead. That marker is harmless to expose.
 
-4. If you converted existing objects (section 6), check that each re-encrypt job on **Storage → Jobs** shows `succeeded`, and that an *old* object on the raw backend now carries `dg-sealed` too.
-5. Check that the backend no longer serves unencrypted objects: the box **Unencrypted objects are served** is gone, and `GET /_/api/admin/backends` shows `"serves_plaintext": false` in the `encryption` summary of `hetzner-fsn1`. Then read an old object through the proxy. It must read without an error. An error that says that the object "is not encrypted, but the bucket encrypts" means that the job did not convert it ([troubleshooting](troubleshooting.md#encryption-at-rest-symptoms-and-fixes)).
+4. If the buckets held objects (section 6), check that each re-encrypt job on **Storage → Jobs** shows `succeeded`, and that an *old* object on the raw backend now carries `dg-sealed` too.
+5. Check that the conversions are closed: the card of `hetzner-fsn1` shows no conversion line, and `GET /_/api/admin/buckets` shows no `conversion` in the `effective_encryption` of `releases` and `downloads`. Then read an old object through the proxy. It must read without an error. An error that says that the object "is not encrypted, but the bucket encrypts" means that the job did not convert it ([troubleshooting](troubleshooting.md#encryption-at-rest-symptoms-and-fixes)).
 6. Check that the key is stored somewhere safe **outside** the proxy host.
 
 ## Related

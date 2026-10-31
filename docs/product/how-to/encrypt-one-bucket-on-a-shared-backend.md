@@ -26,31 +26,29 @@ In the admin UI:
 
    ![The key setup of db-archive with the generated key hidden; callout 5 marks the Key id field, a box marks Download key file (step 6), callout 7 marks the field for the last 6 characters, and callout 8 marks Review & apply.](/_/screenshots/bucket-encryption-key.webp)
 
-9. Read the dialog, check the diff, and then click **Apply and Persist**. The dialog says that only new writes change. For a bucket that did not encrypt before, it also says that the proxy keeps serving the objects that are already in the bucket until the re-encrypt job converts them. It also says that the re-encrypt job, which the page offers next, gives the bucket a temporary `503` for uploads and deletes while it runs.
+9. Read the dialog, check the diff, and then click **Apply and Persist**. When `db-archive` already holds objects, the dialog says how many of them are not encrypted yet, and that a re-encrypt job encrypts them in the background while they stay readable. It also says that the job gives the bucket a temporary `503` for uploads and deletes while it runs. When the backend keeps old versions of the bucket, the dialog warns that their plaintext versions stay on the backend, and it has the box **Also delete the old unencrypted versions**. Leave the box clear, unless the old plaintext versions must go: the job then deletes them for good, and they cannot be restored ([details](../reference/encryption.md#old-versions-on-a-versioned-backend)).
+
+   ![The apply dialog of db-archive says that its 412 objects are not encrypted yet and stay readable while a re-encrypt job encrypts them, and warns that the backend keeps old versions; a box marks the unchecked Also delete the old unencrypted versions, and the arrow points at Apply and Persist.](/_/screenshots/bucket-encryption-conversion.webp)
 
 The change applies at once, with its own request. It is not staged with the other fields of the bucket, so the **Encryption** group waits while the page has unsaved changes: apply or discard them first. When the bucket has no explicit backend yet, the page also sets `backend: hetzner-fsn1`, because a bucket's own block belongs to the storage that holds the bucket, and the server refuses a block without a backend when named backends exist.
 
-The objects that `db-archive` already holds are plaintext, because `hetzner-fsn1` does not encrypt. In a bucket that encrypts, the proxy refuses a plaintext object by default, because it cannot tell the history of the bucket from an object that someone planted on the backend ([why](../explanation/encryption-at-rest.md#why-enabling-isnt-retroactive)). For a bucket that did not encrypt before, the page therefore also sets `plaintext_reads: serve` in the bucket's block, so that the existing objects stay readable until section 2 converts them.
+The objects that `db-archive` already holds are plaintext, because `hetzner-fsn1` does not encrypt. In a bucket that encrypts, the proxy refuses a plaintext object, because it cannot tell the history of the bucket from an object that someone planted on the backend ([why](../explanation/encryption-at-rest.md#why-enabling-isnt-retroactive)). The apply therefore opens a *conversion window* for `db-archive` and starts its re-encrypt job. While the window is open, clients read the objects that the backend stored before the apply. Section 2 shows how to follow the job.
 
 When you apply here, the proxy writes the key into the config file, in plain text, in the `key` field of the bucket. The key setup shows the YAML and the environment variable that keep the key out of the file (see the next section).
 
 ## 2. Encrypt the objects that the bucket already holds
 
-The new key encrypts new writes only. The objects that `db-archive` already holds stay in the form that they were written in. An object that the backend key encrypted stays readable, because the keyring of the backend holds that key. A plaintext object stays readable while the bucket's block has `plaintext_reads: serve`, and the re-encrypt job encrypts it.
+The new key encrypts new writes only. The objects that `db-archive` already holds stay in the form that they were written in until the re-encrypt job rewrites them. An object that the backend key encrypted stays readable, because the keyring of the backend holds that key. A plaintext object stays readable while the conversion window of the bucket is open. The apply of section 1 already started the job, so you follow it, and you act only when it stops.
 
 In the admin UI:
 
-1. After the apply, the page asks **Encrypt existing objects?** and lists `db-archive` only. The other buckets on `hetzner-fsn1` are not listed, because their encryption did not change. Check that `db-archive` is selected.
-2. Click **Start now**. The proxy starts a re-encrypt job for the bucket.
+1. On **Storage → Buckets**, the state line of `db-archive` continues with the progress of the job, for example "Now: Encrypted · bucket key db-archive-2026-10 · encrypting the existing objects, 42%". The other buckets on `hetzner-fsn1` are not affected. While the job runs, reads of `db-archive` work, and uploads and deletes get `503 SlowDown`, which S3 clients retry.
+2. To see the job, click **View run** in that line. The job opens on **Storage → Jobs**.
+3. When the job converted every object, it closes the window, and the progress goes away from the state line.
+4. When the line says that the encryption of the existing objects stopped with failures, open the **Failures** tab of the run, fix the cause, and click **Resume** in the line. When the line says that the conversion stopped before it finished, the window passed its deadline of 7 days, and reads of the objects that are not encrypted yet fail. Click **Resume** in that case too: it opens the window again with a new deadline and continues the job.
+5. When the line names objects stored after the cutoff, click it. The run's **Failures** tab lists objects that the backend stored after the apply without encryption. Clients could not read them, and the job converted them. Check that each of them is an object that you expect. An object that nobody wrote through the proxy can be an object that someone planted on the backend.
 
-   ![The dialog Encrypt existing objects? lists only db-archive; the arrow points at Start now.](/_/screenshots/bucket-encryption-reencrypt.webp)
-
-   While the job runs, reads of `db-archive` work, and uploads and deletes get `503 SlowDown`, which S3 clients retry. The other buckets on the backend are not affected. If you click **Later**, start the job when you are ready with **Re-encrypt existing objects** in the open bucket row, or from **Storage → Jobs**.
-
-3. Open **Storage → Jobs** (`/_/admin/jobs`), and wait until the re-encrypt job of `db-archive` shows `succeeded`, with no rows on its **Failures** tab.
-4. On **Storage → Buckets**, open the `db-archive` row. The **Encryption** group shows the box **Unencrypted objects are served**. Click **Refuse unencrypted objects**. From now on, the proxy refuses every object in `db-archive` that it did not encrypt.
-
-While `plaintext_reads: serve` is set, the proxy trusts every plaintext object in the bucket as it is, and the job seals it as part of the bucket's history. Keep that window short.
+The conversion is not configuration, so this section has no YAML. **Resume** is the same request as a new job for the bucket, and the job extends the window by itself: `POST /_/api/admin/jobs/reencrypt` with `{"buckets": ["db-archive"]}`.
 
 ## 3. Create a bucket that is encrypted from its first object
 
@@ -90,16 +88,13 @@ storage:
         mode: aes256-gcm-proxy
         key_id: db-archive-2026-10
         key: ${env:DB_ARCHIVE_ENCRYPTION_KEY}
-        plaintext_reads: serve      # step 4 of section 2 removes this line
 ```
-
-The admin UI writes `plaintext_reads: serve` because the bucket did not encrypt before. **Refuse unencrypted objects** in section 2 removes the line again (the default is `refuse`). Remove it in the file only when the re-encrypt job of the bucket succeeded.
-
-An apply that makes an existing bucket start to encrypt without `plaintext_reads: serve` is refused, because its plaintext objects would become unreadable. When the bucket holds no plaintext that anyone needs, leave the line out and confirm instead: `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example --confirm-plaintext-refusal db-archive`, or the header `X-DGP-Confirm-Plaintext-Refusal: db-archive` with `POST /_/api/admin/config/apply`. A bucket that the create dialog of section 3 makes needs neither, because it holds no objects.
 
 Set the variable in the environment of the proxy, for example `DB_ARCHIVE_ENCRYPTION_KEY=<64 hexadecimal characters>`. While the key comes from a variable, the **Encryption** group of the bucket is read-only and shows a **from env DB_ARCHIVE_ENCRYPTION_KEY** badge: change the key in the deployment, not in the admin UI.
 
-After you edit the file, restart the proxy, or apply the file to the running proxy with `POST /_/api/admin/config/apply` or with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`. The apply response has a warning for `db-archive` that names the re-encrypt job.
+After you edit the file, apply it to the running proxy with `POST /_/api/admin/config/apply` or with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`. The apply does what the admin UI does: it opens the conversion window of `db-archive` and starts its re-encrypt job, and its response lists the bucket in `conversions` ([admin API](../reference/admin-api.md#starting-a-conversion)). On a backend that keeps old versions, the header `X-DGP-Purge-Plaintext-Versions: true` with `POST /_/api/admin/config/apply` makes the job delete the old plaintext versions. The apply is refused with `409` while another job, for example a migration, is active on the bucket.
+
+A restart from the edited file starts no conversion, so after the restart every read of an old object of `db-archive` fails. Open the conversion yourself right after the restart with `POST /_/api/admin/jobs/reencrypt` and `{"buckets": ["db-archive"], "open_window": true}`. A bucket that the create dialog of section 3 makes needs no conversion, because it holds no objects.
 
 ## Rotate the bucket key, turn it off, and clear the old key
 
@@ -164,7 +159,7 @@ A proxy with its own configuration, which shares no sync bucket with these insta
    An object in `downloads` has no `dg-encrypted` marker and no `dg-sealed` value.
 
 4. Read the object back through the proxy, and compare its hash with the original file. Clients notice nothing.
-5. Check that `db-archive` no longer serves unencrypted objects: the box **Unencrypted objects are served** is gone from its **Encryption** group, and `GET /_/api/admin/buckets` shows `"serves_plaintext": false` in its `effective_encryption`. Then read an old object through the proxy again.
+5. Check that the conversion of `db-archive` is closed: its state line shows no progress, and `GET /_/api/admin/buckets` shows no `conversion` in its `effective_encryption`. Then read an old object through the proxy again. It must read without an error.
 
 ## Related
 

@@ -127,6 +127,17 @@ async function aesKeyReady(page: Page): Promise<void> {
 /** The generated key is random: paint over it so the images stay stable. */
 const KEY_MASK: Target = { css: 'textarea[readonly]' };
 
+/**
+ * Behind a dialog a mask would paint over the dialog's edge: show the docs'
+ * example key in the field instead (display only; the page already read
+ * the real key).
+ */
+async function exampleKeyShown(page: Page): Promise<void> {
+  await page.locator('textarea[readonly]').evaluate((el) => {
+    (el as HTMLTextAreaElement).value = '0123456789abcdef'.repeat(4);
+  });
+}
+
 export const ENCRYPTION_SHOTS: Shot[] = [
   {
     id: 'encrypt-mode-select',
@@ -157,18 +168,30 @@ export const ENCRYPTION_SHOTS: Shot[] = [
     ],
   },
   {
-    id: 'encrypt-reencrypt-proposal',
+    id: 'encrypt-conversion-dialog',
     route: '/_/admin/storage/backends',
-    alt: 'After the apply, the dialog Encrypt existing objects? lists the buckets of hetzner-fsn1; the arrow points at Start now.',
+    alt: 'The dialog Encrypt backend hetzner-fsn1? says that 1,241 objects in releases and downloads are not encrypted yet and stay readable while a re-encrypt job encrypts them, and warns that the backend keeps old versions of releases; a box marks the unchecked Also delete the old unencrypted versions, and the arrow points at Encrypt.',
     setup: async (page) => {
       await stubStoragePut(page);
-      // After the stub: the latest route sees the PUT first.
-      await hetznerBucketsAfterApply(page, null, 'hetzner-2026-06');
+      // The seed's buckets are empty: the validate names the example's.
+      await fakeJson(page, `${STORAGE}/validate`, 'POST', {
+        ok: true,
+        warnings: [],
+        conversion_preview: [
+          { bucket: 'downloads', objects: 37, more: false, versioned: false },
+          { bucket: 'releases', objects: 1204, more: false, versioned: true },
+        ],
+      });
       await aesKeyReady(page);
       await page.getByTestId('encryption-apply').click();
-      await page.getByRole('button', { name: /^Start now/ }).waitFor();
+      await page.getByTestId('conversion-purge').waitFor();
+      await exampleKeyShown(page);
+      await page.mouse.move(1, 1);
     },
-    annotations: [{ target: { role: 'button', name: /^Start now/ }, kind: 'arrow', side: 'bottom' }],
+    annotations: [
+      { target: { testId: 'conversion-purge' }, kind: 'box' },
+      { target: { role: 'button', name: 'Encrypt', exact: true }, kind: 'arrow', side: 'bottom' },
+    ],
   },
   {
     id: 'encrypt-kms',
@@ -355,28 +378,27 @@ export const BUCKET_ENCRYPTION_SHOTS: Shot[] = [
     ],
   },
   {
-    id: 'bucket-encryption-reencrypt',
+    id: 'bucket-encryption-conversion',
     route: '/_/admin/storage/buckets',
-    alt: 'The dialog Encrypt existing objects? lists only db-archive; the arrow points at Start now.',
+    alt: 'The apply dialog of db-archive says that its 412 objects are not encrypted yet and stay readable while a re-encrypt job encrypts them, and warns that the backend keeps old versions; a box marks the unchecked Also delete the old unencrypted versions, and the arrow points at Apply and Persist.',
     setup: async (page) => {
-      let applied = false;
       await fakeJson(page, VALIDATE, 'POST', {
         ok: true,
         warnings: [],
         diff: { storage: { 'buckets.db-archive.encryption.mode': { before: null, after: 'aes256-gcm-proxy' } } },
+        conversion_preview: [{ bucket: 'db-archive', objects: 412, more: false, versioned: true }],
       });
-      await page.route(path(STORAGE), async (route: Route) => {
-        if (route.request().method() !== 'PUT') return route.fallback();
-        applied = true;
-        await route.fulfill({ json: { ok: true, warnings: [], requires_restart: false } });
-      });
-      await exampleOrigins(page, () => applied);
+      await exampleOrigins(page);
       await bucketKeyReady(page);
       await page.getByRole('button', { name: 'Review & apply' }).click();
-      await page.getByRole('button', { name: /Apply and persist/i }).click();
-      await page.getByRole('button', { name: /^Start now/ }).waitFor();
+      await page.getByTestId('conversion-purge').waitFor();
+      await exampleKeyShown(page);
+      await page.mouse.move(1, 1);
     },
-    annotations: [{ target: { role: 'button', name: /^Start now/ }, kind: 'arrow', side: 'bottom' }],
+    annotations: [
+      { target: { testId: 'conversion-purge' }, kind: 'box' },
+      { target: { testId: 'apply-dialog-confirm' }, kind: 'arrow', side: 'bottom' },
+    ],
   },
   {
     id: 'create-bucket-encryption',

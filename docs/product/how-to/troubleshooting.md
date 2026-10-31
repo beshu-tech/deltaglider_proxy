@@ -210,9 +210,49 @@ Restore the old key as `legacy_key`, with any `legacy_key_id`, so that the objec
 
 ### Reads return 500 with "is not encrypted, but the bucket encrypts"
 
-The full message is "object '…' in bucket '…' is not encrypted, but the bucket encrypts: the proxy refuses it, because a writer with access to the backend could have planted it". The bucket encrypts, and the object has no encryption at all. Usually it is an object that the bucket held before it started to encrypt, or an object that a tool wrote to the backend directly, around the proxy.
+The full message is "object '…' in bucket '…' is not encrypted, but the bucket encrypts: the proxy refuses it, because a writer with access to the backend could have planted it (for example another proxy that does not have the bucket's key). Plaintext is served only while a conversion of the bucket is open, and only for objects that the backend stored before the conversion's cutoff: this object is newer, or no conversion is open. A re-encrypt job converts it." The bucket encrypts, and the object has no encryption at all. The counter `deltaglider_plaintext_reads_total{outcome="refused"}` counts these reads.
 
-If the object is part of the bucket's history, set `plaintext_reads: serve` in the `encryption` block of the bucket or of its backend, run the re-encrypt job for the bucket, and remove `plaintext_reads: serve` when the job succeeded ([How to encrypt data at rest](encrypt-data-at-rest.md#6-encrypt-the-objects-that-the-backend-already-holds)). If you did not expect a plaintext object in the bucket, treat it as a sign that someone writes to the backend around the proxy.
+A bucket that encrypts serves an object without encryption only while its conversion window is open, and only when the backend stored the object before the cutoff of the conversion, plus 300 seconds ([the read rule](../reference/encryption.md#the-read-rule)). To find out which case applies, look at `effective_encryption.conversion` of the bucket in `GET /_/api/admin/buckets`, or at the state line of the bucket on **Storage → Buckets**:
+
+- **No `conversion`.** The bucket has no conversion window. This happens when the bucket started to encrypt through a restart from an edited file, which starts no conversion, or when the conversion closed while plaintext objects were left. Open a window and start the job: `POST /_/api/admin/jobs/reencrypt` with `{"buckets": ["<bucket>"], "open_window": true}`. The cutoff of the new window is the time of this request, so it serves every plaintext object that is in the bucket now.
+- **`"open": false` with a `run`.** The deadline of the window passed before the job finished: the conversion stopped. The state line says "The conversion stopped before it finished". Click **Resume**, or send `POST /_/api/admin/jobs/reencrypt` with `{"buckets": ["<bucket>"]}`. The resume gives the window a new deadline and keeps its original cutoff.
+- **`"open": true`.** The window is open, so the backend stored this object after the cutoff, or it names no stored time for it. Clients cannot read such an object, but the re-encrypt job converts it and lists it as adopted after the cutoff (see below). After the job converted it, the object reads again.
+
+If you did not expect a plaintext object in the bucket, treat it as a sign that someone writes to the backend around the proxy. Two common sources are an instance that still runs a configuration without the encryption of the bucket, and a tool that writes to the backend directly.
+
+### The re-encrypt job lists objects "stored after the cutoff"
+
+The state line of the bucket names objects stored after the cutoff, and the **Failures** tab of the run has rows that start with `adopted_after_cutoff`. The run summary says, for example, "3 object(s) adopted after the conversion's cutoff in this run". These rows are information, not failures: the job converted these objects. Clients could not read them before the conversion, because the backend stored them after the cutoff without encryption.
+
+Check each object. An upload from an instance that did not encrypt the bucket yet is expected. An object that nobody wrote, through the proxy or another tool, can be an object that someone planted on the backend. After the job, such an object carries a valid seal like every other object, so delete it if you do not trust it.
+
+### A conversion stopped with failures
+
+The state line of the bucket says "The encryption of the existing objects stopped with failures; they stay readable until the window closes", and the run settled with errors. The job could not rewrite some objects (rows that start with `rewrite_failed` on the **Failures** tab of the run). The window stays open, so clients still read the plaintext history, but only until its deadline. Fix the cause that the rows name, for example a backend that did not answer, and then click **Resume** (`POST /_/api/admin/jobs/reencrypt` with `{"buckets": ["<bucket>"]}`). The job continues from its cursor, extends the deadline, and closes the window when it converted every object.
+
+When the state line says "Not every existing object is encrypted, and no job runs on this instance", no job of the bucket runs on this instance. The apply could not queue the job, or the job ran on another instance. Click **Resume** to run it here.
+
+### The re-encrypt job ends with "the job did not close it"
+
+The run settled with an error, the **Failures** tab has a row for `.dg/facts/!!conversion`, and the audit log has `encryption_conversion_close_blocked`. The message is one of these:
+
+- "the conversion marker does not open here or is another run's, so the job did not close it": the marker of the bucket does not open with a key of this instance, for example because another proxy with another key wrote it, or because someone changed it on the backend.
+- "the conversion marker (run …) changed while the job ran (…), so the job did not close it": another write replaced the marker during the run.
+- "the conversion marker (run …) could not be closed: …": the backend refused the delete.
+
+The job converted the objects. Only the window stays as it is. Check which instance or tool writes to the bucket. When the marker belongs to this instance again, run the job once more, and it closes the window.
+
+### An apply is refused with 409: "has an active … job"
+
+The full message is "bucket '…' has an active reencrypt job (maintenance:…, running). This change makes the bucket encrypt, and the conversion of its plaintext history needs a re-encrypt job of its own. Wait for the job to finish, or cancel it, then apply again". The change makes a bucket that holds objects start to encrypt, and another job (a re-encryption, a migration or a metadata backfill) holds the bucket. A delete job does not count. Wait until the job named in the message ends on **Storage → Jobs**, or cancel it, and then apply again.
+
+### A metadata backfill is refused with 409: "is being converted to encryption"
+
+The bucket holds a conversion marker. A backfill would give its plaintext objects a new stored time after the cutoff, and clients could then no longer read them. Let the re-encrypt job finish and close the window, and then start the backfill.
+
+### The log warns that "`encryption.plaintext_reads: serve` is deprecated"
+
+The configuration still sets `plaintext_reads: serve` on a backend or a bucket. This release honours it: reads serve every object that is not encrypted, also one that someone put directly on the storage. The next release refuses the field. Remove the line. In the admin UI, click **Convert now** in the box **Unencrypted objects are served (deprecated setting)** on the backend card or the bucket card. The write that removes the line opens a conversion window and starts the re-encrypt job, so the plaintext history stays readable while the job converts it. See [How to upgrade](upgrade.md).
 
 ### Reads return 500 with "carries an encryption marker but no valid sealed metadata"
 
@@ -235,10 +275,6 @@ The body of the object was cut, extended, changed or replaced on the backend, or
 ### Reads return 500 with "the object body is proxy-encrypted but its metadata names no encryption"
 
 The object body starts with a `DGE` magic (proxy-AES ciphertext), but its metadata has no encryption marker. This is the typical sign of a backup/restore round-trip that preserved file contents but dropped extended attributes. On filesystem backends, per-object metadata lives in the `user.dg.metadata` xattr; older `rsync` without `-X` and some S3 sync tools strip it. Re-run the backup with xattr support. See [How to back up and restore](back-up-and-restore.md).
-
-### An apply is refused with "this change makes … encrypt, but the objects stored there before are plaintext"
-
-The apply makes an existing bucket, or the buckets of a backend, start to encrypt in `aes256-gcm-proxy` mode with `plaintext_reads: refuse`. The proxy would then refuse every object that the bucket held before. Add `plaintext_reads: serve` to the `encryption` block, run the re-encrypt job, and set the field back to `refuse` when the job succeeded ([How to encrypt data at rest](encrypt-data-at-rest.md#6-encrypt-the-objects-that-the-backend-already-holds)). When the subject holds no plaintext that anyone needs, confirm it instead with the header `X-DGP-Confirm-Plaintext-Refusal: <subject>` or `config apply --confirm-plaintext-refusal <subject>`. The admin UI sets `serve` by itself, so this refusal comes from the admin API or the CLI.
 
 ### Startup fails: "one key has two ids"
 

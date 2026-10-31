@@ -121,6 +121,15 @@ deltaglider_cache_miss_rate_ratio > 0.5     # cache thrashing
 
 A client listing of an S3-backed bucket costs one `list` request per page when the page holds deltas or ciphertext that this proxy did not write or read since it started. A `list` rate far above the client listing rate means that the index holds many old entries.
 
+## Encryption conversion
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_plaintext_reads_total` | Counter | `outcome` | Client reads of objects without encryption in buckets that encrypt. `served_in_window`: the conversion window of the bucket is open, and the backend stored the object before its cutoff, so the proxy served it as history. `refused`: the proxy refused the object |
+| `deltaglider_conversion_adopted_after_cutoff_total` | Counter | — | Objects without encryption that the re-encrypt job converted although clients could not read them, because the backend stored them after the cutoff of the conversion, or names no time for them |
+
+A `refused` rate above zero in a bucket that encrypts means that clients read objects that the proxy did not encrypt: the history of a bucket whose conversion is not open, or objects that someone writes to the backend around the proxy. Each adopted object is also a row on the **Failures** tab of its job run. See [Plaintext objects in a bucket that encrypts](encryption.md#plaintext-objects-in-a-bucket-that-encrypts).
+
 ## Backend downloads
 
 | Metric | Type | Labels | Description |

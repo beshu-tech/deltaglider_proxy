@@ -183,8 +183,8 @@ With `config_sync_bucket` set, this release keeps a witness of each bucket's enc
 
 This release replaces the format of proxy-side encryption (`aes256-gcm-proxy`). The earlier formats, `aes-256-gcm-v1` and `aes-256-gcm-chunked-v1` (body magic `DGE1`), have no reader and no migration path in this release, because no deployment used them. If a backend or a bucket of yours encrypted objects with an earlier release, those objects fail to read after the upgrade. Decrypt them before the upgrade, for example with a migrate job to a plaintext backend, and encrypt them again after it. Deployments without `aes256-gcm-proxy` have nothing to do for this change. The changes that you can see:
 
-- **Fail closed.** In a bucket that encrypts, the proxy refuses every object that it cannot authenticate, with `500 InternalError`. That includes a plaintext object, unless the `encryption` block has `plaintext_reads: serve` ([why](../explanation/encryption-at-rest.md#why-enabling-isnt-retroactive)).
-- **Starting to encrypt.** An apply that makes an existing bucket start to encrypt with `plaintext_reads: refuse` is refused, unless the block sets `plaintext_reads: serve` or the request confirms it (`X-DGP-Confirm-Plaintext-Refusal: <subject>`, `config apply --confirm-plaintext-refusal <subject>`). The admin UI sets `serve` by itself and offers **Refuse unencrypted objects** after the re-encrypt job. A script that turns on encryption through the admin API must add one of the two.
+- **Fail closed.** In a bucket that encrypts, the proxy refuses every object that it cannot authenticate, with `500 InternalError`. That includes a plaintext object, except the plaintext history that an open conversion window serves ([why](../explanation/encryption-at-rest.md#why-enabling-isnt-retroactive)).
+- **Starting to encrypt.** An apply that makes a bucket with objects start to encrypt opens a conversion window and starts the re-encrypt job. The release after 2.0.23 introduced this. See [Conversion window instead of `plaintext_reads: serve`](#conversion-window-instead-of-plaintext_reads-serve-the-release-after-2023).
 - **Key ids.** A backend key without `key_id` gets the id `fp-` followed by 16 hexadecimal characters of the key's fingerprint. The backend name no longer takes part in the id. One key can have only one id on a backend; the proxy refuses to start with a config that gives one key two ids.
 - **Stored metadata.** An encrypted object stores no `dg-md5`, no `dg-encryption-key-id`, and no SHA-256 of its content in clear. It stores `dg-encrypted: aes-256-gcm-chunked-v1` and a `dg-sealed` value instead ([Metadata markers](../reference/encryption.md#metadata-markers)). A script that reads `dg-encryption-key-id` on the raw backend must read the key fingerprint in `dg-sealed` instead.
 - **Copies outside the proxy.** An encrypted object that the backend copies to another bucket name or key no longer reads ([Copies outside the proxy](../reference/encryption.md#copies-outside-the-proxy)).
@@ -212,6 +212,28 @@ The facts are these response headers and metadata keys:
 A principal may read the whole folder when one of its Allow rules without conditions grants read on a pattern that ends in `*` and covers the folder (for example `releases/*`), and no Deny rule on reads can match a key in the folder. A principal that may only write, or that may read only some keys of the folder, now gets none of these facts. A reader without credentials, such as a reader of a public prefix or the holder of a presigned URL, also gets none of them.
 
 Two kinds of clients see no change. With `authentication: none`, every request still gets the facts. A principal with read on the whole bucket, or on the whole folder of the key, also still gets them. If a script or a CI job reads one of these headers, make sure that its credentials have read on the whole folder. The full rule is in [Storage facts on write responses](../reference/s3-api-compatibility.md#storage-facts-on-write-responses).
+
+## Conversion window instead of `plaintext_reads: serve` (the release after 2.0.23)
+
+In earlier releases, a bucket that started to encrypt needed `plaintext_reads: serve` in its `encryption` block, so that the proxy served its plaintext history while the re-encrypt job converted it. Under `serve`, the proxy also served an object that someone put on the backend during the conversion. This release replaces the setting with a conversion window. A config write that makes a bucket with objects start to encrypt writes a sealed marker into the bucket and starts the re-encrypt job. While the window is open, clients read only the objects that the backend stored before the write, and the job closes the window when it converted every object ([Plaintext objects in a bucket that encrypts](../reference/encryption.md#plaintext-objects-in-a-bucket-that-encrypts)).
+
+The changes that you can see:
+
+- **`plaintext_reads: serve` is deprecated.** This release still honours it: reads serve every object that is not encrypted. The proxy logs a deprecation warning at load, `config lint` prints it, and every apply returns it. The next release refuses the field, so a config file that still sets it will not load. `plaintext_reads: refuse` is accepted and has no effect.
+- **The confirmation is gone.** The apply that started encryption on a bucket with objects no longer answers `422`. The header `X-DGP-Confirm-Plaintext-Refusal` is ignored, and `config apply --confirm-plaintext-refusal` is an unknown option, so a script that passes it fails. Remove both from your scripts.
+- **A new `409`.** The same apply is refused with `409` when another job, for example a migration, holds one of the buckets. Wait for that job, or cancel it, and apply again.
+- **The admin API.** `serves_plaintext` in the bucket list and in the backend summary is now `serves_plaintext_deprecated`. The bucket list reports the window in `effective_encryption.conversion`, and a config write reports the conversions that it started in `conversions` ([admin API](../reference/admin-api.md#starting-a-conversion)).
+- **A metadata backfill waits.** While a bucket holds a conversion marker, `POST /_/api/admin/jobs/backfill-metadata` for that bucket answers `409`.
+
+To leave `serve` before the next release, do these steps for each backend and each bucket that sets it:
+
+1. Upgrade every instance that writes to the bucket first. An instance on an older release ignores the window: it serves and writes plaintext as before.
+2. In the admin UI, open **Storage → Backends** or **Storage → Buckets**. The card of each backend or bucket that sets `serve` shows the box **Unencrypted objects are served (deprecated setting)**. Click **Convert now**. The write removes the line, opens the conversion window of each bucket that holds objects, and starts their re-encrypt jobs. Without the admin UI, remove the line from the `encryption` block, and apply the file with `deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.example`.
+3. Follow the jobs until the windows close, as in [How to encrypt data at rest](encrypt-data-at-rest.md#6-encrypt-the-objects-that-the-backend-already-holds).
+
+Do not remove the line and restart instead of an apply. A restart starts no conversion, so after it every read of a plaintext object fails until you open the window with `POST /_/api/admin/jobs/reencrypt` and `{"buckets": ["<bucket>"], "open_window": true}`.
+
+With several instances, apply the change on every instance, and then let the job finish. An instance whose configuration does not encrypt the bucket yet writes plaintext into it, and the instances that encrypt refuse those objects after the cutoff.
 
 ## Common gotchas
 

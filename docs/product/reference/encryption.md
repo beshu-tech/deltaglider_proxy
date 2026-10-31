@@ -20,7 +20,7 @@ A backend with no `encryption` block has `mode: none`. `Config::check` rejects `
 | `mode` | all | `none` \| `aes256-gcm-proxy` \| `sse-kms` \| `sse-s3` |
 | `key` | `aes256-gcm-proxy` | 32-byte hex AES-256 key. Treated as an infrastructure secret: stripped from canonical exports (`/config/export`). |
 | `key_id` | `aes256-gcm-proxy` | The name of the key. The admin UI, the audit log, the encryption witness and the legacy-key scan show the key under this name. On a backend, optional: without it, the id is `fp-` and the 16 hexadecimal characters of the key's fingerprint (see [Key IDs](#key-ids)). On a bucket, required. |
-| `plaintext_reads` | `aes256-gcm-proxy` | `refuse` (default) or `serve`. What a read does with an object that is not encrypted. See [Plaintext objects in a bucket that encrypts](#plaintext-objects-in-a-bucket-that-encrypts). |
+| `plaintext_reads` | `aes256-gcm-proxy` | Deprecated. `serve` makes reads serve every object that is not encrypted. This release still honours it, with a warning, and the next release refuses it. `refuse` is accepted and has no effect. See [The deprecated `plaintext_reads: serve`](#the-deprecated-plaintext_reads-serve). |
 | `kms_key_id` | `sse-kms` | The KMS key: a key ARN or alias ARN (`arn:aws:kms:<region>:<account>:key/<id>`), an alias name (`alias/<name>`), a key id (a UUID) or a multi-Region key id (`mrk-<32 hex digits>`). On MinIO, write a key name as `arn:aws:kms:<key name>`. The proxy refuses to start with an empty or malformed value, on a backend and on a bucket, because every write would fail with an S3 error. |
 | `bucket_key_enabled` | `sse-kms` | S3 Bucket Keys; reduces per-request KMS cost. |
 | `legacy_key`, `legacy_key_id` | any mode | Decrypt-only shim for objects written under a previous proxy-AES key. Valid under every mode, including `none`. |
@@ -38,7 +38,7 @@ Env vars override only the secret fields (`key`, `kms_key_id`); the mode itself 
 
 ### A proxy-AES backend with no key
 
-When a backend is in `aes256-gcm-proxy` mode and neither the YAML nor the env var supplies a `key`, the proxy cannot encrypt. It does not fall back to plaintext. Instead, every write to that backend fails with `500 InternalError`, and the log names the backend and the env var to set. Reads keep working: the objects that the `legacy_key` can decrypt stay readable while you fix the key. A plaintext object stays readable only with `plaintext_reads: serve`, because the backend counts as a backend that encrypts. The proxy starts with such a config, so that the stored data stays available. A config apply that would put a backend into this state is refused. `config lint` only warns about it, because lint does not see the env vars of the deployment.
+When a backend is in `aes256-gcm-proxy` mode and neither the YAML nor the env var supplies a `key`, the proxy cannot encrypt. It does not fall back to plaintext. Instead, every write to that backend fails with `500 InternalError`, and the log names the backend and the env var to set. Reads keep working: the objects that the `legacy_key` can decrypt stay readable while you fix the key. A plaintext object follows the read rule of a bucket that encrypts (see [Plaintext objects in a bucket that encrypts](#plaintext-objects-in-a-bucket-that-encrypts)), and no conversion window opens for a backend without a key. The proxy starts with such a config, so that the stored data stays available. A config apply that would put a backend into this state is refused. `config lint` only warns about it, because lint does not see the env vars of the deployment.
 
 ### Examples
 
@@ -165,7 +165,7 @@ A bucket block in `aes256-gcm-proxy` mode with no key makes the proxy refuse eve
 
 ### Changing a bucket's encryption
 
-When an apply changes the encryption that a bucket writes with, the proxy does not rewrite the objects that the bucket already holds. They keep the form they were written in. An encrypted object stays readable while the keyring holds its key, because each object carries the fingerprint of its key. A plaintext object stays readable only when the new block has `plaintext_reads: serve` (see [Plaintext objects in a bucket that encrypts](#plaintext-objects-in-a-bucket-that-encrypts)). The response of the apply has a warning for each such bucket. The warning names the re-encrypt job (`POST /_/api/admin/jobs/reencrypt` with `{"buckets": ["<bucket>"]}`), which rewrites the objects and the delta references into the new form. The proxy does not start the job by itself.
+When an apply changes the encryption that a bucket writes with, the proxy does not rewrite the objects that the bucket already holds. They keep the form they were written in. An encrypted object stays readable while the keyring holds its key, because each object carries the fingerprint of its key. When the apply makes a bucket that holds objects start to encrypt with a proxy key, the proxy opens a conversion window for the bucket and starts its re-encrypt job, so that the plaintext objects stay readable while the job converts them (see [How a conversion starts](#how-a-conversion-starts)). For every other change, such as a key rotation, the response of the apply has a warning for each such bucket. The warning names the re-encrypt job (`POST /_/api/admin/jobs/reencrypt` with `{"buckets": ["<bucket>"]}`), which rewrites the objects and the delta references into the new form. The proxy does not start that job by itself.
 
 The proxy judges every key of a bucket's block on that bucket alone. After an apply, the bucket must still be able to read each key id that its block held: in its own block, or in the encryption of the backend that stores it. A key that another bucket on the same backend holds does not count, because that bucket can change its own block later.
 
@@ -367,7 +367,7 @@ An object can have no listing token. This happens when the write of its token fa
 
 - **An object stored as it is, in a bucket that serves no plaintext.** Every object that this bucket can serve is encrypted, and the stored size of an encrypted body is exactly `76 + plaintext size + 16 × number of frames`. The proxy therefore computes the exact plaintext size from the stored size, with no extra request. The ETag in this first listing is still the ETag of the stored ciphertext, so it differs from the ETag of a `HEAD` request. In the background, the proxy sends one `HEAD` request for the object and writes its listing token again. After that, every LIST request shows the size and the ETag of the object.
 - **A delta.** The stored size of a delta does not tell the size of the object, so the proxy sends a `HEAD` request for the delta while it answers the LIST request. It sends at most 8 such requests for one listing page, all at the same time. The `HEAD` request gives the size and the ETag of the object, and the proxy writes the listing token again, so the next LIST request needs no `HEAD` request. A delta beyond those 8 is listed with the size of the delta once, and the proxy writes its token in the background.
-- **An object stored as it is, in a bucket that serves plaintext** (the bucket writes plaintext, or it has `plaintext_reads: serve`). The object can be a plaintext object, whose stored size is its size. The proxy therefore lists the stored size and the stored ETag, and it sends no request for the object.
+- **An object stored as it is, in a bucket that serves plaintext** (the bucket writes plaintext, its conversion window is open, or it has the deprecated `plaintext_reads: serve`). The object can be a plaintext object, whose stored size is its size. The proxy therefore lists the stored size and the stored ETag, and it sends no request for the object.
 
 When the key of an object is too long for a token object, the proxy keeps the token only in its own memory, so the other proxies and a restarted proxy send the `HEAD` request for a delta again. The counter `deltaglider_listing_token_misses_total` counts these objects (see [Metrics](metrics.md)).
 
@@ -379,7 +379,7 @@ The read path applies one rule to every object in a bucket:
 
 - **An object with sealed metadata.** The proxy finds the key by the fingerprint in the seal, opens the seal at the location of the object, checks the digest of the clear headers, checks the header of the body, and then decrypts and authenticates each frame. When the proxy does not have the key that the fingerprint names, the read fails with `400 InvalidRequest`, and the message names the fingerprint (for example `key fp-8748e64455ba2257`). S3 answers in the same way when a client reads an SSE-C object without its key: a retry cannot succeed. Every other failure is `500 InternalError`, and the log names the cause.
 - **An object without sealed metadata, but with `dg-encrypted`.** The proxy refuses it. The object was written by another release, or its metadata was edited.
-- **An object without any marker in a bucket that encrypts.** The proxy refuses it, unless the bucket has `plaintext_reads: serve` (see the next section).
+- **An object without any marker in a bucket that encrypts.** The proxy refuses it, unless the conversion window of the bucket serves it (see the next section).
 - **An object without any marker in a bucket that stores plaintext.** The proxy serves it as it is. The read path also checks the first bytes of the body: a body that starts with a `DGE` magic and a digit is proxy-encrypted, so its metadata was stripped, and the read fails instead of serving ciphertext as plaintext.
 - **A folder marker** (an empty object whose key ends in `/`) always reads, because the proxy never encrypts it.
 - `dg-encrypted-native: sse-kms` (or `sse-s3`): no proxy-side decryption; AWS returns plaintext.
@@ -394,38 +394,118 @@ The proxy has no reader for the earlier formats `aes-256-gcm-v1` and `aes-256-gc
 
 ### Plaintext objects in a bucket that encrypts
 
-A writer with access to the backend can put a plaintext object into a bucket that encrypts. The proxy cannot tell such an object from the plaintext history of the bucket. By default (`plaintext_reads: refuse`), a read of an object without encryption in a bucket that encrypts therefore fails with `500 InternalError`, and the log says:
+A writer with access to the backend can put a plaintext object into a bucket that encrypts. Its bytes look the same as the plaintext history of the bucket. The proxy therefore serves an object without encryption in a bucket that encrypts only as the history of the bucket, and it judges that by time: a *conversion window* names a cutoff, and only objects that the backend stored before the cutoff are history. Outside an open window, and for every object stored later, a read fails with `500 InternalError`, and the log says:
 
-> object 'nightly/2026-10-14.dump' in bucket 'db-archive' is not encrypted, but the bucket encrypts: the proxy refuses it, because a writer with access to the backend could have planted it. Set encryption.plaintext_reads: serve while a re-encrypt job converts the bucket's history
+> object 'nightly/2026-10-14.dump' in bucket 'db-archive' is not encrypted, but the bucket encrypts: the proxy refuses it, because a writer with access to the backend could have planted it (for example another proxy that does not have the bucket's key). Plaintext is served only while a conversion of the bucket is open, and only for objects that the backend stored before the conversion's cutoff: this object is newer, or no conversion is open. A re-encrypt job converts it. (Until the next release, encryption.plaintext_reads: serve also serves it.)
 
-`plaintext_reads: serve` makes the proxy serve these objects. Set it in the `encryption` block of the backend or of the bucket when you start to encrypt a bucket that already holds objects. The re-encrypt job reads through the same rule, so it can convert the plaintext objects only under `serve`. Under `refuse`, each plaintext object is a failure of the job. Remove `plaintext_reads: serve` when the job succeeded, because every object that the proxy serves under `serve` is trusted as it is.
+The threat model of the window is in [About the encryption threat model](../explanation/encryption-threat-model.md#the-conversion-window).
 
-The field exists only in `aes256-gcm-proxy` mode. The admin UI sets `plaintext_reads: serve` by itself when it turns on proxy-side AES for a backend or a bucket that did not encrypt before. While the field is `serve`, the backend card and the bucket card show the box **Unencrypted objects are served**, and its button **Refuse unencrypted objects** sets the field back to `refuse`. `GET /_/api/admin/buckets` and `GET /_/api/admin/backends` report the field as `serves_plaintext` ([admin API](admin-api.md#backends)).
+#### The conversion marker
 
-```yaml
-# validate
-storage:
-  backends:
-    - name: local-disk
-      type: filesystem
-      path: /var/lib/deltaglider_proxy/data
-  buckets:
-    db-archive:
-      backend: local-disk
-      encryption:
-        mode: aes256-gcm-proxy
-        key: "${env:DB_ARCHIVE_AES_KEY}"
-        key_id: db-archive-2026
-        plaintext_reads: serve      # remove after the re-encrypt job succeeded
-```
+The window is one internal object in the bucket, the conversion marker:
 
-#### Starting to encrypt needs `serve` or a confirmation
+| Backend | Where the marker is |
+|---|---|
+| S3 | The object `.dg/facts/!!conversion` in the real bucket. Listings do not show it, and the proxy refuses a client request for that key. |
+| Filesystem | The file `.dg-conversion` in the bucket directory, next to `.dg-key-claim`. Object keys map under the `deltaspaces/` directory of the bucket, so no client key reaches the file. |
 
-A config change that makes an existing bucket start to encrypt in `aes256-gcm-proxy` mode, with `plaintext_reads: refuse`, would make every object that the bucket held before unreadable. The proxy therefore refuses such a change, unless the new `encryption` block sets `plaintext_reads: serve`, or the request confirms the subject. To confirm, send the header `X-DGP-Confirm-Plaintext-Refusal: <subject>` (comma-separated for several subjects), or use `config apply --confirm-plaintext-refusal <subject>`. Confirm only when the subject holds no plaintext that anyone needs. The subjects are the same as for a downgrade: the bucket name, `backend:<name>` for every bucket of the backend without its own block, and `route:default`. The refusal names each subject, for example:
+The marker holds three sealed fields:
 
-> this change makes bucket 'db-archive' encrypt, but the objects stored there before are plaintext, and with `plaintext_reads: refuse` (the default) the proxy refuses to read them. Set encryption.plaintext_reads: serve and run a re-encrypt job (POST /_/api/admin/jobs/reencrypt) to convert them, then set it back. If the subject holds no plaintext that anyone needs, confirm with the header `X-DGP-Confirm-Plaintext-Refusal: db-archive` (`config apply --confirm-plaintext-refusal db-archive`)
+| Field | Meaning |
+|---|---|
+| cutoff | The time when the window opened, in Unix seconds, from the backend's clock: the `Date` header of an S3 response, or the local clock on a filesystem backend. |
+| deadline | The cutoff plus 7 days. A resume moves it to 7 days after the resume, and never makes it earlier. |
+| run | A random 128-bit id of this conversion. Every instance sees the same run id, unlike a job id, which is local to one instance. The admin API shows it in hexadecimal. |
 
-A bucket that no backend lists yet needs no confirmation, because it holds no objects: for example a bucket that the **Create bucket** dialog creates with its own key. A key rotation, and a change from one encrypting mode to another, are not affected. Every config write runs this gate, as it runs the downgrade gate, and a proxy that starts from an edited file does not run it. Instead, after it starts, the proxy lists the first 100 objects of each bucket that encrypts with `plaintext_reads: refuse` and sends a HEAD request for each of them. When the read rule refuses one of them because it is not encrypted, the proxy logs a warning that names the bucket and the object. The check runs in the background, so the start does not wait for it. `DGP_BOOT_PLAINTEXT_CHECK=false` turns it off.
+The body is `dgc1.`, the hexadecimal fingerprint of a key of the bucket, a dot, and the base64url encoding of a nonce and an AES-256-GCM-SIV seal of the fields. The proxy derives the seal key from the bucket's encryption key. The associated data of the seal is `dg-conversion`, the format version, and the storage identity of the bucket: the backend name and the real bucket name. The marker opens with any key of the bucket's keyring, so a key rotation keeps the window. A marker that does not open, that names another storage identity, or whose deadline is past counts as a closed window.
+
+The proxy creates the marker with `If-None-Match: *`. It changes the deadline and removes the marker *by identity*: it reads the marker, opens it, checks the run id, and then writes or deletes with `If-Match` on the version that it read. When the condition fails, it reads again, up to 3 times. It never takes a failed condition for a removed marker. A backend without conditional writes (`501`, for example Backblaze B2) gets an unconditional write, as for the key claim.
+
+Each instance keeps the state of the window in memory for 60 seconds per bucket, and it checks the deadline against the backend's clock on every use. When the proxy is about to refuse a client read while the remembered window is closed, it reads the marker again first (at most once per 5 seconds per bucket). A window that another instance opened therefore takes effect at once. A window that another instance closed can stay open on this instance for up to 60 seconds. In that time it serves only objects stored before the cutoff, which the job converted already.
+
+#### The read rule
+
+The rule has two readers.
+
+- **A client** reads an object without encryption when the window is open and the backend's own stored time of the object is before the cutoff plus 300 seconds. A client read is a GET, a HEAD, a range read, the source of a copy, and every engine path that is not the re-encrypt job. The stored time is the `Last-Modified` time on S3, and the modification time of the file on a filesystem backend. It is never the proxy's `dg-created-at` field, and never a value from the metadata cache. The proxy refuses an object without a stored time. A LIST request is not affected: it shows every entry, as before.
+- **The re-encrypt job** reads every object without encryption in the bucket, whatever its stored time. Only the job can read in this way, because its reads run in a scope that only the maintenance worker can open. The job converts an object that a client could not read too, and it reports the object as *adopted after the cutoff* (see [The re-encrypt job and the window](#the-re-encrypt-job-and-the-window)).
+
+For both readers, an object that carries `dg-encrypted` but no valid sealed metadata is refused, and a folder marker (an empty object whose key ends in `/`) always reads.
+
+#### How a conversion starts
+
+A config write starts a conversion for a bucket when all of these are true:
+
+- The write makes the bucket encrypt with a usable proxy key: `aes256-gcm-proxy` with a key, and without `plaintext_reads: serve`.
+- Before the write, clients could read plaintext in the bucket: it stored plaintext, used SSE-KMS or SSE-S3, used a proxy mode without a key, or had `plaintext_reads: serve`.
+- The bucket holds at least one object. An empty bucket has no history.
+
+Every config write does this: a section PUT, `POST /_/api/admin/config/apply`, `config apply`, the backend and bucket endpoints, and a backup restore. A key rotation starts no conversion. The steps are:
+
+1. Before the config commits, the proxy refuses the write with `409` when a job other than a delete is active on the bucket. The message names the job. Wait for the job, or cancel it, and then apply again.
+2. The proxy opens the window, for up to 8 buckets at once. When the bucket already holds a marker of its own (from an earlier write, from another instance, or one whose deadline passed), the proxy reuses it, with its cutoff and its run id. When the bucket holds a marker that does not open, the write fails. When the proxy cannot write a marker, it removes the markers that this write created, and the write fails.
+3. The config commits.
+4. The proxy queues one re-encrypt job per bucket. When it cannot queue the job, because another job became active in the meantime, the write still succeeds, with a warning. The window is then open with no job, and **Resume** starts the job.
+
+The response of the write lists each conversion in `conversions` (see [the admin API reference](admin-api.md#starting-a-conversion)). A validate request lists each bucket that the write would convert, with its object count. The admin UI shows that count in its confirmation dialog.
+
+A proxy that starts from an edited file starts no conversion. After it starts, the proxy lists the first 100 objects of each bucket that encrypts with a proxy key, has no open window and has no `plaintext_reads: serve`, and it sends a HEAD request for each of them. When the read rule refuses one of them because it is not encrypted, the proxy logs a warning. The warning names the bucket, the object, and the request that opens the window and starts the job: `POST /_/api/admin/jobs/reencrypt` with `{"buckets": ["<bucket>"], "open_window": true}`. The check runs in the background, so the start does not wait for it. `DGP_BOOT_PLAINTEXT_CHECK=false` turns it off.
+
+#### The re-encrypt job and the window
+
+At each start and each resume, the job reads the marker of its bucket and moves the deadline to 7 days after the backend's current time, by identity. The cutoff and the run id stay. This also applies to a marker whose deadline passed while no job ran, so a resume opens that window again.
+
+The job then converts the objects and the delta references, 8 objects of a page at once, and it saves its cursor after each page. An object that the job converts although a client could not read it is *adopted after the cutoff*:
+
+- It is a row on the **Failures** tab of the run, with the prefix `adopted_after_cutoff`. The row is information, not a failure.
+- The job writes the audit entry `encryption_conversion_adopted_after_cutoff` for it.
+- The job increments `deltaglider_conversion_adopted_after_cutoff_total`.
+- The run summary names the count, for example "3 object(s) adopted after the conversion's cutoff in this run".
+
+An object that the job could not convert is a `rewrite_failed` row. After the last phase, the job closes the window when no object failed: it removes the marker by identity. When objects failed, the window stays open, the run settles with errors, and **Resume** (or `POST /_/api/admin/jobs/reencrypt` for the bucket) runs the job again. When the marker is not the one of this run, or does not open, the job does not remove it. The run then settles with an error, and the audit log has `encryption_conversion_close_blocked`.
+
+While a bucket holds a conversion marker, the proxy refuses a metadata backfill of the bucket (`POST /_/api/admin/jobs/backfill-metadata`) with `409`, because the backfill would move the stored time of the plaintext objects past the cutoff. The backfill job checks this again before it starts.
+
+#### Old versions on a versioned backend
+
+On an S3 backend whose bucket keeps old versions (versioning enabled or suspended), the job rewrites the current object of each key. The plaintext object becomes a noncurrent version, and it stays on the backend. The validate and the apply mark such a bucket with `versioned: true`, and the apply response has a warning for it.
+
+The job can delete these versions in an optional last phase, `purge-versions`. The phase runs after the delta references and before the job closes the window. The default is off. You ask for it in one of three ways:
+
+- In the admin UI, select the box **Also delete the old unencrypted versions** in the confirmation dialog of a versioned bucket.
+- On a config write, send the header `X-DGP-Purge-Plaintext-Versions: true`. It applies to the jobs that the write queues for versioned buckets.
+- In `POST /_/api/admin/jobs/reencrypt`, send `"purge_plaintext_versions": true`.
+
+**A deleted version cannot be restored.** The phase deletes a version only when all of these are true:
+
+- The version is noncurrent. The phase never deletes a current version.
+- The version carries no encryption marker (`dg-encrypted`), so it is plaintext. The phase never deletes an encrypted version.
+- The object of its key exists now, and it is encrypted in every stored form that exists. An object has two stored forms: the object as it is (`app.zip`) and its delta (`app.zip.delta`), because a rewrite can change the form.
+- The key is not an internal key under `.dg/facts/`.
+
+The phase therefore keeps the versions of an object that a client deleted before the conversion, because that key has no current object. A delta reference (`reference.bin`) is different, because no client can read it: the phase deletes its plaintext versions also when the proxy removed the reference, as long as no current plaintext reference exists. The phase runs only when the run converted every object. When objects failed, the run summary says that the versions were not deleted, and a later run that converts every object deletes them. The phase reads the metadata of up to 8 versions at once, deletes the versions of one page of the version listing with one `DeleteObjects` request, saves its cursor after each page of versions, and resumes from that cursor after a restart. The run summary names the count, for example "12 noncurrent plaintext version(s) deleted", and each page with deletions writes the audit entry `encryption_conversion_versions_purged`. A bucket without versioning, and a bucket on a filesystem backend, have nothing to delete.
+
+#### Metrics and audit entries
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `deltaglider_plaintext_reads_total{outcome}` | Counter | Client reads of objects without encryption in buckets that encrypt. `outcome` is `served_in_window` (history that an open window serves) or `refused`. |
+| `deltaglider_conversion_adopted_after_cutoff_total` | Counter | Objects that the re-encrypt job converted although clients could not read them. |
+| `encryption_conversion_opened` | Audit | A config write, or `POST /jobs/reencrypt` with `open_window`, opened a window. The target names the run id. |
+| `encryption_conversion_extended` | Audit | A job start or a resume moved the deadline. The target names the run, the kept cutoff, and the old and the new deadline. |
+| `encryption_conversion_closed` | Audit | The job closed the window. The target names the count of objects adopted after the cutoff. |
+| `encryption_conversion_close_blocked` | Audit | The job did not close the window, because the marker is not the one of its run, or does not open. |
+| `encryption_conversion_adopted_after_cutoff` | Audit | The job converted an object that clients could not read. |
+| `encryption_conversion_versions_purged` | Audit | The `purge-versions` phase deleted noncurrent plaintext versions. The target names the job and the count. |
+| `encryption_marker_ignored` | Audit | A marker of the bucket does not open on this instance (at most one entry per bucket every 10 minutes). |
+
+#### The deprecated `plaintext_reads: serve`
+
+Earlier releases needed `plaintext_reads: serve` in the `encryption` block while a re-encrypt job converted a bucket. Under `serve`, the proxy serves every object without encryption in the bucket, whatever its stored time, so it also serves an object that someone planted during the conversion. The field exists only in `aes256-gcm-proxy` mode.
+
+This release still honours `serve`. The proxy logs a deprecation warning when it loads such a file, and `config lint` and every apply return one. A config write that *sets* `serve` starts no conversion: it keeps the earlier behaviour, and you run the job yourself. `refuse` is accepted and has no effect. The next release refuses the field.
+
+To leave `serve`, remove the line. The write that removes it starts the conversion of each bucket that holds objects, as [How a conversion starts](#how-a-conversion-starts) describes. In the admin UI, the backend card and the bucket card show the box **Unencrypted objects are served (deprecated setting)** while the field is set, and its button **Convert now** removes the line. The admin API reports the field as `serves_plaintext_deprecated` ([admin API](admin-api.md#backends)).
 
 ### Copies outside the proxy
 
@@ -499,7 +579,7 @@ When `legacy_key` is set, the keyring holds it next to `key`. A read picks the k
 
 - **Key rotation keeps one previous key.** When an apply changes `key`, sets it to `null`, or moves a backend away from `aes256-gcm-proxy`, and does not set `legacy_key`, the proxy moves the previous key into `legacy_key`, and its effective id into `legacy_key_id`. An apply that sends `legacy_key: null` drops the previous key instead. The shim holds one legacy generation at a time, so the proxy refuses a key change while `legacy_key` holds a different key. It also refuses a key change that keeps the same `key_id`. A Re-encrypt job (`POST /_/api/admin/jobs/reencrypt`, or **Storage → Jobs** → **New job** → **Re-encrypt buckets…**) rewrites objects under the current configuration; it is durable, resumable across restarts, cancellable, and write-gates affected buckets (`503 SlowDown` on writes; reads unaffected).
 - **An apply keeps what it does not name.** For `key`, `key_id` and `legacy_key`, the same rule applies to every apply, whether it is a section `PUT` or a full document. When the field is absent, the proxy keeps the current value. When the field is `null`, the proxy clears it. A `key: null` is a key change like any other: the previous key moves into `legacy_key` (or the apply is refused while `legacy_key` holds a different key), so the proxy never drops a key that objects can still need. A backend that is left in `aes256-gcm-proxy` mode with no key is then refused, as described in [A proxy-AES backend with no key](#a-proxy-aes-backend-with-no-key). When the field has a value, that value replaces the current one. An id is kept only together with its own key: when the apply sets a new `key` and no `key_id`, the new key gets the generated id `fp-<hex>`, and the previous id moves to `legacy_key_id` with the previous key.
-- **Enabling is not retroactive.** Switching a backend's mode affects new writes only; existing objects keep their stored form until the re-encrypt job rewrites them. In a bucket that encrypts, a plaintext object reads only with `plaintext_reads: serve` (see [Plaintext objects in a bucket that encrypts](#plaintext-objects-in-a-bucket-that-encrypts)).
+- **Enabling is not retroactive.** Switching a backend's mode affects new writes only; existing objects keep their stored form until the re-encrypt job rewrites them. In a bucket that encrypts, a plaintext object reads only while the conversion window of the bucket is open, and only when the backend stored it before the cutoff (see [Plaintext objects in a bucket that encrypts](#plaintext-objects-in-a-bucket-that-encrypts)). A config write that makes a bucket with objects start to encrypt opens the window and starts the job.
 - **Key loss is data loss** in `aes256-gcm-proxy` mode. The proxy does not escrow keys, and there is no recovery path.
 - **Per-bucket native SSE needs an S3 backend.** A bucket `encryption` block takes `aes256-gcm-proxy` or `none` on every backend, and `sse-kms` or `sse-s3` only on an S3 backend. With `config_sync_bucket` set, the encryption witness keeps the instances in agreement. See [Per-bucket encryption](#per-bucket-encryption).
 - **Names and some metadata stay readable on the backend.** Under every mode, the backend stores object names, content-type and `x-amz-meta-*` user metadata unencrypted. In `aes256-gcm-proxy` mode, the sealed metadata authenticates the content type and the client's user metadata, and it hides the hashes and the size of a delta. The stored size of a passthrough object or a reference still gives its exact plaintext size, and the size of a delta stays readable. Under SSE-KMS and SSE-S3, the backend also stores the hashes and the sizes in clear. [About the encryption threat model](../explanation/encryption-threat-model.md) lists what each attacker learns.
