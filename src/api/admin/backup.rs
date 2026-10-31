@@ -1816,6 +1816,8 @@ async fn apply_backup_iam(
                 memberships_created = result.memberships_created,
                 external_identities_created = result.external_identities_created,
                 external_identities_skipped = result.external_identities_skipped,
+                rules_created = result.rules_created,
+                rules_skipped = result.rules_skipped,
                 "Full-backup import: iam.json applied"
             );
             Json(result)

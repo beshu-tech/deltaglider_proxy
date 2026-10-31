@@ -33,6 +33,9 @@ export interface ImportBackupResult {
   memberships_created: number;
   external_identities_created?: number;
   external_identities_skipped?: number;
+  /** Mapping rules inserted, and skipped (group or provider not imported, or an equal rule exists). */
+  rules_created?: number;
+  rules_skipped?: number;
   /** Users imported under a new name because another user had theirs: `"old -> new"`. */
   users_renamed?: string[];
   /** Policy rules kept with a condition the proxy cannot evaluate (contained: an

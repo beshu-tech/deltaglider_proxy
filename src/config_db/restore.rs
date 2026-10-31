@@ -102,6 +102,10 @@ pub struct ImportResult {
     /// Skipped because the referenced user/provider didn't make it,
     /// or a matching (provider, external_sub) already exists.
     pub external_identities_skipped: u32,
+    pub rules_created: u32,
+    /// Skipped because their group or provider is not imported, or an
+    /// equal rule already exists (merge mode).
+    pub rules_skipped: u32,
     /// Rules kept with a condition the proxy cannot evaluate (review A13):
     /// stored and contained (an Allow grants nothing; a Deny applies
     /// without its condition), so a restore loses no user over it.
@@ -413,22 +417,62 @@ fn restore_on(
         provider_id_map.insert(bp.id, pid);
     }
 
-    // ── Mapping rules (remap provider + group) ──
+    // ── Mapping rules (remap provider + group; match existing ones) ──
+    // A rule is skipped when its group or provider is not imported (a
+    // dangling provider would become NULL = every provider), and when an
+    // equal rule already exists: by content uid, or by content (a GUI rule
+    // has a random uid). So a merge of one backup twice adds nothing.
+    let group_names: HashMap<i64, &str> = backup
+        .groups
+        .iter()
+        .map(|g| (g.id, g.name.as_str()))
+        .collect();
+    let provider_names: HashMap<i64, &str> = backup
+        .auth_providers
+        .iter()
+        .map(|p| (p.id, p.name.as_str()))
+        .collect();
+    let mut taken_uids: HashSet<String> = conn
+        .prepare("SELECT rule_uid FROM group_mapping_rules WHERE rule_uid IS NOT NULL")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
     for rule in &backup.mapping_rules {
-        let Some(&gid) = group_id_map.get(&rule.group_id) else {
+        let (Some(&gid), Some(&group)) = (
+            group_id_map.get(&rule.group_id),
+            group_names.get(&rule.group_id),
+        ) else {
             tracing::warn!(
                 "Skipping mapping rule: group_id {} not found in backup",
                 rule.group_id
             );
+            result.rules_skipped += 1;
             continue;
         };
-        let pid = rule
-            .provider_id
-            .and_then(|old| provider_id_map.get(&old).copied());
-        conn.execute(
-            "INSERT INTO group_mapping_rules (provider_id, priority, match_type, match_field, \
-             match_value, group_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        let (pid, provider) = match rule.provider_id {
+            None => (None, None),
+            Some(old) => match (provider_id_map.get(&old), provider_names.get(&old)) {
+                (Some(&pid), Some(&name)) => (Some(pid), Some(name)),
+                _ => {
+                    tracing::warn!("Skipping mapping rule: provider_id {old} not found in backup");
+                    result.rules_skipped += 1;
+                    continue;
+                }
+            },
+        };
+        let content_uid = super::iam_merge::content_rule_uid(
+            provider,
+            rule.priority,
+            &rule.match_type,
+            &rule.match_field,
+            &rule.match_value,
+            group,
+        );
+        let equal_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_mapping_rules \
+             WHERE rule_uid = ?1 OR (provider_id IS ?2 AND priority = ?3 AND match_type = ?4 \
+             AND match_field = ?5 AND match_value = ?6 AND group_id = ?7))",
             params![
+                content_uid,
                 pid,
                 rule.priority,
                 rule.match_type,
@@ -436,7 +480,27 @@ fn restore_on(
                 rule.match_value,
                 gid
             ],
+            |r| r.get(0),
         )?;
+        if equal_exists {
+            result.rules_skipped += 1;
+            continue;
+        }
+        let uid = super::iam_merge::unique_rule_uid(content_uid, &mut taken_uids);
+        conn.execute(
+            "INSERT INTO group_mapping_rules (provider_id, priority, match_type, match_field, \
+             match_value, group_id, rule_uid) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                pid,
+                rule.priority,
+                rule.match_type,
+                rule.match_field,
+                rule.match_value,
+                gid,
+                uid
+            ],
+        )?;
+        result.rules_created += 1;
     }
 
     // ── External identities (remap user + provider; drop dangling ones) ──
@@ -532,6 +596,111 @@ mod tests {
             .collect();
         n.sort();
         n
+    }
+
+    fn provider(id: i64, name: &str) -> AuthProviderConfig {
+        AuthProviderConfig {
+            id,
+            name: name.into(),
+            provider_type: "oidc".into(),
+            enabled: true,
+            priority: 0,
+            display_name: None,
+            client_id: Some("cid".into()),
+            client_secret: Some("secret".into()),
+            issuer_url: Some("https://idp.example".into()),
+            scopes: "openid email".into(),
+            extra_config: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn rule(provider_id: Option<i64>, value: &str, group_id: i64) -> GroupMappingRule {
+        GroupMappingRule {
+            id: 0,
+            provider_id,
+            priority: 0,
+            match_type: "email_domain".into(),
+            match_field: "email".into(),
+            match_value: value.into(),
+            group_id,
+            created_at: String::new(),
+        }
+    }
+
+    fn engineering() -> BackupGroup {
+        BackupGroup {
+            id: 3,
+            name: "Engineering".into(),
+            description: String::new(),
+            permissions: vec![perm()],
+            member_ids: vec![],
+        }
+    }
+
+    /// NEW-04: a merge restore of one backup twice keeps one copy of each
+    /// mapping rule, also when the DB rule has a random (GUI) uid.
+    #[test]
+    fn merge_restore_twice_keeps_one_copy_of_each_mapping_rule() {
+        let (_d, db) = open();
+        let backup = IamBackup {
+            version: 2,
+            users: vec![backup_user(1, "dana", "AKDANA", vec![3])],
+            groups: vec![engineering()],
+            auth_providers: vec![provider(9, "okta")],
+            mapping_rules: vec![
+                rule(Some(9), "acme.example", 3),
+                rule(None, "beta.example", 3),
+            ],
+            external_identities: vec![],
+        };
+        db.restore_iam(&backup, IamRestoreMode::Merge, None, true)
+            .unwrap();
+        assert_eq!(db.load_group_mapping_rules().unwrap().len(), 2);
+        let again = db
+            .restore_iam(&backup, IamRestoreMode::Merge, None, true)
+            .unwrap();
+        assert_eq!(db.load_group_mapping_rules().unwrap().len(), 2);
+        assert_eq!((again.rules_created, again.rules_skipped), (0, 2));
+        // A GUI rule (random uid) with the same content is matched too.
+        let gid = db.load_group_mapping_rules().unwrap()[0].group_id;
+        db.delete_group_mapping_rule(db.load_group_mapping_rules().unwrap()[1].id)
+            .unwrap();
+        db.create_group_mapping_rule(
+            &crate::config_db::auth_providers::CreateMappingRuleRequest {
+                provider_id: None,
+                priority: 0,
+                match_type: "email_domain".into(),
+                match_field: "email".into(),
+                match_value: "beta.example".into(),
+                group_id: gid,
+            },
+        )
+        .unwrap();
+        db.restore_iam(&backup, IamRestoreMode::Merge, None, true)
+            .unwrap();
+        assert_eq!(db.load_group_mapping_rules().unwrap().len(), 2);
+    }
+
+    /// NEW-05: a rule whose provider the backup does not hold is skipped.
+    /// Stored with `provider_id = NULL`, it applied to EVERY provider.
+    #[test]
+    fn a_mapping_rule_with_a_missing_provider_is_skipped() {
+        let (_d, db) = open();
+        let backup = IamBackup {
+            version: 2,
+            users: vec![backup_user(1, "dana", "AKDANA", vec![3])],
+            groups: vec![engineering()],
+            auth_providers: vec![],
+            mapping_rules: vec![rule(Some(9), "acme.example", 3)],
+            external_identities: vec![],
+        };
+        let r = db
+            .restore_iam(&backup, IamRestoreMode::Merge, None, true)
+            .unwrap();
+        assert!(db.load_group_mapping_rules().unwrap().is_empty());
+        assert_eq!((r.rules_created, r.rules_skipped), (0, 1));
     }
 
     /// Review A13: a backup user whose condition the save would refuse is
