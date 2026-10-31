@@ -212,11 +212,12 @@ pub async fn recover_db(
     // bucket. This is an intentional behavior improvement: recover_db is a
     // brute-force-sensitive endpoint, and "no proxy headers → no rate
     // limiting" used to leave deployments without a reverse proxy exposed.
-    // Per-IP + per-account: recover_db gates DB decryption with the
-    // bcrypt hash that ALSO encrypts the config DB. A distributed
-    // attack against the same proxy's recovery flow could otherwise
-    // burn through the per-IP budget across a botnet — the
-    // "bootstrap" subject ties this back to the single account.
+    // Per-IP + per-account: recover_db tests candidate keys of the
+    // config DB (a DB key, or the bootstrap hash that was the DB key
+    // before S8). A distributed attack against the same proxy's recovery
+    // flow could otherwise burn through the per-IP budget across a
+    // botnet — the "bootstrap" subject ties this back to the single
+    // account.
     let guard = match crate::rate_limiter::RateLimitGuard::enter_with_account(
         &state.rate_limiter,
         &headers,
@@ -245,22 +246,30 @@ pub async fn recover_db(
     }
 
     // Try local .db.bak first
-    let bak_path = crate::config_db::config_db_path().with_extension("db.bak");
+    let db_file = crate::config_db::config_db_path();
+    let bak_path = db_file.with_extension("db.bak");
+    // The S3 copy goes to a fresh temp file next to the DB (SEC F-05):
+    // created exclusively with mode 0600, so a planted symlink or another
+    // local user cannot catch the write, and removed when it drops, on
+    // every path out of this handler.
+    let mut recovery_temp: Option<tempfile::NamedTempFile> = None;
     let try_path = if bak_path.exists() {
         Some(bak_path)
     } else {
         // Try S3 fallback if config_sync is enabled
         if let Some(ref sync) = state.config_sync {
             match sync.download_raw().await {
-                Ok(data) => {
-                    let tmp_path = crate::config_db::config_db_path().with_extension("db.recovery");
-                    if let Err(e) = std::fs::write(&tmp_path, &data) {
+                Ok(data) => match write_recovery_temp(&db_file, &data) {
+                    Ok(tmp) => {
+                        let path = tmp.path().to_path_buf();
+                        recovery_temp = Some(tmp);
+                        Some(path)
+                    }
+                    Err(e) => {
                         tracing::warn!("Failed to write recovery temp file: {}", e);
                         None
-                    } else {
-                        Some(tmp_path)
                     }
-                }
+                },
                 Err(e) => {
                     tracing::warn!("Failed to download config DB from S3 for recovery: {}", e);
                     None
@@ -284,19 +293,14 @@ pub async fn recover_db(
             .into_response();
     };
 
-    let is_recovery_temp = db_path
-        .extension()
-        .map(|e| e == "recovery")
-        .unwrap_or(false);
     // Read-only probe: the parked DB is never migrated or re-encrypted here.
     let matched = candidates
         .into_iter()
         .find(|(_, key)| crate::config_db::probe_key(&db_path, key).unwrap_or(false));
 
-    // Always clean up the recovery temp file (from S3 download), regardless of outcome
-    if is_recovery_temp {
-        let _ = std::fs::remove_file(&db_path);
-    }
+    // The recovery temp file (from the S3 download) goes now, whatever
+    // the outcome.
+    drop(recovery_temp);
 
     match matched {
         Some((kind, key)) => {
@@ -347,8 +351,50 @@ pub async fn recover_db(
     }
 }
 
+/// Write `data` (a downloaded config DB) to a new temp file in the
+/// directory of `db_file`: exclusive create, mode 0600, removed on drop.
+fn write_recovery_temp(
+    db_file: &std::path::Path,
+    data: &[u8],
+) -> std::io::Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+    let dir = match db_file.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".dgp-recovery-")
+        .suffix(".db")
+        .tempfile_in(dir)?;
+    tmp.write_all(data)?;
+    tmp.flush()?;
+    Ok(tmp)
+}
+
 #[cfg(test)]
 mod tests {
+    /// SEC F-05: the recovery copy is a private temp file next to the DB,
+    /// and it is gone when its handle drops.
+    #[test]
+    fn the_recovery_copy_is_private_and_removed_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("deltaglider_config.db");
+        let tmp = super::write_recovery_temp(&db, b"cipher").unwrap();
+        let path = tmp.path().to_path_buf();
+        assert_eq!(path.parent(), Some(dir.path()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"cipher");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "readable by others: {mode:o}");
+        }
+        drop(tmp);
+        assert!(!path.exists());
+        let src = crate::source_scan::prod_text(include_str!("password.rs"));
+        assert!(!src.contains(concat!("with_extension(\"db.", "recovery\")")));
+    }
+
     /// S8: the password handler never re-encrypts the config DB (its key does
     /// not depend on the password). Source guard, so a revert is caught.
     #[test]

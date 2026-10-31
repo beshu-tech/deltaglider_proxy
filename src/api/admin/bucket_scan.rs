@@ -354,7 +354,8 @@ impl BucketScanner {
                 previous,
                 &last,
                 outcome,
-            );
+            )
+            .await;
             let _ = tx.send(frame);
         });
 
@@ -389,7 +390,7 @@ impl BucketScanner {
 
     /// Drop a persisted scan for a bucket (e.g. user clicked "forget
     /// this result"). Returns true if a record existed.
-    pub fn forget(&self, bucket: &str) -> bool {
+    pub async fn forget(&self, bucket: &str) -> bool {
         let removed_in_memory = {
             let mut buckets = self.buckets.write();
             match buckets.get(bucket) {
@@ -400,7 +401,10 @@ impl BucketScanner {
         let path = self
             .scan_dir
             .join(format!("{}.json", sanitise_bucket_for_filename(bucket)));
-        let removed_on_disk = std::fs::remove_file(&path).is_ok();
+        // A blocking unlink must not stall a runtime worker (ARCH F-04).
+        let removed_on_disk = tokio::task::spawn_blocking(move || std::fs::remove_file(&path))
+            .await
+            .is_ok_and(|r| r.is_ok());
         removed_in_memory || removed_on_disk
     }
 }
@@ -501,7 +505,7 @@ impl ScanProgress {
 /// stream without `done`, and "Scan all" stopped). A completed result is
 /// persisted and recorded; a failure puts back the previous result. Only
 /// our own Running entry is settled (a `forget()` may have run).
-fn settle_scan(
+async fn settle_scan(
     buckets: &RwLock<HashMap<String, BucketState>>,
     scan_dir: &std::path::Path,
     bucket: &str,
@@ -513,8 +517,12 @@ fn settle_scan(
     match &outcome {
         Ok(result) => {
             // Persist before the in-memory publish. A failed write warns;
-            // the in-memory result still serves this process.
-            persist_scan(scan_dir, result);
+            // the in-memory result still serves this process. The write
+            // is blocking I/O: off the runtime workers (ARCH F-04).
+            let (dir, record) = (scan_dir.to_path_buf(), result.clone());
+            if let Err(e) = tokio::task::spawn_blocking(move || persist_scan(&dir, &record)).await {
+                warn!(bucket = %bucket, error = %e, "Scan cache write task failed");
+            }
             debug!(
                 bucket = %bucket,
                 objects = result.total_objects,
@@ -728,7 +736,7 @@ pub async fn delete_scan(
     AdminQuery(q): AdminQuery<BucketQuery>,
 ) -> Result<Json<serde_json::Value>, super::AdminError> {
     let bucket = q.bucket.admit(&state)?;
-    let forgotten = state.bucket_scanner.forget(&bucket);
+    let forgotten = state.bucket_scanner.forget(&bucket).await;
     Ok(Json(serde_json::json!({ "forgotten": forgotten })))
 }
 
@@ -850,8 +858,8 @@ mod tests {
     /// Review A10: every end of a scan records its result first and then
     /// gives a terminal frame: the totals on success, the previous result
     /// back and the error otherwise.
-    #[test]
-    fn settle_scan_records_then_gives_a_terminal_frame() {
+    #[tokio::test]
+    async fn settle_scan_records_then_gives_a_terminal_frame() {
         let dir = tempfile::tempdir().unwrap();
         let result = |n: u64| ScanResult {
             bucket: "b".into(),
@@ -883,7 +891,7 @@ mod tests {
         };
 
         let map = running();
-        let frame = settle_scan(&map, dir.path(), "b", Some(result(1)), &last, Ok(result(5)));
+        let frame = settle_scan(&map, dir.path(), "b", Some(result(1)), &last, Ok(result(5))).await;
         assert_eq!(done(&map), Some(5));
         assert!(frame.finished && !frame.has_more && frame.error.is_none());
         assert_eq!((frame.objects, frame.original_bytes), (5, 50));
@@ -893,7 +901,8 @@ mod tests {
             (ScanFailure::Cancelled, "cancelled"),
         ] {
             let map = running();
-            let frame = settle_scan(&map, dir.path(), "b", Some(result(1)), &last, Err(failure));
+            let frame =
+                settle_scan(&map, dir.path(), "b", Some(result(1)), &last, Err(failure)).await;
             assert_eq!(done(&map), Some(1), "the previous result is back");
             assert!(frame.finished && frame.error.as_deref().is_some_and(|e| e.contains(text)));
             assert_eq!(frame.objects, 3, "the last counts");
