@@ -105,7 +105,11 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                              witness gate): every metadata-returning method presents, raw metadata never leaves it (source guards
                              `the_seal_key_is_named_only_where_a_sealed_shape_is_handled`, `no_v1_encryption_format_remains`). S3 lists
                              logical facts of sealed objects from `!!2` tokens (`FileMetadata::listing_token` → `put` path; in-process
-                             `list_size_cache::record_token`); `!!1` facts are ignored on a backend with a key. The read rule
+                             `list_size_cache::record_token`); `!!1` facts are ignored on a backend with a key. A token MISS
+                             (`token_heal.rs`, pure `decide_miss`): a passthrough in a bucket that serves no plaintext lists
+                             `v2::plaintext_len_of(stored)` (`ListedSize::SizeOnly`, stored ETag), ≤8 delta misses per page
+                             are HEADed on the LIST path, and the token is re-kept via `StorageBackend::keep_listing_token`
+                             (inline or by the bounded background healer). The read rule
                              gates GET/HEAD/copy/range only: a LIST shows an entry whose seal does not open as stored
                              (`FileMetadata::is_unopened_seal`, never cached), a DELETE removes it (`resolve_forms_to_delete`),
                              and boot warns about plaintext in a `refuse` bucket (`startup::spawn_plaintext_refusal_check`)

@@ -1560,6 +1560,18 @@ pub trait StorageBackend: Send + Sync {
         objects: &[(String, FileMetadata)],
     ) -> impl Future<Output = Vec<Option<ListedToken>>> + Send;
 
+    /// Keep the listing token `token` of a stored object that a LIST found
+    /// without one (the encrypting wrapper's token healer learned it from a
+    /// HEAD): remember it in this process and, where the marker key fits,
+    /// write its `!!2` marker in the background, as a PUT does. Best effort,
+    /// never fails. Filesystem: nothing (its listing carries the logical
+    /// facts). No default: a wrapper must forward it.
+    fn keep_listing_token(
+        &self,
+        bucket: &str,
+        token: &ListedToken,
+    ) -> impl Future<Output = ()> + Send;
+
     /// Enrich listed objects with full metadata from HEAD calls.
     /// Used by the `metadata=true` MinIO ListObjectsV2 extension.
     ///

@@ -647,6 +647,184 @@ async fn a_list_heals_missing_listing_facts() {
     );
 }
 
+/// The keys of the listing markers (`!!1` facts, `!!2` tokens) under
+/// `.dg/facts/{prefix}` in `bucket`, read directly from MinIO.
+async fn marker_keys(raw: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> Vec<String> {
+    raw.list_objects_v2()
+        .bucket(bucket)
+        .prefix(format!(".dg/facts/{prefix}"))
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect()
+}
+
+/// Delete the listing markers of `prefix`: an object whose token write
+/// failed, or whose marker key is too long for S3.
+async fn drop_markers(raw: &aws_sdk_s3::Client, bucket: &str, prefix: &str) {
+    for k in marker_keys(raw, bucket, prefix).await {
+        raw.delete_object()
+            .bucket(bucket)
+            .key(k)
+            .send()
+            .await
+            .unwrap();
+    }
+}
+
+/// The size and ETag of each listed key under `prefix`.
+async fn listed_facts(server: &TestServer, prefix: &str) -> Vec<(String, i64, String)> {
+    server
+        .s3_client()
+        .await
+        .list_objects_v2()
+        .bucket(server.bucket())
+        .prefix(prefix)
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .iter()
+        .map(|o| {
+            (
+                o.key().unwrap().to_string(),
+                o.size().unwrap(),
+                o.e_tag().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+async fn head_facts(server: &TestServer, key: &str) -> (i64, String) {
+    let head = server
+        .s3_client()
+        .await
+        .head_object()
+        .bucket(server.bucket())
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    (
+        head.content_length().unwrap(),
+        head.e_tag().unwrap().to_string(),
+    )
+}
+
+async fn token_misses(endpoint: &str, kind: &str) -> u64 {
+    scrape_counter(
+        endpoint,
+        &format!("deltaglider_listing_token_misses_total{{kind=\"{kind}\"}}"),
+    )
+    .await
+}
+
+/// Wait (10 s at most) until a listing marker exists under `prefix`.
+async fn wait_for_marker(raw: &aws_sdk_s3::Client, bucket: &str, prefix: &str, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while marker_keys(raw, bucket, prefix).await.is_empty() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// An encrypted object whose listing token is gone (its marker write
+/// failed, or its marker key is too long for S3) listed its CIPHERTEXT
+/// size, and a delta the size of the delta. Now, on a node that never saw
+/// the object: a passthrough lists the plaintext size that its stored size
+/// gives (no request), and a background HEAD keeps its token again, after
+/// which the ETag matches HEAD too. A delta is HEADed on the LIST's path,
+/// so its size and ETag match HEAD on the first LIST.
+#[tokio::test]
+async fn an_encrypted_object_without_its_listing_token_lists_its_head_size() {
+    skip_unless_minio!();
+    const KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let bucket = common::unique_bucket("enc-token-miss");
+    let encrypted = || {
+        TestServer::builder()
+            .s3_endpoint(&common::minio_endpoint_url())
+            .bucket(&bucket)
+            .encryption_key(KEY_HEX)
+    };
+    let writer = encrypted().build().await;
+    let client = writer.s3_client().await;
+    let prefix = unique_prefix();
+    let photo = format!("{prefix}/photo.jpg");
+    let base = generate_binary(100_000, 31);
+    let variant = mutate_binary(&base, 0.01);
+    for (key, body) in [
+        (photo.clone(), generate_binary(70_000, 32)),
+        (format!("{prefix}/base.zip"), base),
+        (format!("{prefix}/v1.zip"), variant.clone()),
+    ] {
+        client
+            .put_object()
+            .bucket(writer.bucket())
+            .key(&key)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .unwrap();
+    }
+    let raw = common::minio_client().await;
+    let v1 = format!("{prefix}/v1.zip");
+    wait_for_facts_in(&raw, &bucket, &photo, 1).await;
+    wait_for_facts_in(&raw, &bucket, &v1, 1).await;
+    drop_markers(&raw, &bucket, &photo).await;
+    drop_markers(&raw, &bucket, &v1).await;
+    let stored_v1 = raw
+        .head_object()
+        .bucket(&bucket)
+        .key(format!("{v1}.delta"))
+        .send()
+        .await
+        .expect("v1.zip is stored as a delta")
+        .content_length()
+        .unwrap();
+    assert!((stored_v1 as usize) < variant.len() / 2);
+
+    // A node that never saw the objects (no in-process token).
+    let reader = encrypted().build().await;
+    let listed = listed_facts(&reader, &format!("{prefix}/")).await;
+    let (photo_head, v1_head) = (
+        head_facts(&reader, &photo).await,
+        head_facts(&reader, &v1).await,
+    );
+    let entry = |key: &str| listed.iter().find(|(k, _, _)| k == key).unwrap().clone();
+    let (_, photo_size, _) = entry(&photo);
+    assert_eq!(photo_size, photo_head.0, "passthrough: plaintext size");
+    let (_, v1_size, v1_etag) = entry(&v1);
+    assert_eq!(
+        v1_size, v1_head.0,
+        "delta: the original size, not the delta"
+    );
+    assert_eq!(v1_size as usize, variant.len());
+    assert_eq!(v1_etag, v1_head.1, "delta: the logical ETag");
+    assert!(token_misses(&reader.endpoint(), "passthrough_inverted").await >= 1);
+    assert!(token_misses(&reader.endpoint(), "delta_headed").await >= 1);
+
+    // Both tokens are kept again (the delta's by the LIST's HEAD, the
+    // passthrough's by a background HEAD): a third node lists size AND
+    // ETag of both from them.
+    wait_for_marker(&raw, &bucket, &v1, "the delta's token is kept").await;
+    wait_for_marker(&raw, &bucket, &photo, "the passthrough's token is healed").await;
+    let third = encrypted().build().await;
+    let listed = listed_facts(&third, &format!("{prefix}/")).await;
+    let entry = |key: &str| listed.iter().find(|(k, _, _)| k == key).unwrap().clone();
+    assert_eq!((entry(&photo).1, entry(&photo).2), photo_head);
+    assert_eq!((entry(&v1).1, entry(&v1).2), v1_head);
+    assert_eq!(
+        token_misses(&third.endpoint(), "unresolved").await
+            + token_misses(&third.endpoint(), "passthrough_inverted").await
+            + token_misses(&third.endpoint(), "delta_headed").await,
+        0,
+        "no miss left"
+    );
+}
+
 /// A PUT writes its listing facts in the background (storage-8): wait until
 /// the facts namespace under `prefix` holds at least `n` entries.
 async fn wait_for_facts(raw: &aws_sdk_s3::Client, prefix: &str, n: usize) {

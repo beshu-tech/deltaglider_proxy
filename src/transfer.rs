@@ -2916,6 +2916,7 @@ mod multipart_abort_tests {
         ) -> Vec<Option<crate::storage::ListedToken>> {
             vec![None; objects.len()]
         }
+        async fn keep_listing_token(&self, _: &str, _: &crate::storage::ListedToken) {}
         async fn read_key_claim(
             &self,
             _: &str,
@@ -3157,6 +3158,9 @@ mod multipart_abort_tests {
             objects: &[(String, crate::types::FileMetadata)],
         ) -> Vec<Option<crate::storage::ListedToken>> {
             self.0.listing_tokens(b, objects).await
+        }
+        async fn keep_listing_token(&self, b: &str, t: &crate::storage::ListedToken) {
+            self.0.keep_listing_token(b, t).await
         }
         async fn read_key_claim(
             &self,

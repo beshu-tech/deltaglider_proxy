@@ -30,8 +30,11 @@ mod sentinel;
 mod sentinel_tests;
 #[cfg(test)]
 mod tests;
+mod token_heal;
 pub(crate) mod v2;
 mod witness;
+
+pub use token_heal::LISTING_TOKEN_MISSES;
 
 pub use seal::{ENCRYPTION_MARKER_KEYS, PRESENTED_MARKER_VALUE};
 
@@ -309,21 +312,25 @@ async fn collect_stream(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
 
 /// Transparent encryption wrapper around any `StorageBackend`.
 pub struct EncryptingBackend<B: StorageBackend> {
-    inner: B,
+    /// Shared with the background token healer (`token_heal.rs`).
+    inner: Arc<B>,
     config: Arc<ArcSwap<EncryptionConfig>>,
     /// The raw backend's name and the witness gate (multi-instance).
     witness: Option<(String, Arc<WitnessGate>)>,
     /// The foreign-key sentinel (`sentinel.rs`); `None` = no check.
     sentinel: Option<Arc<KeySentinel>>,
+    /// Heals listing-token misses (`token_heal.rs`).
+    healer: token_heal::TokenHealer,
 }
 
 impl<B: StorageBackend> EncryptingBackend<B> {
     pub fn new(inner: B, config: Arc<ArcSwap<EncryptionConfig>>) -> Self {
         Self {
-            inner,
+            inner: Arc::new(inner),
             config,
             witness: None,
             sentinel: None,
+            healer: Default::default(),
         }
     }
 
@@ -1345,7 +1352,90 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     }
 }
 
-impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
+impl<B: StorageBackend + Send + Sync + 'static> EncryptingBackend<B> {
+    /// The entries a LIST found without a listing token (see
+    /// `token_heal.rs`): a sealed passthrough lists its exact plaintext
+    /// size, a few deltas per page are HEADed now (not when the caller
+    /// HEADs its misses itself), and every miss whose facts stay
+    /// incomplete is healed in the background, so the next LIST finds its
+    /// token.
+    async fn resolve_token_misses(
+        &self,
+        b: &str,
+        objects: &mut [(String, FileMetadata)],
+        sizes: &mut [ListedSize],
+        how: ResolveListed,
+    ) {
+        use token_heal::{count, MissDecision};
+        let plaintext_ok = self.plaintext_ok(b);
+        let mut budget = if how.caller_heads_misses {
+            0
+        } else {
+            token_heal::INLINE_DELTA_HEADS
+        };
+        let mut head_now: Vec<(usize, token_heal::Miss)> = Vec::new();
+        let mut background = Vec::new();
+        for (i, ((key, meta), size)) in objects.iter_mut().zip(sizes.iter_mut()).enumerate() {
+            if *size != ListedSize::StoredOnly {
+                continue;
+            }
+            let miss = token_heal::Miss::of(key, meta);
+            let may_head = miss.is_delta && budget > 0 && self.healer.try_inline(b, &miss);
+            match token_heal::decide_miss(miss.stored_size, miss.is_delta, plaintext_ok, may_head) {
+                MissDecision::Invert(n) => {
+                    meta.file_size = n;
+                    *size = ListedSize::SizeOnly;
+                    count(token_heal::PASSTHROUGH_INVERTED);
+                    background.push(miss);
+                }
+                MissDecision::HeadNow => {
+                    budget -= 1;
+                    head_now.push((i, miss));
+                }
+                MissDecision::Keep { heal } => {
+                    count(token_heal::UNRESOLVED);
+                    if heal {
+                        background.push(miss);
+                    }
+                }
+            }
+        }
+        if !head_now.is_empty() {
+            let cfg = self.config.load_full();
+            let heads = futures::future::join_all(
+                head_now
+                    .iter()
+                    .map(|(_, miss)| token_heal::heal_one(&*self.inner, &cfg, b, miss)),
+            )
+            .await;
+            for ((i, miss), head) in head_now.into_iter().zip(heads) {
+                let resolved = match head {
+                    Ok(Some(t)) => open_token(cfg.ring(), b, &t)
+                        .is_some_and(|lf| apply_listing_facts(&mut objects[i].1, &t, &lf)),
+                    Ok(None) | Err(StorageError::NotFound(_)) => false,
+                    Err(e) => {
+                        tracing::debug!("listing {b}: HEAD of {} failed: {e}", miss.key);
+                        self.healer.pause();
+                        false
+                    }
+                };
+                if resolved {
+                    sizes[i] = ListedSize::Cached;
+                    count(token_heal::DELTA_HEADED);
+                } else {
+                    count(token_heal::UNRESOLVED);
+                }
+            }
+        }
+        for miss in background {
+            let _ = self
+                .healer
+                .queue(self.inner.clone(), self.config.clone(), b, miss);
+        }
+    }
+}
+
+impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBackend<B> {
     // ── Writes: seal ──
 
     /// A storage-level copy moves the stored bytes as they are, so it is
@@ -1717,6 +1807,9 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     ) -> Vec<Option<crate::storage::ListedToken>> {
         self.inner.listing_tokens(b, objects).await
     }
+    async fn keep_listing_token(&self, b: &str, token: &crate::storage::ListedToken) {
+        self.inner.keep_listing_token(b, token).await
+    }
 
     // ── Metadata: present / re-seal ──
 
@@ -1931,6 +2024,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 }
             }
         }
+        self.resolve_token_misses(b, objects, &mut sizes, how).await;
         sizes
     }
 

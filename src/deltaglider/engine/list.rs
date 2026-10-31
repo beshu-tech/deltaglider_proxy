@@ -127,7 +127,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// form. A sealed delta's plaintext size comes from its listing token
     /// with its logical facts. Pure; unit-tested.
     pub(super) fn list_entry_needs_head(size: crate::storage::list_size_cache::ListedSize) -> bool {
-        !size.is_known()
+        // A `SizeOnly` entry lists its exact size, but `metadata=true`
+        // promises the object's facts, and its logical ETag is one of them.
+        !size.is_exact()
     }
 
     /// A delta entry built from LIST data alone (no HEAD) — the `delta_stub`
@@ -333,8 +335,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // in the logical size and ETag of each exact stored object (same key,
         // ETag and size), from this process's listing-size cache or from the
         // durable listing facts (one more LIST per page, any node, after a
-        // restart; see `storage::listing_facts`). A miss keeps the stored
-        // size: a client LIST never sends a HEAD (issue #82). Never fails.
+        // restart; see `storage::listing_facts`). A client LIST sends no HEAD
+        // per key (issue #82): on an encrypted backend a sealed passthrough
+        // without its token lists the plaintext size its stored size gives,
+        // and only a few delta misses per page are HEADed (see
+        // `storage::encrypting::token_heal`). Never fails.
         let sizes = if page.objects.is_empty() {
             Vec::new()
         } else {

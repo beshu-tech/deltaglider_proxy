@@ -174,6 +174,7 @@ impl crate::storage::StorageBackend for NullInner {
     ) -> Vec<Option<crate::storage::ListedToken>> {
         vec![None; objects.len()]
     }
+    async fn keep_listing_token(&self, _: &str, _: &crate::storage::ListedToken) {}
     async fn read_key_claim(
         &self,
         _: &str,

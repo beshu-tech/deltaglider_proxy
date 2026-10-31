@@ -24,6 +24,7 @@ mod traits;
 #[cfg(unix)]
 pub(crate) mod xattr_meta;
 
+pub use encrypting::LISTING_TOKEN_MISSES;
 pub use encrypting::{
     BucketKeys, EncryptingBackend, EncryptionConfig, EncryptionKey, EncryptionPolicies, PolicySlot,
     WitnessGate, WitnessGateState, WriteMode, WITNESS_BACKEND_DEFAULT,
@@ -44,7 +45,7 @@ pub use s3::{
     NativeEncryptionConfig, NativeEncryptionPolicy, NativeOverrides, S3Backend,
     BACKEND_GET_BODY_RESUMES, BACKEND_HEAD_REQUESTS, BACKEND_REQUEST_ATTEMPTS,
     BACKEND_REQUEST_DURATION, DELEGATED_LIST_PROBE_REQUESTS, DELEGATED_LIST_UPSTREAM_PAGES,
-    LISTING_FACTS_MISSES, LISTING_FACTS_REQUESTS,
+    LISTING_FACTS_MISSES, LISTING_FACTS_READ_ERRORS, LISTING_FACTS_REQUESTS,
 };
 pub use traits::{
     clamp_range, copy_keeps_encryption, io_error_is_name_too_long, io_error_is_path_type_conflict,

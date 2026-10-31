@@ -2824,6 +2824,48 @@ mod sealed_shape_tests {
         );
     }
 
+    /// A facts LIST that fails is sent once more: one failure no longer
+    /// costs the page its tokens. Two failures leave the page without them,
+    /// and both outcomes are counted.
+    #[tokio::test]
+    async fn a_failed_facts_list_is_retried_once() {
+        let (s3, fake) = crate::storage::fake_s3::backend().await;
+        fake.insert_object("b/r/a.bin", b"aaaa", &[]);
+        let a = md5_hex(b"aaaa");
+        s3.write_listing_token("b", "r/a.bin", &a, 4, "aTok");
+        s3.facts_cleanup.settle("b").await;
+        let objects = s3.bulk_list_objects("b", "r/").await.unwrap();
+        let facts_lists = |fake: &crate::storage::FakeS3| -> usize {
+            fake.requests()
+                .iter()
+                .filter(|r| r.contains("prefix=.dg%2Ffacts"))
+                .count()
+        };
+        let errors = |outcome: &str| {
+            LISTING_FACTS_READ_ERRORS
+                .with_label_values(&[outcome])
+                .get()
+        };
+
+        // A 400 is not retried by the SDK, so each fault is one request.
+        let retried = errors("retried");
+        fake.clear();
+        fake.fail("LIST", "prefix=.dg%2Ffacts", 400, "InvalidRequest", 1);
+        let tokens = s3.listing_tokens("b", &objects).await;
+        assert_eq!(tokens[0].as_ref().map(|t| t.token.as_str()), Some("aTok"));
+        assert_eq!(facts_lists(&fake), 2);
+        assert!(errors("retried") > retried);
+
+        let failed = errors("failed");
+        fake.clear();
+        fake.clear_faults();
+        fake.fail("LIST", "prefix=.dg%2Ffacts", 400, "InvalidRequest", 2);
+        let tokens = s3.listing_tokens("b", &objects).await;
+        assert!(tokens[0].is_none());
+        assert_eq!(facts_lists(&fake), 2, "one retry, no more");
+        assert!(errors("failed") > failed);
+    }
+
     /// With `trust_v1_facts: false` neither the `!!1` facts nor the process
     /// entries learned from them resolve a listed size, and no facts LIST
     /// is sent.

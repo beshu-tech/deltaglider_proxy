@@ -556,6 +556,9 @@ impl StorageBackend for FaultyFs {
     ) -> Vec<Option<crate::storage::ListedToken>> {
         self.inner.listing_tokens(b, objects).await
     }
+    async fn keep_listing_token(&self, b: &str, token: &crate::storage::ListedToken) {
+        self.inner.keep_listing_token(b, token).await
+    }
 
     async fn read_key_claim(
         &self,

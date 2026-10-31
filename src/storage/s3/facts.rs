@@ -8,6 +8,9 @@ use super::*;
 /// one or two; more means stale entries, and the rest keep stored sizes.
 pub(super) const MAX_FACTS_PAGES: usize = 4;
 
+/// Attempts of one facts LIST request (one retry).
+const FACTS_READ_ATTEMPTS: u32 = 2;
+
 impl S3Backend {
     /// Record, in the listing-size cache, what a client must see for the
     /// stored object `key` (see `list_size_cache`). Called wherever the
@@ -202,17 +205,32 @@ impl S3Backend {
                 Some(t) => request.continuation_token(t),
                 None => request.start_after(&scan.start_after),
             };
-            LISTING_FACTS_REQUESTS.with_label_values(&["list"]).inc();
-            let resp = match request.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(
-                        "listing facts of {bucket} not read: {}",
-                        self.classify(bucket, &e, S3Op::ListObjects)
-                    );
-                    break;
+            // One retry: a failed read costs the whole page its logical
+            // sizes (and, encrypted, its listing tokens).
+            let mut attempt = 0;
+            let resp = loop {
+                LISTING_FACTS_REQUESTS.with_label_values(&["list"]).inc();
+                match request.clone().send().await {
+                    Ok(r) => break Some(r),
+                    Err(e) => {
+                        let err = self.classify(bucket, &e, S3Op::ListObjects);
+                        attempt += 1;
+                        if attempt < FACTS_READ_ATTEMPTS {
+                            LISTING_FACTS_READ_ERRORS
+                                .with_label_values(&["retried"])
+                                .inc();
+                            debug!("listing facts of {bucket} not read, retrying: {err}");
+                            continue;
+                        }
+                        LISTING_FACTS_READ_ERRORS
+                            .with_label_values(&["failed"])
+                            .inc();
+                        warn!("listing facts of {bucket} not read: {err}");
+                        break None;
+                    }
                 }
             };
+            let Some(resp) = resp else { break };
             let mut past = false;
             for key in resp.contents().iter().filter_map(|o| o.key()) {
                 if scan.is_past(key) {

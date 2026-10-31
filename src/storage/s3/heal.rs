@@ -35,7 +35,7 @@ const PAUSE: Duration = Duration::from_secs(60);
 
 /// Why a miss is not queued, or `None` when it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Skip {
+pub(in crate::storage) enum Skip {
     ShuttingDown,
     Paused,
     Full,
@@ -43,7 +43,7 @@ pub(super) enum Skip {
 }
 
 /// Pure: whether a facts miss gets a background HEAD now.
-pub(super) fn admit(
+pub(in crate::storage) fn admit(
     shutting_down: bool,
     paused: bool,
     pending: usize,

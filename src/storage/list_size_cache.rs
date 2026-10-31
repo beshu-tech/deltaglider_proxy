@@ -289,13 +289,25 @@ pub enum ListedSize {
     /// The listing-size cache or the durable listing facts supplied the
     /// logical size and ETag.
     Cached,
+    /// The logical size is exact, the ETag is still the stored one: a
+    /// sealed passthrough object listed without its listing token. Its
+    /// stored size is the exact stored size of a DGE2 body, which gives the
+    /// plaintext size (`encrypting::v2::plaintext_len_of`) without a
+    /// request. Its logical ETag is known only to a HEAD (or a token).
+    SizeOnly,
     /// Only the stored size is known.
     StoredOnly,
 }
 
 impl ListedSize {
+    /// Is the logical SIZE known?
     pub fn is_known(self) -> bool {
         !matches!(self, ListedSize::StoredOnly)
+    }
+
+    /// Are both the logical size and the logical ETag known?
+    pub fn is_exact(self) -> bool {
+        matches!(self, ListedSize::Listed | ListedSize::Cached)
     }
 }
 

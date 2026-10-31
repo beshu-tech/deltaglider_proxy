@@ -26,7 +26,7 @@ mod client;
 mod copy;
 mod errors;
 mod facts;
-mod heal;
+pub(in crate::storage) mod heal;
 mod listing;
 mod metadata;
 mod objects;
@@ -126,6 +126,21 @@ pub static LISTING_FACTS_REQUESTS: std::sync::LazyLock<prometheus::IntCounterVec
                 "Requests sent to S3 to read, write or clean up listing facts",
             ),
             &["kind"],
+        )
+        .expect("valid metric")
+    });
+
+/// Facts LIST requests (see `storage::listing_facts`) that failed, by
+/// outcome: `retried` (sent once more), `failed` (the second failed too;
+/// the page lists stored sizes where its facts were not read).
+pub static LISTING_FACTS_READ_ERRORS: std::sync::LazyLock<prometheus::IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "deltaglider_listing_facts_read_errors_total",
+                "Failed LIST requests of the listing facts, by outcome (retried, failed)",
+            ),
+            &["outcome"],
         )
         .expect("valid metric")
     });
@@ -1584,6 +1599,26 @@ impl StorageBackend for S3Backend {
         objects: &[(String, FileMetadata)],
     ) -> Vec<Option<crate::storage::ListedToken>> {
         self.read_listing_tokens(bucket, objects).await
+    }
+
+    async fn keep_listing_token(&self, bucket: &str, t: &crate::storage::ListedToken) {
+        crate::storage::list_size_cache::record_token(
+            &StoredObjectId {
+                scope: &self.list_cache_scope,
+                bucket,
+                key: &t.stored_key,
+                etag: &t.stored_etag,
+                size: t.stored_size,
+            },
+            &t.token,
+        );
+        self.write_listing_token(
+            bucket,
+            &t.stored_key,
+            &t.stored_etag,
+            t.stored_size,
+            &t.token,
+        );
     }
 
     /// Optimised listing that delegates paging and delimiter collapsing to

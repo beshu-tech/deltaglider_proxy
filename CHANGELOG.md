@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — Encrypted objects without a listing token list their real size
+
+- On an encrypted S3 backend, the proxy lists an object with the size and the ETag from its listing token. An object without a token was listed with its stored size. For an object stored as it is, that was the size of the ciphertext, and for a delta it was the size of the delta, so a 4 GB object could show as 46 bytes. A tool that compares sizes, such as `rclone sync`, then copied the object again. An object has no token when the write of its token failed, when it was stored before listing tokens existed, or when its key is longer than about 900 bytes.
+- A LIST request now computes the exact size of an object that is stored as it is from its stored size, because the encrypted format adds a fixed number of bytes for each 64 KiB. This needs no extra request. The proxy does this only in a bucket that serves no plaintext, because in other buckets the object can be plaintext.
+- A LIST request sends a `HEAD` request for up to 8 deltas without a token on each page, and it lists their size and ETag. The proxy then writes the missing token again, so the next LIST request needs no `HEAD` request. The proxy writes the tokens of the other objects without a token in the background.
+- The folder usage and the quota use the computed sizes too, so their totals are exact for objects stored as they are.
+- A failed request that reads the listing facts index is now sent once more. Before, one failed request made the whole listing page show stored sizes.
+- Two new counters show these cases: `deltaglider_listing_token_misses_total` and `deltaglider_listing_facts_read_errors_total`. See [Metrics](docs/product/reference/metrics.md).
+
 ## v2.0.23 — 2026-10-31
 
 ### Added — A preview of HTML files

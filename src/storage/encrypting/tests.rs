@@ -82,7 +82,7 @@ async fn collect(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
 }
 
 /// The bytes of a range read, or its error (the open or the stream).
-async fn read_range<B: StorageBackend>(
+async fn read_range<B: StorageBackend + 'static>(
     w: &EncryptingBackend<B>,
     bucket: &str,
     prefix: &str,
@@ -404,6 +404,8 @@ mod wrapper_tests {
         file_puts: Mutex<Vec<(std::path::PathBuf, usize)>>,
         /// What `listing_tokens` answers.
         tokens: Mutex<Vec<Option<crate::storage::ListedToken>>>,
+        /// What `keep_listing_token` was handed.
+        kept: Mutex<Vec<crate::storage::ListedToken>>,
     }
 
     impl CountingBackend {
@@ -416,6 +418,7 @@ mod wrapper_tests {
                 probe_spool: None,
                 file_puts: Mutex::new(Vec::new()),
                 tokens: Mutex::new(Vec::new()),
+                kept: Mutex::new(Vec::new()),
             }
         }
 
@@ -523,6 +526,9 @@ mod wrapper_tests {
             let mut t = self.tokens.lock().unwrap().clone();
             t.resize(objects.len(), None);
             t
+        }
+        async fn keep_listing_token(&self, _: &str, t: &crate::storage::ListedToken) {
+            self.kept.lock().unwrap().push(t.clone());
         }
         fn lite_list_carries_logical_facts(&self, _: &str) -> bool {
             false
@@ -709,7 +715,7 @@ mod wrapper_tests {
         )
         .await
         .unwrap();
-        let inner = w.inner;
+        let inner = std::sync::Arc::into_inner(w.inner).expect("the only owner");
         (EncryptingBackend::new(inner, shared(cfg)), data)
     }
 
@@ -1877,21 +1883,37 @@ mod wrapper_tests {
         let sizes = w
             .resolve_listed_sizes("b", &mut objects, ResolveListed::default())
             .await;
-        use ListedSize::{Cached, Listed, StoredOnly};
+        use ListedSize::{Cached, Listed, SizeOnly};
+        // An entry without a valid token lists the plaintext size of its
+        // ciphertext (the bucket serves no plaintext), with its stored ETag.
         assert_eq!(
             sizes,
-            [Cached, StoredOnly, StoredOnly, StoredOnly, Cached, StoredOnly, Listed]
+            [Cached, SizeOnly, SizeOnly, SizeOnly, Cached, SizeOnly, Listed]
         );
         assert_eq!(objects[0].1.file_size, 1000);
         assert_eq!(
             objects[0].1.etag(),
             format!("\"{}\"", hex::encode([3u8; 16]))
         );
-        assert_eq!(objects[1].1.file_size, stored, "a forged token applied");
+        assert_eq!(objects[1].1.etag(), "\"e1\"", "a forged token applied");
+        assert_eq!(objects[3].1.file_size, 1000, "the token's size applied");
+        assert_eq!(objects[5].1.file_size, 1000);
         assert_eq!(
             objects[4].1.etag(),
             format!("\"{}-3\"", hex::encode([3u8; 16]))
         );
+
+        // A bucket that serves plaintext may hold a plaintext object of
+        // that size: the stored size stands.
+        let mut serving = keyed(key(0xa1), "kid-a");
+        serving.serve_plaintext = true;
+        let w = EncryptingBackend::new(CountingBackend::new(), shared(serving));
+        let mut objects = listing();
+        let sizes = w
+            .resolve_listed_sizes("b", &mut objects, ResolveListed::default())
+            .await;
+        assert_eq!(sizes[5], ListedSize::StoredOnly);
+        assert_eq!(objects[5].1.file_size, stored);
 
         // Without any key, the inner listing stands.
         let plain =
@@ -2580,7 +2602,7 @@ mod range_matrix_tests {
         })
     }
 
-    async fn outcome<B: StorageBackend>(
+    async fn outcome<B: StorageBackend + 'static>(
         w: &EncryptingBackend<B>,
         name: &str,
         start: u64,
@@ -2605,7 +2627,7 @@ mod range_matrix_tests {
         }
     }
 
-    async fn run<B: StorageBackend, F: Fn() -> B>(mk: F) -> Vec<String> {
+    async fn run<B: StorageBackend + 'static, F: Fn() -> B>(mk: F) -> Vec<String> {
         let (a, p) = (key(0xaa), key(0xbb));
         let writer_a =
             EncryptingBackend::new(mk(), cfg(Some(a.clone()), Some("kid-a"), None, false));

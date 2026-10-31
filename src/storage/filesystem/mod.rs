@@ -1752,6 +1752,9 @@ impl StorageBackend for FilesystemBackend {
         vec![None; objects.len()]
     }
 
+    /// The listing carries the logical facts: no token to keep.
+    async fn keep_listing_token(&self, _bucket: &str, _token: &crate::storage::ListedToken) {}
+
     // === Scanning operations ===
 
     #[instrument(skip(self))]
