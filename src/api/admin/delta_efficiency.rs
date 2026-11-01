@@ -477,9 +477,15 @@ fn ranges_after(next: &str, seeds: Vec<String>) -> Vec<KeyRange> {
 }
 
 /// Ranges of one scan: enough that [`SCAN_PARALLEL`] readers stay busy when
-/// the ranges differ in size.
+/// the ranges differ in size. More ranges only add requests: 64 and 128
+/// were not faster (measured with the numbers of [`SCAN_PARALLEL`]).
 const SCAN_RANGES: usize = 32;
-/// Pages listed at the same time by one scan.
+/// Pages listed at the same time by one scan. Measured on Hetzner Object
+/// Storage with prod's `beshu` (92 860 objects, 125 requests, median of 3
+/// runs): 1 → 52 s, 2 → 29 s, 4 → 12 s, 8 → 9.8 s, 12 → 8.8 s, 16 → 13.7 s,
+/// 32 → 13.2 s. Above about 12 the backend answers each request slower
+/// (median 0.17 s alone, 0.47 s at 16, 1 s at 32), so the scan gets no
+/// faster; 8 is on the plateau and leaves room for client traffic.
 const SCAN_PARALLEL: usize = 8;
 /// Depth of the folder walk that finds the range boundaries.
 const SEED_DEPTH: usize = 4;
