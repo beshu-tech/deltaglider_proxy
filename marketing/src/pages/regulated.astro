@@ -37,7 +37,7 @@ const description =
         <p class="hero-lede">
           DeltaGlider encrypts every object with AES-256-GCM before it
           reaches the bucket. Your encryption key lives in your runtime.
-          The storage provider (Hetzner, Wasabi, Cloudflare, an offshore
+          The storage provider (AWS, Hetzner, a MinIO cluster, an offshore
           mirror) sees only ciphertext.
         </p>
 
@@ -74,7 +74,7 @@ const description =
           <pre class="enc-cipher">9f 2e 41 c7 88 0a d3 5b 6c e1 74 92 fb 08 1d a6
 33 c9 5e 07 b4 8f 2a d1 66 0b 9c e8 45 71 af 12
 de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
-          <span class="enc-cipher-note">ciphertext only, on Hetzner, Wasabi, or any other provider</span>
+          <span class="enc-cipher-note">ciphertext only, on Hetzner, AWS, or any backend with atomic writes</span>
         </div>
       </div>
     </div>
@@ -98,15 +98,25 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
           <li>
             In proxy-AES mode you supply the key per backend, as an env var
             or a <code>{'${env:...}'}</code> reference, and the proxy strips
-            it from config exports. The backend (S3, Hetzner, Wasabi, etc.)
+            it from config exports. The backend (AWS S3, Hetzner, MinIO, etc.)
             sees only ciphertext.
+          </li>
+          <li>
+            Proxy-AES needs a backend with atomic (conditional) writes,
+            because the proxy rewrites encrypted objects in place. The
+            proxy checks each backend with a probe. AWS S3, MinIO, Hetzner
+            Object Storage and filesystem backends pass. Backblaze B2 does
+            not, so there you use the backend's own encryption (SSE).
+            <a href="/docs/how-to/backend-capability-validation">How the check works</a>.
           </li>
           <li>
             Key rotation happens per backend and does not replace the old
             key in place. The old key stays as a decrypt-only shim while a
             background re-encrypt job rewrites historical objects. When
-            the job finishes, you delete the old key. While a bucket is
-            being re-encrypted, writes to it get 503 and reads pass.
+            the job finishes, you delete the old key. Reads and writes go
+            on while the job runs: each rewrite is conditional on the
+            version that the job read, so it never overwrites a client
+            write.
           </li>
           <li>
             A bucket holds one key. A second proxy that shares the backend
