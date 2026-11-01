@@ -81,6 +81,8 @@ interface DeltaEfficiencyScanning {
   bucket: string;
   min_deltas: number;
   status: 'scan_started' | 'scan_already_running';
+  /** Keys the scan listed so far; grows while it makes progress. */
+  listed_keys: number;
 }
 
 /**
@@ -106,7 +108,7 @@ type DeltaEfficiencyFetchResult = DeltaEfficiencyResponse | DeltaEfficiencyScann
 /**
  * Scan one bucket's deltaspaces and surface those whose reference
  * baseline produces too-large deltas. Same shape as the usage scanner:
- *   - 200 OK with the result if a fresh cached scan exists (5-min TTL).
+ *   - 200 OK with the result if a fresh cached scan exists (1-hour TTL).
  *   - 202 Accepted with `{ scanning: true }` when a background scan
  *     was just enqueued (or one is already running). Caller polls.
  */

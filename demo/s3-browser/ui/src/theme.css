@@ -1341,3 +1341,15 @@ code, kbd, pre, samp, .ant-typography code,
     column-gap: 8px;
   }
 }
+
+/* iOS Safari zooms the page in when a text field with text under 16 px gets
+   focus, and it stays zoomed after the field loses focus: the page then runs
+   past the right edge of the phone (the bucket picker of Compression health
+   did it with 14 px). On a touch screen every text field gets 16 px text. */
+@media (pointer: coarse) {
+  input:not([type='checkbox']):not([type='radio']),
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+}

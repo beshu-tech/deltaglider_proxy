@@ -14,23 +14,39 @@ import { qk } from './keys';
 /** The optimized scan of a 141-prefix bucket lands in ~3-5 s: one tick. */
 const POLL_MS = 3000;
 
-/** Ceiling for the 202 → 200 polling; sized for thousands of deltaspaces. */
-const SCAN_TIMEOUT_MS = 300_000;
+/**
+ * A running scan fails when it lists no new object for this long. A fixed
+ * ceiling (300 s) gave up on a large bucket while the server was still
+ * making progress (prod: 93 000 objects on a slow backend).
+ */
+const STALL_TIMEOUT_MS = 120_000;
+
+/** The last progress the poll saw: keys listed, and when the count grew. */
+export interface ScanProgress {
+  keys: number;
+  at: number;
+}
 
 export function useDeltaEfficiency(
   bucket: string | undefined,
   minDeltas: number,
-  opts: { enabled: boolean; startedAt: () => number },
+  opts: { enabled: boolean; progress: () => ScanProgress },
 ) {
   return useQuery({
     queryKey: qk.deltaEfficiency(bucket ?? '', minDeltas),
     queryFn: async () => {
       const r = await fetchDeltaEfficiency(bucket ?? '', minDeltas);
       if ('scanning' in r && !r.scanning) throw new Error(r.error);
-      if ('scanning' in r && Date.now() - opts.startedAt() > SCAN_TIMEOUT_MS) {
-        throw new Error(
-          `Scan timed out after ${Math.round(SCAN_TIMEOUT_MS / 1000)}s — try again or check server logs`,
-        );
+      if ('scanning' in r) {
+        const seen = opts.progress();
+        if (r.listed_keys > seen.keys) {
+          seen.keys = r.listed_keys;
+          seen.at = Date.now();
+        } else if (Date.now() - seen.at > STALL_TIMEOUT_MS) {
+          throw new Error(
+            `The scan listed no new object for ${Math.round(STALL_TIMEOUT_MS / 1000)} s. Try again, or check the server logs.`,
+          );
+        }
       }
       return r;
     },

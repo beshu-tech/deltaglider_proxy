@@ -96,6 +96,25 @@ impl SavingsTotals {
         }
     }
 
+    /// Add the totals of another, disjoint scope (one listing read in
+    /// parts).
+    pub fn merge(&mut self, other: &SavingsTotals) {
+        self.original_bytes = self.original_bytes.saturating_add(other.original_bytes);
+        self.stored_bytes = self.stored_bytes.saturating_add(other.stored_bytes);
+        self.reference_bytes = self.reference_bytes.saturating_add(other.reference_bytes);
+        self.delta_stored_bytes = self
+            .delta_stored_bytes
+            .saturating_add(other.delta_stored_bytes);
+        self.passthrough_bytes = self
+            .passthrough_bytes
+            .saturating_add(other.passthrough_bytes);
+        self.reference_count = self.reference_count.saturating_add(other.reference_count);
+        self.delta_count = self.delta_count.saturating_add(other.delta_count);
+        self.passthrough_count = self
+            .passthrough_count
+            .saturating_add(other.passthrough_count);
+    }
+
     /// Saturating "bytes saved" — never negative. Returns 0 when stored
     /// exceeds original (rare: a 99% delta on a 10 MB file still leaves
     /// a 10 MB reference behind, so for a single delta the apparent

@@ -39,9 +39,11 @@ use crate::api::admin::extract::{AdminJson, AdminQuery};
 use crate::storage::StorageBackend;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::{DateTime, Utc};
+use futures::{FutureExt, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -49,9 +51,11 @@ use super::{AdminError, AdminState};
 use crate::api::handlers::AppState;
 use crate::types::{FileMetadata, StorageInfo};
 
-/// Cache TTL — five minutes mirrors `UsageScanner` so an operator
-/// reloading the diagnostics tab doesn't kick off duplicate work.
-const CACHE_TTL_SECS: i64 = 300;
+/// Cache TTL. A scan of a large bucket on a slow backend takes minutes, so
+/// its result must outlive the scan: with the old 5 minutes, a result that
+/// landed after the UI stopped polling expired unseen, and the next visit
+/// started the whole scan again. Re-scan forces a new one.
+const CACHE_TTL_SECS: i64 = 3600;
 
 // ─── Pure-function core ──────────────────────────────────────────────
 
@@ -250,7 +254,8 @@ impl EfficiencyResponse {
 /// (`bucket` → `EfficiencyResponse`), one dedup set.
 pub struct DeltaEfficiencyScanner {
     cache: Arc<RwLock<HashMap<String, EfficiencyResponse>>>,
-    scanning: Arc<RwLock<HashSet<String>>>,
+    /// The running scans, with the number of keys each one listed so far.
+    scanning: Arc<RwLock<HashMap<String, Arc<AtomicU64>>>>,
     /// Scans that failed a short time ago. A GET in this window answers
     /// the failure and starts no new scan (before, every poll after a
     /// failure started another full bucket scan).
@@ -282,7 +287,7 @@ impl DeltaEfficiencyScanner {
     pub fn new() -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
-            scanning: Arc::new(RwLock::new(HashSet::new())),
+            scanning: Arc::new(RwLock::new(HashMap::new())),
             failures: Default::default(),
         }
     }
@@ -307,7 +312,16 @@ impl DeltaEfficiencyScanner {
     }
 
     pub fn is_scanning(&self, bucket: &str) -> bool {
-        self.scanning.read().contains(bucket)
+        self.scanning.read().contains_key(bucket)
+    }
+
+    /// The keys that the running scan of `bucket` listed so far, or `None`
+    /// when no scan runs. The UI shows it and judges a stall by it.
+    pub fn listed_keys(&self, bucket: &str) -> Option<u64> {
+        self.scanning
+            .read()
+            .get(bucket)
+            .map(|n| n.load(Ordering::Relaxed))
     }
 
     /// The error of the last scan of `bucket`, when it failed a short time
@@ -323,9 +337,14 @@ impl DeltaEfficiencyScanner {
     /// true if a new scan was started, false if one was already in flight.
     pub fn enqueue_scan(self: &Arc<Self>, bucket: String, s3_state: Arc<AppState>) -> bool {
         // Dedup: skip if already scanning this bucket.
-        if !self.scanning.write().insert(bucket.clone()) {
-            debug!(bucket = %bucket, "Delta-efficiency scan already in progress, skipping");
-            return false;
+        let listed = Arc::new(AtomicU64::new(0));
+        {
+            let mut scanning = self.scanning.write();
+            if scanning.contains_key(&bucket) {
+                debug!(bucket = %bucket, "Delta-efficiency scan already in progress, skipping");
+                return false;
+            }
+            scanning.insert(bucket.clone(), Arc::clone(&listed));
         }
         self.failures.clear(&bucket);
 
@@ -338,7 +357,7 @@ impl DeltaEfficiencyScanner {
                 key: bucket.clone(),
             };
 
-            match Self::scan_bucket(&s3_state, &bucket).await {
+            match Self::scan_bucket(&s3_state, &bucket, &listed).await {
                 Ok(entry) => {
                     debug!(
                         bucket = %bucket,
@@ -368,42 +387,50 @@ impl DeltaEfficiencyScanner {
     ///
     /// ONE lite listing of the bucket, paged by [`LIST_PAGE_KEYS`] keys
     /// (one LIST request each on S3), grouped by directory in memory. **No
-    /// HEAD** and no listing per directory: the listing carries the delta
-    /// sizes and the `reference.bin` baselines. (It once listed the whole
-    /// bucket for the directory names, then each directory's subtree again,
-    /// about N × depth / 1000 requests.) Memory per directory is one size
-    /// per delta, not the listed entries.
-    async fn scan_bucket(s3_state: &AppState, bucket: &str) -> Result<EfficiencyResponse, String> {
-        let mut dirs: BTreeMap<String, DeltaspaceStats> = BTreeMap::new();
-        let mut start_after: Option<String> = None;
-        loop {
-            let engine = s3_state.engine.load_full();
-            let page = engine
-                .storage()
-                .bulk_list_objects_with_baselines(
-                    bucket,
-                    "",
-                    start_after.as_deref(),
-                    Some(LIST_PAGE_KEYS),
-                )
-                .await
-                .map_err(|e| format!("listing {bucket} failed: {e}"))?;
-            for (key, meta) in &page.objects {
-                // A folder marker is no object of its folder.
-                if !key.ends_with('/') {
-                    dirs.entry(parent_dir(key)).or_default().add(meta);
-                }
+    /// HEAD**: the listing carries the delta sizes and the `reference.bin`
+    /// baselines. Memory per directory is one size per delta.
+    ///
+    /// A bucket that does not fit in one page is read as
+    /// [`SCAN_RANGES`] key ranges, [`SCAN_PARALLEL`] at a time: one page
+    /// waits for the one before it, so on a backend that answers a page in
+    /// seconds a 100 000-key bucket took minutes read in one sequence
+    /// (prod: more than the 300 s the UI waited). The ranges add about one
+    /// request each, for the page that crosses the end of a range.
+    async fn scan_bucket(
+        s3_state: &AppState,
+        bucket: &str,
+        listed: &AtomicU64,
+    ) -> Result<EfficiencyResponse, String> {
+        let storage = || s3_state.engine.load_full();
+        let first = list_page(&storage(), bucket, None).await?;
+        listed.fetch_add(first.objects.len() as u64, Ordering::Relaxed);
+        let mut dirs = BTreeMap::new();
+        fold_page(&mut dirs, &first, None);
+        let rest = match &first.next_start_after {
+            Some(next) => {
+                let seeds = coarsen(partition_seeds(&storage(), bucket).await, SCAN_RANGES);
+                ranges_after(next, seeds)
             }
-            for (key, size) in &page.baselines {
-                dirs.entry(parent_dir(key))
-                    .or_default()
-                    .add(&super::savings::reference_metadata(key, *size));
-            }
-            match page.next_start_after {
-                Some(next) => start_after = Some(next),
-                None => break,
+            None => Vec::new(),
+        };
+
+        // Built before the stream: a closure that returns a borrowing future
+        // inside `tokio::spawn` is not general enough for the compiler.
+        let jobs: Vec<_> = rest
+            .into_iter()
+            .map(|range| {
+                let engine = storage();
+                async move { scan_range(&engine, bucket, range, listed).await }.boxed()
+            })
+            .collect();
+        let ranges = futures::stream::iter(jobs).buffer_unordered(SCAN_PARALLEL);
+        futures::pin_mut!(ranges);
+        while let Some(part) = ranges.next().await {
+            for (dir, stats) in part? {
+                dirs.entry(dir).or_default().merge(stats);
             }
         }
+
         let scanned = dirs.len();
         let mut reports: Vec<DeltaspaceReport> = dirs
             .into_iter()
@@ -420,6 +447,180 @@ impl DeltaEfficiencyScanner {
             cached: false,
         })
     }
+}
+
+/// The keys `after < key < before` of a bucket (`None`: unbounded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyRange {
+    after: Option<String>,
+    before: Option<String>,
+}
+
+/// The ranges of the keys after `next` (the last key of the first page),
+/// split at the sorted `seeds`.
+fn ranges_after(next: &str, seeds: Vec<String>) -> Vec<KeyRange> {
+    let mut ranges = Vec::new();
+    let mut after = next.to_string();
+    for seed in seeds {
+        if seed > after {
+            ranges.push(KeyRange {
+                after: Some(std::mem::replace(&mut after, seed.clone())),
+                before: Some(seed),
+            });
+        }
+    }
+    ranges.push(KeyRange {
+        after: Some(after),
+        before: None,
+    });
+    ranges
+}
+
+/// Ranges of one scan: enough that [`SCAN_PARALLEL`] readers stay busy when
+/// the ranges differ in size.
+const SCAN_RANGES: usize = 32;
+/// Pages listed at the same time by one scan.
+const SCAN_PARALLEL: usize = 8;
+/// Depth of the folder walk that finds the range boundaries.
+const SEED_DEPTH: usize = 4;
+/// Pages of one folder's subfolders read for boundaries.
+const SEED_PAGES: usize = 3;
+
+async fn list_page(
+    storage: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    after: Option<&str>,
+) -> Result<crate::storage::BulkListing, String> {
+    storage
+        .storage()
+        .bulk_list_objects_with_baselines(bucket, "", after, Some(LIST_PAGE_KEYS))
+        .await
+        .map_err(|e| format!("listing {bucket} failed: {e}"))
+}
+
+/// Fold the keys of `page` below `before` into their directories.
+fn fold_page(
+    dirs: &mut BTreeMap<String, DeltaspaceStats>,
+    page: &crate::storage::BulkListing,
+    before: Option<&str>,
+) {
+    let in_range = |key: &str| before.is_none_or(|b| key < b);
+    for (key, meta) in &page.objects {
+        // A folder marker is no object of its folder.
+        if !key.ends_with('/') && in_range(key) {
+            dirs.entry(parent_dir(key)).or_default().add(meta);
+        }
+    }
+    for (key, size) in &page.baselines {
+        if in_range(key) {
+            dirs.entry(parent_dir(key))
+                .or_default()
+                .add(&super::savings::reference_metadata(key, *size));
+        }
+    }
+}
+
+/// List one key range page by page.
+async fn scan_range(
+    storage: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    range: KeyRange,
+    listed: &AtomicU64,
+) -> Result<BTreeMap<String, DeltaspaceStats>, String> {
+    let mut dirs = BTreeMap::new();
+    let mut after = range.after;
+    loop {
+        let page = list_page(storage, bucket, after.as_deref()).await?;
+        listed.fetch_add(page.objects.len() as u64, Ordering::Relaxed);
+        fold_page(&mut dirs, &page, range.before.as_deref());
+        match page.next_start_after {
+            Some(next) if range.before.as_ref().is_none_or(|b| &next < b) => after = Some(next),
+            _ => return Ok(dirs),
+        }
+    }
+}
+
+/// Folder prefixes that split the bucket's key space into ranges, sorted:
+/// the subfolders of the bucket, expanded level by level until there are
+/// [`SCAN_RANGES`] of them. Empty when the backend cannot list folders
+/// (the scan then reads one range).
+async fn partition_seeds(storage: &crate::deltaglider::DynEngine, bucket: &str) -> Vec<String> {
+    let mut frontier = vec![String::new()];
+    for _ in 0..SEED_DEPTH {
+        if frontier.len() >= SCAN_RANGES {
+            break;
+        }
+        let jobs: Vec<_> = frontier
+            .iter()
+            .map(|prefix| subfolders(storage, bucket, prefix).boxed())
+            .collect();
+        let children: Vec<Vec<String>> = futures::stream::iter(jobs)
+            .buffered(SCAN_PARALLEL)
+            .collect()
+            .await;
+        let mut next = Vec::new();
+        let mut grew = false;
+        for (prefix, kids) in frontier.iter().zip(children) {
+            if kids.is_empty() {
+                next.push(prefix.clone());
+            } else {
+                grew = true;
+                next.extend(kids);
+            }
+        }
+        frontier = next;
+        if !grew {
+            break;
+        }
+    }
+    frontier.retain(|p| !p.is_empty());
+    frontier.sort();
+    frontier.dedup();
+    frontier
+}
+
+/// The subfolders of `prefix` (at most [`SEED_PAGES`] pages), or none when
+/// the backend cannot list them.
+async fn subfolders(
+    storage: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    prefix: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..SEED_PAGES {
+        let page = match storage
+            .storage()
+            .list_objects_delegated(bucket, prefix, Some("/"), 1000, token.as_deref())
+            .await
+        {
+            Ok(Some(page)) => page,
+            Ok(None) => break,
+            Err(e) => {
+                // Fewer boundaries only make the scan slower, never wrong.
+                debug!(bucket, prefix, error = %e, "no range boundaries under this folder");
+                break;
+            }
+        };
+        out.extend(page.common_prefixes);
+        match page.next_continuation_token {
+            Some(next) if page.is_truncated => token = Some(next),
+            _ => break,
+        }
+    }
+    out
+}
+
+/// At most `n` of the sorted `seeds`, evenly spaced: merging neighbour
+/// ranges keeps the key space covered.
+fn coarsen(seeds: Vec<String>, n: usize) -> Vec<String> {
+    if seeds.len() <= n {
+        return seeds;
+    }
+    let step = seeds.len() as f64 / n as f64;
+    (1..n)
+        .map(|i| seeds[(i as f64 * step) as usize].clone())
+        .collect()
 }
 
 /// Keys per page of the bucket listing (one LIST request on S3).
@@ -503,6 +704,15 @@ impl DeltaspaceStats {
             StorageInfo::Passthrough => self.passthrough_count += 1,
         }
         self.totals.accumulate(m);
+    }
+
+    /// Add the stats of the same deltaspace from another key range.
+    fn merge(&mut self, other: DeltaspaceStats) {
+        self.reference_bytes = self.reference_bytes.or(other.reference_bytes);
+        self.delta_sizes.extend(other.delta_sizes);
+        self.passthrough_count += other.passthrough_count;
+        self.totals.merge(&other.totals);
+        self.originals_estimated |= other.originals_estimated;
     }
 
     /// The report of this deltaspace, or `None` below `min_deltas`.
@@ -610,6 +820,8 @@ pub async fn get_delta_efficiency(
             "min_deltas": min_deltas,
             "scanning": scanning,
             "status": if started { "scan_started" } else { "scan_already_running" },
+            // Grows while the scan lists; the UI judges a stall by it.
+            "listed_keys": state.delta_efficiency_scanner.listed_keys(&bucket).unwrap_or(0),
         })),
     )
         .into_response()
@@ -663,6 +875,7 @@ pub async fn post_delta_efficiency_scan(
             // Started now or already running: a scan runs either way.
             "scanning": true,
             "status": if started { "scan_started" } else { "scan_already_running" },
+            "listed_keys": state.delta_efficiency_scanner.listed_keys(&bucket).unwrap_or(0),
         })),
     )
         .into_response()
@@ -1009,8 +1222,13 @@ mod tests {
     fn is_scanning_tracks_dedup() {
         let scanner = DeltaEfficiencyScanner::new();
         assert!(!scanner.is_scanning("bucket"));
-        scanner.scanning.write().insert("bucket".into());
+        scanner
+            .scanning
+            .write()
+            .insert("bucket".into(), Arc::new(AtomicU64::new(7)));
         assert!(scanner.is_scanning("bucket"));
+        assert_eq!(scanner.listed_keys("bucket"), Some(7));
+        assert_eq!(scanner.listed_keys("other"), None);
         assert!(!scanner.is_scanning("other"));
     }
 
@@ -1018,8 +1236,13 @@ mod tests {
     #[test]
     fn scan_guard_clears_dedup_on_drop() {
         let scanner = Arc::new(DeltaEfficiencyScanner::new());
-        scanner.scanning.write().insert("bucket".into());
+        scanner
+            .scanning
+            .write()
+            .insert("bucket".into(), Arc::new(AtomicU64::new(7)));
         assert!(scanner.is_scanning("bucket"));
+        assert_eq!(scanner.listed_keys("bucket"), Some(7));
+        assert_eq!(scanner.listed_keys("other"), None);
         {
             let _g = ScanInProgressGuard {
                 scanner: scanner.clone(),
@@ -1463,7 +1686,7 @@ mod tests {
         put_raw_many(&endpoint, delta_folders(50, 9)).await;
         let state = AppState::for_tests(engine);
         fake.clear();
-        let r = DeltaEfficiencyScanner::scan_bucket(&state, "b")
+        let r = DeltaEfficiencyScanner::scan_bucket(&state, "b", &AtomicU64::new(0))
             .await
             .unwrap();
         let lists = scope_lists(&fake);
@@ -1474,6 +1697,71 @@ mod tests {
         );
         assert_eq!((r.scanned_deltaspaces, r.reported_deltaspaces), (50, 50));
         assert!(r.reports.iter().all(|x| x.deltas == 9));
+    }
+
+    /// Prod: `beshu` (93 000 objects) on a backend that answers a LIST page
+    /// in seconds was read one page after the other and passed the 300 s
+    /// the UI waits. A bucket of more than one page is now read as key
+    /// ranges in parallel, and the result is the one of a single sequence.
+    #[tokio::test]
+    async fn a_bucket_of_many_pages_is_scanned_in_ranges() {
+        let (engine, fake, endpoint) = fake_s3_engine().await;
+        // 3 060 keys: four LIST pages read in one sequence.
+        let mut keys = delta_folders(60, 50);
+        // A folder's direct objects sort between its subfolders, so its
+        // deltaspace is split across ranges and must be merged.
+        keys.extend(["root.bin".into(), "dir00/zz.zip.delta".into()]);
+        put_raw_many(&endpoint, keys).await;
+        let state = AppState::for_tests(engine);
+        fake.clear();
+        let listed = AtomicU64::new(0);
+        let r = DeltaEfficiencyScanner::scan_bucket(&state, "b", &listed)
+            .await
+            .unwrap();
+        assert_eq!(r.scanned_deltaspaces, 61, "60 folders and the root");
+        assert_eq!(r.reported_deltaspaces, 60);
+        for report in &r.reports {
+            let want = if report.prefix == "dir00" { 51 } else { 50 };
+            assert_eq!(report.deltas, want, "{}", report.prefix);
+            assert!(report.reference_bytes.is_some(), "{}", report.prefix);
+        }
+        assert!(listed.load(Ordering::Relaxed) >= 3_062);
+        let lists = scope_lists(&fake).len();
+        assert!(lists > 4, "the ranges were not used: {lists} LIST requests");
+        assert!(lists <= 4 + SCAN_RANGES + 2, "{lists} LIST requests");
+    }
+
+    #[test]
+    fn ranges_cover_the_keys_after_the_first_page() {
+        let seeds = ["a/", "c/", "e/"].map(String::from).to_vec();
+        let r = |after: &str, before: Option<&str>| KeyRange {
+            after: Some(after.into()),
+            before: before.map(Into::into),
+        };
+        // A first page that ended inside `c/` skips the seeds it passed.
+        assert_eq!(
+            ranges_after("c/x", seeds.clone()),
+            vec![r("c/x", Some("e/")), r("e/", None)]
+        );
+        assert_eq!(
+            ranges_after(".dg/z", seeds),
+            vec![
+                r(".dg/z", Some("a/")),
+                r("a/", Some("c/")),
+                r("c/", Some("e/")),
+                r("e/", None)
+            ]
+        );
+        assert_eq!(ranges_after("z", Vec::new()), vec![r("z", None)]);
+    }
+
+    #[test]
+    fn coarsen_keeps_at_most_n_sorted_seeds() {
+        let seeds: Vec<String> = (0..100).map(|i| format!("{i:03}/")).collect();
+        let few = coarsen(seeds.clone(), 8);
+        assert_eq!(few.len(), 7, "8 ranges need 7 boundaries");
+        assert!(few.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(coarsen(seeds[..5].to_vec(), 8), seeds[..5].to_vec());
     }
 
     /// Cockroach scan (ui.md I): `min_deltas` was part of the cache key, so

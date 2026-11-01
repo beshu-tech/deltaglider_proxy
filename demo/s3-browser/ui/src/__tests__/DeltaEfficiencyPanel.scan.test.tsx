@@ -12,7 +12,7 @@ import { renderWithQuery } from '../test/render';
 
 const GET = /^\/_\/api\/admin\/diagnostics\/delta-efficiency\?/;
 const POST = '/_/api/admin/diagnostics/delta-efficiency/scan';
-const RUNNING = { bucket: 'releases', min_deltas: 3, scanning: true, status: 'scan_started' };
+const RUNNING = { bucket: 'releases', min_deltas: 3, scanning: true, status: 'scan_started', listed_keys: 0 };
 const report = (bucket: string, prefix: string, efficiency: string) => ({
   bucket, prefix, deltas: 5, passthrough: 0, reference_bytes: 1000, total_delta_bytes: 4000,
   total_original_bytes: 5000, median_delta_bytes: 800, max_delta_bytes: 900, savings_bytes: 1000,
@@ -56,16 +56,48 @@ test('a 202 polls every 3 s until the report lands', async () => {
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   renderWithQuery(<DeltaEfficiencyPanel />);
   await clickScan(user);
-  expect(await screen.findByText('Scan running on the server, polling…')).toBeInTheDocument();
+  expect(await screen.findByText('Scan running on the server…')).toBeInTheDocument();
   expect(gets()[0].path).toContain('bucket=db-archive');
   await act(() => vi.advanceTimersByTimeAsync(3100));
   await waitFor(() => expect(gets()).toHaveLength(2));
   await act(() => vi.advanceTimersByTimeAsync(3100));
   expect(await screen.findByText('1 of 1 folder needs a new reference')).toBeInTheDocument();
-  expect(screen.queryByText('Scan running on the server, polling…')).toBeNull();
+  expect(screen.queryByText('Scan running on the server…')).toBeNull();
   // The report ends the polling.
   await act(() => vi.advanceTimersByTimeAsync(10_000));
   expect(gets()).toHaveLength(3);
+});
+
+test('a scan that keeps listing runs past 300 s and shows its progress', async () => {
+  // Prod: a 93 000-object bucket on a slow backend outlived the old fixed
+  // 300 s ceiling while the server was still listing.
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  let polls = 0;
+  http.on('GET', GET, () => {
+    polls += 1;
+    return polls <= 120
+      ? json({ ...RUNNING, listed_keys: polls * 1000 }, 202)
+      : json(result('db-archive', [report('db-archive', 'nightly/', 'poor')]));
+  });
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  renderWithQuery(<DeltaEfficiencyPanel />);
+  await clickScan(user);
+  await act(() => vi.advanceTimersByTimeAsync(3100));
+  expect(await screen.findByText('Scanning: 2,000 objects listed…')).toBeInTheDocument();
+  // One poll per step: the scan runs 6 minutes.
+  for (let i = 0; i < 120; i++) await act(() => vi.advanceTimersByTimeAsync(3100));
+  expect(await screen.findByText('1 of 1 folder needs a new reference')).toBeInTheDocument();
+});
+
+test('a scan that lists nothing new for 120 s fails', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  http.on('GET', GET, json({ ...RUNNING, listed_keys: 5000 }, 202));
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  renderWithQuery(<DeltaEfficiencyPanel />);
+  await clickScan(user);
+  expect(await screen.findByText('Scanning: 5,000 objects listed…')).toBeInTheDocument();
+  await act(() => vi.advanceTimersByTimeAsync(125_000));
+  expect(await screen.findByText(/listed no new object for 120 s/)).toBeInTheDocument();
 });
 
 test('an empty report says no scope met the threshold', async () => {

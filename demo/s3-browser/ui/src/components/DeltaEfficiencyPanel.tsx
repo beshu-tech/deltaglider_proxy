@@ -34,7 +34,7 @@ import { contentColumn, CONTENT_WIDE, SPACE } from './shared-styles';
 import { plainError } from '../plainError';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
-import { useDeltaEfficiency, useTriggerDeltaEfficiencyScan } from '../queries/deltaEfficiency';
+import { useDeltaEfficiency, useTriggerDeltaEfficiencyScan, type ScanProgress } from '../queries/deltaEfficiency';
 import { tint } from '../themeVars';
 
 /**
@@ -73,8 +73,8 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
   // query key moves with them, so A's report never shows under B.
   const [requested, setRequested] = useState<{ bucket: string; minDeltas: number } | null>(null);
   const active = requested !== null && requested.bucket === bucket && requested.minDeltas === minDeltas;
-  const startedAt = useRef(0);
-  const scan = useDeltaEfficiency(bucket, minDeltas, { enabled: active, startedAt: () => startedAt.current });
+  const progress = useRef<ScanProgress>({ keys: 0, at: 0 });
+  const scan = useDeltaEfficiency(bucket, minDeltas, { enabled: active, progress: () => progress.current });
   const trigger = useTriggerDeltaEfficiencyScan();
 
   // Bucket names from the SHARED query cache (sorted) — no per-mount fetch of
@@ -90,6 +90,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
   useSessionExpiredOn(rawError, onSessionExpired);
   const error = rawError ?? null;
   const scanning = !rawError && !!data && 'scanning' in data;
+  const listedKeys = data && 'scanning' in data && data.scanning ? data.listed_keys : 0;
   const loading = active && (scan.isFetching || trigger.isPending);
   // A text field: "0" or "abc" shows its error under the field and the scan
   // keeps the last valid minimum (an InputNumber clamped it silently, D9).
@@ -104,13 +105,13 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
   );
 
   /**
-   * The first scan may answer from the server's 5-minute cache (200), or
+   * The first scan may answer from the server's 1-hour cache (200), or
    * start a background scan (202) that the query polls. `forceRescan` POSTs
    * a new scan first.
    */
   const runScan = (forceRescan = false) => {
     if (!bucket) return;
-    startedAt.current = Date.now();
+    progress.current = { keys: 0, at: Date.now() };
     const wasActive = active;
     setRequested({ bucket, minDeltas });
     if (forceRescan) {
@@ -180,7 +181,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
             style={{ width: 96 }}
           />
         </div>
-        {/* One button. The first scan may answer from the server's 5-minute
+        {/* One button. The first scan may answer from the server's 1-hour
             cache; once a result is on screen, the button forces a fresh scan
             (a cached re-read would only show the same result again). After
             an error it forces one too: a GET answers a recent failure
@@ -193,14 +194,18 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
           }}
           loading={loading && !scanning}
           disabled={!bucket}
-          title={response ? 'Scan this bucket again now, ignoring the 5-minute cache' : undefined}
+          title={response ? 'Scan this bucket again now, ignoring the 1-hour cache' : undefined}
         >
           {response ? 'Re-scan' : 'Scan'}
         </Button>
         {scanning && (
           <Space>
             <Spin size="small" />
-            <Text type="secondary">Scan running on the server, polling…</Text>
+            <Text type="secondary">
+              {listedKeys > 0
+                ? `Scanning: ${listedKeys.toLocaleString()} objects listed…`
+                : 'Scan running on the server…'}
+            </Text>
           </Space>
         )}
       </div>
@@ -477,7 +482,7 @@ function HeroHeadline({
       <div style={{ fontSize: 13, color: colors.TEXT_SECONDARY }}>
         {subText}
         {cached && (
-          <HoverHint hint={`Scan completed at ${scannedAt}. Cached for 5 min — click Re-scan for fresh data.`}>
+          <HoverHint hint={`Scan completed at ${scannedAt}. Cached for 1 hour — click Re-scan for fresh data.`}>
             <Tag
               color="blue"
               style={{ marginLeft: 8, fontSize: 11, padding: '0 8px', lineHeight: '18px' }}

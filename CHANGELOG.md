@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — The compression-health scan of a large bucket
+
+- The scan of a bucket listed it one page of 1,000 keys after the other. On a backend that answers a page in a few seconds, a bucket with about 90,000 objects took longer than 300 seconds, and the page stopped waiting after 300 seconds with "Scan timed out", although the scan still ran on the server. A bucket that does not fit in one page is now listed as up to 32 key ranges, 8 at a time, and the ranges are split at its folders. The result is the same as before.
+- The page no longer stops after a fixed time. The answer of a running scan includes `listed_keys`, the number of keys that the scan listed so far, and the page shows it. The page reports an error only when that number does not grow for 120 seconds.
+- The proxy now keeps a scan result for 1 hour instead of 5 minutes. A scan that took longer than 5 minutes could expire before anybody saw its result, and the next visit started the whole scan again. **Re-scan** still starts a new scan.
+
+### Fixed — The page zoomed in on a phone
+
+- iOS Safari zooms the page in when a text field with text smaller than 16 pixels gets focus, and it stays zoomed after the field loses focus. The page then runs past the right edge of the screen. The text fields of the admin pages use 14 pixels, so a tap on a field such as the bucket selector zoomed the page. On a touch screen, text fields now use 16 pixels.
+
 ## v2.1.0 — 2026-11-01
 
 ### Upgrade steps for 2.1.0 (read before you upgrade)
