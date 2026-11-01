@@ -372,7 +372,11 @@ async fn run_job(
         "migrate" => {
             crate::storage::encrypting::conversion::as_conversion_job(
                 conversion_reads::PROOF,
-                super::migrate::execute_migrate_phases(mutator, db, state, holder, &job),
+                // Boxed: the migrate future is large, and the scope must not
+                // carry it on the worker's stack (a debug build overflowed it).
+                Box::pin(super::migrate::execute_migrate_phases(
+                    mutator, db, state, holder, &job,
+                )),
             )
             .await
         }
