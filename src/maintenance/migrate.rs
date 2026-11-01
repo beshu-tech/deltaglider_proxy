@@ -1096,6 +1096,12 @@ impl MigrateRun<'_> {
         let count = c.total.is_none().then(|| {
             BackgroundCount::spawn(self.state.engine.load().clone(), self.job.bucket.clone())
         });
+        let engine = self.state.engine.load().clone();
+        let marker = super::conversion::observe(&engine, &self.job.bucket).await;
+        let serves = {
+            let cfg = self.mutator.read().await;
+            super::rule_serves_plaintext(&cfg, &self.job.bucket)
+        };
         let mut step = CopyStep {
             m: self,
             c,
@@ -1105,6 +1111,8 @@ impl MigrateRun<'_> {
             forms: Default::default(),
             page_token: None,
             desired: None,
+            marker,
+            serves,
         };
         paged_phase(
             self.ctx(),
@@ -1412,6 +1420,12 @@ struct CopyStep<'a, 'r> {
     page_token: Option<String>,
     /// The at-rest form of the target, read per page.
     desired: Option<super::DesiredEncryption>,
+    /// The source's conversion window, read at the start of the phase: an
+    /// unsealed source object that a client could not read is an adoption.
+    marker: super::conversion::JobMarker,
+    /// The source bucket writes plaintext (its unsealed objects are its
+    /// own: never an adoption).
+    serves: bool,
 }
 
 impl CopyStep<'_, '_> {
@@ -1429,6 +1443,9 @@ enum CopyDone {
     Skipped,
     Copied {
         bytes: i64,
+        /// An unsealed source object that a client could not read
+        /// (a read-only bucket's plaintext history): reported.
+        adopted: bool,
     },
     Failed {
         transient: bool,
@@ -1531,10 +1548,14 @@ impl PageStep for CopyStep<'_, '_> {
         };
         // No per-object fsync: `checkpoint` flushes the copies before any
         // progress that counts on them is saved.
+        let adopted = source
+            .as_ref()
+            .is_some_and(|meta| super::conversion::adopted(&self.marker, self.serves, key, meta));
         let copy = copy_object_known(engine, req, source.as_ref(), prior.as_ref());
         match crate::storage::with_deferred_fsync(copy).await {
             Ok(outcome) => CopyDone::Copied {
                 bytes: outcome.bytes_copied as i64,
+                adopted,
             },
             Err(e) => CopyDone::Failed {
                 transient: e.class.retryable(),
@@ -1551,9 +1572,19 @@ impl PageStep for CopyStep<'_, '_> {
         let m = self.m;
         match done {
             CopyDone::Skipped => self.c.skipped += 1,
-            CopyDone::Copied { bytes } => {
+            CopyDone::Copied { bytes, adopted } => {
                 self.c.done += 1;
                 self.c.bytes += bytes;
+                if adopted {
+                    crate::storage::encrypting::conversion::ADOPTED_AFTER_CUTOFF.inc();
+                    super::worker::record_adoption(
+                        m.db,
+                        m.job,
+                        key,
+                        "encrypted on the migration's target",
+                    )
+                    .await?;
+                }
             }
             CopyDone::Failed { transient, message } => {
                 record_failure(m.db, m.job.id, key, &message).await?;

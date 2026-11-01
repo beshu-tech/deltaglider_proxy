@@ -1515,8 +1515,9 @@ mod source_guards {
                 bad.push(format!("{file}: makes the proof"));
             }
             let enters = code.matches(entered.as_str()).count();
-            // The re-encrypt job (the definition has generics before `(`).
-            let allowed = usize::from(file == "src/maintenance/worker.rs");
+            // The re-encrypt and the migrate job (the definition has
+            // generics before `(`).
+            let allowed = 2 * usize::from(file == "src/maintenance/worker.rs");
             if enters != allowed {
                 bad.push(format!("{file}: enters the job's scope {enters} time(s)"));
             }

@@ -73,7 +73,9 @@ pub(crate) const REENCRYPT_CONCURRENCY: usize = 8;
 /// its reads serve every unsealed object of the bucket, also those that a
 /// client may not read, and report them. A [`ConversionReadProof`] opens
 /// that scope, and only this module makes one (source guard
-/// `only_the_conversion_job_reads_as_the_job`).
+/// `only_the_conversion_job_reads_as_the_job`). Two jobs enter it: the
+/// re-encrypt job, and the migrate job (the way out of a read-only bucket
+/// whose plaintext history no client may read).
 mod conversion_reads {
     /// Proof that the reads in a scope are the re-encrypt job's.
     #[derive(Debug)]
@@ -364,7 +366,16 @@ async fn run_job(
             )
             .await
         }
-        "migrate" => super::migrate::execute_migrate_phases(mutator, db, state, holder, &job).await,
+        // A migrate reads its source as the job too: a read-only bucket
+        // with plaintext history moves out (compatibility review C1); the
+        // copy reports each unsealed object it encrypts on the target.
+        "migrate" => {
+            crate::storage::encrypting::conversion::as_conversion_job(
+                conversion_reads::PROOF,
+                super::migrate::execute_migrate_phases(mutator, db, state, holder, &job),
+            )
+            .await
+        }
         super::backfill::KIND => {
             super::backfill::execute_backfill_phases(db, state, holder, &job).await
         }
@@ -772,7 +783,7 @@ async fn execute_phases(
                 Ok(ReferenceRewrite::Kept | ReferenceRewrite::Done { adopted: false }) => {}
                 Ok(ReferenceRewrite::Done { adopted: true }) => {
                     adoptions.add();
-                    record_adoption(db, job, &key).await?;
+                    record_adoption(db, job, &key, "converted").await?;
                 }
                 // A client re-wrote (or a delete reclaimed) the reference
                 // after the job read it: it stays as it is now.
@@ -1322,7 +1333,7 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
             Visit::Adopted { bytes } => {
                 self.c.done += 1;
                 self.c.bytes += bytes;
-                record_adoption(self.db, self.job, key).await?;
+                record_adoption(self.db, self.job, key, "converted").await?;
             }
             Visit::Skipped => self.c.skipped += 1,
             Visit::Changed => {
@@ -1668,16 +1679,18 @@ pub(crate) async fn record_failure(
 }
 
 /// Report one object (or reference) `key` that the conversion job
-/// converted although a client could not read it: counted in the job row,
-/// sampled in the failure ring, audited.
-async fn record_adoption(
+/// converted (or the migrate job encrypted on its target) although a
+/// client could not read it: counted in the job row, sampled in the
+/// failure ring, audited. `did`: what the job did with it.
+pub(crate) async fn record_adoption(
     db: &Arc<Mutex<JobsDb>>,
     job: &MaintenanceJob,
     key: &str,
+    did: &str,
 ) -> Result<(), PhaseStop> {
     stop_if_shutting_down()?;
     let note = format!(
-        "{}: converted, but clients could not read it (no conversion window of this job's run, \
+        "{}: {did}, but clients could not read it (no conversion window of this job's run, \
          or the backend stored it after the conversion's cutoff, or names no time)",
         super::conversion::ADOPTED_AFTER_CUTOFF
     );

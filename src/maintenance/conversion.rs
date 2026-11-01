@@ -275,6 +275,26 @@ pub(crate) async fn begin(
     }
 }
 
+/// The marker of `bucket` as it is, for a job that reads the bucket but
+/// never writes its marker (the migrate job, which reports the unsealed
+/// objects that it encrypts on its target): the window of the marker of
+/// any run of this proxy, else none. A read that fails counts as no
+/// window, so the job reports more adoptions, never fewer.
+pub(crate) async fn observe(engine: &DynEngine, bucket: &str) -> JobMarker {
+    match engine
+        .storage()
+        .conversion(bucket, ConversionOp::Status)
+        .await
+    {
+        Ok(ConversionReply::Status(MarkerState::Ours { fields, .. })) => JobMarker::Ours {
+            run: fields.run,
+            window: window_of(&fields),
+        },
+        Ok(ConversionReply::Status(MarkerState::Foreign)) => JobMarker::Foreign,
+        _ => JobMarker::None,
+    }
+}
+
 /// THE deadline of a resume (pure): `server_now + window_secs`, never
 /// earlier than the marker's deadline now.
 pub(crate) fn extended_deadline(current: i64, server_now: i64, window_secs: i64) -> i64 {

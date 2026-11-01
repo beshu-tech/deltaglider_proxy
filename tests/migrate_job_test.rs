@@ -1190,3 +1190,114 @@ async fn test_migrate_row_reports_progress_and_status_follows_the_gate() {
     assert_eq!(last["writes_blocked"], false, "{last}");
     assert_eq!(newest_job(&admin, &endpoint).await["status"], "cancelled");
 }
+
+/// Compatibility review C1: the way out of a read-only bucket. A bucket on
+/// backend `src` holds plaintext objects; then `src` encrypts with the
+/// proxy and its verdict is non-CAS, so the bucket is read-only and its
+/// plaintext (no conversion window) is refused to clients. A migrate to a
+/// backend with atomic writes reads the plaintext as the job (not as a
+/// client), encrypts it on the target, and reports each such object as an
+/// adoption (failure ring and audit). After the move the history is
+/// readable again.
+#[tokio::test]
+async fn test_migrate_moves_a_read_only_bucket_with_plaintext_history() {
+    const KEY_A: &str = "a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0";
+    const KEY_B: &str = "b1b2b3b4b5b6b7b8b9babbbcbdbebfc0a1a2a3a4a5a6a7a8a9aaabacadaeafb0";
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migro";
+    let mut server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    seed(&server.http(), &endpoint, bucket, 3).await;
+
+    // Both backends now encrypt with the proxy; `src` has no atomic writes.
+    let cfg = std::fs::read_to_string(server.config_path()).unwrap();
+    let mut out = String::new();
+    for line in cfg.lines() {
+        out.push_str(line);
+        out.push('\n');
+        for (dir, key, id) in [
+            (dir_a.path(), KEY_A, "mig-a"),
+            (dir_b.path(), KEY_B, "mig-b"),
+        ] {
+            if line.trim() == format!("path: \"{}\"", dir.display()) {
+                out.push_str(&format!(
+                    "    encryption:\n      mode: aes256-gcm-proxy\n      key: \"{key}\"\n      key_id: {id}\n"
+                ));
+            }
+        }
+    }
+    assert_eq!(out.matches("aes256-gcm-proxy").count(), 2, "{out}");
+    std::fs::write(server.config_path(), out).unwrap();
+    server
+        .respawn_with_env(&[("DGP_TEST_FORCE_NONCAS_BACKEND", "src")])
+        .await;
+    let http = server.http();
+    let admin = admin_http_client(&endpoint).await;
+    let get = |key: String| http.get(format!("{endpoint}/{bucket}/{key}")).send();
+    assert!(
+        !get("obj-000.json".into())
+            .await
+            .unwrap()
+            .status()
+            .is_success(),
+        "premise: plaintext without a window is refused to clients"
+    );
+
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202, "{:?}", resp.text().await);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["kind"], "migrate", "{job}");
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+    for i in 0..3 {
+        let r = get(format!("obj-{i:03}.json")).await.unwrap();
+        assert_eq!(r.status(), 200, "history readable on the target");
+        assert!(r.bytes().await.unwrap().starts_with(MARKER));
+    }
+    // Stored encrypted on the target.
+    let stored = walkdir_files(&dir_b.path().join(bucket))
+        .into_iter()
+        .find(|f| f.ends_with("obj-000.json"))
+        .expect("copied");
+    assert!(
+        !std::fs::read(&stored).unwrap().starts_with(MARKER),
+        "encrypted at rest on the target"
+    );
+
+    // Reported: the failure ring samples, and the audit.
+    let id = job["id"].as_str().unwrap().to_string();
+    let failures: serde_json::Value = admin
+        .get(format!("{endpoint}/_/api/admin/jobs/{id}/failures"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let adopted = failures.to_string().matches("adopted_after_cutoff").count();
+    assert_eq!(adopted, 3, "three adoptions sampled: {failures}");
+    let audit: serde_json::Value = admin
+        .get(format!("{endpoint}/_/api/admin/audit?limit=200"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let audited = audit["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "encryption_conversion_adopted_after_cutoff")
+        .count();
+    assert_eq!(audited, 3, "{audit}");
+}
