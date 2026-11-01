@@ -495,6 +495,19 @@ async fn test_migrate_refuses_a_bucket_with_an_alias() {
         .await
         .unwrap();
     seed(&http, &endpoint, "releases", 2).await;
+    // ListBuckets shows both names of the one storage.
+    let listed = server
+        .s3_client()
+        .await
+        .list_buckets()
+        .send()
+        .await
+        .unwrap();
+    let names: Vec<_> = listed.buckets().iter().filter_map(|b| b.name()).collect();
+    assert!(
+        names.contains(&"releases") && names.contains(&"downloads"),
+        "{names:?}"
+    );
 
     let admin = admin_http_client(&endpoint).await;
     for (bucket, other) in [("releases", "'downloads'"), ("downloads", "'releases'")] {

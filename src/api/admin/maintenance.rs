@@ -443,8 +443,7 @@ pub async fn start_migrate(
 
     // NEW-10: another name of the same storage is neither gated nor copied,
     // and the cleanup or the prune would delete its objects. Config only,
-    // so before the existence check: the bucket listing shows one name of
-    // an aliased storage, not both.
+    // so it runs before the existence check.
     {
         let cfg = state.config.read().await;
         let from_backend = cfg.storage_key_of(&bucket_key).backend;

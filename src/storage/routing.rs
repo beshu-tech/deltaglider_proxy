@@ -53,25 +53,43 @@ fn previous_route_identity(bucket: &str, route: &BucketRoute) -> Option<String> 
     route.real_bucket.is_none().then(|| bucket.to_string())
 }
 
-/// Reverse-lookup over `routes`: the virtual name that maps to
-/// `(backend_name, real_bucket)`, if any.
-fn reverse_lookup(
+/// Pure: every virtual name whose route maps to `(backend_name,
+/// real_bucket)`, in name order. Two names share one storage when one is an
+/// `alias` of the other; both are bucket names a client can use.
+fn route_names_of(
     routes: &HashMap<String, BucketRoute>,
     backend_name: &str,
     real_bucket: &str,
-) -> Option<String> {
-    for (virtual_name, route) in routes {
-        if route.backend_name == backend_name {
-            let route_real = route
-                .real_bucket
-                .as_deref()
-                .unwrap_or(virtual_name.as_str());
-            if route_real == real_bucket {
-                return Some(virtual_name.clone());
-            }
-        }
+) -> Vec<String> {
+    let mut names: Vec<String> = routes
+        .iter()
+        .filter(|(virtual_name, route)| {
+            route.backend_name == backend_name
+                && route.real_bucket.as_deref().unwrap_or(virtual_name) == real_bucket
+        })
+        .map(|(virtual_name, _)| virtual_name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Pure: the bucket names a listing shows for `real_bucket` found on
+/// `backend_name`, in name order. Every route to that storage gives one
+/// name; with no route the real name is shown (an unrouted bucket resolves
+/// by HeadBucket at request time). Transient migrate routes never show,
+/// and a storage that only a transient route maps is not shown at all:
+/// the source side lists it under its own name.
+fn listed_names(
+    routes: &HashMap<String, BucketRoute>,
+    backend_name: &str,
+    real_bucket: &str,
+) -> Vec<String> {
+    let mut names = route_names_of(routes, backend_name, real_bucket);
+    if names.is_empty() {
+        names.push(real_bucket.to_string());
     }
-    None
+    names.retain(|n| !RoutingBackend::is_listing_plumbing(n));
+    names
 }
 
 /// True when `real_bucket` on `backend_name` is the storage of a route
@@ -81,8 +99,9 @@ fn alias_owns_real_bucket(
     backend_name: &str,
     real_bucket: &str,
 ) -> bool {
-    reverse_lookup(routes, backend_name, real_bucket)
-        .is_some_and(|virtual_name| virtual_name != real_bucket)
+    route_names_of(routes, backend_name, real_bucket)
+        .iter()
+        .any(|virtual_name| virtual_name != real_bucket)
 }
 
 /// Where an unrouted bucket lives: the HeadBucket probe and its caches.
@@ -566,34 +585,20 @@ impl RoutingBackend {
         })
     }
 
-    /// Reverse-lookup: given a backend name and real bucket, find the virtual name.
-    /// Returns `None` if no route maps to this (backend, real_bucket) pair.
-    fn reverse_lookup(&self, backend_name: &str, real_bucket: &str) -> Option<String> {
-        reverse_lookup(&self.routes, backend_name, real_bucket)
-    }
-
     /// True when `real_bucket` on `backend_name` is the storage of a route
     /// under another (alias) name.
     fn alias_owns_real_bucket(&self, backend_name: &str, real_bucket: &str) -> bool {
         alias_owns_real_bucket(&self.routes, backend_name, real_bucket)
     }
 
-    /// Convert a bucket discovered on a concrete backend into the virtual
-    /// bucket name that clients may safely use.
-    ///
-    /// If a route maps `(backend, real_bucket)` to a virtual name, that name
-    /// is returned. Otherwise the real bucket name is returned as-is — this is
-    /// safe because `resolve_existing` HEAD-scans all backends and will find
-    /// the bucket at runtime regardless of whether an explicit route exists.
-    fn listed_bucket_virtual_name(&self, backend_name: &str, real_bucket: &str) -> String {
-        self.reverse_lookup(backend_name, real_bucket)
-            .unwrap_or_else(|| real_bucket.to_string())
+    /// The bucket names a listing shows for a bucket found on a backend:
+    /// see [`listed_names`].
+    fn listed_names(&self, backend_name: &str, real_bucket: &str) -> Vec<String> {
+        listed_names(&self.routes, backend_name, real_bucket)
     }
 
-    /// Migration plumbing (`__dgmigrate_*` staging routes) must never
-    /// surface in bucket listings: clients can't reference such names
-    /// anyway (s3s rejects them at parse time) and the underlying real
-    /// bucket is already listed under its own name from the source side.
+    /// Migration plumbing (`__dgmigrate_*` staging routes) never shows in
+    /// a bucket listing: clients cannot use such names (s3s refuses them).
     fn is_listing_plumbing(virtual_name: &str) -> bool {
         virtual_name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX)
     }
@@ -939,12 +944,7 @@ impl StorageBackend for RoutingBackend {
             match res {
                 Ok(buckets) => {
                     for (real_bucket, _) in buckets {
-                        let virtual_name =
-                            self.listed_bucket_virtual_name(backend_name, real_bucket);
-                        if Self::is_listing_plumbing(&virtual_name) {
-                            continue;
-                        }
-                        all_buckets.insert(virtual_name);
+                        all_buckets.extend(self.listed_names(backend_name, real_bucket));
                     }
                 }
                 Err(e) => tracing::error!(
@@ -972,12 +972,9 @@ impl StorageBackend for RoutingBackend {
             match res {
                 Ok(buckets) => {
                     for (real_bucket, date) in buckets {
-                        let virtual_name =
-                            self.listed_bucket_virtual_name(backend_name, real_bucket);
-                        if Self::is_listing_plumbing(&virtual_name) {
-                            continue;
+                        for virtual_name in self.listed_names(backend_name, real_bucket) {
+                            all_buckets.entry(virtual_name).or_insert(*date);
                         }
-                        all_buckets.entry(virtual_name).or_insert(*date);
                     }
                 }
                 Err(e) => tracing::error!(
@@ -1004,32 +1001,31 @@ impl StorageBackend for RoutingBackend {
                 Ok(buckets) => {
                     any_ok = true;
                     for (real_bucket, creation_date) in buckets {
-                        let virtual_name =
-                            self.listed_bucket_virtual_name(backend_name, real_bucket);
-                        if Self::is_listing_plumbing(&virtual_name) {
-                            continue;
-                        }
-                        let priority = if self.reverse_lookup(backend_name, real_bucket).is_some() {
+                        let priority = if !route_names_of(&self.routes, backend_name, real_bucket)
+                            .is_empty()
+                        {
                             0
                         } else if backend_name == &self.default_backend {
                             1
                         } else {
                             2
                         };
-                        let real_bucket_alias = (real_bucket.as_str() != virtual_name.as_str())
-                            .then(|| real_bucket.clone());
-                        candidates.push((
-                            virtual_name.clone(),
-                            priority,
-                            backend_name.clone(),
-                            BucketListing {
-                                name: virtual_name,
-                                creation_date: Some(*creation_date),
-                                backend_name: Some(backend_name.clone()),
-                                real_bucket: real_bucket_alias,
-                                unavailable: None,
-                            },
-                        ));
+                        for virtual_name in self.listed_names(backend_name, real_bucket) {
+                            let real_bucket_alias = (real_bucket.as_str() != virtual_name.as_str())
+                                .then(|| real_bucket.clone());
+                            candidates.push((
+                                virtual_name.clone(),
+                                priority,
+                                backend_name.clone(),
+                                BucketListing {
+                                    name: virtual_name,
+                                    creation_date: Some(*creation_date),
+                                    backend_name: Some(backend_name.clone()),
+                                    real_bucket: real_bucket_alias,
+                                    unavailable: None,
+                                },
+                            ));
+                        }
                     }
                 }
                 Err(e) => {
@@ -1079,11 +1075,11 @@ impl StorageBackend for RoutingBackend {
                         .get(backend_name)
                         .map(|(_, roster)| roster.clone());
                     for (real_bucket, _) in snapshot.unwrap_or_default() {
-                        let virtual_name =
-                            self.listed_bucket_virtual_name(backend_name, &real_bucket);
-                        let real_alias = (real_bucket.as_str() != virtual_name.as_str())
-                            .then(|| real_bucket.clone());
-                        push(virtual_name, real_alias);
+                        for virtual_name in self.listed_names(backend_name, &real_bucket) {
+                            let real_alias = (real_bucket.as_str() != virtual_name.as_str())
+                                .then(|| real_bucket.clone());
+                            push(virtual_name, real_alias);
+                        }
                     }
                 }
             }
@@ -2090,76 +2086,41 @@ mod tests {
     }
 
     #[test]
-    fn test_reverse_lookup() {
-        // Can't construct RoutingBackend without real backends, but we can test
-        // the reverse lookup logic conceptually via the BucketRoute struct
-        let route = BucketRoute {
-            backend_name: "hetzner".to_string(),
-            real_bucket: Some("prod-archive".to_string()),
+    fn listed_names_show_every_route_to_a_storage() {
+        let route = |backend: &str, real: Option<&str>| BucketRoute {
+            backend_name: backend.to_string(),
+            real_bucket: real.map(str::to_string),
         };
-        assert_eq!(
-            route.real_bucket.as_deref().unwrap_or("archive"),
-            "prod-archive"
-        );
+        let transient = format!("{}x", crate::maintenance::migrate::TRANSIENT_PREFIX);
+        let routes = HashMap::from([
+            (
+                "virtual-archive".to_string(),
+                route("archive", Some("real-archive")),
+            ),
+            ("plain-routed".to_string(), route("archive", None)),
+            ("releases".to_string(), route("hetzner-fsn1", None)),
+            (
+                "downloads".to_string(),
+                route("hetzner-fsn1", Some("releases")),
+            ),
+            (transient.clone(), route("hetzner-fsn1", Some("staged"))),
+        ]);
+        let names = |backend: &str, real: &str| listed_names(&routes, backend, real);
 
-        let route_no_alias = BucketRoute {
-            backend_name: "local".to_string(),
-            real_bucket: None,
-        };
-        assert_eq!(
-            route_no_alias.real_bucket.as_deref().unwrap_or("dev-data"),
-            "dev-data"
-        );
-    }
-
-    #[test]
-    fn listed_bucket_virtual_name_exposes_unrouted_backend_buckets() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            "virtual-archive".to_string(),
-            BucketRoute {
-                backend_name: "archive".to_string(),
-                real_bucket: Some("real-archive".to_string()),
-            },
-        );
-        routes.insert(
-            "plain-routed".to_string(),
-            BucketRoute {
-                backend_name: "archive".to_string(),
-                real_bucket: None,
-            },
-        );
-        let routing = RoutingBackend {
-            backends: HashMap::new(),
-            routes,
-            default_backend: "primary".to_string(),
-            health: parking_lot::Mutex::new(BackendHealth::default()),
-            list_cooldown: std::time::Duration::from_secs(30),
-            list_timeout: std::time::Duration::from_secs(5),
-            list_fresh: std::time::Duration::ZERO,
-            resolver: Arc::new(Resolver::new(
-                HashMap::new(),
-                HashMap::new(),
-                "primary".to_string(),
-            )),
-        };
-
-        assert_eq!(
-            routing.listed_bucket_virtual_name("primary", "default-bucket"),
-            "default-bucket"
-        );
-        assert_eq!(
-            routing.listed_bucket_virtual_name("archive", "real-archive"),
-            "virtual-archive"
-        );
-        assert_eq!(
-            routing.listed_bucket_virtual_name("archive", "plain-routed"),
-            "plain-routed"
-        );
-        assert_eq!(
-            routing.listed_bucket_virtual_name("archive", "unrouted-real"),
-            "unrouted-real"
-        );
+        assert_eq!(names("primary", "default-bucket"), ["default-bucket"]);
+        assert_eq!(names("archive", "real-archive"), ["virtual-archive"]);
+        assert_eq!(names("archive", "plain-routed"), ["plain-routed"]);
+        assert_eq!(names("archive", "unrouted-real"), ["unrouted-real"]);
+        // Both names of one storage, in name order.
+        assert_eq!(names("hetzner-fsn1", "releases"), ["downloads", "releases"]);
+        // The same real name on another backend is another storage.
+        assert_eq!(names("archive", "releases"), ["releases"]);
+        // A storage that only a transient route maps is hidden.
+        assert!(names("hetzner-fsn1", "staged").is_empty());
+        // An unrouted lookup of `releases` on hetzner-fsn1 hits the storage
+        // of the alias `downloads`.
+        assert!(alias_owns_real_bucket(&routes, "hetzner-fsn1", "releases"));
+        assert!(!alias_owns_real_bucket(&routes, "archive", "plain-routed"));
     }
 
     #[tokio::test]
@@ -2261,6 +2222,45 @@ mod tests {
         assert_eq!(routing.previous_storage_identity("downloads"), None);
         assert_eq!(routing.storage_identity("db-archive"), "db-archive");
         assert_eq!(routing.previous_storage_identity("db-archive"), None);
+    }
+
+    /// Two configured names on one storage (`downloads` is an alias of
+    /// `releases` on hetzner-fsn1): the bucket list showed one of them,
+    /// picked by HashMap order. Every name appears, in name order, in all
+    /// three listings; a transient migrate route stays hidden.
+    #[tokio::test]
+    async fn every_name_of_an_aliased_storage_is_listed() {
+        let mk = |b: &[&str]| Arc::new(DynStorageBackend::new_box(TestBackend::with_buckets(b)));
+        let backends = HashMap::from([
+            ("local-disk".to_string(), mk(&["db-archive"])),
+            ("hetzner-fsn1".to_string(), mk(&["releases"])),
+        ]);
+        let transient = format!("{}x", crate::maintenance::migrate::TRANSIENT_PREFIX);
+        let routes = HashMap::from([
+            ("releases".to_string(), ("hetzner-fsn1".to_string(), None)),
+            (
+                "downloads".to_string(),
+                ("hetzner-fsn1".to_string(), Some("releases".to_string())),
+            ),
+            (
+                transient,
+                ("hetzner-fsn1".to_string(), Some("releases".to_string())),
+            ),
+        ]);
+        let routing = RoutingBackend::new(backends, routes, "local-disk".to_string()).unwrap();
+        let want = ["db-archive", "downloads", "releases"];
+
+        assert_eq!(routing.list_buckets().await.unwrap(), want);
+        let dated = routing.list_buckets_with_dates().await.unwrap();
+        let names: Vec<_> = dated.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, want);
+        let origins = routing.list_bucket_origins().await.unwrap();
+        let names: Vec<_> = origins.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, want);
+        let downloads = &origins[1];
+        assert_eq!(downloads.backend_name.as_deref(), Some("hetzner-fsn1"));
+        assert_eq!(downloads.real_bucket.as_deref(), Some("releases"));
+        assert_eq!(origins[2].real_bucket, None);
     }
 
     /// Tier 4: every op on an unrouted bucket sent a head_bucket to each
