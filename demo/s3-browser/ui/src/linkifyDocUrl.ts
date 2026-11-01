@@ -28,8 +28,22 @@ export function docsUrlToInAppHref(url: string): string | null {
   return `/_/docs/${pathToId(m[1])}`;
 }
 
+/** The link text of a docs page (review finding 12: a person reads a
+ *  label, never a raw URL). */
+const DOC_LABELS: Record<string, string> = {
+  [CAPABILITY_DOC_URL]: 'How to check a backend',
+};
+
+/** Pure: the link text of `url`: a label for a deltaglider.com docs page,
+ *  else the URL itself. */
+function linkLabel(url: string, inApp: string | null): string {
+  if (!inApp) return url;
+  return DOC_LABELS[url.replace('://www.', '://')] ?? 'Open the docs page';
+}
+
 /** Split a plain message into text/link segments. Trailing prose punctuation
- *  after a URL stays text so "see https://…/x." doesn't 404. */
+ *  after a URL stays text so "see https://…/x." doesn't 404. A docs link's
+ *  text is its label ("How to check a backend"), not the URL. */
 export function splitLinkSegments(text: string): LinkSegment[] {
   const out: LinkSegment[] = [];
   const re = /https:\/\/[^\s)"'<>]+/g;
@@ -39,7 +53,8 @@ export function splitLinkSegments(text: string): LinkSegment[] {
     const trimmed = m[0].replace(/[.,;:!?]+$/, '');
     if (trimmed.length === 0) continue;
     if (m.index > last) out.push({ kind: 'text', text: text.slice(last, m.index) });
-    out.push({ kind: 'link', text: trimmed, href: docsUrlToInAppHref(trimmed) ?? trimmed });
+    const inApp = docsUrlToInAppHref(trimmed);
+    out.push({ kind: 'link', text: linkLabel(trimmed, inApp), href: inApp ?? trimmed });
     last = m.index + trimmed.length;
   }
   if (last < text.length) out.push({ kind: 'text', text: text.slice(last) });

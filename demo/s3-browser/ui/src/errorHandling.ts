@@ -248,7 +248,9 @@ function describeS3Error(err: unknown, context: string): Error {
   const codePart = code ? ` [${code}]` : '';
   const statusPart = status ? ` (${status})` : '';
   const reqPart = requestIdSuffix(requestId);
-  return new Error(`${context} failed${statusPart}${codePart}: ${trimOneLine(raw)}${reqPart}`);
+  // The proxy's own <Message> stays whole: a refusal that names its doc
+  // link must not lose it to the one-line cut.
+  return new Error(`${context} failed${statusPart}${codePart}: ${serverMessage ?? trimOneLine(raw)}${reqPart}`);
 }
 
 export function normalizeUiError(err: unknown, fallback: string): string {

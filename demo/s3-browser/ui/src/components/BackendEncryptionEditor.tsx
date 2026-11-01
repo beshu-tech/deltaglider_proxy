@@ -25,7 +25,7 @@ import {
   ReloadOutlined,
 } from '@ant-design/icons';
 import type { BackendCapabilityVerdict, BackendEncryptionSummary, BackendEncryptionMode } from '../adminApi';
-import { atomicWrites } from '../atomicWrites';
+import { atomicWrites, needsAtomicWrites } from '../atomicWrites';
 import AtomicWritesNotice from './AtomicWritesNotice';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
@@ -90,6 +90,9 @@ interface Props {
    *  Proxy AES needs atomic writes: without them the mode and the key
    *  rotation are disabled, with the reason and "Check again". */
   capability?: BackendCapabilityVerdict;
+  /** The server's sentence why proxy AES is not offered (GET /backends
+   *  `proxy_unavailable`). */
+  proxyUnavailable?: string | null;
 }
 
 export default function BackendEncryptionEditor({
@@ -101,9 +104,11 @@ export default function BackendEncryptionEditor({
   conversions,
   usage,
   capability,
+  proxyUnavailable,
 }: Props) {
   const atomic = atomicWrites(capability);
   const noAtomic = atomic.kind === 'missing';
+  const atomicReason = needsAtomicWrites(backendName, atomic);
   const uid = useId();
   const colors = useColors();
   const { cardStyle, inputRadius } = useCardStyles();
@@ -284,7 +289,7 @@ export default function BackendEncryptionEditor({
                when an env var makes the encryption read-only. */}
             {!pending &&
               (conversions ?? []).map((c) => (
-                <ConversionStatusLine key={c.bucket} bucket={c.bucket} view={c.view} />
+                <ConversionStatusLine key={c.bucket} bucket={c.bucket} view={c.view} backend={backendName} capability={capability} />
               ))}
           </div>
         </div>
@@ -296,10 +301,16 @@ export default function BackendEncryptionEditor({
                 icon={<ReloadOutlined />}
                 onClick={() => startEdit('aes256-gcm-proxy')}
                 disabled={keyChangeBlocked || noAtomic}
-                title={keyChangeBlocked ? keyChangeBlockedReason : undefined}
+                title={keyChangeBlocked ? keyChangeBlockedReason : (atomicReason ?? undefined)}
+                aria-describedby={!keyChangeBlocked && atomicReason ? `${uid}-rotate-reason` : undefined}
               >
                 Rotate key
               </Button>
+            )}
+            {current.mode === 'aes256-gcm-proxy' && !keyChangeBlocked && atomicReason && (
+              <Text id={`${uid}-rotate-reason`} type="secondary" style={{ fontSize: 12 }}>
+                {atomicReason}
+              </Text>
             )}
             <span data-testid="encryption-mode-select">
               <Select
@@ -327,7 +338,7 @@ export default function BackendEncryptionEditor({
       )}
       {!readOnly && (noAtomic || pending?.mode === 'aes256-gcm-proxy') && (
         <div style={{ marginTop: 8 }}>
-          <AtomicWritesNotice backend={backendName} capability={capability} />
+          <AtomicWritesNotice backend={backendName} capability={capability} proxyUnavailable={proxyUnavailable} />
         </div>
       )}
       {current.shim_active && !pending && (

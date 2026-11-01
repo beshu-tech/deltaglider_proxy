@@ -32,7 +32,7 @@ import { Alert, Button, Checkbox, Input, Radio, Space, Tag, Typography, message 
 import { ReloadOutlined } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
 import type { BackendCapabilityVerdict, EffectiveEncryption, SectionApplyResponse } from '../adminApi';
-import { atomicWrites } from '../atomicWrites';
+import { atomicWrites, needsAtomicWrites } from '../atomicWrites';
 import AtomicWritesNotice from './AtomicWritesNotice';
 import { ConfigConflictError, getSectionVersioned, validateSection } from '../adminApi';
 import { applySection, persistFailureText, sectionApplyErrorText } from '../applySection';
@@ -145,6 +145,8 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
   const proxyChoice = (c: BucketEncryptionChoice) =>
     c === 'bucket-key' || (c === 'inherit' && eff.inherited.mode === 'aes256-gcm-proxy');
   const noAtomic = (c: BucketEncryptionChoice) => atomic.kind === 'missing' && proxyChoice(c) && c !== current;
+  const atomicReason = needsAtomicWrites(eff.backend, atomic);
+  const rotateReasonId = `rotate-reason-${bucket}`;
 
   const cancel = () => {
     setChoice(null);
@@ -305,7 +307,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         {!editing && conversionRowState(eff.conversion) ? (
           // Resume is a job request, not a config write: offered also
           // when an env var makes the encryption read-only.
-          <ConversionStatusInline bucket={bucket} view={eff.conversion} />
+          <ConversionStatusInline bucket={bucket} view={eff.conversion} backend={eff.backend} capability={capability} />
         ) : (
           '.'
         )}
@@ -316,7 +318,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
         </Text>
       )}
       {(atomic.kind === 'missing' || (editing && proxyChoice(rotating ? 'bucket-key' : selected))) && (
-        <AtomicWritesNotice backend={eff.backend} capability={capability} />
+        <AtomicWritesNotice backend={eff.backend} capability={capability} proxyUnavailable={eff.proxy_unavailable} />
       )}
       <Radio.Group
         aria-label="Encryption of this bucket"
@@ -331,7 +333,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
       >
         {offeredChoices(eff).map((c) => {
           const blocked =
-            choiceBlocked(eff, c) ?? (noAtomic(c) ? `Needs atomic writes, which ${eff.backend} does not provide.` : null);
+            choiceBlocked(eff, c) ?? (noAtomic(c) ? atomicReason : null);
           const sub =
             c === 'inherit'
               ? `New writes follow backend ${eff.backend}.`
@@ -367,11 +369,17 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           icon={<ReloadOutlined />}
           style={{ marginTop: SPACE.xs }}
           disabled={!!rotateBlocked || !!blockedReason || atomic.kind === 'missing'}
-          title={rotateBlocked ?? undefined}
+          title={rotateBlocked ?? atomicReason ?? undefined}
+          aria-describedby={!rotateBlocked && atomicReason ? rotateReasonId : undefined}
           onClick={() => setRotating(true)}
         >
           Rotate key
         </Button>
+      )}
+      {ownKey && !editing && !readOnly && !rotateBlocked && atomicReason && (
+        <Text id={rotateReasonId} type="secondary" style={{ fontSize: 12, display: 'block', marginTop: SPACE.xxs }}>
+          {atomicReason}
+        </Text>
       )}
 
       {eff.source === 'bucket' && eff.legacy_key_id && !editing && (

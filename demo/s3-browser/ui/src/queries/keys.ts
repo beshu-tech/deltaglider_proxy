@@ -47,6 +47,10 @@ export const qk = {
     // buckets, so BackendsPanel's refresh() of the list also refetches origins.
     list: () => ['backends'] as const,
     origins: () => ['backends', 'origins'] as const,
+    // Under the prefix: a "Check again" (which invalidates the list)
+    // refreshes the Create dialog's answer too.
+    encryptionPreview: (bucket: string, backend: string | undefined) =>
+      ['backends', 'encryption-preview', bucket, backend ?? ''] as const,
     // NOT under the `backends` prefix: every scan HEADs every object, so a
     // list invalidation must not start one.
     /** `bucket` set: the check of one bucket's own legacy key. */

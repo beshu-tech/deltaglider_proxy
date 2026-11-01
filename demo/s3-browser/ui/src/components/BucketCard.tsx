@@ -26,10 +26,10 @@ import { bucketNameError } from '../bucketName';
 import { Children, isValidElement, useEffect, useState, useId } from 'react';
 import type { ReactNode } from 'react';
 import { useIsNarrow } from '../useIsNarrow';
-import { BREAKPOINT, SPACE } from './shared-styles';
+import { BREAKPOINT } from './shared-styles';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
 import { Alert, Button, Collapse, Input, Modal, Progress, Radio, Select, Typography } from 'antd';
-import { READ_ONLY_PILL, readOnlyBadge } from '../atomicWrites';
+import { READ_ONLY_PILL } from '../atomicWrites';
 import { CheckAgainButton } from './AtomicWritesNotice';
 import { LinkifiedText } from './LinkifiedText';
 import { DownOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
@@ -719,15 +719,10 @@ export default function BucketCard({
               showIcon
               data-testid="bucket-read-only"
               style={{ marginTop: 12, borderRadius: 6, fontSize: 12 }}
-              title={readOnlyBadge(effectiveEncryption?.backend ?? originBackend ?? defaultName)}
-              description={
-                <>
-                  <LinkifiedText text={readOnly} />
-                  <div style={{ marginTop: SPACE.xs }}>
-                    <CheckAgainButton backend={effectiveEncryption?.backend ?? originBackend ?? defaultName} />
-                  </div>
-                </>
-              }
+              // The server's reason is the title; the description holds
+              // only the action (the badge text repeated the reason).
+              title={<LinkifiedText text={readOnly} />}
+              description={<CheckAgainButton backend={effectiveEncryption?.backend ?? originBackend ?? defaultName} />}
             />
           )}
           {eff.replication_target_only && (

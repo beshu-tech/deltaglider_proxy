@@ -26,7 +26,9 @@
  *
  * Resume is `POST /jobs/reencrypt` for the bucket: a job request, not a
  * config write, so a read-only encryption (key from an env var) still
- * offers it; these components render only on admin pages. On a versioned
+ * offers it. A backend without proven atomic writes disables it, with the
+ * reason next to it (the server refuses it there); a refusal shows as an
+ * alert under the line; these components render only on admin pages. On a versioned
  * bucket Resume first asks whether the job deletes the old unencrypted
  * versions (the box starts unchecked); so does a bucket whose versioning
  * read failed, with the error. The bucket list refetches on its
@@ -34,6 +36,9 @@
  * and the status goes away when the conversion ends.
  */
 import { useState, type ReactNode } from 'react';
+import type { BackendCapabilityVerdict } from '../adminApi';
+import { resumeBlockedReason } from '../atomicWrites';
+import PlainErrorAlert from './PlainErrorAlert';
 import { Button, Space, Typography, message } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import type { ConversionView } from '../adminApi';
@@ -41,7 +46,7 @@ import { startReencrypt } from '../adminApi';
 import { confirmDialog } from '../confirmDialog';
 import { adoptedText, conversionPhrase, conversionRowState, runId, sentence, type ConversionRowState } from '../conversionView';
 import { useNavigation } from '../NavigationContext';
-import { plainError } from '../plainError';
+import { plainError, type PlainError } from '../plainError';
 import { qk } from '../queries/keys';
 import { buildViewUrl } from '../urlState';
 import PurgeVersionsBox from './PurgeVersionsBox';
@@ -52,7 +57,13 @@ const { Text } = Typography;
 interface Props {
   bucket: string;
   view: ConversionView | null | undefined;
+  /** The bucket's backend and its atomic-writes verdict: a conversion
+   *  keeps writing, so without proven atomic writes the server refuses
+   *  Resume, and the UI disables it with the reason. */
+  backend?: string;
+  capability?: BackendCapabilityVerdict;
 }
+
 
 const LINK = { padding: 0, height: 'auto', fontSize: 12 } as const;
 
@@ -89,25 +100,33 @@ async function askPurge(bucket: string, versioningError?: string): Promise<boole
   return ok ? purge : null;
 }
 
-/** The links and the Resume button of a conversion state. */
-function useActions(bucket: string, view: ConversionView, state: ConversionRowState): ReactNode[] {
+/** The links and the Resume button of a conversion state, and the error
+ *  of the last Resume (an alert under the line, links clickable). */
+function useActions(
+  bucket: string,
+  view: ConversionView,
+  state: ConversionRowState,
+  blocked: string | null,
+): { actions: ReactNode[]; error: PlainError | null } {
   const qc = useQueryClient();
   const { navigate } = useNavigation();
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<PlainError | null>(null);
   const openRun = (jobId: number, tab?: string) =>
     navigate(buildViewUrl('admin', 'jobs', tab ? { job: runId(jobId), tab } : { job: runId(jobId) }));
   const resume = async () => {
     const purge = view.versioned || view.versioning_error ? await askPurge(bucket, view.versioning_error) : false;
     if (purge === null) return;
     setBusy(true);
+    setError(null);
     try {
       const r = await startReencrypt([bucket], { purgePlaintextVersions: purge, openWindow: true });
-      const error = r.errors[0]?.error;
-      if (error) message.error(`Resume of ${bucket}: ${error}`);
+      const refused = r.errors[0]?.error;
+      if (refused) setError(plainError(refused, `The conversion of ${bucket} could not be resumed.`));
       else message.success(`Conversion of ${bucket} resumed`);
       await qc.invalidateQueries({ queryKey: qk.backends.origins() });
     } catch (e) {
-      message.error(plainError(e, `The conversion of ${bucket} could not be resumed.`).text);
+      setError(plainError(e, `The conversion of ${bucket} could not be resumed.`));
     } finally {
       setBusy(false);
     }
@@ -149,14 +168,23 @@ function useActions(bucket: string, view: ConversionView, state: ConversionRowSt
         key="resume"
         size="small"
         loading={busy}
+        disabled={!!blocked}
         aria-label={`Resume the conversion of ${bucket}`}
+        aria-describedby={blocked ? `resume-blocked-${bucket}` : undefined}
         onClick={() => void resume()}
       >
         Resume
       </Button>,
     );
+    if (blocked) {
+      out.push(
+        <Text key="resume-blocked" id={`resume-blocked-${bucket}`} type="secondary" style={{ fontSize: 12 }}>
+          {blocked}
+        </Text>,
+      );
+    }
   }
-  return out;
+  return { actions: out, error };
 }
 
 /** Separator of a status line. */
@@ -164,14 +192,16 @@ const DOT = <span aria-hidden> · </span>;
 
 /** The conversion state as the continuation of the bucket card's "Now:"
  *  line; nothing without a conversion. */
-export function ConversionStatusInline({ bucket, view }: Props) {
+export function ConversionStatusInline({ bucket, view, backend, capability }: Props) {
   const state = conversionRowState(view);
   if (!state || !view) return null;
-  return <InlineBody bucket={bucket} view={view} state={state} />;
+  return <InlineBody bucket={bucket} view={view} state={state} blocked={resumeBlockedReason(backend, capability)} />;
 }
 
-function InlineBody({ bucket, view, state }: Props & { view: ConversionView; state: ConversionRowState }) {
-  const actions = useActions(bucket, view, state);
+type BodyProps = { bucket: string; view: ConversionView; state: ConversionRowState; blocked: string | null };
+
+function InlineBody({ bucket, view, state, blocked }: BodyProps) {
+  const { actions, error } = useActions(bucket, view, state, blocked);
   return (
     <span data-testid="conversion-status" data-state={state.kind}>
       {DOT}
@@ -184,20 +214,21 @@ function InlineBody({ bucket, view, state }: Props & { view: ConversionView; sta
           {a}
         </span>
       ))}
+      {error && <PlainErrorAlert error={error} style={{ marginTop: SPACE.xs }} />}
     </span>
   );
 }
 
 /** One line of the backend card: the bucket's name as a label, then the
  *  state as a sentence; nothing without a conversion. */
-export function ConversionStatusLine({ bucket, view }: Props) {
+export function ConversionStatusLine({ bucket, view, backend, capability }: Props) {
   const state = conversionRowState(view);
   if (!state || !view) return null;
-  return <LineBody bucket={bucket} view={view} state={state} />;
+  return <LineBody bucket={bucket} view={view} state={state} blocked={resumeBlockedReason(backend, capability)} />;
 }
 
-function LineBody({ bucket, view, state }: Props & { view: ConversionView; state: ConversionRowState }) {
-  const actions = useActions(bucket, view, state);
+function LineBody({ bucket, view, state, blocked }: BodyProps) {
+  const { actions, error } = useActions(bucket, view, state, blocked);
   return (
     <div
       data-testid="conversion-status"
@@ -209,6 +240,7 @@ function LineBody({ bucket, view, state }: Props & { view: ConversionView; state
         {sentence(conversionPhrase(state))}
       </Text>
       {actions}
+      {error && <PlainErrorAlert error={error} style={{ flexBasis: '100%' }} />}
     </div>
   );
 }

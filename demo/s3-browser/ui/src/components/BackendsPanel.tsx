@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { LinkifiedText } from './LinkifiedText';
 import { CAPABILITY_DOC_URL } from '../linkifyDocUrl';
-import { readOnlyBadge } from '../atomicWrites';
+import { CHECKING_TITLE, readOnlyBadge } from '../atomicWrites';
 import { CheckAgainButton } from './AtomicWritesNotice';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
@@ -640,6 +640,16 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                  client-writable buckets routed here). */}
               {/* Encryption needs atomic writes (N2): its encrypted buckets
                  serve reads only. */}
+              {b.atomic_writes_checking && (
+                <Alert
+                  type="info"
+                  showIcon
+                  data-testid="backend-atomic-writes-checking"
+                  title={CHECKING_TITLE}
+                  description="Its encrypted buckets need atomic writes. Until the check ends, writes to them get a 503 answer, which clients retry. Reads keep working."
+                  style={{ marginTop: 8, borderRadius: 6 }}
+                />
+              )}
               {(b.read_only_buckets ?? []).length > 0 && (
                 <Alert
                   type="error"
@@ -649,7 +659,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   description={
                     <>
                       <LinkifiedText
-                        text={`Encrypted buckets ${(b.read_only_buckets ?? []).join(', ')} are read-only: reads work, writes are refused. Move them to a backend with atomic writes with a migrate job. See ${CAPABILITY_DOC_URL}`}
+                        text={`Encrypted buckets ${(b.read_only_buckets ?? []).join(', ')} are read-only: reads work, writes are refused. Move them to a backend with atomic writes with a migrate job — see ${CAPABILITY_DOC_URL}`}
                       />
                       <div style={{ marginTop: 8 }}>
                         <CheckAgainButton backend={b.name} />
@@ -689,11 +699,17 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 <Alert
                   type="info"
                   showIcon
-                  title="Conditional-write support could not be verified"
+                  data-testid="backend-capability-unknown"
+                  title="The proxy could not verify atomic writes on this backend"
                   description={
-                    <LinkifiedText
-                      text={`${b.capability.reason} — multi-instance write safety is unproven on this backend. See ${CAPABILITY_DOC_URL}`}
-                    />
+                    <>
+                      <LinkifiedText
+                        text={`${sentenceCase(b.capability_words ?? 'The proxy could not verify the backend')}. Writes to its encrypted buckets wait (503, retried) and encryption changes are refused until a check succeeds — see ${CAPABILITY_DOC_URL}`}
+                      />
+                      <div style={{ marginTop: 8 }}>
+                        <CheckAgainButton backend={b.name} />
+                      </div>
+                    </>
                   }
                   style={{ marginTop: 8, borderRadius: 6 }}
                 />
@@ -716,6 +732,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 readOnly={!!encryptionEnv(b)}
                 usage={backendBucketCountText(encryptionCounts[b.name])}
                 capability={b.capability}
+                proxyUnavailable={b.proxy_unavailable}
               />
             </BackendCard>
           ))}
@@ -863,4 +880,9 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       </Space>
     </div>
   );
+}
+
+/** Pure: `words` with a capital first letter. */
+function sentenceCase(words: string): string {
+  return words.charAt(0).toUpperCase() + words.slice(1);
 }

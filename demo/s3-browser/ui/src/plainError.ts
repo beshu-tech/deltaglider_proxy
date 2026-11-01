@@ -148,8 +148,15 @@ const STATUS_SENTENCE: Record<number, string> = {
   429: 'Too many requests. Wait a moment and try again.',
 };
 
+/** Pure: a server text that names a deltaglider.com doc page. The proxy's
+ *  enforcement messages (a read-only encrypted bucket, a backend whose
+ *  atomic writes are not verified yet) end with their how-to link: that
+ *  sentence is specific, so the UI shows it instead of a generic one. */
+const NAMES_A_DOC = /https:\/\/(?:www\.)?deltaglider\.com\/docs\//;
+
 /** Pure: the plain sentence for an S3 (or HTTP) failure, or null. */
 function knownRequestSentence({ status, code, detail }: ErrorFacts): string | null {
+  if (detail && NAMES_A_DOC.test(detail)) return null; // the proxy's own reason is better
   const quota = detail && /Bucket quota exceeded: (.+?) used \+ (.+?) upload > (.+?) limit/.exec(detail);
   if (quota) {
     return `This bucket is full: ${quota[1]} is used of ${quota[3]}, and this file needs ${quota[2]}. Delete objects or ask an administrator to raise the quota.`;

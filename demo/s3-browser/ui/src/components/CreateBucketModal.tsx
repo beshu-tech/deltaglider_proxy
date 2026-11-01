@@ -31,13 +31,14 @@
  * missing under the field (a disabled button gave no reason). A name that
  * already exists is an error under the name, never a "created" toast.
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Button, Modal, Input, Radio, Select, Typography, message } from 'antd';
 import type { InputRef } from 'antd';
 import { createBucket } from '../s3client';
-import { getBackends, getBucketEncryptionPreview } from '../adminApi';
-import type { BackendInfo } from '../adminApi';
+import { getBucketEncryptionPreview } from '../adminApi';
+import { useBackends } from '../queries/backends';
+import { qk } from '../queries/keys';
 import { ApiError } from '../errorHandling';
 import { plainError, type PlainError } from '../adminApi';
 import PlainErrorAlert from './PlainErrorAlert';
@@ -45,7 +46,7 @@ import { v } from '../validation';
 import FormField from './FormField';
 import { SPACE } from './shared-styles';
 import { encryptionWord } from '../backendFacts';
-import { atomicWrites } from '../atomicWrites';
+import { atomicWrites, needsAtomicWrites } from '../atomicWrites';
 import AtomicWritesNotice from './AtomicWritesNotice';
 import { describeBucketEncryption, modeWord, newBucketEncryptionBlock, type NewBucketEncryption } from '../bucketEncryption';
 import { confirmDialog } from '../confirmDialog';
@@ -75,8 +76,6 @@ export default function CreateBucketModal({
 }: Props) {
   const [name, setName] = useState('');
   const [creating, setCreating] = useState(false);
-  const [backends, setBackends] = useState<BackendInfo[]>([]);
-  const [defaultBackend, setDefaultBackend] = useState<string | undefined>(undefined);
   const [selectedBackend, setSelectedBackend] = useState<string | undefined>(undefined);
   const inputRef = useRef<InputRef>(null);
   const [messageApi, contextHolder] = message.useMessage();
@@ -96,29 +95,23 @@ export default function CreateBucketModal({
     return () => window.clearTimeout(id);
   }, [open]);
 
-  // Load the backend list (admin only). Preselect: explicit preset > default > first.
+  // The backend list (admin only), shared with the Backends page: a
+  // "Check again" (which invalidates it) refreshes this dialog too.
+  const backendsQuery = useBackends({ enabled: open && canAdmin });
+  const backends = useMemo(() => (canAdmin ? (backendsQuery.data?.backends ?? []) : []), [canAdmin, backendsQuery.data]);
+  const defaultBackend = (canAdmin && backendsQuery.data?.default_backend) || undefined;
+  // Preselect once per opening: explicit preset > default > first.
+  const preselected = useRef(false);
   useEffect(() => {
-    if (!open || !canAdmin) return;
-    let cancelled = false;
-    getBackends()
-      .then((resp) => {
-        if (cancelled) return;
-        const list = resp.backends || [];
-        setBackends(list);
-        setDefaultBackend(resp.default_backend || undefined);
-        const preferred = presetBackend || resp.default_backend || list[0]?.name;
-        setSelectedBackend(preferred || undefined);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setBackends([]);
-        setDefaultBackend(undefined);
-        setSelectedBackend(undefined);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, canAdmin, presetBackend]);
+    if (!open) {
+      preselected.current = false;
+      return;
+    }
+    if (preselected.current || !backendsQuery.data) return;
+    preselected.current = true;
+    const preferred = presetBackend || backendsQuery.data.default_backend || backendsQuery.data.backends?.[0]?.name;
+    setSelectedBackend(preferred || undefined);
+  }, [open, presetBackend, backendsQuery.data]);
 
   const showPicker = canAdmin && backends.length > 1;
   const nameError = v.bucketName()(name.trim());
@@ -127,7 +120,7 @@ export default function CreateBucketModal({
   const targetName = selectedBackend ?? defaultBackend ?? backends[0]?.name;
   const trimmedName = name.trim();
   const preview = useQuery({
-    queryKey: ['bucket-encryption-preview', trimmedName, targetName],
+    queryKey: qk.backends.encryptionPreview(trimmedName, targetName),
     queryFn: () => getBucketEncryptionPreview(trimmedName, targetName!),
     enabled: open && canAdmin && !!targetName && !!trimmedName && v.bucketName()(trimmedName) === null,
     retry: false,
@@ -136,12 +129,26 @@ export default function CreateBucketModal({
   const offerKey = modes.includes('aes256-gcm-proxy');
   const offerOff = modes.includes('none') && !!preview && preview.mode !== 'none';
   // Encryption needs atomic writes (N2): on a backend without them the
-  // choices that encrypt with the proxy are off, with the reason.
-  const atomic = atomicWrites(backends.find((b) => b.name === targetName)?.capability);
+  // choices that encrypt with the proxy are off, with the reason. The
+  // server's answer for this bucket wins over the backend list.
+  const targetInfo = backends.find((b) => b.name === targetName);
+  const capability = preview?.capability ?? targetInfo?.capability;
+  const proxyUnavailable = preview?.proxy_unavailable ?? targetInfo?.proxy_unavailable ?? null;
+  const atomic = atomicWrites(capability);
+  const atomicReason = targetName ? needsAtomicWrites(targetName, atomic) : null;
   const sameEncryptsProxy = preview?.mode === 'aes256-gcm-proxy';
   const noAtomic = atomic.kind === 'missing';
-  const choice: NewBucketEncryption['kind'] =
-    (encChoice === 'bucket-key' && (!offerKey || noAtomic)) || (encChoice === 'off' && !offerOff) ? 'same' : encChoice;
+  // The bucket key shows also when the server left it out for lack of
+  // atomic writes (disabled, with the reason), as on the bucket card.
+  const showKey = offerKey || !!proxyUnavailable;
+  const available = (c: NewBucketEncryption['kind']): boolean =>
+    c === 'same' ? !(noAtomic && sameEncryptsProxy) : c === 'bucket-key' ? offerKey && !noAtomic : offerOff;
+  // An option that is not available is never the selection: the dialog
+  // moves to the first one that is (Off, on a proxy-encrypting backend
+  // without atomic writes).
+  const choice: NewBucketEncryption['kind'] = available(encChoice)
+    ? encChoice
+    : ((['same', 'off', 'bucket-key'] as const).find(available) ?? encChoice);
   const choiceNeedsAtomic = choice === 'bucket-key' || (choice === 'same' && sameEncryptsProxy);
   const keyNotReady = choice === 'bucket-key' && !keyValue?.ready;
   const emptyName = !trimmedName;
@@ -155,7 +162,7 @@ export default function CreateBucketModal({
         : nameError;
   const backendMissing = showPicker && !selectedBackend;
   const formInvalid =
-    emptyName || nameError !== null || backendMissing || keyNotReady || nameMessage !== null || (noAtomic && choiceNeedsAtomic);
+    emptyName || nameError !== null || backendMissing || keyNotReady || nameMessage !== null || (noAtomic && choiceNeedsAtomic) || !available(choice);
 
   const reset = () => {
     setName('');
@@ -174,7 +181,9 @@ export default function CreateBucketModal({
     if (creating) return;
     setTried(true);
     if (formInvalid) {
-      inputRef.current?.focus();
+      // The encryption choice says what is wrong under the group; the
+      // name field takes the focus only when the name is the problem.
+      if (nameMessage !== null || emptyName || nameError !== null) inputRef.current?.focus();
       return;
     }
     const enc: NewBucketEncryption =
@@ -324,13 +333,13 @@ export default function CreateBucketModal({
             </Text>
           </div>
         )}
-        {canAdmin && preview && (offerKey || offerOff) && (
+        {canAdmin && preview && (showKey || offerOff) && (
           <div style={{ marginTop: 12 }} data-testid="bucket-encryption-choice">
             <Text strong style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>
               Encryption
             </Text>
             {(noAtomic || choiceNeedsAtomic) && targetName && (
-              <AtomicWritesNotice backend={targetName} capability={backends.find((b) => b.name === targetName)?.capability} />
+              <AtomicWritesNotice backend={targetName} capability={capability} proxyUnavailable={proxyUnavailable} />
             )}
             <Radio.Group
               aria-label="Encryption of the new bucket"
@@ -338,18 +347,25 @@ export default function CreateBucketModal({
               onChange={(e) => setEncChoice(e.target.value)}
               style={{ display: 'flex', flexDirection: 'column', gap: 4 }}
             >
-              <Radio value="same" disabled={noAtomic && sameEncryptsProxy}>
+              <Radio value="same" disabled={!available('same')}>
                 {preview.source === 'bucket'
                   ? `Keep the settings this name already has (${describeBucketEncryption(preview).label})`
                   : `Same as backend (${modeWord(preview.mode, preview.encrypts)})`}
+                {!available('same') && atomicReason && <DisabledReason text={atomicReason} />}
               </Radio>
-              {offerKey && (
-                <Radio value="bucket-key" disabled={noAtomic}>
+              {showKey && (
+                <Radio value="bucket-key" disabled={!available('bucket-key')}>
                   Encrypt with a bucket key
+                  {!available('bucket-key') && atomicReason && <DisabledReason text={atomicReason} />}
                 </Radio>
               )}
               {offerOff && <Radio value="off">Off for this bucket (plaintext)</Radio>}
             </Radio.Group>
+            {tried && !available(choice) && atomicReason && (
+              <Text role="alert" type="danger" style={{ display: 'block', marginTop: SPACE.xs, fontSize: 12 }}>
+                {atomicReason} Choose another encryption, or another backend.
+              </Text>
+            )}
             {choice === 'bucket-key' && name.trim() && !nameError && (
               <div style={{ marginTop: 8 }}>
                 <BucketKeySetup bucket={name.trim()} backend={preview.backend} onChange={setKeyValue} />
@@ -375,5 +391,15 @@ export default function CreateBucketModal({
         {createError && <PlainErrorAlert error={createError} style={{ marginTop: 12 }} />}
       </Modal>
     </>
+  );
+}
+
+/** The reason of a disabled option, inside its label: visible, and part of
+ *  the radio's accessible name. */
+function DisabledReason({ text }: { text: string }) {
+  return (
+    <Text type="secondary" style={{ fontSize: 11, display: 'block' }}>
+      {text}
+    </Text>
   );
 }

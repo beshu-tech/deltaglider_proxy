@@ -19,10 +19,11 @@ import { conversionPollMs } from '../conversionView';
  */
 export const BACKENDS_REFRESH_MS = 15_000;
 
-export function useBackends() {
+export function useBackends(opts?: { enabled?: boolean }) {
   return useQuery({
     queryKey: qk.backends.list(),
     queryFn: getBackends,
+    enabled: opts?.enabled ?? true,
     refetchInterval: BACKENDS_REFRESH_MS,
   });
 }

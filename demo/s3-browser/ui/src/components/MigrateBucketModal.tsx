@@ -33,6 +33,7 @@ import {
   migrateErrorInModalWords,
 } from '../backendFacts';
 import { describeBucketEncryption, encryptsAfterMigrate } from '../bucketEncryption';
+import { LinkifiedText } from './LinkifiedText';
 
 const { Text } = Typography;
 
@@ -68,6 +69,9 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
   const currentBackend = originsQuery.isSuccess ? (origin?.backend_name ?? null) : null;
   const source = backends.find((b) => b.name === currentBackend);
   const sourceEnc = origin?.effective_encryption ?? null;
+  // An encrypted bucket on a backend without atomic writes is read-only
+  // (403, not a temporary 503); the migration is its way out.
+  const readOnly = origin?.read_only ?? null;
   const targets = originsQuery.isSuccess ? backends.filter((b) => b.name !== currentBackend) : [];
   const targetInfo = backends.find((b) => b.name === target);
   const targetGated = isGated(targetInfo?.health);
@@ -143,9 +147,18 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
         style={{ marginBottom: 12, borderRadius: 8 }}
         title="While the migration runs"
         description={
-          <span style={{ fontSize: 12 }}>
-            Reads keep working; <strong>uploads and deletes get a temporary 503</strong> until
-            the switch-over (S3 clients retry automatically).
+          <span style={{ fontSize: 12 }} data-testid="migrate-while-running">
+            {readOnly ? (
+              <>
+                <LinkifiedText text={readOnly} /> Reads keep working; <strong>uploads and deletes stay refused</strong>{' '}
+                until the switch-over. After it, writes go to the target backend.
+              </>
+            ) : (
+              <>
+                Reads keep working; <strong>uploads and deletes get a temporary 503</strong> until
+                the switch-over (S3 clients retry automatically).
+              </>
+            )}
           </span>
         }
       />

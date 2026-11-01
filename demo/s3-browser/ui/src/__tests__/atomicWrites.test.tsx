@@ -36,8 +36,9 @@ test('a non-CAS backend: the bucket key choice is disabled, with the reason and 
   // Off stays possible.
   expect(within(group).getByRole('radio', { name: /Off for this bucket/ })).toBeEnabled();
   const notice = screen.getByTestId('atomic-writes-missing');
-  expect(notice).toHaveTextContent('Encryption is not available on backend b2: it does not support atomic writes (the backend ignored or rejected a conditional write, as Backblaze B2 does)');
-  expect(within(notice).getByRole('link')).toHaveAttribute('href', expect.stringContaining('backend-capability-validation'));
+  expect(notice).toHaveTextContent('Encryption with a proxy key is not available on backend b2: it does not support atomic writes (conditional writes), which encryption needs');
+  // The doc link reads as a label, not as a raw URL (review finding 12).
+  expect(within(notice).getByRole('link', { name: 'How to check a backend' })).toHaveAttribute('href', expect.stringContaining('backend-capability-validation'));
   expect(within(notice).getByRole('button', { name: /Check again/ })).toBeInTheDocument();
 });
 
@@ -57,7 +58,10 @@ test('the backend encryption editor disables rotation on a non-CAS backend and s
     />,
   );
   expect(screen.getByRole('button', { name: /Rotate key/ })).toBeDisabled();
-  expect(screen.getByTestId('atomic-writes-missing')).toHaveTextContent('could not reach the backend to verify (timeout)');
+  // Unknown is "could not verify", never "does not support" (review finding 2d).
+  const notice = screen.getByTestId('atomic-writes-missing');
+  expect(notice).toHaveTextContent('the proxy could not verify that it supports atomic writes');
+  expect(notice).not.toHaveTextContent('does not support');
 });
 
 test('the bucket card shows a read-only bucket in its row and in the open card', () => {
@@ -87,7 +91,7 @@ test('the bucket card shows a read-only bucket in its row and in the open card',
   const pill = screen.getByText('Read-only', { exact: true });
   expect(pill.closest('[title]')).toHaveAttribute('title', reason);
   const alert = screen.getByTestId('bucket-read-only');
-  expect(alert).toHaveTextContent('Read-only: b2 does not support atomic writes');
+  expect(alert).toHaveTextContent("Bucket 'releases' is read-only");
   expect(within(alert).getByRole('link')).toHaveAttribute('href', expect.stringContaining('backend-capability-validation'));
   expect(within(alert).getByRole('button', { name: /Check again/ })).toBeInTheDocument();
 });
@@ -129,7 +133,8 @@ test('the synthesized single backend without atomic writes: the bucket card offe
   const group = screen.getByRole('radiogroup', { name: 'Encryption of this bucket' });
   expect(within(group).getByRole('radio', { name: /Encrypt with a bucket key/ })).toBeDisabled();
   const notice = screen.getByTestId('atomic-writes-missing');
-  expect(notice).toHaveTextContent('Encryption is not available on backend default');
+  // The server's own sentence (one source of wording, review finding 13).
+  expect(notice).toHaveTextContent("Encryption with a proxy key needs atomic writes, which backend 'default' does not provide");
   expect(within(notice).getByRole('button', { name: /Check again/ })).toBeInTheDocument();
 });
 

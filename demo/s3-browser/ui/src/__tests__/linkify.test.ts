@@ -30,12 +30,15 @@ test('splitLinkSegments', () => {
   assert.equal(segs[0].kind, 'text');
   assert.equal(segs[1].kind, 'link');
   assert.equal(segs[1].href, '/_/docs/how-to-backend-capability-validation');
+  // Review finding 12: a docs link reads as a label, never as a raw URL.
+  assert.equal(segs[1].text, 'How to check a backend');
 
   // Trailing prose punctuation stays out of the link.
   const withDot = splitLinkSegments('see https://deltaglider.com/docs/faq.');
-  assert.equal(withDot[1].text, 'https://deltaglider.com/docs/faq');
+  assert.equal(withDot[1].text, 'Open the docs page');
   assert.equal(withDot[1].href, '/_/docs/faq');
   assert.equal(withDot[2].text, '.');
+
 
   // Multiple links + non-docs link opens as-is.
   const multi = splitLinkSegments(
@@ -54,5 +57,7 @@ test('splitLinkSegments', () => {
 
   // A URL inside quotes/parens doesn't swallow the closer.
   const quoted = splitLinkSegments('(see "https://deltaglider.com/docs/faq")');
-  assert.equal(quoted.find((s) => s.kind === 'link')?.text, 'https://deltaglider.com/docs/faq');
+  assert.equal(quoted.find((s) => s.kind === 'link')?.href, '/_/docs/faq');
+  // A link that is not ours keeps its URL as its text.
+  assert.equal(multi[1].text, 'https://example.com/x');
 });

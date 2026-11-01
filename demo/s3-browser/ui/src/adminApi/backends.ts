@@ -20,7 +20,7 @@ interface BucketOriginResponse {
   /** Verbatim backend error when this bucket's backend couldn't be listed (503/throttle). */
   unavailable?: string | null;
   /** Why the bucket is read-only (it encrypts with the proxy, and its
-   *  backend has no proven atomic writes). Absent when writable. */
+   *  backend does not support atomic writes). Absent when writable. */
   read_only?: string | null;
   /** The server's answer to "how are this bucket's new writes encrypted".
    *  null only when the bucket routes to an undefined backend. */
@@ -62,8 +62,10 @@ export interface EffectiveEncryption {
    *  yet). The server's answer for THIS bucket's backend, also for the
    *  synthesized single backend that GET /config lists without a verdict. */
   capability?: BackendCapabilityVerdict;
-  /** Why proxy AES is not offered (no atomic writes), with the doc link. */
-  proxy_unavailable?: string;
+  /** Why proxy AES is not offered (no proven atomic writes), with the doc link. */
+  proxy_unavailable?: string | null;
+  /** The server's plain words for `capability`. */
+  capability_words?: string | null;
   /** What "Inherit" gives the bucket: the backend's own encryption. */
   inherited: { mode: BackendEncryptionMode; encrypts: boolean; key_id?: string };
 }

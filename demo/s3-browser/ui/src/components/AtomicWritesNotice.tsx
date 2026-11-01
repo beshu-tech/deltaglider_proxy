@@ -6,7 +6,7 @@
  * that now proves atomic writes enables the options at once.
  *
  * Renders nothing when the backend has atomic writes. Without a verdict
- * yet it shows a short note (the apply checks).
+ * yet it shows a short note (the action checks).
  */
 import { useState } from 'react';
 import { Alert, Button, Typography } from 'antd';
@@ -39,10 +39,9 @@ export function CheckAgainButton({ backend }: { backend: string }) {
           setError(null);
           try {
             await probeBackendCapability(backend);
-            await Promise.all([
-              qc.invalidateQueries({ queryKey: qk.backends.list() }),
-              qc.invalidateQueries({ queryKey: qk.backends.origins() }),
-            ]);
+            // The list key is the prefix of the origins and of the Create
+            // dialog's preview: one invalidation refreshes all three.
+            await qc.invalidateQueries({ queryKey: qk.backends.list() });
           } catch (e) {
             setError(plainError(e, `The proxy could not check ${backend}. Try again.`));
           } finally {
@@ -60,9 +59,12 @@ export function CheckAgainButton({ backend }: { backend: string }) {
 export default function AtomicWritesNotice({
   backend,
   capability,
+  proxyUnavailable,
 }: {
   backend: string;
   capability: BackendCapabilityVerdict | undefined;
+  /** The server's sentence (`proxy_unavailable`), when it sent one. */
+  proxyUnavailable?: string | null;
 }) {
   const state = atomicWrites(capability);
   if (state.kind === 'atomic') return null;
@@ -79,7 +81,7 @@ export default function AtomicWritesNotice({
       showIcon
       data-testid="atomic-writes-missing"
       style={{ borderRadius: 6, fontSize: 12, marginBottom: SPACE.xs }}
-      title={<LinkifiedText text={encryptionUnavailableReason(backend, state) ?? ''} />}
+      title={<LinkifiedText text={encryptionUnavailableReason(backend, state, proxyUnavailable) ?? ''} />}
       description={<CheckAgainButton backend={backend} />}
     />
   );

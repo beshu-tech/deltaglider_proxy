@@ -383,9 +383,17 @@ export interface BackendInfo {
    *  backend (GET /backends only). */
   bucket_encryption_modes?: BackendEncryptionMode[];
   /** Buckets on this backend that are read-only: they encrypt with the
-   *  proxy, and the backend has no proven atomic writes (omitted when
-   *  empty; GET /backends only). */
+   *  proxy, and the backend does not support atomic writes (verdict
+   *  `non-cas`; omitted when empty; GET /backends only). */
   read_only_buckets?: string[];
+  /** The server's plain words for `capability` (GET /backends only). */
+  capability_words?: string | null;
+  /** The server's sentence why proxy AES is not offered on this backend
+   *  (no proven atomic writes), ending with the doc link. */
+  proxy_unavailable?: string | null;
+  /** The backend stores buckets that encrypt with the proxy and has no
+   *  verdict yet: writes to them get 503 until the check ends. */
+  atomic_writes_checking?: boolean;
 }
 
 /** Mirror of the server's coordination::CapabilityVerdict (kebab-case tag). */
