@@ -102,6 +102,10 @@ pub struct ConfigResponse {
     // live only until the next restart; the GUI warns about it.
     config_file_path: String,
     config_file_writable: bool,
+    // The OAuth callback URI that `advanced.public_url` pins; `None` when
+    // unset (the URI then follows the request's host). The SSO page shows
+    // it so the operator registers the URI the proxy really sends.
+    oauth_callback_url: Option<String>,
 }
 
 /// Per-backend encryption status summary. Exposed in
@@ -621,6 +625,9 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
             env_overrides: crate::config::env_overrides::process_env_overrides(&cfg),
             config_file_path,
             config_file_writable,
+            oauth_callback_url: crate::api::admin::external_auth::pinned_callback_uri(
+                cfg.public_url.as_deref(),
+            ),
             // Encryption status is now per-backend. Each `BackendInfoResponse`
             // in `backends` carries an `encryption: BackendEncryptionSummary`
             // non-secret summary. The former top-level `encryption_enabled`

@@ -244,6 +244,8 @@ export interface AdminConfig {
   /** The file an apply persists to, and whether that write can work. */
   config_file_path?: string;
   config_file_writable?: boolean;
+  /** The OAuth callback URL that `advanced.public_url` pins; null when unset. */
+  oauth_callback_url?: string | null;
 }
 
 export type IamMode = 'gui' | 'declarative';

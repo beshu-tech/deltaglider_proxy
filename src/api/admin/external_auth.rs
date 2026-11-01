@@ -1291,6 +1291,13 @@ async fn build_callback_uri(state: &AdminState, headers: &HeaderMap) -> String {
     )
 }
 
+/// Pure: the callback URI that `advanced.public_url` pins, or `None`
+/// when it is unset (the URI then follows the request). `GET /config`
+/// reports it, so the GUI shows the URI that the proxy sends to the IdP.
+pub fn pinned_callback_uri(public_url: Option<&str>) -> Option<String> {
+    public_url.map(|base| format!("{}/_/api/admin/oauth/callback", base.trim_end_matches('/')))
+}
+
 /// Pure core. A `public_url` pins the URI (SEC F-03): `Host` and
 /// `X-Forwarded-*` are then ignored. Without it, X-Forwarded-Proto/-Host
 /// count only from a trusted proxy (S23): otherwise any client picks the
@@ -1301,8 +1308,8 @@ fn build_callback_uri_with(
     headers: &HeaderMap,
     trust_proxy: bool,
 ) -> String {
-    if let Some(base) = public_url {
-        return format!("{}/_/api/admin/oauth/callback", base.trim_end_matches('/'));
+    if let Some(uri) = pinned_callback_uri(public_url) {
+        return uri;
     }
     let fwd = |name: &str| {
         trust_proxy
@@ -1582,6 +1589,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pinned_callback_uri_needs_a_public_url() {
+        assert_eq!(super::pinned_callback_uri(None), None);
+        assert_eq!(
+            super::pinned_callback_uri(Some("https://s3.acme.example/")).as_deref(),
+            Some("https://s3.acme.example/_/api/admin/oauth/callback")
+        );
     }
 
     #[test]

@@ -56,7 +56,7 @@ In the admin UI:
 
    ![The External authentication page with the form of a new Okta provider; callout 1 marks the New provider button, callout 2 the provider fields from Display name to Scopes, and callout 3 the Create button.](/_/screenshots/sso-add-provider.webp)
 
-The form shows the **Callback URL** below **Scopes**, with a button that copies it. It is the URL of step 1.
+The form shows the **Callback URL** below **Scopes**, with a button that copies it. It is the URL of step 1. When `advanced.public_url` is set, the form shows the URL that the proxy builds from that value. Otherwise, the form shows the URL of the address that the page is open on, so open the page at the address that your users sign in from.
 
 The form has no priority field. In the admin API and in YAML, `priority` sets the order of the buttons on the login page: a provider with a higher number is shown first.
 

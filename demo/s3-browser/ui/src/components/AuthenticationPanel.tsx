@@ -5,7 +5,8 @@ import {
   testAuthProvider, previewMapping, syncMemberships,
   type AuthProvider, type ProviderTestForm, type ProviderTestResult,
 } from '../adminApi';
-import { useIamMode } from '../queries/config';
+import { useAdminConfig, useIamMode } from '../queries/config';
+import { oauthCallbackUrl } from '../oauthCallback';
 import { useAuthProviders, useCreateAuthProvider, useUpdateAuthProvider, useDeleteAuthProvider } from '../queries/authProviders';
 import { useGroupMappingRules, useCreateMappingRule, useUpdateMappingRule, useDeleteMappingRule } from '../queries/mappingRules';
 import { useExternalIdentities } from '../queries/externalIdentities';
@@ -203,7 +204,9 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   };
   useApplyHandler(IAM_DIRTY_KEYS.mappingRules, () => { if (!rulesSaving) void saveRules(); }, rulesDirty && !readOnly);
 
-  const callbackUrl = `${window.location.origin}/_/api/admin/oauth/callback`;
+  // The URL the proxy really sends: the pinned one when `public_url` is set.
+  const { data: adminConfig } = useAdminConfig();
+  const callbackUrl = oauthCallbackUrl(adminConfig?.oauth_callback_url, window.location.origin);
 
   const label = useFormLabelStyle();
 
