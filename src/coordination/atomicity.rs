@@ -49,8 +49,8 @@ pub fn verdict_words(verdict: &CapabilityVerdict) -> String {
         CapabilityVerdict::CasVerified { .. } => {
             "the backend enforces conditional writes".to_string()
         }
-        CapabilityVerdict::NonCas => "Backblaze-like: the backend ignored or rejected a \
-                                      conditional write"
+        CapabilityVerdict::NonCas => "the backend ignored or rejected a conditional write, as \
+                                      Backblaze B2 does"
             .to_string(),
         CapabilityVerdict::Unknown { reason } => {
             format!("could not reach the backend to verify ({reason})")
@@ -665,7 +665,7 @@ mod tests {
         };
         let m = r.message();
         assert!(m.contains("backend 'b2'"), "{m}");
-        assert!(m.contains("Backblaze-like"), "{m}");
+        assert!(m.contains("as Backblaze B2 does"), "{m}");
         assert!(m.contains(CAPABILITY_DOC_URL), "{m}");
         assert_eq!(r.details()["probe"], "non-cas");
         assert_eq!(r.details()["backend"], "b2");
@@ -881,7 +881,7 @@ mod tests {
         .await
         .expect_err("refused");
         assert_eq!(r.verdict, CapabilityVerdict::NonCas, "{r}");
-        assert!(r.message().contains("Backblaze-like"), "{r}");
+        assert!(r.message().contains("as Backblaze B2 does"), "{r}");
     }
 
     #[tokio::test]

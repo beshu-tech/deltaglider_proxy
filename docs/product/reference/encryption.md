@@ -298,7 +298,7 @@ A verdict has one of three values:
 | Verdict | Meaning | Proxy encryption |
 |---|---|---|
 | `cas-verified` | The backend enforces conditional writes (`via: probe` or `via: local-filesystem`). | Allowed |
-| `non-cas` | The backend ignored or refused a conditional write ("Backblaze-like"). | Refused; encrypted buckets are read-only |
+| `non-cas` | The backend ignored or refused a conditional write, as Backblaze B2 does. | Refused; encrypted buckets are read-only |
 | `unknown` | The proxy could not reach the backend to verify it. | Refused; encrypted buckets are read-only |
 
 ### Actions that run a fresh probe
@@ -317,12 +317,12 @@ A refused action changes nothing and answers `409 Conflict`. The body has the us
 
 ```json
 {
-  "error": "Failed to apply section 'storage' (no state changed): encryption of bucket 'releases' refused: encryption needs atomic writes (conditional PUT and DELETE), and backend 'aws-dr' does not provide them: Backblaze-like: the backend ignored or rejected a conditional write. Keep encrypted buckets on a backend with atomic writes (move a bucket there with a migrate job) — see https://deltaglider.com/docs/how-to/backend-capability-validation",
+  "error": "Failed to apply section 'storage' (no state changed): encryption of bucket 'releases' refused: encryption needs atomic writes (conditional PUT and DELETE), and backend 'aws-dr' does not provide them: the backend ignored or rejected a conditional write, as Backblaze B2 does. Keep encrypted buckets on a backend with atomic writes (move a bucket there with a migrate job) — see https://deltaglider.com/docs/how-to/backend-capability-validation",
   "atomic_writes": {
     "code": "atomic_writes_required",
     "backend": "aws-dr",
     "probe": "non-cas",
-    "probe_result": "Backblaze-like: the backend ignored or rejected a conditional write",
+    "probe_result": "the backend ignored or rejected a conditional write, as Backblaze B2 does",
     "doc_url": "https://deltaglider.com/docs/how-to/backend-capability-validation"
   }
 }
@@ -346,7 +346,7 @@ A bucket that encrypts with the proxy, on a backend whose verdict is `non-cas` o
 
 The `403` is `AccessDenied` because the refusal comes from the configuration, not from a temporary state. An S3 client retries a `503`, and it must not retry this refusal. S3 has no error code for a read-only bucket. A refused `CreateBucket` also gets `403`, not `409`: clients read a `409` on `CreateBucket` as "the bucket already exists" and go on as if it were there. The message of a refused `CreateBucket` ends with `[atomic_writes: backend=<name>, probe=<verdict>]`. The message names the bucket, the backend and the reason:
 
-> Bucket 'releases' is read-only: it is encrypted, and encryption needs atomic writes, which backend 'aws-dr' does not provide (Backblaze-like: the backend ignored or rejected a conditional write). Reads keep working. To write to it again, move the bucket to a backend with atomic writes with a migrate job — see https://deltaglider.com/docs/how-to/backend-capability-validation
+> Bucket 'releases' is read-only: it is encrypted, and encryption needs atomic writes, which backend 'aws-dr' does not provide (the backend ignored or rejected a conditional write, as Backblaze B2 does). Reads keep working. To write to it again, move the bucket to a backend with atomic writes with a migrate job — see https://deltaglider.com/docs/how-to/backend-capability-validation
 
 A migrate job out of a read-only bucket is allowed. It is the way to make the bucket writable again: [How to move a bucket to another backend](../how-to/move-a-bucket-between-backends.md).
 

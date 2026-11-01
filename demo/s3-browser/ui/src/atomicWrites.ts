@@ -30,7 +30,7 @@ function capabilityWords(cap: BackendCapabilityVerdict): string {
     case 'cas-verified':
       return 'the backend enforces conditional writes';
     case 'non-cas':
-      return 'Backblaze-like: the backend ignored or rejected a conditional write';
+      return 'the backend ignored or rejected a conditional write, as Backblaze B2 does';
     case 'unknown':
       return `could not reach the backend to verify (${cap.reason})`;
   }
@@ -48,7 +48,7 @@ export function atomicWrites(cap: BackendCapabilityVerdict | undefined): AtomicW
  *  link), or null when it is. */
 export function encryptionUnavailableReason(backend: string, state: AtomicWrites): string | null {
   if (state.kind !== 'missing') return null;
-  return `Encryption needs atomic writes. ${backend} does not provide them: ${state.words}. See ${CAPABILITY_DOC_URL}`;
+  return `Encryption is not available on backend ${backend}: it does not support atomic writes (${state.words}). Details: ${CAPABILITY_DOC_URL}`;
 }
 
 /** The note shown when the backend has no verdict yet. */

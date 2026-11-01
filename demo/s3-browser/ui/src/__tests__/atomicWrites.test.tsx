@@ -36,7 +36,7 @@ test('a non-CAS backend: the bucket key choice is disabled, with the reason and 
   // Off stays possible.
   expect(within(group).getByRole('radio', { name: /Off for this bucket/ })).toBeEnabled();
   const notice = screen.getByTestId('atomic-writes-missing');
-  expect(notice).toHaveTextContent('Encryption needs atomic writes. b2 does not provide them: Backblaze-like');
+  expect(notice).toHaveTextContent('Encryption is not available on backend b2: it does not support atomic writes (the backend ignored or rejected a conditional write, as Backblaze B2 does)');
   expect(within(notice).getByRole('link')).toHaveAttribute('href', expect.stringContaining('backend-capability-validation'));
   expect(within(notice).getByRole('button', { name: /Check again/ })).toBeInTheDocument();
 });
@@ -129,7 +129,7 @@ test('the synthesized single backend without atomic writes: the bucket card offe
   const group = screen.getByRole('radiogroup', { name: 'Encryption of this bucket' });
   expect(within(group).getByRole('radio', { name: /Encrypt with a bucket key/ })).toBeDisabled();
   const notice = screen.getByTestId('atomic-writes-missing');
-  expect(notice).toHaveTextContent('default does not provide them');
+  expect(notice).toHaveTextContent('Encryption is not available on backend default');
   expect(within(notice).getByRole('button', { name: /Check again/ })).toBeInTheDocument();
 });
 

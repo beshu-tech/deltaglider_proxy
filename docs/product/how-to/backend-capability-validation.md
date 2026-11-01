@@ -160,13 +160,13 @@ The other way out is to turn proxy encryption off for the bucket. That change is
 
 ### `409 — atomic_writes_required`
 
-> encryption of bucket 'releases' refused: encryption needs atomic writes (conditional PUT and DELETE), and backend 'aws-dr' does not provide them: Backblaze-like: the backend ignored or rejected a conditional write. Keep encrypted buckets on a backend with atomic writes (move a bucket there with a migrate job) — see https://deltaglider.com/docs/how-to/backend-capability-validation
+> encryption of bucket 'releases' refused: encryption needs atomic writes (conditional PUT and DELETE), and backend 'aws-dr' does not provide them: the backend ignored or rejected a conditional write, as Backblaze B2 does. Keep encrypted buckets on a backend with atomic writes (move a bucket there with a migrate job) — see https://deltaglider.com/docs/how-to/backend-capability-validation
 
 A config change, a bucket create, a re-encrypt job (or Resume), a migrate, or the boot conversion tried to make the proxy encrypt on a backend without proven atomic writes. Nothing changed. Put the encrypted bucket on a backend with atomic writes. When the result says `could not reach the backend to verify (...)`, fix the connection to the backend first, and then click **Check again** on its card.
 
 ### `403 — Bucket '<name>' is read-only`
 
-> Bucket 'releases' is read-only: it is encrypted, and encryption needs atomic writes, which backend 'aws-dr' does not provide (Backblaze-like: the backend ignored or rejected a conditional write). Reads keep working. To write to it again, move the bucket to a backend with atomic writes with a migrate job — see https://deltaglider.com/docs/how-to/backend-capability-validation
+> Bucket 'releases' is read-only: it is encrypted, and encryption needs atomic writes, which backend 'aws-dr' does not provide (the backend ignored or rejected a conditional write, as Backblaze B2 does). Reads keep working. To write to it again, move the bucket to a backend with atomic writes with a migrate job — see https://deltaglider.com/docs/how-to/backend-capability-validation
 
 Follow [Make a read-only bucket writable again](#make-a-read-only-bucket-writable-again).
 
