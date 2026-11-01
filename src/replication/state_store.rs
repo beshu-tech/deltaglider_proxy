@@ -370,6 +370,17 @@ impl JobsDb {
         Ok(n > 0)
     }
 
+    /// Make the rule due no later than `now` (the catch-up walk after the
+    /// event consumer skipped events that its destination refused,
+    /// `replication::deferral`). Returns `true` if the row existed.
+    pub fn replication_make_due(&self, rule_name: &str, now: i64) -> Result<bool, ConfigDbError> {
+        let n = self.conn.execute(
+            "UPDATE replication_state SET next_due_at = MIN(next_due_at, ?1) WHERE rule_name = ?2",
+            params![now, rule_name],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Resume a paused rule and make it due no later than `now`. The cursor
     /// of a run that the pause stopped is KEPT: the next run continues where
     /// that run stopped. The event consumer drops a paused rule's events, so

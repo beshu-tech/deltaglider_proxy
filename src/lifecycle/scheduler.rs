@@ -211,7 +211,7 @@ async fn run_due_rules(
         {
             // Shown on the rule's Jobs row; logged once, not every check.
             if super::live::set_deferred(&rule.name, Some(maintenance_deferral(&why))) {
-                info!("Lifecycle scheduler deferring rule '{}': {why}", rule.name);
+                warn!("Lifecycle scheduler deferring rule '{}': {why}", rule.name);
             }
             // Release the just-acquired lease — leaking it blocks run-now
             // for a full TTL after the maintenance window.
@@ -239,7 +239,7 @@ async fn run_due_rules(
                 &rule.name,
                 Some(format!("{why}; the rule runs when the backend recovers")),
             ) {
-                info!("Lifecycle scheduler deferring rule '{}': {why}", rule.name);
+                warn!("Lifecycle scheduler deferring rule '{}': {why}", rule.name);
             }
             if let Some(db) = db.as_ref() {
                 let db = db.lock().await;

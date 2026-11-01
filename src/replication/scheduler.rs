@@ -154,10 +154,8 @@ async fn run_due_rules(
             .maintenance_gate
             .write_blocked(&rule.destination.bucket)
         {
-            info!(
-                "Replication scheduler deferring rule '{}': {why}",
-                rule.name
-            );
+            // Shown on the rule's Jobs row; one WARN per change.
+            super::deferral::destination_blocked(&rule.name, &why);
             // Release the just-acquired lease — leaking it blocks run-now AND
             // (via the lease-anchored liveness check) rule deletion for a TTL.
             let _ = lease
@@ -176,16 +174,22 @@ async fn run_due_rules(
             config: config.clone(),
         };
         if let Some(cause) = health.gated(&engine, rule).await {
-            info!(
-                "Replication scheduler deferring rule '{}': {}",
-                rule.name, cause
-            );
+            if super::deferral::set_deferred(
+                &rule.name,
+                Some(format!("{cause}; the rule runs when the backend recovers")),
+            ) {
+                warn!(
+                    "Replication scheduler deferring rule '{}': {}",
+                    rule.name, cause
+                );
+            }
             let _ = lease
                 .release(LeaseSubsystem::Replication, &rule.name, instance_id)
                 .await;
             continue;
         }
 
+        super::deferral::writes_again(&rule.name);
         info!("Replication scheduler running due rule '{}'", rule.name);
         if let Err(err) = run_rule_gated(
             db.clone(),

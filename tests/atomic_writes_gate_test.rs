@@ -912,3 +912,116 @@ async fn read_only_holds_before_the_router_resolves_the_bucket() {
     eprintln!("stored on aws-dr/photos: {stored:?}");
     assert_eq!((first, second, third), (403, 403, 403), "read-only bucket");
 }
+
+/// Compatibility review C4: replication into a read-only destination. The
+/// rule shows `deferred` with the reason (Jobs row and `detail.deferred`);
+/// its events do not pin the outbox (the cursor moves on and the pruner
+/// removes them); once the destination is writable again (Check again),
+/// the rule's catch-up run copies what it skipped.
+#[tokio::test]
+async fn replication_into_a_read_only_destination_is_visible_and_does_not_pin_the_outbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let flag = dir.path().join("flag");
+    let mut env = Env::new("atomcsrc", &[]).await;
+    let client = env.server.s3_client().await;
+    client
+        .create_bucket()
+        .bucket("atomcdst")
+        .send()
+        .await
+        .unwrap();
+    let (code, v) = env
+        .storage(
+            json!({
+                "buckets": { "atomcdst": { "encryption": aes() } },
+                "replication": { "enabled": true, "tick_interval": "5s", "rules": [{
+                    "name": "atomc-rule", "enabled": true,
+                    "source": { "bucket": "atomcsrc", "prefix": "" },
+                    "destination": { "bucket": "atomcdst", "prefix": "" },
+                    "interval": "1h", "batch_size": 100
+                }]}
+            }),
+            false,
+        )
+        .await;
+    assert_eq!(code, 200, "{v}");
+    // The outbox pruner runs on the dispatcher's tick.
+    let (code, v) = send(
+        env.admin
+            .put(format!("{}/_/api/admin/config/section/advanced", env.ep()))
+            .json(&json!({ "event_delivery": { "tick_interval": "1s" } })),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    std::fs::write(&flag, b"x").unwrap();
+    let f = flag.to_str().unwrap().to_string();
+    env.server
+        .respawn_with_env(&[FORCED, ("DGP_TEST_FORCE_NONCAS_WHILE_FILE", &f)])
+        .await;
+    env.admin = admin_http_client(&env.ep()).await;
+    env.wait_read_only("atomcdst").await;
+    assert_eq!(env.put("atomcsrc", "late.txt").await, 200);
+
+    let row = || async {
+        let (_, v) = send(env.admin.get(format!("{}/_/api/admin/jobs", env.ep()))).await;
+        v["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == "replication:atomc-rule")
+            .cloned()
+            .unwrap()
+    };
+    let outbox_total = || async {
+        let (_, v) = send(
+            env.admin
+                .get(format!("{}/_/api/admin/event-outbox", env.ep())),
+        )
+        .await;
+        v["total"].as_i64().unwrap()
+    };
+    let (mut seen, mut total) = (Value::Null, -1);
+    for _ in 0..400 {
+        seen = row().await;
+        total = outbox_total().await;
+        if seen["status"] == "deferred" && total == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        seen["status"], "deferred",
+        "visible on the Jobs row: {seen}"
+    );
+    let why = seen["detail"]["deferred"].as_str().unwrap_or("");
+    assert!(why.contains("read-only"), "the reason: {seen}");
+    assert_eq!(total, 0, "the rule's events do not pin the outbox");
+
+    // Writable again: the catch-up run copies what the rule skipped.
+    std::fs::remove_file(&flag).unwrap();
+    let (code, v) = send(env.admin.post(format!(
+        "{}/_/api/admin/backends/default/capability-probe",
+        env.ep()
+    )))
+    .await;
+    assert_eq!(code, 200, "{v}");
+    let mut copied = 0;
+    for _ in 0..300 {
+        copied = env
+            .server
+            .http()
+            .get(format!("{}/atomcdst/late.txt", env.ep()))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        if copied == 200 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(copied, 200, "the rule caught up");
+    let seen = row().await;
+    assert_ne!(seen["status"], "deferred", "{seen}");
+}

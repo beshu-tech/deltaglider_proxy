@@ -434,10 +434,14 @@ fn lifecycle_job_view(
     lc_cfg: &crate::config_sections::LifecycleConfig,
 ) -> JobView {
     let st = db.lifecycle_load_state(&rule.name).ok().flatten();
-    let status_raw = st
+    let mut status_raw = st
         .as_ref()
         .map(|s| s.last_status.clone())
         .unwrap_or_else(|| "idle".to_string());
+    let deferred = crate::lifecycle::live::deferred(&rule.name);
+    if deferred.is_some() && status_raw == "idle" {
+        status_raw = "deferred".to_string();
+    }
     let live = crate::lifecycle::live::running(&rule.name);
     let latest = db
         .lifecycle_recent_runs(&rule.name, 1)
@@ -517,7 +521,7 @@ fn lifecycle_job_view(
             "tick_interval": lc_cfg.tick_interval,
             // Why the scheduler did not run the due rule (a maintenance
             // job, or an unhealthy backend); absent when nothing holds it.
-            "deferred": crate::lifecycle::live::deferred(&rule.name),
+            "deferred": deferred,
             "live": live.as_ref().map(|run| run.counters()),
         }),
     }
@@ -703,6 +707,12 @@ pub async fn list_jobs(
                 None => (0, None),
             };
             let events = crate::replication::event_consumer::event_activity(&rule.name);
+            // Why the rule does not write now (its destination refuses
+            // writes, or a backend is gated): `deferred`, not `idle`.
+            let deferred = crate::replication::deferral::deferred(&rule.name);
+            if deferred.is_some() && status_raw == "idle" {
+                status_raw = "deferred".to_string();
+            }
             jobs.push(JobView {
                 id: format!("replication:{}", rule.name),
                 kind: "replication".into(),
@@ -730,6 +740,7 @@ pub async fn list_jobs(
                 detail: serde_json::json!({
                     "interval": rule.interval,
                     "destination_prefix": rule.destination.prefix,
+                    "deferred": deferred,
                     // What the event-driven path did between runs, since the
                     // proxy started (node-local): copies and deletes it
                     // applied, its failures, and when it last applied one.

@@ -1168,6 +1168,8 @@ async fn drain_rule_rows(
     };
     let mut window = DrainWindow::default();
     let mut deletes: Vec<&KeyWork<'_>> = Vec::new();
+    // Why the destination refused this drain's keys (not a maintenance job).
+    let mut refused: Option<String> = None;
     for (i, w) in work.iter().enumerate() {
         if drain_must_stop(&window) {
             // The destination is dead or throttling: hold the rest of the
@@ -1190,14 +1192,23 @@ async fn drain_rule_rows(
             }
             return std::ops::ControlFlow::Continue(window);
         }
-        // Maintenance gate: the destination bucket is being rewritten in
-        // place (re-encryption). Stall this key's events — the cursor does
-        // not advance past them, so they replay after the job ends.
+        // The destination refuses writes. A maintenance job rewrites it in
+        // place: that ends on its own, so this key's events wait (the cursor
+        // does not advance past them) and replay after the job. Anything
+        // else (a read-only encrypted bucket, the atomic-write check, the
+        // encryption witness) may last: the events are skipped, so they do
+        // not pin the outbox, and the rule is made due for a catch-up walk
+        // that the scheduler runs once the destination accepts writes.
         if let Some(why) = gate.write_blocked(&w.rule.destination.bucket) {
-            debug!("event consumer: rule '{}' deferred — {why}", w.rule.name);
-            hold(failed_ids, w);
+            if gate.busy_kind(&w.rule.destination.bucket).is_some() {
+                debug!("event consumer: rule '{}' deferred — {why}", w.rule.name);
+                hold(failed_ids, w);
+            } else {
+                refused.get_or_insert(why);
+            }
             continue;
         }
+        super::deferral::writes_again(&w.rule.name);
         match claim_key(
             config,
             db,
@@ -1236,6 +1247,13 @@ async fn drain_rule_rows(
         settle_key(&dbg, replication, w, outcome, now, &mut window, failed_ids);
     }
 
+    if let Some(why) = refused {
+        super::deferral::destination_blocked(rule_name, &why);
+        let dbg = db.lock().await;
+        if let Err(e) = dbg.replication_make_due(rule_name, now) {
+            warn!("event consumer: rule '{rule_name}' not made due for its catch-up: {e}");
+        }
+    }
     if deletes.is_empty() {
         return std::ops::ControlFlow::Continue(window);
     }

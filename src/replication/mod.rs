@@ -18,6 +18,7 @@
 //! executes due rules via the same worker used by "Run now".
 
 pub mod backend_gate;
+pub mod deferral;
 pub mod event_consumer;
 mod mirror_delete;
 pub mod parity;
