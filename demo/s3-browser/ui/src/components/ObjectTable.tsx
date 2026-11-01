@@ -605,7 +605,7 @@ export default function ObjectTable({
   ];
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', boxSizing: 'border-box', paddingTop: SPACE.sm, paddingLeft: SPACE.sm }}>
       {refreshing && (
         <Progress
           aria-label="Refreshing the listing"

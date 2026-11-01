@@ -38,7 +38,7 @@ const KEYS_THAT_CLICK = new Set(['Enter', ' ']);
 
 /** The focusable entries of the open menu, in order. */
 function menuItems(root: HTMLElement | null): HTMLElement[] {
-  return root ? Array.from(root.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])')) : [];
+  return root ? Array.from(root.querySelectorAll<HTMLElement>('[role^="menuitem"]:not([disabled])')) : [];
 }
 
 export default function AccountMenu({
@@ -204,8 +204,8 @@ export default function AccountMenu({
               </button>
             )}
           </div>
-          <div className="account-menu-section" role="group" aria-label="Quick actions">
-            <div className="account-menu-section-label dg-eyebrow" aria-hidden>Quick actions</div>
+          <div className="account-menu-section" role="group" aria-label="Theme">
+            <div className="account-menu-section-label dg-eyebrow" aria-hidden>Theme</div>
             <button
               type="button"
               className="account-menu-item"
@@ -237,12 +237,15 @@ export default function AccountMenu({
                 <span>{s.label} style</span>
               </button>
             ))}
-            {onToggleHidden && (
+          </div>
+          {onToggleHidden && (
+            <div className="account-menu-section" role="group" aria-label="Quick actions">
+              <div className="account-menu-section-label dg-eyebrow" aria-hidden>Quick actions</div>
               <button
                 type="button"
                 className="account-menu-item"
-                role="menuitem"
-                aria-pressed={showHidden === true}
+                role="menuitemcheckbox"
+                aria-checked={showHidden === true}
                 onClick={onToggleHidden}
               >
                 {showHidden ? (
@@ -252,8 +255,8 @@ export default function AccountMenu({
                 )}
                 <span>{showHidden ? 'Hide system files' : 'Show system files'}</span>
               </button>
-            )}
-          </div>
+            </div>
+          )}
           {onLogout && (
             <div className="account-menu-signout-section" role="group" aria-label="Account">
               <button

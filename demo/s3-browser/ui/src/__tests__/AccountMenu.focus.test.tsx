@@ -40,3 +40,20 @@ test('the menu has no caveat prose', () => {
   expect(screen.queryByText(/LIVE secrets|password file|does not include users/i)).toBeNull();
   expect(screen.getByRole('menuitem', { name: 'Sign out' })).not.toHaveClass('account-menu-item--danger');
 });
+
+test('the arrow keys reach every item, the style radios included', () => {
+  render(
+    <AccountMenu identityLabel="admin" onLogout={() => {}} showHidden={false} onToggleHidden={() => {}} />,
+  );
+  const trigger = screen.getByRole('button', { name: /account menu/i });
+  trigger.focus();
+  fireEvent.keyDown(trigger, { key: 'ArrowDown' });
+  const visited: (string | null)[] = [];
+  for (let i = 0; i < 5; i++) {
+    const el = document.activeElement as HTMLElement;
+    visited.push(el.getAttribute('role'));
+    fireEvent.keyDown(el, { key: 'ArrowDown' });
+  }
+  expect(visited).toEqual(['menuitem', 'menuitemradio', 'menuitemradio', 'menuitemcheckbox', 'menuitem']);
+  expect(screen.getByRole('menuitemcheckbox', { name: 'Show system files' })).toHaveAttribute('aria-checked', 'false');
+});
