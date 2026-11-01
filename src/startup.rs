@@ -166,8 +166,7 @@ fn warn_active_test_seams() {
         "DGP_TEST_FORCE_NONCAS_BACKEND",
         "DGP_TEST_CONVERSION_GRACE_SECS",
         "DGP_TEST_CONVERSION_WINDOW_SECS",
-        "DGP_TEST_REWRITE_STALL_MS",
-        "DGP_TEST_REWRITE_LOCK_STALL_MS",
+        "DGP_TEST_REWRITE_STALL",
         "DGP_RELAY_FOREIGN_MIN_AGE_SECS",
     ];
     let active: Vec<&str> = SEAMS
@@ -1426,8 +1425,9 @@ pub async fn validate_backend_write_capability(
         .is_none_or(|b| b.is_empty())
     {
         info!(
-            "Backend capability gate skipped: single instance (config_sync_bucket not set) — \
-             the in-process lock is sufficient"
+            "Backend capability gate (multi-instance CAS for client-writable buckets) skipped: \
+             single instance (config_sync_bucket not set). Encrypted buckets still need atomic \
+             writes: the atomicity check runs separately."
         );
         return;
     }

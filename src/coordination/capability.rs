@@ -49,7 +49,7 @@ pub enum CapabilityVerdict {
 /// credentials) under the same name misses the cache and re-probes — a stale
 /// `CasVerified` must never vouch for a swapped-out endpoint, and a stale
 /// `NonCas` must never lock out a fixed one. A name keeps the verdicts of
-/// up to [`DEFINITIONS_PER_NAME`] definitions, so probing a CANDIDATE
+/// up to `DEFINITIONS_PER_NAME` (4) definitions, so probing a CANDIDATE
 /// definition (a validate or a refused apply with rotated credentials)
 /// never evicts the verdict of the RUNNING one.
 #[derive(Debug, Default)]

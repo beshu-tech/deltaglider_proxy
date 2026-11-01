@@ -281,7 +281,7 @@ A replication rule from a bucket that encrypts into a bucket that stores plainte
 
 ## Encryption needs atomic writes
 
-The proxy writes `aes256-gcm-proxy` objects only on a backend whose conditional writes it has proven. A conditional write is a `PUT` or a `DELETE` with `If-Match` or `If-None-Match`, which the backend refuses with `412` when the condition does not hold. The proxy needs these writes because it rewrites encrypted buckets in place: a conversion and a key rotation read each object and store it again, conditional on the version that they read (see [Conditional rewrites and the write gate](#conditional-rewrites-and-the-write-gate)). The key claim and the conversion marker are also conditional writes. On a backend that ignores the condition, a rewrite can overwrite a newer client write. So the proxy refuses to turn proxy encryption on there, and an encrypted bucket that is already there becomes read-only.
+The proxy writes `aes256-gcm-proxy` objects only on a backend whose conditional writes it has proven. A conditional write is a `PUT` or a `DELETE` with `If-Match` or `If-None-Match`, which the backend refuses with `412` when the condition does not hold. The proxy needs these writes because it rewrites encrypted buckets in place: a conversion and a key rotation read each object and store it again, conditional on the version that they read (see [Conditional rewrites and the write gate](#conditional-rewrites-and-the-write-gate)). The key claim and the conversion marker are also conditional writes. On a backend that ignores the condition, a rewrite can overwrite a newer client write. So the proxy refuses to turn proxy encryption on there, and an encrypted bucket that is already there becomes read-only. This rule applies with one instance too.
 
 The rule applies to `aes256-gcm-proxy` only. In `sse-s3` and `sse-kms` modes the backend encrypts each object itself. The proxy never converts or rotates those objects (the re-encrypt job refuses native SSE modes), so it needs no conditional write for them. A proxy mode without a key refuses every write, so it needs none either.
 
@@ -290,16 +290,19 @@ The rule applies to `aes256-gcm-proxy` only. In `sse-s3` and `sse-kms` modes the
 The proxy proves the conditional writes of a backend with a probe:
 
 - A filesystem backend has atomic writes. It has one node, and every write of an object on that node takes the object's in-process lock. The probe sends no request. The verdict is `cas-verified` with `via: local-filesystem`.
-- On an S3 backend, the probe writes one small object, `.deltaglider/_cwprobe/<uuid>`, in a bucket that the backend holds. Then it tests `If-None-Match: *`, `If-Match` with a wrong ETag, and `If-Match` with the current ETag. It deletes the object afterwards. On a bucket that keeps versions, it also deletes every version of the key. The details are in [How to use a backend without conditional writes](../how-to/backend-capability-validation.md#how-the-probe-works).
-- Some backends close the connection when they receive a conditional `PUT`, and send no HTTP answer at all. Backblaze B2 (`eu-central-003`) did this on 2026-10-31. When this happens, the probe sends a plain `PUT` of the same key. When the plain `PUT` works, the dropped connection was the backend's answer to the condition, so the verdict is `non-cas`. When the plain `PUT` fails too, the probe cannot reach the backend, so the verdict is `unknown`. The SDK retries each request a limited number of times, and the whole probe stops after 15 seconds, so a probe never retries without end.
+- On an S3 backend, the probe writes one small object, `.deltaglider/_cwprobe/<uuid>`, in a bucket that the backend holds. Then it tests `If-None-Match: *`, `If-Match` with a wrong ETag, and `If-Match` with the current ETag. It deletes the object afterwards. On a bucket that keeps versions, it also deletes every version of the key. It does this also when the probe ran out of time, so no noncurrent version of the probe key stays in the bucket. The details are in [How to use a backend without conditional writes](../how-to/backend-capability-validation.md#how-the-probe-works).
+- Some backends close the connection when they receive a conditional `PUT`, and send no HTTP answer at all. Backblaze B2 (`eu-central-003`) did this on 2026-10-31. When this happens, the probe sends a plain `PUT` of the same key. When the plain `PUT` works, the dropped connection was the backend's answer to the condition, so the verdict is `non-cas`. When the plain `PUT` fails too, the probe cannot reach the backend, so the verdict is `unknown`.
+- One probe has one deadline of 15 seconds in total. The listing of the backend's buckets, which picks the bucket that the probe writes in, may use 5 seconds of it. The SDK retries each request a limited number of times inside the deadline, so a probe never retries without end.
 
 A verdict has one of three values:
 
-| Verdict | Meaning | Proxy encryption |
-|---|---|---|
-| `cas-verified` | The backend enforces conditional writes (`via: probe` or `via: local-filesystem`). | Allowed |
-| `non-cas` | The backend ignored or refused a conditional write, as Backblaze B2 does. | Refused; encrypted buckets are read-only |
-| `unknown` | The proxy could not reach the backend to verify it. | Refused; encrypted buckets are read-only |
+| Verdict | Meaning | Proxy encryption | Writes to encrypted buckets |
+|---|---|---|---|
+| `cas-verified` | The backend supports atomic writes (`via: probe` or `via: local-filesystem`). | Allowed | Allowed |
+| `non-cas` | The backend does not support atomic writes: it ignored or refused a conditional write, as Backblaze B2 does. | Refused | Refused with `403`: the buckets are read-only |
+| `unknown` | The proxy could not verify the backend's atomic writes, because the probe did not reach it. | Refused | Refused with `503 SlowDown`, which clients retry |
+
+A backend without a verdict yet is handled like `unknown`: the writes to its encrypted buckets get `503 SlowDown` until the probe ends.
 
 ### Actions that run a fresh probe
 
@@ -311,28 +314,36 @@ Each action below runs a new probe of the backend first. It does not use a verdi
 - The conversion that a restart starts (see [A conversion that a restart starts](#a-conversion-that-a-restart-starts)). A refused boot conversion writes the audit entry `encryption_conversion_refused`.
 - `POST /_/api/admin/buckets/:bucket/migrate`, when the bucket will encrypt with a proxy key on the target backend.
 
-When a re-encrypt run starts, it uses a `cas-verified` verdict of the backend's current definition. Without one, it runs the probe, and it fails the run when the backend has no atomic writes.
+These actions refuse a backend whose fresh verdict is `non-cas` or `unknown`. A bucket that the configuration does not name can live on any backend, so the proxy asks the storage router which backend holds it before it probes, and it probes that backend.
+
+When a re-encrypt run starts, it uses a `cas-verified` verdict of the current definition of the backend that holds the bucket. Without one, it runs the probe. It fails the run when the backend does not support atomic writes, and it stops the run for a later retry when the proxy could not verify them.
 
 A refused action changes nothing and answers `409 Conflict`. The body has the usual error text and an `atomic_writes` object:
 
 ```json
 {
-  "error": "Failed to apply section 'storage' (no state changed): encryption of bucket 'releases' refused: encryption needs atomic writes (conditional PUT and DELETE), and backend 'aws-dr' does not provide them: the backend ignored or rejected a conditional write, as Backblaze B2 does. Keep encrypted buckets on a backend with atomic writes (move a bucket there with a migrate job) — see https://deltaglider.com/docs/how-to/backend-capability-validation",
+  "error": "Failed to apply section 'storage' (no state changed): encryption of bucket 'releases' refused: encryption needs atomic writes (conditional PUT and DELETE), and backend 'aws-dr' does not support them: it ignored or rejected a conditional write, as Backblaze B2 does. Keep encrypted buckets on a backend with atomic writes (move a bucket there with a migrate job) — see https://deltaglider.com/docs/how-to/backend-capability-validation",
   "atomic_writes": {
     "code": "atomic_writes_required",
     "backend": "aws-dr",
     "probe": "non-cas",
-    "probe_result": "the backend ignored or rejected a conditional write, as Backblaze B2 does",
+    "probe_result": "the backend does not support atomic writes: it ignored or rejected a conditional write, as Backblaze B2 does",
     "doc_url": "https://deltaglider.com/docs/how-to/backend-capability-validation"
   }
 }
 ```
 
+When the probe could not reach the backend, the text says so instead, and `probe` is `unknown`:
+
+> encryption of bucket 'releases' refused: encryption needs atomic writes (conditional PUT and DELETE), and the proxy could not verify them on backend 'aws-dr': the proxy could not verify the backend's atomic writes (…). Retry when the backend is reachable (Check again on the backend card) — see https://deltaglider.com/docs/how-to/backend-capability-validation
+
+The endpoints of the admin API that create a bucket (`POST /_/api/admin/buckets`) or start a migrate send the same `atomic_writes` object with their `409`.
+
 A change that turns proxy encryption off is never refused for this reason. A decrypt job (target `none`) needs no atomic writes. On a backend without them, the decrypt job keeps the bucket's write gate, so uploads and deletes on the instance that runs it get a temporary `503 SlowDown`.
 
 ### Read-only encrypted buckets
 
-A bucket that encrypts with the proxy, on a backend whose verdict is `non-cas` or `unknown`, is read-only. GET, HEAD, LIST and a copy out of the bucket keep working. Every write is refused:
+A bucket that encrypts with the proxy, on a backend whose verdict is `non-cas`, is read-only. GET, HEAD, LIST and a copy out of the bucket keep working. Every write is refused:
 
 | Write | Answer |
 |---|---|
@@ -341,24 +352,52 @@ A bucket that encrypts with the proxy, on a backend whose verdict is `non-cas` o
 | Admin bulk copy into the bucket, move out of it, delete, and delete jobs (`POST /_/api/admin/objects/delete-jobs`) | `403` |
 | Metadata backfill (`POST /_/api/admin/jobs/backfill-metadata`) | `403` |
 | Re-encrypt to a proxy key (`POST /_/api/admin/jobs/reencrypt`) | `409` with `atomic_writes` |
-| Replication and lifecycle writes into the bucket, delete jobs that already run | They wait. A replication run-now answers `409` with the reason. |
+| Replication into the bucket | The rule shows `deferred` with the reason. Its events are skipped, not held, and the rule catches up with a full run when the bucket is writable again (see [Replication reference](replication.md)). A replication run-now answers `409` with the reason. |
+| Lifecycle writes into the bucket, delete jobs that already run | They wait. A lifecycle rule shows `deferred` with the reason. |
 | S3 `CreateBucket` of a bucket that would encrypt with the proxy on such a backend (a bucket without a policy inherits the encryption of its backend) | `403 AccessDenied`; the proxy does not create the bucket |
 
-The `403` is `AccessDenied` because the refusal comes from the configuration, not from a temporary state. An S3 client retries a `503`, and it must not retry this refusal. S3 has no error code for a read-only bucket. A refused `CreateBucket` also gets `403`, not `409`: clients read a `409` on `CreateBucket` as "the bucket already exists" and go on as if it were there. The message of a refused `CreateBucket` ends with `[atomic_writes: backend=<name>, probe=<verdict>]`. The message names the bucket, the backend and the reason:
+The `403` is `AccessDenied` because the refusal comes from the configuration, not from a temporary state. An S3 client retries a `503`, and it must not retry this refusal. S3 has no error code for a read-only bucket. A refused `CreateBucket` also gets `403`, not `409`: clients read a `409` on `CreateBucket` as "the bucket already exists" and go on as if it were there.
 
-> Bucket 'releases' is read-only: it is encrypted, and encryption needs atomic writes, which backend 'aws-dr' does not provide (the backend ignored or rejected a conditional write, as Backblaze B2 does). Reads keep working. To write to it again, move the bucket to a backend with atomic writes with a migrate job — see https://deltaglider.com/docs/how-to/backend-capability-validation
+An S3 client gets a fixed sentence. It does not name the backend, and it never carries the error of the probe, because that error can name the address of the backend:
 
-A migrate job out of a read-only bucket is allowed. It is the way to make the bucket writable again: [How to move a bucket to another backend](../how-to/move-a-bucket-between-backends.md).
+> Bucket 'releases' is read-only: it is encrypted, and its backend does not support atomic writes, which encryption needs. Reads keep working. To write to it again, move the bucket to a backend with atomic writes with a migrate job — see https://deltaglider.com/docs/how-to/backend-capability-validation
 
-The proxy gets the verdicts in the background:
+A refused `CreateBucket` gets:
 
-- At boot, it starts the probe of every backend that holds a bucket that encrypts with the proxy at once, all backends at the same time. The boot waits up to 3 seconds for them, so a backend with atomic writes is usually verified before the proxy serves. A slower probe does not hold the start.
-- After a config change, it probes a backend that has no verdict yet for its current definition.
-- While a backend has no verdict, the writes to its encrypted buckets fail closed: they get `503 SlowDown` with a message that says that the atomic-write check is still running. S3 clients retry a `503`. Reads are never blocked. When the verdict arrives, the writes go through (CAS) or the buckets become read-only (`non-cas`, `unknown`). A filesystem backend gets its verdict at once, without a request, so its buckets never wait.
-- While a verdict is `non-cas` or `unknown`, it probes the backend again every 10 minutes.
-- It logs each change of the read-only set: a warning that names the read-only buckets, and an info line when they are writable again.
+> Bucket 'releases' cannot be created: it would be encrypted by the proxy, and its backend does not support atomic writes (conditional PUT and DELETE), which encryption needs. The proxy does not create a bucket that would be read-only. Create it on a backend with atomic writes — see https://deltaglider.com/docs/how-to/backend-capability-validation
 
-**Check again** on the backend card (`POST /_/api/admin/backends/:name/capability-probe`) runs a fresh probe at once. When the backend now proves atomic writes, its encrypted buckets become writable at once, without a restart. The admin views show the state: `GET /_/api/admin/backends` lists `read_only_buckets` for each backend, and `GET /_/api/admin/buckets` has a `read_only` reason on each read-only bucket. Both list every read-only bucket that the storage listing shows, also a bucket without a policy that inherits the encryption of its backend.
+The admin API (admin bulk operations, backfill, the `read_only` field of a bucket) and the server log use a longer message that names the backend and the probe result.
+
+A migrate job out of a read-only bucket is allowed. It is the way to make the bucket writable again: [How to move a bucket to another backend](../how-to/move-a-bucket-between-backends.md). The job reads the source as the job, so it also copies plaintext objects that the bucket holds from before its encryption: it encrypts them on the target and reports each one as adopted.
+
+The proxy judges each write against the backend that really holds the bucket. A bucket that the configuration does not name can live on any backend, so the storage router finds it there first: from its cache, or with the same `HeadBucket` round that the write itself sends. When the router cannot tell where the bucket is (a backend did not answer), the write gets `503 SlowDown` unless every backend whose own storage encrypts with the proxy has proven atomic writes, because the bucket can be on any of them.
+
+### Pending writes: before a verdict, and when the probe cannot reach the backend
+
+While a backend has no verdict for its current definition, or its verdict is `unknown`, the writes to its encrypted buckets fail closed with `503 SlowDown`. S3 clients retry a `503`. Reads are never blocked. An S3 client gets this fixed sentence:
+
+> Bucket 'releases' is encrypted, and the proxy has not yet verified that its backend supports atomic writes, which encryption needs. Writes wait until the check succeeds; retry in a few seconds. Reads keep working — see https://deltaglider.com/docs/how-to/backend-capability-validation
+
+A filesystem backend gets its verdict at once, without a request, so its buckets never wait. For an S3 backend, the proxy gets the verdicts in the background:
+
+- At boot, the proxy starts the probe of every backend that holds a bucket that encrypts with the proxy as one of its first steps, all backends at the same time, in parallel with the boot health check. The boot waits up to 3 seconds for them, so a backend with atomic writes is usually verified before the proxy serves. A slower probe does not hold the start: a probe ends within its 15-second deadline, so the writes to the encrypted buckets of an S3 backend answer `503` for at most about 15 seconds after the start.
+- After a config change, the proxy probes a backend that has no verdict yet for its current definition.
+- When a probe could not reach the backend (`unknown`), the proxy probes it again after 5 seconds, then after 10, 20 and 40 seconds, and then every 60 seconds. When the health check sees the backend become reachable again, the proxy probes it at once.
+- A `cas-verified` or `non-cas` verdict is never probed again on a timer. A probe writes a key into a bucket of the backend, and on a versioned bucket a probe every few minutes would leave versions there for nothing. The proxy probes such a backend again only on **Check again**, after a config change that redefines it, and at a restart.
+- A failed probe never replaces a verdict that an earlier probe of the same backend definition proved. A network error therefore does not make the encrypted buckets of a backend with atomic writes wait, and it does not lift the read-only state of a backend without them.
+- The proxy keeps the verdicts per backend name and per backend definition, for up to 4 definitions of one name. A validate or an apply that probes a changed definition (new credentials, a new endpoint) does not remove the verdict of the definition that runs, so the running buckets are not affected by the check of a change that you have not applied.
+- The proxy logs each change of the read-only set (a warning that names the read-only buckets, and an info line when they are writable again), and a warning when it could not verify a backend.
+
+`GET /_/ready` shows the state in its body, as `atomic_writes` with one entry per backend that holds encrypted buckets: `checking` (no verdict yet), `unverified`, `supported` or `unsupported`. The state never makes the proxy not ready: reads and the other buckets work, and a pending check ends on its own, so a load balancer that removed the instance would only lose service.
+
+**Check again** on the backend card (`POST /_/api/admin/backends/:name/capability-probe`) runs a fresh probe at once. When the backend now proves atomic writes, its encrypted buckets become writable at once, without a restart. The admin views show the state:
+
+- `GET /_/api/admin/backends` lists `read_only_buckets` for each backend, `capability_words` (the verdict in plain words), `proxy_unavailable` (why proxy AES is not offered there) and `atomic_writes_checking` (`true` while a backend with encrypted buckets has no verdict yet). The backend card shows **Checking atomic writes…** in that case.
+- `GET /_/api/admin/buckets` has a `read_only` reason on each read-only bucket, and `capability_words` in the encryption view of each bucket.
+
+Both lists show every read-only bucket that the storage listing shows, also a bucket without a policy that inherits the encryption of its backend.
+
+The proxy's own writes follow the same rule. In an encrypted bucket on a backend without proven atomic writes, the proxy does not store listing tokens (see [Listing tokens](#listing-tokens-s3-backends)) and does not write a key claim. Reads keep working without them, but a listing of such a bucket can send more `HEAD` requests, because it finds no stored token.
 
 ## Key check value
 
@@ -499,7 +538,7 @@ The marker holds three sealed fields:
 
 The body is `dgc1.`, the hexadecimal fingerprint of a key of the bucket, a dot, and the base64url encoding of a nonce and an AES-256-GCM-SIV seal of the fields. The proxy derives the seal key from the bucket's encryption key. The associated data of the seal is `dg-conversion`, the format version, and the storage identity of the bucket: the backend name and the real bucket name. The marker opens with any key of the bucket's keyring, so a key rotation keeps the window. A marker that does not open, that names another storage identity, or whose deadline is past counts as a closed window.
 
-The proxy creates the marker with `If-None-Match: *`. It changes the deadline and removes the marker *by identity*: it reads the marker, opens it, checks the run id, and then writes or deletes with `If-Match` on the version that it read. When the condition fails, it reads again, up to 3 times. It never takes a failed condition for a removed marker. A backend without conditional writes (`501`, for example Backblaze B2) gets an unconditional write, as for the key claim.
+The proxy creates the marker with `If-None-Match: *`. It changes the deadline and removes the marker *by identity*: it reads the marker, opens it, checks the run id, and then writes or deletes with `If-Match` on the version that it read. When the condition fails, it reads again, up to 3 times. It never takes a failed condition for a removed marker. The proxy encrypts only on a backend with proven atomic writes (see [Encryption needs atomic writes](#encryption-needs-atomic-writes)), so the marker is always a conditional write.
 
 Each instance keeps the state of the window in memory for 60 seconds per bucket, and it checks the deadline against the backend's clock on every use. When the proxy is about to refuse a client read while the remembered window is closed, it reads the marker again first (at most once per 5 seconds per bucket). A window that another instance opened therefore takes effect at once. A window that another instance closed can stay open on this instance for up to 60 seconds. In that time it serves only objects stored before the cutoff, which the job converted already.
 
@@ -579,7 +618,7 @@ On such a backend, clients keep writing to the bucket while the job runs, on eve
 
 On a backend that enforces conditional writes, a conversion needs no extra step with several instances. A client write through any instance either lands before the job reads the object (and the job then encrypts that version), or after the read (and the job then skips the object, which the writing instance encrypted already). Apply the encryption on every instance first, so that every instance encrypts its writes, and then let the job finish.
 
-On a backend that keeps the write gate, the gate stops client writes to the bucket only on the instance that runs the job. The job still writes conditionally where the backend allows it, but a backend that answers `501` to a condition gets an unconditional write. While such a conversion runs in a deployment with several instances, do one of these two things until the job ends:
+On a backend that keeps the write gate, the gate stops client writes to the bucket only on the instance that runs the job. The job still writes conditionally where the backend allows it, but a backend that refuses a condition with `501 NotImplemented` gets an unconditional write. Only a decrypt job (target `none`) runs on such a backend, because an encrypting job needs atomic writes. While such a conversion runs in a deployment with several instances, do one of these two things until the job ends:
 
 - Stop client writes to the bucket on every instance (for example with a request rule that rejects writes to the bucket).
 - Send every write to the bucket to the instance that runs the job (for example with the directory-hash router of the Kubernetes operator, or a sticky route for the bucket).
@@ -643,7 +682,7 @@ What a proxy does with the claim depends on its own key:
 | an older key of the proxy (`legacy_key` or the keyring) | a new key | The proxy moves the claim to the new key. This is a key rotation. Other proxies that have only the older key are then refused. |
 | a key of the proxy | no key | The proxy removes the claim, because the bucket stops encrypting. |
 
-On a backend without conditional writes (Backblaze B2 answers `501`), the proxy writes the claim without the condition, so two proxies that start on an empty bucket at the same moment can both write their claim. The last claim stays, and the other proxy is refused at its next read of the claim.
+The proxy encrypts only on a backend with proven atomic writes (see [Encryption needs atomic writes](#encryption-needs-atomic-writes)), so the claim is always a conditional write. In a bucket that encrypts on a backend without proven atomic writes (a read-only or pending bucket), the proxy writes no claim at all.
 
 When the claim or an object names a key that the proxy does not have, every write to the bucket fails with `400 InvalidRequest`, and nothing is written. The writes are PUT, multipart uploads, copies into the bucket, metadata rewrites and folder markers. The client gets only the label of the key, because the other facts (the real bucket name behind an alias, the names of other objects, the id of this proxy's key) are not the client's to know:
 
@@ -671,7 +710,7 @@ When more than one proxy writes a bucket with the same key, change the key in th
 
 The claim stops two proxies with different keys from both writing one bucket, also when both start on an empty bucket at the same moment. These cases stay open:
 
-- **A backend without conditional writes.** Backblaze B2 answers a conditional write with `501`, so the proxy writes the claim without the condition. When two proxies start on an empty bucket at the same moment, both write their claim, and the last claim stays. The other proxy finds the new claim at its next read of the claim, up to 10 minutes later. Until then, both proxies write the bucket with their own key. Use a backend with conditional writes for a bucket that more than one proxy writes.
+- **A proxy of an earlier release on a backend without conditional writes.** A release up to v2.0.23 encrypts also on a backend without atomic writes, such as Backblaze B2, and writes its claim there without a condition. Two such proxies that start on an empty bucket at the same moment can both write their claim. This release makes such a bucket read-only, so it writes no claim there.
 - **A key rotation out of order.** A proxy that rotates its key (and keeps the old key as `legacy_key`) moves the claim to the new key. A second proxy that has only the old key reads its cached claim, which still names its own key, for up to 10 minutes. Until then, it keeps writing with the old key, and the second proxy cannot read the objects of the new key. The order in [Rotate a key on proxies that share a bucket](#rotate-a-key-on-proxies-that-share-a-bucket) avoids this.
 - **A write in flight.** A write that the proxy checked before the claim changed still completes.
 - **An earlier release.** A proxy of a release before this check ignores the claim, the sample and the sightings. Upgrade every proxy that writes the bucket.
@@ -692,9 +731,9 @@ When `legacy_key` is set, the keyring holds it next to `key`. A read picks the k
 - **An apply keeps what it does not name.** For `key`, `key_id` and `legacy_key`, the same rule applies to every apply, whether it is a section `PUT` or a full document. When the field is absent, the proxy keeps the current value. When the field is `null`, the proxy clears it. A `key: null` is a key change like any other: the previous key moves into `legacy_key` (or the apply is refused while `legacy_key` holds a different key), so the proxy never drops a key that objects can still need. A backend that is left in `aes256-gcm-proxy` mode with no key is then refused, as described in [A proxy-AES backend with no key](#a-proxy-aes-backend-with-no-key). When the field has a value, that value replaces the current one. An id is kept only together with its own key: when the apply sets a new `key` and no `key_id`, the new key gets the generated id `fp-<hex>`, and the previous id moves to `legacy_key_id` with the previous key.
 - **Enabling is not retroactive.** Switching a backend's mode affects new writes only; existing objects keep their stored form until the re-encrypt job rewrites them. In a bucket that encrypts, a plaintext object reads only while the conversion window of the bucket is open, and only when the backend stored it before the cutoff (see [Plaintext objects in a bucket that encrypts](#plaintext-objects-in-a-bucket-that-encrypts)). A config write that makes a bucket with objects start to encrypt opens the window and starts the job.
 - **Key loss is data loss** in `aes256-gcm-proxy` mode. The proxy does not escrow keys, and there is no recovery path.
-- **Per-bucket native SSE needs an S3 backend.** A bucket `encryption` block takes `aes256-gcm-proxy` or `none` on every backend, and `sse-kms` or `sse-s3` only on an S3 backend. With `config_sync_bucket` set, the encryption witness keeps the instances in agreement. See [Per-bucket encryption](#per-bucket-encryption).
+- **Per-bucket native SSE needs an S3 backend.** A bucket `encryption` block takes `none` on every backend, `aes256-gcm-proxy` only on a backend with proven atomic writes (see [Encryption needs atomic writes](#encryption-needs-atomic-writes)), and `sse-kms` or `sse-s3` only on an S3 backend. With `config_sync_bucket` set, the encryption witness keeps the instances in agreement. See [Per-bucket encryption](#per-bucket-encryption).
 - **Names and some metadata stay readable on the backend.** Under every mode, the backend stores object names, content-type and `x-amz-meta-*` user metadata unencrypted. In `aes256-gcm-proxy` mode, the sealed metadata authenticates the content type and the client's user metadata, and it hides the hashes and the size of a delta. The stored size of a passthrough object or a reference still gives its exact plaintext size, and the size of a delta stays readable. Under SSE-KMS and SSE-S3, the backend also stores the hashes and the sizes in clear. [About the encryption threat model](../explanation/encryption-threat-model.md) lists what each attacker learns.
-- **One key per bucket across proxies, with short windows.** A proxy does not write a bucket that another proxy encrypts with a key that it does not have. On a backend without conditional writes (Backblaze B2), and for up to 10 minutes after a key rotation that does not follow the documented order, two keys can still reach one bucket. See [What the claim does not stop](#what-the-claim-does-not-stop).
+- **One key per bucket across proxies, with short windows.** A proxy does not write a bucket that another proxy encrypts with a key that it does not have. For up to 10 minutes after a key rotation that does not follow the documented order, two keys can still reach one bucket. See [What the claim does not stop](#what-the-claim-does-not-stop).
 - **Copies outside the proxy are unreadable.** An encrypted object that the backend copies to another bucket name or key does not read there (see [Copies outside the proxy](#copies-outside-the-proxy)).
 - **Less room for user metadata.** The sealed metadata takes about 220 to 280 bytes of the 2 KB S3 metadata limit.
 - **No forward secrecy.** A disclosed proxy-AES key decrypts all past ciphertext written under it.

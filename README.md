@@ -72,7 +72,7 @@ You manage everything from a web UI on the same port as the S3 API, without extr
 - Object lifecycle: preview and run expiration and transition/archive rules, with pause/resume, crash-resume, scheduler history/failures, and engine-routed deletes
 - Object replication: configure source → destination replication rules from the GUI. Replication is event-driven (mutations replicate in near-real time, and a slow full reconcile catches anything missed), with run-now, pause/resume, history/failures, and delete replication
 - One Jobs screen: replication, lifecycle, re-encryption, and migrations in one table with per-job runs, failures, progress, pause/resume, and cancel
-- Bucket re-encryption: enable or rotate at-rest encryption, then rewrite the existing objects with a one-off durable job. Writes get 503 SlowDown while the job runs, so no write races the rewrite
+- Bucket re-encryption: enable or rotate at-rest encryption, and a durable job rewrites the existing objects. Each rewrite is conditional on the object that the job read, so the job never overwrites a client write, and clients keep writing while it runs. Only a decrypt job on a backend without conditional writes pauses writes (503 SlowDown) on the instance that runs it
 - Event outbox and notifications: durable object mutation events with background webhook delivery, fan-out endpoints, retry backoff, and failed-row requeue, all editable in the GUI. Built-in Slack formatting posts object events to a channel through an Incoming Webhook URL or a bot token, with per-bucket/prefix → channel routing
 - Monitoring dashboard: live Prometheus metrics for request rates, latencies, cache hit rates, status codes, and auth events
 - Storage analytics: per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
@@ -88,7 +88,7 @@ You manage everything from a web UI on the same port as the S3 API, without extr
 
 - Mandatory authentication: the proxy refuses to start without credentials, so a deployment cannot be open by accident
 - Encrypted config database: the proxy stores IAM users and OAuth config in a SQLCipher-encrypted database, synced across instances through S3
-- Proxy-side encryption: AES-256-GCM before data reaches the backend, for low-cost or untrusted S3-compatible storage where the keys must stay in your environment
+- Proxy-side encryption: AES-256-GCM before data reaches the backend, for untrusted S3-compatible storage where the keys must stay in your environment. It needs a backend with atomic (conditional) writes, such as AWS S3, MinIO or Ceph RGW. Backblaze B2 has none: there, use the backend's own encryption (SSE)
 - Per-IP rate limiting: progressive delay and lockout on auth endpoints, against brute-force attacks
 - Session hardening: IP binding, configurable TTL, max concurrent sessions, SameSite/Secure cookies
 - SigV4 replay detection: constant-time signature comparison, clock skew validation

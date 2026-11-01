@@ -73,9 +73,9 @@ Status: approved by the owner 2026-10-31 (decisions below are his).
   `maintenance_jobs.objects_changed`; exposed as `objects_skipped_changed` on the
   run entry and the bucket status view; run summary note. A key gone since the
   listing (HEAD 404) is `Changed`, not a failure.
-- **Seams.** `DGP_TEST_REWRITE_STALL_MS` (after the read, before the conditional
-  write) and `DGP_TEST_REWRITE_LOCK_STALL_MS` (after the HEAD, before the object
-  lock).
+- **Seams.** `DGP_TEST_REWRITE_STALL=<point>:<ms>[:<signal file>]`: `before-write`
+  (after the read, before the conditional write) or `before-lock` (after the HEAD,
+  before the object lock). (Two variables until the four-way review merged them.)
 - **UI.** No UI file changed. The UI already follows `writes_blocked`; the apply
   dialog copy "uploads and deletes get a temporary 503" must say that this holds
   only on a backend without conditional writes (routed separately).
@@ -167,3 +167,46 @@ Status: approved by the owner 2026-10-31 (decisions below are his).
   held it (`held_by`, else the default). `atomicity::read_only_buckets(app)` lists the
   configured ones and every bucket of the storage listing; GET /backends, the capability probe
   answer, the bucket view and the watch log use it.
+
+## As built: four-way review fixes (2026-11-01)
+
+- **The real backend.** `StorageBackend::bucket_home` (router: route, cached resolution, or the
+  shared HeadBucket round; `Undetermined` on a failed HEAD) and `bucket_home_now` (memory only,
+  resolves in the background). `AppState::atomic_write_block` (async, request path: S3 verbs,
+  CreateBucket, form POST, admin bulk, backfill, boot advice) and `atomic_write_block_now` (the
+  maintenance gate's write-refusal probe, `BackendCheck::gated`). An undetermined home of a bucket
+  without a policy is pending unless every encrypting site is CAS. Source guard
+  `no_caller_judges_an_unresolved_bucket`. `atomicity::bucket_backend` gives the re-encrypt job
+  (`require_for_bucket`, `proven_for_bucket`, `rewrites_are_conditional`) the router's backend for
+  a bucket without a policy.
+- **Unknown is pending.** `WriteBlock::{Pending {backend, unverified}, ReadOnly {backend}}`:
+  no verdict or `Unknown` → 503 SlowDown; `NonCas` → 403. Action refusals stay strict.
+  `merged_verdict`: `Unknown` never replaces CAS/NonCas of the same definition.
+- **Cache.** Verdicts per (name, fingerprint), up to 4 per name, the running definition (from
+  `set_encrypted_plan`) never evicted; a change of a running verdict notifies `plan_changed`.
+- **Watch.** `recheck_after`: none → now; Unknown → 5 s doubling to 60 s; CAS / NonCas never on a
+  timer (C6: probe key versions piled up in versioned B2 buckets). `BackendHealthCache::recovered`
+  wakes it. `spawn_boot_probes` runs in parallel with the boot health gate (C5); one 15 s deadline
+  per probe (5 s for the listing). `/_/ready` reports `atomic_writes` (never unready).
+- **Probe cleanup.** `cas_probe::remove_all_versions`, also on the timeout path.
+- **Messages.** S3 clients get fixed phrases (`WriteBlock::message`, no backend name, no probe
+  error: C3); `admin_message` names backend and reason. No `[atomic_writes: …]` tag.
+  `verdict_words` / `proxy_unavailable_reason` say "does not support" vs "could not verify".
+- **Admin errors.** `AdminError` carries `atomic_writes` (`From<AtomicityRefusal>`,
+  `AdminError::write_block`). GET /backends: `capability_words`, `proxy_unavailable`,
+  `atomic_writes_checking`; bucket views `capability_words`.
+- **Own writes.** `storage::AtomicityGate` (in `EncryptionPolicies`, kept by the cache): the
+  encrypting wrapper keeps no listing token and writes no key claim in a proxy-encrypted bucket on
+  a backend without proven atomic writes.
+- **Order.** `set_encrypted_plan` before `install_engine` in the transition.
+- **Worker.** `settle_gate_switch`: a failed save of a switch to the gate stops the run
+  (`FailedTransient`).
+- **C1.** The migrate job reads the source in the job read scope and reports adoptions.
+- **C4.** Replication into a destination that refuses writes (other than a maintenance job): the
+  event consumer skips the events (cursor moves, outbox pruned), marks the rule due, and the rule
+  shows `deferred` (`replication::deferral`, one WARN per change); the scheduled full run catches
+  up. Lifecycle rows show `deferred`.
+- **C8.** The removed `plaintext_reads` error names its backend or bucket and the migrate; the prod
+  fixture has an S3 backend with proxy AES; the matrix covers read-only and pending.
+- **UI.** Server words, labelled doc links, Check again refreshes the create dialog, Resume and
+  Rotate key disabled with reasons, "Checking atomic writes…".

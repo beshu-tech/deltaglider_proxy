@@ -4,6 +4,8 @@ This guide shows you how to change the encryption key or the encryption mode of 
 
 The examples use the backend `hetzner-fsn1`, which holds the buckets `releases` and `downloads` and uses proxy-side AES with the key id `hetzner-2026-06`.
 
+**A rotation needs a backend with atomic writes.** The re-encrypt job of a rotation rewrites each object, conditional on the version that it read, so it never overwrites a client write. The proxy probes the backend before it accepts a new proxy key, and again when the job starts, and it refuses the change with `409 atomic_writes_required` on a backend without atomic writes, such as Backblaze B2. An encrypted bucket that is on such a backend already is read-only: move it to a backend with atomic writes with a migrate job before you rotate its key ([Make a read-only bucket writable again](backend-capability-validation.md#make-a-read-only-bucket-writable-again)).
+
 ## Which recipe do you need?
 
 | You want to… | Recipe |

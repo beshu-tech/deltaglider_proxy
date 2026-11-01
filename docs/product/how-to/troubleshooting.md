@@ -254,17 +254,25 @@ The bucket holds a conversion marker. A backfill would give its plaintext object
 
 Symptom: a config apply or validate, a bucket create, a re-encrypt job, Resume, or a migrate answers `409`. The body has `atomic_writes.code` `atomic_writes_required` (a bucket create and a migrate answer `"error": "atomic_writes_required"`), and the message names the backend and the probe result.
 
-Cause: proxy encryption needs a backend whose conditional writes a fresh probe proves. The probe found that the backend ignores or refuses a conditional write (`non-cas`, for example a Backblaze B2 backend), or it could not reach the backend (`unknown`). Nothing changed.
+Cause: proxy encryption needs a backend whose conditional writes a fresh probe proves. The probe found that the backend does not support atomic writes, because it ignored or refused a conditional write (`non-cas`, for example a Backblaze B2 backend), or the proxy could not verify them, because the probe did not reach the backend (`unknown`). Nothing changed.
 
-Fix: put the encrypted bucket on a backend with atomic writes, or use native SSE on that backend. When the result says `could not reach the backend to verify`, fix the connection, and then click **Check again** on the backend card. See [How to use a backend without conditional writes](backend-capability-validation.md#encryption-needs-a-backend-with-atomic-writes).
+Fix: put the encrypted bucket on a backend with atomic writes, or use native SSE on that backend. When the message says that the proxy could not verify the backend, fix the connection, and then click **Check again** on the backend card. See [How to use a backend without conditional writes](backend-capability-validation.md#encryption-needs-a-backend-with-atomic-writes).
 
 ### Writes to an encrypted bucket return 403: "Bucket '…' is read-only"
 
-Symptom: reads of the bucket work, but every PUT, DELETE, multipart upload, copy into the bucket, form POST and admin bulk operation gets `403 AccessDenied` with the message `Bucket '<bucket>' is read-only: it is encrypted, and encryption needs atomic writes, which backend '<backend>' does not provide`. Replication into the bucket waits. The startup log has a warning that names the read-only buckets.
+Symptom: reads of the bucket work, but every PUT, DELETE, multipart upload, copy into the bucket, form POST and admin bulk operation gets `403 AccessDenied` with the message `Bucket '<bucket>' is read-only: it is encrypted, and its backend does not support atomic writes, which encryption needs`. A replication rule into the bucket shows `deferred` with the reason. The startup log has a warning that names the read-only buckets and the backend.
 
-Cause: the bucket encrypts with the proxy, and the probe of its backend says that the backend has no atomic writes. The proxy refuses the writes, because a rewrite of the bucket could overwrite a newer client write there.
+Cause: the bucket encrypts with the proxy, and the probe of its backend says that the backend does not support atomic writes (`non-cas`). The proxy refuses the writes, because a rewrite of the bucket could overwrite a newer client write there.
 
 Fix: move the bucket to a backend with atomic writes with a migrate job. After a fix on the backend side, click **Check again** on the backend card: a backend that proves atomic writes makes the bucket writable at once. See [Make a read-only bucket writable again](backend-capability-validation.md#make-a-read-only-bucket-writable-again).
+
+### Writes to an encrypted bucket return 503: "the proxy has not yet verified that its backend supports atomic writes"
+
+Symptom: reads of the bucket work, but writes get `503 SlowDown` with the message `Bucket '<bucket>' is encrypted, and the proxy has not yet verified that its backend supports atomic writes, which encryption needs`. S3 clients retry the request.
+
+Cause: the proxy has no verdict for the backend yet, or its last probe could not reach the backend. After a start or a config change, the probe of an S3 backend ends within 15 seconds. When the probe cannot reach the backend, the proxy tries again after 5 seconds, doubling to every 60 seconds, and at once when the health check sees the backend recover. `GET /_/ready` shows the state of each backend in `atomic_writes`: `checking` or `unverified`. The server log has the warning "could not verify the atomic writes of backend '<backend>'" with the reason.
+
+Fix: when the writes keep failing, fix the connection to the backend (see [How to diagnose a backend that isn't serving](diagnose-backend-connectivity.md)). Then click **Check again** on the backend card to probe it at once.
 
 ### The proxy does not start: "encryption.plaintext_reads was removed"
 

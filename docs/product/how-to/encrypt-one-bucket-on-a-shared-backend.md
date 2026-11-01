@@ -8,6 +8,8 @@ The example encrypts `db-archive`, where `backup-bot` writes nightly database du
 
 A bucket block takes `aes256-gcm-proxy`, `none`, and on an S3 backend also the native modes `sse-kms` and `sse-s3`. The admin UI offers only the modes that the server accepts for the bucket's backend. With `config_sync_bucket` set (several instances), the encryption witness makes an instance that disagrees about a bucket's encryption refuse writes to it, so apply the same configuration on every instance. The [encryption reference](../reference/encryption.md#per-bucket-encryption) has the full list of rules.
 
+**Proxy-side AES needs a backend with atomic writes.** The proxy rewrites encrypted objects in place when it converts a bucket or rotates a key, and each rewrite is conditional on the version of the object that it read. A backend that does not enforce conditional writes, such as Backblaze B2, could let a rewrite overwrite a newer client write. So the proxy probes the backend before it gives a bucket a proxy key, and it refuses the change with `409 atomic_writes_required` on a backend without atomic writes. The backend card on **Storage → Backends** shows the verdict, and the admin UI does not offer proxy-side AES on such a backend. A filesystem backend, AWS S3, MinIO and Ceph RGW (for example Hetzner Object Storage) have atomic writes. On a backend without them, use the backend's own encryption (SSE) instead. See [Encryption needs a backend with atomic writes](backend-capability-validation.md#encryption-needs-a-backend-with-atomic-writes).
+
 ## 1. Give the bucket its own key
 
 In the admin UI:

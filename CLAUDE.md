@@ -120,7 +120,14 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                              gates GET/HEAD/copy/range only: a LIST shows an entry whose seal does not open as stored
                              (`FileMetadata::is_unopened_seal`, never cached), a DELETE removes it (`resolve_forms_to_delete`),
                              and boot opens the window + queues the job of a never-encrypted bucket with plaintext (no claim, no marker, no sealed object in the sample), else warns (`maintenance::conversion::start_at_boot`)
-  → storage/routing.rs      Multi-backend routing (virtual bucket → real backend)
+  → storage/routing.rs      Multi-backend routing (virtual bucket → real backend); `bucket_home` / `bucket_home_now` = where a bucket's
+                             writes go (route, cached resolution, or the shared HeadBucket round; `Undetermined` when a backend errs)
+  → coordination/atomicity.rs  Encryption needs atomic writes (N2): fresh probe before every encryption action (409
+                             `atomic_writes_required` + `atomic_writes` details), THE write rule of proxy-encrypted buckets
+                             (`AppState::atomic_write_block` async on the request path, `_now` for background gates; judges the
+                             router's `bucket_home`; no verdict/unknown → 503 SlowDown, non-CAS → read-only 403 with a fixed S3
+                             phrase; source guard `no_caller_judges_an_unresolved_bucket`), boot probes + `spawn_watch` (unknown
+                             re-probed 5 s→60 s and on health recovery, CAS/non-CAS never on a timer; one 15 s deadline per probe)
   → glob_filter.rs          THE include/exclude glob matcher of replication, lifecycle and Slack (`compile`, `verdict`, `in_scope`; a glob matches the whole key from the bucket root, `*` crosses `/`, exclude wins). A replication rule's filters bound its copies, its mirror deletes (walk + event consumer, via `planner::dest_key_in_scope`) AND Verify; `POST /jobs/filter-preview` (api/admin/filter_preview.rs) runs it on a sample for the editor's Which-objects preview
   → security.rs             Pure security primitives (validate_bucket_name, bucket_name_is_ip_like, outbound-URL SSRF policy) — unit + proptest, shared by CLI URL parser
   → demo.rs                 Embedded UI + admin API router, mounted under /_/
@@ -395,17 +402,19 @@ single-instance planes below are addressed.
 |---|---|---|
 | Coordination bucket (`config_sync_bucket`) | always | boot probe → exit(1) |
 | Client-writable delta storage, multi-instance | yes | startup probe of every S3 backend (default included, via `Config::effective_backend_for_bucket`) hosting such buckets; `POST /buckets` runs the same gate + hot-apply pre-commit gate (`apply_config_transition` step 0) → exit(1)/reject |
-| Client-writable delta storage, single-instance | no | in-process prefix lock (no probes, zero cost) |
+| Client-writable delta storage, single-instance | no (for delta/plain) | in-process prefix lock; the multi-instance gate does not run (a proxy-encrypted bucket still needs the next row) |
+| Proxy-encrypted bucket (`aes256-gcm-proxy`), single- or multi-instance | always | `coordination/atomicity.rs`: fresh probe before every encryption action → 409; existing bucket: verdict of the router-resolved backend → non-CAS read-only 403, none/unknown 503 (retried); boot probes in parallel with the health gate, watch re-probes unknown |
 | `replication_target_only` bucket (any backend incl. B2) | no | client writes → 403 (`check_client_write_allowed`, ten s3s/form-POST/admin-bulk call sites) → replication is the single writer |
 
 The `replication_target_only` bucket marker (`bucket_policy.rs`) is what makes a
-non-CAS backend (Backblaze B2 answers conditional writes with 501) safe as a cheap
-replication destination. Verdicts live in `BackendCapabilityCache`
-(`src/coordination/capability.rs`, stamped on `GET /backends` → BackendsPanel
-banner), keyed to the backend DEFINITION fingerprint (redefine = re-probe; no
-witness object in data buckets — it would be client-visible and block
-DeleteBucket). Probe outcomes: 412=CAS, 200-or-501=definitive non-CAS,
-transport error=Unknown (warn, never fatal). Every enforcement message
+non-CAS backend (Backblaze B2 drops the connection on a conditional PUT) safe as a cheap
+replication destination (not for a proxy-encrypted mirror: that is read-only). Verdicts live in
+`BackendCapabilityCache` (`src/coordination/capability.rs`, stamped on `GET /backends` → BackendsPanel
+banner), indexed by backend NAME and DEFINITION fingerprint (up to 4 definitions per name, the running
+one never evicted; redefine = re-probe; `Unknown` never replaces a proven verdict of the same definition;
+no witness object in data buckets — it would be client-visible and block DeleteBucket). Probe outcomes:
+412=CAS, 200-or-501-or-dropped-connection-with-a-working-plain-PUT=definitive non-CAS, transport
+error=Unknown (warn for the multi-instance gate; fail closed 503 for encrypted buckets). Every enforcement message
 ends with the doc URL (`CAPABILITY_DOC_URL` → `docs/product/how-to/backend-capability-validation.md`);
 the GUI linkifies it (`LinkifiedText`). Test seam: `DGP_TEST_FORCE_NONCAS_BACKEND`.
 `Config::check()` warns on orphaned markers, lifecycle rules writing into marked

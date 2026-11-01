@@ -89,12 +89,10 @@ impl AtomicityRefusal {
             ),
             _ => format!(
                 "{} refused: encryption needs atomic writes (conditional PUT and DELETE), and \
-                 backend '{}' does not support them: {}. Keep encrypted buckets on a backend \
-                 with atomic writes (move a bucket there with a migrate job) — see \
-                 {CAPABILITY_DOC_URL}",
-                self.what,
-                self.backend,
-                verdict_words(&self.verdict)
+                 backend '{}' does not support them: it ignored or rejected a conditional \
+                 write, as Backblaze B2 does. Keep encrypted buckets on a backend with atomic \
+                 writes (move a bucket there with a migrate job) — see {CAPABILITY_DOC_URL}",
+                self.what, self.backend,
             ),
         }
     }
@@ -772,7 +770,7 @@ const UNKNOWN_RECHECK_MAX: std::time::Duration = std::time::Duration::from_secs(
 /// Probe every backend of the encrypted plan that has no verdict yet, all
 /// at once (boot: this runs in parallel with the boot health check, so the
 /// pending window of the encrypted buckets is one probe, at most
-/// [`PROBE_TIMEOUT`], not the health check plus a probe).
+/// 15 s (`PROBE_TIMEOUT`), not the health check plus a probe).
 pub fn spawn_boot_probes(
     config: Config,
     cache: std::sync::Arc<BackendCapabilityCache>,
@@ -951,6 +949,7 @@ mod tests {
         let m = r.message();
         assert!(m.contains("backend 'b2'"), "{m}");
         assert!(m.contains("as Backblaze B2 does"), "{m}");
+        assert_eq!(m.matches("does not support").count(), 1, "said once: {m}");
         assert!(m.contains(CAPABILITY_DOC_URL), "{m}");
         assert_eq!(r.details()["probe"], "non-cas");
         assert_eq!(r.details()["backend"], "b2");
