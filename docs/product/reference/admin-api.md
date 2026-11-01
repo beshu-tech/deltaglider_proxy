@@ -167,7 +167,9 @@ A config write that makes a bucket store new objects in plaintext where it encry
 | `conversion` | The conversion of the bucket to encryption. Absent when the bucket has no conversion marker. The fields are in the next table. |
 | `reencrypt` | A re-encrypt job can change objects of this bucket: it encrypts with a proxy key, or it is plaintext and can still read an older key. |
 | `pinned` | The config fixes the bucket's backend (`backend:`, or a single backend). A bucket's own block needs it, so a change that adds a block to a bucket where this is `false` also sets `backend:`. |
-| `bucket_modes` | The modes that the bucket's own block accepts. |
+| `bucket_modes` | The modes that the bucket's own block accepts. On a backend whose atomic-writes verdict is `non-cas` or `unknown`, `aes256-gcm-proxy` is not among them. |
+| `capability` | The atomic-writes verdict of the bucket's backend (absent: not checked yet). It is also given for the synthesized single backend. |
+| `proxy_unavailable` | Why `aes256-gcm-proxy` is not offered: the backend has no proven atomic writes. The text has the doc link. Absent when it is offered. |
 | `inherited` | `{mode, encrypts, key_id?}`: what the backend does on its own, which is what the bucket gets without its own block. |
 
 The fields of `conversion`:

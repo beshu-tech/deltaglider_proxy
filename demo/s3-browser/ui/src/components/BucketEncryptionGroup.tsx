@@ -95,7 +95,9 @@ const CHOICE_TITLE: Record<BucketEncryptionChoice, string> = {
   off: 'Off for this bucket',
 };
 
-export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onApplied, capability }: Props) {
+export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onApplied, capability: capabilityProp }: Props) {
+  // The server's verdict of the bucket's own backend wins (N2 review).
+  const capability = eff?.capability ?? capabilityProp;
   const colors = useColors();
   const qc = useQueryClient();
   const [choice, setChoice] = useState<BucketEncryptionChoice | null>(null);

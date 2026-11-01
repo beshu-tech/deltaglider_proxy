@@ -1933,24 +1933,70 @@ pub(crate) fn spawn_plaintext_refusal_check(state: &Arc<AppState>, config: &Conf
                      job maintenance:{job_id}; clients read the history until the job ends",
                     hex::encode(run)
                 ),
-                Ok(BootConversion::Refused { key, why }) => warn!(
-                    "bucket '{bucket}' encrypts with a proxy key, but holds objects that are \
-                     not encrypted (for example '{key}'): every read of them fails with 500. \
-                     The boot did not convert it: {why}. Convert them: POST \
-                     /_/api/admin/jobs/reencrypt with {{\"buckets\": [\"{bucket}\"], \
-                     \"open_window\": true}} opens a conversion window (the history stays \
-                     readable) and starts the job"
-                ),
+                Ok(BootConversion::NoAtomicWrites { key, why }) => {
+                    warn!("{}", boot_conversion_advice(bucket, &key, &why, true))
+                }
+                Ok(BootConversion::Refused { key, why }) => {
+                    // A bucket on a backend without atomic writes cannot be
+                    // converted, whatever stopped the boot: the advice is the
+                    // way out, never a re-encrypt that the backend refuses.
+                    let non_atomic = state
+                        .atomic_write_block(bucket)
+                        .is_some_and(|b| b.is_read_only());
+                    warn!("{}", boot_conversion_advice(bucket, &key, &why, non_atomic))
+                }
                 Err(e) => warn!("plaintext check of bucket '{bucket}' failed: {e}"),
             }
         }
     });
 }
 
+/// Pure: the boot warning of an encrypted bucket that holds plaintext
+/// objects which the boot did not convert (`why`). On a backend without
+/// atomic writes (`non_atomic`) no re-encrypt job can run, so the advice is
+/// a migrate job to a backend with them; elsewhere, the re-encrypt job with
+/// a conversion window.
+fn boot_conversion_advice(bucket: &str, key: &str, why: &str, non_atomic: bool) -> String {
+    let head = format!(
+        "bucket '{bucket}' encrypts with a proxy key, but holds objects that are not encrypted \
+         (for example '{key}'): every read of them fails with 500. The boot did not convert it: \
+         {why}."
+    );
+    if non_atomic {
+        format!(
+            "{head} Its backend has no atomic writes, so the bucket is read-only and no \
+             conversion can run there. Move it to a backend with atomic writes with a migrate \
+             job: POST /_/api/admin/buckets/{bucket}/migrate with {{\"target_backend\": \
+             \"<backend>\"}} (Migrate on the bucket card) — see {}",
+            deltaglider_proxy::coordination::capability::CAPABILITY_DOC_URL
+        )
+    } else {
+        format!(
+            "{head} Convert them: POST /_/api/admin/jobs/reencrypt with \
+             {{\"buckets\": [\"{bucket}\"], \"open_window\": true}} opens a conversion window \
+             (the history stays readable) and starts the job"
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use deltaglider_proxy::config::Config;
+
+    /// On a backend without atomic writes the boot advice is a migrate job,
+    /// never the re-encrypt job that the backend refuses.
+    #[test]
+    fn the_boot_advice_on_a_non_atomic_backend_is_a_migrate() {
+        let a = boot_conversion_advice("db-archive", "k.txt", "no atomic writes", true);
+        assert!(a.contains("/migrate") && a.contains("read-only"), "{a}");
+        assert!(!a.contains("reencrypt"), "{a}");
+        let b = boot_conversion_advice("db-archive", "k.txt", "a key claim", false);
+        assert!(
+            b.contains("jobs/reencrypt") && !b.contains("/migrate"),
+            "{b}"
+        );
+    }
 
     /// Open access still checks the signature of a signed request, with
     /// the access key as the secret. The banner says so, and names the

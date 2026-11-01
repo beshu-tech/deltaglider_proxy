@@ -52,11 +52,13 @@ const CHOICE_MODE: Record<Exclude<BucketEncryptionChoice, 'inherit'>, BackendEnc
 
 /** The choices to show: Inherit always, the others when the server accepts
  *  their mode on a bucket (`bucket_modes`). A mode that the server learns to
- *  accept appears with no change here. */
+ *  accept appears with no change here. The bucket key also shows when the
+ *  server left it out for lack of atomic writes (`proxy_unavailable`): the
+ *  group shows it disabled, with the reason, instead of hiding it. */
 export function offeredChoices(eff: EffectiveEncryption): BucketEncryptionChoice[] {
   const out: BucketEncryptionChoice[] = ['inherit'];
   for (const c of ['bucket-key', 'sse-kms', 'sse-s3', 'off'] as const) {
-    if (eff.bucket_modes.includes(CHOICE_MODE[c])) out.push(c);
+    if (eff.bucket_modes.includes(CHOICE_MODE[c]) || (c === 'bucket-key' && eff.proxy_unavailable)) out.push(c);
   }
   return out;
 }

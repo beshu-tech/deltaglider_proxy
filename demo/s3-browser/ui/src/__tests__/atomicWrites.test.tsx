@@ -82,9 +82,55 @@ test('the bucket card shows a read-only bucket in its row and in the open card',
       inputRadius={{ borderRadius: 6 }}
     />,
   );
-  expect(screen.getAllByText('Read-only: b2 does not support atomic writes').length).toBeGreaterThanOrEqual(2);
+  // The header pill is short (the long text made the pills wrap); the
+  // reason is its hover title and the visible text of the open card.
+  const pill = screen.getByText('Read-only', { exact: true });
+  expect(pill.closest('[title]')).toHaveAttribute('title', reason);
   const alert = screen.getByTestId('bucket-read-only');
+  expect(alert).toHaveTextContent('Read-only: b2 does not support atomic writes');
   expect(within(alert).getByRole('link')).toHaveAttribute('href', expect.stringContaining('backend-capability-validation'));
+  expect(within(alert).getByRole('button', { name: /Check again/ })).toBeInTheDocument();
+});
+
+test('the synthesized single backend without atomic writes: the bucket card offers no bucket key', () => {
+  // GET /config lists the synthesized `default` backend WITHOUT a verdict;
+  // the server's answer for the bucket carries it (and drops proxy AES).
+  renderWithQuery(
+    <BucketCard
+      name="releases"
+      row={{ ...DEFAULT_ROW_FIELDS, public_prefixes: [], _id: 'r1', name: 'releases' }}
+      real
+      expanded
+      onToggle={() => {}}
+      backends={[
+        {
+          name: 'default', backend_type: 'filesystem', path: '/data', endpoint: null, region: null,
+          force_path_style: null, has_credentials: false, is_synthesized: true,
+          encryption: { mode: 'none', has_key: false, shim_active: false },
+        },
+      ]}
+      defaultBackend="default"
+      originBackend="default"
+      effectiveEncryption={eff({
+        backend: 'default',
+        bucket_modes: ['none'],
+        capability: NON_CAS,
+        proxy_unavailable:
+          "Encryption with a proxy key needs atomic writes, which backend 'default' does not provide — see https://deltaglider.com/docs/how-to/backend-capability-validation",
+      })}
+      onEncryptionApplied={vi.fn()}
+      globalCompressionOn
+      globalRatio={0.75}
+      onPatch={() => {}}
+      onPrefixesChange={() => {}}
+      inputRadius={{ borderRadius: 6 }}
+    />,
+  );
+  const group = screen.getByRole('radiogroup', { name: 'Encryption of this bucket' });
+  expect(within(group).getByRole('radio', { name: /Encrypt with a bucket key/ })).toBeDisabled();
+  const notice = screen.getByTestId('atomic-writes-missing');
+  expect(notice).toHaveTextContent('default does not provide them');
+  expect(within(notice).getByRole('button', { name: /Check again/ })).toBeInTheDocument();
 });
 
 test('the backend card lists its read-only buckets, and Check again lifts them after a CAS probe', async () => {

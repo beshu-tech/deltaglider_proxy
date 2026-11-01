@@ -320,6 +320,31 @@ pub fn read_only_message(
     ))
 }
 
+/// Pure: why proxy encryption is not offered on `backend` under
+/// `verdict`, or `None` when the verdict proves atomic writes.
+pub fn proxy_unavailable_reason(backend: &str, verdict: &CapabilityVerdict) -> Option<String> {
+    if matches!(verdict, CapabilityVerdict::CasVerified { .. }) {
+        return None;
+    }
+    Some(format!(
+        "Encryption with a proxy key needs atomic writes, which backend '{backend}' does not \
+         provide ({}) — see {CAPABILITY_DOC_URL}",
+        verdict_words(verdict)
+    ))
+}
+
+/// The atomic-writes verdict of backend `name` for the admin views: the
+/// cached verdict of its current definition, else the verdict that needs
+/// no request (a filesystem backend). `None`: not checked yet.
+pub fn backend_verdict(
+    config: &Config,
+    cache: &BackendCapabilityCache,
+    name: &str,
+) -> Option<CapabilityVerdict> {
+    let def = config.backend_by_name(name)?;
+    cache.get(name, def).or_else(|| static_verdict(name, def))
+}
+
 /// Why a write to a bucket that encrypts with the proxy must not pass now
 /// ([`BackendCapabilityCache::write_block`]).
 #[derive(Debug, Clone, PartialEq, Eq)]

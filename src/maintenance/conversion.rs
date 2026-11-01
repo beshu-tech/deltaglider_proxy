@@ -519,6 +519,10 @@ pub enum BootConversion {
     /// `key` is refused to clients, and the boot did not start a
     /// conversion (`why`): the operator decides.
     Refused { key: String, why: String },
+    /// `key` is refused to clients, and the bucket's backend has no proven
+    /// atomic writes (`why`): no conversion can run there, and the bucket
+    /// is read-only. The way out is a migrate job to a backend with them.
+    NoAtomicWrites { key: String, why: String },
 }
 
 /// The boot's conversion of a bucket that a restart made encrypt
@@ -603,7 +607,10 @@ pub async fn start_at_boot(
         Ok(a) => a,
         Err(r) => {
             audit("encryption_conversion_refused", "boot", &r.backend, bucket);
-            return refused(&r.message());
+            return Ok(BootConversion::NoAtomicWrites {
+                key: key.clone(),
+                why: r.message(),
+            });
         }
     };
     let opened = match open_window(&engine, bucket, OpenMode::Refresh, "boot").await {

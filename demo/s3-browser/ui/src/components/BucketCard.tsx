@@ -26,10 +26,11 @@ import { bucketNameError } from '../bucketName';
 import { Children, isValidElement, useEffect, useState, useId } from 'react';
 import type { ReactNode } from 'react';
 import { useIsNarrow } from '../useIsNarrow';
-import { BREAKPOINT } from './shared-styles';
+import { BREAKPOINT, SPACE } from './shared-styles';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
 import { Alert, Button, Collapse, Input, Modal, Progress, Radio, Select, Typography } from 'antd';
-import { readOnlyBadge } from '../atomicWrites';
+import { READ_ONLY_PILL, readOnlyBadge } from '../atomicWrites';
+import { CheckAgainButton } from './AtomicWritesNotice';
 import { LinkifiedText } from './LinkifiedText';
 import { DownOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
 import type { BackendInfo, EffectiveEncryption } from '../adminApi';
@@ -351,7 +352,7 @@ export default function BucketCard({
     // Encryption needs atomic writes (N2): reads work, writes are refused.
     chips.push(
       <Chip key="read-only" tone={colors.ACCENT_RED} title={readOnly}>
-        {readOnlyBadge(effectiveEncryption?.backend ?? originBackend ?? defaultName)}
+        {READ_ONLY_PILL}
       </Chip>
     );
   }
@@ -719,7 +720,14 @@ export default function BucketCard({
               data-testid="bucket-read-only"
               style={{ marginTop: 12, borderRadius: 6, fontSize: 12 }}
               title={readOnlyBadge(effectiveEncryption?.backend ?? originBackend ?? defaultName)}
-              description={<LinkifiedText text={readOnly} />}
+              description={
+                <>
+                  <LinkifiedText text={readOnly} />
+                  <div style={{ marginTop: SPACE.xs }}>
+                    <CheckAgainButton backend={effectiveEncryption?.backend ?? originBackend ?? defaultName} />
+                  </div>
+                </>
+              }
             />
           )}
           {eff.replication_target_only && (
@@ -814,7 +822,13 @@ export default function BucketCard({
             <BucketEncryptionGroup
               bucket={name}
               eff={effectiveEncryption}
-              capability={backends.find((b) => b.name === effectiveEncryption?.backend)?.capability}
+              // The server's verdict of THIS bucket's backend first: the
+              // backends list of GET /config (the synthesized single backend)
+              // carries no verdict.
+              capability={
+                effectiveEncryption?.capability ??
+                backends.find((b) => b.name === effectiveEncryption?.backend)?.capability
+              }
               blockedReason={encryptionBlockedReason}
               onApplied={onEncryptionApplied}
             />

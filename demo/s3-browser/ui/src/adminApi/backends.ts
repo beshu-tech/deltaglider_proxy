@@ -1,7 +1,7 @@
 // === Multi-Backend Management ===
 import { adminJson, confirmHeaderMap } from './core';
 import type { ConfirmHeaders } from './core';
-import type { BackendEncryptionMode, BackendInfo } from './core';
+import type { BackendCapabilityVerdict, BackendEncryptionMode, BackendInfo } from './core';
 
 interface BackendListResponse {
   backends: BackendInfo[];
@@ -55,8 +55,15 @@ export interface EffectiveEncryption {
   /** The config fixes the bucket's backend; an edit that adds the bucket's
    *  own block must also set `backend:` when false. */
   pinned: boolean;
-  /** The modes that the bucket's own block accepts. */
+  /** The modes that the bucket's own block accepts. Without proven atomic
+   *  writes on the backend, the server leaves out `aes256-gcm-proxy`. */
   bucket_modes: BackendEncryptionMode[];
+  /** The atomic-writes verdict of the bucket's backend (absent: not checked
+   *  yet). The server's answer for THIS bucket's backend, also for the
+   *  synthesized single backend that GET /config lists without a verdict. */
+  capability?: BackendCapabilityVerdict;
+  /** Why proxy AES is not offered (no atomic writes), with the doc link. */
+  proxy_unavailable?: string;
   /** What "Inherit" gives the bucket: the backend's own encryption. */
   inherited: { mode: BackendEncryptionMode; encrypts: boolean; key_id?: string };
 }

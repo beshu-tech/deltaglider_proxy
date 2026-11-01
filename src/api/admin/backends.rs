@@ -177,17 +177,25 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
     };
     // Stamp the startup capability-gate verdicts (guard B) so the panel can
     // render a per-backend conditional-write banner. Absent = not assessed.
-    let verdicts = state.s3_state.backend_capabilities.snapshot();
     // Stamp connectivity/auth health (boot probe + re-probe loop) — drives
     // the panel's health column. Absent = never probed (probe off).
     let health = state.s3_state.backend_health.snapshot();
     for b in &mut backends {
-        b.capability = verdicts
-            .get(&b.name)
-            .cloned()
-            .or_else(|| static_verdict(&cfg, &b.name));
+        b.capability = crate::coordination::atomicity::backend_verdict(
+            &cfg,
+            &state.s3_state.backend_capabilities,
+            &b.name,
+        );
         b.health = health.get(&b.name).cloned();
-        b.bucket_encryption_modes = Some(cfg.bucket_encryption_modes(&b.name));
+        let mut modes = cfg.bucket_encryption_modes(&b.name);
+        // Without proven atomic writes, a bucket here cannot take proxy
+        // AES (N2): the create dialog must not offer it.
+        if b.capability.as_ref().is_some_and(|v| {
+            crate::coordination::atomicity::proxy_unavailable_reason(&b.name, v).is_some()
+        }) {
+            modes.retain(|m| *m != "aes256-gcm-proxy");
+        }
+        b.bucket_encryption_modes = Some(modes);
         b.read_only_buckets = read_only.remove(&b.name).unwrap_or_default();
     }
 
@@ -198,21 +206,6 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
         // marks the backend that unrouted buckets use and confirms an add
         // that takes the default from an encrypting backend.
         default_backend: Some(cfg.default_backend_name()),
-    })
-}
-
-/// The verdict of a backend that needs no probe: a filesystem backend has
-/// atomic writes (one node, in-process locks), unless the test seam names
-/// it non-CAS (then its verdict comes from a probe).
-fn static_verdict(
-    cfg: &crate::config::Config,
-    name: &str,
-) -> Option<crate::coordination::CapabilityVerdict> {
-    let def = cfg.backend_by_name(name)?;
-    (matches!(def, crate::config::BackendConfig::Filesystem { .. })
-        && !crate::coordination::capability::forced_noncas_backends().contains(name))
-    .then_some(crate::coordination::CapabilityVerdict::CasVerified {
-        via: crate::coordination::VerifiedVia::LocalFilesystem,
     })
 }
 
@@ -347,11 +340,19 @@ pub async fn list_bucket_origins(
             let backend = backend_name
                 .as_deref()
                 .and_then(|name| backend_by_name.get(name).copied());
-            let effective_encryption = super::bucket_encryption_view::effective_encryption(
+            let mut effective_encryption = super::bucket_encryption_view::effective_encryption(
                 &cfg,
                 &bucket.name,
                 backend_name.as_deref(),
             );
+            if let Some(e) = effective_encryption.as_mut() {
+                let verdict = crate::coordination::atomicity::backend_verdict(
+                    &cfg,
+                    &state.s3_state.backend_capabilities,
+                    &e.backend,
+                );
+                super::bucket_encryption_view::apply_capability(e, verdict);
+            }
             BucketBackendOriginResponse {
                 effective_encryption,
                 read_only: state
@@ -546,12 +547,19 @@ pub async fn bucket_encryption_preview(
     let mut cfg = state.config.read().await.clone();
     // The config the create would make (route only), then THE resolver.
     route_bucket(&mut cfg, &key, q.backend.trim(), None)?;
-    super::bucket_encryption_view::effective_encryption(&cfg, &key, Some(q.backend.trim()))
-        .map(Json)
-        .ok_or(AdminError::invalid(format!(
-            "Unknown backend '{}'",
-            q.backend.trim()
-        )))
+    let mut e =
+        super::bucket_encryption_view::effective_encryption(&cfg, &key, Some(q.backend.trim()))
+            .ok_or(AdminError::invalid(format!(
+                "Unknown backend '{}'",
+                q.backend.trim()
+            )))?;
+    let verdict = crate::coordination::atomicity::backend_verdict(
+        &cfg,
+        &state.s3_state.backend_capabilities,
+        &e.backend,
+    );
+    super::bucket_encryption_view::apply_capability(&mut e, verdict);
+    Ok(Json(e))
 }
 
 /// Route `bucket_key` to `backend_name` in `cfg`, with the bucket's own

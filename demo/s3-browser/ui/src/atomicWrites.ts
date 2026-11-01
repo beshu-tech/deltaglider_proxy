@@ -54,6 +54,10 @@ export function encryptionUnavailableReason(backend: string, state: AtomicWrites
 /** The note shown when the backend has no verdict yet. */
 export const UNCHECKED_NOTE = 'The apply checks that the backend has atomic writes (conditional writes) before it encrypts.';
 
+/** The short header pill of a read-only bucket (the reason is its title
+ *  and the visible text of the open card). */
+export const READ_ONLY_PILL = 'Read-only';
+
 /** Pure: the read-only badge text of an encrypted bucket on `backend`. */
 export function readOnlyBadge(backend: string): string {
   return `Read-only: ${backend} does not support atomic writes`;

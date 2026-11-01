@@ -796,3 +796,41 @@ async fn read_only_buckets_list_buckets_without_a_policy() {
     );
     assert_eq!(env.put("atomnopol", "x.txt").await, 403);
 }
+
+/// Review: the synthesized single backend (`is_synthesized: true`, no named
+/// backends) without atomic writes. A plaintext bucket on it is not offered
+/// proxy AES: `bucket_modes` lacks `aes256-gcm-proxy`, `proxy_unavailable`
+/// says why, and the backend's `bucket_encryption_modes` lacks it too.
+#[tokio::test]
+async fn the_synthesized_backend_without_atomic_writes_offers_no_proxy_aes() {
+    let env = Env::new("atomsyn", &[FORCED]).await;
+    let (_, v) = send(env.admin.get(format!("{}/_/api/admin/backends", env.ep()))).await;
+    let b = &v["backends"][0];
+    assert_eq!(b["is_synthesized"], true, "{v}");
+    assert_eq!(b["capability"]["verdict"], "non-cas", "{v}");
+    assert!(
+        !b["bucket_encryption_modes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "aes256-gcm-proxy"),
+        "{v}"
+    );
+    let e = env.bucket_view("atomsyn").await["effective_encryption"].clone();
+    assert_eq!(e["mode"], "none", "{e}");
+    assert_eq!(e["bucket_modes"], json!(["none"]), "{e}");
+    assert_eq!(e["capability"]["verdict"], "non-cas", "{e}");
+    let why = e["proxy_unavailable"].as_str().unwrap_or("");
+    assert!(
+        why.contains("atomic writes") && why.contains("'default'") && why.contains(DOC),
+        "{e}"
+    );
+    // The create dialog's preview says the same.
+    let (code, p) = send(env.admin.get(format!(
+        "{}/_/api/admin/buckets/atomsynnew/encryption-preview?backend=default",
+        env.ep()
+    )))
+    .await;
+    assert_eq!(code, 200, "{p}");
+    assert_eq!(p["bucket_modes"], json!(["none"]), "{p}");
+}

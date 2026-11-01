@@ -50,8 +50,18 @@ pub struct EffectiveEncryption {
     /// backend). A bucket's own `encryption` block needs that, so an edit
     /// that adds one also sets `backend:` when this is false.
     pub pinned: bool,
-    /// The modes that the bucket's own block accepts.
+    /// The modes that the bucket's own block accepts. Without proven
+    /// atomic writes on the backend, `aes256-gcm-proxy` is not among them
+    /// (see [`apply_capability`]).
     pub bucket_modes: Vec<&'static str>,
+    /// The atomic-writes verdict of the bucket's backend (`None`: not
+    /// checked yet). Encryption with a proxy key needs atomic writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability: Option<crate::coordination::CapabilityVerdict>,
+    /// Why `aes256-gcm-proxy` is not offered (the backend has no proven
+    /// atomic writes), with the doc link; `None` when it is offered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_unavailable: Option<String>,
     /// What the bucket's backend does on its own: the encryption that
     /// "Inherit" gives the bucket (equal to the top-level fields when
     /// `source` is `backend`).
@@ -210,7 +220,27 @@ pub fn effective_encryption(
         reencrypt,
         pinned: cfg.bucket_storage(&name).is_some(),
         bucket_modes: cfg.bucket_encryption_modes(&e.backend),
+        capability: None,
+        proxy_unavailable: None,
     })
+}
+
+/// Pure: the atomic-writes verdict of the bucket's backend into the view
+/// (N2). A verdict that does not prove atomic writes (non-CAS, unknown)
+/// takes `aes256-gcm-proxy` out of `bucket_modes` and says why in
+/// `proxy_unavailable`. No verdict yet offers it (the apply probes).
+pub fn apply_capability(
+    e: &mut EffectiveEncryption,
+    verdict: Option<crate::coordination::CapabilityVerdict>,
+) {
+    if let Some(reason) = verdict
+        .as_ref()
+        .and_then(|v| crate::coordination::atomicity::proxy_unavailable_reason(&e.backend, v))
+    {
+        e.bucket_modes.retain(|m| *m != "aes256-gcm-proxy");
+        e.proxy_unavailable = Some(reason);
+    }
+    e.capability = verdict;
 }
 
 /// Fill in the conversion state of each bucket in `rows` that encrypts
@@ -374,6 +404,27 @@ storage:
         assert!(e.has_key && e.encrypts && e.reencrypt && e.pinned);
         assert_eq!(e.legacy_key_id, None);
         assert_eq!(e.bucket_modes, vec!["none", "aes256-gcm-proxy"]);
+        // Without atomic writes on the backend, proxy AES is not offered,
+        // and the view says why (N2 review).
+        let mut no_cas = e.clone();
+        apply_capability(
+            &mut no_cas,
+            Some(crate::coordination::CapabilityVerdict::NonCas),
+        );
+        assert_eq!(no_cas.bucket_modes, vec!["none"]);
+        assert!(no_cas
+            .proxy_unavailable
+            .as_deref()
+            .is_some_and(|r| r.contains("atomic writes") && r.contains("hetzner-fsn1")));
+        let mut cas = e.clone();
+        apply_capability(
+            &mut cas,
+            Some(crate::coordination::CapabilityVerdict::CasVerified {
+                via: crate::coordination::VerifiedVia::Probe,
+            }),
+        );
+        assert_eq!(cas.bucket_modes, vec!["none", "aes256-gcm-proxy"]);
+        assert_eq!(cas.proxy_unavailable, None);
         // The neighbour on the same backend stays plaintext.
         // Inherit would give the backend's plaintext.
         assert_eq!(e.inherited.mode, "none");
