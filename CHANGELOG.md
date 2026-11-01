@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.1.0 — 2026-11-01
+
 ### Fixed — Conditional writes on Hetzner Object Storage (Ceph RGW)
 
 - Hetzner Object Storage, which runs Ceph RGW, refuses a `PUT` whose `If-Match` holds the correct ETag in quotes, the form that S3 returns, with `412 Precondition Failed`. It accepts the same ETag without quotes. Before this fix, the capability probe read that `412` as a refusal of the condition, so the verdict of a Hetzner backend was `non-cas`: its encrypted buckets would have been read-only, a coordination bucket on it would have stopped the start, and every conditional write on it would have looked like a lost race. The probe now tries the ETag without quotes when the quoted form fails, and it checks that a wrong ETag without quotes is still refused. Such a backend gets the verdict `cas-verified` with `if_match: unquoted`, and every conditional request of the proxy to it sends the ETag without quotes: the re-encrypt rewrites, the fenced writes of `reference.bin`, the key claim, the conversion marker, the source-conditional copies, the leases, the reference locks, the encryption witness and the config DB sync. AWS S3 and MinIO keep the quoted form, and their probe is unchanged. The backend card and `GET /_/api/admin/backends` show the form in `capability.if_match`. The probe of such a backend sends 11 requests instead of 7. See [The `If-Match` form](docs/product/how-to/backend-capability-validation.md#the-if-match-form-and-backends-that-ignore-it-on-delete).
