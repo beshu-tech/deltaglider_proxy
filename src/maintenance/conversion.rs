@@ -312,13 +312,18 @@ fn window_of(f: &marker::Fields) -> Window {
 
 /// Was the unsealed object (or reference) whose job read gave `meta`
 /// adopted: converted although a client could not read it? Never in a
-/// bucket whose rule serves plaintext (`serves`). Otherwise THE read rule
+/// bucket that writes plaintext (`writes_plaintext`). Otherwise THE read rule
 /// decides, for the job reader, with the window of this job's run: no
 /// marker of this run (none, a foreign one, another run's, a job without
 /// a run) is a closed window, so every unsealed object that is not a
 /// folder marker is adopted and reported.
-pub(crate) fn adopted(marker: &JobMarker, serves: bool, key: &str, meta: &FileMetadata) -> bool {
-    if serves
+pub(crate) fn adopted(
+    marker: &JobMarker,
+    writes_plaintext: bool,
+    key: &str,
+    meta: &FileMetadata,
+) -> bool {
+    if writes_plaintext
         || meta
             .user_metadata
             .contains_key(crate::storage::encrypting::ENCRYPTION_MARKER_KEY)

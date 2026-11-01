@@ -55,7 +55,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await
     }
 
-    async fn open_raw(
+    pub(super) async fn open_raw(
         &self,
         bucket: &str,
         prefix: &str,

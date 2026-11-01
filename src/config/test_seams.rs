@@ -56,20 +56,21 @@ pub struct TestSeams {
     /// `DGP_TEST_CONVERSION_WINDOW_SECS`: the length of a conversion window
     /// (default 7 days), so a test can see a deadline pass.
     pub conversion_window_secs: Option<i64>,
-    /// `DGP_TEST_REWRITE_STALL_MS`: the re-encrypt job's in-place rewrite
-    /// of an object sleeps after its read and before its conditional write
-    /// (inside the object's locks), so a test can write the object from
-    /// another instance in that window.
-    pub rewrite_stall_ms: u64,
-    /// `DGP_TEST_REWRITE_LOCK_STALL_MS`: the re-encrypt job sleeps after
-    /// its HEAD of an object and before the rewrite takes the object's
-    /// write lock, so a test can write the object through the same
-    /// instance in that window.
-    pub rewrite_lock_stall_ms: u64,
+    /// `DGP_TEST_REWRITE_STALL=<point>:<ms>[:<signal file>]`: the
+    /// re-encrypt job's in-place rewrite of an object sleeps `ms` at
+    /// `point` ([`RewriteStall`]), so a test can write the object in that
+    /// window. With a signal file, each stall first appends the object's
+    /// name as one line to it: the test waits for that line instead of a
+    /// fixed time.
+    pub rewrite_stall: Option<RewriteStallSeam>,
     /// `DGP_TEST_KEEP_WRITE_GATE=true`: a re-encrypt job keeps the bucket's
-    /// write gate although its rewrites are conditional. Encryption runs
-    /// only on backends with atomic writes (N2), so the gate tests (whose
-    /// mechanics a decrypt job on a backend without them uses) need it.
+    /// write gate although its rewrites are conditional. Why it exists:
+    /// since N2, encryption runs only on backends with atomic writes, where
+    /// every rewrite is conditional, so an ENCRYPT job never arms the gate
+    /// on its own. Only a decrypt job on a backend without atomic writes
+    /// still does. The gate tests (503 to clients, drain, unwind, the
+    /// cancel paths) need those gated mechanics with an encrypt job, which
+    /// is what they set up; this seam keeps the gate for them.
     pub keep_write_gate: bool,
     /// `DGP_TEST_ATOMICITY_PROBE_DELAY_MS`: every atomicity probe sleeps
     /// this long first, and a filesystem backend gets its verdict from the
@@ -78,7 +79,53 @@ pub struct TestSeams {
     pub atomicity_probe_delay_ms: u64,
 }
 
+/// Where the re-encrypt job's rewrite stalls (`DGP_TEST_REWRITE_STALL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteStall {
+    /// `before-lock`: after the job's HEAD of an object, before the rewrite
+    /// takes the object's write lock (a write through the same instance
+    /// lands in the window).
+    BeforeLock,
+    /// `before-write`: after the rewrite's read, before its conditional
+    /// write, inside the object's locks (a write from another instance
+    /// lands in the window).
+    BeforeWrite,
+}
+
+/// The parsed `DGP_TEST_REWRITE_STALL`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteStallSeam {
+    pub point: RewriteStall,
+    pub ms: u64,
+    /// The file that each stall appends the object's name to.
+    pub signal: Option<std::path::PathBuf>,
+}
+
+impl RewriteStallSeam {
+    /// Pure: parse `<point>:<ms>[:<signal file>]`; `None` for anything
+    /// else or `ms == 0`.
+    pub fn parse(v: &str) -> Option<Self> {
+        let mut parts = v.trim().splitn(3, ':');
+        let point = match parts.next()?.trim() {
+            "before-lock" => RewriteStall::BeforeLock,
+            "before-write" => RewriteStall::BeforeWrite,
+            _ => return None,
+        };
+        let ms: u64 = parts.next()?.trim().parse().ok().filter(|ms| *ms > 0)?;
+        let signal = parts
+            .next()
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from);
+        Some(Self { point, ms, signal })
+    }
+}
+
 impl TestSeams {
+    /// The rewrite stall at `point`, if the seam names this point.
+    pub fn rewrite_stall_at(&self, point: RewriteStall) -> Option<&RewriteStallSeam> {
+        self.rewrite_stall.as_ref().filter(|s| s.point == point)
+    }
+
     /// Parse every seam from `env`.
     pub fn from_env(env: EnvLookup) -> Self {
         let delay = |flag: &str, ms: &str| {
@@ -112,8 +159,7 @@ impl TestSeams {
                 .filter(|n| *n >= 0),
             conversion_window_secs: lookup_parse::<i64>(env, "DGP_TEST_CONVERSION_WINDOW_SECS")
                 .filter(|n| *n > 0),
-            rewrite_stall_ms: lookup_parse(env, "DGP_TEST_REWRITE_STALL_MS").unwrap_or(0),
-            rewrite_lock_stall_ms: lookup_parse(env, "DGP_TEST_REWRITE_LOCK_STALL_MS").unwrap_or(0),
+            rewrite_stall: env("DGP_TEST_REWRITE_STALL").and_then(|v| RewriteStallSeam::parse(&v)),
             keep_write_gate: lookup_parse(env, "DGP_TEST_KEEP_WRITE_GATE").unwrap_or(false),
             atomicity_probe_delay_ms: lookup_parse(env, "DGP_TEST_ATOMICITY_PROBE_DELAY_MS")
                 .unwrap_or(0),
@@ -168,7 +214,30 @@ mod tests {
             ("DGP_TEST_FORCE_NONCAS_BACKEND", " b2sim, ,other "),
             ("DGP_TEST_CONVERSION_GRACE_SECS", "0"),
             ("DGP_TEST_CONVERSION_WINDOW_SECS", "30"),
+            ("DGP_TEST_REWRITE_STALL", "before-lock:3000"),
         ]);
+        assert_eq!(
+            t.rewrite_stall_at(RewriteStall::BeforeLock).map(|s| s.ms),
+            Some(3000)
+        );
+        assert_eq!(t.rewrite_stall_at(RewriteStall::BeforeWrite), None);
+        assert_eq!(
+            RewriteStallSeam::parse("before-write:40:/tmp/sig"),
+            Some(RewriteStallSeam {
+                point: RewriteStall::BeforeWrite,
+                ms: 40,
+                signal: Some("/tmp/sig".into()),
+            })
+        );
+        for bad in [
+            "before-write",
+            "after:5",
+            "before-lock:x",
+            "before-lock:0",
+            "",
+        ] {
+            assert_eq!(RewriteStallSeam::parse(bad), None, "{bad}");
+        }
         assert_eq!(t.conversion_grace_secs, Some(0));
         assert_eq!(t.conversion_window_secs, Some(30));
         assert_eq!(t.complete_stall_ms, 1500);

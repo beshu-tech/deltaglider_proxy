@@ -1098,9 +1098,9 @@ impl MigrateRun<'_> {
         });
         let engine = self.state.engine.load().clone();
         let marker = super::conversion::observe(&engine, &self.job.bucket).await;
-        let serves = {
+        let writes_plaintext = {
             let cfg = self.mutator.read().await;
-            super::rule_serves_plaintext(&cfg, &self.job.bucket)
+            super::bucket_writes_plaintext(&cfg, &self.job.bucket)
         };
         let mut step = CopyStep {
             m: self,
@@ -1112,7 +1112,7 @@ impl MigrateRun<'_> {
             page_token: None,
             desired: None,
             marker,
-            serves,
+            writes_plaintext,
         };
         paged_phase(
             self.ctx(),
@@ -1425,7 +1425,7 @@ struct CopyStep<'a, 'r> {
     marker: super::conversion::JobMarker,
     /// The source bucket writes plaintext (its unsealed objects are its
     /// own: never an adoption).
-    serves: bool,
+    writes_plaintext: bool,
 }
 
 impl CopyStep<'_, '_> {
@@ -1548,9 +1548,9 @@ impl PageStep for CopyStep<'_, '_> {
         };
         // No per-object fsync: `checkpoint` flushes the copies before any
         // progress that counts on them is saved.
-        let adopted = source
-            .as_ref()
-            .is_some_and(|meta| super::conversion::adopted(&self.marker, self.serves, key, meta));
+        let adopted = source.as_ref().is_some_and(|meta| {
+            super::conversion::adopted(&self.marker, self.writes_plaintext, key, meta)
+        });
         let copy = copy_object_known(engine, req, source.as_ref(), prior.as_ref());
         match crate::storage::with_deferred_fsync(copy).await {
             Ok(outcome) => CopyDone::Copied {

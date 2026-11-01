@@ -77,12 +77,12 @@ pub enum DesiredEncryption {
     Proxy { key_id: String },
 }
 
-/// Does the read rule of `bucket` serve every unsealed object
-/// (`seal::PlaintextRule::Serves`)? Yes when the bucket does not encrypt
-/// with a proxy key: it writes plaintext. The conversion job adopts
+/// Does `bucket` write plaintext (its read rule then serves every unsealed
+/// object, `seal::PlaintextRule::Serves`)? Yes when it does not encrypt
+/// with a proxy key. The conversion job adopts
 /// silently only there; in a bucket that encrypts it reports every
 /// unsealed object that a client could not read.
-pub fn rule_serves_plaintext(config: &Config, bucket: &str) -> bool {
+pub fn bucket_writes_plaintext(config: &Config, bucket: &str) -> bool {
     match config.encryption_for_bucket(bucket) {
         None => false,
         Some(resolved) => match &resolved.config {

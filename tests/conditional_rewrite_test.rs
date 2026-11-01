@@ -167,6 +167,26 @@ async fn new_minio_bucket(prefix: &str) -> String {
     bucket
 }
 
+/// A file that the rewrite stall seam appends each stalled object's name
+/// to (`DGP_TEST_REWRITE_STALL=<point>:<ms>:<file>`), and the seam value.
+fn stall_signal(point: &str, ms: u64) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("stalled");
+    let seam = format!("{point}:{ms}:{}", file.display());
+    (dir, file, seam)
+}
+
+/// Wait until the job stalls at `object` (the seam wrote its line).
+async fn wait_stalled_at(file: &std::path::Path, object: &str) {
+    for _ in 0..300 {
+        if std::fs::read_to_string(file).is_ok_and(|s| s.lines().any(|l| l == object)) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the job never stalled at {object}");
+}
+
 /// Test (1): a client PUT of `k.txt` through a SECOND proxy on the same
 /// MinIO lands between the job's read of the object and its write. The
 /// job's PUT carries `If-Match` on the version it read, MinIO refuses it,
@@ -182,7 +202,8 @@ async fn a_client_write_on_another_instance_during_the_rewrite_survives() {
     assert_eq!(other.encrypt_bucket(&bucket).await, None);
 
     // The job's instance: each rewrite waits between its read and its write.
-    let node = Node::minio(&bucket, &[("DGP_TEST_REWRITE_STALL_MS", "4000")]).await;
+    let (_signal_dir, signal, seam) = stall_signal("before-write", 4000);
+    let node = Node::minio(&bucket, &[("DGP_TEST_REWRITE_STALL", seam.as_str())]).await;
     assert_eq!(node.put(&bucket, "k.txt", OLD).await, 200);
     assert_eq!(node.put(&bucket, "other.txt", OLD).await, 200);
     assert!(!minio_sealed(&bucket, "k.txt").await);
@@ -191,7 +212,8 @@ async fn a_client_write_on_another_instance_during_the_rewrite_survives() {
         .encrypt_bucket(&bucket)
         .await
         .expect("a conversion job");
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    // The job read k.txt and waits before its conditional write.
+    wait_stalled_at(&signal, "k.txt").await;
     let status = node.bucket_status(&bucket).await;
     assert!(!status["active"].is_null(), "the job still runs: {status}");
     assert_eq!(status["writes_blocked"], false, "{status}");
@@ -218,16 +240,18 @@ async fn a_client_write_on_another_instance_during_the_rewrite_survives() {
 /// nothing; the client's object survives and the job counts it as changed.
 #[tokio::test]
 async fn a_client_write_before_the_object_lock_survives_on_the_filesystem() {
+    let (_signal_dir, signal, seam) = stall_signal("before-lock", 3000);
     let server = TestServer::builder()
         .bucket("condfs")
-        .env("DGP_TEST_REWRITE_LOCK_STALL_MS", "3000")
+        .env("DGP_TEST_REWRITE_STALL", &seam)
         .build()
         .await;
     let node = Node::new(server).await;
     assert_eq!(node.put("condfs", "k.txt", OLD).await, 200);
 
     let job = node.encrypt_backend().await.expect("a conversion job");
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    // The job's HEAD of k.txt is done; it waits before the object lock.
+    wait_stalled_at(&signal, "k.txt").await;
     let status = node.bucket_status("condfs").await;
     assert!(!status["active"].is_null(), "the job still runs: {status}");
     assert_eq!(status["writes_blocked"], false, "{status}");
@@ -250,14 +274,15 @@ async fn a_client_write_before_the_object_lock_survives_on_the_filesystem() {
     assert_eq!(run["errors"], 0, "{run}");
 }
 
-/// Writes to `bucket` while its conversion job runs: the status of the
-/// gate and the answer to a client PUT.
-async fn write_during_the_job(node: &Node, bucket: &str) -> (Value, u16) {
+/// Writes to `bucket` while its conversion job runs (`signal`: the stall
+/// seam's file): the status of the gate and the answer to a client PUT.
+async fn write_during_the_job(node: &Node, bucket: &str, signal: &std::path::Path) -> (Value, u16) {
     for i in 0..12 {
         assert_eq!(node.put(bucket, &format!("h-{i:02}.txt"), OLD).await, 200);
     }
     node.encrypt_bucket(bucket).await.expect("a conversion job");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // The walk is under way: 11 more objects at 300 ms each to go.
+    wait_stalled_at(signal, "h-00.txt").await;
     let status = node.bucket_status(bucket).await;
     assert!(!status["active"].is_null(), "the job still runs: {status}");
     let code = node.put(bucket, "during.txt", NEW).await;
@@ -271,8 +296,16 @@ async fn write_during_the_job(node: &Node, bucket: &str) -> (Value, u16) {
 async fn a_cas_backend_takes_client_writes_during_the_walk() {
     skip_unless_minio!();
     let bucket = new_minio_bucket("condcas").await;
-    let node = Node::minio(&bucket, &[("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "300")]).await;
-    let (status, code) = write_during_the_job(&node, &bucket).await;
+    let (_signal_dir, signal, seam) = stall_signal("before-write", 1);
+    let node = Node::minio(
+        &bucket,
+        &[
+            ("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "300"),
+            ("DGP_TEST_REWRITE_STALL", seam.as_str()),
+        ],
+    )
+    .await;
+    let (status, code) = write_during_the_job(&node, &bucket, &signal).await;
     assert_eq!(status["writes_blocked"], false, "{status}");
     assert_eq!(code, 200);
     assert_eq!(node.get(&bucket, "during.txt").await, (200, NEW.to_vec()));
@@ -285,15 +318,17 @@ async fn a_cas_backend_takes_client_writes_during_the_walk() {
 async fn a_gated_job_keeps_the_write_gate() {
     skip_unless_minio!();
     let bucket = new_minio_bucket("condnoncas").await;
+    let (_signal_dir, signal, seam) = stall_signal("before-write", 1);
     let node = Node::minio(
         &bucket,
         &[
             ("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "300"),
             ("DGP_TEST_KEEP_WRITE_GATE", "true"),
+            ("DGP_TEST_REWRITE_STALL", seam.as_str()),
         ],
     )
     .await;
-    let (status, code) = write_during_the_job(&node, &bucket).await;
+    let (status, code) = write_during_the_job(&node, &bucket, &signal).await;
     assert_eq!(status["writes_blocked"], true, "{status}");
     assert_eq!(code, 503);
 }

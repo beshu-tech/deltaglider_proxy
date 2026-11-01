@@ -19,6 +19,7 @@
 
 use super::conditional::ObjectWriteGuard;
 use super::*;
+use crate::config::test_seams::RewriteStall;
 use crate::storage::{ObjectVariant, PutBody, RewriteTarget, StoredObject, StoredWrite, WriteIf};
 
 /// What a rewrite does on a backend without conditional writes (S3 501).
@@ -39,6 +40,29 @@ pub enum Rewritten {
     /// Not stored: the object is gone or is another version than the one
     /// the caller read (a client wrote it meanwhile). It stays as it is.
     Changed,
+}
+
+/// Pure: what a conditional rewrite's answer means. `Ok(None)`: the
+/// backend has no conditional writes and the job holds the write gate, so
+/// the caller writes without the condition. One rule for every form.
+fn conditional_outcome(
+    out: WriteIf,
+    bytes: u64,
+    unconditional: Unconditional,
+    bucket: &str,
+) -> Result<Option<Rewritten>, EngineError> {
+    match out {
+        WriteIf::Written => Ok(Some(Rewritten::Done { bytes })),
+        WriteIf::Changed => Ok(Some(Rewritten::Changed)),
+        WriteIf::Unsupported if unconditional == Unconditional::Allowed => Ok(None),
+        WriteIf::Unsupported => Err(no_conditional_writes(bucket)),
+    }
+}
+
+/// A passthrough body that a rewrite read: in memory, or in a spool file.
+struct ReadBody {
+    hashes: BodyHashes,
+    data: Option<Bytes>,
 }
 
 /// The hashes of a rewrite's plaintext body.
@@ -126,7 +150,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         };
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
         let name = obj_key.filename.clone();
-        test_stall(crate::config::test_seams::test_seams().rewrite_lock_stall_ms).await;
+        test_stall(RewriteStall::BeforeLock, key).await;
         let lock = self.lock_object_write(bucket, key).await;
         let out = match form {
             ObjectVariant::Passthrough => {
@@ -157,7 +181,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         unconditional: Unconditional,
     ) -> Result<Rewritten, EngineError> {
         lock.covers(bucket, deltaspace_id, name)?;
-        let object = StoredObject::Passthrough(name);
         let size = read.file_size;
         // Large: the body goes through a spool file (bounded memory).
         // Taken before the GET, so no response waits for budget.
@@ -168,7 +191,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         };
         let opened = match self
             .storage
-            .open_object(bucket, deltaspace_id, object)
+            .open_object(bucket, deltaspace_id, StoredObject::Passthrough(name))
             .await
         {
             Ok(o) => o,
@@ -179,59 +202,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(Rewritten::Changed);
         }
         let body_meta = opened.metadata.clone();
-        let mut stream = opened.stream;
-        let (hashes, data) = match &spool {
+        let read_body = match &spool {
             Some(spool) => {
-                let md5 =
-                    std::sync::Arc::new(std::sync::Mutex::new(<md5::Md5 as md5::Digest>::new()));
-                let feed = md5.clone();
-                let mut hashed = futures::StreamExt::map(&mut stream, move |chunk| {
-                    if let Ok(c) = &chunk {
-                        md5::Digest::update(&mut *feed.lock().expect("md5 lock"), c);
-                    }
-                    chunk
-                });
-                use crate::deltaglider::spool::SpoolFillError;
-                let fill =
-                    spool
-                        .fill_from_stream(&mut hashed, size)
-                        .await
-                        .map_err(|e| match e {
-                            SpoolFillError::Source(e) => EngineError::Storage(e),
-                            SpoolFillError::Write(e) => EngineError::Storage(e.into()),
-                            SpoolFillError::Overrun { .. } => {
-                                EngineError::Storage(StorageError::Other(format!(
-                                    "{bucket}/{name} grew while it was read"
-                                )))
-                            }
-                        })?;
-                drop(hashed);
-                if fill.written != size {
-                    return Ok(Rewritten::Changed);
-                }
-                let md5 = std::mem::replace(
-                    &mut *md5.lock().expect("md5 lock"),
-                    <md5::Md5 as md5::Digest>::new(),
-                );
-                let hashes = BodyHashes {
-                    sha256: fill.sha256,
-                    md5: hex::encode(md5::Digest::finalize(md5)),
-                };
-                (hashes, None)
+                Self::read_into_spool(opened.stream, spool, size, (bucket, name)).await?
             }
-            None => {
-                use futures::TryStreamExt;
-                let data: Vec<u8> = stream
-                    .try_fold(Vec::new(), |mut acc, chunk| async move {
-                        acc.extend_from_slice(&chunk);
-                        Ok(acc)
-                    })
-                    .await?;
-                if data.len() as u64 != size {
-                    return Ok(Rewritten::Changed);
-                }
-                (BodyHashes::of(&data), Some(Bytes::from(data)))
-            }
+            None => Self::read_into_memory(opened.stream, size).await?,
+        };
+        // A body of another size than the HEAD said: another version.
+        let Some(ReadBody { hashes, data }) = read_body else {
+            return Ok(Rewritten::Changed);
         };
         let meta = rewrite_metadata(&body_meta, Some(&hashes))?;
         // The encrypting wrapper's ciphertext file, reserved now (a storage
@@ -255,24 +234,87 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             (None, Some(d)) => PutBody::Bytes(d.clone()),
             (None, None) => unreachable!("a body in memory or in a spool file"),
         };
-        test_stall(crate::config::test_seams::test_seams().rewrite_stall_ms).await;
+        test_stall(RewriteStall::BeforeWrite, name).await;
         let target = RewriteTarget::Passthrough { name };
         let out = self
             .storage
             .put_if_unchanged(bucket, deltaspace_id, target, body(), &meta, version)
             .await?;
-        match out {
-            WriteIf::Written => Ok(Rewritten::Done { bytes: size }),
-            WriteIf::Changed => Ok(Rewritten::Changed),
-            WriteIf::Unsupported if unconditional == Unconditional::Allowed => {
-                let target = StoredWrite::Passthrough { name };
-                self.storage
-                    .put_object(bucket, deltaspace_id, target, body(), &meta)
-                    .await?;
-                Ok(Rewritten::Done { bytes: size })
-            }
-            WriteIf::Unsupported => Err(no_conditional_writes(bucket)),
+        if let Some(done) = conditional_outcome(out, size, unconditional, bucket)? {
+            return Ok(done);
         }
+        let target = StoredWrite::Passthrough { name };
+        self.storage
+            .put_object(bucket, deltaspace_id, target, body(), &meta)
+            .await?;
+        Ok(Rewritten::Done { bytes: size })
+    }
+
+    /// A large passthrough body into `spool`, hashed on the way (SHA-256
+    /// by the spool, MD5 by the stream). `Ok(None)`: it was not `size`
+    /// bytes long.
+    async fn read_into_spool(
+        mut stream: crate::storage::ByteStream,
+        spool: &crate::deltaglider::spool::Spool,
+        size: u64,
+        (bucket, name): (&str, &str),
+    ) -> Result<Option<ReadBody>, EngineError> {
+        use crate::deltaglider::spool::SpoolFillError;
+        let md5 = std::sync::Arc::new(std::sync::Mutex::new(<md5::Md5 as md5::Digest>::new()));
+        let feed = md5.clone();
+        let mut hashed = futures::StreamExt::map(&mut stream, move |chunk| {
+            if let Ok(c) = &chunk {
+                md5::Digest::update(&mut *feed.lock().expect("md5 lock"), c);
+            }
+            chunk
+        });
+        let fill = spool
+            .fill_from_stream(&mut hashed, size)
+            .await
+            .map_err(|e| match e {
+                SpoolFillError::Source(e) => EngineError::Storage(e),
+                SpoolFillError::Write(e) => EngineError::Storage(e.into()),
+                SpoolFillError::Overrun { .. } => EngineError::Storage(StorageError::Other(
+                    format!("{bucket}/{name} grew while it was read"),
+                )),
+            })?;
+        drop(hashed);
+        if fill.written != size {
+            return Ok(None);
+        }
+        let md5 = std::mem::replace(
+            &mut *md5.lock().expect("md5 lock"),
+            <md5::Md5 as md5::Digest>::new(),
+        );
+        Ok(Some(ReadBody {
+            hashes: BodyHashes {
+                sha256: fill.sha256,
+                md5: hex::encode(md5::Digest::finalize(md5)),
+            },
+            data: None,
+        }))
+    }
+
+    /// A small passthrough body into memory. `Ok(None)`: it was not `size`
+    /// bytes long.
+    async fn read_into_memory(
+        stream: crate::storage::ByteStream,
+        size: u64,
+    ) -> Result<Option<ReadBody>, EngineError> {
+        use futures::TryStreamExt;
+        let data: Vec<u8> = stream
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
+            .await?;
+        if data.len() as u64 != size {
+            return Ok(None);
+        }
+        Ok(Some(ReadBody {
+            hashes: BodyHashes::of(&data),
+            data: Some(Bytes::from(data)),
+        }))
     }
 
     /// Under the deltaspace lock: the delta bytes, read and stored again.
@@ -288,7 +330,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .held_reference_lock(bucket, deltaspace_id, "delta")
             .map_err(EngineError::Storage)?;
         let (data, read) = match self
-            .open_raw_bytes(bucket, deltaspace_id, StoredObject::Delta(name))
+            .open_raw(bucket, deltaspace_id, StoredObject::Delta(name))
             .await
         {
             Ok(r) => r,
@@ -311,7 +353,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let meta = rewrite_metadata(&read, None)?;
         let bytes = data.len() as u64;
         let data = Bytes::from(data);
-        test_stall(crate::config::test_seams::test_seams().rewrite_stall_ms).await;
+        test_stall(RewriteStall::BeforeWrite, name).await;
         let out = held
             .rewrite_delta_if(
                 &*self.storage,
@@ -323,16 +365,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 version,
             )
             .await?;
-        match out {
-            WriteIf::Written => Ok(Rewritten::Done { bytes }),
-            WriteIf::Changed => Ok(Rewritten::Changed),
-            WriteIf::Unsupported if unconditional == Unconditional::Allowed => {
-                held.put_delta(&*self.storage, bucket, deltaspace_id, name, data, &meta)
-                    .await?;
-                Ok(Rewritten::Done { bytes })
-            }
-            WriteIf::Unsupported => Err(no_conditional_writes(bucket)),
+        if let Some(done) = conditional_outcome(out, bytes, unconditional, bucket)? {
+            return Ok(done);
         }
+        held.put_delta(&*self.storage, bucket, deltaspace_id, name, data, &meta)
+            .await?;
+        Ok(Rewritten::Done { bytes })
     }
 
     /// Rewrite reference.bin of `prefix` in place, when `needs(meta)` says
@@ -352,10 +390,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let held = self
             .held_reference_lock(bucket, prefix, "reference")
             .map_err(EngineError::Storage)?;
-        let (data, read) = match self
-            .open_raw_bytes(bucket, prefix, StoredObject::Reference)
-            .await
-        {
+        let (data, read) = match self.open_raw(bucket, prefix, StoredObject::Reference).await {
             Ok(r) => r,
             Err(StorageError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -383,46 +418,36 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 &version,
             )
             .await?;
-        let outcome = match out {
-            WriteIf::Written => Rewritten::Done { bytes },
-            WriteIf::Changed => Rewritten::Changed,
-            WriteIf::Unsupported if unconditional == Unconditional::Allowed => {
+        let outcome = match conditional_outcome(out, bytes, unconditional, bucket)? {
+            Some(done) => done,
+            None => {
                 held.put_reference(&*self.storage, bucket, prefix, &data, &meta)
                     .await?;
                 Rewritten::Done { bytes }
             }
-            WriteIf::Unsupported => return Err(no_conditional_writes(bucket)),
         };
         Ok(Some((outcome, read)))
     }
-
-    /// One stored object's bytes and the metadata of the same read.
-    async fn open_raw_bytes(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        object: StoredObject<'_>,
-    ) -> Result<(Vec<u8>, FileMetadata), StorageError> {
-        use futures::TryStreamExt;
-        let crate::storage::ObjectRead {
-            stream, metadata, ..
-        } = self.storage.open_object(bucket, prefix, object).await?;
-        let data = stream
-            .try_fold(Vec::new(), |mut acc, chunk| async move {
-                acc.extend_from_slice(&chunk);
-                Ok(acc)
-            })
-            .await?;
-        Ok((data, metadata))
-    }
 }
 
-/// Test seams (debug builds only, 0 = off): see
-/// `config::test_seams::TestSeams::rewrite_stall_ms`.
-async fn test_stall(ms: u64) {
-    if ms > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+/// Test seam (debug builds only): the stall of `DGP_TEST_REWRITE_STALL`
+/// at `point`, if it names this point. With a signal file, `object` is
+/// appended to it as one line first.
+async fn test_stall(point: RewriteStall, object: &str) {
+    let Some(stall) = crate::config::test_seams::test_seams().rewrite_stall_at(point) else {
+        return;
+    };
+    if let Some(path) = &stall.signal {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{object}");
+        }
     }
+    tokio::time::sleep(std::time::Duration::from_millis(stall.ms)).await;
 }
 
 /// The error of a rewrite that must be conditional on a backend that has

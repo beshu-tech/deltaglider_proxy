@@ -735,7 +735,7 @@ async fn execute_phases(
         config,
         bucket,
         desired: None,
-        serves: false,
+        writes_plaintext: false,
         marker: &marker,
         adoptions: &adoptions,
         unconditional,
@@ -751,11 +751,11 @@ async fn execute_phases(
     // ── Phase: references (deltaspace reference.bin blobs) ──
     if phase == "references" {
         check_cancel(db, job.id).await?;
-        let (desired, serves) = {
+        let (desired, writes_plaintext) = {
             let cfg = config.read().await;
             let desired = resolve_desired(&cfg, bucket)
                 .map_err(|e| format!("config changed mid-run: {e}"))?;
-            (desired, super::rule_serves_plaintext(&cfg, bucket))
+            (desired, super::bucket_writes_plaintext(&cfg, bucket))
         };
         let engine = state.engine.load().clone();
         // The objects walk read them (one listing of the bucket, not two);
@@ -774,7 +774,7 @@ async fn execute_phases(
             check_cancel(db, job.id).await?;
             let key = format!("{prefix}/.dg/reference.bin");
             let adopted = |meta: &crate::types::FileMetadata| {
-                super::conversion::adopted(&marker, serves, &key, meta)
+                super::conversion::adopted(&marker, writes_plaintext, &key, meta)
             };
             let rewrite = rewrite_reference_if_needed(
                 &engine,
@@ -943,9 +943,9 @@ struct Reencrypt<'a> {
     config: &'a SharedConfig,
     bucket: &'a str,
     desired: Option<DesiredEncryption>,
-    /// The bucket's rule serves plaintext (it writes plaintext): its
+    /// The bucket writes plaintext (its rule serves plaintext): its
     /// unsealed objects are never adopted.
-    serves: bool,
+    writes_plaintext: bool,
     /// The bucket's conversion marker for this run.
     marker: &'a super::conversion::JobMarker,
     adoptions: &'a super::conversion::Adoptions,
@@ -966,7 +966,7 @@ impl ObjectVisitor for Reencrypt<'_> {
             resolve_desired(&cfg, self.bucket)
                 .map_err(|e| format!("config changed mid-run: {e}"))?,
         );
-        self.serves = super::rule_serves_plaintext(&cfg, self.bucket);
+        self.writes_plaintext = super::bucket_writes_plaintext(&cfg, self.bucket);
         Ok(())
     }
 
@@ -1039,7 +1039,7 @@ impl ObjectVisitor for Reencrypt<'_> {
             return Visit::Skipped;
         }
         // Judged on this read (the backend's metadata, never a cache).
-        if super::conversion::adopted(self.marker, self.serves, key, &targets[0].1) {
+        if super::conversion::adopted(self.marker, self.writes_plaintext, key, &targets[0].1) {
             self.adoptions.add();
             return Visit::Adopted { bytes };
         }
