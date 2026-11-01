@@ -281,7 +281,7 @@ async fn write_during_the_job(node: &Node, bucket: &str, signal: &std::path::Pat
         assert_eq!(node.put(bucket, &format!("h-{i:02}.txt"), OLD).await, 200);
     }
     node.encrypt_bucket(bucket).await.expect("a conversion job");
-    // The walk is under way: 11 more objects at 300 ms each to go.
+    // The walk is under way: the job stalled at its first object.
     wait_stalled_at(signal, "h-00.txt").await;
     let status = node.bucket_status(bucket).await;
     assert!(!status["active"].is_null(), "the job still runs: {status}");
@@ -341,7 +341,11 @@ async fn minio_probes_the_quoted_if_match_form() {
 async fn a_gated_job_keeps_the_write_gate() {
     skip_unless_minio!();
     let bucket = new_minio_bucket("condnoncas").await;
-    let (_signal_dir, signal, seam) = stall_signal("before-write", 1);
+    // The job holds each object 5 s before its write, so the status read
+    // and the PUT land while the gate is armed. The objects run in
+    // parallel, so the per-object stall alone left a window of about one
+    // stall (300 ms), and a loaded host lost it: the PUT got 200.
+    let (_signal_dir, signal, seam) = stall_signal("before-write", 5000);
     let node = Node::minio(
         &bucket,
         &[
