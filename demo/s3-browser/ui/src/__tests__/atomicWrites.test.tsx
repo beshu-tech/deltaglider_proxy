@@ -96,6 +96,34 @@ test('the bucket card shows a read-only bucket in its row and in the open card',
   expect(within(alert).getByRole('button', { name: /Check again/ })).toBeInTheDocument();
 });
 
+test('a read-only bucket explains the missing atomic writes once, with one Check again', () => {
+  // The read-only alert already says why; the Encryption group must not
+  // add a second notice with its own Check again.
+  renderWithQuery(
+    <BucketCard
+      name="releases"
+      row={{ ...DEFAULT_ROW_FIELDS, public_prefixes: [], _id: 'r1', name: 'releases' }}
+      real
+      expanded
+      onToggle={() => {}}
+      backends={[]}
+      defaultBackend="b2"
+      originBackend="b2"
+      effectiveEncryption={bucketKeyEff({ backend: 'b2', capability: NON_CAS })}
+      readOnly="Bucket 'releases' is read-only: it is encrypted, and encryption needs atomic writes."
+      onEncryptionApplied={() => {}}
+      globalCompressionOn
+      globalRatio={0.75}
+      onPatch={() => {}}
+      onPrefixesChange={() => {}}
+      inputRadius={{ borderRadius: 6 }}
+    />,
+  );
+  expect(screen.getByTestId('bucket-read-only')).toBeInTheDocument();
+  expect(screen.queryByTestId('atomic-writes-missing')).toBeNull();
+  expect(screen.getAllByRole('button', { name: /Check again/ })).toHaveLength(1);
+});
+
 test('the synthesized single backend without atomic writes: the bucket card offers no bucket key', () => {
   // GET /config lists the synthesized `default` backend WITHOUT a verdict;
   // the server's answer for the bucket carries it (and drops proxy AES).

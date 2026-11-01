@@ -507,10 +507,9 @@ impl WriteBlock {
             ),
             Self::ReadOnly { backend } => format!(
                 "Bucket '{bucket}' is read-only: it is encrypted, and encryption needs atomic \
-                 writes, which backend '{backend}' does not support ({}). Reads keep working. \
-                 To write to it again, move the bucket to a backend with atomic writes with a \
-                 migrate job — see {CAPABILITY_DOC_URL}",
-                verdict_words(&CapabilityVerdict::NonCas)
+                 writes, which backend '{backend}' does not support (it ignored or rejected a \
+                 conditional write). Reads keep working. To write to it again, move the bucket \
+                 to a backend with atomic writes with a migrate job — see {CAPABILITY_DOC_URL}"
             ),
         }
     }

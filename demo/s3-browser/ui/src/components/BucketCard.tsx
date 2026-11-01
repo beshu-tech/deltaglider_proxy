@@ -825,6 +825,9 @@ export default function BucketCard({
                 backends.find((b) => b.name === effectiveEncryption?.backend)?.capability
               }
               blockedReason={encryptionBlockedReason}
+              // The read-only alert above already says why encryption has no
+              // atomic writes here: the group does not repeat it.
+              atomicNoticeShown={!!readOnly}
               onApplied={onEncryptionApplied}
             />
           )}

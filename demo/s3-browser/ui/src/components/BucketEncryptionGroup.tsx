@@ -85,6 +85,9 @@ interface Props {
    *  `capability`). Proxy encryption needs atomic writes: without them the
    *  choices that encrypt with the proxy are disabled, with the reason. */
   capability?: BackendCapabilityVerdict;
+  /** The card already shows the atomic-writes problem (the read-only
+   *  alert): do not show a second notice with its own Check again. */
+  atomicNoticeShown?: boolean;
 }
 
 const CHOICE_TITLE: Record<BucketEncryptionChoice, string> = {
@@ -95,7 +98,14 @@ const CHOICE_TITLE: Record<BucketEncryptionChoice, string> = {
   off: 'Off for this bucket',
 };
 
-export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onApplied, capability: capabilityProp }: Props) {
+export default function BucketEncryptionGroup({
+  bucket,
+  eff,
+  blockedReason,
+  onApplied,
+  capability: capabilityProp,
+  atomicNoticeShown = false,
+}: Props) {
   // The server's verdict of the bucket's own backend wins (N2 review).
   const capability = eff?.capability ?? capabilityProp;
   const colors = useColors();
@@ -317,7 +327,7 @@ export default function BucketEncryptionGroup({ bucket, eff, blockedReason, onAp
           {blockedReason}
         </Text>
       )}
-      {(atomic.kind === 'missing' || (editing && proxyChoice(rotating ? 'bucket-key' : selected))) && (
+      {!atomicNoticeShown && (atomic.kind === 'missing' || (editing && proxyChoice(rotating ? 'bucket-key' : selected))) && (
         <AtomicWritesNotice backend={eff.backend} capability={capability} proxyUnavailable={eff.proxy_unavailable} />
       )}
       <Radio.Group
