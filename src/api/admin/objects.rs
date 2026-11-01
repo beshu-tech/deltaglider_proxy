@@ -438,7 +438,11 @@ fn reject_if_replication_target_only(
     bucket: &str,
 ) -> Result<(), AdminError> {
     crate::api::handlers::object_helpers::check_client_write_allowed(&state.s3_state, bucket)
-        .map_err(|e| AdminError::forbidden(e.to_string()))
+        .map_err(|e| match e {
+            // The atomic-write check of an encrypted bucket still runs.
+            crate::api::errors::S3Error::SlowDown(m) => AdminError::unavailable(m),
+            e => AdminError::forbidden(e.to_string()),
+        })
 }
 
 pub async fn copy_objects(

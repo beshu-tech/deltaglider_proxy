@@ -400,7 +400,7 @@ impl BackendCheck {
             if let Some(why) = self
                 .buckets
                 .iter()
-                .find_map(|b| self.state.backend_capabilities.read_only_reason(b))
+                .find_map(|b| self.state.atomic_write_block(b).map(|w| w.message(b)))
             {
                 return Some(why);
             }

@@ -93,9 +93,19 @@ impl BackendCapabilityCache {
     }
 
     /// Install the encrypted-bucket plan of `config` (boot, and every
-    /// config transition) and wake the atomicity watch.
+    /// config transition) and wake the atomicity watch. A backend whose
+    /// verdict needs no request gets it here, at once: a filesystem
+    /// backend has atomic writes (the test seam
+    /// `DGP_TEST_FORCE_NONCAS_BACKEND` makes it non-CAS), so its buckets
+    /// never wait for the watch.
     pub fn set_encrypted_plan(&self, config: &crate::config::Config) {
-        *self.encrypted.write() = super::atomicity::EncryptedPlan::of(config);
+        let plan = super::atomicity::EncryptedPlan::of(config);
+        for (name, def) in plan.backends() {
+            if let Some(v) = super::atomicity::static_verdict(&name, &def) {
+                self.set(&name, &def, v);
+            }
+        }
+        *self.encrypted.write() = plan;
         self.plan_changed.notify_one();
     }
 
@@ -104,35 +114,35 @@ impl BackendCapabilityCache {
         self.encrypted.read().clone()
     }
 
-    /// THE read-only rule (N2): why every write to `bucket` is refused now,
-    /// or `None`. A bucket that encrypts with the proxy needs atomic writes
-    /// on its backend; while that backend's verdict (for its current
-    /// definition) is non-CAS or unknown, the bucket serves reads only. No
-    /// verdict yet (the boot probe runs) refuses nothing. Memory only.
-    pub fn read_only_reason(&self, bucket: &str) -> Option<String> {
+    /// THE write rule of encrypted buckets (N2): why a write to `bucket`
+    /// must not pass now, or `None`. A bucket that encrypts with the proxy
+    /// needs atomic writes on its backend (`held_by`: the backend that the
+    /// router found an unconfigured bucket on). For the backend's CURRENT
+    /// definition: no verdict yet → [`super::atomicity::WriteBlock::Pending`]
+    /// (fail closed while the probe runs); non-CAS or unknown →
+    /// [`super::atomicity::WriteBlock::ReadOnly`]; CAS → `None`. Memory only.
+    pub fn write_block(
+        &self,
+        bucket: &str,
+        held_by: Option<&str>,
+    ) -> Option<super::atomicity::WriteBlock> {
         let plan = self.encrypted.read();
-        let (backend, fp) = plan.backend_of(bucket)?;
+        let (backend, fp) = plan.backend_of(bucket, held_by)?;
         let verdict = self
             .verdicts
             .read()
             .get(backend)
             .filter(|(stored, _)| stored == fp)
-            .map(|(_, v)| v.clone())?;
-        super::atomicity::read_only_message(bucket, backend, &verdict)
+            .map(|(_, v)| v.clone());
+        super::atomicity::WriteBlock::of(backend, verdict)
     }
 
-    /// The buckets that [`Self::read_only_reason`] refuses now, by backend
-    /// (configured buckets; the default backend's unnamed buckets are not
-    /// listed).
-    pub fn read_only_buckets(&self) -> std::collections::BTreeMap<String, Vec<String>> {
-        let plan = self.encrypted.read().clone();
-        let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-        for (bucket, backend) in plan.buckets() {
-            if self.read_only_reason(&bucket).is_some() {
-                out.entry(backend).or_default().push(bucket);
-            }
-        }
-        out
+    /// Why `bucket` is read-only now ([`Self::write_block`], the
+    /// read-only case only), or `None`.
+    pub fn read_only_reason(&self, bucket: &str, held_by: Option<&str>) -> Option<String> {
+        self.write_block(bucket, held_by)
+            .filter(super::atomicity::WriteBlock::is_read_only)
+            .map(|b| b.message(bucket))
     }
 
     /// Snapshot for the admin backends API (name → verdict).

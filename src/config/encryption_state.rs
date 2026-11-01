@@ -533,12 +533,12 @@ impl Config {
                 }
             }
         }
-        let nd = self.default_backend_name();
-        let default = self
+        let sites = self
             .backend_sites()
-            .get(&nd)
-            .is_some_and(|s| proxy(&s.write))
-            .then_some(nd);
+            .into_iter()
+            .filter(|(_, s)| proxy(&s.write))
+            .map(|(n, _)| n)
+            .collect();
         ProxyEncryptedStorage {
             configured: self
                 .buckets
@@ -546,7 +546,8 @@ impl Config {
                 .map(|b| b.to_ascii_lowercase())
                 .collect(),
             buckets,
-            default,
+            default_backend: self.default_backend_name(),
+            sites,
         }
     }
 }
@@ -573,29 +574,35 @@ pub struct ProxyEncryptedStorage {
     /// Configured bucket (lowercase) that encrypts with the proxy → its
     /// backend.
     pub buckets: std::collections::BTreeMap<String, String>,
-    /// The default backend, when the buckets the config does not name
-    /// encrypt with the proxy there.
-    pub default: Option<String>,
+    /// Where a bucket that the config does not name goes when no listing
+    /// placed it on another backend.
+    pub default_backend: String,
+    /// The backends whose own site encrypts with the proxy: every bucket
+    /// that the config does not name on them encrypts.
+    pub sites: std::collections::BTreeSet<String>,
 }
 
 impl ProxyEncryptedStorage {
     /// The backend whose atomic writes `bucket` needs, or `None` when the
-    /// bucket does not encrypt with the proxy.
-    pub fn backend_of(&self, bucket: &str) -> Option<&str> {
+    /// bucket does not encrypt with the proxy. `held_by`: the backend that
+    /// the storage listing or the router found the bucket on (a bucket that
+    /// the config does not name may live on a backend other than the
+    /// default); a configured bucket ignores it.
+    pub fn backend_of(&self, bucket: &str, held_by: Option<&str>) -> Option<&str> {
         let key = bucket.to_ascii_lowercase();
         if self.configured.contains(&key) {
-            self.buckets.get(&key).map(String::as_str)
-        } else {
-            self.default.as_deref()
+            return self.buckets.get(&key).map(String::as_str);
         }
+        let backend = held_by.unwrap_or(&self.default_backend);
+        self.sites.get(backend).map(String::as_str)
     }
 
     /// Every backend that stores a bucket that encrypts with the proxy.
     pub fn backends(&self) -> std::collections::BTreeSet<&str> {
         self.buckets
             .values()
+            .chain(&self.sites)
             .map(String::as_str)
-            .chain(self.default.as_deref())
             .collect()
     }
 }

@@ -342,8 +342,9 @@ A bucket that encrypts with the proxy, on a backend whose verdict is `non-cas` o
 | Metadata backfill (`POST /_/api/admin/jobs/backfill-metadata`) | `403` |
 | Re-encrypt to a proxy key (`POST /_/api/admin/jobs/reencrypt`) | `409` with `atomic_writes` |
 | Replication and lifecycle writes into the bucket, delete jobs that already run | They wait. A replication run-now answers `409` with the reason. |
+| S3 `CreateBucket` of a bucket that would encrypt with the proxy on such a backend (a bucket without a policy inherits the encryption of its backend) | `403 AccessDenied`; the proxy does not create the bucket |
 
-The `403` is `AccessDenied` because the refusal comes from the configuration, not from a temporary state. An S3 client retries a `503`, and it must not retry this refusal. S3 has no error code for a read-only bucket. The message names the bucket, the backend and the reason:
+The `403` is `AccessDenied` because the refusal comes from the configuration, not from a temporary state. An S3 client retries a `503`, and it must not retry this refusal. S3 has no error code for a read-only bucket. A refused `CreateBucket` also gets `403`, not `409`: clients read a `409` on `CreateBucket` as "the bucket already exists" and go on as if it were there. The message of a refused `CreateBucket` ends with `[atomic_writes: backend=<name>, probe=<verdict>]`. The message names the bucket, the backend and the reason:
 
 > Bucket 'releases' is read-only: it is encrypted, and encryption needs atomic writes, which backend 'aws-dr' does not provide (Backblaze-like: the backend ignored or rejected a conditional write). Reads keep working. To write to it again, move the bucket to a backend with atomic writes with a migrate job — see https://deltaglider.com/docs/how-to/backend-capability-validation
 
@@ -351,12 +352,13 @@ A migrate job out of a read-only bucket is allowed. It is the way to make the bu
 
 The proxy gets the verdicts in the background:
 
-- At boot, it probes every backend that holds a bucket that encrypts with the proxy. The boot does not wait for these probes. While a backend has no verdict for its current definition, its buckets stay writable.
-- After a config change, it probes a backend that has no verdict yet.
+- At boot, it starts the probe of every backend that holds a bucket that encrypts with the proxy at once, all backends at the same time. The boot waits up to 3 seconds for them, so a backend with atomic writes is usually verified before the proxy serves. A slower probe does not hold the start.
+- After a config change, it probes a backend that has no verdict yet for its current definition.
+- While a backend has no verdict, the writes to its encrypted buckets fail closed: they get `503 SlowDown` with a message that says that the atomic-write check is still running. S3 clients retry a `503`. Reads are never blocked. When the verdict arrives, the writes go through (CAS) or the buckets become read-only (`non-cas`, `unknown`). A filesystem backend gets its verdict at once, without a request, so its buckets never wait.
 - While a verdict is `non-cas` or `unknown`, it probes the backend again every 10 minutes.
 - It logs each change of the read-only set: a warning that names the read-only buckets, and an info line when they are writable again.
 
-**Check again** on the backend card (`POST /_/api/admin/backends/:name/capability-probe`) runs a fresh probe at once. When the backend now proves atomic writes, its encrypted buckets become writable at once, without a restart. The admin views show the state: `GET /_/api/admin/backends` lists `read_only_buckets` for each backend, and `GET /_/api/admin/buckets` has a `read_only` reason on each read-only bucket. A bucket that the config does not name, on a default backend that encrypts with a proxy key, is also read-only, but `read_only_buckets` lists only the configured buckets.
+**Check again** on the backend card (`POST /_/api/admin/backends/:name/capability-probe`) runs a fresh probe at once. When the backend now proves atomic writes, its encrypted buckets become writable at once, without a restart. The admin views show the state: `GET /_/api/admin/backends` lists `read_only_buckets` for each backend, and `GET /_/api/admin/buckets` has a `read_only` reason on each read-only bucket. Both list every read-only bucket that the storage listing shows, also a bucket without a policy that inherits the encryption of its backend.
 
 ## Key check value
 

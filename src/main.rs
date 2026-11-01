@@ -898,7 +898,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .write_refusal(bucket)
                     // An encrypted bucket on a backend without atomic
                     // writes is read-only (N2): background writers wait.
-                    .or_else(|| s.backend_capabilities.read_only_reason(bucket))
+                    .or_else(|| s.atomic_write_block(bucket).map(|b| b.message(bucket)))
             })
         }));
     }
@@ -906,7 +906,23 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // proxy-encrypted buckets in the background (boot does not wait); a
     // bucket on a backend without them serves reads only.
     backend_capabilities.set_encrypted_plan(&config);
-    deltaglider_proxy::coordination::atomicity::spawn_watch(state.clone(), shared_config.clone());
+    let first_round = deltaglider_proxy::coordination::atomicity::spawn_watch(
+        state.clone(),
+        shared_config.clone(),
+    );
+    // Writes to an encrypted bucket fail closed (503) until its backend
+    // has a verdict. The probe started at once; wait a short, bounded time
+    // so a CAS backend is verified before anything serves. A slow backend
+    // does not hold the start: its buckets answer 503 until the probe ends.
+    if tokio::time::timeout(std::time::Duration::from_secs(3), first_round)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "encryption: the atomic-write probe of a backend of encrypted buckets is still \
+             running; writes to those buckets answer 503 until it ends"
+        );
+    }
     if deltaglider_proxy::config::env_bool("DGP_BOOT_PLAINTEXT_CHECK", true) {
         startup::spawn_plaintext_refusal_check(&state, &config);
     }

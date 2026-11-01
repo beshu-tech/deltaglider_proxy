@@ -71,6 +71,11 @@ pub struct TestSeams {
     /// only on backends with atomic writes (N2), so the gate tests (whose
     /// mechanics a decrypt job on a backend without them uses) need it.
     pub keep_write_gate: bool,
+    /// `DGP_TEST_ATOMICITY_PROBE_DELAY_MS`: every atomicity probe sleeps
+    /// this long first, and a filesystem backend gets its verdict from the
+    /// (delayed) probe too, so a test sees the window before the first
+    /// verdict.
+    pub atomicity_probe_delay_ms: u64,
 }
 
 impl TestSeams {
@@ -110,6 +115,8 @@ impl TestSeams {
             rewrite_stall_ms: lookup_parse(env, "DGP_TEST_REWRITE_STALL_MS").unwrap_or(0),
             rewrite_lock_stall_ms: lookup_parse(env, "DGP_TEST_REWRITE_LOCK_STALL_MS").unwrap_or(0),
             keep_write_gate: lookup_parse(env, "DGP_TEST_KEEP_WRITE_GATE").unwrap_or(false),
+            atomicity_probe_delay_ms: lookup_parse(env, "DGP_TEST_ATOMICITY_PROBE_DELAY_MS")
+                .unwrap_or(0),
         }
     }
 }

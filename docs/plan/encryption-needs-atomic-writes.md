@@ -118,7 +118,7 @@ Status: approved by the owner 2026-10-31 (decisions below are his).
   Unknown → `FailedTransient`, NonCas → `Failed`.
 - **Read-only.** `BackendCapabilityCache` holds the `EncryptedPlan`; `read_only_reason(bucket)`
   = plan backend × verdict of its current definition (non-CAS / unknown → reason; no verdict
-  yet → writable). Enforced by `check_client_write_allowed` (403 AccessDenied: the refusal is
+  yet → pending, see review fixes below). Enforced by `check_client_write_allowed` (403 AccessDenied: the refusal is
   configuration, not transient, so a client must not retry it as it would a 503; S3 has no
   read-only code; the same code as `replication_target_only`), so every caller of it (s3s
   PUT/DELETE/DeleteObjects/multipart create+complete/copy ×2/DeleteBucket, form POST, admin
@@ -144,6 +144,26 @@ Status: approved by the owner 2026-10-31 (decisions below are his).
   time at or before the Unix epoch as stale (buckets and objects). 0 of 30 after.
 - **Deviations.** No source guard existed for the `replication_target_only` call sites (none
   added). PATCH /config has no encryption fields (n/a). A re-encrypt run start trusts a cached
-  CAS verdict. An S3 CreateBucket on a default backend that encrypts with the proxy is not
-  refused (the bucket is read-only at once). Buckets the config does not name, on such a default
-  backend, are read-only but not listed in `read_only_buckets`.
+  CAS verdict.
+
+## As built: N2 review fixes (2026-11-01)
+
+- **Fail closed before the first verdict.** `BackendCapabilityCache::write_block(bucket,
+  held_by)` → `WriteBlock::{Pending, ReadOnly}`; one `AppState::atomic_write_block` passes the
+  backend the router resolved. Pending (no verdict for the backend's current definition) →
+  `503 SlowDown` ("the atomic-write check is still running"); background writers and jobs wait
+  on the same rule. A filesystem backend gets its verdict with the plan
+  (`atomicity::static_verdict`), so it never waits. The watch probes every due backend at once
+  (concurrently) and signals its first round; the boot waits for it up to 3 s. Seam:
+  `DGP_TEST_ATOMICITY_PROBE_DELAY_MS` (every probe sleeps first; filesystem verdicts come from
+  the probe then).
+- **CreateBucket.** The s3s `create_bucket` asks the same rule: a bucket that would encrypt
+  with the proxy on a backend without atomic writes is not created, `403 AccessDenied` (not
+  409: clients read 409 on CreateBucket as already-exists and go on) with
+  `[atomic_writes: backend=…, probe=…]` in the message; pending → 503. The admin create path
+  already refused with a fresh probe.
+- **Every read-only bucket listed.** `ProxyEncryptedStorage` keeps every backend whose own site
+  encrypts with the proxy (`sites`) and resolves a bucket without a policy on the backend that
+  held it (`held_by`, else the default). `atomicity::read_only_buckets(app)` lists the
+  configured ones and every bucket of the storage listing; GET /backends, the capability probe
+  answer, the bucket view and the watch log use it.

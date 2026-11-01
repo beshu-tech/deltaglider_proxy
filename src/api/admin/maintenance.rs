@@ -325,8 +325,12 @@ pub async fn start_backfill(
         }
         // A backfill rewrites metadata in place: an encrypted bucket on a
         // backend without atomic writes is read-only (N2).
-        if let Some(reason) = state.s3_state.backend_capabilities.read_only_reason(&key) {
-            return Err(AdminError::forbidden(reason));
+        match state.s3_state.atomic_write_block(&key) {
+            Some(b @ crate::coordination::atomicity::WriteBlock::Pending { .. }) => {
+                return Err(AdminError::unavailable(b.message(&key)))
+            }
+            Some(b) => return Err(AdminError::forbidden(b.message(&key))),
+            None => {}
         }
         match crate::maintenance::conversion::marker_exists(&engine, &key).await {
             Ok(false) => {}

@@ -338,18 +338,20 @@ fn object_created_event(
 ///
 /// The same gate refuses every client write to a bucket that encrypts with
 /// the proxy on a backend without proven atomic writes (N2,
-/// `BackendCapabilityCache::read_only_reason`): reads keep working. 403
+/// `BackendCapabilityCache::write_block`): reads keep working. 403
 /// AccessDenied, like the marker above: the refusal is the operator's
 /// configuration, not a transient state, so a client must not retry it
 /// (a 503 would be retried), and S3 has no "read-only bucket" code. The
 /// background writers ask the same rule through the maintenance gate's
-/// `write_blocked`.
+/// `write_blocked`. Before the backend's first verdict (boot, a config
+/// change) the same gate answers 503 SlowDown: it fails closed, and S3
+/// clients retry.
 pub(crate) fn check_client_write_allowed(
     state: &Arc<AppState>,
     bucket: &str,
 ) -> Result<(), S3Error> {
-    if let Some(reason) = state.backend_capabilities.read_only_reason(bucket) {
-        return Err(S3Error::AccessDeniedReason(reason));
+    if let Some(block) = state.atomic_write_block(bucket) {
+        return Err(block.to_s3_error(bucket, false));
     }
     let engine = state.engine.load();
     // Blocks the configured marked name AND an unconfigured name that resolves

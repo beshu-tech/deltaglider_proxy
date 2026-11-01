@@ -128,6 +128,18 @@ pub(super) async fn create_bucket(
     // creatable (that's how a replication target is bootstrapped). The
     // marker gates OBJECT writes and bucket DELETION; a bare CreateBucket
     // corrupts nothing (an existing bucket returns BucketAlreadyOwnedByYou).
+    //
+    // Encryption needs atomic writes (N2): a bucket that would encrypt with
+    // the proxy on a backend without proven atomic writes is NOT created
+    // (it would be read-only from birth): 403 AccessDenied with the
+    // backend, the probe result and the doc link. Not a 409: clients and
+    // tools read a 409 on CreateBucket as BucketAlreadyExists /
+    // BucketAlreadyOwnedByYou and go on as if the bucket were there. A 403
+    // is final for every SDK and is what writes to such a bucket get.
+    // Before the backend's first verdict: 503 SlowDown (retried).
+    if let Some(block) = svc.state.atomic_write_block(&bucket) {
+        return Err(block.to_s3_error(&bucket, true).into());
+    }
     svc.state.engine.load().create_bucket(&bucket).await?;
     Ok(s3s::S3Response::new(s3s::dto::CreateBucketOutput {
         location: Some(format!("/{bucket}")),

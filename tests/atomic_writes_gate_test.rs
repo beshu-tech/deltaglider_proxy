@@ -670,3 +670,129 @@ async fn check_again_lifts_read_only_when_the_backend_has_atomic_writes() {
     assert!(env.bucket_view("atomlift").await["read_only"].is_null());
     assert_eq!(env.put("atomlift", "x.txt").await, 200, "writable again");
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Review gaps: fail closed before the first verdict; CreateBucket; every
+// read-only bucket listed
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Before the backend of an encrypted bucket has its first verdict (here
+/// the probe takes 8 s; the boot waits 3 s for it), a write gets `503
+/// SlowDown` that says the check runs; a read is served. Once the verdict
+/// (CAS) exists, the same write is stored.
+#[tokio::test]
+async fn writes_wait_with_503_until_the_first_verdict() {
+    let mut env = Env::new("atompend", &[]).await;
+    let (code, v) = env
+        .storage(
+            json!({ "buckets": { "atompend": { "encryption": aes() } } }),
+            false,
+        )
+        .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(env.put("atompend", "a.txt").await, 200);
+    env.server
+        .respawn_with_env(&[("DGP_TEST_ATOMICITY_PROBE_DELAY_MS", "8000")])
+        .await;
+    env.admin = admin_http_client(&env.ep()).await;
+
+    let r = env
+        .server
+        .http()
+        .put(format!("{}/atompend/b.txt", env.ep()))
+        .body(b"x".to_vec())
+        .send()
+        .await
+        .unwrap();
+    let code = r.status().as_u16();
+    let text = r.text().await.unwrap();
+    assert_eq!(code, 503, "fail closed before the first verdict: {text}");
+    assert!(
+        text.contains("SlowDown") && text.contains("still running"),
+        "{text}"
+    );
+    let r = env
+        .server
+        .http()
+        .get(format!("{}/atompend/a.txt", env.ep()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200, "reads are never blocked");
+
+    let mut stored = 0;
+    for _ in 0..200 {
+        stored = env.put("atompend", "b.txt").await;
+        if stored == 200 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(stored, 200, "writable once the verdict (CAS) exists");
+}
+
+/// The whole default backend encrypts (its own site, so buckets without a
+/// policy inherit it), then the proxy restarts where the backend has no
+/// atomic writes.
+async fn backend_wide_read_only(name: &str) -> Env {
+    let mut env = Env::new(name, &[]).await;
+    let (code, v) = env
+        .storage(json!({ "backend_encryption": aes() }), false)
+        .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(env.put(name, "a.txt").await, 200);
+    env.server.respawn_with_env(&[FORCED]).await;
+    env.admin = admin_http_client(&env.ep()).await;
+    env
+}
+
+/// S3 CreateBucket of a bucket that would inherit the proxy encryption of
+/// a backend without atomic writes: 403 AccessDenied (not a 409, which
+/// clients read as "already exists"), with the backend and the probe
+/// result in the message; no bucket is created.
+#[tokio::test]
+async fn s3_create_bucket_that_would_be_read_only_is_refused() {
+    let env = backend_wide_read_only("atomcrs3").await;
+    env.wait_read_only("atomcrs3").await;
+    let c = env.server.s3_client().await;
+    let err = c
+        .create_bucket()
+        .bucket("atomcrs3new")
+        .send()
+        .await
+        .expect_err("CreateBucket refused");
+    assert_eq!(err.meta().code(), Some("AccessDenied"), "{err:?}");
+    let m = err.meta().message().unwrap_or("");
+    assert!(
+        m.contains("cannot be created")
+            && m.contains("backend 'default'")
+            && m.contains("probe=non-cas")
+            && m.contains(DOC),
+        "{m}"
+    );
+    assert!(
+        !env.server.data_dir().unwrap().join("atomcrs3new").exists(),
+        "no bucket was created"
+    );
+    assert!(c.head_bucket().bucket("atomcrs3new").send().await.is_err());
+}
+
+/// `read_only_buckets` of the backend and the bucket view list a bucket
+/// without a policy that inherits the backend's encryption.
+#[tokio::test]
+async fn read_only_buckets_list_buckets_without_a_policy() {
+    let env = backend_wide_read_only("atomnopol").await;
+    let v = env.wait_read_only("atomnopol").await;
+    assert!(
+        v["read_only"].as_str().unwrap().contains("read-only"),
+        "{v}"
+    );
+    let (_, v) = send(env.admin.get(format!("{}/_/api/admin/backends", env.ep()))).await;
+    let ro = v["backends"][0]["read_only_buckets"].clone();
+    assert!(
+        ro.as_array()
+            .is_some_and(|a| a.iter().any(|b| b == "atomnopol")),
+        "the bucket without a policy is listed: {v}"
+    );
+    assert_eq!(env.put("atomnopol", "x.txt").await, 403);
+}

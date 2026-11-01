@@ -162,6 +162,8 @@ fn build_backend_config(req: &CreateBackendRequest) -> Result<BackendConfig, Str
 /// backend go?" moment. The same synthesis also lives in
 /// `GET /config`'s `backends[]` projection; both endpoints now agree.
 pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    // Backend I/O (the bucket listing) before the config read lock.
+    let mut read_only = crate::coordination::atomicity::read_only_buckets(&state.s3_state).await;
     let cfg = state.config.read().await;
     let mut backends: Vec<super::config::BackendInfoResponse> = if cfg.backends.is_empty() {
         vec![super::config::BackendInfoResponse::synthesized_default(
@@ -179,7 +181,6 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
     // Stamp connectivity/auth health (boot probe + re-probe loop) — drives
     // the panel's health column. Absent = never probed (probe off).
     let health = state.s3_state.backend_health.snapshot();
-    let mut read_only = state.s3_state.backend_capabilities.read_only_buckets();
     for b in &mut backends {
         b.capability = verdicts
             .get(&b.name)
@@ -261,7 +262,10 @@ pub async fn probe_backend_capability(
         backend: name.clone(),
         probe_result: crate::coordination::atomicity::verdict_words(&verdict),
         capability: verdict,
-        read_only_buckets: cache.read_only_buckets().remove(&name).unwrap_or_default(),
+        read_only_buckets: crate::coordination::atomicity::read_only_buckets(&state.s3_state)
+            .await
+            .remove(&name)
+            .unwrap_or_default(),
     }))
 }
 
@@ -353,7 +357,7 @@ pub async fn list_bucket_origins(
                 read_only: state
                     .s3_state
                     .backend_capabilities
-                    .read_only_reason(&bucket.name),
+                    .read_only_reason(&bucket.name, bucket.backend_name.as_deref()),
                 name: bucket.name,
                 creation_date: bucket.creation_date.map(|d| d.to_rfc3339()),
                 backend_name,
