@@ -325,12 +325,8 @@ pub async fn start_backfill(
         }
         // A backfill rewrites metadata in place: an encrypted bucket on a
         // backend without atomic writes is read-only (N2).
-        match state.s3_state.atomic_write_block(&key) {
-            Some(b @ crate::coordination::atomicity::WriteBlock::Pending { .. }) => {
-                return Err(AdminError::unavailable(b.message(&key)))
-            }
-            Some(b) => return Err(AdminError::forbidden(b.message(&key))),
-            None => {}
+        if let Some(b) = state.s3_state.atomic_write_block(&key).await {
+            return Err(AdminError::write_block(&b, &key));
         }
         match crate::maintenance::conversion::marker_exists(&engine, &key).await {
             Ok(false) => {}
@@ -551,14 +547,7 @@ pub async fn start_migrate(
             &flipped,
             &state.s3_state.backend_capabilities,
         )
-        .await
-        .map_err(|r| {
-            AdminError::coded(
-                crate::coordination::atomicity::ATOMIC_WRITES_REQUIRED,
-                StatusCode::CONFLICT,
-                r.message(),
-            )
-        })?;
+        .await?;
     }
 
     // A backend that the health loop gates would fail every copy: refuse

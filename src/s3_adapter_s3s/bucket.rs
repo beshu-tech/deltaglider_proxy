@@ -137,7 +137,7 @@ pub(super) async fn create_bucket(
     // BucketAlreadyOwnedByYou and go on as if the bucket were there. A 403
     // is final for every SDK and is what writes to such a bucket get.
     // Before the backend's first verdict: 503 SlowDown (retried).
-    if let Some(block) = svc.state.atomic_write_block(&bucket) {
+    if let Some(block) = svc.state.atomic_write_block(&bucket).await {
         return Err(block.to_s3_error(&bucket, true).into());
     }
     svc.state.engine.load().create_bucket(&bucket).await?;
@@ -153,7 +153,7 @@ pub(super) async fn delete_bucket(
     let bucket = req.input.bucket;
     // A client must not delete a replication mirror (an object-empty or
     // freshly-marked destination would otherwise be destructible).
-    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &bucket)?;
+    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &bucket).await?;
     let engine = svc.state.engine.load();
 
     // Check object emptiness first: only visible objects are hard blockers.

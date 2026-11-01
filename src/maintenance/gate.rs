@@ -397,11 +397,11 @@ impl BackendCheck {
             return Some(why);
         }
         if self.read_only_waits {
-            if let Some(why) = self
-                .buckets
-                .iter()
-                .find_map(|b| self.state.atomic_write_block(b).map(|w| w.message(b)))
-            {
+            if let Some(why) = self.buckets.iter().find_map(|b| {
+                self.state
+                    .atomic_write_block_now(b)
+                    .map(|w| w.admin_message(b))
+            }) {
                 return Some(why);
             }
         }

@@ -41,23 +41,38 @@ pub enum CapabilityVerdict {
     Unknown { reason: String },
 }
 
-/// Thread-safe backend-name → verdict map, `Arc`-shared into `AppState`.
+/// Thread-safe verdict map, indexed by backend NAME and DEFINITION,
+/// `Arc`-shared into `AppState`.
 ///
 /// Entries carry a FINGERPRINT of the `BackendConfig` they were probed
 /// against: a hot-apply that redefines a backend (new endpoint, rotated
 /// credentials) under the same name misses the cache and re-probes — a stale
 /// `CasVerified` must never vouch for a swapped-out endpoint, and a stale
-/// `NonCas` must never lock out a fixed one.
+/// `NonCas` must never lock out a fixed one. A name keeps the verdicts of
+/// up to [`DEFINITIONS_PER_NAME`] definitions, so probing a CANDIDATE
+/// definition (a validate or a refused apply with rotated credentials)
+/// never evicts the verdict of the RUNNING one.
 #[derive(Debug, Default)]
 pub struct BackendCapabilityCache {
-    verdicts: parking_lot::RwLock<HashMap<String, (String, CapabilityVerdict)>>,
+    /// Name → (definition fingerprint, verdict), oldest first.
+    verdicts: parking_lot::RwLock<HashMap<String, Vec<(String, CapabilityVerdict)>>>,
+    /// Name → fingerprint of the running definition (from the last
+    /// [`Self::set_encrypted_plan`]): never evicted.
+    running: parking_lot::RwLock<HashMap<String, String>>,
     /// Which buckets encrypt with the proxy, on which backend, by the
     /// running config ([`super::atomicity`]): the read-only rule.
     encrypted: parking_lot::RwLock<super::atomicity::EncryptedPlan>,
     /// Wakes the atomicity watch ([`super::atomicity::spawn_watch`]) after
-    /// a config change.
+    /// a config change, and after the verdict of a running definition
+    /// changes (the watch logs the new read-only set).
     pub(crate) plan_changed: tokio::sync::Notify,
+    /// The storage wrappers' view of the backends without proven atomic
+    /// writes ([`crate::storage::AtomicityGate`]), kept current here.
+    storage_gate: std::sync::OnceLock<std::sync::Arc<crate::storage::AtomicityGate>>,
 }
+
+/// How many definitions of one backend name keep a verdict.
+const DEFINITIONS_PER_NAME: usize = 4;
 
 /// In-memory identity of a backend definition (includes credentials — never
 /// persisted or exposed; a credential rotation deliberately re-probes).
@@ -66,16 +81,91 @@ pub(crate) fn fingerprint(config: &crate::config::BackendConfig) -> String {
     serde_json::to_string(config).unwrap_or_default()
 }
 
+/// Pure: the verdict to keep when a probe of the same definition answers
+/// `new` over `old`. `Unknown` is not evidence: it never replaces a proven
+/// `CasVerified` or `NonCas` (a transient network error must not make a
+/// CAS backend's buckets wait, nor lift a non-CAS one's read-only state).
+pub fn merged_verdict(
+    old: Option<&CapabilityVerdict>,
+    new: CapabilityVerdict,
+) -> CapabilityVerdict {
+    match (old, &new) {
+        (
+            Some(old @ (CapabilityVerdict::CasVerified { .. } | CapabilityVerdict::NonCas)),
+            CapabilityVerdict::Unknown { .. },
+        ) => old.clone(),
+        _ => new,
+    }
+}
+
 impl BackendCapabilityCache {
+    /// Store the verdict of `backend` under definition `config`
+    /// ([`merged_verdict`] with the one it had). Returns the verdict kept.
     pub fn set(
         &self,
         backend: &str,
         config: &crate::config::BackendConfig,
         verdict: CapabilityVerdict,
-    ) {
-        self.verdicts
-            .write()
-            .insert(backend.to_string(), (fingerprint(config), verdict));
+    ) -> CapabilityVerdict {
+        let fp = fingerprint(config);
+        let running = self.running.read().get(backend).cloned();
+        let (kept, changed) = {
+            let mut map = self.verdicts.write();
+            let entries = map.entry(backend.to_string()).or_default();
+            let old = entries
+                .iter()
+                .position(|(f, _)| *f == fp)
+                .map(|i| entries.remove(i).1);
+            let kept = merged_verdict(old.as_ref(), verdict);
+            let changed = old.as_ref() != Some(&kept);
+            entries.push((fp.clone(), kept.clone()));
+            while entries.len() > DEFINITIONS_PER_NAME {
+                // Oldest first, never the running definition.
+                match entries
+                    .iter()
+                    .position(|(f, _)| Some(f) != running.as_ref() && *f != fp)
+                {
+                    Some(i) => {
+                        entries.remove(i);
+                    }
+                    None => break,
+                }
+            }
+            (kept, changed)
+        };
+        if changed && running.as_deref() == Some(fp.as_str()) {
+            self.publish_unproven();
+            self.plan_changed.notify_one();
+        }
+        kept
+    }
+
+    /// Hand the storage wrappers' atomic-writes gate to this cache (boot,
+    /// once the engine exists): it is kept current from now on.
+    pub fn attach_storage_gate(&self, gate: std::sync::Arc<crate::storage::AtomicityGate>) {
+        let _ = self.storage_gate.set(gate);
+        self.publish_unproven();
+    }
+
+    /// Store in the storage gate the backends of the running plan whose
+    /// running definition has no CAS verdict.
+    fn publish_unproven(&self) {
+        let Some(gate) = self.storage_gate.get() else {
+            return;
+        };
+        let plan = self.encrypted.read().clone();
+        let unproven = plan
+            .backends()
+            .into_iter()
+            .filter(|(name, def)| {
+                !matches!(
+                    self.get(name, def),
+                    Some(CapabilityVerdict::CasVerified { .. })
+                )
+            })
+            .map(|(name, _)| name)
+            .collect();
+        gate.set_unproven(unproven);
     }
 
     /// Verdict for this backend NAME, only if it was established against this
@@ -85,20 +175,31 @@ impl BackendCapabilityCache {
         backend: &str,
         config: &crate::config::BackendConfig,
     ) -> Option<CapabilityVerdict> {
+        self.get_fp(backend, &fingerprint(config))
+    }
+
+    fn get_fp(&self, backend: &str, fp: &str) -> Option<CapabilityVerdict> {
         self.verdicts
             .read()
-            .get(backend)
-            .filter(|(fp, _)| *fp == fingerprint(config))
+            .get(backend)?
+            .iter()
+            .find(|(f, _)| f == fp)
             .map(|(_, v)| v.clone())
     }
 
-    /// Install the encrypted-bucket plan of `config` (boot, and every
-    /// config transition) and wake the atomicity watch. A backend whose
+    /// Install the running config: its backend definitions (their verdicts
+    /// are never evicted) and its encrypted-bucket plan (boot, and every
+    /// config transition), and wake the atomicity watch. A backend whose
     /// verdict needs no request gets it here, at once: a filesystem
     /// backend has atomic writes (the test seam
     /// `DGP_TEST_FORCE_NONCAS_BACKEND` makes it non-CAS), so its buckets
     /// never wait for the watch.
     pub fn set_encrypted_plan(&self, config: &crate::config::Config) {
+        *self.running.write() = config
+            .backends
+            .iter()
+            .map(|b| (b.name.clone(), fingerprint(&b.backend)))
+            .collect();
         let plan = super::atomicity::EncryptedPlan::of(config);
         for (name, def) in plan.backends() {
             if let Some(v) = super::atomicity::static_verdict(&name, &def) {
@@ -106,6 +207,7 @@ impl BackendCapabilityCache {
             }
         }
         *self.encrypted.write() = plan;
+        self.publish_unproven();
         self.plan_changed.notify_one();
     }
 
@@ -116,42 +218,35 @@ impl BackendCapabilityCache {
 
     /// THE write rule of encrypted buckets (N2): why a write to `bucket`
     /// must not pass now, or `None`. A bucket that encrypts with the proxy
-    /// needs atomic writes on its backend (`held_by`: the backend that the
-    /// router found an unconfigured bucket on). For the backend's CURRENT
-    /// definition: no verdict yet → [`super::atomicity::WriteBlock::Pending`]
-    /// (fail closed while the probe runs); non-CAS or unknown →
-    /// [`super::atomicity::WriteBlock::ReadOnly`]; CAS → `None`. Memory only.
+    /// needs atomic writes on the backend that holds it (`home`: where the
+    /// router sends the bucket's writes, see
+    /// [`crate::storage::BucketHome`]). For the backend's CURRENT
+    /// definition: no verdict yet or `Unknown` →
+    /// [`super::atomicity::WriteBlock::Pending`] (fail closed, retried);
+    /// non-CAS → [`super::atomicity::WriteBlock::ReadOnly`]; CAS → `None`.
+    /// A home that the router could not determine is judged against every
+    /// backend that could hold the bucket and encrypts: pending unless all
+    /// of them are CAS. Memory only.
     pub fn write_block(
         &self,
         bucket: &str,
-        held_by: Option<&str>,
+        home: &crate::storage::BucketHome,
     ) -> Option<super::atomicity::WriteBlock> {
         let plan = self.encrypted.read();
-        let (backend, fp) = plan.backend_of(bucket, held_by)?;
-        let verdict = self
-            .verdicts
-            .read()
-            .get(backend)
-            .filter(|(stored, _)| stored == fp)
-            .map(|(_, v)| v.clone());
-        super::atomicity::WriteBlock::of(backend, verdict)
+        let verdict = |backend: &str, fp: &str| self.get_fp(backend, fp);
+        plan.write_block(bucket, home, verdict)
     }
 
     /// Why `bucket` is read-only now ([`Self::write_block`], the
     /// read-only case only), or `None`.
-    pub fn read_only_reason(&self, bucket: &str, held_by: Option<&str>) -> Option<String> {
-        self.write_block(bucket, held_by)
+    pub fn read_only_reason(
+        &self,
+        bucket: &str,
+        home: &crate::storage::BucketHome,
+    ) -> Option<String> {
+        self.write_block(bucket, home)
             .filter(super::atomicity::WriteBlock::is_read_only)
-            .map(|b| b.message(bucket))
-    }
-
-    /// Snapshot for the admin backends API (name → verdict).
-    pub fn snapshot(&self) -> HashMap<String, CapabilityVerdict> {
-        self.verdicts
-            .read()
-            .iter()
-            .map(|(k, (_, v))| (k.clone(), v.clone()))
-            .collect()
+            .map(|b| b.admin_message(bucket))
     }
 }
 
@@ -189,7 +284,7 @@ pub fn client_writable_s3_backends(
         if matches!(backend, crate::config::BackendConfig::Filesystem { .. }) {
             continue;
         }
-        let real = policy.alias.clone().unwrap_or_else(|| bucket.clone());
+        let real = config.real_bucket_name(bucket);
         groups
             .entry(backend_name)
             .or_insert_with(|| ClientWritableGroup {
@@ -306,6 +401,17 @@ pub async fn establish_backend_verdict(
     group: &ClientWritableGroup,
     forced_noncas: &std::collections::BTreeSet<String>,
 ) -> CapabilityVerdict {
+    establish_backend_verdict_within(name, group, forced_noncas, PROBE_TIMEOUT).await
+}
+
+/// [`establish_backend_verdict`] bounded by `budget` (the rest of a
+/// caller's deadline).
+pub async fn establish_backend_verdict_within(
+    name: &str,
+    group: &ClientWritableGroup,
+    forced_noncas: &std::collections::BTreeSet<String>,
+    budget: std::time::Duration,
+) -> CapabilityVerdict {
     if forced_noncas.contains(name) {
         return CapabilityVerdict::NonCas;
     }
@@ -325,26 +431,24 @@ pub async fn establish_backend_verdict(
     };
     let probe_key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
     match tokio::time::timeout(
-        PROBE_TIMEOUT,
+        budget,
         super::cas_probe::probe_cas(&client, &group.probe_bucket, &probe_key),
     )
     .await
     {
         Err(_) => {
             // The timed-out future was cancelled mid-flight — possibly between
-            // its PUT and its cleanup delete. Sweep the probe object so a
-            // client-visible plaintext key is never leaked into a data bucket.
+            // its PUT and its cleanup. Sweep the probe key with ALL its
+            // versions (a versioned bucket, as every B2 bucket is, keeps a
+            // noncurrent version of an unversioned DELETE), so no
+            // client-visible key is left in a data bucket.
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                client
-                    .delete_object()
-                    .bucket(&group.probe_bucket)
-                    .key(&probe_key)
-                    .send(),
+                super::cas_probe::remove_all_versions(&client, &group.probe_bucket, &probe_key),
             )
             .await;
             CapabilityVerdict::Unknown {
-                reason: format!("capability probe timed out ({}s)", PROBE_TIMEOUT.as_secs()),
+                reason: format!("capability probe timed out ({}s)", budget.as_secs()),
             }
         }
         Ok(Ok(p)) if p.cas => CapabilityVerdict::CasVerified {
@@ -468,12 +572,8 @@ pub async fn migrate_target_capability_gate(
                 .effective_backend_for_bucket(b)
                 .is_some_and(|(n, _)| n == target_backend)
         })
-        .map(|(b, p)| p.alias.clone().unwrap_or_else(|| b.clone()))
-        .unwrap_or_else(|| {
-            policy
-                .and_then(|p| p.alias.clone())
-                .unwrap_or_else(|| bucket.to_string())
-        });
+        .map(|(b, _)| config.real_bucket_name(b))
+        .unwrap_or_else(|| config.real_bucket_name(bucket));
     let group = ClientWritableGroup {
         backend: target_def.clone(),
         buckets: vec![bucket.to_string()],
@@ -527,7 +627,115 @@ mod tests {
             },
         );
         assert_eq!(cache.get("b2", &b2), Some(CapabilityVerdict::NonCas));
-        assert_eq!(cache.snapshot().len(), 2);
+    }
+
+    /// C6: a probe that its deadline cuts short still removes EVERY
+    /// version of its key (B2 buckets are versioned: one plain DELETE
+    /// leaves noncurrent versions).
+    #[tokio::test]
+    async fn a_probe_cut_by_its_deadline_removes_every_version_of_its_key() {
+        use std::sync::atomic::Ordering;
+        let (endpoint, counts) = super::super::cas_probe::b2_like::start(true).await;
+        let group = ClientWritableGroup {
+            backend: s3_backend(&endpoint),
+            buckets: Vec::new(),
+            probe_bucket: "coord".into(),
+        };
+        let v = establish_backend_verdict_within(
+            "b2",
+            &group,
+            &Default::default(),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(v, CapabilityVerdict::Unknown { .. }), "{v:?}");
+        assert!(
+            counts.version_lists.load(Ordering::SeqCst) >= 1,
+            "the cleanup lists and deletes the key's versions"
+        );
+    }
+
+    /// `Unknown` never replaces a proven verdict of the same definition.
+    #[test]
+    fn unknown_never_replaces_a_proven_verdict() {
+        let cache = BackendCapabilityCache::default();
+        let d = s3_backend("https://b2.example");
+        let unknown = CapabilityVerdict::Unknown {
+            reason: "timeout".into(),
+        };
+        for proven in [
+            CapabilityVerdict::NonCas,
+            CapabilityVerdict::CasVerified {
+                via: VerifiedVia::Probe,
+            },
+        ] {
+            cache.set("b2", &d, proven.clone());
+            assert_eq!(cache.set("b2", &d, unknown.clone()), proven);
+            assert_eq!(cache.get("b2", &d), Some(proven));
+        }
+        let fresh = s3_backend("https://new.example");
+        assert_eq!(
+            cache.set("b2", &fresh, unknown.clone()),
+            unknown,
+            "no proof yet"
+        );
+    }
+
+    /// The storage wrappers learn which plan backends lack proven atomic
+    /// writes, and follow each verdict change of the running definition.
+    #[test]
+    fn the_storage_gate_follows_the_running_verdicts() {
+        let cfg = crate::config::Config::from_yaml_str(
+            "storage:\n  backends:\n    - name: b2\n      type: s3\n      \
+             endpoint: \"https://b2.example\"\n      region: us-east-1\n      \
+             access_key_id: k\n      secret_access_key: s\n      encryption: { mode: \
+             aes256-gcm-proxy, key: \"1111111111111111111111111111111111111111111111111111111111111111\", \
+             key_id: a }\n",
+        )
+        .unwrap();
+        let cache = BackendCapabilityCache::default();
+        let gate = std::sync::Arc::new(crate::storage::AtomicityGate::default());
+        cache.set_encrypted_plan(&cfg);
+        cache.attach_storage_gate(gate.clone());
+        assert!(gate.is_unproven("b2"), "no verdict yet");
+        let def = cfg.backend_by_name("b2").unwrap();
+        cache.set(
+            "b2",
+            def,
+            CapabilityVerdict::CasVerified {
+                via: VerifiedVia::Probe,
+            },
+        );
+        assert!(!gate.is_unproven("b2"));
+        cache.set("b2", def, CapabilityVerdict::NonCas);
+        assert!(gate.is_unproven("b2"));
+    }
+
+    /// Probes of many candidate definitions never evict the running one.
+    #[test]
+    fn candidate_definitions_never_evict_the_running_verdict() {
+        let cfg = crate::config::Config::from_yaml_str(
+            "storage:\n  backends:\n    - name: b2\n      type: s3\n      \
+             endpoint: \"https://b2.example\"\n      region: us-east-1\n      \
+             access_key_id: k\n      secret_access_key: s\n",
+        )
+        .unwrap();
+        let cache = BackendCapabilityCache::default();
+        cache.set_encrypted_plan(&cfg);
+        let running = cfg.backend_by_name("b2").unwrap().clone();
+        let cas = CapabilityVerdict::CasVerified {
+            via: VerifiedVia::Probe,
+        };
+        cache.set("b2", &running, cas.clone());
+        for i in 0..10 {
+            cache.set(
+                "b2",
+                &s3_backend(&format!("https://candidate-{i}.example")),
+                CapabilityVerdict::NonCas,
+            );
+        }
+        assert_eq!(cache.get("b2", &running), Some(cas));
+        assert!(cache.verdicts.read()["b2"].len() <= DEFINITIONS_PER_NAME);
     }
 
     #[test]

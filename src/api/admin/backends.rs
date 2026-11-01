@@ -164,6 +164,14 @@ fn build_backend_config(req: &CreateBackendRequest) -> Result<BackendConfig, Str
 pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     // Backend I/O (the bucket listing) before the config read lock.
     let mut read_only = crate::coordination::atomicity::read_only_buckets(&state.s3_state).await;
+    let encrypting: std::collections::HashSet<String> = state
+        .s3_state
+        .backend_capabilities
+        .encrypted_plan()
+        .backends()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
     let cfg = state.config.read().await;
     let mut backends: Vec<super::config::BackendInfoResponse> = if cfg.backends.is_empty() {
         vec![super::config::BackendInfoResponse::synthesized_default(
@@ -189,12 +197,19 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
         b.health = health.get(&b.name).cloned();
         let mut modes = cfg.bucket_encryption_modes(&b.name);
         // Without proven atomic writes, a bucket here cannot take proxy
-        // AES (N2): the create dialog must not offer it.
-        if b.capability.as_ref().is_some_and(|v| {
-            crate::coordination::atomicity::proxy_unavailable_reason(&b.name, v).is_some()
-        }) {
+        // AES (N2): the create dialog must not offer it, and says why.
+        b.proxy_unavailable = b
+            .capability
+            .as_ref()
+            .and_then(|v| crate::coordination::atomicity::proxy_unavailable_reason(&b.name, v));
+        if b.proxy_unavailable.is_some() {
             modes.retain(|m| *m != "aes256-gcm-proxy");
         }
+        b.capability_words = b
+            .capability
+            .as_ref()
+            .map(crate::coordination::atomicity::verdict_words);
+        b.atomic_writes_checking = b.capability.is_none() && encrypting.contains(&b.name);
         b.bucket_encryption_modes = Some(modes);
         b.read_only_buckets = read_only.remove(&b.name).unwrap_or_default();
     }
@@ -241,12 +256,7 @@ pub async fn probe_backend_capability(
         .buckets
         .into_iter()
         .find(|(_, b)| *b == name)
-        .map(|(bucket, _)| {
-            cfg.buckets
-                .get(&bucket)
-                .and_then(|p| p.alias.clone())
-                .unwrap_or(bucket)
-        });
+        .map(|(bucket, _)| cfg.real_bucket_name(&bucket));
     let verdict =
         crate::coordination::atomicity::probe_atomic_writes(&cfg, cache, &name, hint.as_deref())
             .await;
@@ -355,10 +365,13 @@ pub async fn list_bucket_origins(
             }
             BucketBackendOriginResponse {
                 effective_encryption,
-                read_only: state
-                    .s3_state
-                    .backend_capabilities
-                    .read_only_reason(&bucket.name, bucket.backend_name.as_deref()),
+                read_only: state.s3_state.backend_capabilities.read_only_reason(
+                    &bucket.name,
+                    &bucket.backend_name.clone().map_or(
+                        crate::storage::BucketHome::Default,
+                        crate::storage::BucketHome::Backend,
+                    ),
+                ),
                 name: bucket.name,
                 creation_date: bucket.creation_date.map(|d| d.to_rfc3339()),
                 backend_name,
@@ -459,11 +472,7 @@ pub async fn create_bucket_on_backend(
         .map(|_| ()),
         false => Ok(()),
     } {
-        return Err(AdminError::coded(
-            crate::coordination::atomicity::ATOMIC_WRITES_REQUIRED,
-            StatusCode::CONFLICT,
-            r.message(),
-        ));
+        return Err(r.into());
     }
     drop(probe);
 

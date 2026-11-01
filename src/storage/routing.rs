@@ -1533,6 +1533,38 @@ impl StorageBackend for RoutingBackend {
         previous_route_identity(bucket, route)
     }
 
+    async fn bucket_home(&self, bucket: &str) -> crate::storage::BucketHome {
+        use crate::storage::BucketHome;
+        if let Some(route) = self.routes.get(bucket) {
+            return BucketHome::Backend(route.backend_name.clone());
+        }
+        match self.resolver.resolve(bucket, Lookup::Cached).await {
+            (_, Probed::Failed(_)) => BucketHome::Undetermined,
+            (name, _) => BucketHome::Backend(name),
+        }
+    }
+
+    fn bucket_home_now(&self, bucket: &str) -> crate::storage::BucketHome {
+        use crate::storage::BucketHome;
+        if let Some(route) = self.routes.get(bucket) {
+            return BucketHome::Backend(route.backend_name.clone());
+        }
+        match self.resolver.cached(bucket) {
+            Some((name, _)) => BucketHome::Backend(name),
+            None => match self.resolver.stale_resolution(bucket) {
+                Some(name) => {
+                    self.resolver.refresh_in_background(bucket);
+                    BucketHome::Backend(name)
+                }
+                None => {
+                    // Resolve it for the next check (one shared probe).
+                    self.resolver.refresh_in_background(bucket);
+                    BucketHome::Undetermined
+                }
+            },
+        }
+    }
+
     fn resolved_backend_name(&self, bucket: &str) -> Option<String> {
         if let Some(route) = self.routes.get(bucket) {
             return Some(route.backend_name.clone());

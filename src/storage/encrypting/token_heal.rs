@@ -166,15 +166,17 @@ impl Miss {
     }
 }
 
-/// HEAD the stored object of `miss`, open its seal, and make and keep the
-/// listing token of exactly the listed stored object. `Ok(None)`: nothing
-/// to learn (not sealed, a key this proxy lacks, no ETag, or another
-/// object than the listed one: its sealed body size disagrees).
+/// HEAD the stored object of `miss`, open its seal, and make the listing
+/// token of exactly the listed stored object; `keep`: also store it on the
+/// object (never in a bucket whose writes are refused, N2). `Ok(None)`:
+/// nothing to learn (not sealed, a key this proxy lacks, no ETag, or
+/// another object than the listed one: its sealed body size disagrees).
 pub(super) async fn heal_one<B: StorageBackend>(
     inner: &B,
     cfg: &EncryptionConfig,
     bucket: &str,
     miss: &Miss,
+    keep: bool,
 ) -> Result<Option<ListedToken>, StorageError> {
     if bare_etag(&miss.stored_etag).is_empty() {
         return Ok(None);
@@ -215,7 +217,9 @@ pub(super) async fn heal_one<B: StorageBackend>(
         stored_etag: miss.stored_etag.clone(),
         stored_size: miss.stored_size,
     };
-    inner.keep_listing_token(bucket, &kept).await;
+    if keep {
+        inner.keep_listing_token(bucket, &kept).await;
+    }
     Ok(Some(kept))
 }
 
@@ -312,7 +316,7 @@ impl TokenHealer {
                 if !crate::shutdown::is_shutting_down() && !healer.paused() {
                     healer.state.tried.insert(key.clone(), ());
                     let cfg = config.load_full();
-                    match heal_one(&*inner, &cfg, &bucket, &miss).await {
+                    match heal_one(&*inner, &cfg, &bucket, &miss, true).await {
                         Ok(Some(_)) => count(HEALED),
                         Ok(None) => {}
                         // Deleted since the LIST: nothing to heal.

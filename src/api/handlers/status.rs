@@ -213,6 +213,27 @@ pub struct ReadinessResponse {
     /// (`GET /_/api/admin/encryption-witness`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_witness: Option<WitnessReadiness>,
+    /// The atomic-writes state of each backend that stores buckets which
+    /// encrypt with the proxy (`checking`: no verdict yet; `unverified`:
+    /// the check could not reach it; both answer writes to those buckets
+    /// with 503, retried. `supported`; `unsupported`: read-only buckets).
+    /// Informational: it never fails readiness, because reads and every
+    /// other bucket work, and the pending state ends on its own.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub atomic_writes: std::collections::BTreeMap<String, &'static str>,
+}
+
+/// Pure: the readiness word of an atomic-writes verdict.
+pub fn atomic_writes_word(
+    verdict: Option<&crate::coordination::CapabilityVerdict>,
+) -> &'static str {
+    use crate::coordination::CapabilityVerdict;
+    match verdict {
+        None => "checking",
+        Some(CapabilityVerdict::Unknown { .. }) => "unverified",
+        Some(CapabilityVerdict::CasVerified { .. }) => "supported",
+        Some(CapabilityVerdict::NonCas) => "unsupported",
+    }
 }
 
 /// The public part of the encryption witness verdict.
@@ -459,6 +480,17 @@ pub async fn readiness_check(
             encryption_witness: state.encryption_witness.as_ref().map(|w| WitnessReadiness {
                 status: w.status().status,
             }),
+            atomic_writes: state
+                .backend_capabilities
+                .encrypted_plan()
+                .backends()
+                .into_iter()
+                .map(|(name, def)| {
+                    let word =
+                        atomic_writes_word(state.backend_capabilities.get(&name, &def).as_ref());
+                    (name, word)
+                })
+                .collect(),
         }),
     )
 }

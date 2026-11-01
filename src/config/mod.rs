@@ -2075,6 +2075,16 @@ impl Config {
         })
     }
 
+    /// The name of `bucket` on its backend: the policy's `alias`, else the
+    /// bucket's own name (lowercase when a policy names it).
+    pub fn real_bucket_name(&self, bucket: &str) -> String {
+        let key = bucket.to_ascii_lowercase();
+        match self.buckets.get(&key) {
+            Some(policy) => policy.alias.clone().unwrap_or(key),
+            None => bucket.to_string(),
+        }
+    }
+
     /// `(name, definition)` of the backend a bucket routes to by config: its
     /// explicit route, else [`Self::default_backend_name`]. `None` = the route
     /// names an undefined backend. Every "which backend is this bucket on"

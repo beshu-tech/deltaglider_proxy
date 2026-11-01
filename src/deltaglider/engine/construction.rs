@@ -117,6 +117,7 @@ impl DynEngine {
                     crate::storage::EncryptingBackend::new(raw, slot)
                         .with_built(built)
                         .with_witness(&named.name, policies.witness_gate())
+                        .with_atomicity(policies.atomicity_gate())
                         .with_sentinel(policies.sentinel(&slot_key)),
                 );
                 backends.insert(named.name.clone(), Arc::new(wrapped));

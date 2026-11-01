@@ -1942,6 +1942,7 @@ pub(crate) fn spawn_plaintext_refusal_check(state: &Arc<AppState>, config: &Conf
                     // way out, never a re-encrypt that the backend refuses.
                     let non_atomic = state
                         .atomic_write_block(bucket)
+                        .await
                         .is_some_and(|b| b.is_read_only());
                     warn!("{}", boot_conversion_advice(bucket, &key, &why, non_atomic))
                 }

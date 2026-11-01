@@ -182,8 +182,8 @@ where
     assert_eq!(err.meta().code(), Some("AccessDenied"), "{what}: {err:?}");
     let m = err.meta().message().unwrap_or("");
     assert!(
-        m.contains("read-only") && m.contains("backend 'default'") && m.contains(DOC),
-        "{what}: the message names the bucket, the backend and why: {m}"
+        m.contains("read-only") && m.contains("does not support atomic writes") && m.contains(DOC),
+        "{what}: the message says why, in a fixed phrase: {m}"
     );
 }
 
@@ -708,7 +708,7 @@ async fn writes_wait_with_503_until_the_first_verdict() {
     let text = r.text().await.unwrap();
     assert_eq!(code, 503, "fail closed before the first verdict: {text}");
     assert!(
-        text.contains("SlowDown") && text.contains("still running"),
+        text.contains("SlowDown") && text.contains("retry in a few seconds"),
         "{text}"
     );
     let r = env
@@ -719,6 +719,25 @@ async fn writes_wait_with_503_until_the_first_verdict() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 200, "reads are never blocked");
+    // The pending state shows in /_/ready and never fails readiness.
+    let r = reqwest::get(format!("{}/_/ready", env.ep())).await.unwrap();
+    assert_eq!(r.status().as_u16(), 200, "pending is not unready");
+    let ready: Value = r.json().await.unwrap();
+    assert_eq!(ready["atomic_writes"]["default"], "checking", "{ready}");
+    // And on the backend card of the admin API.
+    let backends: Value = env
+        .admin
+        .get(format!("{}/_/api/admin/backends", env.ep()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        backends["backends"][0]["atomic_writes_checking"], true,
+        "{backends}"
+    );
 
     let mut stored = 0;
     for _ in 0..200 {
@@ -765,8 +784,8 @@ async fn s3_create_bucket_that_would_be_read_only_is_refused() {
     let m = err.meta().message().unwrap_or("");
     assert!(
         m.contains("cannot be created")
-            && m.contains("backend 'default'")
-            && m.contains("probe=non-cas")
+            && m.contains("does not support atomic writes")
+            && !m.contains("[atomic_writes")
             && m.contains(DOC),
         "{m}"
     );
@@ -833,4 +852,63 @@ async fn the_synthesized_backend_without_atomic_writes_offers_no_proxy_aes() {
     .await;
     assert_eq!(code, 200, "{p}");
     assert_eq!(p["bucket_modes"], json!(["none"]), "{p}");
+}
+
+/// An unconfigured bucket on a NON-default backend whose own site
+/// encrypts with the proxy, and whose verdict is non-CAS.
+#[tokio::test]
+async fn read_only_holds_before_the_router_resolves_the_bucket() {
+    let data = tempfile::TempDir::new().unwrap();
+    let local = data.path().join("local");
+    let dr = data.path().join("dr");
+    std::fs::create_dir_all(dr.join("photos")).unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    let doc = format!(
+        "access:\n  access_key_id: {}\n  secret_access_key: {}\n\
+         storage:\n  backends:\n    - name: local-disk\n      type: filesystem\n      path: {}\n\
+         \x20   - name: aws-dr\n      type: filesystem\n      path: {}\n      encryption: {{ mode: aes256-gcm-proxy, key: \"{KEY}\", key_id: {KEY_ID} }}\n\
+         \x20 default_backend: local-disk\n\
+         advanced:\n  listen_addr: {}\n  bootstrap_password_hash: \"{}\"\n",
+        common::TEST_ACCESS_KEY,
+        common::TEST_SECRET_KEY,
+        local.display(),
+        dr.display(),
+        common::LISTEN_ADDR_PLACEHOLDER,
+        common::TEST_BOOTSTRAP_PASSWORD_HASH
+    );
+    let server = TestServer::from_config_document(
+        &doc,
+        data,
+        (common::TEST_ACCESS_KEY, common::TEST_SECRET_KEY),
+        "first",
+        vec![(
+            "DGP_TEST_FORCE_NONCAS_BACKEND".to_string(),
+            "aws-dr".to_string(),
+        )],
+    )
+    .await;
+    async fn put(server: &TestServer, key: &str) -> u16 {
+        server
+            .http()
+            .put(format!("{}/photos/{key}", server.endpoint()))
+            .body(b"x".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+    let first = put(&server, "a.txt").await;
+    let second = put(&server, "b.txt").await;
+    // Any CreateBucket clears the router's resolutions.
+    let c = server.s3_client().await;
+    c.create_bucket().bucket("other").send().await.unwrap();
+    let third = put(&server, "c.txt").await;
+    eprintln!("PUT photos/a: {first}, photos/b: {second}, after CreateBucket photos/c: {third}");
+    let stored: Vec<_> = std::fs::read_dir(dr.join("photos"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .collect();
+    eprintln!("stored on aws-dr/photos: {stored:?}");
+    assert_eq!((first, second, third), (403, 403, 403), "read-only bucket");
 }

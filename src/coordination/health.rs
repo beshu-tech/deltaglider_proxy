@@ -228,6 +228,10 @@ pub struct BackendHealthCache {
     /// The last live `/_/ready` backend probe and when it ended. Behind an
     /// async mutex: concurrent probes wait for the one that runs.
     ready_probe: tokio::sync::Mutex<Option<(std::time::Instant, &'static str)>>,
+    /// Fires when a backend's verdict turns healthy from unhealthy: the
+    /// atomicity watch probes a backend that it could not verify again at
+    /// once (`coordination::atomicity::spawn_watch`).
+    pub(crate) recovered: tokio::sync::Notify,
 }
 
 /// The health loop's interval (set when the loop starts) and the backends
@@ -294,10 +298,17 @@ impl BackendHealthCache {
             Some(old) => old.fp != fp || old.entry.verdict != entry.verdict,
             None => true,
         };
+        let recovered = entry.verdict.is_healthy()
+            && map
+                .get(backend)
+                .is_some_and(|old| !old.entry.verdict.is_healthy());
         map.insert(backend.to_string(), Stored { fp, entry, started });
         drop(map);
         if changed {
             bump_backend_health_version();
+        }
+        if recovered {
+            self.recovered.notify_one();
         }
         Some(changed)
     }
@@ -933,7 +944,7 @@ pub fn probe_targets(
                     .effective_backend_for_bucket(b)
                     .is_some_and(|(n, _)| n == name)
             })
-            .map(|(b, p)| p.alias.clone().unwrap_or_else(|| b.clone()))
+            .map(|(b, _)| config.real_bucket_name(b))
     };
     if config.backends.is_empty() {
         return vec![(

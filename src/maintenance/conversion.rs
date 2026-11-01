@@ -696,9 +696,9 @@ async fn encrypts_on_atomic_backend(
     ) {
         return Ok(());
     }
-    let backend = config
-        .effective_backend_for_bucket(&r.bucket)
-        .map(|(b, _)| b);
+    let backend = crate::coordination::atomicity::bucket_backend(app, config, &r.bucket)
+        .await
+        .ok();
     if r.atomic.as_ref().map(|a| a.backend()) == backend.as_deref() && backend.is_some() {
         return Ok(());
     }
@@ -719,8 +719,8 @@ pub async fn require_reencrypt_atomic(
     crate::coordination::atomicity::AtomicityRefusal,
 > {
     crate::coordination::atomicity::require_for_bucket(
+        app,
         config,
-        &app.backend_capabilities,
         bucket,
         &format!("the re-encrypt job of bucket '{bucket}'"),
     )
@@ -729,66 +729,39 @@ pub async fn require_reencrypt_atomic(
 
 /// Whether every write that a re-encrypt job makes in `bucket` is
 /// conditional on the object that the job read, so that the job runs
-/// without the bucket's write gate and client writes go on (no 503):
-///
-/// - a filesystem backend: yes. It has one node, and the in-process locks
-///   that every write of an object takes make the job's version check and
-///   its write one step;
-/// - an S3 backend: when its conditional writes are proven, by the
-///   capability verdict of this backend definition or, without one, by a
-///   probe now (`If-None-Match` / `If-Match` PUTs, cached). A backend
-///   without them (B2 answers 501), one that the test seam
-///   `DGP_TEST_FORCE_NONCAS_BACKEND` names, or one that the probe could not
-///   judge keeps the gate.
+/// without the bucket's write gate and client writes go on (no 503): when
+/// the backend that the bucket's writes really go to has atomic writes
+/// (`atomicity::proven_for_bucket`: a filesystem backend, one node with
+/// in-process locks; an S3 backend whose cached verdict or a probe now
+/// proves conditional writes). A backend without them (B2), one that the
+/// test seam `DGP_TEST_FORCE_NONCAS_BACKEND` names, or one that could not
+/// be verified keeps the gate. `DGP_TEST_KEEP_WRITE_GATE` keeps it
+/// everywhere: since N2 encryption runs only on atomic backends, so an
+/// encrypt job is never gated otherwise, and the gate tests need one.
 pub async fn rewrites_are_conditional(
     app: &crate::api::handlers::AppState,
     config: &crate::config::Config,
     bucket: &str,
 ) -> bool {
-    use crate::coordination::capability::{
-        establish_backend_verdict, forced_noncas_backends, ClientWritableGroup,
-    };
-    use crate::coordination::CapabilityVerdict;
-    let Some((name, backend)) = config.effective_backend_for_bucket(bucket) else {
-        return false;
-    };
-    // The gate tests keep the gate (`DGP_TEST_KEEP_WRITE_GATE`).
     if crate::config::test_seams::test_seams().keep_write_gate {
         return false;
     }
-    // The test seam names any backend (a filesystem one too).
-    let forced = forced_noncas_backends();
-    if forced.contains(&name) {
-        return false;
+    let what = format!("the conditional rewrites of bucket '{bucket}'");
+    match crate::coordination::atomicity::proven_for_bucket(app, config, bucket, &what).await {
+        Ok(_) => true,
+        Err(r) => {
+            if matches!(
+                r.verdict,
+                crate::coordination::CapabilityVerdict::Unknown { .. }
+            ) {
+                tracing::warn!(
+                    "re-encrypt of '{bucket}': {}; the job keeps the bucket's write gate",
+                    crate::coordination::atomicity::verdict_words(&r.verdict)
+                );
+            }
+            false
+        }
     }
-    if matches!(backend, crate::config::BackendConfig::Filesystem { .. }) {
-        return true;
-    }
-    match app.backend_capabilities.get(&name, backend) {
-        Some(CapabilityVerdict::CasVerified { .. }) => return true,
-        Some(CapabilityVerdict::NonCas) => return false,
-        Some(CapabilityVerdict::Unknown { .. }) | None => {}
-    }
-    let probe_bucket = config
-        .buckets
-        .get(&bucket.to_ascii_lowercase())
-        .and_then(|p| p.alias.clone())
-        .unwrap_or_else(|| bucket.to_string());
-    let group = ClientWritableGroup {
-        backend: backend.clone(),
-        buckets: vec![bucket.to_string()],
-        probe_bucket,
-    };
-    let verdict = establish_backend_verdict(&name, &group, &forced).await;
-    app.backend_capabilities
-        .set(&name, backend, verdict.clone());
-    if let CapabilityVerdict::Unknown { reason } = &verdict {
-        tracing::warn!(
-            "re-encrypt of '{bucket}': the conditional writes of backend '{name}' could not \
-             be verified ({reason}); the job keeps the bucket's write gate"
-        );
-    }
-    matches!(verdict, CapabilityVerdict::CasVerified { .. })
 }
 
 /// THE creation of re-encrypt jobs (the apply, the boot, the admin

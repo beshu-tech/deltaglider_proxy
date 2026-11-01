@@ -12,6 +12,21 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Bucket listing entry with optional routing-origin metadata.
+/// Where the writes of a bucket go, as the storage router knows it
+/// ([`StorageBackend::bucket_home`]): what the write rule of encrypted
+/// buckets judges (`coordination::atomicity`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BucketHome {
+    /// The named backend: an explicit route, or where the router found the
+    /// bucket (or, when no backend has it, the default it creates it on).
+    Backend(String),
+    /// No router: the one backend, which is the default.
+    Default,
+    /// The router could not tell (a HeadBucket failed, or the answer needs
+    /// a request that a memory-only caller cannot send).
+    Undetermined,
+}
+
 #[derive(Debug, Clone)]
 pub struct BucketListing {
     pub name: String,
@@ -1449,6 +1464,21 @@ pub trait StorageBackend: Send + Sync {
     /// filesystem default); S3 + actively-encrypting wrapper override `false`.
     fn lite_list_carries_logical_facts(&self, _bucket: &str) -> bool {
         true
+    }
+
+    /// Where `bucket`'s writes go ([`BucketHome`]): an explicit route, a
+    /// cached resolution, or the one HeadBucket round that the write itself
+    /// would send (shared with it). Only `RoutingBackend` routes; a single
+    /// backend is [`BucketHome::Default`].
+    fn bucket_home(&self, _bucket: &str) -> impl Future<Output = BucketHome> + Send {
+        async { BucketHome::Default }
+    }
+
+    /// [`Self::bucket_home`] from memory only: [`BucketHome::Undetermined`]
+    /// when the answer needs a request (the router then resolves it in the
+    /// background).
+    fn bucket_home_now(&self, _bucket: &str) -> BucketHome {
+        BucketHome::Default
     }
 
     /// Name of the backend this bucket's requests go to, when the backend

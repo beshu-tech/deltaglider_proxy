@@ -812,7 +812,7 @@ pub async fn handle_form_post_upload(
     // bucket's configuration and backend, which an unverified caller must
     // not learn (S23). Still before any backend I/O (403-before-404 parity
     // with the PUT path, commit b1b2249).
-    check_client_write_allowed(state, bucket)?;
+    check_client_write_allowed(state, bucket).await?;
     // Only now, with the policy signature verified: the gates' 503 names a
     // busy bucket or a backend's state.
     crate::maintenance::gate::check_verified_request(

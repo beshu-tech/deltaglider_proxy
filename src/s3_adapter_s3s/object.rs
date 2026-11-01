@@ -385,7 +385,8 @@ pub(super) async fn delete_object(
     req: s3s::S3Request<s3s::dto::DeleteObjectInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteObjectOutput>> {
     let input = req.input;
-    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
+    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
+        .await?;
     // `DELETE photos/` deletes the folder marker `photos/` only, as on S3
     // (review D3). Folder deletes list and batch-delete the keys.
     match svc
@@ -422,7 +423,8 @@ pub(super) async fn delete_objects(
     use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome};
     let headers = req.headers.clone();
     let input = req.input;
-    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
+    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
+        .await?;
     validate_delete_objects_count(input.delete.objects.len())?;
     // Per-key misses are successes, so a missing bucket is asked here.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
@@ -560,7 +562,8 @@ pub(super) async fn put_object(
     // Gate BEFORE the bucket check: a marked bucket refuses client bytes
     // regardless of backend reachability (403-before-404, no backend I/O
     // for a doomed request).
-    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
+    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
+        .await?;
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
     // One HeadBucket per bucket per 5 seconds, not one per PUT.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;

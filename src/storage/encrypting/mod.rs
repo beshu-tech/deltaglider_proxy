@@ -190,6 +190,9 @@ pub struct EncryptionPolicies {
     slots: parking_lot::Mutex<std::collections::HashMap<String, Arc<ArcSwap<EncryptionConfig>>>>,
     /// The witness gate that every wrapper of the lineage consults.
     witness: Arc<WitnessGate>,
+    /// The backends without proven atomic writes (N2), for every wrapper
+    /// of the lineage.
+    atomicity: Arc<AtomicityGate>,
     /// The foreign-key sentinel of each slot (same keys as `slots`).
     sentinels: parking_lot::Mutex<std::collections::HashMap<String, Arc<KeySentinel>>>,
 }
@@ -198,6 +201,12 @@ impl EncryptionPolicies {
     /// The witness gate of every engine that shares these slots.
     pub fn witness_gate(&self) -> Arc<WitnessGate> {
         self.witness.clone()
+    }
+
+    /// The atomic-writes gate of every engine that shares these slots
+    /// (filled by `coordination::BackendCapabilityCache`).
+    pub fn atomicity_gate(&self) -> Arc<AtomicityGate> {
+        self.atomicity.clone()
     }
 
     /// The foreign-key sentinel of slot `key`: an engine rebuild keeps the
@@ -242,6 +251,28 @@ impl EncryptionPolicies {
         self.sentinels
             .lock()
             .retain(|k, _| published.iter().any(|(p, _, _)| p == k));
+    }
+}
+
+/// The raw backends whose atomic writes are NOT proven now (no verdict,
+/// unknown or non-CAS; `coordination::atomicity`). A wrapper on such a
+/// backend makes none of its OWN writes into a bucket that encrypts with
+/// the proxy (a listing token it would keep, a key claim): those buckets
+/// are read-only or pending there, and reads keep working without them.
+#[derive(Debug, Default)]
+pub struct AtomicityGate {
+    unproven: parking_lot::RwLock<std::collections::HashSet<String>>,
+}
+
+impl AtomicityGate {
+    /// Replace the set of backends without proven atomic writes.
+    pub fn set_unproven(&self, backends: std::collections::HashSet<String>) {
+        *self.unproven.write() = backends;
+    }
+
+    /// Are the atomic writes of `backend` unproven?
+    pub fn is_unproven(&self, backend: &str) -> bool {
+        self.unproven.read().contains(backend)
     }
 }
 
@@ -321,6 +352,8 @@ pub struct EncryptingBackend<B: StorageBackend> {
     witness: Option<(String, Arc<WitnessGate>)>,
     /// The foreign-key sentinel (`sentinel.rs`); `None` = no check.
     sentinel: Option<Arc<KeySentinel>>,
+    /// The atomic-writes gate (named by the witness's backend name).
+    atomicity: Option<Arc<AtomicityGate>>,
     /// Heals listing-token misses (`token_heal.rs`).
     healer: token_heal::TokenHealer,
     /// The conversion windows of this wrapper's buckets (`conversion.rs`).
@@ -340,6 +373,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             config,
             witness: None,
             sentinel: None,
+            atomicity: None,
             healer: Default::default(),
             windows: Default::default(),
             ignored: Default::default(),
@@ -531,7 +565,10 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             // The probe and the sightings first: a writer never claims a
             // bucket that holds another key.
             refusal = sentinel.refusal(bucket, now(), held);
-            if refusal.is_none() && sentinel.claim_due(bucket, now(), held, write) {
+            if refusal.is_none()
+                && sentinel.claim_due(bucket, now(), held, write)
+                && !self.own_writes_skipped(bucket)
+            {
                 if let Err(e) = self.settle_claim(sentinel, bucket, held, write).await {
                     if sentinel.claim_failed(bucket, now()) {
                         tracing::warn!(
@@ -691,6 +728,25 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             }
         }
         Ok(found)
+    }
+
+    /// Skip this wrapper's own writes (listing tokens, key claims) into a
+    /// bucket that encrypts with the proxy while the atomic writes of this
+    /// raw backend (the [`Self::with_witness`] name) are unproven.
+    pub fn with_atomicity(mut self, gate: Arc<AtomicityGate>) -> Self {
+        self.atomicity = Some(gate);
+        self
+    }
+
+    /// Must this wrapper skip its own writes into `bucket` (N2)? The
+    /// bucket encrypts with the proxy, and this backend's atomic writes
+    /// are unproven.
+    fn own_writes_skipped(&self, bucket: &str) -> bool {
+        let unproven = match (&self.atomicity, &self.witness) {
+            (Some(gate), Some((name, _))) => gate.is_unproven(name),
+            _ => false,
+        };
+        unproven && matches!(self.write_key(bucket), Ok(Some(_)))
     }
 
     /// Refuse the writes that the witness gate names for raw backend `name`.
@@ -1951,12 +2007,17 @@ impl<B: StorageBackend + Send + Sync + 'static> EncryptingBackend<B> {
                 }
             }
         }
+        // N2: no token is kept in a bucket that is read-only or pending.
+        let keep = !self.own_writes_skipped(b);
+        if !keep {
+            background.clear();
+        }
         if !head_now.is_empty() {
             let cfg = self.config.load_full();
             let heads = futures::future::join_all(
                 head_now
                     .iter()
-                    .map(|(_, miss)| token_heal::heal_one(&*self.inner, &cfg, b, miss)),
+                    .map(|(_, miss)| token_heal::heal_one(&*self.inner, &cfg, b, miss, keep)),
             )
             .await;
             for ((i, miss), head) in head_now.into_iter().zip(heads) {

@@ -1876,6 +1876,28 @@ mod wrapper_tests {
     /// With a key, a listed entry's logical size and ETag come only from a
     /// listing token that opens under a key of this backend for exactly
     /// that stored object; a forged, foreign or mismatched token is ignored.
+    /// Finding 6: on a backend whose atomic writes are unproven, the
+    /// wrapper makes none of its own writes (listing tokens, key claims)
+    /// into a bucket that encrypts with the proxy; a plaintext bucket and a
+    /// proven backend are unaffected.
+    #[test]
+    fn own_writes_are_skipped_on_a_backend_without_proven_atomic_writes() {
+        let gate = Arc::new(AtomicityGate::default());
+        let wrap = |cfg: EncryptionConfig| {
+            EncryptingBackend::new(CountingBackend::new(), shared(cfg))
+                .with_witness("b2", Arc::new(WitnessGate::default()))
+                .with_atomicity(gate.clone())
+        };
+        let encrypting = wrap(keyed(key(0xa1), "kid-a"));
+        let plain = wrap(EncryptionConfig::default());
+        assert!(!encrypting.own_writes_skipped("b"), "proven by default");
+        gate.set_unproven(["b2".to_string()].into());
+        assert!(encrypting.own_writes_skipped("b"));
+        assert!(!plain.own_writes_skipped("b"), "a plaintext bucket writes");
+        gate.set_unproven(Default::default());
+        assert!(!encrypting.own_writes_skipped("b"));
+    }
+
     #[tokio::test]
     async fn resolve_listed_sizes_applies_only_a_valid_listing_token() {
         let site = v2::SiteKey::new(&key(0xa1));

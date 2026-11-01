@@ -25,8 +25,8 @@
 //! itself and the proxy never rewrites them for encryption.
 
 use super::capability::{
-    establish_backend_verdict, forced_noncas_backends, BackendCapabilityCache, CapabilityVerdict,
-    ClientWritableGroup, VerifiedVia, CAPABILITY_DOC_URL, PROBE_TIMEOUT,
+    establish_backend_verdict_within, forced_noncas_backends, BackendCapabilityCache,
+    CapabilityVerdict, ClientWritableGroup, VerifiedVia, CAPABILITY_DOC_URL, PROBE_TIMEOUT,
 };
 use crate::config::{BackendConfig, Config};
 use std::collections::BTreeMap;
@@ -43,17 +43,20 @@ pub fn verdict_tag(verdict: &CapabilityVerdict) -> &'static str {
     }
 }
 
-/// Pure: the probe result in plain words, for messages and the UI.
+/// Pure: the probe result in plain words, for messages and the UI. A
+/// non-CAS verdict says that the backend does NOT support atomic writes;
+/// an unknown one only that the proxy COULD NOT VERIFY them (with the
+/// reason: for the admin API and the logs only, never an S3 client).
 pub fn verdict_words(verdict: &CapabilityVerdict) -> String {
     match verdict {
         CapabilityVerdict::CasVerified { .. } => {
-            "the backend enforces conditional writes".to_string()
+            "the backend supports atomic writes (it enforced a conditional write)".to_string()
         }
-        CapabilityVerdict::NonCas => "the backend ignored or rejected a conditional write, as \
-                                      Backblaze B2 does"
+        CapabilityVerdict::NonCas => "the backend does not support atomic writes: it ignored or \
+                                      rejected a conditional write, as Backblaze B2 does"
             .to_string(),
         CapabilityVerdict::Unknown { reason } => {
-            format!("could not reach the backend to verify ({reason})")
+            format!("the proxy could not verify the backend's atomic writes ({reason})")
         }
     }
 }
@@ -75,14 +78,25 @@ impl AtomicityRefusal {
     /// The operator-facing message: what, the backend, the probe result in
     /// plain words, the way out, and the doc link.
     pub fn message(&self) -> String {
-        format!(
-            "{} refused: encryption needs atomic writes (conditional PUT and DELETE), and \
-             backend '{}' does not provide them: {}. Keep encrypted buckets on a backend \
-             with atomic writes (move a bucket there with a migrate job) — see {CAPABILITY_DOC_URL}",
-            self.what,
-            self.backend,
-            verdict_words(&self.verdict)
-        )
+        match &self.verdict {
+            CapabilityVerdict::Unknown { .. } => format!(
+                "{} refused: encryption needs atomic writes (conditional PUT and DELETE), and \
+                 the proxy could not verify them on backend '{}': {}. Retry when the backend \
+                 is reachable (Check again on the backend card) — see {CAPABILITY_DOC_URL}",
+                self.what,
+                self.backend,
+                verdict_words(&self.verdict)
+            ),
+            _ => format!(
+                "{} refused: encryption needs atomic writes (conditional PUT and DELETE), and \
+                 backend '{}' does not support them: {}. Keep encrypted buckets on a backend \
+                 with atomic writes (move a bucket there with a migrate job) — see \
+                 {CAPABILITY_DOC_URL}",
+                self.what,
+                self.backend,
+                verdict_words(&self.verdict)
+            ),
+        }
     }
 
     /// The structured part of a refusal body.
@@ -123,7 +137,7 @@ impl AtomicWrites {
 /// buckets routed there.
 fn probe_candidates(config: &Config, backend: &str, hint: Option<&str>) -> Vec<String> {
     let mut out: Vec<String> = hint.map(str::to_string).into_iter().collect();
-    for (name, policy) in &config.buckets {
+    for name in config.buckets.keys() {
         if name.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX) {
             continue;
         }
@@ -131,7 +145,7 @@ fn probe_candidates(config: &Config, backend: &str, hint: Option<&str>) -> Vec<S
             .effective_backend_for_bucket(name)
             .is_some_and(|(b, _)| b == backend)
         {
-            let real = policy.alias.clone().unwrap_or_else(|| name.clone());
+            let real = config.real_bucket_name(name);
             if !out.contains(&real) {
                 out.push(real);
             }
@@ -144,7 +158,11 @@ fn probe_candidates(config: &Config, backend: &str, hint: Option<&str>) -> Vec<S
 /// in: the first candidate that the backend lists, else any bucket it
 /// lists. Without a listing (a key restricted to some buckets), the first
 /// candidate. `Err`: nothing to probe on.
-async fn pick_probe_bucket(def: &BackendConfig, candidates: &[String]) -> Result<String, String> {
+async fn pick_probe_bucket(
+    def: &BackendConfig,
+    candidates: &[String],
+    budget: std::time::Duration,
+) -> Result<String, String> {
     let client = crate::config_db_sync::ConfigDbSync::build_client_labelled(
         def,
         crate::storage::S3Backend::request_timeout(),
@@ -152,7 +170,7 @@ async fn pick_probe_bucket(def: &BackendConfig, candidates: &[String]) -> Result
     )
     .await
     .map_err(|e| format!("client build failed: {e}"))?;
-    let listed = tokio::time::timeout(PROBE_TIMEOUT, client.list_buckets().send()).await;
+    let listed = tokio::time::timeout(budget, client.list_buckets().send()).await;
     match listed {
         Ok(Ok(out)) => {
             let names: Vec<String> = out
@@ -176,6 +194,10 @@ async fn pick_probe_bucket(def: &BackendConfig, candidates: &[String]) -> Result
             .ok_or_else(|| "the backend's buckets could not be listed".to_string()),
     }
 }
+
+/// How long the bucket listing of a probe may take (part of the probe's
+/// one deadline, [`PROBE_TIMEOUT`]).
+const PROBE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// THE atomicity probe of `backend` under `config`, FRESH (never a cached
 /// verdict): the test seam `DGP_TEST_FORCE_NONCAS_BACKEND` → non-CAS; a
@@ -207,7 +229,12 @@ pub async fn probe_atomic_writes(
             via: VerifiedVia::LocalFilesystem,
         }
     } else {
-        match pick_probe_bucket(def, &probe_candidates(config, backend, hint)).await {
+        // ONE deadline for the whole probe (the bucket listing and the
+        // conditional writes): the pending window of the backend's
+        // encrypted buckets is at most PROBE_TIMEOUT.
+        let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+        let candidates = probe_candidates(config, backend, hint);
+        match pick_probe_bucket(def, &candidates, PROBE_LISTING_TIMEOUT).await {
             Err(reason) => CapabilityVerdict::Unknown { reason },
             Ok(probe_bucket) => {
                 let group = ClientWritableGroup {
@@ -215,7 +242,8 @@ pub async fn probe_atomic_writes(
                     buckets: Vec::new(),
                     probe_bucket,
                 };
-                establish_backend_verdict(backend, &group, &forced).await
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                establish_backend_verdict_within(backend, &group, &forced, left).await
             }
         }
     };
@@ -244,30 +272,102 @@ pub async fn require_atomic_writes(
     }
 }
 
-/// [`require_atomic_writes`] for the backend that `bucket` routes to, with
-/// the bucket's real name as the probe hint.
-pub async fn require_for_bucket(
+/// The backend that the writes of `bucket` go to under `config`: the
+/// config's answer for a bucket it names, else the router's (a bucket that
+/// the config does not name can live on any backend; the router finds it,
+/// see [`crate::storage::StorageBackend::bucket_home`]). `Err`: the reason
+/// it could not be determined.
+pub async fn bucket_backend(
+    app: &crate::api::handlers::AppState,
     config: &Config,
-    cache: &BackendCapabilityCache,
+    bucket: &str,
+) -> Result<String, String> {
+    use crate::storage::{BucketHome, StorageBackend};
+    let key = bucket.to_ascii_lowercase();
+    if config.buckets.contains_key(&key) {
+        return config
+            .effective_backend_for_bucket(&key)
+            .map(|(name, _)| name)
+            .ok_or_else(|| format!("bucket '{bucket}' routes to an unknown backend"));
+    }
+    match app.engine.load().storage().bucket_home(&key).await {
+        BucketHome::Backend(name) if config.backend_by_name(&name).is_some() => Ok(name),
+        BucketHome::Backend(name) => Err(format!(
+            "bucket '{bucket}' is on backend '{name}', which the config does not define"
+        )),
+        BucketHome::Default => Ok(config.default_backend_name()),
+        BucketHome::Undetermined => Err(format!(
+            "the backend of bucket '{bucket}' could not be determined (a backend did not answer)"
+        )),
+    }
+}
+
+/// The backend of `bucket` ([`bucket_backend`]), or the refusal of `what`
+/// when it cannot be determined.
+async fn backend_or_refusal(
+    app: &crate::api::handlers::AppState,
+    config: &Config,
+    bucket: &str,
+    what: &str,
+) -> Result<String, AtomicityRefusal> {
+    bucket_backend(app, config, bucket)
+        .await
+        .map_err(|reason| AtomicityRefusal {
+            backend: "(unknown)".to_string(),
+            verdict: CapabilityVerdict::Unknown { reason },
+            what: what.to_string(),
+        })
+}
+
+/// [`require_atomic_writes`] (a FRESH probe) for the backend that the
+/// writes of `bucket` really go to ([`bucket_backend`]), with the
+/// bucket's real name as the probe hint.
+pub async fn require_for_bucket(
+    app: &crate::api::handlers::AppState,
+    config: &Config,
     bucket: &str,
     what: &str,
 ) -> Result<AtomicWrites, AtomicityRefusal> {
-    let key = bucket.to_ascii_lowercase();
-    let Some((backend, _)) = config.effective_backend_for_bucket(&key) else {
-        return Err(AtomicityRefusal {
-            backend: "(none)".to_string(),
-            verdict: CapabilityVerdict::Unknown {
-                reason: format!("bucket '{bucket}' routes to an unknown backend"),
-            },
-            what: what.to_string(),
-        });
-    };
-    let real = config
-        .buckets
-        .get(&key)
-        .and_then(|p| p.alias.clone())
-        .unwrap_or(key);
-    require_atomic_writes(config, cache, &backend, Some(&real), what).await
+    let backend = backend_or_refusal(app, config, bucket, what).await?;
+    let real = config.real_bucket_name(bucket);
+    require_atomic_writes(
+        config,
+        &app.backend_capabilities,
+        &backend,
+        Some(&real),
+        what,
+    )
+    .await
+}
+
+/// Atomic writes on the backend of `bucket`, proven by the cached CAS
+/// verdict of the backend's current definition, else by a fresh probe
+/// ([`require_for_bucket`]). For a job's run start: the action that queued
+/// it already probed fresh.
+pub async fn proven_for_bucket(
+    app: &crate::api::handlers::AppState,
+    config: &Config,
+    bucket: &str,
+    what: &str,
+) -> Result<AtomicWrites, AtomicityRefusal> {
+    let backend = backend_or_refusal(app, config, bucket, what).await?;
+    let forced = forced_noncas_backends().contains(&backend);
+    let cached_cas = config
+        .backend_by_name(&backend)
+        .and_then(|def| app.backend_capabilities.get(&backend, def))
+        .is_some_and(|v| matches!(v, CapabilityVerdict::CasVerified { .. }));
+    if cached_cas && !forced {
+        return Ok(AtomicWrites { backend });
+    }
+    let real = config.real_bucket_name(bucket);
+    require_atomic_writes(
+        config,
+        &app.backend_capabilities,
+        &backend,
+        Some(&real),
+        what,
+    )
+    .await
 }
 
 /// The apply gate (config apply, validate, section and field writes, CLI
@@ -290,47 +390,27 @@ pub async fn gate_encryption_change(
             Some(b) => format!("encryption of bucket '{b}'"),
             None => format!("encryption on backend '{backend}'"),
         };
-        let hint = bucket.as_ref().map(|b| {
-            new.buckets
-                .get(b)
-                .and_then(|p| p.alias.clone())
-                .unwrap_or_else(|| b.clone())
-        });
+        let hint = bucket.as_ref().map(|b| new.real_bucket_name(b));
         require_atomic_writes(new, cache, &backend, hint.as_deref(), &what).await?;
     }
     Ok(())
 }
 
-/// Pure: the read-only message of `bucket` on `backend` under `verdict`,
-/// or `None` when the verdict proves atomic writes.
-pub fn read_only_message(
-    bucket: &str,
-    backend: &str,
-    verdict: &CapabilityVerdict,
-) -> Option<String> {
-    if matches!(verdict, CapabilityVerdict::CasVerified { .. }) {
-        return None;
-    }
-    Some(format!(
-        "Bucket '{bucket}' is read-only: it is encrypted, and encryption needs atomic writes, \
-         which backend '{backend}' does not provide ({}). Reads keep working. To write to it \
-         again, move the bucket to a backend with atomic writes with a migrate job — see \
-         {CAPABILITY_DOC_URL}",
-        verdict_words(verdict)
-    ))
-}
-
 /// Pure: why proxy encryption is not offered on `backend` under
 /// `verdict`, or `None` when the verdict proves atomic writes.
 pub fn proxy_unavailable_reason(backend: &str, verdict: &CapabilityVerdict) -> Option<String> {
-    if matches!(verdict, CapabilityVerdict::CasVerified { .. }) {
-        return None;
+    match verdict {
+        CapabilityVerdict::CasVerified { .. } => None,
+        CapabilityVerdict::NonCas => Some(format!(
+            "Encryption with a proxy key needs atomic writes, and backend '{backend}' does not \
+             support them (it ignored or rejected a conditional write) — see {CAPABILITY_DOC_URL}"
+        )),
+        CapabilityVerdict::Unknown { .. } => Some(format!(
+            "Encryption with a proxy key needs atomic writes, and the proxy could not verify \
+             them on backend '{backend}' (the check did not reach it). Check again when the \
+             backend is reachable — see {CAPABILITY_DOC_URL}"
+        )),
     }
-    Some(format!(
-        "Encryption with a proxy key needs atomic writes, which backend '{backend}' does not \
-         provide ({}) — see {CAPABILITY_DOC_URL}",
-        verdict_words(verdict)
-    ))
 }
 
 /// The atomic-writes verdict of backend `name` for the admin views: the
@@ -349,31 +429,36 @@ pub fn backend_verdict(
 /// ([`BackendCapabilityCache::write_block`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteBlock {
-    /// The backend has no verdict yet for its current definition (boot, or
-    /// a config change; the watch probes it now). Fail closed: S3 `503
-    /// SlowDown`, which clients retry.
-    Pending { backend: String },
-    /// The backend has no proven atomic writes: the bucket is read-only
-    /// (S3 `403 AccessDenied`).
-    ReadOnly {
+    /// The backend has no CAS or non-CAS verdict for its current
+    /// definition: the check has not run yet (boot, a config change) or
+    /// could not reach the backend (`unverified`: the reason, for the
+    /// admin API and the logs only). Fail closed: S3 `503 SlowDown`, which
+    /// clients retry; the watch probes again within seconds.
+    Pending {
         backend: String,
-        verdict: CapabilityVerdict,
+        unverified: Option<String>,
     },
+    /// The backend does not support atomic writes (non-CAS verdict): the
+    /// bucket is read-only (S3 `403 AccessDenied`, not retried).
+    ReadOnly { backend: String },
 }
 
 impl WriteBlock {
     /// Pure: the block of a bucket on `backend` under `verdict` (`None`:
     /// no verdict yet).
     pub fn of(backend: &str, verdict: Option<CapabilityVerdict>) -> Option<Self> {
+        let backend = backend.to_string();
         match verdict {
             None => Some(Self::Pending {
-                backend: backend.to_string(),
+                backend,
+                unverified: None,
+            }),
+            Some(CapabilityVerdict::Unknown { reason }) => Some(Self::Pending {
+                backend,
+                unverified: Some(reason),
             }),
             Some(CapabilityVerdict::CasVerified { .. }) => None,
-            Some(verdict) => Some(Self::ReadOnly {
-                backend: backend.to_string(),
-                verdict,
-            }),
+            Some(CapabilityVerdict::NonCas) => Some(Self::ReadOnly { backend }),
         }
     }
 
@@ -382,32 +467,66 @@ impl WriteBlock {
         matches!(self, Self::ReadOnly { .. })
     }
 
-    /// The operator-facing message of a write to `bucket`.
+    /// The message of a write to `bucket` for an S3 client: fixed phrases,
+    /// never the probe's error (it can name the backend's address).
     pub fn message(&self, bucket: &str) -> String {
         match self {
-            Self::Pending { backend } => format!(
-                "Bucket '{bucket}' is encrypted, and the check that backend '{backend}' has \
-                 atomic writes (which encryption needs) is still running. Writes wait until it \
-                 ends; retry in a few seconds. Reads keep working — see {CAPABILITY_DOC_URL}"
+            Self::Pending { .. } => format!(
+                "Bucket '{bucket}' is encrypted, and the proxy has not yet verified that its \
+                 backend supports atomic writes, which encryption needs. Writes wait until the \
+                 check succeeds; retry in a few seconds. Reads keep working — see \
+                 {CAPABILITY_DOC_URL}"
             ),
-            Self::ReadOnly { backend, verdict } => {
-                read_only_message(bucket, backend, verdict).unwrap_or_default()
-            }
+            Self::ReadOnly { .. } => format!(
+                "Bucket '{bucket}' is read-only: it is encrypted, and its backend does not \
+                 support atomic writes, which encryption needs. Reads keep working. To write \
+                 to it again, move the bucket to a backend with atomic writes with a migrate \
+                 job — see {CAPABILITY_DOC_URL}"
+            ),
         }
     }
 
-    /// The message of a CreateBucket of `bucket` that would encrypt.
+    /// The message for the admin API and the logs: names the backend and,
+    /// for an unverified backend, why the check failed.
+    pub fn admin_message(&self, bucket: &str) -> String {
+        match self {
+            Self::Pending {
+                backend,
+                unverified: None,
+            } => format!(
+                "Bucket '{bucket}' is encrypted, and the check that backend '{backend}' supports \
+                 atomic writes (which encryption needs) is still running. Writes wait until it \
+                 ends; retry in a few seconds. Reads keep working — see {CAPABILITY_DOC_URL}"
+            ),
+            Self::Pending {
+                backend,
+                unverified: Some(reason),
+            } => format!(
+                "Bucket '{bucket}' is encrypted, and the proxy could not verify that backend \
+                 '{backend}' supports atomic writes, which encryption needs ({reason}). Writes \
+                 wait (503, retried) and the proxy checks again within a minute. Reads keep \
+                 working — see {CAPABILITY_DOC_URL}"
+            ),
+            Self::ReadOnly { backend } => format!(
+                "Bucket '{bucket}' is read-only: it is encrypted, and encryption needs atomic \
+                 writes, which backend '{backend}' does not support ({}). Reads keep working. \
+                 To write to it again, move the bucket to a backend with atomic writes with a \
+                 migrate job — see {CAPABILITY_DOC_URL}",
+                verdict_words(&CapabilityVerdict::NonCas)
+            ),
+        }
+    }
+
+    /// The message of a CreateBucket of `bucket` that would encrypt (S3
+    /// client: fixed phrases).
     pub fn create_message(&self, bucket: &str) -> String {
         match self {
             Self::Pending { .. } => self.message(bucket),
-            Self::ReadOnly { backend, verdict } => format!(
-                "Bucket '{bucket}' cannot be created: it would encrypt with the proxy on backend \
-                 '{backend}', and encryption needs atomic writes (conditional PUT and DELETE), \
-                 which the backend does not provide ({}). The proxy does not create a bucket \
-                 that would be read-only. Create it on a backend with atomic writes — see \
-                 {CAPABILITY_DOC_URL} [atomic_writes: backend={backend}, probe={}]",
-                verdict_words(verdict),
-                verdict_tag(verdict)
+            Self::ReadOnly { .. } => format!(
+                "Bucket '{bucket}' cannot be created: it would be encrypted by the proxy, and \
+                 its backend does not support atomic writes (conditional PUT and DELETE), which \
+                 encryption needs. The proxy does not create a bucket that would be read-only. \
+                 Create it on a backend with atomic writes — see {CAPABILITY_DOC_URL}"
             ),
         }
     }
@@ -427,13 +546,37 @@ impl WriteBlock {
 }
 
 impl crate::api::handlers::AppState {
-    /// [`BackendCapabilityCache::write_block`] of `bucket`, with the
-    /// backend that the router resolved for it.
-    pub fn atomic_write_block(&self, bucket: &str) -> Option<WriteBlock> {
+    /// THE write rule of the request path:
+    /// [`BackendCapabilityCache::write_block`] of `bucket` on the backend
+    /// that its writes really go to. The router resolves a bucket that the
+    /// config does not name (a cached answer, or one HeadBucket round shared
+    /// with the write that follows), so a cold resolution after a boot, a
+    /// config apply or a CreateBucket never judges the default backend in
+    /// place of the real one.
+    pub async fn atomic_write_block(&self, bucket: &str) -> Option<WriteBlock> {
+        let cache = &self.backend_capabilities;
+        if !cache.encrypted_plan().needs_home(bucket) {
+            return cache.write_block(bucket, &crate::storage::BucketHome::Default);
+        }
         use crate::storage::StorageBackend;
-        let held = self.engine.load().storage().resolved_backend_name(bucket);
-        self.backend_capabilities
-            .write_block(bucket, held.as_deref())
+        let engine = self.engine.load();
+        let home = engine.storage().bucket_home(bucket).await;
+        cache.write_block(bucket, &home)
+    }
+
+    /// [`Self::atomic_write_block`] from memory only, for the background
+    /// writers' synchronous gates: a bucket whose home the router does not
+    /// know without a request is undetermined (fail closed: pending unless
+    /// every encrypting backend is CAS), and the router resolves it in the
+    /// background, so the next check knows.
+    pub fn atomic_write_block_now(&self, bucket: &str) -> Option<WriteBlock> {
+        let cache = &self.backend_capabilities;
+        if !cache.encrypted_plan().needs_home(bucket) {
+            return cache.write_block(bucket, &crate::storage::BucketHome::Default);
+        }
+        use crate::storage::StorageBackend;
+        let home = self.engine.load().storage().bucket_home_now(bucket);
+        cache.write_block(bucket, &home)
     }
 }
 
@@ -476,9 +619,10 @@ pub async fn read_only_buckets(
     }
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (bucket, held) in names {
-        if let Some(WriteBlock::ReadOnly { backend, .. }) =
-            cache.write_block(&bucket, held.as_deref())
-        {
+        let home = held.map_or(crate::storage::BucketHome::Default, |b| {
+            crate::storage::BucketHome::Backend(b)
+        });
+        if let Some(WriteBlock::ReadOnly { backend }) = cache.write_block(&bucket, &home) {
             out.entry(backend).or_default().push(bucket);
         }
     }
@@ -520,6 +664,50 @@ impl EncryptedPlan {
         Some((name, self.defs.get(name)?.1.as_str()))
     }
 
+    /// Does the write rule of `bucket` depend on the backend the router
+    /// finds it on? Only for a bucket that the config does not name, while
+    /// some backend's own site encrypts with the proxy.
+    pub fn needs_home(&self, bucket: &str) -> bool {
+        !self.storage.sites.is_empty()
+            && !self
+                .storage
+                .configured
+                .contains(&bucket.to_ascii_lowercase())
+    }
+
+    /// Pure: the write rule of `bucket` at `home`, with `verdict(name,
+    /// fingerprint)` the cached verdict of a definition
+    /// ([`BackendCapabilityCache::write_block`]). An undetermined home of
+    /// a bucket that needs one is pending unless every encrypting site is
+    /// CAS (any of them could hold it).
+    pub fn write_block(
+        &self,
+        bucket: &str,
+        home: &crate::storage::BucketHome,
+        verdict: impl Fn(&str, &str) -> Option<CapabilityVerdict>,
+    ) -> Option<WriteBlock> {
+        use crate::storage::BucketHome;
+        let held_by = match home {
+            BucketHome::Backend(b) => Some(b.as_str()),
+            BucketHome::Default => None,
+            BucketHome::Undetermined if self.needs_home(bucket) => {
+                return self.storage.sites.iter().find_map(|site| {
+                    let fp = self.defs.get(site.as_str())?.1.as_str();
+                    match WriteBlock::of(site, verdict(site, fp))? {
+                        WriteBlock::ReadOnly { backend } => Some(WriteBlock::Pending {
+                            backend,
+                            unverified: None,
+                        }),
+                        pending => Some(pending),
+                    }
+                });
+            }
+            BucketHome::Undetermined => None,
+        };
+        let (backend, fp) = self.backend_of(bucket, held_by)?;
+        WriteBlock::of(backend, verdict(backend, fp))
+    }
+
     /// The configured buckets that encrypt with the proxy: (bucket,
     /// backend).
     pub fn buckets(&self) -> Vec<(String, String)> {
@@ -544,90 +732,187 @@ impl EncryptedPlan {
             .buckets
             .iter()
             .find(|(_, b)| b.as_str() == backend)
-            .map(|(name, _)| {
-                config
-                    .buckets
-                    .get(name)
-                    .and_then(|p| p.alias.clone())
-                    .unwrap_or_else(|| name.clone())
-            })
+            .map(|(name, _)| config.real_bucket_name(name))
     }
 }
 
-/// How often the watch probes a backend of encrypted buckets again whose
-/// verdict does not prove atomic writes.
-const RECHECK: std::time::Duration = std::time::Duration::from_secs(600);
+/// Pure: when the watch probes a backend of encrypted buckets again,
+/// given its cached verdict and how many probes in a row could not verify
+/// it (`failures`, counted from 1 after the first one). `None`: never on a
+/// timer. No verdict → now. Unknown → 5 s, doubling to 60 s (its buckets
+/// answer 503 meanwhile, so the next try comes soon). CAS and non-CAS are
+/// verdicts: they are probed again only on Check again, a config change or
+/// a restart. A timer on non-CAS would write a probe key into the
+/// customer's bucket every few minutes forever (a versioned bucket keeps
+/// every version) to detect a backend that rarely changes.
+pub fn recheck_after(
+    verdict: Option<&CapabilityVerdict>,
+    failures: u32,
+) -> Option<std::time::Duration> {
+    match verdict {
+        None => Some(std::time::Duration::ZERO),
+        Some(CapabilityVerdict::Unknown { .. }) => {
+            let exp = failures.saturating_sub(1).min(4);
+            Some(
+                UNKNOWN_RECHECK_FIRST
+                    .saturating_mul(1 << exp)
+                    .min(UNKNOWN_RECHECK_MAX),
+            )
+        }
+        Some(_) => None,
+    }
+}
+
+/// The first re-probe of a backend that could not be verified.
+const UNKNOWN_RECHECK_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+/// The longest wait between two probes of a backend that could not be
+/// verified.
+const UNKNOWN_RECHECK_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Probe every backend of the encrypted plan that has no verdict yet, all
+/// at once (boot: this runs in parallel with the boot health check, so the
+/// pending window of the encrypted buckets is one probe, at most
+/// [`PROBE_TIMEOUT`], not the health check plus a probe).
+pub fn spawn_boot_probes(
+    config: Config,
+    cache: std::sync::Arc<BackendCapabilityCache>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let plan = cache.encrypted_plan();
+        let due: Vec<(String, Option<String>)> = plan
+            .backends()
+            .into_iter()
+            .filter(|(name, def)| cache.get(name, def).is_none())
+            .map(|(name, _)| {
+                let hint = plan.hint(&config, &name);
+                (name, hint)
+            })
+            .collect();
+        futures::future::join_all(
+            due.iter()
+                .map(|(name, hint)| probe_atomic_writes(&config, &cache, name, hint.as_deref())),
+        )
+        .await;
+    })
+}
 
 /// The atomicity watch: probes every backend that stores a bucket that
-/// encrypts with the proxy, at once when the backend has no verdict for
-/// its current definition (boot, a config change; writes to its encrypted
-/// buckets wait with 503 meanwhile), and every ten minutes while its
-/// verdict does not prove atomic writes, so a fixed backend lifts its
-/// buckets' read-only state without a restart. The backends are probed
+/// encrypts with the proxy and has no verdict for its current definition
+/// (boot, a config change: writes to its encrypted buckets wait with 503
+/// meanwhile), and probes again, with a short backoff
+/// ([`recheck_after`]), every backend that it could not verify; at once
+/// when the health loop sees a backend recover. The backends are probed
 /// concurrently. Logs each change of the read-only set (a warning per
-/// backend). The returned receiver fires after the first round: the boot
-/// waits for it a short, bounded time.
+/// backend). `boot`: the boot probes ([`spawn_boot_probes`]), awaited
+/// before the first round. The returned receiver fires after the first
+/// round: the boot waits for it a short, bounded time.
 pub fn spawn_watch(
     app: std::sync::Arc<crate::api::handlers::AppState>,
     config: crate::config::SharedConfig,
+    boot: Option<tokio::task::JoinHandle<()>>,
 ) -> tokio::sync::oneshot::Receiver<()> {
     let (first_round, done) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
+        if let Some(boot) = boot {
+            let _ = boot.await;
+        }
         let mut first_round = Some(first_round);
         let mut announced: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut last_probe: BTreeMap<String, std::time::Instant> = BTreeMap::new();
+        // Backend → (when probed last, probes in a row without a verdict).
+        let mut tries: BTreeMap<String, (std::time::Instant, u32)> = BTreeMap::new();
+        let mut recovered = false;
+        let mut unverified: BTreeMap<String, String> = BTreeMap::new();
         loop {
             let cfg = config.read().await.clone();
             let cache = &app.backend_capabilities;
             let plan = cache.encrypted_plan();
             let mut probes = Vec::new();
+            let mut next_wake: Option<std::time::Duration> = None;
             for (name, def) in plan.backends() {
-                let due = match cache.get(&name, &def) {
-                    None => true,
-                    Some(CapabilityVerdict::CasVerified { .. }) => false,
-                    Some(_) => last_probe.get(&name).is_none_or(|t| t.elapsed() >= RECHECK),
+                let verdict = cache.get(&name, &def);
+                let failures = tries.get(&name).map_or(0, |(_, n)| *n);
+                let Some(after) = recheck_after(verdict.as_ref(), failures) else {
+                    tries.remove(&name);
+                    continue;
                 };
-                if due {
+                let since = tries
+                    .get(&name)
+                    .map_or(std::time::Duration::MAX, |(t, _)| t.elapsed());
+                if verdict.is_none() || recovered || since >= after {
                     let hint = plan.hint(&cfg, &name);
                     probes.push((name, hint));
+                } else {
+                    let left = after - since;
+                    next_wake = Some(next_wake.map_or(left, |w| w.min(left)));
                 }
             }
+            recovered = false;
             let cfg_ref = &cfg;
-            futures::future::join_all(probes.iter().map(|(name, hint)| async move {
-                probe_atomic_writes(cfg_ref, cache, name, hint.as_deref()).await
-            }))
-            .await;
-            for (name, _) in probes {
-                last_probe.insert(name, std::time::Instant::now());
+            let verdicts =
+                futures::future::join_all(probes.iter().map(|(name, hint)| async move {
+                    probe_atomic_writes(cfg_ref, cache, name, hint.as_deref()).await
+                }))
+                .await;
+            for ((name, _), fresh) in probes.into_iter().zip(verdicts) {
+                let kept = cfg_ref
+                    .backend_by_name(&name)
+                    .and_then(|d| cache.get(&name, d))
+                    .unwrap_or(fresh);
+                let entry = tries.entry(name).or_insert((std::time::Instant::now(), 0));
+                entry.0 = std::time::Instant::now();
+                entry.1 = match kept {
+                    CapabilityVerdict::Unknown { .. } => entry.1 + 1,
+                    _ => 0,
+                };
+                if let Some(after) = recheck_after(Some(&kept), entry.1) {
+                    next_wake = Some(next_wake.map_or(after, |w| w.min(after)));
+                }
             }
+            let now_unverified: BTreeMap<String, String> = plan
+                .backends()
+                .into_iter()
+                .filter_map(|(name, def)| match cache.get(&name, &def) {
+                    Some(CapabilityVerdict::Unknown { reason }) => Some((name, reason)),
+                    _ => None,
+                })
+                .collect();
+            for (backend, reason) in &now_unverified {
+                if !unverified.contains_key(backend) {
+                    tracing::warn!(
+                        "encryption: could not verify the atomic writes of backend '{backend}' \
+                         ({reason}); writes to its encrypted buckets answer 503 (retried) until \
+                         a check succeeds — see {CAPABILITY_DOC_URL}"
+                    );
+                }
+            }
+            unverified = now_unverified;
             if let Some(tx) = first_round.take() {
                 let _ = tx.send(());
             }
             let now = read_only_buckets(&app).await;
             if now != announced {
                 for (backend, buckets) in &now {
-                    let verdict = cfg
-                        .backend_by_name(backend)
-                        .and_then(|d| cache.get(backend, d));
                     tracing::warn!(
                         "encryption: bucket(s) {buckets:?} on backend '{backend}' are READ-ONLY: \
-                         encryption needs atomic writes, which the backend does not provide \
+                         encryption needs atomic writes, which the backend does not support \
                          ({}). Reads keep working; writes are refused. Move them to a backend \
                          with atomic writes with a migrate job — see {CAPABILITY_DOC_URL}",
-                        verdict.as_ref().map_or_else(String::new, verdict_words)
+                        verdict_words(&CapabilityVerdict::NonCas)
                     );
                 }
                 for backend in announced.keys().filter(|b| !now.contains_key(*b)) {
                     tracing::info!(
-                        "encryption: the encrypted buckets on backend '{backend}' are writable \
-                         again (atomic writes verified)"
+                        "encryption: the encrypted buckets on backend '{backend}' are no longer \
+                         read-only"
                     );
                 }
                 announced = now;
             }
+            let sleep = next_wake.unwrap_or(std::time::Duration::from_secs(3600));
             tokio::select! {
-                _ = tokio::time::sleep(RECHECK) => {}
+                _ = tokio::time::sleep(sleep) => {}
                 _ = cache.plan_changed.notified() => {}
+                _ = app.backend_health.recovered.notified() => { recovered = true; }
             }
         }
     });
@@ -672,16 +957,97 @@ mod tests {
         let unknown = CapabilityVerdict::Unknown {
             reason: "timeout".into(),
         };
-        assert!(verdict_words(&unknown).contains("could not reach the backend to verify"));
-        let ro = read_only_message("releases", "b2", &unknown).unwrap();
-        assert!(ro.contains("read-only") && ro.contains("'b2'"), "{ro}");
+        assert!(verdict_words(&unknown).contains("could not verify"));
+        assert!(verdict_words(&CapabilityVerdict::NonCas).contains("does not support"));
+        let u = AtomicityRefusal {
+            verdict: unknown.clone(),
+            ..r.clone()
+        };
+        assert!(
+            u.message().contains("could not verify") && !u.message().contains("does not support"),
+            "{u}"
+        );
+        let ro = WriteBlock::ReadOnly {
+            backend: "b2".into(),
+        };
+        assert!(ro.admin_message("releases").contains("'b2'"));
+        assert!(proxy_unavailable_reason("b2", &unknown)
+            .unwrap()
+            .contains("could not verify"));
+        assert!(proxy_unavailable_reason("b2", &CapabilityVerdict::NonCas)
+            .unwrap()
+            .contains("does not support"));
         assert_eq!(
-            read_only_message(
-                "releases",
+            proxy_unavailable_reason(
                 "b2",
                 &CapabilityVerdict::CasVerified {
                     via: VerifiedVia::Probe
                 }
+            ),
+            None
+        );
+    }
+
+    /// C3: an S3 client never gets the probe's error (it can name the
+    /// backend's address); the admin message keeps it.
+    #[test]
+    fn s3_clients_get_fixed_phrases_without_the_probe_error() {
+        let secret = "DispatchFailure ConnectError 10.0.0.7:9000";
+        let pending = WriteBlock::of(
+            "b2",
+            Some(CapabilityVerdict::Unknown {
+                reason: secret.into(),
+            }),
+        )
+        .unwrap();
+        for create in [false, true] {
+            let crate::api::errors::S3Error::SlowDown(m) = pending.to_s3_error("photos", create)
+            else {
+                panic!("pending is a 503")
+            };
+            assert!(!m.contains(secret) && !m.contains("b2"), "{m}");
+            assert!(m.contains(CAPABILITY_DOC_URL), "{m}");
+        }
+        assert!(pending.admin_message("photos").contains(secret));
+        let ro = WriteBlock::of("b2", Some(CapabilityVerdict::NonCas)).unwrap();
+        for create in [false, true] {
+            let crate::api::errors::S3Error::AccessDeniedReason(m) =
+                ro.to_s3_error("photos", create)
+            else {
+                panic!("read-only is a 403")
+            };
+            assert!(!m.contains("[atomic_writes"), "no machine tag: {m}");
+            assert!(m.contains(CAPABILITY_DOC_URL), "{m}");
+        }
+    }
+
+    /// The watch re-probes an unverified backend soon (5 s doubling to
+    /// 60 s) and never a verdict on a timer (C6: no probe keys pile up in
+    /// a non-CAS customer bucket).
+    #[test]
+    fn the_watch_rechecks_only_what_it_could_not_verify() {
+        use std::time::Duration;
+        let unknown = CapabilityVerdict::Unknown { reason: "x".into() };
+        assert_eq!(recheck_after(None, 0), Some(Duration::ZERO));
+        assert_eq!(
+            recheck_after(Some(&unknown), 1),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            recheck_after(Some(&unknown), 2),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            recheck_after(Some(&unknown), 30),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(recheck_after(Some(&CapabilityVerdict::NonCas), 0), None);
+        assert_eq!(
+            recheck_after(
+                Some(&CapabilityVerdict::CasVerified {
+                    via: VerifiedVia::Probe
+                }),
+                0
             ),
             None
         );
@@ -782,11 +1148,17 @@ mod tests {
         ))
     }
 
+    fn home(b: Option<&str>) -> crate::storage::BucketHome {
+        b.map_or(crate::storage::BucketHome::Default, |b| {
+            crate::storage::BucketHome::Backend(b.into())
+        })
+    }
+
     /// The write rule follows the verdict of the backend's CURRENT
-    /// definition: no verdict yet → pending (fail closed), non-CAS and
-    /// unknown → read-only, CAS → writable. A bucket without a policy that
-    /// the router found on the encrypting backend follows the same rule; on
-    /// the plaintext default it is never blocked.
+    /// definition: no verdict yet or unknown → pending (fail closed, 503,
+    /// retried), non-CAS → read-only, CAS → writable. A bucket without a
+    /// policy that the router found on the encrypting backend follows the
+    /// same rule; on the plaintext default it is never blocked.
     #[test]
     fn the_write_rule_follows_the_verdict() {
         let c = s3_b2_encrypting();
@@ -794,18 +1166,41 @@ mod tests {
         cache.set_encrypted_plan(&c);
         let pending = Some(WriteBlock::Pending {
             backend: "b2".into(),
+            unverified: None,
         });
-        assert_eq!(cache.write_block("releases", None), pending, "no verdict");
-        assert_eq!(cache.write_block("photos", Some("b2")), pending, "unnamed");
-        assert_eq!(cache.write_block("photos", None), None, "plain default");
-        assert_eq!(cache.read_only_reason("releases", None), None);
+        assert_eq!(
+            cache.write_block("releases", &home(None)),
+            pending,
+            "no verdict"
+        );
+        assert_eq!(
+            cache.write_block("photos", &home(Some("b2"))),
+            pending,
+            "unnamed"
+        );
+        assert_eq!(
+            cache.write_block("photos", &home(None)),
+            None,
+            "plain default"
+        );
+        assert_eq!(cache.read_only_reason("releases", &home(None)), None);
         let def = c.backend_by_name("b2").unwrap();
-        cache.set("b2", def, CapabilityVerdict::NonCas);
-        assert!(cache.read_only_reason("releases", None).is_some());
-        assert!(cache.read_only_reason("photos", Some("b2")).is_some());
-        assert!(cache.read_only_reason("photos", None).is_none());
         cache.set("b2", def, CapabilityVerdict::Unknown { reason: "x".into() });
-        assert!(cache.read_only_reason("releases", None).is_some());
+        assert_eq!(
+            cache.write_block("releases", &home(None)),
+            Some(WriteBlock::Pending {
+                backend: "b2".into(),
+                unverified: Some("x".into())
+            }),
+            "unknown is pending, not read-only"
+        );
+        assert!(cache.read_only_reason("releases", &home(None)).is_none());
+        cache.set("b2", def, CapabilityVerdict::NonCas);
+        assert!(cache.read_only_reason("releases", &home(None)).is_some());
+        assert!(cache
+            .read_only_reason("photos", &home(Some("b2")))
+            .is_some());
+        assert!(cache.read_only_reason("photos", &home(None)).is_none());
         cache.set(
             "b2",
             def,
@@ -813,8 +1208,71 @@ mod tests {
                 via: VerifiedVia::Probe,
             },
         );
-        assert_eq!(cache.write_block("releases", None), None, "lifted");
-        assert_eq!(cache.write_block("photos", Some("b2")), None);
+        assert_eq!(cache.write_block("releases", &home(None)), None, "lifted");
+        assert_eq!(cache.write_block("photos", &home(Some("b2"))), None);
+    }
+
+    /// A bucket that the config does not name, whose home the router could
+    /// not determine, is pending while any encrypting site lacks a CAS
+    /// verdict (it could be there), never judged against the default.
+    #[test]
+    fn an_undetermined_home_fails_closed() {
+        let c = s3_b2_encrypting();
+        let cache = BackendCapabilityCache::default();
+        cache.set_encrypted_plan(&c);
+        let undetermined = crate::storage::BucketHome::Undetermined;
+        let def = c.backend_by_name("b2").unwrap();
+        cache.set("b2", def, CapabilityVerdict::NonCas);
+        assert!(
+            matches!(
+                cache.write_block("photos", &undetermined),
+                Some(WriteBlock::Pending { .. })
+            ),
+            "may be on the non-CAS site"
+        );
+        assert_eq!(
+            cache.write_block("releases", &undetermined),
+            Some(WriteBlock::ReadOnly {
+                backend: "b2".into()
+            }),
+            "a configured bucket needs no home"
+        );
+        cache.set(
+            "b2",
+            def,
+            CapabilityVerdict::CasVerified {
+                via: VerifiedVia::Probe,
+            },
+        );
+        assert_eq!(cache.write_block("photos", &undetermined), None);
+    }
+
+    /// Source guard (finding 1 of the N2 review): the write rule judges
+    /// the backend a bucket's writes REALLY go to. Only this module asks
+    /// `write_block`, always with a home from the router
+    /// (`bucket_home`/`bucket_home_now`, or the backend a storage listing
+    /// found the bucket on). Nobody judges by the router's no-I/O
+    /// `resolved_backend_name` (empty after a boot, an apply or a
+    /// CreateBucket, so a cold bucket looked like the default's); every
+    /// other caller goes through `AppState::atomic_write_block{,_now}`.
+    #[test]
+    fn no_caller_judges_an_unresolved_bucket() {
+        let mut offenders = Vec::new();
+        for (rel, text) in crate::source_scan::prod_sources("src") {
+            let code = crate::source_scan::prod_text(&text);
+            let here =
+                rel == "src/coordination/atomicity.rs" || rel == "src/coordination/capability.rs";
+            if !here && code.contains(".write_block(") {
+                offenders.push(format!("{rel}: write_block outside the atomicity module"));
+            }
+            if rel == "src/coordination/atomicity.rs" && code.contains("resolved_backend_name") {
+                offenders.push(format!("{rel}: judges by resolved_backend_name"));
+            }
+            if !here && code.contains("read_only_reason(") && !code.contains("BucketHome") {
+                offenders.push(format!("{rel}: read_only_reason without a BucketHome"));
+            }
+        }
+        assert!(offenders.is_empty(), "{offenders:#?}");
     }
 
     /// A filesystem backend gets its verdict with the plan: its encrypted
@@ -830,30 +1288,26 @@ mod tests {
         );
         let cache = BackendCapabilityCache::default();
         cache.set_encrypted_plan(&c);
-        assert_eq!(cache.write_block("releases", None), None);
+        assert_eq!(cache.write_block("releases", &home(None)), None);
     }
 
     #[test]
     fn the_messages_of_a_block_say_what_happens() {
         let p = WriteBlock::Pending {
             backend: "b2".into(),
+            unverified: None,
         };
-        assert!(p.message("releases").contains("still running"));
+        assert!(p.admin_message("releases").contains("still running"));
+        assert!(p.message("releases").contains("retry in a few seconds"));
         assert!(matches!(
             p.to_s3_error("releases", false),
             crate::api::errors::S3Error::SlowDown(_)
         ));
         let r = WriteBlock::ReadOnly {
             backend: "b2".into(),
-            verdict: CapabilityVerdict::NonCas,
         };
         let m = r.create_message("photos");
-        assert!(
-            m.contains("cannot be created")
-                && m.contains("backend=b2")
-                && m.contains("probe=non-cas"),
-            "{m}"
-        );
+        assert!(m.contains("cannot be created"), "{m}");
         assert!(matches!(
             r.to_s3_error("photos", true),
             crate::api::errors::S3Error::AccessDeniedReason(_)
@@ -882,6 +1336,74 @@ mod tests {
         .expect_err("refused");
         assert_eq!(r.verdict, CapabilityVerdict::NonCas, "{r}");
         assert!(r.message().contains("as Backblaze B2 does"), "{r}");
+    }
+
+    /// A proven CAS verdict, then ONE fresh probe that
+    /// fails for a transient reason (unreachable endpoint). Expected: the
+    /// running buckets stay writable.
+    #[tokio::test]
+    async fn a_transient_probe_failure_does_not_make_cas_buckets_read_only() {
+        let c = cfg(&format!(
+            "storage:\n  backends:\n    - name: local-disk\n      type: filesystem\n      \
+             path: /tmp/dgp-atomicity-c\n    - name: b2\n      type: s3\n      \
+             endpoint: \"http://127.0.0.1:1\"\n      region: us-east-1\n      allow_local: true\n      \
+             access_key_id: k\n      secret_access_key: s\n      encryption: {}\n  \
+             default_backend: local-disk\n  buckets:\n    releases: {{ backend: b2 }}\n",
+            aes("site")
+        ));
+        let cache = BackendCapabilityCache::default();
+        cache.set_encrypted_plan(&c);
+        let def = c.backend_by_name("b2").unwrap();
+        cache.set(
+            "b2",
+            def,
+            CapabilityVerdict::CasVerified {
+                via: VerifiedVia::Probe,
+            },
+        );
+        assert_eq!(cache.write_block("releases", &home(None)), None, "writable");
+        let v = probe_atomic_writes(&c, &cache, "b2", Some("releases")).await;
+        eprintln!("fresh probe verdict: {v:?}");
+        assert_eq!(
+            cache.write_block("releases", &home(None)),
+            None,
+            "after a transient probe failure"
+        );
+    }
+
+    /// A probe of a NOT-running definition of the same
+    /// backend name (validate / refused apply with rotated credentials)
+    /// must not evict the running definition's verdict.
+    #[tokio::test]
+    async fn a_probe_of_another_definition_keeps_the_running_verdict() {
+        let c = s3_b2_encrypting();
+        let cache = BackendCapabilityCache::default();
+        cache.set_encrypted_plan(&c);
+        let def = c.backend_by_name("b2").unwrap();
+        cache.set(
+            "b2",
+            def,
+            CapabilityVerdict::CasVerified {
+                via: VerifiedVia::Probe,
+            },
+        );
+        let mut candidate = c.clone();
+        for b in candidate.backends.iter_mut() {
+            if b.name == "b2" {
+                if let BackendConfig::S3 {
+                    secret_access_key, ..
+                } = &mut b.backend
+                {
+                    *secret_access_key = Some("rotated".into());
+                }
+            }
+        }
+        let _ = probe_atomic_writes(&candidate, &cache, "b2", Some("releases")).await;
+        assert_eq!(
+            cache.write_block("releases", &home(None)),
+            None,
+            "running definition still CAS"
+        );
     }
 
     #[tokio::test]

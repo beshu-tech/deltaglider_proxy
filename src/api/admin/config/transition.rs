@@ -374,6 +374,11 @@ pub(crate) async fn apply_config_transition(
     // backends, backup, migrate flip) emits it once. Key ids only.
     audit_encryption_changes(&ctx, &new_cfg.encryption_changes(old_cfg));
 
+    // The read-only rule (N2) follows the new config BEFORE the new engine
+    // serves, so no write is judged against the old plan with the new
+    // backends; the atomicity watch probes a backend of an encrypted
+    // bucket that has no verdict yet.
+    ctx.app().backend_capabilities.set_encrypted_plan(&new_cfg);
     // The engine store and the config swap are the LAST steps: every check
     // above passed, and the write guard is held across both.
     let engine_rebuilt = new_engine.is_some();
@@ -446,9 +451,6 @@ pub(crate) async fn apply_config_transition(
     if let Some(db) = ctx.app().jobs_db.as_ref() {
         crate::event_outbox::set_config_readers(db, &new_cfg);
     }
-    // The read-only rule (N2) follows the new config; the atomicity watch
-    // probes a backend of an encrypted bucket that has no verdict yet.
-    ctx.app().backend_capabilities.set_encrypted_plan(&new_cfg);
     **cfg = new_cfg;
 
     Ok(TransitionReport {
@@ -1076,6 +1078,22 @@ mod transition_order_tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Finding 5: the write rule's plan follows the new config BEFORE the
+    /// new engine (its backends) serves, so no write is judged against the
+    /// old plan with the new backends.
+    #[test]
+    fn the_encrypted_plan_is_installed_before_the_engine() {
+        let body = transition_body();
+        let plan = body
+            .find("set_encrypted_plan(")
+            .expect("set_encrypted_plan");
+        let engine = body.find("install_engine(").expect("install_engine");
+        assert!(
+            plan < engine,
+            "set_encrypted_plan runs after install_engine"
+        );
     }
 
     #[test]

@@ -65,6 +65,11 @@ pub struct AdminError {
     /// A 5xx whose message is written for the client
     /// ([`AdminError::unavailable`]). Every other 5xx is scrubbed.
     public: bool,
+    /// The structured part of a refusal, sent as `atomic_writes` next to
+    /// `error` and `message` (an [`AtomicityRefusal`]'s details).
+    ///
+    /// [`AtomicityRefusal`]: crate::coordination::atomicity::AtomicityRefusal
+    atomic_writes: Option<serde_json::Value>,
 }
 
 impl AdminError {
@@ -76,6 +81,7 @@ impl AdminError {
             code: code_for_status(status),
             message: message.into(),
             public: false,
+            atomic_writes: None,
         }
     }
 
@@ -203,11 +209,43 @@ impl IntoResponse for AdminError {
             tracing::warn!("admin API {}: {}", self.status, self.message);
         }
         let (code, message) = self.wire();
-        (
-            self.status,
-            axum::Json(serde_json::json!({ "error": code, "message": message })),
-        )
-            .into_response()
+        let mut body = serde_json::json!({ "error": code, "message": message });
+        if let Some(details) = self.atomic_writes.as_ref().filter(|_| !self.scrubbed()) {
+            body["atomic_writes"] = details.clone();
+        }
+        (self.status, axum::Json(body)).into_response()
+    }
+}
+
+/// A refusal for lack of atomic writes: 409 `atomic_writes_required`, with
+/// the refusal's details as `atomic_writes`.
+impl From<crate::coordination::atomicity::AtomicityRefusal> for AdminError {
+    fn from(r: crate::coordination::atomicity::AtomicityRefusal) -> Self {
+        Self {
+            atomic_writes: Some(r.details()),
+            ..Self::coded(
+                crate::coordination::atomicity::ATOMIC_WRITES_REQUIRED,
+                StatusCode::CONFLICT,
+                r.message(),
+            )
+        }
+    }
+}
+
+impl AdminError {
+    /// The refusal of an admin write into `bucket` under the write rule of
+    /// encrypted buckets: pending → 503 (retry), read-only → 403. The
+    /// admin message names the backend and the reason.
+    pub(crate) fn write_block(
+        block: &crate::coordination::atomicity::WriteBlock,
+        bucket: &str,
+    ) -> Self {
+        let message = block.admin_message(bucket);
+        if block.is_read_only() {
+            Self::forbidden(message)
+        } else {
+            Self::unavailable(message)
+        }
     }
 }
 

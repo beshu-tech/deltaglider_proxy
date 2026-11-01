@@ -62,6 +62,10 @@ pub struct EffectiveEncryption {
     /// atomic writes), with the doc link; `None` when it is offered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_unavailable: Option<String>,
+    /// The atomic-writes verdict of the backend in plain words (the
+    /// server's wording), or `None` without a verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_words: Option<String>,
     /// What the bucket's backend does on its own: the encryption that
     /// "Inherit" gives the bucket (equal to the top-level fields when
     /// `source` is `backend`).
@@ -222,6 +226,7 @@ pub fn effective_encryption(
         bucket_modes: cfg.bucket_encryption_modes(&e.backend),
         capability: None,
         proxy_unavailable: None,
+        capability_words: None,
     })
 }
 
@@ -240,6 +245,9 @@ pub fn apply_capability(
         e.bucket_modes.retain(|m| *m != "aes256-gcm-proxy");
         e.proxy_unavailable = Some(reason);
     }
+    e.capability_words = verdict
+        .as_ref()
+        .map(crate::coordination::atomicity::verdict_words);
     e.capability = verdict;
 }
 

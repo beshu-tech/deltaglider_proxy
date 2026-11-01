@@ -433,16 +433,18 @@ impl BulkPlan {
 
 /// 403 when the bucket is `replication_target_only` — admin bulk ops are
 /// client writes too (same seam as the S3 gate, adapted to admin errors).
-fn reject_if_replication_target_only(
+async fn reject_if_replication_target_only(
     state: &std::sync::Arc<crate::api::admin::AdminState>,
     bucket: &str,
 ) -> Result<(), AdminError> {
+    // The write rule of encrypted buckets, with the admin's message (it
+    // names the backend and the reason).
+    if let Some(b) = state.s3_state.atomic_write_block(bucket).await {
+        return Err(AdminError::write_block(&b, bucket));
+    }
     crate::api::handlers::object_helpers::check_client_write_allowed(&state.s3_state, bucket)
-        .map_err(|e| match e {
-            // The atomic-write check of an encrypted bucket still runs.
-            crate::api::errors::S3Error::SlowDown(m) => AdminError::unavailable(m),
-            e => AdminError::forbidden(e.to_string()),
-        })
+        .await
+        .map_err(|e| AdminError::forbidden(e.to_string()))
 }
 
 pub async fn copy_objects(
@@ -459,7 +461,7 @@ pub async fn copy_objects(
         req.items,
     )?;
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
-    reject_if_replication_target_only(&state, &req.dest_bucket)?;
+    reject_if_replication_target_only(&state, &req.dest_bucket).await?;
     if req.items.is_empty() {
         return Err(AdminError::invalid("no items to copy"));
     }
@@ -767,8 +769,8 @@ pub async fn move_objects(
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_under_maintenance(&state, &req.source_bucket)?;
     // Move = store into dest + delete from source: both are client writes.
-    reject_if_replication_target_only(&state, &req.dest_bucket)?;
-    reject_if_replication_target_only(&state, &req.source_bucket)?;
+    reject_if_replication_target_only(&state, &req.dest_bucket).await?;
+    reject_if_replication_target_only(&state, &req.source_bucket).await?;
     if req.items.is_empty() {
         return Err(AdminError::invalid("no items to move"));
     }
@@ -978,7 +980,7 @@ pub async fn bulk_delete(
         savings: state.savings_cache.clone(),
     };
     reject_if_under_maintenance(&state, &req.bucket)?;
-    reject_if_replication_target_only(&state, &req.bucket)?;
+    reject_if_replication_target_only(&state, &req.bucket).await?;
     if req.keys.is_empty() {
         return Err(AdminError::invalid("no keys to delete"));
     }
@@ -1044,7 +1046,7 @@ pub async fn start_delete_job(
 ) -> Result<(StatusCode, Json<DeleteJobStarted>), AdminError> {
     use crate::maintenance::delete::{self as job, DeleteParams};
     let bucket = req.bucket.admit(&state)?;
-    reject_if_replication_target_only(&state, &bucket)?;
+    reject_if_replication_target_only(&state, &bucket).await?;
     if req.prefixes.is_empty() && req.keys.is_empty() {
         return Err(AdminError::invalid("nothing to delete"));
     }

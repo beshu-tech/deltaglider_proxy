@@ -241,6 +241,18 @@ pub struct BackendInfoResponse {
     /// writes (N2). Populated by `GET /backends` only; omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_only_buckets: Vec<String>,
+    /// The atomic-writes verdict in plain words (the server's wording, the
+    /// UI shows it as is). `GET /backends` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_words: Option<String>,
+    /// Why a bucket on this backend cannot take proxy AES (the verdict does
+    /// not prove atomic writes), or `None`. `GET /backends` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_unavailable: Option<String>,
+    /// The backend stores buckets that encrypt with the proxy and has no
+    /// verdict yet: writes to them answer 503 until the check ends.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub atomic_writes_checking: bool,
 }
 
 impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
@@ -262,6 +274,9 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 health: None,
                 bucket_encryption_modes: None,
                 read_only_buckets: Vec::new(),
+                capability_words: None,
+                proxy_unavailable: None,
+                atomic_writes_checking: false,
             },
             crate::config::BackendConfig::S3 {
                 endpoint,
@@ -284,6 +299,9 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 health: None,
                 bucket_encryption_modes: None,
                 read_only_buckets: Vec::new(),
+                capability_words: None,
+                proxy_unavailable: None,
+                atomic_writes_checking: false,
             },
         }
     }

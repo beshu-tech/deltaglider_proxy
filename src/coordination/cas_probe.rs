@@ -169,6 +169,13 @@ async fn purge_versions(client: &Client, bucket: &str, key: &str) {
     }
 }
 
+/// Remove `key` with every version of it (best effort): the cleanup of a
+/// probe, also of one that a deadline cut short.
+pub async fn remove_all_versions(client: &Client, bucket: &str, key: &str) {
+    let _ = client.delete_object().bucket(bucket).key(key).send().await;
+    purge_versions(client, bucket, key).await;
+}
+
 /// Run the probe on `bucket/key` and delete the key afterwards (best
 /// effort). `Err` = indeterminate, as in [`classify_cas_probe`]. Seven
 /// requests: four PUTs, the DELETE with a wrong ETag, the cleanup, and the
@@ -239,8 +246,7 @@ pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<Probe
             .send()
             .await,
     );
-    let _ = client.delete_object().bucket(bucket).key(key).send().await;
-    purge_versions(client, bucket, key).await;
+    remove_all_versions(client, bucket, key).await;
     Ok(ProbeResult {
         cas: classify_cas_probe(&create, &wrong, &right)?,
         conditional_delete: classify_conditional_delete(&delete_wrong),
@@ -395,6 +401,8 @@ pub(crate) mod b2_like {
     pub(crate) struct Counts {
         /// Conditional PUTs whose connection the fake dropped.
         pub dropped: AtomicU32,
+        /// Version listings (the cleanup of every version of a key).
+        pub version_lists: AtomicU32,
     }
 
     /// Start the fake; returns its endpoint and counters. `reachable =
@@ -458,6 +466,7 @@ pub(crate) mod b2_like {
                     .to_string(),
             )
         } else if line.contains("versions") {
+            c.version_lists.fetch_add(1, Ordering::SeqCst);
             (
                 "200 OK",
                 "",

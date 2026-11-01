@@ -12,7 +12,8 @@ pub(super) async fn create_multipart_upload(
     let input = req.input;
     // Earliest reject: parts are staged in-memory, but refusing at
     // create saves the client uploading them at all (403-before-404).
-    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
+    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
+        .await?;
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let engine = svc.state.engine.load();
@@ -142,7 +143,8 @@ pub(super) async fn complete_multipart_upload(
     let input = req.input;
     // Defense-in-depth: the marker can be hot-applied mid-upload, so
     // Complete (the moment bytes reach the backend) re-checks.
-    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
+    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
+        .await?;
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let requested_parts = completed_parts_to_request(input.multipart_upload.as_ref())?;
     svc.state

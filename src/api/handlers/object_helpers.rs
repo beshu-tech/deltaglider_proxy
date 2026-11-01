@@ -346,11 +346,11 @@ fn object_created_event(
 /// `write_blocked`. Before the backend's first verdict (boot, a config
 /// change) the same gate answers 503 SlowDown: it fails closed, and S3
 /// clients retry.
-pub(crate) fn check_client_write_allowed(
+pub(crate) async fn check_client_write_allowed(
     state: &Arc<AppState>,
     bucket: &str,
 ) -> Result<(), S3Error> {
-    if let Some(block) = state.atomic_write_block(bucket) {
+    if let Some(block) = state.atomic_write_block(bucket).await {
         return Err(block.to_s3_error(bucket, false));
     }
     let engine = state.engine.load();

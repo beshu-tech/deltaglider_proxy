@@ -848,6 +848,15 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let maintenance_notify = Arc::new(tokio::sync::Notify::new());
     let backend_capabilities =
         Arc::new(deltaglider_proxy::coordination::BackendCapabilityCache::default());
+    // Encryption needs atomic writes (N2): probe the backends of the
+    // proxy-encrypted buckets now, in parallel with the capability and
+    // health gates below, so their pending window (writes answer 503) is
+    // one bounded probe, not the boot checks plus a probe.
+    backend_capabilities.set_encrypted_plan(&config);
+    let atomicity_boot_probes = deltaglider_proxy::coordination::atomicity::spawn_boot_probes(
+        config.clone(),
+        backend_capabilities.clone(),
+    );
 
     // Backend write-capability gate (guard B): under multi-instance, a
     // client-writable bucket on a non-CAS named backend is a data-corruption
@@ -898,17 +907,24 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .write_refusal(bucket)
                     // An encrypted bucket on a backend without atomic
                     // writes is read-only (N2): background writers wait.
-                    .or_else(|| s.atomic_write_block(bucket).map(|b| b.message(bucket)))
+                    .or_else(|| {
+                        s.atomic_write_block_now(bucket)
+                            .map(|b| b.admin_message(bucket))
+                    })
             })
         }));
     }
-    // Encryption needs atomic writes (N2): probe the backends of the
-    // proxy-encrypted buckets in the background (boot does not wait); a
-    // bucket on a backend without them serves reads only.
-    backend_capabilities.set_encrypted_plan(&config);
+    // The storage wrappers skip their own writes (listing tokens, key
+    // claims) into encrypted buckets on a backend without proven atomic
+    // writes.
+    backend_capabilities
+        .attach_storage_gate(state.engine.load().encryption_policies().atomicity_gate());
+    // The atomicity watch takes over from the boot probes: a bucket on a
+    // backend without atomic writes serves reads only.
     let first_round = deltaglider_proxy::coordination::atomicity::spawn_watch(
         state.clone(),
         shared_config.clone(),
+        Some(atomicity_boot_probes),
     );
     // Writes to an encrypted bucket fail closed (503) until its backend
     // has a verdict. The probe started at once; wait a short, bounded time
