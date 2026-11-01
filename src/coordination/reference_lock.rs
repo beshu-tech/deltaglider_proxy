@@ -197,6 +197,34 @@ pub fn plan_lock_renew(current: &Observed, now: i64, owner: &str) -> RenewLockAc
     }
 }
 
+/// What a renew that got 412 learned from the read after it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RenewConflict {
+    /// Ours and live, and the object changed: our own renew landed (its
+    /// response was lost). `etag` is that write.
+    Renewed { etag: String },
+    /// Gone, corrupt, another owner's, or lapsed.
+    Lost,
+    /// Ours and live, but the same object we tried to replace: the
+    /// backend refused the condition and wrote nothing. Still held, but
+    /// not extended, so it must not count as a renew.
+    NotExtended,
+}
+
+/// Pure judgement of a renew 412 (`sent_etag` = the `If-Match` it sent).
+pub fn judge_renew_conflict(
+    after: &Observed,
+    now: i64,
+    owner: &str,
+    sent_etag: &str,
+) -> RenewConflict {
+    match plan_lock_renew(after, now, owner) {
+        RenewLockAction::Lost => RenewConflict::Lost,
+        RenewLockAction::Renew { etag, .. } if etag == sent_etag => RenewConflict::NotExtended,
+        RenewLockAction::Renew { etag, .. } => RenewConflict::Renewed { etag },
+    }
+}
+
 /// A per-deltaspace cross-instance mutex.
 #[dynosaur::dynosaur(pub DynReferenceLock = dyn(box) ReferenceLock)]
 pub trait ReferenceLock: Send + Sync {
@@ -525,17 +553,21 @@ impl ReferenceLock for S3ReferenceLock {
         if written {
             return Ok(());
         }
-        // A 412: the object moved since our read. Either a peer stole it
-        // (lost), or the PUT landed and its response was lost, so the SDK
-        // retry got 412 against our own write. Read once to tell them
-        // apart (as `S3Lease::renew` does): still ours and live = renewed,
-        // by that write.
-        match plan_lock_renew(&self.read_lock(key, now).await?, now, owner) {
-            RenewLockAction::Renew { etag, .. } => {
+        // A 412. Either a peer stole it (lost), or the PUT landed and its
+        // response was lost, so the SDK retry got 412 against our own
+        // write. Read once to tell them apart (as `S3Lease::renew` does).
+        let after = self.read_lock(key, now).await?;
+        match judge_renew_conflict(&after, now, owner, &etag) {
+            RenewConflict::Renewed { etag } => {
                 self.kept.note(key, owner, &Ok::<_, ()>(Some(etag)));
                 Ok(())
             }
-            RenewLockAction::Lost => Err(LeaseError::Lost),
+            RenewConflict::Lost => Err(LeaseError::Lost),
+            RenewConflict::NotExtended => Err(LeaseError::Backend(
+                "the coordination bucket refused the renew of an unchanged lock (412 on a \
+                 matching If-Match): the lock was not extended"
+                    .into(),
+            )),
         }
     }
 
@@ -1244,6 +1276,46 @@ mod tests {
         lock.release("k", "hold-1").await.unwrap();
         assert_eq!(lossy.seen(), ["DELETE"]);
         assert!(lossy.body("k").is_none());
+    }
+
+    /// A backend answers 412 to the renew's `If-Match` although the ETag
+    /// matches, and writes nothing. The read after it finds our lock,
+    /// unchanged. That is not a renew: the expiry did not move, so the
+    /// holder must not count it as confirmed.
+    #[tokio::test]
+    async fn a_refused_renew_of_an_unchanged_lock_is_not_confirmed() {
+        let (lock, lossy) = lossy_lock();
+        let now = crate::event_outbox::current_unix_seconds();
+        assert!(lock.try_acquire("k", "hold-1", now).await.unwrap());
+        let before = lossy.body("k").unwrap()["expires_at"].clone();
+        *lossy.refuse_if_match_puts.lock().unwrap() = 1;
+        let err = lock.renew("k", "hold-1", now + 10).await.unwrap_err();
+        assert!(matches!(err, LeaseError::Backend(_)), "{err:?}");
+        assert_eq!(lossy.body("k").unwrap()["expires_at"], before);
+        // The next renew, accepted, extends it.
+        lock.renew("k", "hold-1", now + 10).await.unwrap();
+        assert_ne!(lossy.body("k").unwrap()["expires_at"], before);
+    }
+
+    #[test]
+    fn renew_conflict_truth_table() {
+        let mine = held(obj("me", "nodeA", 7, 100));
+        assert_eq!(
+            judge_renew_conflict(&mine, 100, "me", "e1"),
+            RenewConflict::NotExtended
+        );
+        assert_eq!(
+            judge_renew_conflict(&mine, 100, "me", "e0"),
+            RenewConflict::Renewed { etag: "e1".into() }
+        );
+        assert_eq!(
+            judge_renew_conflict(&mine, 101, "me", "e0"),
+            RenewConflict::Lost
+        );
+        assert_eq!(
+            judge_renew_conflict(&Observed::Absent, 100, "me", "e0"),
+            RenewConflict::Lost
+        );
     }
 
     /// A renew 412 whose re-read shows another owner is still lost.

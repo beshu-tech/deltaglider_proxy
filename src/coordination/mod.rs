@@ -262,6 +262,10 @@ pub(crate) mod test_s3 {
         writes: Arc<Mutex<u32>>,
         /// How many of the next successful PUTs lose their response.
         pub lose_puts: Arc<Mutex<u32>>,
+        /// How many of the next `If-Match` PUTs answer 412 and write
+        /// nothing although the ETag matches (a backend that rejects the
+        /// header's form, as Ceph RGW does with a quoted ETag).
+        pub refuse_if_match_puts: Arc<Mutex<u32>>,
         /// Methods of the requests seen, in order (`PUT 412` for a lost race).
         pub seen: Arc<Mutex<Vec<String>>>,
     }
@@ -304,7 +308,14 @@ pub(crate) mod test_s3 {
             let current = objects.get(&key).map(|(_, e)| e.clone());
             let if_match = request.headers().get("if-match").map(str::to_string);
             let if_none = request.headers().get("if-none-match").is_some();
-            let failed = (if_none && current.is_some())
+            let refused = if_match.is_some() && request.method() == "PUT" && {
+                let mut refuse = self.refuse_if_match_puts.lock().unwrap();
+                let hit = *refuse > 0;
+                *refuse = refuse.saturating_sub(1);
+                hit
+            };
+            let failed = refused
+                || (if_none && current.is_some())
                 || if_match
                     .as_ref()
                     .is_some_and(|m| Some(m) != current.as_ref());
