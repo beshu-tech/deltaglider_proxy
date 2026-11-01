@@ -4,7 +4,9 @@
 # shape — declarative IAM (inline permissions, group membership,
 # ${iam:username} templates, StringLike s3:prefix conditions including the
 # empty-string prefix), an OIDC provider with mapping rules, a remote S3
-# backend plus an encrypted filesystem backend, bucket routing,
+# backend plus an encrypted filesystem backend, a second S3 backend that
+# encrypts with the proxy (prod: an encrypted bucket on Backblaze B2, which
+# has no atomic writes, so the bucket is read-only), bucket routing,
 # public_prefixes, a replication rule, a lifecycle rule, and advanced
 # overrides. All names use the docs example cast; every secret is a
 # same-shaped dummy.
@@ -195,6 +197,16 @@ storage:
     encryption:
       mode: aes256-gcm-proxy
       key: 0000000000000000000000000000000000000000000000000000000000000000
+  - name: aws-dr
+    type: s3
+    endpoint: https://s3.eu-central-003.dr.example
+    region: eu-central-003
+    access_key_id: DUMMYDRKEY0000000000
+    secret_access_key: DummyDrSecret0000000000000000000000000000
+    encryption:
+      mode: aes256-gcm-proxy
+      key: "2222222222222222222222222222222222222222222222222222222222222222"
+      key_id: aws-dr-2026
   default_backend: hetzner-fsn1
   buckets:
     releases:
@@ -217,7 +229,7 @@ storage:
     ml-models:
       compression: null
       max_delta_ratio: null
-      backend: local-disk
+      backend: aws-dr
     pippo:
       compression: null
       max_delta_ratio: null

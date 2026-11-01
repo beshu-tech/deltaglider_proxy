@@ -14,6 +14,11 @@
 //!
 //! Two variants: the default backend `hetzner-fsn1` is a filesystem
 //! backend (PR gate, no MinIO) or MinIO (skipped without it).
+//!
+//! Encryption needs atomic writes: the S3 backend `aws-dr` encrypts with
+//! the proxy, and the test seam makes its verdict non-CAS (prod keeps such a
+//! bucket on Backblaze B2), so its bucket `ml-models` is read-only. A boot
+//! whose atomicity probe is slow shows the pending state (503) first.
 
 use crate::common;
 
@@ -28,6 +33,9 @@ use serde_yaml::Value;
 use std::path::{Path, PathBuf};
 
 const FIXTURE: &str = include_str!("fixtures/prod_shape_config.yaml");
+
+/// The backend without atomic writes (the test seam forces its verdict).
+const NON_ATOMIC: (&str, &str) = ("DGP_TEST_FORCE_NONCAS_BACKEND", "aws-dr");
 
 /// The fixture's bootstrap S3 pair (also the `legacy-admin` IAM user).
 const ADMIN: (&str, &str) = ("admin", "bootstrap-dummy-secret-000");
@@ -89,7 +97,7 @@ fn adapt_fixture(
     {
         let name = b["name"].as_str().expect("backend name").to_string();
         match (name.as_str(), default_backend) {
-            ("hetzner-fsn1", DefaultBackend::Filesystem) => {
+            ("hetzner-fsn1" | "aws-dr", DefaultBackend::Filesystem) => {
                 let m = b.as_mapping_mut().unwrap();
                 for k in [
                     "endpoint",
@@ -103,7 +111,7 @@ fn adapt_fixture(
                 set(b, "type", "filesystem");
                 set(b, "path", data_root.join(&name).display().to_string());
             }
-            ("hetzner-fsn1", DefaultBackend::Minio) => {
+            ("hetzner-fsn1" | "aws-dr", DefaultBackend::Minio) => {
                 set(b, "endpoint", common::minio_endpoint_url());
                 set(b, "region", "us-east-1");
                 set(b, "access_key_id", common::MINIO_ACCESS_KEY);
@@ -123,6 +131,11 @@ fn adapt_fixture(
         let releases = map_get(buckets, "releases");
         set(releases, "backend", "hetzner-fsn1");
         set(releases, "alias", format!("releases-{suffix}"));
+        set(
+            map_get(buckets, "ml-models"),
+            "alias",
+            format!("ml-models-{suffix}"),
+        );
     }
     let scratch_real = format!("scratch-{suffix}");
     set(map_get(buckets, "scratch"), "alias", scratch_real.clone());
@@ -140,7 +153,24 @@ async fn boot(default_backend: DefaultBackend) -> ProdShape {
         .to_string();
     let (doc, scratch_real) = adapt_fixture(data.path(), &default_backend, &suffix);
     let local_disk = data.path().join("local-disk");
-    let server = TestServer::from_config_document(&doc, data, ADMIN, "releases", Vec::new()).await;
+    // `ml-models` exists on `aws-dr` before the proxy starts: the proxy
+    // does not create a bucket that would be read-only.
+    match default_backend {
+        DefaultBackend::Filesystem => {
+            std::fs::create_dir_all(data.path().join("aws-dr").join("ml-models")).unwrap()
+        }
+        DefaultBackend::Minio => {
+            common::minio_client()
+                .await
+                .create_bucket()
+                .bucket(format!("ml-models-{suffix}"))
+                .send()
+                .await
+                .expect("create ml-models on MinIO");
+        }
+    }
+    let env = vec![(NON_ATOMIC.0.to_string(), NON_ATOMIC.1.to_string())];
+    let server = TestServer::from_config_document(&doc, data, ADMIN, "releases", env).await;
     let s3 = server.s3_client().await;
     for b in ["db-archive", "pippo", "scratch", "downloads", "reenc-demo"] {
         s3.create_bucket()
@@ -932,7 +962,63 @@ async fn jobs_matrix(ps: &ProdShape) {
     );
 }
 
+/// The encrypted bucket on the backend without atomic writes is
+/// read-only: reads work, every write gets 403 AccessDenied, the admin
+/// bucket view says why; the other backends' buckets stay writable.
+async fn read_only_matrix(ps: &ProdShape) {
+    let http = &ps.admin_http;
+    let ep = ps.server.endpoint();
+    let (code, _) = list(http, ps, "ml-models", "").await;
+    assert_eq!(code, 200, "reads keep working");
+    for (method, key) in [(Method::PUT, "w.bin"), (Method::DELETE, "w.bin")] {
+        let resp = http
+            .s3_request(method.clone(), &url(ps, "ml-models", key))
+            .body(b"x".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "{method} into a read-only bucket"
+        );
+        assert!(resp.text().await.unwrap().contains("AccessDenied"));
+    }
+    let admin = admin_http_client(&ep).await;
+    let v: serde_json::Value = admin
+        .get(format!("{ep}/_/api/admin/buckets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = v["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "ml-models")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        row["read_only"].is_string(),
+        "the bucket view says why: {row}"
+    );
+    for b in ["db-archive", "reenc-demo"] {
+        assert!(
+            v["buckets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == b)
+                .is_some_and(|r| r["read_only"].is_null()),
+            "{b} stays writable: {v}"
+        );
+    }
+}
+
 async fn run_matrix(ps: &ProdShape) {
+    read_only_matrix(ps).await;
     for bucket in ["releases", "db-archive", "scratch"] {
         object_matrix(ps, bucket).await;
     }
@@ -950,6 +1036,63 @@ async fn run_matrix(ps: &ProdShape) {
 async fn prod_shape_filesystem_serves_the_request_matrix() {
     let ps = boot(DefaultBackend::Filesystem).await;
     run_matrix(&ps).await;
+}
+
+/// Before the first atomic-writes verdict (here every probe takes 6 s; the
+/// boot waits 3 s for the first round), a write into an encrypted bucket
+/// gets 503 SlowDown, which S3 clients retry, and reads work. Once the
+/// verdict is in, the same write is stored.
+#[tokio::test]
+async fn prod_shape_writes_wait_for_the_first_atomic_writes_verdict() {
+    let data = tempfile::TempDir::new().expect("temp dir");
+    let (doc, _) = adapt_fixture(data.path(), &DefaultBackend::Filesystem, "pending");
+    // The bucket exists before the start: CreateBucket waits too.
+    std::fs::create_dir_all(data.path().join("local-disk").join("db-archive")).unwrap();
+    let env = vec![
+        (NON_ATOMIC.0.to_string(), NON_ATOMIC.1.to_string()),
+        (
+            "DGP_TEST_ATOMICITY_PROBE_DELAY_MS".to_string(),
+            "6000".to_string(),
+        ),
+    ];
+    let server = TestServer::from_config_document(&doc, data, ADMIN, "releases", env).await;
+    let http = server.http();
+    let put = || async {
+        let resp = http
+            .s3_request(
+                Method::PUT,
+                &format!("{}/db-archive/pending.bin", server.endpoint()),
+            )
+            .body(b"pending".to_vec())
+            .send()
+            .await
+            .unwrap();
+        let code = resp.status().as_u16();
+        (code, resp.text().await.unwrap_or_default())
+    };
+    let (code, body) = put().await;
+    assert_eq!(code, 503, "pending: {body}");
+    assert!(body.contains("SlowDown"), "{body}");
+    let listed = http
+        .s3_request(
+            Method::GET,
+            &format!("{}/db-archive?list-type=2", server.endpoint()),
+        )
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(listed, 200, "reads do not wait");
+    let mut last = (code, body);
+    for _ in 0..200 {
+        last = put().await;
+        if last.0 == 200 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(last.0, 200, "stored once the verdict is in: {}", last.1);
 }
 
 #[tokio::test]

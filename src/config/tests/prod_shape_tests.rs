@@ -66,7 +66,7 @@ fn iam_templates_survive_env_expansion() {
 fn storage_shape_is_intact() {
     let cfg = parsed();
     let names: Vec<&str> = cfg.backends.iter().map(|b| b.name.as_str()).collect();
-    assert_eq!(names, vec!["hetzner-fsn1", "local-disk"]);
+    assert_eq!(names, vec!["hetzner-fsn1", "local-disk", "aws-dr"]);
     assert_eq!(cfg.default_backend.as_deref(), Some("hetzner-fsn1"));
 
     // The filesystem backend carries proxy-AES encryption with an
@@ -85,7 +85,19 @@ fn storage_shape_is_intact() {
         .values()
         .filter(|p| p.backend.as_deref() == Some("local-disk"))
         .count();
-    assert_eq!(routed_local, 7, "seven buckets routed to local-disk");
+    assert_eq!(routed_local, 6, "six buckets routed to local-disk");
+    // Prod keeps an encrypted bucket on an S3 backend without atomic
+    // writes (Backblaze B2): the site of `aws-dr` encrypts with the proxy.
+    let dr = cfg.encryption_for_bucket("ml-models").unwrap();
+    assert_eq!(dr.backend, "aws-dr");
+    assert!(
+        !dr.from_bucket,
+        "ml-models inherits the backend's encryption"
+    );
+    assert!(matches!(
+        dr.config,
+        crate::config::BackendEncryptionConfig::Aes256GcmProxy { .. }
+    ));
     assert_eq!(
         cfg.buckets["releases"].public_prefixes,
         vec!["firmware/public/".to_string()],
