@@ -66,6 +66,8 @@ Bucket-level operations match the bare bucket name (no `/*`); object operations 
 ]
 ```
 
+A bucket-level request has no object key. When no rule matches the bare bucket name, the proxy checks the request again with the resource `releases/`, which `releases/*` matches. It does this for every action except `admin`. So a rule on `releases/*` alone allows the bucket-level requests for `list`, `delete` and `write`: a LIST request, a batch delete (`POST ?delete`) and a browser form upload. It does not allow `CreateBucket`, `DeleteBucket` or another bucket-level `PUT` or `DELETE`, which need `admin` on `releases` or on `*`. An explicit Deny on the bucket name is final, and a Deny on `releases/*` also wins on the second check.
+
 ## Permission templates
 
 Resource strings and string condition values accept identity templates:

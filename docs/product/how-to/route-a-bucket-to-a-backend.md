@@ -72,6 +72,8 @@ Aliasing is useful when:
 - The upstream name carries a prefix you don't want to expose (`acme-prod-releases-fsn1` vs `releases`).
 - You want two logical namespaces in one physical bucket (two aliases that point at the same real bucket). Avoid this unless you also scope access by prefix with IAM.
 
+When two bucket names point at one real bucket on one backend, `ListBuckets` lists both names. The proxy treats the two names as one storage in two places. A replication rule from one name into the other is refused when the destination prefix contains the source prefix ([Replication reference](../reference/replication.md#static-validation-configcheck)). A migrate job of either name is refused with `409`, because the job would not block or copy the writes through the other name ([How to move a bucket to another backend](move-a-bucket-between-backends.md)).
+
 ## The same change in YAML
 
 The steps above write this configuration into the `storage` section of `deltaglider_proxy.yaml` ([why the UI and the file hold the same configuration](../explanation/two-ways-to-configure.md)):

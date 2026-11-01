@@ -16,7 +16,7 @@ Two shapes exist because the work has two shapes, and this is also why the rules
 
 ## Why maintenance jobs take a write gate
 
-While a re-encrypt, migrate or metadata-backfill job works a bucket, S3 writes to that bucket get `503 SlowDown`. Reads pass untouched. The proxy chooses consistency over availability here on purpose.
+While a migrate or metadata-backfill job works a bucket, S3 writes to that bucket get `503 SlowDown`. A re-encrypt job takes the same gate only on a backend that cannot refuse a stale write, as the third paragraph below explains. Reads pass untouched. The proxy chooses consistency over availability here on purpose.
 
 The gate prevents a race. Suppose that a re-encrypt job sweeps `db-archive` after a key rotation while `backup-bot` PUTs tonight's dump. Without the gate, that PUT can land under the old configuration *after* the sweep passed its key. The job then finishes "successfully", and one object stays under a key that you are about to retire, with no error to tell you. A migration has the same race with a worse ending: a write to the old backend after the copy phase is lost when traffic flips.
 

@@ -51,6 +51,12 @@ kubectl apply -f operator/deploy/operator.yaml
 To upgrade an installed operator, apply the new `crd.yaml` before the new
 `operator.yaml`. Operator 0.3.0 adds `spec.router.trustedProxyCidrs` to the CRD.
 
+Operator 0.3.24 adds `patch` on Secrets to the ClusterRole in `operator.yaml`. The
+operator adds the config DB key (`dbKey`) to an existing `<name>-bootstrap` Secret that
+does not have it. With an older ClusterRole that request gets `403`, so every reconcile
+fails and the operator changes nothing in the cluster. Apply the new `operator.yaml` to
+get the new ClusterRole and the new image together.
+
 ## 2. Create the credentials Secret
 
 Every pod receives the same Secret. This also guarantees that all pods share the same
@@ -172,6 +178,16 @@ pod), the HAProxy router pods, and a Service named `dgp` in front of the routers
 Point your Ingress and all of your S3 clients at the `dgp` Service. **Never point them at the
 proxy pods directly.** A client that bypasses the router also bypasses the
 path-pinning, and its multipart uploads will fail.
+
+To make the cluster enforce this, set `spec.router.networkPolicy: true`. The operator
+then creates a NetworkPolicy `<name>-proxy`, and the proxy pods accept connections only
+from the router pods of the same resource, on port 9000. The policy also blocks a
+Prometheus that scrapes the pods directly, so it is off by default. It has an effect only
+when the network plugin of the cluster enforces NetworkPolicy.
+
+`spec.storage` (the size and the class of the volume of each pod) cannot change after you
+create the resource, because a StatefulSet refuses a change to its volume claim
+templates. Choose the size before you apply the resource.
 
 ## 4. Verify that multipart uploads work across pods
 

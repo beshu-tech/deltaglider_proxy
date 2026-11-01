@@ -119,8 +119,8 @@ More operational notes:
   pod network of the cluster, so the default is every private range (`10.0.0.0/8`,
   `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `fc00::/7`). Any pod in those
   ranges can name a client, so set `trustedProxyCidrs` to your pod CIDR. If
-  untrusted workloads share the cluster network, also add a NetworkPolicy that only
-  allows ingress to the proxy pods from the router.
+  untrusted workloads share the cluster network, also set
+  `spec.router.networkPolicy: true`, so that only the router can reach the proxy pods.
 - **Scaling down keeps the volumes.** The operator never deletes a pod's persistent
   volume. After you scale `replicas` down, reclaim the removed pods' volumes manually
   if you want the storage back.

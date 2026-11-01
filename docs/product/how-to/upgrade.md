@@ -179,12 +179,12 @@ With `config_sync_bucket` set, this release keeps a witness of each bucket's enc
 - A backend key or mode that you change by editing the file or an environment variable and restarting the instances is not published by the restart. After such a rollout, every instance with the new key refuses all writes to that backend until you run `deltaglider_proxy witness publish backend:<name>` once on one of them. A change made with a config apply is published at once and needs nothing else.
 - An instance that starts while the sync bucket does not answer refuses writes to every encrypting backend and to every bucket with its own `encryption` block until its first check succeeds.
 
-## Encryption at rest, format v2 (the release after 2.0.14)
+## Encryption at rest, format v2 (2.0.15)
 
 This release replaces the format of proxy-side encryption (`aes256-gcm-proxy`). The earlier formats, `aes-256-gcm-v1` and `aes-256-gcm-chunked-v1` (body magic `DGE1`), have no reader and no migration path in this release, because no deployment used them. If a backend or a bucket of yours encrypted objects with an earlier release, those objects fail to read after the upgrade. Decrypt them before the upgrade, for example with a migrate job to a plaintext backend, and encrypt them again after it. Deployments without `aes256-gcm-proxy` have nothing to do for this change. The changes that you can see:
 
 - **Fail closed.** In a bucket that encrypts, the proxy refuses every object that it cannot authenticate, with `500 InternalError`. That includes a plaintext object, except the plaintext history that an open conversion window serves ([why](../explanation/encryption-at-rest.md#why-enabling-isnt-retroactive)).
-- **Starting to encrypt.** An apply that makes a bucket with objects start to encrypt opens a conversion window and starts the re-encrypt job. The release after 2.0.23 introduced this. See [The conversion window replaces a read setting](#the-conversion-window-replaces-a-read-setting-210).
+- **Starting to encrypt.** An apply that makes a bucket with objects start to encrypt opens a conversion window and starts the re-encrypt job. Release 2.1.0 introduced this. See [The conversion window replaces a read setting](#the-conversion-window-replaces-a-read-setting-210).
 - **Key ids.** A backend key without `key_id` gets the id `fp-` followed by 16 hexadecimal characters of the key's fingerprint. The backend name no longer takes part in the id. One key can have only one id on a backend; the proxy refuses to start with a config that gives one key two ids.
 - **Stored metadata.** An encrypted object stores no `dg-md5`, no `dg-encryption-key-id`, and no SHA-256 of its content in clear. It stores `dg-encrypted: aes-256-gcm-chunked-v1` and a `dg-sealed` value instead ([Metadata markers](../reference/encryption.md#metadata-markers)). A script that reads `dg-encryption-key-id` on the raw backend must read the key fingerprint in `dg-sealed` instead.
 - **Copies outside the proxy.** An encrypted object that the backend copies to another bucket name or key no longer reads ([Copies outside the proxy](../reference/encryption.md#copies-outside-the-proxy)).
@@ -200,7 +200,7 @@ deltaglider_proxy witness publish backend:hetzner-fsn1 db-archive --server https
 
 The **Encryption witness** card on **System → System** lists the subjects that differ, and **Publish all** does the same. After the publish, an instance on the old release disagrees with the witness and refuses writes. Deployments without `aes256-gcm-proxy` can upgrade one instance at a time, as before.
 
-## Storage facts only for readers of the whole folder (the release after 2.0.14)
+## Storage facts only for readers of the whole folder (2.0.15)
 
 This change applies to every deployment, with or without encryption. A delta is encoded against the reference of its folder, and that reference can hold data that another user uploaded. The storage facts of an object therefore tell how similar the object is to the other objects in its folder. For this reason, the proxy now sends these facts only to a principal that may read every object in the folder of the key.
 
@@ -255,6 +255,42 @@ Check your backends before or right after the upgrade:
 2. For an `unknown` verdict, fix the connection to the backend. The proxy probes it again by itself, at once when its health check sees the backend recover. To probe at once, click **Check again** on its card (`POST /_/api/admin/backends/<name>/capability-probe`).
 3. For a `non-cas` verdict, move each read-only bucket to a backend with atomic writes with a migrate job: [Make a read-only bucket writable again](backend-capability-validation.md#make-a-read-only-bucket-writable-again). The move out of a read-only bucket is allowed.
 
+## A rule on `bucket/*` no longer allows CreateBucket or DeleteBucket (2.1.0)
+
+A bucket-level request, such as a LIST request or `CreateBucket`, has no object key, so a rule with the resource `releases/*` does not match it on its own. In earlier releases, the proxy then checked the request again with the resource `releases/`, which `releases/*` matches, for every action. So a user whose only rule was `{"actions": ["*"], "resources": ["releases/*"]}` could also create and delete the bucket `releases`. This release makes that second check for every action except `admin`.
+
+The changes that you can see:
+
+- **`CreateBucket` and `DeleteBucket` get `403`** for a user whose rules name only `releases/*`. The same applies to the other bucket-level `PUT` and `DELETE` requests, which need `admin`.
+- **The other bucket-level requests still work.** A LIST request, a batch delete (`POST ?delete`) and a browser form upload still need only a rule on `releases/*` with `list`, `delete` or `write`.
+
+When a user or a group must create or delete a bucket, add a rule whose resources hold the bucket name itself, for example `{"effect": "Allow", "actions": ["admin"], "resources": ["releases"]}`, or use `*` ([Resources](../reference/iam-permissions.md#resources)).
+
+## A replication destination that contains its source (2.1.0)
+
+A replication rule must not write into a prefix that contains its own source. An example is the rule `releases/builds/nightly/` → `releases/builds/`. The destination `builds/` holds the folder `builds/nightly/`, so the rule finds its own source objects in the destination. These objects have no twin at the source side, so a rule with delete replication deleted them, and its next run deleted the copies. Two bucket names that an `alias` points at one real bucket on one backend count as one storage, so a rule from `releases` to such a second name can have the same problem.
+
+The changes that you can see:
+
+- **Such a rule does not run.** The proxy still starts with a configuration that holds one, and it logs a warning that names the rule. Every run of the rule fails at its start with a failure entry, and the event consumer sends nothing for it.
+- **`config lint` reports such a rule as an error** (exit code `6`), and a config change that makes a new one is refused. A bucket change, such as a new `alias`, that makes one is refused too.
+
+Before you upgrade, run `deltaglider_proxy config lint deltaglider_proxy.yaml` with the new binary. For each rule that it reports, give the rule a destination prefix outside its source, or another bucket ([Replication reference](../reference/replication.md#static-validation-configcheck)).
+
+## A migrate of an aliased bucket (2.1.0)
+
+A migrate job blocks writes to the bucket that it moves, and it copies only that bucket. When another bucket name points at the same storage through an `alias`, the writes through that name were not blocked and not copied, and the cleanup deleted them. The proxy now refuses to start such a job: `POST /_/api/admin/buckets/:bucket/migrate` answers `409 Conflict`, and the error names the other bucket names. Remove the alias before you move the bucket ([How to move a bucket to another backend](move-a-bucket-between-backends.md)).
+
+## The Kubernetes operator (2.1.0)
+
+Operator 0.3.24 and later need a new ClusterRole and a new custom resource definition:
+
+- The ClusterRole allows `patch` on Secrets. The operator adds the config DB key (`dbKey`) to an existing `<name>-bootstrap` Secret that does not have it. With the old ClusterRole, that request got `403`, so every reconcile failed and the operator changed nothing in the cluster.
+- The ClusterRole allows the operator to manage NetworkPolicies, for the new `spec.router.networkPolicy` field.
+- The custom resource definition refuses a change of `spec.storage` after you create the resource, because a StatefulSet refuses a change to its volume claim templates.
+
+Apply the new `operator/deploy/crd.yaml` first, and then the new `operator/deploy/operator.yaml`. The second file holds the ClusterRole and the operator image, so you get them together ([How to scale out with the Kubernetes operator](scale-out-with-the-kubernetes-operator.md#1-install-the-operator)).
+
 ## Common gotchas
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.
@@ -299,7 +335,7 @@ storage:
 
 Keep `DGP_ENCRYPTION_KEY` in the environment unchanged.
 
-The upgrade to v0.9 did not change the objects on disk. Only the config location changed. Current releases no longer read the objects that v0.9 to 2.0.14 encrypted (see [Encryption at rest, format v2](#encryption-at-rest-format-v2-the-release-after-2014)).
+The upgrade to v0.9 did not change the objects on disk. Only the config location changed. Current releases no longer read the objects that v0.9 to 2.0.14 encrypted (see [Encryption at rest, format v2](#encryption-at-rest-format-v2-2015)).
 
 If you did not configure encryption before v0.9, you have nothing to do. Your backends default to `encryption: none`.
 
