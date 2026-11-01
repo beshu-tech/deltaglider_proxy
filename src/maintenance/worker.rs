@@ -617,6 +617,25 @@ fn backend_check(
     }
 }
 
+/// Pure: whether a re-encrypt run writes conditionally (`Ok(true)`) or
+/// behind the write gate (`Ok(false)`), after it tried to save a changed
+/// gate decision (`now_conditional`) in the job row (`saved`). The gate
+/// follows the ROW (`maintenance_gate_arms`). A save that failed while
+/// switching to conditional leaves the row gated: the run goes on gated.
+/// One that failed while switching to GATED leaves the row ungated, so
+/// no gate arms: the run must stop (retried), never write unconditionally
+/// while clients write.
+fn settle_gate_switch(now_conditional: bool, saved: Result<(), String>) -> Result<bool, String> {
+    match saved {
+        Ok(()) => Ok(now_conditional),
+        Err(_) if now_conditional => Ok(false),
+        Err(e) => Err(format!(
+            "the switch to the bucket's write gate was not saved ({e}); the run stops and \
+             is retried"
+        )),
+    }
+}
+
 /// The three phases, resumable at page granularity. Returns Err(reason)
 /// only for job-fatal conditions (per-object failures are recorded and
 /// skipped over instead).
@@ -643,26 +662,16 @@ async fn execute_phases(
             resolve_desired(&cfg, bucket),
             Ok(super::DesiredEncryption::Proxy { .. })
         ) {
-            let cached_cas = cfg
-                .effective_backend_for_bucket(bucket)
-                .and_then(|(n, d)| state.backend_capabilities.get(&n, d))
-                .is_some_and(|v| {
-                    matches!(
-                        v,
-                        crate::coordination::CapabilityVerdict::CasVerified { .. }
-                    )
+            let what = format!("the re-encrypt job of bucket '{bucket}'");
+            if let Err(r) =
+                crate::coordination::atomicity::proven_for_bucket(state, &cfg, bucket, &what).await
+            {
+                return Err(match r.verdict {
+                    crate::coordination::CapabilityVerdict::Unknown { .. } => {
+                        PhaseStop::FailedTransient(r.message())
+                    }
+                    _ => PhaseStop::Failed(r.message()),
                 });
-            if !cached_cas {
-                if let Err(r) =
-                    super::conversion::require_reencrypt_atomic(state, &cfg, bucket).await
-                {
-                    return Err(match r.verdict {
-                        crate::coordination::CapabilityVerdict::Unknown { .. } => {
-                            PhaseStop::FailedTransient(r.message())
-                        }
-                        _ => PhaseStop::Failed(r.message()),
-                    });
-                }
             }
         }
     }
@@ -673,13 +682,15 @@ async fn execute_phases(
     if conditional != params.conditional_writes {
         params.conditional_writes = conditional;
         let db = db.lock().await;
-        if let Err(e) = db.maintenance_set_params(job.id, params.to_json().as_deref()) {
-            // Fail closed: a row that still says "gated" keeps the gate,
-            // and a rewrite without the gate must be conditional.
+        let saved = db
+            .maintenance_set_params(job.id, params.to_json().as_deref())
+            .map_err(|e| e.to_string());
+        if let Err(e) = &saved {
             warn!("maintenance: job #{} params not saved: {e}", job.id);
-            params.conditional_writes = false;
         }
         state.maintenance_gate.sync_from(&db);
+        params.conditional_writes =
+            settle_gate_switch(conditional, saved).map_err(PhaseStop::FailedTransient)?;
     }
     let unconditional = if params.conditional_writes {
         crate::deltaglider::Unconditional::Refused
@@ -1699,6 +1710,23 @@ pub(crate) mod cost_tests;
 mod tests {
     use super::*;
     use crate::storage::DynStorageBackend;
+
+    /// Finding 4: a failed save of a switch to the gate stops the run; it
+    /// never continues ungated with unconditional writes allowed.
+    #[test]
+    fn a_failed_switch_to_the_gate_stops_the_run() {
+        assert_eq!(settle_gate_switch(true, Ok(())), Ok(true));
+        assert_eq!(settle_gate_switch(false, Ok(())), Ok(false));
+        assert_eq!(
+            settle_gate_switch(true, Err("disk".into())),
+            Ok(false),
+            "the row stays gated: run gated"
+        );
+        assert!(
+            settle_gate_switch(false, Err("disk".into())).is_err(),
+            "the row stays ungated: no gate arms, so the run stops"
+        );
+    }
 
     fn claimed_job(ttl: i64) -> (Arc<Mutex<JobsDb>>, i64) {
         let db = JobsDb::in_memory("testpass").unwrap();
