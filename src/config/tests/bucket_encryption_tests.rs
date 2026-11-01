@@ -612,9 +612,17 @@ fn a_removed_plaintext_reads_fails_the_load_and_says_what_to_do() {
         let bucket = format!(
             "storage:\n  filesystem: /tmp/x\n  buckets:\n    db-archive:\n      encryption: {block}\n"
         );
-        for doc in [backend, bucket] {
+        for (doc, at) in [
+            (backend, "backend 'local-disk'"),
+            (bucket, "bucket 'db-archive'"),
+        ] {
             let err = Config::from_yaml_str(&doc).expect_err(&doc).to_string();
             says_what_to_do(&err);
+            // C8: the error names where the field is.
+            assert!(err.contains(at), "names {at}: {err}");
+            // On a backend without atomic writes no re-encrypt job runs:
+            // the advice names the way out there too.
+            assert!(err.contains("migrate"), "{err}");
             // The file load (boot, `config lint`) is the same parse.
             let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
             std::fs::write(file.path(), &doc).unwrap();

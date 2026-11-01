@@ -472,14 +472,62 @@ pub enum BackendEncryptionConfig {
 /// removed, or `None`. Pure: the deserializer of [`BackendEncryptionConfig`]
 /// calls it for every config surface (file, apply, section PUT, CLI).
 pub(crate) fn removed_encryption_field(block: &serde_yaml::Mapping) -> Option<String> {
-    const REMOVED: &str = "plaintext_reads";
-    block.contains_key(REMOVED).then(|| {
-        format!(
-            "encryption.{REMOVED} was removed: delete this line from the config. \
-             A bucket that starts to encrypt converts its existing plaintext objects \
-             through its conversion window and the re-encrypt job (Storage > Jobs)"
-        )
-    })
+    block
+        .contains_key(REMOVED)
+        .then(|| removed_encryption_field_message(None))
+}
+
+/// The encryption field this release removed.
+const REMOVED: &str = "plaintext_reads";
+
+/// Pure: the error of the removed field, at `at` ("backend 'x'",
+/// "bucket 'y'") when the caller knows where it is.
+fn removed_encryption_field_message(at: Option<&str>) -> String {
+    let at = at
+        .map(|a| format!(" (in the encryption of {a})"))
+        .unwrap_or_default();
+    format!(
+        "encryption.{REMOVED} was removed{at}: delete this line from the \
+         config. A bucket that starts to encrypt converts its existing plaintext objects \
+         through its conversion window and the re-encrypt job (Storage > Jobs). On a backend \
+         without atomic writes (Backblaze B2) no re-encrypt job runs: move the bucket to a \
+         backend with them with a migrate job, which encrypts its plaintext on the way"
+    )
+}
+
+/// Pure: where the first encryption block of `doc` that holds the removed
+/// field is ("backend 'x'", "bucket 'y'", "the default backend"), in the
+/// sectioned and in the flat shape. `None`: no such block.
+fn removed_encryption_field_location(doc: &serde_yaml::Value) -> Option<String> {
+    use serde_yaml::Value;
+    let has_removed = |v: &Value| {
+        v.get("encryption")
+            .and_then(Value::as_mapping)
+            .is_some_and(|m| m.contains_key(REMOVED))
+    };
+    let storage = doc.get("storage").unwrap_or(doc);
+    if let Some(backends) = storage.get("backends").and_then(Value::as_sequence) {
+        for b in backends {
+            if has_removed(b) {
+                let name = b.get("name").and_then(Value::as_str).unwrap_or("?");
+                return Some(format!("backend '{name}'"));
+            }
+        }
+    }
+    if let Some(buckets) = storage.get("buckets").and_then(Value::as_mapping) {
+        for (name, policy) in buckets {
+            if has_removed(policy) {
+                return Some(format!("bucket '{}'", name.as_str().unwrap_or("?")));
+            }
+        }
+    }
+    let singleton = ["backend_encryption", "encryption"].iter().any(|k| {
+        storage
+            .get(*k)
+            .and_then(Value::as_mapping)
+            .is_some_and(|m| m.contains_key(REMOVED))
+    });
+    singleton.then(|| "the default backend".to_string())
 }
 
 impl Serialize for BackendEncryptionConfig {
@@ -1382,6 +1430,13 @@ impl Config {
         // apply), never per-request.
         let doc: serde_yaml::Value =
             serde_yaml::from_str(content).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        // The removed encryption field: name where it is (the deserializer
+        // of one block cannot know).
+        if let Some(at) = removed_encryption_field_location(&doc) {
+            return Err(ConfigError::Parse(removed_encryption_field_message(Some(
+                &at,
+            ))));
+        }
 
         let mut cfg = match classify_shape(&doc) {
             ConfigShape::Sectioned => {
