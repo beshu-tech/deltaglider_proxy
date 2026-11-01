@@ -23,12 +23,12 @@ The proxy is a single stateful binary. Every upgrade has three steps: back up, s
 2. **Roll the image/binary.** For Docker:
 
    ```bash
-   docker pull beshultd/deltaglider_proxy:2.0.23
+   docker pull beshultd/deltaglider_proxy:2.1.0
    docker stop dgp && docker rm dgp
    docker run -d --name dgp -p 9000:9000 \
      -v dgp-data:/data \
      -e DGP_BOOTSTRAP_PASSWORD_HASH=... \
-     beshultd/deltaglider_proxy:2.0.23
+     beshultd/deltaglider_proxy:2.1.0
    ```
 
    Coolify, Kubernetes, and systemd have their own commands to pull and restart. The only requirement is that `/data` persists across the swap.
@@ -184,7 +184,7 @@ With `config_sync_bucket` set, this release keeps a witness of each bucket's enc
 This release replaces the format of proxy-side encryption (`aes256-gcm-proxy`). The earlier formats, `aes-256-gcm-v1` and `aes-256-gcm-chunked-v1` (body magic `DGE1`), have no reader and no migration path in this release, because no deployment used them. If a backend or a bucket of yours encrypted objects with an earlier release, those objects fail to read after the upgrade. Decrypt them before the upgrade, for example with a migrate job to a plaintext backend, and encrypt them again after it. Deployments without `aes256-gcm-proxy` have nothing to do for this change. The changes that you can see:
 
 - **Fail closed.** In a bucket that encrypts, the proxy refuses every object that it cannot authenticate, with `500 InternalError`. That includes a plaintext object, except the plaintext history that an open conversion window serves ([why](../explanation/encryption-at-rest.md#why-enabling-isnt-retroactive)).
-- **Starting to encrypt.** An apply that makes a bucket with objects start to encrypt opens a conversion window and starts the re-encrypt job. The release after 2.0.23 introduced this. See [The conversion window replaces a read setting](#the-conversion-window-replaces-a-read-setting-the-release-after-2023).
+- **Starting to encrypt.** An apply that makes a bucket with objects start to encrypt opens a conversion window and starts the re-encrypt job. The release after 2.0.23 introduced this. See [The conversion window replaces a read setting](#the-conversion-window-replaces-a-read-setting-210).
 - **Key ids.** A backend key without `key_id` gets the id `fp-` followed by 16 hexadecimal characters of the key's fingerprint. The backend name no longer takes part in the id. One key can have only one id on a backend; the proxy refuses to start with a config that gives one key two ids.
 - **Stored metadata.** An encrypted object stores no `dg-md5`, no `dg-encryption-key-id`, and no SHA-256 of its content in clear. It stores `dg-encrypted: aes-256-gcm-chunked-v1` and a `dg-sealed` value instead ([Metadata markers](../reference/encryption.md#metadata-markers)). A script that reads `dg-encryption-key-id` on the raw backend must read the key fingerprint in `dg-sealed` instead.
 - **Copies outside the proxy.** An encrypted object that the backend copies to another bucket name or key no longer reads ([Copies outside the proxy](../reference/encryption.md#copies-outside-the-proxy)).
@@ -213,7 +213,7 @@ A principal may read the whole folder when one of its Allow rules without condit
 
 Two kinds of clients see no change. With `authentication: none`, every request still gets the facts. A principal with read on the whole bucket, or on the whole folder of the key, also still gets them. If a script or a CI job reads one of these headers, make sure that its credentials have read on the whole folder. The full rule is in [Storage facts on write responses](../reference/s3-api-compatibility.md#storage-facts-on-write-responses).
 
-## The conversion window replaces a read setting (the release after 2.0.23)
+## The conversion window replaces a read setting (2.1.0)
 
 In earlier releases, a bucket that started to encrypt needed `plaintext_reads: serve` in its `encryption` block, so that the proxy served its plaintext history while the re-encrypt job converted it. Under `serve`, the proxy also served an object that someone put on the backend during the conversion. This release replaces the setting with a conversion window. A config write that makes a bucket with objects start to encrypt writes a sealed marker into the bucket and starts the re-encrypt job. While the window is open, clients read only the objects that the backend stored before the write, and the job closes the window when it converted every object ([Plaintext objects in a bucket that encrypts](../reference/encryption.md#plaintext-objects-in-a-bucket-that-encrypts)).
 
@@ -237,7 +237,7 @@ A restart does start the conversion of a bucket that never encrypted before. Whe
 
 With several instances, apply the change on every instance, and then let the job finish. An instance whose configuration does not encrypt the bucket yet writes plaintext into it, and the instances that encrypt refuse those objects after the cutoff. While the job runs, stop client writes to the bucket on every instance, or send them all to the instance that runs the job: the write gate of the job holds only on its own instance ([A conversion on several instances](../reference/encryption.md#a-conversion-on-several-instances)).
 
-## Encryption needs atomic writes (the next release)
+## Encryption needs atomic writes (2.1.0)
 
 Proxy encryption (`aes256-gcm-proxy`) now works only on a backend whose conditional writes the proxy proves with a probe. The proxy rewrites encrypted objects in place, each rewrite conditional on the version that it read, and a backend that ignores the condition could let a rewrite overwrite a newer client write ([Encryption needs atomic writes](../reference/encryption.md#encryption-needs-atomic-writes)). Native SSE modes are not affected.
 
