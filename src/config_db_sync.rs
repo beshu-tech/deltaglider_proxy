@@ -159,6 +159,9 @@ pub struct ConfigDbSync {
     /// strictly ordered; cross-node conflicts still use the reconcile path.
     upload_lock: tokio::sync::Mutex<()>,
     health: parking_lot::Mutex<SyncHealth>,
+    /// The `If-Match` form of the bucket ([`Self::use_profile`], from the
+    /// coordination-bucket validation): the upload's compare-and-swap.
+    if_match: parking_lot::Mutex<crate::coordination::if_match::IfMatchDialect>,
 }
 
 impl ConfigDbSync {
@@ -215,8 +218,15 @@ impl ConfigDbSync {
             needs_upload: AtomicBool::new(pending.is_some()),
             upload_lock: tokio::sync::Mutex::new(()),
             health: parking_lot::Mutex::new(SyncHealth::default()),
+            if_match: Default::default(),
         })
         .inspect(|s: &Self| s.publish_health())
+    }
+
+    /// Use what the validation of the bucket found: the upload sends its
+    /// `If-Match` in that dialect.
+    pub fn use_profile(&self, profile: crate::coordination::if_match::ConditionalProfile) {
+        *self.if_match.lock() = profile.if_match;
     }
 
     /// The primary config DB key (the key of the local DB after boot).
@@ -661,7 +671,11 @@ impl ConfigDbSync {
             .body(ByteStream::from(data.clone()))
             .content_type("application/octet-stream");
         put = match &expected_etag {
-            Some(etag) => put.if_match(etag),
+            Some(etag) => {
+                use crate::coordination::if_match::IfMatchRequest;
+                let dialect = *self.if_match.lock();
+                put.if_match_etag(etag, dialect)
+            }
             None => put.if_none_match("*"),
         };
         // The client's request deadline, plus time for the DB's bytes.
@@ -778,7 +792,11 @@ impl ConfigDbSync {
     ///     STALE witness is refreshed with a plain overwrite (CAS already proven
     ///     in step 2; the timestamp bump isn't CAS-critical).
     pub async fn validate_coordination_bucket(&self) -> Result<CoordinationValidation, String> {
-        validate_coordination_bucket_with(&self.s3_client, &self.bucket).await
+        let validation = validate_coordination_bucket_with(&self.s3_client, &self.bucket).await;
+        if let Ok(v) = &validation {
+            self.use_profile(v.profile());
+        }
+        validation
     }
 }
 
@@ -842,23 +860,30 @@ async fn validate_cas_bucket_as(
     // `refreshing_stale` = we saw an EXISTING witness that aged out. It
     // matters for step 3: a stale witness must be OVERWRITTEN (its key already
     // exists, so a create-if-absent write would 412 and never bump the stamp).
-    // A witness from a release before the conditional-DELETE step has no
-    // verdict for it: it counts as stale, so the probe runs once more.
+    // A witness from a release before the conditional-DELETE step or the
+    // `If-Match` dialect has no verdict for it: it counts as stale, so the
+    // probe runs once more. (A witness with no dialect may come from a
+    // release whose probe never tested `If-Match` with the right ETag: it
+    // must not vouch for the quoted form.)
     let mut refreshing_stale = false;
     match read_witness(client, bucket, witness_key).await {
         Ok(Some(Witness {
             validated_at_unix,
             validated_by,
             conditional_delete: Some(conditional_delete),
+            if_match: Some(if_match),
             ..
         })) if witness_is_fresh(validated_at_unix, now, WITNESS_MAX_AGE_SECS) => {
             return Ok(CoordinationValidation::CachedWitness {
                 validated_at_unix,
                 validated_by,
-                conditional_delete,
+                profile: crate::coordination::if_match::ConditionalProfile {
+                    if_match,
+                    conditional_delete,
+                },
             });
         }
-        Ok(Some(_)) => refreshing_stale = true, // aged out or no DELETE verdict → overwrite
+        Ok(Some(_)) => refreshing_stale = true, // aged out or a verdict missing → overwrite
         Ok(None) => {}                          // absent → create-if-absent
         Err(e) => {
             // A read error is not itself a validation failure (transient), but
@@ -869,12 +894,12 @@ async fn validate_cas_bucket_as(
 
     // ── 2. Isolated probe on a random key (fail-closed) ──
     let probe_key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
-    let conditional_delete =
-        match crate::coordination::cas_probe::probe_cas(client, bucket, &probe_key).await {
-            Ok(p) if p.cas => p.conditional_delete,
-            Ok(_) => return Err(CasValidationFailure::NonCas),
-            Err(e) => return Err(CasValidationFailure::Indeterminate(e)),
-        };
+    let profile = match crate::coordination::cas_probe::probe_cas(client, bucket, &probe_key).await
+    {
+        Ok(p) if p.cas => p.profile(),
+        Ok(_) => return Err(CasValidationFailure::NonCas),
+        Err(e) => return Err(CasValidationFailure::Indeterminate(e)),
+    };
 
     // ── 3. Witness write (create-if-absent; overwrite if refreshing stale) ──
     write_witness(
@@ -883,11 +908,11 @@ async fn validate_cas_bucket_as(
         witness_key,
         now,
         node(),
-        conditional_delete,
+        profile,
         refreshing_stale,
     )
     .await; // best-effort
-    Ok(CoordinationValidation::Probed { conditional_delete })
+    Ok(CoordinationValidation::Probed { profile })
 }
 
 /// Read + parse a witness object. `Ok(None)` = absent (a 404/NoSuchKey).
@@ -927,7 +952,7 @@ async fn write_witness(
     key: &str,
     now: i64,
     validated_by: String,
-    conditional_delete: bool,
+    profile: crate::coordination::if_match::ConditionalProfile,
     overwrite: bool,
 ) {
     let body = serde_json::to_vec(&Witness {
@@ -935,7 +960,8 @@ async fn write_witness(
         validated_at_unix: now,
         validated_by,
         primitive: "if-none-match-cas".to_string(),
-        conditional_delete: Some(conditional_delete),
+        conditional_delete: Some(profile.conditional_delete),
+        if_match: Some(profile.if_match),
     })
     .unwrap_or_default();
     let mut put = client
@@ -966,21 +992,25 @@ pub enum CoordinationValidation {
     CachedWitness {
         validated_at_unix: i64,
         validated_by: String,
-        conditional_delete: bool,
+        profile: crate::coordination::if_match::ConditionalProfile,
     },
     /// We ran the live probe this boot (and it passed).
-    Probed { conditional_delete: bool },
+    Probed {
+        profile: crate::coordination::if_match::ConditionalProfile,
+    },
 }
 
 impl CoordinationValidation {
     /// Does the bucket enforce `If-Match` on DELETE? When it does not, a
     /// lock or lease release reads the object before it deletes it.
     pub fn conditional_delete(&self) -> bool {
+        self.profile().conditional_delete
+    }
+
+    /// What the probe found: the `If-Match` dialect and the DELETE verdict.
+    pub fn profile(&self) -> crate::coordination::if_match::ConditionalProfile {
         match self {
-            Self::CachedWitness {
-                conditional_delete, ..
-            }
-            | Self::Probed { conditional_delete } => *conditional_delete,
+            Self::CachedWitness { profile, .. } | Self::Probed { profile } => *profile,
         }
     }
 }
@@ -996,6 +1026,10 @@ struct Witness {
     /// from an older release: the next boot probes again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conditional_delete: Option<bool>,
+    /// The `If-Match` dialect the probe found. Absent in a witness from an
+    /// older release: the next boot probes again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    if_match: Option<crate::coordination::if_match::IfMatchDialect>,
 }
 
 /// Pure freshness check — extracted so the TTL decision is unit-testable.
@@ -2042,7 +2076,10 @@ mod tests {
         assert_eq!(
             first,
             Ok(CoordinationValidation::Probed {
-                conditional_delete: false
+                profile: crate::coordination::if_match::ConditionalProfile {
+                    if_match: crate::coordination::if_match::IfMatchDialect::Quoted,
+                    conditional_delete: false,
+                }
             })
         );
         fake.clear();
@@ -2051,7 +2088,10 @@ mod tests {
             matches!(
                 second,
                 CoordinationValidation::CachedWitness {
-                    conditional_delete: false,
+                    profile: crate::coordination::if_match::ConditionalProfile {
+                        conditional_delete: false,
+                        ..
+                    },
                     ..
                 }
             ),
@@ -2068,6 +2108,7 @@ mod tests {
             validated_by: "node-abc".into(),
             primitive: "if-none-match-cas".into(),
             conditional_delete: Some(false),
+            if_match: Some(crate::coordination::if_match::IfMatchDialect::Unquoted),
         };
         let bytes = serde_json::to_vec(&w).unwrap();
         let back: Witness = serde_json::from_slice(&bytes).unwrap();

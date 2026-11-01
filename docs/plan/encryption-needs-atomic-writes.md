@@ -168,6 +168,62 @@ Status: approved by the owner 2026-10-31 (decisions below are his).
   configured ones and every bucket of the storage listing; GET /backends, the capability probe
   answer, the bucket view and the watch log use it.
 
+## As built: the `If-Match` dialect (2026-11-01, release blocker)
+
+Measured with raw SigV4 requests on Hetzner Object Storage (hel1, Ceph RGW), bucket `debug`:
+PUT `If-None-Match: *` → 412 on an existing key, 200 on a new one; PUT `If-Match` with a wrong
+quoted ETag → 412; PUT `If-Match` with the CORRECT ETag quoted (as HEAD/PUT return it) → 412;
+the same ETag unquoted → 200; `If-Match: *` → 200; GET `If-Match` quoted → 200; DELETE
+`If-Match` with a wrong ETag → 204 and the object is gone. On main the probe sent the SDK's
+quoted ETag in its right-ETag step, so Hetzner was `NonCas`: `beshu-encrypted` would have become
+read-only at the next release, and every `If-Match` write would have reported a lost race.
+
+- **Dialect.** `coordination::if_match::IfMatchDialect {Quoted (default), Unquoted}` and
+  `ConditionalProfile {if_match, conditional_delete}`. `CapabilityVerdict::CasVerified` gained
+  `if_match` (`#[serde(default)]`: a verdict without it reads as `quoted`; the verdict now also
+  derives `Deserialize`). Admin: `capability.if_match` on GET /backends, `verdict_words`, the
+  backend card.
+- **Probe.** `cas_probe::probe_cas`: quoted right-ETag step first; on 412 (after the lost-response
+  GET), a wrong unquoted step and, after a HEAD re-read, a right unquoted step. Pure
+  `classify_cas_dialect` (truth table): Unquoted only when `If-None-Match`, the quoted wrong ETag
+  AND the unquoted wrong ETag are refused and the unquoted right ETag is written. The DELETE step
+  uses the found dialect. `ProbeResult.if_match` + `profile()`. 7 requests quoted, 11 unquoted.
+- **One helper.** `IfMatchRequest::if_match_etag(etag, dialect)` on PutObject, DeleteObject,
+  CopyObject and UploadPartCopy (`copy_source_if_match`), and GetObject (always quoted: RGW
+  unquotes reads, measured 200). Source guard `if_match_headers_go_through_one_helper` (src/lib.rs):
+  no `.if_match(` / `.copy_source_if_match(` in production code outside `if_match.rs`.
+- **Where the dialect comes from.** Data backends: `if_match::record_for(def, profile)` from
+  `establish_backend_verdict_within` (every S3 capability probe: boot gate, atomicity watch,
+  fresh action probes, hot-apply, migrate target) and from the boot's coordination validation
+  (same definition); `S3Backend::conditional_profile` looks it up by its health fingerprint
+  (`with_conditional_profile` pins one for tests). Never probed → quoted, DELETE unproven.
+  Coordination: `CoordinationValidation::{CachedWitness, Probed}` carry `profile`;
+  `S3Lease::with_profile`, `S3ReferenceLock::with_profile`, `EncryptionWitness::with_if_match`,
+  `ConfigDbSync::use_profile` (also set by `validate_coordination_bucket`). The witness object
+  records `if_match`; a witness without it is stale (re-probe once: an older release's probe may
+  not have tested the right ETag at all, so it must not vouch for `quoted`).
+- **Call sites (If-Match).** `cas::conditional_put_etag` (lease/lock create-steal-renew, encryption
+  witness manifest), `cas::delete_if_match` (lease/lock release, only with conditional DELETE),
+  lease and lock read-first release DELETE, `config_db_sync::upload`, S3 `claim.rs` marker/claim
+  Replace and Remove, `objects.rs` `apply_put_fence` (fenced reference/delta PUTs and
+  `put_if_unchanged` through `put_object_*_fenced_with`), the fenced metadata self-copy
+  (`copy_source_if_match`), `delete_s3_object_fenced`, `delete_variant_if`, `copy.rs` CopyObject and
+  UploadPartCopy, `body.rs` resumed GET, and the probe itself.
+- **Conditional DELETE.** Read first unless the profile proves DELETE `If-Match`: lease and lock
+  release (already), `claim.rs` Remove (new: HEAD, Lost when the ETag differs or the object is gone),
+  `delete_variant_if` (new: `variant_version` HEAD; the engine's `delete_if` / `only_if` already read
+  before under the object lock), `delete_s3_object_fenced` (already HEADs always). Remaining race:
+  a peer instance's write between the HEAD and the DELETE is deleted (request-time window); the
+  in-process object lock still serialises this node. Unprobed backends pay one HEAD per such delete.
+- **Tests.** `FakeS3::set_rgw_conditions` (PUT `If-Match` against the bare ETag, DELETE ignores it,
+  copy source unquoted). `coordination/rgw_dialect_tests.rs`: probe → Unquoted, verdict + registry
+  → `put_if_unchanged` Written then Changed, pinned delete reads first (probed and unprobed),
+  `conditional_put_etag`, lease and reference-lock round trips (stale release keeps the peer's
+  lock), config sync double upload; `conversion_tests::on_rgw_the_marker_is_replaced_and_closed_by_identity`.
+  All nine failed on main (17be3eaa) with the RGW fake. One more defect showed there: the
+  reference lock's renew, refused (412 on the quoted ETag), re-read the unchanged lock as its own
+  and reported success without moving the expiry; with the dialect the renew really writes.
+
 ## As built: four-way review fixes (2026-11-01)
 
 - **The real backend.** `StorageBackend::bucket_home` (router: route, cached resolution, or the

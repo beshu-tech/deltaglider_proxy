@@ -429,6 +429,7 @@ storage:
             &mut cas,
             Some(crate::coordination::CapabilityVerdict::CasVerified {
                 via: crate::coordination::VerifiedVia::Probe,
+                if_match: Default::default(),
             }),
         );
         assert_eq!(cas.bucket_modes, vec!["none", "aes256-gcm-proxy"]);

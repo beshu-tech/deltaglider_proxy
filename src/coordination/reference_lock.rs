@@ -80,6 +80,7 @@
 //! whose lock lapsed while a peer wrote gets a precondition failure, never an
 //! overwrite. The renew-and-check above still stops most such writes early.
 
+use super::if_match::IfMatchRequest;
 use std::future::Future;
 use std::time::Duration;
 
@@ -297,6 +298,9 @@ pub struct S3ReferenceLock {
     /// then may a release delete by its kept ETag with no read: on a bucket
     /// that ignores the condition, that DELETE removes a lock a peer stole.
     conditional_delete: bool,
+    /// The form of the ETag in `If-Match` that the bucket enforces (the
+    /// probe found it; Ceph RGW wants it unquoted).
+    if_match: super::if_match::IfMatchDialect,
 }
 
 impl S3ReferenceLock {
@@ -311,6 +315,7 @@ impl S3ReferenceLock {
             request_timeout: lock_request_timeout(acquire_timeout),
             kept: Default::default(),
             conditional_delete: false,
+            if_match: Default::default(),
         }
     }
 
@@ -319,6 +324,13 @@ impl S3ReferenceLock {
     pub fn with_conditional_delete(mut self, enforced: bool) -> Self {
         self.conditional_delete = enforced;
         self
+    }
+
+    /// Set everything the CAS probe found: the `If-Match` dialect and the
+    /// DELETE verdict ([`Self::with_conditional_delete`]).
+    pub fn with_profile(mut self, profile: super::if_match::ConditionalProfile) -> Self {
+        self.if_match = profile.if_match;
+        self.with_conditional_delete(profile.conditional_delete)
     }
 
     pub fn with_tunables(mut self, ttl_secs: i64, acquire_timeout_secs: u64) -> Self {
@@ -413,6 +425,7 @@ impl S3ReferenceLock {
                     key,
                     body,
                     precondition,
+                    self.if_match,
                 )
                 .await
                 .map_err(LeaseError::Backend)
@@ -464,7 +477,8 @@ impl ReferenceLock for S3ReferenceLock {
         // only on a bucket that enforces the condition on DELETE.
         let kept = self.kept.take(key, owner);
         if let Some(etag) = kept.filter(|_| self.conditional_delete) {
-            let delete = super::cas::delete_if_match(&self.client, &self.bucket, key, &etag);
+            let delete =
+                super::cas::delete_if_match(&self.client, &self.bucket, key, &etag, self.if_match);
             let _ = self
                 .bounded(async {
                     delete.await;
@@ -486,7 +500,7 @@ impl ReferenceLock for S3ReferenceLock {
                     .delete_object()
                     .bucket(&self.bucket)
                     .key(key)
-                    .if_match(&etag)
+                    .if_match_etag(&etag, self.if_match)
                     .send();
                 let _ = self.bounded(async { Ok(delete.await) }).await;
             }

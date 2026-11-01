@@ -6,11 +6,14 @@
 //! `storage/encrypting/conversion.rs`). Each is one small object, written
 //! with `If-None-Match: *` / `If-Match`, so two proxies cannot both create
 //! or both replace it. A backend without conditional writes (B2, 501) gets
-//! the write without the condition.
+//! the write without the condition. `If-Match` is in the backend's dialect
+//! (unquoted on Ceph RGW). A remove on a backend whose DELETE is not proven
+//! to enforce `If-Match` (Hetzner ignores it) reads the ETag first.
 
 use super::errors::S3Op;
 use super::S3Backend;
 use crate::coordination::cas::{conditional_write_lost, is_not_implemented, sdk_error_signal};
+use crate::coordination::if_match::IfMatchRequest;
 use crate::coordination::server_clock::ServerDate;
 use crate::storage::listing_facts::{CONVERSION_MARKER_KEY, KEY_CLAIM_KEY};
 use crate::storage::{
@@ -88,17 +91,30 @@ impl S3Backend {
             super::metadata::apply_native_encryption(request, &native)
         };
         let delete = || self.client.delete_object().bucket(bucket).key(key);
+        let dialect = self.if_match_dialect();
         let (conditional, op_name) = match op {
             MarkerWrite::Create(body) => (
                 put(body).if_none_match("*").send().await.map(drop),
                 S3Op::PutObject,
             ),
             MarkerWrite::Replace { body, version } => (
-                put(body).if_match(version).send().await.map(drop),
+                put(body)
+                    .if_match_etag(version, dialect)
+                    .send()
+                    .await
+                    .map(drop),
                 S3Op::PutObject,
             ),
             MarkerWrite::Remove { version } => {
-                match delete().if_match(version).send().await {
+                // A DELETE that may ignore `If-Match` must not remove a
+                // newer object: read its ETag first. The window left is
+                // between this read and the DELETE.
+                if !self.conditional_delete_proven()
+                    && !self.small_still_is(bucket, key, version).await?
+                {
+                    return Ok(ClaimOutcome::Lost);
+                }
+                match delete().if_match_etag(version, dialect).send().await {
                     Ok(_) => return Ok(ClaimOutcome::Written),
                     Err(e) => {
                         let signal = sdk_error_signal(&e);
@@ -136,6 +152,31 @@ impl S3Backend {
             .await
             .map_err(|e| self.classify(bucket, &e, S3Op::PutObject))?;
         Ok(ClaimOutcome::Written)
+    }
+
+    /// Is `key` of `bucket` still the version `version` (one HEAD)? An
+    /// absent object is not.
+    async fn small_still_is(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: &str,
+    ) -> Result<bool, StorageError> {
+        super::BACKEND_HEAD_REQUESTS.inc();
+        match self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(head) => Ok(head.e_tag() == Some(version)),
+            Err(e) if crate::coordination::cas::is_object_absent(&sdk_error_signal(&e)) => {
+                Ok(false)
+            }
+            Err(e) => Err(self.classify(bucket, &e, S3Op::HeadObject)),
+        }
     }
 
     pub(super) async fn read_claim(&self, bucket: &str) -> Result<Option<KeyClaim>, StorageError> {

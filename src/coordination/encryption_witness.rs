@@ -491,6 +491,9 @@ pub struct EncryptionWitness {
     /// What the last apply's publish replaced: `(storage, previous entry,
     /// published intent)`. A rollback of that apply puts it back.
     last_publish: parking_lot::Mutex<Vec<(Storage, Option<Published>, WriteEncryption)>>,
+    /// The `If-Match` form of the coordination bucket (from its
+    /// validation, [`Self::with_if_match`]).
+    if_match: super::if_match::IfMatchDialect,
 }
 
 /// The file of the saved manifest, in the config-DB directory.
@@ -564,6 +567,7 @@ impl EncryptionWitness {
             cache_path,
             pending: Default::default(),
             last_publish: Default::default(),
+            if_match: Default::default(),
             manifest: parking_lot::Mutex::new(cached),
             server_offset_ms: Default::default(),
             status: arc_swap::ArcSwap::from_pointee(WitnessStatus {
@@ -602,6 +606,13 @@ impl EncryptionWitness {
             + self
                 .server_offset_ms
                 .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Send the manifest's `If-Match` in `dialect` (what the validation of
+    /// the coordination bucket found).
+    pub fn with_if_match(mut self, dialect: super::if_match::IfMatchDialect) -> Self {
+        self.if_match = dialect;
+        self
     }
 
     /// Judge `cfg` against the last manifest read, with no I/O: the gate
@@ -690,6 +701,7 @@ impl EncryptionWitness {
                 MANIFEST_KEY,
                 body.into(),
                 etag.as_deref(),
+                self.if_match,
             )
             .await
             {

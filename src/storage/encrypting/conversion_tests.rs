@@ -782,6 +782,88 @@ async fn on_s3_the_marker_is_a_cas_object_with_the_server_clock() {
     assert_eq!(s3.read_conversion_marker("b").await.unwrap().marker, None);
 }
 
+/// On an S3 backend that answers conditions as Ceph RGW does (Hetzner: the
+/// correct ETag quoted gets 412 on PUT; DELETE ignores `If-Match`), the
+/// marker is replaced and removed by identity in the probed dialect, and a
+/// remove of a stale version (a peer replaced the marker) leaves the
+/// peer's marker.
+#[tokio::test]
+async fn on_rgw_the_marker_is_replaced_and_closed_by_identity() {
+    use crate::coordination::if_match::{ConditionalProfile, IfMatchDialect};
+    let (ep, fake) = crate::storage::fake_s3::start().await;
+    fake.set_rgw_conditions(true);
+    let profile = ConditionalProfile {
+        if_match: IfMatchDialect::Unquoted,
+        conditional_delete: false,
+    };
+    let s3 =
+        crate::storage::s3_test_support::for_test_endpoint(&ep).with_conditional_profile(profile);
+    s3.write_conversion_marker("b", MarkerWrite::Create(b"one"))
+        .await
+        .unwrap();
+    let one = s3
+        .read_conversion_marker("b")
+        .await
+        .unwrap()
+        .marker
+        .unwrap();
+    assert_eq!(
+        s3.write_conversion_marker(
+            "b",
+            MarkerWrite::Replace {
+                body: b"two",
+                version: &one.version
+            }
+        )
+        .await
+        .unwrap(),
+        ClaimOutcome::Written,
+        "the replace by the read's ETag"
+    );
+    assert_eq!(
+        s3.write_conversion_marker(
+            "b",
+            MarkerWrite::Remove {
+                version: &one.version
+            }
+        )
+        .await
+        .unwrap(),
+        ClaimOutcome::Lost,
+        "a remove of a stale version"
+    );
+    let two = s3
+        .read_conversion_marker("b")
+        .await
+        .unwrap()
+        .marker
+        .unwrap();
+    assert_eq!(two.content, b"two", "the newer marker stays");
+    assert_eq!(
+        s3.write_conversion_marker(
+            "b",
+            MarkerWrite::Remove {
+                version: &two.version
+            }
+        )
+        .await
+        .unwrap(),
+        ClaimOutcome::Written
+    );
+
+    // Through the wrapper: open, then close by identity.
+    let wrapper = EncryptingBackend::new(
+        crate::storage::s3_test_support::for_test_endpoint(&ep).with_conditional_profile(profile),
+        Arc::new(ArcSwap::new(Arc::new(encrypting(0xaa, "k")))),
+    );
+    let run = wrapper.open_conversion_secs("b", 7 * 86_400).await.unwrap();
+    assert!(matches!(
+        wrapper.close_conversion("b", &run).await.unwrap(),
+        ByIdentity::Done(None, _)
+    ));
+    assert_eq!(s3.read_conversion_marker("b").await.unwrap().marker, None);
+}
+
 /// The admin view's marker state, from the wrapper's window cache.
 async fn cached_status(
     w: &EncryptingBackend<crate::storage::FilesystemBackend>,

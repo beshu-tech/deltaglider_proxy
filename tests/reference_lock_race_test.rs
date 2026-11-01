@@ -333,7 +333,9 @@ async fn minio_enforces_conditional_delete() {
         got,
         Ok(deltaglider_proxy::coordination::cas_probe::ProbeResult {
             cas: true,
-            conditional_delete: true
+            conditional_delete: true,
+            // MinIO compares If-Match with the quoted ETag, as AWS does.
+            if_match: deltaglider_proxy::coordination::if_match::IfMatchDialect::Quoted,
         })
     );
     cleanup(&key).await;

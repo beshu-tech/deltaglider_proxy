@@ -72,7 +72,7 @@ where
 
 /// THE conditional PUT of the lease and the lock: PUT a JSON coordination
 /// object with a precondition: `None` → `If-None-Match: *` (create only),
-/// `Some(etag)` → `If-Match: etag`. Returns the ETag of the written object. `Ok(Some(etag))` = written
+/// `Some(etag)` → `If-Match: etag` in the bucket's `dialect`. Returns the ETag of the written object. `Ok(Some(etag))` = written
 /// (`etag` is empty when the response carries none), `Ok(None)` = a peer
 /// won the race. The writer keeps the ETag, so its next step (release,
 /// renew) can be conditional on it without a read first.
@@ -82,7 +82,9 @@ pub(crate) async fn conditional_put_etag(
     key: &str,
     body: aws_sdk_s3::primitives::ByteStream,
     precondition: Option<&str>,
+    dialect: super::if_match::IfMatchDialect,
 ) -> Result<Option<String>, String> {
+    use super::if_match::IfMatchRequest;
     let put = client
         .put_object()
         .bucket(bucket)
@@ -90,7 +92,7 @@ pub(crate) async fn conditional_put_etag(
         .body(body)
         .content_type("application/json");
     let put = match precondition {
-        Some(etag) => put.if_match(etag),
+        Some(etag) => put.if_match_etag(etag, dialect),
         None => put.if_none_match("*"),
     };
     match put.send().await {
@@ -160,12 +162,14 @@ pub(crate) async fn delete_if_match(
     bucket: &str,
     key: &str,
     etag: &str,
+    dialect: super::if_match::IfMatchDialect,
 ) {
+    use super::if_match::IfMatchRequest;
     if let Err(e) = client
         .delete_object()
         .bucket(bucket)
         .key(key)
-        .if_match(etag)
+        .if_match_etag(etag, dialect)
         .send()
         .await
     {

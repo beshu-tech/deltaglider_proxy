@@ -63,6 +63,9 @@ pub(crate) struct FakeS3 {
     /// Object DELETEs ignore `If-Match`, as on a backend that honours the
     /// condition on PUT only ([`FakeS3::set_delete_if_match_ignored`]).
     delete_if_match_ignored: std::sync::atomic::AtomicBool,
+    /// Conditions as Ceph RGW (Hetzner Object Storage) answers them
+    /// ([`FakeS3::set_rgw_conditions`]).
+    rgw_conditions: std::sync::atomic::AtomicBool,
     /// Overwrites armed by [`FakeS3::overwrite_after_reads`]: (object,
     /// source, GETs and HEADs of the object still to answer first).
     overwrites: parking_lot::Mutex<Vec<(String, String, u32)>>,
@@ -118,6 +121,21 @@ impl FakeS3 {
     pub(crate) fn set_delete_if_match_ignored(&self, ignored: bool) {
         self.delete_if_match_ignored
             .store(ignored, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Answer conditions as Ceph RGW does (Hetzner Object Storage, hel1,
+    /// measured 2026-11-01): a PUT compares `If-Match` with the BARE ETag,
+    /// so the correct ETag quoted gets 412 and unquoted gets 200; a DELETE
+    /// ignores `If-Match`; `x-amz-copy-source-if-match` is unquoted first,
+    /// as RGW's read path does. The ETags it returns stay quoted.
+    pub(crate) fn set_rgw_conditions(&self, rgw: bool) {
+        self.rgw_conditions
+            .store(rgw, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn rgw(&self) -> bool {
+        self.rgw_conditions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Remove every fault rule.
@@ -489,7 +507,13 @@ fn copy_object(
         .get("x-amz-copy-source-if-match")
         .and_then(|v| v.to_str().ok())
     {
-        if want != src.etag {
+        let unquote = |e: &str| e.trim_matches('"').to_string();
+        let holds = if f.rgw() {
+            unquote(want) == unquote(&src.etag)
+        } else {
+            want == src.etag
+        };
+        if !holds {
             return (
                 StatusCode::PRECONDITION_FAILED,
                 HeaderMap::new(),
@@ -636,6 +660,13 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                         let if_none = headers.get("if-none-match").is_some();
                         let etag_now = current.as_ref().map(|o| o.etag.as_str());
                         let failed = match method {
+                            // RGW: the stored ETag without its quotes.
+                            Method::PUT if f.rgw() => {
+                                (if_none && current.is_some())
+                                    || if_match.is_some_and(|m| {
+                                        Some(m) != etag_now.map(|e| e.trim_matches('"'))
+                                    })
+                            }
                             Method::PUT => {
                                 (if_none && current.is_some())
                                     || if_match.is_some_and(|m| Some(m) != etag_now)
@@ -643,6 +674,7 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                             Method::DELETE => {
                                 !f.delete_if_match_ignored
                                     .load(std::sync::atomic::Ordering::Relaxed)
+                                    && !f.rgw()
                                     && if_match.is_some_and(|m| Some(m) != etag_now)
                             }
                             _ => false,

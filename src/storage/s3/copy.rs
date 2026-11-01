@@ -5,6 +5,7 @@
 //! proxy.
 
 use super::*;
+use crate::coordination::if_match::IfMatchRequest;
 
 /// S3's limit on the source of one CopyObject request.
 pub(super) const COPY_OBJECT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -177,7 +178,7 @@ impl S3Backend {
             .bucket(bucket)
             .key(key)
             .copy_source(copy_source)
-            .copy_source_if_match(source_etag)
+            .if_match_etag(source_etag, self.if_match_dialect())
             .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
             .content_type("application/octet-stream");
         for (k, v) in headers {
@@ -271,7 +272,7 @@ impl S3Backend {
                 .upload_id(upload_id)
                 .part_number(number)
                 .copy_source(copy_source)
-                .copy_source_if_match(source_etag)
+                .if_match_etag(source_etag, self.if_match_dialect())
                 .copy_source_range(format!("bytes={start}-{end}"))
                 .send()
                 .await

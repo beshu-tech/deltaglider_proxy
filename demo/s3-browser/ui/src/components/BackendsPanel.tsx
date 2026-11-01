@@ -673,7 +673,11 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 <Alert
                   type="success"
                   showIcon
-                  title="Conditional writes: verified by live probe — safe for multi-instance client writes"
+                  title={
+                    b.capability.if_match === 'unquoted'
+                      ? 'Conditional writes: verified by live probe (this backend wants the ETag unquoted in If-Match, as Ceph RGW does) — safe for multi-instance client writes'
+                      : 'Conditional writes: verified by live probe — safe for multi-instance client writes'
+                  }
                   style={{ marginTop: 8, borderRadius: 6 }}
                 />
               )}

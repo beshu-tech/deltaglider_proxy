@@ -13,14 +13,27 @@
 //! that ignores it reads the object first and deletes only its own
 //! ([`ProbeResult::conditional_delete`]).
 //!
+//! The `If-Match` dialect: S3 returns ETags quoted, and AWS and MinIO
+//! compare `If-Match` with that quoted form. Ceph RGW (Hetzner Object
+//! Storage) compares the `If-Match` of a PUT with the bare ETag, so the
+//! correct ETag, quoted, gets 412. When the quoted right-ETag step gets 412,
+//! the probe tries the unquoted form with a wrong and with the right ETag;
+//! both enforced → CAS in the unquoted dialect
+//! ([`super::if_match::IfMatchDialect`]). The DELETE step then uses that
+//! dialect too.
+//!
 //! A backend that drops the connection on a conditional PUT (Backblaze B2,
 //! eu-central-003, 2026-10-31) gives no answer at all. When an
 //! unconditional PUT of the same key goes through right after, the drop is
 //! the backend's answer to the condition: the probe reads it as a refusal
 //! (definitive non-CAS), not as an unreachable backend.
 
+use super::if_match::{IfMatchDialect, IfMatchRequest};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+
+/// The ETag of the probe's wrong-ETag steps.
+const WRONG_ETAG: &str = "00000000000000000000000000000000";
 
 /// How one conditional step answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +92,43 @@ pub fn classify_cas_probe(
     }
 }
 
+/// The two `If-Match` steps in the unquoted form, run only when the quoted
+/// form refused the CORRECT ETag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnquotedSteps {
+    /// `If-Match: <wrong etag>`, unquoted: must be 412.
+    pub wrong: StepOutcome,
+    /// `If-Match: <current etag>`, unquoted: must be written.
+    pub right: StepOutcome,
+}
+
+/// Pure: the CAS verdict and the `If-Match` dialect. The quoted form first
+/// ([`classify_cas_probe`]). A backend that refused the correct ETag quoted
+/// (412) is CAS in the unquoted dialect when `If-None-Match` and the quoted
+/// wrong ETag were refused, and the unquoted form refuses a wrong ETag AND
+/// writes with the correct one. Otherwise it is non-CAS. `Err` =
+/// indeterminate.
+pub fn classify_cas_dialect(
+    create_on_existing: &StepOutcome,
+    if_match_wrong_etag: &StepOutcome,
+    if_match_right_etag: &StepOutcome,
+    unquoted: Option<&UnquotedSteps>,
+) -> Result<(bool, IfMatchDialect), String> {
+    use StepOutcome::*;
+    let (PreconditionFailed, Some(u)) = (if_match_right_etag, unquoted) else {
+        return classify_cas_probe(create_on_existing, if_match_wrong_etag, if_match_right_etag)
+            .map(|cas| (cas, IfMatchDialect::Quoted));
+    };
+    if !classify_cas_probe(create_on_existing, if_match_wrong_etag, &u.right)? {
+        return Ok((false, IfMatchDialect::Quoted));
+    }
+    match &u.wrong {
+        PreconditionFailed => Ok((true, IfMatchDialect::Unquoted)),
+        Written | NotImplemented => Ok((false, IfMatchDialect::Quoted)),
+        Dropped(e) | Other(e) => Err(format!("unquoted If-Match with a wrong etag: {e}")),
+    }
+}
+
 /// Pure: did the backend enforce `If-Match` on DELETE? Only a real 412
 /// counts. A DELETE that went through, a 501 or an unclear answer all mean
 /// "not proven", and the release then reads before it deletes.
@@ -94,6 +144,18 @@ pub struct ProbeResult {
     /// `If-Match` is enforced on DELETE: a release may delete by its kept
     /// ETag with no read first.
     pub conditional_delete: bool,
+    /// The form of the ETag in `If-Match` that the backend enforces.
+    pub if_match: IfMatchDialect,
+}
+
+impl ProbeResult {
+    /// The profile that every conditional request to this backend uses.
+    pub fn profile(&self) -> super::if_match::ConditionalProfile {
+        super::if_match::ConditionalProfile {
+            if_match: self.if_match,
+            conditional_delete: self.conditional_delete,
+        }
+    }
 }
 
 fn outcome<T, E>(res: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> StepOutcome
@@ -176,11 +238,26 @@ pub async fn remove_all_versions(client: &Client, bucket: &str, key: &str) {
     purge_versions(client, bucket, key).await;
 }
 
+/// The ETag of `bucket/key` now (`None` when the HEAD fails).
+async fn current_etag(client: &Client, bucket: &str, key: &str) -> Option<String> {
+    crate::storage::BACKEND_HEAD_REQUESTS.inc();
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .ok()?;
+    head.e_tag().map(str::to_string).filter(|e| !e.is_empty())
+}
+
 /// Run the probe on `bucket/key` and delete the key afterwards (best
 /// effort). `Err` = indeterminate, as in [`classify_cas_probe`]. Seven
 /// requests: four PUTs, the DELETE with a wrong ETag, the cleanup, and the
 /// version listing of the version cleanup (plus one DELETE for each version
-/// of the key on a bucket that keeps versions).
+/// of the key on a bucket that keeps versions). A backend that refuses the
+/// correct ETag quoted costs four more: the GET that tells a refusal from a
+/// lost response, two unquoted PUTs and a HEAD.
 pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<ProbeResult, String> {
     let first = client
         .put_object()
@@ -198,42 +275,73 @@ pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<Probe
             .key(key)
             .body(ByteStream::from_static(body))
     };
+    // One `If-Match` PUT of `body` on `etag` in `dialect`.
+    let put_if = |body: &'static [u8], etag: String, dialect: IfMatchDialect| async move {
+        match outcome(&put(body).if_match_etag(&etag, dialect).send().await) {
+            // The write landed but its response was lost, and the SDK retry
+            // met the probe's own new ETag. The key then holds the probe's
+            // body: the condition held, it is no refusal.
+            StepOutcome::PreconditionFailed if key_holds(client, bucket, key, body).await => {
+                StepOutcome::Written
+            }
+            other => other,
+        }
+    };
     let create = outcome(&put(b"2").if_none_match("*").send().await);
     let wrong = outcome(
         &put(b"3")
-            .if_match("\"00000000000000000000000000000000\"")
+            .if_match_etag(WRONG_ETAG, IfMatchDialect::Quoted)
             .send()
             .await,
     );
     let right = if etag.is_empty() {
         StepOutcome::Other("the first PUT returned no etag".into())
     } else {
-        match outcome(&put(b"4").if_match(&etag).send().await) {
-            // The write landed but its response was lost, and the SDK retry
-            // met the probe's own new ETag. The key then holds the probe's
-            // body: the condition held, it is no refusal.
-            StepOutcome::PreconditionFailed if key_holds(client, bucket, key, b"4").await => {
-                StepOutcome::Written
-            }
-            other => other,
-        }
+        put_if(b"4", etag, IfMatchDialect::Quoted).await
+    };
+    // The correct ETag, quoted, refused (Ceph RGW: Hetzner): the unquoted
+    // form, with a wrong and with the current ETag (read again: the key
+    // may hold another write of the probe's by now).
+    let unquoted = if right == StepOutcome::PreconditionFailed {
+        let wrong = outcome(
+            &put(b"6")
+                .if_match_etag(WRONG_ETAG, IfMatchDialect::Unquoted)
+                .send()
+                .await,
+        );
+        let right = match current_etag(client, bucket, key).await {
+            Some(now) => put_if(b"7", now, IfMatchDialect::Unquoted).await,
+            None => StepOutcome::Other("the probe could not read its key's ETag".into()),
+        };
+        Some(UnquotedSteps { wrong, right })
+    } else {
+        None
     };
     // A conditional step without an HTTP answer: does a plain PUT of the
     // key go through now? Then the backend dropped the condition, not the
     // connection (Backblaze B2).
-    let (create, wrong, right) = if [&create, &wrong, &right]
-        .iter()
-        .any(|o| matches!(o, StepOutcome::Dropped(_)))
-    {
+    let dropped = [&create, &wrong, &right]
+        .into_iter()
+        .chain(unquoted.iter().flat_map(|u| [&u.wrong, &u.right]))
+        .any(|o| matches!(o, StepOutcome::Dropped(_)));
+    let (create, wrong, right, unquoted) = if dropped {
         let control = put(b"5").send().await.is_ok();
         (
             resolve_dropped(create, control),
             resolve_dropped(wrong, control),
             resolve_dropped(right, control),
+            unquoted.map(|u| UnquotedSteps {
+                wrong: resolve_dropped(u.wrong, control),
+                right: resolve_dropped(u.right, control),
+            }),
         )
     } else {
-        (create, wrong, right)
+        (create, wrong, right, unquoted)
     };
+    let verdict = classify_cas_dialect(&create, &wrong, &right, unquoted.as_ref());
+    let dialect = verdict
+        .as_ref()
+        .map_or(IfMatchDialect::Quoted, |(_, dialect)| *dialect);
     // The key exists here (the probe wrote it). A DELETE with a wrong ETag
     // must leave it; a backend that ignores the condition deletes it, and
     // the cleanup below is then a no-op.
@@ -242,14 +350,16 @@ pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<Probe
             .delete_object()
             .bucket(bucket)
             .key(key)
-            .if_match("\"00000000000000000000000000000000\"")
+            .if_match_etag(WRONG_ETAG, dialect)
             .send()
             .await,
     );
     remove_all_versions(client, bucket, key).await;
+    let (cas, if_match) = verdict?;
     Ok(ProbeResult {
-        cas: classify_cas_probe(&create, &wrong, &right)?,
+        cas,
         conditional_delete: classify_conditional_delete(&delete_wrong),
+        if_match,
     })
 }
 
@@ -582,7 +692,8 @@ mod conditional_delete_tests {
             got,
             Ok(ProbeResult {
                 cas: true,
-                conditional_delete: true
+                conditional_delete: true,
+                if_match: IfMatchDialect::Quoted,
             })
         );
         assert_eq!(fake.requests().len(), 7, "{:?}", fake.requests());
@@ -599,7 +710,8 @@ mod conditional_delete_tests {
             got,
             Ok(ProbeResult {
                 cas: true,
-                conditional_delete: false
+                conditional_delete: false,
+                if_match: IfMatchDialect::Quoted,
             })
         );
     }
@@ -662,6 +774,59 @@ mod tests {
         assert_eq!(
             classify_cas_probe(&NotImplemented, &PreconditionFailed, &Written),
             Ok(false)
+        );
+    }
+
+    /// The `If-Match` dialect: the quoted form decides unless it refused
+    /// the correct ETag; then the unquoted form must refuse a wrong ETag
+    /// AND write with the right one.
+    #[test]
+    fn the_dialect_truth_table() {
+        use super::super::if_match::IfMatchDialect::*;
+        let pf = || PreconditionFailed;
+        let u = |wrong, right| UnquotedSteps { wrong, right };
+        // AWS / MinIO: quoted works, the unquoted steps never ran.
+        assert_eq!(
+            classify_cas_dialect(&pf(), &pf(), &Written, None),
+            Ok((true, Quoted))
+        );
+        // Ceph RGW (Hetzner).
+        assert_eq!(
+            classify_cas_dialect(&pf(), &pf(), &pf(), Some(&u(pf(), Written))),
+            Ok((true, Unquoted))
+        );
+        // Unquoted ignored (a wrong ETag written): not CAS.
+        assert_eq!(
+            classify_cas_dialect(&pf(), &pf(), &pf(), Some(&u(Written, Written))),
+            Ok((false, Quoted))
+        );
+        // Both forms refuse the correct ETag: not CAS, as before.
+        assert_eq!(
+            classify_cas_dialect(&pf(), &pf(), &pf(), Some(&u(pf(), pf()))),
+            Ok((false, Quoted))
+        );
+        // The quoted wrong ETag written: not CAS whatever the unquoted say.
+        assert_eq!(
+            classify_cas_dialect(&pf(), &Written, &pf(), Some(&u(pf(), Written))),
+            Ok((false, Quoted))
+        );
+        // If-None-Match ignored: not CAS.
+        assert_eq!(
+            classify_cas_dialect(&Written, &pf(), &pf(), Some(&u(pf(), Written))),
+            Ok((false, Quoted))
+        );
+        // An unclear unquoted step: indeterminate.
+        assert!(
+            classify_cas_dialect(&pf(), &pf(), &pf(), Some(&u(Other("x".into()), Written)))
+                .is_err()
+        );
+        assert!(
+            classify_cas_dialect(&pf(), &pf(), &pf(), Some(&u(pf(), Other("x".into())))).is_err()
+        );
+        // A refusal of the correct ETag with no unquoted steps: not CAS.
+        assert_eq!(
+            classify_cas_dialect(&pf(), &pf(), &pf(), None),
+            Ok((false, Quoted))
         );
     }
 

@@ -311,6 +311,29 @@ async fn a_cas_backend_takes_client_writes_during_the_walk() {
     assert_eq!(node.get(&bucket, "during.txt").await, (200, NEW.to_vec()));
 }
 
+/// MinIO compares `If-Match` with the quoted ETag, as AWS does: its probe
+/// verdict keeps the quoted form (Ceph RGW, Hetzner, gets `unquoted`).
+#[tokio::test]
+async fn minio_probes_the_quoted_if_match_form() {
+    skip_unless_minio!();
+    let bucket = new_minio_bucket("condquoted").await;
+    let node = Node::minio(&bucket, &[]).await;
+    let resp = node
+        .admin
+        .post(format!(
+            "{}/_/api/admin/backends/default/capability-probe",
+            node.server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["capability"]["verdict"], "cas-verified", "{v}");
+    assert_eq!(v["capability"]["via"], "probe", "{v}");
+    assert_eq!(v["capability"]["if_match"], "quoted", "{v}");
+}
+
 /// Test (3), the control: a job that keeps the write gate (in production a
 /// decrypt job on a backend without proven conditional writes; encryption
 /// itself needs them, N2) answers the same PUT with 503.

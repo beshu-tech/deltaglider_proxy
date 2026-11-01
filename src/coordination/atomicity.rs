@@ -49,6 +49,12 @@ pub fn verdict_tag(verdict: &CapabilityVerdict) -> &'static str {
 /// reason: for the admin API and the logs only, never an S3 client).
 pub fn verdict_words(verdict: &CapabilityVerdict) -> String {
     match verdict {
+        CapabilityVerdict::CasVerified {
+            if_match: super::if_match::IfMatchDialect::Unquoted,
+            ..
+        } => "the backend supports atomic writes (it enforced a conditional write; it wants \
+              the ETag in If-Match without quotes, as Ceph RGW does)"
+            .to_string(),
         CapabilityVerdict::CasVerified { .. } => {
             "the backend supports atomic writes (it enforced a conditional write)".to_string()
         }
@@ -225,6 +231,7 @@ pub async fn probe_atomic_writes(
     } else if matches!(def, BackendConfig::Filesystem { .. }) {
         CapabilityVerdict::CasVerified {
             via: VerifiedVia::LocalFilesystem,
+            if_match: Default::default(),
         }
     } else {
         // ONE deadline for the whole probe (the bucket listing and the
@@ -592,6 +599,7 @@ pub fn static_verdict(name: &str, def: &BackendConfig) -> Option<CapabilityVerdi
     } else {
         CapabilityVerdict::CasVerified {
             via: VerifiedVia::LocalFilesystem,
+            if_match: Default::default(),
         }
     })
 }
@@ -979,7 +987,8 @@ mod tests {
             proxy_unavailable_reason(
                 "b2",
                 &CapabilityVerdict::CasVerified {
-                    via: VerifiedVia::Probe
+                    via: VerifiedVia::Probe,
+                    if_match: Default::default(),
                 }
             ),
             None
@@ -1043,7 +1052,8 @@ mod tests {
         assert_eq!(
             recheck_after(
                 Some(&CapabilityVerdict::CasVerified {
-                    via: VerifiedVia::Probe
+                    via: VerifiedVia::Probe,
+                    if_match: Default::default(),
                 }),
                 0
             ),
@@ -1204,6 +1214,7 @@ mod tests {
             def,
             CapabilityVerdict::CasVerified {
                 via: VerifiedVia::Probe,
+                if_match: Default::default(),
             },
         );
         assert_eq!(cache.write_block("releases", &home(None)), None, "lifted");
@@ -1240,6 +1251,7 @@ mod tests {
             def,
             CapabilityVerdict::CasVerified {
                 via: VerifiedVia::Probe,
+                if_match: Default::default(),
             },
         );
         assert_eq!(cache.write_block("photos", &undetermined), None);
@@ -1357,6 +1369,7 @@ mod tests {
             def,
             CapabilityVerdict::CasVerified {
                 via: VerifiedVia::Probe,
+                if_match: Default::default(),
             },
         );
         assert_eq!(cache.write_block("releases", &home(None)), None, "writable");
@@ -1383,6 +1396,7 @@ mod tests {
             def,
             CapabilityVerdict::CasVerified {
                 via: VerifiedVia::Probe,
+                if_match: Default::default(),
             },
         );
         let mut candidate = c.clone();

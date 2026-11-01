@@ -293,6 +293,11 @@ pub struct S3Backend {
     /// skips the attempt. One backend instance is one backend definition,
     /// so a redefined backend tries again.
     copy_unsupported: std::sync::atomic::AtomicBool,
+    /// A conditional-request profile fixed at construction
+    /// ([`S3Backend::with_conditional_profile`]); `None` = the one that
+    /// the capability probe found for this definition
+    /// ([`crate::coordination::if_match::lookup`]).
+    pinned_profile: Option<crate::coordination::if_match::ConditionalProfile>,
 }
 
 impl S3Backend {
@@ -338,6 +343,7 @@ impl S3Backend {
             healer: heal::FactsHealer::new(client.clone()),
             acl_support: Default::default(),
             copy_unsupported: Default::default(),
+            pinned_profile: None,
             client,
             bulk_client,
             health_key: None,
@@ -359,6 +365,41 @@ impl S3Backend {
             crate::coordination::capability::fingerprint(config),
         ));
         self
+    }
+
+    /// Use `profile` for every conditional request, whatever a probe
+    /// finds (tests, and a caller that probed the backend itself).
+    pub fn with_conditional_profile(
+        mut self,
+        profile: crate::coordination::if_match::ConditionalProfile,
+    ) -> Self {
+        self.pinned_profile = Some(profile);
+        self
+    }
+
+    /// The conditional-request profile of this backend: pinned, else what
+    /// the capability probe of its definition found. `None`: never
+    /// probed.
+    fn conditional_profile(&self) -> Option<crate::coordination::if_match::ConditionalProfile> {
+        self.pinned_profile.or_else(|| {
+            let (_, fp) = self.health_key.as_ref()?;
+            crate::coordination::if_match::lookup(fp)
+        })
+    }
+
+    /// The `If-Match` form of this backend (quoted until a probe says
+    /// otherwise).
+    pub(crate) fn if_match_dialect(&self) -> crate::coordination::if_match::IfMatchDialect {
+        self.conditional_profile()
+            .map(|p| p.if_match)
+            .unwrap_or_default()
+    }
+
+    /// Does DELETE enforce `If-Match` here? Only a probe proves it; until
+    /// then a delete that must not remove a newer object reads it first.
+    pub(crate) fn conditional_delete_proven(&self) -> bool {
+        self.conditional_profile()
+            .is_some_and(|p| p.conditional_delete)
     }
 
     // === Key generation helpers ===
@@ -974,7 +1015,10 @@ impl StorageBackend for S3Backend {
 
     /// `DeleteObject` with `If-Match`. A 412/409 means a peer overwrote it:
     /// nothing deleted. A backend that answers 501 to a conditional delete
-    /// gets a plain one (the in-process lock is then the only guard).
+    /// gets a plain one (the in-process lock is then the only guard). A
+    /// backend whose DELETE is not proven to enforce `If-Match` (Hetzner
+    /// ignores it) gets a HEAD first: a version that changed is not
+    /// deleted, and the window left is between the HEAD and the DELETE.
     async fn delete_variant_if(
         &self,
         bucket: &str,
@@ -983,14 +1027,25 @@ impl StorageBackend for S3Backend {
         variant: crate::storage::ObjectVariant,
         version: &str,
     ) -> Result<bool, StorageError> {
+        use crate::coordination::if_match::IfMatchRequest;
         let key = self.variant_key(prefix, filename, variant);
+        if !self.conditional_delete_proven() {
+            match self
+                .variant_version(bucket, prefix, filename, variant)
+                .await
+            {
+                Ok(Some(now)) if now == version => {}
+                Ok(_) | Err(StorageError::NotFound(_)) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
         let date = crate::coordination::server_clock::ServerDate::default();
         let sent = self
             .client
             .delete_object()
             .bucket(bucket)
             .key(&key)
-            .if_match(version)
+            .if_match_etag(version, self.if_match_dialect())
             .customize()
             .interceptor(date.clone())
             .send()

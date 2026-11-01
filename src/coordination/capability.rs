@@ -17,7 +17,7 @@ pub const CAPABILITY_DOC_URL: &str =
     "https://deltaglider.com/docs/how-to/backend-capability-validation";
 
 /// How a `CasVerified` verdict was established (for operator-facing logs/GUI).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VerifiedVia {
     /// Live `If-None-Match` + `If-Match` probe (`cas_probe`) ran this boot.
@@ -28,11 +28,18 @@ pub enum VerifiedVia {
 }
 
 /// The capability verdict for one backend.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "verdict", rename_all = "kebab-case")]
 pub enum CapabilityVerdict {
     /// Conditional writes enforced (412 on a violated `If-None-Match:*`).
-    CasVerified { via: VerifiedVia },
+    CasVerified {
+        via: VerifiedVia,
+        /// The form of the ETag in `If-Match` that the backend enforces
+        /// (`unquoted` on Ceph RGW: Hetzner). Missing in a verdict from
+        /// before the dialect existed = `quoted`.
+        #[serde(default)]
+        if_match: super::if_match::IfMatchDialect,
+    },
     /// DEFINITIVE: the backend silently ignored the condition. Unsafe for
     /// multi-instance client-writable buckets and for coordination.
     NonCas,
@@ -451,10 +458,19 @@ pub async fn establish_backend_verdict_within(
                 reason: format!("capability probe timed out ({}s)", budget.as_secs()),
             }
         }
-        Ok(Ok(p)) if p.cas => CapabilityVerdict::CasVerified {
-            via: VerifiedVia::Probe,
-        },
-        Ok(Ok(_)) => CapabilityVerdict::NonCas,
+        Ok(Ok(p)) => {
+            // Every conditional request of the backends built from this
+            // definition uses what the probe found.
+            super::if_match::record_for(&group.backend, p.profile());
+            if p.cas {
+                CapabilityVerdict::CasVerified {
+                    via: VerifiedVia::Probe,
+                    if_match: p.if_match,
+                }
+            } else {
+                CapabilityVerdict::NonCas
+            }
+        }
         Ok(Err(reason)) => CapabilityVerdict::Unknown { reason },
     }
 }
@@ -624,6 +640,7 @@ mod tests {
             &s3_backend("https://hetzner.example"),
             CapabilityVerdict::CasVerified {
                 via: VerifiedVia::Probe,
+                if_match: Default::default(),
             },
         );
         assert_eq!(cache.get("b2", &b2), Some(CapabilityVerdict::NonCas));
@@ -667,6 +684,7 @@ mod tests {
             CapabilityVerdict::NonCas,
             CapabilityVerdict::CasVerified {
                 via: VerifiedVia::Probe,
+                if_match: Default::default(),
             },
         ] {
             cache.set("b2", &d, proven.clone());
@@ -704,6 +722,7 @@ mod tests {
             def,
             CapabilityVerdict::CasVerified {
                 via: VerifiedVia::Probe,
+                if_match: Default::default(),
             },
         );
         assert!(!gate.is_unproven("b2"));
@@ -725,6 +744,7 @@ mod tests {
         let running = cfg.backend_by_name("b2").unwrap().clone();
         let cas = CapabilityVerdict::CasVerified {
             via: VerifiedVia::Probe,
+            if_match: Default::default(),
         };
         cache.set("b2", &running, cas.clone());
         for i in 0..10 {
@@ -751,6 +771,7 @@ mod tests {
             &old_def,
             CapabilityVerdict::CasVerified {
                 via: VerifiedVia::Probe,
+                if_match: Default::default(),
             },
         );
         assert_eq!(cache.get("remote", &new_def), None, "redefinition → miss");
@@ -842,9 +863,36 @@ storage:
     fn verdict_serializes_kebab_case_for_the_admin_api() {
         let v = serde_json::to_value(CapabilityVerdict::CasVerified {
             via: VerifiedVia::Probe,
+            if_match: Default::default(),
         })
         .unwrap();
         assert_eq!(v["verdict"], "cas-verified");
         assert_eq!(v["via"], "probe");
+        assert_eq!(v["if_match"], "quoted");
+    }
+
+    /// A verdict without the dialect (from before it existed) reads as
+    /// the quoted form; the unquoted one round-trips.
+    #[test]
+    fn a_verdict_without_a_dialect_is_quoted() {
+        let old: CapabilityVerdict =
+            serde_json::from_str(r#"{"verdict":"cas-verified","via":"probe"}"#).unwrap();
+        assert_eq!(
+            old,
+            CapabilityVerdict::CasVerified {
+                via: VerifiedVia::Probe,
+                if_match: super::super::if_match::IfMatchDialect::Quoted,
+            }
+        );
+        let rgw = CapabilityVerdict::CasVerified {
+            via: VerifiedVia::Probe,
+            if_match: super::super::if_match::IfMatchDialect::Unquoted,
+        };
+        let json = serde_json::to_string(&rgw).unwrap();
+        assert!(json.contains(r#""if_match":"unquoted""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<CapabilityVerdict>(&json).unwrap(),
+            rgw
+        );
     }
 }

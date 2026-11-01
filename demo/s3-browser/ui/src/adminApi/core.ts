@@ -398,7 +398,12 @@ export interface BackendInfo {
 
 /** Mirror of the server's coordination::CapabilityVerdict (kebab-case tag). */
 export type BackendCapabilityVerdict =
-  | { verdict: 'cas-verified'; via: 'probe' | 'local-filesystem' }
+  | {
+      verdict: 'cas-verified';
+      via: 'probe' | 'local-filesystem';
+      /** The ETag form the backend enforces in If-Match (unquoted on Ceph RGW, e.g. Hetzner). */
+      if_match?: 'quoted' | 'unquoted';
+    }
   | { verdict: 'non-cas' }
   | { verdict: 'unknown'; reason: string };
 

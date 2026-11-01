@@ -12,6 +12,7 @@
 //! version.
 
 use super::*;
+use crate::coordination::if_match::IfMatchRequest;
 use crate::storage::traits::object_changed_while_read;
 use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
@@ -189,7 +190,10 @@ impl BodyState {
             .bucket(&r.bucket)
             .key(&r.key)
             .range(format!("bytes={}-{}", r.next, r.end - 1))
-            .if_match(&r.etag)
+            .if_match_etag(
+                &r.etag,
+                crate::coordination::if_match::IfMatchDialect::Quoted,
+            )
             .send()
             .await;
         let at = r.next;

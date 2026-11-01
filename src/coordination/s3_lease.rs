@@ -24,6 +24,7 @@
 //! write, and the release is one `DELETE If-Match` on it. A free lease costs
 //! 2 requests per hold (it cost 4). The body format is unchanged.
 
+use super::if_match::IfMatchRequest;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use serde::{Deserialize, Serialize};
@@ -204,6 +205,9 @@ pub struct S3Lease {
     /// then may a release delete by its kept ETag with no read: on a bucket
     /// that ignores the condition, that DELETE removes a lease a peer stole.
     conditional_delete: bool,
+    /// The form of the ETag in `If-Match` that the bucket enforces (the
+    /// probe found it; Ceph RGW wants it unquoted).
+    if_match: super::if_match::IfMatchDialect,
 }
 
 impl S3Lease {
@@ -236,6 +240,7 @@ impl S3Lease {
             previous_boot_id: boot.previous,
             kept: Default::default(),
             conditional_delete: false,
+            if_match: Default::default(),
         }
     }
 
@@ -244,6 +249,13 @@ impl S3Lease {
     pub fn with_conditional_delete(mut self, enforced: bool) -> Self {
         self.conditional_delete = enforced;
         self
+    }
+
+    /// Set everything the CAS probe found: the `If-Match` dialect and the
+    /// DELETE verdict ([`Self::with_conditional_delete`]).
+    pub fn with_profile(mut self, profile: super::if_match::ConditionalProfile) -> Self {
+        self.if_match = profile.if_match;
+        self.with_conditional_delete(profile.conditional_delete)
     }
 
     fn object_key(subsystem: LeaseSubsystem, rule: &str) -> String {
@@ -309,9 +321,15 @@ impl S3Lease {
         body: ByteStream,
         precondition: Option<&str>,
     ) -> Result<bool, LeaseError> {
-        let outcome =
-            super::cas::conditional_put_etag(&self.client, &self.bucket, key, body, precondition)
-                .await;
+        let outcome = super::cas::conditional_put_etag(
+            &self.client,
+            &self.bucket,
+            key,
+            body,
+            precondition,
+            self.if_match,
+        )
+        .await;
         self.kept.note(key, owner, &outcome);
         outcome
             .map(|written| written.is_some())
@@ -456,7 +474,8 @@ impl CoordinationLease for S3Lease {
         // on DELETE.
         let kept = self.kept.take(&key, owner);
         if let Some(etag) = kept.filter(|_| self.conditional_delete) {
-            super::cas::delete_if_match(&self.client, &self.bucket, &key, &etag).await;
+            super::cas::delete_if_match(&self.client, &self.bucket, &key, &etag, self.if_match)
+                .await;
             return Ok(());
         }
         // No kept ETag (our last write of it lost or failed), or a bucket
@@ -471,7 +490,7 @@ impl CoordinationLease for S3Lease {
                     .delete_object()
                     .bucket(&self.bucket)
                     .key(&key)
-                    .if_match(&etag)
+                    .if_match_etag(&etag, self.if_match)
                     .send()
                     .await;
             }

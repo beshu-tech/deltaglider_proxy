@@ -27,8 +27,11 @@ pub mod cas;
 pub mod cas_probe;
 pub mod encryption_witness;
 pub mod health;
+pub mod if_match;
 pub mod lease;
 pub mod reference_lock;
+#[cfg(test)]
+mod rgw_dialect_tests;
 pub mod s3_lease;
 pub mod server_clock;
 

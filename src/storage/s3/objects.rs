@@ -3,6 +3,7 @@
 //! Object reads, writes and deletes, fenced and plain.
 
 use super::*;
+use crate::coordination::if_match::IfMatchRequest;
 
 /// Resolve an object's `created_at` from its (optional) `dg-created-at`
 /// metadata value, falling back to `fallback` (the object's stable S3
@@ -225,7 +226,7 @@ impl S3Backend {
             request = request.metadata(k, v);
         }
         if let Some(e) = &expect_etag {
-            request = request.copy_source_if_match(e);
+            request = request.if_match_etag(e, self.if_match_dialect());
         }
 
         let resp = match request.send().await {
@@ -393,7 +394,7 @@ impl S3Backend {
                 request = request.metadata(k.clone(), v.clone());
             }
             request = apply_native_encryption(request, &native);
-            request = apply_put_fence(request, &fence);
+            request = apply_put_fence(request, &fence, self.if_match_dialect());
             let sent = match self.upload_config(data.len() as u64) {
                 Some(c) => request.customize().config_override(c).send().await,
                 None => request.send().await,
@@ -602,7 +603,7 @@ impl S3Backend {
                 request = request.metadata(k.clone(), v.clone());
             }
             request = apply_native_encryption(request, &native);
-            request = apply_put_fence(request, &fence);
+            request = apply_put_fence(request, &fence, self.if_match_dialect());
             let sent = match self.upload_config(stored_size.unwrap_or(0)) {
                 Some(c) => request.customize().config_override(c).send().await,
                 None => request.send().await,
@@ -739,7 +740,7 @@ impl S3Backend {
             .delete_object()
             .bucket(bucket)
             .key(key)
-            .if_match(etag)
+            .if_match_etag(etag, self.if_match_dialect())
             .send()
             .await
         {
@@ -790,10 +791,11 @@ impl S3Backend {
 pub(super) fn apply_put_fence(
     req: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
     fence: &RefFence,
+    dialect: crate::coordination::if_match::IfMatchDialect,
 ) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
     match fence {
         RefFence::Absent => req.if_none_match("*"),
-        RefFence::ETag(e) if !e.is_empty() => req.if_match(e),
+        RefFence::ETag(e) if !e.is_empty() => req.if_match_etag(e, dialect),
         _ => req,
     }
 }

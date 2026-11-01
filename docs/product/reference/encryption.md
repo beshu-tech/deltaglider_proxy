@@ -291,6 +291,7 @@ The proxy proves the conditional writes of a backend with a probe:
 
 - A filesystem backend has atomic writes. It has one node, and every write of an object on that node takes the object's in-process lock. The probe sends no request. The verdict is `cas-verified` with `via: local-filesystem`.
 - On an S3 backend, the probe writes one small object, `.deltaglider/_cwprobe/<uuid>`, in a bucket that the backend holds. Then it tests `If-None-Match: *`, `If-Match` with a wrong ETag, and `If-Match` with the current ETag. It deletes the object afterwards. On a bucket that keeps versions, it also deletes every version of the key. It does this also when the probe ran out of time, so no noncurrent version of the probe key stays in the bucket. The details are in [How to use a backend without conditional writes](../how-to/backend-capability-validation.md#how-the-probe-works).
+- Ceph RGW (Hetzner Object Storage) compares the `If-Match` of a `PUT` with the ETag without its quotes, so it refuses the correct ETag in the quoted form that S3 returns. When the probe's write with the current ETag gets `412`, the probe tries the same ETag without quotes, and it checks that a wrong ETag without quotes is still refused. When both hold, the verdict is `cas-verified` with `if_match: unquoted`, and every conditional request of the proxy to that backend sends the ETag without quotes. Hetzner also ignores `If-Match` on `DELETE`, so the proxy reads an object before each delete that must not remove a newer version. See [The `If-Match` form](../how-to/backend-capability-validation.md#the-if-match-form-and-backends-that-ignore-it-on-delete).
 - Some backends close the connection when they receive a conditional `PUT`, and send no HTTP answer at all. Backblaze B2 (`eu-central-003`) did this on 2026-10-31. When this happens, the probe sends a plain `PUT` of the same key. When the plain `PUT` works, the dropped connection was the backend's answer to the condition, so the verdict is `non-cas`. When the plain `PUT` fails too, the probe cannot reach the backend, so the verdict is `unknown`.
 - One probe has one deadline of 15 seconds in total. The listing of the backend's buckets, which picks the bucket that the probe writes in, may use 5 seconds of it. The SDK retries each request a limited number of times inside the deadline, so a probe never retries without end.
 
@@ -298,7 +299,7 @@ A verdict has one of three values:
 
 | Verdict | Meaning | Proxy encryption | Writes to encrypted buckets |
 |---|---|---|---|
-| `cas-verified` | The backend supports atomic writes (`via: probe` or `via: local-filesystem`). | Allowed | Allowed |
+| `cas-verified` | The backend supports atomic writes (`via: probe` or `via: local-filesystem`). `if_match` is `quoted` or `unquoted`: the form of the ETag that the backend accepts in `If-Match`. | Allowed | Allowed |
 | `non-cas` | The backend does not support atomic writes: it ignored or refused a conditional write, as Backblaze B2 does. | Refused | Refused with `403`: the buckets are read-only |
 | `unknown` | The proxy could not verify the backend's atomic writes, because the probe did not reach it. | Refused | Refused with `503 SlowDown`, which clients retry |
 

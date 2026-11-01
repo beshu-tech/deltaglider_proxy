@@ -2204,6 +2204,40 @@ mod source_guards {
     /// A 204 carries no body. Behind an HTTP/2 proxy, a 204 with a JSON
     /// body (and its `content-length`) is a protocol error, so the browser
     /// fails the request although the server did the work.
+    /// Every `If-Match` (and `x-amz-copy-source-if-match`) goes through
+    /// `coordination::if_match::IfMatchRequest`, which formats the ETag in
+    /// the backend's dialect. Ceph RGW (Hetzner) refuses the correct ETag
+    /// quoted on PUT: a raw `.if_match(etag)` with the SDK's quoted ETag
+    /// reported every conditional write on it as lost.
+    #[test]
+    fn if_match_headers_go_through_one_helper() {
+        const HELPER: &str = "src/coordination/if_match.rs";
+        let src = rust_files("src");
+        let test_files = out_of_line_test_modules(&src);
+        let needles = [
+            [".if_", "match("].concat(),
+            [".copy_source_if_", "match("].concat(),
+        ];
+        let mut offenders = Vec::new();
+        for file in src {
+            let rel = rel_path(&file);
+            if rel == HELPER || test_files.contains(&file) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                if needles.iter().any(|needle| line.contains(needle.as_str())) {
+                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "set If-Match through IfMatchRequest::if_match_etag (the backend's dialect):\n{}",
+            offenders.join("\n")
+        );
+    }
+
     #[test]
     fn no_content_responses_carry_no_body() {
         let src = rust_files("src");

@@ -1113,9 +1113,17 @@ pub async fn validate_coordination_once(config: &Config) -> CoordinationCheck {
             return None;
         }
     };
-    Some(
-        deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(&client, bucket).await,
-    )
+    let validation =
+        deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(&client, bucket).await;
+    if let Ok(v) = &validation {
+        // A data backend with the same definition (the coordination bucket
+        // on the data backend) sends its If-Match in the same dialect.
+        deltaglider_proxy::coordination::if_match::record_for(
+            coordination_backend(config),
+            v.profile(),
+        );
+    }
+    Some(validation)
 }
 
 /// Build the job-plane leader lease, selecting the impl by whether a
@@ -1190,8 +1198,8 @@ pub async fn build_coordination_lease(
         Some(done) => done.clone(),
         None => sync.validate_coordination_bucket().await,
     };
-    let conditional_delete = match validation {
-        Ok(v) => v.conditional_delete(),
+    let profile = match validation {
+        Ok(v) => v.profile(),
         Err(e) => {
             error!("FATAL: coordination bucket validation failed (lease build): {e}");
             std::process::exit(1);
@@ -1210,8 +1218,7 @@ pub async fn build_coordination_lease(
                     .unwrap_or_else(|| std::path::Path::new(".")),
             );
             DynCoordinationLease::new_arc(
-                S3Lease::with_boot(client, sync_bucket, node_id, boot)
-                    .with_conditional_delete(conditional_delete),
+                S3Lease::with_boot(client, sync_bucket, node_id, boot).with_profile(profile),
             )
         }
         Err(e) => {
@@ -1262,27 +1269,28 @@ pub async fn build_reference_lock(
     );
     match ConfigDbSync::build_client(coordination_backend(config)).await {
         Ok(client) => {
-            let conditional_delete = match check {
-                Some(Ok(v)) => v.conditional_delete(),
+            let profile = match check {
+                Some(Ok(v)) => v.profile(),
                 Some(Err(e)) => {
                     warn!(
                         "Reference lock: coordination bucket validation failed ({e}); \
                          releases read the lock first"
                     );
-                    false
+                    Default::default()
                 }
                 None => {
                     warn!(
                         "Reference lock: coordination bucket not validated; releases read the \
                          lock first"
                     );
-                    false
+                    Default::default()
                 }
             };
             info!(
                 "Reference lock: S3-CAS on bucket '{sync_bucket}' (cross-node reference.bin \
-                 protection, node_id={node_id}, conditional DELETE {})",
-                if conditional_delete {
+                 protection, node_id={node_id}, If-Match {}, conditional DELETE {})",
+                profile.if_match.label(),
+                if profile.conditional_delete {
                     "enforced"
                 } else {
                     "not enforced: releases read first"
@@ -1291,7 +1299,7 @@ pub async fn build_reference_lock(
             Some(DynReferenceLock::new_arc(
                 S3ReferenceLock::new(client, sync_bucket, node_id)
                     .with_tunables(ttl_secs, acquire_timeout_secs)
-                    .with_conditional_delete(conditional_delete),
+                    .with_profile(profile),
             ))
         }
         Err(e) => {
@@ -1358,15 +1366,21 @@ pub async fn build_encryption_witness(
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
-    let witness = Arc::new(EncryptionWitness::new(
-        client,
-        sync_bucket.clone(),
-        durable_node_id(&dir),
-        poll,
-        gate,
-        config,
-        Some(&dir),
-    ));
+    let witness = Arc::new(
+        EncryptionWitness::new(
+            client,
+            sync_bucket.clone(),
+            durable_node_id(&dir),
+            poll,
+            gate,
+            config,
+            Some(&dir),
+        )
+        .with_if_match(match check {
+            Some(Ok(v)) => v.profile().if_match,
+            _ => Default::default(),
+        }),
+    );
     if witness.status().status == "unavailable" {
         return Some(witness);
     }
@@ -1444,9 +1458,10 @@ pub async fn validate_backend_write_capability(
         let verdict = establish_backend_verdict(&name, &group, &forced).await;
         cache.set(&name, &group.backend, verdict.clone());
         match verdict {
-            CapabilityVerdict::CasVerified { via } => info!(
-                "backend capability: '{name}' conditional writes verified ({via:?}) — \
+            CapabilityVerdict::CasVerified { via, if_match } => info!(
+                "backend capability: '{name}' conditional writes verified ({via:?}, If-Match {}) — \
                  client-writable bucket(s) {:?} are safe under multi-instance",
+                if_match.label(),
                 group.buckets
             ),
             CapabilityVerdict::NonCas => {
@@ -1611,6 +1626,9 @@ pub async fn init_config_sync(
         Some(done) => done.clone(),
         None => sync.validate_coordination_bucket().await,
     };
+    if let Ok(v) = &validation {
+        sync.use_profile(v.profile());
+    }
     match validation {
         Ok(deltaglider_proxy::config_db_sync::CoordinationValidation::CachedWitness {
             validated_at_unix,
