@@ -137,3 +137,55 @@ for (const { name, colors: c } of ALL_THEMES) {
     assert.deepEqual(fails, []);
   });
 }
+
+// A selected or hovered option of a Select, Menu or Dropdown is AntD's text
+// (colorText, an alpha over the fill) on controlItemBgActive /
+// controlItemBgHover, flattened onto the popup (colorBgElevated). The dark
+// algorithm derives the selected fill from the primary: in Instrument dark it
+// read 4.26:1 (axe, /admin/system Section select).
+function parseColor(c: string): [number, number, number, number] {
+  const m = /^rgba?\(([^)]+)\)$/.exec(c);
+  if (m) {
+    const [r, g, b, a = '1'] = m[1].split(',').map((s) => s.trim());
+    return [Number(r), Number(g), Number(b), Number(a)];
+  }
+  const h = c.replace('#', '');
+  const full = h.length === 3 || h.length === 4 ? [...h].map((x) => x + x).join('') : h;
+  const ch = (i: number) => parseInt(full.slice(i, i + 2), 16);
+  return [ch(0), ch(2), ch(4), full.length === 8 ? ch(6) / 255 : 1];
+}
+function flatten(fg: string, bg: string): string {
+  const [r, g, b, a] = parseColor(fg);
+  const [R, G, B] = parseColor(bg);
+  return '#' + [[r, R], [g, G], [b, B]].map(([x, y]) => Math.round(x * a + y * (1 - a)).toString(16).padStart(2, '0')).join('');
+}
+
+for (const { name, antd: t } of ALL_THEMES) {
+  test(`${name}: a selected or hovered list item reaches 4.5:1`, () => {
+    const tok = theme.getDesignToken(t as ThemeConfig) as unknown as Record<string, string>;
+    const fails: string[] = [];
+    for (const key of ['controlItemBgActive', 'controlItemBgActiveHover', 'controlItemBgHover']) {
+      const fill = flatten(tok[key], tok.colorBgElevated);
+      const ink = flatten(tok.colorText, fill);
+      const r = ratio(ink, fill);
+      if (r < 4.5) fails.push(`${key}: ${ink} on ${fill}: ${r.toFixed(2)}`);
+    }
+    assert.deepEqual(fails, []);
+  });
+}
+
+// A primary button keeps its ink (colorTextLightSolid) through hover and
+// press: the hover fill is lighter than the rest fill (Editorial light "New
+// job" failed axe while the pointer was on it).
+for (const { name, antd: t } of ALL_THEMES) {
+  test(`${name}: primary button text reaches 4.5:1 at rest, hover and press`, () => {
+    const tok = theme.getDesignToken(t as ThemeConfig) as unknown as Record<string, string>;
+    const fails: string[] = [];
+    for (const key of ['colorPrimary', 'colorPrimaryHover', 'colorPrimaryActive']) {
+      const fill = flatten(tok[key], tok.colorBgContainer);
+      const r = ratio(flatten(tok.colorTextLightSolid, fill), fill);
+      if (r < 4.5) fails.push(`${key}: ${tok.colorTextLightSolid} on ${fill}: ${r.toFixed(2)}`);
+    }
+    assert.deepEqual(fails, []);
+  });
+}

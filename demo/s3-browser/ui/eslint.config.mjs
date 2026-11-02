@@ -83,7 +83,12 @@ const UI_RULES = {
         {
           name: 'antd',
           importNames: ['Dropdown'],
-          message: 'Use components/KeyboardDropdown: it focuses the menu on open so the arrow keys work.',
+          message: 'Use components/KeyboardDropdown: it focuses the menu on open and marks the trigger as a menu button.',
+        },
+        {
+          name: 'antd',
+          importNames: ['AutoComplete'],
+          message: 'Use components/SimpleAutoComplete: AntD points aria-activedescendant at a missing option (`_list_-1`).',
         },
       ],
     },

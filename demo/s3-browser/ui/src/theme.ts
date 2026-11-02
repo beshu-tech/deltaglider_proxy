@@ -66,6 +66,9 @@ export const darkTheme = {
     colorLink: D.ACCENT_BLUE,
     colorLinkHover: D.ACCENT_BLUE_LIGHT,
     colorLinkActive: '#14b8a6',
+    // The dark algorithm derives #1f6a61 from the teal primary: the text of a
+    // hovered selected option read 4.27:1 there (contrast.test.ts).
+    controlItemBgActiveHover: '#1e5d55',
     fontSize: 14,
     borderRadius: 8,
   },
@@ -111,6 +114,10 @@ export function antdTheme(style: ThemeStyle, isDark: boolean) {
     token: {
       ...DG_BRAND,
       colorPrimary: c.ACCENT_BLUE,
+      // The algorithm's derived hover (light) and press (dark) fills sit
+      // under 4.5:1 with ON_ACCENT; the palette's companion keeps it.
+      colorPrimaryHover: c.ACCENT_BLUE_LIGHT,
+      colorPrimaryActive: c.ACCENT_BLUE,
       colorLink: c.ACCENT_BLUE,
       colorLinkHover: c.ACCENT_BLUE_LIGHT,
       colorLinkActive: c.ACCENT_BLUE_LIGHT,

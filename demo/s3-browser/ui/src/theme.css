@@ -668,7 +668,7 @@ code, kbd, pre, samp, .ant-typography code,
 
 .account-menu-section-label {
   margin: 0 0 8px 2px;
-  color: color-mix(in srgb, var(--docs-toc-text) 80%, transparent);
+  color: var(--dg-text-muted);
   font: 600 11px/1 var(--font-ui);
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1005,7 +1005,7 @@ code, kbd, pre, samp, .ant-typography code,
   position: absolute !important;
   top: 18px;
   right: 18px;
-  color: color-mix(in srgb, var(--login-hero-text) 58%, transparent) !important;
+  color: var(--dg-text-muted) !important;
   border: 1px solid color-mix(in srgb, var(--login-card-border) 78%, transparent) !important;
   background: color-mix(in srgb, var(--glass-bg) 48%, transparent) !important;
 }
@@ -1120,14 +1120,14 @@ code, kbd, pre, samp, .ant-typography code,
 .dg-login-label {
   display: block;
   margin-bottom: 8px;
-  color: color-mix(in srgb, var(--login-hero-text) 70%, transparent);
+  color: var(--dg-text-secondary);
   font: 600 13px/1.3 var(--font-ui);
 }
 
 .dg-login-hint {
   display: block;
   margin-top: 8px;
-  color: color-mix(in srgb, var(--login-hero-text) 46%, transparent) !important;
+  color: var(--dg-text-muted) !important;
   font: 500 12px/1.4 var(--font-ui);
 }
 

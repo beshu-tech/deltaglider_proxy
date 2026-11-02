@@ -47,6 +47,8 @@ interface Props {
   id?: string;
   'aria-label'?: string;
   'aria-labelledby'?: string;
+  /** The value is rejected: red border and `aria-invalid`. */
+  invalid?: boolean;
 }
 
 function normalizeGroups(options: string[] | undefined, optionGroups: AutoCompleteGroup[] | undefined): AutoCompleteGroup[] {
@@ -91,6 +93,7 @@ export default function SimpleAutoComplete({
   id,
   'aria-label': ariaLabel,
   'aria-labelledby': ariaLabelledBy,
+  invalid = false,
 }: Props) {
   const listId = useId();
   const colors = useColors();
@@ -159,6 +162,7 @@ export default function SimpleAutoComplete({
           id={id}
           aria-label={ariaLabel}
           aria-labelledby={ariaLabelledBy}
+          aria-invalid={invalid || undefined}
           aria-expanded={showDrop}
           aria-controls={showDrop ? listId : undefined}
           aria-activedescendant={
@@ -206,7 +210,7 @@ export default function SimpleAutoComplete({
             width: '100%',
             height: 36,
             padding: '0 8px',
-            border: `1px solid ${focused ? colors.ACCENT_BLUE : colors.BORDER}`,
+            border: `1px solid ${invalid ? colors.ACCENT_RED : focused ? colors.ACCENT_BLUE : colors.BORDER}`,
             borderRadius: BORDER_RADIUS.sm,
             background: colors.BG_ELEVATED,
             color: colors.TEXT_PRIMARY,

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, type CSSProperties } from 'react';
-import { AutoComplete, Button, Typography, Input, Space, Modal } from 'antd';
+import { Button, Typography, Input, Space, Modal } from 'antd';
+import SimpleAutoComplete from './SimpleAutoComplete';
 import {
   CloudUploadOutlined,
   FolderAddOutlined,
@@ -361,18 +362,15 @@ export default function UploadPage({
             )}
           </div>
           <div style={{ display: 'flex', gap: SPACE.xs }}>
-            <AutoComplete
+            <SimpleAutoComplete
               id="upload-destination"
               value={destination}
-              onChange={(v) => setDestination(v)}
-              options={folderSuggestions.map((f) => ({
-                value: f,
-                label: <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}>{f}</span>,
-              }))}
+              onChange={setDestination}
+              options={folderSuggestions}
               placeholder="folder/ (optional)"
               aria-label="Destination path prefix — type to autocomplete existing folders"
-              status={destError ? 'error' : undefined}
-              style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 13 }}
+              invalid={Boolean(destError)}
+              style={{ flex: 1 }}
             />
             <Button icon={<FolderAddOutlined />} onClick={handleNewFolder}>
               New folder

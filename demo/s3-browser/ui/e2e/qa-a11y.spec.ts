@@ -2,7 +2,10 @@
  * UX audit P2.5: an accessibility gate. axe-core (WCAG 2.0/2.1/2.2 A and AA,
  * incl. `target-size`, the 24×24 px rule) runs on every admin page and on the
  * object browser, in the light and the dark theme. A serious or critical
- * violation fails the spec.
+ * violation fails the spec. The sign-in page is checked before sign-in, every
+ * style is checked (Instrument and Editorial), and every popup a page offers
+ * (`aria-haspopup` triggers: account menu, row and bucket actions) is opened
+ * and checked too: a closed menu is invisible to axe.
  *
  * The admin pages come from the sidebar links themselves, so a new page is
  * checked without an edit here.
@@ -26,6 +29,11 @@ test.describe.configure({ timeout: 300_000 });
 
 /** One line per serious/critical violation: rule, impact, first targets. */
 async function violations(page: Page, where: string): Promise<string[]> {
+  // A fading popup or a fade-in card is measured mid-opacity: low contrast
+  // and stale listboxes that no user sees. Scan the settled page.
+  await page
+    .waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running'), null, { timeout: 5_000 })
+    .catch(() => {});
   const result = await new AxeBuilder({ page })
     .withTags(TAGS)
     // Monaco draws its own editor surface; its internals are not ours to fix.
@@ -46,8 +54,32 @@ async function signIn(page: Page) {
   await expect(page.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
 }
 
-async function setTheme(page: Page, theme: 'light' | 'dark') {
-  await page.evaluate((t) => localStorage.setItem('dg-theme', t), theme);
+const STYLES = ['instrument', 'editorial'] as const;
+const MODES = ['light', 'dark'] as const;
+
+async function setTheme(page: Page, style: (typeof STYLES)[number], mode: (typeof MODES)[number]) {
+  await page.evaluate(([s, m]) => {
+    localStorage.setItem('dg-theme-style', s);
+    localStorage.setItem('dg-theme', m);
+  }, [style, mode]);
+}
+
+/** Open each popup the page offers, check it, close it. */
+async function popupViolations(page: Page, where: string): Promise<string[]> {
+  const found: string[] = [];
+  const triggers = page.locator('[aria-haspopup]:visible');
+  const count = await triggers.count();
+  for (let i = 0; i < count; i++) {
+    const trigger = triggers.nth(i);
+    if (await trigger.isDisabled()) continue;
+    const name = (await trigger.getAttribute('aria-label')) ?? (await trigger.innerText()).trim();
+    await trigger.click();
+    await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+    found.push(...(await violations(page, `${where} [open: ${name}]`)));
+    await page.keyboard.press('Escape');
+    await expect(trigger).toHaveAttribute('aria-expanded', 'false');
+  }
+  return found;
 }
 
 /** Wait until the page settles: no skeleton, no spinner. */
@@ -69,6 +101,16 @@ test('axe: no serious or critical violation on any page, both themes', async ({ 
   }
 
   await page.setViewportSize({ width: 1440, height: 900 });
+  const found: string[] = [];
+  await page.goto('/_/browse');
+  for (const style of STYLES) {
+    for (const mode of MODES) {
+      await setTheme(page, style, mode);
+      await page.reload();
+      await expect(page.getByLabel('Admin password', { exact: true })).toBeVisible({ timeout: 30_000 });
+      found.push(...(await violations(page, `${style}/${mode} sign-in`)));
+    }
+  }
   await signIn(page);
   await page.goto('/_/admin/dashboard');
   const nav = page.getByRole('navigation', { name: 'Admin navigation' });
@@ -77,13 +119,15 @@ test('axe: no serious or critical violation on any page, both themes', async ({ 
   expect(adminPaths.length).toBeGreaterThan(10);
   const paths = [`/_/browse/${BUCKET}/`, `/_/browse/${BUCKET}/builds/`, '/_/upload', ...adminPaths];
 
-  const found: string[] = [];
-  for (const theme of ['light', 'dark'] as const) {
-    await setTheme(page, theme);
-    for (const path of paths) {
-      await page.goto(path);
-      await settle(page);
-      found.push(...(await violations(page, `${theme} ${path}`)));
+  for (const style of STYLES) {
+    for (const mode of MODES) {
+      await setTheme(page, style, mode);
+      for (const path of paths) {
+        await page.goto(path);
+        await settle(page);
+        found.push(...(await violations(page, `${style}/${mode} ${path}`)));
+        found.push(...(await popupViolations(page, `${style}/${mode} ${path}`)));
+      }
     }
   }
   expect(found, found.join('\n')).toEqual([]);

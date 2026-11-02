@@ -134,6 +134,24 @@ test('theme.css: colour literals live only in custom-property declarations (and 
   expect(stray).toEqual([]);
 });
 
+test('no text colour is faded with transparency (contrast is tested on the opaque tokens)', () => {
+  // `color: color-mix(..., transparent)` blends the ink with whatever lies
+  // behind it, so contrast.test.ts never sees the result: the account-menu
+  // labels read 3.8:1 and the login hint 3:1. Use a TEXT_* token. Placeholder
+  // and disabled ink are exempt (WCAG 1.4.3 does not cover them).
+  const found = CSS.flatMap((f) => {
+    const out: string[] = [];
+    for (const m of stripComments(read(f)).matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      const selector = m[1].trim();
+      if (/::?placeholder|:disabled|\[disabled\]/.test(selector)) continue;
+      for (const d of m[2].split(';'))
+        if (/^\s*color\s*:\s*color-mix\([^;]*transparent/.test(d)) out.push(`${relative(SRC, f)}: ${selector} { ${d.trim()} }`);
+    }
+    return out;
+  });
+  expect(found).toEqual([]);
+});
+
 test('font families are named only in themeVars.ts', () => {
   const found = [...CSS, ...CODE]
     .filter((f) => !f.endsWith('themeVars.ts'))
