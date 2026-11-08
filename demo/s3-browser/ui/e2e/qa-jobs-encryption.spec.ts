@@ -82,8 +82,12 @@ async function waitJobDone(page: Page): Promise<void> {
     .toBeNull();
 }
 
-/** In the open card: fill the key setup and apply it through the review dialog. */
-async function applyNewKey(page: Page, keyId: string): Promise<void> {
+/**
+ * In the open card: fill the key setup and apply it through the review dialog.
+ * `summary` is the dialog's line about existing objects: the object count when
+ * the bucket still holds plaintext, else the "only new writes" note.
+ */
+async function applyNewKey(page: Page, keyId: string, summary: string): Promise<void> {
   const group = page.getByTestId('bucket-encryption-group');
   await group.getByLabel('Key id').fill(keyId);
   const key = await group.getByLabel('Generated key').inputValue();
@@ -94,7 +98,7 @@ async function applyNewKey(page: Page, keyId: string): Promise<void> {
   await expect(review).toBeEnabled();
   await review.click();
   const dialog = page.getByRole('dialog').filter({ hasText: 'Review changes before applying' });
-  await expect(dialog).toContainText('Only new writes change');
+  await expect(dialog).toContainText(summary);
   await dialog.getByRole('button', { name: /Apply and persist/i }).click();
   await expect(dialog).toBeHidden();
 }
@@ -127,13 +131,12 @@ test('a bucket key from the bucket card: ciphertext at rest, re-encrypt, rotate'
   const group = page.getByTestId('bucket-encryption-group');
   await expect(group).toBeVisible();
   await group.getByText('Encrypt with a bucket key', { exact: true }).click();
-  await applyNewKey(page, KEY_ID);
+  await applyNewKey(page, KEY_ID, `The 1 object already in bucket ${BUCKET} is not encrypted yet.`);
 
-  // The proposal: encrypt the existing object of this bucket.
-  const proposal = page.getByRole('dialog').filter({ hasText: 'Encrypt existing objects?' });
-  await expect(proposal).toBeVisible();
-  await expect(proposal.getByRole('checkbox', { name: BUCKET })).toBeChecked();
-  await proposal.getByRole('button', { name: /^Start now/ }).click();
+  // The apply starts a conversion: the server queues the re-encrypt job of
+  // the existing object itself, so no proposal dialog asks for it.
+  await expect(page.getByText(`A re-encrypt job encrypts its existing objects in the background.`)).toBeVisible();
+  await expect(page.getByRole('dialog').filter({ hasText: 'Encrypt existing objects?' })).toHaveCount(0);
   await waitJobDone(page);
 
   const e1 = await effective(page);
@@ -151,7 +154,7 @@ test('a bucket key from the bucket card: ciphertext at rest, re-encrypt, rotate'
   await page.reload();
   await page.getByRole('button', { name: new RegExp(`^${BUCKET} `), expanded: false }).click();
   await page.getByTestId('bucket-encryption-group').getByRole('button', { name: /Rotate key/ }).click();
-  await applyNewKey(page, KEY_ID_2);
+  await applyNewKey(page, KEY_ID_2, 'Only new writes change');
   const rotate = page.getByRole('dialog').filter({ hasText: 'Re-encrypt existing objects with the new key?' });
   await expect(rotate).toBeVisible();
   await rotate.getByRole('button', { name: 'Later' }).click();

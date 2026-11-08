@@ -30,9 +30,21 @@ test.describe.configure({ timeout: 300_000 });
 /** One line per serious/critical violation: rule, impact, first targets. */
 async function violations(page: Page, where: string): Promise<string[]> {
   // A fading popup or a fade-in card is measured mid-opacity: low contrast
-  // and stale listboxes that no user sees. Scan the settled page.
+  // and stale listboxes that no user sees. Scan the settled page. rc-motion
+  // sets its `*-enter`/`*-appear` class a frame after the click, so an empty
+  // getAnimations() alone can pass before the fade starts: wait for both.
   await page
-    .waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running'), null, { timeout: 5_000 })
+    .waitForFunction(
+      () => {
+        const motion = /\bant-[\w-]+-(enter|appear|leave)\b/;
+        const moving = [...document.querySelectorAll('[class*="ant-"]')].some((el) =>
+          motion.test(typeof el.className === 'string' ? el.className : ''),
+        );
+        return !moving && document.getAnimations().every((a) => a.playState !== 'running');
+      },
+      null,
+      { timeout: 5_000, polling: 'raf' },
+    )
     .catch(() => {});
   const result = await new AxeBuilder({ page })
     .withTags(TAGS)
