@@ -3112,6 +3112,7 @@ fn retrying_client(
     interceptor: impl aws_sdk_s3::config::Intercept + 'static,
 ) -> aws_sdk_s3::Client {
     let conf = aws_sdk_s3::Config::builder()
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new("us-east-1"))
         .endpoint_url(server.endpoint())

@@ -441,6 +441,7 @@ jobs:
           mc mb --ignore-existing local/deltaglider-test
           mc mb --ignore-existing local/deltaglider-data
           echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
+          echo "DGP_TEST_REQUIRE_MINIO=1" >> $GITHUB_ENV
       - name: Integration tests (group ${{ matrix.group }})
         env:
           RUST_BACKTRACE: "1"

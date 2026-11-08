@@ -765,6 +765,7 @@ async fn rule_delete_that_cannot_persist_changes_nothing() {
     let (code, v) = json_of(resp).await;
     if code == StatusCode::NO_CONTENT {
         // Root ignores the directory mode: nothing to test here.
+        common::root_skip("rule_delete_that_cannot_persist_changes_nothing");
         return;
     }
     assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{v}");

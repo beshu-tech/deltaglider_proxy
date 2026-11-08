@@ -55,6 +55,7 @@ pub async fn minio_client() -> Client {
         .endpoint_url(minio_endpoint_url())
         .credentials_provider(credentials)
         .force_path_style(true)
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
         .build();
     Client::from_conf(config)
 }
@@ -69,6 +70,23 @@ const STALE_AGE_SECS: i64 = 2 * 3600;
 /// the bucket of a running test (its versioning went with it).
 fn is_stale(timestamp_secs: i64, now: i64) -> bool {
     timestamp_secs > 0 && now - timestamp_secs >= STALE_AGE_SECS
+}
+
+/// Buckets the sweep never deletes, however old. [`MINIO_BUCKET`] is the gate
+/// the harness checks; `deltaglider-data` is the dev bucket that
+/// `docker-compose.yml` creates on the same MinIO.
+const PROTECTED_BUCKETS: [&str; 2] = [MINIO_BUCKET, "deltaglider-data"];
+
+/// Does the sweep delete this bucket? Pure: unit-tested below.
+fn is_sweepable_bucket(name: &str, created_secs: i64, now: i64) -> bool {
+    !PROTECTED_BUCKETS.contains(&name) && is_stale(created_secs, now)
+}
+
+/// `DGP_TEST_REQUIRE_MINIO` value → must the MinIO tests run? CI sets it, so
+/// an unreachable MinIO fails the run instead of skipping every S3 test as a
+/// pass. Pure: unit-tested below.
+fn minio_required(value: Option<&str>) -> bool {
+    super::env_flag_on(value)
 }
 
 /// Tests create buckets and objects and do not delete them (a panic would
@@ -103,7 +121,7 @@ async fn sweep_stale_buckets() {
         let (Some(name), Some(created)) = (bucket.name(), bucket.creation_date()) else {
             continue;
         };
-        if name == MINIO_BUCKET || !is_stale(created.secs(), now) {
+        if !is_sweepable_bucket(name, created.secs(), now) {
             continue;
         }
         // MinIO's force delete removes the objects, versions and pending
@@ -166,14 +184,40 @@ async fn sweep_stale_objects(client: &Client, now: i64) {
     }
 }
 
-/// Check if MinIO is available (TCP probe + HeadBucket with 2s timeout)
+/// Check if MinIO is available (TCP probe + HeadBucket, each with a timeout).
+///
+/// When `DGP_TEST_REQUIRE_MINIO` is set (CI) an unavailable MinIO PANICS: a
+/// skip is a libtest pass, so a dead MinIO would turn every S3 test green
+/// without running it.
 pub async fn minio_available() -> bool {
+    let available = probe_minio().await;
+    if !available && minio_required(std::env::var("DGP_TEST_REQUIRE_MINIO").ok().as_deref()) {
+        panic!(
+            "MinIO is required (DGP_TEST_REQUIRE_MINIO is set) but the bucket {MINIO_BUCKET:?} \
+             is not reachable at {}",
+            minio_endpoint_url()
+        );
+    }
+    if available {
+        start_stale_bucket_sweep();
+    }
+    available
+}
+
+async fn probe_minio() -> bool {
+    use std::net::ToSocketAddrs;
     // Quick TCP check first — parse host:port from endpoint URL
     let endpoint = minio_endpoint_url();
     let addr = endpoint
         .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    if std::net::TcpStream::connect(addr).is_err() {
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    let reachable = addr
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+        .is_some_and(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_secs(2)).is_ok());
+    if !reachable {
         return false;
     }
 
@@ -181,15 +225,11 @@ pub async fn minio_available() -> bool {
 
     // Verify the specific test bucket exists (not just any S3-compatible service)
     let result = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         client.head_bucket().bucket(MINIO_BUCKET).send(),
     )
     .await;
-    let available = matches!(result, Ok(Ok(_)));
-    if available {
-        start_stale_bucket_sweep();
-    }
-    available
+    matches!(result, Ok(Ok(_)))
 }
 
 /// Macro to skip a test if MinIO is not available.
@@ -202,4 +242,34 @@ macro_rules! skip_unless_minio {
             return;
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sweep_spares_the_protected_buckets() {
+        let now = 1_000_000_000;
+        let old = now - 10 * 3600;
+        assert!(!is_sweepable_bucket(MINIO_BUCKET, old, now));
+        assert!(!is_sweepable_bucket("deltaglider-data", old, now));
+        assert!(is_sweepable_bucket("some-test-bucket", old, now));
+        assert!(!is_sweepable_bucket("some-test-bucket", now - 60, now));
+        assert!(
+            !is_sweepable_bucket("some-test-bucket", 0, now),
+            "epoch is not a time"
+        );
+    }
+
+    #[test]
+    fn minio_required_truth_table() {
+        for on in ["1", "true", "yes", " 1 "] {
+            assert!(minio_required(Some(on)), "{on:?}");
+        }
+        for off in ["", "0", "false", "FALSE", "  "] {
+            assert!(!minio_required(Some(off)), "{off:?}");
+        }
+        assert!(!minio_required(None));
+    }
 }

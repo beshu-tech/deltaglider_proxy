@@ -51,6 +51,7 @@ async fn server_with_public_prefix(
     // Use a signed put through the admin SigV4 creds.
     let signed = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::Config::builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
                 "admin",
                 "admin-secret-1234567890",
@@ -213,6 +214,7 @@ async fn authenticated_admin_sees_full_bucket_regardless_of_public_prefix() {
 
     let signed = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::Config::builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
                 "admin",
                 "admin-secret-1234567890",
@@ -283,6 +285,7 @@ async fn anonymous_object_metadata_has_no_tool_stamp() {
 
     let signed = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::Config::builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
                 "admin",
                 "admin-secret-1234567890",
@@ -340,6 +343,7 @@ async fn get_object_is_sandboxed_and_anonymous_overrides_are_refused() {
     let (server, anon) = server_with_public_prefix("testbk", "ror/libs/").await;
     let signed = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::Config::builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
                 "admin",
                 "admin-secret-1234567890",

@@ -253,9 +253,23 @@ async fn test_quota_delete_frees_space() {
 // freeze must block EVERY way bytes can enter a bucket.
 // ════════════════════════════════════════════════════════════════════
 
-/// Frozen bucket (quota=0) must reject `CopyObject` as well as `PutObject`.
-/// Gap that landed in production silently on s3s before today's fix:
-/// s3s adapter's copy_object skipped the check_quota call entirely.
+/// The S3 error code of a failed SDK call.
+fn error_code<E, R>(err: &aws_sdk_s3::error::SdkError<E, R>) -> String
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata,
+    R: std::fmt::Debug,
+{
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    err.code().unwrap_or("<no code>").to_string()
+}
+
+/// A frozen bucket (quota=0) refuses `CopyObject` with `AccessDenied`, for
+/// every kind of source: a small passthrough object (server-side copy), a
+/// delta-eligible one, and one above the spool threshold (the streaming
+/// store). The sources EXIST, in an unfrozen bucket: a missing source
+/// answers `NoSuchKey` before the quota gate, so such a test passes when the
+/// quota call is deleted. Each copy site calls its own gate; the table
+/// names them so a removed call turns one row red.
 #[tokio::test]
 async fn test_quota_zero_blocks_copy_object() {
     let server = TestServer::builder()
@@ -263,26 +277,55 @@ async fn test_quota_zero_blocks_copy_object() {
         .auth("COPYKEY", "COPYSECRET")
         .bucket_policy(BUCKET, "quota_bytes: 0") // freeze
         .env("DGP_USAGE_CACHE_TTL_SECS", "1")
+        // A 4 KiB object is already "large": the copy takes the spool path.
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "1024")
         .build()
         .await;
-
-    // We can't PUT (quota=0 freezes everything), but we CAN exercise
-    // the CopyObject path: have the SDK try CopyObject with x-amz-
-    // copy-source pointing at a key that doesn't even need to exist
-    // (the quota gate fires before the storage layer is consulted).
     let client = server.s3_client().await;
-    let result = client
-        .copy_object()
-        .bucket(server.bucket())
-        .key("dst-key.bin")
-        .copy_source(format!("{}/source.bin", server.bucket()))
+    client
+        .create_bucket()
+        .bucket("srcbkt")
         .send()
-        .await;
-    assert!(
-        result.is_err(),
-        "quota=0 must reject CopyObject regardless of source existence; got {:?}",
-        result
-    );
+        .await
+        .unwrap();
+
+    // (source key, body): passthrough, delta-eligible.
+    let sources: [(&str, Vec<u8>); 2] = [
+        ("photo.jpg", vec![7u8; 4096]),
+        (
+            "build-1.zip",
+            (0..4096u32).map(|i| (i % 251) as u8).collect(),
+        ),
+    ];
+    for (key, body) in &sources {
+        client
+            .put_object()
+            .bucket("srcbkt")
+            .key(*key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(body.clone()))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("source {key} must store: {e:?}"));
+    }
+    for (key, _) in &sources {
+        let dst = format!("copy-of-{key}");
+        let err = client
+            .copy_object()
+            .bucket(server.bucket())
+            .key(&dst)
+            .copy_source(format!("srcbkt/{key}"))
+            .send()
+            .await
+            .expect_err("quota=0 must reject CopyObject");
+        assert_eq!(error_code(&err), "AccessDenied", "{key}: {err:?}");
+        let head = client
+            .head_object()
+            .bucket(server.bucket())
+            .key(&dst)
+            .send()
+            .await;
+        assert!(head.is_err(), "{key}: the refused copy wrote nothing");
+    }
 }
 
 /// Frozen bucket (quota=0) must reject `CompleteMultipartUpload`.

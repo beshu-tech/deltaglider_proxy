@@ -1539,6 +1539,67 @@ mod source_guards {
             .any(|t| before.ends_with(t))
     }
 
+    /// An S3 client in an integration test never retries. The SDK default is
+    /// three attempts, so a proxy that answers 500 once looked like a pass
+    /// (probe: a server that failed once gave `ok=true hits=2`). Every
+    /// `Config::builder()` in `tests/` sets `retry_config(...)` in its chain.
+    #[test]
+    fn test_sdk_clients_do_not_retry() {
+        let builder = ["aws_sdk_s3::Config", "::builder()"].concat();
+        let mut offenders = Vec::new();
+        let mut seen = 0;
+        for file in rust_files("tests") {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(builder.as_str()) || line.trim_start().starts_with("//") {
+                    continue;
+                }
+                seen += 1;
+                let chain = lines[i..lines.len().min(i + 14)].join("\n");
+                let chain = chain.split(".build()").next().unwrap_or("");
+                if !chain.contains("retry_config(") {
+                    offenders.push(format!("{}:{}", rel_path(&file), i + 1));
+                }
+            }
+        }
+        assert!(seen >= 10, "scan found the test clients ({seen})");
+        assert!(
+            offenders.is_empty(),
+            "an integration-test S3 client must disable retries \
+             (`.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())`): {offenders:?}"
+        );
+    }
+
+    /// CI exports `MINIO_ENDPOINT` only after it starts MinIO, and sets
+    /// `DGP_TEST_REQUIRE_MINIO=1` on the next line: without it a dead MinIO
+    /// turns every S3 test into a skipped pass.
+    #[test]
+    fn test_ci_requires_minio_wherever_it_starts_it() {
+        let mut checked = 0;
+        for entry in std::fs::read_dir(root().join(".github/workflows")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains("MINIO_ENDPOINT=") && line.contains("GITHUB_ENV") {
+                    checked += 1;
+                    let next = lines.get(i + 1).copied().unwrap_or("");
+                    assert!(
+                        next.contains("DGP_TEST_REQUIRE_MINIO=1") && next.contains("GITHUB_ENV"),
+                        "{}:{}: export DGP_TEST_REQUIRE_MINIO=1 right after MINIO_ENDPOINT",
+                        path.display(),
+                        i + 1
+                    );
+                }
+            }
+        }
+        assert!(checked >= 3, "scan found the MinIO steps ({checked})");
+    }
+
     /// Test fixtures come from the real write path or a recorded fixture,
     /// never from a hand-built shape production does not emit: such
     /// fixtures kept C1 (open-access only), D14 (schema gate) and D17
