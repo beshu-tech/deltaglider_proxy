@@ -211,10 +211,6 @@ async fn test_marked_bucket_rejects_client_writes_replication_still_works() {
         .expect("CreateBucket on an existing marked bucket must be allowed");
 }
 
-/// The alias hole: a marked bucket declared with an `alias` is protected under
-/// its VIRTUAL name, but a client PUT to the UNCONFIGURED real (alias) name
-/// resolves — via the cross-backend probe — onto the same protected storage.
-/// That write must be blocked too; an unrelated unconfigured name still writes.
 /// The gate fires BEFORE the upload is looked up (403 before 404), so a
 /// bogus upload id still answers `AccessDenied` on a marked bucket. A removed
 /// gate answers `NoSuchUpload` instead, which is the failure this pins for
@@ -272,6 +268,10 @@ async fn test_marked_bucket_rejects_part_copy_and_complete() {
     assert_access_denied(&err, "CompleteMultipartUpload");
 }
 
+/// The alias hole: a marked bucket declared with an `alias` is protected under
+/// its VIRTUAL name, but a client PUT to the UNCONFIGURED real (alias) name
+/// resolves — via the cross-backend probe — onto the same protected storage.
+/// That write must be blocked too; an unrelated unconfigured name still writes.
 #[tokio::test]
 async fn test_marked_bucket_alias_name_is_also_blocked() {
     let server = TestServer::builder()

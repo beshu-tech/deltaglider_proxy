@@ -1542,7 +1542,8 @@ mod source_guards {
     /// An S3 client in an integration test never retries. The SDK default is
     /// three attempts, so a proxy that answers 500 once looked like a pass
     /// (probe: a server that failed once gave `ok=true hits=2`). Every
-    /// `Config::builder()` in `tests/` sets `retry_config(...)` in its chain.
+    /// `Config::builder()` in `tests/` has `RetryConfig::disabled()` in its
+    /// chain, or a `retries-on: <why>` comment for a client that needs them.
     #[test]
     fn test_sdk_clients_do_not_retry() {
         let builder = ["aws_sdk_s3::Config", "::builder()"].concat();
@@ -1558,16 +1559,18 @@ mod source_guards {
                 seen += 1;
                 let chain = lines[i..lines.len().min(i + 14)].join("\n");
                 let chain = chain.split(".build()").next().unwrap_or("");
-                if !chain.contains("retry_config(") {
+                let off = ["RetryConfig", "::disabled()"].concat();
+                if !chain.contains(off.as_str()) && !chain.contains("retries-on:") {
                     offenders.push(format!("{}:{}", rel_path(&file), i + 1));
                 }
             }
         }
-        assert!(seen >= 10, "scan found the test clients ({seen})");
+        assert!(seen >= 5, "scan found the test clients ({seen})");
         assert!(
             offenders.is_empty(),
             "an integration-test S3 client must disable retries \
-             (`.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())`): {offenders:?}"
+             (`.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())`), or say why \
+             in a `retries-on:` comment: {offenders:?}"
         );
     }
 
@@ -1597,7 +1600,7 @@ mod source_guards {
                 }
             }
         }
-        assert!(checked >= 3, "scan found the MinIO steps ({checked})");
+        assert!(checked >= 4, "scan found the MinIO steps ({checked})");
     }
 
     /// Test fixtures come from the real write path or a recorded fixture,

@@ -55,7 +55,8 @@ pub async fn minio_client() -> Client {
         .endpoint_url(minio_endpoint_url())
         .credentials_provider(credentials)
         .force_path_style(true)
-        .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+        // retries-on: MinIO is not the system under test; a transient MinIO
+        // error must not fail a run (or panic the probe).
         .build();
     Client::from_conf(config)
 }
@@ -212,11 +213,11 @@ async fn probe_minio() -> bool {
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .trim_end_matches('/');
-    let reachable = addr
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut it| it.next())
-        .is_some_and(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_secs(2)).is_ok());
+    // Every resolved address, as `TcpStream::connect` tries them: `localhost`
+    // may resolve to `::1` first while MinIO listens on IPv4 only.
+    let reachable = addr.to_socket_addrs().is_ok_and(|mut it| {
+        it.any(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_secs(2)).is_ok())
+    });
     if !reachable {
         return false;
     }

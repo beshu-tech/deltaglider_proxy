@@ -264,9 +264,9 @@ where
 }
 
 /// A frozen bucket (quota=0) refuses `CopyObject` with `AccessDenied`, for
-/// every kind of source: a small passthrough object (server-side copy), a
-/// delta-eligible one, and one above the spool threshold (the streaming
-/// store). The sources EXIST, in an unfrozen bucket: a missing source
+/// every copy path: a passthrough source (server-side copy), a delta source,
+/// and a passthrough source copied to a delta-eligible key (the streaming
+/// store, above the 1 KiB spool threshold set below). The sources EXIST, in an unfrozen bucket: a missing source
 /// answers `NoSuchKey` before the quota gate, so such a test passes when the
 /// quota call is deleted. Each copy site calls its own gate; the table
 /// names them so a removed call turns one row red.
@@ -289,15 +289,16 @@ async fn test_quota_zero_blocks_copy_object() {
         .await
         .unwrap();
 
-    // (source key, body): passthrough, delta-eligible.
-    let sources: [(&str, Vec<u8>); 2] = [
-        ("photo.jpg", vec![7u8; 4096]),
-        (
-            "build-1.zip",
-            (0..4096u32).map(|i| (i % 251) as u8).collect(),
-        ),
+    // (source key, destination key, body). A passthrough source copied to a
+    // delta-eligible destination key takes the spooled store (the copy
+    // re-encodes it), the third gate.
+    let body_zip: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let sources: [(&str, &str, Vec<u8>); 3] = [
+        ("photo.jpg", "copy-of-photo.jpg", vec![7u8; 4096]),
+        ("build-1.zip", "copy-of-build-1.zip", body_zip),
+        ("other.jpg", "copy-of-other.zip", vec![9u8; 4096]),
     ];
-    for (key, body) in &sources {
+    for (key, _, body) in &sources {
         client
             .put_object()
             .bucket("srcbkt")
@@ -307,24 +308,26 @@ async fn test_quota_zero_blocks_copy_object() {
             .await
             .unwrap_or_else(|e| panic!("source {key} must store: {e:?}"));
     }
-    for (key, _) in &sources {
-        let dst = format!("copy-of-{key}");
+    for (key, dst, _) in &sources {
         let err = client
             .copy_object()
             .bucket(server.bucket())
-            .key(&dst)
+            .key(*dst)
             .copy_source(format!("srcbkt/{key}"))
             .send()
             .await
             .expect_err("quota=0 must reject CopyObject");
-        assert_eq!(error_code(&err), "AccessDenied", "{key}: {err:?}");
+        assert_eq!(error_code(&err), "AccessDenied", "{key} -> {dst}: {err:?}");
         let head = client
             .head_object()
             .bucket(server.bucket())
-            .key(&dst)
+            .key(*dst)
             .send()
             .await;
-        assert!(head.is_err(), "{key}: the refused copy wrote nothing");
+        assert!(
+            head.is_err(),
+            "{key} -> {dst}: the refused copy wrote nothing"
+        );
     }
 }
 
