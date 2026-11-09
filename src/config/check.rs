@@ -510,9 +510,43 @@ impl Config {
                 }
             }
         }
+        errors.extend(self.zero_tunable_errors());
         errors.extend(self.coordination_bucket_exposures());
         errors.extend(self.bucket_encryption_errors());
         errors.extend(self.kms_key_id_errors());
+        errors
+    }
+
+    /// `advanced` count settings where 0 stops the proxy: `blocking_threads: 0`
+    /// panics tokio at the next start (a crash loop after a good-looking
+    /// apply), `codec_concurrency: 0` answers every delta PUT with 503, and
+    /// `filtered_list_max_engine_pages: 0` fails every filtered LIST. Unset
+    /// means the default; only an explicit 0 is refused.
+    fn zero_tunable_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut refuse = |name: &str, what: &str| {
+            errors.push(format!(
+                "advanced.{name} is 0: {what}. Use at least 1, or remove the setting for the default"
+            ));
+        };
+        if self.blocking_threads == Some(0) {
+            refuse(
+                "blocking_threads",
+                "the runtime cannot start with no blocking thread",
+            );
+        }
+        if self.codec_concurrency == Some(0) {
+            refuse(
+                "codec_concurrency",
+                "no delta encode or decode could ever run",
+            );
+        }
+        if self.filtered_list_max_engine_pages == 0 {
+            refuse(
+                "filtered_list_max_engine_pages",
+                "every filtered LIST would fail at once",
+            );
+        }
         errors
     }
 

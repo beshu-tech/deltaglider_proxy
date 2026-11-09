@@ -523,3 +523,112 @@ fn a_storage_patch_replaces_only_a_retagged_tagged_object() {
         json!({"buckets": {"releases": {"quota_bytes": 1}, "type": {"quota_bytes": 3}, "mode": {"quota_bytes": 4}}})
     );
 }
+
+// ── patch_shape_error: a section is never reset by a non-object body ──────
+
+#[test]
+fn a_non_object_body_or_field_is_refused_where_the_target_is_an_object() {
+    use serde_json::json;
+    let section = json!({"backend": {"type": "filesystem", "path": "/data"}, "tls": {"enabled": true}, "buckets": {}});
+    // The whole body.
+    for bad in [json!([]), json!([1]), json!("x"), json!(7), json!(true)] {
+        assert!(
+            patch_shape_error(&section, &bad, "").is_some(),
+            "body {bad} must be refused"
+        );
+    }
+    // A struct-typed field and a map-typed field.
+    for bad in [
+        json!({"tls": []}),
+        json!({"tls": "off"}),
+        json!({"buckets": []}),
+    ] {
+        assert!(
+            patch_shape_error(&section, &bad, "").is_some(),
+            "{bad} must be refused"
+        );
+    }
+    // A scalar target is serde's to judge, not this check's.
+    assert_eq!(
+        patch_shape_error(&section, &json!({"backend": {"path": []}}), ""),
+        None
+    );
+    // Fine: objects, null (delete), scalars where the target is a scalar,
+    // arrays where the target is an array or absent.
+    for ok in [
+        json!({}),
+        json!({"tls": {"enabled": false}}),
+        json!({"tls": null}),
+        json!({"backend": {"path": "/other"}}),
+        json!({"brand_new": [1, 2]}),
+    ] {
+        assert_eq!(patch_shape_error(&section, &ok, ""), None, "{ok}");
+    }
+    let lists = json!({"blocks": [{"name": "a"}]});
+    assert_eq!(
+        patch_shape_error(&lists, &json!({"blocks": []}), ""),
+        None,
+        "an array replaces an array"
+    );
+    // The message names the place.
+    let e = patch_shape_error(&section, &json!({"tls": []}), "").unwrap();
+    assert!(e.contains("`tls`") && e.contains("an array"), "{e}");
+}
+
+/// The real handler path: `[]` against every section is an error, never
+/// `ok` with a reset section.
+#[test]
+fn a_non_object_body_never_resets_any_section() {
+    for section in [
+        SectionName::Admission,
+        SectionName::Access,
+        SectionName::Storage,
+        SectionName::Advanced,
+    ] {
+        let mut cfg = SectionedConfig::default();
+        let before = serde_json::to_value(&cfg).unwrap();
+        let r = merge_patch_section(&mut cfg, section, &serde_json::json!([]));
+        assert!(r.is_err(), "{section:?}: `[]` must be refused, got {r:?}");
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap(),
+            before,
+            "{section:?} untouched"
+        );
+    }
+}
+
+mod patch_shape_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_json() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i32>().prop_map(|n| serde_json::json!(n)),
+            "[a-z]{0,6}".prop_map(serde_json::Value::String),
+        ];
+        leaf.prop_recursive(3, 24, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..3).prop_map(serde_json::Value::Array),
+                prop::collection::btree_map("[a-z]{1,4}", inner, 0..3)
+                    .prop_map(|m| serde_json::Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest! {
+        /// Any non-object, non-null body on a section (an object) is refused;
+        /// every other body is not refused by the shape check.
+        #[test]
+        fn only_a_non_object_body_is_refused_at_the_top(body in arb_json()) {
+            let section = serde_json::json!({"a": {"b": 1}, "list": [1]});
+            let refused = patch_shape_error(&section, &body, "").is_some();
+            match &body {
+                serde_json::Value::Object(_) => {} // depends on the fields
+                serde_json::Value::Null => prop_assert!(!refused),
+                _ => prop_assert!(refused),
+            }
+        }
+    }
+}

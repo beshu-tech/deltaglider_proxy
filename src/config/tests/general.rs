@@ -764,6 +764,37 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     ));
 }
 
+/// `blocking_threads: 0` passed lint, validate and PUT, then panicked tokio
+/// at the next start (a crash loop). `codec_concurrency: 0` booted green and
+/// answered every delta PUT 503. An explicit 0 is fatal; unset is the default.
+#[test]
+fn check_fatal_refuses_a_zero_count_in_advanced() {
+    let fatal = |yaml: &str| Config::from_yaml_str(yaml).expect("parses").check_fatal();
+    assert!(fatal("advanced: {}\n").is_empty(), "unset = the default");
+    for (field, yaml) in [
+        ("blocking_threads", "advanced:\n  blocking_threads: 0\n"),
+        ("codec_concurrency", "advanced:\n  codec_concurrency: 0\n"),
+        (
+            "filtered_list_max_engine_pages",
+            "advanced:\n  filtered_list_max_engine_pages: 0\n",
+        ),
+    ] {
+        let errors = fatal(yaml);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains(&format!("advanced.{field} is 0"))),
+            "{field}: {errors:?}"
+        );
+    }
+    for ok in [
+        "advanced:\n  blocking_threads: 1\n",
+        "advanced:\n  codec_concurrency: 1\n",
+    ] {
+        assert!(fatal(ok).is_empty(), "{ok}");
+    }
+}
+
 #[test]
 fn check_fatal_refuses_a_client_facing_coordination_bucket() {
     let fatal = |buckets: &str| {

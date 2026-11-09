@@ -2186,6 +2186,63 @@ async fn test_read_only_config_file_is_reported() {
 
 /// B089: validate answers what the apply would: a change the apply refuses
 /// (here a sync bucket without DGP_CONFIG_DB_KEY) is not `ok: true`.
+/// A section PUT whose body is not an object is refused with 400 and changes
+/// nothing: `[]` used to answer `ok:true` and reset the section to its
+/// defaults (the backend, and with `{"replication":[]}` the rules). An
+/// explicit `0` for a count that stops the proxy (`blocking_threads` panics
+/// tokio at the next start) is refused the same way.
+#[tokio::test]
+async fn section_put_refuses_a_reset_body_and_a_zero_count() {
+    let server = TestServer::builder()
+        .auth("SHAPEKEY", "SHAPESECRET")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let export = || async {
+        admin
+            .get(format!("{ep}/_/api/admin/config/export"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+    // A configured nested struct: `event_delivery: []` would reset it.
+    let seed = admin
+        .put(format!("{ep}/_/api/admin/config/section/advanced"))
+        .json(&json!({ "event_delivery": { "enabled": true, "webhook_urls": ["https://hooks.example.com/dg"] } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seed.status(), StatusCode::OK, "seed PUT");
+    let before = export().await;
+    assert!(before.contains("hooks.example.com"), "seeded: {before}");
+    for (section, body) in [
+        ("storage", json!([])),
+        ("storage", json!("none")),
+        ("advanced", json!([])),
+        ("advanced", json!({ "event_delivery": [] })),
+        ("advanced", json!({ "blocking_threads": 0 })),
+        ("advanced", json!({ "codec_concurrency": 0 })),
+    ] {
+        let resp = admin
+            .put(format!("{ep}/_/api/admin/config/section/{section}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert!(
+            status.is_client_error() && !text.contains("\"ok\":true"),
+            "PUT {section} {body} must be refused: {status} {text}"
+        );
+    }
+    assert_eq!(export().await, before, "a refused PUT changed the config");
+}
+
 #[tokio::test]
 async fn validate_runs_the_apply_gates() {
     let server = TestServer::builder()

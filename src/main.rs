@@ -479,7 +479,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // runtime starts.
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.enable_all();
-    if let Some(bt) = pre_config.blocking_threads {
+    // tokio panics on 0. A 0 is refused with a clear message by
+    // `Config::check_fatal` once the runtime runs (zero_tunable_errors).
+    if let Some(bt) = pre_config.blocking_threads.filter(|&bt| bt > 0) {
         runtime_builder.max_blocking_threads(bt);
     }
     // #87: enable the per-poll duration histogram. The sampler in

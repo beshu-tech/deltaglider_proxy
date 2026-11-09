@@ -629,45 +629,11 @@ impl SigV4Params {
             );
         }
 
-        // Check expiration — hard-fail on parse errors
-        // AWS caps presigned URL expiry at 7 days (604,800 seconds).
-        const MAX_PRESIGNED_EXPIRY: i64 = 604_800;
-
-        // X-Amz-Expires is REQUIRED for presigned URLs (AWS S3 spec).
-        // Without it, the URL would have no time limit — reject immediately.
-        if expires.is_empty() {
-            warn!("SigV4 presigned: missing X-Amz-Expires (required)");
-            return Err(S3Error::InvalidArgument(
-                "X-Amz-Expires is required for presigned URLs".into(),
-            )
-            .into_response());
-        }
-
-        let expires_secs: i64 = expires.parse().map_err(|_| {
-            warn!("SigV4 presigned: unparseable X-Amz-Expires: {:?}", expires);
-            S3Error::InvalidArgument(format!("Invalid X-Amz-Expires: {}", expires)).into_response()
+        // Check expiration — hard-fail on parse errors and out-of-range values.
+        let expires_secs = parse_presigned_expires(&expires).map_err(|e| {
+            warn!("SigV4 presigned: refused X-Amz-Expires {:?}: {e}", expires);
+            S3Error::InvalidArgument(e).into_response()
         })?;
-
-        // AWS accepts 1..=604800. A negative value is no URL, and a huge one
-        // overflowed the expiry arithmetic below (a pre-auth panic).
-        if expires_secs < 1 {
-            warn!("SigV4 presigned: X-Amz-Expires={expires_secs} is not positive");
-            return Err(S3Error::InvalidArgument(format!(
-                "X-Amz-Expires={expires_secs} must be at least 1 second"
-            ))
-            .into_response());
-        }
-        if expires_secs > MAX_PRESIGNED_EXPIRY {
-            warn!(
-                "SigV4 presigned: X-Amz-Expires={} exceeds 7-day maximum ({})",
-                expires_secs, MAX_PRESIGNED_EXPIRY
-            );
-            return Err(S3Error::InvalidArgument(format!(
-                "X-Amz-Expires={} exceeds maximum of {} seconds (7 days)",
-                expires_secs, MAX_PRESIGNED_EXPIRY
-            ))
-            .into_response());
-        }
 
         let request_time = chrono::NaiveDateTime::parse_from_str(&amz_date, "%Y%m%dT%H%M%SZ")
             .map_err(|_| {
@@ -707,6 +673,32 @@ impl SigV4Params {
             payload_hash: "UNSIGNED-PAYLOAD".to_string(),
         })
     }
+}
+
+/// AWS caps presigned URL expiry at 7 days (604,800 seconds).
+const MAX_PRESIGNED_EXPIRY: i64 = 604_800;
+
+/// `X-Amz-Expires` as seconds: required (a URL with no limit is refused),
+/// a number, and within 1..=604800. A negative value is no URL, and a huge
+/// one overflowed the expiry arithmetic (a pre-auth panic). Pure, shared by
+/// the credentialed path and open access, so the cap does not depend on the
+/// auth mode.
+fn parse_presigned_expires(expires: &str) -> Result<i64, String> {
+    if expires.is_empty() {
+        return Err("X-Amz-Expires is required for presigned URLs".into());
+    }
+    let secs: i64 = expires
+        .parse()
+        .map_err(|_| format!("Invalid X-Amz-Expires: {expires}"))?;
+    if secs < 1 {
+        return Err(format!("X-Amz-Expires={secs} must be at least 1 second"));
+    }
+    if secs > MAX_PRESIGNED_EXPIRY {
+        return Err(format!(
+            "X-Amz-Expires={secs} exceeds maximum of {MAX_PRESIGNED_EXPIRY} seconds (7 days)"
+        ));
+    }
+    Ok(secs)
 }
 
 /// Check whether the query string contains presigned URL parameters.
@@ -889,7 +881,21 @@ pub async fn sigv4_auth_middleware(
             .into_response());
         }
         // Open access (no auth configured / no IAM extension): pass through.
-        AuthGateDecision::Open => return Ok(next.run(request).await),
+        AuthGateDecision::Open => {
+            // No credentials to check, but the 7-day cap on a presigned
+            // query is the same in every mode (the docs promise it).
+            if let Some(query) = request.uri().query() {
+                if has_presigned_query_params(query) {
+                    if let Ok(target) = RequestTarget::from_uri(request.uri()) {
+                        let expires = target.query_value("X-Amz-Expires").unwrap_or_default();
+                        if let Err(e) = parse_presigned_expires(expires) {
+                            return Err(S3Error::InvalidArgument(e).into_response());
+                        }
+                    }
+                }
+            }
+            return Ok(next.run(request).await);
+        }
         // Auth required — fall through to signature verification below.
         decision => decision,
     };
@@ -1270,6 +1276,26 @@ mod tests {
         );
         let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
         assert!(SigV4Params::from_query(&request).is_ok());
+    }
+
+    /// The expiry rule is one pure function: required, numeric, 1..=604800.
+    /// Open access applies it too (it used to accept 30 days).
+    #[test]
+    fn parse_presigned_expires_truth_table() {
+        for (input, want) in [
+            ("1", Some(1)),
+            ("3600", Some(3600)),
+            ("604800", Some(604_800)),
+            ("604801", None),
+            ("2592000", None), // 30 days
+            ("0", None),
+            ("-1", None),
+            ("", None),
+            ("abc", None),
+            ("9223372036854775808", None),
+        ] {
+            assert_eq!(parse_presigned_expires(input).ok(), want, "{input:?}");
+        }
     }
 
     /// Only an s3s-verified signature resets the limiter; a 403 before
