@@ -60,7 +60,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Run a spool acquisition under the configured timeout, mapping a timeout to
     /// SlowDown (don't park the request + its budget forever under contention).
     /// The ONE place the timeout/Overloaded policy lives — both PUT/POST
-    /// (`spool_acquire`) and GET (`spool_acquire_pair`) go through it.
+    /// (`spool_acquire`) and GET (`spool_acquire_group`) go through it.
     async fn with_spool_timeout<T, F>(&self, fut: F) -> Result<T, EngineError>
     where
         F: std::future::Future<Output = std::io::Result<T>>,
@@ -98,19 +98,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.with_spool_timeout(self.spool.acquire(bytes)).await
     }
 
-    /// Acquire a deadlock-safe spool PAIR (timed) — the GET reconstruct path.
-    pub async fn spool_acquire_pair(
+    /// Acquire a deadlock-safe GROUP of spool files in one reservation
+    /// (timed), in the order of `sizes` — the GET reconstruct path.
+    pub async fn spool_acquire_group(
         &self,
-        a: u64,
-        b: u64,
-    ) -> Result<
-        (
-            crate::deltaglider::spool::Spool,
-            crate::deltaglider::spool::Spool,
-        ),
-        EngineError,
-    > {
-        self.with_spool_timeout(self.spool.acquire_pair(a, b)).await
+        sizes: &[u64],
+    ) -> Result<Vec<crate::deltaglider::spool::Spool>, EngineError> {
+        self.with_spool_timeout(self.spool.acquire_group(sizes))
+            .await
     }
 
     /// Reserve, BEFORE the deltaspace lock, the spool that a file-streaming

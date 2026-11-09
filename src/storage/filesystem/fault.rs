@@ -88,6 +88,10 @@ struct FaultState {
     max_in_flight: usize,
     /// Delta writes whose body was a file (streamed), not memory.
     delta_file_writes: usize,
+    /// Whole-object reads (`get_object`, into memory) of deltas and of
+    /// reference.bin.
+    whole_delta_reads: usize,
+    whole_reference_reads: usize,
 }
 
 /// The faults armed on a [`FaultyFs`], by point and `"bucket/prefix/filename"`.
@@ -148,6 +152,13 @@ impl Faults {
     /// spool file, never read into memory).
     pub(crate) fn delta_file_writes(&self) -> usize {
         self.0.lock().unwrap().delta_file_writes
+    }
+
+    /// How many whole-object reads (into memory) of a delta, and of
+    /// reference.bin, the backend served.
+    pub(crate) fn whole_reads(&self) -> (usize, usize) {
+        let state = self.0.lock().unwrap();
+        (state.whole_delta_reads, state.whole_reference_reads)
     }
 
     /// Disarm every fault. The fire counts stay.
@@ -440,6 +451,14 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         object: StoredObject<'_>,
     ) -> Result<Vec<u8>, StorageError> {
+        {
+            let mut state = self.faults.0.lock().unwrap();
+            match object {
+                StoredObject::Delta(_) => state.whole_delta_reads += 1,
+                StoredObject::Reference => state.whole_reference_reads += 1,
+                StoredObject::Passthrough(_) => {}
+            }
+        }
         self.inner.get_object(bucket, prefix, object).await
     }
 

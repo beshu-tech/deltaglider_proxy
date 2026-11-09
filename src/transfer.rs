@@ -340,13 +340,10 @@ async fn copy_object_once(
     // deltas; this closes it now that the store side streams (Phase 4).
     let source_size = source_head.file_size;
     if source_size > engine.spool_threshold() {
-        if let Some(outcome) =
-            spooled_copy(engine, lock, &request, source_head, source_size).await?
-        {
-            return Ok(outcome);
-        }
+        return spooled_copy(engine, lock, &request, source_head, source_size).await;
     }
 
+    // small: the source's HEAD size is at most the spool threshold.
     let (data, meta) = engine
         .retrieve(request.source_bucket, request.source_key)
         .await
@@ -1829,8 +1826,12 @@ async fn spooled_copy(
     request: &ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
     source_size: u64,
-) -> Result<Option<ObjectTransferOutcome>, CopyError> {
+) -> Result<ObjectTransferOutcome, CopyError> {
     // Stream the (reconstructed) source to a spool file — bounded memory.
+    // Every large source streams (a large delta or reference object from
+    // its verified spool file). A buffered answer is an object that is
+    // small now: it changed since the HEAD, which the size check below
+    // reports. It is not read a second time.
     let resp = engine
         .retrieve_stream(request.source_bucket, request.source_key)
         .await
@@ -1839,8 +1840,11 @@ async fn spooled_copy(
         crate::deltaglider::RetrieveResponse::Streamed {
             stream, metadata, ..
         } => (stream, metadata),
-        // Buffered (small) source — let the caller's buffered path handle it.
-        crate::deltaglider::RetrieveResponse::Buffered { .. } => return Ok(None),
+        crate::deltaglider::RetrieveResponse::Buffered { data, metadata, .. } => {
+            let once: crate::storage::ByteStream =
+                Box::pin(futures::stream::once(async move { Ok(Bytes::from(data)) }));
+            (once, metadata)
+        }
     };
 
     // Same generation as the HEAD? (The size below is the HEAD's.)
@@ -1915,13 +1919,13 @@ async fn spooled_copy(
     .await?;
 
     let label = source_head.storage_info.label();
-    Ok(Some(ObjectTransferOutcome {
+    Ok(ObjectTransferOutcome {
         bytes_copied: source_size as usize,
         strategy: CopyStrategy::Reconstructed,
         source_storage_label: label,
         source_file_size: source_size,
         bytes_egress_saved: 0,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -2037,8 +2041,7 @@ mod tests {
                 CopyClass::SourceChanged,
                 "a changed source must be retryable: {e}"
             ),
-            Ok(None) => {}
-            Ok(Some(_)) => {
+            Ok(_) => {
                 let (got, _) = engine.retrieve("dst", "big.bin").await.unwrap();
                 assert!(
                     got == old || got == new,

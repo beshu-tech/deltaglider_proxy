@@ -893,6 +893,15 @@ mod tests {
                 "InternalError",
             ),
             (
+                "EngineError::ReferenceNotInMemory",
+                en(EngineError::ReferenceNotInMemory {
+                    deltaspace: st(),
+                    size: 2,
+                }),
+                500,
+                "InternalError",
+            ),
+            (
                 "EngineError::TooLarge",
                 en(EngineError::TooLarge { size: 2, max: 1 }),
                 413,

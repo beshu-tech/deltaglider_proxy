@@ -194,7 +194,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         end: u64,
     ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), EngineError> {
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
-        self.retrieve_delta_range_spooled(bucket, &deltaspace_id, &obj_key, source_head, start, end)
+        self.retrieve_range_spooled(bucket, &deltaspace_id, &obj_key, source_head, start, end)
             .await
     }
 

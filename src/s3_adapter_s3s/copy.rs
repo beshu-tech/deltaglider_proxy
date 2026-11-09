@@ -286,6 +286,7 @@ pub(super) async fn read_copy_source(
 ) -> s3s::S3Result<CopySourceBody> {
     let too_large = |size: u64| size > engine.max_object_size();
     if head_size <= spool_threshold {
+        // small: the HEAD size is at most the spool threshold.
         let (data, metadata) = engine.retrieve(bucket, key).await?;
         if too_large(data.len() as u64) {
             return Err(s3s::s3_error!(EntityTooLarge));
@@ -369,14 +370,18 @@ pub(super) async fn upload_part_copy(
     svc.state
         .multipart
         .set_max_object_size(engine.max_object_size());
-    // A ranged part of a passthrough source is read as that range only,
-    // pinned to the generation the conditionals judged: an SDK managed copy
-    // sends one UploadPartCopy per part, and each used to buffer the whole
-    // source (s3surface-10). The part itself is bounded like an UploadPart.
-    let ranged = match input.copy_source_range.as_deref() {
-        Some(range) => {
-            let len = usize::try_from(source_meta.file_size).unwrap_or(usize::MAX);
-            let (start, end) = parse_copy_range(range, len)?;
+    // A part is read as its range only, pinned to the generation the
+    // conditionals judged: an SDK managed copy sends one UploadPartCopy per
+    // part, and each used to buffer the whole source (s3surface-10). A part
+    // with no range is the whole source as one range, so it reads the same
+    // way. The part itself is bounded like an UploadPart.
+    let len = usize::try_from(source_meta.file_size).unwrap_or(usize::MAX);
+    let range = match input.copy_source_range.as_deref() {
+        Some(range) => Some(parse_copy_range(range, len)?),
+        None => len.checked_sub(1).map(|last| (0, last)),
+    };
+    let ranged = match range {
+        Some((start, end)) => {
             if (end - start) as u64 >= engine.max_object_size() {
                 return Err(s3s::s3_error!(EntityTooLarge));
             }
@@ -410,14 +415,14 @@ pub(super) async fn upload_part_copy(
     let part = if let Some((stream, content_length, _)) = ranged {
         collect_exact(stream, content_length).await?
     } else {
-        // A delta source at most the spool threshold (a larger one is read
-        // as its range above), or a whole-object part: `engine.retrieve`
-        // buffers the ENTIRE source, and the range is sliced only after.
-        // Reject a source over `max_object_size` before and after the
-        // buffering read.
+        // What `retrieve_stream_range` does not serve as a range: an empty
+        // source, a reference object at most the spool threshold, or a
+        // source gone since its HEAD. Reject a source over
+        // `max_object_size` before and after the read.
         if source_meta.file_size > engine.max_object_size() {
             return Err(s3s::s3_error!(EntityTooLarge));
         }
+        // small: at most the spool threshold (see above).
         let (data, _) = engine.retrieve(&source_bucket, &source_key).await?;
         if data.len() as u64 > engine.max_object_size() {
             return Err(s3s::s3_error!(EntityTooLarge));

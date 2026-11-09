@@ -73,6 +73,12 @@ pub enum EngineError {
     #[error("Missing reference for deltaspace: {0}")]
     MissingReference(String),
 
+    /// The reference of `deltaspace` is above the spool threshold: it is
+    /// read to a spool file, never into the RAM reference cache. The
+    /// engine's callers of that cache answer it with their file path.
+    #[error("Reference of deltaspace {deltaspace} ({size} bytes) is too large for memory")]
+    ReferenceNotInMemory { deltaspace: String, size: u64 },
+
     #[error("Object too large: {size} bytes (max: {max} bytes)")]
     TooLarge { size: u64, max: u64 },
 
@@ -102,6 +108,10 @@ impl EngineError {
                 actual: actual.clone(),
             },
             Self::MissingReference(s) => Self::MissingReference(s.clone()),
+            Self::ReferenceNotInMemory { deltaspace, size } => Self::ReferenceNotInMemory {
+                deltaspace: deltaspace.clone(),
+                size: *size,
+            },
             Self::TooLarge { size, max } => Self::TooLarge {
                 size: *size,
                 max: *max,
@@ -214,7 +224,9 @@ impl From<EngineError> for crate::api::S3Error {
             // E4: route opaque engine errors through the sanitiser so
             // computed/expected hashes don't escape to the client. Named
             // one by one: a new variant must choose its answer here.
-            e @ (EngineError::ChecksumMismatch { .. } | EngineError::MissingReference(_)) => {
+            e @ (EngineError::ChecksumMismatch { .. }
+            | EngineError::MissingReference(_)
+            | EngineError::ReferenceNotInMemory { .. }) => {
                 crate::api::S3Error::InternalError(crate::api::errors::sanitise_for_client(&e))
             }
         }
@@ -296,6 +308,10 @@ pub(crate) use delete_cost_tests::{s3_engine, store_deltas};
 /// What a PUT costs in backend requests.
 #[cfg(test)]
 mod write_cost_tests;
+
+/// Large objects on the read side stay out of memory.
+#[cfg(test)]
+mod read_spool_tests;
 
 /// `delete_batch`: request costs and the per-key contract.
 #[cfg(test)]

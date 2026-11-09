@@ -913,6 +913,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<(StoreResult, bool), EngineError> {
         let max_ratio = self.bucket_policies.max_delta_ratio(put.bucket);
         let (outcome, delta) = match put.body {
+            // The reference is too large for the RAM reference cache: the
+            // decision uses the size that the lock's read gave, no request.
+            PutBody::Buffered(data) if ref_meta.file_size > self.spool_threshold() => {
+                self.encode_memory_body_spooled(&put, data, ref_meta, max_ratio)
+                    .await?
+            }
             PutBody::Buffered(data) => self.encode_buffered(&put, data, ref_meta).await?,
             PutBody::Spooled(body) => {
                 self.encode_spooled(&put, body, ref_meta, fresh_baseline, max_ratio)
@@ -1077,6 +1083,37 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             EncodeOutcome::Encoded { delta_len },
             EncodedDelta::InRam(Bytes::from(delta)),
         ))
+    }
+
+    /// A body in memory against a reference above the spool threshold: the
+    /// body goes to a spool file and the streaming encode reads both from
+    /// files (the reference through the folder's verified shared file).
+    /// This runs under the deltaspace lock, so the body spool is taken
+    /// without waiting; with no budget free now the PUT keeps no delta
+    /// (`NoSpool`: stored whole as `delta-unavailable`).
+    async fn encode_memory_body_spooled(
+        &self,
+        put: &PutObject<'_>,
+        data: &Bytes,
+        ref_meta: &FileMetadata,
+        max_ratio: f32,
+    ) -> Result<(EncodeOutcome, EncodedDelta), EngineError> {
+        let body = match self.spool.try_acquire(put.size) {
+            Ok(body) => body,
+            Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => {
+                debug!(
+                    "PUT {}/{}: no spool for the large-reference encode",
+                    put.bucket, put.key
+                );
+                return Ok((EncodeOutcome::NoSpool, EncodedDelta::None));
+            }
+            Err(e) => return Err(EngineError::Storage(StorageError::from(e))),
+        };
+        tokio::fs::write(body.path(), data)
+            .await
+            .map_err(StorageError::from)?;
+        self.encode_spooled(put, &body, ref_meta, false, max_ratio)
+            .await
     }
 
     /// The streaming encode: body spool → delta spool, stopped at the ratio
@@ -2377,17 +2414,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(true);
         }
 
-        let (reference, _cache_hit) = self
-            .get_reference_cached(bucket, deltaspace_id, &ref_meta.file_sha256)
-            .await?;
-        let source_file = self.codec_source_spool_now(reference.len())?;
-        let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
-            EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
-        })?;
-        let delta = self
-            .codec
-            .encode_spooled(&source_file, &reference, &reference)?;
-        drop(_codec_permit);
+        // The object's bytes ARE the reference: its delta is the reference
+        // encoded against itself (a few copy instructions).
+        let delta = if ref_meta.file_size > self.spool_threshold() {
+            self.self_delta_from_file(bucket, deltaspace_id, &ref_meta)
+                .await?
+        } else {
+            let (reference, _cache_hit) = self
+                .get_reference_cached(bucket, deltaspace_id, &ref_meta.file_sha256)
+                .await?;
+            let source_file = self.codec_source_spool_now(reference.len())?;
+            let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
+                EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
+            })?;
+            self.codec
+                .encode_spooled(&source_file, &reference, &reference)?
+        };
 
         let delta_meta = FileMetadata::new_delta(
             filename.to_string(),
@@ -2429,6 +2471,46 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.cache.invalidate(&cache_key);
 
         Ok(true)
+    }
+
+    /// The delta of a reference above the spool threshold against itself,
+    /// from a spool file (the reference cache holds no reference this
+    /// large). Under the deltaspace lock: the spool is taken without
+    /// waiting (a full budget is SlowDown), and the file is checked
+    /// against the reference's SHA-256 before the encode.
+    async fn self_delta_from_file(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        ref_meta: &FileMetadata,
+    ) -> Result<Vec<u8>, EngineError> {
+        let file = self.codec_source_spool_now(ref_meta.file_size as usize)?;
+        self.storage
+            .get_reference_to_file(bucket, deltaspace_id, file.path())
+            .await?;
+        let (actual, _, _) = Self::hash_spool_file(file.path()).await?;
+        if actual != ref_meta.file_sha256 {
+            return Err(EngineError::ChecksumMismatch {
+                key: format!("{deltaspace_id}/.dg/reference.bin"),
+                expected: ref_meta.file_sha256.clone(),
+                actual,
+            });
+        }
+        let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
+            EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
+        })?;
+        let codec = self.codec.clone();
+        let path = file.path().to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, EngineError> {
+            let target = std::fs::File::open(&path).map_err(StorageError::from)?;
+            let mut delta = Vec::new();
+            codec
+                .encode_from_reader(&path, target, &mut delta)
+                .map_err(EngineError::Codec)?;
+            Ok(delta)
+        })
+        .await
+        .map_err(|e| EngineError::Storage(StorageError::Other(format!("encode task: {e}"))))?
     }
 
     /// Batch-migrate all legacy reference objects in a bucket. Visits only

@@ -735,3 +735,84 @@ async fn a_source_that_changes_under_a_server_side_copy_answers_slowdown() {
         assert!(engine.head("c1", "pics/a.jpg").await.is_err());
     }
 }
+
+/// A reference object above the spool threshold (an object that carries
+/// the folder reference's metadata): CopyObject and an UploadPartCopy with
+/// no range read it from ONE verified spool file. Before, each read the
+/// whole reference.bin into memory.
+#[tokio::test]
+async fn a_large_reference_object_copies_from_one_verified_spool_file() {
+    let (s3, fake) = crate::storage::fake_s3_backend().await;
+    let mut config = crate::config::Config::default();
+    config.tuning.spool_threshold_bytes = Some(1024);
+    let f = Fixture::new(DynStorageBackend::new_box(s3), config).await;
+    let engine = f.engine();
+    let body: Vec<u8> = (0..64 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
+    let meta = FileMetadata::new_reference(
+        "a.zip".into(),
+        "a.zip".into(),
+        hex::encode(sha2::Sha256::digest(&body)),
+        hex::encode(md5::Md5::digest(&body)),
+        body.len() as u64,
+        None,
+    );
+    use crate::storage::StorageBackendExt;
+    engine
+        .storage()
+        .put_reference(
+            "b",
+            "legacy",
+            bytes::Bytes::from(body.clone()),
+            &meta,
+            crate::deltaglider::RefWriteProof::for_tests(),
+        )
+        .await
+        .unwrap();
+    engine
+        .storage()
+        .put_passthrough(
+            "b",
+            "legacy",
+            "a.zip",
+            bytes::Bytes::from(body.clone()),
+            &meta,
+        )
+        .await
+        .unwrap();
+    fake.clear();
+
+    f.copy(("b", "legacy/a.zip"), ("c2", "x/a.zip"), None)
+        .await
+        .unwrap();
+    let upload_id = f
+        .state
+        .multipart
+        .create("c1", "parts/copy.zip", None, Default::default())
+        .unwrap();
+    let input = s3s::dto::UploadPartCopyInput::builder()
+        .bucket("c1".into())
+        .key("parts/copy.zip".into())
+        .upload_id(upload_id)
+        .part_number(1)
+        .copy_source(s3s::dto::CopySource::Bucket {
+            bucket: "b".into(),
+            key: "legacy/a.zip".into(),
+            version_id: None,
+        })
+        .build()
+        .unwrap();
+    let out = copy::upload_part_copy(&f.svc, request(input))
+        .await
+        .unwrap();
+    let etag = out.output.copy_part_result.unwrap().e_tag.unwrap();
+    let want = format!("\"{}\"", hex::encode(md5::Md5::digest(&body)));
+    assert_eq!(etag, parse_s3s_etag(&want).unwrap());
+
+    let reference_gets = fake
+        .requests()
+        .iter()
+        .filter(|r| r.starts_with("GET ") && r.contains("legacy/reference.bin"))
+        .count();
+    assert_eq!(reference_gets, 1, "{:#?}", fake.requests());
+    assert_eq!(engine.retrieve("c2", "x/a.zip").await.unwrap().0, body);
+}

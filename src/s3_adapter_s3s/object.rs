@@ -166,6 +166,9 @@ pub(super) async fn get_object(
             );
         }
 
+        // small: `retrieve_stream_range` serves every large object as a
+        // range; what it leaves is a delta or reference object at most the
+        // spool threshold, or a key gone since its HEAD.
         let (data, metadata) = engine.retrieve(&input.bucket, &input.key).await?;
         served_the_judged_version(&head, &metadata, &input, true)?;
         // `checked` was validated against the HEAD `file_size`, but we

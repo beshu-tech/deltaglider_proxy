@@ -2474,4 +2474,79 @@ mod source_guards {
                 .join("\n")
         );
     }
+
+    /// A whole-object read (`engine.retrieve`, the storage `get_object` /
+    /// `get_delta` / `get_reference` / `get_passthrough`) holds the whole
+    /// object in memory. Outside the storage backends, which implement
+    /// them, each one says why its object is bounded: `// small: <why>`
+    /// on its line or in the 4 lines above. A large object streams
+    /// (`retrieve_stream`, `retrieve_stream_range`, `open_object`).
+    #[test]
+    fn whole_object_reads_are_marked_small() {
+        // Sites that a later change removes: (file, offending lines, why).
+        // A stale entry fails too.
+        const PENDING: &[(&str, usize, &str)] = &[(
+            "src/deltaglider/engine/raw.rs",
+            2,
+            "the replication fast path reads its delta and reference whole (follow-up)",
+        )];
+        let needles = [
+            ".retrieve(",
+            ".get_object(",
+            ".get_delta(",
+            ".get_reference(",
+            ".get_passthrough(",
+        ];
+        let files = rust_files("src");
+        let test_files = out_of_line_test_modules(&files);
+        let mut offenders: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for file in files {
+            let rel = rel_path(&file);
+            if test_files.contains(&file) || rel.starts_with("src/storage/") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            let mask = prod_mask(&text);
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !mask[i] || line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // The AWS SDK's `client.get_object()` is a request builder.
+                let probe = line.replace(".get_object()", "");
+                if !needles.iter().any(|n| probe.contains(n)) {
+                    continue;
+                }
+                let marked = lines[i.saturating_sub(4)..=i]
+                    .iter()
+                    .any(|l| l.contains("// small:"));
+                if !marked {
+                    offenders.entry(rel.clone()).or_default().push(format!(
+                        "{rel}:{}: {}",
+                        i + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        for (file, count, why) in PENDING {
+            let found = offenders.remove(*file).unwrap_or_default();
+            assert_eq!(
+                found.len(),
+                *count,
+                "{file} ({why}): the pending whole-object reads changed; update PENDING:\n{}",
+                found.join("\n")
+            );
+        }
+        assert!(
+            offenders.is_empty(),
+            "a whole-object read without a bound; stream the object, or say why it \
+             is small with `// small: <why>`:\n{}",
+            offenders
+                .into_values()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }

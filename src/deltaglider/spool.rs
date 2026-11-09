@@ -372,35 +372,51 @@ impl SpoolDir {
         a_bytes: u64,
         b_bytes: u64,
     ) -> std::io::Result<(Spool, Spool)> {
+        let group = self.acquire_group_beside(held, &[a_bytes, b_bytes]).await?;
+        let [a, b] = <[Spool; 2]>::try_from(group)
+            .map_err(|_| std::io::Error::other("a pair is two spool files"))?;
+        Ok((a, b))
+    }
+
+    /// [`Self::acquire_pair`] for any number of files: ONE permit for all of
+    /// them (the large delta GET needs reference + output + delta), shared
+    /// by the returned spools in the order of `sizes`. The budget is
+    /// released when the last of them drops.
+    pub async fn acquire_group(&self, sizes: &[u64]) -> std::io::Result<Vec<Spool>> {
+        self.acquire_group_beside(None, sizes).await
+    }
+
+    /// [`Self::acquire_group`] for an op that holds `held` (see
+    /// [`Self::acquire_pair_beside`]): clamped, and no wait for a holder.
+    pub async fn acquire_group_beside(
+        &self,
+        held: Option<&Spool>,
+        sizes: &[u64],
+    ) -> std::io::Result<Vec<Spool>> {
         let held_mib = held.map_or(0, Spool::reserved_mib);
-        // A holder of the whole budget would get the pair with 0 MiB
-        // accounted (the clamp), so the op used held + a + b on disk. The
-        // pair is optional work (the streaming PUT stores passthrough
+        let total = sizes.iter().fold(0u64, |acc, s| acc.saturating_add(*s));
+        // A holder of the whole budget would get the group with 0 MiB
+        // accounted (the clamp), so the op used held + the group on disk.
+        // The group is optional work (the streaming PUT stores passthrough
         // without it): refuse it. A storage write's own temp files
         // (`SpoolBudget`) keep the clamp, because the object cannot be
         // stored without them.
-        if held_mib > 0 && self.want_mib(a_bytes.saturating_add(b_bytes), held_mib) == 0 {
+        if held_mib > 0 && self.want_mib(total, held_mib) == 0 {
             return Err(std::io::Error::new(
                 CONTENDED,
-                "spool budget: the op holds the whole budget, no room for a delta pair",
+                "spool budget: the op holds the whole budget, no room for more spool files",
             ));
         }
-        let permit = std::sync::Arc::new(
-            self.reserve_within(a_bytes.saturating_add(b_bytes), held_mib)
-                .await?,
-        );
-        let a = NamedTempFile::new_in(&self.dir)?;
-        let b = NamedTempFile::new_in(&self.dir)?;
-        Ok((
-            Spool {
-                file: a,
-                _permit: SharedOrOwned::Shared(permit.clone()),
-            },
-            Spool {
-                file: b,
-                _permit: SharedOrOwned::Shared(permit),
-            },
-        ))
+        let permit = std::sync::Arc::new(self.reserve_within(total, held_mib).await?);
+        sizes
+            .iter()
+            .map(|_| {
+                Ok(Spool {
+                    file: NamedTempFile::new_in(&self.dir)?,
+                    _permit: SharedOrOwned::Shared(permit.clone()),
+                })
+            })
+            .collect()
     }
 
     /// Reserve `bytes` for the temp files of a storage write, with no file
@@ -1024,6 +1040,40 @@ mod tests {
             .err()
             .expect("a full holder must not get an unaccounted pair");
         assert_eq!(err.kind(), CONTENDED);
+    }
+
+    /// A group (the large delta GET: reference + output + delta) is ONE
+    /// reservation: all files or none, released when the last one drops,
+    /// and a holder of the whole budget gets no group.
+    #[tokio::test]
+    async fn acquire_group_is_one_reservation_for_every_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 8 * 1024 * 1024).unwrap();
+        let mib = 1024 * 1024;
+        let group = pool
+            .acquire_group(&[3 * mib, 3 * mib, 2 * mib])
+            .await
+            .unwrap();
+        assert_eq!(group.len(), 3);
+        assert_eq!(pool.free_mib(), 0, "the sum is reserved at once");
+        let mut paths: Vec<_> = group.iter().map(|s| s.path().to_path_buf()).collect();
+        paths.dedup();
+        assert_eq!(paths.len(), 3, "three distinct files");
+        let mut group = group;
+        group.truncate(1);
+        assert_eq!(
+            pool.free_mib(),
+            0,
+            "a file of the group keeps the reservation"
+        );
+        let err = pool
+            .acquire_group_beside(Some(&group[0]), &[mib, mib])
+            .await
+            .err()
+            .expect("a holder of the whole budget gets no more files");
+        assert_eq!(err.kind(), CONTENDED);
+        drop(group);
+        assert_eq!(pool.free_mib(), 8, "the last file releases the reservation");
     }
 
     #[tokio::test]
