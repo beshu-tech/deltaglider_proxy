@@ -2868,7 +2868,7 @@ mod multipart_abort_tests {
             body: crate::storage::PutBody<'_>,
             _: &FileMetadata,
         ) -> Result<(), StorageError> {
-            body.into_bytes().await?;
+            body.read_all_for_test().await?;
             Err(nope())
         }
 
@@ -2881,7 +2881,7 @@ mod multipart_abort_tests {
             _: &FileMetadata,
             _: &str,
         ) -> Result<crate::storage::WriteIf, StorageError> {
-            body.into_bytes().await?;
+            body.read_all_for_test().await?;
             Err(nope())
         }
 
@@ -3165,7 +3165,7 @@ mod multipart_abort_tests {
             body: crate::storage::PutBody<'_>,
             m: &FileMetadata,
         ) -> Result<(), StorageError> {
-            let body = crate::storage::PutBody::Bytes(body.into_bytes().await?);
+            let body = crate::storage::PutBody::Bytes(body.read_all_for_test().await?);
             self.0.put_object(b, p, t, body, m).await
         }
 
@@ -3178,7 +3178,7 @@ mod multipart_abort_tests {
             m: &FileMetadata,
             v: &str,
         ) -> Result<crate::storage::WriteIf, StorageError> {
-            let body = crate::storage::PutBody::Bytes(body.into_bytes().await?);
+            let body = crate::storage::PutBody::Bytes(body.read_all_for_test().await?);
             self.0.put_if_unchanged(b, p, t, body, m, v).await
         }
 

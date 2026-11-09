@@ -14,6 +14,11 @@
 
 - A multipart upload of a delta-eligible type used to keep every part in memory until the upload held more than `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES` (64 MiB). The proxy now keeps the parts in memory only up to `DGP_SPOOL_THRESHOLD_BYTES` (16 MiB by default) and writes them to relay files after that. When the upload completes, the proxy joins the relay files into one spool file and delta-encodes that file as a stream. `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES` now decides only whether the proxy tries a delta, so raising it no longer raises memory use. The spool use of such an upload peaks at twice its size for a short time.
 
+### Fixed — Large stored bodies no longer pass through memory in the storage layer
+
+- On an S3 backend without proxy encryption, a multipart upload that the proxy stores from its relay parts was assembled in memory before the PUT, so its memory use was the size of the object. The proxy now sends the part files as one PUT body of a known length, read from the files. A retry of that PUT reads the files again from their start.
+- In a bucket with proxy encryption, a delta or a `reference.bin` was read whole into memory and then decrypted whole, and a baseline written from a spool file was read whole and encrypted in memory. The proxy now decrypts these bodies frame by frame as they are read, and it encrypts a file body into a spool file that holds spool budget. The memory use is one frame (64 KiB), whatever the size of the object.
+
 ### Changed — Error answers for faults that a retry can clear
 
 - A full disk, a used-up storage quota, a lock that another writer holds, a copy source that changed during the copy, a delta codec timeout and a backend `RequestTimeout` or `OperationAborted` now answer `503` with `Retry-After`. Before, they answered `500 InternalError`. A full disk and a used-up quota answer `503 ServiceUnavailable` with a text that names the condition. The cause goes to the log.

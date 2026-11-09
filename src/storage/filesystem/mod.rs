@@ -355,46 +355,43 @@ impl FilesystemBackend {
         })
     }
 
-    /// `put_object` of a passthrough from a local file.
+    /// Store `object` from a local file of any size: copied to a temp file
+    /// in the destination folder with its xattr, then renamed into place
+    /// (`durability` says when it is synced). Never loaded into memory, and
+    /// never a hardlink: the stored file must not share an inode (and so
+    /// its xattr) with the caller's file.
     #[instrument(skip(self, metadata))]
-    async fn put_passthrough_from_file(
+    async fn put_object_from_file(
         &self,
         bucket: &str,
         prefix: &str,
-        filename: &str,
+        object: StoredObject<'_>,
         source_path: &Path,
         metadata: &FileMetadata,
+        durability: Durability,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
-        let data_path = self.passthrough_path(bucket, prefix, filename)?;
+        let (data_path, label, _) = self.object_path(bucket, prefix, object)?;
+        // `ensure_dir`, never `create_dir_all`: that re-created a bucket
+        // deleted after `require_bucket_exists` (C-P0-1, storage-12).
         let dir = self.ensure_dir(bucket, &data_path)?;
-        atomic_copy_with_metadata(
-            dir,
-            source_path,
-            &data_path,
-            metadata,
-            Durability::for_object(),
-        )
-        .await?;
-        debug!(
-            "Copied passthrough file {:?} -> {:?} for {}/{}",
-            source_path, data_path, prefix, filename
-        );
+        atomic_copy_with_metadata(dir, source_path, &data_path, metadata, durability).await?;
+        debug!("Copied {label} file {source_path:?} -> {data_path:?}");
         Ok(())
     }
 
-    /// `put_object` of a passthrough from ordered part files.
+    /// `put_object` of `object` from ordered part files.
     #[instrument(skip(self, part_paths, metadata))]
-    async fn put_passthrough_from_parts(
+    async fn put_object_from_parts(
         &self,
         bucket: &str,
         prefix: &str,
-        filename: &str,
+        object: StoredObject<'_>,
         part_paths: &[PathBuf],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
-        let data_path = self.passthrough_path(bucket, prefix, filename)?;
+        let (data_path, _, _) = self.object_path(bucket, prefix, object)?;
         let dir = self.ensure_dir(bucket, &data_path)?;
         let target = data_path.clone();
         let parts: Vec<PathBuf> = part_paths.to_vec();
@@ -416,19 +413,18 @@ impl FilesystemBackend {
         .map_err(super::join_error)?
     }
 
-    /// `put_object` of a passthrough from chunks, without a contiguous
-    /// buffer.
+    /// `put_object` of `object` from chunks, without a contiguous buffer.
     #[instrument(skip(self, chunks, metadata))]
-    async fn put_passthrough_from_chunks(
+    async fn put_object_from_chunks(
         &self,
         bucket: &str,
         prefix: &str,
-        filename: &str,
+        object: StoredObject<'_>,
         chunks: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
-        let data_path = self.passthrough_path(bucket, prefix, filename)?;
+        let (data_path, label, filename) = self.object_path(bucket, prefix, object)?;
 
         let dir = self.ensure_dir(bucket, &data_path)?;
 
@@ -454,8 +450,8 @@ impl FilesystemBackend {
         .map_err(super::join_error)??;
 
         debug!(
-            "Wrote passthrough chunked ({} chunks) for {}/{}",
-            num_chunks, prefix, filename
+            "Wrote {} chunked ({} chunks) for {}/{}",
+            label, num_chunks, prefix, filename
         );
         Ok(())
     }
@@ -1667,16 +1663,20 @@ impl StorageBackend for FilesystemBackend {
                 )
                 .await
             }
-            RefWrite::PutFile { path, metadata } => {
-                self.require_bucket_exists(bucket).await?;
-                let dest = self.reference_path(bucket, prefix)?;
-                // `ensure_dir`, never `create_dir_all`: that re-created a bucket
-                // deleted after `require_bucket_exists` (C-P0-1, storage-12).
-                let dir = self.ensure_dir(bucket, &dest)?;
+            RefWrite::PutFile { path, metadata, .. } => {
                 // Copy to a temp file + xattr + fsync + rename. Delete-then-copy lost
                 // the baseline on a failed or short copy, and a hardlink shared the
                 // inode (and so the xattr) with the caller's source file.
-                atomic_copy_with_metadata(dir, path, &dest, metadata, Durability::Sync).await
+                let reference = StoredObject::Reference;
+                self.put_object_from_file(
+                    bucket,
+                    prefix,
+                    reference,
+                    path,
+                    metadata,
+                    Durability::Sync,
+                )
+                .await
             }
             RefWrite::Metadata { metadata } => {
                 self.require_bucket_exists(bucket).await?;
@@ -1766,43 +1766,37 @@ impl StorageBackend for FilesystemBackend {
         body: PutBody<'_>,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let (object, data) = match (target, body) {
-            // A delta is in memory (bounded by the object size limit).
-            (StoredWrite::Delta { name, .. }, body) => {
-                (StoredObject::Delta(name), body.into_bytes().await?)
+        let object = target.object();
+        match body {
+            PutBody::Bytes(data) => {
+                self.require_bucket_exists(bucket).await?;
+                let (path, label, filename) = self.object_path(bucket, prefix, object)?;
+                self.put_object_file(
+                    bucket,
+                    &path,
+                    data,
+                    metadata,
+                    label,
+                    prefix,
+                    filename,
+                    Durability::for_object(),
+                )
+                .await
             }
-            (StoredWrite::Passthrough { name }, PutBody::Bytes(data)) => {
-                (StoredObject::Passthrough(name), data)
+            PutBody::File { path, .. } => {
+                let durability = Durability::for_object();
+                self.put_object_from_file(bucket, prefix, object, path, metadata, durability)
+                    .await
             }
-            (StoredWrite::Passthrough { name }, PutBody::File { path, .. }) => {
-                return self
-                    .put_passthrough_from_file(bucket, prefix, name, path, metadata)
-                    .await;
+            PutBody::Parts { paths, .. } => {
+                self.put_object_from_parts(bucket, prefix, object, paths, metadata)
+                    .await
             }
-            (StoredWrite::Passthrough { name }, PutBody::Parts { paths, .. }) => {
-                return self
-                    .put_passthrough_from_parts(bucket, prefix, name, paths, metadata)
-                    .await;
+            PutBody::Chunks(chunks) => {
+                self.put_object_from_chunks(bucket, prefix, object, chunks, metadata)
+                    .await
             }
-            (StoredWrite::Passthrough { name }, PutBody::Chunks(chunks)) => {
-                return self
-                    .put_passthrough_from_chunks(bucket, prefix, name, chunks, metadata)
-                    .await;
-            }
-        };
-        self.require_bucket_exists(bucket).await?;
-        let (path, label, filename) = self.object_path(bucket, prefix, object)?;
-        self.put_object_file(
-            bucket,
-            &path,
-            data,
-            metadata,
-            label,
-            prefix,
-            filename,
-            Durability::for_object(),
-        )
-        .await
+        }
     }
 
     /// The file's version (inode, mtime and size) is checked, then the file is
@@ -1840,12 +1834,16 @@ impl StorageBackend for FilesystemBackend {
                     .await?
             }
             RewriteTarget::Reference { proof } => match body {
-                PutBody::File { path, .. } => {
-                    let op = RefWrite::PutFile { path, metadata };
+                PutBody::File { path, spool } => {
+                    let op = RefWrite::PutFile {
+                        path,
+                        metadata,
+                        spool,
+                    };
                     self.write_reference(bucket, prefix, op, proof).await?
                 }
                 body => {
-                    let data = body.into_bytes().await?;
+                    let data = body.into_small_bytes()?;
                     let op = RefWrite::Put {
                         data: &data,
                         metadata,

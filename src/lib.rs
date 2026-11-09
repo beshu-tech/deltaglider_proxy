@@ -2398,4 +2398,87 @@ mod source_guards {
             offenders.join("\n")
         );
     }
+
+    /// A stored body (a spool file, relay parts, a ciphertext temp file)
+    /// can be any size: the storage and engine code stream it and never
+    /// read a whole file into memory. A whole-file read that is bounded
+    /// says why on its line or the line above (`// small: <why>`).
+    /// `PutBody::into_small_bytes` refuses a file body at run time; this
+    /// guard keeps the file reads out of the source.
+    #[test]
+    fn stored_bodies_are_never_heap_loaded() {
+        const SCOPE: &[&str] = &[
+            "src/storage",
+            "src/deltaglider",
+            "src/multipart.rs",
+            "src/transfer.rs",
+        ];
+        // Sites that a later commit of the streaming-ingest work removes:
+        // (file, offending lines, why). A stale entry fails too.
+        const PENDING: &[(&str, usize, &str)] = &[
+            (
+                "src/multipart.rs",
+                2,
+                "relay parts are read whole until the relay rewrite",
+            ),
+            (
+                "src/deltaglider/engine/store.rs",
+                1,
+                "a kept delta is read whole until it commits from its file",
+            ),
+        ];
+        let needles = [["fs::", "read("].concat()];
+        let test_files = out_of_line_test_modules(&rust_files("src"));
+        let mut offenders: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for p in SCOPE {
+            let files = if p.ends_with(".rs") {
+                vec![root().join(p)]
+            } else {
+                rust_files(p)
+            };
+            for file in files {
+                if test_files.contains(&file) {
+                    continue;
+                }
+                let rel = rel_path(&file);
+                let text = std::fs::read_to_string(&file).unwrap();
+                let mask = prod_mask(&text);
+                let lines: Vec<&str> = text.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    let marked = line.contains("// small:")
+                        || i.checked_sub(1)
+                            .is_some_and(|p| lines[p].contains("// small:"));
+                    if !mask[i] || marked || line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    if needles.iter().any(|n| line.contains(n.as_str())) {
+                        offenders.entry(rel.clone()).or_default().push(format!(
+                            "{rel}:{}: {}",
+                            i + 1,
+                            line.trim()
+                        ));
+                    }
+                }
+            }
+        }
+        for (file, count, why) in PENDING {
+            let found = offenders.remove(*file).unwrap_or_default();
+            assert_eq!(
+                found.len(),
+                *count,
+                "{file} ({why}): the pending whole-file reads changed; update PENDING:\n{}",
+                found.join("\n")
+            );
+        }
+        assert!(
+            offenders.is_empty(),
+            "a stored body is read whole into memory; stream it, or mark a \
+             bounded read with `// small: <why>`:\n{}",
+            offenders
+                .into_values()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }

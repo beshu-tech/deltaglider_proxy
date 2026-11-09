@@ -331,10 +331,12 @@ mod reference_writes {
             deltaspace: &str,
             path: &std::path::Path,
             meta: &FileMetadata,
+            spool: crate::deltaglider::spool::SpoolBudget<'_>,
         ) -> Result<(), EngineError> {
             let op = crate::storage::RefWrite::PutFile {
                 path,
                 metadata: meta,
+                spool,
             };
             self.write_reference(storage, bucket, deltaspace, op).await
         }

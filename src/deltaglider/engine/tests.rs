@@ -110,7 +110,7 @@ impl crate::storage::StorageBackend for NullInner {
         body: crate::storage::PutBody<'_>,
         _: &crate::types::FileMetadata,
     ) -> Result<(), crate::storage::StorageError> {
-        body.into_bytes().await?;
+        body.read_all_for_test().await?;
         Ok(())
     }
 
@@ -123,7 +123,7 @@ impl crate::storage::StorageBackend for NullInner {
         _: &crate::types::FileMetadata,
         _: &str,
     ) -> Result<crate::storage::WriteIf, crate::storage::StorageError> {
-        body.into_bytes().await?;
+        body.read_all_for_test().await?;
         Ok(crate::storage::WriteIf::Written)
     }
 

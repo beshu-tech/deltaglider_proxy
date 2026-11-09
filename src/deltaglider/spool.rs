@@ -454,7 +454,8 @@ impl SpoolReservation {
         self.permit.num_permits()
     }
 
-    fn file(&self) -> std::io::Result<Spool> {
+    /// A temp file in the spool dir that shares this reservation.
+    pub(crate) fn file(&self) -> std::io::Result<Spool> {
         Ok(Spool {
             file: NamedTempFile::new_in(&self.dir)?,
             _permit: SharedOrOwned::Shared(self.permit.clone()),
@@ -473,6 +474,20 @@ pub struct SpoolBudget<'a> {
     dir: &'a SpoolDir,
     held: Option<&'a Spool>,
     reserved: Option<&'a SpoolReservation>,
+}
+
+/// Manual: a [`crate::storage::RefWrite`] carries one and derives `Debug`.
+impl std::fmt::Debug for SpoolBudget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpoolBudget")
+            .field("dir", &self.dir.dir)
+            .field("held_mib", &self.held.map(Spool::reserved_mib))
+            .field(
+                "reserved_mib",
+                &self.reserved.map(SpoolReservation::reserved_mib),
+            )
+            .finish()
+    }
 }
 
 impl<'a> SpoolBudget<'a> {

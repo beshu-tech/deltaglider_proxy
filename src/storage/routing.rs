@@ -1900,7 +1900,7 @@ mod tests {
             body: crate::storage::PutBody<'_>,
             _: &FileMetadata,
         ) -> Result<(), StorageError> {
-            body.into_bytes().await?;
+            body.read_all_for_test().await?;
             Ok(())
         }
 
@@ -1913,7 +1913,7 @@ mod tests {
             _: &FileMetadata,
             _: &str,
         ) -> Result<crate::storage::WriteIf, StorageError> {
-            body.into_bytes().await?;
+            body.read_all_for_test().await?;
             Ok(crate::storage::WriteIf::Written)
         }
 

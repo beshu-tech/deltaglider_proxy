@@ -1233,6 +1233,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
             PutBody::Spooled(body) => {
                 // Streamed into place from the spool (no heap-load — M1.4).
+                // The body spool makes this op a holder, so the reservation
+                // for the storage write's own temp file never waits.
+                let reserved = self
+                    .reserve_storage_spool(put.bucket, put.size, false, body.reserved_mib())
+                    .await?;
                 xnode
                     .put_reference_from_file(
                         &*self.storage,
@@ -1240,6 +1245,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         put.deltaspace_id,
                         body.path(),
                         &metadata,
+                        SpoolBudget::new(&self.spool, Some(body), reserved.as_ref()),
                     )
                     .await?;
                 self.record_reference(put.bucket, put.size as i64);
@@ -1461,9 +1467,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             size,
             ref_meta.content_type.clone(),
         );
-        // counter: unchanged (the same bytes under repaired metadata).
+        // counter: unchanged (the same bytes under repaired metadata). The
+        // heal holds its spool, so this reservation never waits.
+        let reserved = self
+            .reserve_storage_spool(bucket, size, false, spool.reserved_mib())
+            .await?;
         xnode
-            .put_reference_from_file(&*self.storage, bucket, deltaspace_id, spool.path(), &healed)
+            .put_reference_from_file(
+                &*self.storage,
+                bucket,
+                deltaspace_id,
+                spool.path(),
+                &healed,
+                SpoolBudget::new(&self.spool, Some(&spool), reserved.as_ref()),
+            )
             .await?;
         self.cache
             .invalidate(&self.cache_key(bucket, deltaspace_id));

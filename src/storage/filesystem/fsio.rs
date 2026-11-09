@@ -138,9 +138,12 @@ pub(super) fn open_blocking(path: &Path) -> io::Result<std::fs::File> {
     }
 }
 
+/// The whole file: the backend's `get_object`, whose callers ask for a
+/// whole object on purpose.
 pub(super) async fn read(path: &Path) -> io::Result<Vec<u8>> {
     match injected(path) {
         Some(e) => Err(e),
+        // small: the whole-object read API (`get_object`).
         None => tokio::fs::read(path).await,
     }
 }
