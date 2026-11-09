@@ -657,8 +657,10 @@ pub(super) fn check_metadata_size(
     let total: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
     if total > S3_USER_METADATA_MAX_BYTES {
         return Err(StorageError::MetadataTooLarge(format!(
-            "the metadata of {bucket}/{key} is {total} bytes with the proxy's own fields; \
-             an S3 backend stores at most {S3_USER_METADATA_MAX_BYTES} bytes"
+            "the metadata of {bucket}/{key} is {total} bytes with the proxy's own fields \
+             (the key name itself, {} bytes, is part of it); an S3 backend stores at most \
+             {S3_USER_METADATA_MAX_BYTES} bytes. A shorter key name helps",
+            key.len()
         )));
     }
     Ok(())

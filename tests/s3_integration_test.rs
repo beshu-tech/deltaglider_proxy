@@ -93,6 +93,38 @@ async fn proxy_server() -> TestServer {
         .await
 }
 
+/// F16 (#140): a key that MinIO refuses (`XMinioInvalidObjectName`: a control
+/// character, a space-only name, an over-long segment) is the client's fault.
+/// (A TAB in the key still answers 500: the backend fails the signature of the
+/// header that carries it. Whether to refuse control characters at ingest is the
+/// owner decision of #142 F39.)
+/// It answered 500, which SDKs treat as permanent and log as a server bug.
+#[tokio::test]
+async fn test_a_key_the_backend_refuses_is_a_client_error() {
+    skip_unless_minio!();
+    let server = proxy_server().await;
+    let endpoint = server.endpoint();
+    let client = reqwest::Client::new();
+    let long = "a".repeat(300);
+    for key in [
+        "ctl%01byte.bin".to_string(),
+        "ctl%0Anewline.bin".to_string(),
+        "%20%20%20".to_string(),
+        format!("{long}/x.bin"),
+    ] {
+        let url = format!("{endpoint}/{TEST_BUCKET}/{key}");
+        let resp = client
+            .put(&url)
+            .body(b"data".to_vec())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(status.as_u16(), 400, "PUT {key}: {status} {body}");
+    }
+}
+
 // ============================================================================
 // Group 1: Bucket CRUD
 // ============================================================================

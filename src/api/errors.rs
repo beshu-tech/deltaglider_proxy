@@ -79,6 +79,14 @@ pub(crate) fn ensure_retry_after(status: StatusCode, headers: &mut axum::http::H
 const TRANSIENT_503: &str =
     "The storage backend failed while it served this request. A retry can succeed.";
 
+/// The client text of a 503 for a full disk. The path stays in the log.
+const DISK_FULL_503: &str = "The storage backend is out of space. Free space on it; \
+     a retry can succeed after that.";
+
+/// The client text of a 503 for a used-up storage quota of the backend.
+const QUOTA_503: &str = "The storage backend refuses writes because its storage cap or \
+     quota is used up. Raise the cap or free space; a retry can succeed after that.";
+
 /// S3 API errors
 #[derive(Debug, Error)]
 pub enum S3Error {
@@ -417,9 +425,14 @@ impl From<crate::storage::StorageError> for S3Error {
             crate::storage::StorageError::TooLarge { size, max } => {
                 S3Error::EntityTooLarge { size, max }
             }
-            crate::storage::StorageError::DiskFull => S3Error::InternalError(
-                "Insufficient storage space. The server's disk is full.".to_string(),
-            ),
+            // A full disk clears when the operator frees space: a 503 that
+            // SDKs retry with backoff, with a text that names the cause. (An
+            // S3 `InsufficientStorage` code does not exist; a 507 is no S3
+            // answer.)
+            crate::storage::StorageError::DiskFull => S3Error::SlowDown(DISK_FULL_503.to_string()),
+            crate::storage::StorageError::Io(e) if crate::storage::io_error_is_disk_full(&e) => {
+                S3Error::SlowDown(DISK_FULL_503.to_string())
+            }
             // E-P1-1: backend throttling propagates as a 503 SlowDown
             // so AWS-SDK clients honour the spec retry/backoff
             // contract. Pre-fix this fell into the catch-all below,
@@ -442,7 +455,59 @@ impl From<crate::storage::StorageError> for S3Error {
                 tracing::error!("transient storage fault answered 503, cause: {cause}");
                 S3Error::ServiceUnavailable(TRANSIENT_503.to_string())
             }
-            other => S3Error::InternalError(sanitise_for_client(&other)),
+            // Retryable: another writer holds the lock past the wait, or the
+            // copy source changed during the copy. `transfer.rs` reads both
+            // as Busy.
+            crate::storage::StorageError::Contended(msg)
+            | crate::storage::StorageError::PreconditionFailed(msg) => {
+                tracing::warn!("retryable storage conflict answered 503: {msg}");
+                S3Error::SlowDown(
+                    "Another request changed or holds this object; please retry.".to_string(),
+                )
+            }
+            crate::storage::StorageError::QuotaExceeded(cause) => {
+                tracing::error!("backend quota exceeded answered 503, cause: {cause}");
+                S3Error::ServiceUnavailable(QUOTA_503.to_string())
+            }
+            crate::storage::StorageError::NoSuchUpload(id) => S3Error::NoSuchUpload(id),
+            // No client action helps: sanitised 500 (the cause is logged).
+            // Named one by one so a new variant cannot reach here unmapped.
+            e @ (crate::storage::StorageError::Io(_)
+            | crate::storage::StorageError::Serialization(_)
+            | crate::storage::StorageError::S3(_)
+            | crate::storage::StorageError::AccessDenied(_)
+            | crate::storage::StorageError::Encryption(_)
+            | crate::storage::StorageError::Other(_)) => {
+                S3Error::InternalError(sanitise_for_client(&e))
+            }
+        }
+    }
+}
+
+/// The delta codec's errors on the wire: a timeout is retryable (a busier
+/// host killed xdelta3), a size overrun is the client's, the rest is a
+/// sanitised 500. Exhaustive.
+impl From<crate::deltaglider::CodecError> for S3Error {
+    fn from(err: crate::deltaglider::CodecError) -> Self {
+        use crate::deltaglider::CodecError as C;
+        match err {
+            C::TimedOut(cause) => {
+                tracing::error!("delta codec timed out, answered 503, cause: {cause}");
+                S3Error::ServiceUnavailable(
+                    "The delta codec timed out while it served this request. A retry can succeed."
+                        .to_string(),
+                )
+            }
+            C::TooLarge { size, max } => S3Error::EntityTooLarge {
+                size: size as u64,
+                max: max as u64,
+            },
+            C::Io(e) if crate::storage::io_error_is_disk_full(&e) => {
+                S3Error::SlowDown(DISK_FULL_503.to_string())
+            }
+            e @ (C::EncodeFailed(_) | C::DecodeFailed(_) | C::Io(_)) => {
+                S3Error::InternalError(sanitise_for_client(&e))
+            }
         }
     }
 }
@@ -551,6 +616,395 @@ mod tests {
             "a log target outside the crate (the default filter drops it):\n{}",
             offenders.join("\n")
         );
+    }
+
+    // ── The wire answer of every engine, storage and codec error ──────────
+
+    use crate::deltaglider::{CodecError, EngineError};
+    use crate::storage::StorageError;
+
+    const SECRET: &str = "SECRET-DETAIL-/var/data/xyz";
+
+    /// (variant name, the error, status, S3 code). One row per variant at
+    /// least; a row per distinct answer of a variant. A transient fault is a
+    /// 503 that SDKs retry; a 500 is permanent and says nothing of its cause.
+    fn answer_table() -> Vec<(&'static str, S3Error, u16, &'static str)> {
+        fn s(e: StorageError) -> S3Error {
+            e.into()
+        }
+        fn c(e: CodecError) -> S3Error {
+            e.into()
+        }
+        fn en(e: EngineError) -> S3Error {
+            e.into()
+        }
+        let io = |code| std::io::Error::from_raw_os_error(code);
+        let st = || SECRET.to_string();
+        vec![
+            (
+                "StorageError::NotFound",
+                s(StorageError::NotFound(st())),
+                404,
+                "NoSuchKey",
+            ),
+            (
+                "StorageError::AlreadyExists",
+                s(StorageError::AlreadyExists(st())),
+                409,
+                "BucketAlreadyExists",
+            ),
+            (
+                "StorageError::Io",
+                s(StorageError::Io(io(libc::EIO))),
+                500,
+                "InternalError",
+            ),
+            (
+                "StorageError::Io",
+                s(StorageError::Io(io(libc::ENOSPC))),
+                503,
+                "SlowDown",
+            ),
+            (
+                "StorageError::Io",
+                s(StorageError::Io(io(libc::ENAMETOOLONG))),
+                400,
+                "KeyTooLongError",
+            ),
+            (
+                "StorageError::DiskFull",
+                s(StorageError::DiskFull),
+                503,
+                "SlowDown",
+            ),
+            (
+                "StorageError::Serialization",
+                s(StorageError::Serialization(serde::de::Error::custom(
+                    SECRET,
+                ))),
+                500,
+                "InternalError",
+            ),
+            (
+                "StorageError::TooLarge",
+                s(StorageError::TooLarge { size: 2, max: 1 }),
+                413,
+                "EntityTooLarge",
+            ),
+            (
+                "StorageError::S3",
+                s(StorageError::S3(st())),
+                500,
+                "InternalError",
+            ),
+            (
+                "StorageError::AccessDenied",
+                s(StorageError::AccessDenied(st())),
+                500,
+                "InternalError",
+            ),
+            (
+                "StorageError::KeyNotHeld",
+                s(StorageError::KeyNotHeld {
+                    key: "fp-ab".into(),
+                    write: false,
+                    detail: st(),
+                }),
+                400,
+                "InvalidRequest",
+            ),
+            (
+                "StorageError::BucketNotFound",
+                s(StorageError::BucketNotFound(st())),
+                404,
+                "NoSuchBucket",
+            ),
+            (
+                "StorageError::Encryption",
+                s(StorageError::Encryption(st())),
+                500,
+                "InternalError",
+            ),
+            (
+                "StorageError::BucketNotEmpty",
+                s(StorageError::BucketNotEmpty(st())),
+                409,
+                "BucketNotEmpty",
+            ),
+            (
+                "StorageError::Throttled",
+                s(StorageError::Throttled(st())),
+                503,
+                "SlowDown",
+            ),
+            (
+                "StorageError::WritesRefused",
+                s(StorageError::WritesRefused("x".into())),
+                503,
+                "SlowDown",
+            ),
+            (
+                "StorageError::InvalidKey",
+                s(StorageError::InvalidKey("x".into())),
+                400,
+                "InvalidArgument",
+            ),
+            (
+                "StorageError::KeyTooLong",
+                s(StorageError::KeyTooLong("x".into())),
+                400,
+                "KeyTooLongError",
+            ),
+            (
+                "StorageError::MetadataTooLarge",
+                s(StorageError::MetadataTooLarge("x".into())),
+                400,
+                "MetadataTooLarge",
+            ),
+            (
+                "StorageError::Unavailable",
+                s(StorageError::Unavailable("x".into())),
+                503,
+                "ServiceUnavailable",
+            ),
+            (
+                "StorageError::Transient",
+                s(StorageError::Transient(st())),
+                503,
+                "ServiceUnavailable",
+            ),
+            (
+                "StorageError::Contended",
+                s(StorageError::Contended(st())),
+                503,
+                "SlowDown",
+            ),
+            (
+                "StorageError::PreconditionFailed",
+                s(StorageError::PreconditionFailed(st())),
+                503,
+                "SlowDown",
+            ),
+            (
+                "StorageError::QuotaExceeded",
+                s(StorageError::QuotaExceeded(st())),
+                503,
+                "ServiceUnavailable",
+            ),
+            (
+                "StorageError::NoSuchUpload",
+                s(StorageError::NoSuchUpload("u".into())),
+                404,
+                "NoSuchUpload",
+            ),
+            (
+                "StorageError::InvalidRange",
+                s(StorageError::InvalidRange(st())),
+                416,
+                "InvalidRange",
+            ),
+            (
+                "StorageError::Other",
+                s(StorageError::Other(st())),
+                500,
+                "InternalError",
+            ),
+            (
+                "CodecError::EncodeFailed",
+                c(CodecError::EncodeFailed(st())),
+                500,
+                "InternalError",
+            ),
+            (
+                "CodecError::DecodeFailed",
+                c(CodecError::DecodeFailed(st())),
+                500,
+                "InternalError",
+            ),
+            (
+                "CodecError::TimedOut",
+                c(CodecError::TimedOut(st())),
+                503,
+                "ServiceUnavailable",
+            ),
+            (
+                "CodecError::TooLarge",
+                c(CodecError::TooLarge { size: 2, max: 1 }),
+                413,
+                "EntityTooLarge",
+            ),
+            (
+                "CodecError::Io",
+                c(CodecError::Io(io(libc::EIO))),
+                500,
+                "InternalError",
+            ),
+            (
+                "CodecError::Io",
+                c(CodecError::Io(io(libc::ENOSPC))),
+                503,
+                "SlowDown",
+            ),
+            (
+                "EngineError::Storage",
+                en(EngineError::Storage(StorageError::Throttled(st()))),
+                503,
+                "SlowDown",
+            ),
+            (
+                "EngineError::Codec",
+                en(EngineError::Codec(CodecError::TimedOut(st()))),
+                503,
+                "ServiceUnavailable",
+            ),
+            (
+                "EngineError::NotFound",
+                en(EngineError::NotFound("k".into())),
+                404,
+                "NoSuchKey",
+            ),
+            (
+                "EngineError::ChecksumMismatch",
+                en(EngineError::ChecksumMismatch {
+                    key: st(),
+                    expected: st(),
+                    actual: st(),
+                }),
+                500,
+                "InternalError",
+            ),
+            (
+                "EngineError::MissingReference",
+                en(EngineError::MissingReference(st())),
+                500,
+                "InternalError",
+            ),
+            (
+                "EngineError::TooLarge",
+                en(EngineError::TooLarge { size: 2, max: 1 }),
+                413,
+                "EntityTooLarge",
+            ),
+            (
+                "EngineError::InvalidArgument",
+                en(EngineError::InvalidArgument("x".into())),
+                400,
+                "InvalidArgument",
+            ),
+            (
+                "EngineError::Overloaded",
+                en(EngineError::Overloaded("x".into())),
+                503,
+                "SlowDown",
+            ),
+        ]
+    }
+
+    /// The variant names of the enum `name`, read from `src`: the lines at
+    /// four spaces of indent that start with a capital.
+    fn enum_variants(src: &str, name: &str) -> Vec<String> {
+        let head = format!("pub enum {name} {{");
+        let body = src
+            .split_once(head.as_str())
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("enum {name}"));
+        body.lines()
+            .filter(|l| l.starts_with("    ") && !l.starts_with("     "))
+            .map(str::trim)
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_uppercase()))
+            .map(|l| {
+                let v = l
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .next()
+                    .unwrap();
+                format!("{name}::{v}")
+            })
+            .collect()
+    }
+
+    /// F15/F16: every variant of the three error enums has a row, the wire
+    /// answer of each row is the one the table says, every 503 carries a
+    /// `Retry-After`, and no 500 repeats the cause (a path, a hash). A new
+    /// variant fails here until it gets a row.
+    #[test]
+    fn every_engine_storage_and_codec_error_has_its_wire_answer() {
+        let table = answer_table();
+        let mut variants = enum_variants(include_str!("../storage/traits.rs"), "StorageError");
+        variants.extend(enum_variants(
+            include_str!("../deltaglider/codec.rs"),
+            "CodecError",
+        ));
+        variants.extend(enum_variants(
+            include_str!("../deltaglider/engine/mod.rs"),
+            "EngineError",
+        ));
+        assert!(
+            variants.len() >= 35,
+            "the scan found the variants: {variants:?}"
+        );
+        let missing: Vec<_> = variants
+            .iter()
+            .filter(|v| !table.iter().any(|(n, ..)| n == v))
+            .collect();
+        assert!(missing.is_empty(), "no row for: {missing:?}");
+        let unknown: Vec<_> = table
+            .iter()
+            .map(|(n, ..)| *n)
+            .filter(|n| !variants.iter().any(|v| v == n))
+            .collect();
+        assert!(unknown.is_empty(), "rows of no variant: {unknown:?}");
+        for (name, err, status, code) in &table {
+            assert_eq!(err.status_code().as_u16(), *status, "{name}: {err}");
+            assert_eq!(err.code(), *code, "{name}: {err}");
+            if *status == 503 {
+                assert!(
+                    err.retry_after_secs().is_some(),
+                    "{name}: a 503 says Retry-After"
+                );
+            }
+            if *status == 500 {
+                assert!(
+                    !err.to_string().contains("SECRET"),
+                    "{name} leaks its cause: {err}"
+                );
+            }
+        }
+    }
+
+    /// F15 class guard: the three bridges name every variant, none ends in a
+    /// catch-all arm, so a new variant does not compile without a mapping.
+    #[test]
+    fn the_error_bridges_have_no_catch_all_arm() {
+        for (what, text) in [
+            ("StorageError → S3Error", include_str!("errors.rs")),
+            (
+                "EngineError → S3Error",
+                include_str!("../deltaglider/engine/mod.rs"),
+            ),
+        ] {
+            let heads: &[&str] = if what.starts_with("Storage") {
+                &[
+                    "impl From<crate::storage::StorageError> for S3Error",
+                    "impl From<crate::deltaglider::CodecError> for S3Error",
+                ]
+            } else {
+                &["impl From<EngineError> for crate::api::S3Error"]
+            };
+            for head in heads {
+                let body = text
+                    .split_once(head)
+                    .and_then(|(_, rest)| rest.split_once("\n}\n"))
+                    .map(|(b, _)| b)
+                    .unwrap_or_else(|| panic!("{head}"));
+                for line in body.lines().map(str::trim_start) {
+                    assert!(
+                        !line.starts_with("other =>") && !line.starts_with("_ =>"),
+                        "{head}: a catch-all arm: {line}"
+                    );
+                }
+            }
+        }
     }
 
     /// Every variant reaches the s3s wire with its own S3 code: the bridge
