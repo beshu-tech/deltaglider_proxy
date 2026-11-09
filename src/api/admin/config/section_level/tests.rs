@@ -597,6 +597,23 @@ fn a_non_object_body_never_resets_any_section() {
     }
 }
 
+/// The shape check also judges the field's TYPE: a struct field that holds no
+/// value yet (`event_delivery`, `tls`) took `[true]` as positional input.
+#[test]
+fn an_array_for_an_unset_struct_field_is_refused() {
+    for body in [
+        serde_json::json!({"event_delivery": [true]}),
+        serde_json::json!({"tls": [true]}),
+        serde_json::json!({"event_delivery": "on"}),
+    ] {
+        let mut cfg = SectionedConfig::default();
+        let before = serde_json::to_value(&cfg).unwrap();
+        let r = merge_patch_section(&mut cfg, SectionName::Advanced, &body);
+        assert!(r.is_err(), "{body} must be refused, got {r:?}");
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), before, "{body}");
+    }
+}
+
 mod patch_shape_props {
     use super::*;
     use proptest::prelude::*;

@@ -122,7 +122,9 @@ impl RuntimeTuning {
     /// parse helpers print for a value that does not parse.
     pub fn from_env(env: EnvLookup) -> Self {
         let parse_or = |var: &str, default: u64| lookup_parse(env, var).unwrap_or(default);
-        let clock_skew_secs: u32 = lookup_parse(env, "DGP_CLOCK_SKEW_SECONDS").unwrap_or(900);
+        let clock_skew_secs: u32 = lookup_parse(env, "DGP_CLOCK_SKEW_SECONDS")
+            .unwrap_or(900)
+            .max(1);
         let codec = CodecTimeouts::default();
         Self {
             // 0 would time every request out at once.
@@ -229,10 +231,8 @@ mod tests {
         ("DGP_HEADER_READ_TIMEOUT_SECS", Zero::Floor1),
         ("DGP_MAX_CONNECTIONS", Zero::Floor1),
         ("DGP_BACKEND_SHARE_PERCENT", Zero::Floor1),
-        (
-            "DGP_CLOCK_SKEW_SECONDS",
-            Zero::Meaningful("no skew allowed"),
-        ),
+        // 0 would refuse every signed request (RequestTimeTooSkewed).
+        ("DGP_CLOCK_SKEW_SECONDS", Zero::Floor1),
         (
             "DGP_REPLAY_WINDOW_SECS",
             Zero::Meaningful("replay check off"),
@@ -264,35 +264,28 @@ mod tests {
         ),
     ];
 
-    /// The floor holds for `0` on every `Floor1` setting (zero is the value
-    /// that turned `DGP_MAX_CONCURRENT_REQUESTS=0` into a hang).
+    /// `0` reads as `1` on every `Floor1` setting: the whole tuning struct
+    /// with the variable at `0` equals the one with it at `1` (zero is the
+    /// value that turned `DGP_MAX_CONCURRENT_REQUESTS=0` into a hang).
     #[test]
     fn a_zero_never_stops_the_proxy() {
-        let zeroed: Vec<(&str, &str)> = ZERO_RULES
-            .iter()
-            .filter(|(_, rule)| matches!(rule, Zero::Floor1))
-            .map(|(var, _)| (*var, "0"))
-            .collect();
-        let t = from(&zeroed);
-        assert!(t.request_timeout_secs >= 1);
-        assert!(t.max_concurrent_requests >= 1);
-        assert!(t.header_read_timeout_secs >= 1);
-        assert!(t.max_connections.is_none_or(|n| n >= 1));
-        assert!(t.backend_share_percent >= 1);
-        assert!(
-            t.codec.buffered_secs >= 1 && t.codec.stall_secs >= 1 && t.codec.absolute_secs >= 1
-        );
-        assert!(t.spool_acquire_timeout_secs >= 1);
-        assert!(
-            t.stream_copy_threshold >= 1 && t.multipart_part_size >= 1 && t.upload_concurrency >= 1
-        );
-        assert!(t.ready.timeout_secs >= 1);
-        // The meaningful zeros stay zero.
+        let mut floors = 0;
         for (var, rule) in ZERO_RULES {
-            if let Zero::Meaningful(why) = rule {
-                assert!(!why.is_empty(), "{var} documents what 0 means");
+            match rule {
+                Zero::Floor1 => {
+                    floors += 1;
+                    assert_eq!(
+                        from(&[(var, "0")]),
+                        from(&[(var, "1")]),
+                        "{var}=0 must read as 1"
+                    );
+                }
+                Zero::Meaningful(why) => {
+                    assert!(!why.is_empty(), "{var} documents what 0 means");
+                }
             }
         }
+        assert!(floors >= 10, "the table holds the Floor1 rows");
     }
 
     /// Every numeric `DGP_*` variable that this file reads has a row in
@@ -301,45 +294,34 @@ mod tests {
     fn every_numeric_variable_has_a_zero_rule() {
         let src = include_str!("tuning.rs");
         let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        // Drop comment lines, then take the first quoted `DGP_` name after
+        // each numeric read, wherever the call breaks its lines.
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut vars = std::collections::BTreeSet::new();
-        for line in body.lines() {
-            let t = line.trim_start();
-            if t.starts_with("//") {
-                continue;
-            }
-            let reads_number = t.contains("parse_or(") || t.contains("lookup_parse");
-            if !reads_number {
-                continue;
-            }
-            for part in t.split('"').skip(1).step_by(2) {
-                if part.starts_with("DGP_") {
-                    vars.insert(part.to_string());
-                }
-            }
-        }
-        // The multi-line `lookup_parse` (name on the next line) calls: scan the quoted names near them.
-        for (i, line) in body.lines().enumerate() {
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            if line.contains("lookup_parse") && !line.contains('"') {
-                if let Some(next) = body.lines().nth(i + 1) {
-                    for part in next.split('"').skip(1).step_by(2) {
-                        if part.starts_with("DGP_") {
-                            vars.insert(part.to_string());
-                        }
-                    }
+        for marker in ["parse_or(", "lookup_parse"] {
+            for (at, _) in code.match_indices(marker) {
+                let tail = &code[at + marker.len()..];
+                let window = crate::security::str_prefix(tail, 160);
+                if let Some(q) = window.find("\"DGP_") {
+                    let name: String = window[q + 1..].chars().take_while(|c| *c != '"').collect();
+                    vars.insert(name);
                 }
             }
         }
         assert!(
-            vars.len() >= 15,
+            vars.len() >= 20,
             "scan found the numeric variables: {vars:?}"
         );
         let ruled: std::collections::BTreeSet<String> =
             ZERO_RULES.iter().map(|(v, _)| v.to_string()).collect();
         let missing: Vec<_> = vars.difference(&ruled).collect();
         assert!(missing.is_empty(), "add a ZERO_RULES row for: {missing:?}");
+        let stale: Vec<_> = ruled.difference(&vars).collect();
+        assert!(stale.is_empty(), "ZERO_RULES rows nothing reads: {stale:?}");
     }
 
     /// B109: s3s accepts a signature dated up to the skew AHEAD, so one

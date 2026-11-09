@@ -371,13 +371,17 @@ fn whole_scalar_quote(input: &str, start: usize, end: usize) -> Option<Option<ch
 /// A `#` starts one at the line start or after whitespace, outside a quoted
 /// scalar: `k: v  # ${env:UNSET}` has a comment, `k: a#${env:X}` and
 /// `k: "a # ${env:X}"` do not (the `#` is text there). A quote opens a
-/// scalar after whitespace or a flow opener, so the apostrophe of `don't`
-/// is text. Pure: unit-tested below.
+/// scalar only where a value can start (line start, or after `:` `-` `,`
+/// `[` `{`), so the apostrophe of `don't` or `a 'b` is text. `''` inside a
+/// single-quoted scalar is an escaped quote. The check sees one line: a
+/// double-quoted scalar that spans lines is not tracked. Pure: unit-tested.
 fn comment_starts_in(prefix: &str) -> bool {
     let mut quote: Option<char> = None;
     let mut escaped = false;
     let mut opener_before = true; // the line start
-    for c in prefix.chars() {
+    let mut value_start = true; // only indicators and spaces so far
+    let mut chars = prefix.chars().peekable();
+    while let Some(c) = chars.next() {
         match quote {
             Some(q) => {
                 if q == '"' && c == '\\' && !escaped {
@@ -385,17 +389,24 @@ fn comment_starts_in(prefix: &str) -> bool {
                     continue;
                 }
                 if c == q && !escaped {
-                    quote = None;
+                    if q == '\'' && chars.peek() == Some(&'\'') {
+                        chars.next(); // `''`: an escaped quote, still inside
+                    } else {
+                        quote = None;
+                    }
                 }
                 escaped = false;
             }
             None => match c {
                 '#' if opener_before => return true,
-                '"' | '\'' if opener_before => quote = Some(c),
+                '"' | '\'' if opener_before && value_start => quote = Some(c),
                 _ => {}
             },
         }
         opener_before = quote.is_none() && (c.is_whitespace() || matches!(c, '[' | '{' | ','));
+        if !c.is_whitespace() {
+            value_start = matches!(c, ':' | '-' | '[' | '{' | ',' | '?');
+        }
     }
     false
 }
@@ -763,6 +774,9 @@ mod tests {
             ("k: \"a \\\" # still quoted ", false),
             ("k: don't # apostrophe is text, comment follows ", true),
             ("- [a, # flow ", true),
+            ("k: 'it''s # in quotes ", false),
+            ("k: a 'b # a quote inside a plain scalar ", true),
+            ("k: 'a' 'b # ", true),
         ] {
             assert_eq!(comment_starts_in(prefix), want, "{prefix:?}");
         }

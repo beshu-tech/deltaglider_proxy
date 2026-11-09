@@ -233,6 +233,7 @@ Tokio blocking thread-pool size. It controls how many CPU-bound operations (xdel
 | **Env var** | `DGP_BLOCKING_THREADS` |
 | **YAML** | `advanced.blocking_threads` |
 | **Default** | tokio default (512) |
+| **Minimum** | `1`. A value of `0` stops the proxy at startup with an error. |
 | **Hot-reload** | No |
 
 ### `debug_headers`
@@ -324,6 +325,7 @@ The same limit applies to the folder listing of the file browser (`GET /_/api/ad
 | **Env var** | `DGP_FILTERED_LIST_MAX_ENGINE_PAGES` |
 | **YAML** | `advanced.filtered_list_max_engine_pages` |
 | **Default** | `50` |
+| **Minimum** | `1`. A value of `0` stops the proxy at startup with an error. |
 | **Hot-reload** | Yes |
 
 ### `codec_concurrency`
@@ -335,6 +337,7 @@ Maximum concurrent xdelta3 subprocesses. Auto-detected as `num_cpus * 4` (min 16
 | **Env var** | `DGP_CODEC_CONCURRENCY` |
 | **YAML** | `advanced.codec_concurrency` |
 | **Default** | `num_cpus * 4` (min 16) |
+| **Minimum** | `1`. A value of `0` stops the proxy at startup with an error. |
 | **Hot-reload** | Yes (triggers engine rebuild) |
 
 ### `range_spool_ttl_secs`
@@ -596,11 +599,12 @@ Admin GUI session TTL.
 |---|---|
 | **Env var** | `DGP_SESSION_TTL_HOURS` |
 | **Default** | `4` |
+| **Minimum** | `1`. The proxy reads `0` as `1`. |
 | **Hot-reload** | No |
 
 ### `clock_skew_seconds`
 
-SigV4 clock skew tolerance.
+SigV4 clock skew tolerance. The minimum is `1` second: the proxy reads `0` as `1`, because a tolerance of zero refuses every signed request.
 
 | | |
 |---|---|

@@ -587,7 +587,7 @@ where
     // Deserialize with field-path tracking so a type error names the exact
     // offending field ("buckets.beshu-b2.public_prefixes: invalid type …")
     // instead of a path-less serde message the operator can't act on.
-    serde_path_to_error::deserialize(merged).map_err(|e| {
+    let typed: T = serde_path_to_error::deserialize(merged).map_err(|e| {
         let path = e.path().to_string();
         let inner = e.into_inner();
         if path == "." {
@@ -595,7 +595,16 @@ where
         } else {
             format!("invalid {label} section body at `{path}`: {inner}")
         }
-    })
+    })?;
+    // The check above reads the CURRENT value, so a struct field that holds
+    // none (`event_delivery`, `tls`) let `[true]` through: serde reads an
+    // array positionally. The result knows the field's real type.
+    let result = serde_json::to_value(&typed)
+        .map_err(|e| format!("internal: failed to project {label} section: {e}"))?;
+    match patch_shape_error(&result, patch, "") {
+        Some(problem) => Err(format!("invalid {label} section body: {problem}")),
+        None => Ok(typed),
+    }
 }
 
 /// Where a patch would replace a whole object (a section, or a struct-typed

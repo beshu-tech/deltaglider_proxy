@@ -2184,8 +2184,6 @@ async fn test_read_only_config_file_is_reported() {
     assert!(restore_body.contains("read-only"), "{restore_body}");
 }
 
-/// B089: validate answers what the apply would: a change the apply refuses
-/// (here a sync bucket without DGP_CONFIG_DB_KEY) is not `ok: true`.
 /// A section PUT whose body is not an object is refused with 400 and changes
 /// nothing: `[]` used to answer `ok:true` and reset the section to its
 /// defaults (the backend, and with `{"replication":[]}` the rules). An
@@ -2243,6 +2241,8 @@ async fn section_put_refuses_a_reset_body_and_a_zero_count() {
     assert_eq!(export().await, before, "a refused PUT changed the config");
 }
 
+/// B089: validate answers what the apply would: a change the apply refuses
+/// (here a sync bucket without DGP_CONFIG_DB_KEY) is not `ok: true`.
 #[tokio::test]
 async fn validate_runs_the_apply_gates() {
     let server = TestServer::builder()

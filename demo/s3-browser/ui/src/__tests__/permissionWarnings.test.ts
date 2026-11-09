@@ -68,11 +68,12 @@ test('invalidPatternWarnings: mid-pattern wildcard, whitespace, dedup', () => {
     assert.equal(w.length, 1);
     assert.ok(w[0].includes('mid-pattern'));
   }
-  // Internal whitespace → rejected.
-  {
-    const w = invalidPatternWarnings(['beshu/a b/*']);
-    assert.equal(w.length, 1);
-    assert.ok(w[0].includes('space or control'));
+  // A plain space is a valid key character; a tab or U+00A0 is not.
+  assert.deepEqual(invalidPatternWarnings(['beshu/a b/*']), []);
+  for (const bad of ['beshu/a\tb/*', 'beshu/a\u00a0b/*']) {
+    const w = invalidPatternWarnings([bad]);
+    assert.equal(w.length, 1, bad);
+    assert.ok(w[0].includes('non-space whitespace'), w[0]);
   }
   // A wildcard inside the bucket segment → rejected as mid-pattern.
   assert.equal(invalidPatternWarnings(['b*cket/x']).length, 1);
@@ -80,7 +81,7 @@ test('invalidPatternWarnings: mid-pattern wildcard, whitespace, dedup', () => {
   assert.deepEqual(invalidPatternWarnings(['beshu/ok/*  ']), []);
   // Multiple bad patterns → one message each, de-duped.
   {
-    const w = invalidPatternWarnings(['a/*/b', 'a/*/b', 'c d/*']);
+    const w = invalidPatternWarnings(['a/*/b', 'a/*/b', 'c\td/*']);
     assert.equal(w.length, 2);
   }
 });
