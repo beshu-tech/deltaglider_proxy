@@ -827,14 +827,26 @@ pub async fn handle_form_post_upload(
         &parsed.file_data,
     )?;
     let precondition = form_post_precondition(headers)?;
+    // The file goes through the same ingest as a PutObject body (memory or
+    // a spool file, with its hashes).
+    let engine = state.engine.load_full();
+    let body = crate::deltaglider::ingest::ingest_bytes(
+        &engine,
+        bucket,
+        parsed.file_data.clone(),
+        engine.max_object_size(),
+        None,
+    )
+    .await
+    .map_err(crate::api::body_ingest::ingest_failure)?;
     // The same client write as PutObject: quota, the object's write lock,
-    // the preconditions, the store (spooled when large), the event.
+    // the preconditions, the store, the event.
     let result = store_client_write(
         state,
         ClientWrite {
             bucket,
             key: &parsed.resolved_key,
-            data: parsed.file_data.clone(),
+            body,
             content_type: parsed.content_type.clone(),
             user_metadata: parsed.user_metadata.clone(),
             precondition: &precondition,

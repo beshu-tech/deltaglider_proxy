@@ -1287,8 +1287,27 @@ async fn s3s_verifies_the_payload_hash_we_trust() {
         r.body = body.to_vec();
         r
     };
+    // A body of many chunks, the size that goes to a spool file: s3s checks
+    // the hash as it streams, the last chunk decides.
+    let big: Vec<u8> = (0..1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
+    let mut big_wrong = big.clone();
+    *big_wrong.last_mut().unwrap() ^= 1;
+    let big_sha: &'static str =
+        Box::leak(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&big)).into_boxed_str());
     // (name, request, the adapter trusts the digest, what s3s does)
     let rows: Vec<(&str, RawRequest, bool, BodyCheck)> = vec![
+        (
+            "v4 header, lowercase hex, large body",
+            put(Auth::V4Header(ALICE, big_sha), &big, &[]),
+            true,
+            Delivered,
+        ),
+        (
+            "v4 header, lowercase hex, large body, last byte wrong",
+            put(Auth::V4Header(ALICE, big_sha), &big_wrong, &[]),
+            true,
+            Refused,
+        ),
         (
             "v4 header, lowercase hex, right body",
             put(Auth::V4Header(ALICE, HELLO_SHA256), b"hello", &[]),

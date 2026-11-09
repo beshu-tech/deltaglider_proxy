@@ -397,18 +397,18 @@ fn s3s_decoded_aws_chunked(headers: &axum::http::HeaderMap, has_credentials: boo
             .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256 "))
 }
 
-/// What `collect_blob_limited` needs from the request besides the body:
-/// the headers (aws-chunked framing, `x-amz-checksum-*`) and the trailers
-/// s3s took off a body it decoded. Taken before `req.input` moves.
-pub(super) struct BodyContext {
-    headers: axum::http::HeaderMap,
+/// What the ingest of a body needs from the request besides the body: the
+/// headers (length, aws-chunked framing, `x-amz-checksum-*`) and the
+/// trailers s3s took off a body it decoded. Taken before `req.input` moves.
+pub(crate) struct BodyContext {
+    pub(crate) headers: axum::http::HeaderMap,
     /// The body still carries aws-chunked framing (s3s did not decode it).
-    still_chunked: bool,
-    s3s_trailers: Option<s3s::TrailingHeaders>,
+    pub(crate) still_chunked: bool,
+    pub(crate) s3s_trailers: Option<s3s::TrailingHeaders>,
 }
 
 impl BodyContext {
-    pub(super) fn of<T>(req: &s3s::S3Request<T>) -> Self {
+    pub(crate) fn of<T>(req: &s3s::S3Request<T>) -> Self {
         Self {
             headers: req.headers.clone(),
             still_chunked: !s3s_decoded_aws_chunked(&req.headers, req.credentials.is_some()),
@@ -478,9 +478,9 @@ pub(crate) fn s3s_verified_payload_sha256(
     crate::deltaglider::KnownSha256::from_verified_hex(claimed)
 }
 
-/// THE collection of an object body (PutObject, UploadPart): bounded by
-/// `limit`, de-framed when s3s left aws-chunked framing, and checked
-/// against the client's `x-amz-checksum-*` header or trailer.
+/// A body collected whole for UploadPart, its one remaining caller:
+/// bounded by `limit`, de-framed when s3s left aws-chunked framing, and
+/// checked against the client's `x-amz-checksum-*` header or trailer.
 async fn collect_blob_limited(
     body: Option<s3s::dto::StreamingBlob>,
     limit: u64,
@@ -505,31 +505,8 @@ async fn collect_and_unframe(
     };
     let mut out = Vec::new();
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|e| {
-            // s3s wraps the request body in a hashing reader that
-            // verifies `x-amz-content-sha256` AS THE BODY STREAMS.
-            // On mismatch, the chunk read fails with
-            // `UploadStreamError::Sha256Mismatch` (Display string
-            // `"UploadStreamError: Sha256Mismatch"`). That IS the
-            // H1 integrity check the axum adapter performs after
-            // collecting the body — surface it as the same wire
-            // error (`BadDigest`, 400) instead of a generic 500
-            // InternalError. Match-on-Display is fragile because
-            // `UploadStreamError` is private to s3s, but the
-            // alternative (downcast) needs the type to be public.
-            // If the s3s crate ever exports the type or renames the
-            // variant, the test `test_sigv4_payload_hash_mismatch_rejected`
-            // catches the drift.
-            let msg = e.to_string();
-            if msg.contains("Sha256Mismatch") {
-                tracing::warn!(
-                    "request body sha256 doesn't match x-amz-content-sha256 header — rejecting as BadDigest"
-                );
-                return s3s::s3_error!(BadDigest);
-            }
-            tracing::error!(error = ?e, "collect_blob_limited: body chunk read failed");
-            s3s::s3_error!(InternalError, "failed to read request body: {e}")
-        })?;
+        let chunk =
+            chunk.map_err(|e| s3s::S3Error::from(crate::api::body_ingest::body_read_error(e)))?;
         let next_len = out
             .len()
             .checked_add(chunk.len())
@@ -618,15 +595,12 @@ fn policy_context_for_ip(client_ip: Option<std::net::IpAddr>) -> iam_rs::Context
     context
 }
 
+/// `Content-MD5` against a collected body (UploadPart).
 fn validate_content_md5_s3s(content_md5: Option<&str>, body: &[u8]) -> s3s::S3Result<()> {
-    let Some(content_md5) = content_md5 else {
+    let Some(expected) = crate::api::body_ingest::parse_content_md5(content_md5)? else {
         return Ok(());
     };
-    use base64::Engine as _;
     use md5::Digest as _;
-    let expected = base64::engine::general_purpose::STANDARD
-        .decode(content_md5.trim())
-        .map_err(|_| s3s::s3_error!(InvalidDigest))?;
     let actual = md5::Md5::digest(body);
     if actual.as_slice() != expected.as_slice() {
         return Err(s3s::s3_error!(BadDigest));
@@ -929,6 +903,8 @@ mod review2_tests;
 #[cfg(test)]
 mod delete_bucket_tests;
 
+#[cfg(test)]
+mod put_ingest_tests;
 /// What the read verbs send upstream, per backend and cache state.
 #[cfg(test)]
 mod read_cost_tests;

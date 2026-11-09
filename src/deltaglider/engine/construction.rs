@@ -696,6 +696,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self
     }
 
+    /// A spool of its own (tests that check the budget is whole again).
+    #[cfg(test)]
+    pub(crate) fn with_spool_dir(mut self, spool: crate::deltaglider::spool::SpoolDir) -> Self {
+        self.spool = Arc::new(spool);
+        self
+    }
+
+    /// The engine's spool (tests).
+    #[cfg(test)]
+    pub(crate) fn spool_dir(&self) -> &crate::deltaglider::spool::SpoolDir {
+        &self.spool
+    }
+
     /// Attach the per-instance usage counter (builder; called once at startup
     /// after the usage DB is opened). The handle survives engine rebuilds by
     /// being re-attached.

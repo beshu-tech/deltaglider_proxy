@@ -145,6 +145,18 @@ pub enum S3Error {
     #[error("BadDigest: The Content-MD5 you specified did not match what we received.")]
     BadDigest,
 
+    /// `Content-MD5` that is not base64 (400).
+    #[error("InvalidDigest: The Content-MD5 you specified is not valid.")]
+    InvalidDigest,
+
+    /// The body ended before the length the request declared (400).
+    #[error("IncompleteBody: {0}")]
+    IncompleteBody(String),
+
+    /// The request declares no body length (411).
+    #[error("MissingContentLength: You must provide the Content-Length HTTP header.")]
+    MissingContentLength,
+
     /// `BadDigest` whose message names the checksum (`x-amz-checksum-*`).
     #[error("BadDigest: {0}")]
     BadDigestReason(String),
@@ -204,6 +216,9 @@ impl S3Error {
             S3Error::InvalidPart(_) => "InvalidPart",
             S3Error::InvalidPartOrder => "InvalidPartOrder",
             S3Error::BadDigest | S3Error::BadDigestReason(_) => "BadDigest",
+            S3Error::InvalidDigest => "InvalidDigest",
+            S3Error::IncompleteBody(_) => "IncompleteBody",
+            S3Error::MissingContentLength => "MissingContentLength",
             S3Error::NotImplemented(_) => "NotImplemented",
             S3Error::AccessDenied => "AccessDenied",
             S3Error::AccessDeniedReason(_) => "AccessDenied",
@@ -236,6 +251,8 @@ impl S3Error {
             S3Error::InvalidPart(_) => StatusCode::BAD_REQUEST,
             S3Error::InvalidPartOrder => StatusCode::BAD_REQUEST,
             S3Error::BadDigest | S3Error::BadDigestReason(_) => StatusCode::BAD_REQUEST,
+            S3Error::InvalidDigest | S3Error::IncompleteBody(_) => StatusCode::BAD_REQUEST,
+            S3Error::MissingContentLength => StatusCode::LENGTH_REQUIRED,
             S3Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             S3Error::AccessDenied => StatusCode::FORBIDDEN,
             S3Error::AccessDeniedReason(_) => StatusCode::FORBIDDEN,
@@ -349,6 +366,9 @@ impl From<S3Error> for s3s::S3Error {
             S3Error::InvalidRange => s3s::s3_error!(InvalidRange),
             S3Error::BadDigest => s3s::s3_error!(BadDigest),
             S3Error::BadDigestReason(msg) => s3s::s3_error!(BadDigest, "{}", msg),
+            S3Error::InvalidDigest => s3s::s3_error!(InvalidDigest),
+            S3Error::IncompleteBody(msg) => s3s::s3_error!(IncompleteBody, "{}", msg),
+            S3Error::MissingContentLength => s3s::s3_error!(MissingContentLength),
             S3Error::SignatureDoesNotMatch => s3s::s3_error!(SignatureDoesNotMatch),
             S3Error::RequestTimeTooSkewed => s3s::s3_error!(RequestTimeTooSkewed),
             // 503 SlowDown must reach the wire as SlowDown — AWS SDKs back off on
@@ -367,6 +387,13 @@ impl From<S3Error> for s3s::S3Error {
                 s3s::s3_error!(InternalError, "{}", other.code())
             }
         }
+    }
+}
+
+/// A source that cannot fail (a body already in memory).
+impl From<std::convert::Infallible> for S3Error {
+    fn from(never: std::convert::Infallible) -> Self {
+        match never {}
     }
 }
 
@@ -1056,6 +1083,9 @@ mod tests {
             S3Error::InvalidPartOrder,
             S3Error::BadDigest,
             S3Error::BadDigestReason("x".into()),
+            S3Error::InvalidDigest,
+            S3Error::IncompleteBody("x".into()),
+            S3Error::MissingContentLength,
             S3Error::NotImplemented("x".into()),
             S3Error::AccessDenied,
             S3Error::AccessDeniedReason("x".into()),

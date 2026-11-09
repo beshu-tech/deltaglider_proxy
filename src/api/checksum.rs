@@ -143,15 +143,33 @@ pub fn verify_digest(
     expected_b64: &str,
     digest: &[u8],
 ) -> Result<(), ChecksumError> {
-    let expected = base64::engine::general_purpose::STANDARD
-        .decode(expected_b64.trim())
-        .ok()
-        .filter(|d| d.len() == algorithm.digest_len())
-        .ok_or(ChecksumError::Invalid(algorithm))?;
+    let expected = decode_value(algorithm, expected_b64)?;
     if digest != expected.as_slice() {
         return Err(ChecksumError::Mismatch(algorithm));
     }
     Ok(())
+}
+
+/// Pure: the raw digest a checksum value names; `Invalid` when it is not
+/// base64 of the algorithm's digest length.
+fn decode_value(algorithm: ChecksumAlgorithm, b64: &str) -> Result<Vec<u8>, ChecksumError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .ok()
+        .filter(|d| d.len() == algorithm.digest_len())
+        .ok_or(ChecksumError::Invalid(algorithm))
+}
+
+/// Pure: the checks of the checksum HEADERS that need no body, run before
+/// the first byte is read: more than one checksum, or a value that is not
+/// a digest, is refused at once. A checksum announced for the trailer is
+/// judged after the body.
+pub(crate) fn precheck_headers(headers: &HeaderMap) -> Result<(), ChecksumError> {
+    match expected_checksum(headers, None) {
+        Ok(Some((algorithm, value))) => decode_value(algorithm, &value).map(drop),
+        Ok(None) | Err(ChecksumError::MissingTrailer(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// The algorithms to compute while a body arrives, so the client's
@@ -555,6 +573,33 @@ mod tests {
         }
     }
 
+    /// The header checks that need no body: a well-formed value or a
+    /// trailer still to come pass; two checksums or a malformed one fail.
+    #[test]
+    fn checksum_headers_are_judged_before_the_body() {
+        assert_eq!(precheck_headers(&headers(&[])), Ok(()));
+        assert_eq!(
+            precheck_headers(&headers(&[("x-amz-checksum-crc32", "NhCmhg==")])),
+            Ok(())
+        );
+        assert_eq!(
+            precheck_headers(&headers(&[("x-amz-trailer", "x-amz-checksum-crc32")])),
+            Ok(()),
+            "the trailer arrives after the body"
+        );
+        assert_eq!(
+            precheck_headers(&headers(&[("x-amz-checksum-crc32", "dGVzdA==AA")])),
+            Err(ChecksumError::Invalid(Crc32))
+        );
+        assert_eq!(
+            precheck_headers(&headers(&[
+                ("x-amz-checksum-crc32", "NhCmhg=="),
+                ("x-amz-checksum-sha1", "98O8HYCOBHMq32eZZczDTKeuNEE="),
+            ])),
+            Err(ChecksumError::Multiple)
+        );
+    }
+
     /// The late re-hash gives the same digest over a memory body and over
     /// a spool file.
     #[tokio::test]
@@ -565,7 +610,8 @@ mod tests {
             crate::deltaglider::spool::SpoolDir::new(tmp.path().to_path_buf(), 64 << 20).unwrap();
         for &(algorithm, body, b64) in VECTORS {
             let memory = IngestedBody::hashed_from_bytes(bytes::Bytes::from_static(body));
-            let spooled = IngestedBody::spooled_for_test(&pool, body).await;
+            let spooled =
+                IngestedBody::spooled_for_test(&pool, bytes::Bytes::from_static(body)).await;
             for b in [&memory, &spooled] {
                 let digest = digest_of(algorithm, b).await.unwrap();
                 assert_eq!(

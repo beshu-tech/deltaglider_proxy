@@ -52,6 +52,24 @@ struct HashedSpool<'a> {
     spool: &'a crate::deltaglider::spool::Spool,
     sha256: &'a str,
     md5: &'a str,
+    /// The reservation the ingest of this body took for its storage writes.
+    storage: Option<&'a crate::deltaglider::spool::SpoolReservation>,
+}
+
+/// The spool reservation of one storage write's temp files: the one the
+/// ingest of the body carried, or one taken for this write.
+enum StorageSpool<'a> {
+    Carried(&'a crate::deltaglider::spool::SpoolReservation),
+    Own(Option<crate::deltaglider::spool::SpoolReservation>),
+}
+
+impl StorageSpool<'_> {
+    fn get(&self) -> Option<&crate::deltaglider::spool::SpoolReservation> {
+        match self {
+            StorageSpool::Carried(r) => Some(r),
+            StorageSpool::Own(r) => r.as_ref(),
+        }
+    }
 }
 
 impl PassthroughMultipartHandle {
@@ -226,6 +244,9 @@ struct PutObject<'a> {
     multipart_etag: Option<String>,
     /// What the key held before: the commit records the counter against it.
     prior: &'a CounterPrior,
+    /// The reservation the ingest of a spooled body took for its storage
+    /// writes (see [`HashedSpool::storage`]).
+    storage: Option<&'a crate::deltaglider::spool::SpoolReservation>,
 }
 
 impl PutObject<'_> {
@@ -493,7 +514,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
         known_prior: Option<CounterPrior>,
-        known_sha256: Option<KnownSha256>,
+        known: Option<BodyHashes>,
     ) -> Result<StoreResult, EngineError> {
         // Invalidate stale metadata on overwrite (before the write, so concurrent
         // readers don't see outdated metadata during the write window).
@@ -520,8 +541,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // counter is best-effort and reconciled by Refresh.
         let prior = self.prior_or_read(bucket, key, known_prior).await;
 
-        // Calculate hashes (the SHA-256 only when the caller does not know it).
-        let (sha256, md5) = BodyHashes::compute(data, known_sha256).await?.into_parts();
+        // The hashes of the body: from its ingest, else computed here.
+        let (sha256, md5) = match known {
+            Some(hashes) => hashes,
+            None => BodyHashes::compute(data, None).await?,
+        }
+        .into_parts();
 
         info!(
             "Storing {}/{} ({} bytes, sha256={})",
@@ -545,6 +570,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             user_metadata,
             multipart_etag,
             prior: &prior,
+            storage: None,
         };
         if let Some(reason) = self.decline_reason(bucket, &obj_key, &put.user_metadata, put.size) {
             // The key's write lock only (P7.4): see `write_passthrough_locked`.
@@ -690,13 +716,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             multipart_etag,
             None,
             known_hashes,
+            None,
         )
         .await
     }
 
     /// Body of [`Self::store_spooled_delta`]. The commit records the counter;
     /// this attaches the accounting to the result. `known_prior`: as for
-    /// [`Self::store_inner`].
+    /// [`Self::store_inner`]. `storage`: the reservation the ingest of the
+    /// body took for its storage writes; the writes use it before they
+    /// reserve anything.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn store_spooled_delta_inner(
         &self,
@@ -710,6 +739,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         multipart_etag: Option<String>,
         known_prior: Option<CounterPrior>,
         known_hashes: Option<BodyHashes>,
+        storage: Option<&crate::deltaglider::spool::SpoolReservation>,
     ) -> Result<StoreResult, EngineError> {
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
@@ -763,6 +793,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         spool: body,
                         sha256: &sha256,
                         md5: &md5,
+                        storage,
                     }),
                     size,
                     content_type,
@@ -790,6 +821,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             user_metadata,
             multipart_etag,
             prior: &prior,
+            storage,
         };
         self.store_delta_eligible(put).await
     }
@@ -915,12 +947,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     EncodedDelta::Spooled { .. } => {
                         let held_mib =
                             put.body.held().map_or(0, |b| b.reserved_mib()) + delta.held_mib();
-                        self.reserve_storage_spool(put.bucket, delta_len, false, held_mib)
+                        self.storage_spool(put.storage, put.bucket, delta_len, held_mib)
                             .await?
                     }
-                    EncodedDelta::InRam(_) | EncodedDelta::None => None,
+                    EncodedDelta::InRam(_) | EncodedDelta::None => StorageSpool::Own(None),
                 };
-                let body = delta.body(&self.spool, reserved.as_ref())?;
+                let body = delta.body(&self.spool, reserved.get())?;
                 let result = self
                     .commit_delta(&put, ref_meta, body, delta_len, fresh_baseline, xnode)
                     .await?;
@@ -944,16 +976,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // never waits (a holder never waits): safe under the lock.
                 let reserved = match put.body {
                     PutBody::Spooled(body) => {
-                        self.reserve_storage_spool(put.bucket, put.size, false, body.reserved_mib())
+                        self.storage_spool(put.storage, put.bucket, put.size, body.reserved_mib())
                             .await?
                     }
-                    PutBody::Buffered(_) => None,
+                    PutBody::Buffered(_) => StorageSpool::Own(None),
                 };
                 // Write passthrough FIRST, then clean up. This prevents
                 // transient 404s on concurrent GETs during strategy
                 // transition.
                 let result = self
-                    .write_passthrough_locked(put.passthrough_write(reason), reserved.as_ref())
+                    .write_passthrough_locked(put.passthrough_write(reason), reserved.get())
                     .await?;
                 self.count_decision("passthrough");
                 let removed = remove_fresh_baseline
@@ -1244,6 +1276,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         })
     }
 
+    /// The spool reservation of a storage write of `bytes`: the one the
+    /// ingest of the body `carried`, else a new one. The op holds
+    /// `held_mib` already, so that one never waits (a holder never waits):
+    /// safe under the locks.
+    async fn storage_spool<'r>(
+        &self,
+        carried: Option<&'r crate::deltaglider::spool::SpoolReservation>,
+        bucket: &str,
+        bytes: u64,
+        held_mib: usize,
+    ) -> Result<StorageSpool<'r>, EngineError> {
+        if let Some(r) = carried {
+            return Ok(StorageSpool::Carried(r));
+        }
+        Ok(StorageSpool::Own(
+            self.reserve_storage_spool(bucket, bytes, false, held_mib)
+                .await?,
+        ))
+    }
+
     /// Write this PUT's body as the deltaspace baseline.
     async fn write_baseline(
         &self,
@@ -1279,7 +1331,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // The body spool makes this op a holder, so the reservation
                 // for the storage write's own temp file never waits.
                 let reserved = self
-                    .reserve_storage_spool(put.bucket, put.size, false, body.reserved_mib())
+                    .storage_spool(put.storage, put.bucket, put.size, body.reserved_mib())
                     .await?;
                 xnode
                     .put_reference_from_file(
@@ -1288,7 +1340,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         put.deltaspace_id,
                         body.path(),
                         &metadata,
-                        SpoolBudget::new(&self.spool, Some(body), reserved.as_ref()),
+                        SpoolBudget::new(&self.spool, Some(body), reserved.get()),
                     )
                     .await?;
                 self.record_reference(put.bucket, put.size as i64);
@@ -2051,12 +2103,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             total_size,
             PassthroughReason::MultipartOverDeltaCap,
         );
+        let carried = held.and_then(|h| h.storage);
         let held = held.map(|h| h.spool);
         let reserved = self
-            .reserve_storage_spool(
+            .storage_spool(
+                carried,
                 bucket,
                 total_size,
-                false,
                 held.map_or(0, crate::deltaglider::spool::Spool::reserved_mib),
             )
             .await?;
@@ -2082,8 +2135,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 held,
             },
         };
-        self.write_passthrough_locked(write, reserved.as_ref())
-            .await
+        self.write_passthrough_locked(write, reserved.get()).await
     }
 
     /// Begin a streaming passthrough multipart upload (Phase B). Gated on
@@ -3226,6 +3278,56 @@ mod review2_tests {
             )
             .await
             .unwrap();
+        let (got, _) = engine.retrieve("b", "x/a.png").await.unwrap();
+        assert_eq!(got, v);
+    }
+
+    /// The ingest of a body reserves the storage write's temp files with the
+    /// body, and the store uses that reservation: with the rest of the spool
+    /// taken by others, an encrypted streaming PUT still stores (it no
+    /// longer asks for new budget under its locks, where a full budget was
+    /// a SlowDown).
+    #[tokio::test]
+    async fn an_ingested_body_carries_the_spool_of_its_storage_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = encrypted_engine(&tmp, 4 * 1024 * 1024)
+            .await
+            .with_memory_budget(crate::deltaglider::memory_budget::MemoryBudget::new(0));
+        let v = vec![5u8; 1_500_000];
+        let body = crate::deltaglider::ingest::ingest_bytes(
+            &engine,
+            "b",
+            Bytes::from(v.clone()),
+            u64::MAX,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                body,
+                crate::deltaglider::ingest::IngestedBody::Spooled { .. }
+            ),
+            "{body:?}"
+        );
+        let others = engine
+            .spool
+            .try_acquire((engine.spool.free_mib() * 1024 * 1024) as u64)
+            .unwrap();
+        assert_eq!(engine.spool.free_mib(), 0, "the rest of the spool is taken");
+        engine
+            .store_conditional(
+                "b",
+                "x/a.png",
+                body,
+                None,
+                HashMap::new(),
+                &crate::deltaglider::Precondition::none(),
+            )
+            .await
+            .expect("the ciphertext temp uses the ingest's reservation");
+        drop(others);
+        assert_eq!(engine.spool.free_mib(), 4, "every reservation released");
         let (got, _) = engine.retrieve("b", "x/a.png").await.unwrap();
         assert_eq!(got, v);
     }

@@ -599,50 +599,36 @@ fn engine_error_maps_to_s3s_code() {
     assert_eq!(e.message(), Some("InternalError"));
 }
 
-#[tokio::test]
-async fn collect_blob_limited_rejects_oversize_body() {
-    let blob = s3s::dto::StreamingBlob::from(s3s::Body::from(bytes::Bytes::from_static(b"abcd")));
-    let ctx = body_ctx(&[], false);
-    let err = collect_blob_limited(Some(blob), 3, &ctx).await.unwrap_err();
-    assert_eq!(err.code(), &s3s::S3ErrorCode::EntityTooLarge);
-}
-
-fn body_ctx(headers: &[(&'static str, &str)], still_chunked: bool) -> BodyContext {
-    let mut map = axum::http::HeaderMap::new();
-    for (k, v) in headers {
-        map.append(*k, v.parse().unwrap());
-    }
-    BodyContext {
-        headers: map,
-        still_chunked,
-        s3s_trailers: None,
-    }
-}
-
-async fn collect(body: &'static [u8], ctx: &BodyContext) -> s3s::S3Result<bytes::Bytes> {
-    let blob = s3s::dto::StreamingBlob::from(s3s::Body::from(bytes::Bytes::from_static(body)));
-    collect_blob_limited(Some(blob), 1 << 20, ctx).await
-}
-
 /// Every client object body is checked against its `x-amz-checksum-*`:
-/// an s3s verb reads `input.body` only through `collect_blob_limited`, the
-/// request path de-frames aws-chunked bodies only with the trailer-keeping
-/// decoder, and the form POST runs the same check.
+/// an s3s verb reads `input.body` only as the body argument of
+/// `ingest_client_body` (or of `collect_blob_limited`, which UploadPart
+/// still uses), the request path de-frames aws-chunked bodies only with
+/// the trailer-keeping decoder, and the form POST runs the same check.
 #[test]
 fn every_client_body_passes_the_checksum_check() {
     use crate::source_scan::{files, prod_lines, read, rel};
     let test_files = crate::source_scan::out_of_line_test_modules(&files("src", "rs"));
     let mut offenders = Vec::new();
+    let mut ingested = 0;
     for path in files("src", "rs") {
         let file = rel(&path);
         if test_files.contains(&path) {
             continue;
         }
         let text = read(&file);
-        for (n, line) in prod_lines(&text) {
-            let body_read = file.starts_with("src/s3_adapter_s3s/")
-                && line.contains("input.body")
-                && !line.contains("collect_blob_limited(input.body");
+        let lines = prod_lines(&text);
+        for (i, (n, line)) in lines.iter().enumerate() {
+            // rustfmt puts a long call's arguments on lines of their own:
+            // the call is on one of the lines just above the argument.
+            let in_ingest_call = lines[i.saturating_sub(6)..=i]
+                .iter()
+                .any(|(_, l)| l.contains("ingest_client_body("));
+            let read_here = file.starts_with("src/s3_adapter_s3s/") && line.contains("input.body");
+            if read_here && in_ingest_call {
+                ingested += 1;
+            }
+            let body_read =
+                read_here && !in_ingest_call && !line.contains("collect_blob_limited(input.body");
             // The trailer-dropping decoder: its own module, the fuzz entry
             // and the fake S3 backend only.
             let trailer_drop = line.contains("decode_aws_chunked(")
@@ -656,62 +642,67 @@ fn every_client_body_passes_the_checksum_check() {
         }
     }
     assert!(offenders.is_empty(), "unchecked body: {offenders:#?}");
+    assert!(ingested >= 1, "the scan found PutObject's ingest");
     let form = crate::source_scan::prod_text(&read("src/api/handlers/form_post.rs"));
     assert!(form.contains("checksum::verify_body_checksum("));
 }
 
-/// CRC32 of `hello` is 3610a686.
-#[tokio::test]
-async fn collect_blob_limited_checks_the_checksum_header() {
-    let right = body_ctx(&[("x-amz-checksum-crc32", "NhCmhg==")], false);
-    assert_eq!(collect(b"hello", &right).await.unwrap().as_ref(), b"hello");
-    let err = collect(b"hellO", &right).await.unwrap_err();
-    assert_eq!(err.code(), &s3s::S3ErrorCode::BadDigest);
-    let malformed = body_ctx(&[("x-amz-checksum-crc32", "dGVzdA==AA")], false);
-    let err = collect(b"hello", &malformed).await.unwrap_err();
-    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+/// The text of production function `name` in `file` (from its `fn` line to
+/// the next `fn` line).
+fn prod_fn_text(file: &str, name: &str) -> String {
+    let text = crate::source_scan::prod_text(&crate::source_scan::read(file));
+    let start = text
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("{file}: no fn {name}"));
+    let rest = &text[start + 3..];
+    let end = ["\nfn ", " fn "]
+        .iter()
+        .filter_map(|p| rest.find(p))
+        .min()
+        .unwrap_or(rest.len());
+    rest[..end].to_string()
 }
 
-/// The trailer of a body this adapter de-frames is checked too.
-#[tokio::test]
-async fn collect_blob_limited_checks_the_chunked_trailer() {
-    let headers = [
-        ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
-        ("x-amz-decoded-content-length", "5"),
-        ("x-amz-trailer", "x-amz-checksum-crc32"),
-    ];
-    let ctx = body_ctx(&headers, true);
-    let right = collect(
-        b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n",
-        &ctx,
-    )
-    .await;
-    assert_eq!(right.unwrap().as_ref(), b"hello");
-    let wrong = collect(
-        b"5\r\nhellO\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n",
-        &ctx,
-    )
-    .await;
-    assert_eq!(wrong.unwrap_err().code(), &s3s::S3ErrorCode::BadDigest);
-    let missing = collect(b"5\r\nhello\r\n0\r\n\r\n", &ctx).await;
-    assert_eq!(
-        missing.unwrap_err().code(),
-        &s3s::S3ErrorCode::InvalidRequest
-    );
-}
-
+/// A client write reads its whole body (and checks it) BEFORE it takes the
+/// object's write lock: the lock is held for the store, never for the
+/// upload, so a slow client does not block every other writer of the key.
+/// PutObject, CopyObject through the store and the form POST each call
+/// their ingest before `store_client_write` (which takes the lock), and
+/// take no lock of their own.
 #[test]
-fn content_md5_validation_detects_mismatch() {
-    use base64::Engine as _;
-    use md5::Digest as _;
-    let good = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(b"abc"));
-    assert!(validate_content_md5_s3s(Some(&good), b"abc").is_ok());
-    assert_eq!(
-        validate_content_md5_s3s(Some(&good), b"xyz")
-            .unwrap_err()
-            .code(),
-        &s3s::S3ErrorCode::BadDigest
-    );
+fn client_writes_take_the_object_lock_after_the_body() {
+    for (file, func, ingest) in [
+        (
+            "src/s3_adapter_s3s/object.rs",
+            "put_object",
+            "ingest_client_body(",
+        ),
+        (
+            "src/s3_adapter_s3s/copy.rs",
+            "copy_through_store",
+            "read_copy_source(",
+        ),
+        (
+            "src/api/handlers/form_post.rs",
+            "handle_form_post_upload",
+            "ingest_bytes(",
+        ),
+    ] {
+        let body = prod_fn_text(file, func);
+        let ingest_at = body
+            .find(ingest)
+            .unwrap_or_else(|| panic!("{file} {func}: no {ingest}"));
+        let store_at = body
+            .find("store_client_write(")
+            .unwrap_or_else(|| panic!("{file} {func}: no store_client_write"));
+        assert!(
+            ingest_at < store_at,
+            "{file} {func}: the store before the body"
+        );
+        for lock in ["lock_and_check(", "lock_object_write("] {
+            assert!(!body.contains(lock), "{file} {func} takes {lock} itself");
+        }
+    }
 }
 
 /// An object stored at 12:00:05.700, and an HTTP date `delta` whole
@@ -1015,48 +1006,6 @@ proptest::proptest! {
     }
 }
 
-#[tokio::test]
-async fn signed_payload_hash_validation_detects_mismatch() {
-    use sha2::Digest as _;
-    let signed = |h: &str| crate::api::auth::SignedPayloadHash(h.to_string());
-    let small = bytes::Bytes::from_static(b"abc");
-    // Above the blocking threshold: hashed on a blocking thread.
-    let large = bytes::Bytes::from(vec![7u8; crate::deltaglider::BLOCKING_HASH_THRESHOLD + 1]);
-    for body in [small, large] {
-        let good = hex::encode(sha2::Sha256::digest(&body));
-        let verified = verify_signed_payload_hash_s3s(Some(&signed(&good)), &body)
-            .await
-            .unwrap();
-        assert_eq!(verified.map(|d| d.to_hex()), Some(good.clone()));
-        // Uppercase hex is the same digest.
-        let upper = verify_signed_payload_hash_s3s(Some(&signed(&good.to_uppercase())), &body)
-            .await
-            .unwrap();
-        assert_eq!(upper.map(|d| d.to_hex()), Some(good));
-        let bad = "0".repeat(64);
-        assert_eq!(
-            verify_signed_payload_hash_s3s(Some(&signed(&bad)), &body)
-                .await
-                .unwrap_err()
-                .code(),
-            &s3s::S3ErrorCode::BadDigest
-        );
-        // No hash to check: the engine hashes the body.
-        for unsigned in ["UNSIGNED-PAYLOAD", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"] {
-            assert!(
-                verify_signed_payload_hash_s3s(Some(&signed(unsigned)), &body)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-        }
-        assert!(verify_signed_payload_hash_s3s(None, &body)
-            .await
-            .unwrap()
-            .is_none());
-    }
-}
-
 /// Truth table of `s3s_verified_payload_sha256`: a digest only for a
 /// unique SigV4 header with a unique lowercase-hex payload hash and no
 /// SigV2 query signature.
@@ -1134,10 +1083,11 @@ fn completed_parts_conversion_requires_etags() {
 }
 
 /// X2: CopyObject read its whole source into memory (`engine.retrieve`)
-/// whatever its size. Above the spool threshold the source must stream
-/// into a spool file instead; at or below it stays the buffer it was.
+/// whatever its size. The source goes through the PutObject ingest: above
+/// the spool threshold into a spool file, at or below it into memory.
 #[tokio::test]
 async fn copy_source_above_the_spool_threshold_streams_to_a_spool() {
+    use crate::deltaglider::ingest::IngestedBody;
     use crate::deltaglider::{DeltaGliderEngine, DynEngine};
     let dir = tempfile::tempdir().unwrap();
     let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
@@ -1145,49 +1095,47 @@ async fn copy_source_above_the_spool_threshold_streams_to_a_spool() {
             .await
             .unwrap(),
     );
-    let engine: DynEngine = DeltaGliderEngine::new_with_backend(
-        Arc::new(backend),
-        &crate::config::Config::default(),
-        None,
-    );
+    let mut config = crate::config::Config::default();
+    config.tuning.spool_threshold_bytes = Some(64 * 1024);
+    let engine: DynEngine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
     engine.create_bucket("src").await.unwrap();
-    let body: Vec<u8> = (0..200 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
+    let small: Vec<u8> = (0..32 * 1024u32).map(|i| (i * 7 % 251) as u8).collect();
+    let large: Vec<u8> = (0..200 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
     for key in ["a/blob.dat", "a/app.zip"] {
-        engine
-            .store("src", key, &body, None, Default::default())
-            .await
-            .unwrap();
-        let size = engine.head("src", key).await.unwrap().file_size;
-        match read_copy_source(&engine, "src", key, size, 64 * 1024)
-            .await
-            .unwrap()
-        {
-            CopySourceBody::Spooled { spool, size, .. } => {
-                assert_eq!(size, body.len() as u64, "{key}");
-                assert_eq!(std::fs::read(spool.path()).unwrap(), body, "{key}");
+        for (body, spooled) in [(&large, true), (&small, false)] {
+            engine
+                .store("src", key, body, None, Default::default())
+                .await
+                .unwrap();
+            let size = engine.head("src", key).await.unwrap().file_size;
+            let (got, metadata) = read_copy_source(&engine, "src", key, "dst", size)
+                .await
+                .unwrap();
+            assert_eq!(metadata.file_size, size, "{key}");
+            assert_eq!(got.size(), body.len() as u64, "{key}");
+            match got {
+                IngestedBody::Spooled { spool, .. } if spooled => {
+                    assert_eq!(std::fs::read(spool.path()).unwrap(), *body, "{key}")
+                }
+                IngestedBody::Memory { data, .. } if !spooled => assert_eq!(data, *body, "{key}"),
+                other => panic!("{key}: {} bytes in the wrong medium: {other:?}", body.len()),
             }
-            // A delta source is reconstructed by `retrieve_stream`, which
-            // spools only above the ENGINE's threshold (the same value in
-            // production; the default here): its buffer is bounded by it.
-            CopySourceBody::Buffered(data, _) if key.ends_with(".zip") => {
-                assert_eq!(data, body, "{key}")
-            }
-            CopySourceBody::Buffered(..) => panic!("{key}: a large source was buffered"),
-        }
-        match read_copy_source(&engine, "src", key, size, size)
-            .await
-            .unwrap()
-        {
-            CopySourceBody::Buffered(data, _) => assert_eq!(data, body, "{key}"),
-            CopySourceBody::Spooled { .. } => panic!("{key}: a small source was spooled"),
         }
     }
-    // A source that grew after the HEAD does not overrun its reservation.
-    let grown = read_copy_source(&engine, "src", "a/blob.dat", 100 * 1024, 64 * 1024).await;
-    assert_eq!(
-        grown.err().map(|e| e.code().as_str().to_string()),
-        Some("SlowDown".to_string())
-    );
+    // A source that changed after the HEAD the conditionals judged is a
+    // retryable SlowDown, larger or smaller.
+    for head_size in [100 * 1024, 300 * 1024] {
+        engine
+            .store("src", "a/blob.dat", &large, None, Default::default())
+            .await
+            .unwrap();
+        let changed = read_copy_source(&engine, "src", "a/blob.dat", "dst", head_size).await;
+        assert_eq!(
+            changed.err().map(|e| e.code().as_str().to_string()),
+            Some("SlowDown".to_string()),
+            "{head_size}"
+        );
+    }
 }
 
 /// N10: a multipart completion that tries no delta (a non-eligible key, the

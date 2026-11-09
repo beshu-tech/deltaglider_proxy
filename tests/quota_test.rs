@@ -118,8 +118,8 @@ async fn test_quota_first_put_optimistic() {
 #[tokio::test]
 async fn test_quota_second_put_enforced() {
     // After the first PUT triggers a scan, subsequent PUTs are enforced.
-    // We use a generous quota (10KB) and overshoot it significantly,
-    // then retry until the scanner catches up (up to 10 seconds).
+    // We use a generous quota (10KB), fill 9KB of it, then probe with 2KB
+    // until the scanner catches up (up to 10 seconds).
     //
     // DGP_USAGE_CACHE_TTL_SECS=1 shortens the scan cache TTL so that
     // each probe retriggers a re-scan; in production the default 5-min
@@ -134,9 +134,14 @@ async fn test_quota_second_put_enforced() {
         .build()
         .await;
 
-    // First PUT: 20 KB (optimistic, no cached data) — it triggers a background
-    // scan via check_quota → get_or_scan (cache empty → enqueue).
-    put_sized(&server, "seed.bin", 20000).await.ok();
+    // First PUT: 9 KB, under the quota. Its quota check (on the declared
+    // length, before the body) triggers a background scan via check_quota →
+    // get_or_scan (cache empty → enqueue). The check on the exact size after
+    // the body can already see that scan, so a seed above the quota could
+    // be refused itself.
+    put_sized(&server, "seed.bin", 9000)
+        .await
+        .expect("a seed under the quota is stored");
 
     // Signal-driven poll: wait for a scan to complete (bounded, non-panicking),
     // then probe. Replaces the old blind sleep(500ms)×N loop while preserving
@@ -157,7 +162,7 @@ async fn test_quota_second_put_enforced() {
             std::time::Duration::from_millis(500),
         )
         .await;
-        if put_sized(&server, "probe.bin", 10).await.is_err() {
+        if put_sized(&server, "probe.bin", 2000).await.is_err() {
             blocked = true;
             break;
         }

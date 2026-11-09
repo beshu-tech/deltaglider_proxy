@@ -571,23 +571,28 @@ pub(super) async fn put_object(
     // One HeadBucket per bucket per 5 seconds, not one per PUT.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
 
-    let data = collect_blob_limited(input.body, engine.max_object_size(), &body_ctx).await?;
-    // s3s verified the signed payload hash while the body streamed in: its
-    // digest is the body's SHA-256. Otherwise a verifiable signed hash is
-    // checked here, and an unsigned shape leaves the hashing to the engine.
-    let known_sha256 = match s3s_verified_sha256 {
-        Some(verified) => Some(verified),
-        None => verify_signed_payload_hash_s3s(signed_payload_hash.as_ref(), &data).await?,
-    };
-    validate_content_md5_s3s(input.content_md5.as_deref(), &data)?;
-    // The body is already collected here (SigV4 payload-hash verification
-    // needs it); the engine spools a large delta-eligible body.
-    let result = crate::api::handlers::object_helpers::store_client_write_hashed(
+    // The body, read once and checked, before the object's write lock: the
+    // lock is held for the store, never for the upload.
+    let body = crate::api::body_ingest::ingest_client_body(
+        &svc.state,
+        &input.bucket,
+        &input.key,
+        input.body,
+        &body_ctx,
+        engine.max_object_size(),
+        crate::api::body_ingest::ContentChecks {
+            content_md5: input.content_md5.as_deref(),
+            signed_payload_hash: signed_payload_hash.as_ref(),
+            s3s_verified_sha256,
+        },
+    )
+    .await?;
+    let result = crate::api::handlers::object_helpers::store_client_write(
         &svc.state,
         crate::api::handlers::object_helpers::ClientWrite {
             bucket: &input.bucket,
             key: &input.key,
-            data: data.clone(),
+            body,
             content_type: input.content_type,
             user_metadata: input.metadata.unwrap_or_default(),
             precondition: &crate::deltaglider::Precondition {
@@ -595,7 +600,6 @@ pub(super) async fn put_object(
                 if_none_match: input.if_none_match,
             },
         },
-        known_sha256,
     )
     .await?;
     let mut resp = s3s::S3Response::new(s3s::dto::PutObjectOutput {
@@ -838,36 +842,6 @@ pub(super) fn apply_get_response_overrides(
     if let Some(v) = input.response_expires.as_ref() {
         output.expires = Some(v.clone());
     }
-}
-
-/// Check a signed payload hash that s3s did not verify against the body
-/// (`s3s_verified_payload_sha256` returned `None`). Returns the body's
-/// SHA-256 when the check ran and passed, `None` for an unsigned shape. A
-/// body above `BLOCKING_HASH_THRESHOLD` hashes on a blocking thread.
-pub(super) async fn verify_signed_payload_hash_s3s(
-    signed: Option<&crate::api::auth::SignedPayloadHash>,
-    body: &bytes::Bytes,
-) -> s3s::S3Result<Option<crate::deltaglider::KnownSha256>> {
-    let Some(claimed) = signed.filter(|c| c.is_verifiable_hex()).cloned() else {
-        return Ok(None);
-    };
-    let check = move |body: &[u8]| {
-        // Delegate to the canonical verifier so axum + s3s can never desync
-        // on the H1 integrity contract (BadDigest / NotImplemented).
-        claimed.verify_against_body(body)?;
-        Ok::<_, crate::api::S3Error>(crate::deltaglider::KnownSha256::from_verified_hex(
-            claimed.as_str(),
-        ))
-    };
-    let verified = if body.len() <= crate::deltaglider::BLOCKING_HASH_THRESHOLD {
-        check(body)
-    } else {
-        let body = body.clone();
-        tokio::task::spawn_blocking(move || check(&body))
-            .await
-            .map_err(|e| s3s::s3_error!(InternalError, "hash task: {e}"))?
-    };
-    Ok(verified?)
 }
 
 pub(super) fn validate_delete_objects_count(count: usize) -> s3s::S3Result<()> {

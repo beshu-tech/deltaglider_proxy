@@ -22,6 +22,22 @@ Status legend:
 | `DeleteObject` | ✅ Full | Deletes one key. A key that ends in `/` deletes only the folder marker with that name, never the keys under it, as on S3. To delete a folder, list its keys and delete them with `DeleteObjects` (the object browser and `aws s3 rm --recursive` do this). A missing key is treated as success (S3 semantics). |
 | `DeleteObjects` | ✅ Full | Batch delete up to 1000 keys; `Quiet` flag and per-key error reporting honoured. The batch finishes even when the client disconnects or the request times out, because the proxy runs it in its own task. The proxy works on up to 8 folders at the same time, and each deleted key gets its event as soon as it is deleted. |
 
+### How the proxy reads an upload body
+
+The proxy reads the body of a `PutObject` request once, before it takes the write lock of the object, and it checks the body while it reads it. A body of at most `DGP_SPOOL_THRESHOLD_BYTES` (16 MiB by default) goes into memory when the memory budget for upload bodies (`DGP_INGEST_MEMORY_MAX_BYTES`) has room for it. Every other body goes into a file in the spool directory (`DGP_SPOOL_DIR`). A `CopyObject` request that the proxy cannot copy as stored reads its source in the same way.
+
+Before the proxy reads the first byte of the body, it checks what the request headers say about the body:
+
+- The request must declare the length of its body: `Content-Length`, or `x-amz-decoded-content-length` for an aws-chunked body. The proxy reserves memory or spool space for that length before it reads the body, so a request that declares no length (for example a body sent with plain `Transfer-Encoding: chunked`) gets `411 MissingContentLength`. A request with neither header and no body is an empty upload.
+- A declared length larger than `max_object_size` gets `413 EntityTooLarge`.
+- A declared length larger than the whole spool budget (`DGP_SPOOL_MAX_BYTES`) gets `413 EntityTooLarge`, with a message that names `DGP_SPOOL_MAX_BYTES`, because the proxy could never hold such a body in a spool file.
+- A `Content-MD5` header that is not base64 gets `400 InvalidDigest`. More than one `x-amz-checksum-*` header, or a value that is not a digest of the right length, gets `400 InvalidRequest`.
+- The bucket quota is checked against the declared length, and it is checked again against the exact size after the body has arrived.
+
+While the body arrives, the proxy computes the checksums that the request announces in an `x-amz-checksum-*` header, in `x-amz-trailer`, or in `x-amz-sdk-checksum-algorithm`. For a SigV4 request that signs a payload hash, the S3 protocol layer checks the hash while the body streams, and a body that does not match gets `400 BadDigest`. After the last byte, the proxy compares the checksum header or trailer, a signed payload hash, and `Content-MD5` with what it computed. A trailer checksum of an algorithm that the request did not announce is computed from the received body in one more pass. A mismatch gets `400 BadDigest`. A body that is longer than its declared length gets `400 InvalidArgument`, and a body that ends before its declared length gets `400 IncompleteBody`.
+
+A body that fails any of these checks is never stored. The proxy deletes its spool file and gives its memory and spool space back at once.
+
 ### Storage facts on write responses
 
 The proxy tells the writer how it stored each object. The responses to `PutObject`, `CompleteMultipartUpload`, `CopyObject` and a browser form upload carry these headers:

@@ -27,7 +27,7 @@ const KIB: u64 = 1024;
 pub struct MemoryBudget(Arc<Inner>);
 
 struct Inner {
-    /// The budget, in KiB. `0`: every body takes the spool path.
+    /// The budget, in KiB. `0`: every non-empty body takes the spool path.
     max_kib: u64,
     /// KiB held by live permits.
     held_kib: AtomicU64,
@@ -70,7 +70,8 @@ impl Default for MemoryBudget {
 }
 
 impl MemoryBudget {
-    /// A budget of `max_bytes` (rounded up to KiB). `0` grants nothing.
+    /// A budget of `max_bytes` (rounded up to KiB). `0` grants only empty
+    /// bodies.
     pub fn new(max_bytes: u64) -> Self {
         Self(Arc::new(Inner {
             max_kib: max_bytes.div_ceil(KIB),
@@ -93,13 +94,14 @@ impl MemoryBudget {
         Self::new(u64::MAX)
     }
 
-    /// `bytes` of the budget now, or `None`. Never waits.
+    /// `bytes` of the budget now, or `None`. Never waits. An empty body
+    /// costs nothing and is always granted: it has no bytes to put on disk.
     pub fn try_reserve(&self, bytes: u64) -> Option<MemoryPermit> {
         let inner = &self.0;
-        if inner.max_kib == 0 {
+        let kib = bytes.div_ceil(KIB);
+        if inner.max_kib == 0 && kib > 0 {
             return None;
         }
-        let kib = bytes.div_ceil(KIB);
         let held = inner
             .held_kib
             .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
@@ -155,17 +157,18 @@ mod tests {
     }
 
     #[test]
-    fn rounds_up_to_kib_and_zero_grants_nothing() {
+    fn rounds_up_to_kib_and_zero_grants_only_empty_bodies() {
         let budget = MemoryBudget::new(2 * KIB);
         let p = budget.try_reserve(1).unwrap();
         assert_eq!(p.bytes(), KIB);
         assert!(budget.try_reserve(KIB + 1).is_none());
         let off = MemoryBudget::new(0);
+        // An empty body costs nothing (a folder marker has no file).
+        assert_eq!(off.try_reserve(0).map(|p| p.bytes()), Some(0));
         assert!(
-            off.try_reserve(0).is_none(),
-            "0 sends every body to the spool"
+            off.try_reserve(1).is_none(),
+            "0 sends every other body to the spool"
         );
-        assert!(off.try_reserve(1).is_none());
         assert!(MemoryBudget::unbounded().try_reserve(u64::MAX).is_some());
     }
 
@@ -219,7 +222,7 @@ mod memory_budget_model_tests {
                         // Never waits: granted exactly when it fits now.
                         prop_assert_eq!(
                             got.is_some(),
-                            max > 0 && n.div_ceil(KIB) * KIB <= free,
+                            n.div_ceil(KIB) * KIB <= free && (max > 0 || n == 0),
                             "try {} with {} free", n, free
                         );
                         held.extend(got);

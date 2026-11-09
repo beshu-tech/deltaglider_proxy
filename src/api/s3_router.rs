@@ -405,7 +405,7 @@ where
             Err(e) => {
                 tracing::warn!("form-POST body collection failed or exceeded limit: {e}");
                 // Proper S3 XML error (EntityTooLarge) so SDKs/Cyberduck parse it,
-                // matching the PUT path's collect_blob_limited behaviour.
+                // as the PUT path answers a body over the limit.
                 return crate::api::S3Error::EntityTooLarge {
                     size: 0,
                     max: max_body as u64,

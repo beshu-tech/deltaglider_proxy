@@ -62,34 +62,24 @@ pub(crate) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEv
 pub(crate) struct ClientWrite<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
-    /// The body as collected: shared, never copied, down to the storage write.
-    pub data: bytes::Bytes,
+    /// The body as its ingest read it: in memory (shared, never copied,
+    /// down to the storage write) or in a spool file, with its hashes.
+    pub body: crate::deltaglider::ingest::IngestedBody,
     pub content_type: Option<String>,
     pub user_metadata: std::collections::HashMap<String, String>,
     pub precondition: &'a crate::deltaglider::Precondition,
 }
 
-/// THE client write of a whole body: the quota gate, then the engine's
-/// conditional store (the object's write lock, the preconditions, the
-/// store), then the `ObjectCreated` event. Every surface that stores a
-/// client body goes through here, so none of them skips the lock, the
-/// conditionals, the quota or the event.
+/// THE client write of a whole body: the quota gate on the body's exact
+/// size, then the engine's conditional store (the object's write lock, the
+/// preconditions, the store), then the `ObjectCreated` event. Every surface
+/// that stores a client body goes through here, so none of them skips the
+/// lock, the conditionals, the quota or the event.
 pub(crate) async fn store_client_write(
     state: &Arc<AppState>,
     write: ClientWrite<'_>,
 ) -> Result<crate::types::StoreResult, S3Error> {
-    store_client_write_hashed(state, write, None).await
-}
-
-/// [`store_client_write`] of a body whose SHA-256 the caller proved
-/// (`known_sha256`): the engine stores that digest and does not hash the
-/// body for it again.
-pub(crate) async fn store_client_write_hashed(
-    state: &Arc<AppState>,
-    write: ClientWrite<'_>,
-    known_sha256: Option<crate::deltaglider::KnownSha256>,
-) -> Result<crate::types::StoreResult, S3Error> {
-    let size = write.data.len() as u64;
+    let size = write.body.size();
     check_quota_for_write(state, write.bucket, write.key, size).await?;
     let result = state
         .engine
@@ -97,59 +87,13 @@ pub(crate) async fn store_client_write_hashed(
         .store_conditional(
             write.bucket,
             write.key,
-            write.data,
-            known_sha256,
+            write.body,
             write.content_type,
             write.user_metadata,
             write.precondition,
         )
         .await?;
     object_created(state, write.bucket, write.key, size, &result).await;
-    Ok(result)
-}
-
-/// One client write of a body staged in a spool file (a CopyObject of a
-/// source above the spool threshold).
-pub(crate) struct SpooledClientWrite<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub spool: &'a crate::deltaglider::spool::Spool,
-    pub size: u64,
-    /// The hashes of the spool's bytes, from the fill that wrote it.
-    pub hashes: crate::deltaglider::ingest::BodyHashes,
-    pub content_type: Option<String>,
-    pub user_metadata: std::collections::HashMap<String, String>,
-    pub precondition: &'a crate::deltaglider::Precondition,
-}
-
-/// [`store_client_write`] of a spooled body: the same quota gate, write
-/// lock, preconditions and event, and the streaming store, so the body
-/// never comes into memory.
-pub(crate) async fn store_client_write_spooled(
-    state: &Arc<AppState>,
-    write: SpooledClientWrite<'_>,
-) -> Result<crate::types::StoreResult, S3Error> {
-    check_quota_for_write(state, write.bucket, write.key, write.size).await?;
-    let engine = state.engine.load();
-    let result = {
-        let guard = engine
-            .lock_and_check(write.bucket, write.key, write.precondition)
-            .await?;
-        engine
-            .store_spooled_delta(
-                &guard,
-                write.bucket,
-                write.key,
-                write.spool,
-                write.size,
-                write.content_type,
-                write.user_metadata,
-                None,
-                Some(write.hashes),
-            )
-            .await?
-    };
-    object_created(state, write.bucket, write.key, write.size, &result).await;
     Ok(result)
 }
 
@@ -710,7 +654,9 @@ mod write_path_tests {
             ClientWrite {
                 bucket: "b",
                 key,
-                data: bytes::Bytes::from(data),
+                body: crate::deltaglider::ingest::IngestedBody::hashed_from_bytes(
+                    bytes::Bytes::from(data),
+                ),
                 content_type: None,
                 user_metadata: Default::default(),
                 precondition: &crate::deltaglider::Precondition::none(),

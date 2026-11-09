@@ -190,14 +190,14 @@ impl IngestedBody {
     #[cfg(test)]
     pub(crate) async fn spooled_for_test(
         pool: &crate::deltaglider::spool::SpoolDir,
-        data: &[u8],
+        data: Bytes,
     ) -> Self {
-        let storage = pool.reserve_beside(0, data.len() as u64).await.unwrap();
+        let len = data.len() as u64;
+        let storage = pool.reserve_beside(0, len).await.unwrap();
         let spool = storage.file().unwrap();
-        let mut stream =
-            futures::stream::iter([Ok::<_, std::io::Error>(Bytes::copy_from_slice(data))]);
+        let mut stream = futures::stream::iter([Ok::<_, std::io::Error>(data)]);
         let fill = spool
-            .fill_from_stream(&mut stream, data.len() as u64, None)
+            .fill_from_stream(&mut stream, len, None)
             .await
             .unwrap();
         Self::Spooled {
@@ -272,6 +272,27 @@ pub fn declared_body_len(headers: &axum::http::HeaderMap) -> Result<u64, Missing
 /// of backends. Counted in MiB, as the reservations are.
 pub fn spool_admits(declared: u64, max_bytes: u64, held_mib: usize) -> bool {
     mib_ceil(declared) <= mib_ceil(max_bytes).max(1).saturating_sub(held_mib)
+}
+
+/// Pure: may a body of `plan.declared` bytes be read at all? Above the
+/// request's limit, or above what the spool budget (`spool_max_bytes`)
+/// could ever hold beside what the op holds, it is refused before a byte
+/// is read. Every body is judged against the spool: one that finds no RAM
+/// goes there too.
+pub fn admit_declared<E>(plan: &IngestPlan, spool_max_bytes: u64) -> Result<(), IngestError<E>> {
+    if plan.declared > plan.limit {
+        return Err(IngestError::TooLarge {
+            declared: plan.declared,
+            limit: plan.limit,
+        });
+    }
+    if !spool_admits(plan.declared, spool_max_bytes, plan.held_spool_mib) {
+        return Err(IngestError::SpoolTooSmall {
+            declared: plan.declared,
+            max_bytes: spool_max_bytes,
+        });
+    }
+    Ok(())
 }
 
 /// What [`ingest`] reads.
@@ -354,12 +375,7 @@ where
     B: StorageBackend,
     S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
-    if plan.declared > plan.limit {
-        return Err(IngestError::TooLarge {
-            declared: plan.declared,
-            limit: plan.limit,
-        });
-    }
+    admit_declared(&plan, engine.spool_max_bytes())?;
     let threshold = engine.spool_threshold();
     let permit = (plan.declared <= threshold)
         .then(|| engine.memory_budget().try_reserve(plan.declared))
@@ -419,13 +435,6 @@ where
     B: StorageBackend,
     S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
-    let max_bytes = engine.spool_max_bytes();
-    if !spool_admits(plan.declared, max_bytes, plan.held_spool_mib) {
-        return Err(IngestError::SpoolTooSmall {
-            declared: plan.declared,
-            max_bytes,
-        });
-    }
     // A large body waits for its reservation, before the body is polled.
     // A small body that found no RAM takes free budget now or is refused:
     // it never queues behind a large reservation.
@@ -460,6 +469,26 @@ where
         hashes: fill.hashes,
         storage,
     })
+}
+
+/// [`ingest`] of a body that is in memory already (a form POST's file, a
+/// small copy source): one chunk, of exactly its length.
+pub async fn ingest_bytes<B: StorageBackend>(
+    engine: &DeltaGliderEngine<B>,
+    bucket: &str,
+    data: Bytes,
+    limit: u64,
+    known_sha256: Option<KnownSha256>,
+) -> Result<IngestedBody, IngestError<std::convert::Infallible>> {
+    let plan = IngestPlan {
+        declared: data.len() as u64,
+        limit,
+        known_sha256,
+        held_spool_mib: 0,
+        strict_length: true,
+    };
+    let stream = futures::stream::iter([Ok(data)]);
+    ingest(engine, bucket, stream, plan).await
 }
 
 /// A body shorter than declared fails, unless the plan allows it.
@@ -549,6 +578,34 @@ mod tests {
         assert!(spool_admits(0, 16 * MIB, 16));
         assert!(!spool_admits(1, 16 * MIB, 16));
         assert!(!spool_admits(1, 16 * MIB, 99), "held above max");
+    }
+
+    #[test]
+    fn admit_declared_truth_table() {
+        let plan = |declared, limit, held| IngestPlan {
+            declared,
+            limit,
+            known_sha256: None,
+            held_spool_mib: held,
+            strict_length: true,
+        };
+        let verdict = |p: IngestPlan, max| match admit_declared::<()>(&p, max) {
+            Ok(()) => "ok",
+            Err(IngestError::TooLarge { .. }) => "too-large",
+            Err(IngestError::SpoolTooSmall { .. }) => "spool",
+            Err(_) => "other",
+        };
+        assert_eq!(verdict(plan(MIB, 2 * MIB, 0), 16 * MIB), "ok");
+        assert_eq!(verdict(plan(2 * MIB, 2 * MIB, 0), 16 * MIB), "ok");
+        assert_eq!(
+            verdict(plan(2 * MIB + 1, 2 * MIB, 0), 16 * MIB),
+            "too-large"
+        );
+        // The limit first: a body above both is TooLarge.
+        assert_eq!(verdict(plan(32 * MIB, 2 * MIB, 0), 16 * MIB), "too-large");
+        assert_eq!(verdict(plan(17 * MIB, 64 * MIB, 0), 16 * MIB), "spool");
+        assert_eq!(verdict(plan(13 * MIB, 64 * MIB, 4), 16 * MIB), "spool");
+        assert_eq!(verdict(plan(0, 0, 0), 16 * MIB), "ok", "an empty body");
     }
 
     proptest! {

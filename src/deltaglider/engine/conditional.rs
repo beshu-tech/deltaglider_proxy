@@ -346,90 +346,63 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// A client write of a whole body: lock, judge the precondition, store.
-    /// `data` is the body as the S3 adapter collected it: the store shares
-    /// the buffer down to the storage write, it never copies it.
-    /// `known_sha256`: the body's SHA-256 when the caller proved it (a
-    /// verified SigV4 payload hash); `None` hashes the body here.
-    #[allow(clippy::too_many_arguments)]
+    /// `body` was read once by its ingest, with its hashes and, for a
+    /// spooled body, the reservation of its storage writes: a body in
+    /// memory is stored from its buffer (shared, never copied, down to the
+    /// storage write), a spooled one from its file.
     pub async fn store_conditional(
         &self,
         bucket: &str,
         key: &str,
-        data: Bytes,
-        known_sha256: Option<super::store::KnownSha256>,
+        body: crate::deltaglider::ingest::IngestedBody,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
         precondition: &Precondition,
     ) -> Result<StoreResult, ConditionalError> {
+        use crate::deltaglider::ingest::IngestedBody;
         let guard = self.lock_and_check(bucket, key, precondition).await?;
-        Ok(self
-            .store_client_body(
-                &guard,
-                bucket,
-                key,
+        let known_prior = guard.known_prior();
+        Ok(match body {
+            IngestedBody::Memory {
                 data,
-                known_sha256,
-                content_type,
-                user_metadata,
-                guard.known_prior(),
-            )
-            .await?)
-    }
-
-    /// Store a client body that is already in memory. A large body that tries
-    /// a delta goes through the streaming spool store, so the delta encode and
-    /// the ratio decision run with bounded memory; the others are stored
-    /// buffered. `known_prior`: what the precondition check read, if it ran.
-    #[allow(clippy::too_many_arguments)]
-    async fn store_client_body(
-        &self,
-        lock: &ObjectWriteGuard,
-        bucket: &str,
-        key: &str,
-        data: Bytes,
-        known_sha256: Option<super::store::KnownSha256>,
-        content_type: Option<String>,
-        user_metadata: HashMap<String, String>,
-        known_prior: Option<super::usage::CounterPrior>,
-    ) -> Result<StoreResult, EngineError> {
-        let size = data.len() as u64;
-        if size > self.spool_threshold()
-            && self.write_tries_delta(bucket, key, &user_metadata, size)
-        {
-            let spool = self.spool_acquire(size).await?;
-            // Hash from RAM while the spool is written: the spooled store
-            // then does not read the body back to hash it.
-            let hashing = crate::deltaglider::ingest::BodyHashes::compute(&data, known_sha256);
-            let (written, hashes) = tokio::join!(tokio::fs::write(spool.path(), &data), hashing);
-            written.map_err(|e| EngineError::Storage(StorageError::from(e)))?;
-            let hashes = hashes?;
-            self.store_spooled_delta_inner(
-                lock,
-                bucket,
-                key,
-                &spool,
+                hashes,
+                permit: _permit,
+            } => {
+                self.store_inner(
+                    &guard,
+                    bucket,
+                    key,
+                    &data,
+                    content_type,
+                    user_metadata,
+                    None,
+                    known_prior,
+                    Some(hashes),
+                )
+                .await?
+            }
+            IngestedBody::Spooled {
+                spool,
                 size,
-                content_type,
-                user_metadata,
-                None,
-                known_prior,
-                Some(hashes),
-            )
-            .await
-        } else {
-            self.store_inner(
-                lock,
-                bucket,
-                key,
-                &data,
-                content_type,
-                user_metadata,
-                None,
-                known_prior,
-                known_sha256,
-            )
-            .await
-        }
+                hashes,
+                storage,
+            } => {
+                self.store_spooled_delta_inner(
+                    &guard,
+                    bucket,
+                    key,
+                    &spool,
+                    size,
+                    content_type,
+                    user_metadata,
+                    None,
+                    known_prior,
+                    Some(hashes),
+                    Some(&storage),
+                )
+                .await?
+            }
+        })
     }
 }
 
@@ -580,8 +553,9 @@ mod tests {
             .store_conditional(
                 "b",
                 "img/a.jpg",
-                Bytes::from_static(b"one"),
-                None,
+                crate::deltaglider::ingest::IngestedBody::hashed_from_bytes(Bytes::from_static(
+                    b"one",
+                )),
                 None,
                 HashMap::new(),
                 &create_only,
@@ -602,8 +576,9 @@ mod tests {
             .store_conditional(
                 "b",
                 "img/a.jpg",
-                Bytes::from_static(b"two!"),
-                None,
+                crate::deltaglider::ingest::IngestedBody::hashed_from_bytes(Bytes::from_static(
+                    b"two!",
+                )),
                 None,
                 HashMap::new(),
                 &replace,

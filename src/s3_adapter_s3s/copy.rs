@@ -157,61 +157,36 @@ async fn copy_through_store(
     directive: &str,
     source_meta: &FileMetadata,
 ) -> s3s::S3Result<crate::types::StoreResult> {
-    let body = read_copy_source(
+    let (body, metadata) = read_copy_source(
         engine,
         source_bucket,
         source_key,
+        &input.bucket,
         source_meta.file_size,
-        engine.spool_threshold(),
     )
     .await?;
     let (content_type, user_metadata) = copy_destination_fields(
         directive,
         input.content_type.clone(),
         input.metadata.clone(),
-        &body.metadata(),
+        &metadata,
     )?;
     // A copy creates a new object at the destination: the same client
     // write as a PUT (quota on the destination, the object's write lock,
     // the ObjectCreated event). s3s models no conditional headers for it.
     let precondition = crate::deltaglider::Precondition::none();
-    Ok(match &body {
-        CopySourceBody::Buffered(data, _) => {
-            crate::api::handlers::object_helpers::store_client_write(
-                &svc.state,
-                crate::api::handlers::object_helpers::ClientWrite {
-                    bucket: &input.bucket,
-                    key: &input.key,
-                    data: bytes::Bytes::copy_from_slice(data),
-                    content_type,
-                    user_metadata,
-                    precondition: &precondition,
-                },
-            )
-            .await?
-        }
-        CopySourceBody::Spooled {
-            spool,
-            size,
-            hashes,
-            ..
-        } => {
-            crate::api::handlers::object_helpers::store_client_write_spooled(
-                &svc.state,
-                crate::api::handlers::object_helpers::SpooledClientWrite {
-                    bucket: &input.bucket,
-                    key: &input.key,
-                    spool,
-                    size: *size,
-                    hashes: hashes.clone(),
-                    content_type,
-                    user_metadata,
-                    precondition: &precondition,
-                },
-            )
-            .await?
-        }
-    })
+    Ok(crate::api::handlers::object_helpers::store_client_write(
+        &svc.state,
+        crate::api::handlers::object_helpers::ClientWrite {
+            bucket: &input.bucket,
+            key: &input.key,
+            body,
+            content_type,
+            user_metadata,
+            precondition: &precondition,
+        },
+    )
+    .await?)
 }
 
 /// The content type and user metadata of a CopyObject destination: the
@@ -254,83 +229,56 @@ pub(super) fn copy_size_limit(engine: &crate::deltaglider::DynEngine) -> u64 {
     COPY_OBJECT_MAX_BYTES.min(engine.max_passthrough_object_size())
 }
 
-/// The body of a CopyObject source, read with bounded memory.
-pub(super) enum CopySourceBody {
-    /// At most the spool threshold (or a delta the engine reconstructed in
-    /// memory): the same buffer a PutObject body is.
-    Buffered(Vec<u8>, FileMetadata),
-    /// Larger: streamed into a spool file on the spool budget.
-    Spooled {
-        spool: crate::deltaglider::spool::Spool,
-        size: u64,
-        /// From the fill: the store does not read the spool back.
-        hashes: crate::deltaglider::ingest::BodyHashes,
-        metadata: FileMetadata,
-    },
-}
-
-impl CopySourceBody {
-    fn metadata(&self) -> FileMetadata {
-        match self {
-            CopySourceBody::Buffered(_, m) | CopySourceBody::Spooled { metadata: m, .. } => {
-                m.clone()
-            }
-        }
-    }
-}
-
-/// Read a copy source. Up to `spool_threshold` bytes it is buffered, as a
-/// PutObject body is; above it the source streams into a spool file, so a
-/// CopyObject never holds a large object in memory. `head_size` is the
-/// size the conditionals judged: the spool is reserved for it, and a
-/// source that grew since answers 503 SlowDown (the client retries and the
-/// retry judges the new object).
+/// Read a copy source through the same ingest as a PutObject body: up to
+/// the spool threshold into memory (when the RAM budget has room), above it
+/// into a spool file, so a CopyObject never holds a large object in memory.
+/// `head_size` is the size the conditionals judged: the declared length of
+/// the ingest. A source that changed since answers 503 SlowDown (the client
+/// retries and the retry judges the new object). `dest_bucket`: where the
+/// copy is stored (its storage writes are reserved with the body).
 pub(super) async fn read_copy_source(
     engine: &crate::deltaglider::DynEngine,
     bucket: &str,
     key: &str,
+    dest_bucket: &str,
     head_size: u64,
-    spool_threshold: u64,
-) -> s3s::S3Result<CopySourceBody> {
-    let too_large = |size: u64| size > engine.max_object_size();
-    if head_size <= spool_threshold {
+) -> s3s::S3Result<(crate::deltaglider::ingest::IngestedBody, FileMetadata)> {
+    use crate::deltaglider::ingest::{ingest, IngestError, IngestPlan};
+    let (stream, metadata) = if head_size <= engine.spool_threshold() {
         // small: the HEAD size is at most the spool threshold.
         let (data, metadata) = engine.retrieve(bucket, key).await?;
-        if too_large(data.len() as u64) {
-            return Err(s3s::s3_error!(EntityTooLarge));
+        let one: BoxStream<'static, Result<bytes::Bytes, StorageError>> =
+            futures::stream::iter([Ok(bytes::Bytes::from(data))]).boxed();
+        (one, metadata)
+    } else {
+        match engine.retrieve_stream(bucket, key).await? {
+            RetrieveResponse::Buffered { data, metadata, .. } => (
+                futures::stream::iter([Ok(bytes::Bytes::from(data))]).boxed(),
+                metadata,
+            ),
+            RetrieveResponse::Streamed {
+                stream, metadata, ..
+            } => (stream, metadata),
         }
-        return Ok(CopySourceBody::Buffered(data, metadata));
-    }
-    let (mut stream, metadata) = match engine.retrieve_stream(bucket, key).await? {
-        RetrieveResponse::Buffered { data, metadata, .. } => {
-            if too_large(data.len() as u64) {
-                return Err(s3s::s3_error!(EntityTooLarge));
-            }
-            return Ok(CopySourceBody::Buffered(data, metadata));
-        }
-        RetrieveResponse::Streamed {
-            stream, metadata, ..
-        } => (stream, metadata),
     };
-    let spool = engine.spool_acquire(head_size).await?;
-    use crate::deltaglider::spool::SpoolFillError;
-    let fill = spool
-        .fill_from_stream(&mut stream, head_size, None)
+    let plan = IngestPlan {
+        declared: head_size,
+        limit: copy_size_limit(engine),
+        known_sha256: None,
+        held_spool_mib: 0,
+        strict_length: true,
+    };
+    let body = ingest(engine, dest_bucket, stream, plan)
         .await
         .map_err(|e| match e {
-            SpoolFillError::Source(e) => s3s::S3Error::from(e),
-            SpoolFillError::Write(e) => crate::api::S3Error::from(StorageError::from(e)).into(),
-            SpoolFillError::Overrun { .. } => crate::api::S3Error::SlowDown(
-                "the copy source changed during the copy; retry the request".to_string(),
-            )
-            .into(),
+            IngestError::TooLong { .. } | IngestError::Incomplete { .. } => {
+                crate::api::S3Error::SlowDown(
+                    "the copy source changed during the copy; retry the request".to_string(),
+                )
+            }
+            e => crate::api::body_ingest::ingest_failure(e),
         })?;
-    Ok(CopySourceBody::Spooled {
-        spool,
-        size: fill.written,
-        hashes: fill.hashes,
-        metadata,
-    })
+    Ok((body, metadata))
 }
 
 pub(super) async fn upload_part_copy(
