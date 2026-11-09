@@ -93,12 +93,11 @@ async fn proxy_server() -> TestServer {
         .await
 }
 
-/// F16 (#140): a key that MinIO refuses (`XMinioInvalidObjectName`: a control
-/// character, a space-only name, an over-long segment) is the client's fault.
-/// (A TAB in the key still answers 500: the backend fails the signature of the
-/// header that carries it. Whether to refuse control characters at ingest is the
-/// owner decision of #142 F39.)
-/// It answered 500, which SDKs treat as permanent and log as a server bug.
+/// F16 (#140): a key that the S3 backend cannot take is the client's fault:
+/// a control character or a space-only name (the proxy refuses them before
+/// the SDK builds the request: the key's name travels in a metadata header),
+/// and an over-long segment (MinIO answers a HEAD with `XMinioInvalidObjectName`
+/// in a header). All of them answered 500.
 #[tokio::test]
 async fn test_a_key_the_backend_refuses_is_a_client_error() {
     skip_unless_minio!();
@@ -109,6 +108,7 @@ async fn test_a_key_the_backend_refuses_is_a_client_error() {
     for key in [
         "ctl%01byte.bin".to_string(),
         "ctl%0Anewline.bin".to_string(),
+        "ctl%09tab.bin".to_string(),
         "%20%20%20".to_string(),
         format!("{long}/x.bin"),
     ] {

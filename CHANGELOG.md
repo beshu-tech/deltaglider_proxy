@@ -6,6 +6,13 @@
 
 - **Remove a `0` from `advanced.blocking_threads`, `advanced.codec_concurrency` and `advanced.filtered_list_max_engine_pages`** (and from `DGP_BLOCKING_THREADS`, `DGP_CODEC_CONCURRENCY`, `DGP_FILTERED_LIST_MAX_ENGINE_PAGES`). A `0` in one of these now stops the proxy at startup with an error that names the setting. Before, it caused a panic at startup or a hang. Other `DGP_*` timeouts and counts that a `0` would break (for example `DGP_REQUEST_TIMEOUT_SECS`, `DGP_MAX_CONCURRENT_REQUESTS`, `DGP_CLOCK_SKEW_SECONDS`, `DGP_SESSION_TTL_HOURS`) are read as `1`.
 
+### Changed — Error answers for faults that a retry can clear
+
+- A full disk, a used-up storage quota, a lock that another writer holds, a copy source that changed during the copy, a delta codec timeout and a backend `RequestTimeout` or `OperationAborted` now answer `503` with `Retry-After`. Before, they answered `500 InternalError`. A full disk and a used-up quota answer `503 ServiceUnavailable` with a text that names the condition. The cause goes to the log.
+- On an S3 backend, a key that is only spaces or that holds a control character (a tab, a newline) answers `400 InvalidArgument`. A key that MinIO refuses (`XMinioInvalidObjectName`, for example a segment of 300 bytes) answers `400` too. Before, they answered `500`.
+- A multipart upload that the backend lost during a copy answers `503`, not `NoSuchKey`/`NoSuchUpload`. `NoSuchUpload` now means only an upload id that this proxy does not know.
+- The error text for a write whose metadata is too large now names the length of the last part of the key.
+
 ### Fixed — Configuration checks at the boundaries
 
 - A section PUT whose body gives an array, a string, a number or a boolean where a setting holds an object is refused with `400`. `PUT /config/section/storage` with `[]` used to answer `ok: true` and reset the backend to its default.

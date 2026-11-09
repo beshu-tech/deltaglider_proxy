@@ -925,9 +925,14 @@ pub fn io_error_is_name_too_long(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(libc::ENAMETOOLONG) || e.kind() == std::io::ErrorKind::InvalidFilename
 }
 
-/// Pure: whether an I/O error says that the disk is full (`ENOSPC`).
+/// Pure: whether an I/O error says that the disk is full (`ENOSPC`) or the
+/// user's disk quota is used up (`EDQUOT`).
 pub fn io_error_is_disk_full(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(libc::ENOSPC) || e.kind() == std::io::ErrorKind::StorageFull
+    e.raw_os_error() == Some(libc::ENOSPC)
+        || matches!(
+            e.kind(),
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+        )
 }
 
 /// Pure: whether an I/O error says that a path component is a directory

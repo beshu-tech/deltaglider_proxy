@@ -83,6 +83,14 @@ const TRANSIENT_503: &str =
 const DISK_FULL_503: &str = "The storage backend is out of space. Free space on it; \
      a retry can succeed after that.";
 
+/// A full disk answers 503 ServiceUnavailable (not `SlowDown`: nothing
+/// throttles, and `SlowDown` makes adaptive SDKs slow all their requests).
+/// The cause goes to the log; the client text names the condition.
+fn disk_full_503(cause: &str) -> S3Error {
+    tracing::error!("disk full answered 503, cause: {cause}");
+    S3Error::ServiceUnavailable(DISK_FULL_503.to_string())
+}
+
 /// The client text of a 503 for a used-up storage quota of the backend.
 const QUOTA_503: &str = "The storage backend refuses writes because its storage cap or \
      quota is used up. Raise the cap or free space; a retry can succeed after that.";
@@ -429,9 +437,9 @@ impl From<crate::storage::StorageError> for S3Error {
             // SDKs retry with backoff, with a text that names the cause. (An
             // S3 `InsufficientStorage` code does not exist; a 507 is no S3
             // answer.)
-            crate::storage::StorageError::DiskFull => S3Error::SlowDown(DISK_FULL_503.to_string()),
+            crate::storage::StorageError::DiskFull => disk_full_503("storage write"),
             crate::storage::StorageError::Io(e) if crate::storage::io_error_is_disk_full(&e) => {
-                S3Error::SlowDown(DISK_FULL_503.to_string())
+                disk_full_503(&e.to_string())
             }
             // E-P1-1: backend throttling propagates as a 503 SlowDown
             // so AWS-SDK clients honour the spec retry/backoff
@@ -469,7 +477,14 @@ impl From<crate::storage::StorageError> for S3Error {
                 tracing::error!("backend quota exceeded answered 503, cause: {cause}");
                 S3Error::ServiceUnavailable(QUOTA_503.to_string())
             }
-            crate::storage::StorageError::NoSuchUpload(id) => S3Error::NoSuchUpload(id),
+            // The backend lost a multipart upload that the PROXY owns (a copy
+            // or migrate in flight); the client's own uploads live in memory.
+            // `NoSuchUpload` would send the client to look for a sticky
+            // session, so it is a 503 and the cause goes to the log.
+            crate::storage::StorageError::NoSuchUpload(cause) => {
+                tracing::error!("backend multipart upload vanished answered 503, cause: {cause}");
+                S3Error::ServiceUnavailable(TRANSIENT_503.to_string())
+            }
             // No client action helps: sanitised 500 (the cause is logged).
             // Named one by one so a new variant cannot reach here unmapped.
             e @ (crate::storage::StorageError::Io(_)
@@ -502,9 +517,7 @@ impl From<crate::deltaglider::CodecError> for S3Error {
                 size: size as u64,
                 max: max as u64,
             },
-            C::Io(e) if crate::storage::io_error_is_disk_full(&e) => {
-                S3Error::SlowDown(DISK_FULL_503.to_string())
-            }
+            C::Io(e) if crate::storage::io_error_is_disk_full(&e) => disk_full_503(&e.to_string()),
             e @ (C::EncodeFailed(_) | C::DecodeFailed(_) | C::Io(_)) => {
                 S3Error::InternalError(sanitise_for_client(&e))
             }
@@ -663,7 +676,7 @@ mod tests {
                 "StorageError::Io",
                 s(StorageError::Io(io(libc::ENOSPC))),
                 503,
-                "SlowDown",
+                "ServiceUnavailable",
             ),
             (
                 "StorageError::Io",
@@ -675,7 +688,7 @@ mod tests {
                 "StorageError::DiskFull",
                 s(StorageError::DiskFull),
                 503,
-                "SlowDown",
+                "ServiceUnavailable",
             ),
             (
                 "StorageError::Serialization",
@@ -794,8 +807,8 @@ mod tests {
             (
                 "StorageError::NoSuchUpload",
                 s(StorageError::NoSuchUpload("u".into())),
-                404,
-                "NoSuchUpload",
+                503,
+                "ServiceUnavailable",
             ),
             (
                 "StorageError::InvalidRange",
@@ -843,7 +856,7 @@ mod tests {
                 "CodecError::Io",
                 c(CodecError::Io(io(libc::ENOSPC))),
                 503,
-                "SlowDown",
+                "ServiceUnavailable",
             ),
             (
                 "EngineError::Storage",
@@ -998,10 +1011,16 @@ mod tests {
                     .map(|(b, _)| b)
                     .unwrap_or_else(|| panic!("{head}"));
                 for line in body.lines().map(str::trim_start) {
-                    assert!(
-                        !line.starts_with("other =>") && !line.starts_with("_ =>"),
-                        "{head}: a catch-all arm: {line}"
-                    );
+                    // An arm that only binds a name (`other =>`, `e =>`, `_ =>`)
+                    // takes every variant that is left.
+                    let first = line.split_whitespace().next().unwrap_or("");
+                    let binds_only = line.contains("=>")
+                        && first
+                            .chars()
+                            .all(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_digit())
+                        && !first.is_empty()
+                        && line.split_whitespace().nth(1) == Some("=>");
+                    assert!(!binds_only, "{head}: a catch-all arm: {line}");
                 }
             }
         }

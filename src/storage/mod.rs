@@ -83,12 +83,9 @@ pub(crate) fn fsync_deferred() -> bool {
     DEFERRED_FSYNC.try_with(|_| ()).is_ok()
 }
 
-/// ENOSPC raw error code on Linux and macOS.
-const ENOSPC: i32 = 28;
-
 /// Convert an io::Error into StorageError, detecting disk-full and not-found.
 pub(crate) fn io_to_storage_error(e: std::io::Error) -> StorageError {
-    if e.raw_os_error() == Some(ENOSPC) {
+    if io_error_is_disk_full(&e) {
         StorageError::DiskFull
     } else if e.kind() == std::io::ErrorKind::NotFound {
         StorageError::NotFound(e.to_string())
@@ -148,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_io_to_storage_error_disk_full() {
-        let e = std::io::Error::from_raw_os_error(ENOSPC);
+        let e = std::io::Error::from_raw_os_error(libc::ENOSPC);
         let se = io_to_storage_error(e);
         assert!(
             matches!(se, StorageError::DiskFull),

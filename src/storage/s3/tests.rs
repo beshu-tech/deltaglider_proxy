@@ -57,7 +57,8 @@ mod classify_tests {
             ),
             (object_op, Some(400), "InvalidObjectName", "InvalidKey"),
             (object_op, Some(400), "KeyTooLongError", "KeyTooLong"),
-            (S3Op::HeadObject, Some(400), "", "InvalidKey"),
+            // A bare 400 is not the key's fault (wrong region, expired token).
+            (S3Op::HeadObject, Some(400), "", "S3"),
             // F16: a backend that gives up on the request, a retry can clear.
             (object_op, Some(400), "RequestTimeout", "Transient"),
             (object_op, Some(408), "RequestTimeout", "Transient"),
@@ -112,12 +113,6 @@ mod classify_tests {
             };
             assert_eq!(name, want, "{op} status={status:?} code={code:?}");
         }
-        // A request that cannot be built (a control character in the key
-        // is no header value) is the client's input.
-        let err: SdkError<aws_sdk_s3::operation::put_object::PutObjectError> =
-            SdkError::construction_failure("bad header value");
-        let got = S3Backend::classify_s3_error("b", &err, S3Op::PutObject);
-        assert!(matches!(got, E::InvalidKey(_)), "{got:?}");
         // A response that broke off is transient.
         let got = errors::classify_response("b", &S3Op::GetObject, None, "", true, "x");
         assert!(matches!(got, E::Transient(_)), "{got:?}");

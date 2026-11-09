@@ -142,22 +142,12 @@ impl S3Backend {
         if matches!(e, SdkError::TimeoutError(_) | SdkError::DispatchFailure(_)) {
             return StorageError::Unavailable(format!("{op} on bucket '{bucket}': {e}"));
         }
-        // The request could not even be built: the SDK refuses a part of the
-        // input, in practice the key (the proxy stores it in a metadata
-        // header, and a control character cannot be a header value). It is
-        // the client's input, never a server fault.
-        if matches!(e, SdkError::ConstructionFailure(_)) {
-            return StorageError::InvalidKey(format!(
-                "{op}: the storage backend cannot take this key (a character in it, such \
-                 as a control character, cannot be sent)"
-            ));
-        }
         // Classify by the structured error CODE only (see `classify_response`).
         classify_response(
             bucket,
             &op,
             status,
-            e.code().unwrap_or(""),
+            backend_error_code(e),
             matches!(e, SdkError::ResponseError(_)),
             &e.to_string(),
         )
@@ -205,6 +195,24 @@ fn code_is_credential_refusal(code: &str) -> bool {
     )
 }
 
+/// The structured error code of an SDK error. A HEAD answer has no body, so
+/// the SDK reads no code from it; MinIO names the code in the
+/// `x-minio-error-code` header (`XMinioInvalidObjectName` for a key it
+/// refuses), so that header is the code when the body gave none. A bare
+/// status is never read as the key's fault: a wrong region, an expired token
+/// or a proxy's HTML 400 look the same.
+fn backend_error_code<E: std::fmt::Debug + ProvideErrorMetadata>(e: &SdkError<E>) -> &str {
+    if let Some(code) = e.code().filter(|c| !c.is_empty()) {
+        return code;
+    }
+    if let SdkError::ServiceError(svc) = e {
+        if let Some(h) = svc.raw().headers().get("x-minio-error-code") {
+            return h;
+        }
+    }
+    ""
+}
+
 /// THE mapping from a backend's answer — the op, the HTTP status (`None` =
 /// none came), the structured error code, whether the response body broke
 /// off — to a [`StorageError`]. Pure: the table test over every
@@ -245,14 +253,6 @@ pub(super) fn classify_response(
     // a space-only name, an over-long segment): a client error, not a 500.
     if matches!(code, "XMinioInvalidObjectName" | "InvalidObjectName") {
         return StorageError::InvalidKey(format!("{op}: the storage backend refused the key name"));
-    }
-    // A bare 400 on an object op (a HEAD has no body, so no code): the
-    // backend refused what the client named, in practice the key (MinIO
-    // answers an over-long segment so). A retry cannot succeed.
-    if status == Some(400) && code.is_empty() && !op.is_bucket_level() {
-        return StorageError::InvalidKey(format!(
-            "{op}: the storage backend refused the request, most likely the key name"
-        ));
     }
     // The backend gave up on the request (a slow body, a conflicting
     // operation in flight): a retry can succeed. Whatever the status is
