@@ -28,6 +28,96 @@ use crate::storage::StorageBackendExt;
 mod classify_tests {
     use super::*;
 
+    /// F16 class guard: THE table of a backend's answer. Each row is
+    /// (op, HTTP status, error code, the variant). A permanent client fault
+    /// is a 4xx variant, a fault a retry can clear is `Throttled`,
+    /// `Transient` or `Unavailable` (all 503 on the wire), and a code that
+    /// MinIO, Ceph, B2 or R2 sends maps by code whatever the status is.
+    #[test]
+    fn a_backends_answer_maps_to_one_variant() {
+        use crate::storage::StorageError as E;
+        let object_op = S3Op::PutObject;
+        let rows: Vec<(S3Op, Option<u16>, &str, &str)> = vec![
+            // Missing things.
+            (S3Op::GetObject, Some(404), "NoSuchKey", "NotFound"),
+            (S3Op::Other("copy_object"), Some(404), "", "NotFound"),
+            (S3Op::HeadBucket, Some(404), "", "BucketNotFound"),
+            (S3Op::PutObject, Some(404), "NoSuchBucket", "BucketNotFound"),
+            (S3Op::HeadBucket, Some(403), "", "BucketNotFound"),
+            // F16: NoSuchUpload is its own answer, not a missing key.
+            (S3Op::UploadPart, Some(404), "NoSuchUpload", "NoSuchUpload"),
+            (S3Op::CompleteMpu, Some(404), "NoSuchUpload", "NoSuchUpload"),
+            (S3Op::AbortMpu, Some(404), "NoSuchUpload", "NoSuchUpload"),
+            // F16: the backend refuses the key name (MinIO sends 400).
+            (
+                object_op,
+                Some(400),
+                "XMinioInvalidObjectName",
+                "InvalidKey",
+            ),
+            (object_op, Some(400), "InvalidObjectName", "InvalidKey"),
+            (object_op, Some(400), "KeyTooLongError", "KeyTooLong"),
+            // A bare 400 is not the key's fault (wrong region, expired token).
+            (S3Op::HeadObject, Some(400), "", "S3"),
+            // F16: a backend that gives up on the request, a retry can clear.
+            (object_op, Some(400), "RequestTimeout", "Transient"),
+            (object_op, Some(408), "RequestTimeout", "Transient"),
+            (object_op, Some(409), "OperationAborted", "Transient"),
+            // Throttling and capacity.
+            (object_op, Some(503), "", "Throttled"),
+            (object_op, Some(503), "SlowDown", "Throttled"),
+            (object_op, Some(429), "", "Throttled"),
+            (object_op, None, "SlowDown", "Throttled"),
+            (object_op, Some(507), "", "QuotaExceeded"),
+            (object_op, Some(403), "cap_exceeded", "QuotaExceeded"),
+            (
+                object_op,
+                Some(400),
+                "XMinioAdminBucketQuotaExceeded",
+                "QuotaExceeded",
+            ),
+            // Refusals.
+            (object_op, Some(403), "AccessDenied", "AccessDenied"),
+            (object_op, Some(301), "PermanentRedirect", "AccessDenied"),
+            (
+                S3Op::ListObjects,
+                Some(403),
+                "AccessDenied",
+                "BucketNotFound",
+            ),
+            // Backend faults.
+            (object_op, Some(500), "InternalError", "Transient"),
+            (object_op, Some(502), "", "Transient"),
+            (object_op, Some(504), "", "Transient"),
+            (object_op, Some(416), "InvalidRange", "InvalidRange"),
+            // The rest stays a sanitised 500.
+            (object_op, Some(400), "InvalidRequest", "S3"),
+            (object_op, Some(412), "PreconditionFailed", "S3"),
+            (object_op, Some(418), "", "S3"),
+        ];
+        for (op, status, code, want) in rows {
+            let got = errors::classify_response("b", &op, status, code, false, "detail");
+            let name = match got {
+                E::NotFound(_) => "NotFound",
+                E::BucketNotFound(_) => "BucketNotFound",
+                E::NoSuchUpload(_) => "NoSuchUpload",
+                E::InvalidKey(_) => "InvalidKey",
+                E::KeyTooLong(_) => "KeyTooLong",
+                E::Transient(_) => "Transient",
+                E::Throttled(_) => "Throttled",
+                E::QuotaExceeded(_) => "QuotaExceeded",
+                E::AccessDenied(_) => "AccessDenied",
+                E::InvalidRange(_) => "InvalidRange",
+                E::S3(_) => "S3",
+                ref other => panic!("{op} {status:?} {code}: unexpected {other:?}"),
+            };
+            assert_eq!(name, want, "{op} status={status:?} code={code:?}");
+        }
+        // A response that broke off is transient.
+        let got = errors::classify_response("b", &S3Op::GetObject, None, "", true, "x");
+        assert!(matches!(got, E::Transient(_)), "{got:?}");
+    }
+
     /// storage-14: a HEAD without an ETag is an explicit Unfenced.
     #[test]
     fn a_head_without_an_etag_is_unfenced() {

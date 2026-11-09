@@ -645,6 +645,22 @@ pub(super) fn apply_native_encryption<R: SseRequest>(
 /// S3's limit on the user metadata of one object, in bytes (keys + values).
 pub(super) const S3_USER_METADATA_MAX_BYTES: usize = 2048;
 
+/// Pure: whether the SDK can send a write of `key` to an S3 backend. The
+/// proxy keeps the key's name in a metadata header, and a control character
+/// (a tab, a newline) is no header value; a key of only spaces is no key for
+/// the SDK. The SDK would fail to build the request, or the backend would
+/// fail its signature, and the client would see a 500 for its own input.
+pub(super) fn check_key_sendable(key: &str) -> Result<(), StorageError> {
+    if key.trim().is_empty() || key.chars().any(char::is_control) {
+        return Err(StorageError::InvalidKey(
+            "this storage backend cannot store a key that is only spaces or that holds a \
+             control character (tab, newline, ...)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Pure: whether the headers of a write (the proxy's own `dg-*` metadata
 /// plus the client's) fit S3's 2 KB limit. Over it is `MetadataTooLarge`
 /// (400): the client's metadata can pass the adapter's 2 KB gate while the
@@ -654,11 +670,23 @@ pub(super) fn check_metadata_size(
     bucket: &str,
     key: &str,
 ) -> Result<(), StorageError> {
+    check_key_sendable(key)?;
+    // The key's name also travels as a header VALUE (`dg-original-name`),
+    // in the form the client sent it, whatever the stored key looks like.
+    if headers.values().any(|v| v.chars().any(char::is_control)) {
+        return Err(StorageError::InvalidKey(
+            "this storage backend cannot store a key or metadata value that holds a control \
+             character (tab, newline, ...)"
+                .to_string(),
+        ));
+    }
     let total: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
     if total > S3_USER_METADATA_MAX_BYTES {
         return Err(StorageError::MetadataTooLarge(format!(
-            "the metadata of {bucket}/{key} is {total} bytes with the proxy's own fields; \
-             an S3 backend stores at most {S3_USER_METADATA_MAX_BYTES} bytes"
+            "the metadata of {bucket}/{key} is {total} bytes with the proxy's own fields \
+             (the last part of the key name, {} bytes, is part of it); an S3 backend stores \
+             at most {S3_USER_METADATA_MAX_BYTES} bytes. A shorter key name helps",
+            key.rsplit('/').next().unwrap_or(key).len()
         )));
     }
     Ok(())

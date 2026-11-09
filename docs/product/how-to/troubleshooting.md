@@ -96,6 +96,13 @@ A `503 SlowDown` comes either from the upstream S3 backend, when it throttles th
 3. **Too many multipart uploads** (`Too many concurrent multipart uploads`), limited by `DGP_MAX_MULTIPART_UPLOADS` (default 1000), or too many multipart bytes in flight (`Multipart in-flight bytes cap reached`), limited by `DGP_MAX_TOTAL_MULTIPART_BYTES`.
 4. **A maintenance job gates the bucket** (see the next entry).
 5. **Another instance changed the baseline of a delta prefix during the write.** This happens only with a `config_sync_bucket`.
+6. **Another writer holds the object, or the copy source changed during the copy.** The message is "Another request changed or holds this object; please retry." A retry succeeds when the other request ends.
+
+The proxy answers `503 ServiceUnavailable` (not `SlowDown`) when the cause is a condition that you must clear first, or a fault inside the proxy:
+
+- **The disk is full** ("The storage backend is out of space"). Free space on the disk of the filesystem backend or of the spool directory. The log line "disk full answered 503" names the cause.
+- **The storage quota of the backend is used up** ("storage cap or quota is used up"). This is the `507`, `QuotaExceeded` or `cap_exceeded` answer of a backend such as Backblaze B2. Raise the cap or free space on the backend.
+- **The delta codec timed out.** Check the load of the host and `DGP_CODEC_*_SECS`.
 
 A `503 ServiceUnavailable` that names a backend is a different case: see [How to diagnose a backend that isn't serving](diagnose-backend-connectivity.md).
 

@@ -49,16 +49,16 @@ pub use s3::{
     LISTING_FACTS_MISSES, LISTING_FACTS_READ_ERRORS, LISTING_FACTS_REQUESTS,
 };
 pub use traits::{
-    claim_label, clamp_range, copy_keeps_encryption, io_error_is_name_too_long,
-    io_error_is_path_type_conflict, open_object_by_parts, open_passthrough_range_by_parts,
-    open_reference_source_by_parts, reference_fence_lost, same_stored_generation,
-    unfenced_reference_fence, unfenced_reference_fence_with_metadata, unfenced_reference_write,
-    BucketHome, BucketListing, BulkListing, ByteStream, ClaimOutcome, ClaimWrite, ConversionMarker,
-    CopyOutcome, DelegatedListResult, DynStorageBackend, KeyClaim, ListedForms, ListedToken,
-    MarkerRead, MarkerWrite, MultipartUpload, ObjectAt, ObjectRead, ObjectVariant, PutBody,
-    RangeRead, RefFence, RefWrite, ReferenceSource, RewriteBasis, RewriteTarget, StorageBackend,
-    StorageBackendExt, StorageError, StoredObject, StoredWrite, UploadedPart, VersionPurgePage,
-    WriteIf, MAX_BUCKET_OBJECT_BYTES,
+    claim_label, clamp_range, copy_keeps_encryption, io_error_is_disk_full,
+    io_error_is_name_too_long, io_error_is_path_type_conflict, open_object_by_parts,
+    open_passthrough_range_by_parts, open_reference_source_by_parts, reference_fence_lost,
+    same_stored_generation, unfenced_reference_fence, unfenced_reference_fence_with_metadata,
+    unfenced_reference_write, BucketHome, BucketListing, BulkListing, ByteStream, ClaimOutcome,
+    ClaimWrite, ConversionMarker, CopyOutcome, DelegatedListResult, DynStorageBackend, KeyClaim,
+    ListedForms, ListedToken, MarkerRead, MarkerWrite, MultipartUpload, ObjectAt, ObjectRead,
+    ObjectVariant, PutBody, RangeRead, RefFence, RefWrite, ReferenceSource, RewriteBasis,
+    RewriteTarget, StorageBackend, StorageBackendExt, StorageError, StoredObject, StoredWrite,
+    UploadedPart, VersionPurgePage, WriteIf, MAX_BUCKET_OBJECT_BYTES,
 };
 
 tokio::task_local! {
@@ -83,12 +83,9 @@ pub(crate) fn fsync_deferred() -> bool {
     DEFERRED_FSYNC.try_with(|_| ()).is_ok()
 }
 
-/// ENOSPC raw error code on Linux and macOS.
-const ENOSPC: i32 = 28;
-
 /// Convert an io::Error into StorageError, detecting disk-full and not-found.
 pub(crate) fn io_to_storage_error(e: std::io::Error) -> StorageError {
-    if e.raw_os_error() == Some(ENOSPC) {
+    if io_error_is_disk_full(&e) {
         StorageError::DiskFull
     } else if e.kind() == std::io::ErrorKind::NotFound {
         StorageError::NotFound(e.to_string())
@@ -148,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_io_to_storage_error_disk_full() {
-        let e = std::io::Error::from_raw_os_error(ENOSPC);
+        let e = std::io::Error::from_raw_os_error(libc::ENOSPC);
         let se = io_to_storage_error(e);
         assert!(
             matches!(se, StorageError::DiskFull),

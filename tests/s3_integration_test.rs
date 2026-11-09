@@ -93,6 +93,38 @@ async fn proxy_server() -> TestServer {
         .await
 }
 
+/// F16 (#140): a key that the S3 backend cannot take is the client's fault:
+/// a control character or a space-only name (the proxy refuses them before
+/// the SDK builds the request: the key's name travels in a metadata header),
+/// and an over-long segment (MinIO answers a HEAD with `XMinioInvalidObjectName`
+/// in a header). All of them answered 500.
+#[tokio::test]
+async fn test_a_key_the_backend_refuses_is_a_client_error() {
+    skip_unless_minio!();
+    let server = proxy_server().await;
+    let endpoint = server.endpoint();
+    let client = reqwest::Client::new();
+    let long = "a".repeat(300);
+    for key in [
+        "ctl%01byte.bin".to_string(),
+        "ctl%0Anewline.bin".to_string(),
+        "ctl%09tab.bin".to_string(),
+        "%20%20%20".to_string(),
+        format!("{long}/x.bin"),
+    ] {
+        let url = format!("{endpoint}/{TEST_BUCKET}/{key}");
+        let resp = client
+            .put(&url)
+            .body(b"data".to_vec())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(status.as_u16(), 400, "PUT {key}: {status} {body}");
+    }
+}
+
 // ============================================================================
 // Group 1: Bucket CRUD
 // ============================================================================

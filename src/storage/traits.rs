@@ -768,22 +768,26 @@ pub enum StorageError {
     Transient(String),
 
     /// Another writer holds the resource past the wait (the cross-instance
-    /// reference lock). A retry can succeed. Same Display and wire answer
-    /// (500) as `Other`.
+    /// reference lock). A retry can succeed. Maps to 503 SlowDown.
     #[error("Storage error: {0}")]
     Contended(String),
 
     /// The object is not the generation the caller pinned: it changed
     /// after the caller's HEAD (a copy source overwritten during the copy).
-    /// Same Display and wire answer (500) as `Other`.
+    /// A retry reads the new generation. Maps to 503 SlowDown.
     #[error("Storage error: {0}")]
     PreconditionFailed(String),
 
     /// The backend refuses writes because a storage cap or quota is used
-    /// up (507, `QuotaExceeded`, B2 `cap_exceeded`). Same Display and wire
-    /// answer (500) as `S3`.
+    /// up (507, `QuotaExceeded`, B2 `cap_exceeded`). Maps to 503
+    /// ServiceUnavailable with a text that names the cause.
     #[error("S3 error: {0}")]
     QuotaExceeded(String),
+
+    /// The backend does not know the multipart upload id (404 `NoSuchUpload`):
+    /// it was completed, aborted or expired. Maps to 404 `NoSuchUpload`.
+    #[error("Upload not found: {0}")]
+    NoSuchUpload(String),
 
     /// The requested byte range starts past the object's end (the caller
     /// resolved it against a stale size). Maps to 416 InvalidRange.
@@ -836,6 +840,7 @@ impl StorageError {
             E::PreconditionFailed(s) => E::PreconditionFailed(s.clone()),
             E::QuotaExceeded(s) => E::QuotaExceeded(s.clone()),
             E::InvalidRange(s) => E::InvalidRange(s.clone()),
+            E::NoSuchUpload(s) => E::NoSuchUpload(s.clone()),
             E::Other(s) => E::Other(s.clone()),
         }
     }
@@ -918,6 +923,16 @@ pub fn clamp_range(start: u64, end: u64, len: u64) -> Result<(u64, u64), Storage
 /// this is a client error, never a 500.
 pub fn io_error_is_name_too_long(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(libc::ENAMETOOLONG) || e.kind() == std::io::ErrorKind::InvalidFilename
+}
+
+/// Pure: whether an I/O error says that the disk is full (`ENOSPC`) or the
+/// user's disk quota is used up (`EDQUOT`).
+pub fn io_error_is_disk_full(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ENOSPC)
+        || matches!(
+            e.kind(),
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+        )
 }
 
 /// Pure: whether an I/O error says that a path component is a directory

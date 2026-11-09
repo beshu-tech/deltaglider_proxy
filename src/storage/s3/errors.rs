@@ -142,109 +142,15 @@ impl S3Backend {
         if matches!(e, SdkError::TimeoutError(_) | SdkError::DispatchFailure(_)) {
             return StorageError::Unavailable(format!("{op} on bucket '{bucket}': {e}"));
         }
-        // Classify by the structured error CODE only. The Debug text embeds
-        // the error message, which names the key: a key `SlowDown-q3.pdf`
-        // turned every error on it into a 503 forever.
-        let code = e.code().unwrap_or("");
-        // Explicit NoSuchBucket → bucket doesn't exist.
-        if code == "NoSuchBucket" {
-            return StorageError::BucketNotFound(bucket.to_string());
-        }
-        // DeleteBucket on a bucket that still holds objects or old versions
-        // (B2 keeps every version): a 409 to the client, not a 500.
-        if code == "BucketNotEmpty" {
-            return StorageError::BucketNotEmpty(bucket.to_string());
-        }
-        // The backend refuses the key's length: a client error, not a 500.
-        if code == "KeyTooLongError" {
-            return StorageError::KeyTooLong(format!(
-                "{op}: the storage backend refused the key as too long"
-            ));
-        }
-        // NoSuchKey (object-level 404) → NotFound, not a 500. This generic
-        // classifier runs for ops without a typed error variant (e.g.
-        // CopyObject, where the *source* key may have been deleted by a
-        // concurrent request). Without this, such a benign race surfaced as
-        // `S3(...)` → HTTP 500 instead of 404. The typed GET path already
-        // does this via `classify_get_error`; this covers the rest. Guard on
-        // the op NOT being bucket-level so a 404 on a bucket op stays a
-        // BucketNotFound concern, not a key NotFound.
-        if !op.is_bucket_level() && (code == "NoSuchKey" || matches!(status, Some(404))) {
-            return StorageError::NotFound(format!("{} key not found", op));
-        }
-        // Bucket-level 404 → the bucket is absent. HEAD responses carry NO
-        // body, so the NoSuchBucket marker check above can never match for
-        // HeadBucket — and S3 semantics define a HeadBucket 404 as "bucket
-        // does not exist". Without this, a bare 404 fell into `S3(...)`,
-        // which routing treats as TRANSIENT: an unrouted bucket became
-        // "transiently" unroutable forever and backend discovery never ran
-        // (the beshu-b2 incident).
-        if op.is_bucket_level() && matches!(status, Some(404)) {
-            return StorageError::BucketNotFound(bucket.to_string());
-        }
-        // Some S3-compatible providers (MinIO, Ceph) return 403 for non-existent
-        // buckets to prevent bucket enumeration. Only treat 403 as BucketNotFound
-        // if the operation is bucket-level. Object-level 403 errors are genuine
-        // AccessDenied and should not be misclassified.
-        if let Some(s) = status {
-            // 416: the range starts at or past the object's end. Every
-            // ranged read (passthrough range, the encrypting wrapper's
-            // second read, chunked frames) answers the client 416, not 500.
-            if s == 416 {
-                return StorageError::InvalidRange(format!("{op} on bucket '{bucket}': {e}"));
-            }
-            if s == 403 && bucket_level_403_means_absent(&op, code) {
-                return StorageError::BucketNotFound(bucket.to_string());
-            }
-            // E-P1-1: 503 SlowDown is the AWS-spec transient throttle
-            // signal. Map to a dedicated `Throttled` variant so the
-            // API layer can surface 503 SlowDown to the caller —
-            // pre-fix this fell into `S3(...)` → catch-all in
-            // `api/errors.rs` → 500 InternalError, which AWS SDKs
-            // treat as permanent and DON'T back off on. Real
-            // production load against a back-pressuring backend
-            // would cascade into client retry storms with no
-            // throttle propagation. Also catches `SlowDown` literal
-            // in the SDK error body when the upstream returns it
-            // without a 503 status (some implementations).
-            // 429 Too Many Requests is the throttle signal from Backblaze B2 and
-            // Cloudflare R2 (and some S3-compatibles) where AWS uses 503 SlowDown.
-            // Classify it the same, or it falls into the S3(...) catch-all → 500,
-            // which SDKs treat as permanent and don't back off on.
-            if s == 503 || s == 429 || code == "SlowDown" {
-                return StorageError::Throttled(format!("{} throttled (status={}): {}", op, s, e));
-            }
-            if s == 507 || code_is_quota(code) {
-                return StorageError::QuotaExceeded(format!("{op} failed (status={s}): {e}"));
-            }
-            if s == 403 {
-                return StorageError::AccessDenied(format!("{op} failed (status=403): {e}"));
-            }
-            // The bucket lives behind another endpoint: every request fails
-            // the same way, as a refused one does.
-            if s == 301 || code == "PermanentRedirect" {
-                return StorageError::AccessDenied(format!("{op} failed (status={s}): {e}"));
-            }
-            // A server-side fault a retry can clear (500 InternalError, 502,
-            // 504). 503 is `Throttled` above.
-            if matches!(s, 500 | 502 | 504) {
-                return StorageError::Transient(format!("{op} failed (status={s}): {e}"));
-            }
-        } else if code == "SlowDown" {
-            return StorageError::Throttled(format!("{} throttled: {}", op, e));
-        } else if code_is_quota(code) {
-            return StorageError::QuotaExceeded(format!("{op} failed (status=0): {e}"));
-        }
-        // The response came back but broke off or could not be read.
-        if matches!(e, SdkError::ResponseError(_)) {
-            return StorageError::Transient(format!("{op} failed (status=0): {e}"));
-        }
-        StorageError::S3(format!(
-            "{} failed (status={}): {}",
-            op,
-            status.unwrap_or(0),
-            e
-        ))
+        // Classify by the structured error CODE only (see `classify_response`).
+        classify_response(
+            bucket,
+            &op,
+            status,
+            backend_error_code(e),
+            matches!(e, SdkError::ResponseError(_)),
+            &e.to_string(),
+        )
     }
 
     /// Classify a GetObject SDK error, mapping NoSuchKey to NotFound.
@@ -287,6 +193,160 @@ fn code_is_credential_refusal(code: &str) -> bool {
             | "AccountProblem"
             | "InvalidSecurity"
     )
+}
+
+/// The structured error code of an SDK error. A HEAD answer has no body, so
+/// the SDK reads no code from it; MinIO names the code in the
+/// `x-minio-error-code` header (`XMinioInvalidObjectName` for a key it
+/// refuses), so that header is the code when the body gave none. A bare
+/// status is never read as the key's fault: a wrong region, an expired token
+/// or a proxy's HTML 400 look the same.
+fn backend_error_code<E: std::fmt::Debug + ProvideErrorMetadata>(e: &SdkError<E>) -> &str {
+    if let Some(code) = e.code().filter(|c| !c.is_empty()) {
+        return code;
+    }
+    if let SdkError::ServiceError(svc) = e {
+        if let Some(h) = svc.raw().headers().get("x-minio-error-code") {
+            return h;
+        }
+    }
+    ""
+}
+
+/// THE mapping from a backend's answer — the op, the HTTP status (`None` =
+/// none came), the structured error code, whether the response body broke
+/// off — to a [`StorageError`]. Pure: the table test over every
+/// (op, status, code) triple lives in `tests`. `detail` is the SDK error's
+/// text, for the variants that carry it to the log.
+pub(super) fn classify_response(
+    bucket: &str,
+    op: &S3Op,
+    status: Option<u16>,
+    code: &str,
+    response_error: bool,
+    detail: &str,
+) -> StorageError {
+    // Classify by the structured error CODE only. The Debug text embeds
+    // the error message, which names the key: a key `SlowDown-q3.pdf`
+    // turned every error on it into a 503 forever.
+    // Explicit NoSuchBucket → bucket doesn't exist.
+    if code == "NoSuchBucket" {
+        return StorageError::BucketNotFound(bucket.to_string());
+    }
+    // DeleteBucket on a bucket that still holds objects or old versions
+    // (B2 keeps every version): a 409 to the client, not a 500.
+    if code == "BucketNotEmpty" {
+        return StorageError::BucketNotEmpty(bucket.to_string());
+    }
+    // The backend refuses the key's length: a client error, not a 500.
+    if code == "KeyTooLongError" {
+        return StorageError::KeyTooLong(format!(
+            "{op}: the storage backend refused the key as too long"
+        ));
+    }
+    // The backend does not know the multipart upload: a 404 that is NOT a
+    // missing key (it fell into `NoSuchKey` below).
+    if code == "NoSuchUpload" {
+        return StorageError::NoSuchUpload(format!("{op} on bucket '{bucket}'"));
+    }
+    // The backend refuses the key's characters (MinIO: a control character,
+    // a space-only name, an over-long segment): a client error, not a 500.
+    if matches!(code, "XMinioInvalidObjectName" | "InvalidObjectName") {
+        return StorageError::InvalidKey(format!("{op}: the storage backend refused the key name"));
+    }
+    // The backend gave up on the request (a slow body, a conflicting
+    // operation in flight): a retry can succeed. Whatever the status is
+    // (S3 answers 400 and 408 for RequestTimeout, 409 for OperationAborted).
+    if matches!(code, "RequestTimeout" | "OperationAborted") {
+        return StorageError::Transient(format!(
+            "{op} failed (status={}): {code}: {detail}",
+            status.unwrap_or(0)
+        ));
+    }
+    // NoSuchKey (object-level 404) → NotFound, not a 500. This generic
+    // classifier runs for ops without a typed error variant (e.g.
+    // CopyObject, where the *source* key may have been deleted by a
+    // concurrent request). Without this, such a benign race surfaced as
+    // `S3(...)` → HTTP 500 instead of 404. The typed GET path already
+    // does this via `classify_get_error`; this covers the rest. Guard on
+    // the op NOT being bucket-level so a 404 on a bucket op stays a
+    // BucketNotFound concern, not a key NotFound.
+    if !op.is_bucket_level() && (code == "NoSuchKey" || matches!(status, Some(404))) {
+        return StorageError::NotFound(format!("{} key not found", op));
+    }
+    // Bucket-level 404 → the bucket is absent. HEAD responses carry NO
+    // body, so the NoSuchBucket marker check above can never match for
+    // HeadBucket — and S3 semantics define a HeadBucket 404 as "bucket
+    // does not exist". Without this, a bare 404 fell into `S3(...)`,
+    // which routing treats as TRANSIENT: an unrouted bucket became
+    // "transiently" unroutable forever and backend discovery never ran
+    // (the beshu-b2 incident).
+    if op.is_bucket_level() && matches!(status, Some(404)) {
+        return StorageError::BucketNotFound(bucket.to_string());
+    }
+    // Some S3-compatible providers (MinIO, Ceph) return 403 for non-existent
+    // buckets to prevent bucket enumeration. Only treat 403 as BucketNotFound
+    // if the operation is bucket-level. Object-level 403 errors are genuine
+    // AccessDenied and should not be misclassified.
+    if let Some(s) = status {
+        // 416: the range starts at or past the object's end. Every
+        // ranged read (passthrough range, the encrypting wrapper's
+        // second read, chunked frames) answers the client 416, not 500.
+        if s == 416 {
+            return StorageError::InvalidRange(format!("{op} on bucket '{bucket}': {detail}"));
+        }
+        if s == 403 && bucket_level_403_means_absent(op, code) {
+            return StorageError::BucketNotFound(bucket.to_string());
+        }
+        // E-P1-1: 503 SlowDown is the AWS-spec transient throttle
+        // signal. Map to a dedicated `Throttled` variant so the
+        // API layer can surface 503 SlowDown to the caller —
+        // pre-fix this fell into `S3(...)` → catch-all in
+        // `api/errors.rs` → 500 InternalError, which AWS SDKs
+        // treat as permanent and DON'T back off on. Real
+        // production load against a back-pressuring backend
+        // would cascade into client retry storms with no
+        // throttle propagation. Also catches `SlowDown` literal
+        // in the SDK error body when the upstream returns it
+        // without a 503 status (some implementations).
+        // 429 Too Many Requests is the throttle signal from Backblaze B2 and
+        // Cloudflare R2 (and some S3-compatibles) where AWS uses 503 SlowDown.
+        // Classify it the same, or it falls into the S3(...) catch-all → 500,
+        // which SDKs treat as permanent and don't back off on.
+        if s == 503 || s == 429 || code == "SlowDown" {
+            return StorageError::Throttled(format!("{} throttled (status={}): {}", op, s, detail));
+        }
+        if s == 507 || code_is_quota(code) {
+            return StorageError::QuotaExceeded(format!("{op} failed (status={s}): {detail}"));
+        }
+        if s == 403 {
+            return StorageError::AccessDenied(format!("{op} failed (status=403): {detail}"));
+        }
+        // The bucket lives behind another endpoint: every request fails
+        // the same way, as a refused one does.
+        if s == 301 || code == "PermanentRedirect" {
+            return StorageError::AccessDenied(format!("{op} failed (status={s}): {detail}"));
+        }
+        // A server-side fault a retry can clear (500 InternalError, 502,
+        // 504). 503 is `Throttled` above.
+        if matches!(s, 500 | 502 | 504) {
+            return StorageError::Transient(format!("{op} failed (status={s}): {detail}"));
+        }
+    } else if code == "SlowDown" {
+        return StorageError::Throttled(format!("{} throttled: {}", op, detail));
+    } else if code_is_quota(code) {
+        return StorageError::QuotaExceeded(format!("{op} failed (status=0): {detail}"));
+    }
+    // The response came back but broke off or could not be read.
+    if response_error {
+        return StorageError::Transient(format!("{op} failed (status=0): {detail}"));
+    }
+    StorageError::S3(format!(
+        "{} failed (status={}): {}",
+        op,
+        status.unwrap_or(0),
+        detail
+    ))
 }
 
 /// Pure: an S3 error code that means "storage cap or quota used up".
