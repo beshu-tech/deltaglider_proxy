@@ -61,6 +61,7 @@ impl AppState {
     /// An app state around `engine` with no config DB and no counters.
     pub(crate) fn for_tests(engine: DynEngine) -> Arc<Self> {
         let config = crate::config::Config::default();
+        let ingest_memory = engine.memory_budget().clone();
         Arc::new(Self {
             engine: arc_swap::ArcSwap::from_pointee(engine),
             multipart: Arc::new(crate::multipart::MultipartStore::new(
@@ -77,6 +78,7 @@ impl AppState {
             backend_capabilities: Default::default(),
             backend_health: Default::default(),
             encryption_witness: None,
+            ingest_memory,
         })
     }
 }
@@ -116,6 +118,10 @@ pub struct AppState {
     /// single instance. A config apply publishes through it; `/_/ready`
     /// reports its verdict.
     pub encryption_witness: Option<Arc<crate::coordination::EncryptionWitness>>,
+    /// The RAM budget of request bodies (`DGP_INGEST_MEMORY_MAX_BYTES`):
+    /// one per process, attached to every engine, re-attached on every
+    /// rebuild, mirroring `bucket_usage`.
+    pub ingest_memory: crate::deltaglider::memory_budget::MemoryBudget,
 }
 
 // ---------------------------------------------------------------------------

@@ -24,6 +24,11 @@
 - An upload of at most `DGP_SPOOL_THRESHOLD_BYTES` into a folder whose `reference.bin` is larger than that loaded the whole reference into memory. The proxy now writes the upload to a spool file and encodes it against the reference file. When no spool space is free at that moment, the object is stored whole with `x-amz-meta-dg-passthrough-reason: delta-unavailable`. The legacy-reference migration (`/_/api/admin/migrate`) of a large reference reads it from a spool file too.
 - An UploadPartCopy with no `x-amz-copy-source-range` now reads the whole source as one range, like a ranged part: a source that changed after the copy conditions were checked fails with `412`, and a large delta source is reconstructed in a spool file, not in memory.
 
+### Changed — Framed upload bodies are decoded as they arrive
+
+- An upload body in the aws-chunked framing that the proxy decodes itself (an anonymous or open-access `STREAMING-*` upload) now goes through a decoder that reads the body as it arrives. It refuses a chunk header line longer than 4 KiB and a trailer section longer than 16 KiB or 64 lines with `400 InvalidArgument`. AWS SDKs send header lines of about 90 bytes and one or two trailer lines, so no SDK upload reaches these limits. A body whose chunks hold more bytes than `x-amz-decoded-content-length` now fails at the chunk that goes past that length.
+- A CopyObject of a large source, a replication or lifecycle copy, and a CLI copy now compute the SHA-256 and MD5 of the object while they write it to the spool file. Before, the store read the whole spool file a second time to compute them.
+
 ### Changed — Error answers for faults that a retry can clear
 
 - A full disk, a used-up storage quota, a lock that another writer holds, a copy source that changed during the copy, a delta codec timeout and a backend `RequestTimeout` or `OperationAborted` now answer `503` with `Retry-After`. Before, they answered `500 InternalError`. A full disk and a used-up quota answer `503 ServiceUnavailable` with a text that names the condition. The cause goes to the log.

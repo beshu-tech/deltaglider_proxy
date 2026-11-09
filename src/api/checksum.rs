@@ -14,13 +14,12 @@
 
 use axum::http::HeaderMap;
 use base64::Engine as _;
-use s3s::crypto::Checksum as _;
 
 use super::S3Error;
 
 /// One S3 flexible-checksum algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChecksumAlgorithm {
+pub enum ChecksumAlgorithm {
     Crc32,
     Crc32c,
     Crc64Nvme,
@@ -65,14 +64,22 @@ impl ChecksumAlgorithm {
             .find(|a| a.header().eq_ignore_ascii_case(name.trim()))
     }
 
+    /// From an `x-amz-sdk-checksum-algorithm` value (`CRC32`, `SHA256`, ...).
+    fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|a| a.label().eq_ignore_ascii_case(label.trim()))
+    }
+
     fn digest(self, body: &[u8]) -> Vec<u8> {
-        match self {
-            Self::Crc32 => s3s::crypto::Crc32::checksum(body).to_vec(),
-            Self::Crc32c => s3s::crypto::Crc32c::checksum(body).to_vec(),
-            Self::Crc64Nvme => s3s::crypto::Crc64Nvme::checksum(body).to_vec(),
-            Self::Sha1 => s3s::crypto::Sha1::checksum(body).as_ref().to_vec(),
-            Self::Sha256 => s3s::crypto::Sha256::checksum(body).as_ref().to_vec(),
-        }
+        let mut hasher = ChecksumPlan::only(self).hasher();
+        hasher.update(body);
+        computed_digest(self, &hasher.finalize()).unwrap_or_default()
+    }
+
+    /// The position of this algorithm in [`Self::ALL`].
+    fn index(self) -> usize {
+        self as usize
     }
 
     fn digest_len(self) -> usize {
@@ -86,7 +93,7 @@ impl ChecksumAlgorithm {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ChecksumError {
+pub enum ChecksumError {
     /// The value is not base64 of the algorithm's digest length.
     Invalid(ChecksumAlgorithm),
     /// More than one checksum value.
@@ -125,15 +132,144 @@ pub(crate) fn verify_checksum(
     expected_b64: &str,
     body: &[u8],
 ) -> Result<(), ChecksumError> {
+    verify_digest(algorithm, expected_b64, &algorithm.digest(body))
+}
+
+/// Pure: is `digest` (raw bytes, computed over the body) the value
+/// `expected_b64` names under `algorithm`? A value that is not base64 of
+/// the algorithm's digest length is `Invalid`, as S3 answers.
+pub fn verify_digest(
+    algorithm: ChecksumAlgorithm,
+    expected_b64: &str,
+    digest: &[u8],
+) -> Result<(), ChecksumError> {
     let expected = base64::engine::general_purpose::STANDARD
         .decode(expected_b64.trim())
         .ok()
         .filter(|d| d.len() == algorithm.digest_len())
         .ok_or(ChecksumError::Invalid(algorithm))?;
-    if algorithm.digest(body) != expected {
+    if digest != expected.as_slice() {
         return Err(ChecksumError::Mismatch(algorithm));
     }
     Ok(())
+}
+
+/// The algorithms to compute while a body arrives, so the client's
+/// checksum is checked without a second pass over the body. Built from
+/// the request headers before the first byte: a checksum header names its
+/// algorithm, `x-amz-trailer` announces one that comes after the body,
+/// and `x-amz-sdk-checksum-algorithm` names the one the SDK computes. A
+/// trailer that names another algorithm is checked by [`digest_of`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChecksumPlan {
+    algorithms: [bool; 5],
+}
+
+impl ChecksumPlan {
+    /// Pure: the plan of a request with these headers.
+    pub fn from_headers(headers: &HeaderMap) -> Self {
+        let mut plan = Self::default();
+        let text = |name: &'static str| {
+            headers
+                .get_all(name)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .collect::<Vec<_>>()
+        };
+        for algorithm in ChecksumAlgorithm::ALL {
+            if headers.contains_key(algorithm.header()) {
+                plan.add(algorithm);
+            }
+        }
+        for name in text("x-amz-trailer") {
+            if let Some(a) = ChecksumAlgorithm::from_header(name) {
+                plan.add(a);
+            }
+        }
+        for label in text("x-amz-sdk-checksum-algorithm") {
+            if let Some(a) = ChecksumAlgorithm::from_label(label) {
+                plan.add(a);
+            }
+        }
+        plan
+    }
+
+    /// The plan of one algorithm.
+    pub fn only(algorithm: ChecksumAlgorithm) -> Self {
+        let mut plan = Self::default();
+        plan.add(algorithm);
+        plan
+    }
+
+    fn add(&mut self, algorithm: ChecksumAlgorithm) {
+        self.algorithms[algorithm.index()] = true;
+    }
+
+    pub fn contains(&self, algorithm: ChecksumAlgorithm) -> bool {
+        self.algorithms[algorithm.index()]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.algorithms.contains(&true)
+    }
+
+    /// The incremental hasher of the planned algorithms (s3s's, which
+    /// computes several in one pass).
+    pub fn hasher(&self) -> s3s::checksum::ChecksumHasher {
+        let on = |a: ChecksumAlgorithm| self.contains(a);
+        s3s::checksum::ChecksumHasher {
+            crc32: on(ChecksumAlgorithm::Crc32).then(Default::default),
+            crc32c: on(ChecksumAlgorithm::Crc32c).then(Default::default),
+            sha1: on(ChecksumAlgorithm::Sha1).then(Default::default),
+            sha256: on(ChecksumAlgorithm::Sha256).then(Default::default),
+            crc64nvme: on(ChecksumAlgorithm::Crc64Nvme).then(Default::default),
+        }
+    }
+}
+
+/// Pure: the raw digest of `algorithm` in a finished hasher's result;
+/// `None` when it was not planned.
+pub fn computed_digest(algorithm: ChecksumAlgorithm, sums: &s3s::dto::Checksum) -> Option<Vec<u8>> {
+    let b64 = match algorithm {
+        ChecksumAlgorithm::Crc32 => sums.checksum_crc32.as_ref(),
+        ChecksumAlgorithm::Crc32c => sums.checksum_crc32c.as_ref(),
+        ChecksumAlgorithm::Crc64Nvme => sums.checksum_crc64nvme.as_ref(),
+        ChecksumAlgorithm::Sha1 => sums.checksum_sha1.as_ref(),
+        ChecksumAlgorithm::Sha256 => sums.checksum_sha256.as_ref(),
+    }?;
+    base64::engine::general_purpose::STANDARD.decode(b64).ok()
+}
+
+/// The digest of `algorithm` over an ingested body, for a checksum whose
+/// algorithm was not planned (a trailer that names another one). One
+/// sequential pass: over the memory body, or over the spool file in
+/// 256 KiB reads on a blocking thread.
+pub async fn digest_of(
+    algorithm: ChecksumAlgorithm,
+    body: &crate::deltaglider::ingest::IngestedBody,
+) -> std::io::Result<Vec<u8>> {
+    use crate::deltaglider::ingest::IngestedBody;
+    let path = match body {
+        IngestedBody::Memory { data, .. } => return Ok(algorithm.digest(data)),
+        IngestedBody::Spooled { spool, .. } => spool.path().to_path_buf(),
+    };
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = ChecksumPlan::only(algorithm).hasher();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(computed_digest(algorithm, &hasher.finalize()).unwrap_or_default())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Pure: the one checksum the client sent, from the request headers or the
@@ -333,6 +469,111 @@ mod tests {
             (ChecksumError::Mismatch(Crc32), "BadDigest"),
         ] {
             assert_eq!(S3Error::from(err).code(), code);
+        }
+    }
+
+    /// The plan collects the algorithm of a checksum header, of a trailer
+    /// announced in `x-amz-trailer`, and of `x-amz-sdk-checksum-algorithm`;
+    /// anything else plans nothing.
+    #[test]
+    fn the_plan_comes_from_the_three_headers() {
+        let plan = |pairs: &[(&'static str, &str)]| ChecksumPlan::from_headers(&headers(pairs));
+        assert!(plan(&[]).is_empty());
+        assert_eq!(
+            plan(&[("x-amz-checksum-sha1", "x")]),
+            ChecksumPlan::only(Sha1)
+        );
+        assert_eq!(
+            plan(&[("x-amz-trailer", "x-amz-checksum-crc64nvme")]),
+            ChecksumPlan::only(Crc64Nvme)
+        );
+        assert_eq!(
+            plan(&[("x-amz-sdk-checksum-algorithm", "crc32c")]),
+            ChecksumPlan::only(Crc32c)
+        );
+        let all = plan(&[
+            ("x-amz-checksum-crc32", "x"),
+            ("x-amz-trailer", "x-amz-meta-a, x-amz-checksum-sha256"),
+            ("x-amz-sdk-checksum-algorithm", "SHA1"),
+        ]);
+        for a in [Crc32, Sha256, Sha1] {
+            assert!(all.contains(a), "{a:?}");
+        }
+        assert!(!all.contains(Crc32c) && !all.contains(Crc64Nvme));
+        assert!(plan(&[
+            ("x-amz-trailer", "x-amz-meta-a"),
+            ("x-amz-sdk-checksum-algorithm", "MD5"),
+            ("x-amz-checksum-algorithm", "CRC32"),
+        ])
+        .is_empty());
+    }
+
+    /// One incremental hasher of every algorithm, fed in pieces, gives
+    /// the known digests.
+    #[test]
+    fn the_incremental_hasher_gives_the_known_digests() {
+        let mut plan = ChecksumPlan::default();
+        for a in ChecksumAlgorithm::ALL {
+            plan.add(a);
+        }
+        for body in [&b"123456789"[..], b""] {
+            let mut hasher = plan.hasher();
+            for piece in body.chunks(2) {
+                hasher.update(piece);
+            }
+            let sums = hasher.finalize();
+            for &(algorithm, _, b64) in VECTORS.iter().filter(|v| v.1 == body) {
+                let digest = computed_digest(algorithm, &sums).unwrap();
+                assert_eq!(
+                    verify_digest(algorithm, b64, &digest),
+                    Ok(()),
+                    "{algorithm:?}"
+                );
+            }
+        }
+        // Not planned: no digest.
+        let mut only = ChecksumPlan::only(Crc32).hasher();
+        only.update(b"x");
+        assert_eq!(computed_digest(Sha256, &only.finalize()), None);
+    }
+
+    #[test]
+    fn verify_digest_judges_the_value_and_its_form() {
+        for &(algorithm, body, b64) in VECTORS {
+            let digest = algorithm.digest(body);
+            assert_eq!(verify_digest(algorithm, b64, &digest), Ok(()));
+            let mut wrong = digest.clone();
+            wrong[0] ^= 1;
+            assert_eq!(
+                verify_digest(algorithm, b64, &wrong),
+                Err(ChecksumError::Mismatch(algorithm))
+            );
+            assert_eq!(
+                verify_digest(algorithm, "not base64!", &digest),
+                Err(ChecksumError::Invalid(algorithm))
+            );
+        }
+    }
+
+    /// The late re-hash gives the same digest over a memory body and over
+    /// a spool file.
+    #[tokio::test]
+    async fn digest_of_reads_memory_and_spool_bodies() {
+        use crate::deltaglider::ingest::IngestedBody;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool =
+            crate::deltaglider::spool::SpoolDir::new(tmp.path().to_path_buf(), 64 << 20).unwrap();
+        for &(algorithm, body, b64) in VECTORS {
+            let memory = IngestedBody::hashed_from_bytes(bytes::Bytes::from_static(body));
+            let spooled = IngestedBody::spooled_for_test(&pool, body).await;
+            for b in [&memory, &spooled] {
+                let digest = digest_of(algorithm, b).await.unwrap();
+                assert_eq!(
+                    verify_digest(algorithm, b64, &digest),
+                    Ok(()),
+                    "{algorithm:?}"
+                );
+            }
         }
     }
 }

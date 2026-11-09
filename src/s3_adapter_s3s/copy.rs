@@ -190,7 +190,12 @@ async fn copy_through_store(
             )
             .await?
         }
-        CopySourceBody::Spooled { spool, size, .. } => {
+        CopySourceBody::Spooled {
+            spool,
+            size,
+            hashes,
+            ..
+        } => {
             crate::api::handlers::object_helpers::store_client_write_spooled(
                 &svc.state,
                 crate::api::handlers::object_helpers::SpooledClientWrite {
@@ -198,6 +203,7 @@ async fn copy_through_store(
                     key: &input.key,
                     spool,
                     size: *size,
+                    hashes: hashes.clone(),
                     content_type,
                     user_metadata,
                     precondition: &precondition,
@@ -257,6 +263,8 @@ pub(super) enum CopySourceBody {
     Spooled {
         spool: crate::deltaglider::spool::Spool,
         size: u64,
+        /// From the fill: the store does not read the spool back.
+        hashes: crate::deltaglider::ingest::BodyHashes,
         metadata: FileMetadata,
     },
 }
@@ -307,7 +315,7 @@ pub(super) async fn read_copy_source(
     let spool = engine.spool_acquire(head_size).await?;
     use crate::deltaglider::spool::SpoolFillError;
     let fill = spool
-        .fill_from_stream(&mut stream, head_size)
+        .fill_from_stream(&mut stream, head_size, None)
         .await
         .map_err(|e| match e {
             SpoolFillError::Source(e) => s3s::S3Error::from(e),
@@ -320,6 +328,7 @@ pub(super) async fn read_copy_source(
     Ok(CopySourceBody::Spooled {
         spool,
         size: fill.written,
+        hashes: fill.hashes,
         metadata,
     })
 }

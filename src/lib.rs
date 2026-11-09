@@ -2347,6 +2347,7 @@ mod source_guards {
             "src/api/admin/config/field_level.rs",
             "src/api/admin/config/password.rs",
             "src/deltaglider/engine",
+            "src/deltaglider/ingest.rs",
             "src/deltaglider/codec.rs",
             "src/maintenance/worker.rs",
         ];

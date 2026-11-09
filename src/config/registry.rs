@@ -555,6 +555,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Delta Engine",
     },
     EnvVarEntry {
+        name: "DGP_INGEST_MEMORY_MAX_BYTES",
+        description: "Most memory used for upload bodies at once; a body at most DGP_SPOOL_THRESHOLD_BYTES is read into memory while this has room, else it goes to the spool; read at startup only (default: 1 GiB; 0 = every body goes to the spool)",
+        example: "1073741824",
+        category: "Delta Engine",
+    },
+    EnvVarEntry {
         name: "DGP_LISTING_FACTS_GC",
         description: "Periodic removal (every 6 h) of S3 listing-facts entries whose object is gone (default: true)",
         example: "false",

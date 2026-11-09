@@ -100,11 +100,14 @@ pub(crate) async fn upload_file(
         size,
         content_type,
         user_metadata,
+        None,
     )
     .await
 }
 
 /// The streaming store of a spooled body, under the object's write lock.
+/// `hashes`: from the fill that wrote the spool, if it hashed it.
+#[allow(clippy::too_many_arguments)]
 async fn store_spooled(
     engine: &DynEngine,
     bucket: &str,
@@ -113,6 +116,7 @@ async fn store_spooled(
     size: u64,
     content_type: Option<String>,
     user_metadata: HashMap<String, String>,
+    hashes: Option<crate::deltaglider::ingest::BodyHashes>,
 ) -> Result<StoreResult, TransferError> {
     let lock = engine.lock_object_write(bucket, key).await;
     engine
@@ -125,6 +129,7 @@ async fn store_spooled(
             content_type,
             user_metadata,
             None,
+            hashes,
         )
         .await
         .map_err(TransferError::Dest)
@@ -286,7 +291,7 @@ pub(crate) async fn copy_object(
         observed,
     };
     let fill = spool
-        .fill_from_stream(&mut stream, size)
+        .fill_from_stream(&mut stream, size, None)
         .await
         .map_err(|e| match e {
             SpoolFillError::Source(e) => TransferError::Source(EngineError::Storage(e)),
@@ -296,7 +301,8 @@ pub(crate) async fn copy_object(
     if fill.written != size {
         return Err(changed(fill.written));
     }
-    store_spooled(dst, dst_bucket, dst_key, &spool, size, ct, meta).await
+    let hashes = Some(fill.hashes);
+    store_spooled(dst, dst_bucket, dst_key, &spool, size, ct, meta, hashes).await
 }
 
 #[cfg(test)]

@@ -399,7 +399,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             let spool = self.spool_acquire(size).await?;
             // Hash from RAM while the spool is written: the spooled store
             // then does not read the body back to hash it.
-            let hashing = super::store::BodyHashes::compute(&data, known_sha256);
+            let hashing = crate::deltaglider::ingest::BodyHashes::compute(&data, known_sha256);
             let (written, hashes) = tokio::join!(tokio::fs::write(spool.path(), &data), hashing);
             written.map_err(|e| EngineError::Storage(StorageError::from(e)))?;
             let hashes = hashes?;

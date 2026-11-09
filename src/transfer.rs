@@ -1866,7 +1866,7 @@ async fn spooled_copy(
     // exactly the bytes the metadata names.
     use crate::deltaglider::spool::SpoolFillError;
     let fill = spool
-        .fill_from_stream(&mut stream, source_size)
+        .fill_from_stream(&mut stream, source_size, None)
         .await
         .map_err(|e| match e {
             SpoolFillError::Source(e) => CopyError::storage("source stream error", e),
@@ -1874,7 +1874,7 @@ async fn spooled_copy(
             SpoolFillError::Overrun { .. } => changed(),
         })?;
     if fill.written != source_size
-        || (!meta.file_sha256.is_empty() && fill.sha256 != meta.file_sha256)
+        || (!meta.file_sha256.is_empty() && fill.hashes.sha256() != meta.file_sha256)
     {
         return Err(changed());
     }
@@ -1905,6 +1905,8 @@ async fn spooled_copy(
             content_type,
             user_metadata,
             meta.multipart_etag.clone(),
+            // Hashed by the fill: the store does not read the spool back.
+            Some(fill.hashes),
         )
         .await
         .map_err(|e| CopyError::engine("destination spooled store failed", e))?;
@@ -3443,10 +3445,15 @@ mod request_count_tests {
 
     /// Requests that start with `prefix`, without the background listing
     /// facts upkeep under `.dg/` (it races the assertions).
+    /// Requests that start with `prefix`, without the listing-facts
+    /// upkeep (`.dg/` writes and their listings), which the earlier
+    /// writes of a fixture can still send in the background.
     fn count(fake: &FakeS3, prefix: &str) -> usize {
         fake.requests()
             .iter()
-            .filter(|r| r.starts_with(prefix) && !r.contains("/.dg/"))
+            .filter(|r| {
+                r.starts_with(prefix) && !r.contains("/.dg/") && !r.contains("prefix=.dg%2F")
+            })
             .count()
     }
 

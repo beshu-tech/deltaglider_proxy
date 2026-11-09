@@ -277,6 +277,9 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     /// Env-only settings, copied from the config at build (see
     /// [`crate::config::RuntimeTuning`]).
     tuning: crate::config::RuntimeTuning,
+    /// The RAM budget of request bodies (`deltaglider::ingest`); the
+    /// process's one budget, attached with [`Self::with_memory_budget`].
+    memory: crate::deltaglider::memory_budget::MemoryBudget,
     /// The encryption-policy slots of the raw backends (issue #116 review
     /// D): shared with the engine this one replaces.
     encryption: construction::EngineEncryption,
@@ -309,6 +312,8 @@ pub(crate) use delete_cost_tests::{s3_engine, store_deltas};
 #[cfg(test)]
 mod write_cost_tests;
 
+#[cfg(test)]
+mod ingest_tests;
 /// Large objects on the read side stay out of memory.
 #[cfg(test)]
 mod read_spool_tests;

@@ -346,7 +346,8 @@ The number of seconds that a verified reconstruction of a large delta object sta
 
 | | |
 |---|---|
-| **Env var** | `DGP_RANGE_SPOOL_TTL_SECS` |
+| **Env var** | `DGP_INGEST_MEMORY_MAX_BYTES` | 1073741824 (1 GiB) | The most memory that the proxy uses for upload bodies at once. The proxy reads a body that is at most `DGP_SPOOL_THRESHOLD_BYTES` into memory when this budget has room for the length that the request declares, and it gives that room back when the request ends. When the budget is full, the proxy writes the body to a file in `DGP_SPOOL_DIR` instead, so the upload still succeeds and only costs a disk write. A body larger than `DGP_SPOOL_THRESHOLD_BYTES` always goes to the spool. The proxy reads this variable once at startup; a config reload does not change it. `0` sends every body to the spool. The metrics `deltaglider_ingest_memory_bytes` and `deltaglider_ingest_bodies_total` show how the budget is used |
+| `DGP_RANGE_SPOOL_TTL_SECS` |
 | **YAML** | `advanced.range_spool_ttl_secs` |
 | **Default** | `60` |
 | **Hot-reload** | Yes (triggers engine rebuild) |

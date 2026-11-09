@@ -16,6 +16,18 @@ pub fn default_spool_threshold(max_object_size: u64) -> u64 {
     DEFAULT_SPOOL_THRESHOLD_BYTES.min(max_object_size)
 }
 
+/// A spool acquisition error as the engine reports it: a reservation
+/// refused without a wait ([`crate::deltaglider::spool::CONTENDED`]: a
+/// holder never waits, or a no-wait caller found no free budget) is a
+/// retryable `Overloaded`; anything else is a storage error.
+fn spool_error(e: std::io::Error) -> EngineError {
+    if e.kind() == crate::deltaglider::spool::CONTENDED {
+        EngineError::Overloaded(e.to_string())
+    } else {
+        EngineError::Storage(StorageError::from(e))
+    }
+}
+
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Access the underlying storage backend (for operations that bypass the delta engine)
     pub fn storage(&self) -> &S {
@@ -52,6 +64,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .unwrap_or_else(|| default_spool_threshold(self.max_object_size))
     }
 
+    /// The RAM budget of request bodies.
+    pub fn memory_budget(&self) -> &crate::deltaglider::memory_budget::MemoryBudget {
+        &self.memory
+    }
+
+    /// The whole spool budget, in bytes (`DGP_SPOOL_MAX_BYTES`).
+    pub fn spool_max_bytes(&self) -> u64 {
+        self.spool.max_bytes()
+    }
+
     /// The env-only settings this engine was built with.
     pub fn tuning(&self) -> &crate::config::RuntimeTuning {
         &self.tuning
@@ -65,14 +87,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     where
         F: std::future::Future<Output = std::io::Result<T>>,
     {
-        self.with_spool_timeout_io(fut).await?.map_err(|e| {
-            // A holder refused a wait (hold-and-wait guard): retryable.
-            if e.kind() == crate::deltaglider::spool::CONTENDED {
-                EngineError::Overloaded(e.to_string())
-            } else {
-                EngineError::Storage(StorageError::from(e))
-            }
-        })
+        self.with_spool_timeout_io(fut).await?.map_err(spool_error)
     }
 
     /// [`Self::with_spool_timeout`] that hands back the acquisition's own
@@ -133,6 +148,33 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .map(Some)
     }
 
+    /// The spool reservation of an ingested body of `bytes` bound for
+    /// `bucket`: the body's file plus the temp files its storage write
+    /// needs (`file_put_spool_bytes`), in ONE reservation, so the write
+    /// later uses it and never waits under a lock. `wait`: queue for the
+    /// budget (timed); else take free budget now, whatever the queue, or
+    /// `Overloaded` (a small body never waits behind a large one).
+    /// `held_mib`: budget the op holds already; a holder never waits.
+    pub(crate) async fn reserve_ingest_spool(
+        &self,
+        bucket: &str,
+        bytes: u64,
+        held_mib: usize,
+        wait: bool,
+    ) -> Result<crate::deltaglider::spool::SpoolReservation, EngineError> {
+        let extra = self
+            .storage
+            .file_put_spool_bytes(bucket, bytes, false)
+            .await;
+        let total = bytes.saturating_add(extra);
+        if wait {
+            return self
+                .with_spool_timeout(self.spool.reserve_beside(held_mib, total))
+                .await;
+        }
+        self.spool.try_reserve(total, held_mib).map_err(spool_error)
+    }
+
     /// The spool file for the buffered codec's source, taken WITHOUT waiting:
     /// the buffered PUT encodes under the deltaspace lock. A full budget is a
     /// retryable SlowDown.
@@ -140,13 +182,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         bytes: usize,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
-        self.spool.try_acquire(bytes as u64).map_err(|e| {
-            if e.kind() == crate::deltaglider::spool::CONTENDED {
-                EngineError::Overloaded(e.to_string())
-            } else {
-                EngineError::Storage(StorageError::from(e))
-            }
-        })
+        self.spool.try_acquire(bytes as u64).map_err(spool_error)
     }
 
     /// `spool_acquire` for an op that holds `held_mib` of the budget already

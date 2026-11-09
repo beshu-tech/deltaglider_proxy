@@ -115,6 +115,8 @@ pub(crate) struct SpooledClientWrite<'a> {
     pub key: &'a str,
     pub spool: &'a crate::deltaglider::spool::Spool,
     pub size: u64,
+    /// The hashes of the spool's bytes, from the fill that wrote it.
+    pub hashes: crate::deltaglider::ingest::BodyHashes,
     pub content_type: Option<String>,
     pub user_metadata: std::collections::HashMap<String, String>,
     pub precondition: &'a crate::deltaglider::Precondition,
@@ -143,6 +145,7 @@ pub(crate) async fn store_client_write_spooled(
                 write.content_type,
                 write.user_metadata,
                 None,
+                Some(write.hashes),
             )
             .await?
     };

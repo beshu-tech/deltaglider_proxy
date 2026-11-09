@@ -5,6 +5,7 @@
 use super::conditional::ObjectWriteGuard;
 use super::usage::CounterPrior;
 use super::*;
+use crate::deltaglider::ingest::BodyHashes;
 use crate::deltaglider::spool::SpoolBudget;
 use crate::storage::{MultipartUpload, ObjectVariant, StorageBackend, UploadedPart};
 use crate::types::PassthroughReason;
@@ -142,43 +143,6 @@ impl StorePlan {
                 reason,
             }
         }
-    }
-}
-
-/// The hex SHA-256 and MD5 of a body, computed by a caller that held it.
-pub(super) struct BodyHashes {
-    pub(super) sha256: String,
-    pub(super) md5: String,
-}
-
-impl BodyHashes {
-    /// Hash `data`; a `known` SHA-256 is used as is, so only the MD5 pass
-    /// runs. CPU work: [`Self::compute`] moves a large body off the async
-    /// runtime.
-    fn of(data: &[u8], known: Option<KnownSha256>) -> Self {
-        Self {
-            sha256: match known {
-                Some(k) => k.to_hex(),
-                None => hex::encode(Sha256::digest(data)),
-            },
-            md5: hex::encode(Md5::digest(data)),
-        }
-    }
-
-    /// [`Self::of`], on a blocking thread when the body is above
-    /// [`BLOCKING_HASH_THRESHOLD`]: a 16 MiB body takes about 10 ms per
-    /// pass, which a tokio worker must not spend.
-    pub(super) async fn compute(
-        data: &Bytes,
-        known: Option<KnownSha256>,
-    ) -> Result<Self, EngineError> {
-        if data.len() <= BLOCKING_HASH_THRESHOLD {
-            return Ok(Self::of(data, known));
-        }
-        let data = data.clone();
-        tokio::task::spawn_blocking(move || Self::of(&data, known))
-            .await
-            .map_err(|e| EngineError::Storage(StorageError::Other(format!("hash task: {e}"))))
     }
 }
 
@@ -557,7 +521,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let prior = self.prior_or_read(bucket, key, known_prior).await;
 
         // Calculate hashes (the SHA-256 only when the caller does not know it).
-        let BodyHashes { sha256, md5 } = BodyHashes::compute(data, known_sha256).await?;
+        let (sha256, md5) = BodyHashes::compute(data, known_sha256).await?.into_parts();
 
         info!(
             "Storing {}/{} ({} bytes, sha256={})",
@@ -699,6 +663,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ///    spool, capped at `ratio_threshold × size`.
     ///
     /// The caller owns `body` (a `Spool`); it lives until this returns.
+    /// `known_hashes`: the hashes of the body, from the fill that wrote the
+    /// spool ([`crate::deltaglider::spool::Spool::fill_from_stream`]); with
+    /// them the spool is not read back to hash it. `None` hashes the file.
     #[allow(clippy::too_many_arguments)]
     pub async fn store_spooled_delta(
         &self,
@@ -710,6 +677,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
+        known_hashes: Option<BodyHashes>,
     ) -> Result<StoreResult, EngineError> {
         self.store_spooled_delta_inner(
             lock,
@@ -721,7 +689,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             user_metadata,
             multipart_etag,
             None,
-            None,
+            known_hashes,
         )
         .await
     }
@@ -763,10 +731,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // A caller that hashed the body from RAM while it wrote the spool
         // passes the hashes: the spool is not read back (it was, in full,
         // per PUT). The size check then reads the file's length.
-        let (sha256, md5, observed) = match known_hashes {
-            Some(h) => (
-                h.sha256,
-                h.md5,
+        let (sha256, md5, observed) = match known_hashes.map(BodyHashes::into_parts) {
+            Some((sha256, md5)) => (
+                sha256,
+                md5,
                 tokio::fs::metadata(body.path())
                     .await
                     .map_err(|e| EngineError::Storage(StorageError::from(e)))?
@@ -1873,6 +1841,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             content_type,
             user_metadata,
             Some(multipart_etag),
+            None,
         )
         .await
     }
@@ -2663,6 +2632,7 @@ mod counter_tests {
                 None,
                 HashMap::new(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2827,6 +2797,7 @@ mod no_delta_hint_tests {
                 None,
                 with_hint(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2964,6 +2935,7 @@ mod spool_budget_tests {
                 data.len() as u64,
                 None,
                 HashMap::new(),
+                None,
                 None,
             );
             tokio::time::timeout(std::time::Duration::from_secs(10), put)
@@ -3143,6 +3115,7 @@ mod review2_tests {
             None,
             HashMap::new(),
             None,
+            None,
         );
         let b = engine.store_spooled_delta(
             &lock_b,
@@ -3152,6 +3125,7 @@ mod review2_tests {
             v.len() as u64,
             None,
             HashMap::new(),
+            None,
             None,
         );
         let (ra, rb) = tokio::time::timeout(
@@ -3208,7 +3182,17 @@ mod review2_tests {
             let put = move |key: &'static str, body| async move {
                 let lock = engine.lock_object_write("b", key).await;
                 engine
-                    .store_spooled_delta(&lock, "b", key, body, size, None, HashMap::new(), None)
+                    .store_spooled_delta(
+                        &lock,
+                        "b",
+                        key,
+                        body,
+                        size,
+                        None,
+                        HashMap::new(),
+                        None,
+                        None,
+                    )
                     .await
             };
             let (ra, rb) = tokio::time::timeout(
@@ -3237,6 +3221,7 @@ mod review2_tests {
                 v.len() as u64,
                 None,
                 HashMap::new(),
+                None,
                 None,
             )
             .await
@@ -3269,6 +3254,7 @@ mod review2_tests {
                     body.len() as u64,
                     None,
                     HashMap::new(),
+                    None,
                     None,
                 )
                 .await
@@ -3476,6 +3462,7 @@ mod other_form_tests {
                 v2.len() as u64,
                 None,
                 HashMap::new(),
+                None,
                 None,
             )
             .await

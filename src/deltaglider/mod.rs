@@ -6,6 +6,8 @@ mod cache;
 mod codec;
 mod engine;
 mod file_router;
+pub mod ingest;
+pub mod memory_budget;
 pub(crate) mod range_spool;
 pub mod savings;
 pub mod spool;

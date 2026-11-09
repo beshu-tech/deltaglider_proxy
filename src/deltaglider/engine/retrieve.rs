@@ -635,8 +635,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             )
             .await?
             .stream;
+        // Unhashed: the decoded object is checked against its SHA-256.
         delta_spool
-            .fill_from_stream(&mut delta_stream, delta_cap)
+            .fill_unhashed(&mut delta_stream, delta_cap)
             .await
             .map_err(|e| match e {
                 crate::deltaglider::spool::SpoolFillError::Source(e) => EngineError::Storage(e),

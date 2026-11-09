@@ -552,25 +552,60 @@ impl Spool {
         self.file.path()
     }
 
-    /// Write `stream` into this spool file, hashing it (SHA-256) on the way.
-    /// At most `cap` bytes (the reservation): a longer stream stops at the
-    /// first chunk past `cap`, so a source that grew after its size was read
-    /// never overruns the spool budget. The caller judges a short stream.
-    pub async fn fill_from_stream<S>(
+    /// Write `stream` into this spool file, hashing it (SHA-256 and MD5)
+    /// on the way; a `known_sha256` (proven for these bytes by the caller)
+    /// is used as is, and only MD5 is computed. At most `cap` bytes (the
+    /// reservation): a longer stream stops at the first chunk past `cap`,
+    /// so a source that grew after its size was read never overruns the
+    /// spool budget. The caller judges a short stream. The one spool writer
+    /// of the proxy: writes go through a 1 MiB buffer, so small chunks do
+    /// not each cost a trip to the blocking pool.
+    pub async fn fill_from_stream<S, E>(
         &self,
         stream: &mut S,
         cap: u64,
-    ) -> Result<SpoolFill, SpoolFillError>
+        known_sha256: Option<crate::deltaglider::KnownSha256>,
+    ) -> Result<SpoolFill, SpoolFillError<E>>
     where
-        S: futures::Stream<Item = Result<bytes::Bytes, crate::storage::StorageError>> + Unpin,
+        S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    {
+        let mut hasher = crate::deltaglider::ingest::BodyHasher::new(known_sha256);
+        let written = self.fill(stream, cap, Some(&mut hasher)).await?;
+        Ok(SpoolFill {
+            written,
+            hashes: hasher.finish(),
+        })
+    }
+
+    /// [`Self::fill_from_stream`] without hashes, for bytes that are checked
+    /// another way (the delta of a GET: the decoded object is checked).
+    /// The number of bytes written.
+    pub async fn fill_unhashed<S, E>(
+        &self,
+        stream: &mut S,
+        cap: u64,
+    ) -> Result<u64, SpoolFillError<E>>
+    where
+        S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    {
+        self.fill(stream, cap, None).await
+    }
+
+    async fn fill<S, E>(
+        &self,
+        stream: &mut S,
+        cap: u64,
+        mut hasher: Option<&mut crate::deltaglider::ingest::BodyHasher>,
+    ) -> Result<u64, SpoolFillError<E>>
+    where
+        S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
     {
         use futures::StreamExt;
-        use sha2::Digest;
         use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::File::create(self.path())
+        let file = tokio::fs::File::create(self.path())
             .await
             .map_err(SpoolFillError::Write)?;
-        let mut hasher = sha2::Sha256::new();
+        let mut file = tokio::io::BufWriter::with_capacity(FILL_BUFFER, file);
         let mut written: u64 = 0;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(SpoolFillError::Source)?;
@@ -578,16 +613,15 @@ impl Spool {
             if written > cap {
                 return Err(SpoolFillError::Overrun { cap, written });
             }
-            hasher.update(&chunk);
+            if let Some(h) = hasher.as_deref_mut() {
+                h.update(&chunk);
+            }
             file.write_all(&chunk)
                 .await
                 .map_err(SpoolFillError::Write)?;
         }
         file.flush().await.map_err(SpoolFillError::Write)?;
-        Ok(SpoolFill {
-            written,
-            sha256: hex::encode(hasher.finalize()),
-        })
+        Ok(written)
     }
 
     /// Budget this spool holds, in MiB (a pair's shared permit counts once
@@ -600,19 +634,22 @@ impl Spool {
     }
 }
 
+/// The write buffer of [`Spool::fill_from_stream`].
+const FILL_BUFFER: usize = 1024 * 1024;
+
 /// What [`Spool::fill_from_stream`] wrote.
 #[derive(Debug)]
 pub struct SpoolFill {
     pub written: u64,
-    /// Hex SHA-256 of the bytes written.
-    pub sha256: String,
+    /// The hashes of the bytes written.
+    pub hashes: crate::deltaglider::ingest::BodyHashes,
 }
 
 /// Why [`Spool::fill_from_stream`] stopped.
 #[derive(Debug)]
-pub enum SpoolFillError {
+pub enum SpoolFillError<E> {
     /// The source stream failed.
-    Source(crate::storage::StorageError),
+    Source(E),
     /// Writing the spool file failed.
     Write(std::io::Error),
     /// The stream is longer than `cap`: the source changed after its size
@@ -826,32 +863,55 @@ mod tests {
             futures::stream::iter(
                 parts
                     .iter()
-                    .map(|p| Ok(bytes::Bytes::from_static(p)))
+                    .map(|p| Ok::<_, std::io::Error>(bytes::Bytes::from_static(p)))
                     .collect::<Vec<_>>(),
             )
         };
 
         let spool = pool.acquire(10).await.unwrap();
         let fill = spool
-            .fill_from_stream(&mut chunks(&[b"hello ", b"spool"]), 11)
+            .fill_from_stream(&mut chunks(&[b"hello ", b"spool"]), 11, None)
             .await
             .unwrap();
         assert_eq!(fill.written, 11);
         assert_eq!(
-            fill.sha256,
+            fill.hashes.sha256(),
             hex::encode(sha2::Sha256::digest(b"hello spool"))
+        );
+        assert_eq!(
+            fill.hashes.md5(),
+            hex::encode(<md5::Md5 as md5::Digest>::digest(b"hello spool"))
         );
         assert_eq!(std::fs::read(spool.path()).unwrap(), b"hello spool");
 
+        // A SHA-256 the caller proved is taken as is; MD5 is still computed.
+        let proven = crate::deltaglider::KnownSha256::of(b"proven elsewhere");
+        let fill = spool
+            .fill_from_stream(&mut chunks(&[b"hello ", b"spool"]), 11, Some(proven))
+            .await
+            .unwrap();
+        assert_eq!(fill.hashes.sha256(), proven.to_hex());
+        assert_eq!(
+            fill.hashes.md5(),
+            hex::encode(<md5::Md5 as md5::Digest>::digest(b"hello spool"))
+        );
+
         // Short: the caller judges it.
         let fill = spool
-            .fill_from_stream(&mut chunks(&[b"abc"]), 11)
+            .fill_from_stream(&mut chunks(&[b"abc"]), 11, None)
             .await
             .unwrap();
         assert_eq!(fill.written, 3);
+        assert_eq!(
+            spool
+                .fill_unhashed(&mut chunks(&[b"ab", b"c"]), 11)
+                .await
+                .unwrap(),
+            3
+        );
 
         let grown = spool
-            .fill_from_stream(&mut chunks(&[b"12345", b"67890", b"x"]), 10)
+            .fill_from_stream(&mut chunks(&[b"12345", b"67890", b"x"]), 10, None)
             .await;
         assert!(
             matches!(
@@ -872,7 +932,7 @@ mod tests {
             Ok(bytes::Bytes::from_static(b"ok")),
             Err(crate::storage::StorageError::Other("reset".into())),
         ]);
-        let err = spool.fill_from_stream(&mut failing, 10).await;
+        let err = spool.fill_from_stream(&mut failing, 10, None).await;
         assert!(matches!(err, Err(SpoolFillError::Source(_))), "{err:?}");
     }
 

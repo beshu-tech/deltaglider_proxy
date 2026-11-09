@@ -11,23 +11,89 @@ use axum::body::{Body, Bytes};
 use axum::http::Request;
 
 /// The aws-chunked body decoder (pre-auth input on an open-access server).
-/// The first byte picks whether an expected decoded length is passed.
+/// The first byte picks whether an expected decoded length is passed (and
+/// seeds the split points). The streaming decoder must give the same
+/// result whatever way the body is split, through the stream adapter
+/// too, and the buffered wrapper must agree with it.
 pub fn aws_chunked(data: &[u8]) {
-    let (expected, body) = match data.split_first() {
+    use crate::api::aws_chunked::{
+        decode_aws_chunked, decode_aws_chunked_with_trailers, AwsChunkedStream,
+    };
+    let (seed, expected, body) = match data.split_first() {
         Some((&flag, rest)) if flag % 2 == 1 && rest.len() >= 2 => {
             let n = u16::from_le_bytes([rest[0], rest[1]]) as usize;
-            (Some(n), &rest[2..])
+            (flag, Some(n), &rest[2..])
         }
-        Some((_, rest)) => (None, rest),
-        None => (None, data),
+        Some((&flag, rest)) => (flag, None, rest),
+        None => (0, None, data),
     };
     let body = Bytes::copy_from_slice(body);
-    if let Some(decoded) = crate::api::aws_chunked::decode_aws_chunked(&body, expected) {
+    let wrapper = decode_aws_chunked_with_trailers(&body, expected);
+    assert_eq!(
+        decode_aws_chunked(&body, expected),
+        wrapper.as_ref().map(|(b, _)| b.clone())
+    );
+    if let Some((decoded, _)) = &wrapper {
         // The framing only removes bytes.
         assert!(decoded.len() <= body.len());
         if let Some(n) = expected {
             assert_eq!(decoded.len(), n);
         }
+    }
+    // Split points derived from the data: piece sizes 1..=8 from a
+    // generator seeded by the flag byte and the body.
+    let mut x = (u64::from(seed) ^ (body.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
+    let mut pieces = Vec::new();
+    let mut at = 0;
+    while at < body.len() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let end = (at + 1 + (x % 8) as usize).min(body.len());
+        pieces.push(body.slice(at..end));
+        at = end;
+    }
+    let expected = expected.map(|n| n as u64);
+    let split = {
+        let mut decoder = crate::api::aws_chunked::ChunkedDecoder::new(expected);
+        let mut out = Vec::new();
+        pieces
+            .iter()
+            .try_for_each(|p| decoder.feed(p.clone(), &mut out))
+            .and_then(|()| decoder.finish())
+            .map(|trailers| (out.concat(), trailers))
+    };
+    assert_eq!(
+        split.as_ref().ok().map(|(b, t)| (b.as_slice(), t)),
+        wrapper.as_ref().map(|(b, t)| (b.as_ref(), t)),
+        "a split feed disagrees with one feed"
+    );
+    // The stream adapter over the same pieces (a ready source: one poll
+    // per item, no runtime).
+    let source = futures::stream::iter(pieces.into_iter().map(Ok::<_, std::convert::Infallible>));
+    let mut stream = AwsChunkedStream::new(source, expected);
+    let slot = stream.trailers();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut streamed = Vec::new();
+    let mut failed = false;
+    loop {
+        match futures::Stream::poll_next(std::pin::Pin::new(&mut stream), &mut cx) {
+            std::task::Poll::Ready(Some(Ok(piece))) => streamed.extend_from_slice(&piece),
+            std::task::Poll::Ready(Some(Err(_))) => failed = true,
+            std::task::Poll::Ready(None) => break,
+            std::task::Poll::Pending => unreachable!("a ready source never pends"),
+        }
+    }
+    match &split {
+        Ok((decoded, trailers)) => {
+            assert!(!failed, "the stream failed where the decoder did not");
+            assert_eq!(&streamed, decoded);
+            assert_eq!(slot.get().as_ref(), Some(trailers));
+        }
+        Err(_) => assert!(
+            failed && slot.get().is_none(),
+            "the stream accepted a bad body"
+        ),
     }
 }
 

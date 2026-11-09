@@ -20,6 +20,7 @@
 use super::conditional::ObjectWriteGuard;
 use super::*;
 use crate::config::test_seams::RewriteStall;
+use crate::deltaglider::ingest::BodyHashes;
 use crate::storage::{ObjectVariant, PutBody, RewriteTarget, StoredObject, StoredWrite, WriteIf};
 
 /// What a rewrite does on a backend without conditional writes (S3 501).
@@ -65,22 +66,6 @@ struct ReadBody {
     data: Option<Bytes>,
 }
 
-/// The hashes of a rewrite's plaintext body.
-struct BodyHashes {
-    sha256: String,
-    md5: String,
-}
-
-impl BodyHashes {
-    fn of(data: &[u8]) -> Self {
-        use md5::Digest as _;
-        Self {
-            sha256: hex::encode(sha2::Sha256::digest(data)),
-            md5: hex::encode(md5::Md5::digest(data)),
-        }
-    }
-}
-
 /// Pure: is `s` a bare MD5 in hex (32 hex digits)? A foreign object's
 /// fallback metadata carries its backend ETag there, which for a multipart
 /// upload is `<hex>-<parts>`.
@@ -99,15 +84,15 @@ fn rewrite_metadata(
     let mut meta = read.clone();
     crate::storage::encrypting::strip_encryption_markers(&mut meta.user_metadata);
     if let Some(h) = hashes {
-        if !meta.file_sha256.is_empty() && meta.file_sha256 != h.sha256 {
+        if !meta.file_sha256.is_empty() && meta.file_sha256 != h.sha256() {
             return Err(EngineError::Storage(StorageError::Other(format!(
                 "{}: the stored body does not match its SHA-256; not rewritten",
                 meta.original_name
             ))));
         }
-        meta.file_sha256 = h.sha256.clone();
+        meta.file_sha256 = h.sha256().to_string();
         if !is_md5_hex(&meta.md5) {
-            meta.md5 = h.md5.clone();
+            meta.md5 = h.md5().to_string();
         }
     }
     Ok(meta)
@@ -250,9 +235,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(Rewritten::Done { bytes: size })
     }
 
-    /// A large passthrough body into `spool`, hashed on the way (SHA-256
-    /// by the spool, MD5 by the stream). `Ok(None)`: it was not `size`
-    /// bytes long.
+    /// A large passthrough body into `spool`, hashed on the way.
+    /// `Ok(None)`: it was not `size` bytes long.
     async fn read_into_spool(
         mut stream: crate::storage::ByteStream,
         spool: &crate::deltaglider::spool::Spool,
@@ -260,16 +244,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         (bucket, name): (&str, &str),
     ) -> Result<Option<ReadBody>, EngineError> {
         use crate::deltaglider::spool::SpoolFillError;
-        let md5 = std::sync::Arc::new(std::sync::Mutex::new(<md5::Md5 as md5::Digest>::new()));
-        let feed = md5.clone();
-        let mut hashed = futures::StreamExt::map(&mut stream, move |chunk| {
-            if let Ok(c) = &chunk {
-                md5::Digest::update(&mut *feed.lock().expect("md5 lock"), c);
-            }
-            chunk
-        });
         let fill = spool
-            .fill_from_stream(&mut hashed, size)
+            .fill_from_stream(&mut stream, size, None)
             .await
             .map_err(|e| match e {
                 SpoolFillError::Source(e) => EngineError::Storage(e),
@@ -278,19 +254,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     format!("{bucket}/{name} grew while it was read"),
                 )),
             })?;
-        drop(hashed);
         if fill.written != size {
             return Ok(None);
         }
-        let md5 = std::mem::replace(
-            &mut *md5.lock().expect("md5 lock"),
-            <md5::Md5 as md5::Digest>::new(),
-        );
         Ok(Some(ReadBody {
-            hashes: BodyHashes {
-                sha256: fill.sha256,
-                md5: hex::encode(md5::Digest::finalize(md5)),
-            },
+            hashes: fill.hashes,
             data: None,
         }))
     }
@@ -312,7 +280,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(None);
         }
         Ok(Some(ReadBody {
-            hashes: BodyHashes::of(&data),
+            hashes: BodyHashes::of(&data, None),
             data: Some(Bytes::from(data)),
         }))
     }
@@ -405,7 +373,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                  and a rewrite is conditional on one"
             ))));
         };
-        let hashes = BodyHashes::of(&data);
+        let hashes = BodyHashes::of(&data, None);
         let meta = rewrite_metadata(&read, Some(&hashes))?;
         let bytes = data.len() as u64;
         let data = Bytes::from(data);
