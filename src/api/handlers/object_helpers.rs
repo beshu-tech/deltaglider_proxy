@@ -213,6 +213,11 @@ pub(crate) async fn store_client_server_copy(
     copy: ClientStoredCopy<'_>,
 ) -> Result<Option<crate::types::StoreResult>, S3Error> {
     let size = copy.source_head.file_size;
+    let engine = state.engine.load_full();
+    // The destination stores the source as it is, so it tries no delta; it
+    // gives the reason that a store of the same content gives.
+    let passthrough_reason =
+        engine.write_decline_reason(copy.bucket, copy.key, &copy.user_metadata, size);
     let Some(metadata) = crate::transfer::destination_metadata(
         copy.source_head,
         crate::types::ObjectKey::parse(copy.bucket, copy.key)
@@ -222,12 +227,12 @@ pub(crate) async fn store_client_server_copy(
             content_type: copy.content_type,
             user_metadata: copy.user_metadata,
             multipart_etag: None,
+            passthrough_reason,
         },
     ) else {
         return Ok(None);
     };
     check_quota_for_write(state, copy.bucket, copy.key, size).await?;
-    let engine = state.engine.load_full();
     let result = {
         let guard = engine
             .lock_and_check(copy.bucket, copy.key, copy.precondition)

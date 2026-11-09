@@ -17,7 +17,15 @@ pub(super) async fn create_multipart_upload(
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let engine = svc.state.engine.load();
-    let delta_limit = engine.tuning().mpu_delta_reconstruct_max_bytes;
+    // Parts stay in memory only while the upload is small: up to the spool
+    // threshold. A larger upload goes to relay files from the part that
+    // crosses it, whatever the delta cap is; the cap only decides whether a
+    // delta is tried (`completion_stores_from_parts`), never how much RAM
+    // an upload may hold.
+    let relay_threshold = engine
+        .tuning()
+        .mpu_delta_reconstruct_max_bytes
+        .min(engine.spool_threshold());
     let user_metadata = input.metadata.unwrap_or_default();
     // A write that tries no delta is never assembled in memory: its parts go
     // to relay files from the first one. Completion decides again (the config
@@ -30,7 +38,7 @@ pub(super) async fn create_multipart_upload(
         &input.key,
         input.content_type.clone(),
         user_metadata,
-        Some(delta_limit),
+        Some(relay_threshold),
         relay_now,
     )?;
     Ok(s3s::S3Response::new(
@@ -412,22 +420,53 @@ pub(super) async fn run_multipart_completion(
             }
         }
     } else {
-        let completed = state
-            .multipart
-            .complete(&upload_id, &bucket, &key, &requested_parts)?;
+        // A delta candidate. Its parts are in memory (a small upload) or in
+        // relay files (a large one): `complete_passthrough` hands back
+        // whichever it holds, and neither is assembled into one buffer here
+        // unless the whole upload fits the spool threshold.
+        let completed =
+            state
+                .multipart
+                .complete_passthrough(&upload_id, &bucket, &key, &requested_parts)?;
         let etag = completed.etag.clone();
-        match engine
-            .store_with_multipart_etag(
-                write_lock,
-                &bucket,
-                &key,
-                &completed.data,
-                completed.content_type,
-                completed.user_metadata,
-                etag.clone(),
-            )
-            .await
-        {
+        let stored = match completed.payload {
+            crate::multipart::PassthroughPayload::Chunks(parts) => {
+                let mut data = bytes::BytesMut::with_capacity(completed.total_size as usize);
+                for part in &parts {
+                    data.extend_from_slice(part);
+                }
+                drop(parts);
+                engine
+                    .store_with_multipart_etag(
+                        write_lock,
+                        &bucket,
+                        &key,
+                        &data,
+                        completed.content_type,
+                        completed.user_metadata,
+                        etag.clone(),
+                    )
+                    .await
+            }
+            crate::multipart::PassthroughPayload::RelayedParts(paths) => {
+                // Protect the relay part files from the idle-TTL sweeper while
+                // the store reads them (H18).
+                let _store_guard = state.multipart.store_guard(&upload_id);
+                engine
+                    .store_relayed_parts_delta_with_multipart_etag(
+                        write_lock,
+                        &bucket,
+                        &key,
+                        &paths,
+                        completed.total_size,
+                        completed.content_type,
+                        completed.user_metadata,
+                        etag.clone(),
+                    )
+                    .await
+            }
+        };
+        match stored {
             Ok(result) => (etag, result),
             Err(e) => {
                 state.multipart.rollback_upload(&upload_id);

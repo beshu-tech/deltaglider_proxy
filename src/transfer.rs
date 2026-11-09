@@ -1309,6 +1309,11 @@ pub(crate) struct DestinationFields {
     /// The multipart ETag the destination keeps (`None`: its ETag is the
     /// MD5 of the content).
     pub multipart_etag: Option<String>,
+    /// Why the destination stores a passthrough source whole: the reason a
+    /// store of the same content under the destination key gives
+    /// ([`DynEngine::write_decline_reason`]). Only a copy that ships the
+    /// stored file as it is sets it; a delta copy has none.
+    pub passthrough_reason: Option<crate::types::PassthroughReason>,
 }
 
 impl DestinationFields {
@@ -1333,6 +1338,7 @@ impl DestinationFields {
             content_type: source.content_type.clone(),
             user_metadata,
             multipart_etag: source.multipart_etag.clone(),
+            passthrough_reason: None,
         }
     }
 }
@@ -1384,6 +1390,9 @@ pub(crate) fn destination_metadata(
     };
     meta.set_user_metadata(fields.user_metadata);
     meta.multipart_etag = fields.multipart_etag;
+    if let Some(reason) = fields.passthrough_reason {
+        meta = meta.with_passthrough_reason(reason);
+    }
     strip_encryption_markers(&mut meta.user_metadata);
     Some(meta)
 }
@@ -1399,15 +1408,18 @@ async fn server_side_copy(
     source_head: &crate::types::FileMetadata,
     prior: Option<&crate::deltaglider::CounterPrior>,
 ) -> Result<Option<ObjectTransferOutcome>, CopyError> {
-    let fields = DestinationFields::of_transfer(&request, source_head);
-    if engine.write_tries_delta(
+    let mut fields = DestinationFields::of_transfer(&request, source_head);
+    // The destination stores the source as it is only when it tries no
+    // delta; the reason it gives is the one a store of the content gives.
+    let Some(reason) = engine.write_decline_reason(
         request.destination_bucket,
         request.destination_key,
         &fields.user_metadata,
         source_head.file_size,
-    ) {
+    ) else {
         return Ok(None);
-    }
+    };
+    fields.passthrough_reason = Some(reason);
     let dest = crate::types::ObjectKey::parse(request.destination_bucket, request.destination_key);
     let Some(metadata) = destination_metadata(source_head, &dest.filename, fields) else {
         return Ok(None);
@@ -1476,6 +1488,7 @@ pub(crate) async fn client_delta_copy(
         content_type,
         user_metadata,
         multipart_etag: None,
+        passthrough_reason: None,
     };
     let Some(shipped) =
         delta_passthrough_copy(engine, lock, request, source_head, None, fields).await?

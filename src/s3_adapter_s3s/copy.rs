@@ -241,7 +241,7 @@ pub(super) const COPY_OBJECT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// The largest CopyObject source: S3's 5 GiB copy limit, capped at
 /// `max_passthrough_object_size`. The source streams through a spool file,
 /// so its size costs disk, not memory. A source above `max_object_size` is
-/// stored whole (`StorePlan::tries_delta`), so the delta limit never refuses
+/// stored whole (`StorePlan::decline_reason`), so the delta limit never refuses
 /// a copy; with it, rclone and mc copies of larger objects failed with
 /// EntityTooLarge.
 pub(super) fn copy_size_limit(engine: &crate::deltaglider::DynEngine) -> u64 {

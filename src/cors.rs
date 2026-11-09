@@ -52,6 +52,7 @@ pub const EXPOSED_HEADERS: &[&str] = &[
     meta_keys::H_REF_SHA256,
     meta_keys::H_DELTA_SIZE,
     meta_keys::H_DELTA_CMD,
+    meta_keys::H_PASSTHROUGH_REASON,
     meta_keys::H_ENCRYPTED,
     concat!("x-amz-meta-", "dg-md5"),
     concat!("x-amz-meta-", "dg-created-at"),

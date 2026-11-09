@@ -342,6 +342,12 @@ impl S3Backend {
             .collect();
 
         let multipart_etag = get_value(&["dg-multipart-etag"]);
+        // Only a passthrough object carries a reason; ignore a stray one.
+        let passthrough_reason = if matches!(storage_info, StorageInfo::Passthrough) {
+            get_value(&[mk::PASSTHROUGH_REASON])
+        } else {
+            None
+        };
         Ok(FileMetadata {
             tool,
             original_name,
@@ -349,6 +355,7 @@ impl S3Backend {
             file_size,
             md5,
             multipart_etag,
+            passthrough_reason,
             created_at,
             // Use the empty-skipping `get_value` (not raw `headers.get`): an
             // object stored with no/blank content-type leaves an empty

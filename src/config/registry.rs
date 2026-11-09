@@ -652,7 +652,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
-        description: "Largest multipart upload that CompleteMultipartUpload assembles in memory to try a delta. The parts of an upload stay in memory up to this total, then go to relay files in the spool. A larger upload, or one that tries no delta, is stored from its parts without a delta (default: 64 MiB)",
+        description: "Largest multipart upload for which CompleteMultipartUpload tries a delta. It decides only whether a delta is tried, not how much memory an upload uses: the parts of an upload stay in memory only up to DGP_SPOOL_THRESHOLD_BYTES and go to relay files in the spool after that, and a delta candidate is joined into one spool file and delta-encoded as a stream. A larger upload, or one that tries no delta, is stored from its parts without a delta (default: 64 MiB)",
         example: "67108864",
         category: "Delta Engine",
     },

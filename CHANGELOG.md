@@ -6,6 +6,14 @@
 
 - **Remove a `0` from `advanced.blocking_threads`, `advanced.codec_concurrency` and `advanced.filtered_list_max_engine_pages`** (and from `DGP_BLOCKING_THREADS`, `DGP_CODEC_CONCURRENCY`, `DGP_FILTERED_LIST_MAX_ENGINE_PAGES`). A `0` in one of these now stops the proxy at startup with an error that names the setting. Before, it caused a panic at startup or a hang. Other `DGP_*` timeouts and counts that a `0` would break (for example `DGP_REQUEST_TIMEOUT_SECS`, `DGP_MAX_CONCURRENT_REQUESTS`, `DGP_CLOCK_SKEW_SECONDS`, `DGP_SESSION_TTL_HOURS`) are read as `1`.
 
+### Added — A passthrough object says why it was stored whole
+
+- `HeadObject` and `GetObject` now return `x-amz-meta-dg-passthrough-reason` on an object that the proxy stored whole: `not-delta-eligible`, `compression-disabled`, `no-delta-requested`, `over-max-object-size`, `multipart-over-delta-cap`, `delta-ratio-over-limit` or `delta-unavailable`. Before, `x-amz-meta-dg-note: passthrough` did not say whether a file type, a size limit or a poor delta caused it. The header follows the rule of the other delta facts: a reader that may not read the whole folder of the key does not get it. An encrypted bucket does not keep it. See [Why an object is stored whole](docs/product/reference/s3-api-compatibility.md#why-an-object-is-stored-whole).
+
+### Changed — A large multipart upload still becomes a delta, with bounded memory
+
+- A multipart upload of a delta-eligible type used to keep every part in memory until the upload held more than `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES` (64 MiB). The proxy now keeps the parts in memory only up to `DGP_SPOOL_THRESHOLD_BYTES` (16 MiB by default) and writes them to relay files after that. When the upload completes, the proxy joins the relay files into one spool file and delta-encodes that file as a stream. `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES` now decides only whether the proxy tries a delta, so raising it no longer raises memory use. The spool use of such an upload peaks at twice its size for a short time.
+
 ### Changed — Error answers for faults that a retry can clear
 
 - A full disk, a used-up storage quota, a lock that another writer holds, a copy source that changed during the copy, a delta codec timeout and a backend `RequestTimeout` or `OperationAborted` now answer `503` with `Retry-After`. Before, they answered `500 InternalError`. A full disk and a used-up quota answer `503 ServiceUnavailable` with a text that names the condition. The cause goes to the log.

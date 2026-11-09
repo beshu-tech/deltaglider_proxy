@@ -399,13 +399,14 @@ async fn a_single_put_stores_no_multipart_etag() {
 use super::store::{EncodeOutcome, StorePlan};
 
 #[test]
-fn tries_delta_only_when_compressing_an_eligible_key_that_fits_without_the_hint() {
+fn a_put_tries_a_delta_only_when_compressing_an_eligible_key_that_fits_without_the_hint() {
     for compression in [false, true] {
         for eligible in [false, true] {
             for no_delta in [false, true] {
                 for fits in [false, true] {
+                    let reason = StorePlan::decline_reason(compression, eligible, no_delta, fits);
                     assert_eq!(
-                        StorePlan::tries_delta(compression, eligible, no_delta, fits),
+                        reason.is_none(),
                         compression && eligible && !no_delta && fits,
                         "compression={compression} eligible={eligible} no_delta={no_delta} fits={fits}"
                     );
@@ -413,6 +414,18 @@ fn tries_delta_only_when_compressing_an_eligible_key_that_fits_without_the_hint(
             }
         }
     }
+}
+
+/// The stored reason names the first failed check, in a fixed order.
+#[test]
+fn the_decline_reason_names_the_first_failed_check() {
+    use crate::types::PassthroughReason as R;
+    let why = StorePlan::decline_reason;
+    assert_eq!(why(false, false, true, false), Some(R::CompressionDisabled));
+    assert_eq!(why(true, false, true, false), Some(R::NoDeltaRequested));
+    assert_eq!(why(true, false, false, false), Some(R::NotDeltaEligible));
+    assert_eq!(why(true, true, false, false), Some(R::OverMaxObjectSize));
+    assert_eq!(why(true, true, false, true), None);
 }
 
 #[test]
@@ -442,8 +455,10 @@ fn store_pipeline_sets_user_metadata_through_the_hint_filter() {
 #[test]
 fn decide_truth_table() {
     let encoded = |delta_len| EncodeOutcome::Encoded { delta_len };
+    use crate::types::PassthroughReason as R;
     let pass = |remove_fresh_baseline| StorePlan::Passthrough {
         remove_fresh_baseline,
+        reason: R::DeltaRatioOverLimit,
     };
     for fresh in [false, true] {
         assert_eq!(
@@ -468,9 +483,13 @@ fn decide_truth_table() {
             StorePlan::decide(1000, EncodeOutcome::OverCap, 0.75, fresh),
             pass(fresh)
         );
+        // A busy spool is not a poor delta: the reason says which.
         assert_eq!(
             StorePlan::decide(1000, EncodeOutcome::NoSpool, 0.75, fresh),
-            pass(fresh)
+            StorePlan::Passthrough {
+                remove_fresh_baseline: fresh,
+                reason: R::DeltaUnavailable
+            }
         );
         // An empty body never keeps a delta (ratio 1.0).
         assert_eq!(StorePlan::decide(0, encoded(0), 0.75, fresh), pass(fresh));
@@ -492,7 +511,170 @@ proptest::proptest! {
         if ratio < max_ratio {
             proptest::prop_assert_eq!(plan, StorePlan::Delta);
         } else {
-            proptest::prop_assert_eq!(plan, StorePlan::Passthrough { remove_fresh_baseline: fresh });
+            proptest::prop_assert_eq!(
+                plan,
+                StorePlan::Passthrough {
+                    remove_fresh_baseline: fresh,
+                    reason: crate::types::PassthroughReason::DeltaRatioOverLimit,
+                }
+            );
         }
+    }
+}
+
+// ---- Why an object was stored whole.
+
+/// A passthrough object says why, on both PUT paths; a delta says nothing.
+#[tokio::test]
+async fn a_passthrough_object_stores_the_reason_for_it() {
+    for path in PATHS {
+        let h = harness().await;
+        let reason_of = |bucket: &'static str, key: &'static str| {
+            let engine = &h.engine;
+            async move {
+                let head = engine.head(bucket, key).await.unwrap();
+                (head.storage_info.label(), head.passthrough_reason)
+            }
+        };
+        put_as(&h, path, "b", "img/a.jpg", &noise(4, 1000), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            reason_of("b", "img/a.jpg").await,
+            ("passthrough", Some("not-delta-eligible".to_string())),
+            "{path:?}"
+        );
+        put_as(&h, path, "nocomp", "rel/a.zip", &noise(5, 1000), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            reason_of("nocomp", "rel/a.zip").await,
+            ("passthrough", Some("compression-disabled".to_string())),
+            "{path:?}"
+        );
+        // A delta, then a body that shares nothing with its baseline.
+        let v1 = noise(1, 200_000);
+        put(&h, path, "rel/a.zip", &v1).await;
+        put(&h, path, "rel/b.zip", &near(&v1)).await;
+        assert_eq!(
+            reason_of("b", "rel/b.zip").await,
+            ("delta", None),
+            "{path:?}"
+        );
+        put(&h, path, "rel/c.zip", &noise(9, 200_000)).await;
+        assert_eq!(
+            reason_of("b", "rel/c.zip").await,
+            ("passthrough", Some("delta-ratio-over-limit".to_string())),
+            "{path:?}"
+        );
+    }
+}
+
+/// The reason is a stored fact: it survives the metadata map that the S3
+/// headers are made from, and a delta never carries one.
+#[tokio::test]
+async fn the_reason_reaches_the_metadata_headers() {
+    let h = harness().await;
+    put(&h, Path::Buffered, "img/a.jpg", &noise(4, 1000)).await;
+    let head = h.engine.head("b", "img/a.jpg").await.unwrap();
+    let map = head.to_bare_metadata_map();
+    assert_eq!(
+        map.get(crate::types::meta_keys::PASSTHROUGH_REASON)
+            .map(String::as_str),
+        Some("not-delta-eligible")
+    );
+}
+
+/// A multipart upload whose parts are relay files: a delta candidate is
+/// joined into one spool file and delta-encoded; the multipart ETag stays.
+#[tokio::test]
+async fn relayed_parts_of_a_delta_candidate_are_stored_as_a_delta() {
+    let h = harness().await;
+    put(&h, Path::Buffered, "rel/a.zip", &noise(1, 200_000)).await;
+    let body = near(&noise(1, 200_000));
+    let dir = tempfile::tempdir().unwrap();
+    let mut paths = Vec::new();
+    for (i, chunk) in body.chunks(70_000).enumerate() {
+        let path = dir.path().join(format!("part-{i}"));
+        std::fs::write(&path, chunk).unwrap();
+        paths.push(path);
+    }
+    let mpe = "\"0123456789abcdef0123456789abcdef-3\"".to_string();
+    let lock = h.engine.lock_object_write("b", "rel/b.zip").await;
+    let stored = h
+        .engine
+        .store_relayed_parts_delta_with_multipart_etag(
+            &lock,
+            "b",
+            "rel/b.zip",
+            &paths,
+            body.len() as u64,
+            Some("application/zip".to_string()),
+            user_meta(),
+            mpe.clone(),
+        )
+        .await
+        .unwrap();
+    drop(lock);
+    assert_eq!(stored.metadata.storage_info.label(), "delta");
+    let head = h.engine.head("b", "rel/b.zip").await.unwrap();
+    assert_eq!(head.storage_info.label(), "delta");
+    assert_eq!(head.etag(), mpe);
+    assert_eq!(head.file_size, body.len() as u64);
+    assert_eq!(read_back(&h, "b", "rel/b.zip").await, body);
+}
+
+/// The two stored-whole reasons of a relayed multipart: a write that tries
+/// no delta says why, and one that does but was sent past the delta cap
+/// says that.
+#[tokio::test]
+async fn relayed_parts_stored_whole_say_why() {
+    let h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("part-0");
+    let body = noise(7, 50_000);
+    std::fs::write(&path, &body).unwrap();
+    let paths = [path];
+    let mpe = "\"0123456789abcdef0123456789abcdef-1\"".to_string();
+    for (key, via_delta_store, expected) in [
+        ("img/a.jpg", true, "not-delta-eligible"),
+        ("rel/over.zip", false, "multipart-over-delta-cap"),
+    ] {
+        let lock = h.engine.lock_object_write("b", key).await;
+        let size = body.len() as u64;
+        let ct = Some("application/zip".to_string());
+        if via_delta_store {
+            h.engine
+                .store_relayed_parts_delta_with_multipart_etag(
+                    &lock,
+                    "b",
+                    key,
+                    &paths,
+                    size,
+                    ct,
+                    user_meta(),
+                    mpe.clone(),
+                )
+                .await
+                .unwrap();
+        } else {
+            h.engine
+                .store_passthrough_relayed_parts_with_multipart_etag(
+                    &lock,
+                    "b",
+                    key,
+                    &paths,
+                    size,
+                    ct,
+                    user_meta(),
+                    mpe.clone(),
+                )
+                .await
+                .unwrap();
+        }
+        drop(lock);
+        let head = h.engine.head("b", key).await.unwrap();
+        assert_eq!(head.storage_info.label(), "passthrough", "{key}");
+        assert_eq!(head.passthrough_reason.as_deref(), Some(expected), "{key}");
     }
 }

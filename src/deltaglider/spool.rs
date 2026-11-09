@@ -330,9 +330,15 @@ impl SpoolDir {
     /// `acquire` for an op that already holds the spool `held`: clamped like
     /// [`Self::acquire_pair_beside`], so the op never waits on itself.
     pub async fn acquire_beside(&self, held: Option<&Spool>, bytes: u64) -> std::io::Result<Spool> {
-        let permit = self
-            .reserve_within(bytes, held.map_or(0, Spool::reserved_mib))
-            .await?;
+        self.acquire_beside_mib(held.map_or(0, Spool::reserved_mib), bytes)
+            .await
+    }
+
+    /// [`Self::acquire_beside`] for an op whose held budget is not one
+    /// `Spool` but a number of MiB: the relay parts of a multipart upload,
+    /// which hold one reservation each.
+    pub async fn acquire_beside_mib(&self, held_mib: usize, bytes: u64) -> std::io::Result<Spool> {
+        let permit = self.reserve_within(bytes, held_mib).await?;
         let file = NamedTempFile::new_in(&self.dir)?;
         Ok(Spool {
             file,

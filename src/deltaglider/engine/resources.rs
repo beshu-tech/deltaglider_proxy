@@ -154,6 +154,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         })
     }
 
+    /// `spool_acquire` for an op that holds `held_mib` of the budget already
+    /// (the relay parts of a multipart upload): it never waits for its own
+    /// budget, and a budget that other requests use is `Overloaded`.
+    pub(crate) async fn spool_acquire_beside_mib(
+        &self,
+        held_mib: usize,
+        bytes: u64,
+    ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
+        self.with_spool_timeout(self.spool.acquire_beside_mib(held_mib, bytes))
+            .await
+    }
+
     /// `spool_acquire` for an op that may already hold a spool (`held`).
     pub(crate) async fn spool_acquire_beside(
         &self,
