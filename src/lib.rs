@@ -2415,18 +2415,11 @@ mod source_guards {
         ];
         // Sites that a later commit of the streaming-ingest work removes:
         // (file, offending lines, why). A stale entry fails too.
-        const PENDING: &[(&str, usize, &str)] = &[
-            (
-                "src/multipart.rs",
-                2,
-                "relay parts are read whole until the relay rewrite",
-            ),
-            (
-                "src/deltaglider/engine/store.rs",
-                1,
-                "a kept delta is read whole until it commits from its file",
-            ),
-        ];
+        const PENDING: &[(&str, usize, &str)] = &[(
+            "src/multipart.rs",
+            2,
+            "relay parts are read whole until the relay rewrite",
+        )];
         let needles = [["fs::", "read("].concat()];
         let test_files = out_of_line_test_modules(&rust_files("src"));
         let mut offenders: std::collections::BTreeMap<String, Vec<String>> = Default::default();

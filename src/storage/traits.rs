@@ -1953,13 +1953,14 @@ pub trait StorageBackendExt: StorageBackend {
         self.get_object(bucket, prefix, StoredObject::Passthrough(filename))
     }
 
-    /// Store a delta file with its metadata.
+    /// Store a delta with its metadata: from memory, or streamed from the
+    /// file the encode wrote (`PutBody::File`).
     fn put_delta(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: Bytes,
+        body: PutBody<'_>,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
@@ -1968,7 +1969,7 @@ pub trait StorageBackendExt: StorageBackend {
                 name: filename,
                 proof,
             };
-            self.put_object(bucket, prefix, target, PutBody::Bytes(data), metadata)
+            self.put_object(bucket, prefix, target, body, metadata)
                 .await
         }
     }

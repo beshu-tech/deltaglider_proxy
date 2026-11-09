@@ -18,6 +18,7 @@
 
 - On an S3 backend without proxy encryption, a multipart upload that the proxy stores from its relay parts was assembled in memory before the PUT, so its memory use was the size of the object. The proxy now sends the part files as one PUT body of a known length, read from the files. A retry of that PUT reads the files again from their start.
 - In a bucket with proxy encryption, a delta or a `reference.bin` was read whole into memory and then decrypted whole, and a baseline written from a spool file was read whole and encrypted in memory. The proxy now decrypts these bodies frame by frame as they are read, and it encrypts a file body into a spool file that holds spool budget. The memory use is one frame (64 KiB), whatever the size of the object.
+- A delta that a large PUT (above `DGP_SPOOL_THRESHOLD_BYTES`) keeps was read whole into memory before it was written, so the memory use was up to `max_delta_ratio` times the size of the object. The proxy now writes the delta from the spool file that the encode wrote, on every backend.
 
 ### Changed — Error answers for faults that a retry can clear
 

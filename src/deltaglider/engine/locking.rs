@@ -374,7 +374,7 @@ mod reference_writes {
             bucket: &str,
             deltaspace: &str,
             filename: &str,
-            data: Bytes,
+            body: crate::storage::PutBody<'_>,
             meta: &FileMetadata,
             version: &str,
         ) -> Result<crate::storage::WriteIf, EngineError> {
@@ -383,7 +383,6 @@ mod reference_writes {
                 name: filename,
                 proof: PROOF,
             };
-            let body = crate::storage::PutBody::Bytes(data);
             Ok(storage
                 .put_if_unchanged(bucket, deltaspace, target, body, meta, version)
                 .await?)
@@ -399,7 +398,7 @@ mod reference_writes {
             storage: &B,
             bucket: &str,
             deltaspace: &str,
-            data: Bytes,
+            body: crate::storage::PutBody<'_>,
             meta: &FileMetadata,
             version: &str,
         ) -> Result<crate::storage::WriteIf, EngineError> {
@@ -413,7 +412,6 @@ mod reference_writes {
                 }
             }
             let target = crate::storage::RewriteTarget::Reference { proof: PROOF };
-            let body = crate::storage::PutBody::Bytes(data);
             let out = storage
                 .put_if_unchanged(bucket, deltaspace, target, body, meta, version)
                 .await?;
@@ -439,12 +437,12 @@ mod reference_writes {
             bucket: &str,
             deltaspace: &str,
             filename: &str,
-            data: Bytes,
+            body: crate::storage::PutBody<'_>,
             meta: &FileMetadata,
         ) -> Result<(), EngineError> {
             self.ensure_held().await?;
             storage
-                .put_delta(bucket, deltaspace, filename, data, meta, PROOF)
+                .put_delta(bucket, deltaspace, filename, body, meta, PROOF)
                 .await?;
             let Some(h) = &self.hold else {
                 return Ok(());

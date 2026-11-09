@@ -299,7 +299,7 @@ mod wrapper_tests {
                 "b",
                 p,
                 "app.zip",
-                Bytes::from(data.clone()),
+                crate::storage::PutBody::Bytes(Bytes::from(data.clone())),
                 &dmeta("app.zip", &data),
                 RefWriteProof::for_tests(),
             )
@@ -477,7 +477,7 @@ mod wrapper_tests {
             "b",
             "p",
             "app.zip",
-            Bytes::from(data.clone()),
+            crate::storage::PutBody::Bytes(Bytes::from(data.clone())),
             &dmeta("app.zip", &data),
             proof,
         )
@@ -1466,7 +1466,7 @@ mod wrapper_tests {
                 "b",
                 "p",
                 "x",
-                x.clone(),
+                crate::storage::PutBody::Bytes(x.clone()),
                 &dmeta("x", b"x"),
                 RefWriteProof::for_tests(),
             )
@@ -1540,7 +1540,7 @@ mod wrapper_tests {
                 "b",
                 "p",
                 "f",
-                b(),
+                crate::storage::PutBody::Bytes(b()),
                 &forge(dmeta("f", &body)),
                 RefWriteProof::for_tests(),
             )
@@ -1632,7 +1632,7 @@ mod wrapper_tests {
                 "b",
                 "p",
                 "d",
-                Bytes::from(data.clone()),
+                crate::storage::PutBody::Bytes(Bytes::from(data.clone())),
                 &dmeta("d", &data),
                 RefWriteProof::for_tests(),
             )
@@ -1781,7 +1781,7 @@ mod wrapper_tests {
             "b",
             "p",
             "x",
-            Bytes::from(delta.clone()),
+            crate::storage::PutBody::Bytes(Bytes::from(delta.clone())),
             &dmeta("x", &delta),
             RefWriteProof::for_tests(),
         )
@@ -1794,7 +1794,7 @@ mod wrapper_tests {
                 "b",
                 "p",
                 "y",
-                Bytes::from(body),
+                crate::storage::PutBody::Bytes(Bytes::from(body)),
                 &raw,
                 RefWriteProof::for_tests(),
             )
@@ -2695,7 +2695,7 @@ mod read_request_tests {
                 "b",
                 "p",
                 "a.bin",
-                Bytes::from(body.clone()),
+                crate::storage::PutBody::Bytes(Bytes::from(body.clone())),
                 &dmeta("a.bin", &body),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )

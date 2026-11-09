@@ -338,7 +338,9 @@ struct PassthroughWrite<'a> {
 
 /// The delta the encode produced, where it lives until the commit.
 enum EncodedDelta {
-    InRam(Vec<u8>),
+    /// The buffered encode's delta (its body is at most the spool
+    /// threshold, so the delta is too).
+    InRam(Bytes),
     /// On the delta spool of the (ref, delta) pair.
     Spooled {
         _ref_spool: crate::deltaglider::spool::Spool,
@@ -349,17 +351,38 @@ enum EncodedDelta {
 }
 
 impl EncodedDelta {
-    /// The delta bytes, for the commit (a kept delta is below the cap).
-    async fn into_bytes(self) -> Result<Vec<u8>, EngineError> {
+    /// Spool budget this delta holds, in MiB (the pair's one permit).
+    fn held_mib(&self) -> usize {
         match self {
-            EncodedDelta::InRam(delta) => Ok(delta),
-            EncodedDelta::Spooled { delta_spool, .. } => Ok(tokio::fs::read(delta_spool.path())
-                .await
-                .map_err(StorageError::from)?),
-            EncodedDelta::None => Err(EngineError::Storage(StorageError::Other(
-                "store plan kept a delta that the encode did not produce".into(),
-            ))),
+            EncodedDelta::Spooled { delta_spool, .. } => delta_spool.reserved_mib(),
+            EncodedDelta::InRam(_) | EncodedDelta::None => 0,
         }
+    }
+
+    /// The delta as a storage body: the buffer, or its spool file, which
+    /// the backend streams (never read into memory). `dir` and `reserved`
+    /// serve the storage write's own temp file (the encrypting wrapper's
+    /// ciphertext), as for every file write.
+    fn body<'a>(
+        &'a self,
+        dir: &'a crate::deltaglider::spool::SpoolDir,
+        reserved: Option<&'a crate::deltaglider::spool::SpoolReservation>,
+    ) -> Result<crate::storage::PutBody<'a>, EngineError> {
+        match self {
+            EncodedDelta::InRam(delta) => Ok(crate::storage::PutBody::Bytes(delta.clone())),
+            EncodedDelta::Spooled { delta_spool, .. } => Ok(crate::storage::PutBody::File {
+                path: delta_spool.path(),
+                spool: SpoolBudget::new(dir, Some(delta_spool), reserved),
+            }),
+            EncodedDelta::None => Err(Self::missing()),
+        }
+    }
+
+    /// The store plan kept a delta that the encode did not produce.
+    fn missing() -> EngineError {
+        EngineError::Storage(StorageError::Other(
+            "store plan kept a delta that the encode did not produce".into(),
+        ))
     }
 }
 
@@ -908,9 +931,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         match StorePlan::decide(put.size, outcome, max_ratio, fresh_baseline) {
             StorePlan::Delta => {
-                let delta = delta.into_bytes().await?;
+                let EncodeOutcome::Encoded { delta_len } = outcome else {
+                    return Err(EncodedDelta::missing());
+                };
+                // A spooled delta exists only beside a held body spool, so
+                // this reservation for the storage write's temp file never
+                // waits under the lock (a holder never waits).
+                let reserved = match &delta {
+                    EncodedDelta::Spooled { .. } => {
+                        let held_mib =
+                            put.body.held().map_or(0, |b| b.reserved_mib()) + delta.held_mib();
+                        self.reserve_storage_spool(put.bucket, delta_len, false, held_mib)
+                            .await?
+                    }
+                    EncodedDelta::InRam(_) | EncodedDelta::None => None,
+                };
+                let body = delta.body(&self.spool, reserved.as_ref())?;
                 let result = self
-                    .commit_delta(&put, ref_meta, delta, fresh_baseline, xnode)
+                    .commit_delta(&put, ref_meta, body, delta_len, fresh_baseline, xnode)
                     .await?;
                 if let (true, PutBody::Spooled(body)) = (fresh_baseline, &put.body) {
                     self.seed_shared_reference(put.bucket, put.deltaspace_id, body, ref_meta)
@@ -1037,7 +1075,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let delta_len = delta.len() as u64;
         Ok((
             EncodeOutcome::Encoded { delta_len },
-            EncodedDelta::InRam(delta),
+            EncodedDelta::InRam(Bytes::from(delta)),
         ))
     }
 
@@ -1281,16 +1319,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Commit the encoded delta: write it (only valid against the reference
     /// we locked), then drop an older passthrough variant of the key.
+    /// `delta`: in memory or the encode's spool file, `delta_len` bytes.
     /// `fresh_baseline`: this PUT created the reference the delta uses.
     async fn commit_delta(
         &self,
         put: &PutObject<'_>,
         ref_meta: &FileMetadata,
-        delta: Vec<u8>,
+        delta: crate::storage::PutBody<'_>,
+        delta_len: u64,
         fresh_baseline: bool,
         xnode: &super::ReferenceLockGuard,
     ) -> Result<StoreResult, EngineError> {
-        let delta = Bytes::from(delta);
         let mut metadata = FileMetadata::new_delta(
             put.obj_key.filename.clone(),
             put.sha256.clone(),
@@ -1298,7 +1337,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             put.size,
             "reference.bin".to_string(),
             ref_meta.file_sha256.clone(),
-            delta.len() as u64,
+            delta_len,
             put.content_type.clone(),
         );
         metadata.set_user_metadata(put.user_metadata.clone());
@@ -1309,7 +1348,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 put.bucket,
                 put.deltaspace_id,
                 &put.obj_key.filename,
-                delta.clone(),
+                delta,
                 &metadata,
             )
             .await?;
@@ -1324,7 +1363,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .inc();
             }
             m.delta_bytes_saved_total
-                .inc_by(put.size.saturating_sub(delta.len() as u64));
+                .inc_by(put.size.saturating_sub(delta_len));
         });
         self.drop_other_form(
             put.lock,
@@ -1337,7 +1376,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         .await;
         self.metadata_cache
             .insert(put.bucket, put.key, metadata.clone());
-        Ok(StoreResult::new(metadata, delta.len() as u64))
+        Ok(StoreResult::new(metadata, delta_len))
     }
 
     /// Write a passthrough object, then drop an older delta variant of the
@@ -2369,7 +2408,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 bucket,
                 deltaspace_id,
                 filename,
-                Bytes::from(delta),
+                crate::storage::PutBody::Bytes(Bytes::from(delta)),
                 &delta_meta,
             )
             .await?;
@@ -3121,6 +3160,41 @@ mod review2_tests {
             .await
             .unwrap();
         let (got, _) = engine.retrieve("b", "x/a.png").await.unwrap();
+        assert_eq!(got, v);
+    }
+
+    /// A kept delta of a streaming PUT on an encrypting backend commits
+    /// from its spool file: the wrapper encrypts the file into a spool
+    /// file of its own (reserved without waiting, beside the body and the
+    /// delta) and the delta reads back.
+    #[tokio::test]
+    async fn encrypted_streaming_delta_commits_from_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = encrypted_engine(&tmp, 64 * 1024 * 1024).await;
+        let base: Vec<u8> = (0..1_500_000u32).map(|n| (n % 251) as u8).collect();
+        let mut v = base.clone();
+        v[700_000..700_100].fill(9);
+        for (key, body) in [("rel/a.zip", &base), ("rel/b.zip", &v)] {
+            let spool = engine.spool_acquire(body.len() as u64).await.unwrap();
+            tokio::fs::write(spool.path(), body).await.unwrap();
+            let lock = engine.lock_object_write("b", key).await;
+            engine
+                .store_spooled_delta(
+                    &lock,
+                    "b",
+                    key,
+                    &spool,
+                    body.len() as u64,
+                    None,
+                    HashMap::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let head = engine.head("b", "rel/b.zip").await.unwrap();
+        assert_eq!(head.storage_info.label(), "delta");
+        let (got, _) = engine.retrieve("b", "rel/b.zip").await.unwrap();
         assert_eq!(got, v);
     }
 

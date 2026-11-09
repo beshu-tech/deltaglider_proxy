@@ -1767,7 +1767,7 @@ mod facts_off_the_put_path_tests {
             "b",
             "v1",
             "a.zip",
-            bytes::Bytes::from_static(b"0123456789"),
+            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"0123456789")),
             &delta_meta(),
             crate::deltaglider::RefWriteProof::for_tests(),
         )
@@ -1804,7 +1804,7 @@ mod facts_off_the_put_path_tests {
             "b",
             "v1",
             "a.zip",
-            bytes::Bytes::from_static(b"0123456789"),
+            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"0123456789")),
             &delta_meta(),
             crate::deltaglider::RefWriteProof::for_tests(),
         )

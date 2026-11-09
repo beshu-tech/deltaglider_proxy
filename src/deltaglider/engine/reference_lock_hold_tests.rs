@@ -202,7 +202,12 @@ async fn fast_path_seed_holds_the_lock() {
     let res: Result<(), EngineError> = engine
         .with_dest_prefix_lock("releases", "v1", || async {
             Ok(engine
-                .put_reference_raw("releases", "v1", &bytes::Bytes::from_static(b"abc"), &meta)
+                .put_reference_raw(
+                    "releases",
+                    "v1",
+                    crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"abc")),
+                    &meta,
+                )
                 .await?)
         })
         .await;
@@ -211,7 +216,12 @@ async fn fast_path_seed_holds_the_lock() {
 
     // Outside the scope, multi-instance refuses the raw write.
     assert!(engine
-        .put_reference_raw("releases", "v1", &bytes::Bytes::from_static(b"abc"), &meta)
+        .put_reference_raw(
+            "releases",
+            "v1",
+            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"abc")),
+            &meta
+        )
         .await
         .is_err());
     // The same for a raw delta (review 4 coordination-5): outside the
@@ -232,7 +242,7 @@ async fn fast_path_seed_holds_the_lock() {
             "releases",
             "v1",
             "app.zip",
-            bytes::Bytes::from_static(b"abc"),
+            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"abc")),
             &delta_meta,
             &super::usage::CounterPrior::Unknown,
         )

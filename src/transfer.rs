@@ -1678,7 +1678,7 @@ async fn delta_passthrough_copy(
                     .put_reference_raw(
                         &dest_bucket,
                         &dest_prefix2,
-                        &Bytes::from(ref_data),
+                        crate::storage::PutBody::Bytes(Bytes::from(ref_data)),
                         &ref_meta,
                     )
                     .await?;
@@ -1692,7 +1692,7 @@ async fn delta_passthrough_copy(
                     &dest_bucket,
                     &dest_prefix2,
                     &dest_filename2,
-                    Bytes::from(delta_bytes),
+                    crate::storage::PutBody::Bytes(Bytes::from(delta_bytes)),
                     &meta,
                     &counter_prior,
                 )
@@ -1803,7 +1803,7 @@ async fn heal_stripped_dest_delta(
                     bucket,
                     &dest_key.prefix,
                     &dest_key.filename,
-                    Bytes::from(delta_bytes),
+                    crate::storage::PutBody::Bytes(Bytes::from(delta_bytes)),
                     meta,
                     // A re-stamp of a stored delta: no read says the
                     // passthrough form is absent.

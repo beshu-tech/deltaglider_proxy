@@ -360,7 +360,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 bucket,
                 deltaspace_id,
                 name,
-                data.clone(),
+                crate::storage::PutBody::Bytes(data.clone()),
                 &meta,
                 version,
             )
@@ -368,7 +368,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         if let Some(done) = conditional_outcome(out, bytes, unconditional, bucket)? {
             return Ok(done);
         }
-        held.put_delta(&*self.storage, bucket, deltaspace_id, name, data, &meta)
+        let body = crate::storage::PutBody::Bytes(data);
+        held.put_delta(&*self.storage, bucket, deltaspace_id, name, body, &meta)
             .await?;
         Ok(Rewritten::Done { bytes })
     }
@@ -413,7 +414,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 &*self.storage,
                 bucket,
                 prefix,
-                data.clone(),
+                crate::storage::PutBody::Bytes(data.clone()),
                 &meta,
                 &version,
             )

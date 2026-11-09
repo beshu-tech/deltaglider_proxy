@@ -195,7 +195,7 @@ async fn a_raw_delta_write_drops_the_other_form_through_the_helper() {
                         "b",
                         "run",
                         "copy.zip",
-                        bytes::Bytes::copy_from_slice(&bytes),
+                        crate::storage::PutBody::Bytes(bytes::Bytes::copy_from_slice(&bytes)),
                         &meta,
                         &prior,
                     )
@@ -633,4 +633,52 @@ async fn a_large_put_refuses_a_corrupt_reference() {
         engine.head("b", "rel/v1.zip").await.is_err(),
         "nothing stored"
     );
+}
+
+/// A kept delta of a streaming PUT commits from the encode's spool file:
+/// the backend gets a file body and streams it. Before, the engine read the
+/// whole delta file into memory (up to `max_delta_ratio` x the object) and
+/// passed the bytes. A buffered PUT keeps its small delta in memory.
+#[tokio::test]
+async fn a_kept_streaming_delta_commits_from_its_spool_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let faulty = crate::storage::FaultyFs::new(
+        crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let faults = faulty.faults.clone();
+    let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
+    let mut config = Config::default();
+    config.tuning.spool_threshold_bytes = Some(1024);
+    let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
+    engine.create_bucket("b").await.unwrap();
+    let base = noise(61, 64 * 1024);
+    // The first PUT is the baseline and a delta against itself.
+    for (n, key) in [(1, "rel/a.zip"), (2, "rel/v1.zip")] {
+        let body = if n == 1 {
+            base.clone()
+        } else {
+            variant(&base, 1)
+        };
+        let r = put_large(&engine, key, &body).await;
+        assert_eq!(r.metadata.storage_info.label(), "delta");
+        assert_eq!(faults.delta_file_writes(), n, "the delta went as a file");
+    }
+    let (got, _) = engine.retrieve("b", "rel/v1.zip").await.unwrap();
+    assert_eq!(got, variant(&base, 1));
+    // The buffered PUT (below the threshold) writes its delta from memory.
+    let small = noise(62, 900);
+    engine
+        .store("b", "small/a.zip", &small, None, HashMap::new())
+        .await
+        .unwrap();
+    let mut v = small.clone();
+    v[10] ^= 1;
+    let r = engine
+        .store("b", "small/b.zip", &v, None, HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(r.metadata.storage_info.label(), "delta");
+    assert_eq!(faults.delta_file_writes(), 2, "a buffered delta is bytes");
 }

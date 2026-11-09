@@ -86,6 +86,8 @@ struct FaultState {
     slow_passthrough: Option<std::time::Duration>,
     in_flight: usize,
     max_in_flight: usize,
+    /// Delta writes whose body was a file (streamed), not memory.
+    delta_file_writes: usize,
 }
 
 /// The faults armed on a [`FaultyFs`], by point and `"bucket/prefix/filename"`.
@@ -140,6 +142,12 @@ impl Faults {
         let out = write.await;
         self.0.lock().unwrap().in_flight -= 1;
         out
+    }
+
+    /// How many delta writes got a file body (streamed from the encode's
+    /// spool file, never read into memory).
+    pub(crate) fn delta_file_writes(&self) -> usize {
+        self.0.lock().unwrap().delta_file_writes
     }
 
     /// Disarm every fault. The fire counts stay.
@@ -461,6 +469,9 @@ impl StorageBackend for FaultyFs {
             StoredWrite::Delta { name, .. } => {
                 self.armed(FaultPoint::PutDelta, bucket, prefix, name)
                     .await?;
+                if body.files().is_some() {
+                    self.faults.0.lock().unwrap().delta_file_writes += 1;
+                }
                 self.inner
                     .put_object(bucket, prefix, target, body, metadata)
                     .await

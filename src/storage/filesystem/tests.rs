@@ -75,7 +75,7 @@ mod backend_tests {
                 "ghost",
                 "ns",
                 "f.delta",
-                bytes::Bytes::from_static(b"x"),
+                crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"x")),
                 &dummy_metadata("f.delta"),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -311,7 +311,7 @@ mod backend_tests {
                 "bucket",
                 "a/b",
                 "file.bin",
-                bytes::Bytes::from_static(b"delta"),
+                crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"delta")),
                 &dummy_metadata("file.bin"),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -550,7 +550,7 @@ mod backend_tests {
                             "bucket",
                             prefix,
                             "x.zip",
-                            bytes::Bytes::from_static(b"d"),
+                            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"d")),
                             &dummy_metadata("x.zip"),
                             crate::deltaglider::RefWriteProof::for_tests()
                         )
@@ -1496,7 +1496,7 @@ async fn listing_fixture() -> (tempfile::TempDir, FilesystemBackend) {
             "b",
             "x",
             file,
-            bytes::Bytes::from_static(b"ddd"),
+            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"ddd")),
             &delta(named),
             proof,
         )
