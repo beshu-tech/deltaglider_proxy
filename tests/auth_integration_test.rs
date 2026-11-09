@@ -3123,6 +3123,7 @@ fn retrying_client(
             "test",
         ))
         .force_path_style(true)
+        // retries-on: this test is ABOUT the retry (same signature twice).
         // A 10 ms backoff keeps the retry inside the first attempt's signing
         // second, so both attempts carry the SAME signature.
         .retry_config(

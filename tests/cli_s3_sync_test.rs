@@ -198,6 +198,7 @@ async fn sync_delete_keeps_remote_copies_of_unreadable_local_files() {
         // Root ignores mode bits: nothing to prove here.
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
         cleanup(&bucket).await;
+        common::root_skip("sync_delete_keeps_remote_copies_of_unreadable_local_files");
         return;
     }
     let mut args = sync_args(src, dst);

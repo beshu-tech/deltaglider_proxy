@@ -758,6 +758,7 @@ async fn test_config_apply_rejected_iam_gate_does_not_publish_public_prefix() {
     // Seed an object under the prefix we'll try to make public, using signed creds.
     let signed = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::Config::builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
                 "H8KEY",
                 "H8SECRETKEY1234567890",
@@ -2088,6 +2089,7 @@ async fn test_read_only_config_file_is_reported() {
     use std::os::unix::fs::PermissionsExt;
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
+        common::root_skip("test_read_only_config_file_is_reported");
         return;
     }
     let server = TestServer::builder()

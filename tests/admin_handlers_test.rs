@@ -743,6 +743,12 @@ async fn backend_and_rule_writes_answer_as_the_golden_file() {
 #[tokio::test]
 async fn rule_delete_that_cannot_persist_changes_nothing() {
     use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        // Root ignores the directory mode: nothing to test here.
+        common::root_skip("rule_delete_that_cannot_persist_changes_nothing");
+        return;
+    }
     let server = TestServer::builder()
         .extra_yaml_storage_section(
             "lifecycle:\n  enabled: true\n  tick_interval: \"1h\"\n  rules:\n    - name: expire-downloads\n      enabled: true\n      bucket: downloads\n      prefix: \"\"\n      expire_after: \"30d\"\n",
@@ -763,10 +769,6 @@ async fn rule_delete_that_cannot_persist_changes_nothing() {
         .unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
     let (code, v) = json_of(resp).await;
-    if code == StatusCode::NO_CONTENT {
-        // Root ignores the directory mode: nothing to test here.
-        return;
-    }
     assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
     assert_eq!(v["error"], "internal", "{v}");
     let message = v["message"].as_str().unwrap();

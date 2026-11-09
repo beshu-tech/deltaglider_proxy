@@ -1774,6 +1774,7 @@ async fn test_replication_foreign_object_missing_created_at_converges_on_second_
             "test",
         );
         let cfg = aws_sdk_s3::Config::builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .endpoint_url(common::minio_endpoint_url())

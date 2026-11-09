@@ -73,6 +73,7 @@ jobs:
           mc mb --ignore-existing local/deltaglider-test
           mc mb --ignore-existing local/deltaglider-data
           echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
+          echo "DGP_TEST_REQUIRE_MINIO=1" >> $GITHUB_ENV
       # Build in two steps so the two ~2 GB rustc processes (lib unit tests and
       # tests/all) never run at the same time. The last step only runs tests.
       - name: Build lib unit tests
@@ -126,6 +127,7 @@ jobs:
           mc mb --ignore-existing local/deltaglider-test
           mc mb --ignore-existing local/deltaglider-data
           echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
+          echo "DGP_TEST_REQUIRE_MINIO=1" >> $GITHUB_ENV
       # Lib tests, then every integration test, under one instrumented
       # build: `show-env` makes the proxy children the harness spawns write
       # profiles too (scripts/coverage.sh).

@@ -411,6 +411,8 @@ impl TestServer {
             .endpoint_url(self.endpoint())
             .credentials_provider(credentials)
             .force_path_style(true)
+            // A retry hides an intermittent 5xx: the first failure must fail the test.
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .build();
 
         Client::from_conf(config)
@@ -994,5 +996,39 @@ impl TestServer {
         }
         self.process = cmd.spawn().expect("Failed to respawn server");
         self.wait_ready().await;
+    }
+}
+
+/// Does an env-var value switch a flag on? Unset, empty, `0` and `false` are
+/// off. Pure: unit-tested below.
+pub fn env_flag_on(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+}
+
+/// A fault-injection test that needs mode bits (an unreadable file, a
+/// read-only directory) proves nothing as root: root ignores them. Such a
+/// test calls this and returns. The skip is loud, and a run that sets
+/// `DGP_TEST_REQUIRE_NONROOT` (a developer run, or a job as a non-root user)
+/// fails instead of passing without a check.
+pub fn root_skip(test: &str) {
+    if env_flag_on(std::env::var("DGP_TEST_REQUIRE_NONROOT").ok().as_deref()) {
+        panic!("{test} needs a non-root user (DGP_TEST_REQUIRE_NONROOT is set): root ignores mode bits");
+    }
+    eprintln!("SKIPPED AS ROOT: {test} injects its fault with mode bits and checks nothing here");
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::env_flag_on;
+
+    #[test]
+    fn env_flag_truth_table() {
+        for on in ["1", "true", "yes", " 1 "] {
+            assert!(env_flag_on(Some(on)), "{on:?}");
+        }
+        for off in ["", "0", "false", "FALSE", "  "] {
+            assert!(!env_flag_on(Some(off)), "{off:?}");
+        }
+        assert!(!env_flag_on(None));
     }
 }

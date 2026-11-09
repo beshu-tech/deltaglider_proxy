@@ -943,7 +943,8 @@ async fn a_failed_rewrite_keeps_the_window() {
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
     if std::fs::read(&blocked).is_ok() {
         // Root reads any file: this check cannot fail a rewrite here.
-        eprintln!("skipped: the test runs as root");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        common::root_skip("a_failed_rewrite_keeps_the_window");
         return;
     }
     let id = c.reencrypt(true).await;

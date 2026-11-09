@@ -211,6 +211,63 @@ async fn test_marked_bucket_rejects_client_writes_replication_still_works() {
         .expect("CreateBucket on an existing marked bucket must be allowed");
 }
 
+/// The gate fires BEFORE the upload is looked up (403 before 404), so a
+/// bogus upload id still answers `AccessDenied` on a marked bucket. A removed
+/// gate answers `NoSuchUpload` instead, which is the failure this pins for
+/// `UploadPartCopy` and `CompleteMultipartUpload` (CreateMultipartUpload is
+/// covered above; a marked bucket never has an upload of its own).
+#[tokio::test]
+async fn test_marked_bucket_rejects_part_copy_and_complete() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .bucket_policy("rto-dst", "replication_target_only: true")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    client.create_bucket().bucket("rto-src").send().await.ok();
+    client.create_bucket().bucket("rto-dst").send().await.ok();
+    client
+        .put_object()
+        .bucket("rto-src")
+        .key("a.txt")
+        .body(ByteStream::from_static(b"alpha"))
+        .send()
+        .await
+        .expect("PUT to the unmarked bucket must succeed");
+
+    let err = client
+        .upload_part_copy()
+        .bucket("rto-dst")
+        .key("big.bin")
+        .upload_id("no-such-upload")
+        .part_number(1)
+        .copy_source("rto-src/a.txt")
+        .send()
+        .await
+        .expect_err("UploadPartCopy into a marked bucket must fail");
+    assert_access_denied(&err, "UploadPartCopy");
+
+    let err = client
+        .complete_multipart_upload()
+        .bucket("rto-dst")
+        .key("big.bin")
+        .upload_id("no-such-upload")
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .parts(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag("\"x\"")
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect_err("CompleteMultipartUpload on a marked bucket must fail");
+    assert_access_denied(&err, "CompleteMultipartUpload");
+}
+
 /// The alias hole: a marked bucket declared with an `alias` is protected under
 /// its VIRTUAL name, but a client PUT to the UNCONFIGURED real (alias) name
 /// resolves — via the cross-backend probe — onto the same protected storage.

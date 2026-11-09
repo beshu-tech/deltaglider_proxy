@@ -312,6 +312,7 @@ jobs:
               cli_s3_migrate_test::
               cli_s3_purge_test::
               cli_s3_rm_test::
+              common::
               coordination_bucket_reserved_test::
               delta_passthrough_test::
               folder_marker_test::
@@ -441,6 +442,7 @@ jobs:
           mc mb --ignore-existing local/deltaglider-test
           mc mb --ignore-existing local/deltaglider-data
           echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
+          echo "DGP_TEST_REQUIRE_MINIO=1" >> $GITHUB_ENV
       - name: Integration tests (group ${{ matrix.group }})
         env:
           RUST_BACKTRACE: "1"
@@ -478,6 +480,26 @@ jobs:
         with:
           name: ui-dist
           path: demo/s3-browser/ui/dist
+      # pgsty/silo is the maintained MinIO fork (same MINIO_* env, same
+      # `server /data`, S3 + admin API unchanged); minio/minio left Docker Hub.
+      # Pinned by digest (tag RELEASE.2026-09-16T00-00-00Z): the ephemeral
+      # backend shares the job container's network namespace, so a re-pushed
+      # tag would run next to the job and its cache credentials.
+      - name: Start MinIO for tests
+        run: |
+          docker run -d --name minio-ci --network container:$(hostname) \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            -e MINIO_KMS_SECRET_KEY=dgp-test-key:mbmnuALQu7bPqu79OjbARJ3l6zlJ/wQE2tGSfmdqA/k= \
+            pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46 server /data
+          for i in $(seq 1 30); do
+            mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null && break
+            sleep 1
+          done
+          mc mb --ignore-existing local/deltaglider-test
+          mc mb --ignore-existing local/deltaglider-data
+          echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
+          echo "DGP_TEST_REQUIRE_MINIO=1" >> $GITHUB_ENV
       - name: Delta, optimization, and memory tests
         env:
           RUST_BACKTRACE: "1"
@@ -486,6 +508,14 @@ jobs:
             delta_test:: \
             optimization_test:: \
             memory_test::
+      - name: Clean up MinIO test data
+        if: always()
+        run: |
+          mc rm --recursive --force local/deltaglider-test/ 2>/dev/null || true
+          mc rm --recursive --force local/deltaglider-data/ 2>/dev/null || true
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio-ci 2>/dev/null || true
 
   e2e-smoke:
     name: E2E smoke (embedded UI)

@@ -52,7 +52,8 @@ ci_filters() {
 # Reverse direction: a filter naming no test module would silently run zero
 # tests (the old `--test <name>` form failed loudly on a missing target).
 while read -r filter; do
-  if [[ ! -f "tests/${filter}.rs" ]]; then
+  # `common::` selects the harness's own unit tests (tests/common/, a directory).
+  if [[ ! -f "tests/${filter}.rs" && "$filter" != "common" ]]; then
     echo "error: ci.yml filter '${filter}::' matches no tests/${filter}.rs (it would run zero tests)" >&2
     err=1
   fi
