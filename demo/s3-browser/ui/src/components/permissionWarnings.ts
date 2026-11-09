@@ -83,21 +83,21 @@ export function unknownBucketWarnings(
   return out;
 }
 
-/** True if `s` contains any whitespace or control character. */
-function hasWhitespaceOrControl(s: string): boolean {
-  for (let i = 0; i < s.length; i++) {
-    const code = s.charCodeAt(i);
-    // C0 controls (incl. tab/newline), space, and DEL.
-    if (code <= 0x20 || code === 0x7f) return true;
-  }
-  return false;
+/**
+ * True if `s` holds a control character or whitespace other than a plain
+ * space (a tab, or U+00A0 from a rich-text paste). A plain space is valid:
+ * an S3 key may hold one.
+ */
+function hasControlOrOddSpace(s: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  return /[\u0000-\u001f\u007f]|[^\S ]/.test(s);
 }
 
 /**
  * Flag resource patterns the BACKEND `validate_permissions` rejects, so the
  * operator sees the problem inline instead of a bare HTTP 400 on Apply. Mirrors
  * the server rules (src/iam/permissions.rs): only a TRAILING `*` is allowed, and
- * a pattern must not contain whitespace or control characters. Hyphens, dots,
+ * a pattern must not contain control characters or whitespace other than a space. Hyphens, dots,
  * and slashes are fine. Returns one human-readable reason per offending pattern
  * (empty list = all valid).
  */
@@ -108,8 +108,8 @@ export function invalidPatternWarnings(resources: string[]): string[] {
     const trimmed = part.trim();
     if (!trimmed || seen.has(trimmed)) continue;
     seen.add(trimmed);
-    if (hasWhitespaceOrControl(trimmed)) {
-      out.push(`"${trimmed}" contains a space or control character — patterns can't have them.`);
+    if (hasControlOrOddSpace(trimmed)) {
+      out.push(`"${trimmed}" contains a control character or a non-space whitespace character — patterns can't have them.`);
       continue;
     }
     const star = trimmed.indexOf('*');

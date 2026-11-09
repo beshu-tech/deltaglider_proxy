@@ -628,7 +628,7 @@ pub fn normalize_permissions(permissions: &mut [Permission]) {
 /// - Actions list must not be empty
 /// - Resources must not be empty
 /// - Resource patterns: only trailing `*` is supported (no mid-pattern wildcards)
-/// - Resource must not contain whitespace or control characters
+/// - Resource must not contain control characters (a space is a valid key character)
 /// - `${iam:username}` and `${iam:access_key_id}` may appear in resources or string condition values
 /// - Maximum 100 rules per user/group
 pub fn validate_permissions(permissions: &[Permission]) -> Result<(), String> {
@@ -698,10 +698,19 @@ pub fn validate_permissions_with(
             if res.is_empty() {
                 return Err(format!("{}: resource pattern must not be empty", ctx));
             }
-            if res.contains(char::is_whitespace) || res.chars().any(|c| c.is_control()) {
+            // An S3 key may hold a space or any other printable character, so
+            // `bkt/my docs/*` must be expressible. Control characters (tab,
+            // newline, NUL) stay refused: they cannot be typed or matched safely.
+            // So does any other whitespace (U+00A0 from a rich-text paste):
+            // it looks like a space and would never match a real key.
+            if res
+                .chars()
+                .any(|c| c.is_control() || (c.is_whitespace() && c != ' '))
+            {
                 return Err(format!(
-                    "{}: resource '{}' contains whitespace or control characters",
-                    ctx, res
+                    "{}: resource '{}' contains control characters or whitespace other than a space",
+                    ctx,
+                    res.escape_debug()
                 ));
             }
             validate_template_vars(res).map_err(|e| format!("{}: resource {}", ctx, e))?;
@@ -2716,17 +2725,46 @@ mod tests {
         assert!(err.contains("invalid position"), "error: {}", err);
     }
 
+    /// An S3 key may hold spaces, so a resource can name one: `bucket/my
+    /// docs/*` validates and matches `my docs/a.txt`. Control characters
+    /// (tab, newline, NUL) stay refused.
     #[test]
-    fn test_validate_rejects_whitespace_in_resource() {
-        let perms = vec![Permission {
-            id: 0,
-            effect: "Allow".into(),
-            actions: vec!["read".into()],
-            resources: vec!["bucket /prefix/*".into()],
-            conditions: None,
-        }];
-        let err = validate_permissions(&perms).unwrap_err();
-        assert!(err.contains("whitespace"), "error: {}", err);
+    fn test_validate_accepts_a_space_in_a_resource_and_refuses_control_characters() {
+        let perm = |res: &str| {
+            vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["read".into()],
+                resources: vec![res.into()],
+                conditions: None,
+            }]
+        };
+        for ok in ["bucket/my docs/*", "bucket /prefix/*", "bucket/ lead/*"] {
+            assert!(
+                validate_permissions(&perm(ok)).is_ok(),
+                "{ok:?} must validate"
+            );
+        }
+        for bad in [
+            "bucket/a\tb/*",
+            "bucket/a\nb/*",
+            "bucket/a\0b/*",
+            "bucket/a\u{a0}b/*",
+            "bucket/a\u{2003}b/*",
+        ] {
+            let err = validate_permissions(&perm(bad)).unwrap_err();
+            assert!(err.contains("control characters"), "{bad:?}: {err}");
+        }
+        let allow = perm("bucket/my docs/*");
+        assert!(evaluate(&allow, S3Action::Read, "bucket", "my docs/a.txt"));
+        assert!(!evaluate(&allow, S3Action::Read, "bucket", "my-docs/a.txt"));
+        let mut deny = perm("bucket/my docs/*");
+        deny[0].effect = "Deny".into();
+        let both = [perm("*")[0].clone(), deny[0].clone()];
+        assert!(
+            !evaluate(&both, S3Action::Read, "bucket", "my docs/a.txt"),
+            "a Deny names the prefix too"
+        );
     }
 
     #[test]

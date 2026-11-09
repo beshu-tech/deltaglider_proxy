@@ -122,12 +122,17 @@ impl RuntimeTuning {
     /// parse helpers print for a value that does not parse.
     pub fn from_env(env: EnvLookup) -> Self {
         let parse_or = |var: &str, default: u64| lookup_parse(env, var).unwrap_or(default);
-        let clock_skew_secs: u32 = lookup_parse(env, "DGP_CLOCK_SKEW_SECONDS").unwrap_or(900);
+        let clock_skew_secs: u32 = lookup_parse(env, "DGP_CLOCK_SKEW_SECONDS")
+            .unwrap_or(900)
+            .max(1);
         let codec = CodecTimeouts::default();
         Self {
-            request_timeout_secs: parse_or("DGP_REQUEST_TIMEOUT_SECS", 300),
+            // 0 would time every request out at once.
+            request_timeout_secs: parse_or("DGP_REQUEST_TIMEOUT_SECS", 300).max(1),
+            // 0 would admit no request: the proxy would hang every one.
             max_concurrent_requests: lookup_parse(env, "DGP_MAX_CONCURRENT_REQUESTS")
-                .unwrap_or(1024),
+                .unwrap_or(1024)
+                .max(1),
             header_read_timeout_secs: parse_or(
                 "DGP_HEADER_READ_TIMEOUT_SECS",
                 crate::serve::DEFAULT_HEADER_READ_TIMEOUT.as_secs(),
@@ -146,12 +151,13 @@ impl RuntimeTuning {
             // ahead, so one first used at t0 verifies until t0 + 2 x skew.
             replay_window_secs: parse_or("DGP_REPLAY_WINDOW_SECS", 2 * u64::from(clock_skew_secs)),
             codec: CodecTimeouts {
-                buffered_secs: parse_or("DGP_CODEC_TIMEOUT_SECS", codec.buffered_secs),
-                stall_secs: parse_or("DGP_CODEC_STALL_SECS", codec.stall_secs),
-                absolute_secs: parse_or("DGP_CODEC_ABSOLUTE_SECS", codec.absolute_secs),
+                // 0 would kill every xdelta3 run at its first check.
+                buffered_secs: parse_or("DGP_CODEC_TIMEOUT_SECS", codec.buffered_secs).max(1),
+                stall_secs: parse_or("DGP_CODEC_STALL_SECS", codec.stall_secs).max(1),
+                absolute_secs: parse_or("DGP_CODEC_ABSOLUTE_SECS", codec.absolute_secs).max(1),
             },
             spool_threshold_bytes: lookup_parse(env, "DGP_SPOOL_THRESHOLD_BYTES"),
-            spool_acquire_timeout_secs: parse_or("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", 120),
+            spool_acquire_timeout_secs: parse_or("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", 120).max(1),
             mpu_delta_reconstruct_max_bytes: parse_or(
                 "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
                 64 * 1024 * 1024,
@@ -206,6 +212,116 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         RuntimeTuning::from_env(&move |n: &str| map.get(n).cloned())
+    }
+
+    /// What `0` means for each numeric `DGP_*` setting that the request path
+    /// reads: a floor of 1 (a zero would stop the proxy), or `Zero` where 0
+    /// is a documented value. A new setting must be added here (the source
+    /// test below fails when a variable is missing).
+    enum Zero {
+        /// 0 is read as 1.
+        Floor1,
+        /// 0 is a documented value (off, or no limit).
+        Meaningful(&'static str),
+    }
+
+    const ZERO_RULES: &[(&str, Zero)] = &[
+        ("DGP_REQUEST_TIMEOUT_SECS", Zero::Floor1),
+        ("DGP_MAX_CONCURRENT_REQUESTS", Zero::Floor1),
+        ("DGP_HEADER_READ_TIMEOUT_SECS", Zero::Floor1),
+        ("DGP_MAX_CONNECTIONS", Zero::Floor1),
+        ("DGP_BACKEND_SHARE_PERCENT", Zero::Floor1),
+        // 0 would refuse every signed request (RequestTimeTooSkewed).
+        ("DGP_CLOCK_SKEW_SECONDS", Zero::Floor1),
+        (
+            "DGP_REPLAY_WINDOW_SECS",
+            Zero::Meaningful("replay check off"),
+        ),
+        ("DGP_CODEC_TIMEOUT_SECS", Zero::Floor1),
+        ("DGP_CODEC_STALL_SECS", Zero::Floor1),
+        ("DGP_CODEC_ABSOLUTE_SECS", Zero::Floor1),
+        (
+            "DGP_SPOOL_THRESHOLD_BYTES",
+            Zero::Meaningful("every body takes the spool path"),
+        ),
+        ("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", Zero::Floor1),
+        (
+            "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
+            Zero::Meaningful("no delta is rebuilt"),
+        ),
+        ("DGP_STREAM_COPY_THRESHOLD", Zero::Floor1),
+        ("DGP_MULTIPART_PART_SIZE", Zero::Floor1),
+        ("DGP_UPLOAD_CONCURRENCY", Zero::Floor1),
+        ("DGP_READY_TIMEOUT_SECS", Zero::Floor1),
+        ("DGP_READY_RETRIES", Zero::Meaningful("no retry")),
+        (
+            "DGP_READY_CACHE_TTL_SECS",
+            Zero::Meaningful("strict, no cache"),
+        ),
+        (
+            "DGP_REFERENCE_SCAN_LIMIT",
+            Zero::Meaningful("the chip counts no reference"),
+        ),
+    ];
+
+    /// `0` reads as `1` on every `Floor1` setting: the whole tuning struct
+    /// with the variable at `0` equals the one with it at `1` (zero is the
+    /// value that turned `DGP_MAX_CONCURRENT_REQUESTS=0` into a hang).
+    #[test]
+    fn a_zero_never_stops_the_proxy() {
+        let mut floors = 0;
+        for (var, rule) in ZERO_RULES {
+            match rule {
+                Zero::Floor1 => {
+                    floors += 1;
+                    assert_eq!(
+                        from(&[(var, "0")]),
+                        from(&[(var, "1")]),
+                        "{var}=0 must read as 1"
+                    );
+                }
+                Zero::Meaningful(why) => {
+                    assert!(!why.is_empty(), "{var} documents what 0 means");
+                }
+            }
+        }
+        assert!(floors >= 10, "the table holds the Floor1 rows");
+    }
+
+    /// Every numeric `DGP_*` variable that this file reads has a row in
+    /// [`ZERO_RULES`]: a new setting cannot skip the question "what does 0 do?".
+    #[test]
+    fn every_numeric_variable_has_a_zero_rule() {
+        let src = include_str!("tuning.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        // Drop comment lines, then take the first quoted `DGP_` name after
+        // each numeric read, wherever the call breaks its lines.
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut vars = std::collections::BTreeSet::new();
+        for marker in ["parse_or(", "lookup_parse"] {
+            for (at, _) in code.match_indices(marker) {
+                let tail = &code[at + marker.len()..];
+                let window = crate::security::str_prefix(tail, 160);
+                if let Some(q) = window.find("\"DGP_") {
+                    let name: String = window[q + 1..].chars().take_while(|c| *c != '"').collect();
+                    vars.insert(name);
+                }
+            }
+        }
+        assert!(
+            vars.len() >= 20,
+            "scan found the numeric variables: {vars:?}"
+        );
+        let ruled: std::collections::BTreeSet<String> =
+            ZERO_RULES.iter().map(|(v, _)| v.to_string()).collect();
+        let missing: Vec<_> = vars.difference(&ruled).collect();
+        assert!(missing.is_empty(), "add a ZERO_RULES row for: {missing:?}");
+        let stale: Vec<_> = ruled.difference(&vars).collect();
+        assert!(stale.is_empty(), "ZERO_RULES rows nothing reads: {stale:?}");
     }
 
     /// B109: s3s accepts a signature dated up to the skew AHEAD, so one

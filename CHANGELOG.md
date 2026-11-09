@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Upgrade steps for the next release
+
+- **Remove a `0` from `advanced.blocking_threads`, `advanced.codec_concurrency` and `advanced.filtered_list_max_engine_pages`** (and from `DGP_BLOCKING_THREADS`, `DGP_CODEC_CONCURRENCY`, `DGP_FILTERED_LIST_MAX_ENGINE_PAGES`). A `0` in one of these now stops the proxy at startup with an error that names the setting. Before, it caused a panic at startup or a hang. Other `DGP_*` timeouts and counts that a `0` would break (for example `DGP_REQUEST_TIMEOUT_SECS`, `DGP_MAX_CONCURRENT_REQUESTS`, `DGP_CLOCK_SKEW_SECONDS`, `DGP_SESSION_TTL_HOURS`) are read as `1`.
+
+### Fixed — Configuration checks at the boundaries
+
+- A section PUT whose body gives an array, a string, a number or a boolean where a setting holds an object is refused with `400`. `PUT /config/section/storage` with `[]` used to answer `ok: true` and reset the backend to its default.
+- A resource in an IAM permission may hold a space, so `releases/my docs/*` is valid. Control characters and other whitespace (such as U+00A0) are still refused.
+- A `${env:NAME}` reference in a comment at the end of a line of the YAML file is no longer expanded, so an unset variable in such a comment does not stop the load.
+- A presigned URL with an `X-Amz-Expires` outside 1 to 604800 gets `400` also when the proxy runs with `authentication: none`.
+
 ### Fixed — The compression-health scan of a large bucket
 
 - The scan of a bucket listed it one page of 1,000 keys after the other. On a backend that answers a page in a few seconds, a bucket with about 90,000 objects took longer than 300 seconds, and the page stopped waiting after 300 seconds with "Scan timed out", although the scan still ran on the server. A bucket that does not fit in one page is now listed as up to 32 key ranges, 8 at a time, and the ranges are split at its folders. The result is the same as before.

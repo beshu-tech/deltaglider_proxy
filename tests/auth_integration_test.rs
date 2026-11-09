@@ -3656,6 +3656,45 @@ async fn open_access_serves_unsigned_and_key_equals_secret_only() {
     );
 }
 
+/// Review of #141 (F42): the 7-day cap on `X-Amz-Expires` holds in open
+/// access too, where no signature is checked. s3s allowed any expiry there.
+#[tokio::test]
+async fn open_access_refuses_a_presigned_expiry_beyond_seven_days() {
+    let server = TestServer::builder().open_access().build().await;
+    let client = server.s3_client_with_creds("dummy", "dummy").await;
+    let url = client
+        .get_object()
+        .bucket(server.bucket())
+        .key("x.txt")
+        .presigned(
+            PresigningConfig::builder()
+                .expires_in(Duration::from_secs(60))
+                .build()
+                .unwrap(),
+        )
+        .await
+        .expect("presign")
+        .uri()
+        .to_string();
+    assert!(url.contains("X-Amz-Expires=60"), "{url}");
+    let http = reqwest::Client::new();
+    for (expires, refused) in [
+        ("2592000", true),
+        ("604801", true),
+        ("0", true),
+        ("604800", false),
+        ("60", false),
+    ] {
+        let u = url.replace("X-Amz-Expires=60", &format!("X-Amz-Expires={expires}"));
+        let status = http.get(&u).send().await.unwrap().status();
+        if refused {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "expires {expires}");
+        } else {
+            assert_ne!(status, StatusCode::BAD_REQUEST, "expires {expires}");
+        }
+    }
+}
+
 /// A value typed into the access-key field of a login form may be a secret
 /// (a pasted secret key in the wrong field). A failed login with an access
 /// key that no user has must not put that value in the audit ring, which the

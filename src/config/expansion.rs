@@ -367,6 +367,50 @@ fn whole_scalar_quote(input: &str, start: usize, end: usize) -> Option<Option<ch
     (pre.is_empty() && closes).then_some(quote)
 }
 
+/// Does a YAML comment start inside `prefix`, the line up to a `$`?
+/// A `#` starts one at the line start or after whitespace, outside a quoted
+/// scalar: `k: v  # ${env:UNSET}` has a comment, `k: a#${env:X}` and
+/// `k: "a # ${env:X}"` do not (the `#` is text there). A quote opens a
+/// scalar only where a value can start (line start, or after `:` `-` `,`
+/// `[` `{`), so the apostrophe of `don't` or `a 'b` is text. `''` inside a
+/// single-quoted scalar is an escaped quote. The check sees one line: a
+/// double-quoted scalar that spans lines is not tracked. Pure: unit-tested.
+fn comment_starts_in(prefix: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut opener_before = true; // the line start
+    let mut value_start = true; // only indicators and spaces so far
+    let mut chars = prefix.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if q == '"' && c == '\\' && !escaped {
+                    escaped = true;
+                    continue;
+                }
+                if c == q && !escaped {
+                    if q == '\'' && chars.peek() == Some(&'\'') {
+                        chars.next(); // `''`: an escaped quote, still inside
+                    } else {
+                        quote = None;
+                    }
+                }
+                escaped = false;
+            }
+            None => match c {
+                '#' if opener_before => return true,
+                '"' | '\'' if opener_before && value_start => quote = Some(c),
+                _ => {}
+            },
+        }
+        opener_before = quote.is_none() && (c.is_whitespace() || matches!(c, '[' | '{' | ','));
+        if !c.is_whitespace() {
+            value_start = matches!(c, ':' | '-' | '[' | '{' | ',' | '?');
+        }
+    }
+    false
+}
+
 /// The text between the start of the node that holds a ref and the ref:
 /// `before` (the line up to the ref) without its indentation, sequence
 /// dashes and mapping key. `None` when the line opens no node before the
@@ -493,9 +537,7 @@ fn expand_core(
         // A `#` line inside a block scalar is text, not a comment.
         if doc {
             let line_start = input[..i].rfind('\n').map_or(0, |p| p + 1);
-            if input[line_start..i].trim_start().starts_with('#')
-                && !in_block_scalar(input, line_start)
-            {
+            if comment_starts_in(&input[line_start..i]) && !in_block_scalar(input, line_start) {
                 out.push('$');
                 i += 1;
                 cursor = i;
@@ -697,6 +739,47 @@ mod tests {
         assert!(out.contains("key: !envref \"v\""), "{out}");
         // Not a comment: `#` after content on the line, or inside a value.
         assert!(expand_env_doc_with("k: a#${env:UNSET_X}\n", lookup).is_err());
+    }
+
+    /// Review: a ref in a TRAILING comment (`k: v  # ${env:UNSET}`) failed the
+    /// load; only whole-line comments were skipped.
+    #[test]
+    fn a_ref_in_a_trailing_comment_is_not_expanded() {
+        let lookup = |n: &str| (n == "SET").then(|| "v".to_string());
+        let doc = "a: 1  # rotate ${env:UNSET_A}\nb: ${env:SET} # was ${env:UNSET_B}\nc: 'x' # ${env:UNSET_C}\n";
+        let out = expand_env_doc_with(doc, lookup).unwrap();
+        assert!(out.contains("# rotate ${env:UNSET_A}"), "{out}");
+        assert!(
+            out.contains("b: !envref \"v\" # was ${env:UNSET_B}"),
+            "{out}"
+        );
+        // Text, not a comment: no whitespace before `#`, or inside quotes.
+        assert!(expand_env_doc_with("k: a#${env:UNSET_X}\n", lookup).is_err());
+        let quoted = expand_env_doc_with("k: \"a # ${env:SET}\"\n", lookup).unwrap();
+        assert!(quoted.contains("a # v"), "{quoted}");
+        assert!(expand_env_doc_with("k: don't #${env:UNSET_X}\n", lookup).is_ok());
+    }
+
+    #[test]
+    fn comment_starts_in_truth_table() {
+        for (prefix, want) in [
+            ("", false),
+            ("# whole line ", true),
+            ("  # indented ", true),
+            ("k: v # trailing ", true),
+            ("k: v#not ", false),
+            ("k: \"a # in quotes ", false),
+            ("k: 'a # in quotes ", false),
+            ("k: \"a\" # after quotes ", true),
+            ("k: \"a \\\" # still quoted ", false),
+            ("k: don't # apostrophe is text, comment follows ", true),
+            ("- [a, # flow ", true),
+            ("k: 'it''s # in quotes ", false),
+            ("k: a 'b # a quote inside a plain scalar ", true),
+            ("k: 'a' 'b # ", true),
+        ] {
+            assert_eq!(comment_starts_in(prefix), want, "{prefix:?}");
+        }
     }
 
     // ── ${VAR} expansion (expand_env_with) ──────────────────────────────────

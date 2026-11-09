@@ -580,11 +580,14 @@ where
     let mut merged = serde_json::to_value(current)
         .map_err(|e| format!("internal: failed to project {} section: {}", label, e))?;
     prepare(&mut merged, patch);
+    if let Some(problem) = patch_shape_error(&merged, patch, "") {
+        return Err(format!("invalid {label} section body: {problem}"));
+    }
     apply_merge_patch(&mut merged, patch);
     // Deserialize with field-path tracking so a type error names the exact
     // offending field ("buckets.beshu-b2.public_prefixes: invalid type …")
     // instead of a path-less serde message the operator can't act on.
-    serde_path_to_error::deserialize(merged).map_err(|e| {
+    let typed: T = serde_path_to_error::deserialize(merged).map_err(|e| {
         let path = e.path().to_string();
         let inner = e.into_inner();
         if path == "." {
@@ -592,7 +595,71 @@ where
         } else {
             format!("invalid {label} section body at `{path}`: {inner}")
         }
-    })
+    })?;
+    // The check above reads the CURRENT value, so a struct field that holds
+    // none (`event_delivery`, `tls`) let `[true]` through: serde reads an
+    // array positionally. The result knows the field's real type.
+    let result = serde_json::to_value(&typed)
+        .map_err(|e| format!("internal: failed to project {label} section: {e}"))?;
+    match patch_shape_error(&result, patch, "") {
+        Some(problem) => Err(format!("invalid {label} section body: {problem}")),
+        None => Ok(typed),
+    }
+}
+
+/// Where a patch would replace a whole object (a section, or a struct-typed
+/// field such as `tls`, `jobs`, `replication`) with an array or a scalar.
+/// RFC 7396 lets a non-object patch replace its target, but for a section of
+/// settings that is a silent reset: `PUT /config/section/storage` with `[]`
+/// answered `ok:true` and the backend fell back to the default (serde reads
+/// `[]` as "all defaults" for a struct with `#[serde(default)]` fields).
+/// Pure: `None` = fine. `path` names the place in the message ("" = the
+/// section body).
+fn patch_shape_error(
+    target: &serde_json::Value,
+    patch: &serde_json::Value,
+    path: &str,
+) -> Option<String> {
+    use serde_json::Value;
+    let kind = |v: &Value| match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    };
+    match patch {
+        Value::Object(patch_map) => {
+            for (k, v) in patch_map {
+                let Some(t) = target.get(k) else { continue };
+                let at = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                if let Some(e) = patch_shape_error(t, v, &at) {
+                    return Some(e);
+                }
+            }
+            None
+        }
+        // `null` deletes the key; that is the merge patch's own meaning.
+        Value::Null => None,
+        other if target.is_object() => {
+            let place = if path.is_empty() {
+                "the section body".to_string()
+            } else {
+                format!("`{path}`")
+            };
+            Some(format!(
+                "{place} holds settings (an object), but the body gave {}; \
+                 send an object, or null to remove the key",
+                kind(other)
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Apply a JSON Merge Patch (RFC 7396) in-place to `target`.
