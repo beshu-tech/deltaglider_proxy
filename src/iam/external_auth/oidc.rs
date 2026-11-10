@@ -294,24 +294,16 @@ impl OidcProvider {
             Err(e) => (OidcNetPolicy::default(), Some(e)),
         };
         let url_kind = policy.url_kind();
-        // Disable redirects: the OIDC discovery + JWKS targets are
-        // operator-supplied; a redirect from a legit-looking host to
-        // 169.254.169.254 is the SSRF pivot we want to block. Callers
-        // also enforce `validate_outbound_url` before even reaching the
-        // client.
-        let mut builder = reqwest::Client::builder()
+        // The OIDC discovery + JWKS targets are operator-supplied: the one
+        // guarded builder (resolver check at connect time, no redirects, no
+        // system proxy). Callers also enforce `validate_outbound_url` before
+        // even reaching the client. `allow_local` admits private addresses;
+        // metadata and link-local stay refused.
+        let mut builder = crate::security::guarded_reqwest_builder(url_kind)
             // rustls, as in production, whatever TLS backend the build
             // unifies to (tests enable native-tls through dev-deps).
             .use_rustls_tls()
-            .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            // Close the DNS-rebinding gap: reject hostnames resolving to
-            // metadata/private addresses at connect time (the literal-IP
-            // validate_outbound_url check can't see DNS). `allow_local`
-            // admits private addresses; metadata stays refused.
-            .dns_resolver(std::sync::Arc::new(
-                crate::security::SsrfGuardedResolver::new(url_kind),
-            ));
+            .timeout(std::time::Duration::from_secs(10));
         match policy.load_ca_certs() {
             Ok(certs) => {
                 for c in certs {

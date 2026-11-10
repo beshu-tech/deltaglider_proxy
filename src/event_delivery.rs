@@ -247,25 +247,16 @@ pub struct HttpWebhookDeliveryClient {
 
 impl Default for HttpWebhookDeliveryClient {
     fn default() -> Self {
-        // Do NOT follow redirects: an operator-configured webhook URL is an
-        // SSRF surface, and a redirect could bounce a request that passed
-        // validate_outbound_url onto a private/metadata address. Pair with the
-        // per-URL validate_outbound_url(_, UrlKind::Webhook) checks below.
-        // Close the DNS-rebinding gap: a webhook hostname that resolves to a
-        // metadata/private address fails closed at connect time (the
-        // literal-IP validate_outbound_url check can't see DNS).
+        // An operator-configured webhook URL is an SSRF surface: the one
+        // guarded builder (resolver check at connect time, no redirects, no
+        // system proxy) pairs with the per-URL
+        // validate_outbound_url(_, UrlKind::Webhook) checks below.
         let build = |kind| {
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .dns_resolver(std::sync::Arc::new(
-                    crate::security::SsrfGuardedResolver::new(kind),
-                ))
-                .build()
-                .map_err(|e| {
-                    let reason = format!("the webhook HTTP client could not be built: {e}");
-                    tracing::error!("{reason}");
-                    reason
-                })
+            crate::security::guarded_reqwest_client(kind).map_err(|e| {
+                let reason = format!("the webhook HTTP client could not be built: {e}");
+                tracing::error!("{reason}");
+                reason
+            })
         };
         Self {
             client: build(UrlKind::Webhook),

@@ -489,6 +489,29 @@ impl SsrfGuardedResolver {
     }
 }
 
+/// THE builder of an outbound HTTP client that an operator-supplied URL can
+/// reach (webhook, Slack, OIDC discovery and token requests). Three guards:
+/// the [`SsrfGuardedResolver`] (a name that resolves to a refused address
+/// fails at connect time), no redirects (a redirect could bounce a request
+/// that passed [`validate_outbound_url`] onto a private or metadata address),
+/// and no system proxy (`HTTP(S)_PROXY`, `ALL_PROXY`): with a proxy, only the
+/// proxy host is resolved here, the proxy resolves the target, and the
+/// connect-time address check never runs. A source guard
+/// (`outbound_http_clients_come_from_the_one_guarded_builder`) refuses any
+/// other client builder.
+pub fn guarded_reqwest_builder(kind: UrlKind) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver::new(kind)))
+}
+
+/// [`guarded_reqwest_builder`], built. A build error is an error: there is no
+/// fallback to a client without the guards.
+pub fn guarded_reqwest_client(kind: UrlKind) -> Result<reqwest::Client, reqwest::Error> {
+    guarded_reqwest_builder(kind).build()
+}
+
 impl reqwest::dns::Resolve for SsrfGuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let kind = self.kind;

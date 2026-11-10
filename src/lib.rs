@@ -2393,43 +2393,77 @@ mod source_guards {
         );
     }
 
-    /// E10/F54: a client built with the SSRF resolver has no fallback. A
-    /// failed build is an error that stops the request, never a default
-    /// client (which has no resolver guard and follows redirects).
+    /// E10/F54: an outbound HTTP client that an operator-supplied URL can
+    /// reach comes from ONE builder, `security::guarded_reqwest_builder`:
+    /// the SSRF resolver, no redirects, and no system proxy (a proxy would
+    /// resolve the target itself, so the connect-time address check would
+    /// never run). Nothing else builds a reqwest client, and a failed build
+    /// is an error, never a default client.
     #[test]
-    fn a_guarded_http_client_has_no_unguarded_fallback() {
-        let mut guarded_files = 0;
+    fn outbound_http_clients_come_from_the_one_guarded_builder() {
+        // Clients that no operator-supplied URL reaches, with the reason.
+        const UNGUARDED: [(&str, &str); 2] = [
+            (
+                "src/cli/config.rs",
+                "the admin CLI signs in to the proxy URL the operator typed on the command line",
+            ),
+            (
+                "src/cli/engine_factory.rs",
+                "a 3 s health probe of the endpoint of the CLI verb the operator ran, before it connects",
+            ),
+        ];
+        const CONSTRUCTORS: [&str; 6] = [
+            "reqwest::Client::builder(",
+            "reqwest::ClientBuilder::new(",
+            "reqwest::Client::new(",
+            "reqwest::Client::default(",
+            "Client::builder(",
+            ".dns_resolver(",
+        ];
+        let mut users = 0;
         for (file, text) in crate::source_scan::prod_sources("src") {
             let prod = crate::source_scan::prod_text(&text);
-            if !prod.contains("SsrfGuardedResolver::new(") || file == "src/security.rs" {
+            if prod.contains("guarded_reqwest_") && file != "src/security.rs" {
+                users += 1;
+                // A `.build()` followed by a default: the failed build
+                // becomes a client without the resolver.
+                for (at, _) in prod.match_indices(".build()") {
+                    let after: String = prod[at + 8..]
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .take(40)
+                        .collect();
+                    assert!(
+                        !after.starts_with(".unwrap_or_default()")
+                            && !after.starts_with(".ok().unwrap_or_default()")
+                            && !after.starts_with(".unwrap_or_else(|_|")
+                            && !after.starts_with(".unwrap_or_else(|e|")
+                            && !after.starts_with(".ok()"),
+                        "{file}: a failed client build falls back to a default client"
+                    );
+                }
+            }
+            if file == "src/security.rs" || UNGUARDED.iter().any(|(f, _)| *f == file) {
                 continue;
             }
-            guarded_files += 1;
-            for bare in ["reqwest::Client::default()", "reqwest::Client::new()"] {
+            for c in CONSTRUCTORS {
                 assert!(
-                    !prod.contains(bare),
-                    "{file} builds an SSRF-guarded client and also has `{bare}`"
-                );
-            }
-            // A `.build()` followed by a default: the failed build becomes
-            // a client without the resolver.
-            for (at, _) in prod.match_indices(".build()") {
-                let after: String = prod[at + 8..]
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .take(40)
-                    .collect();
-                assert!(
-                    !after.starts_with(".unwrap_or_default()")
-                        && !after.starts_with(".unwrap_or_else(|_|reqwest"),
-                    "{file}: a failed client build falls back to a default client"
+                    !prod.contains(c),
+                    "{file} builds an HTTP client with `{c}`: use \
+                     `security::guarded_reqwest_builder`, or list the file in UNGUARDED with a reason"
                 );
             }
         }
-        assert!(
-            guarded_files >= 2,
-            "the scan found the guarded clients ({guarded_files})"
-        );
+        assert!(users >= 2, "the scan found the guarded clients ({users})");
+        // The one builder keeps its three guards.
+        let security = crate::source_scan::prod_text(&crate::source_scan::read("src/security.rs"));
+        let at = security
+            .find("pub fn guarded_reqwest_builder")
+            .expect("the guarded builder exists");
+        let builder: String = security[at..].chars().take(900).collect();
+        for part in [".no_proxy()", ".redirect(", ".dns_resolver("] {
+            assert!(builder.contains(part), "the guarded builder lost `{part}`");
+        }
     }
 
     /// Review A14: every admin path that can remove IAM users decides the
