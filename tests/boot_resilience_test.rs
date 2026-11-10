@@ -306,78 +306,55 @@ async fn a_client_cannot_store_a_key_that_the_temp_sweep_would_delete() {
 /// its `.dg-tmp.*` file. The next boot on the same data directory removes it
 /// when it is old, keeps a fresh one (a live writer may hold it), and LIST
 /// never shows either.
+///
+/// The test does not race a live write for its temp file (that depends on
+/// timing). It kills the proxy with SIGKILL, then plants the leftovers a
+/// killed write leaves, with known ages, and restarts.
 #[tokio::test]
 async fn a_restart_after_sigkill_sweeps_the_stale_temp_file() {
-    let mut server = TestServer::builder()
-        .max_object_size(2 * 1024 * 1024 * 1024)
-        .build()
-        .await;
+    let mut server = TestServer::filesystem().await;
     let ep = server.endpoint();
     let bucket = server.bucket().to_string();
     let data = server.data_dir().expect("data dir").to_path_buf();
-    let http = server.http();
 
-    // A large passthrough body: the write copies it into a temp file for a
-    // moment, long enough to poll for.
-    let body = vec![0x5au8; 768 * 1024 * 1024];
-    let put = tokio::spawn({
-        let ep = ep.clone();
-        let bucket = bucket.clone();
-        async move {
-            let r = http
-                .s3_request(
-                    reqwest::Method::PUT,
-                    &format!("{ep}/{bucket}/big/photo.jpg"),
-                )
-                .header("content-type", "image/jpeg")
-                .body(body)
-                .send()
-                .await;
-            drop(r);
-        }
-    });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let stale = loop {
-        if let Some(f) = temp_files_below(&data).into_iter().next() {
-            break f;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no .dg-tmp.* file appeared during the PUT"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    };
     server.kill(); // SIGKILL: no destructor runs.
-    put.abort();
-    assert!(stale.exists(), "the kill removed the temp file itself");
 
-    // Another leftover that is fresh, as a live writer's file would be.
-    let fresh = stale.with_file_name(".dg-tmp.fresh0");
-    std::fs::write(&fresh, b"live").unwrap();
-    // The killed write's file is two hours old.
-    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&stale)
-        .unwrap()
-        .set_modified(old)
-        .unwrap();
+    let folder = data.join(&bucket).join("big");
+    std::fs::create_dir_all(&folder).unwrap();
+    let plant = |name: &str, age_secs: u64| {
+        let path = folder.join(name);
+        std::fs::write(&path, b"leftover").unwrap();
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        path
+    };
+    let stale = plant(".dg-tmp.killed0", 7200);
+    let stale_old_name = plant(".tmpAb12Cd", 7200);
+    let fresh = plant(".dg-tmp.fresh0", 0);
+    let kept = plant("photo.jpg", 7200);
 
     server.respawn_with_env(&[]).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while stale.exists() {
+    while stale.exists() || stale_old_name.exists() {
         assert!(
             std::time::Instant::now() < deadline,
-            "the stale temp file {} is still there after the restart",
-            stale.display()
+            "a stale temp file is still there after the restart: {} {}",
+            stale.exists(),
+            stale_old_name.exists()
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(fresh.exists(), "a fresh temp file must be kept");
+    assert!(kept.exists(), "an old file with a normal name must be kept");
 
     let listing = common::list_objects_raw(&server.http(), &ep, &bucket, "").await;
     assert!(
-        !listing.contains(".dg-tmp."),
+        !listing.contains(".dg-tmp.") && !listing.contains(".tmpAb12Cd"),
         "LIST shows a temp file: {listing}"
     );
 }
