@@ -17,7 +17,12 @@ import {
   trialOfferSchema,
 } from '../lib/seo';
 
-const title = '30-day Commercial trial — DeltaGlider';
+// One mail link for both buttons. The body asks the five things we need
+// to answer usefully; the reader fills them in their own mail client.
+const TRIAL_MAILTO =
+  'mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Commercial%20trial&body=Company%3A%0AStored%20data%20today%20%28TB%29%3A%0AStorage%20backend%20%28AWS%20S3%2C%20Hetzner%2C%20MinIO%2C%20other%29%3A%0AWhat%20you%20store%20%28builds%2C%20backups%2C%20other%29%3A%0AWhat%20you%20want%20from%20the%2030%20days%3A%0A';
+
+const title = '30-day support trial — DeltaGlider';
 const description =
   "The trial gives you direct engineering email, a 12-hour response SLA, and one architecture review call. The software stays free under the 15 TB grant regardless.";
 
@@ -98,7 +103,7 @@ const timeline = [
 
         <div class="hero-ctas">
           <a
-            href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Commercial%20trial"
+            href={TRIAL_MAILTO}
             class="btn btn-primary"
           >
             Start the trial
@@ -214,7 +219,7 @@ const timeline = [
 
       <div class="hero-ctas">
         <a
-          href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Commercial%20trial"
+          href={TRIAL_MAILTO}
           class="btn btn-primary"
         >
           Email contact@beshu.tech
