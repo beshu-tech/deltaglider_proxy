@@ -38,6 +38,8 @@ mod aws_chunked_upload_test;
 mod backend_capability_gate_test;
 #[path = "backend_health_test.rs"]
 mod backend_health_test;
+#[path = "boot_resilience_test.rs"]
+mod boot_resilience_test;
 #[path = "bootstrap_password_hash_invariant_test.rs"]
 mod bootstrap_password_hash_invariant_test;
 #[path = "browser_session_connect_test.rs"]

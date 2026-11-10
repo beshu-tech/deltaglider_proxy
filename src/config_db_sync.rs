@@ -774,8 +774,10 @@ impl ConfigDbSync {
 
     /// Boot-time gate: PROVE the coordination bucket enforces atomic
     /// conditional writes (`If-None-Match: *`) before any HA feature hinges on
-    /// it. Returns `Err` on a bucket that can't be trusted — the caller CRASHES
-    /// the process (a silent-clobber coordination bucket is a data-loss trap).
+    /// it. Returns `Err` on a bucket that can't be trusted. The caller applies
+    /// [`coordination_boot_action`]: `NonCas` crashes the process (a
+    /// silent-clobber coordination bucket is a data-loss trap); `Indeterminate`
+    /// (the probe could not run) warns and boots.
     ///
     /// Design (simple + 16-node-concurrency-safe):
     ///  1. WITNESS fast-path — if `.deltaglider/coordination-witness.json` exists
@@ -791,7 +793,9 @@ impl ConfigDbSync {
     ///     a free live-fire CAS test, and either way the witness now exists. A
     ///     STALE witness is refreshed with a plain overwrite (CAS already proven
     ///     in step 2; the timestamp bump isn't CAS-critical).
-    pub async fn validate_coordination_bucket(&self) -> Result<CoordinationValidation, String> {
+    pub async fn validate_coordination_bucket(
+        &self,
+    ) -> Result<CoordinationValidation, CasValidationFailure> {
         let validation = validate_coordination_bucket_with(&self.s3_client, &self.bucket).await;
         if let Ok(v) = &validation {
             self.use_profile(v.profile());
@@ -805,10 +809,41 @@ impl ConfigDbSync {
 pub async fn validate_coordination_bucket_with(
     client: &Client,
     bucket: &str,
-) -> Result<CoordinationValidation, String> {
-    validate_cas_bucket(client, bucket, COORDINATION_WITNESS_KEY)
-        .await
-        .map_err(|failure| match failure {
+) -> Result<CoordinationValidation, CasValidationFailure> {
+    validate_cas_bucket(client, bucket, COORDINATION_WITNESS_KEY).await
+}
+
+/// What the boot does with the verdict on the coordination bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinationBootAction {
+    /// The bucket is proven. Go on.
+    Continue,
+    /// The probe could not run (network, missing bucket, timeout). The
+    /// verdict is unknown, not non-CAS: warn, boot, and probe again in the
+    /// background. Every lease and lock request fails closed on its own
+    /// transport error, so no write is made on a guess.
+    WarnContinue,
+    /// The bucket is definitely not CAS: HA coordination would be unsafe.
+    Fatal,
+}
+
+/// THE boot rule for the coordination bucket (pure). `NonCas` is fatal in
+/// every boot probe mode: the probe is a data-safety gate, not a health
+/// check, so `DGP_BOOT_BACKEND_PROBE` does not change it.
+pub fn coordination_boot_action(
+    verdict: &Result<CoordinationValidation, CasValidationFailure>,
+) -> CoordinationBootAction {
+    match verdict {
+        Ok(_) => CoordinationBootAction::Continue,
+        Err(CasValidationFailure::Indeterminate(_)) => CoordinationBootAction::WarnContinue,
+        Err(CasValidationFailure::NonCas) => CoordinationBootAction::Fatal,
+    }
+}
+
+impl CasValidationFailure {
+    /// The operator-facing text of a failed validation of `bucket`.
+    pub fn describe_for_coordination(&self, bucket: &str) -> String {
+        match self {
             CasValidationFailure::NonCas => format!(
                 "Coordination bucket '{bucket}' does NOT enforce atomic conditional writes \
                  (If-None-Match). HA coordination (leases, single-writer locks) would be \
@@ -816,8 +851,11 @@ pub async fn validate_coordination_bucket_with(
                  (>=2024-09), or Ceph/Hetzner; Backblaze B2 (501) and old MinIO/SeaweedFS \
                  (silent overwrite) are NOT supported."
             ),
-            CasValidationFailure::Indeterminate(e) => e,
-        })
+            CasValidationFailure::Indeterminate(e) => {
+                format!("Coordination bucket '{bucket}' could not be probed: {e}")
+            }
+        }
+    }
 }
 
 /// Why a CAS validation did not pass. `NonCas` is DEFINITIVE (the backend
@@ -1610,6 +1648,44 @@ mod iam_rebuild_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_boot_action_table_for_the_coordination_bucket() {
+        let proven = Ok(CoordinationValidation::Probed {
+            profile: Default::default(),
+        });
+        let cases = [
+            (proven, CoordinationBootAction::Continue),
+            (
+                Err(CasValidationFailure::NonCas),
+                CoordinationBootAction::Fatal,
+            ),
+            (
+                Err(CasValidationFailure::Indeterminate("timeout".into())),
+                CoordinationBootAction::WarnContinue,
+            ),
+        ];
+        for (verdict, want) in cases {
+            assert_eq!(coordination_boot_action(&verdict), want, "{verdict:?}");
+        }
+    }
+
+    /// Every boot site judges the coordination verdict through
+    /// `settle_coordination` (which applies `coordination_boot_action`); a
+    /// hand-written `exit(1)` on a validation error would bring F12 back.
+    #[test]
+    fn boot_sites_judge_the_coordination_bucket_through_one_rule() {
+        let startup = include_str!("startup.rs");
+        assert!(startup.contains("settle_coordination(&validation, &sync_bucket, \"lease build\")"));
+        assert!(startup.contains("settle_coordination(&validation, &sync_bucket, \"config sync\")"));
+        assert_eq!(
+            startup
+                .matches("FATAL: coordination bucket validation failed")
+                .count(),
+            1,
+            "only settle_coordination exits on a failed validation"
+        );
+    }
 
     fn dead_s3_backend() -> BackendConfig {
         BackendConfig::S3 {

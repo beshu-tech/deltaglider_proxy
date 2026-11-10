@@ -21,7 +21,7 @@ For this reason, the proxy validates the capability up front, logs the result, a
 
 | Role of the bucket | CAS needed? | What the proxy does |
 |---|---|---|
-| Coordination bucket (`config_sync_bucket`) | Always | Boot-time probe; refuses to start if the backend is non-CAS |
+| Coordination bucket (`config_sync_bucket`) | Always | Boot-time probe; refuses to start if the backend is non-CAS. When the probe cannot run (the verdict is unknown), the proxy starts anyway, warns, and probes again in the background. |
 | Client-writable storage, multi-instance | Yes | Boot-time probe of every backend hosting such buckets; refuses to start if one is non-CAS. Config applies that would create this situation are rejected. |
 | Client-writable storage, single-instance | No, for delta and plain objects | The in-process lock protects `reference.bin`, so the multi-instance gate does not run. A bucket that encrypts with the proxy still needs atomic writes (next row). |
 | Bucket that encrypts with the proxy (`aes256-gcm-proxy`), single- or multi-instance | Always | A probe in the background at boot and after a config change, and a fresh probe before every action that turns proxy encryption on. Without proven atomic writes, the action is refused with `409`, and an encrypted bucket that is already there is read-only (`403`) or waits (`503`) while the proxy cannot verify the backend. See [Encryption needs a backend with atomic writes](#encryption-needs-a-backend-with-atomic-writes). |
@@ -43,6 +43,7 @@ The proxy writes a small object under an isolated key (`.deltaglider/_cwprobe/<r
 - **Definitively non-CAS**: a wrong condition is written (`200`), a condition is rejected with 501/NotImplemented, the backend drops the connection on a conditional `PUT` while a plain `PUT` of the same key works, or the write with the current ETag is refused. A 200 means the condition was *silently ignored* (the dangerous case). Backblaze B2 (`eu-central-003`) drops the connection: it sends no HTTP answer to a conditional `PUT`.
 - **Anything else** (network error, missing bucket, a probe that takes too long): the verdict is *unknown* (the GUI says "could not be verified"), which is different from non-CAS. What happens next depends on the role:
   - The multi-instance gate at boot logs a warning and continues, so that a transient error does not stop the proxy.
+  - For the coordination bucket, the proxy also logs a warning and starts. Each lease and lock request that it sends to the bucket fails by itself when the bucket does not answer, so the proxy never acts on a guess. It probes the bucket again after 5 seconds, doubling to every 60 seconds. When the probe shows that the bucket is not CAS, the proxy exits, as it does at a start.
   - For a bucket that encrypts with the proxy, the proxy fails closed: writes to the bucket get `503 SlowDown`, which S3 clients retry, and every action that turns proxy encryption on is refused. The proxy probes the backend again after 5 seconds, doubling to every 60 seconds, and at once when its health check sees the backend recover.
 
 One probe has one deadline of 15 seconds in total. The listing of the backend's buckets, which picks the bucket that the probe writes in, may use 5 seconds of it.

@@ -1097,8 +1097,78 @@ fn coordination_backend(config: &Config) -> &BackendConfig {
 /// them validated the bucket again). `None`: no coordination bucket, or no
 /// client could be built; a builder that needs the verdict then validates
 /// through its own client.
-pub type CoordinationCheck =
-    Option<Result<deltaglider_proxy::config_db_sync::CoordinationValidation, String>>;
+pub type CoordinationCheck = Option<
+    Result<
+        deltaglider_proxy::config_db_sync::CoordinationValidation,
+        deltaglider_proxy::config_db_sync::CasValidationFailure,
+    >,
+>;
+
+/// Apply [`coordination_boot_action`] to the verdict on the coordination
+/// bucket: `NonCas` exits, an unknown verdict warns, a proven bucket passes.
+/// `site` names the caller in the log line. Returns the validation when the
+/// bucket is proven.
+///
+/// [`coordination_boot_action`]: deltaglider_proxy::config_db_sync::coordination_boot_action
+fn settle_coordination(
+    verdict: &Result<
+        deltaglider_proxy::config_db_sync::CoordinationValidation,
+        deltaglider_proxy::config_db_sync::CasValidationFailure,
+    >,
+    bucket: &str,
+    site: &str,
+) -> Option<deltaglider_proxy::config_db_sync::CoordinationValidation> {
+    use deltaglider_proxy::config_db_sync::{coordination_boot_action, CoordinationBootAction};
+    match (coordination_boot_action(verdict), verdict) {
+        (CoordinationBootAction::Continue, Ok(v)) => Some(v.clone()),
+        (CoordinationBootAction::Fatal, Err(failure)) => {
+            error!(
+                "FATAL: coordination bucket validation failed ({site}): {}",
+                failure.describe_for_coordination(bucket)
+            );
+            std::process::exit(1);
+        }
+        (_, Err(failure)) => {
+            warn!(
+                "Coordination bucket validation did not finish ({site}): {}. The proxy boots \
+                 anyway; each lease and lock request fails closed on its own error, and the \
+                 bucket is probed again in the background",
+                failure.describe_for_coordination(bucket)
+            );
+            None
+        }
+        (_, Ok(_)) => None,
+    }
+}
+
+/// Probe the coordination bucket again until the verdict is known (5 s,
+/// doubling to 60 s). A proven bucket ends the task; `NonCas` exits the
+/// process, as it does at boot.
+fn spawn_coordination_reprobe(client: aws_sdk_s3::Client, bucket: String, backend: BackendConfig) {
+    tokio::spawn(async move {
+        let mut wait = Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(Duration::from_secs(60));
+            let verdict = deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(
+                &client, &bucket,
+            )
+            .await;
+            match &verdict {
+                Ok(v) => {
+                    deltaglider_proxy::coordination::if_match::record_for(&backend, v.profile());
+                    info!("Coordination bucket '{bucket}': conditional writes proven after boot");
+                    return;
+                }
+                Err(_) => {
+                    if settle_coordination(&verdict, &bucket, "background probe").is_some() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
 
 /// Validate the coordination bucket of `config` (see [`CoordinationCheck`]).
 pub async fn validate_coordination_once(config: &Config) -> CoordinationCheck {
@@ -1115,13 +1185,23 @@ pub async fn validate_coordination_once(config: &Config) -> CoordinationCheck {
     };
     let validation =
         deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(&client, bucket).await;
-    if let Ok(v) = &validation {
-        // A data backend with the same definition (the coordination bucket
-        // on the data backend) sends its If-Match in the same dialect.
-        deltaglider_proxy::coordination::if_match::record_for(
-            coordination_backend(config),
-            v.profile(),
-        );
+    match &validation {
+        Ok(v) => {
+            // A data backend with the same definition (the coordination bucket
+            // on the data backend) sends its If-Match in the same dialect.
+            deltaglider_proxy::coordination::if_match::record_for(
+                coordination_backend(config),
+                v.profile(),
+            );
+        }
+        Err(deltaglider_proxy::config_db_sync::CasValidationFailure::Indeterminate(_)) => {
+            spawn_coordination_reprobe(
+                client,
+                bucket.clone(),
+                coordination_backend(config).clone(),
+            );
+        }
+        Err(_) => {}
     }
     Some(validation)
 }
@@ -1198,13 +1278,11 @@ pub async fn build_coordination_lease(
         Some(done) => done.clone(),
         None => sync.validate_coordination_bucket().await,
     };
-    let profile = match validation {
-        Ok(v) => v.profile(),
-        Err(e) => {
-            error!("FATAL: coordination bucket validation failed (lease build): {e}");
-            std::process::exit(1);
-        }
-    };
+    // An unknown verdict boots with the safe default profile (the lease reads
+    // before it releases); the S3 lease fails closed on a transport error.
+    let profile = settle_coordination(&validation, &sync_bucket, "lease build")
+        .map(|v| v.profile())
+        .unwrap_or_default();
 
     match ConfigDbSync::build_client(coordination_backend(config)).await {
         Ok(client) => {
@@ -1273,8 +1351,9 @@ pub async fn build_reference_lock(
                 Some(Ok(v)) => v.profile(),
                 Some(Err(e)) => {
                     warn!(
-                        "Reference lock: coordination bucket validation failed ({e}); \
-                         releases read the lock first"
+                        "Reference lock: coordination bucket validation failed ({}); \
+                         releases read the lock first",
+                        e.describe_for_coordination(&sync_bucket)
                     );
                     Default::default()
                 }
@@ -1347,7 +1426,12 @@ pub async fn build_encryption_witness(
         check,
         ConfigDbSync::build_client(coordination_backend(config)).await,
     ) {
-        (Some(Err(e)), _) => Err(format!("the coordination bucket failed validation ({e})")),
+        (Some(Err(e @ deltaglider_proxy::config_db_sync::CasValidationFailure::NonCas)), _) => {
+            Err(format!(
+                "the coordination bucket failed validation ({})",
+                e.describe_for_coordination(&sync_bucket)
+            ))
+        }
         (_, Err(e)) => Err(format!("the coordination client could not be built ({e})")),
         (_, Ok(c)) => Ok(c),
     };
@@ -1629,8 +1713,8 @@ pub async fn init_config_sync(
     if let Ok(v) = &validation {
         sync.use_profile(v.profile());
     }
-    match validation {
-        Ok(deltaglider_proxy::config_db_sync::CoordinationValidation::CachedWitness {
+    match settle_coordination(&validation, &sync_bucket, "config sync") {
+        Some(deltaglider_proxy::config_db_sync::CoordinationValidation::CachedWitness {
             validated_at_unix,
             validated_by,
             ..
@@ -1638,14 +1722,11 @@ pub async fn init_config_sync(
             "Coordination bucket '{}': conditional-write support confirmed (cached witness, validated at unix={} by {})",
             sync_bucket, validated_at_unix, validated_by
         ),
-        Ok(deltaglider_proxy::config_db_sync::CoordinationValidation::Probed { .. }) => info!(
+        Some(deltaglider_proxy::config_db_sync::CoordinationValidation::Probed { .. }) => info!(
             "Coordination bucket '{}': conditional-write support PROBED and confirmed (witness written)",
             sync_bucket
         ),
-        Err(e) => {
-            error!("FATAL: coordination bucket validation failed: {e}");
-            std::process::exit(1);
-        }
+        None => {}
     }
 
     // An upload parked before the restart goes FIRST: downloading would merge
