@@ -35,6 +35,8 @@ struct Fault {
     status: StatusCode,
     code: String,
     remaining: u32,
+    /// Requests this rule answered so far ([`FakeS3::faulted`]).
+    hits: usize,
 }
 
 /// Requests of `op` that must be in flight together, one whose path
@@ -164,7 +166,22 @@ impl FakeS3 {
             status: StatusCode::from_u16(status).unwrap(),
             code: code.to_string(),
             remaining: times,
+            hits: 0,
         });
+    }
+
+    /// How many requests of `op` whose path contains `path_contains` the
+    /// fault rules answered with an error so far. A request is logged when
+    /// it ARRIVES, but a rule is applied only after the request's waits: a
+    /// test that removes a rule ([`FakeS3::clear_faults`]) once the requests
+    /// arrived can let the last ones through. It waits on this count.
+    pub(crate) fn faulted(&self, op: &str, path_contains: &str) -> usize {
+        self.faults
+            .lock()
+            .iter()
+            .filter(|f| f.op == op && f.path_contains == path_contains)
+            .map(|f| f.hits)
+            .sum()
     }
 
     /// Send object GET bodies chunked, with no Content-Length header.
@@ -307,6 +324,7 @@ impl FakeS3 {
         if fault.remaining != u32::MAX {
             fault.remaining -= 1;
         }
+        fault.hits += 1;
         Some((
             fault.status,
             format!(
