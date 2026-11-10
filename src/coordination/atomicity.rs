@@ -756,16 +756,19 @@ pub fn recheck_after(
 ) -> Option<std::time::Duration> {
     match verdict {
         None => Some(std::time::Duration::ZERO),
-        Some(CapabilityVerdict::Unknown { .. }) => {
-            let exp = failures.saturating_sub(1).min(4);
-            Some(
-                UNKNOWN_RECHECK_FIRST
-                    .saturating_mul(1 << exp)
-                    .min(UNKNOWN_RECHECK_MAX),
-            )
-        }
+        Some(CapabilityVerdict::Unknown { .. }) => Some(unknown_recheck_delay(failures)),
         Some(_) => None,
     }
+}
+
+/// The wait before the next probe of a backend that could not be verified
+/// `failures` times in a row (counted from 1): 5 s, doubling to 60 s. The
+/// boot-time re-probe of the coordination bucket uses the same schedule.
+pub fn unknown_recheck_delay(failures: u32) -> std::time::Duration {
+    let exp = failures.saturating_sub(1).min(4);
+    UNKNOWN_RECHECK_FIRST
+        .saturating_mul(1 << exp)
+        .min(UNKNOWN_RECHECK_MAX)
 }
 
 /// The first re-probe of a backend that could not be verified.

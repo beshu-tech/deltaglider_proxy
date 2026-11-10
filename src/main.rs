@@ -511,6 +511,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = outcome {
         startup::exit_with_boot_error(&e.to_string());
     }
+    // A shutdown the process asked for (`shutdown::request_exit`) ends here,
+    // after the drain, with the failure code a supervisor sees.
+    if let Some(code) = deltaglider_proxy::shutdown::requested_exit_code() {
+        std::process::exit(code);
+    }
     Ok(())
 }
 

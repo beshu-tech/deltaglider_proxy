@@ -1085,6 +1085,35 @@ fn accept_legacy_sync() -> bool {
     )
 }
 
+// ---- coordination boot (guarded) ----
+
+/// The coordination bucket's boot state, made ONCE and shared by the
+/// reference lock, the job-plane lease, the encryption witness and the
+/// config sync (each of them validated the bucket again).
+pub struct CoordinationBoot {
+    /// The boot validation. `None`: no coordination bucket, or no client
+    /// could be built; a builder that needs the verdict then validates
+    /// through its own client.
+    pub verdict: CoordinationVerdict,
+    /// What the process knows about the bucket's conditional writes. EVERY
+    /// coordination writer reads this one cell on each request; it is unknown
+    /// until a probe proves the bucket (boot, or the background re-probe),
+    /// and its writers fail closed until then.
+    pub profile: deltaglider_proxy::coordination::if_match::ProfileCell,
+    /// The coordination bucket (empty when there is none).
+    bucket: String,
+    /// Its backend, for the background re-probe.
+    backend: BackendConfig,
+}
+
+/// The validation of the coordination bucket (see [`CoordinationBoot`]).
+pub type CoordinationVerdict = Option<
+    Result<
+        deltaglider_proxy::config_db_sync::CoordinationValidation,
+        deltaglider_proxy::config_db_sync::CasValidationFailure,
+    >,
+>;
+
 /// The coordination bucket's backend (see [`Config::coordination_backend`]).
 /// Falls back to the singleton only for a sync bucket routed to an undefined
 /// backend, which `check_fatal` refuses before this runs.
@@ -1092,85 +1121,138 @@ fn coordination_backend(config: &Config) -> &BackendConfig {
     config.coordination_backend().unwrap_or(&config.backend)
 }
 
-/// The boot validation of the coordination bucket, run ONCE and shared by
-/// the reference lock, the job-plane lease and the config sync (each of
-/// them validated the bucket again). `None`: no coordination bucket, or no
-/// client could be built; a builder that needs the verdict then validates
-/// through its own client.
-pub type CoordinationCheck = Option<
-    Result<
-        deltaglider_proxy::config_db_sync::CoordinationValidation,
-        deltaglider_proxy::config_db_sync::CasValidationFailure,
-    >,
->;
+/// Record a proven profile: the shared cell (every writer reads it from its
+/// next request on), and the dialect table of the data backends with the
+/// same definition (the coordination bucket on the data backend sends its
+/// `If-Match` in the same dialect).
+fn prove_coordination(
+    boot: &CoordinationBoot,
+    profile: deltaglider_proxy::coordination::if_match::ConditionalProfile,
+) {
+    boot.profile.prove(profile);
+    deltaglider_proxy::coordination::if_match::record_for(&boot.backend, profile);
+}
 
-/// Apply [`coordination_boot_action`] to the verdict on the coordination
-/// bucket: `NonCas` exits, an unknown verdict warns, a proven bucket passes.
-/// `site` names the caller in the log line. Returns the validation when the
-/// bucket is proven.
+/// Judge the verdict on the coordination bucket. `site` names the caller
+/// in the log line. Returns the validation when the bucket is proven.
 ///
-/// [`coordination_boot_action`]: deltaglider_proxy::config_db_sync::coordination_boot_action
+/// - Proven: the shared profile cell is set and the writers open.
+/// - `NonCas`: the boot exits. A coordination bucket that clobbers is a
+///   data-loss trap, and no probe mode changes that. This is the ONLY
+///   hard exit of this section (source guard
+///   `only_settle_coordination_exits_the_process_on_a_coordination_verdict`).
+/// - Unknown (the probe could not run): the proxy boots, but every
+///   coordination writer fails closed (retryable `503 SlowDown` on a request
+///   path, "retry later" in the background; the config sync upload stays
+///   parked) until the background re-probe proves the bucket.
 fn settle_coordination(
     verdict: &Result<
         deltaglider_proxy::config_db_sync::CoordinationValidation,
         deltaglider_proxy::config_db_sync::CasValidationFailure,
     >,
-    bucket: &str,
+    boot: &CoordinationBoot,
     site: &str,
 ) -> Option<deltaglider_proxy::config_db_sync::CoordinationValidation> {
-    use deltaglider_proxy::config_db_sync::{coordination_boot_action, CoordinationBootAction};
-    match (coordination_boot_action(verdict), verdict) {
-        (CoordinationBootAction::Continue, Ok(v)) => Some(v.clone()),
-        (CoordinationBootAction::Fatal, Err(failure)) => {
+    use deltaglider_proxy::config_db_sync::CasValidationFailure;
+    match verdict {
+        Ok(v) => {
+            prove_coordination(boot, v.profile());
+            Some(v.clone())
+        }
+        Err(failure @ CasValidationFailure::NonCas) => {
             error!(
                 "FATAL: coordination bucket validation failed ({site}): {}",
-                failure.describe_for_coordination(bucket)
+                failure.describe_for_coordination(&boot.bucket)
             );
             std::process::exit(1);
         }
-        (_, Err(failure)) => {
+        Err(failure @ CasValidationFailure::Indeterminate(_)) => {
             warn!(
-                "Coordination bucket validation did not finish ({site}): {}. The proxy boots \
-                 anyway; each lease and lock request fails closed on its own error, and the \
-                 bucket is probed again in the background",
-                failure.describe_for_coordination(bucket)
+                "Coordination bucket validation did not finish ({site}): {}. The proxy boots, \
+                 but the lease, the reference lock, the encryption witness and the config sync \
+                 upload refuse to write until a background probe proves the bucket",
+                failure.describe_for_coordination(&boot.bucket)
             );
+            start_coordination_reprobe(boot);
             None
         }
-        (_, Ok(_)) => None,
     }
 }
 
-/// Probe the coordination bucket again until the verdict is known (5 s,
-/// doubling to 60 s). A proven bucket ends the task; `NonCas` exits the
-/// process, as it does at boot.
-fn spawn_coordination_reprobe(client: aws_sdk_s3::Client, bucket: String, backend: BackendConfig) {
+/// Set once the background re-probe runs: the three boot sites may all see
+/// an unknown verdict, and one probe loop is enough.
+static REPROBE_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Start the background re-probe of the coordination bucket, once per
+/// process. It probes on the schedule of the encrypted-bucket re-check
+/// (5 s, doubling to 60 s):
+/// - proven: the shared profile cell is set and the task ends;
+/// - `NonCas` twice in a row: the process shuts down gracefully with a
+///   failure exit code ([`deltaglider_proxy::shutdown::request_exit`]),
+///   so a supervisor sees it and the drain still runs;
+/// - anything else: probe again.
+///
+/// Never a hard exit: that would skip the drain.
+fn start_coordination_reprobe(boot: &CoordinationBoot) {
+    use deltaglider_proxy::config_db_sync::{reprobe_step, ReprobeStep};
+    if REPROBE_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let (profile, bucket, backend) = (
+        boot.profile.clone(),
+        boot.bucket.clone(),
+        boot.backend.clone(),
+    );
     spawn_supervised("coordination-reprobe", move || {
-        let (client, bucket, backend) = (client.clone(), bucket.clone(), backend.clone());
+        let (profile, bucket, backend) = (profile.clone(), bucket.clone(), backend.clone());
         async move {
-            let mut wait = Duration::from_secs(5);
+            let mut failures: u32 = 0;
+            let mut noncas_streak: u32 = 0;
             loop {
-                tokio::time::sleep(wait).await;
-                wait = (wait * 2).min(Duration::from_secs(60));
-                let verdict = deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(
-                    &client, &bucket,
-                )
-                .await;
-                match &verdict {
-                    Ok(v) => {
-                        deltaglider_proxy::coordination::if_match::record_for(
-                            &backend,
-                            v.profile(),
-                        );
+                failures = failures.saturating_add(1);
+                let wait =
+                    deltaglider_proxy::coordination::atomicity::unknown_recheck_delay(failures);
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = deltaglider_proxy::shutdown::started() => return,
+                }
+                let verdict = match ConfigDbSync::build_client(&backend).await {
+                    Ok(client) => {
+                        deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(
+                            &client, &bucket,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(
+                        deltaglider_proxy::config_db_sync::CasValidationFailure::Indeterminate(
+                            format!("client build failed: {e}"),
+                        ),
+                    ),
+                };
+                match reprobe_step(&verdict, noncas_streak) {
+                    ReprobeStep::Proven => {
+                        if let Ok(v) = &verdict {
+                            profile.prove(v.profile());
+                            deltaglider_proxy::coordination::if_match::record_for(
+                                &backend,
+                                v.profile(),
+                            );
+                        }
                         info!(
-                            "Coordination bucket '{bucket}': conditional writes proven after boot"
+                            "Coordination bucket '{bucket}': conditional writes proven after \
+                             boot; the coordination writers are open"
                         );
                         return;
                     }
-                    Err(_) => {
-                        if settle_coordination(&verdict, &bucket, "background probe").is_some() {
-                            return;
-                        }
+                    ReprobeStep::Again { noncas_streak: n } => noncas_streak = n,
+                    ReprobeStep::Shutdown => {
+                        error!(
+                            "FATAL: coordination bucket '{bucket}' does NOT enforce atomic \
+                             conditional writes (two probes in a row). Shutting down; the exit \
+                             code is 1"
+                        );
+                        deltaglider_proxy::shutdown::request_exit(1);
+                        return;
                     }
                 }
             }
@@ -1178,41 +1260,50 @@ fn spawn_coordination_reprobe(client: aws_sdk_s3::Client, bucket: String, backen
     });
 }
 
-/// Validate the coordination bucket of `config` (see [`CoordinationCheck`]).
-pub async fn validate_coordination_once(config: &Config) -> CoordinationCheck {
+/// Validate the coordination bucket of `config` (see [`CoordinationBoot`]).
+pub async fn validate_coordination_once(config: &Config) -> CoordinationBoot {
+    let backend = coordination_backend(config).clone();
     let bucket = config
         .config_sync_bucket
-        .as_ref()
-        .filter(|b| !b.is_empty())?;
-    let client = match ConfigDbSync::build_client(coordination_backend(config)).await {
+        .clone()
+        .filter(|b| !b.is_empty())
+        .unwrap_or_default();
+    let boot = CoordinationBoot {
+        verdict: None,
+        profile: Default::default(),
+        bucket,
+        backend,
+    };
+    if boot.bucket.is_empty() {
+        return boot;
+    }
+    let client = match ConfigDbSync::build_client(&boot.backend).await {
         Ok(client) => client,
         Err(e) => {
-            warn!("Coordination bucket '{bucket}': client build failed ({e}); not validated yet");
-            return None;
+            warn!(
+                "Coordination bucket '{}': client build failed ({e}); not validated yet. \
+                 The coordination writers refuse to write until a background probe proves it",
+                boot.bucket
+            );
+            start_coordination_reprobe(&boot);
+            return boot;
         }
     };
     let validation =
-        deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(&client, bucket).await;
-    match &validation {
-        Ok(v) => {
-            // A data backend with the same definition (the coordination bucket
-            // on the data backend) sends its If-Match in the same dialect.
-            deltaglider_proxy::coordination::if_match::record_for(
-                coordination_backend(config),
-                v.profile(),
-            );
-        }
-        Err(deltaglider_proxy::config_db_sync::CasValidationFailure::Indeterminate(_)) => {
-            spawn_coordination_reprobe(
-                client,
-                bucket.clone(),
-                coordination_backend(config).clone(),
-            );
-        }
-        Err(_) => {}
+        deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(&client, &boot.bucket)
+            .await;
+    if let Ok(v) = &validation {
+        prove_coordination(&boot, v.profile());
     }
-    Some(validation)
+    // An unknown verdict starts the re-probe in `settle_coordination`, which
+    // each boot site calls with it.
+    CoordinationBoot {
+        verdict: Some(validation),
+        ..boot
+    }
 }
+
+// ---- end coordination boot ----
 
 /// Build the job-plane leader lease, selecting the impl by whether a
 /// CAS-capable coordination bucket is configured. Called BEFORE the schedulers
@@ -1223,16 +1314,18 @@ pub async fn validate_coordination_once(config: &Config) -> CoordinationCheck {
 /// - `config_sync_bucket` set → validate it enforces conditional writes
 ///   ([`ConfigDbSync::validate_coordination_bucket`], which CRASHES on a
 ///   silent-clobber backend). On success → [`S3Lease`] (real cross-node failover).
+///   An unknown verdict builds the same lease, closed: it takes no lease until
+///   the background re-probe proves the bucket.
 ///   If the bucket/client can't be built at all, LOG and fall back to
 ///   [`LocalLease`] rather than block startup (edge case E6 — never a SPOF).
 ///
-/// It uses the boot's one validation (`check`); it validates the bucket
+/// It uses the boot's one validation (`boot.verdict`); it validates the bucket
 /// itself only when that did not run.
 pub async fn build_coordination_lease(
     config: &Config,
     jobs_db: &Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::JobsDb>>,
     db_keys: &deltaglider_proxy::config_db::ConfigDbKeys,
-    check: &CoordinationCheck,
+    boot: &CoordinationBoot,
 ) -> Arc<deltaglider_proxy::coordination::DynCoordinationLease<'static>> {
     use deltaglider_proxy::coordination::{
         durable_node_id, process_boot_ids, DynCoordinationLease, LocalLease, S3Lease,
@@ -1282,15 +1375,13 @@ pub async fn build_coordination_lease(
         }
     };
 
-    let validation = match check {
+    let validation = match &boot.verdict {
         Some(done) => done.clone(),
         None => sync.validate_coordination_bucket().await,
     };
-    // An unknown verdict boots with the safe default profile (the lease reads
-    // before it releases); the S3 lease fails closed on a transport error.
-    let profile = settle_coordination(&validation, &sync_bucket, "lease build")
-        .map(|v| v.profile())
-        .unwrap_or_default();
+    // An unknown verdict boots with the lease closed: it writes only after
+    // the shared profile cell is proven.
+    settle_coordination(&validation, boot, "lease build");
 
     match ConfigDbSync::build_client(coordination_backend(config)).await {
         Ok(client) => {
@@ -1298,13 +1389,14 @@ pub async fn build_coordination_lease(
                 "Job-plane lease: S3-CAS on bucket '{sync_bucket}' (cross-node failover, \
                  node_id={node_id})"
             );
-            let boot = process_boot_ids(
+            let boot_ids = process_boot_ids(
                 config_db_path()
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new(".")),
             );
             DynCoordinationLease::new_arc(
-                S3Lease::with_boot(client, sync_bucket, node_id, boot).with_profile(profile),
+                S3Lease::with_boot(client, sync_bucket, node_id, boot_ids)
+                    .with_profile_cell(boot.profile.clone()),
             )
         }
         Err(e) => {
@@ -1320,18 +1412,19 @@ pub async fn build_coordination_lease(
 /// Gated exactly like the job-plane lease: no `config_sync_bucket` → `None`
 /// (single-instance; the engine's in-process prefix mutex is the whole story,
 /// zero S3 traffic). With a coordination bucket set, build a CAS client against
-/// it and return an [`S3ReferenceLock`]. It takes the boot's one validation
-/// of the bucket (`check`): the lock must know whether the bucket
-/// enforces `If-Match` on DELETE before it releases by a kept ETag with no
-/// read. A failed (or missing) validation is not fatal HERE: the lock then
-/// reads before each release, and the later gates ([`build_coordination_lease`],
-/// `init_config_sync`, after the backend capability gate) `exit(1)` on it.
-/// A client-build failure is non-fatal (`None`, warn):
+/// it and return an [`S3ReferenceLock`] over the shared profile cell
+/// (`boot.profile`): the lock must know what the bucket enforces (`If-Match`
+/// dialect, `If-Match` on DELETE) before it writes. Only a `NonCas` verdict is
+/// fatal, and not HERE: the later gates ([`build_coordination_lease`],
+/// `init_config_sync`, after the backend capability gate) exit on it. An
+/// unknown verdict builds the lock CLOSED: every acquire fails with a
+/// retryable error (`503 SlowDown`) until the background re-probe proves the
+/// bucket. A client-build failure is non-fatal (`None`, warn):
 /// same "never a SPOF" stance as the lease builder — a transient blip must not
 /// wedge startup, and the single-writer routing contract still applies.
 pub async fn build_reference_lock(
     config: &Config,
-    check: &CoordinationCheck,
+    boot: &CoordinationBoot,
 ) -> Option<Arc<deltaglider_proxy::coordination::DynReferenceLock<'static>>> {
     use deltaglider_proxy::coordination::{durable_node_id, DynReferenceLock, S3ReferenceLock};
 
@@ -1355,38 +1448,38 @@ pub async fn build_reference_lock(
     );
     match ConfigDbSync::build_client(coordination_backend(config)).await {
         Ok(client) => {
-            let profile = match check {
-                Some(Ok(v)) => v.profile(),
-                Some(Err(e)) => {
-                    warn!(
-                        "Reference lock: coordination bucket validation failed ({}); \
-                         releases read the lock first",
-                        e.describe_for_coordination(&sync_bucket)
-                    );
-                    Default::default()
-                }
-                None => {
-                    warn!(
-                        "Reference lock: coordination bucket not validated; releases read the \
-                         lock first"
-                    );
-                    Default::default()
-                }
-            };
+            match &boot.verdict {
+                Some(Err(e)) => warn!(
+                    "Reference lock: coordination bucket not proven ({}); the lock refuses \
+                     to write until a background probe proves it",
+                    e.describe_for_coordination(&sync_bucket)
+                ),
+                None => warn!(
+                    "Reference lock: coordination bucket not validated; the lock refuses to \
+                     write until a background probe proves it"
+                ),
+                Some(Ok(_)) => {}
+            }
             info!(
                 "Reference lock: S3-CAS on bucket '{sync_bucket}' (cross-node reference.bin \
-                 protection, node_id={node_id}, If-Match {}, conditional DELETE {})",
-                profile.if_match.label(),
-                if profile.conditional_delete {
-                    "enforced"
-                } else {
-                    "not enforced: releases read first"
+                 protection, node_id={node_id}, {})",
+                match boot.profile.get() {
+                    Some(p) => format!(
+                        "If-Match {}, conditional DELETE {}",
+                        p.if_match.label(),
+                        if p.conditional_delete {
+                            "enforced"
+                        } else {
+                            "not enforced: releases read first"
+                        }
+                    ),
+                    None => "closed until the bucket is proven".to_string(),
                 }
             );
             Some(DynReferenceLock::new_arc(
                 S3ReferenceLock::new(client, sync_bucket, node_id)
                     .with_tunables(ttl_secs, acquire_timeout_secs)
-                    .with_profile(profile),
+                    .with_profile_cell(boot.profile.clone()),
             ))
         }
         Err(e) => {
@@ -1420,7 +1513,7 @@ pub fn encryption_witness_poll_interval() -> Duration {
 /// each apply judges the new config, so buckets added later are covered.
 pub async fn build_encryption_witness(
     config: &Config,
-    check: &CoordinationCheck,
+    boot: &CoordinationBoot,
     gate: Arc<deltaglider_proxy::storage::WitnessGate>,
 ) -> Option<Arc<deltaglider_proxy::coordination::EncryptionWitness>> {
     use deltaglider_proxy::coordination::{durable_node_id, EncryptionWitness};
@@ -1431,7 +1524,7 @@ pub async fn build_encryption_witness(
         .clone();
     let poll = encryption_witness_poll_interval();
     let client = match (
-        check,
+        &boot.verdict,
         ConfigDbSync::build_client(coordination_backend(config)).await,
     ) {
         (Some(Err(e @ deltaglider_proxy::config_db_sync::CasValidationFailure::NonCas)), _) => {
@@ -1468,10 +1561,7 @@ pub async fn build_encryption_witness(
             config,
             Some(&dir),
         )
-        .with_if_match(match check {
-            Some(Ok(v)) => v.profile().if_match,
-            _ => Default::default(),
-        }),
+        .with_profile_cell(boot.profile.clone()),
     );
     if witness.status().status == "unavailable" {
         return Some(witness);
@@ -1662,7 +1752,7 @@ pub async fn init_config_sync(
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<deltaglider_proxy::iam::external_auth::ExternalAuthManager>>,
     sessions: &Arc<deltaglider_proxy::session::SessionStore>,
-    check: &CoordinationCheck,
+    boot: &CoordinationBoot,
 ) -> Option<Arc<ConfigDbSync>> {
     let sync_bucket = match &config.config_sync_bucket {
         Some(b) if !b.is_empty() => b.clone(),
@@ -1692,7 +1782,7 @@ pub async fn init_config_sync(
     )
     .await
     {
-        Ok(s) => Arc::new(s),
+        Ok(s) => Arc::new(s.with_profile_cell(boot.profile.clone())),
         Err(e) => {
             warn!("Config DB S3 sync: failed to initialize: {}", e);
             return None;
@@ -1714,14 +1804,11 @@ pub async fn init_config_sync(
     // A silent-clobber bucket is a data-loss trap — crash rather than run unsafe.
     // Skips itself on the fast path when a fresh witness from a prior boot
     // exists; the boot's one validation (`check`) is reused when it ran.
-    let validation = match check {
+    let validation = match &boot.verdict {
         Some(done) => done.clone(),
         None => sync.validate_coordination_bucket().await,
     };
-    if let Ok(v) = &validation {
-        sync.use_profile(v.profile());
-    }
-    match settle_coordination(&validation, &sync_bucket, "config sync") {
+    match settle_coordination(&validation, boot, "config sync") {
         Some(deltaglider_proxy::config_db_sync::CoordinationValidation::CachedWitness {
             validated_at_unix,
             validated_by,
@@ -2016,6 +2103,10 @@ pub async fn shutdown_signal() {
         }
         _ = terminate => {
             warn!("Received SIGTERM, initiating graceful shutdown...");
+        }
+        // The process asked for it (`shutdown::request_exit`).
+        _ = deltaglider_proxy::shutdown::started() => {
+            warn!("Shutdown requested by the process, draining...");
         }
     }
     // BEFORE the drain and the runtime teardown: background jobs must see it

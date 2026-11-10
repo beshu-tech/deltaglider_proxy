@@ -159,9 +159,11 @@ pub struct ConfigDbSync {
     /// strictly ordered; cross-node conflicts still use the reconcile path.
     upload_lock: tokio::sync::Mutex<()>,
     health: parking_lot::Mutex<SyncHealth>,
-    /// The `If-Match` form of the bucket ([`Self::use_profile`], from the
-    /// coordination-bucket validation): the upload's compare-and-swap.
-    if_match: parking_lot::Mutex<crate::coordination::if_match::IfMatchDialect>,
+    /// What the coordination-bucket validation proved ([`Self::use_profile`]),
+    /// shared with the other coordination writers: the upload's
+    /// compare-and-swap uses its `If-Match` form. While it is unknown, the
+    /// upload fails closed and stays parked.
+    profile: crate::coordination::if_match::ProfileCell,
 }
 
 impl ConfigDbSync {
@@ -218,7 +220,7 @@ impl ConfigDbSync {
             needs_upload: AtomicBool::new(pending.is_some()),
             upload_lock: tokio::sync::Mutex::new(()),
             health: parking_lot::Mutex::new(SyncHealth::default()),
-            if_match: Default::default(),
+            profile: Default::default(),
         })
         .inspect(|s: &Self| s.publish_health())
     }
@@ -226,7 +228,14 @@ impl ConfigDbSync {
     /// Use what the validation of the bucket found: the upload sends its
     /// `If-Match` in that dialect.
     pub fn use_profile(&self, profile: crate::coordination::if_match::ConditionalProfile) {
-        *self.if_match.lock() = profile.if_match;
+        self.profile.prove(profile);
+    }
+
+    /// Read the profile from the process-wide `cell` on every upload (the
+    /// production wiring: the background re-probe proves the cell later).
+    pub fn with_profile_cell(mut self, cell: crate::coordination::if_match::ProfileCell) -> Self {
+        self.profile = cell;
+        self
     }
 
     /// The primary config DB key (the key of the local DB after boot).
@@ -659,6 +668,13 @@ impl ConfigDbSync {
             ));
         }
 
+        // No conditional write on a guess: until a probe proved the bucket,
+        // the upload is refused (the caller parks it and retries later).
+        let profile = self
+            .profile
+            .proven()
+            .map_err(|e| UploadError::Other(e.to_string()))?;
+
         // Snapshot the ETag we expect the remote object to still carry. This is
         // the compare half of the compare-and-swap.
         let expected_etag = self.last_etag.read().await.clone();
@@ -673,8 +689,7 @@ impl ConfigDbSync {
         put = match &expected_etag {
             Some(etag) => {
                 use crate::coordination::if_match::IfMatchRequest;
-                let dialect = *self.if_match.lock();
-                put.if_match_etag(etag, dialect)
+                put.if_match_etag(etag, profile.if_match)
             }
             None => put.if_none_match("*"),
         };
@@ -774,10 +789,12 @@ impl ConfigDbSync {
 
     /// Boot-time gate: PROVE the coordination bucket enforces atomic
     /// conditional writes (`If-None-Match: *`) before any HA feature hinges on
-    /// it. Returns `Err` on a bucket that can't be trusted. The caller applies
-    /// [`coordination_boot_action`]: `NonCas` crashes the process (a
-    /// silent-clobber coordination bucket is a data-loss trap); `Indeterminate`
-    /// (the probe could not run) warns and boots.
+    /// it. Returns `Err` on a bucket that can't be trusted. The boot judges it
+    /// (`settle_coordination` in `startup.rs`): `NonCas` crashes the
+    /// process (a silent-clobber coordination bucket is a data-loss trap);
+    /// `Indeterminate` (the probe could not run) boots with every
+    /// coordination writer closed until a background re-probe
+    /// ([`reprobe_step`]) proves the bucket.
     ///
     /// Design (simple + 16-node-concurrency-safe):
     ///  1. WITNESS fast-path — if `.deltaglider/coordination-witness.json` exists
@@ -813,30 +830,40 @@ pub async fn validate_coordination_bucket_with(
     validate_cas_bucket(client, bucket, COORDINATION_WITNESS_KEY).await
 }
 
-/// What the boot does with the verdict on the coordination bucket.
+/// How many NonCas verdicts in a row the background re-probe takes as
+/// final. One could be a mixed answer of a bucket behind a flapping proxy;
+/// two in a row is a verdict.
+pub const REPROBE_NONCAS_LIMIT: u32 = 2;
+
+/// What the background re-probe does with its latest verdict (pure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CoordinationBootAction {
-    /// The bucket is proven. Go on.
-    Continue,
-    /// The probe could not run (network, missing bucket, timeout). The
-    /// verdict is unknown, not non-CAS: warn, boot, and probe again in the
-    /// background. Every lease and lock request fails closed on its own
-    /// transport error, so no write is made on a guess.
-    WarnContinue,
-    /// The bucket is definitely not CAS: HA coordination would be unsafe.
-    Fatal,
+pub enum ReprobeStep {
+    /// The bucket is proven: enable the coordination writers and stop.
+    Proven,
+    /// Not decided yet: wait, then probe again. `noncas_streak` is the
+    /// number of NonCas verdicts in a row, this one included.
+    Again { noncas_streak: u32 },
+    /// The bucket is not CAS, twice in a row: HA coordination is unsafe.
+    /// Shut down gracefully with a failure exit code.
+    Shutdown,
 }
 
-/// THE boot rule for the coordination bucket (pure). `NonCas` is fatal in
-/// every boot probe mode: the probe is a data-safety gate, not a health
-/// check, so `DGP_BOOT_BACKEND_PROBE` does not change it.
-pub fn coordination_boot_action(
+/// THE re-probe rule for the coordination bucket (pure). `streak` is the
+/// number of NonCas verdicts in a row BEFORE this one. An `Indeterminate`
+/// verdict resets the streak: the probe could not run, so it says nothing.
+pub fn reprobe_step(
     verdict: &Result<CoordinationValidation, CasValidationFailure>,
-) -> CoordinationBootAction {
+    streak: u32,
+) -> ReprobeStep {
     match verdict {
-        Ok(_) => CoordinationBootAction::Continue,
-        Err(CasValidationFailure::Indeterminate(_)) => CoordinationBootAction::WarnContinue,
-        Err(CasValidationFailure::NonCas) => CoordinationBootAction::Fatal,
+        Ok(_) => ReprobeStep::Proven,
+        Err(CasValidationFailure::Indeterminate(_)) => ReprobeStep::Again { noncas_streak: 0 },
+        Err(CasValidationFailure::NonCas) if streak + 1 >= REPROBE_NONCAS_LIMIT => {
+            ReprobeStep::Shutdown
+        }
+        Err(CasValidationFailure::NonCas) => ReprobeStep::Again {
+            noncas_streak: streak + 1,
+        },
     }
 }
 
@@ -1649,35 +1676,108 @@ mod iam_rebuild_tests {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_boot_action_table_for_the_coordination_bucket() {
-        let proven = Ok(CoordinationValidation::Probed {
+    fn proven() -> Result<CoordinationValidation, CasValidationFailure> {
+        Ok(CoordinationValidation::Probed {
             profile: Default::default(),
-        });
+        })
+    }
+
+    #[test]
+    fn the_reprobe_step_table() {
+        let unknown = || Err(CasValidationFailure::Indeterminate("timeout".into()));
+        let noncas = || Err(CasValidationFailure::NonCas);
+        // (verdict, streak before, want)
         let cases = [
-            (proven, CoordinationBootAction::Continue),
-            (
-                Err(CasValidationFailure::NonCas),
-                CoordinationBootAction::Fatal,
-            ),
-            (
-                Err(CasValidationFailure::Indeterminate("timeout".into())),
-                CoordinationBootAction::WarnContinue,
-            ),
+            (proven(), 0, ReprobeStep::Proven),
+            (proven(), 1, ReprobeStep::Proven),
+            (unknown(), 0, ReprobeStep::Again { noncas_streak: 0 }),
+            // an unknown verdict between two NonCas verdicts breaks the streak
+            (unknown(), 1, ReprobeStep::Again { noncas_streak: 0 }),
+            (noncas(), 0, ReprobeStep::Again { noncas_streak: 1 }),
+            (noncas(), 1, ReprobeStep::Shutdown),
         ];
-        for (verdict, want) in cases {
-            assert_eq!(coordination_boot_action(&verdict), want, "{verdict:?}");
+        for (verdict, streak, want) in cases {
+            assert_eq!(reprobe_step(&verdict, streak), want, "{verdict:?} {streak}");
         }
     }
 
+    /// A writer with no proven profile refuses (retryable); a proven cell
+    /// writes. The upload sends nothing before the check.
+    #[tokio::test]
+    async fn an_upload_with_an_unknown_profile_refuses_and_a_proven_one_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cell = crate::coordination::if_match::ProfileCell::unknown();
+        let sync = ConfigDbSync::new(
+            &dead_s3_backend(),
+            "coord".into(),
+            "db".into(),
+            dir.path().join("config.db"),
+            crate::config_db::ConfigDbKeys::primary_only(&"k".repeat(40)),
+            false,
+        )
+        .await
+        .unwrap()
+        .with_profile_cell(cell.clone());
+        match sync.upload(vec![1, 2, 3]).await {
+            Err(UploadError::Other(e)) => {
+                assert_eq!(e, crate::coordination::if_match::NOT_PROVEN)
+            }
+            other => panic!("an unknown profile must refuse: {other:?}"),
+        }
+        cell.prove(Default::default());
+        // Proven: the write is attempted, and fails on the dead endpoint.
+        match sync.upload(vec![1, 2, 3]).await {
+            Err(UploadError::Other(e)) => {
+                assert_ne!(e, crate::coordination::if_match::NOT_PROVEN)
+            }
+            other => panic!("the dead endpoint must fail the write: {other:?}"),
+        }
+    }
+
+    /// Only `settle_coordination` may end the process on a coordination
+    /// verdict, and the re-probe never does: it asks for a graceful
+    /// shutdown. A hand-written `process::exit` in the coordination section
+    /// of `startup.rs` would bring F12 back (a transient blip kills the
+    /// pod), and an exit in the re-probe would skip the drain.
+    #[test]
+    fn only_settle_coordination_exits_the_process_on_a_coordination_verdict() {
+        let startup = include_str!("startup.rs");
+        let from = startup
+            .find("// ---- coordination boot (guarded) ----")
+            .expect("section start marker");
+        let to = startup
+            .find("// ---- end coordination boot ----")
+            .expect("section end marker");
+        let section = &startup[from..to];
+        let settle = section
+            .find("fn settle_coordination(")
+            .expect("settle_coordination");
+        let settle_end = section[settle..]
+            // A closing brace at column 0 (written as an escape: the source
+            // scan counts braces, even in strings).
+            .find(&format!("\n{}\n", '\u{7d}'))
+            .map(|i| settle + i)
+            .expect("end of settle_coordination");
+        let outside = format!("{}{}", &section[..settle], &section[settle_end..]);
+        assert!(
+            !outside.contains("process::exit"),
+            "a coordination verdict ends the process only in settle_coordination"
+        );
+        assert_eq!(
+            section.matches("process::exit").count(),
+            1,
+            "settle_coordination holds the one exit"
+        );
+        assert!(section.contains("shutdown::request_exit"));
+    }
+
     /// Every boot site judges the coordination verdict through
-    /// `settle_coordination` (which applies `coordination_boot_action`); a
-    /// hand-written `exit(1)` on a validation error would bring F12 back.
+    /// `settle_coordination`.
     #[test]
     fn boot_sites_judge_the_coordination_bucket_through_one_rule() {
         let startup = include_str!("startup.rs");
-        assert!(startup.contains("settle_coordination(&validation, &sync_bucket, \"lease build\")"));
-        assert!(startup.contains("settle_coordination(&validation, &sync_bucket, \"config sync\")"));
+        assert!(startup.contains("settle_coordination(&validation, boot, \"lease build\""));
+        assert!(startup.contains("settle_coordination(&validation, boot, \"config sync\""));
         assert_eq!(
             startup
                 .matches("FATAL: coordination bucket validation failed")
@@ -1685,6 +1785,22 @@ mod tests {
             1,
             "only settle_coordination exits on a failed validation"
         );
+    }
+
+    /// Every coordination writer is built over the one shared profile cell
+    /// (a writer with a private copy never sees the re-probe's verdict).
+    #[test]
+    fn every_coordination_writer_reads_the_shared_profile_cell() {
+        let startup = include_str!("startup.rs");
+        assert!(
+            startup
+                .matches(".with_profile_cell(boot.profile.clone())")
+                .count()
+                >= 4,
+            "S3Lease, S3ReferenceLock, EncryptionWitness and ConfigDbSync each take the cell"
+        );
+        assert!(!startup.contains(".with_profile(profile)"));
+        assert!(!startup.contains("with_if_match"));
     }
 
     fn dead_s3_backend() -> BackendConfig {

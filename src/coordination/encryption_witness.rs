@@ -491,9 +491,10 @@ pub struct EncryptionWitness {
     /// What the last apply's publish replaced: `(storage, previous entry,
     /// published intent)`. A rollback of that apply puts it back.
     last_publish: parking_lot::Mutex<Vec<(Storage, Option<Published>, WriteEncryption)>>,
-    /// The `If-Match` form of the coordination bucket (from its
-    /// validation, [`Self::with_if_match`]).
-    if_match: super::if_match::IfMatchDialect,
+    /// What the validation of the coordination bucket proved (shared with
+    /// the other coordination writers, [`Self::with_profile_cell`]). While
+    /// it is unknown, the manifest is not written.
+    profile: super::if_match::ProfileCell,
 }
 
 /// The file of the saved manifest, in the config-DB directory.
@@ -567,7 +568,7 @@ impl EncryptionWitness {
             cache_path,
             pending: Default::default(),
             last_publish: Default::default(),
-            if_match: Default::default(),
+            profile: Default::default(),
             manifest: parking_lot::Mutex::new(cached),
             server_offset_ms: Default::default(),
             status: arc_swap::ArcSwap::from_pointee(WitnessStatus {
@@ -608,10 +609,11 @@ impl EncryptionWitness {
                 .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Send the manifest's `If-Match` in `dialect` (what the validation of
-    /// the coordination bucket found).
-    pub fn with_if_match(mut self, dialect: super::if_match::IfMatchDialect) -> Self {
-        self.if_match = dialect;
+    /// Read the profile of the coordination bucket (the `If-Match` form)
+    /// from the shared `cell` on every write. While the cell is unknown,
+    /// a write fails and the gate of the buckets stays closed.
+    pub fn with_profile_cell(mut self, cell: super::if_match::ProfileCell) -> Self {
+        self.profile = cell;
         self
     }
 
@@ -694,6 +696,7 @@ impl EncryptionWitness {
             if !edit(&mut manifest, self.server_now()) {
                 return Ok(manifest);
             }
+            let profile = self.profile.proven().map_err(str::to_string)?;
             let body = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
             match super::cas::conditional_put_etag(
                 client,
@@ -701,7 +704,7 @@ impl EncryptionWitness {
                 MANIFEST_KEY,
                 body.into(),
                 etag.as_deref(),
-                self.if_match,
+                profile.if_match,
             )
             .await
             {

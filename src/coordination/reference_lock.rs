@@ -322,13 +322,11 @@ pub struct S3ReferenceLock {
     /// The ETag of each lock this process wrote last: the release deletes
     /// on it without reading the lock first.
     kept: super::cas::KeptEtags,
-    /// The bucket enforces `If-Match` on DELETE (the probe proved it). Only
-    /// then may a release delete by its kept ETag with no read: on a bucket
-    /// that ignores the condition, that DELETE removes a lock a peer stole.
-    conditional_delete: bool,
-    /// The form of the ETag in `If-Match` that the bucket enforces (the
-    /// probe found it; Ceph RGW wants it unquoted).
-    if_match: super::if_match::IfMatchDialect,
+    /// What the CAS probe proved about the bucket (the `If-Match` dialect
+    /// and whether DELETE enforces `If-Match`; only then may a release
+    /// delete by its kept ETag with no read). Shared with every other
+    /// coordination writer. While it is unknown, a write fails closed.
+    profile: super::if_match::ProfileCell,
 }
 
 impl S3ReferenceLock {
@@ -342,23 +340,32 @@ impl S3ReferenceLock {
             acquire_timeout,
             request_timeout: lock_request_timeout(acquire_timeout),
             kept: Default::default(),
-            conditional_delete: false,
-            if_match: Default::default(),
+            profile: Default::default(),
         }
     }
 
     /// Set what the CAS probe found about `If-Match` on DELETE. The default
     /// (`false`) reads the lock before every release.
     pub fn with_conditional_delete(mut self, enforced: bool) -> Self {
-        self.conditional_delete = enforced;
+        let mut profile = self.profile.get().unwrap_or_default();
+        profile.conditional_delete = enforced;
+        self.profile = super::if_match::ProfileCell::with(profile);
         self
     }
 
     /// Set everything the CAS probe found: the `If-Match` dialect and the
     /// DELETE verdict ([`Self::with_conditional_delete`]).
     pub fn with_profile(mut self, profile: super::if_match::ConditionalProfile) -> Self {
-        self.if_match = profile.if_match;
-        self.with_conditional_delete(profile.conditional_delete)
+        self.profile = super::if_match::ProfileCell::with(profile);
+        self
+    }
+
+    /// Read the profile from the shared cell on every request (the
+    /// production wiring). The cell may still be unknown: the writes then
+    /// fail closed until a probe proves the bucket.
+    pub fn with_profile_cell(mut self, cell: super::if_match::ProfileCell) -> Self {
+        self.profile = cell;
+        self
     }
 
     pub fn with_tunables(mut self, ttl_secs: i64, acquire_timeout_secs: u64) -> Self {
@@ -445,6 +452,10 @@ impl S3ReferenceLock {
         body: ByteStream,
         precondition: Option<&str>,
     ) -> Result<bool, LeaseError> {
+        let profile = self
+            .profile
+            .proven()
+            .map_err(|e| LeaseError::Backend(e.to_string()))?;
         let outcome = self
             .bounded(async {
                 super::cas::conditional_put_etag(
@@ -453,7 +464,7 @@ impl S3ReferenceLock {
                     key,
                     body,
                     precondition,
-                    self.if_match,
+                    profile.if_match,
                 )
                 .await
                 .map_err(LeaseError::Backend)
@@ -504,9 +515,16 @@ impl ReferenceLock for S3ReferenceLock {
         // write. A 412 = a peer stole it after our hold lapsed. No read, but
         // only on a bucket that enforces the condition on DELETE.
         let kept = self.kept.take(key, owner);
-        if let Some(etag) = kept.filter(|_| self.conditional_delete) {
-            let delete =
-                super::cas::delete_if_match(&self.client, &self.bucket, key, &etag, self.if_match);
+        // A lock is held only after a write that needed a proven profile.
+        let profile = self.profile.get().unwrap_or_default();
+        if let Some(etag) = kept.filter(|_| profile.conditional_delete) {
+            let delete = super::cas::delete_if_match(
+                &self.client,
+                &self.bucket,
+                key,
+                &etag,
+                profile.if_match,
+            );
             let _ = self
                 .bounded(async {
                     delete.await;
@@ -528,7 +546,7 @@ impl ReferenceLock for S3ReferenceLock {
                     .delete_object()
                     .bucket(&self.bucket)
                     .key(key)
-                    .if_match_etag(&etag, self.if_match)
+                    .if_match_etag(&etag, profile.if_match)
                     .send();
                 let _ = self.bounded(async { Ok(delete.await) }).await;
             }
@@ -842,7 +860,8 @@ mod tests {
             crate::coordination::test_s3::client(&canned),
             "coord".into(),
             "nodeA".into(),
-        );
+        )
+        .with_profile(Default::default());
         let got = lock.try_acquire("k", "peer", now).await.unwrap();
         assert!(!got, "a live lock (server age 10 s < ttl 120 s) was stolen");
         assert_eq!(canned.puts(), 0);
@@ -868,7 +887,8 @@ mod tests {
             crate::coordination::test_s3::client(&canned),
             "coord".into(),
             "nodeA".into(),
-        );
+        )
+        .with_profile(Default::default());
         assert!(lock.try_acquire("k", "peer", now).await.unwrap());
         assert_eq!(canned.puts(), 1);
     }
@@ -1035,9 +1055,32 @@ mod tests {
             .await
             .unwrap();
         (
-            S3ReferenceLock::new(client, "coord".into(), "node".into()),
+            S3ReferenceLock::new(client, "coord".into(), "node".into())
+                .with_profile(Default::default()),
             fake,
         )
+    }
+
+    /// A lock whose cell is unknown writes nothing (retryable error); once
+    /// the shared cell is proven, the same lock writes.
+    #[tokio::test]
+    async fn an_unknown_profile_refuses_the_lock_and_a_proven_one_writes() {
+        let (lock, fake) = fake_lock().await;
+        let cell = crate::coordination::if_match::ProfileCell::unknown();
+        let lock = lock.with_profile_cell(cell.clone());
+        let now = crate::event_outbox::current_unix_seconds();
+        let refused = lock.try_acquire("k", "o", now).await;
+        assert!(
+            matches!(refused, Err(LeaseError::Backend(_))),
+            "{refused:?}"
+        );
+        assert!(
+            methods(&fake).is_empty(),
+            "nothing was sent: {:?}",
+            methods(&fake)
+        );
+        cell.prove(Default::default());
+        assert!(lock.try_acquire("k", "o", now).await.unwrap());
     }
 
     fn methods(fake: &crate::storage::FakeS3) -> Vec<String> {
@@ -1178,8 +1221,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let lock =
-            S3ReferenceLock::new(client, "coord".into(), "node".into()).with_tunables(120, 1);
+        let lock = S3ReferenceLock::new(client, "coord".into(), "node".into())
+            .with_profile(Default::default())
+            .with_tunables(120, 1);
         let started = std::time::Instant::now();
         let res = tokio::time::timeout(
             Duration::from_secs(10),
