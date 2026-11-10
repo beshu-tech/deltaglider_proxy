@@ -601,8 +601,8 @@ fn engine_error_maps_to_s3s_code() {
 
 /// Every client object body is checked against its `x-amz-checksum-*`:
 /// an s3s verb reads `input.body` only as the body argument of
-/// `ingest_client_body` (or of `collect_blob_limited`, which UploadPart
-/// still uses), the request path de-frames aws-chunked bodies only with
+/// `ingest_client_body` (PutObject) or `ingest_part_body` (UploadPart),
+/// the request path de-frames aws-chunked bodies only with
 /// the trailer-keeping decoder, and the form POST runs the same check.
 #[test]
 fn every_client_body_passes_the_checksum_check() {
@@ -622,13 +622,12 @@ fn every_client_body_passes_the_checksum_check() {
             // the call is on one of the lines just above the argument.
             let in_ingest_call = lines[i.saturating_sub(6)..=i]
                 .iter()
-                .any(|(_, l)| l.contains("ingest_client_body("));
+                .any(|(_, l)| l.contains("ingest_client_body(") || l.contains("ingest_part_body("));
             let read_here = file.starts_with("src/s3_adapter_s3s/") && line.contains("input.body");
             if read_here && in_ingest_call {
                 ingested += 1;
             }
-            let body_read =
-                read_here && !in_ingest_call && !line.contains("collect_blob_limited(input.body");
+            let body_read = read_here && !in_ingest_call;
             // The trailer-dropping decoder: its own module, the fuzz entry
             // and the fake S3 backend only.
             let trailer_drop = line.contains("decode_aws_chunked(")
@@ -642,7 +641,10 @@ fn every_client_body_passes_the_checksum_check() {
         }
     }
     assert!(offenders.is_empty(), "unchecked body: {offenders:#?}");
-    assert!(ingested >= 1, "the scan found PutObject's ingest");
+    assert!(
+        ingested >= 2,
+        "the scan found PutObject's and UploadPart's ingest"
+    );
     let form = crate::source_scan::prod_text(&read("src/api/handlers/form_post.rs"));
     assert!(form.contains("checksum::verify_body_checksum("));
 }

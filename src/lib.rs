@@ -2414,13 +2414,6 @@ mod source_guards {
             "src/multipart.rs",
             "src/transfer.rs",
         ];
-        // Sites that a later commit of the streaming-ingest work removes:
-        // (file, offending lines, why). A stale entry fails too.
-        const PENDING: &[(&str, usize, &str)] = &[(
-            "src/multipart.rs",
-            2,
-            "relay parts are read whole until the relay rewrite",
-        )];
         let needles = [["fs::", "read("].concat()];
         let test_files = out_of_line_test_modules(&rust_files("src"));
         let mut offenders: std::collections::BTreeMap<String, Vec<String>> = Default::default();
@@ -2454,15 +2447,6 @@ mod source_guards {
                     }
                 }
             }
-        }
-        for (file, count, why) in PENDING {
-            let found = offenders.remove(*file).unwrap_or_default();
-            assert_eq!(
-                found.len(),
-                *count,
-                "{file} ({why}): the pending whole-file reads changed; update PENDING:\n{}",
-                found.join("\n")
-            );
         }
         assert!(
             offenders.is_empty(),

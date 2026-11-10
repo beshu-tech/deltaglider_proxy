@@ -8,15 +8,17 @@
 //!
 //! - a body of at most the spool threshold (`DGP_SPOOL_THRESHOLD_BYTES`)
 //!   is read into one buffer of its declared size when the RAM budget
-//!   (`DGP_INGEST_MEMORY_MAX_BYTES`, [`MemoryBudget`]) has room for it;
+//!   (`DGP_INGEST_MEMORY_MAX_BYTES`, `memory_budget::MemoryBudget`) has room for it;
 //! - a larger body takes a spool reservation, and may wait for it (up to
 //!   `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS`) before the body is polled, so a
 //!   client that sent `Expect: 100-continue` has sent nothing yet;
 //! - a small body that finds no RAM takes free spool budget without
 //!   waiting (it never queues behind a large reservation), else the request
-//!   is a retryable 503 SlowDown.
+//!   is a retryable 503 SlowDown;
+//! - a multipart part ([`Destination::MultipartPart`]) always goes to a
+//!   spool file, which the multipart store keeps as a relay part.
 //!
-//! The spool reservation covers the body AND the temp files that the
+//! The spool reservation of an object covers the body AND the temp files that the
 //! storage write of that body needs (`file_put_spool_bytes`), so the write
 //! never waits for budget under its locks. The fill is capped at the
 //! declared length, which the reservation covers: disk use never exceeds
@@ -37,7 +39,7 @@ use crate::deltaglider::{DeltaGliderEngine, EngineError, KnownSha256, BLOCKING_H
 use crate::storage::{StorageBackend, StorageError};
 
 /// The hex SHA-256 and MD5 of a body. Only the code that saw the bytes
-/// makes one ([`BodyHasher`], [`BodyHashes::compute`] and the spool fill),
+/// makes one (`BodyHasher`, `BodyHashes::compute` and the spool fill),
 /// so a store that receives one does not hash the body again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BodyHashes {
@@ -218,6 +220,9 @@ pub enum Medium {
     SpoolOverThreshold,
     /// Into a spool file: small, but the RAM budget is full.
     SpoolMemoryBudget,
+    /// Into a spool file that becomes a multipart relay part: a part is
+    /// never held in memory, whatever its size.
+    SpoolMultipartPart,
 }
 
 impl Medium {
@@ -228,6 +233,7 @@ impl Medium {
             Self::Memory => ["memory", "under_threshold"],
             Self::SpoolOverThreshold => ["spool", "over_threshold"],
             Self::SpoolMemoryBudget => ["spool", "memory_budget"],
+            Self::SpoolMultipartPart => ["spool", "multipart_part"],
         }
     }
 }
@@ -312,6 +318,22 @@ pub struct IngestPlan {
     /// `true`: a body shorter than `declared` fails. `false`: `declared`
     /// is an upper bound (a form file), and a shorter body is the body.
     pub strict_length: bool,
+    /// What the body becomes.
+    pub destination: Destination,
+}
+
+/// What an ingested body becomes, which decides its medium and what its
+/// spool reservation covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    /// An object, stored right after the ingest: memory or spool by size
+    /// ([`medium`]), and the reservation also covers the temp files of its
+    /// storage write.
+    Object,
+    /// A multipart part, kept as a relay file until the upload completes:
+    /// always a spool file, and the reservation covers the file only (the
+    /// completion reserves for its own storage write).
+    MultipartPart,
 }
 
 /// Why [`ingest`] failed. Every variant leaves nothing behind.
@@ -377,10 +399,15 @@ where
 {
     admit_declared(&plan, engine.spool_max_bytes())?;
     let threshold = engine.spool_threshold();
-    let permit = (plan.declared <= threshold)
+    let object = plan.destination == Destination::Object;
+    let permit = (object && plan.declared <= threshold)
         .then(|| engine.memory_budget().try_reserve(plan.declared))
         .flatten();
-    let medium = medium(plan.declared, threshold, permit.is_some());
+    let medium = if object {
+        medium(plan.declared, threshold, permit.is_some())
+    } else {
+        Medium::SpoolMultipartPart
+    };
     if let Some(m) = engine.metrics() {
         m.ingest_bodies_total
             .with_label_values(&medium.labels())
@@ -388,7 +415,7 @@ where
     }
     match permit.filter(|_| medium == Medium::Memory) {
         Some(permit) => into_memory(stream, plan, permit).await,
-        None => into_spool(engine, bucket, stream, plan, medium).await,
+        None => into_spool(engine, bucket, stream, plan, plan.declared > threshold).await,
     }
 }
 
@@ -429,18 +456,24 @@ async fn into_spool<B, S, E>(
     bucket: &str,
     mut stream: S,
     plan: IngestPlan,
-    medium: Medium,
+    over_threshold: bool,
 ) -> Result<IngestedBody, IngestError<E>>
 where
     B: StorageBackend,
     S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
-    // A large body waits for its reservation, before the body is polled.
-    // A small body that found no RAM takes free budget now or is refused:
-    // it never queues behind a large reservation.
-    let wait = medium == Medium::SpoolOverThreshold;
+    // A large body waits for its reservation, before the body is polled
+    // (an op that holds spool budget already never waits). A small body
+    // takes free budget now or is refused: it never queues behind a large
+    // reservation.
     let storage = engine
-        .reserve_ingest_spool(bucket, plan.declared, plan.held_spool_mib, wait)
+        .reserve_ingest_spool(
+            bucket,
+            plan.declared,
+            plan.held_spool_mib,
+            over_threshold,
+            plan.destination == Destination::Object,
+        )
         .await
         .map_err(IngestError::Engine)?;
     if storage.reserved_mib() < mib_ceil(plan.declared) {
@@ -486,6 +519,7 @@ pub async fn ingest_bytes<B: StorageBackend>(
         known_sha256,
         held_spool_mib: 0,
         strict_length: true,
+        destination: Destination::Object,
     };
     let stream = futures::stream::iter([Ok(data)]);
     ingest(engine, bucket, stream, plan).await
@@ -524,6 +558,10 @@ mod tests {
         assert_eq!(
             Medium::SpoolMemoryBudget.labels(),
             ["spool", "memory_budget"]
+        );
+        assert_eq!(
+            Medium::SpoolMultipartPart.labels(),
+            ["spool", "multipart_part"]
         );
     }
 
@@ -588,6 +626,7 @@ mod tests {
             known_sha256: None,
             held_spool_mib: held,
             strict_length: true,
+            destination: Destination::Object,
         };
         let verdict = |p: IngestPlan, max| match admit_declared::<()>(&p, max) {
             Ok(()) => "ok",

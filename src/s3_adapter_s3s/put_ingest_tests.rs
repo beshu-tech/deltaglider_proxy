@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! PutObject through `api::body_ingest` on an engine over the filesystem
-//! backend, with a 1 MiB spool threshold: the medium each body takes, the
-//! RAM peak, and, for every way a body can fail, that nothing is stored and
-//! the RAM and spool budgets are whole again.
+//! PutObject and UploadPart through `api::body_ingest` on an engine over
+//! the filesystem backend, with a 1 MiB spool threshold: the medium each
+//! body takes, the RAM peak, and, for every way a body can fail, that
+//! nothing is stored and the RAM and spool budgets are whole again.
 
 use super::multipart::adapter_test_support::service;
 use super::*;
@@ -93,8 +93,11 @@ impl Rig {
             SPOOL_MIB,
             "{when}: spool budget held"
         );
-        let files = std::fs::read_dir(&self.spool_dir).unwrap().count();
-        assert_eq!(files, 0, "{when}: a spool file was left behind");
+        let files = files_under(&self.spool_dir);
+        assert!(
+            files.is_empty(),
+            "{when}: spool files left behind: {files:?}"
+        );
     }
 
     async fn put(&self, req: s3s::S3Request<s3s::dto::PutObjectInput>) -> s3s::S3Result<String> {
@@ -105,6 +108,21 @@ impl Rig {
     async fn stored(&self, key: &str) -> Option<Vec<u8>> {
         self.engine().retrieve("b", key).await.ok().map(|(d, _)| d)
     }
+}
+
+/// The regular files under `dir`, at any depth (the relay parts are in
+/// subdirectories of the spool dir).
+fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files_under(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
 }
 
 fn body(n: usize) -> Vec<u8> {
@@ -461,4 +479,331 @@ async fn the_headers_are_judged_before_a_byte_is_read() {
         assert!(!polled.load(Ordering::SeqCst), "{what}: the body was read");
         rig.assert_restored(what);
     }
+}
+
+/// An UploadPart of `upload_id` with `items` as its body and `headers`.
+fn part_req(
+    upload_id: &str,
+    n: i32,
+    items: Vec<Item>,
+    headers: &[(&'static str, String)],
+    content_md5: Option<String>,
+) -> s3s::S3Request<s3s::dto::UploadPartInput> {
+    let input = s3s::dto::UploadPartInput::builder()
+        .bucket("b".into())
+        .key("m/photo.jpg".into())
+        .upload_id(upload_id.into())
+        .part_number(n)
+        .content_md5(content_md5)
+        .body(Some(s3s::dto::StreamingBlob::wrap(futures::stream::iter(
+            items,
+        ))))
+        .build()
+        .unwrap();
+    let mut req = super::multipart::adapter_test_support::request(input);
+    for (name, value) in headers {
+        req.headers.append(*name, value.parse().unwrap());
+    }
+    req
+}
+
+impl Rig {
+    fn create_upload(&self, key: &str) -> String {
+        self.svc
+            .state
+            .multipart
+            .create("b", key, None, Default::default())
+            .unwrap()
+    }
+
+    async fn part(&self, req: s3s::S3Request<s3s::dto::UploadPartInput>) -> s3s::S3Result<String> {
+        let resp = multipart::upload_part(&self.svc, req).await?;
+        Ok(resp.output.e_tag.unwrap().value().to_string())
+    }
+
+    async fn complete(&self, key: &str, upload_id: &str, etags: &[String]) -> s3s::S3Result<()> {
+        let parts = etags
+            .iter()
+            .enumerate()
+            .map(|(i, etag)| s3s::dto::CompletedPart {
+                part_number: Some(i as i32 + 1),
+                e_tag: Some(parse_s3s_etag(&format!("\"{etag}\"")).unwrap()),
+                ..Default::default()
+            })
+            .collect();
+        let input = s3s::dto::CompleteMultipartUploadInput::builder()
+            .bucket("b".into())
+            .key(key.into())
+            .upload_id(upload_id.into())
+            .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
+                parts: Some(parts),
+            }))
+            .build()
+            .unwrap();
+        multipart::complete_multipart_upload(
+            &self.svc,
+            super::multipart::adapter_test_support::request(input),
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+#[test]
+fn part_size_limit_truth_table() {
+    use super::multipart::{part_size_limit, S3_MAX_SINGLE_TRANSFER_BYTES};
+    const GIB: u64 = 1 << 30;
+    assert_eq!(S3_MAX_SINGLE_TRANSFER_BYTES, 5 * GIB);
+    assert_eq!(part_size_limit(100 * GIB), 5 * GIB);
+    assert_eq!(part_size_limit(5 * GIB), 5 * GIB);
+    assert_eq!(part_size_limit(5 * GIB - 1), 5 * GIB - 1);
+    assert_eq!(part_size_limit(32 << 20), 32 << 20);
+    assert_eq!(part_size_limit(0), 0);
+}
+
+/// An UploadPart three times the spool threshold goes straight to a spool
+/// file, which becomes the relay part: no RAM, one reservation, and the
+/// completed object is the part.
+#[tokio::test]
+async fn an_upload_part_three_times_the_threshold_becomes_a_relay_file() {
+    let rig = Rig::new().await;
+    let data = body(3 * THRESHOLD);
+    let id = rig.create_upload("m/photo.jpg");
+    let etag = rig
+        .part(part_req(
+            &id,
+            1,
+            chunks(&data),
+            &len_header(data.len()),
+            Some(md5_b64(&data)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(etag, hex::encode(md5::Md5::digest(&data)));
+    assert_eq!(rig.bodies("spool", "multipart_part"), 1);
+    assert_eq!(rig.engine().memory_budget().peak_bytes(), 0);
+    assert_eq!(rig.engine().spool_dir().free_mib(), SPOOL_MIB - 3);
+    let files = files_under(&rig.spool_dir);
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(std::fs::read(&files[0]).unwrap(), data);
+
+    // A small part is a relay file too.
+    let small = body(10 * KIB);
+    let etag2 = rig
+        .part(part_req(
+            &id,
+            2,
+            chunks(&small),
+            &len_header(small.len()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rig.bodies("spool", "multipart_part"), 2);
+    assert_eq!(rig.engine().memory_budget().peak_bytes(), 0);
+
+    rig.complete("m/photo.jpg", &id, &[etag, etag2])
+        .await
+        .unwrap();
+    rig.assert_restored("after the completion");
+    let mut whole = data.clone();
+    whole.extend_from_slice(&small);
+    assert_eq!(rig.stored("m/photo.jpg").await.unwrap(), whole);
+}
+
+/// Every way a part body can fail: the right S3 code, no part kept, every
+/// budget whole again.
+#[tokio::test]
+async fn every_part_failure_keeps_nothing_and_restores_the_budgets() {
+    let rig = Rig::new().await;
+    let id = rig.create_upload("m/photo.jpg");
+    let size = 3 * THRESHOLD;
+    let data = body(size);
+    let other = body(size + 1)[1..].to_vec();
+    let mut last_chunk_fails = chunks(&data);
+    *last_chunk_fails.last_mut().unwrap() =
+        Err(std::io::Error::other("UploadStreamError: Sha256Mismatch"));
+    let cases: Vec<(&str, s3s::S3Request<_>, &str)> = vec![
+        (
+            "payload hash mismatch on the last chunk",
+            part_req(&id, 1, last_chunk_fails, &len_header(size), None),
+            "BadDigest",
+        ),
+        (
+            "Content-MD5 mismatch",
+            part_req(
+                &id,
+                1,
+                chunks(&data),
+                &len_header(size),
+                Some(md5_b64(&other)),
+            ),
+            "BadDigest",
+        ),
+        (
+            "checksum header mismatch",
+            part_req(
+                &id,
+                1,
+                chunks(&data),
+                &[
+                    ("content-length", size.to_string()),
+                    ("x-amz-checksum-crc32", crc32_b64(&other)),
+                ],
+                None,
+            ),
+            "BadDigest",
+        ),
+        (
+            "body longer than declared",
+            part_req(&id, 1, chunks(&data), &len_header(size - 1), None),
+            "InvalidArgument",
+        ),
+        (
+            "body shorter than declared",
+            part_req(&id, 1, chunks(&data), &len_header(size + 1), None),
+            "IncompleteBody",
+        ),
+    ];
+    for (what, req, code) in cases {
+        let err = rig.part(req).await.unwrap_err();
+        assert_eq!(err.code().as_str(), code, "{what}: {err:?}");
+        assert!(
+            rig.svc
+                .state
+                .multipart
+                .list_parts(&id, "b", "m/photo.jpg")
+                .unwrap()
+                .is_empty(),
+            "{what}: a part was kept"
+        );
+        rig.assert_restored(what);
+    }
+}
+
+/// A part refused for its declared length or its upload is refused before
+/// a byte of it is read: above S3's 5 GiB, above `max_object_size`, for an
+/// upload that does not exist.
+#[tokio::test]
+async fn a_part_is_judged_before_a_byte_is_read() {
+    let rig = Rig::new().await;
+    let id = rig.create_upload("m/photo.jpg");
+    let cases: Vec<(&str, String, usize, &str)> = vec![
+        ("above 5 GiB", id.clone(), (5 << 30) + 1, "EntityTooLarge"),
+        (
+            "above max_object_size",
+            id.clone(),
+            MAX_OBJECT + 1,
+            "EntityTooLarge",
+        ),
+        ("an unknown upload", "nope".to_string(), 10, "NoSuchUpload"),
+    ];
+    for (what, upload, declared, code) in cases {
+        let polled = Arc::new(AtomicBool::new(false));
+        let flag = polled.clone();
+        let stream = futures::stream::poll_fn(move |_| {
+            flag.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(None::<Item>)
+        });
+        let input = s3s::dto::UploadPartInput::builder()
+            .bucket("b".into())
+            .key("m/photo.jpg".into())
+            .upload_id(upload)
+            .part_number(1)
+            .body(Some(s3s::dto::StreamingBlob::wrap(stream)))
+            .build()
+            .unwrap();
+        let mut req = super::multipart::adapter_test_support::request(input);
+        req.headers
+            .append("content-length", declared.to_string().parse().unwrap());
+        let err = rig.part(req).await.unwrap_err();
+        assert_eq!(err.code().as_str(), code, "{what}: {err:?}");
+        assert!(!polled.load(Ordering::SeqCst), "{what}: the body was read");
+        rig.assert_restored(what);
+    }
+}
+
+/// A relay file swapped on disk between UploadPart and Complete fails the
+/// completion (the store checks each part's MD5 while it reads it), and
+/// nothing is stored; the upload stays open for a retry.
+#[tokio::test]
+async fn a_tampered_relay_file_fails_the_completion() {
+    let rig = Rig::new().await;
+    let data = body(2 * THRESHOLD);
+    let id = rig.create_upload("m/photo.jpg");
+    let etag = rig
+        .part(part_req(
+            &id,
+            1,
+            chunks(&data),
+            &len_header(data.len()),
+            None,
+        ))
+        .await
+        .unwrap();
+    let files = files_under(&rig.spool_dir);
+    let mut swapped = data.clone();
+    swapped[0] ^= 0xFF;
+    std::fs::write(&files[0], &swapped).unwrap();
+    let err = rig.complete("m/photo.jpg", &id, &[etag]).await.unwrap_err();
+    assert_eq!(err.code().as_str(), "InternalError", "{err:?}");
+    assert!(rig.stored("m/photo.jpg").await.is_none());
+    rig.svc
+        .state
+        .multipart
+        .abort(&id, "b", "m/photo.jpg")
+        .unwrap();
+    rig.assert_restored("after the abort");
+}
+
+/// UploadPartCopy of a whole source larger than the threshold reads the
+/// source as a stream into the part's spool file: no RAM, and the
+/// completed object is the source.
+#[tokio::test]
+async fn an_upload_part_copy_of_a_large_source_becomes_a_relay_file() {
+    let rig = Rig::new().await;
+    let data = body(3 * THRESHOLD);
+    rig.put(put_req(
+        "src/photo.jpg",
+        chunks(&data),
+        &len_header(data.len()),
+        None,
+    ))
+    .await
+    .unwrap();
+    let peak_before = rig.engine().memory_budget().peak_bytes();
+    let id = rig.create_upload("m/photo.jpg");
+    let input = s3s::dto::UploadPartCopyInput::builder()
+        .bucket("b".into())
+        .key("m/photo.jpg".into())
+        .upload_id(id.clone())
+        .part_number(1)
+        .copy_source(s3s::dto::CopySource::Bucket {
+            bucket: "b".into(),
+            key: "src/photo.jpg".into(),
+            version_id: None,
+        })
+        .build()
+        .unwrap();
+    let resp = copy::upload_part_copy(
+        &rig.svc,
+        super::multipart::adapter_test_support::request(input),
+    )
+    .await
+    .unwrap();
+    let etag = resp
+        .output
+        .copy_part_result
+        .unwrap()
+        .e_tag
+        .unwrap()
+        .value()
+        .to_string();
+    assert_eq!(etag, hex::encode(md5::Md5::digest(&data)));
+    assert_eq!(rig.bodies("spool", "multipart_part"), 1);
+    assert_eq!(rig.engine().memory_budget().peak_bytes(), peak_before);
+    assert_eq!(rig.engine().spool_dir().free_mib(), SPOOL_MIB - 3);
+    rig.complete("m/photo.jpg", &id, &[etag]).await.unwrap();
+    rig.assert_restored("after the completion");
+    assert_eq!(rig.stored("m/photo.jpg").await.unwrap(), data);
 }

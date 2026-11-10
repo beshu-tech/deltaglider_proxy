@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+use super::tests::put;
 use super::*;
 
 /// A relay part is clamped to what its upload does not hold yet: once an
@@ -15,15 +16,13 @@ fn review3_relay_parts_past_the_budget_are_not_written_for_free() {
     let store = MultipartStore::new(64 << 20)
         .with_spool(spool.clone())
         .with_relay_upload_max(Some(4 << 20));
-    let id = store
-        .create_with_relay_policy("b", "k", None, HashMap::new(), None, true)
-        .unwrap();
-    let mib = |n: usize| Bytes::from(vec![7u8; n << 20]);
-    store.upload_part(&id, "b", "k", 1, mib(4)).unwrap();
+    let id = store.create("b", "k", None, HashMap::new()).unwrap();
+    let mib = |n: usize| vec![7u8; n << 20];
+    put(&store, &id, "b", "k", 1, mib(4)).unwrap();
     assert_eq!(spool.free_mib(), 12);
     let mut accepted = 0;
     for n in 2..=4 {
-        match store.upload_part(&id, "b", "k", n, mib(4)) {
+        match put(&store, &id, "b", "k", n, mib(4)) {
             Ok(_) => accepted += 1,
             Err(e) => {
                 let msg = e.to_string();
@@ -41,7 +40,7 @@ fn review3_relay_parts_past_the_budget_are_not_written_for_free() {
     );
     assert_eq!(spool.free_mib(), 12, "a refused part reserves nothing");
     // Re-uploading part 1 replaces it: within the share.
-    store.upload_part(&id, "b", "k", 1, mib(4)).unwrap();
+    put(&store, &id, "b", "k", 1, mib(4)).unwrap();
 }
 
 #[test]
@@ -59,15 +58,17 @@ fn relay_upload_cap_truth_table() {
 fn no_per_upload_cap_leaves_only_the_global_budget() {
     let dir = tempfile::tempdir().unwrap();
     let spool = SpoolDir::new(dir.path().join("spool"), 8 << 20).unwrap();
-    let store = MultipartStore::new(64 << 20)
-        .with_spool(spool.clone())
-        .with_relay_upload_max(Some(0));
-    let id = store
-        .create_with_relay_policy("b", "k", None, HashMap::new(), None, true)
-        .unwrap();
-    let mib = |n: usize| Bytes::from(vec![7u8; n << 20]);
-    store.upload_part(&id, "b", "k", 1, mib(8)).unwrap();
-    let err = store.upload_part(&id, "b", "k", 2, mib(1)).unwrap_err();
+    let store = MultipartStore {
+        // Only the spool budget: no global part cap either.
+        max_total_configured: Some(u64::MAX),
+        ..MultipartStore::new(64 << 20)
+            .with_spool(spool.clone())
+            .with_relay_upload_max(Some(0))
+    };
+    let id = store.create("b", "k", None, HashMap::new()).unwrap();
+    let mib = |n: usize| vec![7u8; n << 20];
+    put(&store, &id, "b", "k", 1, mib(8)).unwrap();
+    let err = put(&store, &id, "b", "k", 2, mib(1)).unwrap_err();
     assert!(matches!(err, S3Error::SlowDown(_)), "{err:?}");
 }
 

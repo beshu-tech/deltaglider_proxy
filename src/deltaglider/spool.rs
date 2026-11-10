@@ -624,6 +624,26 @@ impl Spool {
         Ok(written)
     }
 
+    /// Keep the file past this `Spool`: rename it to `path` (a new name in
+    /// the spool's file system, never an existing one) and hand back the
+    /// reservation that holds its budget. A multipart part becomes a relay
+    /// part this way, with no copy and no second reservation. On an error
+    /// the temp file is deleted and the budget released.
+    pub(crate) fn keep_as(self, path: &Path) -> std::io::Result<(PathBuf, SpoolReservation)> {
+        let Spool { file, _permit } = self;
+        let dir = file
+            .path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        file.persist_noclobber(path).map_err(|e| e.error)?;
+        let permit = match _permit {
+            SharedOrOwned::Owned(p) => Arc::new(p),
+            SharedOrOwned::Shared(p) => p,
+        };
+        Ok((path.to_path_buf(), SpoolReservation { dir, permit }))
+    }
+
     /// Budget this spool holds, in MiB (a pair's shared permit counts once
     /// per holder; callers pass one spool of a pair at most).
     pub(crate) fn reserved_mib(&self) -> usize {

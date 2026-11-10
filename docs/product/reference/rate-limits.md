@@ -109,7 +109,7 @@ The proxy applies a deadline to each S3 API request. A request that exceeds the 
 
 ## Multipart upload limit
 
-The proxy caps the number of concurrent in-progress multipart uploads. The proxy holds the parts of each upload until completion, in memory or in relay files in `DGP_SPOOL_DIR`, so the limit bounds the memory and the spool space that abandoned or excessive uploads can take. A CreateMultipartUpload request past the limit gets `503 SlowDown`.
+The proxy caps the number of concurrent in-progress multipart uploads. The proxy holds the parts of each upload until completion, in relay files in `DGP_SPOOL_DIR`, so the limit bounds the spool space that abandoned or excessive uploads can take. A CreateMultipartUpload request past the limit gets `503 SlowDown`.
 
 | Setting | Default | Env var |
 |---------|---------|---------|

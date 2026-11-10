@@ -155,17 +155,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// budget (timed); else take free budget now, whatever the queue, or
     /// `Overloaded` (a small body never waits behind a large one).
     /// `held_mib`: budget the op holds already; a holder never waits.
+    /// `stored_now`: the body is stored right after (an object), so its
+    /// storage write's temp files are reserved too; a multipart part is
+    /// stored only at completion, which reserves for its own write.
     pub(crate) async fn reserve_ingest_spool(
         &self,
         bucket: &str,
         bytes: u64,
         held_mib: usize,
         wait: bool,
+        stored_now: bool,
     ) -> Result<crate::deltaglider::spool::SpoolReservation, EngineError> {
-        let extra = self
-            .storage
-            .file_put_spool_bytes(bucket, bytes, false)
-            .await;
+        let extra = if stored_now {
+            self.storage
+                .file_put_spool_bytes(bucket, bytes, false)
+                .await
+        } else {
+            0
+        };
         let total = bytes.saturating_add(extra);
         if wait {
             return self

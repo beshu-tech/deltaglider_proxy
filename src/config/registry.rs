@@ -436,7 +436,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MAX_TOTAL_MULTIPART_BYTES",
-        description: "Cap on total buffered multipart bytes across all uploads (default: max_object_size * max_uploads / 4)",
+        description: "Cap on the part bytes that all open multipart uploads hold together in the spool; a part past it gets 503 SlowDown (default: half of DGP_SPOOL_MAX_BYTES)",
         example: "1073741824",
         category: "Server",
     },
@@ -568,7 +568,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
-        description: "Max spool bytes one relayed multipart upload may hold (default: half of DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)",
+        description: "Max spool bytes one multipart upload may hold, which is also the largest multipart object; a part past it gets 413 EntityTooLarge (default: half of DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)",
         example: "8589934592",
         category: "Delta Engine",
     },
@@ -658,7 +658,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
-        description: "Largest multipart upload for which CompleteMultipartUpload tries a delta. It decides only whether a delta is tried, not how much memory an upload uses: the parts of an upload stay in memory only up to DGP_SPOOL_THRESHOLD_BYTES and go to relay files in the spool after that, and a delta candidate is joined into one spool file and delta-encoded as a stream. A larger upload, or one that tries no delta, is stored from its parts without a delta (default: 64 MiB)",
+        description: "Largest multipart upload for which CompleteMultipartUpload tries a delta. It decides only whether a delta is tried, not how much memory an upload uses: every part goes to a relay file in the spool, and a delta candidate is joined into one spool file and delta-encoded as a stream. A larger upload, or one that tries no delta, is stored from its parts without a delta (default: 64 MiB)",
         example: "67108864",
         category: "Delta Engine",
     },

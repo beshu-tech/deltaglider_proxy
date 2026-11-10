@@ -13,7 +13,8 @@
 //!    checksum headers must name one digest (`InvalidRequest`); the request
 //!    must declare its length (`411 MissingContentLength`); that length must
 //!    be within the request's limit and the spool budget (`EntityTooLarge`);
-//!    the bucket quota must admit it (`AccessDenied`).
+//!    the bucket quota must admit it (`AccessDenied`), or, for a multipart
+//!    part, its upload must ([`ingest_part_body`]).
 //! 2. The body: s3s fails the read when the bytes do not hash to a signed
 //!    `x-amz-content-sha256` (`BadDigest`); a still-framed body is decoded as
 //!    it streams; the planned checksums are computed on the way.
@@ -31,7 +32,7 @@ use crate::api::checksum::{self, ChecksumPlan};
 use crate::api::handlers::AppState;
 use crate::api::S3Error;
 use crate::deltaglider::ingest::{
-    self, IngestError, IngestPlan, IngestedBody, MissingContentLength,
+    self, Destination, IngestError, IngestPlan, IngestedBody, MissingContentLength,
 };
 use crate::deltaglider::KnownSha256;
 use crate::s3_adapter_s3s::BodyContext;
@@ -113,7 +114,8 @@ pub(crate) fn body_read_error(e: s3s::StdError) -> S3Error {
     S3Error::InternalError(format!("failed to read request body: {e}"))
 }
 
-/// THE ingest of an S3 object body (PutObject): see the module docs.
+/// THE ingest of an S3 object body (PutObject): see the module docs. The
+/// bucket quota admits the declared size before the body is read.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ingest_client_body(
     state: &Arc<AppState>,
@@ -124,92 +126,203 @@ pub(crate) async fn ingest_client_body(
     limit: u64,
     checks: ContentChecks<'_>,
 ) -> Result<IngestedBody, S3Error> {
-    use s3s::stream::ByteStream as _;
     let engine = state.engine.load_full();
-    let headers = &ctx.headers;
+    let body = ClientBody::precheck(&engine, body, ctx, limit, checks)?;
+    crate::api::handlers::object_helpers::check_quota_for_write(
+        state,
+        bucket,
+        key,
+        body.declared(),
+    )
+    .await?;
+    body.ingest(&engine, bucket, 0, Destination::Object).await
+}
 
-    // (1) Before any byte.
-    let expected_md5 = parse_content_md5(checks.content_md5)?;
-    checksum::precheck_headers(headers)?;
-    let transport_len = match &body {
-        Some(b) => b.remaining_length().exact().map(|n| n as u64),
-        None => Some(0),
-    };
-    let declared =
-        declared_len(headers, transport_len).map_err(|_| S3Error::MissingContentLength)?;
-    let plan = IngestPlan {
-        declared,
-        limit,
-        known_sha256: checks.s3s_verified_sha256,
-        held_spool_mib: 0,
-        strict_length: true,
-    };
-    ingest::admit_declared::<S3Error>(&plan, engine.spool_max_bytes()).map_err(ingest_failure)?;
-    crate::api::handlers::object_helpers::check_quota_for_write(state, bucket, key, declared)
-        .await?;
+/// The part of an UploadPart: the ingest of [`ingest_client_body`], into
+/// a spool file that the multipart store keeps as a relay part. The upload
+/// admits the declared size before the body is read
+/// (`MultipartStore::admit_part`: the upload is open, its caps hold), so a
+/// part for an unknown, aborted or completing upload never reaches the
+/// spool. The quota is checked at completion, as before.
+pub(crate) async fn ingest_part_body(
+    state: &Arc<AppState>,
+    body: Option<s3s::dto::StreamingBlob>,
+    ctx: &BodyContext,
+    part: PartTarget<'_>,
+    limit: u64,
+    checks: ContentChecks<'_>,
+) -> Result<IngestedBody, S3Error> {
+    let engine = state.engine.load_full();
+    let body = ClientBody::precheck(&engine, body, ctx, limit, checks)?;
+    let admission = state.multipart.admit_part(
+        part.upload_id,
+        part.bucket,
+        part.key,
+        part.part_number,
+        body.declared(),
+    )?;
+    body.ingest(
+        &engine,
+        part.bucket,
+        admission.held_spool_mib,
+        Destination::MultipartPart,
+    )
+    .await
+}
 
-    // (2) The body.
-    let raw: BoxStream<'static, Result<Bytes, S3Error>> = match body {
-        Some(b) => b.map(|r| r.map_err(body_read_error)).boxed(),
-        None => futures::stream::empty().boxed(),
-    };
-    let mut trailer_slot = None;
-    let source = if ctx.still_chunked && crate::api::aws_chunked::is_aws_chunked(headers) {
-        let decoder = crate::api::aws_chunked::AwsChunkedStream::new(raw, Some(declared));
-        trailer_slot = Some(decoder.trailers());
-        decoder
-            .map(|r| {
-                r.map_err(|e| match e {
-                    crate::api::aws_chunked::AwsChunkedStreamError::Source(e) => e,
-                    crate::api::aws_chunked::AwsChunkedStreamError::Framing(e) => {
-                        S3Error::InvalidArgument(format!(
-                            "Failed to decode AWS chunked transfer encoding: {e}"
-                        ))
-                    }
-                })
-            })
-            .boxed()
-    } else {
-        raw
-    };
-    let checksum_plan = ChecksumPlan::from_headers(headers);
-    let mut sums = (!checksum_plan.is_empty()).then(|| checksum_plan.hasher());
-    let observed = source.inspect(|chunk| {
-        if let (Ok(chunk), Some(sums)) = (chunk, sums.as_mut()) {
-            sums.update(chunk);
-        }
-    });
-    let ingested = ingest::ingest(&engine, bucket, observed, plan)
-        .await
-        .map_err(ingest_failure)?;
+/// The upload and part number an UploadPart body is for.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PartTarget<'a> {
+    pub upload_id: &'a str,
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub part_number: u32,
+}
 
-    // (3) After the body.
-    let own_trailers = trailer_slot.and_then(|slot| slot.get());
-    let s3s_trailers = ctx.s3s_trailers.as_ref().and_then(|t| t.read(Clone::clone));
-    let trailers = own_trailers.as_ref().or(s3s_trailers.as_ref());
-    if let Some((algorithm, expected)) = checksum::expected_checksum(headers, trailers)? {
-        let planned = sums
-            .map(|h| h.finalize())
-            .and_then(|done| checksum::computed_digest(algorithm, &done));
-        let digest = match planned {
-            Some(digest) => digest,
-            None => checksum::digest_of(algorithm, &ingested)
-                .await
-                .map_err(|e| S3Error::InternalError(format!("checksum of the body: {e}")))?,
+/// A request body that passed the checks before its first byte (step 1
+/// of the module docs), with the length it declares.
+pub(crate) struct ClientBody<'a> {
+    body: Option<s3s::dto::StreamingBlob>,
+    ctx: &'a BodyContext,
+    checks: ContentChecks<'a>,
+    expected_md5: Option<Vec<u8>>,
+    declared: u64,
+    limit: u64,
+}
+
+impl<'a> ClientBody<'a> {
+    /// (1) Before any byte.
+    pub(crate) fn precheck(
+        engine: &crate::deltaglider::DynEngine,
+        body: Option<s3s::dto::StreamingBlob>,
+        ctx: &'a BodyContext,
+        limit: u64,
+        checks: ContentChecks<'a>,
+    ) -> Result<Self, S3Error> {
+        use s3s::stream::ByteStream as _;
+        let headers = &ctx.headers;
+        let expected_md5 = parse_content_md5(checks.content_md5)?;
+        checksum::precheck_headers(headers)?;
+        let transport_len = match &body {
+            Some(b) => b.remaining_length().exact().map(|n| n as u64),
+            None => Some(0),
         };
-        checksum::verify_digest(algorithm, &expected, &digest)?;
+        let declared =
+            declared_len(headers, transport_len).map_err(|_| S3Error::MissingContentLength)?;
+        let this = Self {
+            body,
+            ctx,
+            checks,
+            expected_md5,
+            declared,
+            limit,
+        };
+        ingest::admit_declared::<S3Error>(
+            &this.plan(0, Destination::Object),
+            engine.spool_max_bytes(),
+        )
+        .map_err(ingest_failure)?;
+        Ok(this)
     }
-    if checks.s3s_verified_sha256.is_none() {
-        if let Some(signed) = checks.signed_payload_hash {
-            signed.verify_against_digest(ingested.hashes().sha256())?;
+
+    /// The length the request declares for its body.
+    pub(crate) fn declared(&self) -> u64 {
+        self.declared
+    }
+
+    fn plan(&self, held_spool_mib: usize, destination: Destination) -> IngestPlan {
+        IngestPlan {
+            declared: self.declared,
+            limit: self.limit,
+            known_sha256: self.checks.s3s_verified_sha256,
+            held_spool_mib,
+            strict_length: true,
+            destination,
         }
     }
-    if let Some(expected) = expected_md5 {
-        if hex::encode(expected) != ingested.hashes().md5() {
-            return Err(S3Error::BadDigest);
+
+    /// (2) The body, then (3) the checks of what arrived.
+    pub(crate) async fn ingest(
+        self,
+        engine: &crate::deltaglider::DynEngine,
+        bucket: &str,
+        held_spool_mib: usize,
+        destination: Destination,
+    ) -> Result<IngestedBody, S3Error> {
+        let plan = self.plan(held_spool_mib, destination);
+        let Self {
+            body,
+            ctx,
+            checks,
+            expected_md5,
+            declared,
+            ..
+        } = self;
+        let headers = &ctx.headers;
+
+        // (2) The body.
+        let raw: BoxStream<'static, Result<Bytes, S3Error>> = match body {
+            Some(b) => b.map(|r| r.map_err(body_read_error)).boxed(),
+            None => futures::stream::empty().boxed(),
+        };
+        let mut trailer_slot = None;
+        let source = if ctx.still_chunked && crate::api::aws_chunked::is_aws_chunked(headers) {
+            let decoder = crate::api::aws_chunked::AwsChunkedStream::new(raw, Some(declared));
+            trailer_slot = Some(decoder.trailers());
+            decoder
+                .map(|r| {
+                    r.map_err(|e| match e {
+                        crate::api::aws_chunked::AwsChunkedStreamError::Source(e) => e,
+                        crate::api::aws_chunked::AwsChunkedStreamError::Framing(e) => {
+                            S3Error::InvalidArgument(format!(
+                                "Failed to decode AWS chunked transfer encoding: {e}"
+                            ))
+                        }
+                    })
+                })
+                .boxed()
+        } else {
+            raw
+        };
+        let checksum_plan = ChecksumPlan::from_headers(headers);
+        let mut sums = (!checksum_plan.is_empty()).then(|| checksum_plan.hasher());
+        let observed = source.inspect(|chunk| {
+            if let (Ok(chunk), Some(sums)) = (chunk, sums.as_mut()) {
+                sums.update(chunk);
+            }
+        });
+        let ingested = ingest::ingest(engine, bucket, observed, plan)
+            .await
+            .map_err(ingest_failure)?;
+
+        // (3) After the body.
+        let own_trailers = trailer_slot.and_then(|slot| slot.get());
+        let s3s_trailers = ctx.s3s_trailers.as_ref().and_then(|t| t.read(Clone::clone));
+        let trailers = own_trailers.as_ref().or(s3s_trailers.as_ref());
+        if let Some((algorithm, expected)) = checksum::expected_checksum(headers, trailers)? {
+            let planned = sums
+                .map(|h| h.finalize())
+                .and_then(|done| checksum::computed_digest(algorithm, &done));
+            let digest = match planned {
+                Some(digest) => digest,
+                None => checksum::digest_of(algorithm, &ingested)
+                    .await
+                    .map_err(|e| S3Error::InternalError(format!("checksum of the body: {e}")))?,
+            };
+            checksum::verify_digest(algorithm, &expected, &digest)?;
         }
+        if checks.s3s_verified_sha256.is_none() {
+            if let Some(signed) = checks.signed_payload_hash {
+                signed.verify_against_digest(ingested.hashes().sha256())?;
+            }
+        }
+        if let Some(expected) = expected_md5 {
+            if hex::encode(expected) != ingested.hashes().md5() {
+                return Err(S3Error::BadDigest);
+            }
+        }
+        Ok(ingested)
     }
-    Ok(ingested)
 }
 
 #[cfg(test)]

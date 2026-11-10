@@ -8,6 +8,7 @@
 use super::*;
 use crate::bucket_usage::{BucketUsage, BucketUsageRow};
 use crate::config::Config;
+use crate::deltaglider::RelayPart;
 use md5::{Digest, Md5};
 use sha2::Sha256;
 
@@ -27,6 +28,11 @@ struct Harness {
 
 /// Bucket `b` compresses; bucket `nocomp` has `compression: false`.
 async fn harness() -> Harness {
+    harness_with(|engine| engine).await
+}
+
+/// [`harness`] with its engine changed by `adapt` (another spool).
+async fn harness_with(adapt: impl FnOnce(DynEngine) -> DynEngine) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let yaml = format!(
         r#"
@@ -50,6 +56,7 @@ storage:
         .await
         .unwrap()
         .with_bucket_usage(Some(usage.clone()));
+    let engine = adapt(engine);
     engine.create_bucket("b").await.unwrap();
     engine.create_bucket("nocomp").await.unwrap();
     Harness {
@@ -594,11 +601,11 @@ async fn relayed_parts_of_a_delta_candidate_are_stored_as_a_delta() {
     put(&h, Path::Buffered, "rel/a.zip", &noise(1, 200_000)).await;
     let body = near(&noise(1, 200_000));
     let dir = tempfile::tempdir().unwrap();
-    let mut paths = Vec::new();
+    let mut parts = Vec::new();
     for (i, chunk) in body.chunks(70_000).enumerate() {
         let path = dir.path().join(format!("part-{i}"));
         std::fs::write(&path, chunk).unwrap();
-        paths.push(path);
+        parts.push(RelayPart::of_file(&path));
     }
     let mpe = "\"0123456789abcdef0123456789abcdef-3\"".to_string();
     let lock = h.engine.lock_object_write("b", "rel/b.zip").await;
@@ -608,7 +615,7 @@ async fn relayed_parts_of_a_delta_candidate_are_stored_as_a_delta() {
             &lock,
             "b",
             "rel/b.zip",
-            &paths,
+            &parts,
             body.len() as u64,
             Some("application/zip".to_string()),
             user_meta(),
@@ -635,7 +642,7 @@ async fn relayed_parts_stored_whole_say_why() {
     let path = dir.path().join("part-0");
     let body = noise(7, 50_000);
     std::fs::write(&path, &body).unwrap();
-    let paths = [path];
+    let paths = [RelayPart::of_file(&path)];
     let mpe = "\"0123456789abcdef0123456789abcdef-1\"".to_string();
     for (key, via_delta_store, expected) in [
         ("img/a.jpg", true, "not-delta-eligible"),
@@ -677,5 +684,112 @@ async fn relayed_parts_stored_whole_say_why() {
         let head = h.engine.head("b", key).await.unwrap();
         assert_eq!(head.storage_info.label(), "passthrough", "{key}");
         assert_eq!(head.passthrough_reason.as_deref(), Some(expected), "{key}");
+    }
+}
+
+/// Relay `body` as parts of `chunk` bytes under `dir`.
+fn relay(dir: &tempfile::TempDir, body: &[u8], chunk: usize) -> Vec<RelayPart> {
+    body.chunks(chunk)
+        .enumerate()
+        .map(|(i, c)| {
+            let path = dir.path().join(format!("part-{i}"));
+            std::fs::write(&path, c).unwrap();
+            RelayPart::of_file(&path)
+        })
+        .collect()
+}
+
+/// The join of a delta candidate is reserved beside its relay parts and
+/// clamped to what the budget holds; a reservation below the object's size
+/// would let the joined file outgrow it. Such an upload is stored whole
+/// from its parts, with the reason `delta-unavailable`.
+#[tokio::test]
+async fn a_join_the_spool_cannot_hold_is_stored_whole() {
+    let spool_dir = tempfile::tempdir().unwrap();
+    // 4 MiB of budget; parts of 3 MiB leave 1 MiB for a 3 MiB join.
+    let small =
+        crate::deltaglider::spool::SpoolDir::new(spool_dir.path().to_path_buf(), 4 << 20).unwrap();
+    let h = harness_with(|e| e.with_spool_dir(small.clone())).await;
+    put(&h, Path::Buffered, "rel/a.zip", &noise(1, 200_000)).await;
+    let engine = &h.engine;
+    let mut body = noise(1, 3 << 20);
+    body[1000..1100].fill(0xAB);
+    let dir = tempfile::tempdir().unwrap();
+    let parts = relay(&dir, &body, 1 << 20);
+    let mpe = "\"0123456789abcdef0123456789abcdef-3\"".to_string();
+    let lock = engine.lock_object_write("b", "rel/b.zip").await;
+    let stored = engine
+        .store_relayed_parts_delta_with_multipart_etag(
+            &lock,
+            "b",
+            "rel/b.zip",
+            &parts,
+            body.len() as u64,
+            None,
+            user_meta(),
+            mpe.clone(),
+        )
+        .await
+        .unwrap();
+    drop(lock);
+    assert_eq!(stored.metadata.storage_info.label(), "passthrough");
+    assert_eq!(
+        stored.metadata.passthrough_reason.as_deref(),
+        Some("delta-unavailable")
+    );
+    assert_eq!(small.free_mib(), 4, "the join reservation is released");
+    assert_eq!(read_back(&h, "b", "rel/b.zip").await, body);
+    assert_eq!(h.engine.head("b", "rel/b.zip").await.unwrap().etag(), mpe);
+}
+
+/// A relay part that changed on disk since UploadPart (a local attacker
+/// on a shared host) fails the store in the one read pass the store makes,
+/// for both completions, and nothing is stored.
+#[tokio::test]
+async fn a_tampered_relay_part_fails_the_store_and_nothing_is_stored() {
+    let h = harness().await;
+    put(&h, Path::Buffered, "rel/a.zip", &noise(1, 200_000)).await;
+    let body = near(&noise(1, 200_000));
+    for (key, delta) in [("rel/b.zip", true), ("img/b.jpg", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let parts = relay(&dir, &body, 70_000);
+        // Same size, other bytes: only the MD5 can tell.
+        let mut swapped = body[70_000..140_000].to_vec();
+        swapped[0] ^= 0xFF;
+        std::fs::write(&parts[1].path, &swapped).unwrap();
+        let mpe = "\"0123456789abcdef0123456789abcdef-3\"".to_string();
+        let lock = h.engine.lock_object_write("b", key).await;
+        let size = body.len() as u64;
+        let err = if delta {
+            h.engine
+                .store_relayed_parts_delta_with_multipart_etag(
+                    &lock,
+                    "b",
+                    key,
+                    &parts,
+                    size,
+                    None,
+                    user_meta(),
+                    mpe,
+                )
+                .await
+        } else {
+            h.engine
+                .store_passthrough_relayed_parts_with_multipart_etag(
+                    &lock,
+                    "b",
+                    key,
+                    &parts,
+                    size,
+                    None,
+                    user_meta(),
+                    mpe,
+                )
+                .await
+        }
+        .expect_err("a tampered part must fail the store");
+        drop(lock);
+        assert!(err.to_string().contains("relay part 2"), "{key}: {err}");
+        assert!(h.engine.head("b", key).await.is_err(), "{key}: stored");
     }
 }

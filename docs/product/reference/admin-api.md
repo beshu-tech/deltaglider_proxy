@@ -441,7 +441,7 @@ For a migration, the gate ends at the moment the bucket flips to the new backend
 |---|---|---|
 | `DGP_MAX_OBJECT_SIZE` | `100 MiB` | Largest single object (and, per upload, largest multipart upload). |
 | `DGP_MAX_MULTIPART_UPLOADS` | `1000` | Maximum concurrent multipart uploads across the proxy. |
-| `DGP_MAX_TOTAL_MULTIPART_BYTES` | `max_object_size × max_uploads / 4` | Global in-flight byte cap across all multipart uploads. The cap protects against the C3 DoS pattern, in which many uploads accumulate without completing. The proxy rejects a request with `SlowDown` when the cap is exceeded. |
+| `DGP_MAX_TOTAL_MULTIPART_BYTES` | half of `DGP_SPOOL_MAX_BYTES` | Global in-flight byte cap across all multipart uploads, whose parts are spool files. The cap protects against the C3 DoS pattern, in which many uploads accumulate without completing. The proxy rejects a request with `SlowDown` when the cap is exceeded. |
 | `DGP_MULTIPART_IDLE_TTL_HOURS` | `24` | Idle-TTL for incomplete multipart uploads. The periodic sweeper drops uploads with no UploadPart activity for this long (excluding uploads currently being completed). |
 | `DGP_AUDIT_RING_SIZE` | `500` | In-memory audit ring capacity. |
 | `DGP_LOG_RING_SIZE` | `2000` | In-memory operational-log ring capacity (backs the admin Logs viewer). |

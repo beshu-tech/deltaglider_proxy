@@ -94,6 +94,7 @@ fn plan(declared: u64) -> IngestPlan {
         known_sha256: None,
         held_spool_mib: 0,
         strict_length: true,
+        destination: crate::deltaglider::ingest::Destination::Object,
     }
 }
 

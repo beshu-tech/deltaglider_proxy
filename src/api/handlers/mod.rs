@@ -62,11 +62,14 @@ impl AppState {
     pub(crate) fn for_tests(engine: DynEngine) -> Arc<Self> {
         let config = crate::config::Config::default();
         let ingest_memory = engine.memory_budget().clone();
+        // Relay parts live in the engine's spool, as in production (both
+        // are the process-wide spool there).
+        let spool = engine.spool_dir().clone();
         Arc::new(Self {
             engine: arc_swap::ArcSwap::from_pointee(engine),
-            multipart: Arc::new(crate::multipart::MultipartStore::new(
-                config.max_object_size,
-            )),
+            multipart: Arc::new(
+                crate::multipart::MultipartStore::new(config.max_object_size).with_spool(spool),
+            ),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             usage_scanner: Arc::new(crate::usage_scanner::UsageScanner::new()),
             bucket_usage: None,

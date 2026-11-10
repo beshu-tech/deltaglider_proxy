@@ -56,6 +56,84 @@ struct HashedSpool<'a> {
     storage: Option<&'a crate::deltaglider::spool::SpoolReservation>,
 }
 
+/// One part of a multipart upload, kept in a relay file: its path and the
+/// MD5 and size recorded when the part arrived. The store checks both
+/// while it reads the file (`read_relay_parts`): a file that changed on
+/// disk since (a local attacker on a shared host can swap a part between
+/// UploadPart and Complete) fails the store, and nothing is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayPart {
+    pub path: PathBuf,
+    pub md5: [u8; 16],
+    pub size: u64,
+}
+
+impl RelayPart {
+    /// The relay part of the file at `path` as it is now (tests).
+    #[cfg(test)]
+    pub(crate) fn of_file(path: &Path) -> Self {
+        // small: test fixture parts.
+        let data = std::fs::read(path).unwrap();
+        Self {
+            path: path.to_path_buf(),
+            md5: Md5::digest(&data).into(),
+            size: data.len() as u64,
+        }
+    }
+}
+
+/// Read the relay `parts` in order, ONCE, through a 1 MiB buffer: hash the
+/// object (SHA-256 and MD5), check each part against the MD5 and size it
+/// was received with and the total against `expected`, and copy the bytes
+/// to `sink` when there is one (the join of a delta candidate).
+async fn read_relay_parts(
+    parts: &[RelayPart],
+    expected: u64,
+    mut sink: Option<&mut tokio::fs::File>,
+) -> Result<BodyHashes, EngineError> {
+    use tokio::io::AsyncWriteExt;
+    let io = |e: std::io::Error| EngineError::Storage(StorageError::from(e));
+    let mut whole = crate::deltaglider::ingest::BodyHasher::new(None);
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut total = 0u64;
+    for (i, part) in parts.iter().enumerate() {
+        let mut file = tokio::fs::File::open(&part.path).await.map_err(io)?;
+        let mut md5 = Md5::new();
+        let mut size = 0u64;
+        loop {
+            let n = file.read(&mut buf).await.map_err(io)?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            md5.update(chunk);
+            whole.update(chunk);
+            size = size.saturating_add(n as u64);
+            if let Some(sink) = sink.as_deref_mut() {
+                sink.write_all(chunk).await.map_err(io)?;
+            }
+        }
+        let md5: [u8; 16] = md5.finalize().into();
+        if size != part.size || md5 != part.md5 {
+            return Err(EngineError::Storage(StorageError::Other(format!(
+                "multipart relay part {} failed its integrity check: the file changed on \
+                 disk since UploadPart",
+                i + 1
+            ))));
+        }
+        total = total.saturating_add(size);
+    }
+    if let Some(sink) = sink {
+        sink.flush().await.map_err(io)?;
+    }
+    if total != expected {
+        return Err(EngineError::Storage(StorageError::Other(format!(
+            "Multipart relay size mismatch: expected {expected}, observed {total}"
+        ))));
+    }
+    Ok(whole.finish())
+}
+
 /// The spool reservation of one storage write's temp files: the one the
 /// ingest of the body carried, or one taken for this write.
 enum StorageSpool<'a> {
@@ -1622,70 +1700,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.bucket_policies.is_delta_eligible(bucket, key)
     }
 
-    /// Store a non-delta-eligible object from pre-split chunks without assembling
-    /// into a contiguous buffer. Computes SHA256 and MD5 incrementally.
-    #[instrument(skip(self, lock, chunks, user_metadata))]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn store_passthrough_chunked(
-        &self,
-        lock: &ObjectWriteGuard,
-        bucket: &str,
-        key: &str,
-        chunks: &[Bytes],
-        total_size: u64,
-        content_type: Option<String>,
-        user_metadata: HashMap<String, String>,
-    ) -> Result<StoreResult, EngineError> {
-        let prior = self.prior_for_counter(bucket, key).await;
-        let result = self
-            .store_passthrough_chunked_inner(
-                lock,
-                bucket,
-                key,
-                chunks,
-                total_size,
-                content_type,
-                user_metadata,
-                None,
-                &prior,
-            )
-            .await?;
-        Ok(result.with_accounting(prior.replaced(), 0))
-    }
-
-    /// Multipart-aware variant of [`Self::store_passthrough_chunked`]. The
-    /// `multipart_etag` is persisted on metadata so HEAD/GET/LIST return
-    /// it verbatim (H1 correctness fix).
-    #[instrument(skip(self, lock, chunks, user_metadata, multipart_etag))]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn store_passthrough_chunked_with_multipart_etag(
-        &self,
-        lock: &ObjectWriteGuard,
-        bucket: &str,
-        key: &str,
-        chunks: &[Bytes],
-        total_size: u64,
-        content_type: Option<String>,
-        user_metadata: HashMap<String, String>,
-        multipart_etag: String,
-    ) -> Result<StoreResult, EngineError> {
-        let prior = self.prior_for_counter(bucket, key).await;
-        let result = self
-            .store_passthrough_chunked_inner(
-                lock,
-                bucket,
-                key,
-                chunks,
-                total_size,
-                content_type,
-                user_metadata,
-                Some(multipart_etag),
-                &prior,
-            )
-            .await?;
-        Ok(result.with_accounting(prior.replaced(), 0))
-    }
-
     /// Guard a PASSTHROUGH store against the passthrough ceiling (64 GiB
     /// default), NOT the much smaller delta `max_object_size`. Every
     /// passthrough sink shares this — a new one that forgets the check would
@@ -1704,95 +1718,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn store_passthrough_chunked_inner(
-        &self,
-        lock: &ObjectWriteGuard,
-        bucket: &str,
-        key: &str,
-        chunks: &[Bytes],
-        total_size: u64,
-        content_type: Option<String>,
-        user_metadata: HashMap<String, String>,
-        multipart_etag: Option<String>,
-        prior: &CounterPrior,
-    ) -> Result<StoreResult, EngineError> {
-        self.ensure_within_passthrough_ceiling(total_size)?;
-
-        // Invalidate stale metadata on overwrite
-        self.metadata_cache.invalidate(bucket, key);
-
-        let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
-
-        // Compute SHA256 + MD5 incrementally across chunks
-        let mut sha256_hasher = Sha256::new();
-        let mut md5_hasher = Md5::new();
-        for chunk in chunks {
-            sha256_hasher.update(chunk);
-            md5_hasher.update(chunk);
-        }
-        let sha256 = hex::encode(sha256_hasher.finalize());
-        let md5 = hex::encode(md5_hasher.finalize());
-
-        info!(
-            "Storing chunked {}/{} ({} bytes, {} chunks, sha256={})",
-            bucket,
-            key,
-            total_size,
-            chunks.len(),
-            &sha256[..8]
-        );
-
-        // The key's write lock only (P7.4): see `write_passthrough_locked`.
-        let reason = self.parts_passthrough_reason(
-            bucket,
-            key,
-            &user_metadata,
-            total_size,
-            PassthroughReason::MultipartOverDeltaCap,
-        );
-        let mut metadata = FileMetadata::new_passthrough(
-            obj_key.filename.clone(),
-            sha256,
-            md5,
-            total_size,
-            content_type,
-        )
-        .with_passthrough_reason(reason);
-        metadata.set_user_metadata(user_metadata);
-        metadata.multipart_etag = multipart_etag;
-
-        self.storage
-            .put_passthrough_chunked(bucket, &deltaspace_id, &obj_key.filename, chunks, &metadata)
-            .await?;
-        // Committed: count it before the next await.
-        self.record_commit(bucket, prior, &metadata);
-        self.drop_other_form(
-            lock,
-            bucket,
-            &deltaspace_id,
-            &obj_key.filename,
-            ObjectVariant::Passthrough,
-            prior,
-        )
-        .await;
-
-        let result = StoreResult::new(metadata, total_size);
-        self.metadata_cache
-            .insert(bucket, key, result.metadata.clone());
-        Ok(result)
-    }
-
-    /// Store a passthrough object from relayed multipart part files without
-    /// materializing an assembled temporary file.
-    #[instrument(skip(self, lock, part_paths, user_metadata, multipart_etag))]
+    /// Store a passthrough object from the relay part files of a multipart
+    /// upload, without joining them into one file.
+    #[instrument(skip(self, lock, parts, user_metadata, multipart_etag))]
     #[allow(clippy::too_many_arguments)]
     pub async fn store_passthrough_relayed_parts_with_multipart_etag(
         &self,
         lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
-        part_paths: &[PathBuf],
+        parts: &[RelayPart],
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
@@ -1804,7 +1739,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 lock,
                 bucket,
                 key,
-                part_paths,
+                parts,
                 total_size,
                 content_type,
                 user_metadata,
@@ -1816,25 +1751,27 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(result.with_accounting(prior.replaced(), 0))
     }
 
-    /// Store a multipart upload that tries a delta and whose parts are relay
-    /// files, WITHOUT holding the object in RAM. The parts join into ONE spool
-    /// file (a 1 MiB buffer, so memory does not grow with the object), and
-    /// the streaming delta store runs on that file, as it does for a large
-    /// PutObject. Spool use peaks at twice the object: the relay parts and
-    /// the joined file.
+    /// Store a multipart upload that tries a delta, WITHOUT holding the
+    /// object in RAM. The relay parts join into ONE spool file (a 1 MiB
+    /// buffer, so memory does not grow with the object), and the streaming
+    /// delta store runs on that file, as it does for a large PutObject.
+    /// Spool use peaks at twice the object: the relay parts and the joined
+    /// file. The join hashes the object, so the delta store does not read
+    /// the joined file again for its hashes.
     ///
     /// The delta is optional work. When other requests use the spool budget
     /// (the relay parts are this upload's own share, so it never waits for
-    /// that), the object is stored whole from its parts with the reason
+    /// that), or the budget cannot hold the joined file beside the parts,
+    /// the object is stored whole from its parts with the reason
     /// `delta-unavailable`.
-    #[instrument(skip(self, lock, part_paths, user_metadata, multipart_etag))]
+    #[instrument(skip(self, lock, parts, user_metadata, multipart_etag))]
     #[allow(clippy::too_many_arguments)]
     pub async fn store_relayed_parts_delta_with_multipart_etag(
         &self,
         lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
-        part_paths: &[PathBuf],
+        parts: &[RelayPart],
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
@@ -1849,7 +1786,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     lock,
                     bucket,
                     key,
-                    part_paths,
+                    parts,
                     total_size,
                     content_type,
                     user_metadata,
@@ -1857,33 +1794,40 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 )
                 .await;
         }
-        let joined = match self
-            .spool_acquire_beside_mib(crate::deltaglider::spool::mib_ceil(total_size), total_size)
-            .await
-        {
-            Ok(joined) => joined,
+        let parts_mib = crate::deltaglider::spool::mib_ceil(total_size);
+        let joined = match self.spool_acquire_beside_mib(parts_mib, total_size).await {
+            // The reservation is clamped to what the budget holds beside the
+            // parts: never write a joined file larger than it.
+            Ok(joined) if joined.reserved_mib() >= parts_mib => Some(joined),
+            Ok(_) => {
+                debug!("The spool cannot hold a joined {bucket}/{key} beside its parts; storing it whole");
+                None
+            }
             Err(EngineError::Overloaded(why)) => {
                 debug!("No spool for a delta of {bucket}/{key} ({why}); storing it whole");
-                let prior = self.prior_for_counter(bucket, key).await;
-                let result = self
-                    .store_passthrough_relayed_parts_inner(
-                        lock,
-                        bucket,
-                        key,
-                        part_paths,
-                        total_size,
-                        content_type,
-                        user_metadata,
-                        multipart_etag,
-                        &prior,
-                        PassthroughReason::DeltaUnavailable,
-                    )
-                    .await?;
-                return Ok(result.with_accounting(prior.replaced(), 0));
+                None
             }
             Err(e) => return Err(e),
         };
-        Self::join_parts_into(joined.path(), part_paths, total_size).await?;
+        let Some(joined) = joined else {
+            let prior = self.prior_for_counter(bucket, key).await;
+            let result = self
+                .store_passthrough_relayed_parts_inner(
+                    lock,
+                    bucket,
+                    key,
+                    parts,
+                    total_size,
+                    content_type,
+                    user_metadata,
+                    multipart_etag,
+                    &prior,
+                    PassthroughReason::DeltaUnavailable,
+                )
+                .await?;
+            return Ok(result.with_accounting(prior.replaced(), 0));
+        };
+        let hashes = Self::join_parts_into(joined.path(), parts, total_size).await?;
         self.store_spooled_delta(
             lock,
             bucket,
@@ -1893,45 +1837,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             content_type,
             user_metadata,
             Some(multipart_etag),
-            None,
+            Some(hashes),
         )
         .await
     }
 
-    /// Append `part_paths`, in order, to the file at `out` through a 1 MiB
-    /// buffer, and check that `expected` bytes arrived.
+    /// Append `parts`, in order, to the file at `out` (see
+    /// [`read_relay_parts`]); the object's hashes.
     async fn join_parts_into(
         out: &Path,
-        part_paths: &[PathBuf],
+        parts: &[RelayPart],
         expected: u64,
-    ) -> Result<(), EngineError> {
-        use tokio::io::AsyncWriteExt;
-        let io = |e: std::io::Error| EngineError::Storage(StorageError::from(e));
+    ) -> Result<BodyHashes, EngineError> {
         let mut sink = tokio::fs::OpenOptions::new()
             .write(true)
             .open(out)
             .await
-            .map_err(io)?;
-        let mut buf = vec![0u8; 1024 * 1024];
-        let mut written = 0u64;
-        for path in part_paths {
-            let mut part = tokio::fs::File::open(path).await.map_err(io)?;
-            loop {
-                let n = part.read(&mut buf).await.map_err(io)?;
-                if n == 0 {
-                    break;
-                }
-                sink.write_all(&buf[..n]).await.map_err(io)?;
-                written = written.saturating_add(n as u64);
-            }
-        }
-        sink.flush().await.map_err(io)?;
-        if written != expected {
-            return Err(EngineError::Storage(StorageError::Other(format!(
-                "Multipart relay size mismatch: expected {expected}, joined {written}"
-            ))));
-        }
-        Ok(())
+            .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
+        read_relay_parts(parts, expected, Some(&mut sink)).await
     }
 
     /// Body of [`Self::store_passthrough_relayed_parts_with_multipart_etag`]; its commit records the counter.
@@ -1941,7 +1864,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
-        part_paths: &[PathBuf],
+        parts: &[RelayPart],
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
@@ -1954,32 +1877,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
 
-        let mut sha256_hasher = Sha256::new();
-        let mut md5_hasher = Md5::new();
-        let mut observed = 0u64;
-        let mut buf = vec![0u8; 1024 * 1024];
-        for path in part_paths {
-            let mut file = tokio::fs::File::open(path)
-                .await
-                .map_err(StorageError::from)?;
-            loop {
-                let n = file.read(&mut buf).await.map_err(StorageError::from)?;
-                if n == 0 {
-                    break;
-                }
-                observed = observed.saturating_add(n as u64);
-                sha256_hasher.update(&buf[..n]);
-                md5_hasher.update(&buf[..n]);
-            }
-        }
-        if observed != total_size {
-            return Err(EngineError::Storage(StorageError::Other(format!(
-                "Multipart relay size mismatch: expected {}, observed {}",
-                total_size, observed
-            ))));
-        }
-        let sha256 = hex::encode(sha256_hasher.finalize());
-        let md5 = hex::encode(md5_hasher.finalize());
+        let (sha256, md5) = read_relay_parts(parts, total_size, None)
+            .await?
+            .into_parts();
         // The relay parts hold spool budget (the multipart store reserves it
         // per part), so this op is a holder and never waits.
         let parts_mib = crate::deltaglider::spool::mib_ceil(total_size);
@@ -2000,12 +1900,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metadata.set_user_metadata(user_metadata);
         metadata.multipart_etag = Some(multipart_etag);
 
+        let paths: Vec<PathBuf> = parts.iter().map(|p| p.path.clone()).collect();
         self.storage
             .put_passthrough_parts(
                 bucket,
                 &deltaspace_id,
                 &obj_key.filename,
-                part_paths,
+                &paths,
                 &metadata,
                 SpoolBudget::new(&self.spool, None, reserved.as_ref()),
             )
@@ -2693,15 +2594,16 @@ mod counter_tests {
     async fn relayed(h: &Harness, key: &str, data: &[u8]) {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = data.split_at(data.len() / 2);
-        let paths = vec![dir.path().join("p1"), dir.path().join("p2")];
+        let paths = [dir.path().join("p1"), dir.path().join("p2")];
         tokio::fs::write(&paths[0], a).await.unwrap();
         tokio::fs::write(&paths[1], b).await.unwrap();
+        let parts: Vec<RelayPart> = paths.iter().map(|p| RelayPart::of_file(p)).collect();
         h.engine
             .store_passthrough_relayed_parts_with_multipart_etag(
                 &h.engine.lock_object_write(BUCKET, key).await,
                 BUCKET,
                 key,
-                &paths,
+                &parts,
                 data.len() as u64,
                 None,
                 HashMap::new(),
@@ -2724,23 +2626,6 @@ mod counter_tests {
                 None,
                 HashMap::new(),
                 "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
-            )
-            .await
-            .unwrap();
-    }
-
-    async fn chunked(h: &Harness, key: &str, data: &[u8]) {
-        let chunks: Vec<Bytes> = data.chunks(64 * 1024).map(Bytes::copy_from_slice).collect();
-        h.engine
-            .store_passthrough_chunked_with_multipart_etag(
-                &h.engine.lock_object_write(BUCKET, key).await,
-                BUCKET,
-                key,
-                &chunks,
-                data.len() as u64,
-                None,
-                HashMap::new(),
-                "\"0123456789abcdef0123456789abcdef-3\"".to_string(),
             )
             .await
             .unwrap();
@@ -2778,13 +2663,12 @@ mod counter_tests {
     #[tokio::test]
     async fn multipart_sinks_overwrite_counts_one_object() {
         let (v1, v2) = versions();
-        for sink in ["relayed", "file", "chunked"] {
+        for sink in ["relayed", "file"] {
             let h = harness().await;
             for data in [&v1, &v2] {
                 match sink {
                     "relayed" => relayed(&h, "img/a.jpg", data).await,
-                    "file" => file(&h, "img/a.jpg", data).await,
-                    _ => chunked(&h, "img/a.jpg", data).await,
+                    _ => file(&h, "img/a.jpg", data).await,
                 }
             }
             let (count, logical, _) = row(&h);
@@ -3429,9 +3313,10 @@ mod review2_tests {
     async fn encrypted_relayed_store_never_waits_for_budget() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = encrypted_engine(&tmp, 4 * 1024 * 1024).await;
-        let part = tmp.path().join("part1");
+        let path = tmp.path().join("part1");
         let v = vec![5u8; 1024 * 1024];
-        tokio::fs::write(&part, &v).await.unwrap();
+        tokio::fs::write(&path, &v).await.unwrap();
+        let part = RelayPart::of_file(&path);
         let (engine_ref, part_ref, size) = (&engine, &part, v.len() as u64);
         let store = move || async move {
             let lock = engine_ref.lock_object_write("b", "x/a.png").await;
@@ -3569,16 +3454,18 @@ mod other_form_tests {
             )
             .await
             .unwrap();
-        let chunks: Vec<Bytes> = v1.chunks(64 * 1024).map(Bytes::copy_from_slice).collect();
+        let relay = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(relay.path(), &v1).await.unwrap();
         engine
-            .store_passthrough_chunked(
+            .store_passthrough_relayed_parts_with_multipart_etag(
                 &engine.lock_object_write("b", "img/c.jpg").await,
                 "b",
                 "img/c.jpg",
-                &chunks,
+                &[RelayPart::of_file(relay.path())],
                 v1.len() as u64,
                 None,
                 HashMap::new(),
+                "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
             )
             .await
             .unwrap();

@@ -216,9 +216,6 @@ fn copy_destination_fields(
     Ok((content_type, user_metadata))
 }
 
-/// S3's limit on the source of one CopyObject request.
-pub(super) const COPY_OBJECT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-
 /// The largest CopyObject source: S3's 5 GiB copy limit, capped at
 /// `max_passthrough_object_size`. The source streams through a spool file,
 /// so its size costs disk, not memory. A source above `max_object_size` is
@@ -226,7 +223,7 @@ pub(super) const COPY_OBJECT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// a copy; with it, rclone and mc copies of larger objects failed with
 /// EntityTooLarge.
 pub(super) fn copy_size_limit(engine: &crate::deltaglider::DynEngine) -> u64 {
-    COPY_OBJECT_MAX_BYTES.min(engine.max_passthrough_object_size())
+    super::multipart::S3_MAX_SINGLE_TRANSFER_BYTES.min(engine.max_passthrough_object_size())
 }
 
 /// Read a copy source through the same ingest as a PutObject body: up to
@@ -243,7 +240,7 @@ pub(super) async fn read_copy_source(
     dest_bucket: &str,
     head_size: u64,
 ) -> s3s::S3Result<(crate::deltaglider::ingest::IngestedBody, FileMetadata)> {
-    use crate::deltaglider::ingest::{ingest, IngestError, IngestPlan};
+    use crate::deltaglider::ingest::{ingest, Destination, IngestPlan};
     let (stream, metadata) = if head_size <= engine.spool_threshold() {
         // small: the HEAD size is at most the spool threshold.
         let (data, metadata) = engine.retrieve(bucket, key).await?;
@@ -267,18 +264,29 @@ pub(super) async fn read_copy_source(
         known_sha256: None,
         held_spool_mib: 0,
         strict_length: true,
+        destination: Destination::Object,
     };
     let body = ingest(engine, dest_bucket, stream, plan)
         .await
-        .map_err(|e| match e {
-            IngestError::TooLong { .. } | IngestError::Incomplete { .. } => {
-                crate::api::S3Error::SlowDown(
-                    "the copy source changed during the copy; retry the request".to_string(),
-                )
-            }
-            e => crate::api::body_ingest::ingest_failure(e),
-        })?;
+        .map_err(copy_source_ingest_failure)?;
     Ok((body, metadata))
+}
+
+/// The S3 answer to a failed ingest of a copy source: a source longer or
+/// shorter than its HEAD said changed since (503 SlowDown: the client
+/// retries and the retry judges the new object).
+fn copy_source_ingest_failure(
+    e: crate::deltaglider::ingest::IngestError<StorageError>,
+) -> crate::api::S3Error {
+    use crate::deltaglider::ingest::IngestError;
+    match e {
+        IngestError::TooLong { .. } | IngestError::Incomplete { .. } => {
+            crate::api::S3Error::SlowDown(
+                "the copy source changed during the copy; retry the request".to_string(),
+            )
+        }
+        e => crate::api::body_ingest::ingest_failure(e),
+    }
 }
 
 pub(super) async fn upload_part_copy(
@@ -327,6 +335,7 @@ pub(super) async fn upload_part_copy(
     svc.state
         .multipart
         .set_max_object_size(engine.max_object_size());
+    let part_number = u32::try_from(input.part_number).unwrap_or(0);
     // A part is read as its range only, pinned to the generation the
     // conditionals judged: an SDK managed copy sends one UploadPartCopy per
     // part, and each used to buffer the whole source (s3surface-10). A part
@@ -337,65 +346,101 @@ pub(super) async fn upload_part_copy(
         Some(range) => Some(parse_copy_range(range, len)?),
         None => len.checked_sub(1).map(|last| (0, last)),
     };
+    let part_len = range.map_or(0, |(start, end)| (end - start) as u64 + 1);
+    if part_len > super::multipart::part_size_limit(engine.max_object_size()) {
+        return Err(s3s::s3_error!(EntityTooLarge));
+    }
+    // The upload admits the part before a byte of the source is read.
+    let admission = svc.state.multipart.admit_part(
+        &input.upload_id,
+        &input.bucket,
+        &input.key,
+        part_number,
+        part_len,
+    )?;
     let ranged = match range {
-        Some((start, end)) => {
-            if (end - start) as u64 >= engine.max_object_size() {
-                return Err(s3s::s3_error!(EntityTooLarge));
-            }
-            if source_meta.is_delta() {
-                // Every part of a delta source reads one verified
-                // reconstruction (it rebuilt the whole object per part).
-                let (stream, len) = engine
-                    .delta_copy_range(
-                        &source_bucket,
-                        &source_key,
-                        &source_meta,
-                        start as u64,
-                        end as u64,
-                    )
-                    .await?;
-                Some((stream, len, source_meta.clone()))
-            } else {
-                engine
-                    .retrieve_stream_range(
-                        &source_bucket,
-                        &source_key,
-                        start as u64,
-                        end as u64,
-                        Some(&source_meta),
-                    )
-                    .await?
-            }
+        Some((start, end)) if source_meta.is_delta() => {
+            // Every part of a delta source reads one verified
+            // reconstruction (it rebuilt the whole object per part).
+            let (stream, len) = engine
+                .delta_copy_range(
+                    &source_bucket,
+                    &source_key,
+                    &source_meta,
+                    start as u64,
+                    end as u64,
+                )
+                .await?;
+            Some((stream, len))
         }
+        Some((start, end)) => engine
+            .retrieve_stream_range(
+                &source_bucket,
+                &source_key,
+                start as u64,
+                end as u64,
+                Some(&source_meta),
+            )
+            .await?
+            .map(|(stream, len, _)| (stream, len)),
         None => None,
     };
-    let part = if let Some((stream, content_length, _)) = ranged {
-        collect_exact(stream, content_length).await?
-    } else {
-        // What `retrieve_stream_range` does not serve as a range: an empty
-        // source, a reference object at most the spool threshold, or a
-        // source gone since its HEAD. Reject a source over
-        // `max_object_size` before and after the read.
-        if source_meta.file_size > engine.max_object_size() {
-            return Err(s3s::s3_error!(EntityTooLarge));
+    let stream: BoxStream<'static, Result<bytes::Bytes, StorageError>> = match ranged {
+        Some((stream, content_length)) => {
+            if content_length != part_len {
+                return Err(s3s::s3_error!(
+                    InternalError,
+                    "copy source range is not the length announced"
+                ));
+            }
+            stream
         }
-        // small: at most the spool threshold (see above).
-        let (data, _) = engine.retrieve(&source_bucket, &source_key).await?;
-        if data.len() as u64 > engine.max_object_size() {
-            return Err(s3s::s3_error!(EntityTooLarge));
-        }
-        if let Some(range) = input.copy_source_range.as_deref() {
-            let (start, end) = parse_copy_range(range, data.len())?;
-            bytes::Bytes::from(data[start..=end].to_vec())
-        } else {
-            bytes::Bytes::from(data)
+        None => {
+            // What `retrieve_stream_range` does not serve as a range: an
+            // empty source, a delta or reference object at most the spool
+            // threshold, or a source gone or rewritten since its HEAD (a
+            // retry judges the new object).
+            if source_meta.file_size > engine.spool_threshold() {
+                return Err(crate::api::S3Error::SlowDown(
+                    "the copy source changed during the copy; retry the request".to_string(),
+                )
+                .into());
+            }
+            // small: at most the spool threshold (see above).
+            let (data, _) = engine.retrieve(&source_bucket, &source_key).await?;
+            let part = match range {
+                Some((start, end)) if end < data.len() => {
+                    bytes::Bytes::copy_from_slice(&data[start..=end])
+                }
+                Some(_) => {
+                    return Err(crate::api::S3Error::SlowDown(
+                        "the copy source changed during the copy; retry the request".to_string(),
+                    )
+                    .into())
+                }
+                None => bytes::Bytes::new(),
+            };
+            futures::stream::iter([Ok(part)]).boxed()
         }
     };
+    // The same ingest as an UploadPart body: into a spool file, hashed on
+    // the way (no Content-MD5 or checksum: the source is the proxy's own).
+    let plan = crate::deltaglider::ingest::IngestPlan {
+        declared: part_len,
+        limit: super::multipart::part_size_limit(engine.max_object_size()),
+        known_sha256: None,
+        held_spool_mib: admission.held_spool_mib,
+        strict_length: true,
+        destination: crate::deltaglider::ingest::Destination::MultipartPart,
+    };
+    let part = crate::deltaglider::ingest::ingest(&**engine, &input.bucket, stream, plan)
+        .await
+        .map_err(copy_source_ingest_failure)?;
     let etag = svc.state.multipart.upload_part(
         &input.upload_id,
         &input.bucket,
         &input.key,
-        input.part_number as u32,
+        part_number,
         part,
     )?;
     Ok(s3s::S3Response::new(s3s::dto::UploadPartCopyOutput {
@@ -525,32 +570,6 @@ pub(super) fn is_illegal_self_copy(
     !changes
         && source.0 == dest.0
         && source.1.trim_start_matches('/') == dest.1.trim_start_matches('/')
-}
-
-/// Collect a ranged read of `len` bytes. More or fewer bytes than the backend
-/// announced is a backend fault (500), never a short part.
-pub(super) async fn collect_exact(
-    mut stream: BoxStream<'static, Result<bytes::Bytes, StorageError>>,
-    len: u64,
-) -> s3s::S3Result<bytes::Bytes> {
-    let mut buf = bytes::BytesMut::with_capacity(usize::try_from(len).unwrap_or(0));
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if (buf.len() + chunk.len()) as u64 > len {
-            return Err(s3s::s3_error!(
-                InternalError,
-                "copy source range is longer than announced"
-            ));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    if buf.len() as u64 != len {
-        return Err(s3s::s3_error!(
-            InternalError,
-            "copy source range is shorter than announced"
-        ));
-    }
-    Ok(buf.freeze())
 }
 
 pub(super) fn parse_copy_range(range: &str, len: usize) -> s3s::S3Result<(usize, usize)> {

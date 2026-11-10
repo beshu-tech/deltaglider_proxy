@@ -478,74 +478,6 @@ pub(crate) fn s3s_verified_payload_sha256(
     crate::deltaglider::KnownSha256::from_verified_hex(claimed)
 }
 
-/// A body collected whole for UploadPart, its one remaining caller:
-/// bounded by `limit`, de-framed when s3s left aws-chunked framing, and
-/// checked against the client's `x-amz-checksum-*` header or trailer.
-async fn collect_blob_limited(
-    body: Option<s3s::dto::StreamingBlob>,
-    limit: u64,
-    ctx: &BodyContext,
-) -> s3s::S3Result<bytes::Bytes> {
-    let (body, own_trailers) = collect_and_unframe(body, limit, ctx).await?;
-    let s3s_trailers = ctx.s3s_trailers.as_ref().and_then(|t| t.read(Clone::clone));
-    let trailers = own_trailers.as_ref().or(s3s_trailers.as_ref());
-    crate::api::checksum::verify_body_checksum(&ctx.headers, trailers, &body)
-        .map_err(|e| s3s::S3Error::from(crate::api::S3Error::from(e)))?;
-    Ok(body)
-}
-
-/// The body bytes, and the trailers when this function removed the framing.
-async fn collect_and_unframe(
-    body: Option<s3s::dto::StreamingBlob>,
-    limit: u64,
-    ctx: &BodyContext,
-) -> s3s::S3Result<(bytes::Bytes, Option<axum::http::HeaderMap>)> {
-    let Some(mut body) = body else {
-        return Ok((bytes::Bytes::new(), None));
-    };
-    let mut out = Vec::new();
-    while let Some(chunk) = body.next().await {
-        let chunk =
-            chunk.map_err(|e| s3s::S3Error::from(crate::api::body_ingest::body_read_error(e)))?;
-        let next_len = out
-            .len()
-            .checked_add(chunk.len())
-            .ok_or_else(|| s3s::s3_error!(EntityTooLarge))?;
-        if next_len as u64 > limit {
-            return Err(s3s::s3_error!(EntityTooLarge));
-        }
-        out.extend_from_slice(&chunk);
-    }
-    let body = bytes::Bytes::from(out);
-    let headers = &ctx.headers;
-    if ctx.still_chunked && crate::api::aws_chunked::is_aws_chunked(headers) {
-        let expected_len = crate::api::aws_chunked::get_decoded_content_length(headers);
-        if expected_len.is_some_and(|len| len as u64 > limit) {
-            return Err(s3s::s3_error!(EntityTooLarge));
-        }
-        // Require x-amz-decoded-content-length for chunked bodies: without it
-        // the decoder can only frame-check, and a body truncated at a chunk
-        // boundary (with a surviving/crafted 0\r\n\r\n terminator) would pass
-        // framing yet store short. AWS SDKs always send this header for
-        // streaming uploads, so requiring it rejects only malformed inputs.
-        if expected_len.is_none() {
-            return Err(s3s::s3_error!(
-                InvalidArgument,
-                "aws-chunked transfer encoding requires x-amz-decoded-content-length"
-            ));
-        }
-        return crate::api::aws_chunked::decode_aws_chunked_with_trailers(&body, expected_len)
-            .map(|(decoded, trailers)| (decoded, Some(trailers)))
-            .ok_or_else(|| {
-                s3s::s3_error!(
-                    InvalidArgument,
-                    "Failed to decode AWS chunked transfer encoding"
-                )
-            });
-    }
-    Ok((body, None))
-}
-
 /// A live HeadBucket. Only the HeadBucket verb uses it; every other verb
 /// checks its bucket through `crate::api::handlers::ensure_bucket_exists`
 /// (guard `s3_verbs_check_buckets_through_the_cache`).
@@ -593,19 +525,6 @@ fn policy_context_for_ip(client_ip: Option<std::net::IpAddr>) -> iam_rs::Context
     let mut context = iam_rs::Context::new();
     crate::iam::permissions::insert_source_ip(&mut context, client_ip);
     context
-}
-
-/// `Content-MD5` against a collected body (UploadPart).
-fn validate_content_md5_s3s(content_md5: Option<&str>, body: &[u8]) -> s3s::S3Result<()> {
-    let Some(expected) = crate::api::body_ingest::parse_content_md5(content_md5)? else {
-        return Ok(());
-    };
-    use md5::Digest as _;
-    let actual = md5::Md5::digest(body);
-    if actual.as_slice() != expected.as_slice() {
-        return Err(s3s::s3_error!(BadDigest));
-    }
-    Ok(())
 }
 
 fn query_flag(uri: &axum::http::Uri, key: &str, expected: &str) -> bool {
