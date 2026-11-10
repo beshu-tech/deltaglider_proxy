@@ -20,6 +20,8 @@ export interface TransferBatchResult {
   /** Move: items whose destination is their own source. They already are
    *  where the move sends them, so the server deletes no source for them. */
   in_place?: number;
+  /** Items the server left out because a `no_overwrite` write found an object at the destination. */
+  skipped?: number;
   failures: { source_key: string; dest_key: string; error: string }[];
 }
 
@@ -37,7 +39,7 @@ export interface BulkTransferOutcome {
   failures: TransferBatchResult['failures'];
   /** The user stopped the run; the items after the last finished batch were not sent. */
   cancelled: boolean;
-  /** Items left out because the user chose to skip the objects that already exist at the destination (absent = 0). */
+  /** Items the server left out because an object already existed at the destination (part of `total`; absent = 0). */
   skipped?: number;
 }
 
@@ -76,11 +78,29 @@ export async function transferInBatches(
       outcome.failed += answer.failed;
       if (action === 'move') outcome.deleted += answer.deleted ?? 0;
       if (action === 'move' && answer.in_place) outcome.inPlace = (outcome.inPlace ?? 0) + answer.in_place;
+      if (answer.skipped) outcome.skipped = (outcome.skipped ?? 0) + answer.skipped;
       keepFailures(outcome.failures, answer.failures);
       onBatch?.({ done, went: transferred(outcome) });
     },
   });
   return { ...outcome, cancelled };
+}
+
+/**
+ * One batch sent as several requests (the items that may replace an object,
+ * and the ones that may not): the answers added up, as one answer.
+ */
+export function mergeBatchResults(answers: TransferBatchResult[]): TransferBatchResult {
+  const merged: TransferBatchResult = { succeeded: 0, failed: 0, failures: [] };
+  for (const a of answers) {
+    merged.succeeded += a.succeeded;
+    merged.failed += a.failed;
+    merged.failures.push(...a.failures);
+    if (a.deleted !== undefined) merged.deleted = (merged.deleted ?? 0) + a.deleted;
+    if (a.in_place !== undefined) merged.in_place = (merged.in_place ?? 0) + a.in_place;
+    if (a.skipped !== undefined) merged.skipped = (merged.skipped ?? 0) + a.skipped;
+  }
+  return merged;
 }
 
 /** Objects that got where they were sent: copies, or for a move the removed
@@ -131,17 +151,19 @@ export function bulkTransferOutcomeMessage(o: BulkTransferOutcome): { type: 'suc
   const shown = transferOutcomeMessage(o);
   const skipped = o.skipped ?? 0;
   if (skipped === 0) return shown;
-  // The user's own choice: the sources of the skipped items stay, the existing destination objects stay.
+  // The sources of the skipped items stay, and so do the existing destination objects.
   const text = `${shown.text.replace(/\.$/, '')}. ${count(skipped)} existing ${noun(skipped, UNIT[o.action])} at the destination ${skipped === 1 ? 'was' : 'were'} skipped.`;
   return { ...shown, text };
 }
 
 function transferOutcomeMessage(o: BulkTransferOutcome): { type: 'success' | 'info' | 'warning'; text: string } {
+  // The items the server skipped were never tried: the report counts the others.
+  const attempted = o.total - (o.skipped ?? 0);
   const past = o.action === 'copy' ? 'copied' : 'moved';
   const Verb = o.action === 'copy' ? 'Copy' : 'Move';
   const went = transferred(o);
   const unit = UNIT[o.action];
-  const items = `${count(o.total)} ${noun(o.total, unit)}`;
+  const items = `${count(attempted)} ${noun(attempted, unit)}`;
   // A move whose copy succeeded but whose source stayed: a batch with a
   // failed copy keeps all its sources.
   // An item already at its destination is not "kept in the source": the
@@ -168,7 +190,7 @@ function transferOutcomeMessage(o: BulkTransferOutcome): { type: 'success' | 'in
       text: `${count(went)} of ${items} ${past}. ${count(o.failed)} failed${example}.${keptText}${why}`,
     };
   }
-  if (o.total === 0) return { type: 'info', text: (o.skipped ?? 0) > 0 ? `Nothing was ${past}.` : `Nothing to ${o.action}.` };
+  if (attempted === 0) return { type: 'info', text: (o.skipped ?? 0) > 0 ? `Nothing was ${past}.` : `Nothing to ${o.action}.` };
   if (kept > 0) return { type: 'warning', text: `${count(went)} of ${items} ${past}.${keptText}` };
   if (inPlace > 0) return { type: 'info', text: `${count(went)} ${noun(went, unit)} ${past}.${inPlaceText}` };
   return { type: 'success', text: `${count(went)} ${noun(went, unit)} ${past}` };

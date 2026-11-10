@@ -1,8 +1,10 @@
 /**
  * F17 (epic #146): a bulk copy or move never writes over an existing object
- * unasked. The browser looks for the destination keys first, then asks:
- * skip the existing ones, overwrite them, or cancel. A move never removes
- * the source of an object it did not copy.
+ * unasked. The browser lists the destination folders first, then asks: skip
+ * the existing ones, overwrite them, or cancel. The SERVER keeps the promise:
+ * every item that may not replace an object goes with `no_overwrite`, and the
+ * fake server below judges it as the real one does. A move never removes the
+ * source of an object it did not copy.
  */
 import { act, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
@@ -12,7 +14,13 @@ import { folderRowKey, objectRowKey } from '../rowKey';
 import type { BulkTransferOutcome } from '../bulkTransfer';
 import type { ConflictResolver } from '../bulkConflicts';
 
+/** What the destination bucket lists, per folder (direct children). Set per test. */
+const lister = vi.hoisted(() => ({
+  list: async (_bucket: string, _folder: string): Promise<{ keys: string[]; truncated: boolean }> => ({ keys: [], truncated: false }),
+}));
+
 vi.mock('../s3client', () => ({
+  listDirectKeys: (bucket: string, folder: string) => lister.list(bucket, folder),
   hasCredentials: () => true,
   getBucket: () => 'releases',
   setBucket: () => {},
@@ -32,32 +40,51 @@ const PATH = { copy: '/_/api/admin/objects/copy', move: '/_/api/admin/objects/mo
 
 type Item = { source_key: string; relative: string };
 let http: ReturnType<typeof mockFetch>;
-/** Keys that already exist in the destination bucket, by listing prefix. */
+/** Keys that already exist in the destination bucket. */
 let existing: string[];
+/** Keys that exist in the destination but that the user cannot see in a listing. */
+let hidden: string[];
 
 beforeEach(() => {
   existing = [];
+  hidden = [];
+  lister.list = async (bucket, folder) => ({
+    keys: bucket === 'archive' ? existing.filter((k) => k.startsWith(folder) && !hidden.includes(k) && !k.slice(folder.length).includes('/')) : [],
+    truncated: false,
+  });
   http = mockFetch();
   http.on('GET', LIST, (req: RecordedRequest) => {
     const qs = new URLSearchParams(req.path.split('?')[1]);
-    const bucket = qs.get('bucket');
-    const prefix = qs.get('prefix') ?? '';
-    if (bucket === 'archive') return json({ keys: existing.filter((k) => k.startsWith(prefix)), truncated: false });
-    if (prefix === 'builds/nightly/') return json({ keys: ['builds/nightly/a.zip', 'builds/nightly/b.zip'], truncated: false });
+    if (qs.get('prefix') === 'builds/nightly/') return json({ keys: ['builds/nightly/a.zip', 'builds/nightly/b.zip'], truncated: false });
     throw new Error(`unexpected listing ${req.path}`);
   });
 });
 afterEach(() => vi.unstubAllGlobals());
 
+interface TransferBody {
+  items: Item[];
+  dest_prefix: string;
+  no_overwrite?: boolean;
+}
+/** The requests as sent: the items and whether the request may replace. */
+interface Sent {
+  items: Item[];
+  noOverwrite: boolean;
+}
+
+/** A server that judges `no_overwrite` per item against `existing`, as the real one does under its lock. */
 function answerTransfers(op: 'copy' | 'move') {
-  const sent: Item[][] = [];
+  const sent: Sent[] = [];
   http.on('POST', PATH[op], (req: RecordedRequest) => {
-    const { items } = req.body as { items: Item[] };
-    sent.push(items);
-    return json({ succeeded: items.length, failed: 0, failures: [], deleted: op === 'move' ? items.length : undefined });
+    const body = req.body as TransferBody;
+    sent.push({ items: body.items, noOverwrite: body.no_overwrite === true });
+    const skipped = body.no_overwrite ? body.items.filter((i) => existing.includes(body.dest_prefix + i.relative)).length : 0;
+    const copied = body.items.length - skipped;
+    return json({ succeeded: copied, failed: 0, skipped, failures: [], deleted: op === 'move' ? copied : undefined });
   });
   return sent;
 }
+const sources = (sent: Sent[]) => sent.flatMap((r) => r.items.map((i) => i.source_key)).sort();
 
 async function mount() {
   const view = renderHookWithQuery(() =>
@@ -87,7 +114,7 @@ describe.each(['copy', 'move'] as const)('bulk %s onto existing objects', (op) =
     existing = ['out/nightly/a.zip', 'out/top.zip', 'out/nightly/zzz-other.zip'];
   });
 
-  test('asks with the exact existing keys, and "skip" sends only the others', async () => {
+  test('asks with the exact existing keys, and "skip" sends every item conditionally', async () => {
     const sent = answerTransfers(op);
     const { result } = await mount();
     const ask = vi.fn<ConflictResolver>(async () => 'skip');
@@ -98,23 +125,27 @@ describe.each(['copy', 'move'] as const)('bulk %s onto existing objects', (op) =
       'out/nightly/a.zip',
       'out/top.zip',
     ]);
-    expect(sent.flat()).toEqual([{ source_key: 'builds/nightly/b.zip', relative: 'nightly/b.zip' }]);
-    expect(outcome).toMatchObject({ total: 1, skipped: 2, cancelled: false });
+    // Nothing may replace: every request says so, and the server leaves the two.
+    expect(sent.every((r) => r.noOverwrite)).toBe(true);
+    expect(sources(sent)).toEqual(['builds/nightly/a.zip', 'builds/nightly/b.zip', 'builds/top.zip']);
+    expect(outcome).toMatchObject({ total: 3, succeeded: 1, skipped: 2, cancelled: false });
     // A move deletes only what it copied.
     expect(outcome.deleted).toBe(op === 'move' ? 1 : 0);
   });
 
-  test('"overwrite" sends every item', async () => {
+  test('"overwrite" lets only the listed conflicts replace; the others stay conditional', async () => {
+    // An object the user cannot list at the destination: it is not in the dialog.
+    existing = [...existing, 'out/nightly/b.zip'];
+    hidden = ['out/nightly/b.zip'];
     const sent = answerTransfers(op);
     const { result } = await mount();
     const outcome = await run(result, op, async () => 'overwrite');
-    expect(sent.flat().map((i) => i.source_key).sort()).toEqual([
-      'builds/nightly/a.zip',
-      'builds/nightly/b.zip',
-      'builds/top.zip',
-    ]);
-    expect(outcome).toMatchObject({ total: 3 });
-    expect(outcome.skipped).toBeUndefined();
+    const unconditional = sent.filter((r) => !r.noOverwrite).flatMap((r) => r.items.map((i) => i.source_key));
+    const conditional = sent.filter((r) => r.noOverwrite).flatMap((r) => r.items.map((i) => i.source_key));
+    expect(unconditional.sort()).toEqual(['builds/nightly/a.zip', 'builds/top.zip']);
+    expect(conditional).toEqual(['builds/nightly/b.zip']);
+    // The hidden object is skipped by the server, never overwritten.
+    expect(outcome).toMatchObject({ total: 3, succeeded: 2, skipped: 1 });
   });
 
   test('"cancel" sends nothing and keeps the selection', async () => {
@@ -134,34 +165,51 @@ describe.each(['copy', 'move'] as const)('bulk %s onto existing objects', (op) =
     expect(outcome.cancelled).toBe(true);
   });
 
-  test('no conflict: no question, every item sent', async () => {
+  test('no conflict: no question, every item sent conditionally', async () => {
     existing = ['out/nightly/zzz-other.zip'];
     const sent = answerTransfers(op);
     const { result } = await mount();
     const ask = vi.fn<ConflictResolver>(async () => 'cancel');
     const outcome = await run(result, op, ask);
     expect(ask).not.toHaveBeenCalled();
-    expect(sent.flat()).toHaveLength(3);
-    expect(outcome).toMatchObject({ total: 3 });
+    expect(sent.every((r) => r.noOverwrite)).toBe(true);
+    expect(sources(sent)).toHaveLength(3);
+    expect(outcome).toMatchObject({ total: 3, succeeded: 3 });
     expect(outcome.skipped).toBeUndefined();
   });
 
-  test('every item exists and the user skips: nothing is sent, nothing is removed', async () => {
+  test('an object that appears after the check is skipped by the server, not overwritten', async () => {
+    // The listing sees an empty destination; the object lands before the write.
+    existing = [];
+    lister.list = async () => ({ keys: [], truncated: false });
+    const sent = answerTransfers(op);
+    const { result } = await mount();
+    existing = ['out/top.zip'];
+    const outcome = await run(result, op, async () => 'cancel');
+    expect(sent.every((r) => r.noOverwrite)).toBe(true);
+    expect(outcome).toMatchObject({ total: 3, succeeded: 2, skipped: 1 });
+  });
+
+  test('every item exists and the user skips: the server skips them all, nothing is removed', async () => {
     existing = ['out/nightly/a.zip', 'out/nightly/b.zip', 'out/top.zip'];
     const sent = answerTransfers(op);
     const { result } = await mount();
     const outcome = await run(result, op, async () => 'skip');
-    expect(sent).toEqual([]);
-    expect(outcome).toMatchObject({ total: 0, skipped: 3, deleted: 0, cancelled: false });
+    expect(sent.every((r) => r.noOverwrite)).toBe(true);
+    expect(outcome).toMatchObject({ total: 3, succeeded: 0, skipped: 3, deleted: 0, cancelled: false });
   });
 
-  test('a destination listing that fails stops the run before any write', async () => {
+  test('a destination the user cannot list does not fail the run: the copy goes conditionally', async () => {
+    lister.list = async () => {
+      throw new Error('AccessDenied');
+    };
     const sent = answerTransfers(op);
-    http.on('GET', LIST, (req: RecordedRequest) =>
-      req.path.includes('bucket=archive') ? json({ error: 'boom' }, 500) : json({ keys: ['builds/nightly/a.zip'], truncated: false }),
-    );
     const { result } = await mount();
-    await expect(run(result, op, async () => 'overwrite')).rejects.toThrow();
-    expect(sent).toEqual([]);
+    const ask = vi.fn<ConflictResolver>(async () => 'overwrite');
+    const outcome = await run(result, op, ask);
+    expect(ask).not.toHaveBeenCalled();
+    expect(sent.every((r) => r.noOverwrite)).toBe(true);
+    // The server judges per item: the two existing objects are skipped, the other is copied.
+    expect(outcome).toMatchObject({ total: 3, succeeded: 1, skipped: 2, cancelled: false });
   });
 });

@@ -60,6 +60,12 @@ pub struct CopyRequest {
     /// because folder-selection semantics are UI-driven (which prefix
     /// counts as the "common prefix" depends on what the user picked).
     pub items: Vec<CopyItem>,
+    /// Write no destination key that holds an object: judged per item under
+    /// the destination's write lock, so an object that appeared after the
+    /// browser listed the folder, or that the caller cannot see, is never
+    /// replaced. Such an item is reported in `skipped`, not as a failure.
+    #[serde(default)]
+    pub no_overwrite: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,8 +78,19 @@ pub struct CopyItem {
 pub struct CopyResponse {
     pub succeeded: usize,
     pub failed: usize,
+    /// Items left out because `no_overwrite` found an object at the
+    /// destination key. Not failures: a move keeps their sources.
+    pub skipped: usize,
+    /// The first of them (capped at 100 entries).
+    pub skipped_items: Vec<CopySkipped>,
     /// Per-key failures, newest last. Capped at 100 entries.
     pub failures: Vec<CopyFailure>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CopySkipped {
+    pub source_key: String,
+    pub dest_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +107,9 @@ pub struct MoveRequest {
     #[serde(default)]
     pub dest_prefix: AdminObjectPath,
     pub items: Vec<CopyItem>,
+    /// See [`CopyRequest::no_overwrite`].
+    #[serde(default)]
+    pub no_overwrite: bool,
 }
 
 /// Shape mirrors `CopyResponse` plus a `deleted` count — moves are
@@ -103,6 +123,9 @@ pub struct MoveResponse {
     /// the move sends them, so their source is not deleted (it is the only
     /// copy). Not a "kept in the source" leftover.
     pub in_place: usize,
+    /// See [`CopyResponse::skipped`].
+    pub skipped: usize,
+    pub skipped_items: Vec<CopySkipped>,
     pub failures: Vec<CopyFailure>,
 }
 
@@ -412,6 +435,13 @@ struct BulkPlan {
     dest_bucket: ClientBucket,
     dest_prefix: AdminObjectPath,
     items: Vec<CopyItem>,
+    /// See [`CopyRequest::no_overwrite`].
+    no_overwrite: bool,
+    /// Per item of a move: its destination is its own source. Such an item
+    /// is already where the move sends it, so a `no_overwrite` move does not
+    /// copy it and does not report it as skipped (it is `in_place`). Empty
+    /// for a copy.
+    in_place: Vec<bool>,
 }
 
 impl BulkPlan {
@@ -421,12 +451,15 @@ impl BulkPlan {
         dest_bucket: AdminBucket,
         dest_prefix: AdminObjectPath,
         items: Vec<CopyItem>,
+        no_overwrite: bool,
     ) -> Result<Self, AdminError> {
         Ok(Self {
             source_bucket: source_bucket.admit(state)?,
             dest_bucket: dest_bucket.admit(state)?,
             dest_prefix,
             items,
+            no_overwrite,
+            in_place: Vec::new(),
         })
     }
 }
@@ -459,6 +492,7 @@ pub async fn copy_objects(
         req.dest_bucket,
         req.dest_prefix,
         req.items,
+        req.no_overwrite,
     )?;
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_replication_target_only(&state, &req.dest_bucket).await?;
@@ -527,6 +561,8 @@ enum CopyOutcome {
     Failed(String, String),
     /// Not tried: a maintenance job armed on the destination bucket first.
     Skipped,
+    /// Not copied: `no_overwrite`, and the destination key holds an object.
+    Exists(String),
 }
 
 /// Also returns, per item, the source object as it was copied (`None`: not
@@ -586,6 +622,17 @@ async fn run_copy_loop(
                         }
                     });
                 let result = match allowed {
+                    // Already at its destination: nothing to write, and not
+                    // a skip. The delete step counts it as in place.
+                    Ok(()) if req.no_overwrite && req.in_place.get(idx) == Some(&true) => engine
+                        .head(&req.source_bucket, &it.source_key)
+                        .await
+                        .map_err(|e| {
+                            CopyFault::failed(format!(
+                                "head {}/{}: {}",
+                                req.source_bucket, it.source_key, e
+                            ))
+                        }),
                     Ok(()) => {
                         copy_one(
                             s3,
@@ -594,16 +641,18 @@ async fn run_copy_loop(
                             &it.source_key,
                             &req.dest_bucket,
                             &dk,
+                            req.no_overwrite,
                         )
                         .await
                     }
-                    Err(denied) => Err(denied),
+                    Err(denied) => Err(CopyFault::Failed(denied)),
                 };
                 out.push((
                     idx,
                     match result {
                         Ok(source) => CopyOutcome::Copied(Box::new(source)),
-                        Err(e) => CopyOutcome::Failed(dk, e),
+                        Err(CopyFault::Exists) => CopyOutcome::Exists(dk),
+                        Err(CopyFault::Failed(e)) => CopyOutcome::Failed(dk, e),
                     },
                 ));
             }
@@ -625,6 +674,8 @@ async fn run_copy_loop(
     let mut res = CopyResponse {
         succeeded: 0,
         failed: 0,
+        skipped: 0,
+        skipped_items: Vec::new(),
         failures: Vec::new(),
     };
     let mut skip_reported = false;
@@ -633,6 +684,16 @@ async fn run_copy_loop(
             CopyOutcome::Copied(source) => {
                 res.succeeded += 1;
                 copied[idx] = Some(*source);
+                continue;
+            }
+            CopyOutcome::Exists(dest_key) => {
+                res.skipped += 1;
+                if res.skipped_items.len() < MAX_FAILURE_ENTRIES {
+                    res.skipped_items.push(CopySkipped {
+                        source_key: req.items[idx].source_key.to_string(),
+                        dest_key,
+                    });
+                }
                 continue;
             }
             CopyOutcome::Failed(dest_key, error) => (dest_key, error),
@@ -664,6 +725,19 @@ async fn run_copy_loop(
     (res, copied)
 }
 
+/// Why one item of a bulk copy did not copy.
+enum CopyFault {
+    /// `no_overwrite`: the destination key holds an object.
+    Exists,
+    Failed(String),
+}
+
+impl CopyFault {
+    fn failed(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
 /// Copy one object the way a client write is handled: quota gate on the
 /// destination, the shared engine-routed transfer (streams or spools large
 /// objects instead of holding them in RAM; strips encryption markers; keeps
@@ -676,11 +750,12 @@ async fn copy_one(
     src_key: &str,
     dst_bucket: &str,
     dst_key: &str,
-) -> Result<crate::types::FileMetadata, String> {
+    no_overwrite: bool,
+) -> Result<crate::types::FileMetadata, CopyFault> {
     let head = engine
         .head(src_bucket, src_key)
         .await
-        .map_err(|e| format!("head {}/{}: {}", src_bucket, src_key, e))?;
+        .map_err(|e| CopyFault::failed(format!("head {}/{}: {}", src_bucket, src_key, e)))?;
     // An overwrite nets the size of the object it replaces, as a client
     // PUT does.
     crate::api::handlers::object_helpers::check_quota_for_write(
@@ -690,27 +765,38 @@ async fn copy_one(
         head.file_size,
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| CopyFault::failed(e.to_string()))?;
     // The transfer takes the destination's object write lock itself (as
     // every write does), so the copy never lands inside a conditional
     // PUT's check-then-store. Taking it here too would wait forever: the
     // lock is not re-entrant.
-    let outcome = crate::transfer::copy_object_with_retries(
-        engine,
-        crate::transfer::ObjectTransferRequest {
-            source_bucket: src_bucket,
-            source_key: src_key,
-            destination_bucket: dst_bucket,
-            destination_key: dst_key,
-            provenance: None,
-            strip_user_metadata_keys: &[],
-            operation: "admin bulk copy",
-            upload_concurrency: None,
-            keep_created_at: false,
-        },
-    )
-    .await
-    .map_err(|e| format!("copy {src_bucket}/{src_key} -> {dst_bucket}/{dst_key}: {e}"))?;
+    let transfer = crate::transfer::ObjectTransferRequest {
+        source_bucket: src_bucket,
+        source_key: src_key,
+        destination_bucket: dst_bucket,
+        destination_key: dst_key,
+        provenance: None,
+        strip_user_metadata_keys: &[],
+        operation: "admin bulk copy",
+        upload_concurrency: None,
+        keep_created_at: false,
+    };
+    // `no_overwrite`: the existence check runs inside the transfer's own
+    // lock hold, so nothing can land between the check and the write.
+    let outcome = if no_overwrite {
+        crate::transfer::copy_object_if_absent(engine, transfer).await
+    } else {
+        crate::transfer::copy_object_with_retries(engine, transfer).await
+    }
+    .map_err(|e| {
+        if e.class == crate::transfer::CopyClass::DestinationExists {
+            CopyFault::Exists
+        } else {
+            CopyFault::failed(format!(
+                "copy {src_bucket}/{src_key} -> {dst_bucket}/{dst_key}: {e}"
+            ))
+        }
+    })?;
     emit_event(
         s3,
         crate::event_outbox::EventKind::ObjectCopied,
@@ -759,12 +845,13 @@ pub async fn move_objects(
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<MoveRequest>,
 ) -> Result<Json<MoveResponse>, AdminError> {
-    let req = BulkPlan::admit(
+    let mut req = BulkPlan::admit(
         &state,
         req.source_bucket,
         req.dest_bucket,
         req.dest_prefix,
         req.items,
+        req.no_overwrite,
     )?;
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_under_maintenance(&state, &req.source_bucket)?;
@@ -785,6 +872,19 @@ pub async fn move_objects(
     let source_storage = StorageId::of(&state.s3_state.engine.load(), &req.source_bucket);
     let dest_storage = StorageId::of(&state.s3_state.engine.load(), &req.dest_bucket);
     validate_plan(&req.items, &source_storage, &dest_storage, &req.dest_prefix)?;
+    req.in_place = req
+        .items
+        .iter()
+        .map(|it| {
+            is_same_location_move(
+                &source_storage,
+                &dest_storage,
+                &req.dest_prefix,
+                &it.source_key,
+                &it.relative,
+            )
+        })
+        .collect();
 
     let s3 = state.s3_state.clone();
     let actor = BulkActor::for_session(&state, &session)?;
@@ -838,6 +938,8 @@ pub async fn move_objects(
         failed: copy_result.failed,
         deleted,
         in_place,
+        skipped: copy_result.skipped,
+        skipped_items: copy_result.skipped_items,
         failures: copy_result.failures,
     }))
 }
@@ -2353,6 +2455,8 @@ mod tests {
                     source_key: AdminObjectPath::try_from("src/k.jpg".to_string()).unwrap(),
                     relative: AdminObjectPath::try_from("k.jpg".to_string()).unwrap(),
                 }],
+                no_overwrite: false,
+                in_place: Vec::new(),
             };
             let mut state = Arc::try_unwrap(AppState::for_tests(engine)).ok().unwrap();
             state.bucket_usage = Some(usage);
@@ -2556,6 +2660,8 @@ mod tests {
                 source_bucket: registry.client_bucket("b").unwrap(),
                 dest_bucket: registry.client_bucket("b").unwrap(),
                 dest_prefix: AdminObjectPath::try_from("copy/".to_string()).unwrap(),
+                no_overwrite: false,
+                in_place: Vec::new(),
                 items: keys
                     .iter()
                     .map(|k| CopyItem {

@@ -136,11 +136,14 @@ let cachedClient: S3Client | null = null;
 /**
  * THE way to forget the S3 client (F61, epic #146): whoever or wherever the
  * client signs as changed, so what it listed (the shared bucket list) goes
- * with it. A guard test refuses any other reset of `cachedClient`.
+ * with it, and so do the bucket origins in the query cache (a second user
+ * must not get the first user's backends and real bucket names merged into
+ * the list). A guard test refuses any other reset of `cachedClient`.
  */
 function dropClient(): void {
   cachedClient = null;
   listBucketsShared = null;
+  queryClient.removeQueries({ queryKey: qk.backends.origins() });
 }
 
 /** The response headers in which the proxy tells a writer how it stored the object. */
@@ -392,6 +395,39 @@ export async function listCommonPrefixes(bucket: string, prefix = ''): Promise<s
   return folders;
 }
 
+/** Entries per page of `listDirectKeys`. */
+const DIRECT_KEYS_PAGE = 1000;
+
+/**
+ * One page of the objects directly inside `folder` of `bucket` (no deeper
+ * keys: a delimiter folds them into sub-folders), after `startAfter`. Used to
+ * find what a bulk copy would overwrite: only direct children can match a
+ * destination key, so a large subtree costs nothing. Signed as the caller, so
+ * it sees what the caller may list; a refusal (403) is the caller's to handle.
+ */
+export async function listDirectKeys(
+  bucket: string,
+  folder: string,
+  startAfter?: string,
+): Promise<{ keys: string[]; truncated: boolean; next_start_after?: string }> {
+  const resp = await sendCommand<ListObjectsV2CommandOutput>(
+    new ListObjectsV2Command({
+      Bucket: bucket,
+      Prefix: folder || undefined,
+      Delimiter: '/',
+      StartAfter: startAfter,
+      MaxKeys: DIRECT_KEYS_PAGE,
+    }),
+    `List ${bucket}/${folder}`,
+  );
+  const keys = (resp.Contents || []).flatMap((o) => (o.Key ? [o.Key] : []));
+  const folders = (resp.CommonPrefixes || []).flatMap((p) => (p.Prefix ? [p.Prefix] : []));
+  // The next page starts after the last entry of this one, a key or a sub-folder.
+  const last = [...keys, ...folders].sort().pop();
+  return resp.IsTruncated && last !== undefined
+    ? { keys, truncated: true, next_start_after: last }
+    : { keys, truncated: false };
+}
 
 interface HeadObjectShape {
   headers: Record<string, string>;

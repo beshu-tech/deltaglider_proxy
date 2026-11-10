@@ -9,7 +9,10 @@ import { qk } from '../queries/keys';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderHookWithQuery } from '../test/render';
 
-vi.mock('../s3client', () => ({ getBucket: () => 'releases' }));
+vi.mock('../s3client', () => ({
+  getBucket: () => 'releases',
+  listDirectKeys: async () => ({ keys: [], truncated: false }),
+}));
 
 import { useBulkActions } from '../browser/useBulkActions';
 import { objectRowKey } from '../rowKey';

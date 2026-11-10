@@ -2,15 +2,21 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { message } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
-import { getBucket } from '../s3client';
+import { getBucket, listDirectKeys } from '../s3client';
 import { bulkCopyObjects, startDeleteJob, bulkMoveObjects, bulkZipDownloadUrl, listAllUnderPrefix } from '../adminApi';
 import { isSessionExpired } from '../errorHandling';
 import { type ExpandedItem, MAX_BULK_OBJECTS, expandSelection } from '../bulkSelection';
 import { type RowKey, splitRowKeys } from '../rowKey';
 import { type BulkAction, type BulkProgress, BulkActionFailed } from '../bulkBatches';
 import type { DeleteJobOutcome, DeletePlanSummary } from '../bulkDelete';
-import { type BulkTransferOutcome, transferInBatches, transferPlanError } from '../bulkTransfer';
-import { type ConflictResolver, findConflicts, itemsAfterChoice } from '../bulkConflicts';
+import {
+  type BulkTransferOutcome,
+  type TransferBatchResult,
+  mergeBatchResults,
+  transferInBatches,
+  transferPlanError,
+} from '../bulkTransfer';
+import { type ConflictResolver, findConflicts, overwriteSources } from '../bulkConflicts';
 import { downloadZip as saveZip, zipPreflightError } from '../zipDownload';
 
 interface BulkOptions {
@@ -201,11 +207,18 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
    * server removes a batch's sources only when every copy of that batch
    * succeeded.
    *
-   * Nothing is written over an existing object unasked (F17): after the
-   * listing, the destination keys are looked up, and when any exists
-   * `onConflicts` decides: skip those items (a move then keeps their
-   * sources), overwrite, or cancel. With no `onConflicts` an existing
-   * destination cancels the run.
+   * Nothing is written over an existing object unasked (F17), and the
+   * SERVER keeps that promise: every item that the user did not allow to
+   * replace an object goes with `no_overwrite`, which the server judges
+   * under the destination's write lock (so an object that appears after the
+   * check, or one this user cannot list, is never replaced). After the
+   * listing, the destination folders are listed once each as a preview, and
+   * when an existing destination turns up `onConflicts` decides: skip (those
+   * items go conditionally and the server leaves them; a move then keeps
+   * their sources), overwrite (only those items go unconditionally), or
+   * cancel. With no `onConflicts` an existing destination cancels the run.
+   * A destination folder that cannot be listed does not fail the run: its
+   * items go conditionally too, and the result says how many were skipped.
    */
   const bulkTransfer = useCallback(
     (
@@ -218,7 +231,8 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
       // against the same bucket even if the user switches buckets mid-run.
       const sourceBucket = getBucket();
       const request = action === 'copy' ? bulkCopyObjects : bulkMoveObjects;
-      let skipped = 0;
+      // The sources the user allowed to replace an existing object.
+      let replace = new Set<string>();
       return runBulk<BulkTransferOutcome>(action, {
         expand: async (opts) => {
           // The folder's own marker key (empty suffix) is not copied.
@@ -230,11 +244,11 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
           return items;
         },
         prepare: async (items, { signal, checking, confirming }) => {
-          const conflicts = await findConflicts(
+          const { conflicts } = await findConflicts(
             items,
             sourceBucket === destBucket,
             destPrefix,
-            (pfx, after) => listAllUnderPrefix(destBucket, pfx, after),
+            (folder, after) => listDirectKeys(destBucket, folder, after),
             { signal, onProgress: (p) => checking(p.checked, p.total) },
           );
           if (conflicts.length === 0) return items;
@@ -243,25 +257,30 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
             ? await onConflicts({ action, destBucket, total: items.length, conflicts })
             : 'cancel';
           if (choice === 'cancel') return null;
-          const kept = itemsAfterChoice(items, conflicts, choice);
-          skipped = items.length - kept.length;
-          return kept;
+          replace = overwriteSources(conflicts, choice);
+          return items;
         },
-        send: async (items, signal, sent) => ({
-          ...(await transferInBatches(
+        send: async (items, signal, sent) =>
+          transferInBatches(
             action,
             items,
-            (batch) =>
-              request({
+            async (batch) => {
+              const body = (part: typeof batch, noOverwrite: boolean) => ({
                 source_bucket: sourceBucket,
                 dest_bucket: destBucket,
                 dest_prefix: destPrefix,
-                items: batch.map(({ source, relative }) => ({ source_key: source, relative })),
-              }),
+                items: part.map(({ source, relative }) => ({ source_key: source, relative })),
+                no_overwrite: noOverwrite,
+              });
+              const mayReplace = batch.filter((i) => replace.has(i.source));
+              const mayNot = batch.filter((i) => !replace.has(i.source));
+              const answers: TransferBatchResult[] = [];
+              if (mayNot.length > 0) answers.push(await request(body(mayNot, true)));
+              if (mayReplace.length > 0) answers.push(await request(body(mayReplace, false)));
+              return mergeBatchResults(answers);
+            },
             { signal, onBatch: (p) => sent(p.done, p.went) },
-          )),
-          ...(skipped > 0 ? { skipped } : {}),
-        }),
+          ),
         cancelledWhileListing: () => ({
           action,
           total: 0,

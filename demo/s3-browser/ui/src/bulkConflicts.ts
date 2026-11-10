@@ -2,6 +2,9 @@
  * Destination conflicts of a bulk copy or move (F17, epic #146): the objects
  * that already exist where the run would write. The browser finds them
  * BEFORE the first write and asks: skip them, overwrite them, or cancel.
+ * The listing is only the preview for that question. The server keeps the
+ * promise: every write the user did not allow to replace an object is sent
+ * with `no_overwrite`, and the server judges it under the object's lock.
  *
  * React-free and fetch-free (the lister is injected) so the node unit
  * project tests it — see src/__tests__/bulkConflicts.test.ts.
@@ -30,9 +33,9 @@ export interface TransferConflicts {
 /** Asked once, before the first write, when destination objects exist. */
 export type ConflictResolver = (c: TransferConflicts) => Promise<ConflictChoice>;
 
-/** More direct files than this are checked by listing the destination folder once, not one request each. */
-export const FILE_PROBE_LIMIT = 20;
-/** Pages read from a destination folder before the check gives up (it then fails: nothing is written unchecked). */
+/** Destination folders listed at most per check; the items of the others are written conditionally, unchecked. */
+export const MAX_DEST_FOLDERS = 200;
+/** Pages read from one destination folder before it counts as unchecked. */
 const MAX_DEST_PAGES = 50;
 /** Requests at the same time. */
 const CHECK_CONCURRENCY = 4;
@@ -50,108 +53,103 @@ interface CheckOptions {
 /** The destination key of an item. `destPrefix` is `''` or ends with `/`. */
 const destKeyOf = (destPrefix: string, item: ExpandedItem): string => destPrefix + item.relative;
 
+/** The folder a destination key sits in: `''` at the bucket root, else ends with `/`. */
+const folderOf = (destKey: string): string => destKey.slice(0, destKey.lastIndexOf('/') + 1);
+
 /**
- * The destination keys that must be looked up: a folder per selected folder
- * (`dest/name/`: everything the run writes under it), and for the files
- * written straight into `destPrefix` either one exact-key probe each or, when
- * there are many, one listing of `destPrefix` itself.
+ * The destination folders to look into: one per distinct folder that a
+ * destination key sits in, each listed once whatever the number of items.
  */
-export function planChecks(
-  items: ExpandedItem[],
-  destPrefix: string,
-): { folders: string[]; files: string[]; wholeDestination: boolean } {
-  const folders = new Set<string>();
-  const files: string[] = [];
-  for (const item of items) {
-    const slash = item.relative.indexOf('/');
-    if (slash >= 0) folders.add(destPrefix + item.relative.slice(0, slash + 1));
-    else files.push(destKeyOf(destPrefix, item));
-  }
-  const wholeDestination = files.length > FILE_PROBE_LIMIT && destPrefix !== '';
-  return { folders: [...folders], files: wholeDestination ? [] : files, wholeDestination };
+export function destinationFolders(items: ExpandedItem[], destPrefix: string): string[] {
+  return [...new Set(items.map((item) => folderOf(destKeyOf(destPrefix, item))))];
 }
 
-/** Every key under `prefix`, page by page. Throws when the folder is too large to read or the lister fails. */
-async function listEvery(prefix: string, listPrefix: PrefixLister, signal?: AbortSignal): Promise<string[]> {
+/** The objects directly inside `folder`, page by page. Throws when the lister fails or the folder is too large. */
+async function listDirect(folder: string, listFolder: PrefixLister, signal?: AbortSignal): Promise<string[]> {
   const keys: string[] = [];
   let startAfter: string | undefined;
   for (let page = 0; page < MAX_DEST_PAGES; page++) {
     signal?.throwIfAborted();
-    const answer = await listPrefix(prefix, startAfter);
+    const answer = await listFolder(folder, startAfter);
     for (const k of answer.keys) keys.push(k);
     if (!answer.truncated) return keys;
     if (answer.next_start_after === undefined) break;
     startAfter = answer.next_start_after;
   }
-  throw new Error(
-    `The destination folder ${prefix} has more than ${count(keys.length)} objects, too many to check for existing files; choose a smaller destination.`,
-  );
+  throw new Error(`The destination folder ${folder} is too large to check for existing files.`);
+}
+
+/** What the check found: the existing destinations, and how many items it could not look up. */
+export interface ConflictCheck {
+  conflicts: TransferConflict[];
+  /**
+   * Items whose destination folder could not be listed (the caller may not
+   * list it, the listing failed, or there are more folders than
+   * MAX_DEST_FOLDERS). The check does not fail on them: the write is
+   * conditional (`no_overwrite`), so the server decides per item, under its
+   * own lock, and reports what it skipped.
+   */
+  unchecked: number;
 }
 
 /**
- * The items whose destination key already holds an object. An item that
- * is its own destination (same bucket, same key) is no conflict: the server
- * leaves it where it is. Throws when any lookup fails: a write is never sent
- * on an unchecked destination.
+ * The items whose destination key already holds an object, found by listing
+ * each destination folder once (direct children only: a deeper key cannot be
+ * a destination). The listing is a preview for the question the user is
+ * asked; it is not what keeps the run from overwriting (the conditional
+ * write is). An item that is its own destination (same bucket, same key) is
+ * no conflict: the server leaves it where it is. A folder that cannot be
+ * listed does not fail the run. Only an abort of `signal` throws.
  */
 export async function findConflicts(
   items: ExpandedItem[],
   sameBucket: boolean,
   destPrefix: string,
-  listPrefix: PrefixLister,
+  listFolder: PrefixLister,
   { signal, onProgress }: CheckOptions = {},
-): Promise<TransferConflict[]> {
-  const { folders, files, wholeDestination } = planChecks(items, destPrefix);
+): Promise<ConflictCheck> {
+  const allFolders = destinationFolders(items, destPrefix);
+  const folders = allFolders.slice(0, MAX_DEST_FOLDERS);
   const existing = new Set<string>();
-  // One lookup = one unit of work for the progress bar.
-  const work: (() => Promise<void>)[] = [
-    ...folders.map((folder) => async () => {
-      for (const k of await listEvery(folder, listPrefix, signal)) existing.add(k);
-    }),
-    ...files.map((key) => async () => {
-      // The exact key sorts first among the keys that start with it, so one page holds it.
-      if ((await listPrefix(key)).keys.includes(key)) existing.add(key);
-    }),
-    ...(wholeDestination
-      ? [
-          async () => {
-            for (const k of await listEvery(destPrefix, listPrefix, signal)) existing.add(k);
-          },
-        ]
-      : []),
-  ];
+  const unlisted = new Set<string>(allFolders.slice(MAX_DEST_FOLDERS));
   let next = 0;
   let checked = 0;
-  let failure: { error: unknown } | undefined;
-  onProgress?.({ checked, total: work.length });
+  onProgress?.({ checked, total: folders.length });
   const worker = async () => {
-    while (!failure && !signal?.aborted && next < work.length) {
+    while (!signal?.aborted && next < folders.length) {
+      const folder = folders[next++];
       try {
-        await work[next++]();
-        onProgress?.({ checked: ++checked, total: work.length });
+        for (const k of await listDirect(folder, listFolder, signal)) existing.add(k);
       } catch (error) {
-        failure ??= { error };
+        if (signal?.aborted) throw error;
+        unlisted.add(folder);
       }
+      onProgress?.({ checked: ++checked, total: folders.length });
     }
   };
-  await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, work.length) }, worker));
-  if (failure) throw failure.error;
+  await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, folders.length) }, worker));
   signal?.throwIfAborted();
-  return items.flatMap((item) => {
+  const conflicts: TransferConflict[] = [];
+  let unchecked = 0;
+  for (const item of items) {
     const dest = destKeyOf(destPrefix, item);
-    return existing.has(dest) && !(sameBucket && dest === item.source) ? [{ ...item, dest }] : [];
-  });
+    if (unlisted.has(folderOf(dest))) unchecked++;
+    else if (existing.has(dest) && !(sameBucket && dest === item.source)) conflicts.push({ ...item, dest });
+  }
+  return { conflicts, unchecked };
 }
 
-/** The items to send after the user's answer: all of them, or without the ones whose destination exists. */
-export function itemsAfterChoice(
-  items: ExpandedItem[],
+/**
+ * The sources whose copy may replace an existing destination object: the
+ * conflicts when the user chose "overwrite", none otherwise. Every other
+ * item is written conditionally, so "skip" and an unchecked destination
+ * never overwrite.
+ */
+export function overwriteSources(
   conflicts: TransferConflict[],
   choice: Exclude<ConflictChoice, 'cancel'>,
-): ExpandedItem[] {
-  if (choice === 'overwrite') return items;
-  const skip = new Set(conflicts.map((c) => c.source));
-  return items.filter((i) => !skip.has(i.source));
+): Set<string> {
+  return choice === 'overwrite' ? new Set(conflicts.map((c) => c.source)) : new Set();
 }
 
 /** The words of the question: what exists, three examples, and what each answer does. */

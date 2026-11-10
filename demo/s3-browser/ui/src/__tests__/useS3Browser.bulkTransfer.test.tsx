@@ -25,6 +25,7 @@ const listing = vi.hoisted(() => ({ loads: 0 }));
 
 vi.mock('../s3client', () => ({
   hasCredentials: () => true,
+  listDirectKeys: async () => ({ keys: [], truncated: false }),
   getBucket: () => 'releases',
   setBucket: () => {},
   headObject: async () => ({ storageType: 'passthrough', storedSize: 1 }),

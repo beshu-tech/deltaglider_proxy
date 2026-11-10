@@ -27,6 +27,8 @@ vi.mock('../s3client', () => ({
   setBucket: () => {},
   headObject: async () => ({ storageType: 'passthrough', storedSize: 1 }),
   listBuckets: async () => [{ name: 'releases' }],
+  // The destination is empty.
+  listDirectKeys: async () => ({ keys: [], truncated: false }),
   listObjects: async () => {
     listing.loads++;
     return { objects: listing.objects, folders: listing.folders, isTruncated: false };
@@ -120,6 +122,8 @@ describe.each([
       source_bucket: 'releases',
       dest_bucket: 'archive',
       dest_prefix: 'old/',
+      // Nothing was confirmed as replaceable: the server must not overwrite.
+      no_overwrite: true,
       items: [
         { source_key: 'builds/app-1.0.zip', relative: 'app-1.0.zip' },
         // The folder keeps its own name under the destination.
