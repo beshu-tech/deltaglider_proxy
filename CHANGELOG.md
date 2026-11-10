@@ -42,6 +42,16 @@
 
 - iOS Safari zooms the page in when a text field with text smaller than 16 pixels gets focus, and it stays zoomed after the field loses focus. The page then runs past the right edge of the screen. The text fields of the admin pages use 14 pixels, so a tap on a field such as the bucket selector zoomed the page. On a touch screen, text fields now use 16 pixels.
 
+### Fixed — The file browser: selection, copy and move
+
+- An object whose key starts with `folder:` was read as a folder in a bulk action. A bulk delete of an object named `folder:abc/` could remove everything under `abc/`. The browser now gives every row a typed identity (a folder or an object), and no code reads the kind of a row from the text of its key.
+- The filter box left checked rows checked after it hid them. The toolbar and the delete dialog counted the hidden rows. The selection now holds only rows that are shown.
+- A bulk copy or move wrote over objects that already existed at the destination, and a move then deleted the source. The browser now looks for the existing destination objects before it writes, and asks: skip them, overwrite them, or cancel. A skipped object is never sent, so a move never deletes its source.
+
+### Fixed — IAM edits in the admin GUI
+
+- Saving a user edit sent two requests: the change, then `rotate-keys`. When the new access key belonged to another user, the second request failed after the first had changed the user, and the error blamed "the name". `PUT /_/api/admin/users/:id` now also takes `access_key_id` and `secret_access_key`, and `PUT /_/api/admin/groups/:id` takes `member_ids`: an edit is one request and one transaction, and a refusal of any part changes nothing. A UNIQUE conflict now names its column ("the access key id is already in use").
+
 ## v2.1.0 — 2026-11-01
 
 ### Upgrade steps for 2.1.0 (read before you upgrade)

@@ -214,11 +214,11 @@ A config write that makes a bucket that holds objects start to encrypt with a pr
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` / `POST` | `/_/api/admin/users` | List / create |
-| `PUT` / `DELETE` | `/_/api/admin/users/:id` | Update / delete (`409` for the last user when no other credential is left) |
+| `PUT` / `DELETE` | `/_/api/admin/users/:id` | Update / delete (`409` for the last user when no other credential is left). The update also takes `access_key_id` and `secret_access_key`: the edit then rotates the keys in the same transaction, and the answer carries the new secret once |
 | `POST` | `/_/api/admin/users/:id/rotate-keys` | Rotate access keys |
 | `POST` | `/_/api/admin/users/:id/clone` | Clone a user (new keys, copied permissions) |
 | `GET` / `POST` | `/_/api/admin/groups` | List / create |
-| `PUT` / `DELETE` | `/_/api/admin/groups/:id` | Update / delete |
+| `PUT` / `DELETE` | `/_/api/admin/groups/:id` | Update / delete. The update also takes `member_ids`, the whole member list the group must have afterwards: the proxy applies the difference in the same transaction as the rest of the edit |
 | `POST` | `/_/api/admin/groups/:id/clone` | Clone a group |
 | `POST` | `/_/api/admin/groups/:id/members` | Add user to group |
 | `DELETE` | `/_/api/admin/groups/:id/members/:user_id` | Remove user from group |
