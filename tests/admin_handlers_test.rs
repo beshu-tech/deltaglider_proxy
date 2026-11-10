@@ -887,6 +887,71 @@ async fn password_change_verifies_validates_persists_and_audits() {
     assert_audited(&fresh, &ep, "change_password", "").await;
 }
 
+/// F8: the password endpoint is a password oracle like login. It shares the
+/// login lockout and audits each failure (never the password).
+#[tokio::test]
+async fn password_change_is_throttled_audited_and_ends_other_sessions() {
+    let server = TestServer::builder()
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "3")
+        .env("DGP_RATE_LIMIT_WINDOW_SECS", "60")
+        .env("DGP_RATE_LIMIT_LOCKOUT_SECS", "60")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let put = |cur: &str| {
+        admin
+            .put(format!("{ep}/_/api/admin/password"))
+            .json(&json!({ "current_password": cur, "new_password": "a-new-strong-password-1" }))
+            .send()
+    };
+    let mut codes = Vec::new();
+    for i in 0..6 {
+        codes.push(put(&format!("wrong-guess-{i}")).await.unwrap().status());
+    }
+    assert_eq!(codes[0], StatusCode::FORBIDDEN, "{codes:?}");
+    assert!(
+        codes.contains(&StatusCode::TOO_MANY_REQUESTS),
+        "guesses are throttled: {codes:?}"
+    );
+    let entries = audit(&admin, &ep).await;
+    assert!(
+        entries.iter().any(|(a, _)| a == "change_password_failed"),
+        "a failed guess is audited: {entries:?}"
+    );
+    assert!(
+        entries.iter().all(|(_, t)| !t.contains("wrong-guess")),
+        "the guess never reaches the audit log: {entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn password_rotation_ends_the_other_bootstrap_sessions() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let other = admin_http_client(&ep).await;
+    assert!(session_valid(&other, &ep).await);
+    let resp = admin
+        .put(format!("{ep}/_/api/admin/password"))
+        .json(&json!({
+            "current_password": common::TEST_BOOTSTRAP_PASSWORD,
+            "new_password": "a-new-strong-password-1"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        session_valid(&admin, &ep).await,
+        "the session that rotated stays"
+    );
+    assert!(
+        !session_valid(&other, &ep).await,
+        "another bootstrap session ends at the rotation"
+    );
+}
+
 #[tokio::test]
 async fn recover_db_answers_only_under_a_mismatch_and_names_the_key_kind() {
     const KEY_GOOD: &str = "recover-good-key-0123456789abcdef0123456789ab";

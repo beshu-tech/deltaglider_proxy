@@ -2313,6 +2313,34 @@ mod source_guards {
         assert!(sites >= 3, "the scan found the proven sign-ins ({sites})");
     }
 
+    /// E10/F8: an HTTP handler that checks a secret (`bcrypt::verify`,
+    /// `iam_user_secret_valid`, `probe_key`) enters a `RateLimitGuard`
+    /// BEFORE the check, in the same fn. A new password oracle without a
+    /// lockout fails here. The check fns themselves are not handlers.
+    #[test]
+    fn every_secret_check_in_a_handler_enters_a_rate_limit_guard_first() {
+        let checks = ["bcrypt::verify(", "iam_user_secret_valid(", "probe_key("];
+        let mut sites = 0;
+        for (file, text) in crate::source_scan::prod_sources("src/api") {
+            let prod = crate::source_scan::prod_text(&text);
+            for check in checks {
+                for (at, _) in prod.match_indices(check) {
+                    let fn_start = prod[..at].rfind("fn ").unwrap_or(0);
+                    let head = &prod[fn_start..at];
+                    if head.trim_end() == "fn" {
+                        continue; // the definition of the check fn
+                    }
+                    sites += 1;
+                    assert!(
+                        head.contains("RateLimitGuard::enter"),
+                        "{file}: `{check}` without a RateLimitGuard before it in its fn"
+                    );
+                }
+            }
+        }
+        assert!(sites >= 6, "the scan found the secret checks ({sites})");
+    }
+
     /// Review A14: every admin path that can remove IAM users decides the
     /// lockout rule (`check_lockout`, or `allow_empty` for the restore)
     /// BEFORE the write, in the same function. A new path that deletes
