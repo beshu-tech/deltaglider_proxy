@@ -54,3 +54,29 @@ test('"Remove bootstrap credentials" asks, then calls the removal endpoint', asy
   // The server's warning (the same key still signs as an IAM user) is shown.
   expect(await screen.findByText(/also IAM user 'legacy-admin'/)).toBeInTheDocument();
 });
+
+/**
+ * F47 (epic #146): the removal changes the `access` section on the server,
+ * so the editor's version (ETag) is stale after it. The next Apply sent the
+ * old `If-Match`, got 409 and showed a false "changed in another tab"
+ * dialog. The panel re-reads the section after the removal (`rebase`).
+ */
+test('after the removal the editor reads the section again, so its version is current', async () => {
+  let version = 1;
+  http.on('GET', '/_/api/admin/config/section/access', () =>
+    new Response(JSON.stringify({ iam_mode: 'gui' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json', etag: `"v${version}"` },
+    }),
+  );
+  http.on('DELETE', '/_/api/admin/config/bootstrap-credentials', () => {
+    version = 2;
+    return json({ removed: true, warnings: [] });
+  });
+  const user = userEvent.setup();
+  renderWithQuery(<CredentialsModePanel />);
+  await user.click(await screen.findByRole('button', { name: 'Remove bootstrap credentials' }));
+  await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Remove' }));
+  await waitFor(() => expect(http.callsTo('DELETE', '/_/api/admin/config/bootstrap-credentials')).toHaveLength(1));
+  await waitFor(() => expect(http.callsTo('GET', '/_/api/admin/config/section/access')).toHaveLength(2));
+});
