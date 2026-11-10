@@ -13,6 +13,16 @@
 - **The jobs database has `-wal` and `-shm` files.** `deltaglider_jobs.db` now runs in write-ahead-log mode, so next to it the proxy keeps `deltaglider_jobs.db-wal` and `deltaglider_jobs.db-shm`. A backup of `deltaglider_jobs.db` alone can miss the newest commits, and a file copy while the proxy runs can be wrong. Back up the three files with the proxy stopped, or take a snapshot of the whole volume at one instant. The proxy user must be able to create these two files in the folder of the database. The Full Backup does not hold this database. The files `deltaglider_jobs.db-wal` and `deltaglider_jobs.db-shm` are in `.gitignore`.
 - **A power loss can lose the last job commits.** The jobs database commits without waiting for the disk, except the commits that an effect which cannot be undone depends on: the claim of an outbox batch, the Slack post record, each migrate phase save and the first copy of job rows from an older release. A lost append to the outbox is a lost event, and a lost settle is a re-delivery.
 
+### Security
+
+- `PUT /_/api/admin/password` now shares the sign-in lockout of the login endpoint, records each wrong guess in the audit log as `change_password_failed` (never the password), and ends the other bootstrap sessions when the password changes. The session that changed the password stays.
+- A bulk-delete job is cancelled by the principal that started it (the IAM access key id), not by a display name. A user named `admin` can no longer cancel the jobs of the admin session.
+- A filtered LIST with a delimiter other than `/` no longer shows a folded name (such as `sec` for `secret/k`) when a Deny statement hides every key under it. A delimiter of more than one character now lists the whole request instead of a visible prefix, so the folding is the same as without the filter.
+- The presigned `X-Amz-Signature`, `X-Amz-Credential` and `X-Amz-Security-Token` no longer reach the logs. The request span shows them as `REDACTED`, and `s3s::service` stays at `info` whatever the log level, because that module logs the whole request at `debug`.
+- An S3 backend endpoint name that resolves to a loopback address (for example `localtest.me`) is refused at connect time, as the literal `127.0.0.1` already was. `allow_local: true` permits it. Private (RFC 1918) answers stay allowed for on-premises storage behind internal DNS.
+- A webhook or OIDC HTTP client that cannot be built is an error. Before, the proxy fell back to a default client without the SSRF resolver.
+- Where the session cookie is `Secure` (TLS at the proxy or behind a trusted `X-Forwarded-Proto: https`), its name is `__Host-dgp_session`. On plain HTTP the name stays `dgp_session`. The proxy still reads the old name, and logout clears both names.
+
 ### Added
 
 - `DGP_STATE_LOCK_WAIT_SECS` (default 60): how long a starting process waits for the state directory lock. `0` means do not wait.
