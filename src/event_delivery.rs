@@ -232,10 +232,13 @@ pub fn endpoint_id(endpoint: &str) -> String {
 
 #[derive(Clone)]
 pub struct HttpWebhookDeliveryClient {
-    client: reqwest::Client,
+    /// `Err` when the guarded client could not be built: every delivery then
+    /// fails (permanently) with that reason. There is no fallback client: a
+    /// default one has no SSRF resolver.
+    client: Result<reqwest::Client, String>,
     /// The same client for `event_delivery.allow_local: true`: its resolver
     /// allows private addresses (metadata stays refused).
-    local_client: reqwest::Client,
+    local_client: Result<reqwest::Client, String>,
     /// When true, skip the per-URL SSRF `validate_outbound_url` check. ONLY set
     /// by tests that deliver to a local mock server; the production constructor
     /// (`Default`) leaves it false so private/metadata targets are rejected.
@@ -258,7 +261,11 @@ impl Default for HttpWebhookDeliveryClient {
                     crate::security::SsrfGuardedResolver::new(kind),
                 ))
                 .build()
-                .unwrap_or_default()
+                .map_err(|e| {
+                    let reason = format!("the webhook HTTP client could not be built: {e}");
+                    tracing::error!("{reason}");
+                    reason
+                })
         };
         Self {
             client: build(UrlKind::Webhook),
@@ -291,12 +298,13 @@ impl HttpWebhookDeliveryClient {
     }
 
     /// The HTTP client for `config`'s URL policy.
-    fn http(&self, config: &EventDeliveryConfig) -> &reqwest::Client {
-        if config.allow_local {
+    fn http(&self, config: &EventDeliveryConfig) -> Result<&reqwest::Client, String> {
+        let client = if config.allow_local {
             &self.local_client
         } else {
             &self.client
-        }
+        };
+        client.as_ref().map_err(|reason| permanent(reason.clone()))
     }
 
     /// Test-only: like `default()` but skips the SSRF guard so tests can deliver
@@ -513,7 +521,7 @@ impl HttpWebhookDeliveryClient {
         let url = Url::parse(endpoint)
             .map_err(|e| permanent(format!("invalid webhook endpoint: {e}")))?;
         let mut request = self
-            .http(config)
+            .http(config)?
             .post(url)
             .timeout(timeout)
             .header("user-agent", "deltaglider-proxy-event-outbox");
@@ -560,7 +568,7 @@ impl HttpWebhookDeliveryClient {
         }
         let result: Result<(), String> = async {
             let response = self
-                .client
+                .http(config)?
                 .post("https://slack.com/api/chat.postMessage")
                 .timeout(timeout)
                 .bearer_auth(&token)
@@ -603,7 +611,7 @@ impl HttpWebhookDeliveryClient {
         let url = Url::parse(endpoint)
             .map_err(|e| permanent(format!("invalid slack webhook URL: {e}")))?;
         let response = self
-            .http(config)
+            .http(config)?
             .post(url)
             .timeout(timeout)
             .json(&body)
@@ -1387,6 +1395,28 @@ mod tests {
             redact_url_for_error("http://host:8080/a/b"),
             "http://host:8080/<redacted>"
         );
+    }
+
+    /// F54: a client that could not be built is an error on every delivery,
+    /// permanent, never a default client without the SSRF resolver.
+    #[test]
+    fn a_client_that_could_not_be_built_fails_every_delivery() {
+        let broken = HttpWebhookDeliveryClient {
+            client: Err("no tls".to_string()),
+            local_client: Err("no tls".to_string()),
+            skip_ssrf_check: false,
+        };
+        for allow_local in [false, true] {
+            let config = EventDeliveryConfig {
+                allow_local,
+                ..Default::default()
+            };
+            let err = broken.http(&config).unwrap_err();
+            assert!(is_permanent_error(&err), "{err}");
+            assert!(err.contains("no tls"), "{err}");
+        }
+        let ok = HttpWebhookDeliveryClient::default();
+        assert!(ok.http(&EventDeliveryConfig::default()).is_ok());
     }
 
     /// M1 (SSRF): the PRODUCTION client (`default()`, guard ON) must reject a

@@ -201,7 +201,9 @@ pub struct OidcProvider {
     pub issuer_url: String,
     pub scopes: String,
     pub extra_config: serde_json::Value,
-    http: reqwest::Client,
+    /// `None` when the guarded client could not be built (`config_error`
+    /// says why): there is no fallback client, so nothing is sent.
+    http: Option<reqwest::Client>,
     /// Outbound-URL policy from `extra_config.allow_local`.
     url_kind: UrlKind,
     /// Why the HTTP client could not take the configured policy (a bad
@@ -318,11 +320,12 @@ impl OidcProvider {
             }
             Err(e) => config_error = config_error.or(Some(e)),
         }
+        // No fallback: a default client has no SSRF resolver.
         let http = match builder.build() {
-            Ok(c) => c,
+            Ok(c) => Some(c),
             Err(e) => {
                 config_error = config_error.or(Some(format!("HTTP client: {}", error_chain(&e))));
-                reqwest::Client::default()
+                None
             }
         };
         Self {
@@ -346,6 +349,15 @@ impl OidcProvider {
             Some(e) => Err(ExternalAuthError::ConfigError(e.clone())),
             None => Ok(()),
         }
+    }
+
+    /// THE client of every outbound request: the SSRF-guarded one, or the
+    /// construction error. Never a default client.
+    fn client(&self) -> Result<&reqwest::Client, ExternalAuthError> {
+        self.check_config()?;
+        self.http.as_ref().ok_or_else(|| {
+            ExternalAuthError::ConfigError("the HTTP client could not be built".to_string())
+        })
     }
 
     /// Generate the authorization URL for browser redirect.
@@ -436,9 +448,8 @@ impl OidcProvider {
             params.push(("code_verifier", verifier.clone()));
         }
 
-        self.check_config()?;
         let resp = self
-            .http
+            .client()?
             .post(&token_endpoint)
             .form(&params)
             .send()
@@ -561,7 +572,7 @@ impl OidcProvider {
             self.issuer_url.trim_end_matches('/')
         );
         let resp = self
-            .http
+            .client()?
             .get(&url)
             .send()
             .await
@@ -607,7 +618,7 @@ impl OidcProvider {
         validate_outbound_url(jwks_uri, self.url_kind)
             .map_err(|e| ExternalAuthError::DiscoveryFailed(format!("jwks_uri: {e}")))?;
         let resp = self
-            .http
+            .client()?
             .get(jwks_uri)
             .send()
             .await

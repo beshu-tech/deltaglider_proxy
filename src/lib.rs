@@ -2363,6 +2363,45 @@ mod source_guards {
         );
     }
 
+    /// E10/F54: a client built with the SSRF resolver has no fallback. A
+    /// failed build is an error that stops the request, never a default
+    /// client (which has no resolver guard and follows redirects).
+    #[test]
+    fn a_guarded_http_client_has_no_unguarded_fallback() {
+        let mut guarded_files = 0;
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            let prod = crate::source_scan::prod_text(&text);
+            if !prod.contains("SsrfGuardedResolver::new(") || file == "src/security.rs" {
+                continue;
+            }
+            guarded_files += 1;
+            for bare in ["reqwest::Client::default()", "reqwest::Client::new()"] {
+                assert!(
+                    !prod.contains(bare),
+                    "{file} builds an SSRF-guarded client and also has `{bare}`"
+                );
+            }
+            // A `.build()` followed by a default: the failed build becomes
+            // a client without the resolver.
+            for (at, _) in prod.match_indices(".build()") {
+                let after: String = prod[at + 8..]
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .take(40)
+                    .collect();
+                assert!(
+                    !after.starts_with(".unwrap_or_default()")
+                        && !after.starts_with(".unwrap_or_else(|_|reqwest"),
+                    "{file}: a failed client build falls back to a default client"
+                );
+            }
+        }
+        assert!(
+            guarded_files >= 2,
+            "the scan found the guarded clients ({guarded_files})"
+        );
+    }
+
     /// Review A14: every admin path that can remove IAM users decides the
     /// lockout rule (`check_lockout`, or `allow_empty` for the restore)
     /// BEFORE the write, in the same function. A new path that deletes
