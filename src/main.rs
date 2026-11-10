@@ -1297,6 +1297,25 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
 
+    // --- Stale temp files of killed writes (F22) ---
+    // A background walk of every filesystem data root, off the boot path.
+    // Age-based (`STALE_TEMP_MAX_AGE`): the state lock does not cover the
+    // data root, so a file that anyone may still write is never removed.
+    for root in config.filesystem_roots() {
+        tokio::task::spawn_blocking(move || {
+            let removed = deltaglider_proxy::storage::sweep_stale_temp_files(
+                &root,
+                deltaglider_proxy::storage::STALE_TEMP_MAX_AGE,
+            );
+            if removed > 0 {
+                info!(
+                    "Swept {removed} stale temp file(s) of killed writes from {}",
+                    root.display()
+                );
+            }
+        });
+    }
+
     // --- Start server ---
     let limits = deltaglider_proxy::serve::ListenerLimits::from_tuning(&config.tuning);
     if let Some(rustls_config) = rustls_config {

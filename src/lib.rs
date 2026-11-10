@@ -717,6 +717,36 @@ mod source_guards {
         );
     }
 
+    /// F22 (#145): every filesystem data root gets the stale-temp sweep at
+    /// boot, in a background task (never awaited on the boot path), with the
+    /// age rule of `STALE_TEMP_MAX_AGE`. Only `filesystem/sweep.rs` decides
+    /// who is stale; `.dg-tmp.` is made by one function (`internal_temp_in`).
+    #[test]
+    fn the_boot_sweeps_stale_temp_files_in_the_background() {
+        let main = include_str!("main.rs");
+        let call = main
+            .find("sweep_stale_temp_files(")
+            .expect("main.rs no longer sweeps stale temp files");
+        let before = &main[..call];
+        let spawn = before
+            .rfind("spawn_blocking")
+            .expect("sweep is not spawned");
+        assert!(
+            call - spawn < 200 && !main[spawn..call].contains(".await"),
+            "the sweep must run inside spawn_blocking, not on the boot path"
+        );
+        assert!(
+            main.contains("filesystem_roots()") && main.contains("STALE_TEMP_MAX_AGE"),
+            "the sweep covers every filesystem root with the stale-age rule"
+        );
+        let write = include_str!("storage/filesystem/write.rs");
+        assert_eq!(
+            write.matches(".prefix(INTERNAL_TEMP_PREFIX)").count(),
+            1,
+            "one function names the temp files"
+        );
+    }
+
     /// #120: production code names the `dg-sealed` key only where a sealed
     /// object is handled: the encrypting wrapper (which seals and opens),
     /// the key's definition, and the inner-backend code that must recognise

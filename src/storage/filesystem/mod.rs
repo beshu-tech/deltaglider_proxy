@@ -22,11 +22,14 @@ use super::io_to_storage_error;
 #[cfg(test)]
 pub(crate) mod fault;
 mod fsio;
+mod sweep;
 #[cfg(test)]
 mod tests;
 mod write;
 
 use write::*;
+
+pub use sweep::{sweep_stale_temp_files, STALE_TEMP_MAX_AGE};
 
 /// Prefix of this backend's own temp files (atomic write-then-rename).
 const INTERNAL_TEMP_PREFIX: &str = ".dg-tmp.";

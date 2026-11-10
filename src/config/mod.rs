@@ -2261,6 +2261,21 @@ impl Config {
         }
     }
 
+    /// The root folder of every filesystem backend (the legacy singleton
+    /// and each named one), for the startup sweep of stale temp files.
+    pub fn filesystem_roots(&self) -> Vec<std::path::PathBuf> {
+        let mut roots = Vec::new();
+        let all = std::iter::once(&self.backend).chain(self.backends.iter().map(|b| &b.backend));
+        for backend in all {
+            if let BackendConfig::Filesystem { path } = backend {
+                if !roots.contains(path) {
+                    roots.push(path.clone());
+                }
+            }
+        }
+        roots
+    }
+
     /// The startup banner's storage lines: EVERY backend with its type and
     /// location, the default marked. (The banner used to print only the
     /// legacy singleton, so a multi-backend proxy logged "Backend:

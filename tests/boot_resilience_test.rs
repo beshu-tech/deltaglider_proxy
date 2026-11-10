@@ -6,7 +6,7 @@
 
 use crate::common;
 
-use common::TestServer;
+use common::{S3Requests, TestServer};
 
 /// A listener that accepts every connection and closes it at once: the shape
 /// of an S3 endpoint that is up at the TCP level and dead above it.
@@ -193,5 +193,105 @@ async fn hanging_identity_providers_do_not_delay_the_boot() {
     assert!(
         boot < std::time::Duration::from_secs(8),
         "the boot waited on identity-provider discovery: {boot:?}"
+    );
+}
+
+/// Every `.dg-tmp.*` file below `dir`.
+fn temp_files_below(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                stack.push(path);
+            } else if entry.file_name().to_string_lossy().starts_with(".dg-tmp.") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// F22: a proxy killed with SIGKILL in the middle of a storage write leaves
+/// its `.dg-tmp.*` file. The next boot on the same data directory removes it
+/// when it is old, keeps a fresh one (a live writer may hold it), and LIST
+/// never shows either.
+#[tokio::test]
+async fn a_restart_after_sigkill_sweeps_the_stale_temp_file() {
+    let mut server = TestServer::builder()
+        .max_object_size(2 * 1024 * 1024 * 1024)
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let data = server.data_dir().expect("data dir").to_path_buf();
+    let http = server.http();
+
+    // A large passthrough body: the write copies it into a temp file for a
+    // moment, long enough to poll for.
+    let body = vec![0x5au8; 768 * 1024 * 1024];
+    let put = tokio::spawn({
+        let ep = ep.clone();
+        let bucket = bucket.clone();
+        async move {
+            let r = http
+                .s3_request(
+                    reqwest::Method::PUT,
+                    &format!("{ep}/{bucket}/big/photo.jpg"),
+                )
+                .header("content-type", "image/jpeg")
+                .body(body)
+                .send()
+                .await;
+            drop(r);
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let stale = loop {
+        if let Some(f) = temp_files_below(&data).into_iter().next() {
+            break f;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no .dg-tmp.* file appeared during the PUT"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    };
+    server.kill(); // SIGKILL: no destructor runs.
+    put.abort();
+    assert!(stale.exists(), "the kill removed the temp file itself");
+
+    // Another leftover that is fresh, as a live writer's file would be.
+    let fresh = stale.with_file_name(".dg-tmp.fresh0");
+    std::fs::write(&fresh, b"live").unwrap();
+    // The killed write's file is two hours old.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+
+    server.respawn_with_env(&[]).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while stale.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stale temp file {} is still there after the restart",
+            stale.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(fresh.exists(), "a fresh temp file must be kept");
+
+    let listing = common::list_objects_raw(&server.http(), &ep, &bucket, "").await;
+    assert!(
+        !listing.contains(".dg-tmp."),
+        "LIST shows a temp file: {listing}"
     );
 }
