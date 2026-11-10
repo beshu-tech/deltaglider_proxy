@@ -7,6 +7,8 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { queryClient } from '../queries/client';
+import { qk } from '../queries/keys';
 import { json, mockFetch } from '../test/fetchMock';
 import { disconnect, initFromSession, listBuckets, setCredentials, setEndpoint } from '../s3client';
 
@@ -66,4 +68,27 @@ test('only dropClient forgets the client: every credential change drops the list
   // The declaration `let cachedClient: S3Client | null = null;` does not match; the one reset is in dropClient.
   expect(resets).toHaveLength(1);
   expect(text).toMatch(/function dropClient\(\)[^}]*cachedClient = null[^}]*listBucketsShared = null/s);
+});
+
+test('a user who signs in right after another never gets the first user\'s bucket origins', async () => {
+  // The origins sit in the react-query cache (5 s stale time), which is not
+  // indexed by the credentials. The origins endpoint answers per session: an
+  // admin sees an unavailable bucket that the next user must not see.
+  http.on('GET', '/_/api/admin/buckets', () =>
+    json({
+      buckets:
+        signedInAs === 'ak-dana'
+          ? [{ name: 'dana-only-bucket', backend_name: 'aws-dr', real_bucket: 'secret-real-name', unavailable: 'down' }]
+          : [],
+    }),
+  );
+  signedInAs = 'ak-dana';
+  await initFromSession();
+  expect((await listBuckets()).map((b) => b.name)).toContain('dana-only-bucket');
+  disconnect();
+  signedInAs = 'ak-bob';
+  await setCredentials('ak-bob', 'sk-bob');
+  const names = (await listBuckets()).map((b) => b.name);
+  expect(names).toEqual(['buckets-of-ak-bob']);
+  expect(queryClient.getQueryData(qk.backends.origins())).toEqual({ buckets: [] });
 });

@@ -97,6 +97,15 @@ describe('what the preview says about its limits', () => {
   test('with scripts off it claims only what holds', () => {
     expect(isolationNote({ scripts: false, remote: false })).toMatch(/cannot send requests by itself/);
   });
+  test('with remote content on it does not claim the page cannot send requests', () => {
+    // previewCsp lets img/media/font/style load from https: each load is a request.
+    for (const scripts of [false, true]) {
+      const note = isolationNote({ scripts, remote: true });
+      expect(note).toMatch(/loads images, fonts and styles from other https sites, which sends requests/);
+      expect(note).not.toMatch(/cannot send requests/);
+    }
+    expect(previewCsp({ scripts: false, remote: true })).toMatch(/img-src [^;]*https:/);
+  });
   test('it always says the page cannot read the session or credentials', () => {
     for (const opts of ALL) expect(isolationNote(opts)).toMatch(/cannot read your session or credentials/);
   });

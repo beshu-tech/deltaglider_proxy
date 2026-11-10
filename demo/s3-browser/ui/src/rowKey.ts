@@ -7,7 +7,7 @@
  * the table, the selection and the keyboard cursor hold. Only this module
  * makes a `RowKey` (`rowKeyOf`) and only it takes one apart (`parseRowKey`):
  * the encoding adds a one-letter tag, so no object key can equal a folder's
- * row key. A source guard (`src/__tests__/rowKeyGuard.test.ts`) and an ESLint
+ * row key. A source guard (`the source guard in src/__tests__/rowIdentity.test.ts`) and an ESLint
  * rule refuse any other code that builds or parses row-key text.
  *
  * Pure and React-free.

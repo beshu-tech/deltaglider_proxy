@@ -29,13 +29,19 @@ export function sandboxFlags({ scripts }: HtmlPreviewOptions): string {
 /**
  * What the preview tells the user about its limits (F48, epic #146). It must
  * stay true: with scripts on, the page can send a request by moving itself to
- * another address.
+ * another address; with remote content on, its images, fonts, styles and
+ * media load from other https sites, and each load is a request.
  */
-export function isolationNote({ scripts }: HtmlPreviewOptions): string {
+export function isolationNote({ scripts, remote }: HtmlPreviewOptions): string {
   const base = 'The page runs isolated from this console: it cannot read your session or credentials.';
+  const remoteNote = remote
+    ? ' Remote content is on, so the page loads images, fonts and styles from other https sites, which sends requests.'
+    : '';
   return scripts
-    ? `${base} Scripts are on, so the page can still send a request by moving itself to another address.`
-    : `${base} Scripts are off, so the page cannot send requests by itself.`;
+    ? `${base} Scripts are on, so the page can still send a request by moving itself to another address.${remoteNote}`
+    : remote
+      ? `${base}${remoteNote}`
+      : `${base} Scripts are off, so the page cannot send requests by itself.`;
 }
 
 /** The Content-Security-Policy that the preview injects into the page. */
