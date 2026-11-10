@@ -1371,6 +1371,7 @@ impl Env {
 /// it applies the rotation too.
 #[tokio::test]
 async fn the_witness_makes_a_disagreeing_instance_refuse_writes_minio() {
+    crate::common::expect_server_errors("a witness mismatch makes writes answer 503 (asserted)");
     skip_unless_minio!();
     let coord = common::unique_bucket("enc-witness");
     common::minio_client()
@@ -1483,6 +1484,7 @@ async fn the_witness_makes_a_disagreeing_instance_refuse_writes_minio() {
 /// converges, and its plaintext form needs the downgrade confirmation.
 #[tokio::test]
 async fn a_restart_rollout_converges_by_witness_publish_minio() {
+    crate::common::expect_server_errors("a witness mismatch makes writes answer 503 (asserted)");
     skip_unless_minio!();
     let coord = common::unique_bucket("enc-witness");
     common::minio_client()
@@ -1541,6 +1543,7 @@ async fn a_restart_rollout_converges_by_witness_publish_minio() {
 /// even when the node's config does not change.
 #[tokio::test]
 async fn the_witness_never_lets_a_downgrade_win_by_boot_minio() {
+    crate::common::expect_server_errors("a witness mismatch makes writes answer 503 (asserted)");
     skip_unless_minio!();
     let coord = common::unique_bucket("enc-witness");
     common::minio_client()
@@ -1601,6 +1604,7 @@ async fn the_witness_never_lets_a_downgrade_win_by_boot_minio() {
 /// older than the rotation, so it keeps refusing.
 #[tokio::test]
 async fn a_lagging_instance_never_reverts_a_rotation_minio() {
+    crate::common::expect_server_errors("a witness mismatch makes writes answer 503 (asserted)");
     skip_unless_minio!();
     let coord = common::unique_bucket("enc-witness");
     common::minio_client()
@@ -1656,6 +1660,7 @@ async fn a_lagging_instance_never_reverts_a_rotation_minio() {
 /// refuses.
 #[tokio::test]
 async fn a_bucket_block_downgrade_against_the_backends_star_refuses_minio() {
+    crate::common::expect_server_errors("a witness mismatch makes writes answer 503 (asserted)");
     skip_unless_minio!();
     let coord = common::unique_bucket("enc-witness");
     common::minio_client()

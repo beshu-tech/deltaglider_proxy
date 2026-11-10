@@ -26,6 +26,9 @@ fn dropping_endpoint() -> String {
 /// `/_/health`, with the boot probe on `warn` as the operator asked.
 #[tokio::test]
 async fn an_unreachable_coordination_bucket_does_not_stop_the_boot() {
+    crate::common::expect_server_errors(
+        "CreateBucket answers 503 while the coordination bucket is unreachable",
+    );
     let endpoint = dropping_endpoint();
     let server = TestServer::builder()
         .auth("bootstrap_key", "bootstrap_secret")

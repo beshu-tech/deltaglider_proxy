@@ -682,6 +682,9 @@ async fn check_again_lifts_read_only_when_the_backend_has_atomic_writes() {
 /// (CAS) exists, the same write is stored.
 #[tokio::test]
 async fn writes_wait_with_503_until_the_first_verdict() {
+    crate::common::expect_server_errors(
+        "writes answer 503 until the first atomic-writes verdict (asserted)",
+    );
     let mut env = Env::new("atompend", &[]).await;
     let (code, v) = env
         .storage(

@@ -57,6 +57,9 @@ pub mod types;
 pub mod usage_scanner;
 pub mod zip_stream;
 
+#[cfg(test)]
+mod test_root;
+
 /// THE source scanner that every source guard uses: one file walker and one
 /// definition of "production lines". A guard that cut a file at its first
 /// `#[cfg(test)]` stopped at the first test-only ITEM (a `#[cfg(test)] fn`)
@@ -1870,6 +1873,106 @@ mod source_guards {
         assert!(checked >= 4, "scan found the MinIO steps ({checked})");
     }
 
+    /// A fault test that injects its fault with mode bits (`0o000`, `0o5xx`,
+    /// `0o4xx`) proves nothing as root, and CI runs as root. Such a test
+    /// reports the skip through `root_skip` (`tests/common/server.rs`, or
+    /// `crate::test_root` in the lib), which fails under
+    /// `DGP_TEST_REQUIRE_NONROOT`, so the non-root CI job turns a silent
+    /// skip into a red test. A hand-written `return` after `geteuid()` is
+    /// the silent skip; only the two helpers may call `geteuid`.
+    #[test]
+    fn test_mode_bit_fault_tests_skip_through_root_skip() {
+        let geteuid = ["get", "euid("].concat();
+        let helpers = ["src/test_root.rs", "tests/common/server.rs"];
+        let denies =
+            ["0o000", "0o400", "0o444", "0o500", "0o555"].map(|m| ["from_mode(", m, ")"].concat());
+        let mut files = rust_files("tests");
+        let lib_files = rust_files("src");
+        let test_files = out_of_line_test_modules(&lib_files);
+        let mut offenders = Vec::new();
+        let mut faulting = 0;
+        let mut scanned: Vec<(String, String)> = Vec::new();
+        files.retain(|f| f.extension().is_some_and(|e| e == "rs"));
+        for f in &files {
+            scanned.push((rel_path(f), std::fs::read_to_string(f).unwrap()));
+        }
+        for f in &lib_files {
+            let text = std::fs::read_to_string(f).unwrap();
+            let body = if test_files.contains(f) {
+                text.clone()
+            } else {
+                test_module_lines(&text)
+                    .into_iter()
+                    .map(|(_, l)| l)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            scanned.push((rel_path(f), body));
+        }
+        for (rel, body) in &scanned {
+            let uses_root_skip = body.contains("root_skip(");
+            for (n, line) in body.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(geteuid.as_str()) && !helpers.contains(&rel.as_str()) {
+                    offenders.push(format!("{rel}:{}: call root_skip, not geteuid", n + 1));
+                }
+                if denies.iter().any(|d| line.contains(d.as_str())) {
+                    faulting += 1;
+                    if !uses_root_skip {
+                        offenders
+                            .push(format!("{rel}:{}: mode-bit fault without root_skip", n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            faulting >= 6,
+            "scan found the mode-bit fault tests ({faulting})"
+        );
+        assert!(offenders.is_empty(), "{offenders:#?}");
+    }
+
+    /// Every test that reports a root skip runs in the non-root CI job
+    /// (`test-nonroot` in ci.yml), where `DGP_TEST_REQUIRE_NONROOT=1` turns
+    /// the skip into a failure. A new `root_skip("name")` not listed there
+    /// would skip silently in CI forever.
+    #[test]
+    fn test_every_root_skip_runs_in_the_nonroot_ci_job() {
+        let ci = std::fs::read_to_string(root().join(".github/workflows/ci.yml")).unwrap();
+        let job = ci
+            .split("\n  test-nonroot:")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  test-delta:").next())
+            .expect("ci.yml has the test-nonroot job");
+        assert!(
+            job.contains("DGP_TEST_REQUIRE_NONROOT=1"),
+            "the job sets the flag"
+        );
+        let call = regex_lite::Regex::new(r#"root_skip\(\s*"([A-Za-z0-9_]+)""#).unwrap();
+        let mut names = Vec::new();
+        for file in rust_files("tests").into_iter().chain(rust_files("src")) {
+            let rel = rel_path(&file);
+            if rel == "src/lib.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            for c in call.captures_iter(&text) {
+                names.push((rel.clone(), c[1].to_string()));
+            }
+        }
+        assert!(names.len() >= 6, "scan found the root skips ({names:?})");
+        let missing: Vec<_> = names
+            .iter()
+            .filter(|(_, n)| !job.contains(n.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "add these tests to the test-nonroot job in ci.yml: {missing:?}"
+        );
+    }
+
     /// Test fixtures come from the real write path or a recorded fixture,
     /// never from a hand-built shape production does not emit: such
     /// fixtures kept C1 (open-access only), D14 (schema gate) and D17
@@ -2017,7 +2120,11 @@ mod source_guards {
     /// lock, plus two reads that are not config.
     #[test]
     fn test_modules_do_not_read_process_env() {
-        const ALLOWED: [(&str, &str); 7] = [
+        const ALLOWED: [(&str, &str); 8] = [
+            (
+                "src/test_root.rs",
+                "reads DGP_TEST_REQUIRE_NONROOT (read-only flag of the non-root CI job)",
+            ),
             (
                 "src/api/admin/auth.rs",
                 "cookie-flag env parsing, under LOCK",

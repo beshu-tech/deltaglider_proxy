@@ -1044,6 +1044,9 @@ async fn prod_shape_filesystem_serves_the_request_matrix() {
 /// verdict is in, the same write is stored.
 #[tokio::test]
 async fn prod_shape_writes_wait_for_the_first_atomic_writes_verdict() {
+    crate::common::expect_server_errors(
+        "writes answer 503 until the first atomic-writes verdict (asserted)",
+    );
     let data = tempfile::TempDir::new().expect("temp dir");
     let (doc, _) = adapt_fixture(data.path(), &DefaultBackend::Filesystem, "pending");
     // The bucket exists before the start: CreateBucket waits too.
