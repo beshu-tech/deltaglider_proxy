@@ -2341,6 +2341,28 @@ mod source_guards {
         assert!(sites >= 6, "the scan found the secret checks ({sites})");
     }
 
+    /// E10/F35: `triggered_by` is a display label (a user name, an OIDC name
+    /// claim: free text). No admin handler decides ownership by comparing it;
+    /// they compare the stored principal (`maintenance::delete::may_cancel`).
+    #[test]
+    fn no_handler_authorises_by_a_display_name() {
+        let mut offenders = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src/api") {
+            let prod = crate::source_scan::prod_text(&text);
+            for (i, line) in prod.lines().enumerate() {
+                let compares = line.contains("==") || line.contains("!=");
+                if compares && (line.contains("triggered_by") || line.contains(".label()")) {
+                    offenders.push(format!("{file}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "authorise by principal, not by display label:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// Review A14: every admin path that can remove IAM users decides the
     /// lockout rule (`check_lockout`, or `allow_empty` for the restore)
     /// BEFORE the write, in the same function. A new path that deletes

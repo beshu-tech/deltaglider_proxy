@@ -1229,8 +1229,10 @@ pub async fn cancel_delete_job(
             .maintenance_job_by_id(id)?
             .filter(|j| j.kind == crate::maintenance::delete::KIND)
             .ok_or_else(|| AdminError::not_found(format!("no delete job {id}")))?;
-        let own = job.triggered_by.as_deref() == Some(actor.label());
-        if !matches!(actor, BulkActor::Unrestricted) && !own {
+        // By the stored principal (the IAM access key id), never by the
+        // display name in `triggered_by`: that is free text.
+        if !crate::maintenance::delete::may_cancel(&job_principal(&session), job.params.as_deref())
+        {
             return Err(AdminError::forbidden(format!(
                 "AccessDenied: {} did not start delete job {id}",
                 actor.label()
