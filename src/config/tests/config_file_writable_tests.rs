@@ -4,11 +4,6 @@
 
 use crate::config::config_file_writable;
 
-fn is_root() -> bool {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() == 0 }
-}
-
 #[test]
 fn a_writable_dir_is_writable_with_or_without_the_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -28,8 +23,10 @@ fn a_missing_dir_is_not_writable() {
 #[test]
 fn a_read_only_dir_is_not_writable() {
     use std::os::unix::fs::PermissionsExt;
-    if is_root() {
-        return; // root ignores the mode bits; a read-only mount still counts.
+    if crate::test_root::is_root() {
+        // Root ignores the mode bits; fails closed under DGP_TEST_REQUIRE_NONROOT.
+        crate::test_root::root_skip("a_read_only_dir_is_not_writable");
+        return;
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cfg.yaml");

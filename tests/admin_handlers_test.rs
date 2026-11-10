@@ -743,8 +743,7 @@ async fn backend_and_rule_writes_answer_as_the_golden_file() {
 #[tokio::test]
 async fn rule_delete_that_cannot_persist_changes_nothing() {
     use std::os::unix::fs::PermissionsExt;
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
+    if common::running_as_root() {
         // Root ignores the directory mode: nothing to test here.
         common::root_skip("rule_delete_that_cannot_persist_changes_nothing");
         return;

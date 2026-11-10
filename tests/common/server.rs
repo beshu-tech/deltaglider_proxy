@@ -1068,6 +1068,12 @@ pub fn env_flag_on(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
 }
 
+/// Is the test process root? Root ignores mode bits.
+pub fn running_as_root() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
 /// A fault-injection test that needs mode bits (an unreadable file, a
 /// read-only directory) proves nothing as root: root ignores them. Such a
 /// test calls this and returns. The skip is loud, and a run that sets
