@@ -12,35 +12,26 @@
  * Only hooks that a panel actually consumes are exported — knip blocks dead
  * exports.
  */
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import {
   getGroups,
   createGroup,
   updateGroup,
+  type UpdateGroupRequest,
   deleteGroup,
   cloneGroup,
   addGroupMember,
-  removeGroupMember,
   type IamGroup,
 } from '../adminApi';
 import type { IamPermission } from '../adminApi';
 import { qk } from './keys';
+import { useInvalidateIamLists } from './users';
 
 export function useGroups() {
   return useQuery({
     queryKey: qk.groups.list(),
     queryFn: getGroups,
   });
-}
-
-/** Invalidate every cache touched by a group write: the groups list always,
- *  and the users list because group membership/permissions are inherited. */
-function useInvalidateGroups() {
-  const qc = useQueryClient();
-  return () => {
-    qc.invalidateQueries({ queryKey: qk.groups.list() });
-    qc.invalidateQueries({ queryKey: qk.users.list() });
-  };
 }
 
 interface CreateGroupVars {
@@ -50,7 +41,7 @@ interface CreateGroupVars {
 }
 
 export function useCreateGroup() {
-  const invalidate = useInvalidateGroups();
+  const invalidate = useInvalidateIamLists();
   return useMutation<IamGroup, Error, CreateGroupVars>({
     mutationFn: (vars) => createGroup(vars),
     onSuccess: invalidate,
@@ -59,11 +50,11 @@ export function useCreateGroup() {
 
 interface UpdateGroupVars {
   id: number;
-  patch: { name?: string; description?: string; permissions?: IamPermission[] };
+  patch: UpdateGroupRequest;
 }
 
 export function useUpdateGroup() {
-  const invalidate = useInvalidateGroups();
+  const invalidate = useInvalidateIamLists();
   return useMutation<IamGroup, Error, UpdateGroupVars>({
     mutationFn: ({ id, patch }) => updateGroup(id, patch),
     onSuccess: invalidate,
@@ -71,7 +62,7 @@ export function useUpdateGroup() {
 }
 
 export function useDeleteGroup() {
-  const invalidate = useInvalidateGroups();
+  const invalidate = useInvalidateIamLists();
   return useMutation<void, Error, number>({
     mutationFn: deleteGroup,
     onSuccess: invalidate,
@@ -84,7 +75,7 @@ interface CloneGroupVars {
 }
 
 export function useCloneGroup() {
-  const invalidate = useInvalidateGroups();
+  const invalidate = useInvalidateIamLists();
   return useMutation<IamGroup, Error, CloneGroupVars>({
     mutationFn: ({ id, copyMembers }) => cloneGroup(id, { copy_members: copyMembers }),
     onSuccess: invalidate,
@@ -97,17 +88,9 @@ interface GroupMemberVars {
 }
 
 export function useAddGroupMember() {
-  const invalidate = useInvalidateGroups();
+  const invalidate = useInvalidateIamLists();
   return useMutation<void, Error, GroupMemberVars>({
     mutationFn: ({ groupId, userId }) => addGroupMember(groupId, userId),
-    onSuccess: invalidate,
-  });
-}
-
-export function useRemoveGroupMember() {
-  const invalidate = useInvalidateGroups();
-  return useMutation<void, Error, GroupMemberVars>({
-    mutationFn: ({ groupId, userId }) => removeGroupMember(groupId, userId),
     onSuccess: invalidate,
   });
 }

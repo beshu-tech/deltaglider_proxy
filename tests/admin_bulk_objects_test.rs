@@ -1493,3 +1493,111 @@ async fn test_delete_job_refuses_a_bad_selection() {
         assert_eq!(resp.status().as_u16(), 400, "{body}");
     }
 }
+
+/// `no_overwrite` (F17): a destination key that holds an object is never
+/// replaced, whatever the browser listed before. The item is `skipped`
+/// (not a failure), a move keeps its source, and the other items go.
+#[tokio::test]
+async fn bulk_copy_and_move_with_no_overwrite_never_replace_a_destination() {
+    let server = TestServer::filesystem().await;
+    let http = server.http();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let bucket = server.bucket();
+    let put = |key: &'static str, body: &'static [u8]| {
+        let http = http.clone();
+        let url = format!("{ep}/{bucket}/{key}");
+        async move { http.put(url).body(body.to_vec()).send().await.unwrap() }
+    };
+    let get = |key: &'static str| {
+        let http = http.clone();
+        let url = format!("{ep}/{bucket}/{key}");
+        async move { http.get(url).send().await.unwrap() }
+    };
+    put("src/a.txt", b"new-a").await;
+    put("src/b.txt", b"new-b").await;
+    put("out/a.txt", b"old-a").await;
+
+    let request = |no_overwrite: bool| {
+        json!({
+            "source_bucket": bucket,
+            "dest_bucket": bucket,
+            "dest_prefix": "out/",
+            "no_overwrite": no_overwrite,
+            "items": [
+                { "source_key": "src/a.txt", "relative": "a.txt" },
+                { "source_key": "src/b.txt", "relative": "b.txt" }
+            ]
+        })
+    };
+
+    // Copy, conditional: a.txt exists, b.txt does not.
+    let r: Value = admin
+        .post(format!("{ep}/_/api/admin/objects/copy"))
+        .json(&request(true))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["succeeded"], 1, "{r}");
+    assert_eq!(r["failed"], 0, "{r}");
+    assert_eq!(r["skipped"], 1, "{r}");
+    assert_eq!(r["skipped_items"][0]["dest_key"], "out/a.txt", "{r}");
+    assert_eq!(get("out/a.txt").await.bytes().await.unwrap(), "old-a");
+    assert_eq!(get("out/b.txt").await.bytes().await.unwrap(), "new-b");
+
+    // Move, conditional: both destinations exist now. Nothing is written,
+    // no source is deleted.
+    let r: Value = admin
+        .post(format!("{ep}/_/api/admin/objects/move"))
+        .json(&request(true))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["succeeded"], 0, "{r}");
+    assert_eq!(r["failed"], 0, "{r}");
+    assert_eq!(r["skipped"], 2, "{r}");
+    assert_eq!(r["deleted"], 0, "{r}");
+    assert_eq!(get("src/a.txt").await.status().as_u16(), 200);
+    assert_eq!(get("src/b.txt").await.status().as_u16(), 200);
+
+    // A move of an object onto its own place: in place, not skipped, source kept.
+    let r: Value = admin
+        .post(format!("{ep}/_/api/admin/objects/move"))
+        .json(&json!({
+            "source_bucket": bucket,
+            "dest_bucket": bucket,
+            "dest_prefix": "out/",
+            "no_overwrite": true,
+            "items": [{ "source_key": "out/a.txt", "relative": "a.txt" }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["in_place"], 1, "{r}");
+    assert_eq!(r["skipped"], 0, "{r}");
+    assert_eq!(r["deleted"], 0, "{r}");
+    assert_eq!(get("out/a.txt").await.bytes().await.unwrap(), "old-a");
+
+    // The unconditional copy still overwrites (the user chose it).
+    let r: Value = admin
+        .post(format!("{ep}/_/api/admin/objects/copy"))
+        .json(&request(false))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["succeeded"], 2, "{r}");
+    assert_eq!(r["skipped"], 0, "{r}");
+    assert_eq!(get("out/a.txt").await.bytes().await.unwrap(), "new-a");
+}

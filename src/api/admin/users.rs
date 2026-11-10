@@ -35,6 +35,12 @@ pub struct UpdateUserRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
     pub permissions: Option<Vec<Permission>>,
+    /// A new access key id. With `secret_access_key` (or alone, when it
+    /// differs from the current one) the edit also rotates the keys, in the
+    /// same transaction: one edit is one request (a refusal of any part
+    /// applies none). A secret that is not given is generated.
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -488,24 +494,121 @@ pub async fn update_user(
         }
     }
 
+    // The keys part of the edit, decided BEFORE the first write.
+    let rotation = plan_key_rotation(
+        &db.get_user_by_id(user_id)?.access_key_id,
+        body.access_key_id.as_deref(),
+        body.secret_access_key.as_deref(),
+    )?;
+
     let user = db
-        .update_user(
+        .update_user_with_keys(
             user_id,
             body.name.as_deref(),
             body.enabled,
             normalized_perms.as_deref(),
+            rotation
+                .as_ref()
+                .map(|r| (r.access_key_id.as_str(), r.secret_access_key.as_str())),
         )
         .inspect_err(|e| {
             tracing::warn!("Failed to update user {}: {}", user_id, e);
-            // A rename to a name another user has (names are unique) → 409.
+            // A rename to a name another user has (names are unique) → 409,
+            // an access key another user has → 409; nothing was applied.
         })?;
 
-    rebuild_iam_index(&db, &state.iam_state)?;
-    trigger_config_sync(&state);
-
+    let rebuild_result = rebuild_iam_index(&db, &state.iam_state);
+    drop(db);
     tracing::info!("IAM user '{}' updated", user.name);
+    let Some(rotation) = rotation else {
+        rebuild_result?;
+        trigger_config_sync(&state);
+        audit_log("update_user", "admin", &user.name, &headers);
+        return Ok(Json(mask_user(&user)));
+    };
+    finish_key_rotation(&state, rebuild_result, &rotation.old_access_key_id).await?;
     audit_log("update_user", "admin", &user.name, &headers);
-    Ok(Json(mask_user(&user)))
+    audit_log("rotate_keys", "admin", &user.name, &headers);
+    // The full user with the new secret: shown once.
+    Ok(Json(user))
+}
+
+/// THE tail of every key rotation (the edit and `rotate-keys` share it): the
+/// old identity's live sessions die (the revoke push carries the DB, so no
+/// separate sync trigger), also when the rebuild failed: the rotation is
+/// already durable. The caller audits after this returns `Ok`: a failed
+/// rebuild answers 500 and writes no audit line.
+async fn finish_key_rotation(
+    state: &Arc<AdminState>,
+    rebuild_result: Result<(), AdminError>,
+    old_access_key_id: &str,
+) -> Result<(), AdminError> {
+    revoke_rotated_identity(state, old_access_key_id).await;
+    rebuild_result
+}
+
+/// The keys of a user edit that rotates them.
+#[derive(Debug, PartialEq, Eq)]
+struct KeyRotation {
+    access_key_id: String,
+    secret_access_key: String,
+    old_access_key_id: String,
+}
+
+/// Pure but for the random secret: does this edit rotate the keys, and to
+/// what? It does when a secret is given, or an access key id that differs
+/// from the current one. A missing secret is generated, as `rotate-keys`
+/// does; the access key id keeps its current value when only a secret comes.
+/// 400 for an access key id of an unusable format.
+fn plan_key_rotation(
+    current_access_key_id: &str,
+    access_key_id: Option<&str>,
+    secret_access_key: Option<&str>,
+) -> Result<Option<KeyRotation>, AdminError> {
+    let changes_key = access_key_id.is_some_and(|k| k != current_access_key_id);
+    if !changes_key && secret_access_key.is_none() {
+        return Ok(None);
+    }
+    let new_key = access_key_id.unwrap_or(current_access_key_id);
+    let secret = secret_access_key
+        .map(str::to_string)
+        .unwrap_or_else(iam::generate_secret_access_key);
+    check_rotation_keys(new_key, &secret)?;
+    Ok(Some(KeyRotation {
+        access_key_id: new_key.to_string(),
+        secret_access_key: secret,
+        old_access_key_id: current_access_key_id.to_string(),
+    }))
+}
+
+/// THE rule for keys that a rotation stores, on both paths: a usable access
+/// key id, and a secret that is not empty (an empty secret would sign with
+/// an empty key). 400 before anything is written.
+fn check_rotation_keys(access_key_id: &str, secret_access_key: &str) -> Result<(), AdminError> {
+    check_access_key_id(access_key_id)?;
+    if secret_access_key.trim().is_empty() {
+        return Err(AdminError::invalid(
+            "the secret access key must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+/// Rotating a key does NOT invalidate already-minted session cookies:
+/// revoke the old identity everywhere (the helper re-locks the DB itself).
+async fn revoke_rotated_identity(state: &Arc<AdminState>, old_access_key: &str) {
+    let outcome = super::sessions::revoke_identities_everywhere(
+        state,
+        std::slice::from_ref(&old_access_key.to_string()),
+    )
+    .await;
+    if outcome.revoked_local > 0 {
+        tracing::info!(
+            "Revoked {} live session(s) of rotated key {}",
+            outcome.revoked_local,
+            old_access_key
+        );
+    }
 }
 
 /// DELETE /api/admin/users/:id — delete a user.
@@ -651,38 +754,29 @@ pub async fn rotate_user_keys(
             iam::generate_secret_access_key(),
         ),
     };
-    check_access_key_id(&new_access_key)?;
+    check_rotation_keys(&new_access_key, &new_secret_key)?;
 
     // Capture the OLD key before rotation: sessions minted with it must die.
-    let old_access_key = db.get_user_by_id(user_id).ok().map(|u| u.access_key_id);
+    let old_access_key = db.get_user_by_id(user_id)?.access_key_id;
 
+    // The same write as a user edit that rotates the keys.
     let user = db
-        .rotate_keys(user_id, &new_access_key, &new_secret_key)
+        .update_user_with_keys(
+            user_id,
+            None,
+            None,
+            None,
+            Some((&new_access_key, &new_secret_key)),
+        )
         .inspect_err(|e| {
             tracing::warn!("Failed to rotate keys for user {}: {}", user_id, e);
         })?;
 
-    // Rebuild AFTER capturing the result — the old-key revocation below must
-    // run even when the rebuild errs (the rotation is already durable).
+    // Rebuild AFTER capturing the result: the old-key revocation must run
+    // even when the rebuild errs (the rotation is already durable).
     let rebuild_result = rebuild_iam_index(&db, &state.iam_state);
     drop(db);
-    // No separate trigger_config_sync: the revoke push below carries the DB.
-
-    // Rotating a key does NOT invalidate already-minted session cookies —
-    // revoke the old identity everywhere (helper re-locks the DB itself).
-    if let Some(old_key) = old_access_key {
-        let outcome =
-            super::sessions::revoke_identities_everywhere(&state, std::slice::from_ref(&old_key))
-                .await;
-        if outcome.revoked_local > 0 {
-            tracing::info!(
-                "Revoked {} live session(s) of rotated key {}",
-                outcome.revoked_local,
-                old_key
-            );
-        }
-    }
-    rebuild_result?;
+    finish_key_rotation(&state, rebuild_result, &old_access_key).await?;
 
     tracing::info!(
         "IAM user '{}' keys rotated (new: {})",
@@ -698,6 +792,37 @@ pub async fn rotate_user_keys(
 mod tests {
     use super::*;
     use arc_swap::ArcSwap;
+
+    #[test]
+    fn a_user_edit_rotates_keys_only_when_they_change() {
+        let plan = |ak: Option<&str>, sk: Option<&str>| plan_key_rotation("CURRENTKEY01", ak, sk);
+        // Nothing about the keys, or the unchanged access key alone: no rotation.
+        assert_eq!(plan(None, None).unwrap(), None);
+        assert_eq!(plan(Some("CURRENTKEY01"), None).unwrap(), None);
+        // A new access key alone: the secret is generated.
+        let r = plan(Some("NEWKEY000001"), None).unwrap().unwrap();
+        assert_eq!(r.access_key_id, "NEWKEY000001");
+        assert_eq!(r.old_access_key_id, "CURRENTKEY01");
+        assert!(!r.secret_access_key.is_empty());
+        // A secret alone keeps the access key id.
+        let r = plan(None, Some("given-secret")).unwrap().unwrap();
+        assert_eq!(
+            (r.access_key_id.as_str(), r.secret_access_key.as_str()),
+            ("CURRENTKEY01", "given-secret")
+        );
+        // Both.
+        let r = plan(Some("NEWKEY000001"), Some("given-secret"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (r.access_key_id.as_str(), r.secret_access_key.as_str()),
+            ("NEWKEY000001", "given-secret")
+        );
+        // An unusable access key id is a 400, before anything is written.
+        for bad in ["", "HAS SPACE", "AKé"] {
+            assert!(plan(Some(bad), Some("s")).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn user_name_rule_truth_table() {

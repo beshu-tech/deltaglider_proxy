@@ -1854,7 +1854,9 @@ mod tests {
             .create_user("user1", "AKOLD001", "old-secret", true, &[])
             .unwrap();
 
-        let rotated = db.rotate_keys(user.id, "AKNEW001", "new-secret").unwrap();
+        let rotated = db
+            .update_user_with_keys(user.id, None, None, None, Some(("AKNEW001", "new-secret")))
+            .unwrap();
 
         assert_eq!(rotated.access_key_id, "AKNEW001");
         assert_eq!(rotated.secret_access_key, "new-secret");

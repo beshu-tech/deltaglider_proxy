@@ -11,7 +11,10 @@ import { type BulkProgress, bulkProgressPercent, bulkProgressText } from '../bul
 import { type DeleteJobOutcome, type DeletePlanSummary, bulkDeleteConfirm, deleteJobMessage } from '../bulkDelete';
 import { type BulkTransferOutcome, bulkTransferOutcomeMessage } from '../bulkTransfer';
 import { confirmDeletePlan } from './confirmDelete';
+import { confirmConflicts } from './confirmConflicts';
+import type { ConflictResolver } from '../bulkConflicts';
 import { pluralize } from '../utils';
+import type { RowKey } from '../rowKey';
 import { useIsNarrow } from '../useIsNarrow';
 import { cssVar } from '../themeVars';
 import { Z } from '../theme';
@@ -30,13 +33,13 @@ interface Props {
    */
   onDelete?: (confirm: (plan: DeletePlanSummary) => Promise<boolean>) => Promise<DeleteJobOutcome>;
   /** Run the whole copy / move; resolve with its outcome, reject on a failure. */
-  onCopy?: (destBucket: string, destPrefix: string) => Promise<BulkTransferOutcome>;
-  onMove?: (destBucket: string, destPrefix: string) => Promise<BulkTransferOutcome>;
+  onCopy?: (destBucket: string, destPrefix: string, onConflicts: ConflictResolver) => Promise<BulkTransferOutcome>;
+  onMove?: (destBucket: string, destPrefix: string, onConflicts: ConflictResolver) => Promise<BulkTransferOutcome>;
   onDownloadZip?: () => Promise<void>;
   /** The folder being browsed: the copy/move destination starts there. */
   currentPrefix?: string;
   /** The raw selection keys: the destination picker refuses to copy them onto themselves. */
-  selectionKeys?: Iterable<string>;
+  selectionKeys?: Iterable<RowKey>;
   /** The running bulk delete, copy or move (null/absent = none): the bar shows it instead of the actions. */
   progress?: BulkProgress | null;
   /** Stops the running bulk action after the batch in flight. */
@@ -70,7 +73,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
     if (!fn) return;
     setOperating(true);
     try {
-      const { type, text } = bulkTransferOutcomeMessage(await fn(destBucket, destPrefix));
+      const { type, text } = bulkTransferOutcomeMessage(await fn(destBucket, destPrefix, confirmConflicts));
       message[type](text);
     } catch (e) {
       if (isSessionExpired(e) && onSessionExpired) onSessionExpired();

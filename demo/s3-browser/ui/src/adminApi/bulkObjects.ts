@@ -29,6 +29,12 @@ interface BulkCopyRequest {
   dest_bucket: string;
   dest_prefix: string;
   items: BulkCopyItem[];
+  /**
+   * Write no destination key that holds an object. The server judges each
+   * item under the destination's write lock and reports the ones it left
+   * out in `skipped` (not as failures; a move keeps their sources).
+   */
+  no_overwrite?: boolean;
 }
 
 interface BulkCopyFailure {
@@ -40,6 +46,8 @@ interface BulkCopyFailure {
 interface BulkCopyResponse {
   succeeded: number;
   failed: number;
+  /** Items left out because `no_overwrite` found an object at the destination. */
+  skipped?: number;
   failures: BulkCopyFailure[];
 }
 

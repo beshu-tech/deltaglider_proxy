@@ -203,11 +203,49 @@ pub(crate) async fn copy_object_known(
     source: Option<&crate::types::FileMetadata>,
     destination_prior: Option<&crate::deltaglider::CounterPrior>,
 ) -> Result<ObjectTransferOutcome, CopyError> {
+    copy_object_loop(
+        engine,
+        request,
+        source,
+        destination_prior,
+        Overwrite::Allowed,
+    )
+    .await
+}
+
+/// [`copy_object_with_retries`] that never replaces an object: when the
+/// destination key holds one, under the destination's write lock, nothing
+/// is written and the error has the class [`CopyClass::DestinationExists`].
+/// The check and the write share one lock hold, so an object that appears
+/// after any earlier listing is not overwritten.
+pub(crate) async fn copy_object_if_absent(
+    engine: &Arc<DynEngine>,
+    request: ObjectTransferRequest<'_>,
+) -> Result<ObjectTransferOutcome, CopyError> {
+    copy_object_loop(engine, request, None, None, Overwrite::Refused).await
+}
+
+/// Whether a copy may replace an object at the destination key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overwrite {
+    Allowed,
+    /// `If-None-Match: *`, judged under the destination's write lock.
+    Refused,
+}
+
+async fn copy_object_loop(
+    engine: &Arc<DynEngine>,
+    request: ObjectTransferRequest<'_>,
+    source: Option<&crate::types::FileMetadata>,
+    destination_prior: Option<&crate::deltaglider::CounterPrior>,
+    overwrite: Overwrite,
+) -> Result<ObjectTransferOutcome, CopyError> {
     let mut source = source.cloned();
     let mut prior = destination_prior;
     let mut attempt = 1;
     loop {
-        let attempt_result = copy_attempt(engine, request, source.take(), prior.take()).await;
+        let attempt_result =
+            copy_attempt(engine, request, source.take(), prior.take(), overwrite).await;
         let err = match attempt_result {
             Ok(outcome) => return Ok(outcome),
             Err(err) => err,
@@ -252,6 +290,7 @@ async fn copy_attempt(
     request: ObjectTransferRequest<'_>,
     source: Option<crate::types::FileMetadata>,
     prior: Option<&crate::deltaglider::CounterPrior>,
+    overwrite: Overwrite,
 ) -> Result<ObjectTransferOutcome, CopyError> {
     // A HEAD first so callers get a crisp source-disappeared failure row.
     let source_head = match source {
@@ -264,9 +303,39 @@ async fn copy_attempt(
     // The destination's write lock, as every write of an object takes it:
     // no other write of this key on this process interleaves its stored
     // forms with the copy's. Per attempt, so a retry's back-off holds none.
-    let lock = engine
-        .lock_object_write(request.destination_bucket, request.destination_key)
-        .await;
+    let lock = match overwrite {
+        Overwrite::Allowed => {
+            engine
+                .lock_object_write(request.destination_bucket, request.destination_key)
+                .await
+        }
+        Overwrite::Refused => engine
+            .lock_and_check(
+                request.destination_bucket,
+                request.destination_key,
+                &crate::deltaglider::Precondition {
+                    if_match: None,
+                    if_none_match: Some(s3s::dto::ETagCondition::Any),
+                },
+            )
+            .await
+            .map_err(|e| match e {
+                crate::deltaglider::ConditionalError::Engine(e) => {
+                    CopyError::engine("destination check failed", e)
+                }
+                crate::deltaglider::ConditionalError::PreconditionFailed => CopyError::new(
+                    CopyClass::DestinationExists,
+                    format!(
+                        "{}/{} already exists",
+                        request.destination_bucket, request.destination_key
+                    ),
+                ),
+                other => CopyError::new(
+                    CopyClass::Permanent,
+                    format!("destination check failed: {other:?}"),
+                ),
+            })?,
+    };
     if request.keep_created_at {
         crate::types::with_created_at(
             source_head.created_at,
@@ -921,6 +990,9 @@ pub(crate) enum CopyClass {
     /// No object can land: the bucket is gone, access is refused, or a
     /// storage cap is used up.
     DestinationFatal,
+    /// A copy that must not overwrite found an object at the destination
+    /// key ([`copy_object_if_absent`]). Not a fault: nothing was written.
+    DestinationExists,
     /// Anything else: about this object, and a retry does not help.
     Permanent,
 }

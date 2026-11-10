@@ -29,6 +29,7 @@ import { useDocumentEvent } from './useDocumentEvent';
 import { isTypingTarget, anyOverlayOpen, isActivatableTarget } from './keyboard';
 import { parentPrefix } from './utils';
 import { rowKeysFor, nextCursor, orderedRowKeys, sameKeyOrder } from './browserNav';
+import { type RowKey, parseRowKey } from './rowKey';
 import type { S3Object } from './types';
 
 interface BrowserNavArgs {
@@ -46,11 +47,11 @@ interface BrowserNavArgs {
 
 interface BrowserNav {
   /** rowKey of the cursor row, or null when nothing is highlighted. */
-  cursorKey: string | null;
+  cursorKey: RowKey | null;
   /** Sync the cursor (e.g. from a mouse click in ObjectTable). */
-  setCursorKey: (key: string | null) => void;
+  setCursorKey: (key: RowKey | null) => void;
   /** ObjectTable reports its displayed (sorted) row keys here. */
-  setRowOrder: (keys: string[]) => void;
+  setRowOrder: (keys: RowKey[]) => void;
 }
 
 export function useBrowserKeyboardNav({
@@ -61,10 +62,10 @@ export function useBrowserKeyboardNav({
   openInspector,
   enabled,
 }: BrowserNavArgs): BrowserNav {
-  const [cursorKey, setCursorKey] = useState<string | null>(null);
-  const [rowOrder, setRowOrderState] = useState<string[] | null>(null);
+  const [cursorKey, setCursorKey] = useState<RowKey | null>(null);
+  const [rowOrder, setRowOrderState] = useState<RowKey[] | null>(null);
   // Keep the stored array when the report is unchanged (see sameKeyOrder).
-  const setRowOrder = useCallback((next: string[]) => {
+  const setRowOrder = useCallback((next: RowKey[]) => {
     setRowOrderState((prev) => (sameKeyOrder(prev, next) ? prev : next));
   }, []);
 
@@ -92,11 +93,9 @@ export function useBrowserKeyboardNav({
 
   const openCursor = useCallback(() => {
     if (cursorKey === null) return;
-    if (cursorKey.startsWith('folder:')) {
-      navigate(cursorKey.slice('folder:'.length));
-    } else {
-      openInspector(cursorKey);
-    }
+    const id = parseRowKey(cursorKey);
+    if (id.kind === 'folder') navigate(id.prefix);
+    else openInspector(id.key);
   }, [cursorKey, navigate, openInspector]);
 
   const goUp = useCallback(() => {

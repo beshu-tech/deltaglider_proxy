@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { Segmented, Switch, Typography } from 'antd';
 import { useColors } from '../ThemeContext';
 import { SPACE } from './shared-styles';
-import { buildPreviewDocument, sandboxFlags, type HtmlPreviewOptions } from './htmlPreviewRules';
+import { buildPreviewDocument, isolationNote, sandboxFlags, type HtmlPreviewOptions } from './htmlPreviewRules';
 
 const { Text } = Typography;
 
@@ -58,7 +58,7 @@ export default function HtmlPreview({ html, filename }: HtmlPreviewProps) {
             <Text
               type="secondary"
               style={{ fontSize: 12, marginLeft: 'auto' }}
-              title="The page runs isolated from this console: it cannot read your session or credentials, and it cannot send requests."
+              title={isolationNote(opts)}
             >
               Isolated preview
             </Text>

@@ -214,11 +214,11 @@ A config write that makes a bucket that holds objects start to encrypt with a pr
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` / `POST` | `/_/api/admin/users` | List / create |
-| `PUT` / `DELETE` | `/_/api/admin/users/:id` | Update / delete (`409` for the last user when no other credential is left) |
+| `PUT` / `DELETE` | `/_/api/admin/users/:id` | Update / delete (`409` for the last user when no other credential is left). The update also takes `access_key_id` and `secret_access_key`: the edit then rotates the keys in the same transaction, and the answer carries the new secret once |
 | `POST` | `/_/api/admin/users/:id/rotate-keys` | Rotate access keys |
 | `POST` | `/_/api/admin/users/:id/clone` | Clone a user (new keys, copied permissions) |
 | `GET` / `POST` | `/_/api/admin/groups` | List / create |
-| `PUT` / `DELETE` | `/_/api/admin/groups/:id` | Update / delete |
+| `PUT` / `DELETE` | `/_/api/admin/groups/:id` | Update / delete. The update also takes `add_member_ids` and `remove_member_ids`, the users to add to the group and to remove from it. The proxy applies them in the same transaction as the rest of the edit. A request never sends the whole member list, because other writers change members too. A user in both lists is refused with `400` |
 | `POST` | `/_/api/admin/groups/:id/clone` | Clone a group |
 | `POST` | `/_/api/admin/groups/:id/members` | Add user to group |
 | `DELETE` | `/_/api/admin/groups/:id/members/:user_id` | Remove user from group |
@@ -304,8 +304,8 @@ Server-side helpers behind the embedded S3 browser's bulk actions.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/_/api/admin/objects/list` | List all keys under a bucket/prefix |
-| `POST` | `/_/api/admin/objects/copy` | Server-side copy of selected objects |
-| `POST` | `/_/api/admin/objects/move` | Server-side move (copy + delete) |
+| `POST` | `/_/api/admin/objects/copy` | Server-side copy of selected objects. With `"no_overwrite": true` the proxy writes no destination key that holds an object. It checks each item while it holds the write lock of that key. It reports the items it left out in `skipped` and `skipped_items`, and does not count them as failures |
+| `POST` | `/_/api/admin/objects/move` | Server-side move (copy + delete). It takes `no_overwrite` as the copy does. The source of a skipped item is not deleted |
 | `POST` | `/_/api/admin/objects/delete` | Bulk delete selected objects |
 | `POST` | `/_/api/admin/objects/delete-jobs` | Start a delete job: folders of any size and selected objects, deleted on the server |
 | `POST` | `/_/api/admin/objects/delete-jobs/:id/cancel` | Stop a delete job |

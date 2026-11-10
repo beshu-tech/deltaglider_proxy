@@ -26,6 +26,8 @@ export const MAX_REPORTED_FAILURES = 20;
 /** What the action bar shows while a bulk action runs. */
 export type BulkProgress =
   | ({ action: BulkAction; phase: 'listing'; stopping: boolean } & ListingProgress)
+  /** Copy or move: looking for objects that already exist at the destination. Nothing is written yet. */
+  | { action: BulkAction; phase: 'checking'; stopping: boolean; checked: number; total: number }
   /** Counted; the confirmation dialog is open and nothing has started. The
    *  dialog is the one surface then: the action bar shows nothing. */
   | { action: BulkAction; phase: 'confirming'; stopping: boolean; total: number }
@@ -108,6 +110,10 @@ export function bulkProgressText(p: ShownBulkProgress, now: number = Date.now())
     const found = p.keysFound > 0 ? ` ${count(p.keysFound)} ${noun(p.keysFound, 'object')} found` : '';
     return `Listing folders ${p.listed} of ${p.folders}…${found}`;
   }
+  if (p.phase === 'checking') {
+    if (p.stopping) return 'Stopping…';
+    return `Checking the destination for existing objects… ${p.checked} of ${p.total}. Nothing is written yet.`;
+  }
   // A delete only starts its server job here.
   if (p.action === 'delete') return `Starting the delete of ${count(p.total)} ${noun(p.total, 'object')}…`;
   if (p.stopping) return `Stopping after this batch… ${count(p.done)} of ${count(p.total)} done`;
@@ -123,7 +129,8 @@ export function bulkProgressText(p: ShownBulkProgress, now: number = Date.now())
 export function bulkProgressPercent(p: ShownBulkProgress): number | null {
   // A delete only counts and starts its job here: no percent to show.
   if (p.action === 'delete') return null;
-  const [part, whole] = p.phase === 'listing' ? [p.listed, p.folders] : [p.done, p.total];
+  const [part, whole] =
+    p.phase === 'listing' ? [p.listed, p.folders] : p.phase === 'checking' ? [p.checked, p.total] : [p.done, p.total];
   return whole === 0 ? 100 : Math.floor((part / whole) * 100);
 }
 

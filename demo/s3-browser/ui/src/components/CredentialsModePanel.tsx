@@ -115,6 +115,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
     loading,
     loadError,
     refresh,
+    rebase,
     applyOpen,
     applyResponse,
     applying,
@@ -229,6 +230,9 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
       const { warnings } = await removeBootstrapCredentials();
       setRemoveWarnings(warnings);
       await qc.invalidateQueries({ queryKey: qk.config() });
+      // The removal changed the `access` section on the server: take its new
+      // version, or the next Apply sends the old one and gets a false 409.
+      await rebase();
     } catch (e) {
       setRemoveError(
         e instanceof ApiError && (e.status === 404 || e.status === 405)

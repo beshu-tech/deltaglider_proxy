@@ -2,7 +2,7 @@ import { useState, useId } from 'react';
 import { Input, Switch, Button, Space, Divider, Typography } from 'antd';
 import { ThunderboltOutlined, CheckCircleFilled, MinusCircleFilled, CrownFilled } from '@ant-design/icons';
 import type { IamUser, IamPermission, CreateUserRequest, UpdateUserRequest } from '../adminApi';
-import { useCreateUser, useUpdateUser, useDeleteUser, useRotateUserKeys } from '../queries/users';
+import { useCreateUser, useUpdateUser, useDeleteUser } from '../queries/users';
 import { useCannedPolicies } from '../queries/cannedPolicies';
 import { useGroups } from '../queries/groups';
 import { setCredentials, getCredentials } from '../s3client';
@@ -107,7 +107,6 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   const createUserMutation = useCreateUser();
   const updateUserMutation = useUpdateUser();
   const deleteUserMutation = useDeleteUser();
-  const rotateKeysMutation = useRotateUserKeys();
 
   const setSaving = (v: boolean) => { setSavingState(v); onSavingChange?.(v); };
   const setDeleting = (v: boolean) => { setDeletingState(v); onSavingChange?.(v); };
@@ -140,21 +139,19 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
     setSavedCredentials(null);
     try {
       if (isEdit) {
+        const akChanged = accessKeyId.trim() && accessKeyId.trim() !== user.access_key_id;
+        const skChanged = secretKey.trim().length > 0;
+        // ONE request for the whole edit: the keys ride on the same PUT, so a
+        // refusal of any part (a key that another user has) applies none.
         const req: UpdateUserRequest = {
           name: name.trim(),
           enabled,
           permissions: rowsToPermissions(permissions),
+          ...(akChanged ? { access_key_id: accessKeyId.trim() } : {}),
+          ...(skChanged ? { secret_access_key: secretKey.trim() } : {}),
         };
-        await updateUserMutation.mutateAsync({ id: user.id, patch: req });
-
-        const akChanged = accessKeyId.trim() && accessKeyId.trim() !== user.access_key_id;
-        const skChanged = secretKey.trim().length > 0;
+        const rotated = await updateUserMutation.mutateAsync({ id: user.id, patch: req });
         if (akChanged || skChanged) {
-          const rotated = await rotateKeysMutation.mutateAsync({
-            id: user.id,
-            accessKeyId: accessKeyId.trim() || user.access_key_id,
-            secretAccessKey: skChanged ? secretKey.trim() : undefined,
-          });
           const browserAk = getCredentials().accessKeyId;
           // Compare against both old AK and new AK to avoid self-lockout when user changes their own AK
           if ((browserAk === user.access_key_id || browserAk === accessKeyId.trim()) && rotated.secret_access_key) {

@@ -16,7 +16,6 @@ import {
   updateUser,
   deleteUser,
   cloneUser,
-  rotateUserKeys,
   type IamUser,
   type CreateUserRequest,
   type UpdateUserRequest,
@@ -34,6 +33,20 @@ function useInvalidateUsers() {
   const qc = useQueryClient();
   return () => {
     qc.invalidateQueries({ queryKey: qk.users.list() });
+  };
+}
+
+/**
+ * THE invalidation of an IAM write that reaches both lists (F63): the groups
+ * list shows each group's member ids, a user delete removes the user from its
+ * groups, a clone can copy memberships, and a group write changes the users'
+ * inherited permissions. Users and groups mutations both use it.
+ */
+export function useInvalidateIamLists() {
+  const qc = useQueryClient();
+  return () => {
+    qc.invalidateQueries({ queryKey: qk.users.list() });
+    qc.invalidateQueries({ queryKey: qk.groups.list() });
   };
 }
 
@@ -59,7 +72,7 @@ export function useUpdateUser() {
 }
 
 export function useDeleteUser() {
-  const invalidate = useInvalidateUsers();
+  const invalidate = useInvalidateIamLists();
   return useMutation<void, Error, number>({
     mutationFn: deleteUser,
     onSuccess: invalidate,
@@ -73,25 +86,10 @@ interface CloneUserVars {
 }
 
 export function useCloneUser() {
-  const invalidate = useInvalidateUsers();
+  const invalidate = useInvalidateIamLists();
   return useMutation<IamUser, Error, CloneUserVars>({
     mutationFn: ({ id, name, copyGroupMemberships }) =>
       cloneUser(id, { name, copy_group_memberships: copyGroupMemberships }),
-    onSuccess: invalidate,
-  });
-}
-
-interface RotateUserKeysVars {
-  id: number;
-  accessKeyId?: string;
-  secretAccessKey?: string;
-}
-
-export function useRotateUserKeys() {
-  const invalidate = useInvalidateUsers();
-  return useMutation<IamUser, Error, RotateUserKeysVars>({
-    mutationFn: ({ id, accessKeyId, secretAccessKey }) =>
-      rotateUserKeys(id, accessKeyId, secretAccessKey),
     onSuccess: invalidate,
   });
 }

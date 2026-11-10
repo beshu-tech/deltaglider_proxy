@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Drawer, Button, Modal, message, Skeleton, Spin, theme } from 'antd';
 import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CheckOutlined, CopyOutlined, LoadingOutlined, EyeOutlined } from '@ant-design/icons';
-import { deleteObject, getDownloadUrl, getPresignedUrl, getObjectUrl, headObject, getBucket } from '../s3client';
+import { deleteObject, getDownloadUrl, getPresignedUrl, headObject, getBucket } from '../s3client';
 import { GlobalOutlined } from '@ant-design/icons';
 import { formatBytes, getFileName, downloadFromUrl, relativeTime } from '../utils';
 import { plainError } from '../plainError';
@@ -499,16 +499,10 @@ export default function InspectorPanel({
     setModalState({ mode: 'share', phase: 'loading' });
     setShareDuration(seconds);
     try {
-      let url: string;
-      try {
-        url = await getPresignedUrl(reqKey, expiresInSeconds);
-      } catch (e) {
-        // Falling back to a direct URL is an expected, handled path — keep it
-        // off the console's error/warn channel (console.debug is hidden unless
-        // the operator opts into verbose levels).
-        console.debug('Presigned URL unavailable, using direct URL:', e);
-        url = getObjectUrl(reqKey);
-      }
+      // No fallback to the bare object URL (F60): it is not signed and never
+      // expires, so it would sit under "Signed link ready" and a duration it
+      // does not have. A failed signing is an error.
+      const url = await getPresignedUrl(reqKey, expiresInSeconds);
       // Stale-commit guard: don't surface A's URL after the user moved to B.
       if (latestKeyRef.current !== reqKey) return;
       setModalState({ mode: 'share', phase: 'ready', url, expiresAt });

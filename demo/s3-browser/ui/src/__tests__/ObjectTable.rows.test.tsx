@@ -8,6 +8,7 @@ import { expect, test } from 'vitest';
 import ObjectTable from '../components/ObjectTable';
 import type { S3Object } from '../types';
 import { renderWithQuery } from '../test/render';
+import { objectRowKey } from '../rowKey';
 
 const LONG = 'very-long-object-name-segment-1-very-long-object-name-segment-2-app-linux-amd64.tar.gz';
 const OBJECTS: S3Object[] = [
@@ -31,7 +32,7 @@ function mount() {
         },
         virtualFolders: [],
       }}
-      selection={{ inspected: null, selectedKeys: new Set(['builds/app-v2.zip']), onToggleKey: () => {}, onToggleAll: () => {} }}
+      selection={{ inspected: null, selectedKeys: new Set([objectRowKey('builds/app-v2.zip')]), onToggleKey: () => {}, onToggleAll: () => {} }}
       actions={{ onSelect: () => {}, onNavigate: () => {} }}
       folderSizes={{ sizes: {}, canScan: false, onCompute: () => {}, onCancel: () => {} }}
       isMobile={false}
