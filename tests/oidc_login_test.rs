@@ -522,13 +522,14 @@ async fn oauth_authorize_does_not_reset_the_brute_force_counter() {
     );
 }
 
-/// B041/B090/B092: a client that disconnects drops the handler future. A
-/// mutating admin request must still run to its end. The provider set is
-/// rebuilt before the slow discovery, so a dropped request lost the steps
-/// after it: the version bump that this test waits for, and the push to the
-/// other nodes.
+/// B041/B090/B092, now by design: a provider edit publishes the provider set
+/// and starts discovery in the background, so a slow identity provider (2 s
+/// here) does not hold the admin request. The request answers at once, so
+/// there is no dropped request to lose the steps after the rebuild: the
+/// version bump comes with the answer, and a login start works once the
+/// background discovery is done.
 #[tokio::test]
-async fn a_dropped_admin_request_still_completes_its_mutation() {
+async fn a_slow_identity_provider_does_not_hold_the_provider_edit() {
     let (issuer, ca_pem) = start_idp_with_delay(std::time::Duration::from_secs(2)).await;
     let dir = tempfile::tempdir().unwrap();
     let ca_path = dir.path().join("idp-ca.pem");
@@ -537,9 +538,10 @@ async fn a_dropped_admin_request_still_completes_its_mutation() {
     let ep = server.endpoint();
     let admin = admin_http_client(&ep).await;
     let before = crate::common::get_ext_auth_version(&admin, &ep).await;
-    let impatient = admin
+    let started = std::time::Instant::now();
+    let created = admin
         .post(format!("{ep}/_/api/admin/ext-auth/providers"))
-        .timeout(std::time::Duration::from_millis(500))
+        .timeout(std::time::Duration::from_secs(10))
         .json(&json!({
             "name": "corp", "provider_type": "oidc", "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET, "issuer_url": issuer,
@@ -547,17 +549,35 @@ async fn a_dropped_admin_request_still_completes_its_mutation() {
             "extra_config": { "allow_local": true, "ca_cert_path": ca_path.display().to_string() },
         }))
         .send()
-        .await;
-    assert!(impatient.is_err(), "the client was meant to give up first");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        .await
+        .expect("the edit answers");
+    assert_eq!(created.status(), 201);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "the edit waited for discovery: {:?}",
+        started.elapsed()
+    );
+    assert!(crate::common::get_ext_auth_version(&admin, &ep).await > before);
+    // The background discovery ends: the login start redirects to the IdP.
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        if crate::common::get_ext_auth_version(&admin, &ep).await > before {
+        let r = anon
+            .get(format!("{ep}/_/api/admin/oauth/authorize/corp"))
+            .send()
+            .await
+            .unwrap();
+        if r.status() == 307 {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the dropped request never finished its mutation (provider set not rebuilt)"
+            "the login start never worked: {}",
+            r.status()
         );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 }
