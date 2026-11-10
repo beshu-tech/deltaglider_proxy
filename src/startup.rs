@@ -1073,6 +1073,156 @@ fn accept_legacy_sync() -> bool {
     )
 }
 
+/// Startup gate (guard B): under multi-instance, every NAMED S3 backend that
+/// hosts a client-writable routed bucket must enforce conditional writes —
+/// without CAS, two nodes' concurrent same-deltaspace PUTs can corrupt
+/// `reference.bin` (the in-process prefix lock doesn't span processes).
+///
+/// Fail-fast contract (observability is the point — every outcome is loud):
+///  - single-instance → one `info!`, no probes, zero cost.
+///  - each validated backend → one `info!`.
+///  - DEFINITIVE non-CAS (the `If-None-Match:*` re-PUT succeeded) → doc-linked
+///    `FATAL` naming the buckets, the backend, and both fixes → `exit(1)`.
+///  - indeterminate probe (network, missing bucket) → loud `warn!` + Unknown
+///    verdict in the cache (GUI banner), NOT a crash — mirrors the "never a
+///    SPOF" stance of the lease builder above.
+///
+/// Every S3 backend with a client-writable bucket is probed, the default one
+/// included (unrouted buckets land there). `replication_target_only` buckets
+/// are exempt: they have no client writers (guard A).
+pub async fn validate_backend_write_capability(
+    config: &Config,
+    cache: &deltaglider_proxy::coordination::BackendCapabilityCache,
+) {
+    use deltaglider_proxy::coordination::capability::{
+        client_writable_groups_with_default, establish_backend_verdict, forced_noncas_backends,
+        CapabilityVerdict, CAPABILITY_DOC_URL,
+    };
+
+    if config
+        .config_sync_bucket
+        .as_deref()
+        .is_none_or(|b| b.is_empty())
+    {
+        info!(
+            "Backend capability gate (multi-instance CAS for client-writable buckets) skipped: \
+             single instance (config_sync_bucket not set). Encrypted buckets still need atomic \
+             writes: the atomicity check runs separately."
+        );
+        return;
+    }
+    let forced = forced_noncas_backends();
+    let groups = client_writable_groups_with_default(config, &forced).await;
+    if groups.is_empty() {
+        info!(
+            "Backend capability gate: no client-writable buckets on S3 backends — \
+             nothing to validate"
+        );
+        return;
+    }
+    for (name, group) in groups {
+        let verdict = establish_backend_verdict(&name, &group, &forced).await;
+        cache.set(&name, &group.backend, verdict.clone());
+        match verdict {
+            CapabilityVerdict::CasVerified { via, if_match } => info!(
+                "backend capability: '{name}' conditional writes verified ({via:?}, If-Match {}) — \
+                 client-writable bucket(s) {:?} are safe under multi-instance",
+                if_match.label(),
+                group.buckets
+            ),
+            CapabilityVerdict::NonCas => {
+                exit_with_boot_error(
+                    &deltaglider_proxy::coordination::capability::noncas_enforcement_message(
+                        &name,
+                        &group.buckets,
+                    ),
+                );
+            }
+            CapabilityVerdict::Unknown { reason } => warn!(
+                "backend capability: '{name}' could NOT be verified ({reason}) — bucket(s) \
+                 {:?} are unvalidated; the proxy continues but multi-instance write safety \
+                 is UNPROVEN on this backend. See {CAPABILITY_DOC_URL}",
+                group.buckets
+            ),
+        }
+    }
+}
+
+/// Boot-time backend HEALTH gate: probe every configured backend's
+/// connectivity + credentials before serving.
+///
+/// Policy (`DGP_BOOT_BACKEND_PROBE`, default `enforce`):
+///   - every backend healthy → one info! line each.
+///   - SOME unhealthy → ERROR per backend naming the cause; the proxy starts
+///     DEGRADED (their buckets answer 503 via the health gate until the
+///     re-probe loop sees recovery).
+///   - ALL unhealthy + `enforce` → FATAL exit(1): a proxy with zero working
+///     storage backends serves nothing but garbage.
+///   - `warn` → same probes/logs, never exits. `off` → no probes.
+pub async fn boot_backend_health_gate(
+    config: &Config,
+    health: &deltaglider_proxy::coordination::BackendHealthCache,
+) {
+    use deltaglider_proxy::coordination::health::{
+        boot_probe_mode, probe_backend_health, probe_targets, BootProbeMode,
+    };
+
+    let mode = boot_probe_mode();
+    if mode == BootProbeMode::Off {
+        info!("Backend health gate: DISABLED (DGP_BOOT_BACKEND_PROBE=off)");
+        return;
+    }
+    let targets = probe_targets(config);
+    let total = targets.len();
+    let mut gating = 0usize; // AuthRejected / Unreachable — definitive faults
+                             // Every backend at once: a probe may wait the request deadline, and one
+                             // backend after another added those waits up before the proxy served.
+    let probes = targets
+        .into_iter()
+        .map(|(name, backend, fallback)| async move {
+            let verdict = probe_backend_health(&backend, fallback.as_deref()).await;
+            (name, backend, verdict)
+        });
+    for (name, backend, verdict) in futures::future::join_all(probes).await {
+        health.set(&name, &backend, verdict.clone());
+        if verdict.is_healthy() {
+            info!("backend health: '{name}' — connection healthy");
+        } else if verdict.is_gating() {
+            gating += 1;
+            error!(
+                "backend health: '{name}' UNHEALTHY — {}. Buckets routed to it will \
+                 answer 503 until it recovers (re-probed every 30s)",
+                verdict.cause()
+            );
+        } else {
+            error!(
+                "backend health: '{name}' DEGRADED — {}. Requests are NOT blocked \
+                 (the backend is reachable); re-probed every 30s",
+                verdict.cause()
+            );
+        }
+    }
+    // FATAL only when every backend is DEFINITIVELY dead (creds rejected /
+    // unreachable). A merely-Erroring backend (throttle storm, transient 5xx)
+    // must not turn a restart into a crash loop that hammers the provider.
+    if gating == total && total > 0 {
+        match mode {
+            BootProbeMode::Enforce => {
+                exit_with_boot_error(&format!(
+                    "ALL {total} configured storage backend(s) failed the boot health \
+                     probe — the proxy has no working storage and refuses to start. Fix the \
+                     backend endpoints/credentials, or set DGP_BOOT_BACKEND_PROBE=warn to \
+                     start degraded anyway"
+                ));
+            }
+            _ => error!(
+                "ALL {total} configured storage backend(s) failed the boot health probe — \
+                 starting anyway (DGP_BOOT_BACKEND_PROBE=warn); every bucket will answer 503"
+            ),
+        }
+    }
+}
+
 // ---- coordination boot (guarded) ----
 
 /// The coordination bucket's boot state, made ONCE and shared by the
@@ -1289,8 +1439,6 @@ pub async fn validate_coordination_once(config: &Config) -> CoordinationBoot {
         ..boot
     }
 }
-
-// ---- end coordination boot ----
 
 /// Build the job-plane leader lease, selecting the impl by whether a
 /// CAS-capable coordination bucket is configured. Called BEFORE the schedulers
@@ -1576,156 +1724,6 @@ pub async fn build_encryption_witness(
     Some(witness)
 }
 
-/// Startup gate (guard B): under multi-instance, every NAMED S3 backend that
-/// hosts a client-writable routed bucket must enforce conditional writes —
-/// without CAS, two nodes' concurrent same-deltaspace PUTs can corrupt
-/// `reference.bin` (the in-process prefix lock doesn't span processes).
-///
-/// Fail-fast contract (observability is the point — every outcome is loud):
-///  - single-instance → one `info!`, no probes, zero cost.
-///  - each validated backend → one `info!`.
-///  - DEFINITIVE non-CAS (the `If-None-Match:*` re-PUT succeeded) → doc-linked
-///    `FATAL` naming the buckets, the backend, and both fixes → `exit(1)`.
-///  - indeterminate probe (network, missing bucket) → loud `warn!` + Unknown
-///    verdict in the cache (GUI banner), NOT a crash — mirrors the "never a
-///    SPOF" stance of the lease builder above.
-///
-/// Every S3 backend with a client-writable bucket is probed, the default one
-/// included (unrouted buckets land there). `replication_target_only` buckets
-/// are exempt: they have no client writers (guard A).
-pub async fn validate_backend_write_capability(
-    config: &Config,
-    cache: &deltaglider_proxy::coordination::BackendCapabilityCache,
-) {
-    use deltaglider_proxy::coordination::capability::{
-        client_writable_groups_with_default, establish_backend_verdict, forced_noncas_backends,
-        CapabilityVerdict, CAPABILITY_DOC_URL,
-    };
-
-    if config
-        .config_sync_bucket
-        .as_deref()
-        .is_none_or(|b| b.is_empty())
-    {
-        info!(
-            "Backend capability gate (multi-instance CAS for client-writable buckets) skipped: \
-             single instance (config_sync_bucket not set). Encrypted buckets still need atomic \
-             writes: the atomicity check runs separately."
-        );
-        return;
-    }
-    let forced = forced_noncas_backends();
-    let groups = client_writable_groups_with_default(config, &forced).await;
-    if groups.is_empty() {
-        info!(
-            "Backend capability gate: no client-writable buckets on S3 backends — \
-             nothing to validate"
-        );
-        return;
-    }
-    for (name, group) in groups {
-        let verdict = establish_backend_verdict(&name, &group, &forced).await;
-        cache.set(&name, &group.backend, verdict.clone());
-        match verdict {
-            CapabilityVerdict::CasVerified { via, if_match } => info!(
-                "backend capability: '{name}' conditional writes verified ({via:?}, If-Match {}) — \
-                 client-writable bucket(s) {:?} are safe under multi-instance",
-                if_match.label(),
-                group.buckets
-            ),
-            CapabilityVerdict::NonCas => {
-                exit_with_boot_error(
-                    &deltaglider_proxy::coordination::capability::noncas_enforcement_message(
-                        &name,
-                        &group.buckets,
-                    ),
-                );
-            }
-            CapabilityVerdict::Unknown { reason } => warn!(
-                "backend capability: '{name}' could NOT be verified ({reason}) — bucket(s) \
-                 {:?} are unvalidated; the proxy continues but multi-instance write safety \
-                 is UNPROVEN on this backend. See {CAPABILITY_DOC_URL}",
-                group.buckets
-            ),
-        }
-    }
-}
-
-/// Boot-time backend HEALTH gate: probe every configured backend's
-/// connectivity + credentials before serving.
-///
-/// Policy (`DGP_BOOT_BACKEND_PROBE`, default `enforce`):
-///   - every backend healthy → one info! line each.
-///   - SOME unhealthy → ERROR per backend naming the cause; the proxy starts
-///     DEGRADED (their buckets answer 503 via the health gate until the
-///     re-probe loop sees recovery).
-///   - ALL unhealthy + `enforce` → FATAL exit(1): a proxy with zero working
-///     storage backends serves nothing but garbage.
-///   - `warn` → same probes/logs, never exits. `off` → no probes.
-pub async fn boot_backend_health_gate(
-    config: &Config,
-    health: &deltaglider_proxy::coordination::BackendHealthCache,
-) {
-    use deltaglider_proxy::coordination::health::{
-        boot_probe_mode, probe_backend_health, probe_targets, BootProbeMode,
-    };
-
-    let mode = boot_probe_mode();
-    if mode == BootProbeMode::Off {
-        info!("Backend health gate: DISABLED (DGP_BOOT_BACKEND_PROBE=off)");
-        return;
-    }
-    let targets = probe_targets(config);
-    let total = targets.len();
-    let mut gating = 0usize; // AuthRejected / Unreachable — definitive faults
-                             // Every backend at once: a probe may wait the request deadline, and one
-                             // backend after another added those waits up before the proxy served.
-    let probes = targets
-        .into_iter()
-        .map(|(name, backend, fallback)| async move {
-            let verdict = probe_backend_health(&backend, fallback.as_deref()).await;
-            (name, backend, verdict)
-        });
-    for (name, backend, verdict) in futures::future::join_all(probes).await {
-        health.set(&name, &backend, verdict.clone());
-        if verdict.is_healthy() {
-            info!("backend health: '{name}' — connection healthy");
-        } else if verdict.is_gating() {
-            gating += 1;
-            error!(
-                "backend health: '{name}' UNHEALTHY — {}. Buckets routed to it will \
-                 answer 503 until it recovers (re-probed every 30s)",
-                verdict.cause()
-            );
-        } else {
-            error!(
-                "backend health: '{name}' DEGRADED — {}. Requests are NOT blocked \
-                 (the backend is reachable); re-probed every 30s",
-                verdict.cause()
-            );
-        }
-    }
-    // FATAL only when every backend is DEFINITIVELY dead (creds rejected /
-    // unreachable). A merely-Erroring backend (throttle storm, transient 5xx)
-    // must not turn a restart into a crash loop that hammers the provider.
-    if gating == total && total > 0 {
-        match mode {
-            BootProbeMode::Enforce => {
-                exit_with_boot_error(&format!(
-                    "ALL {total} configured storage backend(s) failed the boot health \
-                     probe — the proxy has no working storage and refuses to start. Fix the \
-                     backend endpoints/credentials, or set DGP_BOOT_BACKEND_PROBE=warn to \
-                     start degraded anyway"
-                ));
-            }
-            _ => error!(
-                "ALL {total} configured storage backend(s) failed the boot health probe — \
-                 starting anyway (DGP_BOOT_BACKEND_PROBE=warn); every bucket will answer 503"
-            ),
-        }
-    }
-}
-
 /// Initialize config DB S3 sync if DGP_CONFIG_SYNC_BUCKET is set.
 /// On startup: downloads from S3 if newer, reopens the DB, and rebuilds IAM index.
 #[allow(clippy::too_many_arguments)]
@@ -1870,6 +1868,8 @@ pub async fn init_config_sync(
 
     Some(sync)
 }
+
+// ---- end coordination boot ----
 
 /// Spawn periodic config DB S3 sync poll (every 5 minutes).
 #[allow(clippy::too_many_arguments)]

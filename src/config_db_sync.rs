@@ -1826,14 +1826,26 @@ mod tests {
             .expect("end of settle_coordination");
         let outside = format!("{}{}", &section[..settle], &section[settle_end..]);
         assert!(
-            !outside.contains("exit_with_boot_error("),
+            !outside.contains("exit_with_boot_error(") && !outside.contains("process::exit("),
             "a coordination verdict ends the process only in settle_coordination"
         );
         assert_eq!(
-            section.matches("exit_with_boot_error(").count(),
+            section.matches("exit_with_boot_error(").count()
+                + section.matches("process::exit(").count(),
             1,
             "settle_coordination holds the one exit"
         );
+        // The section holds every coordination builder: a builder outside it
+        // would escape the scan.
+        for builder in [
+            "fn validate_coordination_once(",
+            "fn build_coordination_lease(",
+            "fn build_reference_lock(",
+            "fn build_encryption_witness(",
+            "fn init_config_sync(",
+        ] {
+            assert!(section.contains(builder), "{builder} is outside the section");
+        }
         assert!(section.contains("shutdown::request_exit"));
     }
 
