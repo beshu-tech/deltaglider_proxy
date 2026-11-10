@@ -987,6 +987,23 @@ pub(crate) fn object_groups(claimed: &[EventOutboxRecord]) -> Vec<Vec<usize>> {
     groups
 }
 
+/// Pure: the claimed rows as groups of posts that run one after the other.
+/// Groups run side by side, [`delivery_concurrency`] at a time. One post at
+/// a time means claim (event) order: one row per group, or a repeated key
+/// would run its whole group before the next object and the channel would
+/// read "created a, deleted a, created b" for a, b, a. Several at once keep
+/// the order of one object only ([`object_groups`]).
+pub(crate) fn post_groups(
+    config: &EventDeliveryConfig,
+    claimed: &[EventOutboxRecord],
+) -> Vec<Vec<usize>> {
+    if delivery_concurrency(config) == 1 {
+        (0..claimed.len()).map(|i| vec![i]).collect()
+    } else {
+        object_groups(claimed)
+    }
+}
+
 /// Deliver every claimed row and return what to write: the endpoint
 /// outcomes and each row's final state, in claim order. Writes nothing, so
 /// the caller settles the batch in one transaction. At most
@@ -1026,7 +1043,7 @@ async fn deliver_batch(
         }
     };
     let mut results: Vec<(usize, Vec<EndpointOutcome>, Settlement)> =
-        futures::stream::iter(object_groups(claimed))
+        futures::stream::iter(post_groups(config, claimed))
             .map(deliver_group)
             .buffer_unordered(delivery_concurrency(config))
             .flat_map(futures::stream::iter)
@@ -2561,6 +2578,79 @@ mod tests {
         // Time is up.
         assert!(!drain_continues(10, &full, s(10), s(10)));
         assert!(!drain_continues(10, &BatchReport::default(), s(0), s(10)));
+    }
+
+    /// Review of #156: a Slack channel reads the posts in order. With one
+    /// post at a time, the rows go out in CLAIM order, not grouped by object
+    /// ("created a, deleted a, created b" for a, b, a).
+    #[tokio::test]
+    async fn slack_posts_go_out_in_claim_order_with_repeated_keys() {
+        let mut config = cfg();
+        config.format = EventDeliveryFormat::Slack;
+        config.batch_size = 10;
+        let db = seeded(["a", "b", "a", "c", "b"].map(String::from)).await;
+        let client = SinkClient::new(Duration::ZERO, false);
+        let report = drain_outbox(
+            &db,
+            &client,
+            &config,
+            "w",
+            Duration::from_secs(30),
+            current_unix_seconds,
+        )
+        .await;
+        assert_eq!(report.claimed, 5, "{report:?}");
+        let started: Vec<(String, i64)> = client.started.lock().unwrap().clone();
+        let expected: Vec<(&str, i64)> = vec![("a", 1), ("b", 2), ("a", 3), ("c", 4), ("b", 5)];
+        assert_eq!(
+            started
+                .iter()
+                .map(|(k, id)| (k.as_str(), *id))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn post_groups_follow_the_concurrency_of_the_format() {
+        let rec = |id: i64, key: &str| EventOutboxRecord {
+            id,
+            kind: "ObjectCreated".into(),
+            bucket: "b".into(),
+            key: key.into(),
+            source: "s3".into(),
+            occurred_at: id,
+            payload: json!({}),
+            status: "in_progress".into(),
+            attempts: 1,
+            next_attempt_at: None,
+            claimed_by: None,
+            claimed_at: None,
+            delivered_at: None,
+            last_error: None,
+            created_at: 0,
+        };
+        let claimed = vec![
+            rec(1, "a"),
+            rec(2, "b"),
+            rec(3, "a"),
+            rec(4, "c"),
+            rec(5, "b"),
+        ];
+        let mut slack = cfg();
+        slack.format = EventDeliveryFormat::Slack;
+        assert_eq!(
+            post_groups(&slack, &claimed),
+            vec![vec![0], vec![1], vec![2], vec![3], vec![4]],
+            "Slack: one row per group, claim order"
+        );
+        let mut raw = cfg();
+        raw.format = EventDeliveryFormat::Raw;
+        assert_eq!(
+            post_groups(&raw, &claimed),
+            vec![vec![0, 2], vec![1, 4], vec![3]],
+            "raw webhook: one group per object"
+        );
     }
 
     #[test]
