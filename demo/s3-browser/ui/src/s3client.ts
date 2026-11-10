@@ -61,7 +61,7 @@ export async function initFromSession(): Promise<boolean> {
   activeAccessKeyId = creds.access_key_id;
   activeSecretAccessKey = creds.secret_access_key;
   if (creds.bucket) activeBucket = creds.bucket;
-  cachedClient = null;
+  dropClient();
   return Boolean(creds.access_key_id && creds.secret_access_key);
 }
 
@@ -80,7 +80,7 @@ function getEndpoint(): string {
 
 export function setEndpoint(url: string) {
   activeEndpoint = url;
-  cachedClient = null;
+  dropClient();
 }
 
 export function getCredentials(): { accessKeyId: string; secretAccessKey: string } {
@@ -99,7 +99,7 @@ export function getCredentials(): { accessKeyId: string; secretAccessKey: string
 export async function setCredentials(accessKeyId: string, secretAccessKey: string): Promise<boolean> {
   activeAccessKeyId = accessKeyId;
   activeSecretAccessKey = secretAccessKey;
-  cachedClient = null;
+  dropClient();
   const saved = await storeSessionCredentials({
     endpoint: activeEndpoint,
     region: activeRegion,
@@ -122,7 +122,7 @@ export function disconnect() {
   activeAccessKeyId = '';
   activeSecretAccessKey = '';
   activeEndpoint = '';
-  cachedClient = null;
+  dropClient();
   // Remove legacy localStorage keys (migration cleanup)
   removeStorage('dg-access-key-id');
   removeStorage('dg-secret-access-key');
@@ -132,6 +132,16 @@ export function disconnect() {
 }
 
 let cachedClient: S3Client | null = null;
+
+/**
+ * THE way to forget the S3 client (F61, epic #146): whoever or wherever the
+ * client signs as changed, so what it listed (the shared bucket list) goes
+ * with it. A guard test refuses any other reset of `cachedClient`.
+ */
+function dropClient(): void {
+  cachedClient = null;
+  listBucketsShared = null;
+}
 
 /** The response headers in which the proxy tells a writer how it stored the object. */
 const WRITE_FACT_HEADERS = [
@@ -759,7 +769,8 @@ export function invalidateListBucketsCache(): void {
 }
 
 export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo[]> {
-  const key = opts?.includeOrigins === false ? 'no-origins' : 'origins';
+  // Who lists, where, and what: a listing of another user or endpoint is never reused.
+  const key = JSON.stringify([activeAccessKeyId, getEndpoint(), opts?.includeOrigins === false ? 'no-origins' : 'origins']);
   const now = Date.now();
   if (
     listBucketsShared &&
