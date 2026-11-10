@@ -396,7 +396,8 @@ where
         // The form streams into the handler: it reads the small fields up
         // to the file, checks the signature and the policy, and only then
         // reads the file (into memory or a spool file, capped). An
-        // unauthenticated form never costs more than its small fields.
+        // unauthenticated form never costs more than the form bytes before
+        // its file, which the handler bounds on the stream (FORM_SIDE_MAX).
         let (parts, body) = request.into_parts();
 
         // Hand off to the same handler the axum adapter uses. Identical

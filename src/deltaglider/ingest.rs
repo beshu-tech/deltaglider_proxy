@@ -296,17 +296,27 @@ pub fn spool_admits(declared: u64, max_bytes: u64, held_mib: usize) -> bool {
 /// request's limit, or above what the spool budget (`spool_max_bytes`)
 /// could ever hold beside what the op holds, it is refused before a byte
 /// is read. Every body is judged against the spool: one that finds no RAM
-/// goes there too.
-pub fn admit_declared<E>(plan: &IngestPlan, spool_max_bytes: u64) -> Result<(), IngestError<E>> {
+/// goes there too. `storage_extra`: the spool bytes that the storage write
+/// of the body needs beside it (the ciphertext file of a bucket that the
+/// proxy encrypts, `file_put_spool_bytes`), which the reservation covers
+/// too; judged without it, a body that fits alone was admitted and its
+/// reservation clamped below what the write then put on the disk.
+pub fn admit_declared<E>(
+    plan: &IngestPlan,
+    spool_max_bytes: u64,
+    storage_extra: u64,
+) -> Result<(), IngestError<E>> {
     if plan.declared > plan.limit {
         return Err(IngestError::TooLarge {
             declared: plan.declared,
             limit: plan.limit,
         });
     }
-    if !spool_admits(plan.declared, spool_max_bytes, plan.held_spool_mib) {
+    let needed = plan.declared.saturating_add(storage_extra);
+    if !spool_admits(needed, spool_max_bytes, plan.held_spool_mib) {
         return Err(IngestError::SpoolTooSmall {
             declared: plan.declared,
+            storage_extra,
             max_bytes: spool_max_bytes,
         });
     }
@@ -399,9 +409,14 @@ pub enum IngestError<E> {
     Source(E),
     /// `declared` is above the request's limit (EntityTooLarge).
     TooLarge { declared: u64, limit: u64 },
-    /// `declared` is above what the spool budget can ever hold
+    /// `declared`, with the `storage_extra` that its storage write needs
+    /// (the encrypted copy), is above what the spool budget can ever hold
     /// (`DGP_SPOOL_MAX_BYTES`; EntityTooLarge).
-    SpoolTooSmall { declared: u64, max_bytes: u64 },
+    SpoolTooSmall {
+        declared: u64,
+        storage_extra: u64,
+        max_bytes: u64,
+    },
     /// The body is longer than `declared`.
     TooLong { declared: u64 },
     /// The body ended before `declared` bytes (IncompleteBody).
@@ -423,11 +438,24 @@ impl<E: std::fmt::Display> std::fmt::Display for IngestError<E> {
             }
             Self::SpoolTooSmall {
                 declared,
+                storage_extra: 0,
                 max_bytes,
             } => write!(
                 f,
                 "a body of {declared} bytes does not fit the spool budget \
                  (DGP_SPOOL_MAX_BYTES = {max_bytes})"
+            ),
+            Self::SpoolTooSmall {
+                declared,
+                storage_extra,
+                max_bytes,
+            } => write!(
+                f,
+                "a body of {declared} bytes needs {} bytes of spool: the body and the \
+                 {storage_extra} bytes of its encrypted copy (the bucket is encrypted by the \
+                 proxy, so its uploads need about twice their size in spool space). That does \
+                 not fit the spool budget (DGP_SPOOL_MAX_BYTES = {max_bytes})",
+                declared.saturating_add(*storage_extra)
             ),
             Self::TooLong { declared } => {
                 write!(f, "the body is longer than its declared {declared} bytes")
@@ -453,7 +481,15 @@ where
     B: StorageBackend,
     S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
-    admit_declared(&plan, engine.spool_max_bytes())?;
+    // An object is stored right after: its reservation also covers the
+    // temp files of its storage write. A part is stored at completion,
+    // which reserves for its own write.
+    let storage_extra = if plan.destination == Destination::Object {
+        engine.storage_spool_extra(bucket, plan.declared).await
+    } else {
+        0
+    };
+    admit_declared(&plan, engine.spool_max_bytes(), storage_extra)?;
     let threshold = engine.spool_threshold();
     let object = plan.destination == Destination::Object;
     let permit = (object && plan.declared <= threshold)
@@ -471,7 +507,13 @@ where
     }
     match permit.filter(|_| medium == Medium::Memory) {
         Some(permit) => into_memory(stream, plan, permit).await,
-        None => into_spool(engine, bucket, stream, plan, plan.declared > threshold).await,
+        None => {
+            let reserve = Reserve {
+                bytes: plan.declared.saturating_add(storage_extra),
+                wait: plan.declared > threshold,
+            };
+            into_spool(engine, stream, plan, reserve).await
+        }
     }
 }
 
@@ -507,12 +549,18 @@ where
     })
 }
 
+/// The spool reservation of a body: its `bytes` (the body and the temp
+/// files of its storage write), and whether it may `wait` for them.
+struct Reserve {
+    bytes: u64,
+    wait: bool,
+}
+
 async fn into_spool<B, S, E>(
     engine: &DeltaGliderEngine<B>,
-    bucket: &str,
     mut stream: S,
     plan: IngestPlan,
-    over_threshold: bool,
+    reserve: Reserve,
 ) -> Result<IngestedBody, IngestError<E>>
 where
     B: StorageBackend,
@@ -523,13 +571,7 @@ where
     // takes free budget now or is refused: it never queues behind a large
     // reservation.
     let storage = engine
-        .reserve_ingest_spool(
-            bucket,
-            plan.declared,
-            plan.held_spool_mib,
-            over_threshold,
-            plan.destination == Destination::Object,
-        )
+        .reserve_ingest_spool(reserve.bytes, plan.held_spool_mib, reserve.wait)
         .await
         .map_err(IngestError::Engine)?;
     if storage.reserved_mib() < mib_ceil(plan.declared) {
@@ -730,23 +772,44 @@ mod tests {
             strict_length: true,
             destination: Destination::Object,
         };
-        let verdict = |p: IngestPlan, max| match admit_declared::<()>(&p, max) {
+        let verdict = |p: IngestPlan, max, extra| match admit_declared::<()>(&p, max, extra) {
             Ok(()) => "ok",
             Err(IngestError::TooLarge { .. }) => "too-large",
             Err(IngestError::SpoolTooSmall { .. }) => "spool",
             Err(_) => "other",
         };
-        assert_eq!(verdict(plan(MIB, 2 * MIB, 0), 16 * MIB), "ok");
-        assert_eq!(verdict(plan(2 * MIB, 2 * MIB, 0), 16 * MIB), "ok");
-        assert_eq!(
-            verdict(plan(2 * MIB + 1, 2 * MIB, 0), 16 * MIB),
-            "too-large"
-        );
-        // The limit first: a body above both is TooLarge.
-        assert_eq!(verdict(plan(32 * MIB, 2 * MIB, 0), 16 * MIB), "too-large");
-        assert_eq!(verdict(plan(17 * MIB, 64 * MIB, 0), 16 * MIB), "spool");
-        assert_eq!(verdict(plan(13 * MIB, 64 * MIB, 4), 16 * MIB), "spool");
-        assert_eq!(verdict(plan(0, 0, 0), 16 * MIB), "ok", "an empty body");
+        // (plan, spool max, storage extra) -> verdict
+        let cases = [
+            (plan(MIB, 2 * MIB, 0), 16 * MIB, 0, "ok"),
+            (plan(2 * MIB, 2 * MIB, 0), 16 * MIB, 0, "ok"),
+            (plan(2 * MIB + 1, 2 * MIB, 0), 16 * MIB, 0, "too-large"),
+            // The limit first: a body above both is TooLarge.
+            (plan(32 * MIB, 2 * MIB, 0), 16 * MIB, 0, "too-large"),
+            (plan(17 * MIB, 64 * MIB, 0), 16 * MIB, 0, "spool"),
+            (plan(13 * MIB, 64 * MIB, 4), 16 * MIB, 0, "spool"),
+            (plan(0, 0, 0), 16 * MIB, 0, "ok"),
+            // An encrypted bucket: the body and its ciphertext file must
+            // fit together. 10 MiB alone fits 16; with its copy it does not.
+            (
+                plan(10 * MIB, 64 * MIB, 0),
+                16 * MIB,
+                10 * MIB + 4096,
+                "spool",
+            ),
+            (plan(8 * MIB, 64 * MIB, 0), 16 * MIB, 8 * MIB, "ok"),
+            (plan(8 * MIB, 64 * MIB, 0), 16 * MIB, 8 * MIB + 1, "spool"),
+            (plan(6 * MIB, 64 * MIB, 4), 16 * MIB, 6 * MIB, "ok"),
+            (plan(6 * MIB, 64 * MIB, 5), 16 * MIB, 6 * MIB, "spool"),
+            // The limit still judges the body alone.
+            (plan(2 * MIB, 2 * MIB, 0), 16 * MIB, 2 * MIB, "ok"),
+        ];
+        for (p, max, extra, want) in cases {
+            assert_eq!(
+                verdict(p, max, extra),
+                want,
+                "{p:?} max={max} extra={extra}"
+            );
+        }
     }
 
     proptest! {

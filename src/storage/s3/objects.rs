@@ -178,7 +178,7 @@ impl S3Backend {
         let acl = self.object_acl_for_copy(bucket, key).await;
         // The bucket's own native mode (issue #116).
         let native = self.native_encryption.for_bucket(bucket);
-        let plan = self_copy_plan(
+        let mut plan = self_copy_plan(
             head,
             acl.as_ref(),
             self.metadata_to_headers(metadata),
@@ -188,7 +188,7 @@ impl S3Backend {
         // The copy restates the object's own client metadata next to the
         // new DG fields: over S3's limit is a clean MetadataTooLarge, not
         // the backend's error.
-        check_metadata_size(&plan.metadata, bucket, key)?;
+        fit_metadata(&mut plan.metadata, bucket, key)?;
 
         let mut request = self
             .bulk_client
@@ -378,7 +378,7 @@ impl S3Backend {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
 
-        check_metadata_size(&headers, bucket, key)?;
+        fit_metadata(&mut headers, bucket, key)?;
 
         let mut backoff = UNIDENTIFIED_400_BACKOFF_MS.iter();
         for attempt in 0.. {
@@ -578,7 +578,7 @@ impl S3Backend {
         if let Some(marker) = native.marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
-        check_metadata_size(&headers, bucket, key)?;
+        fit_metadata(&mut headers, bucket, key)?;
 
         // The sizes this PUT sends: the listing facts and the upload
         // deadline use their total.

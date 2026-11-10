@@ -48,7 +48,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::deltaglider::spool::{SpoolDir, SpoolReservation};
+use crate::deltaglider::spool::{mib_ceil, SpoolDir, SpoolReservation};
+use std::sync::Arc;
 
 /// Relay root, under the spool dir (it was under the system temp dir).
 const RELAY_ROOT_DIR: &str = "deltaglider-mpu-relay";
@@ -80,6 +81,72 @@ pub fn relay_upload_cap(spool_max_bytes: u64, configured: Option<u64>) -> Option
 /// the spool: open uploads never pin the budget of every other request.
 pub fn max_total_multipart_bytes(spool_max_bytes: u64, configured: Option<u64>) -> u64 {
     configured.unwrap_or(spool_max_bytes / 2)
+}
+
+/// Pure: the spool budget, in bytes, that a part of `size` bytes holds.
+/// The spool reserves whole MiB, at least one per file, so the caps count
+/// this and not the part's bytes: counted in bytes, 10,000 parts of one
+/// byte passed a cap of a few KiB while they held 10,000 MiB of the spool.
+pub fn part_charge(size: u64) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    (mib_ceil(size).max(1) as u64).saturating_mul(MIB)
+}
+
+/// The charges ([`part_charge`]) of the parts that were admitted and are
+/// still streaming: counted against the caps from their admission until
+/// they are kept or dropped ([`AdmittedPart`]), so parallel parts cannot
+/// pass the caps together.
+#[derive(Default)]
+struct Admitted {
+    total: u64,
+    by_upload: HashMap<String, u64>,
+}
+
+impl Admitted {
+    fn of(&self, upload_id: &str) -> u64 {
+        self.by_upload.get(upload_id).copied().unwrap_or(0)
+    }
+
+    fn add(&mut self, upload_id: &str, charge: u64) {
+        self.total = self.total.saturating_add(charge);
+        *self.by_upload.entry(upload_id.to_string()).or_default() += charge;
+    }
+
+    fn release(&mut self, upload_id: &str, charge: u64) {
+        self.total = self.total.saturating_sub(charge);
+        if let Some(held) = self.by_upload.get_mut(upload_id) {
+            *held = held.saturating_sub(charge);
+            if *held == 0 {
+                self.by_upload.remove(upload_id);
+            }
+        }
+    }
+}
+
+/// RAII: the charge of an admitted part, released when it is kept
+/// ([`MultipartStore::upload_part`]) or when it is dropped (a failed
+/// ingest, a dropped request future, an abort).
+#[must_use = "the part's admission ends when this is dropped"]
+pub struct AdmittedPart {
+    admitted: Arc<parking_lot::Mutex<Admitted>>,
+    upload_id: String,
+    charge: u64,
+}
+
+impl AdmittedPart {
+    /// Release the charge under the caller's lock of `admitted`.
+    fn release_in(&mut self, admitted: &mut Admitted) {
+        admitted.release(&self.upload_id, std::mem::take(&mut self.charge));
+    }
+}
+
+impl Drop for AdmittedPart {
+    fn drop(&mut self) {
+        if self.charge > 0 {
+            let charge = std::mem::take(&mut self.charge);
+            self.admitted.lock().release(&self.upload_id, charge);
+        }
+    }
 }
 
 /// One received part: its relay file and what was recorded when it
@@ -191,12 +258,15 @@ pub struct CompletedParts {
     pub user_metadata: HashMap<String, String>,
 }
 
-/// What [`MultipartStore::admit_part`] found for a part that may be read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What [`MultipartStore::admit_part`] found for a part that may be read,
+/// and its charge against the caps until [`MultipartStore::upload_part`]
+/// keeps it (or it is dropped).
+#[must_use = "the part's admission ends when this is dropped"]
 pub struct PartAdmission {
     /// The spool budget the upload holds already (its relay parts): its
     /// ingest never waits for more.
     pub held_spool_mib: usize,
+    part: AdmittedPart,
 }
 
 /// Summary of one multipart sweeper run.
@@ -353,11 +423,14 @@ pub struct MultipartStore {
     /// adapter refreshes it from the live engine on every part and complete.
     max_object_size: std::sync::atomic::AtomicU64,
     max_uploads: usize,
-    /// Global in-flight bytes across all uploads. Kept consistent with
-    /// the sum of `MultipartUpload.parts[*].size` — updated under the
-    /// same write lock that mutates the parts map. Checked before each
-    /// UploadPart is read and again when it is kept (C3 DoS fix).
+    /// The spool budget that the kept parts of all uploads hold, in bytes:
+    /// the sum of [`part_charge`] of every `MultipartUpload.parts[*]`,
+    /// updated under the same write lock that mutates the parts map.
+    /// Checked, with `admitted`, before each UploadPart is read and again
+    /// when it is kept (C3 DoS fix).
     in_flight_bytes: std::sync::atomic::AtomicU64,
+    /// The charges of the parts admitted and still streaming.
+    admitted: Arc<parking_lot::Mutex<Admitted>>,
     /// `DGP_MAX_TOTAL_MULTIPART_BYTES` as read at construction (`None`:
     /// half of the spool, see [`max_total_multipart_bytes`]).
     max_total_configured: Option<u64>,
@@ -386,6 +459,7 @@ impl MultipartStore {
             max_object_size: std::sync::atomic::AtomicU64::new(max_object_size),
             max_uploads: default_max_uploads(),
             in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
+            admitted: Default::default(),
             max_total_configured: crate::config::env_parse::<u64>(MAX_TOTAL_MULTIPART_ENV),
             idle_ttl: Duration::hours(default_multipart_idle_ttl_hours()),
             spool: shared_spool(),
@@ -503,7 +577,8 @@ impl MultipartStore {
     /// that `upload_part` runs again when it keeps the part, run here on
     /// the declared size BEFORE the body is read: a part for an unknown,
     /// aborted or completing upload, or one past a cap, is refused before
-    /// up to 5 GiB of it reach the spool.
+    /// up to 5 GiB of it reach the spool. An admitted part counts against
+    /// the caps from now on, while it streams ([`PartAdmission`]).
     pub fn admit_part(
         &self,
         upload_id: &str,
@@ -515,9 +590,19 @@ impl MultipartStore {
         check_part_number(part_number)?;
         let uploads = self.uploads.read();
         let upload = open_upload(uploads.get(upload_id), upload_id, bucket, key)?;
-        self.check_part_caps(upload, part_number, declared)?;
+        // Check and count under one lock: two parallel parts cannot both
+        // pass a cap that only one of them fits.
+        let mut admitted = self.admitted.lock();
+        self.check_part_caps(upload, &admitted, part_number, declared)?;
+        let charge = part_charge(declared);
+        admitted.add(upload_id, charge);
         Ok(PartAdmission {
             held_spool_mib: upload.parts.values().map(|p| p.budget.reserved_mib()).sum(),
+            part: AdmittedPart {
+                admitted: self.admitted.clone(),
+                upload_id: upload_id.to_string(),
+                charge,
+            },
         })
     }
 
@@ -535,6 +620,7 @@ impl MultipartStore {
         key: &str,
         part_number: u32,
         body: IngestedBody,
+        admission: PartAdmission,
     ) -> Result<String, S3Error> {
         check_part_number(part_number)?;
         let IngestedBody::Spooled {
@@ -579,7 +665,7 @@ impl MultipartStore {
             uploaded_at: Utc::now(),
         };
         let etag = format!("\"{}\"", part.md5_hex);
-        match self.insert_part(upload_id, bucket, key, part_number, part) {
+        match self.insert_part(upload_id, bucket, key, part_number, part, admission.part) {
             Ok(replaced) => {
                 if let Some(old) = replaced {
                     discard_part(old);
@@ -599,9 +685,10 @@ impl MultipartStore {
     }
 
     /// The map half of [`Self::upload_part`], under the `uploads` lock:
-    /// the checks of [`Self::admit_part`] again, on the received size, then
-    /// the insert. The part this one replaces, or this part when it is
-    /// refused, is handed back for the caller to delete AFTER the lock.
+    /// the part's admission charge is released, the checks of
+    /// [`Self::admit_part`] run again on the received size, then the
+    /// insert. The part this one replaces, or this part when it is refused,
+    /// is handed back for the caller to delete AFTER the lock.
     #[allow(clippy::result_large_err)]
     fn insert_part(
         &self,
@@ -610,13 +697,16 @@ impl MultipartStore {
         key: &str,
         part_number: u32,
         part: PartData,
+        mut admission: AdmittedPart,
     ) -> Result<Option<PartData>, (S3Error, PartData)> {
         let mut uploads = self.uploads.write();
+        let mut admitted = self.admitted.lock();
+        admission.release_in(&mut admitted);
         let upload = match open_upload_mut(uploads.get_mut(upload_id), upload_id, bucket, key) {
             Ok(upload) => upload,
             Err(e) => return Err((e, part)),
         };
-        let delta = match self.check_part_caps(upload, part_number, part.size) {
+        let delta = match self.check_part_caps(upload, &admitted, part_number, part.size) {
             Ok(delta) => delta,
             Err(e) => return Err((e, part)),
         };
@@ -636,30 +726,32 @@ impl MultipartStore {
     }
 
     /// The caps a part of `size` bytes must pass (C3 DoS fix); the change
-    /// of the global in-flight bytes it makes. Overwrite semantics: the
-    /// part it replaces no longer counts.
+    /// of the global held bytes it makes. Overwrite semantics: the part it
+    /// replaces no longer counts. `admitted`: the parts admitted and still
+    /// streaming (not this one), which count against the spool caps.
     ///
-    /// 1. Per upload: `max_object_size` (EntityTooLarge).
-    /// 2. Global: `DGP_MAX_TOTAL_MULTIPART_BYTES` across all uploads
-    ///    (SlowDown, so SDKs back off and retry).
-    /// 3. Per upload: the relay bytes it may hold in the spool
-    ///    ([`relay_upload_cap`], EntityTooLarge naming the variable). A
-    ///    part that went past it was written anyway, so the disk use of one
-    ///    upload grew without a bound while it pinned the budget of every
-    ///    other request.
+    /// 1. Per upload: `max_object_size`, on the part bytes (EntityTooLarge).
+    /// 2. Global: `DGP_MAX_TOTAL_MULTIPART_BYTES` across all uploads, on
+    ///    the spool budget held ([`part_charge`]; SlowDown, so SDKs back off
+    ///    and retry).
+    /// 3. Per upload: the spool budget it may hold ([`relay_upload_cap`],
+    ///    EntityTooLarge naming the variable). A part that went past it was
+    ///    written anyway, so the disk use of one upload grew without a bound
+    ///    while it pinned the budget of every other request.
     fn check_part_caps(
         &self,
         upload: &MultipartUpload,
+        admitted: &Admitted,
         part_number: u32,
         size: u64,
     ) -> Result<i64, S3Error> {
-        let old_part_size = upload.parts.get(&part_number).map(|p| p.size).unwrap_or(0);
+        let old_part_size = upload.parts.get(&part_number).map(|p| p.size);
         let others = upload
             .parts
             .values()
             .map(|p| p.size)
             .sum::<u64>()
-            .saturating_sub(old_part_size);
+            .saturating_sub(old_part_size.unwrap_or(0));
         let cumulative_after = others.saturating_add(size);
 
         let max_object_size = self.max_object_size();
@@ -670,28 +762,41 @@ impl MultipartStore {
             });
         }
 
-        // Compute the global delta we'd contribute (signed on overwrite).
-        let delta: i64 = size as i64 - old_part_size as i64;
+        // The spool budget: whole MiB per part.
+        let charge = part_charge(size);
+        let old_charge = old_part_size.map_or(0, part_charge);
+        let delta: i64 = charge as i64 - old_charge as i64;
         if delta > 0 {
             let new_total = self
                 .in_flight_bytes
                 .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(admitted.total)
                 .saturating_add(delta as u64);
             let cap = self.max_total_multipart_bytes();
             if new_total > cap {
                 return Err(S3Error::SlowDown(format!(
-                    "Multipart in-flight bytes cap reached ({new_total} / {cap} bytes, \
-                     {MAX_TOTAL_MULTIPART_ENV})"
+                    "Multipart uploads would hold {new_total} bytes of spool budget, over the cap \
+                     of {cap} bytes ({MAX_TOTAL_MULTIPART_ENV}; each part holds whole MiB, at \
+                     least one)"
                 )));
             }
         }
 
         if let Some(cap) = relay_upload_cap(self.spool.max_bytes(), self.relay_upload_max) {
-            if cumulative_after > cap {
+            let held_after = upload
+                .parts
+                .values()
+                .map(|p| part_charge(p.size))
+                .sum::<u64>()
+                .saturating_sub(old_charge)
+                .saturating_add(admitted.of(&upload.upload_id))
+                .saturating_add(charge);
+            if held_after > cap {
                 return Err(S3Error::EntityTooLargeReason(format!(
-                    "this multipart upload would hold {cumulative_after} bytes of relay parts in \
-                     the spool; one upload may hold at most {cap} bytes ({RELAY_UPLOAD_MAX_ENV}, \
-                     default half of DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)"
+                    "this multipart upload would hold {held_after} bytes of spool budget for its \
+                     relay parts (each part holds whole MiB, at least one); one upload may hold \
+                     at most {cap} bytes ({RELAY_UPLOAD_MAX_ENV}, default half of \
+                     DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)"
                 )));
             }
         }
@@ -939,10 +1044,10 @@ impl MultipartStore {
         let _ = fs::remove_dir_all(self.relay_dir_for_upload(upload_id));
     }
 
-    /// Return the sum of all part sizes for this upload — used by the
-    /// in-flight counter on release paths.
+    /// Return the spool budget the upload's parts hold ([`part_charge`]),
+    /// and take it off the global counter — used on release paths.
     fn release_bytes(&self, upload: &MultipartUpload) -> u64 {
-        let freed: u64 = upload.parts.values().map(|p| p.size).sum();
+        let freed: u64 = upload.parts.values().map(|p| part_charge(p.size)).sum();
         if freed > 0 {
             self.in_flight_bytes
                 .fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);

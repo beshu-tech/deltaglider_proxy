@@ -452,7 +452,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 })
             }
             StorageInfo::Reference { .. } | StorageInfo::Delta { .. }
-                if metadata.file_size > self.spool_threshold() =>
+                if self.streams_from_spool(&metadata) =>
             {
                 // Large delta or reference object: a verified spool file
                 // (bounded memory), streamed to the client. Integrity is
@@ -540,6 +540,27 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         })
     }
 
+    /// Whether [`Self::retrieve_stream`] of an object with `metadata`
+    /// serves it from a verified spool file (a delta or reference object
+    /// above the spool threshold), which its stream holds until it drops.
+    fn streams_from_spool(&self, metadata: &FileMetadata) -> bool {
+        !matches!(metadata.storage_info, StorageInfo::Passthrough)
+            && metadata.file_size > self.spool_threshold()
+    }
+
+    /// The spool budget, in MiB, that the stream of [`Self::retrieve_stream`]
+    /// for an object with `metadata` holds while it lives (`0`: the stream
+    /// holds none). A caller that reserves more spool while it reads such a
+    /// stream (a copy that ingests it) passes this as its held budget, so
+    /// it never waits for budget while it holds some (hold-and-wait).
+    pub fn stream_spool_mib(&self, metadata: &FileMetadata) -> usize {
+        if self.streams_from_spool(metadata) {
+            crate::deltaglider::spool::mib_ceil(metadata.file_size).max(1)
+        } else {
+            0
+        }
+    }
+
     /// The verified spool file of a large delta or reference object, shared
     /// by the whole GET, the range GETs and the copies of it: concurrent
     /// reads fill it once (storage-11), and its SHA-256 is the object's
@@ -569,9 +590,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     self.cache_key(bucket, deltaspace_id),
                     metadata.file_sha256.clone(),
                 );
+                // Reserved BEFORE the slot: the fill runs under the slot's
+                // lock, and the streaming PUTs and delta GETs of the folder
+                // join this slot while they hold spool budget. A fill that
+                // waited for budget there would wait for them, and they for
+                // it, until the acquire timeout. A cached hit drops this
+                // reservation unused.
+                let spool = self.spool_acquire(metadata.file_size).await?;
                 self.range_spools
-                    .get_or_fill(key, || {
-                        self.fill_reference_object(bucket, deltaspace_id, obj_key, metadata)
+                    .get_or_fill(key, move || {
+                        self.fill_reference_object(bucket, deltaspace_id, obj_key, metadata, spool)
                     })
                     .await
             }
@@ -581,18 +609,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// The spool file of a reference object: reserved at its recorded
-    /// size first (a GET that waits for budget holds nothing, not even an
-    /// open response), then written from one read of reference.bin and
-    /// checked against the object's SHA-256.
+    /// The spool file of a reference object: `spool` was reserved at its
+    /// recorded size before the cache slot was taken (a GET that waits for
+    /// budget holds nothing, not even an open response or the slot), then
+    /// it is written from one read of reference.bin and checked against
+    /// the object's SHA-256.
     async fn fill_reference_object(
         &self,
         bucket: &str,
         deltaspace_id: &str,
         obj_key: &super::ObjectKey,
         metadata: &FileMetadata,
+        spool: crate::deltaglider::spool::Spool,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
-        let spool = self.spool_acquire(metadata.file_size).await?;
         let source = self
             .storage
             .open_reference_source(bucket, deltaspace_id)

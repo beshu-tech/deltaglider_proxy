@@ -5,6 +5,8 @@ use crate::deltaglider::ingest::{BodyHashes, IngestedBody};
 use crate::deltaglider::spool::{mib_ceil, CONTENDED};
 use bytes::Bytes;
 
+const MIB: u64 = 1024 * 1024;
+
 /// `data` as an ingested part body in `store`'s spool, the way the ingest
 /// of an UploadPart makes one: a reservation that covers the file only,
 /// taken without waiting beside the `held_mib` that the upload holds.
@@ -44,7 +46,7 @@ pub(super) fn put(
     let data = data.as_ref();
     let admission = store.admit_part(upload_id, bucket, key, part_number, data.len() as u64)?;
     let body = spooled(store, data, admission.held_spool_mib)?;
-    store.upload_part(upload_id, bucket, key, part_number, body)
+    store.upload_part(upload_id, bucket, key, part_number, body, admission)
 }
 
 /// The object a completion stores: its relay parts, joined.
@@ -754,20 +756,20 @@ fn test_upload_part_overwrite_adjusts_cumulative_correctly() {
         Bytes::from(vec![0u8; 200]),
     )
     .unwrap();
-    // Counter should reflect the overwrite.
-    assert_eq!(store.in_flight_bytes(), 600);
+    // Counter should reflect the overwrite: two parts, 1 MiB of spool each.
+    assert_eq!(store.in_flight_bytes(), 2 * MIB);
 }
 
 #[test]
 fn test_upload_part_respects_global_byte_cap() {
-    // Tight global cap: 2 KiB total across all uploads.
-    let store = MultipartStore::new_for_test(10 * 1024, 2 * 1024, Duration::hours(24));
+    // Tight global cap: 2 MiB of spool budget across all uploads.
+    let store = MultipartStore::new_for_test(10 * MIB, 2 * MIB, Duration::hours(24));
     let id_a = store.create("b", "a", None, HashMap::new()).unwrap();
     let id_b = store.create("b", "b", None, HashMap::new()).unwrap();
 
-    // Fill upload A to 1 KiB.
+    // Upload A holds 1 MiB.
     put(&store, &id_a, "b", "a", 1, Bytes::from(vec![0u8; 1024])).unwrap();
-    // Fill upload B to 1 KiB (total now 2 KiB = cap).
+    // Upload B holds 1 MiB (total now 2 MiB = cap).
     put(&store, &id_b, "b", "b", 1, Bytes::from(vec![0u8; 1024])).unwrap();
     // Next byte anywhere → SlowDown.
     let err = put(&store, &id_a, "b", "a", 2, Bytes::from(vec![0u8; 1])).unwrap_err();
@@ -776,10 +778,10 @@ fn test_upload_part_respects_global_byte_cap() {
 
 #[test]
 fn test_abort_releases_in_flight_bytes() {
-    let store = MultipartStore::new_for_test(10 * 1024, 2 * 1024, Duration::hours(24));
+    let store = MultipartStore::new_for_test(10 * MIB, 2 * MIB, Duration::hours(24));
     let id = store.create("b", "a", None, HashMap::new()).unwrap();
     put(&store, &id, "b", "a", 1, Bytes::from(vec![0u8; 1024])).unwrap();
-    assert_eq!(store.in_flight_bytes(), 1024);
+    assert_eq!(store.in_flight_bytes(), MIB);
 
     store.abort(&id, "b", "a").unwrap();
     assert_eq!(
@@ -791,15 +793,15 @@ fn test_abort_releases_in_flight_bytes() {
 
 #[test]
 fn test_finish_upload_releases_in_flight_bytes() {
-    let store = MultipartStore::new_for_test(10 * 1024, 10 * 1024, Duration::hours(24));
+    let store = MultipartStore::new_for_test(10 * 1024, 10 * MIB, Duration::hours(24));
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     let data = Bytes::from(vec![0u8; 500]);
     let etag = put(&store, &id, "b", "k", 1, data).unwrap();
-    assert_eq!(store.in_flight_bytes(), 500);
+    assert_eq!(store.in_flight_bytes(), MIB);
 
     store.complete_parts(&id, "b", "k", &[(1, etag)]).unwrap();
     // Still in map (Completing) — counter unchanged.
-    assert_eq!(store.in_flight_bytes(), 500);
+    assert_eq!(store.in_flight_bytes(), MIB);
 
     store.finish_upload(&id);
     assert_eq!(store.in_flight_bytes(), 0);
@@ -808,10 +810,10 @@ fn test_finish_upload_releases_in_flight_bytes() {
 #[test]
 fn test_cleanup_expired_idle_ttl_sweeps_and_releases_bytes() {
     // Tiny idle TTL so we can trip it synchronously.
-    let store = MultipartStore::new_for_test(10 * 1024, 10 * 1024, Duration::milliseconds(1));
+    let store = MultipartStore::new_for_test(10 * 1024, 10 * MIB, Duration::milliseconds(1));
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     put(&store, &id, "b", "k", 1, Bytes::from(vec![0u8; 700])).unwrap();
-    assert_eq!(store.in_flight_bytes(), 700);
+    assert_eq!(store.in_flight_bytes(), MIB);
 
     // Sleep past the idle TTL.
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -835,7 +837,7 @@ fn test_cleanup_expired_idle_ttl_sweeps_and_releases_bytes() {
 #[test]
 fn test_cleanup_expired_preserves_recent_completing_upload() {
     // Completing uploads should survive until completing_timeout elapses.
-    let store = MultipartStore::new_for_test(10 * 1024, 10 * 1024, Duration::hours(24));
+    let store = MultipartStore::new_for_test(10 * 1024, 10 * MIB, Duration::hours(24));
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     let etag = put(&store, &id, "b", "k", 1, Bytes::from(vec![0u8; 100])).unwrap();
     store.complete_parts(&id, "b", "k", &[(1, etag)]).unwrap();
@@ -854,7 +856,7 @@ fn test_cleanup_expired_preserves_recent_completing_upload() {
 
 #[test]
 fn test_cleanup_expired_sweeps_stuck_completing_upload() {
-    let store = MultipartStore::new_for_test(10 * 1024, 10 * 1024, Duration::hours(24));
+    let store = MultipartStore::new_for_test(10 * 1024, 10 * MIB, Duration::hours(24));
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     let etag = put(&store, &id, "b", "k", 1, Bytes::from(vec![0u8; 100])).unwrap();
     store.complete_parts(&id, "b", "k", &[(1, etag)]).unwrap();
@@ -876,7 +878,7 @@ fn test_cleanup_expired_spares_completing_upload_with_store_in_flight() {
     // parts the store is reading get deleted and are lost on retry.
     let store = std::sync::Arc::new(MultipartStore::new_for_test(
         10 * 1024,
-        10 * 1024,
+        10 * MIB,
         Duration::hours(24),
     ));
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
@@ -996,7 +998,10 @@ fn an_ingested_part_becomes_the_relay_part_with_one_reservation() {
     };
     let ingested_at = file.path().to_path_buf();
     assert_eq!(spool.free_mib(), 29);
-    store.upload_part(&id, "b", "k", 1, body).unwrap();
+    let admission = store.admit_part(&id, "b", "k", 1, 3 << 20).unwrap();
+    store
+        .upload_part(&id, "b", "k", 1, body, admission)
+        .unwrap();
     assert_eq!(
         spool.free_mib(),
         29,
@@ -1054,17 +1059,24 @@ fn a_refused_part_leaves_no_file() {
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     let etag = put(&store, &id, "b", "k", 1, vec![1u8; 3 << 20]).unwrap();
 
-    // Admitted while the upload had room, refused once it has none.
+    // Admitted at a declared size that fits, refused on the size that
+    // arrived.
+    let admission = store.admit_part(&id, "b", "k", 2, 1).unwrap();
     let body = spooled(&store, &[2u8; 2 << 20], 3).unwrap();
-    let err = store.upload_part(&id, "b", "k", 2, body).unwrap_err();
+    let err = store
+        .upload_part(&id, "b", "k", 2, body, admission)
+        .unwrap_err();
     assert_eq!(err.code(), "EntityTooLarge", "{err:?}");
     assert_eq!(relay_files(&store, &id).len(), 1);
     assert_eq!(spool.free_mib(), 29);
 
-    // Refused because the upload is completing.
+    // Admitted, then refused because the upload is completing.
+    let admission = store.admit_part(&id, "b", "k", 2, 4).unwrap();
     store.complete_parts(&id, "b", "k", &[(1, etag)]).unwrap();
     let body = spooled(&store, b"late", 3).unwrap();
-    let err = store.upload_part(&id, "b", "k", 2, body).unwrap_err();
+    let err = store
+        .upload_part(&id, "b", "k", 2, body, admission)
+        .unwrap_err();
     assert!(matches!(err, S3Error::InvalidRequest(_)), "{err:?}");
     assert_eq!(relay_files(&store, &id).len(), 1);
     assert_eq!(spool.free_mib(), 29);
@@ -1075,50 +1087,43 @@ fn a_refused_part_leaves_no_file() {
 #[test]
 fn admit_part_refuses_before_the_body() {
     let store = MultipartStore::new_for_test(4 << 20, 6 << 20, Duration::hours(24));
-    assert!(matches!(
-        store.admit_part("nope", "b", "k", 1, 1),
-        Err(S3Error::NoSuchUpload(_))
-    ));
-    let id = store.create("b", "k", None, HashMap::new()).unwrap();
-    assert!(matches!(
-        store.admit_part(&id, "b", "other", 1, 1),
-        Err(S3Error::NoSuchUpload(_))
-    ));
-    assert!(matches!(
-        store.admit_part(&id, "b", "k", 0, 1),
-        Err(S3Error::InvalidArgument(_))
-    ));
+    let code =
+        |r: Result<PartAdmission, S3Error>| r.map(|a| a.held_spool_mib).map_err(|e| e.code());
     assert_eq!(
-        store
-            .admit_part(&id, "b", "k", 1, (4 << 20) + 1)
-            .unwrap_err()
-            .code(),
-        "EntityTooLarge"
+        code(store.admit_part("nope", "b", "k", 1, 1)),
+        Err("NoSuchUpload")
+    );
+    let id = store.create("b", "k", None, HashMap::new()).unwrap();
+    assert_eq!(
+        code(store.admit_part(&id, "b", "other", 1, 1)),
+        Err("NoSuchUpload")
+    );
+    assert_eq!(
+        code(store.admit_part(&id, "b", "k", 0, 1)),
+        Err("InvalidArgument")
+    );
+    assert_eq!(
+        code(store.admit_part(&id, "b", "k", 1, (4 << 20) + 1)),
+        Err("EntityTooLarge")
     );
     let etag = put(&store, &id, "b", "k", 1, vec![0u8; 3 << 20]).unwrap();
-    assert_eq!(
-        store.admit_part(&id, "b", "k", 2, 1 << 20).unwrap(),
-        PartAdmission { held_spool_mib: 3 }
-    );
+    assert_eq!(code(store.admit_part(&id, "b", "k", 2, 1 << 20)), Ok(3));
     // The global cap: another upload holds 3 MiB of 6.
     let other = store.create("b", "o", None, HashMap::new()).unwrap();
     put(&store, &other, "b", "o", 1, vec![0u8; 3 << 20]).unwrap();
-    assert!(matches!(
-        store.admit_part(&id, "b", "k", 2, 1),
-        Err(S3Error::SlowDown(_))
-    ));
+    assert_eq!(code(store.admit_part(&id, "b", "k", 2, 1)), Err("SlowDown"));
     // Replacing a part counts only the difference.
-    store.admit_part(&id, "b", "k", 1, 3 << 20).unwrap();
+    assert!(store.admit_part(&id, "b", "k", 1, 3 << 20).is_ok());
     store.complete_parts(&id, "b", "k", &[(1, etag)]).unwrap();
-    assert!(matches!(
-        store.admit_part(&id, "b", "k", 1, 1),
-        Err(S3Error::InvalidRequest(_))
-    ));
+    assert_eq!(
+        code(store.admit_part(&id, "b", "k", 1, 1)),
+        Err("InvalidRequest")
+    );
     store.abort(&other, "b", "o").unwrap();
-    assert!(matches!(
-        store.admit_part(&other, "b", "o", 1, 1),
-        Err(S3Error::NoSuchUpload(_))
-    ));
+    assert_eq!(
+        code(store.admit_part(&other, "b", "o", 1, 1)),
+        Err("NoSuchUpload")
+    );
 }
 
 /// An abort while a part streams: the part, admitted before the abort,
@@ -1133,7 +1138,9 @@ fn an_abort_during_or_after_the_ingest_leaves_no_file_or_dir() {
     let admission = store.admit_part(&id, "b", "k", 1, 5).unwrap();
     let body = spooled(&store, b"hello", admission.held_spool_mib).unwrap();
     store.abort(&id, "b", "k").unwrap();
-    let err = store.upload_part(&id, "b", "k", 1, body).unwrap_err();
+    let err = store
+        .upload_part(&id, "b", "k", 1, body, admission)
+        .unwrap_err();
     assert!(matches!(err, S3Error::NoSuchUpload(_)), "{err:?}");
     assert!(!store.relay_dir_for_upload(&id).exists());
     assert_eq!(spool.free_mib(), 32);
@@ -1184,6 +1191,158 @@ fn a_part_with_the_budget_taken_is_slowdown_at_once() {
     assert!(matches!(err, S3Error::SlowDown(_)), "got {err:?}");
     drop(other);
     put(&store, &id, "b", "k", 2, vec![1u8; 1 << 20]).unwrap();
+}
+
+#[test]
+fn part_charge_is_whole_mib_at_least_one() {
+    assert_eq!(part_charge(0), MIB);
+    assert_eq!(part_charge(1), MIB);
+    assert_eq!(part_charge(MIB), MIB);
+    assert_eq!(part_charge(MIB + 1), 2 * MIB);
+    assert_eq!(part_charge(5 << 30), 5 << 30);
+}
+
+/// Each part holds whole MiB of the spool, at least one: 20 parts of one
+/// byte hold 20 MiB of the caps, and the next part past a cap is refused.
+/// Before, the caps counted part bytes: 20 bytes held, and one writer
+/// could pin most of the spool with tiny parts.
+#[test]
+fn tiny_parts_are_charged_their_spool_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = small_spool(&dir, 64);
+    // Per-upload cap 20 MiB, global cap 30 MiB.
+    let store = MultipartStore::new_for_test(1 << 30, 30 * MIB, Duration::hours(24))
+        .with_spool(spool.clone())
+        .with_relay_upload_max(Some(20 * MIB));
+    let id = store.create("b", "k", None, HashMap::new()).unwrap();
+    for n in 1..=20 {
+        put(&store, &id, "b", "k", n, b"x").unwrap();
+    }
+    assert_eq!(store.in_flight_bytes(), 20 * MIB);
+    assert_eq!(spool.free_mib(), 44);
+    let err = put(&store, &id, "b", "k", 21, b"x").unwrap_err();
+    assert_eq!(err.code(), "EntityTooLarge", "{err:?}");
+    assert!(err.to_string().contains("whole MiB"), "{err}");
+    // Overwriting a part needs no more budget.
+    put(&store, &id, "b", "k", 20, b"y").unwrap();
+
+    // The global cap counts charges too: 10 more MiB fit, the 11th not.
+    let other = store.create("b", "o", None, HashMap::new()).unwrap();
+    for n in 1..=10 {
+        put(&store, &other, "b", "o", n, b"x").unwrap();
+    }
+    let err = put(&store, &other, "b", "o", 11, b"x").unwrap_err();
+    assert!(matches!(err, S3Error::SlowDown(_)), "{err:?}");
+    store.abort(&id, "b", "k").unwrap();
+    store.abort(&other, "b", "o").unwrap();
+    assert_eq!(store.in_flight_bytes(), 0);
+    assert_eq!(spool.free_mib(), 64);
+}
+
+/// A part counts against the caps from its admission, while it streams:
+/// parallel parts cannot pass a cap together that only some of them fit.
+/// Before, the caps read only the kept parts, so N parallel parts each
+/// passed `admit_part` and each reserved its declared size.
+#[test]
+fn parallel_parts_cannot_pass_the_caps_together() {
+    // Per upload: 4 MiB.
+    let store = MultipartStore::new_for_test(1 << 30, 1 << 30, Duration::hours(24))
+        .with_relay_upload_max(Some(4 * MIB));
+    let id = store.create("b", "k", None, HashMap::new()).unwrap();
+    let a = store.admit_part(&id, "b", "k", 1, 2 * MIB).unwrap();
+    let b = store.admit_part(&id, "b", "k", 2, 2 * MIB).unwrap();
+    let err = store
+        .admit_part(&id, "b", "k", 3, 1)
+        .err()
+        .expect("refused");
+    assert_eq!(err.code(), "EntityTooLarge", "{err:?}");
+    // A dropped admission (a failed ingest, a dropped request) gives its
+    // share back.
+    drop(b);
+    let b = store.admit_part(&id, "b", "k", 2, 2 * MIB).unwrap();
+    drop((a, b));
+
+    // Global: 3 MiB across uploads.
+    let store = MultipartStore::new_for_test(1 << 30, 3 * MIB, Duration::hours(24));
+    let ids: Vec<_> = (0..3)
+        .map(|i| {
+            store
+                .create("b", &format!("k{i}"), None, HashMap::new())
+                .unwrap()
+        })
+        .collect();
+    let held: Vec<_> = ids[..2]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| store.admit_part(id, "b", &format!("k{i}"), 1, 1).unwrap())
+        .collect();
+    let third = store.admit_part(&ids[2], "b", "k2", 1, MIB + 1);
+    assert!(
+        matches!(third, Err(S3Error::SlowDown(_))),
+        "parallel parts passed the global cap"
+    );
+    let third = store.admit_part(&ids[2], "b", "k2", 1, MIB).unwrap();
+    // Kept parts take over the charge of their admission: still 3 MiB.
+    let mut kept = 0;
+    for (i, admission) in held.into_iter().enumerate() {
+        let body = spooled(&store, b"x", admission.held_spool_mib).unwrap();
+        store
+            .upload_part(&ids[i], "b", &format!("k{i}"), 1, body, admission)
+            .unwrap();
+        kept += 1;
+    }
+    assert_eq!(kept, 2);
+    assert_eq!(store.in_flight_bytes(), 2 * MIB);
+    assert!(store.admit_part(&ids[0], "b", "k0", 2, 1).is_err(), "full");
+    drop(third);
+    assert!(store.admit_part(&ids[0], "b", "k0", 2, 1).is_ok());
+}
+
+/// An admission ends with its part in every way: kept, refused when kept,
+/// its upload aborted, or its request future dropped mid-ingest. After
+/// each, the caps hold nothing for it.
+#[tokio::test]
+async fn an_admission_is_released_on_every_path() {
+    let store = Arc::new(
+        MultipartStore::new_for_test(1 << 30, 1 << 30, Duration::hours(24))
+            .with_relay_upload_max(Some(2 * MIB)),
+    );
+    let id = store.create("b", "k", None, HashMap::new()).unwrap();
+    // The whole per-upload cap is admitted, then the admission is dropped
+    // with the future that held it.
+    let admission = store.admit_part(&id, "b", "k", 1, 2 * MIB).unwrap();
+    let task = tokio::spawn(async move {
+        let _held = admission;
+        futures::future::pending::<()>().await;
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        store.admit_part(&id, "b", "k", 2, 1).is_err(),
+        "held while streaming"
+    );
+    task.abort();
+    let _ = task.await;
+    // Refused when kept (aborted upload): the charge is released.
+    let admission = store.admit_part(&id, "b", "k", 1, 2 * MIB).unwrap();
+    let body = spooled(&store, &[1u8; 2 << 20], 0).unwrap();
+    store.abort(&id, "b", "k").unwrap();
+    let err = store
+        .upload_part(&id, "b", "k", 1, body, admission)
+        .unwrap_err();
+    assert_eq!(err.code(), "NoSuchUpload");
+    // An admission that outlives its upload's abort releases on drop.
+    let id = store.create("b", "k", None, HashMap::new()).unwrap();
+    let admission = store.admit_part(&id, "b", "k", 1, 2 * MIB).unwrap();
+    store.abort(&id, "b", "k").unwrap();
+    drop(admission);
+    let id = store.create("b", "k", None, HashMap::new()).unwrap();
+    store
+        .admit_part(&id, "b", "k", 1, 2 * MIB)
+        .map(drop)
+        .unwrap();
+    assert_eq!(store.admitted.lock().total, 0);
+    assert!(store.admitted.lock().by_upload.is_empty());
+    assert_eq!(store.in_flight_bytes(), 0);
 }
 
 #[test]

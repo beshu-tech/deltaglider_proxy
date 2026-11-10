@@ -63,7 +63,7 @@ pub(super) async fn upload_part(
     let part_number = u32::try_from(input.part_number).unwrap_or(0);
     // The part goes straight to a spool file, read once and checked, and
     // the multipart store keeps that file as the part.
-    let body = crate::api::body_ingest::ingest_part_body(
+    let (body, admission) = crate::api::body_ingest::ingest_part_body(
         &svc.state,
         input.body,
         &body_ctx,
@@ -87,6 +87,7 @@ pub(super) async fn upload_part(
         &input.key,
         part_number,
         body,
+        admission,
     )?;
     Ok(s3s::S3Response::new(s3s::dto::UploadPartOutput {
         e_tag: Some(parse_s3s_etag(&etag)?),

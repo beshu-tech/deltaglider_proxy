@@ -128,8 +128,15 @@ impl SpoolDir {
         Ok(SHARED.get_or_init(|| pool).clone())
     }
 
+    /// A spool rooted at `dir`, created private to this user (0700) when
+    /// missing. An existing root must be private too
+    /// (`private_dir_verdict`): a root that another user owns or can
+    /// write to lets that user replace a spool file (a relay part, a body)
+    /// between its check and its read. One that only its group can write
+    /// to is set to 0700; any other is refused, and the proxy does not
+    /// start.
     pub fn new(dir: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
-        std::fs::create_dir_all(&dir)?;
+        create_private_dir(&dir)?;
         // Accounted in MiB: small numbers for terabyte-scale budgets.
         let max_mib = mib_ceil(max_bytes).max(1);
         Ok(Self {
@@ -684,6 +691,81 @@ fn backend_share_mib(max_mib: usize, percent: u8) -> usize {
 }
 
 /// Bytes → MiB, rounded up. Budget accounting unit.
+/// What [`private_dir_verdict`] decides about an existing spool root.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DirVerdict {
+    /// Ours, and nobody else can write to it.
+    Private,
+    /// Ours, and only its group can write to it (a directory that an older
+    /// release or a test made under umask 002): set it to 0700.
+    Tighten,
+    /// Not usable as the spool root.
+    Refuse(String),
+}
+
+/// Pure: may a directory owned by `owner` with permission bits `mode` be
+/// the spool root of the user `me`? Only when `me` owns it and no other
+/// user can write to it. A root that only its group can write to is made
+/// private; a world-writable or sticky one (a shared temp root) is
+/// refused, because changing its mode would break its other users.
+pub(crate) fn private_dir_verdict(owner: u32, me: u32, mode: u32) -> DirVerdict {
+    if owner != me {
+        return DirVerdict::Refuse(format!(
+            "it is owned by uid {owner}, not by this process (uid {me}); give DGP_SPOOL_DIR \
+             a directory of its own"
+        ));
+    }
+    if mode & 0o1002 != 0 {
+        return DirVerdict::Refuse(format!(
+            "other users can write to it (mode {:o}); give DGP_SPOOL_DIR a directory of its \
+             own, or run `chmod 700` on it",
+            mode & 0o7777
+        ));
+    }
+    if mode & 0o020 != 0 {
+        return DirVerdict::Tighten;
+    }
+    DirVerdict::Private
+}
+
+/// Create `dir` (and missing parents) with mode 0700, then judge it with
+/// [`private_dir_verdict`]: a pre-existing root keeps a private mode, has
+/// its group write bit removed, or is refused.
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = std::fs::metadata(dir)?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    match private_dir_verdict(meta.uid(), me, meta.mode()) {
+        DirVerdict::Private => Ok(()),
+        DirVerdict::Tighten => {
+            tracing::warn!(
+                "spool directory {} was writable by its group (mode {:o}); setting it to 700",
+                dir.display(),
+                meta.mode() & 0o7777
+            );
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        }
+        DirVerdict::Refuse(why) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "the spool directory {} is not private: {why}",
+                dir.display()
+            ),
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
 pub(crate) fn mib_ceil(bytes: u64) -> usize {
     const MIB: u64 = 1024 * 1024;
     bytes.div_ceil(MIB) as usize
@@ -862,6 +944,71 @@ mod tests {
         let a = SpoolDir::shared().unwrap();
         let b = SpoolDir::shared().unwrap();
         assert!(Arc::ptr_eq(&a.budget, &b.budget), "one budget per process");
+    }
+
+    #[test]
+    fn private_dir_verdict_truth_table() {
+        use DirVerdict::*;
+        let refused = |v: DirVerdict| matches!(v, Refuse(_));
+        assert_eq!(private_dir_verdict(1000, 1000, 0o40700), Private);
+        assert_eq!(private_dir_verdict(1000, 1000, 0o40755), Private);
+        assert_eq!(private_dir_verdict(0, 0, 0o40700), Private);
+        assert_eq!(private_dir_verdict(1000, 1000, 0o40770), Tighten);
+        assert_eq!(private_dir_verdict(1000, 1000, 0o40775), Tighten);
+        let Refuse(why) = private_dir_verdict(0, 1000, 0o40700) else {
+            panic!("another owner")
+        };
+        assert!(why.contains("uid 0"), "{why}");
+        assert!(refused(private_dir_verdict(1000, 1000, 0o40777)));
+        assert!(refused(private_dir_verdict(1000, 1000, 0o40702)));
+        // A sticky dir is a shared temp root, even when ours (root's /tmp).
+        assert!(refused(private_dir_verdict(0, 0, 0o41777)));
+        assert!(refused(private_dir_verdict(1000, 1000, 0o41700)));
+    }
+
+    /// A new root is created 0700; an existing private root is kept as
+    /// it is; one only its group can write to is made 0700; a root that
+    /// other users can write to is refused with a message that names it.
+    #[cfg(unix)]
+    #[test]
+    fn the_spool_root_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("a/spool");
+        SpoolDir::new(fresh.clone(), 1 << 20).unwrap();
+        assert_eq!(mode(&fresh), 0o700);
+
+        let kept = dir.path().join("kept");
+        std::fs::create_dir(&kept).unwrap();
+        set(&kept, 0o750);
+        SpoolDir::new(kept.clone(), 1 << 20).unwrap();
+        assert_eq!(
+            mode(&kept),
+            0o750,
+            "an existing private root keeps its mode"
+        );
+
+        let group = dir.path().join("group");
+        std::fs::create_dir(&group).unwrap();
+        set(&group, 0o775);
+        SpoolDir::new(group.clone(), 1 << 20).unwrap();
+        assert_eq!(mode(&group), 0o700, "a group-writable root is made private");
+
+        for open in [0o777, 0o703, 0o1777] {
+            let shared = dir.path().join(format!("shared-{open:o}"));
+            std::fs::create_dir(&shared).unwrap();
+            set(&shared, open);
+            let err = SpoolDir::new(shared.clone(), 1 << 20)
+                .err()
+                .expect("refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("not private"), "{err}");
+            assert_eq!(mode(&shared), open, "a refused root is not changed");
+        }
     }
 
     #[test]

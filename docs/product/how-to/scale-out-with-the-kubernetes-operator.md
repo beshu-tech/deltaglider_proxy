@@ -228,6 +228,7 @@ The remaining structural consequences:
 |---|---|
 | Readiness is all-or-nothing per pod | Every pod's readiness probe (`/_/ready`) checks the storage backends, so a backend outage removes **all** pods from the ring at once. With one backend, this is correct, because no pod could serve a request anyway. With several backends, a pod stays ready while at least one backend answers, and the buckets on a dead backend answer `503` on their own. |
 | All traffic for one prefix goes to one pod | Load is spread across pods by directory, not by request. A single very busy prefix will not fan out across the fleet. |
+| The spool of a pod is at most 6 GiB | Each proxy pod mounts `/tmp` as an `emptyDir` with a size limit of 8 GiB. The spool lives there, so the operator sets `DGP_SPOOL_MAX_BYTES` to 6 GiB on every pod: a pod whose `emptyDir` grows past its limit is evicted by the kubelet. A pod therefore holds at most 6 GiB of upload bodies, delta reconstructions and multipart parts at one time, and one multipart upload can hold at most half of that (`DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`). A request that finds no spool space free waits for it and then gets `503 SlowDown`. |
 | The admin UI is effectively single-pod | Sessions are in memory and source-IP sticky: a pod restart logs its admin users out, everyone behind one NAT gateway lands on the same pod, and they share that pod's login rate-limit budget. Treat the admin GUI as a one-pod surface for now. |
 
 The rest of the multi-instance contract (the IAM merge, synchronisation lag, and upgrade

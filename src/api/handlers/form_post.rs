@@ -73,6 +73,101 @@ pub(crate) const FORM_FIELDS_MAX: u64 = 1024 * 1024;
 /// file, the part headers and the boundaries.
 pub(crate) const FORM_OVERHEAD: u64 = 4 * FORM_FIELDS_MAX;
 
+/// The most form bytes the proxy reads on one side of the file (the
+/// fields, their names, the part headers and the boundaries), counted on
+/// the body stream itself ([`FormMeter`]). The multipart parser keeps what
+/// it polled until a part header ends, so without this bound one part
+/// header that never ends, or a flood of empty fields, held up to the whole
+/// form in memory before the signature check.
+pub(crate) const FORM_SIDE_MAX: u64 = FORM_OVERHEAD + FORM_FIELDS_MAX;
+
+/// The most fields on one side of the file. Each one costs a map entry
+/// besides its bytes, so an empty field is not free.
+pub(crate) const FORM_FIELD_COUNT_MAX: usize = 1000;
+
+/// Counts the bytes of a form body as the parser polls them, and refuses
+/// the stream once more than [`FORM_SIDE_MAX`] were polled since
+/// [`FormMeter::bound`]. Shared between the stream (which counts) and the
+/// handler (which moves the bound around the file).
+#[derive(Clone, Default)]
+struct FormMeter {
+    polled: Arc<std::sync::atomic::AtomicU64>,
+    /// Polled-byte count past which the stream fails; `u64::MAX` while the
+    /// file is read (the ingest caps the file).
+    allowance: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The stream error of a form side past [`FORM_SIDE_MAX`] (or past the
+/// field count, see [`count_field`]).
+#[derive(Debug)]
+struct FormSideTooLarge;
+
+impl std::fmt::Display for FormSideTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the form fields on one side of the file, with their names and part headers, are \
+             larger than {FORM_SIDE_MAX} bytes"
+        )
+    }
+}
+
+impl std::error::Error for FormSideTooLarge {}
+
+impl FormMeter {
+    /// From now on, at most [`FORM_SIDE_MAX`] more bytes.
+    fn bound(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let polled = self.polled.load(SeqCst);
+        self.allowance
+            .store(polled.saturating_add(FORM_SIDE_MAX), SeqCst);
+    }
+
+    /// No bound: the file (the ingest caps it).
+    fn unbound(&self) {
+        self.allowance
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `body`, counted. A chunk polled after the allowance is used up fails
+    /// the stream, so the parser holds at most the allowance plus one chunk.
+    fn meter<S, E>(
+        &self,
+        body: S,
+    ) -> impl Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send + 'static
+    where
+        S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    {
+        use std::sync::atomic::Ordering::SeqCst;
+        let meter = self.clone();
+        body.map(move |chunk| {
+            let chunk = chunk.map_err(Into::into)?;
+            let before = meter.polled.fetch_add(chunk.len() as u64, SeqCst);
+            if before >= meter.allowance.load(SeqCst) {
+                return Err(Box::new(FormSideTooLarge) as _);
+            }
+            Ok(chunk)
+        })
+    }
+}
+
+/// Count one more field on a side of the file: past
+/// [`FORM_FIELD_COUNT_MAX`] the form is refused. Its name is charged to
+/// the side's value budget (`budget`), as its value is.
+fn count_field(count: &mut usize, name: &str, budget: &mut u64) -> Result<(), S3Error> {
+    *count += 1;
+    let name_len = name.len() as u64;
+    if *count > FORM_FIELD_COUNT_MAX || name_len > *budget {
+        return Err(S3Error::InvalidArgument(format!(
+            "a POST form may have at most {FORM_FIELD_COUNT_MAX} fields on each side of the \
+             file, and their names and values together at most {FORM_FIELDS_MAX} bytes"
+        )));
+    }
+    *budget -= name_len;
+    Ok(())
+}
+
 /// The form up to its file part: the fields before the file, and what
 /// the file part's headers say (its file name and content type).
 #[derive(Debug)]
@@ -217,6 +312,9 @@ fn form_error(e: multer::Error) -> S3Error {
     match e {
         multer::Error::StreamSizeExceeded { .. } | multer::Error::FieldSizeExceeded { .. } => {
             S3Error::EntityTooLargeReason(e.to_string())
+        }
+        multer::Error::StreamReadFailed(e) if e.is::<FormSideTooLarge>() => {
+            S3Error::InvalidArgument(e.to_string())
         }
         multer::Error::StreamReadFailed(e) => {
             S3Error::IncompleteBody(format!("The form body ended early: {e}"))
@@ -726,6 +824,7 @@ async fn read_form_head(
     let mut fields_ci = HashMap::new();
     let mut user_metadata = HashMap::new();
     let mut budget = FORM_FIELDS_MAX;
+    let mut count = 0;
     let mut file = None;
     while let Some(field) = multipart.next_field().await.map_err(form_error)? {
         let name = field
@@ -737,6 +836,7 @@ async fn read_form_head(
             file = Some(field);
             break;
         }
+        count_field(&mut count, &name, &mut budget)?;
         let value = read_small_field(field, &name, &mut budget).await?;
         if let Some(meta_key) = lc_name.strip_prefix("x-amz-meta-") {
             user_metadata.insert(meta_key.to_string(), value.clone());
@@ -793,8 +893,10 @@ async fn read_form_head(
 /// them checks that the form ends well.
 async fn ignore_trailing_fields(multipart: &mut multer::Multipart<'static>) -> Result<(), S3Error> {
     let mut budget = FORM_FIELDS_MAX;
+    let mut count = 0;
     while let Some(field) = multipart.next_field().await.map_err(form_error)? {
         let name = field.name().unwrap_or_default().to_string();
+        count_field(&mut count, &name, &mut budget)?;
         read_small_field(field, &name, &mut budget).await?;
     }
     Ok(())
@@ -1033,7 +1135,13 @@ where
         .map_err(|e| S3Error::InvalidRequest(format!("Invalid multipart boundary: {}", e)))?;
     let constraints = multer::Constraints::new()
         .size_limit(multer::SizeLimit::new().whole_stream(limit.saturating_add(FORM_OVERHEAD)));
-    let mut multipart = multer::Multipart::with_constraints(body, boundary, constraints);
+    // The fields before the file, their names and part headers are read
+    // under FORM_SIDE_MAX, counted on the stream: the parser buffers what it
+    // polls until a part header ends.
+    let meter = FormMeter::default();
+    meter.bound();
+    let mut multipart =
+        multer::Multipart::with_constraints(meter.meter(body), boundary, constraints);
 
     // Authenticate BEFORE the existence check: a 404 to an unauthenticated
     // caller reveals which buckets exist, and the backend round-trip would
@@ -1076,6 +1184,17 @@ where
 
     // The file, read once: the same ingest as a PutObject body.
     let cap = form_file_cap(limit, form_len, auth.length_range.map(|r| r.max));
+    // A form over the quota is refused before its file reaches the spool:
+    // the cap is the most the file can be. The exact check runs again on
+    // the received size, in `store_client_write`.
+    crate::api::handlers::object_helpers::check_quota_for_write(
+        state,
+        bucket,
+        &head.resolved_key,
+        cap.bytes,
+    )
+    .await?;
+    meter.unbound();
     let body = ingest_form_file(
         &engine,
         bucket,
@@ -1086,6 +1205,7 @@ where
     )
     .await?;
     check_file_len(auth.length_range, body.size(), bucket, &head.resolved_key)?;
+    meter.bound();
     ignore_trailing_fields(&mut multipart).await?;
     // The same client write as PutObject: quota, the object's write lock,
     // the preconditions, the store, the event.

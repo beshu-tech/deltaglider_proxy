@@ -143,7 +143,9 @@ pub(crate) async fn ingest_client_body(
 /// admits the declared size before the body is read
 /// (`MultipartStore::admit_part`: the upload is open, its caps hold), so a
 /// part for an unknown, aborted or completing upload never reaches the
-/// spool. The quota is checked at completion, as before.
+/// spool. The admission counts against the caps until the caller hands it
+/// to `MultipartStore::upload_part` with the body (or drops it). The quota
+/// is checked at completion, as before.
 pub(crate) async fn ingest_part_body(
     state: &Arc<AppState>,
     body: Option<s3s::dto::StreamingBlob>,
@@ -151,7 +153,7 @@ pub(crate) async fn ingest_part_body(
     part: PartTarget<'_>,
     limit: u64,
     checks: ContentChecks<'_>,
-) -> Result<IngestedBody, S3Error> {
+) -> Result<(IngestedBody, crate::multipart::PartAdmission), S3Error> {
     let engine = state.engine.load_full();
     let body = ClientBody::precheck(&engine, body, ctx, limit, checks)?;
     let admission = state.multipart.admit_part(
@@ -161,13 +163,15 @@ pub(crate) async fn ingest_part_body(
         part.part_number,
         body.declared(),
     )?;
-    body.ingest(
-        &engine,
-        part.bucket,
-        admission.held_spool_mib,
-        Destination::MultipartPart,
-    )
-    .await
+    let body = body
+        .ingest(
+            &engine,
+            part.bucket,
+            admission.held_spool_mib,
+            Destination::MultipartPart,
+        )
+        .await?;
+    Ok((body, admission))
 }
 
 /// The upload and part number an UploadPart body is for.
@@ -217,9 +221,12 @@ impl<'a> ClientBody<'a> {
             declared,
             limit,
         };
+        // The body alone, before the quota; the ingest judges it again with
+        // the spool that its storage write needs (an encrypted copy).
         ingest::admit_declared::<S3Error>(
             &this.plan(0, Destination::Object),
             engine.spool_max_bytes(),
+            0,
         )
         .map_err(ingest_failure)?;
         Ok(this)
@@ -398,10 +405,20 @@ mod tests {
         );
         let spool = ingest_failure::<S3Error>(IngestError::SpoolTooSmall {
             declared: 2,
+            storage_extra: 0,
             max_bytes: 1,
         });
         assert_eq!(spool.code(), "EntityTooLarge");
         assert!(spool.to_string().contains("DGP_SPOOL_MAX_BYTES"), "{spool}");
+        let encrypted = ingest_failure::<S3Error>(IngestError::SpoolTooSmall {
+            declared: 2,
+            storage_extra: 3,
+            max_bytes: 4,
+        })
+        .to_string();
+        for needle in ["DGP_SPOOL_MAX_BYTES", "encrypted", "twice", "5 bytes"] {
+            assert!(encrypted.contains(needle), "{needle}: {encrypted}");
+        }
         assert_eq!(
             code(IngestError::TooLong { declared: 1 }),
             "InvalidArgument"

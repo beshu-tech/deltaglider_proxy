@@ -27,12 +27,32 @@ struct Rig {
 
 impl Rig {
     async fn new(memory: MemoryBudget) -> Self {
+        Self::with_encryption(memory, false).await
+    }
+
+    /// `encrypted`: the backend is wrapped by the proxy's encryption, so
+    /// a stored body needs a ciphertext file in the spool too.
+    async fn with_encryption(memory: MemoryBudget, encrypted: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
-            FilesystemBackend::new(dir.path().join("data"))
-                .await
-                .unwrap(),
-        );
+        let fs = FilesystemBackend::new(dir.path().join("data"))
+            .await
+            .unwrap();
+        let backend: Box<DynStorageBackend<'static>> = if encrypted {
+            let key = crate::storage::EncryptionKey::from_hex(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap();
+            let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+                crate::storage::EncryptionConfig {
+                    key: Some(key),
+                    key_id: Some("kid-1".to_string()),
+                    ..Default::default()
+                },
+            )));
+            DynStorageBackend::new_box(crate::storage::EncryptingBackend::new(fs, cfg))
+        } else {
+            DynStorageBackend::new_box(fs)
+        };
         let mut config = Config::default();
         config.tuning.spool_threshold_bytes = Some(THRESHOLD);
         config.tuning.spool_acquire_timeout_secs = 1;
@@ -265,6 +285,54 @@ async fn the_declared_length_is_checked_before_a_byte_is_read() {
         "{err:?}"
     );
     rig.assert_restored("after refused lengths");
+}
+
+/// A bucket that the proxy encrypts needs the body AND its ciphertext
+/// file in the spool: a body that fits the budget alone but not with its
+/// encrypted copy is refused before a byte is read, with a message that
+/// names DGP_SPOOL_MAX_BYTES and the encryption. Before, it was admitted,
+/// its reservation clamped to the whole budget, and the write put about
+/// twice the budget on the disk.
+#[tokio::test]
+async fn an_encrypted_body_is_admitted_with_its_ciphertext_file() {
+    let rig = Rig::with_encryption(MemoryBudget::unbounded(), true).await;
+    let never = || {
+        futures::stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<Bytes, std::io::Error>>> {
+                panic!("the body was polled")
+            },
+        )
+    };
+    // 5 MiB fits the 8 MiB spool alone; with its 5 MiB copy it does not.
+    let err = rig.ingest(never(), plan(5 * MIB)).await.unwrap_err();
+    match &err {
+        IngestError::SpoolTooSmall {
+            declared,
+            storage_extra,
+            max_bytes,
+        } => {
+            assert_eq!(*declared, 5 * MIB);
+            assert!(*storage_extra >= 5 * MIB, "{storage_extra}");
+            assert_eq!(*max_bytes, SPOOL_MIB * MIB);
+        }
+        other => panic!("{other:?}"),
+    }
+    let msg = err.to_string();
+    assert!(
+        msg.contains("DGP_SPOOL_MAX_BYTES") && msg.contains("encrypted"),
+        "{msg}"
+    );
+    rig.assert_restored("after a refused encrypted body");
+
+    // 3 MiB with its copy fits: it is read and kept.
+    let data = body(3 * MIB as usize);
+    let got = rig
+        .ingest(chunks(&data, 64 * KIB as usize), plan(3 * MIB))
+        .await
+        .unwrap();
+    assert_eq!(got.size(), 3 * MIB);
+    drop(got);
+    rig.assert_restored("after an encrypted body");
 }
 
 /// Every failure in the middle of a body leaves nothing held, in memory

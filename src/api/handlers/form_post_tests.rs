@@ -183,6 +183,11 @@ struct Rig {
 
 impl Rig {
     async fn new() -> Self {
+        Self::with_quota(None).await
+    }
+
+    /// `quota`: the `quota_bytes` of the bucket (`Some(0)` freezes it).
+    async fn with_quota(quota: Option<u64>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
             FilesystemBackend::new(dir.path().join("data"))
@@ -195,6 +200,15 @@ impl Rig {
         };
         config.tuning.spool_threshold_bytes = Some(THRESHOLD as u64);
         config.tuning.spool_acquire_timeout_secs = 1;
+        if quota.is_some() {
+            config.buckets.insert(
+                "bkt".into(),
+                crate::bucket_policy::BucketPolicyConfig {
+                    quota_bytes: quota,
+                    ..Default::default()
+                },
+            );
+        }
         let metrics = Arc::new(Metrics::new());
         let spool_dir = dir.path().join("spool");
         let engine: DynEngine =
@@ -611,6 +625,147 @@ async fn fields_before_the_file_are_bounded() {
     rig.assert_restored("large fields");
 }
 
+/// A body that counts the bytes the handler polls from it: `head`, then
+/// `filler` chunks for ever (a client that keeps sending).
+fn endless(
+    head: Vec<u8>,
+    filler: Vec<u8>,
+    polled: Arc<std::sync::atomic::AtomicU64>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    let filler = Bytes::from(filler);
+    futures::stream::iter(std::iter::once(Bytes::from(head)).chain(std::iter::repeat(filler))).map(
+        move |chunk| {
+            polled.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+            Ok(chunk)
+        },
+    )
+}
+
+/// The bytes before the file are bounded on the stream, before any
+/// signature work: a part header that never ends, and a flood of empty
+/// fields with distinct names, are refused after at most FORM_SIDE_MAX
+/// bytes plus one chunk. Before, the parser kept every byte of the first
+/// until the end of the form, and every field of the second went into
+/// the field map, up to `max_object_size + FORM_OVERHEAD`. The form is
+/// signed with a wrong secret: had the head been accepted, the answer
+/// would be SignatureDoesNotMatch.
+#[tokio::test]
+async fn the_bytes_before_the_file_are_bounded_on_the_stream() {
+    let rig = Rig::new().await;
+    let chunk = 64 * KIB;
+    let form = Form::signed("f/x.jpg", Vec::new(), &[], "WRONG", "2099-01-01T00:00:00Z");
+    let mut fields = Vec::new();
+    for (k, v) in &form.before {
+        fields.extend(Form::field(k, v));
+    }
+    let header_without_end = {
+        let mut h = fields.clone();
+        h.extend(
+            format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"x\"\r\n").as_bytes(),
+        );
+        h
+    };
+    let header_filler = b"X-Pad: "
+        .iter()
+        .copied()
+        .chain(std::iter::repeat_n(b'a', chunk - 7))
+        .collect::<Vec<u8>>();
+    // Empty fields with distinct names, `chunk` bytes of them per chunk.
+    let mut n = 0usize;
+    let mut empty_fields = || {
+        let mut out = Vec::new();
+        while out.len() < chunk {
+            out.extend(Form::field(&format!("x-ignore-{n}"), ""));
+            n += 1;
+        }
+        out
+    };
+    let flood_head = {
+        let mut h = fields.clone();
+        h.extend(empty_fields());
+        h
+    };
+    let flood_filler = empty_fields();
+    for (what, head, filler) in [
+        (
+            "a part header without its end",
+            header_without_end,
+            header_filler,
+        ),
+        ("empty fields with distinct names", flood_head, flood_filler),
+    ] {
+        let polled = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body = endless(head.clone(), filler.clone(), polled.clone());
+        // The form claims to be as large as the largest object allows.
+        let len = MAX_OBJECT + FORM_OVERHEAD as usize;
+        let err = tokio::time::timeout(std::time::Duration::from_secs(30), rig.post(body, len))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: no answer"))
+            .unwrap_err();
+        assert_eq!(err.code(), "InvalidArgument", "{what}: {err:?}");
+        let polled = polled.load(Ordering::SeqCst);
+        // The allowance, then the chunk that crosses it and the one refused.
+        let bound = FORM_SIDE_MAX as usize + head.len() + 2 * filler.len();
+        assert!(
+            polled as usize <= bound,
+            "{what}: {polled} bytes polled, bound {bound}"
+        );
+        rig.assert_restored(what);
+    }
+}
+
+/// More than FORM_FIELD_COUNT_MAX fields on one side of the file, each
+/// tiny, are refused: a field costs a map entry besides its bytes.
+#[tokio::test]
+async fn the_number_of_fields_is_bounded() {
+    let rig = Rig::new().await;
+    let mut form = Form::valid("f/count.jpg", body(10), &[]);
+    for i in 0..FORM_FIELD_COUNT_MAX {
+        form.before.push((format!("x-ignore-{i}"), String::new()));
+    }
+    let err = rig.post_form(&form).await.unwrap_err();
+    assert_eq!(err.code(), "InvalidArgument", "{err:?}");
+    assert!(err.to_string().contains("fields"), "{err}");
+
+    // After the file too.
+    let mut form = Form::valid("f/count.jpg", body(10), &[]);
+    for i in 0..=FORM_FIELD_COUNT_MAX {
+        form.after.push((format!("x-ignore-{i}"), String::new()));
+    }
+    let err = rig.post_form(&form).await.unwrap_err();
+    assert_eq!(err.code(), "InvalidArgument", "{err:?}");
+    assert!(rig.stored("f/count.jpg").await.is_none());
+    rig.assert_restored("many fields");
+}
+
+/// A form for a bucket over its quota is refused before its file is read:
+/// nothing reaches the spool or the RAM budget, and no body is counted.
+/// Before, the quota ran only in `store_client_write`, after the file was
+/// spooled.
+#[tokio::test]
+async fn a_form_over_the_quota_is_refused_before_its_file() {
+    let rig = Rig::with_quota(Some(0)).await;
+    let err = rig
+        .post_form(&Form::valid("f/q.jpg", body(3 * THRESHOLD), &[]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "AccessDenied", "{err:?}");
+    for (medium, reason) in [
+        ("spool", "over_threshold"),
+        ("memory", "under_threshold"),
+        ("spool", "memory_budget"),
+    ] {
+        assert_eq!(
+            rig.bodies(medium, reason),
+            0,
+            "{medium}/{reason}: the file was read"
+        );
+    }
+    assert_eq!(rig.engine().memory_budget().peak_bytes(), 0);
+    rig.assert_restored("a form over the quota");
+    assert!(rig.stored("f/q.jpg").await.is_none());
+}
+
 /// An `x-amz-checksum-*` field before the file is computed while the file
 /// arrives and checked after it: a right one stores, a wrong one is
 /// `BadDigest` and stores nothing.
@@ -754,6 +909,7 @@ fn the_file_is_ingested_only_after_the_signature_and_the_policy() {
         "check_client_write_allowed(",
         "check_verified_request(",
         "ensure_bucket_exists(",
+        "check_quota_for_write(",
         "ingest_form_file(",
         "check_file_len(",
         "ignore_trailing_fields(",

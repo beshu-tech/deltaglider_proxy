@@ -436,7 +436,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MAX_TOTAL_MULTIPART_BYTES",
-        description: "Cap on the part bytes that all open multipart uploads hold together in the spool; a part past it gets 503 SlowDown (default: half of DGP_SPOOL_MAX_BYTES)",
+        description: "Cap on the spool space that the parts of all open multipart uploads hold together (whole MiB per part, at least 1 MiB); a part past it gets 503 SlowDown (default: half of DGP_SPOOL_MAX_BYTES)",
         example: "1073741824",
         category: "Server",
     },
@@ -544,7 +544,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_SPOOL_DIR",
-        description: "Directory for every scratch file: codec files, multipart relay parts, encrypted-write temps (default: <system temp>/dgp-spool)",
+        description: "Directory for every scratch file: codec files, multipart relay parts, encrypted-write temps; created 0700, refused when another user owns it or all users can write to it (default: <system temp>/dgp-spool)",
         example: "/var/lib/deltaglider/spool",
         category: "Delta Engine",
     },

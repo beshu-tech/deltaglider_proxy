@@ -148,38 +148,34 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .map(Some)
     }
 
-    /// The spool reservation of an ingested body of `bytes` bound for
-    /// `bucket`: the body's file plus the temp files its storage write
-    /// needs (`file_put_spool_bytes`), in ONE reservation, so the write
+    /// The spool reservation of an ingested body: `bytes` is the body's
+    /// file plus the temp files its storage write needs
+    /// ([`Self::storage_spool_extra`]), in ONE reservation, so the write
     /// later uses it and never waits under a lock. `wait`: queue for the
     /// budget (timed); else take free budget now, whatever the queue, or
     /// `Overloaded` (a small body never waits behind a large one).
     /// `held_mib`: budget the op holds already; a holder never waits.
-    /// `stored_now`: the body is stored right after (an object), so its
-    /// storage write's temp files are reserved too; a multipart part is
-    /// stored only at completion, which reserves for its own write.
     pub(crate) async fn reserve_ingest_spool(
         &self,
-        bucket: &str,
         bytes: u64,
         held_mib: usize,
         wait: bool,
-        stored_now: bool,
     ) -> Result<crate::deltaglider::spool::SpoolReservation, EngineError> {
-        let extra = if stored_now {
-            self.storage
-                .file_put_spool_bytes(bucket, bytes, false)
-                .await
-        } else {
-            0
-        };
-        let total = bytes.saturating_add(extra);
         if wait {
             return self
-                .with_spool_timeout(self.spool.reserve_beside(held_mib, total))
+                .with_spool_timeout(self.spool.reserve_beside(held_mib, bytes))
                 .await;
         }
-        self.spool.try_reserve(total, held_mib).map_err(spool_error)
+        self.spool.try_reserve(bytes, held_mib).map_err(spool_error)
+    }
+
+    /// The spool bytes that the storage write of a body of `bytes` into
+    /// `bucket` needs beside the body (the ciphertext file of a bucket
+    /// that the proxy encrypts; `0` elsewhere).
+    pub(crate) async fn storage_spool_extra(&self, bucket: &str, bytes: u64) -> u64 {
+        self.storage
+            .file_put_spool_bytes(bucket, bytes, false)
+            .await
     }
 
     /// The spool file for the buffered codec's source, taken WITHOUT waiting:

@@ -262,7 +262,11 @@ pub(super) async fn read_copy_source(
         declared: head_size,
         limit: copy_size_limit(engine),
         sha256: crate::deltaglider::ingest::Sha256Need::Compute,
-        held_spool_mib: 0,
+        // A large delta or reference source streams from a spool file that
+        // the stream holds: the ingest of the copy holds that budget, so
+        // it never waits for more (a wait there could wait on itself, or
+        // on another copy that waits on it).
+        held_spool_mib: engine.stream_spool_mib(&metadata),
         strict_length: true,
         destination: Destination::Object,
     };
@@ -447,6 +451,7 @@ pub(super) async fn upload_part_copy(
         &input.key,
         part_number,
         part,
+        admission,
     )?;
     Ok(s3s::S3Response::new(s3s::dto::UploadPartCopyOutput {
         copy_part_result: Some(s3s::dto::CopyPartResult {

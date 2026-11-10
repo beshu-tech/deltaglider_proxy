@@ -33,6 +33,16 @@ fn noise(seed: u64, n: usize) -> Vec<u8> {
 /// spool budget of [`SPOOL_MIB`], and no cached spool files (each read
 /// fills its own, so the budget is free again after each test step).
 async fn engine(threshold: u64) -> (tempfile::TempDir, Arc<DynEngine>, Faults) {
+    engine_with(threshold, SPOOL_MIB, 0).await
+}
+
+/// [`engine`] with a spool of `spool_mib`, a spool acquire timeout of 5
+/// seconds, and spool files cached for `range_ttl_secs` (`0`: none).
+async fn engine_with(
+    threshold: u64,
+    spool_mib: u64,
+    range_ttl_secs: u64,
+) -> (tempfile::TempDir, Arc<DynEngine>, Faults) {
     let dir = tempfile::tempdir().unwrap();
     let faulty = FaultyFs::new(
         FilesystemBackend::new(dir.path().join("data"))
@@ -43,10 +53,11 @@ async fn engine(threshold: u64) -> (tempfile::TempDir, Arc<DynEngine>, Faults) {
     let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
     let mut config = Config::default();
     config.tuning.spool_threshold_bytes = Some(threshold);
-    config.range_spool_ttl_secs = 0;
+    config.tuning.spool_acquire_timeout_secs = 5;
+    config.range_spool_ttl_secs = range_ttl_secs;
     let mut engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
     engine.spool = Arc::new(
-        crate::deltaglider::spool::SpoolDir::new(dir.path().join("spool"), SPOOL_MIB * MIB)
+        crate::deltaglider::spool::SpoolDir::new(dir.path().join("spool"), spool_mib * MIB)
             .unwrap(),
     );
     for b in ["b", "dst"] {
@@ -340,4 +351,134 @@ async fn a_large_legacy_reference_migrates_from_a_spool_file() {
     assert!(meta.is_delta());
     assert_eq!(got, body);
     budget_is_free(&engine);
+}
+
+/// A GET of a large reference object reserves its spool file BEFORE it
+/// takes the cache slot of the folder's reference. The streaming PUTs and
+/// delta GETs of the folder join that slot while they hold spool budget;
+/// before, a GET that waited for budget held the slot, so such a holder
+/// waited behind it, and it for the holder, until the acquire timeout.
+#[tokio::test]
+async fn a_reference_fill_never_waits_for_budget_inside_the_slot() {
+    let (_dir, engine, _) = engine_with(1024, 8, 60).await;
+    let body = noise(11, 64 * 1024);
+    legacy_reference(&engine, "a.zip", &body, &body).await;
+    let sha = hex::encode(Sha256::digest(&body));
+    // Every MiB of the budget is held: the GET waits for one.
+    let full = engine.spool.try_acquire(8 * MIB).unwrap();
+    let get = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.retrieve("b", "rel/a.zip").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // A holder joins the folder's reference slot.
+    let key = crate::deltaglider::range_spool::RangeSpoolKey::reference(
+        engine.cache_key("b", "rel"),
+        sha,
+    );
+    let joined = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        engine.range_spools.get_or_fill(key, || async {
+            Err::<crate::deltaglider::spool::Spool, _>("the holder's own fill")
+        }),
+    )
+    .await;
+    assert!(
+        joined.is_ok(),
+        "the holder waited behind a fill that waits for spool budget"
+    );
+    drop(full);
+    let (got, _) = get.await.unwrap().unwrap();
+    assert_eq!(got, body);
+}
+
+fn copy_request<'a>(source_key: &'a str) -> crate::transfer::ObjectTransferRequest<'a> {
+    crate::transfer::ObjectTransferRequest {
+        source_bucket: "b",
+        source_key,
+        destination_bucket: "dst",
+        destination_key: source_key,
+        provenance: None,
+        strip_user_metadata_keys: &[],
+        operation: "replication",
+        upload_concurrency: None,
+        keep_created_at: false,
+    }
+}
+
+/// A background copy whose source streams from a spool file holds that
+/// budget, so it never waits for the budget of its destination copy: a
+/// copy whose source and destination together are larger than the spool
+/// fails at once (it never fits); one that finds the rest of the budget
+/// taken by another holder fails at once with a retryable error. Before,
+/// both waited for the acquire timeout (5 s here, 120 s by default), and
+/// two such copies waited for each other.
+#[tokio::test]
+async fn a_copy_that_holds_its_source_spool_never_waits_for_more() {
+    // Source 2 MiB + destination 2 MiB > a 3 MiB spool.
+    let (_dir, engine, _) = engine_with(1024, 3, 0).await;
+    let body = noise(12, 2 * MIB as usize);
+    legacy_reference(&engine, "a.zip", &body, &body).await;
+    let started = std::time::Instant::now();
+    let err = crate::transfer::copy_object_with_retries(&engine, copy_request("rel/a.zip"))
+        .await
+        .expect_err("the copy cannot fit the spool");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the copy waited {:?} for spool budget: {err}",
+        started.elapsed()
+    );
+    assert!(err.to_string().contains("Object too large"), "{err}");
+    assert_eq!(engine.spool.free_mib(), 3);
+
+    // Another holder (the stream of a concurrent copy of another source)
+    // holds 2 MiB of a 4 MiB spool: the copy holds its source's 2 MiB and
+    // finds nothing left for its destination.
+    let (_dir, engine, _) = engine_with(1024, 4, 0).await;
+    legacy_reference(&engine, "a.zip", &body, &body).await;
+    let other = noise(13, 2 * MIB as usize);
+    let meta = crate::types::FileMetadata::new_reference(
+        "o.zip".into(),
+        "o.zip".into(),
+        hex::encode(Sha256::digest(&other)),
+        hex::encode(Md5::digest(&other)),
+        other.len() as u64,
+        None,
+    );
+    let storage = engine.storage();
+    storage
+        .put_reference(
+            "b",
+            "oth",
+            Bytes::copy_from_slice(&other),
+            &meta,
+            crate::deltaglider::RefWriteProof::for_tests(),
+        )
+        .await
+        .unwrap();
+    storage
+        .put_passthrough("b", "oth", "o.zip", Bytes::copy_from_slice(&other), &meta)
+        .await
+        .unwrap();
+    let RetrieveResponse::Streamed { stream: held, .. } =
+        engine.retrieve_stream("b", "oth/o.zip").await.unwrap()
+    else {
+        panic!("a large reference object streams")
+    };
+    assert_eq!(engine.spool.free_mib(), 2);
+    let started = std::time::Instant::now();
+    let err = crate::transfer::copy_object_with_retries(&engine, copy_request("rel/a.zip"))
+        .await
+        .expect_err("no budget for the destination while the other stream lives");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "the copy waited {:?} for spool budget while it held its source: {err}",
+        started.elapsed()
+    );
+    drop(held);
+    assert_eq!(engine.spool.free_mib(), 4);
+    crate::transfer::copy_object_with_retries(&engine, copy_request("rel/a.zip"))
+        .await
+        .unwrap();
+    assert_eq!(engine.retrieve("dst", "rel/a.zip").await.unwrap().0, body);
 }

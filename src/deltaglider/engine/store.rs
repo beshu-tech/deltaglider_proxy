@@ -57,10 +57,15 @@ struct HashedSpool<'a> {
 }
 
 /// One part of a multipart upload, kept in a relay file: its path and the
-/// MD5 and size recorded when the part arrived. The store checks both
-/// while it reads the file (`read_relay_parts`): a file that changed on
-/// disk since (a local attacker on a shared host can swap a part between
-/// UploadPart and Complete) fails the store, and nothing is stored.
+/// MD5 and size recorded when the part arrived. The store checks both in a
+/// read of the files of its own (`read_relay_parts`): a file that changed
+/// on disk between UploadPart and Complete fails the store, and nothing is
+/// stored. That check is a separate read from the one that uploads the
+/// files (`put_passthrough_parts` opens them again; on S3 it checks only
+/// their size), so a file replaced between the two reads would be stored.
+/// The spool root is private to the proxy's user (`SpoolDir::new` creates
+/// it 0700 and refuses one that other users can write to), so only that
+/// user can replace a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayPart {
     pub path: PathBuf,

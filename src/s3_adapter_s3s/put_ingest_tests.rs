@@ -807,3 +807,53 @@ async fn an_upload_part_copy_of_a_large_source_becomes_a_relay_file() {
     rig.assert_restored("after the completion");
     assert_eq!(rig.stored("m/photo.jpg").await.unwrap(), data);
 }
+
+/// A CopyObject source that streams from a spool file (a reference object
+/// above the threshold) holds that budget while the destination body is
+/// ingested, so the ingest never waits for more: a copy whose source and
+/// destination together do not fit the spool is EntityTooLarge at once.
+/// Before, the ingest held nothing in its plan, waited for the acquire
+/// timeout and answered SlowDown, and two such copies could wait for each
+/// other.
+#[tokio::test]
+async fn a_copy_source_that_holds_its_spool_never_waits_for_the_destination() {
+    use crate::storage::StorageBackendExt as _;
+    use sha2::Digest as _;
+    let rig = Rig::new().await;
+    // 9 MiB: the source spool and the destination do not fit 16 MiB.
+    let data = body(9 * MIB);
+    let meta = crate::types::FileMetadata::new_reference(
+        "a.zip".into(),
+        "a.zip".into(),
+        hex::encode(sha2::Sha256::digest(&data)),
+        hex::encode(md5::Md5::digest(&data)),
+        data.len() as u64,
+        None,
+    );
+    let engine = rig.engine();
+    let storage = engine.storage();
+    storage
+        .put_reference(
+            "b",
+            "rel",
+            Bytes::copy_from_slice(&data),
+            &meta,
+            crate::deltaglider::RefWriteProof::for_tests(),
+        )
+        .await
+        .unwrap();
+    storage
+        .put_passthrough("b", "rel", "a.zip", Bytes::copy_from_slice(&data), &meta)
+        .await
+        .unwrap();
+    let err = copy::read_copy_source(&engine, "b", "rel/a.zip", "b", data.len() as u64)
+        .await
+        .expect_err("source and destination do not fit the spool");
+    assert_eq!(err.code(), &s3s::S3ErrorCode::EntityTooLarge, "{err:?}");
+    assert!(
+        err.message()
+            .unwrap_or_default()
+            .contains("DGP_SPOOL_MAX_BYTES"),
+        "{err:?}"
+    );
+}

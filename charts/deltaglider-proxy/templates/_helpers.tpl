@@ -69,3 +69,26 @@ Create the service account name.
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}
+
+{{/*
+The size limit of the /tmp emptyDir in bytes, from tmp.sizeLimit (Mi or Gi).
+The spool (DGP_SPOOL_DIR, default /tmp/dgp-spool) lives in /tmp.
+*/}}
+{{- define "deltaglider-proxy.tmpSizeLimitBytes" -}}
+{{- $s := toString .Values.tmp.sizeLimit -}}
+{{- if hasSuffix "Gi" $s -}}
+{{- mul (trimSuffix "Gi" $s | atoi) 1073741824 -}}
+{{- else if hasSuffix "Mi" $s -}}
+{{- mul (trimSuffix "Mi" $s | atoi) 1048576 -}}
+{{- else -}}
+{{- fail (printf "tmp.sizeLimit %q must be in Mi or Gi (for example 2Gi): the chart sets DGP_SPOOL_MAX_BYTES below it" $s) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+DGP_SPOOL_MAX_BYTES: three quarters of tmp.sizeLimit, so the spool never
+reaches the limit (a pod past its emptyDir limit is evicted).
+*/}}
+{{- define "deltaglider-proxy.spoolMaxBytes" -}}
+{{- div (mul (include "deltaglider-proxy.tmpSizeLimitBytes" . | atoi) 3) 4 -}}
+{{- end -}}

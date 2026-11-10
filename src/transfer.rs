@@ -1861,7 +1861,19 @@ async fn spooled_copy(
         return Err(changed());
     }
 
-    let spool = engine.spool_acquire(source_size).await?;
+    // The stream of a large delta or reference source holds its spool
+    // file: the copy holds that budget, so it never waits for more. A copy
+    // that the budget cannot hold beside it fails now: a smaller, clamped
+    // reservation would let the fill write past the budget.
+    let held = engine.stream_spool_mib(&meta);
+    if !crate::deltaglider::ingest::spool_admits(source_size, engine.spool_max_bytes(), held) {
+        return Err(crate::deltaglider::EngineError::TooLarge {
+            size: source_size,
+            max: engine.spool_max_bytes(),
+        }
+        .into());
+    }
+    let spool = engine.spool_acquire_beside_mib(held, source_size).await?;
     // Capped at the reservation, hashed on the way: the store must get
     // exactly the bytes the metadata names.
     use crate::deltaglider::spool::SpoolFillError;

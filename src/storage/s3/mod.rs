@@ -1173,7 +1173,7 @@ impl StorageBackend for S3Backend {
         if let Some(marker) = native.marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
-        check_metadata_size(&headers, bucket, &key)?;
+        fit_metadata(&mut headers, bucket, &key)?;
 
         let mut request = self
             .client
