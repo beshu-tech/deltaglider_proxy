@@ -675,10 +675,6 @@ export async function getDownloadUrl(key: string, filename: string, expiresInSec
   }
 }
 
-export function getObjectUrl(key: string): string {
-  return `${getEndpoint()}/${activeBucket}/${encodeURIComponent(key)}`;
-}
-
 // ── Connection testing ──
 
 interface TestConnectionResult {
