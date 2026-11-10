@@ -1132,12 +1132,14 @@ fn db_upload_deadline(
     })
 }
 
-/// Node identifier for witness provenance: THE durable node id the leases
-/// and locks use (`DGP_NODE_ID`, `HOSTNAME`, else the persisted id), so a
-/// witness names the same node they do. Purely diagnostic.
+/// Node identifier for witness provenance: the node id the leases and locks
+/// use (`DGP_NODE_ID`, `HOSTNAME`, else the persisted id), so a witness names
+/// the same node they do. Purely diagnostic, so it only READS the persisted
+/// id: the leases' startup path creates it, and a probe that runs before (or
+/// without) it never writes into the working directory.
 fn node_id() -> String {
     let db = crate::config_db::config_db_path();
-    crate::coordination::durable_node_id(db.parent().unwrap_or_else(|| std::path::Path::new(".")))
+    crate::coordination::node_id_label(db.parent().unwrap_or_else(|| std::path::Path::new(".")))
 }
 
 /// Is this HeadObject error "the config DB object does not exist yet"?
