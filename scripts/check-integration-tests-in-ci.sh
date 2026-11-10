@@ -14,6 +14,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Read ci.yml WITHOUT its YAML comments: a module named only in a comment is
+# not selected by any job. Full-line comments and ` # ...` tails are dropped.
+CI_YML="$(mktemp)"
+trap 'rm -f "$CI_YML"' EXIT
+sed -E -e '/^[[:space:]]*#/d' -e 's/[[:space:]]+#.*$//' .github/workflows/ci.yml > "$CI_YML"
+
 shopt -s nullglob
 names=()
 for f in tests/*.rs; do
@@ -28,7 +34,7 @@ for name in "${names[@]}"; do
     echo "error: tests/${name}.rs is not declared in tests/all.rs (add: #[path = \"${name}.rs\"] mod ${name};)" >&2
     err=1
   fi
-  if ! grep -qE "(^|[^a-z0-9_])${name}::( |\\\\|$)" .github/workflows/ci.yml; then
+  if ! grep -qE "(^|[^a-z0-9_])${name}::( |\\\\|$)" "$CI_YML"; then
     echo "error: tests/${name}.rs is not selected in .github/workflows/ci.yml (add filter: ${name}::)" >&2
     err=1
   fi
@@ -44,8 +50,8 @@ done
 # blocks (one `<name>::` per line).
 ci_filters() {
   {
-    awk '/cargo test .*--test all/ {c=1} c {print; if ($0 !~ /\\$/) c=0}' .github/workflows/ci.yml
-    awk '/filters: >-/ {f=1; next} f && /^[[:space:]]+[a-z0-9_]+::[[:space:]]*$/ {print; next} {f=0}' .github/workflows/ci.yml
+    awk '/cargo test .*--test all/ {c=1} c {print; if ($0 !~ /\\$/) c=0}' "$CI_YML"
+    awk '/filters: >-/ {f=1; next} f && /^[[:space:]]+[a-z0-9_]+::[[:space:]]*$/ {print; next} {f=0}' "$CI_YML"
   } | grep -oE '[a-z0-9_]+::' | sed 's/::$//'
 }
 

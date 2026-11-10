@@ -133,6 +133,9 @@ jobs:
           fi
       - name: Memory-derived cargo parallelism truth table
         run: ./scripts/test-cargo-jobs.sh
+      # Must-fail fixtures: each shell guard refuses a known-bad input.
+      - name: Shell-guard self-tests
+        run: ./scripts/test-guards.sh
 
   verify-spdx-headers:
     name: SPDX license headers
