@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, type CSSProperties } from 'react';
-import { Button, Typography, Input, Space, Modal } from 'antd';
+import { Button, Typography, Input, Space, Modal, message } from 'antd';
 import SimpleAutoComplete from './SimpleAutoComplete';
 import {
   CloudUploadOutlined,
@@ -17,7 +17,7 @@ import {
 import { useQueryClient } from '@tanstack/react-query';
 import { getBucket } from '../s3client';
 import { formatBytes } from '../utils';
-import { collectDroppedFiles } from '../droppedFiles';
+import { collectDroppedFiles, skippedDropMessage } from '../droppedFiles';
 import { useFolderSuggestions } from '../useFolderSuggestions';
 import useUploadQueue from '../useUploadQueue';
 import { useColors } from '../ThemeContext';
@@ -237,7 +237,9 @@ export default function UploadPage({
       // Stage dropped files (don't upload yet) so the destination can be
       // confirmed, the same as a pick. Dropped FOLDERS are walked into their
       // real files (sync call required, see droppedFiles.ts).
-      collectDroppedFiles(e.dataTransfer).then((dropped) => setStaged((prev) => withStaged(prev, dropped)));
+      collectDroppedFiles(e.dataTransfer, (skipped) => message.warning(skippedDropMessage(skipped))).then((dropped) =>
+        setStaged((prev) => withStaged(prev, dropped)),
+      );
     };
 
     el.addEventListener('dragenter', onDragEnter);
