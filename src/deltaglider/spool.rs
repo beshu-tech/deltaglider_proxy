@@ -213,6 +213,12 @@ impl SpoolDir {
     }
 
     /// The directory the spool files live in.
+    /// Can a spool file be made now? Re-creates a missing directory, makes
+    /// and drops one temp file. Blocking, cheap: `/_/ready` runs it.
+    pub fn is_usable(&self) -> bool {
+        temp_in(&self.dir).is_ok()
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -333,7 +339,7 @@ impl SpoolDir {
         let permit = self
             .reserve_within(bytes, held.map_or(0, Spool::reserved_mib))
             .await?;
-        let file = NamedTempFile::new_in(&self.dir)?;
+        let file = temp_in(&self.dir)?;
         Ok(Spool {
             file,
             _permit: SharedOrOwned::Owned(permit),
@@ -383,8 +389,8 @@ impl SpoolDir {
             self.reserve_within(a_bytes.saturating_add(b_bytes), held_mib)
                 .await?,
         );
-        let a = NamedTempFile::new_in(&self.dir)?;
-        let b = NamedTempFile::new_in(&self.dir)?;
+        let a = temp_in(&self.dir)?;
+        let b = temp_in(&self.dir)?;
         Ok((
             Spool {
                 file: a,
@@ -450,7 +456,7 @@ impl SpoolReservation {
 
     fn file(&self) -> std::io::Result<Spool> {
         Ok(Spool {
-            file: NamedTempFile::new_in(&self.dir)?,
+            file: temp_in(&self.dir)?,
             _permit: SharedOrOwned::Shared(self.permit.clone()),
         })
     }
@@ -501,7 +507,7 @@ impl<'a> SpoolBudget<'a> {
             .dir
             .try_permit(bytes, self.held.map_or(0, Spool::reserved_mib))?;
         Ok(Spool {
-            file: NamedTempFile::new_in(&self.dir.dir)?,
+            file: temp_in(&self.dir.dir)?,
             _permit: SharedOrOwned::Owned(permit),
         })
     }
@@ -590,6 +596,21 @@ fn backend_share_mib(max_mib: usize, percent: u8) -> usize {
 }
 
 /// Bytes → MiB, rounded up. Budget accounting unit.
+/// A temp file in the spool directory `dir`. Somebody can remove the
+/// directory while the process runs (a tmp cleaner, an operator). The first
+/// `ENOENT` creates the directory again and tries once more, like the
+/// filesystem backend does for a folder that a DELETE pruned. Any other
+/// error, and a second `ENOENT`, go to the caller.
+pub(crate) fn temp_in(dir: &Path) -> std::io::Result<NamedTempFile> {
+    match NamedTempFile::new_in(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+            NamedTempFile::new_in(dir)
+        }
+        other => other,
+    }
+}
+
 pub(crate) fn mib_ceil(bytes: u64) -> usize {
     const MIB: u64 = 1024 * 1024;
     bytes.div_ceil(MIB) as usize
@@ -859,6 +880,31 @@ mod tests {
             "a GET on another backend waited for the slow backend's spool"
         );
         assert!(second.is_err(), "one backend held the whole budget");
+    }
+
+    #[tokio::test]
+    async fn a_removed_dir_is_made_again_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("spool");
+        let pool = SpoolDir::new(dir.clone(), 8 << 20).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let spool = pool.acquire(1).await.expect("the dir is made again");
+        assert!(spool.path().starts_with(&dir));
+        drop(spool);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(pool.try_acquire(1).is_ok());
+        assert!(pool.is_usable());
+    }
+
+    #[test]
+    fn a_dir_that_cannot_exist_is_not_usable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("spool");
+        let pool = SpoolDir::new(dir.clone(), 8 << 20).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        // A file where the directory belongs: create_dir_all fails.
+        std::fs::write(&dir, b"x").unwrap();
+        assert!(!pool.is_usable());
     }
 
     #[tokio::test]
