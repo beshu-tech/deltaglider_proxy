@@ -9,7 +9,9 @@
 //! one-method [`Lister`], so the algebra is tested without storage.
 
 use crate::deltaglider::{EngineError, ListObjectsPage};
-use crate::iam::{user_can_see_common_prefix, user_can_see_listed_key, ListScope};
+use crate::iam::{
+    deny_may_hide_keys_under, user_can_see_common_prefix, user_can_see_listed_key, ListScope,
+};
 use std::future::Future;
 
 /// The engine calls the listing algebra makes: one LIST page.
@@ -171,6 +173,13 @@ fn list_targets(prefix: &str, delimiter: Option<&str>, visible: &[String]) -> Ve
         return vec![ListTarget::Scan(prefix.to_string())];
     }
     let delimiter = delimiter.filter(|d| !d.is_empty());
+    // A delimiter of several characters can straddle the end of a visible
+    // prefix (`se` + `cret/` at delimiter `ec`): listing the prefix would
+    // then fold at other points than listing the request. Only a one-
+    // character delimiter folds the same way, so read the request itself.
+    if delimiter.is_some_and(|d| d.chars().count() > 1) {
+        return vec![ListTarget::Scan(prefix.to_string())];
+    }
     let mut targets: Vec<ListTarget> = Vec::new();
     for v in visible {
         let Some(rest) = v.strip_prefix(prefix) else {
@@ -195,6 +204,48 @@ fn list_targets(prefix: &str, delimiter: Option<&str>, visible: &[String]) -> Ve
     }
     targets.sort_by(|a, b| a.start().cmp(b.start()));
     targets
+}
+
+/// Does a key that `user` may see lie under `folded` (a name a delimiter
+/// folded keys into)? Reads the keys under it, lite, within the request's
+/// scan budget; a name whose proof the budget cannot finish is not shown
+/// (fail closed). THE rule for a folded name that a Deny may touch
+/// ([`deny_may_hide_keys_under`]): the name of a protected key is shown only
+/// when a visible key lies under it too (S3 shows a folded name only for
+/// keys the caller may list).
+async fn visible_key_under<L: Lister>(
+    lister: &L,
+    bucket: &str,
+    folded: &str,
+    user: &crate::iam::AuthenticatedUser,
+    context: &iam_rs::Context,
+    budget: &mut usize,
+) -> Result<bool, EngineError> {
+    let mut cursor: Option<String> = None;
+    while *budget > 0 {
+        let (page, requests) = lister
+            .list_lite(
+                bucket,
+                folded,
+                None,
+                FILTERED_SCAN_PAGE_KEYS,
+                cursor.as_deref(),
+            )
+            .await?;
+        *budget = budget.saturating_sub(scan_cost(requests));
+        if page
+            .objects
+            .iter()
+            .any(|(key, _)| user_can_see_listed_key(user, bucket, key, context))
+        {
+            return Ok(true);
+        }
+        match page.next_continuation_token {
+            Some(next) if page.is_truncated => cursor = Some(next),
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
 }
 
 /// One LIST page as the caller may see it. THE listing path for V1 and V2.
@@ -495,13 +546,23 @@ async fn scan_visible<L: Lister>(
                 common_prefix,
                 probes,
             } => {
-                for probe in probes {
-                    let (page, requests) =
-                        lister.list_lite(bucket, &probe, delimiter, 1, None).await?;
-                    *budget = budget.saturating_sub(scan_cost(requests));
-                    if !page.objects.is_empty() || !page.common_prefixes.is_empty() {
+                if deny_may_hide_keys_under(user, bucket, &common_prefix) {
+                    // A Deny may protect keys under the name: one probe key
+                    // could be a hidden one. Look for a visible key.
+                    if visible_key_under(lister, bucket, &common_prefix, user, context, budget)
+                        .await?
+                    {
                         scan.prefixes.insert(common_prefix.clone());
-                        break;
+                    }
+                } else {
+                    for probe in probes {
+                        let (page, requests) =
+                            lister.list_lite(bucket, &probe, delimiter, 1, None).await?;
+                        *budget = budget.saturating_sub(scan_cost(requests));
+                        if !page.objects.is_empty() || !page.common_prefixes.is_empty() {
+                            scan.prefixes.insert(common_prefix.clone());
+                            break;
+                        }
                     }
                 }
                 position = Some(common_prefix);
@@ -540,11 +601,16 @@ async fn scan_visible<L: Lister>(
                         .into_iter()
                         .filter(|(key, _)| user_can_see_listed_key(user, bucket, key, context)),
                 );
-                scan.prefixes.extend(
-                    page.common_prefixes
-                        .into_iter()
-                        .filter(|p| user_can_see_common_prefix(user, bucket, p, context)),
-                );
+                for folded in page.common_prefixes {
+                    if !user_can_see_common_prefix(user, bucket, &folded, context) {
+                        continue;
+                    }
+                    if !deny_may_hide_keys_under(user, bucket, &folded)
+                        || visible_key_under(lister, bucket, &folded, user, context, budget).await?
+                    {
+                        scan.prefixes.insert(folded);
+                    }
+                }
                 if more {
                     position = page.next_continuation_token;
                 } else {
@@ -1585,5 +1651,124 @@ mod tests {
             heads(&fake)
         );
         assert_eq!(facts_lists(&fake), 0, "listing facts read for hidden keys");
+    }
+
+    /// The oracle of a listing: the visible keys under `prefix`, folded at
+    /// `delimiter` like S3 does. A name appears only when some visible key
+    /// lies under it.
+    fn oracle(
+        keys: &[&str],
+        scope: &ListScope,
+        prefix: &str,
+        delimiter: Option<&str>,
+    ) -> Vec<String> {
+        let ListScope::Filtered { user, context } = scope else {
+            unreachable!()
+        };
+        let mut out = std::collections::BTreeSet::new();
+        for key in keys {
+            let Some(rest) = key.strip_prefix(prefix) else {
+                continue;
+            };
+            if !user_can_see_listed_key(user, "b", key, context) {
+                continue;
+            }
+            match delimiter
+                .filter(|d| !d.is_empty())
+                .and_then(|d| rest.find(d).map(|i| i + d.len()))
+            {
+                Some(end) => out.insert(format!("{prefix}{}", &rest[..end])),
+                None => out.insert(key.to_string()),
+            };
+        }
+        out.into_iter().collect()
+    }
+
+    /// F34: a custom delimiter folds `secret/k` into `sec`; the folded name
+    /// is a prefix of a Deny-protected key and must not be shown when no
+    /// visible key lies under it.
+    #[tokio::test]
+    async fn a_custom_delimiter_never_rolls_up_a_denied_name() {
+        let keys = ["secret/k", "sector.txt", "pub/a", "sedan/x"];
+        let (_dir, engine) = fs_engine(&keys).await;
+        let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/secret/*"])]);
+        // `sec` holds `sector.txt` (visible): shown, with `sedan/x`. `secr`, `secre` and
+        // `secret` have no visible key under them: not shown.
+        for (prefix, delimiter, shown) in [
+            ("se", "c", vec!["sec", "sedan/x"]),
+            ("se", "r", vec!["sector", "sedan/x"]),
+            ("secr", "e", vec![]),
+            ("secre", "t", vec![]),
+        ] as [(&str, &str, Vec<&str>); 4]
+        {
+            let got = walk(&engine, prefix, Some(delimiter), 1000, &scope).await;
+            assert_eq!(got, shown, "prefix={prefix:?} delimiter={delimiter:?}");
+            assert_eq!(got, oracle(&keys, &scope, prefix, Some(delimiter)));
+        }
+    }
+
+    mod differential {
+        use super::*;
+        use proptest::prelude::*;
+
+        const KEYS: [&str; 14] = [
+            "a/x",
+            "a/secret/k",
+            "a/sector",
+            "secret/k",
+            "secret/j/z",
+            "sector.txt",
+            "sedan/x",
+            "se/c/d",
+            "pub/a",
+            "pub/b/c",
+            "ccc",
+            "c/c/c",
+            "abc/abc",
+            "zz",
+        ];
+        const ALLOWS: [&str; 6] = ["b/*", "b/a/*", "b/pub/*", "b/se*", "b/c*", "b/abc/*"];
+        const DENIES: [&str; 7] = [
+            "b/secret/*",
+            "b/a/secret/*",
+            "b/sec*",
+            "b/se/*",
+            "b/c/*",
+            "b/*/k",
+            "b/abc/abc",
+        ];
+        const DELIMS: [&str; 7] = ["/", "c", "e", "r", "a", "ec", "t/"];
+        const PREFIXES: [&str; 9] = ["", "s", "se", "sec", "secr", "a/", "a/s", "c", "ab"];
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(300))]
+            /// A filtered LIST equals the fold of the visible keys for any
+            /// delimiter, request prefix and Allow/Deny mix: no folded name
+            /// is shown unless a visible key lies under it.
+            #[test]
+            fn a_filtered_list_equals_the_fold_of_the_visible_keys(
+                allows in proptest::collection::vec(proptest::sample::select(&ALLOWS[..]), 1..4),
+                denies in proptest::collection::vec(proptest::sample::select(&DENIES[..]), 0..3),
+                delimiter in proptest::sample::select(&DELIMS[..]),
+                prefix in proptest::sample::select(&PREFIXES[..]),
+                max_keys in prop_oneof![Just(2u32), Just(1000u32)],
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(async {
+                    let (_dir, engine) = fs_engine(&KEYS).await;
+                    let mut perms: Vec<_> = allows.iter().map(|a| rule("Allow", &[a])).collect();
+                    perms.extend(denies.iter().map(|d| rule("Deny", &[d])));
+                    let scope = scoped(perms);
+                    let got = walk(&engine, prefix, Some(delimiter), max_keys, &scope).await;
+                    let want = oracle(&KEYS, &scope, prefix, Some(delimiter));
+                    prop_assert_eq!(
+                        got, want,
+                        "allows={:?} denies={:?} delimiter={:?} prefix={:?}",
+                        allows, denies, delimiter, prefix
+                    );
+                    Ok(())
+                })?;
+            }
+        }
     }
 }
