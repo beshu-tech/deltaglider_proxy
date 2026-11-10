@@ -52,7 +52,9 @@ pub async fn build_rustls_config(
     }
 
     if let (Some(cert), Some(key)) = (&tls.cert_path, &tls.key_path) {
-        Ok(RustlsConfig::from_pem_file(cert, key).await?)
+        RustlsConfig::from_pem_file(cert, key).await.map_err(|e| {
+            format!("cannot load the TLS certificate '{cert}' and key '{key}': {e}").into()
+        })
     } else {
         let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
         let cert_params = rcgen::CertificateParams::new(subject_alt_names)?;

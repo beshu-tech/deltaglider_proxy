@@ -693,6 +693,47 @@ async fn spool_budget_under_concurrent_streaming_ops_returns_to_zero() {
     }
 }
 
+/// E7 F11: the spool directory is made at boot only. Somebody removes it
+/// (a tmp cleaner): a delta PUT and a large delta GET answered 500. The spool
+/// makes its directory again on the first ENOENT.
+#[tokio::test]
+async fn a_removed_spool_dir_is_made_again() {
+    let parent = tempfile::TempDir::new().unwrap();
+    let spool_dir = parent.path().join("spool");
+    const MIB: usize = 1024 * 1024;
+    let server = TestServer::builder()
+        .env("DGP_SPOOL_DIR", &spool_dir.display().to_string())
+        .env("DGP_SPOOL_MAX_BYTES", &(64 * MIB).to_string())
+        .env("DGP_SPOOL_THRESHOLD_BYTES", &MIB.to_string())
+        .env("DGP_RANGE_SPOOL_TTL_SECS", "0")
+        .build()
+        .await;
+    let http = server.http();
+    let base = generate_binary(3 * MIB, 11);
+    let next = mutate_binary(&base, 0.002);
+    let put = |key: &'static str, body: Vec<u8>| {
+        let req = http
+            .s3_request(Method::PUT, &obj_url(&server, key))
+            .body(body);
+        async move { req.send().await.unwrap().status().as_u16() }
+    };
+    assert_eq!(put("gone/base.zip", base.clone()).await, 200, "baseline");
+
+    std::fs::remove_dir_all(&spool_dir).unwrap();
+    assert_eq!(put("gone/next.zip", next.clone()).await, 200, "delta PUT");
+    assert!(spool_dir.is_dir(), "the spool dir is back");
+
+    std::fs::remove_dir_all(&spool_dir).unwrap();
+    let (code, got) = get(&server, "gone/next.zip").await;
+    assert_eq!(code, 200, "large GET");
+    assert!(got == next, "the GET returns the PUT bytes");
+
+    let ready = reqwest::get(format!("{}/_/ready", server.endpoint()))
+        .await
+        .unwrap();
+    assert_eq!(ready.status().as_u16(), 200);
+}
+
 /// P7.4: a passthrough write holds its key's write lock, not the folder's
 /// deltaspace lock. Passthrough writes (`dg-no-delta`) and delta writes of
 /// ONE key, at once, with reads in between: every write answers 200, every

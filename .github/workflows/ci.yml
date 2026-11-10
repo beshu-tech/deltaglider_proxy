@@ -373,6 +373,7 @@ jobs:
               atomic_writes_gate_test::
               backend_capability_gate_test::
               backend_health_test::
+              boot_resilience_test::
               browser_session_connect_test::
               bucket_existence_test::
               bucket_usage_test::

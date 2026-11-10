@@ -189,7 +189,8 @@ Per-request deadline (HTTP 504 when exceeded).
 
 | | |
 |---|---|
-| **Env var** | `DGP_REQUEST_TIMEOUT_SECS` |
+| **Env var** | `DGP_STATE_LOCK_WAIT_SECS` | 60 | How long, in seconds, a starting proxy waits for another proxy process to release the lock on the state directory (the folder of `deltaglider_config.db`). One process at a time may use a state directory, because two processes corrupt the job state and the usage counters. During a rolling deploy the old process is still stopping when the new one starts, so the new process waits and logs one warning. When the wait ends and the lock is still held, the proxy exits with an error that names the directory. `0` means do not wait. A file system that cannot lock files (`ENOLCK`, `EOPNOTSUPP`) gives a warning, and the proxy starts without the lock |
+| `DGP_REQUEST_TIMEOUT_SECS` |
 | **Default** | `300` (5 minutes) |
 | **Hot-reload** | No |
 
@@ -1146,6 +1147,7 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_LOG_RING_LEVEL` | `info` | Minimum severity captured into the log ring/stream |
 | `DGP_AUDIT_RING_SIZE` | `500` | In-memory audit ring capacity (admin Audit log viewer) |
 | `DGP_BLOCKING_THREADS` | 512 | Max tokio blocking threads |
+| `DGP_SHUTDOWN_TIMEOUT_SECS` | 10 | How long, in seconds, the proxy waits for work on its blocking threads when it stops. When the proxy gets SIGTERM, it first stops accepting connections and waits for the running requests (up to 10 seconds), then lets a running maintenance job stop and writes the queued events (up to 10 seconds each). Only after these steps does the process wait for blocking work, for example an xdelta3 run, which can take up to two hours. After this many seconds the process exits and the operating system ends any child xdelta3 process, because the pipes to it close. The longest stop is the sum of the steps: 10 + 10 + 10 + 10 = 40 seconds with the default. Set `terminationGracePeriodSeconds` in Kubernetes to more than that sum; the Helm chart uses 60. The minimum is 1 |
 | `DGP_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout (returns 504) |
 | `DGP_READY_TIMEOUT_SECS` | 3 | Per-attempt backend timeout for the direct `/_/ready` probe. The proxy sends that probe only when the health loop has no recent result for a backend (see the admin API reference). |
 | `DGP_READY_RETRIES` | 2 | Extra attempts of the direct `/_/ready` backend probe before reporting not-ready (short backoff) |

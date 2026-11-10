@@ -195,6 +195,7 @@ async fn s3_lease_self_reclaim_after_restart() {
             "nodeC".to_string(),
             b,
         )
+        .with_profile(Default::default())
     };
     let before_restart = with_boot(boot("boot-c1", None)).await;
     assert!(

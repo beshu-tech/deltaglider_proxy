@@ -77,6 +77,52 @@ pub struct ConditionalProfile {
     pub conditional_delete: bool,
 }
 
+/// What the process knows about the coordination bucket's conditional
+/// writes: nothing yet, or a proven profile. ONE cell is shared by every
+/// coordination writer (job lease, reference lock, encryption witness,
+/// config sync) and read per request, so the background re-probe that
+/// proves the bucket after a boot with an unknown verdict reaches all of
+/// them. A writer with no proven profile refuses to write (see
+/// [`ProfileCell::proven`]): a conditional write on a guess is the
+/// silent-clobber risk the boot probe exists to rule out.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileCell(std::sync::Arc<parking_lot::RwLock<Option<ConditionalProfile>>>);
+
+impl ProfileCell {
+    /// A cell with no verdict yet: its writers fail closed.
+    pub fn unknown() -> Self {
+        Self::default()
+    }
+
+    /// A cell that holds `profile` already.
+    pub fn with(profile: ConditionalProfile) -> Self {
+        let cell = Self::default();
+        cell.prove(profile);
+        cell
+    }
+
+    /// Record the profile that a probe proved. Every holder of this cell
+    /// sees it from its next request on.
+    pub fn prove(&self, profile: ConditionalProfile) {
+        *self.0.write() = Some(profile);
+    }
+
+    /// The proven profile, `None` while the verdict is unknown.
+    pub fn get(&self) -> Option<ConditionalProfile> {
+        *self.0.read()
+    }
+
+    /// The proven profile, or the refusal that a writer returns (its error
+    /// type wraps the text; the request path maps it to a retryable 503).
+    pub fn proven(&self) -> Result<ConditionalProfile, &'static str> {
+        self.get().ok_or(NOT_PROVEN)
+    }
+}
+
+/// Why a coordination writer refuses while the verdict is unknown.
+pub const NOT_PROVEN: &str =
+    "the coordination bucket is not proven to enforce conditional writes yet; retry later";
+
 /// Set an ETag condition on a request in the backend's dialect. The only
 /// code that calls the SDK's `if_match` / `copy_source_if_match`.
 pub trait IfMatchRequest: Sized {

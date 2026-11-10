@@ -268,6 +268,47 @@ async fn wrong_db_key_boot_stays_locked_and_correct_key_promotes_backup() {
         .expect("boot 4: S3 PUT must succeed after recovery");
 }
 
+/// E7 F2: a node that the config-DB lock makes answer 503 to every S3
+/// request is not ready. `/_/ready` read only the DB mutexes and answered 200.
+#[tokio::test]
+async fn a_node_locked_by_a_wrong_db_key_is_not_ready() {
+    let mut server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_CONFIG_DB_KEY", KEY_GOOD)
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let ready = |endpoint: String| async move {
+        let r = reqwest::Client::new()
+            .get(format!("{endpoint}/_/ready"))
+            .send()
+            .await
+            .expect("ready request");
+        (
+            r.status().as_u16(),
+            r.json::<serde_json::Value>().await.unwrap(),
+        )
+    };
+    let (code, body) = ready(endpoint.clone()).await;
+    assert_eq!(
+        (code, body["status"].as_str()),
+        (200, Some("ready")),
+        "{body}"
+    );
+
+    server
+        .respawn_with_env(&[("DGP_CONFIG_DB_KEY", KEY_WRONG)])
+        .await;
+    assert_eq!(raw_put_status(&endpoint, server.bucket()).await, 503);
+    let (code, body) = ready(endpoint.clone()).await;
+    assert_eq!(
+        code, 503,
+        "S3 answers 503 to everything, ready must too: {body}"
+    );
+    assert_eq!(body["status"], "not_ready");
+    assert_eq!(body["config_db"], "key_mismatch", "{body}");
+}
+
 /// Key rotation: the new key in DGP_CONFIG_DB_KEY, the old one in
 /// DGP_CONFIG_DB_KEY_PREVIOUS. The DB migrates; after that the old key is
 /// no longer needed.

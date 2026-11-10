@@ -901,6 +901,45 @@ fn sigterm_then_wait(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// A second proxy process of a test (see [`TestServer::spawn_sibling`]).
+/// Killed when dropped.
+pub struct SiblingProcess {
+    child: Child,
+    out: std::path::PathBuf,
+    err: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl SiblingProcess {
+    /// Send it SIGTERM and do not wait.
+    pub fn sigterm(&self) {
+        // SAFETY: plain kill(2) on our own child's pid.
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+    }
+
+    /// Its exit status when it has exited.
+    pub fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().expect("try_wait")
+    }
+
+    /// Everything it printed so far (stdout and stderr).
+    pub fn output(&self) -> String {
+        format!(
+            "{}\n{}",
+            std::fs::read_to_string(&self.out).unwrap_or_default(),
+            std::fs::read_to_string(&self.err).unwrap_or_default()
+        )
+    }
+}
+
+impl Drop for SiblingProcess {
+    fn drop(&mut self) {
+        stop_child(&mut self.child);
+    }
+}
+
 impl TestServer {
     /// Stop the proxy process (the data dir and config stay). A test edits
     /// on-disk state here, then calls `respawn_with_env`.
@@ -957,6 +996,30 @@ impl TestServer {
             std::fs::read_to_string(&err).unwrap_or_default()
         );
         (status, output)
+    }
+
+    /// Start a second proxy process on the SAME config file and state
+    /// directory with `extra` env vars (give it its own `DGP_LISTEN_ADDR`),
+    /// and leave it running. The caller polls it and reads its output.
+    pub fn spawn_sibling(&self, extra: &[(&str, &str)]) -> SiblingProcess {
+        let mut cmd = proxy_command(&self.config_path, self.production_security);
+        for (key, value) in &self.extra_env {
+            cmd.env(key, value);
+        }
+        for (key, value) in extra {
+            cmd.env(key, value);
+        }
+        let dir = tempfile::tempdir().expect("output dir");
+        let (out, err) = (dir.path().join("out"), dir.path().join("err"));
+        cmd.stdout(std::fs::File::create(&out).expect("stdout file"))
+            .stderr(std::fs::File::create(&err).expect("stderr file"));
+        let child = cmd.spawn().expect("spawn sibling proxy");
+        SiblingProcess {
+            child,
+            out,
+            err,
+            _dir: dir,
+        }
     }
 
     /// Kill + respawn against the SAME config file, data dir, and port —

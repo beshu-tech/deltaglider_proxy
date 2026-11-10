@@ -2017,13 +2017,10 @@ impl Config {
     /// Definition of a backend by NAME. `"default"` means the singleton only
     /// while no named backends exist (the rule `check_fatal` enforces).
     pub fn backend_by_name(&self, name: &str) -> Option<&BackendConfig> {
-        if self.backends.is_empty() {
-            return (name == "default").then_some(&self.backend);
-        }
-        self.backends
-            .iter()
-            .find(|b| b.name == name)
-            .map(|b| &b.backend)
+        self.effective_backends()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, backend)| backend)
     }
 
     /// Encryption config of a backend by NAME (same `"default"` rule as
@@ -2261,6 +2258,39 @@ impl Config {
         }
     }
 
+    /// THE backends this config runs, as `(name, definition)`. The legacy
+    /// singleton (`storage.backend`, named `default`) counts only while no
+    /// named backend exists: beside named backends it is an unused default
+    /// that no bucket routes to and the engine never builds. Every reader
+    /// of "which backends exist" goes through here (the boot sweep, the
+    /// banner, the lookup by name).
+    pub fn effective_backends(&self) -> Vec<(&str, &BackendConfig)> {
+        if self.backends.is_empty() {
+            vec![("default", &self.backend)]
+        } else {
+            self.backends
+                .iter()
+                .map(|b| (b.name.as_str(), &b.backend))
+                .collect()
+        }
+    }
+
+    /// The root folder of every filesystem backend that runs (see
+    /// [`Self::effective_backends`]), for the startup sweep of stale temp
+    /// files. A proxy with only named S3 backends has no root: the sweep
+    /// must not walk the unused singleton's `./data`.
+    pub fn filesystem_roots(&self) -> Vec<std::path::PathBuf> {
+        let mut roots = Vec::new();
+        for (_, backend) in self.effective_backends() {
+            if let BackendConfig::Filesystem { path } = backend {
+                if !roots.contains(path) {
+                    roots.push(path.clone());
+                }
+            }
+        }
+        roots
+    }
+
     /// The startup banner's storage lines: EVERY backend with its type and
     /// location, the default marked. (The banner used to print only the
     /// legacy singleton, so a multi-backend proxy logged "Backend:
@@ -2280,21 +2310,17 @@ impl Config {
             }
         }
         if self.backends.is_empty() {
-            return vec![format!("  Backend: {}", describe(&self.backend))];
+            let (_, only) = self.effective_backends()[0];
+            return vec![format!("  Backend: {}", describe(only))];
         }
         let default = self
             .default_backend
             .clone()
             .unwrap_or_else(|| self.backends[0].name.clone());
         let mut out = vec![format!("  Backends ({}):", self.backends.len())];
-        for nb in &self.backends {
-            let mark = if nb.name == default { " (default)" } else { "" };
-            out.push(format!(
-                "    - {}{}: {}",
-                nb.name,
-                mark,
-                describe(&nb.backend)
-            ));
+        for (name, backend) in self.effective_backends() {
+            let mark = if name == default { " (default)" } else { "" };
+            out.push(format!("    - {}{}: {}", name, mark, describe(backend)));
         }
         out
     }
@@ -2354,8 +2380,10 @@ impl Config {
     /// Accepts both raw bcrypt hash (`$2b$12$...`) and base64-encoded bcrypt hash.
     /// Base64 encoding avoids `$` escaping issues in Docker/shell/env vars.
     ///
-    /// Returns the bcrypt hash (always raw, never base64).
-    pub fn ensure_bootstrap_password_hash(&mut self) -> String {
+    /// Returns the bcrypt hash (always raw, never base64). An error (fatal at
+    /// boot): the hash file cannot be written and stderr is not a terminal,
+    /// so the operator would never learn the generated password.
+    pub fn ensure_bootstrap_password_hash(&mut self) -> Result<String, String> {
         // Check new file first, fall back to legacy file name
         let new_file = std::path::Path::new(".deltaglider_bootstrap_hash");
         let legacy_file = std::path::Path::new(".deltaglider_admin_hash");
@@ -2377,7 +2405,7 @@ impl Config {
                     );
                 }
             }
-            return hash;
+            return Ok(hash);
         }
 
         let state_file = if new_file.exists() {
@@ -2390,7 +2418,7 @@ impl Config {
                 let hash = Self::decode_hash(raw.trim());
                 if !hash.is_empty() {
                     self.bootstrap_password_hash = Some(hash.clone());
-                    return hash;
+                    return Ok(hash);
                 }
             }
         }
@@ -2413,25 +2441,28 @@ impl Config {
 
         // Persist the hash (use new file name)
         let persist_file = std::path::Path::new(".deltaglider_bootstrap_hash");
-        if let Err(e) = write_bootstrap_hash_file(persist_file, &hash) {
-            eprintln!(
-                "Warning: could not persist bootstrap hash to {}: {}",
-                persist_file.display(),
-                e
-            );
-        }
+        let persist_error = write_bootstrap_hash_file(persist_file, &hash)
+            .err()
+            .map(|e| e.to_string());
 
         // Print prominently to stderr — but only expose the plaintext password
         // when stderr is a TTY (interactive terminal). In containers/CI the
         // plaintext would leak into captured logs, so we print only the bcrypt
         // hash and tell the operator to set the env var.
         use std::io::IsTerminal;
-        for line in first_run_banner(&password, &hash, std::io::stderr().is_terminal()) {
+        let lines = first_run_banner(
+            &password,
+            &hash,
+            std::io::stderr().is_terminal(),
+            persist_error.as_deref(),
+            persist_file,
+        )?;
+        for line in lines {
             eprintln!("{line}");
         }
 
         self.bootstrap_password_hash = Some(hash.clone());
-        hash
+        Ok(hash)
     }
 
     /// Wrap this config in an `Arc<RwLock>` for shared mutable access.
@@ -3209,7 +3240,29 @@ pub enum ConfigError {
 /// With a TTY: the plaintext, once. Without (containers, CI): neither the
 /// plaintext nor the hash, because captured logs outlive the process and
 /// the hash is an admin credential that an attacker can guess offline.
-fn first_run_banner(password: &str, hash: &str, is_tty: bool) -> Vec<String> {
+///
+/// `persist_error` is the failure of the hash file write (`None`: written).
+/// The text says what happened. When the write failed AND there is no TTY,
+/// the password was never shown and is not stored: that is `Err` (fatal at
+/// boot) with the file path and the ways out.
+fn first_run_banner(
+    password: &str,
+    hash: &str,
+    is_tty: bool,
+    persist_error: Option<&str>,
+    hash_file: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    if let (false, Some(err)) = (is_tty, persist_error) {
+        return Err(format!(
+            "the bootstrap password was generated, but its hash could not be written to '{}': \
+             {err}. Stderr is not a terminal, so the password cannot be shown either, and no \
+             one could log in to the admin GUI. Make that path writable, or set \
+             DGP_BOOTSTRAP_PASSWORD_HASH (a bcrypt hash) and start again. \
+             `--set-bootstrap-password` also needs a writable '{}'",
+            hash_file.display(),
+            hash_file.display()
+        ));
+    }
     let mut out = vec![String::new()];
     if is_tty {
         out.push("╔══════════════════════════════════════════════════════════════╗".into());
@@ -3220,12 +3273,23 @@ fn first_run_banner(password: &str, hash: &str, is_tty: bool) -> Vec<String> {
         out.push("║  This password appears ONCE. Store it securely.              ║".into());
         out.push("║  Set DGP_BOOTSTRAP_PASSWORD_HASH to skip auto-generation.   ║".into());
         out.push("╚══════════════════════════════════════════════════════════════╝".into());
+        if let Some(err) = persist_error {
+            out.push(format!(
+                "WARNING: the hash could NOT be saved to {}: {err}.",
+                hash_file.display()
+            ));
+            out.push("  This password is lost at the next start. Make that path writable,".into());
+            out.push("  or set DGP_BOOTSTRAP_PASSWORD_HASH.".into());
+        }
     } else {
         let _ = hash; // deliberately not printed
         out.push(
             "BOOTSTRAP PASSWORD auto-generated (not a TTY — password and hash hidden).".into(),
         );
-        out.push("  The hash is in .deltaglider_bootstrap_hash (mode 0600).".into());
+        out.push(format!(
+            "  The hash is in {} (mode 0600).",
+            hash_file.display()
+        ));
         out.push("  To choose a password, change it in the admin GUI, or run".into());
         out.push("  `printf '%s\\n' '<pw>' | deltaglider_proxy --set-bootstrap-password`".into());
         out.push("  (it reads the password from stdin), or set".into());
@@ -3234,7 +3298,7 @@ fn first_run_banner(password: &str, hash: &str, is_tty: bool) -> Vec<String> {
         out.push("  DGP_CONFIG_DB_KEY or the key file next to the database.".into());
     }
     out.push(String::new());
-    out
+    Ok(out)
 }
 
 /// Write the bootstrap hash file with restrictive permissions (0600).

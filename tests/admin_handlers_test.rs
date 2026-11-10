@@ -1440,10 +1440,17 @@ async fn oauth_authorize_reports_an_unreachable_provider_and_crud_errors() {
         .send()
         .await
         .unwrap();
+    // A DNS failure can be a resolver blip, so it stays retryable: 503 with
+    // Retry-After while the background task retries. The page names the cause.
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(resp.headers().contains_key("retry-after"));
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("Provider Unavailable") && body.contains("dead-idp"),
-        "an unreachable IdP gets an explanation page: {body}"
+        body.contains("Provider Not Ready")
+            && body.contains("dead-idp")
+            && body.contains("has not reached the identity provider yet (")
+            && body.contains("does-not-exist.invalid"),
+        "an unreachable IdP gets an explanation page with the cause: {body}"
     );
     let resp = anon
         .get(format!("{ep}/_/api/admin/oauth/authorize/ghost"))

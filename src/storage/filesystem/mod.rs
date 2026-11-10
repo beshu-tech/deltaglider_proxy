@@ -22,11 +22,14 @@ use super::io_to_storage_error;
 #[cfg(test)]
 pub(crate) mod fault;
 mod fsio;
+mod sweep;
 #[cfg(test)]
 mod tests;
 mod write;
 
 use write::*;
+
+pub use sweep::{sweep_stale_temp_files, STALE_TEMP_MAX_AGE};
 
 /// Prefix of this backend's own temp files (atomic write-then-rename).
 const INTERNAL_TEMP_PREFIX: &str = ".dg-tmp.";
@@ -229,7 +232,7 @@ thread_local! {
 /// `.dg-tmp.*` (current) or tempfile's default `.tmpXXXXXX` (older
 /// releases). Every other `.`-name (`.env`, `.gitignore`) is a user object:
 /// LIST shows it and DeleteBucket must not erase it.
-fn is_internal_temp_name(name: &str) -> bool {
+pub(crate) fn is_internal_temp_name(name: &str) -> bool {
     if name.starts_with(INTERNAL_TEMP_PREFIX) {
         return true;
     }
@@ -328,7 +331,12 @@ impl FilesystemBackend {
     /// Validates xattr support at startup.
     pub async fn new(root: PathBuf) -> Result<Self, StorageError> {
         // Ensure root directory exists
-        fs::create_dir_all(&root).await?;
+        fs::create_dir_all(&root).await.map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("cannot create the data directory '{}': {e}", root.display()),
+            )
+        })?;
 
         // Validate that the filesystem supports xattrs
         xattr_meta::validate_xattr_support(&root).await?;

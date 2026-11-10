@@ -217,7 +217,6 @@ pub struct RouterDeps<'a> {
     pub replay_cache: &'a crate::api::auth::ReplayCache,
     /// The config at build time (layer limits, CORS, timeouts).
     pub config: &'a Config,
-    pub config_db_mismatch: bool,
     pub public_prefix_snapshot: &'a crate::bucket_policy::SharedPublicPrefixSnapshot,
     pub admission_chain: &'a crate::admission::SharedAdmissionChain,
     /// The live, hot-reloaded config.
@@ -238,7 +237,6 @@ where
         rate_limiter,
         replay_cache,
         config,
-        config_db_mismatch,
         public_prefix_snapshot,
         admission_chain,
         shared_config,
@@ -527,7 +525,7 @@ where
             },
         ));
 
-    if config_db_mismatch {
+    if state.config_db_key_mismatch {
         tracing::error!(
             "S3 API LOCKED — all requests will be rejected until the config DB key mismatch is resolved via /_/"
         );
@@ -609,7 +607,6 @@ mod backend_share_tests {
             rate_limiter: &rate_limiter,
             replay_cache: &replay_cache,
             config,
-            config_db_mismatch: false,
             public_prefix_snapshot: &snapshot,
             admission_chain: &chain,
             shared_config: &shared_config,

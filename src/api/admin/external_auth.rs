@@ -201,8 +201,16 @@ pub async fn oauth_authorize(
     if let Some(provider) = ext_auth.get_provider(&provider_name) {
         if !provider.is_discovery_cached() {
             tracing::info!("Running on-demand OIDC discovery for '{}'", provider_name);
+            // `discover` keeps the error on the provider: `initiate_auth`
+            // answers it as `DiscoveryFailed` (it cannot be cured by a
+            // retry) or `DiscoveryPending` (a provider that did not answer;
+            // the background task retries it, so make sure one runs: the
+            // cache TTL ran out and no task is left).
             if let Err(e) = provider.discover().await {
                 tracing::warn!("On-demand discovery failed for '{}': {}", provider_name, e);
+                if matches!(e, ExternalAuthError::DiscoveryUnreachable(_)) {
+                    ext_auth.spawn_discovery();
+                }
             }
         }
     }
@@ -241,6 +249,20 @@ pub async fn oauth_authorize(
         }
         Err(ExternalAuthError::ProviderNotFound(_)) => {
             AdminError::not_found("provider not found").into_response()
+        }
+        Err(ExternalAuthError::DiscoveryPending(msg)) => {
+            tracing::warn!("OIDC discovery pending for '{}': {}", provider_name, msg);
+            let mut response = error_page(
+                "Provider Not Ready",
+                &format!("The sign-in provider '{provider_name}' is not ready yet: {msg}"),
+            )
+            .into_response();
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("5"),
+            );
+            response
         }
         Err(ExternalAuthError::DiscoveryFailed(msg)) => {
             tracing::error!("OIDC discovery failed for '{}': {}", provider_name, msg);
@@ -1373,16 +1395,18 @@ pub(super) fn publish_provider_set(
     Ok(Some(ProviderDiscovery(ext_auth.clone())))
 }
 
-/// The OIDC discovery of a published provider set (one HTTP request per
-/// provider, up to 10 s each), and then the version bump.
+/// The OIDC discovery of a published provider set, started in the
+/// background (never awaited: a hanging identity provider must not stall the
+/// write), and then the version bump.
 #[must_use = "run the discovery after the locks are released"]
 pub(crate) struct ProviderDiscovery(Arc<crate::iam::external_auth::ExternalAuthManager>);
 
 impl ProviderDiscovery {
     pub(crate) async fn run(self) {
-        self.0.discover_all().await;
-        // Bump AFTER the rebuilt provider set is live + discovery ran, so a
-        // version observer never sees the new number before the new state.
+        self.0.spawn_discovery();
+        // Bump AFTER the rebuilt provider set is live, so a version observer
+        // never sees the new number before the new state. The discovery task
+        // bumps again when a provider is discovered.
         bump_ext_auth_version();
     }
 }

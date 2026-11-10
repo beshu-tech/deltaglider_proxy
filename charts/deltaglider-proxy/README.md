@@ -75,7 +75,7 @@ sealed/external secret. Do not rely on the chart defaults.
 
 `replicaCount` defaults to `1`. Object replication rules are safe from duplicate execution through a per-rule database lease: automatic scheduler ticks and manual `Run now` compete for the same lease, and long runs heartbeat it before starting more work. Defaults are `lease_ttl: "60s"` and `heartbeat_interval: "20s"`.
 
-Use more than one replica only when every replica can see the same durable config DB state. If each pod has an independent `/data/deltaglider_config.db`, each pod is an independent control plane and scheduled replication is not coordinated across pods.
+The chart runs one pod per state directory, and `updateStrategy.type` is `Recreate`. The proxy takes a lock on its state directory (the folder of `deltaglider_config.db`), and a second process on the same directory waits up to `DGP_STATE_LOCK_WAIT_SECS` (60 seconds by default) and then exits. A rolling update on a shared volume starts the new pod while the old pod still runs, so use `Recreate` there. Replicas do not share a config DB: each pod has its own `/data/deltaglider_config.db`, so each pod is an independent control plane and scheduled replication is not coordinated across pods. Use more than one replica only with a separate volume for each pod and a shared S3 sync bucket (`DGP_CONFIG_SYNC_BUCKET`, with the same `DGP_CONFIG_DB_KEY` on every pod). `terminationGracePeriodSeconds` is 60: a stop can take up to 40 seconds (10 seconds each for requests, a maintenance job, the event outbox and blocking work).
 
 ## Production secrets
 

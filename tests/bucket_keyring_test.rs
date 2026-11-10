@@ -2056,6 +2056,9 @@ mod witness_lib {
             gate.clone(),
             cfg,
             cache,
+        )
+        .with_profile_cell(
+            deltaglider_proxy::coordination::if_match::ProfileCell::with(Default::default()),
         );
         (w, gate)
     }

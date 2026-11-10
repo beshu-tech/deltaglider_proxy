@@ -23,6 +23,7 @@ pub mod config_db_sync;
 pub mod config_sections;
 pub mod coordination;
 pub mod cors;
+pub mod data_dir_lock;
 pub mod deltaglider;
 pub mod event_delivery;
 pub mod event_outbox;
@@ -675,6 +676,138 @@ mod source_guards {
     use crate::source_scan::{
         out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files, test_module_lines,
     };
+
+    /// F13 (#145): everything that can stop a boot for an environment reason
+    /// (the state-directory lock, the spool, the listener, TLS, the bootstrap
+    /// hash, the xdelta3 CLI) is made in ONE function,
+    /// `startup::claim_environment`. That call is the first `.await` of
+    /// `async_main`, and nothing before it spawns, so a boot that cannot
+    /// serve never ran a job or wrote to a backend. A step that moves above
+    /// it (a coordination probe, a backend write) turns this red.
+    #[test]
+    fn the_environment_is_claimed_before_the_first_worker_spawns() {
+        let main = include_str!("main.rs");
+        let body = &main[main.find("async fn async_main").expect("async_main")..];
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        // Code lines only: comments name the steps too.
+        let code: Vec<&str> = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let first_await = code
+            .iter()
+            .position(|l| l.contains(".await"))
+            .expect("async_main awaits");
+        assert!(
+            code[first_await].contains("startup::claim_environment("),
+            "the first `.await` of async_main must be startup::claim_environment, \
+             found: {}",
+            code[first_await].trim()
+        );
+        let first_spawn = code
+            .iter()
+            .position(|l| l.contains("spawn"))
+            .expect("async_main spawns workers");
+        assert!(
+            first_spawn > first_await,
+            "nothing in async_main may spawn before startup::claim_environment: {}",
+            code[first_spawn].trim()
+        );
+        // The function holds every step, in an order that makes the lock first.
+        let startup = include_str!("startup.rs");
+        let f = &startup[startup
+            .find("pub async fn claim_environment")
+            .expect("claim_environment")..];
+        let f = &f[..f.find("\n}\n").expect("end of claim_environment")];
+        let mut at = 0;
+        for step in [
+            "data_dir_lock::acquire(",
+            "SpoolDir::shared()",
+            "bind_listener(",
+            "init_tls(",
+            "ensure_bootstrap_password_hash()",
+            "is_cli_available()",
+        ] {
+            let pos = f
+                .find(step)
+                .unwrap_or_else(|| panic!("claim_environment no longer calls {step}"));
+            assert!(pos >= at, "{step} is out of order in claim_environment");
+            at = pos;
+        }
+        // The spawn inside is the blocking lock wait, awaited at once.
+        assert_eq!(
+            f.matches("spawn").count(),
+            1,
+            "claim_environment starts no worker"
+        );
+        for outside in ["data_dir_lock::acquire(", "bind_listener(", "init_tls("] {
+            assert!(
+                !body.contains(outside),
+                "async_main calls {outside} itself, not through claim_environment"
+            );
+        }
+        assert!(
+            !main.contains("TcpListener::bind"),
+            "main.rs binds only through startup::bind_listener, before the workers"
+        );
+    }
+
+    /// F59 (#145): the exit never waits for the blocking pool without a
+    /// bound. A plain drop of the runtime waits for every blocking task
+    /// (the codec ceiling is 2 hours). The bound is `shutdown_timeout`, read
+    /// from `DGP_SHUTDOWN_TIMEOUT_SECS`.
+    #[test]
+    fn the_runtime_never_waits_for_blocking_tasks_without_a_bound() {
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains("runtime.shutdown_timeout(")
+                && main.contains("tuning.shutdown_timeout_secs"),
+            "main.rs must end the runtime with shutdown_timeout"
+        );
+        assert_eq!(
+            main.matches("Builder::new_multi_thread()").count(),
+            1,
+            "one runtime, one bounded exit"
+        );
+    }
+
+    /// F22 (#145): every filesystem data root gets the stale-temp sweep at
+    /// boot, in a background task (never awaited on the boot path), with the
+    /// age rule of `STALE_TEMP_MAX_AGE`. Only `filesystem/sweep.rs` decides
+    /// who is stale; `.dg-tmp.` is made by one function (`internal_temp_in`).
+    #[test]
+    fn the_boot_sweeps_stale_temp_files_in_the_background() {
+        let main = include_str!("main.rs");
+        let startup = include_str!("startup.rs");
+        assert!(
+            main.contains("startup::spawn_stale_temp_sweeps(&config);"),
+            "async_main no longer starts the stale temp sweeps"
+        );
+        let f = &startup[startup
+            .find("pub fn spawn_stale_temp_sweeps(config: &Config) {")
+            .expect("startup::spawn_stale_temp_sweeps")..];
+        let f = &f[..f.find("\n}\n").expect("end of the function")];
+        let call = f
+            .find("sweep_stale_temp_files(")
+            .expect("the function no longer sweeps stale temp files");
+        let spawn = f[..call]
+            .rfind("spawn_blocking")
+            .expect("sweep is not spawned");
+        assert!(
+            call - spawn < 200 && !f[spawn..].contains(".await"),
+            "the sweep must run inside spawn_blocking, not on the boot path"
+        );
+        assert!(
+            f.contains("filesystem_roots()") && f.contains("STALE_TEMP_MAX_AGE"),
+            "the sweep covers every filesystem root with the stale-age rule"
+        );
+        let write = include_str!("storage/filesystem/write.rs");
+        assert_eq!(
+            write.matches(".prefix(INTERNAL_TEMP_PREFIX)").count(),
+            1,
+            "one function names the temp files"
+        );
+    }
 
     /// #120: production code names the `dg-sealed` key only where a sealed
     /// object is handled: the encrypting wrapper (which seals and opens),

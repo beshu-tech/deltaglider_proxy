@@ -193,8 +193,11 @@ pub struct ReadinessResponse {
     /// succeeded within the last-known-good window; `unreachable` / `timeout` =
     /// not ready.
     pub backend: &'static str,
-    /// Config DB openability ("ready" | "locked" | "absent").
+    /// Config DB state ("ready" | "locked" = mutex held too long |
+    /// "key_mismatch" = no key opens it, the S3 API answers 503 | "absent").
     pub config_db: &'static str,
+    /// Spool directory ("ready" | "unusable"): can a temp file be made.
+    pub spool: &'static str,
     /// Jobs DB openability ("ready" | "locked" | "absent"): the node-local
     /// job state and event outbox.
     pub jobs_db: &'static str,
@@ -403,6 +406,71 @@ async fn live_backend_readiness(engine: &crate::deltaglider::DynEngine) -> &'sta
     backend
 }
 
+/// What `/_/ready` knows about this node, as plain values. The verdict is
+/// [`readiness_verdict`], a pure function over this snapshot.
+///
+/// PARITY RULE: every condition where the S3 API refuses ALL requests
+/// (a global 503) is a row here that makes the node not ready, so a load
+/// balancer never keeps a node that answers 503 to everything. The source
+/// test `every_global_s3_refusal_has_a_readiness_row` lists those
+/// conditions and fails when a new one appears without a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeConditions {
+    /// The storage backends answer (see `backend_verdict_is_ready`).
+    pub backends_ready: bool,
+    /// No config-DB key opens the config DB. The S3 API answers 503
+    /// "Config database locked" to every request.
+    pub config_db_key_mismatch: bool,
+    /// The config DB mutex is held past the wait.
+    pub config_db_wedged: bool,
+    /// The jobs DB mutex is held past the wait.
+    pub jobs_db_wedged: bool,
+    /// The spool directory takes a new file (after one re-create).
+    pub spool_usable: bool,
+}
+
+/// A row's name and the edit that makes it fail.
+#[cfg(test)]
+type FailingRow = (&'static str, fn(&mut NodeConditions));
+
+impl NodeConditions {
+    /// Every row of the table, for the exhaustive unit test: each field
+    /// as the one condition that fails.
+    #[cfg(test)]
+    const FAILING_ROWS: [FailingRow; 5] = [
+        ("backends", |c| c.backends_ready = false),
+        ("config_db_key_mismatch", |c| {
+            c.config_db_key_mismatch = true
+        }),
+        ("config_db_wedged", |c| c.config_db_wedged = true),
+        ("jobs_db_wedged", |c| c.jobs_db_wedged = true),
+        ("spool", |c| c.spool_usable = false),
+    ];
+}
+
+/// THE readiness decision: ready only when no row fails.
+pub fn readiness_verdict(c: &NodeConditions) -> bool {
+    c.backends_ready
+        && !c.config_db_key_mismatch
+        && !c.config_db_wedged
+        && !c.jobs_db_wedged
+        && c.spool_usable
+}
+
+/// The `config_db` word of the response. A key mismatch is named apart
+/// from a wedged mutex: the fix differs (restore the key vs. restart).
+fn config_db_word(mutex_word: &'static str, key_mismatch: bool) -> &'static str {
+    if key_mismatch {
+        "key_mismatch"
+    } else {
+        mutex_word
+    }
+}
+
+/// How long `/_/ready` waits for the spool check before it calls the spool
+/// unusable.
+const SPOOL_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// `ready` when the lock is free within [`CONFIG_DB_READY_WAIT`], else `locked`.
 async fn lock_readiness<T>(db: &tokio::sync::Mutex<T>) -> &'static str {
     match tokio::time::timeout(CONFIG_DB_READY_WAIT, db.lock()).await {
@@ -441,10 +509,11 @@ pub async fn readiness_check(
     // outbox writer task and the job workers hold it for a moment at a
     // time, so the probe waits briefly: a busy mutex is ready, only one
     // held past the wait is not. `None` = legacy/open mode.
-    let config_db = match &state.config_db {
+    let config_db_mutex = match &state.config_db {
         Some(db) => lock_readiness(db).await,
         None => "absent",
     };
+    let config_db = config_db_word(config_db_mutex, state.config_db_key_mismatch);
     let jobs_db = match &state.jobs_db {
         Some(db) => lock_readiness(db).await,
         None => "absent",
@@ -463,7 +532,23 @@ pub async fn readiness_check(
         .collect();
     let backends_ok = live_backends_ready(&verdicts);
     let backend = if backends_ok { backend } else { "unreachable" };
-    let ready = backend_verdict_is_ready(backend) && config_db != "locked" && jobs_db != "locked";
+    // The spool check makes and drops one temp file (and re-creates a
+    // removed directory): off the async threads, single-flight, cached for
+    // a few seconds and bounded (`BackendHealthCache::spool_probe`).
+    let spool_usable = {
+        let engine = state.engine.load_full();
+        state
+            .backend_health
+            .spool_probe(move || engine.spool_usable(), SPOOL_READY_TIMEOUT)
+            .await
+    };
+    let ready = readiness_verdict(&NodeConditions {
+        backends_ready: backend_verdict_is_ready(backend),
+        config_db_key_mismatch: state.config_db_key_mismatch,
+        config_db_wedged: config_db_mutex == "locked",
+        jobs_db_wedged: jobs_db == "locked",
+        spool_usable,
+    });
     let code = if ready {
         StatusCode::OK
     } else {
@@ -476,6 +561,7 @@ pub async fn readiness_check(
             backend,
             config_db,
             jobs_db,
+            spool: if spool_usable { "ready" } else { "unusable" },
             backends,
             encryption_witness: state.encryption_witness.as_ref().map(|w| WitnessReadiness {
                 status: w.status().status,
@@ -519,6 +605,700 @@ mod readiness_tests {
     }
 
     const EVERY: Duration = Duration::from_secs(30);
+
+    fn all_ok() -> NodeConditions {
+        NodeConditions {
+            backends_ready: true,
+            config_db_key_mismatch: false,
+            config_db_wedged: false,
+            jobs_db_wedged: false,
+            spool_usable: true,
+        }
+    }
+
+    /// The full table: ready with no failing row, not ready with any one
+    /// failing, and not ready for every combination of two.
+    #[test]
+    fn the_verdict_follows_the_table() {
+        assert!(readiness_verdict(&all_ok()));
+        for (name, fail) in NodeConditions::FAILING_ROWS {
+            let mut c = all_ok();
+            fail(&mut c);
+            assert!(
+                !readiness_verdict(&c),
+                "row {name} must make the node not ready"
+            );
+        }
+        for (a, fa) in NodeConditions::FAILING_ROWS {
+            for (b, fb) in NodeConditions::FAILING_ROWS {
+                let mut c = all_ok();
+                fa(&mut c);
+                fb(&mut c);
+                assert!(!readiness_verdict(&c), "rows {a}+{b}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_mismatch_is_named_apart_from_a_wedged_mutex() {
+        assert_eq!(config_db_word("ready", true), "key_mismatch");
+        assert_eq!(config_db_word("locked", true), "key_mismatch");
+        assert_eq!(config_db_word("locked", false), "locked");
+        assert_eq!(config_db_word("absent", false), "absent");
+    }
+
+    /// A state that the S3 API refuses entirely is not ready, through the
+    /// real handler.
+    #[tokio::test]
+    async fn a_config_db_key_mismatch_is_not_ready() {
+        let (engine, _fake) = crate::deltaglider::s3_engine().await;
+        let mut state = AppState::for_tests(engine);
+        Arc::get_mut(&mut state).unwrap().config_db_key_mismatch = true;
+        state.backend_health.set_loop_interval(EVERY);
+        let (code, Json(body)) = readiness_check(State(state)).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.config_db, "key_mismatch");
+        assert_eq!(body.status, "not_ready");
+    }
+
+    /// How far a 503 refusal reaches.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Reach {
+        /// Refuses one request or one client (a cap, a conflict, a rate
+        /// limit, a failed backend call): never a readiness row.
+        PerRequest,
+        /// Refuses the requests of one bucket or one backend: the node
+        /// still serves the rest, so not a readiness row.
+        PerBucket,
+        /// Refuses EVERY request of the S3 path: the node is not ready, so
+        /// the row names the `NodeConditions` field that covers it.
+        Global(&'static str),
+        /// Defines, names or translates the 503 type; builds no refusal of
+        /// its own (the sites that cause it are rows of their own).
+        Plumbing,
+    }
+
+    /// CLASS GUARD. Every `SlowDown` / `ServiceUnavailable` /
+    /// `SERVICE_UNAVAILABLE`, and every `StorageError` / `EngineError`
+    /// variant that the bridges answer with a 503 (read from the bridges),
+    /// in production code of `src/` outside `src/storage` has a row
+    /// below: a file, a needle (`=` starts a whole-line match), how many
+    /// lines match it, how far it reaches, and why. A site that no row
+    /// covers fails, whatever its shape, until someone classifies it. A
+    /// `Global` row must name a `NodeConditions` field that `/_/ready`
+    /// reads: where the S3 path refuses every request, the node is not
+    /// ready.
+    ///
+    /// The coordination writers that refuse until the bucket is proven
+    /// (S3Lease, S3ReferenceLock, witness writes) refuse per request: a delta
+    /// PUT meets the reference lock and gets `503 ServiceUnavailable`, a
+    /// write to a witnessed bucket gets `503 SlowDown` (`WritesRefused`).
+    /// Both reach clients through the `errors.rs` mapping below.
+    const REFUSALS: &[(&str, &str, usize, Reach, &str)] = &[
+        (
+            "src/api/errors.rs",
+            "429 | 503 => \"SlowDown\"",
+            1,
+            Reach::Plumbing,
+            "the code of a rejected status",
+        ),
+        (
+            "src/api/errors.rs",
+            "if status == StatusCode::SERVICE_UNAVAILABLE",
+            1,
+            Reach::Plumbing,
+            "adds Retry-After to a 503",
+        ),
+        (
+            "src/api/errors.rs",
+            "=#[error(\"SlowDown: Please reduce your request rate.\")]",
+            1,
+            Reach::Plumbing,
+            "the S3Error type",
+        ),
+        (
+            "src/api/errors.rs",
+            "=SlowDown(String),",
+            1,
+            Reach::Plumbing,
+            "the S3Error type",
+        ),
+        (
+            "src/api/errors.rs",
+            "=#[error(\"ServiceUnavailable: {0}\")]",
+            1,
+            Reach::Plumbing,
+            "the S3Error type",
+        ),
+        (
+            "src/api/errors.rs",
+            "=ServiceUnavailable(String),",
+            1,
+            Reach::Plumbing,
+            "the S3Error type",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::SlowDown(_) => \"SlowDown\"",
+            1,
+            Reach::Plumbing,
+            "the S3 code of the type",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::ServiceUnavailable(_) => \"ServiceUnavailable\"",
+            1,
+            Reach::Plumbing,
+            "the S3 code of the type",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::SlowDown(_) => StatusCode::SERVICE_UNAVAILABLE",
+            1,
+            Reach::Plumbing,
+            "the HTTP status of the type",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE",
+            1,
+            Reach::Plumbing,
+            "the HTTP status of the type",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::SlowDown(_) | S3Error::ServiceUnavailable(_)",
+            1,
+            Reach::Plumbing,
+            "is_retryable of the type",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::SlowDown(msg) => s3s::s3_error!",
+            1,
+            Reach::Plumbing,
+            "the s3s bridge",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::ServiceUnavailable(msg) => s3s::s3_error!",
+            1,
+            Reach::Plumbing,
+            "the s3s bridge",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::ServiceUnavailable(DISK_FULL_503",
+            1,
+            Reach::PerBucket,
+            "the backend that hosts the bucket is full",
+        ),
+        (
+            "src/api/errors.rs",
+            "StorageError::WritesRefused(msg) => S3Error::SlowDown(msg)",
+            1,
+            Reach::PerRequest,
+            "the witness or a coordination writer refuses this write",
+        ),
+        (
+            "src/api/errors.rs",
+            "StorageError::Throttled(_) => S3Error::SlowDown(",
+            1,
+            Reach::PerRequest,
+            "a backend throttled this request",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::ServiceUnavailable(format!(\"the storage backend did not answer",
+            1,
+            Reach::PerBucket,
+            "one backend did not answer",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::ServiceUnavailable(TRANSIENT_503",
+            2,
+            Reach::PerRequest,
+            "a transient fault in this request",
+        ),
+        (
+            "src/api/errors.rs",
+            "=S3Error::SlowDown(",
+            1,
+            Reach::PerRequest,
+            "another writer holds this object",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::ServiceUnavailable(QUOTA_503",
+            1,
+            Reach::PerBucket,
+            "the backend quota is used up",
+        ),
+        (
+            "src/api/errors.rs",
+            "=S3Error::ServiceUnavailable(",
+            1,
+            Reach::PerRequest,
+            "the codec timed out on this request",
+        ),
+        (
+            "src/api/s3_router.rs",
+            "a request to it got 503 SlowDown",
+            1,
+            Reach::PerBucket,
+            "log line: one backend holds its share of slots",
+        ),
+        (
+            "src/api/s3_router.rs",
+            "crate::api::S3Error::SlowDown(",
+            1,
+            Reach::PerBucket,
+            "one backend holds its share of the request slots",
+        ),
+        (
+            "src/api/auth.rs",
+            "S3Error::SlowDown(format!(",
+            1,
+            Reach::PerRequest,
+            "auth lockout of one (client IP, access key)",
+        ),
+        (
+            "src/api/auth.rs",
+            "crate::api::S3Error::ServiceUnavailable(",
+            1,
+            Reach::Global("config_db_key_mismatch"),
+            "no key opens the config database: every request refused",
+        ),
+        (
+            "src/api/admin/external_auth.rs",
+            "StatusCode::SERVICE_UNAVAILABLE",
+            1,
+            Reach::PerRequest,
+            "one provider is not discovered yet",
+        ),
+        (
+            "src/api/admin/objects.rs",
+            "StatusCode::SERVICE_UNAVAILABLE",
+            1,
+            Reach::PerRequest,
+            "a ZIP request met an overloaded backend",
+        ),
+        (
+            "src/api/admin/error.rs",
+            "StatusCode::SERVICE_UNAVAILABLE => \"unavailable\"",
+            1,
+            Reach::Plumbing,
+            "the error code of a 503",
+        ),
+        (
+            "src/api/admin/error.rs",
+            "Self::status(StatusCode::SERVICE_UNAVAILABLE, message)",
+            1,
+            Reach::PerRequest,
+            "an admin request cannot be served now",
+        ),
+        (
+            "src/api/admin/config/conversion_start.rs",
+            "status: StatusCode::SERVICE_UNAVAILABLE",
+            2,
+            Reach::PerRequest,
+            "an apply cannot read the jobs DB",
+        ),
+        (
+            "src/api/handlers/object_helpers.rs",
+            "S3Error::SlowDown(",
+            1,
+            Reach::PerRequest,
+            "the copy source changed during this copy",
+        ),
+        (
+            "src/s3_adapter_s3s/copy.rs",
+            "crate::api::S3Error::SlowDown(",
+            1,
+            Reach::PerRequest,
+            "this copy overran its spool",
+        ),
+        (
+            "src/s3_adapter_s3s/object.rs",
+            "=SlowDown,",
+            1,
+            Reach::PerRequest,
+            "the object changed while this ranged read ran",
+        ),
+        (
+            "src/coordination/health.rs",
+            "S3Error::ServiceUnavailable(format!(",
+            1,
+            Reach::PerBucket,
+            "BackendHealthGate: the bucket's backend is gated",
+        ),
+        (
+            "src/api/handlers/status.rs",
+            "=StatusCode::SERVICE_UNAVAILABLE",
+            1,
+            Reach::Plumbing,
+            "the /_/ready answer itself",
+        ),
+        (
+            "src/maintenance/gate.rs",
+            "S3Error::SlowDown(refusal_message",
+            1,
+            Reach::PerBucket,
+            "a job holds this bucket's write gate",
+        ),
+        (
+            "src/api/admin/objects.rs",
+            "EngineError::Overloaded(_) | EngineError::Storage(StorageError::Throttled(_))",
+            1,
+            Reach::PerRequest,
+            "the admin ZIP maps an overloaded engine to its busy answer",
+        ),
+        (
+            "src/api/errors.rs",
+            "crate::storage::StorageError::DiskFull => disk_full_503(",
+            1,
+            Reach::Plumbing,
+            "the bridge: a full disk",
+        ),
+        (
+            "src/api/errors.rs",
+            "crate::storage::StorageError::Unavailable(msg) => {",
+            1,
+            Reach::Plumbing,
+            "the bridge: a backend that did not answer",
+        ),
+        (
+            "src/api/errors.rs",
+            "crate::storage::StorageError::Transient(cause) => {",
+            1,
+            Reach::Plumbing,
+            "the bridge: a retryable backend fault",
+        ),
+        (
+            "src/api/errors.rs",
+            "=crate::storage::StorageError::Contended(msg)",
+            1,
+            Reach::Plumbing,
+            "the bridge: a writer holds the resource",
+        ),
+        (
+            "src/api/errors.rs",
+            "=| crate::storage::StorageError::PreconditionFailed(msg) => {",
+            1,
+            Reach::Plumbing,
+            "the bridge: the source changed",
+        ),
+        (
+            "src/api/errors.rs",
+            "crate::storage::StorageError::QuotaExceeded(cause) => {",
+            1,
+            Reach::Plumbing,
+            "the bridge: a backend quota",
+        ),
+        (
+            "src/api/errors.rs",
+            "crate::storage::StorageError::NoSuchUpload(cause) => {",
+            1,
+            Reach::Plumbing,
+            "the bridge: a proxy-owned upload vanished",
+        ),
+        (
+            "src/api/handlers/object_helpers.rs",
+            "EngineError::Storage(StorageError::PreconditionFailed(_))",
+            1,
+            Reach::PerRequest,
+            "the copy source changed during this copy",
+        ),
+        (
+            "src/coordination/atomicity.rs",
+            "Self::Pending { .. } => crate::api::errors::S3Error::SlowDown(message)",
+            1,
+            Reach::PerBucket,
+            "the atomic-write verdict of one proxy-encrypted bucket is pending",
+        ),
+        (
+            "src/deltaglider/engine/locking.rs",
+            "EngineError::Storage(StorageError::Unavailable(detail))",
+            1,
+            Reach::PerRequest,
+            "the cross-instance reference lock cannot be reached for this deltaspace",
+        ),
+        (
+            "src/deltaglider/engine/locking.rs",
+            "EngineError::Storage(StorageError::Contended(format!(",
+            1,
+            Reach::PerRequest,
+            "a peer holds this deltaspace past the wait",
+        ),
+        (
+            "src/deltaglider/engine/mod.rs",
+            "EngineError::Overloaded(msg) => crate::api::S3Error::SlowDown(msg)",
+            1,
+            Reach::Plumbing,
+            "the engine bridge",
+        ),
+        (
+            "src/deltaglider/engine/resources.rs",
+            "EngineError::Overloaded(",
+            6,
+            Reach::PerRequest,
+            "a codec slot or the spool budget is full for this request",
+        ),
+        (
+            "src/deltaglider/engine/retrieve.rs",
+            "EngineError::Storage(StorageError::PreconditionFailed(",
+            2,
+            Reach::PerRequest,
+            "the object changed during this read",
+        ),
+        (
+            "src/deltaglider/engine/retrieve.rs",
+            "EngineError::Storage(StorageError::Throttled(format!(",
+            1,
+            Reach::PerRequest,
+            "a shared reconstruction was throttled",
+        ),
+        (
+            "src/multipart.rs",
+            "S3Error::SlowDown(",
+            4,
+            Reach::PerRequest,
+            "a multipart request met a cap or a full spool budget",
+        ),
+        (
+            "src/transfer.rs",
+            "crate::api::S3Error::SlowDown(",
+            1,
+            Reach::PerRequest,
+            "a copy maps its busy error to SlowDown",
+        ),
+    ];
+
+    /// The variants of `prefix` (a path such as `crate::storage::StorageError::`)
+    /// that the exhaustive bridge `impl_header` answers with a 503 (a
+    /// `SlowDown`, a `ServiceUnavailable`, or a `*_503` helper). Read from
+    /// the source of the bridge, so a new 503 variant joins the scan with no
+    /// edit here. A variable-carrying `Io` arm that is a 503 only for a full
+    /// disk is left out: every file write raises it.
+    fn variants_answered_503(file: &str, impl_header: &str, prefix: &str) -> Vec<String> {
+        let text = crate::source_scan::prod_text(&crate::source_scan::read(file));
+        let body = text
+            .split(impl_header)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{file}: {impl_header}"));
+        let body = body
+            .split(format!("\n{}\n", '\u{7d}').as_str())
+            .next()
+            .unwrap();
+        // (variants of the arm, text of the arm)
+        let mut arms: Vec<(Vec<String>, String)> = Vec::new();
+        for line in body.lines() {
+            let head = line
+                .trim()
+                .trim_start_matches("e @ (")
+                .trim_start_matches("| ");
+            if let Some(rest) = head.strip_prefix(prefix) {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                match arms.last_mut() {
+                    // The arm's head is not finished (no `=>` yet): an or-pattern.
+                    Some((names, text)) if !text.contains("=>") => names.push(name),
+                    _ => arms.push((vec![name], String::new())),
+                }
+            }
+            if let Some((_, text)) = arms.last_mut() {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        let is_503 = regex_lite::Regex::new(r"SlowDown|ServiceUnavailable|_503").unwrap();
+        let mut out: Vec<String> = arms
+            .into_iter()
+            .filter(|(_, text)| is_503.is_match(text))
+            .flat_map(|(names, _)| names)
+            .filter(|n| n != "Io")
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The source words of a 503 refusal: the S3 types, and every
+    /// `StorageError` / `EngineError` variant that the bridges turn into one
+    /// (`S3Error::from(StorageError::Throttled(..))` refuses as much as
+    /// `S3Error::SlowDown(..)` does).
+    fn refusal_words() -> regex_lite::Regex {
+        let storage = variants_answered_503(
+            "src/api/errors.rs",
+            "impl From<crate::storage::StorageError> for S3Error {",
+            "crate::storage::StorageError::",
+        );
+        let engine = variants_answered_503(
+            "src/deltaglider/engine/mod.rs",
+            "impl From<EngineError> for crate::api::S3Error {",
+            "EngineError::",
+        );
+        for known in [
+            "Throttled",
+            "WritesRefused",
+            "Unavailable",
+            "Transient",
+            "Contended",
+        ] {
+            assert!(
+                storage.iter().any(|v| v == known),
+                "the bridge read lost {known}"
+            );
+        }
+        assert!(engine.iter().any(|v| v == "Overloaded"));
+        regex_lite::Regex::new(&format!(
+            r"\b(SlowDown|ServiceUnavailable|SERVICE_UNAVAILABLE|StorageError::({})|EngineError::({}))\b",
+            storage.join("|"),
+            engine.join("|")
+        ))
+        .unwrap()
+    }
+
+    /// Production code that cannot refuse a client request: the backends
+    /// RAISE these errors on every fault (the bridges decide the answer),
+    /// the config registry holds help text, and the replication workers run
+    /// in the background (they log a throttled backend and stop a run).
+    const NOT_SCANNED: &[&str] = &["src/storage/", "src/config/registry.rs", "src/replication/"];
+
+    /// `(file, trimmed line)` of every site in the production code of
+    /// `src/` (minus [`NOT_SCANNED`] and test modules).
+    fn refusal_sites() -> Vec<(String, String)> {
+        use crate::source_scan::{prod_lines, prod_sources};
+        let word = refusal_words();
+        let mut sites = Vec::new();
+        for (file, text) in prod_sources("src") {
+            if NOT_SCANNED.iter().any(|p| file.starts_with(p)) {
+                continue;
+            }
+            for (_, line) in prod_lines(&text) {
+                let line = line.trim();
+                if !line.starts_with("//") && word.is_match(line) {
+                    sites.push((file.clone(), line.to_string()));
+                }
+            }
+        }
+        sites
+    }
+
+    fn row_covers(row_needle: &str, line: &str) -> bool {
+        match row_needle.strip_prefix('=') {
+            Some(whole) => line == whole,
+            None => line.contains(row_needle),
+        }
+    }
+
+    /// Sites with no row, and rows whose count is wrong.
+    fn refusal_problems(sites: &[(String, String)]) -> Vec<String> {
+        let mut problems = Vec::new();
+        for (file, line) in sites {
+            let n = REFUSALS
+                .iter()
+                .filter(|(f, needle, ..)| f == file && row_covers(needle, line))
+                .count();
+            if n != 1 {
+                problems.push(format!(
+                    "{file}: `{line}` is covered by {n} rows (want 1): classify it in REFUSALS"
+                ));
+            }
+        }
+        for (file, needle, want, ..) in REFUSALS {
+            let got = sites
+                .iter()
+                .filter(|(f, line)| f == file && row_covers(needle, line))
+                .count();
+            if got != *want {
+                problems.push(format!(
+                    "{file}: `{needle}` matches {got} lines, the row says {want}"
+                ));
+            }
+        }
+        problems
+    }
+
+    #[test]
+    fn every_503_site_is_classified_and_every_global_one_has_a_readiness_row() {
+        let sites = refusal_sites();
+        assert!(sites.len() > 30, "the scan found the request path");
+        let problems = refusal_problems(&sites);
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+
+        // A Global row names a NodeConditions field that readiness reads.
+        let status_src = crate::source_scan::read("src/api/handlers/status.rs");
+        let status_src = status_src
+            .split("#[cfg(test)]\nmod readiness_tests")
+            .next()
+            .unwrap();
+        let verdict_src = status_src
+            .split("pub fn readiness_verdict")
+            .nth(1)
+            // A closing brace at column 0 (built, not written: the scan
+            // that masks the test module counts braces, even in strings).
+            .and_then(|s| s.split(format!("\n{}\n", '\u{7d}').as_str()).next())
+            .expect("readiness_verdict");
+        let mut globals = 0;
+        for (file, needle, _, reach, why) in REFUSALS {
+            if let Reach::Global(field) = reach {
+                globals += 1;
+                assert!(
+                    NodeConditions::FAILING_ROWS
+                        .iter()
+                        .any(|(name, _)| name == field),
+                    "{file} `{needle}` ({why}): {field} is not a NodeConditions row"
+                );
+                assert!(
+                    verdict_src.contains(field),
+                    "readiness_verdict does not read {field} ({file}: {why})"
+                );
+            }
+        }
+        assert_eq!(globals, 1, "a new global refusal needs a readiness row");
+        // The row is fed by the SAME fact the S3 router locks on.
+        assert!(
+            status_src.contains("config_db_key_mismatch: state.config_db_key_mismatch"),
+            "readiness must read AppState::config_db_key_mismatch"
+        );
+        assert!(
+            crate::source_scan::read("src/api/s3_router.rs")
+                .contains("if state.config_db_key_mismatch"),
+            "the S3 router must lock on AppState::config_db_key_mismatch"
+        );
+    }
+
+    /// The review's regression: a shutdown refusal written before the auth
+    /// gate, as `S3Error::SlowDown`, left the old count-based guard green.
+    #[test]
+    fn a_drain_refusal_in_the_auth_middleware_is_caught() {
+        let mut sites = refusal_sites();
+        assert!(refusal_problems(&sites).is_empty());
+        sites.push((
+            "src/api/auth.rs".into(),
+            "return Err(S3Error::SlowDown(\"draining\".into()).into_response());".into(),
+        ));
+        let problems = refusal_problems(&sites);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("draining"), "{problems:?}");
+        // Other shapes, in a file with no rows at all.
+        for line in [
+            "return StatusCode::SERVICE_UNAVAILABLE.into_response();",
+            "Err(s3s::s3_error!(SlowDown, \"busy\"))",
+            "S3Error::ServiceUnavailable(\"x\".into())",
+            // A refusal that goes through the bridges.
+            "return Err(S3Error::from(StorageError::Throttled(\"draining\".into())).into_response());",
+            "return Err(EngineError::Overloaded(\"x\".into()).into());",
+        ] {
+            let mut sites = refusal_sites();
+            sites.push(("src/api/middleware_new.rs".into(), line.into()));
+            assert!(!refusal_problems(&sites).is_empty(), "{line}");
+        }
+    }
 
     /// The health loop already probes every backend each interval; a
     /// second probe per `/_/ready` (kubelet + every router check) only

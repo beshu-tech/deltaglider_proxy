@@ -4,6 +4,18 @@
 
 ### Upgrade steps for the next release
 
+- **Run one process per state directory.** The proxy now takes a lock on the folder of `deltaglider_config.db`. A second process on the same folder waits up to `DGP_STATE_LOCK_WAIT_SECS` (default 60) and then exits with a message that names the folder. On Kubernetes, set `updateStrategy.type: Recreate` for a deployment with one shared volume (the Helm chart now does), because a rolling update starts the new pod while the old one still runs. Give each replica its own volume.
+- **Two more boots now fail.** A second process on a locked state directory exits after the wait. A proxy with no terminal and a bootstrap password hash that it cannot write to `.deltaglider_bootstrap_hash` exits, because the admin password would be lost at the next start. Make the folder writable, or set `DGP_BOOTSTRAP_PASSWORD_HASH`.
+- **Check `/_/ready` after the upgrade.** It answers `503` when no key opens the config DB (`config_db: "key_mismatch"`), and it has a `spool` field (`ready` or `unusable`). A node with `503` gets no traffic from a Kubernetes Service. Reach the recovery wizard through `kubectl port-forward pod/<name> 9000:9000`.
+- **A coordination bucket with an unknown verdict.** When the boot probe cannot reach the coordination bucket, the proxy still starts, but the lease, the reference lock, the encryption witness and the config sync upload do not write until a background probe proves the bucket. A delta PUT answers `503 ServiceUnavailable` (the reference lock), and a write to a witnessed bucket answers `503 SlowDown`. When a probe proves the bucket, the writers open without a restart: the lock and the lease at once, the encryption witness at its next poll (up to 30 seconds), and the parked config database upload at the next sync poll (up to 5 minutes). After two probes in a row that prove no atomic conditional writes, the proxy stops with exit code 1 after a graceful drain.
+- **Set `terminationGracePeriodSeconds` to at least 60** (the Helm chart does). A stop takes up to 40 seconds: 10 for requests, 10 for a maintenance job, 10 for the event outbox and `DGP_SHUTDOWN_TIMEOUT_SECS` (default 10) for blocking work.
+
+### Added
+
+- `DGP_STATE_LOCK_WAIT_SECS` (default 60): how long a starting process waits for the state directory lock. `0` means do not wait.
+- `DGP_SHUTDOWN_TIMEOUT_SECS` (default 10): how long the exit waits for work on the blocking threads.
+
+
 - **Remove a `0` from `advanced.blocking_threads`, `advanced.codec_concurrency` and `advanced.filtered_list_max_engine_pages`** (and from `DGP_BLOCKING_THREADS`, `DGP_CODEC_CONCURRENCY`, `DGP_FILTERED_LIST_MAX_ENGINE_PAGES`). A `0` in one of these now stops the proxy at startup with an error that names the setting. Before, it caused a panic at startup or a hang. Other `DGP_*` timeouts and counts that a `0` would break (for example `DGP_REQUEST_TIMEOUT_SECS`, `DGP_MAX_CONCURRENT_REQUESTS`, `DGP_CLOCK_SKEW_SECONDS`, `DGP_SESSION_TTL_HOURS`) are read as `1`.
 
 ### Changed — Error answers for faults that a retry can clear

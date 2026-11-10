@@ -74,6 +74,17 @@ pub enum ExternalAuthError {
     #[error("OIDC discovery failed: {0}")]
     DiscoveryFailed(String),
 
+    /// The identity provider did not answer (timeout, refused connection,
+    /// DNS, HTTP 5xx or 429). A retry can succeed. Shown as a failure
+    /// (`DiscoveryFailed`) once nothing retries it.
+    #[error("OIDC discovery failed: {0}")]
+    DiscoveryUnreachable(String),
+
+    /// The provider's discovery has not finished yet (the proxy discovers in
+    /// the background after a start, and retries with backoff). Retryable.
+    #[error("OIDC discovery is not finished yet: {0}")]
+    DiscoveryPending(String),
+
     #[error("Token exchange failed: {0}")]
     TokenExchangeFailed(String),
 

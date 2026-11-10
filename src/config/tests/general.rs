@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+fn hash_file() -> &'static std::path::Path {
+    std::path::Path::new(".deltaglider_bootstrap_hash")
+}
+
 /// The non-TTY first-run banner must not print the bcrypt hash: it is an
 /// admin credential an attacker can guess offline, and container logs are
 /// retained. Since S8 the hash does not key the IAM database, and the
@@ -7,13 +11,17 @@
 #[test]
 fn first_run_banner_hides_hash_without_tty() {
     let hash = "$2b$12$abcdefghijklmnopqrstuuFAKEFAKEFAKEFAKEFAKEFAKEFAKE";
-    let lines = first_run_banner("pw123", hash, false).join("\n");
+    let lines = first_run_banner("pw123", hash, false, None, hash_file())
+        .unwrap()
+        .join("\n");
     assert!(!lines.contains(hash), "{lines}");
     assert!(!lines.contains("pw123"), "{lines}");
     assert!(!lines.contains("IAM database readable"), "{lines}");
     assert!(!lines.contains("Before any IAM user exists"), "{lines}");
     assert!(lines.contains("DGP_CONFIG_DB_KEY"), "{lines}");
-    let tty = first_run_banner("pw123", hash, true).join("\n");
+    let tty = first_run_banner("pw123", hash, true, None, hash_file())
+        .unwrap()
+        .join("\n");
     assert!(tty.contains("pw123") && !tty.contains(hash), "{tty}");
 }
 use crate::config::*;
@@ -103,6 +111,38 @@ fn banner_names_every_backend() {
     let single = Config::default().backend_banner_lines();
     assert_eq!(single.len(), 1);
     assert!(single[0].starts_with("  Backend: "), "{single:?}");
+}
+
+/// The legacy singleton (`storage.backend`, a filesystem at `./data` by
+/// default) is a backend only while no named backend exists. A proxy with
+/// only named S3 backends has no filesystem root: the boot sweep must not
+/// walk `./data` and delete `.dg-tmp.*` files that the proxy does not own.
+#[test]
+fn the_singleton_is_a_backend_only_without_named_backends() {
+    let all_s3 = "storage:\n  backends:\n    - name: hetzner-fsn1\n      type: s3\n      endpoint: https://fsn1.example.com\n      region: eu-central\n    - name: aws-dr\n      type: s3\n      region: eu-west-1\n";
+    let cfg = Config::from_yaml_str(all_s3).expect("parse");
+    assert!(
+        cfg.filesystem_roots().is_empty(),
+        "{:?}",
+        cfg.filesystem_roots()
+    );
+    let names: Vec<&str> = cfg.effective_backends().iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, ["hetzner-fsn1", "aws-dr"]);
+    assert!(cfg.backend_by_name("default").is_none());
+
+    // Mixed: only the named filesystem backend is a root.
+    let mixed = "storage:\n  backends:\n    - name: aws-dr\n      type: s3\n      region: eu-west-1\n    - name: local-disk\n      type: filesystem\n      path: /var/lib/dgp\n";
+    let cfg = Config::from_yaml_str(mixed).expect("parse");
+    assert_eq!(
+        cfg.filesystem_roots(),
+        [std::path::PathBuf::from("/var/lib/dgp")]
+    );
+
+    // No named backend: the singleton is the one backend, named `default`.
+    let cfg = Config::default();
+    let names: Vec<&str> = cfg.effective_backends().iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, ["default"]);
+    assert_eq!(cfg.filesystem_roots().len(), 1);
 }
 
 /// The fatal auth messages show the config the operator can paste: YAML
@@ -2461,4 +2501,50 @@ fn flat_only_keys_cover_every_config_key() {
         .filter(|k| *k != "defaults" && !FLAT_ROOT_KEYS.contains(k))
         .collect();
     assert!(missing.is_empty(), "add to FLAT_ROOT_KEYS: {missing:?}");
+}
+
+/// F38 (#145): what the first-run banner says depends on the hash file write
+/// and on the TTY. A banner never says "the hash is in <file>" after the
+/// write failed; a failed write without a TTY is fatal (the password was
+/// never shown).
+#[test]
+fn first_run_banner_outcome_table() {
+    let path = std::path::Path::new("/ro/.deltaglider_bootstrap_hash");
+    let run = |tty, err| first_run_banner("pw123", "hash", tty, err, path);
+
+    // Written, no TTY: names the file, hides the password.
+    let text = run(false, None).unwrap().join("\n");
+    assert!(
+        text.contains("The hash is in /ro/.deltaglider_bootstrap_hash"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("pw123") && !text.contains("WARNING"),
+        "{text}"
+    );
+
+    // Written, TTY: the password, no warning.
+    let text = run(true, None).unwrap().join("\n");
+    assert!(
+        text.contains("pw123") && !text.contains("WARNING"),
+        "{text}"
+    );
+
+    // Write failed, TTY: the password is shown AND the loss is announced.
+    let text = run(true, Some("Permission denied")).unwrap().join("\n");
+    assert!(text.contains("pw123"), "{text}");
+    assert!(
+        text.contains("could NOT be saved to /ro/.deltaglider_bootstrap_hash"),
+        "{text}"
+    );
+    assert!(text.contains("Permission denied"), "{text}");
+    assert!(!text.contains("The hash is in"), "{text}");
+
+    // Write failed, no TTY: fatal, with the path and the ways out.
+    let err = run(false, Some("Permission denied")).unwrap_err();
+    assert!(err.contains("/ro/.deltaglider_bootstrap_hash"), "{err}");
+    assert!(err.contains("Permission denied"), "{err}");
+    assert!(err.contains("DGP_BOOTSTRAP_PASSWORD_HASH"), "{err}");
+    assert!(err.contains("--set-bootstrap-password"), "{err}");
+    assert!(!err.contains("pw123"), "the password must not leak: {err}");
 }
