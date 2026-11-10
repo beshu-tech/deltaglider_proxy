@@ -896,6 +896,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         backend_capabilities: backend_capabilities.clone(),
         backend_health: backend_health.clone(),
         encryption_witness: encryption_witness.clone(),
+        config_db_locked: config_db_mismatch,
     });
     // The background writers (replication, lifecycle) ask the encryption
     // witness and the key sentinel through the maintenance gate: a refused
@@ -1106,7 +1107,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             rate_limiter: &rate_limiter,
             replay_cache: &replay_cache,
             config: &config,
-            config_db_mismatch,
             public_prefix_snapshot: &public_prefix_snapshot,
             admission_chain: &admission_chain,
             shared_config: &shared_config,

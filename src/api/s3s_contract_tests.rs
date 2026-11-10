@@ -311,6 +311,7 @@ async fn harness() -> Harness {
         backend_capabilities: Default::default(),
         backend_health: Default::default(),
         encryption_witness: None,
+        config_db_locked: false,
     });
     let rate_limiter = crate::rate_limiter::RateLimiter::new(
         100,
@@ -328,7 +329,6 @@ async fn harness() -> Harness {
             rate_limiter: &rate_limiter,
             replay_cache: &replay_cache,
             config: &config,
-            config_db_mismatch: false,
             public_prefix_snapshot: &snapshot,
             admission_chain: &chain,
             shared_config: &shared_config,

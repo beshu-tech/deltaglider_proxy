@@ -193,8 +193,11 @@ pub struct ReadinessResponse {
     /// succeeded within the last-known-good window; `unreachable` / `timeout` =
     /// not ready.
     pub backend: &'static str,
-    /// Config DB openability ("ready" | "locked" | "absent").
+    /// Config DB state ("ready" | "locked" = mutex held too long |
+    /// "key_mismatch" = no key opens it, the S3 API answers 503 | "absent").
     pub config_db: &'static str,
+    /// Spool directory ("ready" | "unusable"): can a temp file be made.
+    pub spool: &'static str,
     /// Jobs DB openability ("ready" | "locked" | "absent"): the node-local
     /// job state and event outbox.
     pub jobs_db: &'static str,
@@ -403,6 +406,67 @@ async fn live_backend_readiness(engine: &crate::deltaglider::DynEngine) -> &'sta
     backend
 }
 
+/// What `/_/ready` knows about this node, as plain values. The verdict is
+/// [`readiness_verdict`], a pure function over this snapshot.
+///
+/// PARITY RULE: every condition where the S3 API refuses ALL requests
+/// (a global 503) is a row here that makes the node not ready, so a load
+/// balancer never keeps a node that answers 503 to everything. The source
+/// test `every_global_s3_refusal_has_a_readiness_row` lists those
+/// conditions and fails when a new one appears without a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeConditions {
+    /// The storage backends answer (see `backend_verdict_is_ready`).
+    pub backends_ready: bool,
+    /// No config-DB key opens the config DB. The S3 API answers 503
+    /// "Config database locked" to every request.
+    pub config_db_key_mismatch: bool,
+    /// The config DB mutex is held past the wait.
+    pub config_db_wedged: bool,
+    /// The jobs DB mutex is held past the wait.
+    pub jobs_db_wedged: bool,
+    /// The spool directory takes a new file (after one re-create).
+    pub spool_usable: bool,
+}
+
+/// A row's name and the edit that makes it fail.
+#[cfg(test)]
+type FailingRow = (&'static str, fn(&mut NodeConditions));
+
+impl NodeConditions {
+    /// Every row of the table, for the exhaustive unit test: each field
+    /// as the one condition that fails.
+    #[cfg(test)]
+    const FAILING_ROWS: [FailingRow; 5] = [
+        ("backends", |c| c.backends_ready = false),
+        ("config_db_key_mismatch", |c| {
+            c.config_db_key_mismatch = true
+        }),
+        ("config_db_wedged", |c| c.config_db_wedged = true),
+        ("jobs_db_wedged", |c| c.jobs_db_wedged = true),
+        ("spool", |c| c.spool_usable = false),
+    ];
+}
+
+/// THE readiness decision: ready only when no row fails.
+pub fn readiness_verdict(c: &NodeConditions) -> bool {
+    c.backends_ready
+        && !c.config_db_key_mismatch
+        && !c.config_db_wedged
+        && !c.jobs_db_wedged
+        && c.spool_usable
+}
+
+/// The `config_db` word of the response. A key mismatch is named apart
+/// from a wedged mutex: the fix differs (restore the key vs. restart).
+fn config_db_word(mutex_word: &'static str, key_mismatch: bool) -> &'static str {
+    if key_mismatch {
+        "key_mismatch"
+    } else {
+        mutex_word
+    }
+}
+
 /// `ready` when the lock is free within [`CONFIG_DB_READY_WAIT`], else `locked`.
 async fn lock_readiness<T>(db: &tokio::sync::Mutex<T>) -> &'static str {
     match tokio::time::timeout(CONFIG_DB_READY_WAIT, db.lock()).await {
@@ -441,10 +505,11 @@ pub async fn readiness_check(
     // outbox writer task and the job workers hold it for a moment at a
     // time, so the probe waits briefly: a busy mutex is ready, only one
     // held past the wait is not. `None` = legacy/open mode.
-    let config_db = match &state.config_db {
+    let config_db_mutex = match &state.config_db {
         Some(db) => lock_readiness(db).await,
         None => "absent",
     };
+    let config_db = config_db_word(config_db_mutex, state.config_db_locked);
     let jobs_db = match &state.jobs_db {
         Some(db) => lock_readiness(db).await,
         None => "absent",
@@ -463,7 +528,21 @@ pub async fn readiness_check(
         .collect();
     let backends_ok = live_backends_ready(&verdicts);
     let backend = if backends_ok { backend } else { "unreachable" };
-    let ready = backend_verdict_is_ready(backend) && config_db != "locked" && jobs_db != "locked";
+    // The spool check makes and drops one temp file (and re-creates a
+    // removed directory): off the async threads.
+    let spool_usable = {
+        let engine = state.engine.load_full();
+        tokio::task::spawn_blocking(move || engine.spool_usable())
+            .await
+            .unwrap_or(false)
+    };
+    let ready = readiness_verdict(&NodeConditions {
+        backends_ready: backend_verdict_is_ready(backend),
+        config_db_key_mismatch: state.config_db_locked,
+        config_db_wedged: config_db_mutex == "locked",
+        jobs_db_wedged: jobs_db == "locked",
+        spool_usable,
+    });
     let code = if ready {
         StatusCode::OK
     } else {
@@ -476,6 +555,7 @@ pub async fn readiness_check(
             backend,
             config_db,
             jobs_db,
+            spool: if spool_usable { "ready" } else { "unusable" },
             backends,
             encryption_witness: state.encryption_witness.as_ref().map(|w| WitnessReadiness {
                 status: w.status().status,
@@ -519,6 +599,156 @@ mod readiness_tests {
     }
 
     const EVERY: Duration = Duration::from_secs(30);
+
+    fn all_ok() -> NodeConditions {
+        NodeConditions {
+            backends_ready: true,
+            config_db_key_mismatch: false,
+            config_db_wedged: false,
+            jobs_db_wedged: false,
+            spool_usable: true,
+        }
+    }
+
+    /// The full table: ready with no failing row, not ready with any one
+    /// failing, and not ready for every combination of two.
+    #[test]
+    fn the_verdict_follows_the_table() {
+        assert!(readiness_verdict(&all_ok()));
+        for (name, fail) in NodeConditions::FAILING_ROWS {
+            let mut c = all_ok();
+            fail(&mut c);
+            assert!(
+                !readiness_verdict(&c),
+                "row {name} must make the node not ready"
+            );
+        }
+        for (a, fa) in NodeConditions::FAILING_ROWS {
+            for (b, fb) in NodeConditions::FAILING_ROWS {
+                let mut c = all_ok();
+                fa(&mut c);
+                fb(&mut c);
+                assert!(!readiness_verdict(&c), "rows {a}+{b}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_mismatch_is_named_apart_from_a_wedged_mutex() {
+        assert_eq!(config_db_word("ready", true), "key_mismatch");
+        assert_eq!(config_db_word("locked", true), "key_mismatch");
+        assert_eq!(config_db_word("locked", false), "locked");
+        assert_eq!(config_db_word("absent", false), "absent");
+    }
+
+    /// A state that the S3 API refuses entirely is not ready, through the
+    /// real handler.
+    #[tokio::test]
+    async fn a_config_db_key_mismatch_is_not_ready() {
+        let (engine, _fake) = crate::deltaglider::s3_engine().await;
+        let mut state = AppState::for_tests(engine);
+        Arc::get_mut(&mut state).unwrap().config_db_locked = true;
+        state.backend_health.set_loop_interval(EVERY);
+        let (code, Json(body)) = readiness_check(State(state)).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.config_db, "key_mismatch");
+        assert_eq!(body.status, "not_ready");
+    }
+
+    /// CLASS GUARD. Where the S3 path answers 503 to EVERY request, the
+    /// node is not ready. This lists those refusals (a needle in a source
+    /// file of the request path, how many times, and the readiness row that
+    /// covers it). A new global refusal changes a count and fails here until
+    /// it gets a row in [`NodeConditions`] and a line in this table. Per-
+    /// bucket and per-client 503s (`BackendHealthGate`, rate limit, the
+    /// request caps, DiskFull) refuse only some requests: they are not rows.
+    #[test]
+    fn every_global_s3_refusal_has_a_readiness_row() {
+        // (file, source, needle, expected count, readiness row)
+        type Refusal = (
+            &'static str,
+            &'static str,
+            &'static str,
+            usize,
+            &'static str,
+        );
+        let table: &[Refusal] = &[
+            (
+                "src/api/auth.rs",
+                include_str!("../auth.rs"),
+                "ServiceUnavailable(",
+                1,
+                "config_db_key_mismatch",
+            ),
+            (
+                "src/api/auth.rs",
+                include_str!("../auth.rs"),
+                "Config database locked",
+                1,
+                "config_db_key_mismatch",
+            ),
+            (
+                "src/api/s3_router.rs",
+                include_str!("../s3_router.rs"),
+                "ServiceUnavailable(",
+                0,
+                "-",
+            ),
+            (
+                "src/api/s3s_hooks.rs",
+                include_str!("../s3s_hooks.rs"),
+                "ServiceUnavailable(",
+                0,
+                "-",
+            ),
+            (
+                "src/admission/middleware.rs",
+                include_str!("../../admission/middleware.rs"),
+                "ServiceUnavailable(",
+                0,
+                "-",
+            ),
+        ];
+        // The code above this module only: the needles below also appear in
+        // this test, which would always satisfy itself.
+        let status_src = include_str!("status.rs")
+            .split("#[cfg(test)]\nmod readiness_tests")
+            .next()
+            .unwrap();
+        let verdict_src = status_src
+            .split("pub fn readiness_verdict")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("readiness_verdict");
+        for (file, src, needle, want, row) in table {
+            let code = src.split("#[cfg(test)]").next().unwrap();
+            let n = code
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .map(|l| l.matches(needle).count())
+                .sum::<usize>();
+            assert_eq!(
+                n, *want,
+                "{file}: {needle} appears {n} times, the table says {want}. A global \
+                 refusal of the S3 path needs a row in NodeConditions and in this table"
+            );
+            if *want > 0 {
+                assert!(
+                    verdict_src.contains(row),
+                    "readiness_verdict does not read the row {row}"
+                );
+            }
+        }
+        // The row is fed by the SAME fact the S3 router locks on.
+        assert!(
+            status_src.contains("config_db_key_mismatch: state.config_db_locked"),
+            "readiness must read AppState::config_db_locked"
+        );
+        assert!(
+            include_str!("../s3_router.rs").contains("if state.config_db_locked"),
+            "the S3 router must lock on AppState::config_db_locked"
+        );
+    }
 
     /// The health loop already probes every backend each interval; a
     /// second probe per `/_/ready` (kubelet + every router check) only
