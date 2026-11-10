@@ -588,13 +588,39 @@ impl JobsDb {
         bytes_done: i64,
         continuation_token: Option<&str>,
     ) -> Result<(), ConfigDbError> {
-        self.conn.execute(
-            "UPDATE maintenance_jobs
-                SET phase = ?, objects_total = ?, objects_done = ?,
-                    objects_skipped = ?, objects_failed = ?, bytes_done = ?,
-                    continuation_token = ?, updated_at = ?
-              WHERE id = ? AND status IN ('running','cancelling')",
-            params![
+        update_progress(
+            &self.conn,
+            job_id,
+            phase,
+            objects_total,
+            objects_done,
+            objects_skipped,
+            objects_failed,
+            bytes_done,
+            continuation_token,
+        )
+    }
+
+    /// [`Self::maintenance_update_progress`] as a `synchronous = FULL` commit.
+    /// For a save that an irreversible step depends on (a migrate phase: the
+    /// config flip is on disk and the source delete follows): a power loss
+    /// must not revert the row to a phase that unwinds the live data.
+    #[allow(clippy::too_many_arguments)]
+    pub fn maintenance_update_progress_durable(
+        &self,
+        job_id: i64,
+        phase: &str,
+        objects_total: Option<i64>,
+        objects_done: i64,
+        objects_skipped: i64,
+        objects_failed: i64,
+        bytes_done: i64,
+        continuation_token: Option<&str>,
+    ) -> Result<(), ConfigDbError> {
+        self.durable(|conn| {
+            update_progress(
+                conn,
+                job_id,
                 phase,
                 objects_total,
                 objects_done,
@@ -602,11 +628,8 @@ impl JobsDb {
                 objects_failed,
                 bytes_done,
                 continuation_token,
-                current_unix_seconds(),
-                job_id,
-            ],
-        )?;
-        Ok(())
+            )
+        })
     }
 
     /// Request cancellation. A queued job that never ran cancels at once;
@@ -780,25 +803,27 @@ impl JobsDb {
         error: &str,
         max_retained: usize,
     ) -> Result<(), ConfigDbError> {
-        self.conn.execute(
-            "INSERT INTO maintenance_failures (job_id, object_key, error, created_at)
+        // The insert and the ring prune are ONE commit (E6/F20).
+        self.atomic(|db| {
+            db.conn.execute(
+                "INSERT INTO maintenance_failures (job_id, object_key, error, created_at)
              VALUES (?, ?, ?, ?)",
-            params![job_id, object_key, error, current_unix_seconds()],
-        )?;
-        // The adoption samples are bounded on their own
-        // (`maintenance_record_adoption`): they never evict a failure.
-        job_store::prune_failure_ring_except(
-            &self.conn,
-            "maintenance_failures",
-            "job_id",
-            &job_id,
-            max_retained as u32,
-            Some((
-                "error",
-                crate::maintenance::conversion::ADOPTED_AFTER_CUTOFF,
-            )),
-        )?;
-        Ok(())
+                params![job_id, object_key, error, current_unix_seconds()],
+            )?;
+            // The adoption samples are bounded on their own
+            // (`maintenance_record_adoption`): they never evict a failure.
+            job_store::prune_failure_ring_except(
+                &db.conn,
+                "maintenance_failures",
+                "job_id",
+                &job_id,
+                max_retained as u32,
+                Some((
+                    "error",
+                    crate::maintenance::conversion::ADOPTED_AFTER_CUTOFF,
+                )),
+            )
+        })
     }
 
     /// Count one object that a re-encrypt job did not rewrite because a
@@ -928,6 +953,39 @@ impl JobsDb {
         )?;
         Ok(n)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_progress(
+    conn: &rusqlite::Connection,
+    job_id: i64,
+    phase: &str,
+    objects_total: Option<i64>,
+    objects_done: i64,
+    objects_skipped: i64,
+    objects_failed: i64,
+    bytes_done: i64,
+    continuation_token: Option<&str>,
+) -> Result<(), ConfigDbError> {
+    conn.execute(
+        "UPDATE maintenance_jobs
+            SET phase = ?, objects_total = ?, objects_done = ?,
+                objects_skipped = ?, objects_failed = ?, bytes_done = ?,
+                continuation_token = ?, updated_at = ?
+          WHERE id = ? AND status IN ('running','cancelling')",
+        params![
+            phase,
+            objects_total,
+            objects_done,
+            objects_skipped,
+            objects_failed,
+            bytes_done,
+            continuation_token,
+            current_unix_seconds(),
+            job_id,
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

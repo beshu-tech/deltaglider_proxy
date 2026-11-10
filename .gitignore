@@ -79,6 +79,8 @@ deltaglider_config.db.rekey.tmp
 deltaglider_config.db.discarded
 deltaglider_usage.db
 deltaglider_jobs.db
+deltaglider_jobs.db-wal
+deltaglider_jobs.db-shm
 deltaglider_jobs.db.rekey.tmp
 /node-id
 /boot-id

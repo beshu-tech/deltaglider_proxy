@@ -1886,6 +1886,33 @@ mod tests {
         );
     }
 
+    /// A migrate phase save is a `FULL` commit: the flip and the source delete
+    /// come after it, and a power loss that reverts the row would let an
+    /// unwind delete the live data on the target (review of #156).
+    #[tokio::test]
+    async fn a_migrate_phase_save_commits_with_full() {
+        use super::{persist_flushed, Flushed};
+        use crate::maintenance::worker::Counters;
+        let db = JobsDb::in_memory("migrate-durable-test-key-0123456789abcdef").unwrap();
+        let id = db
+            .maintenance_create_job("migrate", "m", "copy", Some("{}"), "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("w", crate::event_outbox::current_unix_seconds(), 60)
+            .unwrap()
+            .unwrap();
+        let job = db.maintenance_job_by_id(id).unwrap().unwrap();
+        let runs = |db: &JobsDb| db.durable_runs.load(std::sync::atomic::Ordering::Relaxed);
+        let before = runs(&db);
+        let db = std::sync::Arc::new(tokio::sync::Mutex::new(db));
+        let c = Counters::of(&job);
+        persist_flushed(Flushed(()), &db, &job, "cleanup", &c, None).await;
+        let guard = db.lock().await;
+        assert_eq!(runs(&guard) - before, 1, "one FULL commit");
+        let saved = guard.maintenance_job_by_id(id).unwrap().unwrap();
+        assert_eq!(saved.phase, "cleanup");
+    }
+
     use super::*;
 
     /// NEW-10: two names on one storage. The migrate gated and cleaned up

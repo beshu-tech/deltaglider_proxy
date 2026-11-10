@@ -1574,6 +1574,12 @@ pub(crate) async fn persist(
 /// [`persist`] for a phase that writes without the per-object fsync: only
 /// a [`super::migrate::Flushed`] (made by a successful flush) opens it, so
 /// a saved cursor never points past a copy that a crash can lose.
+///
+/// The commit is `synchronous = FULL`. The flip and the source delete come
+/// after a migrate phase save: a power loss that reverts the row to an
+/// earlier phase, with the YAML already flipped, would let a cancel or a
+/// failure of the resumed job unwind (delete) the live data on the target.
+/// One fsync per page or phase costs nothing next to the page's copies.
 pub(crate) async fn persist_flushed(
     _proof: super::migrate::Flushed,
     db: &Arc<Mutex<JobsDb>>,
@@ -1582,7 +1588,15 @@ pub(crate) async fn persist_flushed(
     c: &Counters,
     token: Option<&str>,
 ) {
-    persist(db, job, phase, c, token).await;
+    let db = db.lock().await;
+    if let Err(e) = db.maintenance_update_progress_durable(
+        job.id, phase, c.total, c.done, c.skipped, c.failed, c.bytes, token,
+    ) {
+        warn!(
+            "maintenance: durable progress persist failed for job #{}: {}",
+            job.id, e
+        );
+    }
 }
 
 /// The job's lease keeper. The per-page `heartbeat` is not enough on its

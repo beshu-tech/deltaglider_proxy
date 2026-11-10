@@ -660,12 +660,13 @@ pub fn spawn_dispatcher_with_client(
                         .await;
                     continue;
                 }
-                dispatch_once(
+                drain_outbox(
                     &db,
                     client.as_ref(),
                     &cfg,
                     &claimant,
-                    current_unix_seconds(),
+                    drain_budget(&cfg),
+                    current_unix_seconds,
                 )
                 .await;
             }
@@ -730,6 +731,100 @@ pub async fn prune_while_inactive(
     }
 }
 
+/// What one claimed-and-settled batch did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BatchReport {
+    /// Rows the claim returned.
+    pub claimed: usize,
+    /// Rows that ended `failed` (a retry or dead) in this batch.
+    pub failed: usize,
+}
+
+/// What a whole drain did (see [`drain_outbox`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainReport {
+    pub batches: usize,
+    pub claimed: usize,
+    pub failed: usize,
+}
+
+/// Raw webhook posts that run at once in one batch. A bound, so a slow
+/// target cannot make the proxy open an unbounded number of connections.
+const DELIVERY_CONCURRENCY: usize = 8;
+
+/// Pure: how many posts of one batch run at once. A Slack target takes one at
+/// a time: `chat.postMessage` and Incoming Webhooks answer about one message
+/// per second per channel with 429, and posts in order read in order.
+pub(crate) fn delivery_concurrency(config: &EventDeliveryConfig) -> usize {
+    match config.format {
+        EventDeliveryFormat::Slack => 1,
+        _ => DELIVERY_CONCURRENCY,
+    }
+}
+
+/// Pure: rows one claim takes.
+pub(crate) fn claim_limit(config: &EventDeliveryConfig) -> u32 {
+    config.batch_size.clamp(1, 500)
+}
+
+/// Time one drain may spend claiming new batches: one tick. The sleep
+/// before the next drain adds a tick, so a drain never takes the whole
+/// loop.
+pub(crate) fn drain_budget(config: &EventDeliveryConfig) -> Duration {
+    dispatcher_tick(config)
+}
+
+/// Pure: whether a drain claims another batch. Yes only when the last claim
+/// was FULL (there is probably more), most of its rows were delivered (a
+/// target that fails most rows is not asked again at once: its rows wait for
+/// their retry time, and the posts of the others would only time out too),
+/// and the time budget has room.
+pub(crate) fn drain_continues(
+    batch_limit: u32,
+    last: &BatchReport,
+    elapsed: Duration,
+    budget: Duration,
+) -> bool {
+    last.claimed >= batch_limit as usize && last.failed * 2 < last.claimed && elapsed < budget
+}
+
+/// One dispatcher tick: claim and deliver batches until the outbox has no
+/// due row, a batch comes back mostly failed, or `budget` is spent, then
+/// prune. Before, a tick took ONE batch (50 rows per 10 s tick): at more than
+/// 5 events per second the backlog grew without bound.
+///
+/// Delivery stays at-least-once: every batch is claimed, posted and settled
+/// as before, a crash re-delivers after the stale claim. Order: rows are
+/// claimed oldest event first, and the posts of one object (bucket + key)
+/// run one after the other.
+pub async fn drain_outbox(
+    db: &Arc<Mutex<JobsDb>>,
+    client: &(impl EventDeliveryClient + ?Sized),
+    config: &EventDeliveryConfig,
+    claimant: &str,
+    budget: Duration,
+    now: impl Fn() -> i64,
+) -> DrainReport {
+    let mut report = DrainReport::default();
+    if !config.is_active() {
+        return report;
+    }
+    let started = std::time::Instant::now();
+    loop {
+        let last = dispatch_batch(db, client, config, claimant, now()).await;
+        report.batches += 1;
+        report.claimed += last.claimed;
+        report.failed += last.failed;
+        if !drain_continues(claim_limit(config), &last, started.elapsed(), budget) {
+            break;
+        }
+    }
+    prune_outbox(db, config, now()).await;
+    report
+}
+
+/// Claim, deliver and settle ONE batch, then prune (what a tick did before
+/// it drained; the tests drive it batch by batch).
 pub async fn dispatch_once(
     db: &Arc<Mutex<JobsDb>>,
     client: &(impl EventDeliveryClient + ?Sized),
@@ -740,19 +835,29 @@ pub async fn dispatch_once(
     if !config.is_active() {
         return;
     }
+    dispatch_batch(db, client, config, claimant, now).await;
+    prune_outbox(db, config, now).await;
+}
 
+async fn dispatch_batch(
+    db: &Arc<Mutex<JobsDb>>,
+    client: &(impl EventDeliveryClient + ?Sized),
+    config: &EventDeliveryConfig,
+    claimant: &str,
+    now: i64,
+) -> BatchReport {
     let claimed = {
         let db = db.lock().await;
         match db.event_outbox_claim_due(
             claimant,
             now,
             stale_claim_after_secs(config),
-            config.batch_size.clamp(1, 500),
+            claim_limit(config),
         ) {
             Ok(rows) => rows,
             Err(err) => {
                 warn!("Event outbox claim failed: {}", err);
-                return;
+                return BatchReport::default();
             }
         }
     };
@@ -763,6 +868,10 @@ pub async fn dispatch_once(
     // on `event.id`). A Slack success is saved right after its post, so
     // Slack gets no second message.
     let (endpoints, rows) = deliver_batch(db, client, config, &claimed, now).await;
+    let failed = rows
+        .iter()
+        .filter(|r| matches!(r, Settlement::Failed { .. }))
+        .count();
     if let Err(err) =
         db.lock()
             .await
@@ -774,7 +883,21 @@ pub async fn dispatch_once(
             err
         );
     }
+    BatchReport {
+        claimed: claimed.len(),
+        failed,
+    }
+}
 
+/// Most prune statements one tick runs per kind. A drain delivers many rows
+/// per tick, so one `prune_batch` per tick cannot keep up with it.
+const PRUNE_MAX_ROUNDS: u32 = 50;
+
+/// The retention prunes of a tick: delivered rows by age, dead rows by age,
+/// delivered rows over the count. Each runs until a round deletes less than
+/// `prune_batch` (nothing left to prune) or `PRUNE_MAX_ROUNDS`, and takes the
+/// jobs-DB lock for one round at a time.
+pub(crate) async fn prune_outbox(db: &Arc<Mutex<JobsDb>>, config: &EventDeliveryConfig, now: i64) {
     // Prune FLOOR: never delete a delivered row that a slower listener (e.g.
     // event-driven replication) hasn't consumed yet. We may only remove rows at
     // or below the smallest ACTIVE listener cursor. A cursor that hasn't
@@ -788,40 +911,31 @@ pub async fn dispatch_once(
             .unwrap_or(None)
             .unwrap_or(i64::MAX)
     };
-
+    let batch = config.prune_batch;
     let retention = delivered_retention_secs(config);
     if retention > 0 {
         let before = now.saturating_sub(retention);
-        let db = db.lock().await;
-        if let Err(err) =
-            db.event_outbox_prune_delivered_before(before, config.prune_batch, min_keep_id)
-        {
-            warn!("Event outbox delivered prune failed: {}", err);
-        }
+        prune_rounds(db, batch, "delivered prune", |db| {
+            db.event_outbox_prune_delivered_before(before, batch, min_keep_id)
+        })
+        .await;
     }
     // Age out terminal failed rows independently of `delivered_retention` — a dead
     // target grows the DB even when delivered-retention is 0. Uses a fixed window
     // (or the delivered retention if larger) and the SAME listener-cursor floor so
     // it never drops an event replication hasn't consumed.
-    {
-        let failed_window = retention.max(FAILED_ROW_MAX_AGE_SECS);
-        let before = now.saturating_sub(failed_window);
-        let db = db.lock().await;
-        if let Err(err) =
-            db.event_outbox_prune_failed_before(before, config.prune_batch, min_keep_id)
-        {
-            warn!("Event outbox failed prune failed: {}", err);
-        }
-    }
-    if config.prune_batch > 0 {
-        let db = db.lock().await;
-        if let Err(err) = db.event_outbox_prune_delivered_over_count(
-            config.delivered_max_rows,
-            config.prune_batch,
-            min_keep_id,
-        ) {
-            warn!("Event outbox delivered count-prune failed: {}", err);
-        }
+    let failed_window = retention.max(FAILED_ROW_MAX_AGE_SECS);
+    let failed_before = now.saturating_sub(failed_window);
+    prune_rounds(db, batch, "failed prune", |db| {
+        db.event_outbox_prune_failed_before(failed_before, batch, min_keep_id)
+    })
+    .await;
+    if batch > 0 {
+        let max_rows = config.delivered_max_rows;
+        prune_rounds(db, batch, "delivered count-prune", |db| {
+            db.event_outbox_prune_delivered_over_count(max_rows, batch, min_keep_id)
+        })
+        .await;
     }
     // NOTE: no any-status floor prune here. When delivery is ACTIVE every
     // claimed row ends `delivered` or `failed` (a filtered-out event is marked
@@ -835,9 +949,65 @@ pub async fn dispatch_once(
     // `spawn_dispatcher_with_client` handles that via `prune_while_inactive`.
 }
 
+/// Run one prune until a round deletes less than `batch`, at most
+/// `PRUNE_MAX_ROUNDS` rounds. The lock is taken per round.
+async fn prune_rounds(
+    db: &Arc<Mutex<JobsDb>>,
+    batch: u32,
+    what: &str,
+    mut round: impl FnMut(&JobsDb) -> Result<usize, crate::config_db::ConfigDbError>,
+) {
+    for _ in 0..PRUNE_MAX_ROUNDS {
+        let deleted = round(&*db.lock().await);
+        match deleted {
+            Ok(n) if (n as u32) >= batch && batch > 0 => {}
+            Ok(_) => return,
+            Err(err) => {
+                warn!("Event outbox {what} failed: {}", err);
+                return;
+            }
+        }
+    }
+}
+
+/// Pure: the claimed rows as groups of indexes into `claimed`, one group per
+/// object (bucket + key), in claim order inside a group and by first
+/// appearance across groups. The posts of one group run one after the
+/// other; groups run side by side.
+pub(crate) fn object_groups(claimed: &[EventOutboxRecord]) -> Vec<Vec<usize>> {
+    let mut at: std::collections::HashMap<(&str, &str), usize> = std::collections::HashMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, e) in claimed.iter().enumerate() {
+        let g = *at.entry((&e.bucket, &e.key)).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[g].push(i);
+    }
+    groups
+}
+
+/// Pure: the claimed rows as groups of posts that run one after the other.
+/// Groups run side by side, [`delivery_concurrency`] at a time. One post at
+/// a time means claim (event) order: one row per group, or a repeated key
+/// would run its whole group before the next object and the channel would
+/// read "created a, deleted a, created b" for a, b, a. Several at once keep
+/// the order of one object only ([`object_groups`]).
+pub(crate) fn post_groups(
+    config: &EventDeliveryConfig,
+    claimed: &[EventOutboxRecord],
+) -> Vec<Vec<usize>> {
+    if delivery_concurrency(config) == 1 {
+        (0..claimed.len()).map(|i| vec![i]).collect()
+    } else {
+        object_groups(claimed)
+    }
+}
+
 /// Deliver every claimed row and return what to write: the endpoint
-/// outcomes and each row's final state. Writes nothing, so the caller
-/// settles the batch in one transaction.
+/// outcomes and each row's final state, in claim order. Writes nothing, so
+/// the caller settles the batch in one transaction. At most
+/// [`delivery_concurrency`] objects are posted at once.
 async fn deliver_batch(
     db: &Arc<Mutex<JobsDb>>,
     client: &(impl EventDeliveryClient + ?Sized),
@@ -845,45 +1015,78 @@ async fn deliver_batch(
     claimed: &[EventOutboxRecord],
     now: i64,
 ) -> (Vec<EndpointOutcome>, Vec<Settlement>) {
+    use futures::StreamExt;
     let ids: Vec<i64> = claimed.iter().map(|e| e.id).collect();
     let done = db
         .lock()
         .await
         .event_delivery_done_endpoints_many(&ids)
         .map_err(|e| format!("event delivery state unreadable: {e}"));
-    let mut endpoints = Vec::new();
-    let mut rows = Vec::with_capacity(claimed.len());
-    for event in claimed {
-        let outcome = match &done {
-            Ok(done) => {
-                let mut done = done.get(&event.id).cloned().unwrap_or_default();
-                deliver_to_targets(db, client, config, event, &mut done, &mut endpoints).await
-            }
-            Err(e) => Err(e.clone()),
-        };
-        rows.push(match outcome {
-            Ok(()) => {
-                record_outcome(None, now);
-                Settlement::Delivered { id: event.id }
-            }
-            Err(err) => {
-                let stored = persistable_error(&err);
-                record_outcome(Some(&stored), now);
-                // A permanent error fails the row now: a retry cannot fix it.
-                let next_attempt_at = if is_permanent_error(&err) {
-                    None
-                } else {
-                    next_attempt_after(config, event.attempts, now)
+    let deliver_group = |group: Vec<usize>| {
+        let done = &done;
+        async move {
+            let mut out = Vec::with_capacity(group.len());
+            for i in group {
+                let event = &claimed[i];
+                let mut endpoints = Vec::new();
+                let outcome = match done {
+                    Ok(done) => {
+                        let mut done = done.get(&event.id).cloned().unwrap_or_default();
+                        deliver_to_targets(db, client, config, event, &mut done, &mut endpoints)
+                            .await
+                    }
+                    Err(e) => Err(e.clone()),
                 };
-                Settlement::Failed {
-                    id: event.id,
-                    error: stored,
-                    next_attempt_at,
-                }
+                out.push((i, endpoints, settlement(config, event, outcome, now)));
             }
-        });
+            out
+        }
+    };
+    let mut results: Vec<(usize, Vec<EndpointOutcome>, Settlement)> =
+        futures::stream::iter(post_groups(config, claimed))
+            .map(deliver_group)
+            .buffer_unordered(delivery_concurrency(config))
+            .flat_map(futures::stream::iter)
+            .collect()
+            .await;
+    results.sort_by_key(|(i, _, _)| *i);
+    let mut endpoints = Vec::new();
+    let mut rows = Vec::with_capacity(results.len());
+    for (_, e, row) in results {
+        endpoints.extend(e);
+        rows.push(row);
     }
     (endpoints, rows)
+}
+
+/// A row's final state from the outcome of its posts.
+fn settlement(
+    config: &EventDeliveryConfig,
+    event: &EventOutboxRecord,
+    outcome: Result<(), String>,
+    now: i64,
+) -> Settlement {
+    match outcome {
+        Ok(()) => {
+            record_outcome(None, now);
+            Settlement::Delivered { id: event.id }
+        }
+        Err(err) => {
+            let stored = persistable_error(&err);
+            record_outcome(Some(&stored), now);
+            // A permanent error fails the row now: a retry cannot fix it.
+            let next_attempt_at = if is_permanent_error(&err) {
+                None
+            } else {
+                next_attempt_after(config, event.attempts, now)
+            };
+            Settlement::Failed {
+                id: event.id,
+                error: stored,
+                next_attempt_at,
+            }
+        }
+    }
 }
 
 /// Pure: `true` when a post under `config` cannot be deduplicated by the
@@ -2108,6 +2311,524 @@ mod tests {
                 "{format:?}: webhook secret persisted in last_error: {err}"
             );
         }
+    }
+
+    // === E6/F21: the drain ===
+
+    /// A delivery client that records how its posts overlap and in what
+    /// order they start.
+    struct SinkClient {
+        delay: Duration,
+        fail: bool,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        /// Posts running now, per object key; the max of any of them.
+        per_key: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+        max_per_key: AtomicUsize,
+        /// `(key, event id)` in the order the posts started.
+        started: std::sync::Mutex<Vec<(String, i64)>>,
+    }
+
+    impl SinkClient {
+        fn new(delay: Duration, fail: bool) -> Self {
+            Self {
+                delay,
+                fail,
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+                per_key: Default::default(),
+                max_per_key: AtomicUsize::new(0),
+                started: Default::default(),
+            }
+        }
+    }
+
+    impl EventDeliveryClient for SinkClient {
+        async fn deliver(
+            &self,
+            _config: &EventDeliveryConfig,
+            event: &EventOutboxRecord,
+        ) -> Result<(), String> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            let same = {
+                let mut m = self.per_key.lock().unwrap();
+                let n = m.entry(event.key.clone()).or_default();
+                *n += 1;
+                *n
+            };
+            self.max_per_key.fetch_max(same, Ordering::SeqCst);
+            self.started
+                .lock()
+                .unwrap()
+                .push((event.key.clone(), event.id));
+            tokio::time::sleep(self.delay).await;
+            *self.per_key.lock().unwrap().get_mut(&event.key).unwrap() -= 1;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if self.fail {
+                Err("HTTP 503".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    async fn seeded(keys: impl IntoIterator<Item = String>) -> Arc<Mutex<JobsDb>> {
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("test-pass").unwrap()));
+        {
+            let db = db.lock().await;
+            for k in keys {
+                db.event_outbox_insert(&event(&k)).unwrap();
+            }
+        }
+        db
+    }
+
+    async fn count_status(db: &Arc<Mutex<JobsDb>>, status: &str) -> i64 {
+        db.lock().await.event_outbox_count(Some(status)).unwrap()
+    }
+
+    /// F21: 10x `batch_size` rows drain in ONE tick. Before, a tick claimed
+    /// one batch: 300 events took 60 s, and a producer above 5 events per
+    /// second grew the backlog without bound.
+    #[tokio::test]
+    async fn ten_batches_drain_in_one_tick() {
+        let config = cfg(); // batch_size 10
+        let db = seeded((0..100).map(|i| format!("k{i}"))).await;
+        let client = SinkClient::new(Duration::ZERO, false);
+        let report = drain_outbox(
+            &db,
+            &client,
+            &config,
+            "w",
+            Duration::from_secs(30),
+            current_unix_seconds,
+        )
+        .await;
+        assert_eq!(report.claimed, 100, "{report:?}");
+        assert!(report.batches >= 10, "{report:?}");
+        assert_eq!(count_status(&db, STATUS_DELIVERED).await, 100);
+        assert_eq!(count_status(&db, "pending").await, 0);
+    }
+
+    /// The old behaviour, kept as `dispatch_once`: one batch.
+    #[tokio::test]
+    async fn dispatch_once_still_takes_one_batch() {
+        let db = seeded((0..100).map(|i| format!("k{i}"))).await;
+        let client = SinkClient::new(Duration::ZERO, false);
+        dispatch_once(&db, &client, &cfg(), "w", current_unix_seconds()).await;
+        assert_eq!(count_status(&db, STATUS_DELIVERED).await, 10);
+    }
+
+    #[tokio::test]
+    async fn a_spent_budget_ends_the_drain_after_the_current_batch() {
+        let db = seeded((0..100).map(|i| format!("k{i}"))).await;
+        let client = SinkClient::new(Duration::ZERO, false);
+        let report = drain_outbox(
+            &db,
+            &client,
+            &cfg(),
+            "w",
+            Duration::ZERO,
+            current_unix_seconds,
+        )
+        .await;
+        assert_eq!(report.batches, 1, "{report:?}");
+        assert_eq!(count_status(&db, STATUS_DELIVERED).await, 10);
+    }
+
+    /// A target that fails (nearly) every row is not asked again at once:
+    /// the drain stops after the failed batch, and the rows wait for their
+    /// retry time (the backoff of the row is unchanged).
+    #[tokio::test]
+    async fn a_failing_target_is_not_hammered() {
+        let db = seeded((0..100).map(|i| format!("k{i}"))).await;
+        let client = SinkClient::new(Duration::ZERO, true);
+        let now = current_unix_seconds();
+        let report = drain_outbox(
+            &db,
+            &client,
+            &cfg(),
+            "w",
+            Duration::from_secs(30),
+            move || now,
+        )
+        .await;
+        assert_eq!(report.batches, 1, "{report:?}");
+        assert_eq!(
+            client.started.lock().unwrap().len(),
+            10,
+            "one batch of posts"
+        );
+        let rows = db.lock().await.event_outbox_recent(100).unwrap();
+        let retrying: Vec<_> = rows
+            .iter()
+            .filter(|r| r.status == "pending" && r.attempts == 1)
+            .collect();
+        assert_eq!(retrying.len(), 10);
+        assert!(
+            retrying
+                .iter()
+                .all(|r| r.next_attempt_at.is_some_and(|t| t > now)),
+            "a failed row waits for its retry time"
+        );
+        // The same tick again, at the same instant: the failed rows are not
+        // due, so the next batch is the next 10 fresh rows, not a retry.
+        let before = client.started.lock().unwrap().len();
+        drain_outbox(&db, &client, &cfg(), "w", Duration::ZERO, move || now).await;
+        let started = client.started.lock().unwrap();
+        let ids: std::collections::HashSet<i64> = started.iter().map(|(_, id)| *id).collect();
+        assert_eq!(started.len() - before, 10);
+        assert_eq!(
+            ids.len(),
+            started.len(),
+            "no row posted twice at one instant"
+        );
+    }
+
+    /// Posts overlap (up to the bound), but the posts of ONE object run
+    /// one after the other and in claim order.
+    #[tokio::test]
+    async fn posts_overlap_up_to_the_bound_and_one_object_stays_in_order() {
+        let mut config = cfg();
+        config.batch_size = 100;
+        let mut keys: Vec<String> = (0..30).map(|i| format!("k{i}")).collect();
+        keys.extend((0..5).map(|_| "same".to_string()));
+        let db = seeded(keys).await;
+        let client = SinkClient::new(Duration::from_millis(30), false);
+        let started = std::time::Instant::now();
+        drain_outbox(
+            &db,
+            &client,
+            &config,
+            "w",
+            Duration::from_secs(30),
+            current_unix_seconds,
+        )
+        .await;
+        let max = client.max_in_flight.load(Ordering::SeqCst);
+        assert!(max > 1, "posts ran one by one (max in flight {max})");
+        assert!(max <= DELIVERY_CONCURRENCY, "bound broken: {max}");
+        assert_eq!(client.max_per_key.load(Ordering::SeqCst), 1);
+        let started_order = client.started.lock().unwrap().clone();
+        let same: Vec<i64> = started_order
+            .iter()
+            .filter(|(k, _)| k == "same")
+            .map(|(_, id)| *id)
+            .collect();
+        assert!(same.windows(2).all(|w| w[0] < w[1]), "order: {same:?}");
+        assert_eq!(count_status(&db, STATUS_DELIVERED).await, 35);
+        // 35 posts at 30 ms: sequential would take over a second.
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Slack takes one post at a time (the target answers about one message
+    /// per second per channel with 429; messages read in order).
+    #[tokio::test]
+    async fn slack_posts_one_at_a_time() {
+        let mut config = cfg();
+        config.format = EventDeliveryFormat::Slack;
+        config.webhook_url = Some("http://example.invalid/services/T/B/X".to_string());
+        assert_eq!(delivery_concurrency(&config), 1);
+        config.format = EventDeliveryFormat::Raw;
+        assert_eq!(delivery_concurrency(&config), DELIVERY_CONCURRENCY);
+    }
+
+    #[test]
+    fn drain_continues_truth_table() {
+        let full = BatchReport {
+            claimed: 10,
+            failed: 0,
+        };
+        let s = Duration::from_secs;
+        assert!(drain_continues(10, &full, s(1), s(10)));
+        // A short claim: the outbox is empty.
+        assert!(!drain_continues(
+            10,
+            &BatchReport {
+                claimed: 9,
+                failed: 0
+            },
+            s(1),
+            s(10)
+        ));
+        // Half the rows failed: stop.
+        assert!(!drain_continues(
+            10,
+            &BatchReport {
+                claimed: 10,
+                failed: 5
+            },
+            s(1),
+            s(10)
+        ));
+        assert!(drain_continues(
+            10,
+            &BatchReport {
+                claimed: 10,
+                failed: 4
+            },
+            s(1),
+            s(10)
+        ));
+        // Time is up.
+        assert!(!drain_continues(10, &full, s(10), s(10)));
+        assert!(!drain_continues(10, &BatchReport::default(), s(0), s(10)));
+    }
+
+    /// Review of #156: a Slack channel reads the posts in order. With one
+    /// post at a time, the rows go out in CLAIM order, not grouped by object
+    /// ("created a, deleted a, created b" for a, b, a).
+    #[tokio::test]
+    async fn slack_posts_go_out_in_claim_order_with_repeated_keys() {
+        let mut config = cfg();
+        config.format = EventDeliveryFormat::Slack;
+        config.batch_size = 10;
+        let db = seeded(["a", "b", "a", "c", "b"].map(String::from)).await;
+        let client = SinkClient::new(Duration::ZERO, false);
+        let report = drain_outbox(
+            &db,
+            &client,
+            &config,
+            "w",
+            Duration::from_secs(30),
+            current_unix_seconds,
+        )
+        .await;
+        assert_eq!(report.claimed, 5, "{report:?}");
+        let started: Vec<(String, i64)> = client.started.lock().unwrap().clone();
+        let expected: Vec<(&str, i64)> = vec![("a", 1), ("b", 2), ("a", 3), ("c", 4), ("b", 5)];
+        assert_eq!(
+            started
+                .iter()
+                .map(|(k, id)| (k.as_str(), *id))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn post_groups_follow_the_concurrency_of_the_format() {
+        let rec = |id: i64, key: &str| EventOutboxRecord {
+            id,
+            kind: "ObjectCreated".into(),
+            bucket: "b".into(),
+            key: key.into(),
+            source: "s3".into(),
+            occurred_at: id,
+            payload: json!({}),
+            status: "in_progress".into(),
+            attempts: 1,
+            next_attempt_at: None,
+            claimed_by: None,
+            claimed_at: None,
+            delivered_at: None,
+            last_error: None,
+            created_at: 0,
+        };
+        let claimed = vec![
+            rec(1, "a"),
+            rec(2, "b"),
+            rec(3, "a"),
+            rec(4, "c"),
+            rec(5, "b"),
+        ];
+        let mut slack = cfg();
+        slack.format = EventDeliveryFormat::Slack;
+        assert_eq!(
+            post_groups(&slack, &claimed),
+            vec![vec![0], vec![1], vec![2], vec![3], vec![4]],
+            "Slack: one row per group, claim order"
+        );
+        let mut raw = cfg();
+        raw.format = EventDeliveryFormat::Raw;
+        assert_eq!(
+            post_groups(&raw, &claimed),
+            vec![vec![0, 2], vec![1, 4], vec![3]],
+            "raw webhook: one group per object"
+        );
+    }
+
+    #[test]
+    fn object_groups_keep_claim_order_per_object() {
+        let rec = |id: i64, key: &str| EventOutboxRecord {
+            id,
+            kind: "ObjectCreated".into(),
+            bucket: "b".into(),
+            key: key.into(),
+            source: "s3".into(),
+            occurred_at: id,
+            payload: json!({}),
+            status: "in_progress".into(),
+            attempts: 1,
+            next_attempt_at: None,
+            claimed_by: None,
+            claimed_at: None,
+            delivered_at: None,
+            last_error: None,
+            created_at: 0,
+        };
+        let claimed = vec![
+            rec(1, "a"),
+            rec(2, "b"),
+            rec(3, "a"),
+            rec(4, "c"),
+            rec(5, "a"),
+        ];
+        assert_eq!(
+            object_groups(&claimed),
+            vec![vec![0, 2, 4], vec![1], vec![3]]
+        );
+        assert!(object_groups(&[]).is_empty());
+    }
+
+    /// The retention prunes keep up with a drain: a drain that delivers
+    /// 10x `prune_batch` rows leaves no more than `delivered_max_rows`.
+    #[tokio::test]
+    async fn the_prunes_keep_up_with_a_drain() {
+        let mut config = cfg();
+        config.prune_batch = 5;
+        config.delivered_max_rows = 20;
+        config.delivered_retention = "0s".to_string();
+        let db = seeded((0..100).map(|i| format!("k{i}"))).await;
+        let client = SinkClient::new(Duration::ZERO, false);
+        drain_outbox(
+            &db,
+            &client,
+            &config,
+            "w",
+            Duration::from_secs(30),
+            current_unix_seconds,
+        )
+        .await;
+        assert_eq!(count_status(&db, STATUS_DELIVERED).await, 20);
+    }
+
+    /// End to end with local sinks: a raw webhook that answers 503 for its
+    /// first requests (the rows retry and arrive), and a Slack Incoming
+    /// Webhook (one post at a time, one message per event, in order).
+    #[tokio::test]
+    async fn a_drain_delivers_to_local_sinks_through_5xx_and_slack() {
+        // --- raw webhook: 503 for the first 3 requests
+        let ids = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/hook",
+            post({
+                let (ids, requests) = (ids.clone(), requests.clone());
+                move |Json(payload): Json<Value>| {
+                    let (ids, requests) = (ids.clone(), requests.clone());
+                    async move {
+                        if requests.fetch_add(1, Ordering::SeqCst) < 3 {
+                            return StatusCode::SERVICE_UNAVAILABLE;
+                        }
+                        ids.lock()
+                            .unwrap()
+                            .push(payload["event"]["id"].as_i64().unwrap());
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let db = seeded((0..25).map(|i| format!("k{i}"))).await;
+        let mut config = cfg();
+        config.webhook_url = Some(format!("{base}/hook"));
+        config.max_attempts = 5;
+        let client = HttpWebhookDeliveryClient::for_tests();
+        let t0 = current_unix_seconds();
+        let report = drain_outbox(
+            &db,
+            &client,
+            &config,
+            "w",
+            Duration::from_secs(30),
+            move || t0,
+        )
+        .await;
+        assert_eq!(report.claimed, 25, "{report:?}");
+        assert_eq!(report.failed, 3, "{report:?}");
+        assert_eq!(count_status(&db, STATUS_DELIVERED).await, 22);
+        // The three failed rows come back after their backoff, and nothing
+        // is posted twice.
+        let t1 = t0 + 60;
+        drain_outbox(
+            &db,
+            &client,
+            &config,
+            "w",
+            Duration::from_secs(30),
+            move || t1,
+        )
+        .await;
+        assert_eq!(count_status(&db, STATUS_DELIVERED).await, 25);
+        let mut got = ids.lock().unwrap().clone();
+        got.sort_unstable();
+        got.dedup();
+        assert_eq!(got.len(), 25, "every event arrived once");
+        assert_eq!(requests.load(Ordering::SeqCst), 28, "25 + 3 refused");
+        server.abort();
+
+        // --- Slack incoming webhook
+        let texts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let app = Router::new().route(
+            "/services/T/B/X",
+            post({
+                let texts = texts.clone();
+                move |Json(payload): Json<Value>| {
+                    let texts = texts.clone();
+                    async move {
+                        texts
+                            .lock()
+                            .unwrap()
+                            .push(payload["text"].as_str().unwrap_or("").to_string());
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let db = seeded((0..12).map(|i| format!("slack-{i:02}"))).await;
+        let mut config = cfg();
+        config.format = EventDeliveryFormat::Slack;
+        config.webhook_url = Some(format!("{base}/services/T/B/X"));
+        let report = drain_outbox(
+            &db,
+            &client,
+            &config,
+            "w",
+            Duration::from_secs(30),
+            current_unix_seconds,
+        )
+        .await;
+        assert_eq!(report.claimed, 12, "{report:?}");
+        assert_eq!(count_status(&db, STATUS_DELIVERED).await, 12);
+        let texts = texts.lock().unwrap().clone();
+        assert_eq!(texts.len(), 12);
+        let keys: Vec<usize> = texts
+            .iter()
+            .map(|t| {
+                let at = t.find("slack-").expect("key in text") + 6;
+                t[at..at + 2].parse().unwrap()
+            })
+            .collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] < w[1]),
+            "Slack order: {keys:?}"
+        );
+        server.abort();
     }
 
     #[test]

@@ -69,6 +69,11 @@ pub(crate) const JOBS_ONLY_COLUMNS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The most a `-wal` file keeps after a checkpoint (`journal_size_limit`).
+/// Without it the file keeps the size of its largest transaction (the
+/// one-time `adopt_from` copy, a parity-cache clear) until the process stops.
+pub(crate) const JOURNAL_SIZE_LIMIT_BYTES: i64 = 16 * 1024 * 1024;
+
 /// The node-local job database. Shared as `Arc<tokio::sync::Mutex<JobsDb>>`;
 /// its own lock, so a job write never waits for an IAM read.
 pub struct JobsDb {
@@ -77,6 +82,70 @@ pub struct JobsDb {
     /// `maintenance::store`).
     pub(crate) conn: Connection,
     local_path: PathBuf,
+    /// How many commits ran through [`JobsDb::durable`] (tests: the proof
+    /// that a save runs with `synchronous = FULL`).
+    #[cfg(test)]
+    pub(crate) durable_runs: std::sync::atomic::AtomicU64,
+}
+
+/// Count the commits of a connection (tests): SQLite calls the hook once
+/// per commit, in WAL mode and out of it.
+#[cfg(test)]
+pub(crate) struct CommitCount(std::sync::Arc<std::sync::atomic::AtomicI64>);
+
+#[cfg(test)]
+impl CommitCount {
+    pub(crate) fn get(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+impl JobsDb {
+    /// Start counting this connection's commits from now.
+    pub(crate) fn count_commits(&self) -> CommitCount {
+        extern "C" fn hook(arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+            // SAFETY: `arg` is the `Arc` pointer leaked below: it is valid
+            // for the life of the process.
+            let n = unsafe { &*(arg as *const std::sync::atomic::AtomicI64) };
+            n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            0
+        }
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let leaked = std::sync::Arc::into_raw(counter.clone());
+        // SAFETY: the connection handle is open; `hook` only reads `leaked`.
+        unsafe {
+            rusqlite::ffi::sqlite3_commit_hook(
+                self.conn.handle(),
+                Some(hook),
+                leaked as *mut std::ffi::c_void,
+            );
+        }
+        CommitCount(counter)
+    }
+}
+
+/// Rolls the `dg_atomic` savepoint back unless it was released (the way
+/// rusqlite's `Transaction` does): an error, a panic, or a `RELEASE` that
+/// failed (the savepoint stays open then) must not leave the shared
+/// connection inside a savepoint.
+struct SavepointGuard<'a> {
+    conn: &'a Connection,
+    released: bool,
+}
+
+impl Drop for SavepointGuard<'_> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Err(e) = self
+            .conn
+            .execute_batch("ROLLBACK TO dg_atomic; RELEASE dg_atomic")
+        {
+            warn!("Jobs DB: cannot roll back a savepoint: {e}");
+        }
+    }
 }
 
 /// What [`JobsDb::adopt_from`] did.
@@ -112,11 +181,125 @@ impl JobsDb {
         if schema_objects == 0 {
             conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         }
+        // After auto_vacuum: the mode of a new file is fixed by its first page.
+        Self::enable_wal(&conn, local_path);
         Self::migrate(&conn)?;
         Ok(Self {
             conn,
             local_path: local_path.to_path_buf(),
+            #[cfg(test)]
+            durable_runs: Default::default(),
         })
+    }
+
+    /// Put the file in WAL mode with `synchronous = NORMAL` (E6/F20).
+    ///
+    /// This DB is node-local and never synced, so the extra `-wal`/`-shm`
+    /// files cost nothing (the config DB is uploaded as ONE file: it stays on
+    /// the rollback journal). A commit in WAL mode is one append and one
+    /// fsync at most; the rollback journal with `FULL` took about 10 ms.
+    ///
+    /// `NORMAL` does not fsync the WAL at each commit. A process crash loses
+    /// nothing. A power loss or kernel panic can lose the last commits
+    /// (never corrupts the file). Every table that commits with `NORMAL`
+    /// tolerates that:
+    /// * leases and cursors: a lost renewal lapses and is taken again; a lost
+    ///   cursor re-reads a page of an idempotent copy;
+    /// * outbox settle, run history, failure rings: a lost settle is a
+    ///   re-delivery (at-least-once); a history row is missing.
+    ///
+    /// A lost APPEND to the outbox is a lost event, so no post leaves the
+    /// host before the claim commit of its batch (which is `FULL`, see
+    /// [`Self::durable`]) has synced every earlier frame, appends included.
+    ///
+    /// A commit that comes BEFORE an effect that cannot be undone, in
+    /// another place (a file, the config DB, a backend delete, a Slack
+    /// post), must be `FULL` too, or a power loss can repeat or undo that
+    /// effect. These commits use [`Self::durable`]:
+    /// * the outbox claim (before the posts of a batch);
+    /// * the Slack delivery record (Slack cannot deduplicate);
+    /// * every migrate phase save (the flip and the source delete come
+    ///   after it, see `maintenance::migrate`);
+    /// * the `adopt_from` copy (the config DB rows are deleted after it).
+    ///
+    /// The `-wal` file keeps the size of its largest transaction until the
+    /// process stops, unless `journal_size_limit` cuts it after a
+    /// checkpoint ([`JOURNAL_SIZE_LIMIT_BYTES`]).
+    ///
+    /// A file system without shared memory cannot do WAL: the DB stays on the
+    /// rollback journal (with `FULL`), and the boot logs a warning.
+    fn enable_wal(conn: &Connection, path: &Path) {
+        let mode: Result<String, _> =
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0));
+        match mode {
+            Ok(m) if m.eq_ignore_ascii_case("wal") => {
+                if let Err(e) = conn.pragma_update(None, "synchronous", "NORMAL") {
+                    warn!(
+                        "Jobs DB {}: cannot set synchronous=NORMAL: {e}",
+                        path.display()
+                    );
+                }
+                if let Err(e) = conn.pragma_update_and_check(
+                    None,
+                    "journal_size_limit",
+                    JOURNAL_SIZE_LIMIT_BYTES,
+                    |_| Ok(()),
+                ) {
+                    warn!(
+                        "Jobs DB {}: cannot set journal_size_limit: {e}",
+                        path.display()
+                    );
+                }
+            }
+            Ok(m) => warn!(
+                "Jobs DB {}: WAL is not available here (journal_mode={m}); \
+                 commits stay slow",
+                path.display()
+            ),
+            Err(e) => warn!(
+                "Jobs DB {}: cannot switch to WAL ({e}); commits stay slow",
+                path.display()
+            ),
+        }
+    }
+
+    /// Run `f` (one commit) with `synchronous = FULL`: the commit is on disk
+    /// before it returns, even after a power loss. For the commits that
+    /// must be, see [`Self::enable_wal`]. Back to the connection's own level
+    /// after.
+    ///
+    /// SQLite refuses to change `synchronous` inside a transaction, so inside
+    /// [`Self::atomic`] (or any open transaction) this returns an error
+    /// instead of a commit that is silently `NORMAL`. A save that must be
+    /// durable therefore cannot be a part of a page: commit the page first.
+    pub(crate) fn durable<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, ConfigDbError>,
+    ) -> Result<T, ConfigDbError> {
+        if !self.conn.is_autocommit() {
+            return Err(ConfigDbError::Other(
+                "durable commit inside an open transaction: synchronous=FULL cannot be \
+                 set there, so the commit would not be durable"
+                    .into(),
+            ));
+        }
+        let level: i64 = self
+            .conn
+            .pragma_query_value(None, "synchronous", |r| r.get(0))?;
+        self.conn.pragma_update(None, "synchronous", 2)?;
+        #[cfg(test)]
+        self.durable_runs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let out = f(&self.conn);
+        if let Err(e) = self.conn.pragma_update(None, "synchronous", level) {
+            // The commit is done; the connection stays on FULL, which is
+            // safe (slower) and not worth failing the caller for.
+            warn!(
+                "Jobs DB {}: cannot restore synchronous={level}: {e}",
+                self.local_path.display()
+            );
+        }
+        out
     }
 
     /// Open the LIVE jobs DB with the config DB keys: the primary key, then
@@ -147,11 +330,38 @@ impl JobsDb {
         Ok(Self {
             conn,
             local_path: PathBuf::from(":memory:"),
+            #[cfg(test)]
+            durable_runs: Default::default(),
         })
     }
 
     pub fn local_path(&self) -> &Path {
         &self.local_path
+    }
+
+    /// Run `f` as ONE commit: a savepoint, released when `f` succeeds and
+    /// rolled back when it fails, panics, or when the release fails. Inside
+    /// an open transaction or another `atomic` it nests, and the outermost
+    /// one commits. A job page that settles many rows (failures, cursor,
+    /// state) wraps them in one call: a commit costs one WAL append, N
+    /// commits cost N.
+    ///
+    /// `f` must not open a transaction of its own (`unchecked_transaction`
+    /// fails inside a savepoint): use `atomic` there too. A commit that must
+    /// be `FULL` ([`Self::durable`]) cannot run inside it.
+    pub(crate) fn atomic<T>(
+        &self,
+        f: impl FnOnce(&Self) -> Result<T, ConfigDbError>,
+    ) -> Result<T, ConfigDbError> {
+        self.conn.execute_batch("SAVEPOINT dg_atomic")?;
+        let mut guard = SavepointGuard {
+            conn: &self.conn,
+            released: false,
+        };
+        let value = f(self)?;
+        self.conn.execute_batch("RELEASE dg_atomic")?;
+        guard.released = true;
+        Ok(value)
     }
 
     fn migrate(conn: &Connection) -> Result<(), ConfigDbError> {
@@ -256,67 +466,71 @@ impl JobsDb {
         // fail the boot. Outside the transaction: the pragma is a no-op
         // inside one.
         self.conn.pragma_update(None, "foreign_keys", "OFF")?;
-        let result = super::iam_merge::immediate_tx(&self.conn, |conn| {
-            for t in NODE_LOCAL_TABLES.iter().rev() {
-                conn.execute(&format!("DELETE FROM main.{t}"), [])?;
-            }
-            let mut copied = Vec::new();
-            for t in NODE_LOCAL_TABLES {
-                let cfg_cols = columns(conn, "cfg", t)?;
-                if cfg_cols.is_empty() {
-                    continue; // a config DB from before this table existed
+        // FULL: the next step deletes the config DB's copies (FULL there). A
+        // copy that a power loss reverts after that would lose every row.
+        let result = self.durable(|c| {
+            super::iam_merge::immediate_tx(c, |conn| {
+                for t in NODE_LOCAL_TABLES.iter().rev() {
+                    conn.execute(&format!("DELETE FROM main.{t}"), [])?;
                 }
-                let main_cols = columns(conn, "main", t)?;
-                let common: Vec<&String> =
-                    cfg_cols.iter().filter(|c| main_cols.contains(c)).collect();
-                if common.is_empty() {
-                    continue;
-                }
-                let list = common
-                    .iter()
-                    .map(|c| format!("\"{c}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let n = conn.execute(
-                    &format!("INSERT INTO main.{t} ({list}) SELECT {list} FROM cfg.{t}"),
-                    [],
-                )?;
-                copied.push((t.to_string(), n as i64));
-            }
-            // Ids keep growing past every id the config DB handed out: a
-            // listener cursor on a pruned outbox points above the last row.
-            let has_seq: bool = conn
-                .query_row(
-                    "SELECT 1 FROM cfg.sqlite_master WHERE name = 'sqlite_sequence'",
-                    [],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            if has_seq {
-                let mut stmt = conn.prepare("SELECT name, seq FROM cfg.sqlite_sequence")?;
-                let seqs = stmt
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                drop(stmt);
-                for (name, seq) in seqs {
-                    if !NODE_LOCAL_TABLES.contains(&name.as_str()) {
+                let mut copied = Vec::new();
+                for t in NODE_LOCAL_TABLES {
+                    let cfg_cols = columns(conn, "cfg", t)?;
+                    if cfg_cols.is_empty() {
+                        continue; // a config DB from before this table existed
+                    }
+                    let main_cols = columns(conn, "main", t)?;
+                    let common: Vec<&String> =
+                        cfg_cols.iter().filter(|c| main_cols.contains(c)).collect();
+                    if common.is_empty() {
                         continue;
                     }
-                    let updated = conn.execute(
-                        "UPDATE main.sqlite_sequence SET seq = MAX(seq, ?2) WHERE name = ?1",
-                        rusqlite::params![name, seq],
+                    let list = common
+                        .iter()
+                        .map(|c| format!("\"{c}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let n = conn.execute(
+                        &format!("INSERT INTO main.{t} ({list}) SELECT {list} FROM cfg.{t}"),
+                        [],
                     )?;
-                    if updated == 0 {
-                        conn.execute(
-                            "INSERT INTO main.sqlite_sequence (name, seq) VALUES (?1, ?2)",
+                    copied.push((t.to_string(), n as i64));
+                }
+                // Ids keep growing past every id the config DB handed out: a
+                // listener cursor on a pruned outbox points above the last row.
+                let has_seq: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM cfg.sqlite_master WHERE name = 'sqlite_sequence'",
+                        [],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if has_seq {
+                    let mut stmt = conn.prepare("SELECT name, seq FROM cfg.sqlite_sequence")?;
+                    let seqs = stmt
+                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    drop(stmt);
+                    for (name, seq) in seqs {
+                        if !NODE_LOCAL_TABLES.contains(&name.as_str()) {
+                            continue;
+                        }
+                        let updated = conn.execute(
+                            "UPDATE main.sqlite_sequence SET seq = MAX(seq, ?2) WHERE name = ?1",
                             rusqlite::params![name, seq],
                         )?;
+                        if updated == 0 {
+                            conn.execute(
+                                "INSERT INTO main.sqlite_sequence (name, seq) VALUES (?1, ?2)",
+                                rusqlite::params![name, seq],
+                            )?;
+                        }
                     }
                 }
-            }
-            conn.execute("UPDATE main.jobs_meta SET adopted = 1 WHERE id = 1", [])?;
-            Ok(copied)
+                conn.execute("UPDATE main.jobs_meta SET adopted = 1 WHERE id = 1", [])?;
+                Ok(copied)
+            })
         });
         let _ = self.conn.pragma_update(None, "foreign_keys", "ON");
         let _ = self.conn.execute_batch("DETACH DATABASE cfg;");
@@ -432,6 +646,13 @@ CREATE TABLE IF NOT EXISTS lifecycle_run_counts (
     objects_excluded INTEGER NOT NULL DEFAULT 0,
     objects_not_due  INTEGER NOT NULL DEFAULT 0
 );
+-- E6/F46: the delivered and failed prunes of every dispatcher tick read in
+-- index order instead of sorting the backlog. Jobs DB only: an older binary
+-- ignores them.
+CREATE INDEX IF NOT EXISTS idx_event_outbox_delivered
+    ON event_outbox (delivered_at, id) WHERE status = 'delivered';
+CREATE INDEX IF NOT EXISTS idx_event_outbox_failed
+    ON event_outbox (occurred_at, id) WHERE status = 'failed';
 -- A delete job does not hold its bucket: several deletes, and a delete next
 -- to a job that does, run on one bucket. The index of schema v1 counted
 -- every kind.
