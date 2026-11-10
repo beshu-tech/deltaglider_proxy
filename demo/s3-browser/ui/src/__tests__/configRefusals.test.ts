@@ -57,6 +57,32 @@ test('a refused password change returns the server sentence', async () => {
   await expect(changeAdminPassword('a', 'b')).resolves.toEqual({ ok: false, error: 'Current password is incorrect' });
 });
 
+test('a lockout on a password change names the wait, not the code', async () => {
+  const lockout = (headers: Record<string, string>) =>
+    new Response(
+      JSON.stringify({ ok: false, error: 'too_many_attempts', message: 'Too many failed sign-in attempts.', retry_after_secs: 540 }),
+      { status: 429, headers: { 'content-type': 'application/json', ...headers } },
+    );
+  http.on('PUT', '/_/api/admin/password', () => lockout({ 'retry-after': '540' }));
+  await expect(changeAdminPassword('a', 'b')).resolves.toEqual({
+    ok: false,
+    error: 'Too many wrong passwords. Try again in 9 min.',
+  });
+  // No header: the body's wait. Neither: no number, still no raw code.
+  http.on('PUT', '/_/api/admin/password', () => lockout({}));
+  await expect(changeAdminPassword('a', 'b')).resolves.toMatchObject({ error: 'Too many wrong passwords. Try again in 9 min.' });
+  http.on('PUT', '/_/api/admin/password', () =>
+    new Response(JSON.stringify({ ok: false, error: 'too_many_attempts' }), {
+      status: 429,
+      headers: { 'content-type': 'application/json' },
+    }),
+  );
+  await expect(changeAdminPassword('a', 'b')).resolves.toEqual({
+    ok: false,
+    error: 'Too many wrong passwords. Wait a few minutes, then try again.',
+  });
+});
+
 test('a wrong recovery key returns the server sentence, without a status prefix', async () => {
   http.on('POST', '/_/api/admin/recover-db', json({ success: false, error: 'The key does not open the encrypted database' }, 401));
   await expect(recoverDb('k')).resolves.toEqual({ success: false, error: 'The key does not open the encrypted database' });
