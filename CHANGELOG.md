@@ -56,7 +56,7 @@
 
 - Saving a user edit sent two requests: the change, then `rotate-keys`. When the new access key belonged to another user, the second request failed after the first had changed the user, and the error blamed "the name". `PUT /_/api/admin/users/:id` now also takes `access_key_id` and `secret_access_key`, and `PUT /_/api/admin/groups/:id` takes `add_member_ids` and `remove_member_ids`: an edit is one request and one transaction, and a refusal of any part changes nothing. A UNIQUE conflict now names its column ("the access key id is already in use"). A group edit sends the members that the admin added or removed, never the whole member list, so it does not undo a change that another admin, a peer node or an OIDC login made after the form opened. A key rotation (the edit and `POST /users/:id/rotate-keys`) is one code path and refuses an empty secret with `400`. The `update_user` audit entry is written after the IAM index rebuild, like the other IAM writes.
 - Deleting a user, or cloning one with its group memberships, refreshed the users list only. The groups list still showed the old members until a reload. Both lists now refresh after every IAM mutation that reaches them (F63).
-- "Remove bootstrap credentials" left the access section editor on its old version. The next Apply failed with `409` and a false "changed in another tab" dialog. The editor now reads the new version after the removal (F62).
+- "Remove bootstrap credentials" left the access section editor on its old version. The next Apply failed with `409` and a false "changed in another tab" dialog. The editor now reads the new version after the removal (F47).
 
 ## v2.1.0 — 2026-11-01
 
