@@ -1,0 +1,9 @@
+---
+// Scene — renders one drawing of the set in scenes.ts.
+import { SCENES, type SceneName } from './scenes';
+
+interface Props { name: SceneName; label: string }
+const { name, label } = Astro.props;
+---
+
+<svg class="dg-scene" viewBox="0 0 160 130" role="img" aria-label={label} set:html={SCENES[name]} />

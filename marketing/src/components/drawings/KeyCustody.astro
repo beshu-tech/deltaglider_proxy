@@ -1,0 +1,21 @@
+---
+// KeyCustody — who holds what when the proxy encrypts. The claim: the
+// key stays in your runtime; the provider stores ciphertext only.
+import StepDrawing from './StepDrawing.astro';
+---
+
+<StepDrawing
+  numbered={false}
+  stacked
+  steps={[
+    { scene: 'key', label: 'A file and a key, side by side', focus: true,
+      title: 'Your runtime',
+      body: 'The object and the AES-256 key. The key is never uploaded.' },
+    { scene: 'lock', label: 'A file goes into a padlock, and unreadable blocks come out',
+      title: 'The proxy encrypts',
+      body: 'AES-256-GCM, before the bytes leave your network.' },
+    { scene: 'cipher-bucket', label: 'A bucket that holds unreadable blocks only',
+      title: 'What the provider stores',
+      body: 'Ciphertext only, on AWS, Hetzner, MinIO or any backend with atomic writes.' },
+  ]}
+/>

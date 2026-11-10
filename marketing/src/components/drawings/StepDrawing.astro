@@ -1,0 +1,137 @@
+---
+// StepDrawing — a row of scenes with their captions: the one layout of
+// every drawing on the site. Columns on a wide screen; on a phone each
+// step is one row, the drawing left and the text right.
+import Scene from './Scene.astro';
+import type { SceneName } from './scenes';
+
+interface Step {
+  scene: SceneName;
+  /** What the drawing shows, for a screen reader. */
+  label: string;
+  title: string;
+  /** Marks the step the drawing is about; at most one per drawing. */
+  focus?: boolean;
+  /** Trusted HTML written in this repo (may hold <code>). */
+  body: string;
+}
+interface Props {
+  /** A line above the row, e.g. the request that starts it. */
+  lead?: string;
+  steps: Step[];
+  /** Number the steps. Only for a real sequence. */
+  numbered?: boolean;
+  /** One step per row at every width: for a narrow column. */
+  stacked?: boolean;
+}
+const { lead, steps, numbered = true, stacked = false } = Astro.props;
+---
+
+<figure class:list={['dg-draw', { 'dg-draw--stacked': stacked }]} style={`--dg-steps:${steps.length}`}>
+  {lead && <p class="dg-draw-lead" set:html={lead} />}
+  <div class="dg-draw-row">
+    {steps.map((s, i) => (
+      <>
+        {i > 0 && (
+          <div class="dg-draw-arrow" aria-hidden="true">
+            <svg viewBox="0 0 26 16"><path d="M2 8h20M17 3l6 5l-6 5" /></svg>
+          </div>
+        )}
+        <div class="dg-draw-step">
+          <div class="dg-draw-pic"><Scene name={s.scene} label={s.label} /></div>
+          <div>
+            <p class:list={['dg-draw-title', { 'is-focus': s.focus }]}>
+              {numbered && `${i + 1}. `}{s.title}
+            </p>
+            <p class="dg-draw-body" set:html={s.body} />
+          </div>
+        </div>
+      </>
+    ))}
+  </div>
+  {Astro.slots.has('default') && <figcaption class="dg-draw-cap"><slot /></figcaption>}
+</figure>
+
+<style is:global>
+  .dg-draw {
+    --d-ink: var(--ink-strong);
+    --d-soft: var(--ink-soft);
+    --d-brand: var(--brand);
+    --d-bg: var(--illo-bg, var(--bg));
+    margin: 2rem 0 0;
+    max-width: none;
+  }
+  .dg-scene { display: block; width: 100%; height: auto; overflow: visible; }
+  .dg-scene .k { stroke: var(--d-ink); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .dg-scene .s { stroke: var(--d-soft); fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+  .dg-scene .c { fill: var(--d-bg); }
+  .dg-scene .t { fill: color-mix(in srgb, var(--d-ink) 13%, var(--d-bg)); }
+  .dg-scene .b { stroke: var(--d-brand); fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+  .dg-scene .bf { fill: var(--d-brand); stroke: none; }
+  .dg-scene .bt { fill: color-mix(in srgb, var(--d-brand) 16%, var(--d-bg)); }
+  .dg-scene .h { fill: var(--d-ink); stroke: none; }
+
+  .dg-draw-lead {
+    font-family: var(--font-mono);
+    font-size: var(--fs-small);
+    color: var(--d-soft);
+    margin: 0 0 1rem;
+    max-width: none;
+  }
+  .dg-draw-lead b { color: var(--d-ink); font-weight: 600; }
+
+  .dg-draw-row {
+    display: grid;
+    grid-template-columns: repeat(calc(var(--dg-steps) - 1), minmax(0, 1fr) 28px) minmax(0, 1fr);
+    align-items: start;
+  }
+  .dg-draw-step { min-width: 0; }
+  .dg-draw-pic { padding: 0 0.5rem; max-width: 220px; margin: 0 auto; }
+  .dg-draw-arrow { align-self: start; margin-top: 3.6rem; }
+  .dg-draw-arrow svg { display: block; width: 26px; }
+  .dg-draw-arrow path { stroke: var(--d-soft); fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+
+  .dg-draw-title {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--d-ink);
+    margin: 0.75rem 0 0.3rem;
+    line-height: 1.3;
+    max-width: none;
+  }
+  .dg-draw-title.is-focus { color: var(--brand-dark); }
+  .dg-draw-body {
+    font-size: var(--fs-small);
+    line-height: 1.5;
+    color: var(--d-soft);
+    margin: 0;
+    max-width: none;
+  }
+  .dg-draw-body code { font-size: 0.82em; }
+  .dg-draw-cap {
+    font-size: 0.95rem;
+    line-height: 1.55;
+    color: var(--d-soft);
+    margin: 1.5rem 0 0;
+    max-width: var(--measure);
+  }
+  .dg-draw-cap strong { color: var(--d-ink); font-weight: 600; }
+
+  .dg-draw--stacked { margin-top: 0; }
+  .dg-draw--stacked .dg-draw-row { grid-template-columns: 1fr; }
+  .dg-draw--stacked .dg-draw-step { display: grid; grid-template-columns: 150px 1fr; gap: 0 1.5rem; align-items: center; }
+  .dg-draw--stacked .dg-draw-pic { padding: 0; margin: 0; }
+  .dg-draw--stacked .dg-draw-title { margin-top: 0; font-size: 1.1rem; }
+  .dg-draw--stacked .dg-draw-body { font-size: 0.98rem; }
+  .dg-draw--stacked .dg-draw-arrow { margin: 0.6rem 0 0.6rem 62px; transform: rotate(90deg); width: 26px; }
+
+  @media (max-width: 719px) {
+    .dg-draw--stacked .dg-draw-step { grid-template-columns: 112px 1fr; gap: 0 1rem; }
+    .dg-draw--stacked .dg-draw-arrow { margin: 0.35rem 0 0.35rem 43px; }
+    .dg-draw-row { grid-template-columns: 1fr; }
+    .dg-draw-step { display: grid; grid-template-columns: 112px 1fr; gap: 0 1rem; align-items: center; }
+    .dg-draw-pic { padding: 0; margin: 0; }
+    .dg-draw-title { margin-top: 0; }
+    .dg-draw-arrow { margin: 0.35rem 0 0.35rem 43px; transform: rotate(90deg); width: 26px; }
+  }
+</style>

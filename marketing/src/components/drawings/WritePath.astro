@@ -1,0 +1,27 @@
+---
+// WritePath — what a PUT does. The claim: the proxy keeps a delta only
+// when it saves space; everything else is stored whole.
+import StepDrawing from './StepDrawing.astro';
+---
+
+<StepDrawing
+  lead="A client sends: <b>PUT releases/v2.zip</b> (91 MB)"
+  steps={[
+    { scene: 'upload', label: 'A laptop that sends a file',
+      title: 'The client uploads the whole file',
+      body: 'An ordinary S3 PUT. The proxy records the SHA-256 of these bytes.' },
+    { scene: 'sort', label: 'One file at a switch with two tracks',
+      title: 'The proxy looks at the type',
+      body: 'Archives, images of disks, executables and dumps are delta candidates. JPEG, video and similar files are stored whole.' },
+    { scene: 'encode', label: 'The reference and the new file go into xdelta3, and a thin delta comes out', focus: true,
+      title: 'xdelta3 computes the delta',
+      body: 'Against <code>reference.bin</code>, the first file of this folder. Never against another delta.' },
+    { scene: 'store', label: 'A thin delta goes into the bucket next to the reference',
+      title: 'The bucket gets 148 KB',
+      body: 'If the delta is 75% of the file or more, the proxy discards it and stores the file whole.' },
+  ]}
+>
+  <strong>The proxy keeps a delta only when it saves space.</strong>
+  You do not need a perfect list of file types: a file that does not
+  delta well is stored whole, as plain S3 does.
+</StepDrawing>

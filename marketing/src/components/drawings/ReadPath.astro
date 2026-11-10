@@ -1,0 +1,28 @@
+---
+// ReadPath — what a GET of a delta-stored object does. The claim: the
+// SHA-256 check runs before the first byte leaves the proxy.
+import StepDrawing from './StepDrawing.astro';
+---
+
+<StepDrawing
+  lead="A client asks: <b>GET releases/v2.zip</b>"
+  steps={[
+    { scene: 'bucket', label: 'A bucket that holds a large reference file and a thin delta file',
+      title: 'The bucket holds two files',
+      body: '<code>reference.bin</code>, 91 MB, and <code>v2.zip.delta</code>, 148 KB.' },
+    { scene: 'rebuild', label: 'The reference and the delta go into xdelta3, and the whole file comes out',
+      title: 'The proxy rebuilds the file',
+      body: '<code>xdelta3</code> applies the delta to the reference. Out come the 91 MB of v2.zip.' },
+    { scene: 'check', label: 'Two equal hash strips above a shield with a check mark', focus: true,
+      title: 'The SHA-256 check',
+      body: 'The hash of the rebuilt file must equal the hash recorded at upload. No match: an error, and 0 bytes sent.' },
+    { scene: 'client', label: 'A laptop that shows the whole file',
+      title: 'The client gets v2.zip',
+      body: '91 MB, the same bytes that it uploaded.' },
+  ]}
+>
+  <strong>The check runs before the first byte leaves the proxy.</strong>
+  A client never receives a file that differs from the one it uploaded.
+  The drawing is not to scale: the delta is 1/600 the size of the
+  reference.
+</StepDrawing>

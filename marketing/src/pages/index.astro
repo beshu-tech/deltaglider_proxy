@@ -18,6 +18,7 @@
 
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
+import ReadPath from '../components/drawings/ReadPath.astro';
 import QuickstartTerminal from '../components/QuickstartTerminal.astro';
 import WorkloadFitTable from '../components/WorkloadFitTable.astro';
 import HeroDiagram from '../components/HeroDiagram.astro';
@@ -97,6 +98,19 @@ import {
 
   {/* ===================== THE CLAIM, DRAWN TO SCALE ================== */}
   <StorageScale />
+
+  {/* ========================= THE SAFETY CLAIM ======================= */}
+  <section class="section section-tight">
+    <div class="shell">
+      <h2>You always get back the file you sent</h2>
+
+      <ReadPath />
+
+      <p class="fit-next">
+        <a href="/how-it-works">What a write does, and what lands in your bucket</a>
+      </p>
+    </div>
+  </section>
 
   {/* ============================ HONEST FIT ========================== */}
   <section class="section section-alt">

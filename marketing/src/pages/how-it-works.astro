@@ -1,0 +1,146 @@
+---
+// /how-it-works — the mechanism on one page: what a write does, what a
+// read does, what lands in the bucket, where it does not help. Facts
+// come from docs/product/explanation/delta-compression.md; keep the two
+// in step. Plan: docs/plan/site-rewrite-2026-11.md §4.
+import BaseLayout from '../layouts/BaseLayout.astro';
+import JsonLd from '../components/JsonLd.astro';
+import WritePath from '../components/drawings/WritePath.astro';
+import ReadPath from '../components/drawings/ReadPath.astro';
+import { webPageSchema, breadcrumbListSchema } from '../lib/seo';
+
+const title = 'How it works — DeltaGlider';
+const description =
+  'What DeltaGlider does on a PUT and on a GET: it stores a file as a binary diff against a reference when that saves space, and it checks the SHA-256 of every rebuilt file before it sends the first byte.';
+---
+
+<BaseLayout title={title} description={description}>
+  <Fragment slot="json-ld">
+    <JsonLd schema={webPageSchema({ path: '/how-it-works', title, description })} />
+    <JsonLd
+      schema={breadcrumbListSchema([
+        { name: 'DeltaGlider', path: '/' },
+        { name: 'How it works', path: '/how-it-works' },
+      ])}
+    />
+  </Fragment>
+
+  <section class="hero">
+    <div class="shell">
+      <h1>How it works</h1>
+
+      <p class="hero-lede">
+        Versions of the same build, backup or release are almost the same
+        file. DeltaGlider stores the first one whole and the others as
+        the difference from it. Your clients send and receive whole
+        files, as before.
+      </p>
+    </div>
+  </section>
+
+  <div class="shell hiw">
+    <section>
+      <h2>What a write does</h2>
+
+      <WritePath />
+
+      <p>
+        The first delta candidate that arrives in a folder becomes the
+        reference of that folder. Every later file is compared with that
+        reference, and never with another delta. So any version is
+        rebuilt in one step, and a damaged delta cannot damage another
+        version.
+      </p>
+
+      <p>
+        The reference belongs to one folder, not to the bucket. Versions
+        of one artifact are usually in one folder, and that is where the
+        files are similar.
+      </p>
+    </section>
+
+    <section>
+      <h2>What a read does</h2>
+
+      <ReadPath />
+
+      <p>
+        The client gets an ordinary S3 response, with the size, the ETag
+        and the metadata of the file that it uploaded. When the hashes
+        do not match (a damaged delta or a damaged reference), the proxy
+        answers with an error. You can get an error, but you do not get
+        wrong bytes.
+      </p>
+    </section>
+
+    <section>
+      <h2>What is in your bucket</h2>
+
+      <p>
+        The same layout on S3 and on a local disk. You can decode any
+        <code>.delta</code> file by hand with the stock
+        <code>xdelta3</code> tool, without the proxy.
+      </p>
+
+      <pre><code>releases/
+  firmware/widget-3000/
+    reference.bin            the first upload, kept whole
+    fw-1.4.1.tar.delta       about 60 KB
+    fw-1.4.2.tar.delta
+    release-notes.txt        not a delta candidate, stored as it is</code></pre>
+    </section>
+
+    <section>
+      <h2>Where it does not help</h2>
+
+      <ul>
+        <li>
+          <strong>Images, video and other compressed media.</strong> The
+          proxy stores them whole and does not try.
+        </li>
+        <li>
+          <strong><code>.tar.gz</code> archives.</strong> Gzip compresses
+          the whole stream as one unit, so a small change early in the
+          archive changes every byte after it. A plain
+          <code>.tar</code>, a <code>.zip</code> or a <code>.jar</code>
+          of the same content deltas well.
+        </li>
+        <li>
+          <strong>Files with no earlier version.</strong> One file is one
+          file.
+        </li>
+      </ul>
+
+      <p>
+        In each case the file is stored whole and costs what it costs on
+        plain S3. <a href="/docs/explanation/delta-compression">The full
+        explanation</a> covers the memory and disk use of large files.
+      </p>
+    </section>
+
+    <section>
+      <h2>What it costs</h2>
+
+      <p>
+        An upload that is stored as a delta is slower, because the proxy
+        computes the diff before it answers: 9&nbsp;MB/s against
+        106&nbsp;MB/s in our measurement. Downloads are about the same
+        speed. <a href="/build-artifacts#speed">The table and the
+        method</a>.
+      </p>
+
+      <div class="hero-ctas">
+        <a href="/docs/tutorials/first-delta-savings" class="btn btn-primary">Follow the tutorial</a>
+        <a href="/pricing#calculator" class="btn">Estimate your savings</a>
+      </div>
+    </section>
+  </div>
+</BaseLayout>
+
+<style>
+  .hiw section { margin: 4rem 0; }
+  .hiw section > p { margin-top: 1.5rem; }
+  .hiw pre { max-width: var(--measure-wide); margin-top: 1.25rem; }
+  .hiw ul { max-width: var(--measure); }
+  .hiw li { margin-bottom: 0.75rem; }
+</style>

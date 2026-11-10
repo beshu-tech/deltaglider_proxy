@@ -101,9 +101,16 @@ VC-backed". Each one is checkable.
   cards, testimonial carousel, big gradient call to action" is the look of a
   generated site. The home page uses none of these five blocks.
 - **Motion only on a user action.** Nothing moves by itself.
-- **Real artefacts over drawings**: terminal output copied from a real run,
+- **Real artefacts first**: terminal output copied from a real run,
   screenshots of the real admin UI, the real config diff, the real chart from
   the case-study data.
+- **A small set of drawings** (owner decision, 2026-11-10) for the claims that
+  text delivers slowly: the read path, the write path, key custody. One
+  grammar, in `marketing/src/components/drawings/`: hand-written SVG line
+  art, one 2 px stroke, one file shape in every scene, the brand colour only
+  for the thing the drawing is about, real file names, no text inside the
+  SVG, and a caption that states the claim. No drawing for IAM, SSO, audit
+  or replication: the screenshots show those.
 - **Text-first layout.** A measure of 65–75 characters, left-aligned, with
   tables for comparisons. References for the tone: sqlite.org, litestream.io,
   restic.net, the Tailscale docs. Plain, dense, dated, signed.
@@ -213,8 +220,10 @@ better choice". A compare page without it is an advertisement.
 | 3 | Copy guard as a vitest (`marketing/src/lib/copyGuard.test.ts`) | done | — |
 | 4 | Home page reorder and rewrite (section 5) | done | 1, 2 |
 | 5 | Rename `/saas`, `/regulated`, `/trial`; header; redirects | done | 4 |
-| 6 | `/how-it-works`, `/changelog` | M | 5 |
-| 7 | `/support` form | S | 5 |
+| 6 | `/how-it-works` | done | 5 |
+| 6b | `/changelog` | open | 5 |
+| 7 | `/support` mail with a pre-filled body (owner chose mailto over a form) | done | 5 |
+| 7b | Drawing set: read path, write path, key custody; new social image | done | — |
 | 8 | `/will-it-work`, with the estimator if the product gets one | M | product |
 | 9 | Search pages, one per week | continuous | 5 |
 | 10 | Launch post with measured numbers | S | 4–8 |

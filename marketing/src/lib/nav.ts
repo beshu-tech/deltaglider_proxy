@@ -9,6 +9,7 @@ export interface NavLink {
 
 /** Primary header navigation, in display order. */
 export const NAV_LINKS: readonly NavLink[] = [
+  { label: 'How it works', href: '/how-it-works' },
   { label: 'Build artifacts', href: '/build-artifacts' },
   { label: 'Encryption', href: '/encryption' },
   { label: 'Pricing', href: '/pricing' },
@@ -26,6 +27,7 @@ export const FOOTER_COLUMNS: readonly FooterColumn[] = [
   {
     title: 'Product',
     links: [
+      { label: 'How it works', href: '/how-it-works' },
       { label: 'Build artifacts', href: '/build-artifacts' },
       { label: 'Encryption', href: '/encryption' },
       { label: 'Pricing', href: '/pricing' },
