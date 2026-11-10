@@ -98,6 +98,29 @@ pub fn is_internal_common_prefix(p: &str) -> bool {
     p.starts_with(FACTS_ROOT) || (p.len() > ".dg/".len() && FACTS_ROOT.starts_with(p))
 }
 
+/// The proxy's own directory name. Older releases kept the delta baseline
+/// at `<prefix>/.dg/reference.bin`; this release keeps the listing facts
+/// under `.dg/facts/` (S3). A client key never lives in a `.dg` directory
+/// (F19, epic #142): it is refused at ingest and never listed.
+pub const INTERNAL_DIR: &str = ".dg";
+
+/// Does a path (a key's directory part, a prefix, a common prefix) go
+/// through a `.dg` directory, at any depth?
+pub fn has_internal_segment(path: &str) -> bool {
+    path.split('/').any(|s| s == INTERNAL_DIR)
+}
+
+/// Is a listed key invisible to clients? The listing facts, and any key
+/// below a `.dg` directory except a legacy baseline (`reference.bin`, which
+/// the listing reports apart).
+pub fn is_hidden_key(key: &str) -> bool {
+    if is_facts_key(key) {
+        return true;
+    }
+    let (dir, file) = key.rsplit_once('/').unwrap_or(("", key));
+    has_internal_segment(dir) && file != "reference.bin"
+}
+
 /// Order-preserving, prefix-free encoding of a stored key (see module doc).
 fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);

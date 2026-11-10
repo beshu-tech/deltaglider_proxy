@@ -23,8 +23,8 @@ impl S3ListedObject {
     /// lightweight representation.  Returns `None` if the object has no key.
     pub(super) fn from_s3_object(object: aws_sdk_s3::types::Object) -> Option<Self> {
         let key = object.key?;
-        // Listing facts are internal index entries, never objects.
-        if listing_facts::is_facts_key(&key) {
+        // Listing facts and the `.dg` directory are internal, never objects.
+        if listing_facts::is_hidden_key(&key) {
             return None;
         }
         let last_modified = object.last_modified.and_then(|dt| {
@@ -718,8 +718,9 @@ impl S3Backend {
             if let Some(cps) = response.common_prefixes {
                 for cp in cps {
                     if let Some(p) = cp.prefix {
-                        let last_seg = p.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-                        if last_seg == ".dg" || listing_facts::is_internal_common_prefix(&p) {
+                        if listing_facts::has_internal_segment(&p)
+                            || listing_facts::is_internal_common_prefix(&p)
+                        {
                             continue;
                         }
                         all_common_prefixes.insert(p);

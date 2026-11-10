@@ -9,7 +9,6 @@ use super::traits::{
 use super::xattr_meta;
 use crate::types::FileMetadata;
 use bytes::Bytes;
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
@@ -24,9 +23,13 @@ pub(crate) mod fault;
 mod fsio;
 mod sweep;
 #[cfg(test)]
+mod list_memory_tests;
+mod scan;
+#[cfg(test)]
 mod tests;
 mod write;
 
+use scan::{collapse_key, join_key, FlatWalk, SortedDir, WalkEntry, WalkStep};
 use write::*;
 
 pub use sweep::{sweep_stale_temp_files, STALE_TEMP_MAX_AGE};
@@ -127,86 +130,6 @@ fn stored_name(name: &str) -> StoredName<'_> {
     }
 }
 
-/// One directory of the flat listing walk
-/// ([`FilesystemBackend::list_flat_page`]), its entries in key order.
-struct SortedDir {
-    path: PathBuf,
-    /// The key of the directory (`a/b`; empty at the bucket root).
-    key: String,
-    entries: Vec<WalkEntry>,
-    /// The next entry to visit.
-    next: usize,
-}
-
-#[derive(Clone)]
-struct WalkEntry {
-    /// The name on disk.
-    name: String,
-    /// The name in the key: a file's key name (`x` for `x.delta`, empty for
-    /// the folder marker), a directory's own name.
-    key_name: String,
-    is_dir: bool,
-}
-
-impl WalkEntry {
-    /// Where the entry sorts among its siblings: every key below a
-    /// directory starts with `name/`.
-    fn sort_name(&self) -> std::borrow::Cow<'_, str> {
-        if self.is_dir {
-            format!("{}/", self.key_name).into()
-        } else {
-            self.key_name.as_str().into()
-        }
-    }
-}
-
-impl SortedDir {
-    /// The object entries of the directory at `path`, sorted. Reads names
-    /// and types only (no metadata). `None` when no directory is there.
-    async fn read(path: &Path, key: String) -> Result<Option<Self>, StorageError> {
-        let mut dir = match fs::read_dir(path).await {
-            Ok(dir) => dir,
-            Err(e) if fsio::absent(&e) => return Ok(None),
-            Err(e) => return Err(io_to_storage_error(e)),
-        };
-        let mut entries = Vec::new();
-        while let Some(entry) = dir.next_entry().await? {
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            let is_dir = match entry.file_type().await {
-                Ok(ft) => ft.is_dir(),
-                Err(e) if fsio::absent(&e) => continue, // deleted during the walk
-                Err(e) => return Err(io_to_storage_error(e)),
-            };
-            let key_name = if is_dir {
-                name.clone()
-            } else {
-                match stored_name(&name) {
-                    StoredName::Object { key_filename, .. } => key_filename.to_string(),
-                    StoredName::Internal | StoredName::Reference => continue,
-                }
-            };
-            entries.push(WalkEntry {
-                name,
-                key_name,
-                is_dir,
-            });
-        }
-        entries.sort_by(|a, b| {
-            a.sort_name()
-                .cmp(&b.sort_name())
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        Ok(Some(Self {
-            path: path.to_path_buf(),
-            key,
-            entries,
-            next: 0,
-        }))
-    }
-}
-
 /// Pure: can a subtree whose keys all start with `below` (`a/b/`) hold a
 /// key that starts with `prefix` and sorts after `token`? A key below it
 /// sorts before `token` when `token` sorts after `below` and does not start
@@ -226,7 +149,19 @@ thread_local! {
     /// Directory reads of [`FilesystemBackend::dir_has_visible_data_recursive`]
     /// on this thread.
     static VISIBILITY_DIR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The most directory entries (or listed objects) that one listing
+    /// request held in memory at once on this thread
+    /// ([`note_held`]); the memory-bound tests read it.
+    static HELD_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+/// Test seam: a listing holds `n` entries now. Keeps the peak.
+#[cfg(test)]
+fn note_held(n: usize) {
+    HELD_PEAK.with(|p| p.set(p.get().max(n)));
+}
+#[cfg(not(test))]
+fn note_held(_n: usize) {}
 
 /// Is `name` one of this backend's temp files, and so never a user object?
 /// `.dg-tmp.*` (current) or tempfile's default `.tmpXXXXXX` (older
@@ -810,9 +745,29 @@ impl FilesystemBackend {
 
     /// Return true when a deltaspace subtree contains at least one user-visible
     /// data file. Empty physical directories are not S3 prefixes and must not
-    /// leak into delimiter listings as undeletable "folders".
+    /// leak into delimiter listings as undeletable "folders". Every file
+    /// counts, a `.dg` directory's too: this is the bucket delete's check,
+    /// which must never erase what it cannot name.
     fn dir_has_visible_data_recursive<'a>(
         current_dir: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
+    {
+        Self::dir_holds_data(current_dir, false)
+    }
+
+    /// Does the folder hold a key that a LIST shows? As
+    /// [`Self::dir_has_visible_data_recursive`], but a `.dg` directory (the
+    /// proxy's own, never listed) does not count.
+    fn dir_has_listed_key<'a>(
+        current_dir: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
+    {
+        Self::dir_holds_data(current_dir, true)
+    }
+
+    fn dir_holds_data<'a>(
+        current_dir: &'a Path,
+        skip_internal: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -823,7 +778,12 @@ impl FilesystemBackend {
                 let path = entry.path();
                 let ft = entry.file_type().await?;
                 if ft.is_dir() {
-                    if Self::dir_has_visible_data_recursive(&path).await? {
+                    if skip_internal
+                        && entry.file_name() == crate::storage::listing_facts::INTERNAL_DIR
+                    {
+                        continue;
+                    }
+                    if Self::dir_holds_data(&path, skip_internal).await? {
                         return Ok(true);
                     }
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -1106,43 +1066,24 @@ impl FilesystemBackend {
         } else {
             deltaspaces_dir.join(dir_part)
         };
-        let Some(root) = SortedDir::read(&walk_root, dir_part.to_string()).await? else {
+        if crate::storage::listing_facts::has_internal_segment(dir_part) {
             return Ok(empty);
-        };
+        }
         let token = continuation_token.unwrap_or("");
         let max = max_keys as usize;
+        let Some(mut walk) =
+            FlatWalk::open(&walk_root, dir_part.to_string(), prefix, token, None).await?
+        else {
+            return Ok(empty);
+        };
         // Distinct keys in order; one more than the page proves truncation.
         let mut found: Vec<(String, FileMetadata)> = Vec::new();
         // Keys seen in both forms (sorted: the walk is in key order).
         let mut ambiguous: Vec<String> = Vec::new();
-        let mut stack = vec![root];
-        'walk: while let Some(dir) = stack.last_mut() {
-            let Some(entry) = dir.entries.get(dir.next).cloned() else {
-                stack.pop();
+        while let Some(step) = walk.next().await? {
+            let WalkStep::File { key, path, entry } = step else {
                 continue;
             };
-            dir.next += 1;
-            let key = if dir.key.is_empty() {
-                entry.key_name.clone()
-            } else {
-                format!("{}/{}", dir.key, entry.key_name)
-            };
-            if entry.is_dir {
-                // Every key below starts with `key/`.
-                let below = format!("{key}/");
-                if flat_subtree_may_match(&below, prefix, token) {
-                    let path = dir.path.join(&entry.name);
-                    if let Some(sub) = SortedDir::read(&path, key).await? {
-                        stack.push(sub);
-                    }
-                }
-                continue;
-            }
-            // A marker file at the bucket root names no key.
-            if key.is_empty() || !key.starts_with(prefix) || key.as_str() <= token {
-                continue;
-            }
-            let path = dir.path.join(&entry.name);
             let Some((_, meta)) = Self::listed_entry(&path, &entry.name).await? else {
                 continue; // not an object file, or deleted during the walk
             };
@@ -1160,7 +1101,7 @@ impl FilesystemBackend {
                 _ => {
                     found.push((key, meta));
                     if found.len() > max {
-                        break 'walk;
+                        break;
                     }
                 }
             }
@@ -2228,6 +2169,7 @@ impl StorageBackend for FilesystemBackend {
         let mut baselines: Vec<(String, u64)> = Vec::new();
         Self::bulk_walk_recursive(&deltaspaces_dir, &walk_root, &mut results, &mut baselines)
             .await?;
+        note_held(results.len());
         // One prefix rule for objects and baselines alike.
         results.retain(|(key, _)| key.starts_with(prefix));
         baselines.retain(|(key, _)| key.starts_with(prefix));
@@ -2270,8 +2212,12 @@ impl StorageBackend for FilesystemBackend {
                 .await
                 .map(Some);
         }
-        if delimiter != Some("/") {
-            return Ok(None);
+        let delimiter = delimiter.unwrap_or("/");
+        if delimiter != "/" {
+            return self
+                .list_collapsed_page(bucket, prefix, delimiter, max_keys, continuation_token)
+                .await
+                .map(Some);
         }
 
         let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
@@ -2298,131 +2244,81 @@ impl StorageBackend for FilesystemBackend {
             deltaspaces_dir.join(dir_part)
         };
 
-        // Non-existent directory → empty result (not an error).
+        let no_keys = || DelegatedListResult {
+            objects: Vec::new(),
+            common_prefixes: Vec::new(),
+            is_truncated: false,
+            next_continuation_token: None,
+            upstream_requests: 0,
+            forms: super::traits::ListedForms::Unreported,
+            reference_prefixes: None,
+        };
+        // The proxy's own directory lists nothing (F19). A directory that
+        // does not exist is an empty result, not an error.
+        if crate::storage::listing_facts::has_internal_segment(dir_part) {
+            return Ok(Some(no_keys()));
+        }
+        // A stat error is an error, never "no keys" (review B11).
         if !fsio::exists(&read_dir_path).await? {
-            return Ok(Some(DelegatedListResult {
-                objects: Vec::new(),
-                common_prefixes: Vec::new(),
-                is_truncated: false,
-                next_continuation_token: None,
-                upstream_requests: 0,
-                forms: super::traits::ListedForms::Unreported,
-                reference_prefixes: None,
-            }));
+            return Ok(Some(no_keys()));
         }
+        let token = continuation_token.unwrap_or("");
+        let keep = |dir_key: &str, e: &WalkEntry| level_keep(name_filter, token, dir_key, e);
+        let Some(mut level) = SortedDir::open(&read_dir_path, dir_part.to_string(), &keep).await?
+        else {
+            return Ok(Some(no_keys()));
+        };
 
-        // Single-level read_dir.
-        let mut entries = fs::read_dir(&read_dir_path).await?;
-
-        // Collect common prefixes and candidate object files.
-        // Use BTreeMap for objects keyed by user-visible key so that
-        // delta+passthrough duplicates are resolved (delta wins).
-        // Folder key (`dir/`) → its directory; whether it holds a visible
-        // key is read later, only for the folders the page reaches.
-        let mut common_prefixes: BTreeMap<String, PathBuf> = BTreeMap::new();
-        let mut object_map: BTreeMap<String, (PathBuf, bool)> = BTreeMap::new(); // key → (path, is_delta)
-
-        while let Some(entry) = entries.next_entry().await? {
-            let ft = entry.file_type().await?;
-            let os_name = entry.file_name();
-            let name = match os_name.to_str() {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-
-            if ft.is_dir() {
-                // Hide only the `.dg` internal directory. Other dot-dirs
-                // (`.well-known/`…) are legitimate user prefixes — parity with
-                // the S3 backend and with this backend's own flat listing.
-                if name == ".dg" {
-                    continue;
-                }
-
-                // Apply name filter: the directory name must start with name_filter.
-                if !name_filter.is_empty() && !name.starts_with(name_filter) {
-                    continue;
-                }
-
-                // Build user-visible common-prefix: dir_part + name + "/"
-                let cp = if dir_part.is_empty() {
-                    format!("{}/", name)
-                } else {
-                    format!("{}/{}/", dir_part, name)
-                };
-
-                common_prefixes.insert(cp, entry.path());
-            } else {
-                // Temp files and reference.bin are internal, not objects.
-                let StoredName::Object {
-                    key_filename: user_filename,
-                    variant,
-                } = stored_name(&name)
-                else {
-                    continue;
-                };
-                let is_delta = variant == super::traits::ObjectVariant::Delta;
-                let user_filename = user_filename.to_string();
-
-                // Apply name filter. A marker file at the bucket root names
-                // no key.
-                if (!name_filter.is_empty() && !user_filename.starts_with(name_filter))
-                    || (dir_part.is_empty() && user_filename.is_empty())
-                {
-                    continue;
-                }
-
-                // Build the full user-visible key (`dir/` for the marker).
-                let user_key = if dir_part.is_empty() {
-                    user_filename
-                } else {
-                    format!("{}/{}", dir_part, user_filename)
-                };
-
-                // Dedup: prefer delta metadata over passthrough when both exist.
-                match object_map.get(&user_key) {
-                    Some((_, existing_is_delta)) => {
-                        if is_delta && !existing_is_delta {
-                            // Delta takes precedence over passthrough.
-                            object_map.insert(user_key, (entry.path(), true));
-                        }
-                        // If existing is already delta, or both are passthrough, keep existing.
-                    }
-                    None => {
-                        object_map.insert(user_key, (entry.path(), is_delta));
-                    }
-                }
-            }
-        }
-
-        // Objects and folders after the token, in key order. A folder
-        // counts only when it holds a visible key, and that check walks the
-        // folder: run it in key order, only until the page holds max_keys
-        // entries plus the one that proves truncation. It ran for every
-        // folder of the directory, on every page.
-        let after = |k: &String| continuation_token.is_none_or(|t| k.as_str() > t);
-        let mut candidates: Vec<(String, PathBuf, bool)> = object_map
-            .into_iter()
-            .filter(|(k, _)| after(k))
-            .map(|(key, (path, _))| (key, path, false))
-            .chain(
-                common_prefixes
-                    .into_iter()
-                    .filter(|(k, _)| after(k))
-                    .map(|(cp, path)| (cp, path, true)),
-            )
-            .collect();
-        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        // Objects and folders after the token, in key order, one chunk of
+        // the directory at a time. A folder counts only when it holds a
+        // visible key, and that check walks the folder: run it in key order,
+        // only until the page holds max_keys entries plus the one that
+        // proves truncation.
         let want = max_keys as usize + 1;
         let mut obj_entries: Vec<(String, PathBuf)> = Vec::new();
         let mut cp_entries: Vec<String> = Vec::new();
-        for (key, path, is_dir) in candidates {
-            if obj_entries.len() + cp_entries.len() >= want {
-                break;
+        // The newest-seen file of the key being read: `x` and `x.delta` are
+        // neighbours, and the delta wins.
+        let mut pending: Option<(String, PathBuf, bool)> = None;
+        'level: loop {
+            let entry = level.next_entry(&keep).await?;
+            if let Some(e) = &entry {
+                let key = join_key(dir_part, &e.key_name);
+                if !e.is_dir {
+                    let path = level.path.join(&e.name);
+                    match &mut pending {
+                        Some((k, p, is_delta)) if *k == key => {
+                            if e.is_delta && !*is_delta {
+                                *p = path;
+                                *is_delta = true;
+                            }
+                        }
+                        _ => {
+                            if let Some((k, p, _)) = pending.replace((key, path, e.is_delta)) {
+                                obj_entries.push((k, p));
+                            }
+                        }
+                    }
+                    if obj_entries.len() + cp_entries.len() >= want {
+                        break 'level;
+                    }
+                    continue;
+                }
             }
-            if !is_dir {
-                obj_entries.push((key, path));
-            } else if Self::dir_has_visible_data_recursive(&path).await? {
-                cp_entries.push(key);
+            if let Some((k, p, _)) = pending.take() {
+                obj_entries.push((k, p));
+                if obj_entries.len() + cp_entries.len() >= want {
+                    break 'level;
+                }
+            }
+            let Some(e) = entry else { break };
+            // A folder (`dir/name/`).
+            let cp = format!("{}/", join_key(dir_part, &e.key_name));
+            if Self::dir_has_listed_key(&level.path.join(&e.name)).await? {
+                cp_entries.push(cp);
+                if obj_entries.len() + cp_entries.len() >= want {
+                    break;
+                }
             }
         }
 
@@ -2464,6 +2360,110 @@ impl StorageBackend for FilesystemBackend {
     }
 }
 
+/// Pure: does the single-level listing (`delimiter = /`) keep this entry of
+/// the directory `dir_key`? A name must start with the filter and its entry
+/// (`dir/name` or `dir/name/`) sort after the token. The `.dg` directory is
+/// the proxy's own and never listed (F19). A marker file at the bucket root
+/// names no key.
+fn level_keep(name_filter: &str, token: &str, dir_key: &str, e: &WalkEntry) -> bool {
+    if e.is_dir && e.name == crate::storage::listing_facts::INTERNAL_DIR {
+        return false;
+    }
+    if !e.key_name.starts_with(name_filter) || (dir_key.is_empty() && e.key_name.is_empty()) {
+        return false;
+    }
+    let key = join_key(dir_key, &e.key_name);
+    let entry = if e.is_dir { format!("{key}/") } else { key };
+    entry.as_str() > token
+}
+
+impl FilesystemBackend {
+    /// A listing with a delimiter other than `/`: the sorted walk of the
+    /// prefix, each key collapsed into its common prefix as it passes. It
+    /// holds the page (plus one entry) and one chunk per open directory,
+    /// never the prefix. A folder whose keys all collapse to one common
+    /// prefix is not read, only checked for a key.
+    async fn list_collapsed_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+        max_keys: u32,
+        continuation_token: Option<&str>,
+    ) -> Result<DelegatedListResult, StorageError> {
+        let dir_part = prefix.rfind('/').map_or("", |i| &prefix[..i]);
+        check_path_segments(dir_part, "")?;
+        let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
+        let walk_root = if dir_part.is_empty() {
+            deltaspaces_dir
+        } else {
+            deltaspaces_dir.join(dir_part)
+        };
+        let token = continuation_token.unwrap_or("");
+        let want = max_keys as usize + 1;
+        let mut objects: Vec<(String, FileMetadata)> = Vec::new();
+        let mut prefixes: Vec<String> = Vec::new();
+        let walk = if crate::storage::listing_facts::has_internal_segment(dir_part)
+            || !fsio::exists(&walk_root).await?
+        {
+            None
+        } else {
+            FlatWalk::open(
+                &walk_root,
+                dir_part.to_string(),
+                prefix,
+                token,
+                Some(delimiter),
+            )
+            .await?
+        };
+        if let Some(mut walk) = walk {
+            while let Some(step) = walk.next().await? {
+                if objects.len() + prefixes.len() >= want {
+                    break;
+                }
+                let cp = match step {
+                    WalkStep::Collapsed(cp) => cp,
+                    WalkStep::File { key, path, entry } => {
+                        let Some(cp) = collapse_key(&key, prefix, delimiter) else {
+                            let Some((_, meta)) = Self::listed_entry(&path, &entry.name).await?
+                            else {
+                                continue; // not an object file, or deleted during the walk
+                            };
+                            // `x` and `x.delta` are neighbours: the newest wins.
+                            match objects.last_mut() {
+                                Some((k, m)) if *k == key => {
+                                    if meta.created_at > m.created_at {
+                                        *m = meta;
+                                    }
+                                }
+                                _ => objects.push((key, meta)),
+                            }
+                            continue;
+                        };
+                        cp
+                    }
+                };
+                // Keys of one common prefix are neighbours; one that the
+                // token already ended is not shown again.
+                if cp.as_str() > token && prefixes.last() != Some(&cp) {
+                    prefixes.push(cp);
+                }
+            }
+        }
+        let page = crate::deltaglider::interleave_and_paginate(objects, prefixes, max_keys, None);
+        Ok(DelegatedListResult {
+            objects: page.objects,
+            common_prefixes: page.common_prefixes,
+            is_truncated: page.is_truncated,
+            next_continuation_token: page.next_continuation_token,
+            upstream_requests: 0,
+            forms: super::traits::ListedForms::Unreported,
+            reference_prefixes: None,
+        })
+    }
+}
+
 /// A delimiter-less listing of the filesystem backend pages through a
 /// sorted walk that stops after the page. It walked the whole subtree and
 /// read the metadata of every file for every page: paging through N keys
@@ -2473,6 +2473,7 @@ mod paged_listing_tests {
     use super::*;
     use crate::config::Config;
     use crate::deltaglider::{DeltaGliderEngine, DynEngine as Engine, ListObjectsPage};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     async fn engine() -> (tempfile::TempDir, Engine) {
