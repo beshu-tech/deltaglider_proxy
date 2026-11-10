@@ -158,6 +158,7 @@ The chart ships the hardening that the Dockerfile expects. Leave these settings 
 The proxy writes upload bodies above the spool threshold, large delta reconstructions and multipart parts to its spool directory (`DGP_SPOOL_DIR`, default `/tmp/dgp-spool`). In the chart, `/tmp` is an `emptyDir` with the size limit `tmp.sizeLimit` (default `2Gi`). The kubelet evicts a pod whose `emptyDir` grows past its limit, so the chart sets `DGP_SPOOL_MAX_BYTES` to three quarters of `tmp.sizeLimit` (1.5 GiB with the default). Give `tmp.sizeLimit` in `Mi` or `Gi`; another unit fails the render. Raise it for larger or more concurrent uploads: one multipart upload can hold at most half of the spool budget, so the largest multipart object with the default limit is 768 MiB.
 
 ```yaml
+# not-proxy-config: helm values
 tmp:
   sizeLimit: 16Gi   # DGP_SPOOL_MAX_BYTES = 12 GiB
 ```
