@@ -263,14 +263,38 @@ mod tests {
     /// backend on the same fake with another listing-cache scope (another
     /// node, or this one after a restart).
     async fn deltas_without_facts(dir: &str, n: usize) -> (DynEngine, Arc<FakeS3>, String) {
+        deltas_without_facts_slow(dir, n, 0).await
+    }
+
+    /// [`deltas_without_facts`] on a fake whose PUTs wait `put_delay_ms`
+    /// before they answer: the slow host, made certain.
+    async fn deltas_without_facts_slow(
+        dir: &str,
+        n: usize,
+        put_delay_ms: u64,
+    ) -> (DynEngine, Arc<FakeS3>, String) {
         let (endpoint, fake) = crate::storage::fake_s3::start().await;
         fake.fail("PUT", "/.dg/facts/", 500, "InternalError", u32::MAX);
+        fake.set_put_delay_ms(put_delay_ms);
         let writer = engine_on(test_support::for_test_endpoint(&endpoint));
         writer.create_bucket("b").await.unwrap();
         crate::deltaglider::store_deltas(&writer, dir, n).await;
-        // The writer's facts PUTs all failed before the faults go away.
-        assert!(wait_count(&fake, n, |r| r.starts_with("PUT /b/.dg/facts/")).await);
+        // Every facts PUT must be ANSWERED with its 500 before the fault
+        // goes away. The request log shows a PUT when it ARRIVES; one that
+        // arrived but is not answered yet would succeed after the fault is
+        // gone, and its object would have durable facts: no miss, no
+        // healer HEAD (nightly #153, 1 run in ~40 on one starved core).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while fake.faulted("PUT", "/.dg/facts/") < n {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} of {n} facts PUTs failed",
+                fake.faulted("PUT", "/.dg/facts/")
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         fake.clear_faults();
+        fake.set_put_delay_ms(0);
         (reader(&endpoint, "other-node"), fake, endpoint)
     }
 
@@ -331,6 +355,18 @@ mod tests {
             .unwrap()
     }
 
+    /// The setup helper leaves NO durable facts, whatever the host load:
+    /// with every PUT answered 100 ms late, a facts PUT that had only
+    /// ARRIVED when the fault was removed was stored (nightly #153:
+    /// `healing_is_bounded_and_heads_each_object_once` saw no HEAD).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_setup_leaves_no_durable_facts_on_a_slow_backend() {
+        let (_, fake, _) = deltas_without_facts_slow("rel", 12, 100).await;
+        // Past the 100 ms of every PUT still in flight.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(fake.stored_count("b/.dg/facts/"), 0);
+    }
+
     /// A delta without durable facts made every LIST of its page read the
     /// facts namespace again (up to 4 LISTs), for ever: the miss is now
     /// remembered for a minute per exact stored object.
@@ -385,7 +421,11 @@ mod tests {
         fake.set_delay_ms("HEAD", 30);
         fake.clear();
         list(&engine, "rel/").await;
-        assert!(wait_count(&fake, 24, delta_heads).await);
+        assert!(
+            wait_count(&fake, 24, delta_heads).await,
+            "{:#?}",
+            fake.requests()
+        );
         assert!(fake.peak_in_flight("HEAD") <= HEAL_CONCURRENCY);
         list(&engine, "rel/").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
