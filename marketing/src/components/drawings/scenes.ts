@@ -11,7 +11,7 @@
 export type SceneName =
   | 'bucket' | 'rebuild' | 'check' | 'client'
   | 'upload' | 'sort' | 'encode' | 'store'
-  | 'key' | 'lock' | 'cipher-bucket';
+  | 'key' | 'lock' | 'cipher-bucket' | 'proxy';
 
 const FILE = (x: number, y: number, w: number, h: number, c: number, cls = 'k t') =>
   `<path class="${cls}" d="M${x} ${y}h${w - c}l${c} ${c}v${h - c}h${-w}z"/><path class="k" d="M${x + w - c} ${y}v${c}h${c}"/>`;
@@ -68,4 +68,7 @@ export const SCENES: Record<SceneName, string> = {
   'cipher-bucket': BUCKET_BACK +
     `<g class="h"><rect x="50" y="14" width="13" height="13" rx="2"/><rect x="66" y="14" width="13" height="13" rx="2" opacity=".3"/><rect x="82" y="14" width="13" height="13" rx="2" opacity=".65"/><rect x="98" y="14" width="13" height="13" rx="2" opacity=".3"/><rect x="50" y="30" width="13" height="13" rx="2" opacity=".65"/><rect x="66" y="30" width="13" height="13" rx="2"/><rect x="82" y="30" width="13" height="13" rx="2" opacity=".3"/><rect x="98" y="30" width="13" height="13" rx="2"/><rect x="50" y="46" width="13" height="13" rx="2" opacity=".3"/><rect x="66" y="46" width="13" height="13" rx="2" opacity=".65"/><rect x="82" y="46" width="13" height="13" rx="2"/><rect x="98" y="46" width="13" height="13" rx="2" opacity=".65"/></g>` +
     BUCKET_FRONT,
+  // The proxy alone: the same chip as in the other scenes, drawn large.
+  proxy: `<path class="k" d="M62 32v-11M80 32v-11M98 32v-11M62 109v-11M80 109v-11M98 109v-11"/>` +
+    `<rect class="k c" x="48" y="32" width="64" height="66" rx="9"/><path class="b bt" d="M80 47l17 33h-34z"/>`,
 };

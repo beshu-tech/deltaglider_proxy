@@ -1,0 +1,20 @@
+---
+// WhereItSits — the place of the proxy. The claim: it sits between an
+// unchanged S3 client and a bucket that you already have.
+import StepDrawing from './StepDrawing.astro';
+---
+
+<StepDrawing
+  numbered={false}
+  steps={[
+    { scene: 'client', label: 'A laptop that holds a file',
+      title: 'Your S3 client',
+      body: 'aws-cli, an SDK, a CI job. You change one setting: the endpoint.' },
+    { scene: 'proxy', label: 'The proxy, drawn as a chip', focus: true,
+      title: 'DeltaGlider Proxy',
+      body: 'One binary: delta compression, encryption, users and permissions, replication.' },
+    { scene: 'bucket', label: 'A bucket that holds one whole file and a thin delta',
+      title: 'Your storage',
+      body: 'AWS S3, Hetzner, MinIO, Backblaze B2 or a local disk. It holds one whole file and small deltas.' },
+  ]}
+/>
