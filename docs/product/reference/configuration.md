@@ -404,7 +404,7 @@ AWS S3, MinIO, Hetzner, Backblaze, or any other S3-compatible service. The proxy
 | endpoint | `DGP_S3_ENDPOINT` | `storage.s3: <url>` | `storage.backend.endpoint` | — (AWS default) |
 | region | `DGP_S3_REGION` | `storage.region` | `storage.backend.region` | `us-east-1` |
 | force_path_style | `DGP_S3_PATH_STYLE` | `storage.force_path_style` | `storage.backend.force_path_style` | `true` |
-| allow_local | `DGP_BACKEND_ALLOW_LOCAL` | — | `storage.backend.allow_local` (also on each named backend) | `false` (allow `http://`, private-IP and loopback endpoints, for MinIO, development and CI; a name that resolves to loopback needs it as well; metadata addresses are never allowed) |
+| allow_local | `DGP_BACKEND_ALLOW_LOCAL` | — | `storage.backend.allow_local` (also on each named backend) | `false` (allow `http://`, private-IP and loopback endpoints, for MinIO, development and CI; a name that resolves to loopback needs it as well; cloud-metadata, container-credential and link-local addresses are never allowed) |
 | access_key_id | `DGP_BE_AWS_ACCESS_KEY_ID` | `storage.access_key_id` | `storage.backend.access_key_id` | — |
 | secret_access_key | `DGP_BE_AWS_SECRET_ACCESS_KEY` | `storage.secret_access_key` | `storage.backend.secret_access_key` | — |
 

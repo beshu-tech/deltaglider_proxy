@@ -336,11 +336,10 @@ const FORBIDDEN_SUFFIXES: &[&str] = &[".internal", ".local", ".localdomain"];
 const DEV_ALLOWED: &[&str] = &["localhost", "ip6-localhost", "ip6-loopback"];
 
 pub(crate) fn ip_is_acceptable(ip: IpAddr, kind: UrlKind) -> bool {
-    // Cloud instance-metadata services are NEVER acceptable, even in
-    // BackendDev mode — pointing the S3 backend at IMDS is the cloud-
-    // takeover pivot we're explicitly blocking, and it's never a
-    // legitimate dev use case.
-    if ip_is_metadata_service(ip) {
+    // Cloud credential targets are NEVER acceptable, even in BackendDev
+    // mode — pointing the S3 backend at IMDS is the cloud-takeover pivot
+    // we're explicitly blocking, and it's never a legitimate dev use case.
+    if ip_is_credential_target(ip) {
         return false;
     }
     let private = match ip {
@@ -354,18 +353,39 @@ pub(crate) fn ip_is_acceptable(ip: IpAddr, kind: UrlKind) -> bool {
     matches!(kind, UrlKind::BackendDev)
 }
 
-/// AWS IMDS over IPv6 (Nitro instances).
-const AWS_IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+/// AWS IMDS over IPv6 (Nitro instances) and the EKS Pod Identity agent over
+/// IPv6.
+const METADATA_V6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+    Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0023),
+];
+
+/// Cloud instance-metadata and container-credential endpoints (IPv4):
+/// AWS IMDS, Azure IMDS and the GCP metadata server (all 169.254.169.254),
+/// the ECS task-role endpoint (169.254.170.2) and the EKS Pod Identity agent
+/// (169.254.170.23).
+const METADATA_V4: [[u8; 4]; 3] = [
+    [169, 254, 169, 254],
+    [169, 254, 170, 2],
+    [169, 254, 170, 23],
+];
 
 fn ip_is_metadata_service(ip: IpAddr) -> bool {
     match ip {
-        // AWS IMDSv1/IMDSv2, Azure IMDS, GCP metadata server (all same v4).
-        IpAddr::V4(v4) => v4.octets() == [169, 254, 169, 254],
+        IpAddr::V4(v4) => METADATA_V4.contains(&v4.octets()),
         IpAddr::V6(v6) => {
-            v6 == AWS_IMDS_V6
-                || embedded_ipv4(v6).is_some_and(|m| m.octets() == [169, 254, 169, 254])
+            METADATA_V6.contains(&v6)
+                || embedded_ipv4(v6).is_some_and(|m| METADATA_V4.contains(&m.octets()))
         }
     }
+}
+
+/// An address that hands out cloud credentials or that no storage server
+/// lives on: every metadata endpoint and all link-local space (169.254.0.0/16,
+/// fe80::/10), with their IPv4-embedded IPv6 forms. Refused in EVERY policy:
+/// `allow_local` opens loopback, never these.
+fn ip_is_credential_target(ip: IpAddr) -> bool {
+    ip_is_metadata_service(ip) || ip_is_link_local(ip)
 }
 
 /// The IPv4 address an IPv6 address carries, for every transition form
@@ -508,18 +528,17 @@ pub(crate) fn sdk_resolver_guards_name(endpoint_host: &str, name: &str) -> bool 
 /// internal DNS (`https://minio.corp` → 10.0.0.5) is a normal deployment. So
 /// a resolved name may point at private space (RFC 1918, unique-local,
 /// CGNAT). Refused are the targets that are never remote storage: the
-/// cloud-credential targets (link-local 169.254.0.0/16 incl. IMDS, fe80::/10,
-/// AWS IPv6 IMDS), and this host itself (loopback, the unspecified address).
+/// cloud-credential targets (link-local 169.254.0.0/16 incl. IMDS, the ECS
+/// and EKS credential endpoints, fe80::/10, the AWS IPv6 endpoints), and this host itself (loopback, the unspecified address).
 /// A name such as `localtest.me` (A 127.0.0.1) is the literal `127.0.0.1`
 /// by another spelling, which the text check refuses. All with their
-/// IPv4-embedded IPv6 forms. `BackendDev` (`allow_local`) refuses metadata
+/// IPv4-embedded IPv6 forms. `BackendDev` (`allow_local`) refuses the
+/// credential targets too ([`ip_is_credential_target`]) and opens loopback
 /// only. Other kinds keep the full [`ip_is_acceptable`] policy.
 pub(crate) fn resolved_backend_ip_refused(ip: IpAddr, kind: UrlKind) -> bool {
     match kind {
-        UrlKind::Backend => {
-            ip_is_metadata_service(ip) || ip_is_link_local(ip) || ip_is_this_host(ip)
-        }
-        UrlKind::BackendDev => ip_is_metadata_service(ip),
+        UrlKind::Backend => ip_is_credential_target(ip) || ip_is_this_host(ip),
+        UrlKind::BackendDev => ip_is_credential_target(ip),
         UrlKind::Oidc | UrlKind::Webhook => !ip_is_acceptable(ip, kind),
     }
 }
@@ -554,8 +573,9 @@ fn refused_resolution_message(host: &str, refused: &[IpAddr], kind: UrlKind) -> 
              endpoint's DNS at the storage server's real address."
         }
         UrlKind::BackendDev => {
-            "Cloud-metadata addresses are never allowed for an S3 endpoint, even with \
-             `allow_local: true`. Point the endpoint's DNS at the storage server's real address."
+            "Cloud-metadata and link-local addresses are never allowed for an S3 endpoint, \
+             even with `allow_local: true`. Point the endpoint's DNS at the storage \
+             server's real address."
         }
         UrlKind::Oidc | UrlKind::Webhook => {
             "Private, loopback and metadata addresses are not allowed for this URL."
@@ -1027,14 +1047,20 @@ mod tests {
         // (address, refused for Backend, refused for BackendDev)
         for (a, backend, dev) in [
             ("169.254.169.254", true, true),
-            ("169.254.10.20", true, false),
-            ("fe80::1", true, false),
+            ("169.254.170.2", true, true),
+            ("169.254.170.23", true, true),
+            ("169.254.10.20", true, true),
+            ("fe80::1", true, true),
+            ("fe80::a:b", true, true),
             ("fd00:ec2::254", true, true),
+            ("fd00:ec2::23", true, true),
+            ("::ffff:169.254.170.2", true, true),
+            ("64:ff9b::a9fe:aa17", true, true),
             ("64:ff9b::a9fe:a9fe", true, true),
             ("2002:a9fe:a9fe::", true, true),
             ("::a9fe:a9fe", true, true),
             ("::ffff:169.254.169.254", true, true),
-            ("64:ff9b::a9fe:0101", true, false),
+            ("64:ff9b::a9fe:0101", true, true),
             ("10.0.0.5", false, false),
             ("172.16.0.1", false, false),
             ("127.0.0.1", true, false),
@@ -1057,6 +1083,25 @@ mod tests {
                 dev,
                 "{a}"
             );
+        }
+        // The literal check (`validate_outbound_url`) agrees, in every kind:
+        // `allow_local` never opens a link-local or credential address.
+        for a in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "169.254.170.23",
+            "169.254.10.20",
+            "fe80::1",
+            "fd00:ec2::254",
+            "fd00:ec2::23",
+            "::ffff:169.254.170.2",
+        ] {
+            for kind in [UrlKind::Backend, UrlKind::BackendDev] {
+                assert!(!ip_is_acceptable(ip(a), kind), "{a} {kind:?}");
+            }
+        }
+        for a in ["127.0.0.1", "::1", "10.0.0.5"] {
+            assert!(ip_is_acceptable(ip(a), UrlKind::BackendDev), "{a}");
         }
         // OIDC/webhook keep the strict policy.
         assert!(resolved_backend_ip_refused(ip("10.0.0.5"), UrlKind::Oidc));
@@ -1109,11 +1154,13 @@ mod tests {
             let dev = SdkSsrfGuardedResolver::new(UrlKind::BackendDev, ip);
             assert!(dev.resolve_dns(ip).await.is_ok(), "allow_local {ip}");
         }
-        for ip in ["169.254.1.1", "fe80::1", "fd00:ec2::254"] {
+        for ip in ["169.254.1.1", "fe80::1", "fd00:ec2::254", "169.254.170.2"] {
             let r = SdkSsrfGuardedResolver::new(UrlKind::Backend, ip);
             assert!(r.resolve_dns(ip).await.is_err(), "metadata/link-local {ip}");
+            let dev = SdkSsrfGuardedResolver::new(UrlKind::BackendDev, ip);
+            assert!(dev.resolve_dns(ip).await.is_err(), "allow_local {ip}");
         }
-        // Dev allows private space but never metadata.
+        // Dev allows private space but never metadata or link-local.
         let dev = SdkSsrfGuardedResolver::new(UrlKind::BackendDev, "10.0.0.1");
         assert!(dev.resolve_dns("10.0.0.1").await.is_ok());
         let dev = SdkSsrfGuardedResolver::new(UrlKind::BackendDev, "169.254.169.254");
