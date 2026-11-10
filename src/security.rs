@@ -649,6 +649,17 @@ const SECRET_QUERY_PARAMS: [&str; 6] = [
     "x-amz-content-sha256",
 ];
 
+/// Pure: is `raw_name` (a query parameter name as it came on the wire) a
+/// credential-bearing one? The SigV4 path decodes names before it uses them,
+/// so `X-Amz-%53ignature` authenticates: compare the decoded name, lossy.
+fn is_secret_query_param(raw_name: &str) -> bool {
+    let name =
+        String::from_utf8_lossy(&urlencoding::decode_binary(raw_name.as_bytes())).into_owned();
+    SECRET_QUERY_PARAMS
+        .iter()
+        .any(|s| name.eq_ignore_ascii_case(s))
+}
+
 /// Pure: `uri` (a request target, `path?query`, or a bare query) with the
 /// value of every credential-bearing query parameter replaced by `REDACTED`.
 /// THE form of a URI in a log line or a span: a presigned URL carries a
@@ -664,11 +675,7 @@ pub fn redact_uri_for_log(uri: &str) -> String {
     let query = query
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((name, _))
-                if SECRET_QUERY_PARAMS
-                    .iter()
-                    .any(|s| name.eq_ignore_ascii_case(s)) =>
-            {
+            Some((name, _)) if is_secret_query_param(name) => {
                 format!("{name}=REDACTED")
             }
             _ => pair.to_string(),
@@ -1269,6 +1276,12 @@ mod redact_tests {
             ("?X-Amz-Signature=abc", "?X-Amz-Signature=REDACTED"),
             ("/b/k?X-Amz-Signature", "/b/k?X-Amz-Signature"),
             ("/b/k?a=X-Amz-Signature=1", "/b/k?a=X-Amz-Signature=1"),
+            // The signature check decodes names, so an encoded name still authenticates.
+            ("/b/k?X-Amz-%53ignature=abc", "/b/k?X-Amz-%53ignature=REDACTED"),
+            ("/b/k?x%2Damz%2Dsignature=abc&a=1", "/b/k?x%2Damz%2Dsignature=REDACTED&a=1"),
+            ("/b/k?%58-Amz-Credential=c", "/b/k?%58-Amz-Credential=REDACTED"),
+            ("/b/k?%53ignature=%2f", "/b/k?%53ignature=REDACTED"),
+            ("/b/k?Sig%6eature%00=abc", "/b/k?Sig%6eature%00=abc"),
         ];
         for (raw, want) in cases {
             assert_eq!(redact_uri_for_log(raw), want, "{raw}");
@@ -1285,6 +1298,11 @@ mod redact_tests {
             after in "[a-z]{0,6}=[a-z0-9]{0,6}",
         ) {
             let uri = format!("/b/k?{before}&{name}={value}&{after}");
+            let out = redact_uri_for_log(&uri);
+            proptest::prop_assert!(!out.contains(&value), "{out}");
+            // The same name with every character percent-encoded.
+            let encoded: String = name.bytes().map(|b| format!("%{b:02X}")).collect();
+            let uri = format!("/b/k?{before}&{encoded}={value}&{after}");
             let out = redact_uri_for_log(&uri);
             proptest::prop_assert!(!out.contains(&value), "{out}");
         }
