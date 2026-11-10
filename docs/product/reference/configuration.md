@@ -1146,6 +1146,7 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_LOG_RING_LEVEL` | `info` | Minimum severity captured into the log ring/stream |
 | `DGP_AUDIT_RING_SIZE` | `500` | In-memory audit ring capacity (admin Audit log viewer) |
 | `DGP_BLOCKING_THREADS` | 512 | Max tokio blocking threads |
+| `DGP_SHUTDOWN_TIMEOUT_SECS` | 10 | How long, in seconds, the proxy waits for work on its blocking threads when it stops. When the proxy gets SIGTERM, it first stops accepting connections and waits for the running requests (up to 10 seconds), then lets a running maintenance job stop and writes the queued events (up to 10 seconds each). Only after these steps does the process wait for blocking work, for example an xdelta3 run, which can take up to two hours. After this many seconds the process exits and the operating system ends any child xdelta3 process, because the pipes to it close. Set `terminationGracePeriodSeconds` in Kubernetes (the Helm chart uses 30) to more than the sum of the steps that your workload needs. The minimum is 1 |
 | `DGP_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout (returns 504) |
 | `DGP_READY_TIMEOUT_SECS` | 3 | Per-attempt backend timeout for the direct `/_/ready` probe. The proxy sends that probe only when the health loop has no recent result for a backend (see the admin API reference). |
 | `DGP_READY_RETRIES` | 2 | Extra attempts of the direct `/_/ready` backend probe before reporting not-ready (short backoff) |

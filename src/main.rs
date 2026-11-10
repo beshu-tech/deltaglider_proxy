@@ -502,7 +502,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = runtime_builder.build()?;
 
     // A boot error prints as text (Display), never as `Error: Os { .. }`.
-    if let Err(e) = runtime.block_on(async_main(cli)) {
+    let outcome = runtime.block_on(async_main(cli));
+    // Dropping a runtime waits for EVERY blocking task, and an xdelta3 run
+    // can last 2 hours. Wait a bounded time, then let the process exit (the
+    // children see their pipes close). Source guard:
+    // `the_runtime_never_waits_for_blocking_tasks_without_a_bound`.
+    runtime.shutdown_timeout(Duration::from_secs(pre_config.tuning.shutdown_timeout_secs));
+    if let Err(e) = outcome {
         startup::exit_with_boot_error(&e.to_string());
     }
     Ok(())

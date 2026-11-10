@@ -717,6 +717,25 @@ mod source_guards {
         );
     }
 
+    /// F59 (#145): the exit never waits for the blocking pool without a
+    /// bound. A plain drop of the runtime waits for every blocking task
+    /// (the codec ceiling is 2 hours). The bound is `shutdown_timeout`, read
+    /// from `DGP_SHUTDOWN_TIMEOUT_SECS`.
+    #[test]
+    fn the_runtime_never_waits_for_blocking_tasks_without_a_bound() {
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains("runtime.shutdown_timeout(")
+                && main.contains("tuning.shutdown_timeout_secs"),
+            "main.rs must end the runtime with shutdown_timeout"
+        );
+        assert_eq!(
+            main.matches("Builder::new_multi_thread()").count(),
+            1,
+            "one runtime, one bounded exit"
+        );
+    }
+
     /// F22 (#145): every filesystem data root gets the stale-temp sweep at
     /// boot, in a background task (never awaited on the boot path), with the
     /// age rule of `STALE_TEMP_MAX_AGE`. Only `filesystem/sweep.rs` decides

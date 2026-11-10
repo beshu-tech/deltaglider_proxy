@@ -44,6 +44,11 @@ pub struct ReadyProbe {
     pub cache_ttl_secs: i64,
 }
 
+/// The default of `DGP_SHUTDOWN_TIMEOUT_SECS`. The Helm chart gives a pod 30 s
+/// (`terminationGracePeriodSeconds`); the drain steps before this wait take
+/// up to 10 s each, so this wait stays short.
+pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+
 /// The default of `DGP_BACKEND_SHARE_PERCENT`.
 pub const DEFAULT_BACKEND_SHARE_PERCENT: u8 = 75;
 
@@ -88,6 +93,10 @@ pub struct RuntimeTuning {
     pub spool_threshold_bytes: Option<u64>,
     /// `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS`.
     pub spool_acquire_timeout_secs: u64,
+    /// `DGP_SHUTDOWN_TIMEOUT_SECS` (at least 1): after the drain steps, the
+    /// time that the exit waits for tasks on the blocking pool (an xdelta3
+    /// run can take 2 hours). Read before the runtime exists.
+    pub shutdown_timeout_secs: u64,
     /// `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`.
     pub mpu_delta_reconstruct_max_bytes: u64,
     /// `DGP_STREAM_COPY_THRESHOLD`: a passthrough copy at least this
@@ -158,6 +167,12 @@ impl RuntimeTuning {
             },
             spool_threshold_bytes: lookup_parse(env, "DGP_SPOOL_THRESHOLD_BYTES"),
             spool_acquire_timeout_secs: parse_or("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", 120).max(1),
+            // 0 would abandon the blocking tasks at once.
+            shutdown_timeout_secs: parse_or(
+                "DGP_SHUTDOWN_TIMEOUT_SECS",
+                DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+            )
+            .max(1),
             mpu_delta_reconstruct_max_bytes: parse_or(
                 "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
                 64 * 1024 * 1024,
@@ -245,6 +260,7 @@ mod tests {
             Zero::Meaningful("every body takes the spool path"),
         ),
         ("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", Zero::Floor1),
+        ("DGP_SHUTDOWN_TIMEOUT_SECS", Zero::Floor1),
         (
             "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
             Zero::Meaningful("no delta is rebuilt"),
@@ -357,6 +373,7 @@ mod tests {
         );
         assert_eq!(t.spool_threshold_bytes, None);
         assert_eq!(t.spool_acquire_timeout_secs, 120);
+        assert_eq!(t.shutdown_timeout_secs, DEFAULT_SHUTDOWN_TIMEOUT_SECS);
         assert_eq!(t.mpu_delta_reconstruct_max_bytes, 64 * 1024 * 1024);
         assert_eq!(
             (
@@ -401,6 +418,7 @@ mod tests {
             ("DGP_CODEC_ABSOLUTE_SECS", "11"),
             ("DGP_SPOOL_THRESHOLD_BYTES", "12"),
             ("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", "13"),
+            ("DGP_SHUTDOWN_TIMEOUT_SECS", "17"),
             ("DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES", "14"),
             ("DGP_READY_TIMEOUT_SECS", "0"),
             ("DGP_READY_RETRIES", "5"),
@@ -425,6 +443,7 @@ mod tests {
         );
         assert_eq!(t.spool_threshold_bytes, Some(12));
         assert_eq!(t.spool_acquire_timeout_secs, 13);
+        assert_eq!(t.shutdown_timeout_secs, 17);
         assert_eq!(t.mpu_delta_reconstruct_max_bytes, 14);
         // Clamped: at least one second, never a negative TTL.
         assert_eq!(
