@@ -113,6 +113,38 @@ fn banner_names_every_backend() {
     assert!(single[0].starts_with("  Backend: "), "{single:?}");
 }
 
+/// The legacy singleton (`storage.backend`, a filesystem at `./data` by
+/// default) is a backend only while no named backend exists. A proxy with
+/// only named S3 backends has no filesystem root: the boot sweep must not
+/// walk `./data` and delete `.dg-tmp.*` files that the proxy does not own.
+#[test]
+fn the_singleton_is_a_backend_only_without_named_backends() {
+    let all_s3 = "storage:\n  backends:\n    - name: hetzner-fsn1\n      type: s3\n      endpoint: https://fsn1.example.com\n      region: eu-central\n    - name: aws-dr\n      type: s3\n      region: eu-west-1\n";
+    let cfg = Config::from_yaml_str(all_s3).expect("parse");
+    assert!(
+        cfg.filesystem_roots().is_empty(),
+        "{:?}",
+        cfg.filesystem_roots()
+    );
+    let names: Vec<&str> = cfg.effective_backends().iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, ["hetzner-fsn1", "aws-dr"]);
+    assert!(cfg.backend_by_name("default").is_none());
+
+    // Mixed: only the named filesystem backend is a root.
+    let mixed = "storage:\n  backends:\n    - name: aws-dr\n      type: s3\n      region: eu-west-1\n    - name: local-disk\n      type: filesystem\n      path: /var/lib/dgp\n";
+    let cfg = Config::from_yaml_str(mixed).expect("parse");
+    assert_eq!(
+        cfg.filesystem_roots(),
+        [std::path::PathBuf::from("/var/lib/dgp")]
+    );
+
+    // No named backend: the singleton is the one backend, named `default`.
+    let cfg = Config::default();
+    let names: Vec<&str> = cfg.effective_backends().iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, ["default"]);
+    assert_eq!(cfg.filesystem_roots().len(), 1);
+}
+
 /// The fatal auth messages show the config the operator can paste: YAML
 /// (the only config format), not the TOML `key = "value"` of old.
 #[test]

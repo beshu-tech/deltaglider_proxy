@@ -202,15 +202,10 @@ fn config_storages(cfg: &Config) -> BTreeSet<Storage> {
         .filter(|b| !b.starts_with(crate::maintenance::migrate::TRANSIENT_PREFIX))
         .filter_map(|b| cfg.bucket_storage(b))
         .collect();
-    let backends: Vec<String> = if cfg.backends.is_empty() {
-        vec!["default".to_string()]
-    } else {
-        cfg.backends.iter().map(|b| b.name.clone()).collect()
-    };
     out.extend(
-        backends
+        cfg.effective_backends()
             .into_iter()
-            .map(|b| (b, WITNESS_BACKEND_DEFAULT.to_string())),
+            .map(|(name, _)| (name.to_string(), WITNESS_BACKEND_DEFAULT.to_string())),
     );
     out
 }

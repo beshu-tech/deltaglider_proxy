@@ -2017,13 +2017,10 @@ impl Config {
     /// Definition of a backend by NAME. `"default"` means the singleton only
     /// while no named backends exist (the rule `check_fatal` enforces).
     pub fn backend_by_name(&self, name: &str) -> Option<&BackendConfig> {
-        if self.backends.is_empty() {
-            return (name == "default").then_some(&self.backend);
-        }
-        self.backends
-            .iter()
-            .find(|b| b.name == name)
-            .map(|b| &b.backend)
+        self.effective_backends()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, backend)| backend)
     }
 
     /// Encryption config of a backend by NAME (same `"default"` rule as
@@ -2261,12 +2258,30 @@ impl Config {
         }
     }
 
-    /// The root folder of every filesystem backend (the legacy singleton
-    /// and each named one), for the startup sweep of stale temp files.
+    /// THE backends this config runs, as `(name, definition)`. The legacy
+    /// singleton (`storage.backend`, named `default`) counts only while no
+    /// named backend exists: beside named backends it is an unused default
+    /// that no bucket routes to and the engine never builds. Every reader
+    /// of "which backends exist" goes through here (the boot sweep, the
+    /// banner, the lookup by name).
+    pub fn effective_backends(&self) -> Vec<(&str, &BackendConfig)> {
+        if self.backends.is_empty() {
+            vec![("default", &self.backend)]
+        } else {
+            self.backends
+                .iter()
+                .map(|b| (b.name.as_str(), &b.backend))
+                .collect()
+        }
+    }
+
+    /// The root folder of every filesystem backend that runs (see
+    /// [`Self::effective_backends`]), for the startup sweep of stale temp
+    /// files. A proxy with only named S3 backends has no root: the sweep
+    /// must not walk the unused singleton's `./data`.
     pub fn filesystem_roots(&self) -> Vec<std::path::PathBuf> {
         let mut roots = Vec::new();
-        let all = std::iter::once(&self.backend).chain(self.backends.iter().map(|b| &b.backend));
-        for backend in all {
+        for (_, backend) in self.effective_backends() {
             if let BackendConfig::Filesystem { path } = backend {
                 if !roots.contains(path) {
                     roots.push(path.clone());
@@ -2295,21 +2310,17 @@ impl Config {
             }
         }
         if self.backends.is_empty() {
-            return vec![format!("  Backend: {}", describe(&self.backend))];
+            let (_, only) = self.effective_backends()[0];
+            return vec![format!("  Backend: {}", describe(only))];
         }
         let default = self
             .default_backend
             .clone()
             .unwrap_or_else(|| self.backends[0].name.clone());
         let mut out = vec![format!("  Backends ({}):", self.backends.len())];
-        for nb in &self.backends {
-            let mark = if nb.name == default { " (default)" } else { "" };
-            out.push(format!(
-                "    - {}{}: {}",
-                nb.name,
-                mark,
-                describe(&nb.backend)
-            ));
+        for (name, backend) in self.effective_backends() {
+            let mark = if name == default { " (default)" } else { "" };
+            out.push(format!("    - {}{}: {}", name, mark, describe(backend)));
         }
         out
     }
