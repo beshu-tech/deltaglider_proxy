@@ -2485,12 +2485,15 @@ mod source_guards {
     /// (`retrieve_stream`, `retrieve_stream_range`, `open_object`).
     #[test]
     fn whole_object_reads_are_marked_small() {
-        // Sites that a later change removes: (file, offending lines, why).
-        // A stale entry fails too.
+        // Known unbounded sites, with the reason they stay: (file,
+        // offending lines, why). A stale entry fails too.
         const PENDING: &[(&str, usize, &str)] = &[(
             "src/deltaglider/engine/raw.rs",
             2,
-            "the replication fast path reads its delta and reference whole (follow-up)",
+            "`get_delta_raw` / `get_reference_raw` feed the delta fast path of \
+             `transfer.rs` (engine-routed copies such as replication), which copies the stored delta and \
+             reference verbatim from memory; moving that path to spool files is a \
+             follow-up in docs/plan/streaming-ingest.md",
         )];
         let needles = [
             ".retrieve(",

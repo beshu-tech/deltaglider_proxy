@@ -522,7 +522,7 @@ impl MultipartStore {
     }
 
     /// Keep an ingested part as a relay part, returns the quoted ETag (MD5
-    /// hex). `body` is the part's spool file ([`IngestedBody::Spooled`],
+    /// hex). `body` is the part's spool file (`IngestedBody::Spooled`,
     /// see [`Self::admit_part`]); it is renamed into the upload's relay dir
     /// with its reservation, so the part costs no copy and no second
     /// reservation. The rename runs before the `uploads` lock, the map

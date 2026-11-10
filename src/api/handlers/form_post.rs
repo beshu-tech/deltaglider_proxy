@@ -11,14 +11,14 @@
 //! Stages, in the order of the bytes on the wire: `form_post_bucket`
 //! picks the requests the router hands here; `read_form_head` streams the
 //! multipart body through `multer` up to the file part, holding only the
-//! small fields before it (each at most [`FORM_FIELD_MAX`]) and the file
+//! small fields before it (each at most `FORM_FIELD_MAX`) and the file
 //! part's headers; `authenticate_form_post` rebuilds the SigV4 signing key,
 //! verifies the form signature in constant time, decodes and validates the
 //! policy document (`content-length-range` only for its form), and
 //! authorises the user against IAM on the resolved key. Only then, after
 //! the client-write gates and the bucket-existence check,
 //! `ingest_form_file` reads the file once, into memory or a spool file,
-//! capped by [`form_file_cap`]; the fields after the file are read under
+//! capped by `form_file_cap`; the fields after the file are read under
 //! the same small limit and ignored, as on S3. `handle_form_post_upload`
 //! hands the body to `store_client_write` (quota, the object's write lock,
 //! the `If-Match`/`If-None-Match` preconditions, the store, the

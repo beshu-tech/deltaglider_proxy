@@ -71,7 +71,7 @@ The codec semaphore limits the number of concurrent xdelta3 encode and decode su
 Behavior differs by operation:
 
 - **GET (decode)**: waits up to 60 seconds for a codec slot, then returns `503 SlowDown`.
-- **PUT (encode)**: fails immediately with `503 SlowDown` when no slot is available, so queued uploads do not hold large request bodies in memory while waiting.
+- **PUT (encode)**: fails immediately with `503 SlowDown` when no slot is available, because a waiting upload would keep its body (in memory or in a spool file) for as long as it waits.
 
 ## HTTP concurrency limit
 

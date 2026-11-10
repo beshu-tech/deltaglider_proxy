@@ -480,12 +480,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         .await
     }
 
-    /// Multipart-aware variant of [`Self::store`]. The `multipart_etag` is
-    /// persisted alongside the object so HEAD/GET/LIST return it verbatim
-    /// (H1 correctness fix). All other semantics are identical.
-    #[instrument(skip(self, lock, data, user_metadata, multipart_etag))]
+    /// [`Self::store`] that persists `multipart_etag` with the object, so
+    /// HEAD/GET/LIST return it verbatim. Tests only: production writes
+    /// with a multipart ETag go through [`Self::store_known_prior`] or the
+    /// relayed-parts stores.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub async fn store_with_multipart_etag(
+    pub(crate) async fn store_with_multipart_etag(
         &self,
         lock: &ObjectWriteGuard,
         bucket: &str,
@@ -511,8 +512,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         .await
     }
 
-    /// [`Self::store`] (with `multipart_etag`: [`Self::store_with_multipart_etag`])
-    /// for a caller that read what the key holds already: `known_prior`
+    /// [`Self::store`], with an optional `multipart_etag`, for a caller that read what the key holds already: `known_prior`
     /// replaces the write's own prior read (`CounterPrior`), so the write
     /// sends no HEAD for it and no DELETE for a stored form that the read
     /// found absent. `None` reads it here. A plain prior only from a

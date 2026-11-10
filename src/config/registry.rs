@@ -574,7 +574,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_SPOOL_THRESHOLD_BYTES",
-        description: "Delta objects larger than this reconstruct (GET) or encode (PUT) through a spool file (default: 16 MiB, capped at max_object_size)",
+        description: "Upload bodies larger than this are read into a spool file, and delta objects larger than this reconstruct (GET) or encode (PUT) through a spool file (default: 16 MiB, capped at max_object_size)",
         example: "16777216",
         category: "Delta Engine",
     },

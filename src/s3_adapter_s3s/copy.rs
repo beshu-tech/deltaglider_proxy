@@ -338,7 +338,7 @@ pub(super) async fn upload_part_copy(
     let part_number = u32::try_from(input.part_number).unwrap_or(0);
     // A part is read as its range only, pinned to the generation the
     // conditionals judged: an SDK managed copy sends one UploadPartCopy per
-    // part, and each used to buffer the whole source (s3surface-10). A part
+    // part, so a whole-source read per part is N times the object. A part
     // with no range is the whole source as one range, so it reads the same
     // way. The part itself is bounded like an UploadPart.
     let len = usize::try_from(source_meta.file_size).unwrap_or(usize::MAX);

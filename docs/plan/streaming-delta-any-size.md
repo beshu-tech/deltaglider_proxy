@@ -4,6 +4,9 @@ Status: **PLAN** (not started). Funded multi-week project. Supersedes the
 passthrough-only shortcut (explicitly rejected — the team wants true delta
 DEDUP at any size, not just streamed storage).
 
+Follow-on: request bodies, multipart parts, form uploads and stored bodies
+outside the codec are covered by [streaming-ingest.md](streaming-ingest.md).
+
 Origin: an adversarial x-ray of the naive "stream xdelta3 stdout to the client"
 plan found **12 blockers** (every review domain returned at least one). This
 plan solves each. The naive approach is dead — see "Why not pipe-to-client".

@@ -563,7 +563,7 @@ where
 /// [`ingest`] of a body that is in memory already (tests that store a
 /// body through the ingest): one chunk, of exactly its length.
 #[cfg(test)]
-pub async fn ingest_bytes<B: StorageBackend>(
+pub(crate) async fn ingest_bytes<B: StorageBackend>(
     engine: &DeltaGliderEngine<B>,
     bucket: &str,
     data: Bytes,
