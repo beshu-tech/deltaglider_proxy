@@ -33,6 +33,9 @@ async function violations(page: Page, where: string): Promise<string[]> {
   // and stale listboxes that no user sees. Scan the settled page. rc-motion
   // sets its `*-enter`/`*-appear` class a frame after the click, so an empty
   // getAnimations() alone can pass before the fade starts: wait for both.
+  // An infinite animation (a spinner, a pulse) never ends and is ignored by
+  // name; a finite one that outlasts the timeout FAILS the spec: scanning an
+  // unsettled page would hide or invent violations.
   await page
     .waitForFunction(
       () => {
@@ -40,12 +43,17 @@ async function violations(page: Page, where: string): Promise<string[]> {
         const moving = [...document.querySelectorAll('[class*="ant-"]')].some((el) =>
           motion.test(typeof el.className === 'string' ? el.className : ''),
         );
-        return !moving && document.getAnimations().every((a) => a.playState !== 'running');
+        const finiteRunning = document
+          .getAnimations()
+          .some((a) => a.playState === 'running' && a.effect?.getComputedTiming().iterations !== Infinity);
+        return !moving && !finiteRunning;
       },
       null,
-      { timeout: 5_000, polling: 'raf' },
+      { timeout: 10_000, polling: 'raf' },
     )
-    .catch(() => {});
+    .catch((e: unknown) => {
+      throw new Error(`${where}: the page did not settle within 10 s (a finite animation or an ant-* motion class is still running): ${String(e)}`);
+    });
   const result = await new AxeBuilder({ page })
     .withTags(TAGS)
     // Monaco draws its own editor surface; its internals are not ours to fix.

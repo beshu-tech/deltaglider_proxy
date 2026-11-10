@@ -138,6 +138,9 @@ jobs:
       # Must-fail fixtures: each shell guard refuses a known-bad input.
       - name: Shell-guard self-tests
         run: ./scripts/test-guards.sh
+      # A Playwright spec that skips on a variable nobody sets never runs.
+      - name: Every e2e spec can run
+        run: ./scripts/check-e2e-specs-run.sh
 
   verify-spdx-headers:
     name: SPDX license headers

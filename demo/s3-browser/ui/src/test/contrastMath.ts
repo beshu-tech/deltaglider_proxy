@@ -29,7 +29,7 @@ export function parseColor(c: string): Rgba {
   return [ch(0), ch(2), ch(4), full.length === 8 ? ch(6) / 255 : 1];
 }
 
-export function luminance(color: string): number {
+function luminance(color: string): number {
   const [r, g, b] = parseColor(color)
     .slice(0, 3)
     .map((v) => v / 255)

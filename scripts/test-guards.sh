@@ -5,7 +5,7 @@
 # known-good input must exit zero.
 #
 # Guards under test: check-integration-tests-in-ci.sh, check-workflows.sh,
-# check-no-committed-secrets.sh.
+# check-no-committed-secrets.sh, check-e2e-specs-run.sh.
 #
 # GUARD_SCRIPTS_DIR (default: scripts/ next to this file) names the directory
 # that holds the guards: point it at an older copy to see a fixture go red.
@@ -27,7 +27,8 @@ new_repo() {
   local d="$T/$1"
   mkdir -p "$d/scripts" "$d/tests" "$d/.github/workflows"
   cp "$GUARDS"/check-integration-tests-in-ci.sh "$GUARDS"/check-workflows.sh \
-     "$GUARDS"/check-no-committed-secrets.sh "$d/scripts/"
+     "$GUARDS"/check-no-committed-secrets.sh "$GUARDS"/check-e2e-specs-run.sh "$d/scripts/" 2>/dev/null || true
+  # (check-e2e-specs-run.sh may be missing when GUARD_SCRIPTS_DIR names an old copy.)
   git -C "$d" init -q
   git -C "$d" config user.email t@example.invalid
   git -C "$d" config user.name t
@@ -218,6 +219,21 @@ secret_case ".env file"           .env      "X=1"                               
 secret_case "nested secrets.env"  iac-prod/secrets.env "X=1"                                  "forbidden file"
 secret_case "SQLite DB"           data/state.db "x"                                           "forbidden file"
 secret_case "backup zip"          backup.zip "x"                                              "forbidden file"
+
+# ── check-e2e-specs-run.sh ───────────────────────────────────────────────
+e2e_repo() { # name, spec path, spec body
+  local d; d="$(new_repo "$1")"
+  mkdir -p "$d/demo/s3-browser/ui/e2e/$(dirname "$2")"
+  printf '%s\n' "$3" > "$d/demo/s3-browser/ui/e2e/$2"
+  printf 'export QA_REGRESSION=1\n' > "$d/scripts/run.sh"
+  echo "$d"
+}
+d="$(e2e_repo e2e-good qa-x.spec.ts "test.skip(!process.env.QA_REGRESSION, 'qa');")"
+expect pass "e2e specs: skip variable is set by a script" "$d" check-e2e-specs-run.sh
+d="$(e2e_repo e2e-orphan review/r.spec.ts "test.skip(!process.env.REVIEW, 'Review reproductions: run with REVIEW=1');")"
+expect fail "e2e specs: skip variable that nothing sets (the REVIEW=1 spec)" "$d" check-e2e-specs-run.sh "never runs"
+d="$(e2e_repo e2e-orphan2 explore/e.spec.ts "test.skip(process.env.EXPLORE !== '1', 'x');")"
+expect fail "e2e specs: skip on a variable that nothing sets (EXPLORE)" "$d" check-e2e-specs-run.sh "never runs"
 
 if ((fail != 0)); then
   echo "FAIL: a shell guard accepts input it claims to refuse (see above)." >&2
