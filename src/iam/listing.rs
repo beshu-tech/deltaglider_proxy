@@ -206,13 +206,30 @@ fn list_targets(prefix: &str, delimiter: Option<&str>, visible: &[String]) -> Ve
     targets
 }
 
+/// What the proof of one folded name found.
+#[derive(Debug, PartialEq, Eq)]
+enum Proof {
+    /// A key that the user may see lies under the name.
+    Visible,
+    /// Every key under the name is hidden: the name is not shown.
+    NotVisible,
+    /// The budget ran out before the end of the keys under the name. The
+    /// caller must not decide the name from this.
+    Undecided,
+}
+
 /// Does a key that `user` may see lie under `folded` (a name a delimiter
 /// folded keys into)? Reads the keys under it, lite, within the request's
-/// scan budget; a name whose proof the budget cannot finish is not shown
-/// (fail closed). THE rule for a folded name that a Deny may touch
+/// scan budget. THE rule for a folded name that a Deny may touch
 /// ([`deny_may_hide_keys_under`]): the name of a protected key is shown only
 /// when a visible key lies under it too (S3 shows a folded name only for
-/// keys the caller may list).
+/// keys the caller may list). A proof that the budget cannot finish is
+/// [`Proof::Undecided`]: the scan then stops before the name, so a later
+/// page decides it.
+///
+/// The engine refuses a prefix with a `..` segment, and a folded name can
+/// end in one (`a/..` of `a/..x/k` at delimiter `.`). The proof then reads
+/// the parent folder and keeps the keys that start with the name.
 async fn visible_key_under<L: Lister>(
     lister: &L,
     bucket: &str,
@@ -220,32 +237,43 @@ async fn visible_key_under<L: Lister>(
     user: &crate::iam::AuthenticatedUser,
     context: &iam_rs::Context,
     budget: &mut usize,
-) -> Result<bool, EngineError> {
+) -> Result<Proof, EngineError> {
+    let listed = if crate::types::ObjectKey::validate_prefix(folded).is_ok() {
+        folded
+    } else {
+        &folded[..folded.rfind('/').map_or(0, |i| i + 1)]
+    };
+    if crate::types::ObjectKey::validate_prefix(listed).is_err() {
+        return Ok(Proof::NotVisible);
+    }
     let mut cursor: Option<String> = None;
     while *budget > 0 {
         let (page, requests) = lister
             .list_lite(
                 bucket,
-                folded,
+                listed,
                 None,
                 FILTERED_SCAN_PAGE_KEYS,
                 cursor.as_deref(),
             )
             .await?;
         *budget = budget.saturating_sub(scan_cost(requests));
-        if page
-            .objects
-            .iter()
-            .any(|(key, _)| user_can_see_listed_key(user, bucket, key, context))
-        {
-            return Ok(true);
+        for (key, _) in &page.objects {
+            if key.starts_with(folded) {
+                if user_can_see_listed_key(user, bucket, key, context) {
+                    return Ok(Proof::Visible);
+                }
+            } else if key.as_str() > folded {
+                // Keys come in order: no key under the name follows.
+                return Ok(Proof::NotVisible);
+            }
         }
         match page.next_continuation_token {
             Some(next) if page.is_truncated => cursor = Some(next),
-            _ => return Ok(false),
+            _ => return Ok(Proof::NotVisible),
         }
     }
-    Ok(false)
+    Ok(Proof::Undecided)
 }
 
 /// One LIST page as the caller may see it. THE listing path for V1 and V2.
@@ -548,11 +576,28 @@ async fn scan_visible<L: Lister>(
             } => {
                 if deny_may_hide_keys_under(user, bucket, &common_prefix) {
                     // A Deny may protect keys under the name: one probe key
-                    // could be a hidden one. Look for a visible key.
-                    if visible_key_under(lister, bucket, &common_prefix, user, context, budget)
-                        .await?
-                    {
-                        scan.prefixes.insert(common_prefix.clone());
+                    // could be a hidden one. Look for a visible key under
+                    // each visible prefix: every visible key lies under one.
+                    let mut proof = Proof::NotVisible;
+                    for probe in &probes {
+                        proof =
+                            visible_key_under(lister, bucket, probe, user, context, budget).await?;
+                        if proof != Proof::NotVisible {
+                            break;
+                        }
+                    }
+                    match proof {
+                        Proof::Visible => {
+                            scan.prefixes.insert(common_prefix.clone());
+                        }
+                        // Stop before the name: the next page decides it.
+                        // With no progress this request, nothing can be
+                        // gained by stopping: fail closed, so the walk ends.
+                        Proof::Undecided if moved(&position) => {
+                            scan.resume = position;
+                            return Ok(scan);
+                        }
+                        Proof::Undecided | Proof::NotVisible => {}
                     }
                 } else {
                     for probe in probes {
@@ -596,20 +641,56 @@ async fn scan_visible<L: Lister>(
                     .chain(page.common_prefixes.last().cloned())
                     .max();
                 scan.facts_missing.extend(page.facts_missing_keys);
+                // The names of the page, in key order, each decided in turn.
+                let mut folded_names = page.common_prefixes;
+                folded_names.sort();
+                let mut cut: Option<(String, String)> = None;
+                for folded in &folded_names {
+                    if !user_can_see_common_prefix(user, bucket, folded, context) {
+                        continue;
+                    }
+                    if !deny_may_hide_keys_under(user, bucket, folded) {
+                        scan.prefixes.insert(folded.clone());
+                        continue;
+                    }
+                    match visible_key_under(lister, bucket, folded, user, context, budget).await? {
+                        Proof::Visible => {
+                            scan.prefixes.insert(folded.clone());
+                        }
+                        Proof::NotVisible => {}
+                        Proof::Undecided => {
+                            // The last entry before the name: where the next
+                            // page starts, so that it decides the name.
+                            let before = page
+                                .objects
+                                .iter()
+                                .map(|(k, _)| k)
+                                .chain(folded_names.iter())
+                                .filter(|k| *k < folded)
+                                .max()
+                                .cloned()
+                                .or_else(|| position.clone());
+                            if before.as_deref() != cursor {
+                                cut = Some((folded.clone(), before.unwrap_or_default()));
+                                break;
+                            }
+                            // Nothing before the name was read this request:
+                            // a page that starts here would stop here again.
+                            // The name holds more hidden keys than the whole
+                            // budget reads: fail closed, so the walk ends.
+                        }
+                    }
+                }
+                let below = cut.as_ref().map(|(name, _)| name.as_str());
                 scan.objects.extend(
                     page.objects
                         .into_iter()
+                        .filter(|(key, _)| below.is_none_or(|name| key.as_str() < name))
                         .filter(|(key, _)| user_can_see_listed_key(user, bucket, key, context)),
                 );
-                for folded in page.common_prefixes {
-                    if !user_can_see_common_prefix(user, bucket, &folded, context) {
-                        continue;
-                    }
-                    if !deny_may_hide_keys_under(user, bucket, &folded)
-                        || visible_key_under(lister, bucket, &folded, user, context, budget).await?
-                    {
-                        scan.prefixes.insert(folded);
-                    }
+                if let Some((_, before)) = cut {
+                    scan.resume = Some(before);
+                    return Ok(scan);
                 }
                 if more {
                     position = page.next_continuation_token;
@@ -1036,6 +1117,17 @@ mod tests {
         max_keys: u32,
         scope: &ListScope,
     ) -> Vec<String> {
+        walk_with_budget(engine, prefix, delimiter, max_keys, scope, TEST_BUDGET).await
+    }
+
+    async fn walk_with_budget(
+        engine: &crate::deltaglider::DynEngine,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        scope: &ListScope,
+        budget: usize,
+    ) -> Vec<String> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         for _ in 0..100 {
@@ -1048,7 +1140,7 @@ mod tests {
                 token.as_deref(),
                 false,
                 Some(scope),
-                TEST_BUDGET,
+                budget,
             )
             .await
             .unwrap()
@@ -1707,6 +1799,73 @@ mod tests {
         }
     }
 
+    /// A Deny with a leading wildcard may hide keys under every folded name,
+    /// so each name costs a proof. A proof that the budget cannot pay must
+    /// stop the page before the name, never drop the name: the next page
+    /// decides it, and a client that follows the tokens lists every folder.
+    #[tokio::test]
+    async fn a_wildcard_deny_never_loses_a_folder_past_the_budget() {
+        let keys: Vec<String> = (0..40).map(|i| format!("f{i:02}/x")).collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (_dir, engine) = fs_engine(&refs).await;
+        let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/*.pem"])]);
+        let want: Vec<String> = (0..40).map(|i| format!("f{i:02}/")).collect();
+        for max_keys in [1, 7, 1000] {
+            assert_eq!(
+                walk(&engine, "", Some("/"), max_keys, &scope).await,
+                want,
+                "max_keys={max_keys}"
+            );
+        }
+    }
+
+    /// The roll-up proof reads the user's visible prefixes, not the whole
+    /// folded name: hidden keys outside the grant spend no budget.
+    #[tokio::test]
+    async fn a_rollup_proof_reads_only_the_visible_prefix() {
+        let mut keys: Vec<String> = (0..2500).map(|i| format!("a/hid/{i:05}")).collect();
+        keys.push("a/pub/y".into());
+        let lister = counting(keys);
+        let scope = scoped(vec![
+            rule("Allow", &["b/a/pub/*"]),
+            rule("Deny", &["b/a/pub/x/*"]),
+        ]);
+        let got = list_page_for_caller(
+            &lister,
+            "b",
+            "",
+            Some("/"),
+            10,
+            None,
+            false,
+            Some(&scope),
+            2,
+        )
+        .await
+        .unwrap()
+        .page;
+        assert_eq!(got.common_prefixes, vec!["a/".to_string()]);
+        assert!(!got.is_truncated);
+    }
+
+    /// A folded name that ends in a `..` segment (`a/..` of `a/..x/k` at
+    /// delimiter `.`) is not a prefix the engine accepts. It is a name like
+    /// any other: shown when a visible key lies under it, never an error.
+    #[tokio::test]
+    async fn a_folded_name_with_a_dot_dot_segment_is_decided_like_any_name() {
+        let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/*/k"])]);
+        let (_dir, engine) = fs_engine(&["a/..x/k", "a/.y"]).await;
+        assert_eq!(
+            walk(&engine, "a/.", Some("."), 1000, &scope).await,
+            ["a/.y"]
+        );
+        let (_dir, engine) = fs_engine(&["a/..x/k", "a/..x/j", "a/.y"]).await;
+        assert_eq!(
+            walk(&engine, "a/.", Some("."), 1000, &scope).await,
+            ["a/..", "a/.y"]
+        );
+    }
+
     mod differential {
         use super::*;
         use proptest::prelude::*;
@@ -1752,6 +1911,8 @@ mod tests {
                 delimiter in proptest::sample::select(&DELIMS[..]),
                 prefix in proptest::sample::select(&PREFIXES[..]),
                 max_keys in prop_oneof![Just(2u32), Just(1000u32)],
+                // 4 runs out inside most listings of these 14 keys; 16 never.
+                budget in prop_oneof![Just(4usize), Just(TEST_BUDGET)],
             ) {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 rt.block_on(async {
@@ -1759,12 +1920,12 @@ mod tests {
                     let mut perms: Vec<_> = allows.iter().map(|a| rule("Allow", &[a])).collect();
                     perms.extend(denies.iter().map(|d| rule("Deny", &[d])));
                     let scope = scoped(perms);
-                    let got = walk(&engine, prefix, Some(delimiter), max_keys, &scope).await;
+                    let got = walk_with_budget(&engine, prefix, Some(delimiter), max_keys, &scope, budget).await;
                     let want = oracle(&KEYS, &scope, prefix, Some(delimiter));
                     prop_assert_eq!(
                         got, want,
-                        "allows={:?} denies={:?} delimiter={:?} prefix={:?}",
-                        allows, denies, delimiter, prefix
+                        "allows={:?} denies={:?} delimiter={:?} prefix={:?} budget={}",
+                        allows, denies, delimiter, prefix, budget
                     );
                     Ok(())
                 })?;
