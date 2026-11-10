@@ -16,6 +16,8 @@ People often confuse these three mechanisms:
 
 Take a Full Backup in every case. The other two mechanisms add to it and do not replace it.
 
+The jobs database runs in write-ahead-log mode, so next to `deltaglider_jobs.db` the proxy keeps the files `deltaglider_jobs.db-wal` and `deltaglider_jobs.db-shm` while it runs. The newest commits can exist only in the `-wal` file. A file copy of `deltaglider_jobs.db` alone can therefore miss them. Copy the three files together, or take the snapshot of the whole volume at one instant, or stop the proxy before you copy. The config database does not use this mode, and one file is enough for it.
+
 ## Take a Full Backup
 
 A backup is not configuration, so there is no YAML for this task. You take it in the admin UI or with the admin API.

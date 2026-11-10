@@ -979,7 +979,9 @@ pub struct EventDeliveryConfig {
     #[serde(default = "default_event_delivery_tick")]
     pub tick_interval: String,
 
-    /// Max rows to claim per tick. Clamped to `[1, 500]` by the dispatcher.
+    /// Max rows to claim per batch. Clamped to `[1, 500]` by the dispatcher.
+    /// A tick claims batches until one is not full, one mostly fails, or one
+    /// `tick_interval` has passed.
     #[serde(default = "default_event_delivery_batch_size")]
     pub batch_size: u32,
 
@@ -1013,7 +1015,8 @@ pub struct EventDeliveryConfig {
     #[serde(default = "default_event_delivery_delivered_max_rows")]
     pub delivered_max_rows: u32,
 
-    /// Max delivered rows pruned per tick.
+    /// Max rows one prune round deletes (a tick repeats a round until it
+    /// deletes fewer).
     #[serde(default = "default_event_delivery_prune_batch")]
     pub prune_batch: u32,
 
