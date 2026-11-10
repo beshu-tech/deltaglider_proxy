@@ -718,7 +718,7 @@ mod readiness_tests {
         ("src/api/s3_router.rs", "a request to it got 503 SlowDown", 1, Reach::PerBucket, "log line: one backend holds its share of slots"),
         ("src/api/s3_router.rs", "crate::api::S3Error::SlowDown(", 1, Reach::PerBucket, "one backend holds its share of the request slots"),
         ("src/api/auth.rs", "S3Error::SlowDown(format!(", 1, Reach::PerRequest, "auth lockout of one (client IP, access key)"),
-        ("src/api/auth.rs", "crate::api::S3Error::ServiceUnavailable(", 1, Reach::Global("config_db_key_mismatch"), "no key opens the config DB: every request refused"),
+        ("src/api/auth.rs", "crate::api::S3Error::ServiceUnavailable(", 1, Reach::Global("config_db_key_mismatch"), "no key opens the config database: every request refused"),
         ("src/api/admin/external_auth.rs", "StatusCode::SERVICE_UNAVAILABLE", 1, Reach::PerRequest, "one provider is not discovered yet"),
         ("src/api/admin/objects.rs", "StatusCode::SERVICE_UNAVAILABLE", 1, Reach::PerRequest, "a ZIP request met an overloaded backend"),
         ("src/api/admin/error.rs", "StatusCode::SERVICE_UNAVAILABLE => \"unavailable\"", 1, Reach::Plumbing, "the error code of a 503"),
