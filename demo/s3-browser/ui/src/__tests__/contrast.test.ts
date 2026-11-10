@@ -5,17 +5,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { theme, type ThemeConfig } from 'antd';
 import { test } from 'vitest';
+import { flatten, meetsAA, ratio } from '../test/contrastMath';
 import { ALL_THEMES } from '../test/themes';
-
-function luminance(hex: string): number {
-  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
-    .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-}
-function ratio(a: string, b: string): number {
-  const [x, y] = [luminance(a), luminance(b)].sort((p, q) => q - p);
-  return (x + 0.05) / (y + 0.05);
-}
 
 for (const { name, colors: c, antd: t } of ALL_THEMES) {
   test(`${name}: text tokens reach 4.5:1 on every surface`, () => {
@@ -28,7 +19,7 @@ for (const { name, colors: c, antd: t } of ALL_THEMES) {
     for (const [tn, tc] of Object.entries(texts)) {
       for (const [sn, sc] of Object.entries(surfaces)) {
         const r = ratio(tc, sc);
-        if (r < 4.5) fails.push(`${tn} ${tc} on ${sn} ${sc}: ${r.toFixed(2)}`);
+        if (!meetsAA(r)) fails.push(`${tn} ${tc} on ${sn} ${sc}: ${r.toFixed(2)}`);
       }
     }
     assert.deepEqual(fails, []);
@@ -36,7 +27,7 @@ for (const { name, colors: c, antd: t } of ALL_THEMES) {
 
   test(`${name}: primary button text reaches 4.5:1`, () => {
     const onPrimary = 'colorTextLightSolid' in t.token ? (t.token as { colorTextLightSolid: string }).colorTextLightSolid : '#ffffff';
-    assert.ok(ratio(onPrimary, t.token.colorPrimary) >= 4.5, `${onPrimary} on ${t.token.colorPrimary}`);
+    assert.ok(meetsAA(ratio(onPrimary, t.token.colorPrimary)), `${onPrimary} on ${t.token.colorPrimary}`);
   });
 }
 
@@ -47,7 +38,7 @@ for (const { name, colors: c, antd: t } of ALL_THEMES) {
     assert.ok(link, 'colorLink is set (AntD default is blue #1677ff)');
     assert.equal(link, c.ACCENT_BLUE);
     for (const surface of [c.BG_BASE, c.BG_CARD, c.BG_ELEVATED]) {
-      assert.ok(ratio(link, surface) >= 4.5, `${link} on ${surface}: ${ratio(link, surface).toFixed(2)}`);
+      assert.ok(meetsAA(ratio(link, surface)), `${link} on ${surface}: ${ratio(link, surface).toFixed(2)}`);
     }
   });
 }
@@ -71,12 +62,12 @@ for (const { name, mode, antd: t } of ALL_THEMES) {
     for (const p of PRESETS) {
       const text = overrides[p] ?? tok[`${p}7`];
       const r = ratio(text, tok[`${p}1`]);
-      if (r < 4.5) fails.push(`${p} ${text} on ${tok[`${p}1`]}: ${r.toFixed(2)}`);
+      if (!meetsAA(r)) fails.push(`${p} ${text} on ${tok[`${p}1`]}: ${r.toFixed(2)}`);
     }
     for (const [cls, key] of Object.entries(STATUSES)) {
       const text = overrides[cls] ?? tok[`color${key}`];
       const r = ratio(text, tok[`color${key}Bg`]);
-      if (r < 4.5) fails.push(`${cls} ${text} on ${tok[`color${key}Bg`]}: ${r.toFixed(2)}`);
+      if (!meetsAA(r)) fails.push(`${cls} ${text} on ${tok[`color${key}Bg`]}: ${r.toFixed(2)}`);
     }
     assert.deepEqual(fails, []);
   });
@@ -108,7 +99,7 @@ for (const { name, colors: c } of ALL_THEMES) {
     })) {
       for (const [sn, card] of Object.entries({ card: c.BG_ELEVATED, publicCard })) {
         const r = ratio(tone, over(tone, card, alpha));
-        if (r < 4.5) fails.push(`${tn} on its tint on ${sn}: ${r.toFixed(2)}`);
+        if (!meetsAA(r)) fails.push(`${tn} on its tint on ${sn}: ${r.toFixed(2)}`);
       }
     }
     assert.deepEqual(fails, []);
@@ -125,7 +116,7 @@ for (const { name, colors: c } of ALL_THEMES) {
     const check = (ink: string, inkName: string, fills: Record<string, string>) => {
       for (const [fn, fill] of Object.entries(fills)) {
         const r = ratio(ink, fill);
-        if (r < 4.5) fails.push(`${inkName} on ${fn} ${fill}: ${r.toFixed(2)}`);
+        if (!meetsAA(r)) fails.push(`${inkName} on ${fn} ${fill}: ${r.toFixed(2)}`);
       }
     };
     check(c.ON_ACCENT, 'ON_ACCENT', {
@@ -143,23 +134,6 @@ for (const { name, colors: c } of ALL_THEMES) {
 // controlItemBgHover, flattened onto the popup (colorBgElevated). The dark
 // algorithm derives the selected fill from the primary: in Instrument dark it
 // read 4.26:1 (axe, /admin/system Section select).
-function parseColor(c: string): [number, number, number, number] {
-  const m = /^rgba?\(([^)]+)\)$/.exec(c);
-  if (m) {
-    const [r, g, b, a = '1'] = m[1].split(',').map((s) => s.trim());
-    return [Number(r), Number(g), Number(b), Number(a)];
-  }
-  const h = c.replace('#', '');
-  const full = h.length === 3 || h.length === 4 ? [...h].map((x) => x + x).join('') : h;
-  const ch = (i: number) => parseInt(full.slice(i, i + 2), 16);
-  return [ch(0), ch(2), ch(4), full.length === 8 ? ch(6) / 255 : 1];
-}
-function flatten(fg: string, bg: string): string {
-  const [r, g, b, a] = parseColor(fg);
-  const [R, G, B] = parseColor(bg);
-  return '#' + [[r, R], [g, G], [b, B]].map(([x, y]) => Math.round(x * a + y * (1 - a)).toString(16).padStart(2, '0')).join('');
-}
-
 for (const { name, antd: t } of ALL_THEMES) {
   test(`${name}: a selected or hovered list item reaches 4.5:1`, () => {
     const tok = theme.getDesignToken(t as ThemeConfig) as unknown as Record<string, string>;
@@ -168,7 +142,7 @@ for (const { name, antd: t } of ALL_THEMES) {
       const fill = flatten(tok[key], tok.colorBgElevated);
       const ink = flatten(tok.colorText, fill);
       const r = ratio(ink, fill);
-      if (r < 4.5) fails.push(`${key}: ${ink} on ${fill}: ${r.toFixed(2)}`);
+      if (!meetsAA(r)) fails.push(`${key}: ${ink} on ${fill}: ${r.toFixed(2)}`);
     }
     assert.deepEqual(fails, []);
   });
@@ -184,7 +158,7 @@ for (const { name, antd: t } of ALL_THEMES) {
     for (const key of ['colorPrimary', 'colorPrimaryHover', 'colorPrimaryActive']) {
       const fill = flatten(tok[key], tok.colorBgContainer);
       const r = ratio(flatten(tok.colorTextLightSolid, fill), fill);
-      if (r < 4.5) fails.push(`${key}: ${tok.colorTextLightSolid} on ${fill}: ${r.toFixed(2)}`);
+      if (!meetsAA(r)) fails.push(`${key}: ${tok.colorTextLightSolid} on ${fill}: ${r.toFixed(2)}`);
     }
     assert.deepEqual(fails, []);
   });
