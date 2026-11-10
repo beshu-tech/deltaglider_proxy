@@ -12,6 +12,7 @@ import { type DeleteJobOutcome, type DeletePlanSummary, bulkDeleteConfirm, delet
 import { type BulkTransferOutcome, bulkTransferOutcomeMessage } from '../bulkTransfer';
 import { confirmDeletePlan } from './confirmDelete';
 import { pluralize } from '../utils';
+import type { RowKey } from '../rowKey';
 import { useIsNarrow } from '../useIsNarrow';
 import { cssVar } from '../themeVars';
 import { Z } from '../theme';
@@ -36,7 +37,7 @@ interface Props {
   /** The folder being browsed: the copy/move destination starts there. */
   currentPrefix?: string;
   /** The raw selection keys: the destination picker refuses to copy them onto themselves. */
-  selectionKeys?: Iterable<string>;
+  selectionKeys?: Iterable<RowKey>;
   /** The running bulk delete, copy or move (null/absent = none): the bar shows it instead of the actions. */
   progress?: BulkProgress | null;
   /** Stops the running bulk action after the batch in flight. */

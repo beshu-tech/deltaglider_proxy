@@ -4,6 +4,7 @@ import { describe, expect, test } from 'vitest';
 import type { IamPermission, WhoamiResponse } from '../adminApi';
 import { deriveBrowserCapabilities, type BrowserCapabilityInput } from '../browserCapabilities';
 import { deriveSessionCapabilities } from '../sessionCapabilities';
+import { folderRowKey, objectRowKey } from '../rowKey';
 
 const ADMIN_SESSION = deriveSessionCapabilities({ valid: true, admin_gui: true });
 const FILES_SESSION = deriveSessionCapabilities({ valid: true, admin_gui: false });
@@ -94,7 +95,7 @@ describe('canReadFolder (refresh)', () => {
 });
 
 describe('bulk actions on the selection', () => {
-  const SELECTION = ['a.zip', 'folder:archive/'];
+  const SELECTION = [objectRowKey('a.zip'), folderRowKey('archive/')];
 
   test.each([
     // identity, session, prefix, busy, delete, copy, move, zip
@@ -114,8 +115,8 @@ describe('bulk actions on the selection', () => {
 
   test('a folder key is checked as its prefix', () => {
     const archiveOnly = iam([{ actions: ['read'], resources: ['releases/archive/*'] }]);
-    expect(deriveBrowserCapabilities(input({ identity: archiveOnly, selectedKeys: ['folder:archive/'] })).bulk.zip).toBe(true);
-    expect(deriveBrowserCapabilities(input({ identity: archiveOnly, selectedKeys: ['folder:builds/'] })).bulk.zip).toBe(false);
+    expect(deriveBrowserCapabilities(input({ identity: archiveOnly, selectedKeys: [folderRowKey('archive/')] })).bulk.zip).toBe(true);
+    expect(deriveBrowserCapabilities(input({ identity: archiveOnly, selectedKeys: [folderRowKey('builds/')] })).bulk.zip).toBe(false);
   });
 
   test('no bucket: no bulk action', () => {

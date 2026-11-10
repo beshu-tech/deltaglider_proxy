@@ -12,6 +12,7 @@ import { renderHookWithQuery } from '../test/render';
 vi.mock('../s3client', () => ({ getBucket: () => 'releases' }));
 
 import { useBulkActions } from '../browser/useBulkActions';
+import { objectRowKey } from '../rowKey';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -19,7 +20,7 @@ test('a copy reloads the totals of the source and the destination bucket', async
   const http = mockFetch();
   http.on('POST', '/_/api/admin/objects/copy', json({ succeeded: 1, failed: 0, failures: [], deleted: 0 }));
   const { result, client } = renderHookWithQuery(() =>
-    useBulkActions({ selectedKeys: new Set(['builds/app.zip']), clearSelection: () => {}, refresh: () => {}, mutate: () => {} }),
+    useBulkActions({ selectedKeys: new Set([objectRowKey('builds/app.zip')]), clearSelection: () => {}, refresh: () => {}, mutate: () => {} }),
   );
   const invalidate = vi.spyOn(client, 'invalidateQueries');
   await act(async () => {

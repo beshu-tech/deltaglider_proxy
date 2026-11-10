@@ -1,3 +1,5 @@
+import { type RowKey, parseRowKey } from '../rowKey';
+
 /**
  * Pure destination-prefix normalization for DestinationPickerModal.
  *
@@ -22,15 +24,13 @@ export function normalizeDestPrefix(input: string): string {
 
 /**
  * The folder an item lands under when copied: a file keeps its basename, a
- * selected folder (`folder:<prefix>/`) keeps its own name, so both resolve
- * relative to their PARENT folder (see `expandSelection`).
+ * selected folder keeps its own name, so both resolve relative to their
+ * PARENT folder (see `expandSelection`).
  */
-function parentFolder(selectionKey: string): string {
-  if (selectionKey.startsWith('folder:')) {
-    const pfx = selectionKey.slice('folder:'.length);
-    return pfx.slice(0, pfx.slice(0, -1).lastIndexOf('/') + 1);
-  }
-  return selectionKey.slice(0, selectionKey.lastIndexOf('/') + 1);
+function parentFolder(rowKey: RowKey): string {
+  const id = parseRowKey(rowKey);
+  if (id.kind === 'folder') return id.prefix.slice(0, id.prefix.slice(0, -1).lastIndexOf('/') + 1);
+  return id.key.slice(0, id.key.lastIndexOf('/') + 1);
 }
 
 /**
@@ -40,7 +40,7 @@ function parentFolder(selectionKey: string): string {
  */
 export function destinationIsSource(
   sourceBucket: string,
-  selectionKeys: Iterable<string>,
+  selectionKeys: Iterable<RowKey>,
   destBucket: string,
   destPrefix: string,
 ): boolean {
@@ -76,7 +76,7 @@ export function keyPathError(path: string): string | null {
  * state, "already in this folder", with the button disabled). Then its
  * parent folder; at the bucket root, an empty path for the user to fill in.
  */
-export function initialDestPrefix(sourceBucket: string, selectionKeys: Iterable<string>, currentPrefix: string): string {
+export function initialDestPrefix(sourceBucket: string, selectionKeys: Iterable<RowKey>, currentPrefix: string): string {
   const keys = [...selectionKeys];
   const current = normalizeDestPrefix(currentPrefix);
   if (!destinationIsSource(sourceBucket, keys, sourceBucket, current)) return current;

@@ -6,13 +6,14 @@ import { getBucket } from '../s3client';
 import { bulkCopyObjects, startDeleteJob, bulkMoveObjects, bulkZipDownloadUrl, listAllUnderPrefix } from '../adminApi';
 import { isSessionExpired } from '../errorHandling';
 import { type ExpandedItem, MAX_BULK_OBJECTS, expandSelection } from '../bulkSelection';
+import { type RowKey, splitRowKeys } from '../rowKey';
 import { type BulkAction, type BulkProgress, BulkActionFailed } from '../bulkBatches';
 import type { DeleteJobOutcome, DeletePlanSummary } from '../bulkDelete';
 import { type BulkTransferOutcome, transferInBatches, transferPlanError } from '../bulkTransfer';
 import { downloadZip as saveZip, zipPreflightError } from '../zipDownload';
 
 interface BulkOptions {
-  selectedKeys: Set<string>;
+  selectedKeys: Set<RowKey>;
   clearSelection: () => void;
   /** Reload the listing only (after each batch of a move). */
   refresh: () => void;
@@ -143,11 +144,7 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
     (confirm?: (plan: DeletePlanSummary) => Promise<boolean>): Promise<DeleteJobOutcome> => {
       // Snapshot the bucket: a bucket switch mid-run must not move the delete.
       const bucket = getBucket();
-      const selection = [...selectedKeys];
-      const prefixes = [
-        ...new Set(selection.filter((k) => k.startsWith('folder:') && k !== 'folder:').map((k) => k.slice('folder:'.length))),
-      ];
-      const keys = selection.filter((k) => !k.startsWith('folder:'));
+      const { prefixes, keys } = splitRowKeys(selectedKeys);
       return runBulk<DeleteJobOutcome>('delete', {
         expand: (opts) => expandSelected(bucket, opts),
         confirm:

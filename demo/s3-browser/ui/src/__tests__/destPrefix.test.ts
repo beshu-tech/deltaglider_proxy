@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
 import { normalizeDestPrefix, destinationIsSource, keyPathError, initialDestPrefix } from '../components/destPrefix';
+import { folderRowKey, objectRowKey } from '../rowKey';
 
 test('normalizeDestPrefix: truth table (from the bug report)', () => {
   assert.equal(normalizeDestPrefix('foo//bar'), 'foo/bar'); // THE regression: internal // collapsed
@@ -58,20 +59,20 @@ test('normalizeDestPrefix: fuzz — any slash arrangement is well-formed', () =>
 
 test('destinationIsSource: the default destination (current folder)', () => {
   // Files in the browsed folder, destination = that folder -> self-copy.
-  assert.equal(destinationIsSource('b', ['fw/a.bin', 'fw/b.bin'], 'b', 'fw'), true);
-  assert.equal(destinationIsSource('b', ['fw/a.bin'], 'b', '/fw/'), true); // raw input normalized
+  assert.equal(destinationIsSource('b', [objectRowKey('fw/a.bin'), objectRowKey('fw/b.bin')], 'b', 'fw'), true);
+  assert.equal(destinationIsSource('b', [objectRowKey('fw/a.bin')], 'b', '/fw/'), true); // raw input normalized
   // A selected folder keeps its name: fw/v1/ copied into fw/ lands on fw/v1/.
-  assert.equal(destinationIsSource('b', ['folder:fw/v1/'], 'b', 'fw'), true);
-  assert.equal(destinationIsSource('b', ['folder:fw/v1/', 'fw/x'], 'b', 'fw/'), true);
+  assert.equal(destinationIsSource('b', [folderRowKey('fw/v1/')], 'b', 'fw'), true);
+  assert.equal(destinationIsSource('b', [folderRowKey('fw/v1/'), objectRowKey('fw/x')], 'b', 'fw/'), true);
   // Bucket root.
-  assert.equal(destinationIsSource('b', ['a.txt', 'folder:dir/'], 'b', ''), true);
+  assert.equal(destinationIsSource('b', [objectRowKey('a.txt'), folderRowKey('dir/')], 'b', ''), true);
   // Different bucket or prefix -> real copy.
-  assert.equal(destinationIsSource('b', ['fw/a.bin'], 'c', 'fw'), false);
-  assert.equal(destinationIsSource('b', ['fw/a.bin'], 'b', 'fw/sub'), false);
-  assert.equal(destinationIsSource('b', ['folder:fw/v1/'], 'b', 'fw/v1'), false); // into itself: new keys fw/v1/v1/...
-  assert.equal(destinationIsSource('b', ['fw/a.bin'], 'b', ''), false);
+  assert.equal(destinationIsSource('b', [objectRowKey('fw/a.bin')], 'c', 'fw'), false);
+  assert.equal(destinationIsSource('b', [objectRowKey('fw/a.bin')], 'b', 'fw/sub'), false);
+  assert.equal(destinationIsSource('b', [folderRowKey('fw/v1/')], 'b', 'fw/v1'), false); // into itself: new keys fw/v1/v1/...
+  assert.equal(destinationIsSource('b', [objectRowKey('fw/a.bin')], 'b', ''), false);
   // Mixed parents: only some items would self-map -> not blocked.
-  assert.equal(destinationIsSource('b', ['fw/a.bin', 'other/b.bin'], 'b', 'fw'), false);
+  assert.equal(destinationIsSource('b', [objectRowKey('fw/a.bin'), objectRowKey('other/b.bin')], 'b', 'fw'), false);
   // Empty selection -> nothing to block.
   assert.equal(destinationIsSource('b', [], 'b', ''), false);
 });
@@ -92,9 +93,9 @@ test('keyPathError: "." / ".." segments never reach a request', () => {
 // UX harvest C33: the picker no longer opens in its own blocked state.
 test('initialDestPrefix: the browsed folder, else its parent, never the source', () => {
   // Selection in qa-many/, browsing qa-many/: the parent (bucket root).
-  assert.equal(initialDestPrefix('releases', ['qa-many/a.txt'], 'qa-many/'), '');
-  assert.equal(initialDestPrefix('releases', ['a/b/x.zip'], 'a/b/'), 'a');
+  assert.equal(initialDestPrefix('releases', [objectRowKey('qa-many/a.txt')], 'qa-many/'), '');
+  assert.equal(initialDestPrefix('releases', [objectRowKey('a/b/x.zip')], 'a/b/'), 'a');
   // A selection that is not in the browsed folder keeps it.
-  assert.equal(initialDestPrefix('releases', ['folder:qa-many/'], 'qa-many/'), 'qa-many');
-  assert.equal(destinationIsSource('releases', ['a/b/x.zip'], 'releases', initialDestPrefix('releases', ['a/b/x.zip'], 'a/b/')), false);
+  assert.equal(initialDestPrefix('releases', [folderRowKey('qa-many/')], 'qa-many/'), 'qa-many');
+  assert.equal(destinationIsSource('releases', [objectRowKey('a/b/x.zip')], 'releases', initialDestPrefix('releases', [objectRowKey('a/b/x.zip')], 'a/b/')), false);
 });

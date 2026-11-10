@@ -10,6 +10,7 @@ import { expect, test, vi } from 'vitest';
 import ObjectTable from '../components/ObjectTable';
 import type { S3Object } from '../types';
 import { renderWithQuery } from '../test/render';
+import { type RowKey, folderRowKey, objectRowKey } from '../rowKey';
 
 const OBJECTS = [
   { key: 'builds/notes.txt', size: 2048, lastModified: '2026-01-01T00:00:00Z' },
@@ -49,7 +50,7 @@ function mount(over: { canScan?: boolean; inspected?: S3Object | null; restListe
   return spies;
 }
 
-function row(key: string): HTMLElement {
+function row(key: RowKey): HTMLElement {
   const el = document.querySelector<HTMLElement>(`[data-row-key="${key}"]`);
   if (!el) throw new Error(`no row ${key}`);
   return el;
@@ -58,14 +59,14 @@ function row(key: string): HTMLElement {
 test('the inspected object is the highlighted row', async () => {
   mount({ inspected: OBJECTS[1] });
   await screen.findByText('notes.txt');
-  expect(row('builds/app.zip').className).toContain('ant-table-row-selected');
-  expect(row('builds/notes.txt').className).not.toContain('ant-table-row-selected');
+  expect(row(objectRowKey('builds/app.zip')).className).toContain('ant-table-row-selected');
+  expect(row(objectRowKey('builds/notes.txt')).className).not.toContain('ant-table-row-selected');
 });
 
 test('without an admin session a folder size is a dash', async () => {
   mount({ canScan: false });
   await screen.findByText('notes.txt');
-  expect(within(row('folder:builds/nightly/')).getByTitle(/sign in as an administrator/)).toBeInTheDocument();
+  expect(within(row(folderRowKey('builds/nightly/'))).getByTitle(/sign in as an administrator/)).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: /^Size$/ })).toBeNull();
 });
 
@@ -73,9 +74,9 @@ test('with an admin session the Size button scans the folder; a virtual folder n
   const user = userEvent.setup();
   const spies = mount({ canScan: true });
   await screen.findByText('notes.txt');
-  await user.click(within(row('folder:builds/nightly/')).getByRole('button', { name: /Size/ }));
+  await user.click(within(row(folderRowKey('builds/nightly/'))).getByRole('button', { name: /Size/ }));
   expect(spies.onCompute).toHaveBeenCalledWith('builds/nightly/');
-  expect(within(row('folder:builds/ci/')).getByText('Virtual')).toBeInTheDocument();
+  expect(within(row(folderRowKey('builds/ci/'))).getByText('Virtual')).toBeInTheDocument();
 });
 
 test('a double-click previews a text file, not an archive', async () => {

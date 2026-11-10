@@ -13,6 +13,7 @@ import ObjectTable from '../components/ObjectTable';
 import type { S3Object } from '../types';
 import { useBrowserKeyboardNav } from '../useBrowserKeyboardNav';
 import { renderWithQuery } from '../test/render';
+import { type RowKey, folderRowKey, objectRowKey } from '../rowKey';
 
 const OBJECTS: S3Object[] = [
   { key: 'builds/app-1.0.zip', size: 10, lastModified: '2026-01-01T00:00:00Z' },
@@ -72,7 +73,7 @@ function mount(extra?: React.ReactNode) {
 }
 
 /** The data row for a key (AntD sets data-row-key on each row). */
-function row(key: string): HTMLElement {
+function row(key: RowKey): HTMLElement {
   const el = document.querySelector<HTMLElement>(`[data-row-key="${key}"]`);
   if (!el) throw new Error(`no row ${key}`);
   return el;
@@ -84,15 +85,15 @@ describe('keyboard', () => {
     const spies = mount();
     await screen.findByText('app-1.0.zip');
     fireEvent.keyDown(document, { key: 'ArrowDown' });
-    await waitFor(() => expect(cursorRow()).toBe('folder:builds/nightly/'));
+    await waitFor(() => expect(cursorRow()).toBe(folderRowKey('builds/nightly/')));
     fireEvent.keyDown(document, { key: 'ArrowDown' });
-    await waitFor(() => expect(cursorRow()).toBe('builds/app-1.0.zip'));
+    await waitFor(() => expect(cursorRow()).toBe(objectRowKey('builds/app-1.0.zip')));
     fireEvent.keyDown(document, { key: 'End' });
-    await waitFor(() => expect(cursorRow()).toBe('builds/app-1.1.zip'));
+    await waitFor(() => expect(cursorRow()).toBe(objectRowKey('builds/app-1.1.zip')));
     fireEvent.keyDown(document, { key: 'Enter' });
     expect(spies.openInspector).toHaveBeenCalledWith('builds/app-1.1.zip');
     fireEvent.keyDown(document, { key: 'Home' });
-    await waitFor(() => expect(cursorRow()).toBe('folder:builds/nightly/'));
+    await waitFor(() => expect(cursorRow()).toBe(folderRowKey('builds/nightly/')));
     fireEvent.keyDown(document, { key: 'Enter' });
     expect(spies.navigate).toHaveBeenCalledWith('builds/nightly/');
   });
@@ -131,7 +132,7 @@ describe('mouse', () => {
     const spies = mount();
     await user.click(await screen.findByText('app-1.1.zip'));
     expect(spies.onSelect).toHaveBeenCalledWith(expect.objectContaining({ key: 'builds/app-1.1.zip' }));
-    await waitFor(() => expect(cursorRow()).toBe('builds/app-1.1.zip'));
+    await waitFor(() => expect(cursorRow()).toBe(objectRowKey('builds/app-1.1.zip')));
   });
 
   test('the checkbox cell toggles selection without opening the inspector', async () => {
@@ -139,13 +140,13 @@ describe('mouse', () => {
     const spies = mount();
     await screen.findByText('app-1.0.zip');
     await user.click(screen.getByRole('checkbox', { name: 'Select app-1.0.zip' }));
-    expect(spies.onToggleKey.mock.calls).toEqual([['builds/app-1.0.zip']]);
+    expect(spies.onToggleKey.mock.calls).toEqual([[objectRowKey('builds/app-1.0.zip')]]);
     // The cell around the box is a hit target too (the virtual table renders
     // rows and cells as divs).
-    const cell = row('builds/app-1.1.zip').querySelector<HTMLElement>('.ant-table-cell');
+    const cell = row(objectRowKey('builds/app-1.1.zip')).querySelector<HTMLElement>('.ant-table-cell');
     expect(cell).not.toBeNull();
     await user.click(cell!);
-    expect(spies.onToggleKey.mock.calls).toEqual([['builds/app-1.0.zip'], ['builds/app-1.1.zip']]);
+    expect(spies.onToggleKey.mock.calls).toEqual([[objectRowKey('builds/app-1.0.zip')], [objectRowKey('builds/app-1.1.zip')]]);
     expect(spies.onSelect).not.toHaveBeenCalled();
   });
 
@@ -170,18 +171,18 @@ describe('assistive tech', () => {
     expect([...rows].map((r) => r.getAttribute('role'))).toEqual(['row', 'row', 'row']);
     expect([...rows].map((r) => r.getAttribute('aria-rowindex'))).toEqual(['2', '3', '4']);
     expect([...rows].map((r) => r.getAttribute('tabindex'))).toEqual(['0', '-1', '-1']);
-    expect(row('builds/app-1.0.zip').querySelectorAll('[role="gridcell"]').length).toBeGreaterThan(2);
+    expect(row(objectRowKey('builds/app-1.0.zip')).querySelectorAll('[role="gridcell"]').length).toBeGreaterThan(2);
   });
 
   test('a focused row moves the cursor, and the focus follows the arrows', async () => {
     mount();
     await screen.findByText('app-1.0.zip');
-    row('builds/app-1.0.zip').focus();
-    await waitFor(() => expect(cursorRow()).toBe('builds/app-1.0.zip'));
+    row(objectRowKey('builds/app-1.0.zip')).focus();
+    await waitFor(() => expect(cursorRow()).toBe(objectRowKey('builds/app-1.0.zip')));
     fireEvent.keyDown(document.activeElement!, { key: 'ArrowDown' });
-    await waitFor(() => expect(cursorRow()).toBe('builds/app-1.1.zip'));
-    await waitFor(() => expect(document.activeElement).toBe(row('builds/app-1.1.zip')));
-    expect(row('builds/app-1.1.zip')).toHaveAttribute('tabindex', '0');
+    await waitFor(() => expect(cursorRow()).toBe(objectRowKey('builds/app-1.1.zip')));
+    await waitFor(() => expect(document.activeElement).toBe(row(objectRowKey('builds/app-1.1.zip'))));
+    expect(row(objectRowKey('builds/app-1.1.zip'))).toHaveAttribute('tabindex', '0');
   });
 });
 
@@ -190,7 +191,7 @@ test('Enter on a focused button presses it and does not open the cursor row', as
   const spies = mount(<button onClick={clicked}>Upload Files</button>);
   await screen.findByText('app-1.0.zip');
   fireEvent.keyDown(document, { key: 'End' });
-  await waitFor(() => expect(cursorRow()).toBe('builds/app-1.1.zip'));
+  await waitFor(() => expect(cursorRow()).toBe(objectRowKey('builds/app-1.1.zip')));
   const button = screen.getByRole('button', { name: 'Upload Files' });
   button.focus();
   fireEvent.keyDown(button, { key: 'Enter' });

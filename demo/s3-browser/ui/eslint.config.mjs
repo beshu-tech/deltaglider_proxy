@@ -182,6 +182,12 @@ const UI_RULES = {
         "JSXOpeningElement[name.name='Button'] JSXAttribute[name.name='style'] Property[key.name=/^(background|backgroundColor)$/]:matches([value.name=/^ACCENT_/], [value.property.name=/^ACCENT_/])",
       message: 'No ACCENT_* fill on <Button>: use type="primary" / danger, whose colours contrast.test.ts checks.',
     },
+    {
+      // F6 (epic #146): an object may be named `folder:abc/`. The kind of a row is never
+      // read from key text: rowKey.ts makes and parses row keys.
+      selector: ":matches(Literal[value=/^folder:/], TemplateElement[value.raw=/^folder:/])",
+      message: 'Do not build or parse `folder:` text: a row\'s kind comes from parseRowKey / folderRowKey / objectRowKey in src/rowKey.ts.',
+    },
     ...THEME_SYNTAX_RULES,
     // AntD 6 deprecated props: each one floods the dev console with a warning.
     ...ANTD_DEPRECATED.map(([selector, message]) => ({ selector, message: `AntD 6 deprecation: ${message}` })),
@@ -276,9 +282,9 @@ export default tseslint.config(
     files: ['src/safeStorage.ts'],
     rules: { 'no-restricted-properties': 'off', 'no-restricted-globals': 'off' },
   },
-  // The one sanctioned Enter/Space activation handler.
+  // The one sanctioned Enter/Space activation handler, and the one row-key module.
   {
-    files: ['src/keyboard.ts'],
+    files: ['src/keyboard.ts', 'src/rowKey.ts'],
     rules: { 'no-restricted-syntax': 'off' },
   },
   // Colour literals are allowed only here, each for a stated reason:

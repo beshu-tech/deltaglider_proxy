@@ -8,11 +8,15 @@
  */
 import type { S3Object } from './types';
 import { displayName, numericCompare } from './utils';
+import { type RowKey, folderRowKey, objectRowKey } from './rowKey';
 
-/** One ObjectTable row: a folder (`folder:<prefix>` key) or an object. */
+/**
+ * One ObjectTable row: a folder or an object. `rowKey` is the row's identity
+ * (see `rowKey.ts`); `prefix` and `key` are the folder prefix and the object key.
+ */
 export type BrowserRow =
-  | { _isFolder: true; key: string; name: string }
-  | (S3Object & { _isFolder: false; name: string });
+  | { _isFolder: true; rowKey: RowKey; prefix: string; name: string }
+  | (S3Object & { _isFolder: false; rowKey: RowKey; name: string });
 
 export type SortColumn = 'name' | 'size' | 'modified';
 
@@ -23,15 +27,15 @@ export interface SortState {
 }
 
 /** The unsorted rowKeys ObjectTable renders: folders first, then objects. */
-export function rowKeysFor(folders: string[], objects: S3Object[]): string[] {
-  return [...folders.map((f) => `folder:${f}`), ...objects.map((o) => o.key)];
+export function rowKeysFor(folders: string[], objects: S3Object[]): RowKey[] {
+  return [...folders.map(folderRowKey), ...objects.map((o) => objectRowKey(o.key))];
 }
 
 /** Unsorted rows: folders first, then objects (same order as `rowKeysFor`). */
 export function buildRows(folders: string[], objects: S3Object[], prefix: string): BrowserRow[] {
   return [
-    ...folders.map((f) => ({ _isFolder: true as const, key: `folder:${f}`, name: displayName(f, prefix) })),
-    ...objects.map((o) => ({ ...o, _isFolder: false as const, name: displayName(o.key, prefix) })),
+    ...folders.map((f) => ({ _isFolder: true as const, rowKey: folderRowKey(f), prefix: f, name: displayName(f, prefix) })),
+    ...objects.map((o) => ({ ...o, _isFolder: false as const, rowKey: objectRowKey(o.key), name: displayName(o.key, prefix) })),
   ];
 }
 
@@ -42,7 +46,7 @@ function compareBy(column: SortColumn, folderSize: (folderPrefix: string) => num
     case 'size': {
       // Scanned folder size when known, so the order matches the rendered
       // cell; unscanned folders sort as 0.
-      const size = (r: BrowserRow) => (r._isFolder ? folderSize(r.key.slice('folder:'.length)) : r.size);
+      const size = (r: BrowserRow) => (r._isFolder ? folderSize(r.prefix) : r.size);
       return (a: BrowserRow, b: BrowserRow) => size(a) - size(b);
     }
     case 'modified': {
@@ -80,10 +84,10 @@ export function sortRows(
  *  - Otherwise clamps to the list bounds (no wraparound).
  */
 export function nextCursor(
-  keys: string[],
-  current: string | null,
+  keys: RowKey[],
+  current: RowKey | null,
   move: number | 'first' | 'last',
-): string | null {
+): RowKey | null {
   if (keys.length === 0) return null;
   if (move === 'first') return keys[0];
   if (move === 'last') return keys[keys.length - 1];
@@ -105,11 +109,11 @@ export function nextCursor(
  * array on every render; storing an equal copy would re-render the browser,
  * rebuild the rows and report again — an update loop (React error #185).
  */
-export function sameKeyOrder(a: readonly string[] | null, b: readonly string[]): boolean {
+export function sameKeyOrder(a: readonly RowKey[] | null, b: readonly RowKey[]): boolean {
   return a !== null && a.length === b.length && a.every((k, i) => k === b[i]);
 }
 
-export function orderedRowKeys(baseKeys: string[], reported: string[] | null): string[] {
+export function orderedRowKeys(baseKeys: RowKey[], reported: RowKey[] | null): RowKey[] {
   if (!reported || reported.length !== baseKeys.length) return baseKeys;
   const current = new Set(baseKeys);
   return reported.every((k) => current.has(k)) ? reported : baseKeys;

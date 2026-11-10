@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { folderRowKey, objectRowKey } from '../rowKey';
 import { test } from 'vitest';
 import {
   expandSelection,
@@ -28,7 +29,7 @@ test('folders expand and KEEP their own name', async () => {
   // --- folders expand and KEEP their own name: copying folder a/ into dest/
   //     yields dest/a/..., like any file manager (it used to flatten into dest/,
   //     so two selected folders' same-named files overwrote each other) ---------
-  assert.deepEqual(await expandSelection(['folder:a/', 'top.bin', 'd/e/f.txt'], lister), [
+  assert.deepEqual(await expandSelection([folderRowKey('a/'), objectRowKey('top.bin'), objectRowKey('d/e/f.txt')], lister), [
     { source: 'a/', relative: 'a/' },
     { source: 'a/x.txt', relative: 'a/x.txt' },
     { source: 'a/sub/y.txt', relative: 'a/sub/y.txt' },
@@ -38,7 +39,7 @@ test('folders expand and KEEP their own name', async () => {
 });
 
 test('overlapping selections dedupe; the FIRST relative suffix wins', async () => {
-  assert.deepEqual(await expandSelection(['folder:a/', 'folder:a/sub/', 'a/x.txt'], lister), [
+  assert.deepEqual(await expandSelection([folderRowKey('a/'), folderRowKey('a/sub/'), objectRowKey('a/x.txt')], lister), [
     { source: 'a/', relative: 'a/' },
     { source: 'a/x.txt', relative: 'a/x.txt' },
     { source: 'a/sub/y.txt', relative: 'a/sub/y.txt' },
@@ -46,20 +47,20 @@ test('overlapping selections dedupe; the FIRST relative suffix wins', async () =
 });
 
 test('a nested folder keeps only its own name, not its parents', async () => {
-  assert.deepEqual(await expandSelection(['folder:a/sub/'], lister), [
+  assert.deepEqual(await expandSelection([folderRowKey('a/sub/')], lister), [
     { source: 'a/sub/y.txt', relative: 'sub/y.txt' },
   ]);
 });
 
 test('the empty prefix is never listed (no whole-bucket expansion)', async () => {
   calls.length = 0;
-  assert.deepEqual(await expandSelection(['folder:'], lister), []);
+  assert.deepEqual(await expandSelection([folderRowKey('')], lister), []);
   assert.deepEqual(calls, [], 'empty folder prefix must not reach the lister');
 });
 
 test('a truncated folder aborts the whole expansion with a clear message', async () => {
   await assert.rejects(
-    expandSelection(['folder:a/', 'folder:big/'], lister),
+    expandSelection([folderRowKey('a/'), folderRowKey('big/')], lister),
     (e: unknown) => e instanceof Error && /Folder big\/ has more than 10,000 objects; narrow the selection/.test(e.message),
     'truncated listing must throw',
   );
@@ -106,7 +107,7 @@ function manualLister(answer: (pfx: string) => { keys: string[]; truncated: bool
 /** Let queued promise callbacks run (each await in the expansion takes a turn). */
 const settle = () => new Promise((r) => setTimeout(r, 0));
 
-const tenFolders = Array.from({ length: 10 }, (_, i) => `folder:f${i}/`);
+const tenFolders = Array.from({ length: 10 }, (_, i) => folderRowKey(`f${i}/`));
 
 test(`folders are listed ${FOLDER_LIST_CONCURRENCY} at a time, never more`, async () => {
   assert.equal(FOLDER_LIST_CONCURRENCY, 4);
@@ -124,12 +125,12 @@ test(`folders are listed ${FOLDER_LIST_CONCURRENCY} at a time, never more`, asyn
   assert.equal(l.maxInFlight, 4, 'never more than four requests in flight');
   assert.equal(l.started.length, 10, 'every folder is listed once');
   // Merged in selection order, not completion order.
-  assert.deepEqual(items.map((i) => i.source), tenFolders.map((f) => `${f.slice('folder:'.length)}k`));
+  assert.deepEqual(items.map((i) => i.source), Array.from({ length: 10 }, (_, i) => `f${i}/k`));
 });
 
 test('progress: one call before the first listing, then one per listed folder', async () => {
   const seen: { listed: number; folders: number; keysFound: number }[] = [];
-  await expandSelection(['folder:a/', 'top.bin', 'folder:a/sub/', 'folder:'], lister, {
+  await expandSelection([folderRowKey('a/'), objectRowKey('top.bin'), folderRowKey('a/sub/'), folderRowKey('')], lister, {
     concurrency: 1,
     onProgress: (p) => seen.push({ ...p }),
   });
@@ -151,7 +152,7 @@ test('out-of-order completion: dedupe still keeps the FIRST suffix in selection 
         resolve({ keys: tree[pfx] ?? [], truncated: false });
       }, pfx === 'a/' ? 30 : 1),
     );
-  const items = await expandSelection(['folder:a/', 'folder:a/sub/'], slow);
+  const items = await expandSelection([folderRowKey('a/'), folderRowKey('a/sub/')], slow);
   assert.deepEqual(finished, ['a/sub/', 'a/'], 'a/sub/ completed first');
   assert.deepEqual(items, [
     { source: 'a/', relative: 'a/' },
@@ -212,7 +213,7 @@ test('abort: no new folder is listed and the expansion rejects with the abort re
 // distinct keys found pass the cap.
 test('maxKeys: past the cap no new folder is listed and the expansion rejects', async () => {
   const l = manualLister((pfx) => ({ keys: [`${pfx}a`, `${pfx}b`, 'shared'], truncated: false }));
-  const outcome = expandSelection(['top.zip', ...tenFolders], l.list, { maxKeys: 6 }).then(
+  const outcome = expandSelection([objectRowKey('top.zip'), ...tenFolders], l.list, { maxKeys: 6 }).then(
     () => 'resolved',
     (e: Error) => e.message,
   );
@@ -235,9 +236,9 @@ test('maxKeys: past the cap no new folder is listed and the expansion rejects', 
 
 test('maxKeys counts distinct keys: overlapping folders within the cap pass', async () => {
   const lister: PrefixLister = async (pfx) => ({ keys: ['same/1', 'same/2', pfx], truncated: false });
-  const items = await expandSelection(['folder:x/', 'folder:y/'], lister, { maxKeys: 4 });
+  const items = await expandSelection([folderRowKey('x/'), folderRowKey('y/')], lister, { maxKeys: 4 });
   assert.equal(items.length, 4);
-  await assert.rejects(expandSelection(['folder:x/', 'folder:y/'], lister, { maxKeys: 3 }), /more than 3 objects/);
+  await assert.rejects(expandSelection([folderRowKey('x/'), folderRowKey('y/')], lister, { maxKeys: 3 }), /more than 3 objects/);
 });
 
 // ── Paged folder listing: a folder of more than one listing is read page by
@@ -258,7 +259,7 @@ test('a folder of several listings is read page by page', async () => {
   const keys = Array.from({ length: 25 }, (_, i) => `huge/${String(i).padStart(3, '0')}`);
   const l = pagedLister(keys, 10);
   const seen: number[] = [];
-  const items = await expandSelection(['folder:huge/'], l.list, { onProgress: (p) => seen.push(p.keysFound) });
+  const items = await expandSelection([folderRowKey('huge/')], l.list, { onProgress: (p) => seen.push(p.keysFound) });
   assert.deepEqual(
     items.map((i) => i.source),
     keys,
@@ -271,7 +272,7 @@ test('paging stops once the selection passes maxKeys', async () => {
   const keys = Array.from({ length: 50 }, (_, i) => `huge/${String(i).padStart(3, '0')}`);
   const l = pagedLister(keys, 10);
   await assert.rejects(
-    expandSelection(['folder:huge/'], l.list, { maxKeys: 15 }),
+    expandSelection([folderRowKey('huge/')], l.list, { maxKeys: 15 }),
     /more than 15 objects/,
   );
   assert.equal(l.calls.length, 2, 'no page is read after the limit');

@@ -4,6 +4,7 @@
  * React-free and fetch-free (the lister is injected) so a plain Node regression
  * script can exercise it — see src/__tests__/bulkSelection.test.ts.
  */
+import { type RowKey, parseRowKey, splitRowKeys } from './rowKey';
 
 /**
  * Mirrors `MAX_BULK_OBJECTS` in src/api/admin/objects.rs: the most keys one
@@ -42,7 +43,7 @@ export interface ExpandedItem {
 export interface ListingProgress {
   /** Folders listed so far. */
   listed: number;
-  /** Folders to list: the selected `folder:` entries with a non-empty prefix. */
+  /** Folders to list: the selected folder rows with a non-empty prefix. */
   folders: number;
   /** Keys in the folders listed so far, before dedupe. */
   keysFound: number;
@@ -140,7 +141,7 @@ async function listFolders(
 }
 
 /**
- * Expand a selection (`folder:<prefix>` entries and plain object keys) into
+ * Expand a selection (folder and object rows, see `rowKey.ts`) into
  * absolute keys. Every folder is listed, every page of it, BEFORE the caller
  * mutates anything: when a listing cannot go on this throws, so a bulk action
  * never acts on the first 10,000 keys of a folder and silently leaves the
@@ -152,21 +153,18 @@ async function listFolders(
  * cannot shorten a path an earlier folder established.
  */
 export async function expandSelection(
-  selectedKeys: Iterable<string>,
+  selectedKeys: Iterable<RowKey>,
   listPrefix: PrefixLister,
   options: ExpandOptions = {},
 ): Promise<ExpandedItem[]> {
-  const selection = [...selectedKeys];
-  // Never expand the whole bucket: `folder:` with an empty prefix is skipped.
-  const prefixes = [
-    ...new Set(selection.filter((k) => k.startsWith('folder:')).map((k) => k.slice('folder:'.length)).filter(Boolean)),
-  ];
-  const directKeys = selection.filter((k) => !k.startsWith('folder:'));
+  const selection = [...selectedKeys].map(parseRowKey);
+  // Never expand the whole bucket: a folder with an empty prefix is skipped.
+  const { prefixes, keys: directKeys } = splitRowKeys(selectedKeys);
   const listings = await listFolders(prefixes, directKeys, listPrefix, options);
   const seen = new Map<string, string>();
-  for (const k of selection) {
-    if (k.startsWith('folder:')) {
-      const pfx = k.slice('folder:'.length);
+  for (const id of selection) {
+    if (id.kind === 'folder') {
+      const pfx = id.prefix;
       const listing = listings.get(pfx);
       if (!listing) continue; // the empty prefix
       // Keep the folder's own name: "firmware/v1.0.1/x" relative to the
@@ -178,8 +176,8 @@ export async function expandSelection(
         // Defensive: a listing key outside `pfx` falls back to its basename.
         seen.set(nk, nk.startsWith(pfx) ? nk.slice(parent.length) : (nk.split('/').pop() || nk));
       }
-    } else if (!seen.has(k)) {
-      seen.set(k, k.split('/').pop() || k);
+    } else if (!seen.has(id.key)) {
+      seen.set(id.key, id.key.split('/').pop() || id.key);
     }
   }
   return Array.from(seen, ([source, relative]) => ({ source, relative }));

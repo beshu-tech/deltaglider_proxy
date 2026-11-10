@@ -19,6 +19,7 @@ import { SPACE } from './shared-styles';
 import TruncatedName from './TruncatedName';
 import { buildRows, sortRows, type BrowserRow, type SortColumn, type SortState } from '../browserNav';
 import { useIsNarrow } from '../useIsNarrow';
+import type { RowKey } from '../rowKey';
 
 /** Below this width the Size column folds into a line under the name: the
  *  name column alone did not fit next to it on a phone. */
@@ -97,8 +98,8 @@ interface ObjectTableListing {
 interface ObjectTableSelection {
   /** The object open in the inspector (highlighted row). */
   inspected: S3Object | null;
-  selectedKeys: Set<string>;
-  onToggleKey: (key: string) => void;
+  selectedKeys: Set<RowKey>;
+  onToggleKey: (key: RowKey) => void;
   onToggleAll: () => void;
 }
 
@@ -122,11 +123,11 @@ export interface ObjectTableFolderSizes {
 /** Keyboard cursor (useBrowserKeyboardNav). */
 export interface ObjectTableCursor {
   /** rowKey of the cursor row, or null. */
-  key: string | null;
+  key: RowKey | null;
   /** Sync the cursor when a row is clicked. */
-  onChange?: (key: string | null) => void;
+  onChange?: (key: RowKey | null) => void;
   /** Reports the displayed (sorted) row order, so keyboard navigation walks it. */
-  onRowOrderChange?: (keys: string[]) => void;
+  onRowOrderChange?: (keys: RowKey[]) => void;
 }
 
 interface Props {
@@ -293,7 +294,7 @@ export default function ObjectTable({
     [rows, sortState, folderSizes],
   );
   useEffect(() => {
-    onRowOrderChange?.(sortedRows.map((r) => r.key));
+    onRowOrderChange?.(sortedRows.map((r) => r.rowKey));
   }, [sortedRows, onRowOrderChange]);
 
   // Guard against rapid folder clicks (issue #4)
@@ -420,7 +421,7 @@ export default function ObjectTable({
   // whether to jump, but must only run when the CURSOR moves — including it
   // would make a manual pager click (which changes currentPage) snap the page
   // back to wherever the cursor sits, so the mouse pager would fight the cursor.
-  const cursorIndex = cursorKey ? dataSource.findIndex((r) => r.key === cursorKey) : -1;
+  const cursorIndex = cursorKey ? dataSource.findIndex((r) => r.rowKey === cursorKey) : -1;
   useEffect(() => {
     if (cursorIndex === -1 || !cursorKey) return;
     const targetPage = Math.floor(cursorIndex / pageSize) + 1;
@@ -455,7 +456,7 @@ export default function ObjectTable({
   });
   const pageStart = (currentPage - 1) * pageSize;
   // The row that Tab reaches: the cursor, else the first row of the page.
-  const tabStopKey = cursorKey ?? dataSource[pageStart]?.key ?? null;
+  const tabStopKey = cursorKey ?? dataSource[pageStart]?.rowKey ?? null;
 
   const columns: ColumnsType<RowData> = [
     {
@@ -474,15 +475,15 @@ export default function ObjectTable({
       onCell: (record: RowData) => ({
         onClick: (e: React.MouseEvent) => {
           e.stopPropagation();
-          onToggleKey(record.key);
+          onToggleKey(record.rowKey);
         },
         style: { cursor: 'pointer' },
       }),
       render: (_: unknown, record: RowData) => (
         <Checkbox
-          checked={selectedKeys.has(record.key)}
+          checked={selectedKeys.has(record.rowKey)}
           onClick={(e) => e.stopPropagation()}
-          onChange={() => onToggleKey(record.key)}
+          onChange={() => onToggleKey(record.rowKey)}
           aria-label={`Select ${record.name}`}
         />
       ),
@@ -502,12 +503,12 @@ export default function ObjectTable({
             <button
               className="btn-reset"
               title={record.name}
-              onClick={() => guardedNavigate(record.key.replace('folder:', ''))}
+              onClick={() => guardedNavigate(record.prefix)}
               style={{ fontWeight: 500, color: TEXT_PRIMARY, gap: 8, fontFamily: "var(--font-ui)", maxWidth: '100%', minWidth: 0 }}
             >
               <FolderOutlined aria-hidden="true" style={{ color: ACCENT_BLUE, fontSize: 15, flexShrink: 0 }} />
               <TruncatedName text={record.name} title={false} />
-              {isVirtualFolderPrefix(record.key.replace('folder:', ''), virtualFolders) ? (
+              {isVirtualFolderPrefix(record.prefix, virtualFolders) ? (
                 <sup
                   title="Virtual folder from your permissions. It will become a real folder after upload."
                   style={{ color: TEXT_MUTED, fontSize: 11, fontWeight: 600, lineHeight: 1, marginLeft: 2 }}
@@ -550,7 +551,7 @@ export default function ObjectTable({
       sortOrder: sortOrderFor('size'),
       render: (_: unknown, record: RowData) => {
         if (record._isFolder) {
-          const folderPrefix = record.key.replace('folder:', '');
+          const folderPrefix = record.prefix;
           return (
             <FolderSizeCell
               folderPrefix={folderPrefix}
@@ -630,7 +631,7 @@ export default function ObjectTable({
           onHeaderRow={() => ({ role: 'row', 'aria-rowindex': 1 }) as React.HTMLAttributes<HTMLElement>}
           dataSource={dataSource}
           onChange={handleTableChange}
-          rowKey="key"
+          rowKey="rowKey"
           showSorterTooltip={false} /* Ant Design 6 rc-table renders sort tooltips inline in <th>, causing layout shift */
           pagination={{
             pageSize,
@@ -655,19 +656,19 @@ export default function ObjectTable({
           rowClassName={(record) => {
             const classes: string[] = [];
             if (!record._isFolder && selected?.key === record.key) classes.push('ant-table-row-selected');
-            if (record.key === cursorKey) classes.push('dg-row-cursor');
+            if (record.rowKey === cursorKey) classes.push('dg-row-cursor');
             return classes.join(' ');
           }}
           onRow={(record, index) => ({
             role: 'row',
             'aria-rowindex': pageStart + (index ?? 0) + 2,
-            'aria-selected': selectedKeys.has(record.key),
-            tabIndex: record.key === tabStopKey ? 0 : -1,
+            'aria-selected': selectedKeys.has(record.rowKey),
+            tabIndex: record.rowKey === tabStopKey ? 0 : -1,
             onFocus: (e: React.FocusEvent<HTMLElement>) => {
-              if (e.target === e.currentTarget && record.key !== cursorKey) onCursorChange?.(record.key);
+              if (e.target === e.currentTarget && record.rowKey !== cursorKey) onCursorChange?.(record.rowKey);
             },
             onClick: () => {
-              onCursorChange?.(record.key);
+              onCursorChange?.(record.rowKey);
               if (!record._isFolder) onSelect(record);
             },
             onDoubleClick: () => {

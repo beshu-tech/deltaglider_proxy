@@ -6,6 +6,7 @@
 import type { WhoamiResponse } from './adminApi';
 import { canUse } from './permissions';
 import type { SessionCapabilities } from './sessionCapabilities';
+import { type RowKey, parseRowKey } from './rowKey';
 
 export interface BrowserCapabilityInput {
   identity: WhoamiResponse | null;
@@ -18,8 +19,8 @@ export interface BrowserCapabilityInput {
   bucketBusy: boolean;
   /** Writable folder roots in the bucket (`writablePrefixesForBucket`). */
   writablePrefixes: readonly string[];
-  /** Checked rows: object keys and `folder:<prefix>` keys. */
-  selectedKeys: Iterable<string>;
+  /** Checked rows (see `rowKey.ts`). */
+  selectedKeys: Iterable<RowKey>;
   /** The object open in the inspector, or null. */
   inspectedKey: string | null;
 }
@@ -41,11 +42,10 @@ export interface BrowserCapabilities {
   bulk: { delete: boolean; copy: boolean; move: boolean; zip: boolean };
 }
 
-const FOLDER = 'folder:';
-
-/** A selection key as a permission key: `folder:a/` → `a/`. */
-function permissionKey(selectionKey: string): string {
-  return selectionKey.startsWith(FOLDER) ? selectionKey.slice(FOLDER.length) : selectionKey;
+/** A checked row as a permission key: a folder row → its prefix, an object row → its key. */
+function permissionKey(rowKey: RowKey): string {
+  const id = parseRowKey(rowKey);
+  return id.kind === 'folder' ? id.prefix : id.key;
 }
 
 export function deriveBrowserCapabilities(input: BrowserCapabilityInput): BrowserCapabilities {
