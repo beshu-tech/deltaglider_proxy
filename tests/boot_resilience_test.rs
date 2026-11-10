@@ -182,6 +182,53 @@ async fn a_second_process_takes_over_when_the_first_one_exits_in_time() {
     );
 }
 
+/// A process that waits for the state directory lock stops at once on
+/// SIGTERM (as PID 1 in a container it has no default action for it), with
+/// a log line and a failing status, not after the whole wait.
+#[tokio::test]
+async fn a_sigterm_ends_the_wait_for_the_state_lock_at_once() {
+    let server = TestServer::filesystem().await;
+    let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_port = other.local_addr().unwrap().port();
+    drop(other);
+    let mut second = server.spawn_sibling(&[
+        ("DGP_LISTEN_ADDR", &format!("127.0.0.1:{other_port}")),
+        ("DGP_STATE_LOCK_WAIT_SECS", "60"),
+        ("RUST_LOG", "info"),
+    ]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !second.output().contains("waiting up to 60 s") {
+        assert!(second.exited().is_none(), "{}", second.output());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no wait message:\n{}",
+            second.output()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    second.sigterm();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = second.exited() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the wait ignored SIGTERM:\n{}",
+            second.output()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert!(!status.success(), "{status:?}");
+    assert!(
+        second
+            .output()
+            .contains("SIGTERM while it waited for the state directory lock"),
+        "{}",
+        second.output()
+    );
+}
+
 /// F13: an unusable `DGP_SPOOL_DIR` is a clean exit that names the variable
 /// and the path (it was a panic without either).
 #[tokio::test]

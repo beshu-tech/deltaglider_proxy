@@ -1993,10 +1993,12 @@ pub async fn claim_environment(config: &mut Config) -> ClaimedEnvironment {
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     let wait = Duration::from_secs(config.tuning.state_lock_wait_secs);
-    // The lock wait sleeps: keep it off the async worker threads.
+    // The lock wait sleeps: keep it off the async worker threads. A SIGTERM
+    // or Ctrl+C ends it at once: no handler exists before `shutdown_signal`,
+    // and as PID 1 (a container) the default action does not apply.
     let state_lock = {
         let dir = dir.to_path_buf();
-        let outcome = tokio::task::spawn_blocking(move || {
+        let acquire = tokio::task::spawn_blocking(move || {
             deltaglider_proxy::data_dir_lock::acquire(&dir, wait, || {
                 tracing::warn!(
                     "another process holds the state directory lock; waiting up to {} s for it \
@@ -2004,8 +2006,13 @@ pub async fn claim_environment(config: &mut Config) -> ClaimedEnvironment {
                     wait.as_secs()
                 )
             })
-        })
-        .await;
+        });
+        let outcome = tokio::select! {
+            outcome = acquire => outcome,
+            name = termination_signal() => exit_with_boot_error(&format!(
+                "received {name} while it waited for the state directory lock; stopping"
+            )),
+        };
         match outcome {
             Ok(Ok(lock)) => lock,
             Ok(Err(e)) => exit_with_boot_error(&e),
@@ -2154,8 +2161,8 @@ pub fn spawn_periodic_blocking(
     });
 }
 
-/// Handle shutdown signals (SIGINT, SIGTERM)
-pub async fn shutdown_signal() {
+/// Resolves with the name of the first termination signal (Ctrl+C or SIGTERM).
+async fn termination_signal() -> &'static str {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -2174,11 +2181,16 @@ pub async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {
-            warn!("Received Ctrl+C, initiating graceful shutdown...");
-        }
-        _ = terminate => {
-            warn!("Received SIGTERM, initiating graceful shutdown...");
+        _ = ctrl_c => "Ctrl+C",
+        _ = terminate => "SIGTERM",
+    }
+}
+
+/// Handle shutdown signals (SIGINT, SIGTERM)
+pub async fn shutdown_signal() {
+    tokio::select! {
+        name = termination_signal() => {
+            warn!("Received {name}, initiating graceful shutdown...");
         }
         // The process asked for it (`shutdown::request_exit`).
         _ = deltaglider_proxy::shutdown::started() => {

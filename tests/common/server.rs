@@ -911,6 +911,14 @@ pub struct SiblingProcess {
 }
 
 impl SiblingProcess {
+    /// Send it SIGTERM and do not wait.
+    pub fn sigterm(&self) {
+        // SAFETY: plain kill(2) on our own child's pid.
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+    }
+
     /// Its exit status when it has exited.
     pub fn exited(&mut self) -> Option<std::process::ExitStatus> {
         self.child.try_wait().expect("try_wait")
