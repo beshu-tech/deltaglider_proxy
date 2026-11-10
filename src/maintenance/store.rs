@@ -780,25 +780,27 @@ impl JobsDb {
         error: &str,
         max_retained: usize,
     ) -> Result<(), ConfigDbError> {
-        self.conn.execute(
-            "INSERT INTO maintenance_failures (job_id, object_key, error, created_at)
+        // The insert and the ring prune are ONE commit (E6/F20).
+        self.atomic(|db| {
+            db.conn.execute(
+                "INSERT INTO maintenance_failures (job_id, object_key, error, created_at)
              VALUES (?, ?, ?, ?)",
-            params![job_id, object_key, error, current_unix_seconds()],
-        )?;
-        // The adoption samples are bounded on their own
-        // (`maintenance_record_adoption`): they never evict a failure.
-        job_store::prune_failure_ring_except(
-            &self.conn,
-            "maintenance_failures",
-            "job_id",
-            &job_id,
-            max_retained as u32,
-            Some((
-                "error",
-                crate::maintenance::conversion::ADOPTED_AFTER_CUTOFF,
-            )),
-        )?;
-        Ok(())
+                params![job_id, object_key, error, current_unix_seconds()],
+            )?;
+            // The adoption samples are bounded on their own
+            // (`maintenance_record_adoption`): they never evict a failure.
+            job_store::prune_failure_ring_except(
+                &db.conn,
+                "maintenance_failures",
+                "job_id",
+                &job_id,
+                max_retained as u32,
+                Some((
+                    "error",
+                    crate::maintenance::conversion::ADOPTED_AFTER_CUTOFF,
+                )),
+            )
+        })
     }
 
     /// Count one object that a re-encrypt job did not rewrite because a

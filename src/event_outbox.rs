@@ -232,6 +232,77 @@ pub enum Settlement {
     },
 }
 
+/// The claim reads (E6/F46). Each is served by an index with no sort and no
+/// scan of the backlog: `idx_event_outbox_status_due` for the first two
+/// (`next_attempt_at IS NULL` is an equality there), the `status` prefix of
+/// it for the third (only claimed rows: at most a batch, or a dead claim).
+/// `claim_statements_use_an_index_and_never_sort` checks the plans.
+pub(crate) const SQL_CLAIM_NEW: &str = "SELECT id, occurred_at FROM event_outbox
+     WHERE status = 'pending' AND next_attempt_at IS NULL
+     ORDER BY occurred_at ASC, id ASC LIMIT ?1";
+pub(crate) const SQL_CLAIM_RETRY: &str = "SELECT id, occurred_at FROM event_outbox
+     WHERE status = 'pending' AND next_attempt_at <= ?1
+     ORDER BY next_attempt_at ASC, occurred_at ASC, id ASC LIMIT ?2";
+pub(crate) const SQL_CLAIM_STALE: &str = "SELECT id, occurred_at FROM event_outbox
+     WHERE status = 'in_progress' AND claimed_at <= ?1 LIMIT ?2";
+
+/// The prunes that run at every dispatcher tick. Delivered rows always have
+/// `delivered_at` (`SQL_MARK_DELIVERED`), so the count prune orders by it
+/// alone, and the partial indexes (named with `INDEXED BY`: without table
+/// statistics SQLite prefers `idx_event_outbox_status_due` and sorts) `idx_event_outbox_delivered` and
+/// `idx_event_outbox_failed` serve all three without a sort.
+pub(crate) const SQL_PRUNE_DELIVERED_BEFORE: &str = "DELETE FROM event_outbox
+      WHERE id IN (
+            SELECT id FROM event_outbox INDEXED BY idx_event_outbox_delivered
+             WHERE status = 'delivered' AND delivered_at < ?1 AND id <= ?2
+             ORDER BY delivered_at ASC, id ASC
+             LIMIT ?3
+      )";
+pub(crate) const SQL_PRUNE_DELIVERED_OVER_COUNT: &str = "DELETE FROM event_outbox
+      WHERE id IN (
+            SELECT id FROM event_outbox INDEXED BY idx_event_outbox_delivered
+             WHERE status = 'delivered' AND id <= ?1
+               AND (delivered_at, id) <= (
+                    SELECT delivered_at, id FROM event_outbox INDEXED BY idx_event_outbox_delivered
+                     WHERE status = 'delivered'
+                     ORDER BY delivered_at DESC, id DESC
+                     LIMIT 1 OFFSET ?2)
+             ORDER BY delivered_at ASC, id ASC
+             LIMIT ?3
+      )";
+pub(crate) const SQL_PRUNE_FAILED_BEFORE: &str = "DELETE FROM event_outbox
+      WHERE id IN (
+            SELECT id FROM event_outbox INDEXED BY idx_event_outbox_failed
+             WHERE status = 'failed' AND occurred_at < ?1 AND id <= ?2
+             ORDER BY occurred_at ASC, id ASC
+             LIMIT ?3
+      )";
+
+/// Every statement the dispatcher runs at each tick, by name. The plan guard
+/// (`hot_statements_never_scan_or_sort`) reads this list: a new hot
+/// statement goes here, and a statement that is not in it has no guard.
+#[cfg(test)]
+pub(crate) const HOT_STATEMENTS: &[(&str, &str)] = &[
+    ("claim new rows", SQL_CLAIM_NEW),
+    ("claim due retries", SQL_CLAIM_RETRY),
+    ("claim stale claims", SQL_CLAIM_STALE),
+    ("prune delivered by age", SQL_PRUNE_DELIVERED_BEFORE),
+    ("prune delivered over count", SQL_PRUNE_DELIVERED_OVER_COUNT),
+    ("prune failed by age", SQL_PRUNE_FAILED_BEFORE),
+    ("mark delivered", SQL_MARK_DELIVERED),
+    ("mark failed", SQL_MARK_FAILED),
+];
+
+/// Pure: the first `limit` ids of the claim candidates `(occurred_at, id)`,
+/// oldest event first (ties by id). The three reads overlap in nothing (their
+/// statuses differ), so no id repeats.
+pub(crate) fn merge_claim_candidates(mut candidates: Vec<(i64, i64)>, limit: usize) -> Vec<i64> {
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.truncate(limit);
+    candidates.into_iter().map(|(_, id)| id).collect()
+}
+
 const SQL_RECORD_ENDPOINT: &str =
     "INSERT INTO event_deliveries (outbox_id, endpoint_id, status, attempts, last_error, updated_at)
      VALUES (?1, ?2, ?3, 1, ?4, ?5)
@@ -478,27 +549,25 @@ impl JobsDb {
         }
 
         let stale_claimed_at = now.saturating_sub(stale_after_secs.max(1));
-        let ids = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id
-                   FROM event_outbox
-                  WHERE (
-                            status = 'pending'
-                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                        )
-                     OR (
-                            status = 'in_progress'
-                        AND claimed_at IS NOT NULL
-                        AND claimed_at <= ?
-                        )
-                  ORDER BY occurred_at ASC, id ASC
-                  LIMIT ?",
-            )?;
-            let rows = stmt.query_map(params![now, stale_claimed_at, limit as i64], |row| {
-                row.get::<_, i64>(0)
+        // Three indexed reads (new rows, due retries, stale claims), merged
+        // here in claim order. One `OR` query made SQLite read the whole
+        // backlog and sort it at every tick (80 ms at 500k pending rows).
+        let n = i64::from(limit);
+        let mut candidates: Vec<(i64, i64)> = Vec::new();
+        for (sql, binds) in [
+            (SQL_CLAIM_NEW, vec![n]),
+            (SQL_CLAIM_RETRY, vec![now, n]),
+            (SQL_CLAIM_STALE, vec![stale_claimed_at, n]),
+        ] {
+            let mut stmt = self.conn.prepare_cached(sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
+                Ok((row.get::<_, i64>(1)?, row.get::<_, i64>(0)?))
             })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
+            for row in rows {
+                candidates.push(row?);
+            }
+        }
+        let ids = merge_claim_candidates(candidates, limit as usize);
 
         // One transaction for the whole claim: one commit (journal + fsync),
         // not one per row.
@@ -537,6 +606,10 @@ impl JobsDb {
     }
 
     /// Record one endpoint's outcome for an outbox row (`error = None`: success).
+    ///
+    /// The commit is `synchronous = FULL` (`JobsDb::durable`): the one caller
+    /// saves a Slack post, which cannot be deduplicated, so a power loss
+    /// must not lose the record and post the message twice.
     pub fn event_delivery_record(
         &self,
         outbox_id: i64,
@@ -549,10 +622,12 @@ impl JobsDb {
         } else {
             STATUS_DELIVERED
         };
-        self.conn.execute(
-            SQL_RECORD_ENDPOINT,
-            params![outbox_id, endpoint_id, status, error, now],
-        )?;
+        self.durable(|conn| {
+            conn.execute(
+                SQL_RECORD_ENDPOINT,
+                params![outbox_id, endpoint_id, status, error, now],
+            )
+        })?;
         Ok(())
     }
 
@@ -761,17 +836,7 @@ impl JobsDb {
             return Ok(0);
         }
         let deleted = self.conn.execute(
-            "DELETE FROM event_outbox
-              WHERE id IN (
-                    SELECT id
-                      FROM event_outbox
-                     WHERE status = 'delivered'
-                       AND delivered_at IS NOT NULL
-                       AND delivered_at < ?
-                       AND id <= ?
-                     ORDER BY delivered_at ASC, id ASC
-                     LIMIT ?
-              )",
+            SQL_PRUNE_DELIVERED_BEFORE,
             params![before, min_keep_id, limit as i64],
         )?;
         crate::config_db::reclaim_free_pages(&self.conn);
@@ -792,20 +857,7 @@ impl JobsDb {
             return Ok(0);
         }
         let deleted = self.conn.execute(
-            "DELETE FROM event_outbox
-              WHERE id IN (
-                    SELECT id
-                      FROM (
-                            SELECT id
-                              FROM event_outbox
-                             WHERE status = 'delivered'
-                               AND id <= ?
-                             ORDER BY COALESCE(delivered_at, occurred_at) DESC, id DESC
-                             LIMIT -1 OFFSET ?
-                      )
-                     ORDER BY id ASC
-                     LIMIT ?
-              )",
+            SQL_PRUNE_DELIVERED_OVER_COUNT,
             params![min_keep_id, max_delivered_rows as i64, limit as i64],
         )?;
         crate::config_db::reclaim_free_pages(&self.conn);
@@ -832,13 +884,7 @@ impl JobsDb {
             return Ok(0);
         }
         let deleted = self.conn.execute(
-            "DELETE FROM event_outbox
-              WHERE id IN (
-                    SELECT id FROM event_outbox
-                     WHERE status = 'failed' AND occurred_at < ? AND id <= ?
-                     ORDER BY occurred_at ASC, id ASC
-                     LIMIT ?
-              )",
+            SQL_PRUNE_FAILED_BEFORE,
             params![before, min_keep_id, limit as i64],
         )?;
         crate::config_db::reclaim_free_pages(&self.conn);
@@ -2050,6 +2096,151 @@ mod tests {
             "every claimed row is in progress"
         );
         assert!(pages <= 10, "one commit for the claim, wrote {pages} pages");
+    }
+
+    /// The plan lines of `EXPLAIN QUERY PLAN <sql>`.
+    fn plan(db: &JobsDb, sql: &str) -> Vec<String> {
+        let mut stmt = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let binds = vec![1_000_i64; stmt.parameter_count()];
+        stmt.query_map(rusqlite::params_from_iter(binds), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// E6/F46 class guard: no statement of the dispatcher tick scans the
+    /// outbox or sorts it in a temp B-tree. With a backlog of 500k rows each
+    /// of these would cost tens of milliseconds at EVERY tick, under the
+    /// shared jobs-DB lock.
+    #[test]
+    fn hot_statements_never_scan_or_sort() {
+        let db = JobsDb::in_memory("test-pass").unwrap();
+        for (name, sql) in HOT_STATEMENTS {
+            let lines = plan(&db, sql);
+            for line in &lines {
+                // The count prune finds its cut with one walk of the newest
+                // `delivered_max_rows` index entries (`LIMIT 1 OFFSET n`):
+                // bounded by the setting, not by the backlog.
+                let bounded = *name == "prune delivered over count"
+                    && line.starts_with("SCAN event_outbox USING COVERING INDEX");
+                assert!(
+                    !line.contains("TEMP B-TREE") && (!line.starts_with("SCAN") || bounded),
+                    "{name}: {line}\nfull plan: {lines:#?}"
+                );
+            }
+            assert!(
+                lines.iter().any(|l| l.contains("SEARCH")),
+                "{name}: no SEARCH in {lines:#?}"
+            );
+        }
+    }
+
+    /// The claim serves the same rows in the same order as the one `OR`
+    /// query did: due new rows and due retries by event time, stale claims
+    /// too; a future retry and a fresh claim are not due.
+    #[test]
+    fn claim_returns_due_rows_oldest_event_first() {
+        let db = JobsDb::in_memory("test-pass").unwrap();
+        let ids = db
+            .event_outbox_insert_many(&[
+                event_at(50, "new-late"),
+                event_at(10, "retry-due"),
+                event_at(30, "stale"),
+                event_at(5, "retry-future"),
+                event_at(20, "new-early"),
+                event_at(1, "fresh-claim"),
+            ])
+            .unwrap();
+        let set = |sql: &str, id: i64| db.conn.execute(sql, params![id]).unwrap();
+        set(
+            "UPDATE event_outbox SET next_attempt_at = 90 WHERE id = ?",
+            ids[1],
+        );
+        set(
+            "UPDATE event_outbox SET status = 'in_progress', claimed_at = 100 WHERE id = ?",
+            ids[2],
+        );
+        set(
+            "UPDATE event_outbox SET next_attempt_at = 5000 WHERE id = ?",
+            ids[3],
+        );
+        set(
+            "UPDATE event_outbox SET status = 'in_progress', claimed_at = 990 WHERE id = ?",
+            ids[5],
+        );
+        let claimed = db.event_outbox_claim_due("c", 1_000, 60, 10).unwrap();
+        let keys: Vec<_> = claimed.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["retry-due", "new-early", "stale", "new-late"]);
+        // A limit cuts the same order.
+        let db2 = JobsDb::in_memory("test-pass").unwrap();
+        db2.event_outbox_insert_many(&[event_at(3, "c"), event_at(1, "a"), event_at(2, "b")])
+            .unwrap();
+        let two = db2.event_outbox_claim_due("c", 1_000, 60, 2).unwrap();
+        assert_eq!(
+            two.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn merge_claim_candidates_orders_by_event_time_then_id() {
+        assert_eq!(
+            merge_claim_candidates(vec![(5, 9), (1, 4), (5, 2), (3, 7)], 3),
+            [4, 7, 2]
+        );
+        assert!(merge_claim_candidates(vec![], 5).is_empty());
+    }
+
+    /// Evidence for the PR (run by hand): the claim of one batch, and the
+    /// status counts, with a large backlog that has nothing due.
+    /// `cargo test --lib --release outbox_claim_cost_at_scale -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: cargo test --lib outbox_claim_cost_at_scale -- --ignored --nocapture"]
+    fn outbox_claim_cost_at_scale() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = JobsDb::open_or_create(&dir.path().join("s.db"), "pw").unwrap();
+        let rows: usize = 500_000;
+        for chunk in (0..rows).collect::<Vec<_>>().chunks(10_000) {
+            let events: Vec<NewEvent> = chunk
+                .iter()
+                .map(|i| event_at(*i as i64, &format!("k{i}")))
+                .collect();
+            db.event_outbox_insert_many(&events).unwrap();
+        }
+        // Every row waits for a retry in the future: nothing is due.
+        db.conn
+            .execute("UPDATE event_outbox SET next_attempt_at = 4000000000", [])
+            .unwrap();
+        // The claim of the previous release: one `OR` query.
+        let t = std::time::Instant::now();
+        let old: Vec<i64> = db
+            .conn
+            .prepare(
+                "SELECT id FROM event_outbox
+                  WHERE (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                     OR (status = 'in_progress' AND claimed_at IS NOT NULL AND claimed_at <= ?)
+                  ORDER BY occurred_at ASC, id ASC LIMIT ?",
+            )
+            .unwrap()
+            .query_map(params![1_000, 940, 50], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let old_claim = t.elapsed();
+        assert!(old.is_empty());
+        let t = std::time::Instant::now();
+        let claimed = db.event_outbox_claim_due("c", 1_000, 60, 50).unwrap();
+        let claim = t.elapsed();
+        let t = std::time::Instant::now();
+        db.event_outbox_status_counts().unwrap();
+        let counts = t.elapsed();
+        eprintln!(
+            "MEASURE rows={rows} old OR claim(0 due)={old_claim:?} new claim(0 due)={claim:?} status_counts={counts:?}"
+        );
+        assert!(claimed.is_empty());
     }
 
     fn shared(db: JobsDb) -> std::sync::Arc<tokio::sync::Mutex<JobsDb>> {

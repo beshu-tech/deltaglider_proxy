@@ -659,3 +659,233 @@ fn node_local_sql_matches_reads_and_writes() {
     );
     assert!(node_local_sql("SELECT * FROM users").is_empty());
 }
+
+fn pragma_text(conn: &Connection, name: &str) -> String {
+    conn.query_row(&format!("PRAGMA {name}"), [], |r| {
+        r.get::<_, rusqlite::types::Value>(0)
+    })
+    .map(|v| match v {
+        Value::Text(t) => t,
+        Value::Integer(i) => i.to_string(),
+        other => format!("{other:?}"),
+    })
+    .unwrap()
+}
+
+/// E6/F20: the jobs DB is node-local and never synced, so it runs in WAL
+/// (one fsync per commit, readers never block the writer) with
+/// `synchronous = NORMAL`. A rollback journal with FULL cost about 10 ms per
+/// commit. The config DB stays as it is: it is uploaded as ONE file.
+#[test]
+fn the_jobs_db_opens_in_wal_and_the_config_db_does_not() {
+    let n = node();
+    let jobs = JobsDb::open_or_create(&n.jobs_path, KEY).unwrap();
+    assert_eq!(pragma_text(&jobs.conn, "journal_mode"), "wal");
+    assert_eq!(pragma_text(&jobs.conn, "synchronous"), "1", "NORMAL");
+    assert_eq!(
+        pragma_text(&jobs.conn, "auto_vacuum"),
+        "2",
+        "WAL must not lose incremental auto-vacuum"
+    );
+    let config = ConfigDb::open_or_create(&n.config_path, KEY).unwrap();
+    assert_ne!(
+        pragma_text(&config.conn, "journal_mode"),
+        "wal",
+        "the config DB is synced as one file: a WAL would leave committed rows out of it"
+    );
+}
+
+/// A jobs DB made by an older release (rollback journal) moves to WAL on its
+/// next open, and keeps its rows.
+#[test]
+fn an_older_jobs_db_moves_to_wal_and_keeps_its_rows() {
+    let n = node();
+    {
+        let db = JobsDb::open_or_create(&n.jobs_path, KEY).unwrap();
+        db.conn
+            .execute_batch(
+                "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL;
+                 INSERT INTO listener_cursors (listener_name, last_event_id) VALUES ('a', 7);",
+            )
+            .unwrap();
+    }
+    let db = JobsDb::open_or_create(&n.jobs_path, KEY).unwrap();
+    assert_eq!(pragma_text(&db.conn, "journal_mode"), "wal");
+    assert_eq!(db.listener_cursor_load("a").unwrap(), 7);
+}
+
+/// E6/F20 + rekey: a committed row that still sits in the `-wal` file (a
+/// second connection is open, so nothing checkpointed it) must be in the
+/// re-encrypted file. A rekey that copies only the main file loses it, and a
+/// stale `-wal` that the new file does not match must not stay beside it.
+#[test]
+fn a_rekey_of_a_wal_jobs_db_keeps_rows_that_only_the_wal_holds() {
+    let n = node();
+    const OLD: &str = "old-config-db-key-0123456789abcdef01234567";
+    let live = JobsDb::open_or_create(&n.jobs_path, OLD).unwrap();
+    live.conn
+        .execute(
+            "INSERT INTO listener_cursors (listener_name, last_event_id) VALUES ('wal-only', 42)",
+            [],
+        )
+        .unwrap();
+    let wal = {
+        let mut name = n.jobs_path.file_name().unwrap().to_os_string();
+        name.push("-wal");
+        n.jobs_path.with_file_name(name)
+    };
+    assert!(
+        std::fs::metadata(&wal).map_or(0, |m| m.len()) > 0,
+        "the test needs frames in the WAL"
+    );
+    super::super::rekey_file(&n.jobs_path, OLD, KEY).unwrap();
+    drop(live);
+    assert!(super::super::probe_key(&n.jobs_path, KEY).unwrap());
+    let db = JobsDb::open_or_create(&n.jobs_path, KEY).unwrap();
+    assert_eq!(
+        db.listener_cursor_load("wal-only").unwrap(),
+        42,
+        "a row that only the WAL held is gone after the rekey"
+    );
+}
+
+/// The same through the boot path: a fallback key opens a WAL jobs DB.
+#[test]
+fn a_fallback_key_opens_a_wal_jobs_db_and_moves_it() {
+    let n = node();
+    const OLD: &str = "old-config-db-key-0123456789abcdef01234567";
+    {
+        let db = JobsDb::open_or_create(&n.jobs_path, OLD).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO listener_cursors (listener_name, last_event_id) VALUES ('x', 9)",
+                [],
+            )
+            .unwrap();
+    }
+    let keys = ConfigDbKeys::primary_only(KEY).with_fallback(FallbackKind::PreviousKey, OLD);
+    let db = JobsDb::open_live(&n.jobs_path, &keys).unwrap();
+    assert_eq!(pragma_text(&db.conn, "journal_mode"), "wal");
+    assert_eq!(db.listener_cursor_load("x").unwrap(), 9);
+}
+
+fn failure_db() -> (tempfile::TempDir, JobsDb) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = JobsDb::open_or_create(&dir.path().join("f.db"), KEY).unwrap();
+    db.replication_ensure_state("r", 1).unwrap();
+    db.lifecycle_ensure_state("l", 1).unwrap();
+    (dir, db)
+}
+
+fn replication_failure(db: &JobsDb, i: usize) {
+    db.replication_record_failure(
+        "r",
+        crate::replication::state_store::FailureInsert {
+            run_id: None,
+            occurred_at: 1,
+            source_key: &format!("k{i}"),
+            dest_key: &format!("k{i}"),
+            error_message: "boom",
+        },
+        20,
+    )
+    .unwrap();
+}
+
+/// E6/F20 class guard: recording one failure (the insert AND the ring
+/// prune) is ONE commit, for every job kind. Before, the insert and the
+/// prune were two commits, each with its own fsync.
+#[test]
+fn recording_a_failure_is_one_commit() {
+    let (_dir, db) = failure_db();
+    let commits = db.count_commits();
+    replication_failure(&db, 0);
+    assert_eq!(commits.get(), 1, "replication failure");
+    db.lifecycle_record_failure(
+        "l",
+        crate::lifecycle::state_store::LifecycleFailureInsert {
+            run_id: None,
+            occurred_at: 1,
+            bucket: "b",
+            object_key: "k",
+            error_message: "boom",
+        },
+        20,
+    )
+    .unwrap();
+    assert_eq!(commits.get(), 2, "lifecycle failure");
+    let job = db
+        .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
+        .unwrap()
+        .unwrap();
+    let before = commits.get();
+    db.maintenance_record_failure(job, "k", "boom", 20).unwrap();
+    assert_eq!(commits.get() - before, 1, "maintenance failure");
+    let before = commits.get();
+    db.replication_record_event_failure("r", 1, "ek", "ek", "boom", 20)
+        .unwrap();
+    assert_eq!(commits.get() - before, 1, "event-path failure");
+    let before = commits.get();
+    db.replication_record_object_failure("r", "ok", "boom", 1)
+        .unwrap();
+    assert_eq!(commits.get() - before, 1, "consecutive-failure ledger");
+}
+
+/// A page of failures that one `atomic` settles is ONE commit, however many
+/// rows it has: the bound that a page of N failures costs.
+#[test]
+fn a_page_of_failures_settles_in_one_commit() {
+    let (_dir, db) = failure_db();
+    let commits = db.count_commits();
+    db.atomic(|db| {
+        for i in 0..100 {
+            replication_failure(db, i);
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(commits.get(), 1, "100 failures, one commit");
+    assert_eq!(db.replication_failure_count("r").unwrap(), 20, "the ring");
+}
+
+/// An error inside `atomic` rolls the whole page back.
+#[test]
+fn a_failed_atomic_page_leaves_nothing() {
+    let (_dir, db) = failure_db();
+    let r: Result<(), _> = db.atomic(|db| {
+        replication_failure(db, 1);
+        Err(ConfigDbError::Other("stop".into()))
+    });
+    assert!(r.is_err());
+    assert_eq!(db.replication_failure_count("r").unwrap(), 0);
+}
+
+/// Evidence for the PR (run by hand): commits per second of a failure
+/// record, rollback journal + FULL (the old open) against WAL + NORMAL.
+/// `cargo test --lib --release failure_commit_rate -- --ignored --nocapture`
+#[test]
+#[ignore = "manual: cargo test --lib failure_commit_rate -- --ignored --nocapture"]
+fn failure_commit_rate() {
+    const N: usize = 300;
+    let run = |old: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        let db = JobsDb::open_or_create(&dir.path().join("m.db"), KEY).unwrap();
+        db.replication_ensure_state("r", 1).unwrap();
+        if old {
+            db.conn
+                .execute_batch("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL;")
+                .unwrap();
+        }
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            replication_failure(&db, i);
+        }
+        let e = t.elapsed();
+        (e, N as f64 / e.as_secs_f64())
+    };
+    let (old, old_rate) = run(true);
+    let (new, new_rate) = run(false);
+    eprintln!(
+        "MEASURE {N} failure records: journal+FULL {old:?} ({old_rate:.0}/s), WAL+NORMAL {new:?} ({new_rate:.0}/s)"
+    );
+}
