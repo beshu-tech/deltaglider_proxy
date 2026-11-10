@@ -23,7 +23,6 @@ use deltaglider_proxy::storage::StorageBackend;
 use deltaglider_proxy::usage_scanner::UsageScanner;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
 use tracing::info;
 
 /// Version string including build timestamp for --version output
@@ -502,7 +501,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let runtime = runtime_builder.build()?;
 
-    runtime.block_on(async_main(cli))
+    // A boot error prints as text (Display), never as `Error: Os { .. }`.
+    if let Err(e) = runtime.block_on(async_main(cli)) {
+        startup::exit_with_boot_error(&e.to_string());
+    }
+    Ok(())
 }
 
 /// Run a single async CLI subcommand on its own small tokio runtime.
@@ -537,7 +540,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Config::load()
     };
     if let Some(ref addr) = cli.listen {
-        config.listen_addr = addr.parse()?;
+        config.listen_addr = addr.parse().map_err(|e| {
+            format!("--listen '{addr}' is not a valid socket address (host:port): {e}")
+        })?;
     }
 
     // FATAL config-graph errors: a bucket routed to an undefined backend or
@@ -595,6 +600,34 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log_startup_banner(&config);
+
+    // --- Listener, TLS, state directory, spool: FIRST ---
+    // Everything that can stop a boot for an environment reason runs before
+    // the first background worker spawns, so a boot that cannot serve never
+    // ran a job or changed the config. Source guard:
+    // `the_listener_binds_before_the_first_worker_spawns`.
+    let _state_dir_lock = {
+        let db_path = deltaglider_proxy::config_db::config_db_path();
+        let dir = db_path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        match deltaglider_proxy::data_dir_lock::acquire(dir) {
+            Ok(lock) => lock,
+            Err(e) => startup::exit_with_boot_error(&e),
+        }
+    };
+    if let Err(e) = deltaglider_proxy::deltaglider::spool::SpoolDir::shared() {
+        startup::exit_with_boot_error(&e.to_string());
+    }
+    let listener = match startup::bind_listener(config.listen_addr).await {
+        Ok(l) => l,
+        Err(e) => startup::exit_with_boot_error(&e),
+    };
+    let rustls_config = match init_tls(&config).await {
+        Ok(c) => c,
+        Err(e) => startup::exit_with_boot_error(&e.to_string()),
+    };
 
     // --- Metrics ---
     let metrics = init_metrics(&config);
@@ -1236,9 +1269,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         job_plane,
     });
 
-    // --- TLS ---
-    let rustls_config = init_tls(&config).await?;
-
     // --- Merge UI + security headers ---
     let app = demo::ui_router(admin_state)
         .merge(app)
@@ -1276,7 +1306,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .graceful_shutdown(Some(deltaglider_proxy::serve::GRACEFUL_SHUTDOWN_DEADLINE));
         });
 
-        let listener = TcpListener::bind(&config.listen_addr).await?;
         info!(
             "DeltaGlider Proxy listening on https://{}",
             config.listen_addr
@@ -1290,7 +1319,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // for the failure mode.
         deltaglider_proxy::serve::serve_tls(listener, rustls_config, handle, app, limits).await?;
     } else {
-        let listener = TcpListener::bind(&config.listen_addr).await?;
         info!(
             "DeltaGlider Proxy listening on http://{}",
             config.listen_addr

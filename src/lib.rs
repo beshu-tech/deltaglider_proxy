@@ -23,6 +23,7 @@ pub mod config_db_sync;
 pub mod config_sections;
 pub mod coordination;
 pub mod cors;
+pub mod data_dir_lock;
 pub mod deltaglider;
 pub mod event_delivery;
 pub mod event_outbox;
@@ -675,6 +676,46 @@ mod source_guards {
     use crate::source_scan::{
         out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files, test_module_lines,
     };
+
+    /// F13 (#145): the listener, the TLS config, the state-directory lock and
+    /// the spool are made BEFORE the first background worker spawns, so a
+    /// boot that cannot serve never ran a job. The source order is the proof;
+    /// `main.rs` binds nowhere else.
+    #[test]
+    fn the_listener_binds_before_the_first_worker_spawns() {
+        let main = include_str!("main.rs");
+        let body = &main[main.find("async fn async_main").expect("async_main")..];
+        let first = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("async_main no longer calls {needle}"))
+        };
+        // The first code line (not a comment) that spawns anything.
+        let mut offset = 0;
+        let mut first_spawn = None;
+        for line in body.split_inclusive('\n') {
+            if !line.trim_start().starts_with("//") && line.contains("spawn") {
+                first_spawn = Some(offset);
+                break;
+            }
+            offset += line.len();
+        }
+        let first_spawn = first_spawn.expect("async_main spawns workers");
+        for step in [
+            "data_dir_lock::acquire(",
+            "SpoolDir::shared()",
+            "startup::bind_listener(",
+            "init_tls(&config)",
+        ] {
+            assert!(
+                first(step) < first_spawn,
+                "{step} must run before the first `spawn` in async_main"
+            );
+        }
+        assert!(
+            !main.contains("TcpListener::bind"),
+            "main.rs binds only through startup::bind_listener, before the workers"
+        );
+    }
 
     /// #120: production code names the `dg-sealed` key only where a sealed
     /// object is handled: the encrypting wrapper (which seals and opens),

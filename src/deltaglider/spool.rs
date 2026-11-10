@@ -107,7 +107,18 @@ impl SpoolDir {
             "DGP_BACKEND_SHARE_PERCENT",
             crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT,
         );
-        let pool = Self::new(dir, max_bytes)?.with_backend_share(share);
+        let pool = Self::new(dir.clone(), max_bytes)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "the spool directory '{}' (set by DGP_SPOOL_DIR, default: dgp-spool in \
+                         the system temp dir) is not usable: {e}",
+                        dir.display()
+                    ),
+                )
+            })?
+            .with_backend_share(share);
         pool.sweep_orphans();
         Ok(pool)
     }

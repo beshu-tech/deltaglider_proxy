@@ -328,7 +328,12 @@ impl FilesystemBackend {
     /// Validates xattr support at startup.
     pub async fn new(root: PathBuf) -> Result<Self, StorageError> {
         // Ensure root directory exists
-        fs::create_dir_all(&root).await?;
+        fs::create_dir_all(&root).await.map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("cannot create the data directory '{}': {e}", root.display()),
+            )
+        })?;
 
         // Validate that the filesystem supports xattrs
         xattr_meta::validate_xattr_support(&root).await?;

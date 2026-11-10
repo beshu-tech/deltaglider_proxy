@@ -1863,6 +1863,39 @@ pub fn spawn_config_sync_poll(
 }
 
 /// Build TLS config if enabled in config.
+/// The operator-facing text of a failed bind of `addr` (pure).
+pub fn listen_error_message(addr: &std::net::SocketAddr, e: &std::io::Error) -> String {
+    let hint = match e.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            ". Another process listens on this address: stop it, or set listen_addr / \
+             DGP_LISTEN_ADDR to a free one"
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            ". This user may not bind this address (a port below 1024 needs extra rights): use \
+             a higher port"
+        }
+        std::io::ErrorKind::AddrNotAvailable => {
+            ". This address does not belong to this host: check listen_addr / DGP_LISTEN_ADDR"
+        }
+        _ => "",
+    };
+    format!("cannot listen on {addr}: {e}{hint}")
+}
+
+/// Bind the S3 + admin listener. Called BEFORE any background worker starts:
+/// a boot that cannot serve must not have run a job.
+pub async fn bind_listener(addr: std::net::SocketAddr) -> Result<tokio::net::TcpListener, String> {
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| listen_error_message(&addr, &e))
+}
+
+/// Print a fatal boot error (Display text, never Debug) and exit.
+pub fn exit_with_boot_error(message: &str) -> ! {
+    eprintln!("FATAL: {message}");
+    std::process::exit(1);
+}
+
 pub async fn init_tls(
     config: &Config,
 ) -> Result<Option<axum_server::tls_rustls::RustlsConfig>, Box<dyn std::error::Error>> {
@@ -2081,6 +2114,22 @@ fn boot_conversion_advice(bucket: &str, key: &str, why: &str, non_atomic: bool) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bind_error_names_the_address_and_says_what_to_do() {
+        let addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        for (kind, needle) in [
+            (std::io::ErrorKind::AddrInUse, "Another process listens"),
+            (std::io::ErrorKind::PermissionDenied, "below 1024"),
+            (std::io::ErrorKind::AddrNotAvailable, "does not belong"),
+            (std::io::ErrorKind::Other, "cannot listen on 127.0.0.1:9000"),
+        ] {
+            let text = super::listen_error_message(&addr, &std::io::Error::from(kind));
+            assert!(text.contains("127.0.0.1:9000"), "{text}");
+            assert!(text.contains(needle), "{text}");
+            assert!(!text.contains("Os {"), "{text}");
+        }
+    }
+
     use super::*;
     use deltaglider_proxy::config::Config;
 
