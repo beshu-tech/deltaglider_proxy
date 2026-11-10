@@ -31,8 +31,6 @@ pub(crate) struct SelfCopyPlan {
     pub bucket_key_enabled: Option<bool>,
 }
 
-/// Metadata keys DG owns: the new metadata restates them, so stale values
-/// from the HEAD are dropped (the pre-D17 behaviour for these keys).
 /// Pure: a user-metadata value as the client wrote it. A backend answers a
 /// non-ASCII value as one RFC 2047 encoded word, and each backend picks its
 /// own form (`=?UTF-8?q?…?=` on MinIO, `=?UTF-8?B?…?=` on AWS). The proxy
@@ -86,6 +84,8 @@ fn decode_q(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Metadata keys DG owns: the new metadata restates them, so stale values
+/// from the HEAD are dropped (the pre-D17 behaviour for these keys).
 pub(super) fn is_dg_owned_meta_key(key: &str) -> bool {
     const LEGACY: &[&str] = &[
         "tool",

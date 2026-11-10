@@ -21,10 +21,10 @@ use super::io_to_storage_error;
 #[cfg(test)]
 pub(crate) mod fault;
 mod fsio;
-mod sweep;
 #[cfg(test)]
 mod list_memory_tests;
 mod scan;
+mod sweep;
 #[cfg(test)]
 mod tests;
 mod write;
@@ -2204,8 +2204,8 @@ impl StorageBackend for FilesystemBackend {
         max_keys: u32,
         continuation_token: Option<&str>,
     ) -> Result<Option<DelegatedListResult>, StorageError> {
-        // No delimiter: a sorted walk that stops after the page. Another
-        // delimiter than "/" falls back to the bulk path.
+        // No delimiter: a sorted walk that stops after the page. A
+        // delimiter other than "/" is a sorted walk too (`list_collapsed_page`).
         if delimiter.is_none() {
             return self
                 .list_flat_page(bucket, prefix, max_keys, continuation_token)
