@@ -454,7 +454,7 @@ fn read_rows(conn: &Connection, schema: &str, table: &str) -> Result<Vec<Row>, C
         )));
     }
     let mut stmt = conn.prepare(&format!("SELECT * FROM {schema}.{table}"))?;
-    let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+    let cols: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
     let rows = stmt
         .query_map([], |r| {
             let mut row = Row::new();

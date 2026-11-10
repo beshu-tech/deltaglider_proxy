@@ -172,7 +172,7 @@ uuid = { version = "1", features = ["v4"] }
 # (newer prometheus uses thiserror v2, which matches the rest of the
 # tree — saves one full thiserror compile per build).
 prometheus = { version = "0.14", default-features = false, features = ["process"] }
-rusqlite = { version = "0.39.0", features = ["bundled-sqlcipher"] }
+rusqlite = { version = "0.41.1", features = ["bundled-sqlcipher"] }
 iam-rs = "0.0.23"
 tower = { version = "0.5", features = ["limit"] }
 s3s = "0.14.0"
