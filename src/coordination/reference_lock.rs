@@ -516,6 +516,11 @@ impl ReferenceLock for S3ReferenceLock {
         // only on a bucket that enforces the condition on DELETE.
         let kept = self.kept.take(key, owner);
         // A lock is held only after a write that needed a proven profile.
+        // No profile and no kept ETag: nothing of ours was written (the
+        // acquire was refused), so there is nothing to read or delete.
+        if kept.is_none() && self.profile.get().is_none() {
+            return Ok(());
+        }
         let profile = self.profile.get().unwrap_or_default();
         if let Some(etag) = kept.filter(|_| profile.conditional_delete) {
             let delete = super::cas::delete_if_match(
@@ -1081,6 +1086,21 @@ mod tests {
         );
         cell.prove(Default::default());
         assert!(lock.try_acquire("k", "o", now).await.unwrap());
+    }
+
+    /// `acquire_blocking` releases after a refused acquire. With an unknown
+    /// profile and no kept ETag there is nothing to delete: the release must
+    /// not send a GET (up to the request timeout on a hanging bucket).
+    #[tokio::test]
+    async fn a_release_with_an_unknown_profile_and_no_etag_sends_nothing() {
+        let (lock, fake) = fake_lock().await;
+        let lock = lock.with_profile_cell(crate::coordination::if_match::ProfileCell::unknown());
+        lock.release("k", "o").await.unwrap();
+        assert!(
+            methods(&fake).is_empty(),
+            "the release sent: {:?}",
+            methods(&fake)
+        );
     }
 
     fn methods(fake: &crate::storage::FakeS3) -> Vec<String> {

@@ -679,9 +679,9 @@ mod readiness_tests {
     }
 
     /// CLASS GUARD. Every `SlowDown` / `ServiceUnavailable` /
-    /// `SERVICE_UNAVAILABLE` in production code of the request path
-    /// (`src/api`, `src/admission`, `src/s3_adapter_s3s`,
-    /// `src/maintenance/gate.rs`, `src/coordination/health.rs`) has a row
+    /// `SERVICE_UNAVAILABLE`, and every `StorageError` / `EngineError`
+    /// variant that the bridges answer with a 503 (read from the bridges),
+    /// in production code of `src/` outside `src/storage` has a row
     /// below: a file, a needle (`=` starts a whole-line match), how many
     /// lines match it, how far it reaches, and why. A site that no row
     /// covers fails, whatever its shape, until someone classifies it. A
@@ -730,23 +730,121 @@ mod readiness_tests {
         ("src/coordination/health.rs", "S3Error::ServiceUnavailable(format!(", 1, Reach::PerBucket, "BackendHealthGate: the bucket's backend is gated"),
         ("src/api/handlers/status.rs", "=StatusCode::SERVICE_UNAVAILABLE", 1, Reach::Plumbing, "the /_/ready answer itself"),
         ("src/maintenance/gate.rs", "S3Error::SlowDown(refusal_message", 1, Reach::PerBucket, "a job holds this bucket's write gate"),
+        ("src/api/admin/objects.rs", "EngineError::Overloaded(_) | EngineError::Storage(StorageError::Throttled(_))", 1, Reach::PerRequest, "the admin ZIP maps an overloaded engine to its busy answer"),
+        ("src/api/errors.rs", "crate::storage::StorageError::DiskFull => disk_full_503(", 1, Reach::Plumbing, "the bridge: a full disk"),
+        ("src/api/errors.rs", "crate::storage::StorageError::Unavailable(msg) => {", 1, Reach::Plumbing, "the bridge: a backend that did not answer"),
+        ("src/api/errors.rs", "crate::storage::StorageError::Transient(cause) => {", 1, Reach::Plumbing, "the bridge: a retryable backend fault"),
+        ("src/api/errors.rs", "=crate::storage::StorageError::Contended(msg)", 1, Reach::Plumbing, "the bridge: a writer holds the resource"),
+        ("src/api/errors.rs", "=| crate::storage::StorageError::PreconditionFailed(msg) => {", 1, Reach::Plumbing, "the bridge: the source changed"),
+        ("src/api/errors.rs", "crate::storage::StorageError::QuotaExceeded(cause) => {", 1, Reach::Plumbing, "the bridge: a backend quota"),
+        ("src/api/errors.rs", "crate::storage::StorageError::NoSuchUpload(cause) => {", 1, Reach::Plumbing, "the bridge: a proxy-owned upload vanished"),
+        ("src/api/handlers/object_helpers.rs", "EngineError::Storage(StorageError::PreconditionFailed(_))", 1, Reach::PerRequest, "the copy source changed during this copy"),
+        ("src/coordination/atomicity.rs", "Self::Pending { .. } => crate::api::errors::S3Error::SlowDown(message)", 1, Reach::PerBucket, "the atomic-write verdict of one proxy-encrypted bucket is pending"),
+        ("src/deltaglider/engine/locking.rs", "EngineError::Storage(StorageError::Unavailable(detail))", 1, Reach::PerRequest, "the cross-instance reference lock cannot be reached for this deltaspace"),
+        ("src/deltaglider/engine/locking.rs", "EngineError::Storage(StorageError::Contended(format!(", 1, Reach::PerRequest, "a peer holds this deltaspace past the wait"),
+        ("src/deltaglider/engine/mod.rs", "EngineError::Overloaded(msg) => crate::api::S3Error::SlowDown(msg)", 1, Reach::Plumbing, "the engine bridge"),
+        ("src/deltaglider/engine/resources.rs", "EngineError::Overloaded(", 6, Reach::PerRequest, "a codec slot or the spool budget is full for this request"),
+        ("src/deltaglider/engine/retrieve.rs", "EngineError::Storage(StorageError::PreconditionFailed(", 2, Reach::PerRequest, "the object changed during this read"),
+        ("src/deltaglider/engine/retrieve.rs", "EngineError::Storage(StorageError::Throttled(format!(", 1, Reach::PerRequest, "a shared reconstruction was throttled"),
+        ("src/multipart.rs", "S3Error::SlowDown(", 4, Reach::PerRequest, "a multipart request met a cap or a full spool budget"),
+        ("src/transfer.rs", "crate::api::S3Error::SlowDown(", 1, Reach::PerRequest, "a copy maps its busy error to SlowDown"),
     ];
 
-    /// `(file, trimmed line)` of every site in the scanned production code.
-    fn refusal_sites() -> Vec<(String, String)> {
-        use crate::source_scan::{prod_lines, prod_sources, read};
-        let word = regex_lite::Regex::new(r"\b(SlowDown|ServiceUnavailable|SERVICE_UNAVAILABLE)\b")
+    /// The variants of `prefix` (a path such as `crate::storage::StorageError::`)
+    /// that the exhaustive bridge `impl_header` answers with a 503 (a
+    /// `SlowDown`, a `ServiceUnavailable`, or a `*_503` helper). Read from
+    /// the source of the bridge, so a new 503 variant joins the scan with no
+    /// edit here. A variable-carrying `Io` arm that is a 503 only for a full
+    /// disk is left out: every file write raises it.
+    fn variants_answered_503(file: &str, impl_header: &str, prefix: &str) -> Vec<String> {
+        let text = crate::source_scan::prod_text(&crate::source_scan::read(file));
+        let body = text
+            .split(impl_header)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{file}: {impl_header}"));
+        let body = body
+            .split(format!("\n{}\n", '\u{7d}').as_str())
+            .next()
             .unwrap();
-        let mut files: Vec<(String, String)> = Vec::new();
-        for dir in ["src/api", "src/admission", "src/s3_adapter_s3s"] {
-            files.extend(prod_sources(dir));
+        // (variants of the arm, text of the arm)
+        let mut arms: Vec<(Vec<String>, String)> = Vec::new();
+        for line in body.lines() {
+            let head = line
+                .trim()
+                .trim_start_matches("e @ (")
+                .trim_start_matches("| ");
+            if let Some(rest) = head.strip_prefix(prefix) {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                match arms.last_mut() {
+                    // The arm's head is not finished (no `=>` yet): an or-pattern.
+                    Some((names, text)) if !text.contains("=>") => names.push(name),
+                    _ => arms.push((vec![name], String::new())),
+                }
+            }
+            if let Some((_, text)) = arms.last_mut() {
+                text.push_str(line);
+                text.push('\n');
+            }
         }
-        for file in ["src/maintenance/gate.rs", "src/coordination/health.rs"] {
-            files.push((file.to_string(), read(file)));
+        let is_503 = regex_lite::Regex::new(r"SlowDown|ServiceUnavailable|_503").unwrap();
+        let mut out: Vec<String> = arms
+            .into_iter()
+            .filter(|(_, text)| is_503.is_match(text))
+            .flat_map(|(names, _)| names)
+            .filter(|n| n != "Io")
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The source words of a 503 refusal: the S3 types, and every
+    /// `StorageError` / `EngineError` variant that the bridges turn into one
+    /// (`S3Error::from(StorageError::Throttled(..))` refuses as much as
+    /// `S3Error::SlowDown(..)` does).
+    fn refusal_words() -> regex_lite::Regex {
+        let storage = variants_answered_503(
+            "src/api/errors.rs",
+            "impl From<crate::storage::StorageError> for S3Error {",
+            "crate::storage::StorageError::",
+        );
+        let engine = variants_answered_503(
+            "src/deltaglider/engine/mod.rs",
+            "impl From<EngineError> for crate::api::S3Error {",
+            "EngineError::",
+        );
+        for known in ["Throttled", "WritesRefused", "Unavailable", "Transient", "Contended"] {
+            assert!(storage.iter().any(|v| v == known), "the bridge read lost {known}");
         }
+        assert!(engine.iter().any(|v| v == "Overloaded"));
+        regex_lite::Regex::new(&format!(
+            r"\b(SlowDown|ServiceUnavailable|SERVICE_UNAVAILABLE|StorageError::({})|EngineError::({}))\b",
+            storage.join("|"),
+            engine.join("|")
+        ))
+        .unwrap()
+    }
+
+    /// Production code that cannot refuse a client request: the backends
+    /// RAISE these errors on every fault (the bridges decide the answer),
+    /// the config registry holds help text, and the replication workers run
+    /// in the background (they log a throttled backend and stop a run).
+    const NOT_SCANNED: &[&str] = &["src/storage/", "src/config/registry.rs", "src/replication/"];
+
+    /// `(file, trimmed line)` of every site in the production code of
+    /// `src/` (minus [`NOT_SCANNED`] and test modules).
+    fn refusal_sites() -> Vec<(String, String)> {
+        use crate::source_scan::{prod_lines, prod_sources};
+        let word = refusal_words();
         let mut sites = Vec::new();
-        for (file, text) in &files {
-            for (_, line) in prod_lines(text) {
+        for (file, text) in prod_sources("src") {
+            if NOT_SCANNED.iter().any(|p| file.starts_with(p)) {
+                continue;
+            }
+            for (_, line) in prod_lines(&text) {
                 let line = line.trim();
                 if !line.starts_with("//") && word.is_match(line) {
                     sites.push((file.clone(), line.to_string()));
@@ -858,6 +956,9 @@ mod readiness_tests {
             "return StatusCode::SERVICE_UNAVAILABLE.into_response();",
             "Err(s3s::s3_error!(SlowDown, \"busy\"))",
             "S3Error::ServiceUnavailable(\"x\".into())",
+            // A refusal that goes through the bridges.
+            "return Err(S3Error::from(StorageError::Throttled(\"draining\".into())).into_response());",
+            "return Err(EngineError::Overloaded(\"x\".into()).into());",
         ] {
             let mut sites = refusal_sites();
             sites.push(("src/api/middleware_new.rs".into(), line.into()));
