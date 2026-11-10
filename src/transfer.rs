@@ -3430,7 +3430,8 @@ mod request_count_tests {
     fn count(fake: &FakeS3, prefix: &str) -> usize {
         fake.requests()
             .iter()
-            .filter(|r| r.starts_with(prefix) && !r.contains("/.dg/"))
+            // A facts LIST carries the folder as a query value: `.dg%2Ffacts`.
+            .filter(|r| r.starts_with(prefix) && !r.contains("/.dg/") && !r.contains(".dg%2F"))
             .count()
     }
 

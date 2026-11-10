@@ -127,14 +127,18 @@ async fn expired_objects_are_deleted_in_one_batch_per_page() {
     store_deltas(&engine, "rel", 25).await;
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     fake.clear();
-    fake.set_delete_delay_ms(20);
+    // Each DELETE waits until a DELETE in each folder is in flight: the two
+    // folders delete together, whatever the host load. (A 20 ms delay and
+    // a peak count raced the load, and also counted the DELETEs of the
+    // facts cleanup, so folders one after another could pass it.)
+    fake.rendezvous("DELETE", &["b/run/", "b/rel/"]);
     let out = run(&engine, &rule("expire", "1ms")).await;
     assert_eq!(out.objects_affected, 50, "{out:?}");
     assert_eq!(out.errors, 0, "{out:?}");
     assert_eq!(reclaim_checks(&fake, "run/"), 1, "{:#?}", fake.requests());
     assert_eq!(reclaim_checks(&fake, "rel/"), 1);
     assert!(
-        fake.peak_deletes_in_flight() >= 2,
+        fake.rendezvous_met("DELETE"),
         "the folders were deleted one after another"
     );
     let left = engine

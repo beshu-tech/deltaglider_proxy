@@ -301,6 +301,21 @@ mod tests {
         false
     }
 
+    /// Wait until `n` objects are STORED under `prefix` (`bucket/key`
+    /// form). [`wait_count`] sees a PUT when it arrives, before the fake
+    /// stores the object: a node that lists right after it can still miss
+    /// the facts.
+    async fn wait_stored(fake: &FakeS3, n: usize, prefix: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if fake.stored_count(prefix) >= n {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
     fn delta_heads(r: &str) -> bool {
         r.starts_with("HEAD /b/") && r.ends_with(".delta")
     }
@@ -347,7 +362,7 @@ mod tests {
             "{:?}",
             fake.requests()
         );
-        assert!(wait_count(&fake, 5, |r| r.starts_with("PUT /b/.dg/facts/")).await);
+        assert!(wait_stored(&fake, 5, "b/.dg/facts/").await);
         // This node: from its process cache, no request but the LIST.
         fake.clear();
         let page = list(&engine, "rel/").await;
@@ -416,14 +431,20 @@ mod tests {
     /// and every node and restart missed the deltas again. Now they land
     /// at once, and another node lists every delta from the facts: no miss,
     /// no HEAD.
+    ///
+    /// The cleanup's first LIST is stalled and never answers until the end
+    /// of the test: the cleanup cannot finish, whatever the host load, so
+    /// facts that land can not have waited for it. (A wall-clock bound on
+    /// "at once" failed on a loaded host.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn facts_converge_while_a_long_delete_cleanup_runs() {
         const N: usize = 20;
         let (_, fake, endpoint) = deltas_without_facts("rel", N).await;
         let mut s3 = test_support::for_test_endpoint(&endpoint);
         s3.list_cache_scope = test_support::test_scope(&endpoint, "busy-node");
-        fake.set_delay_ms("LIST", 150);
-        // 40 deleted keys, one per directory: 40 facts LISTs, 6 s.
+        fake.stall("LIST", "prefix=.dg%2Ffacts%2Fe2e");
+        // 40 deleted keys, one per directory: 40 facts LISTs, the first
+        // one never answered.
         for i in 0..40 {
             s3.facts_cleanup
                 .enqueue("b", &format!("e2e/run{i:03}/index.html"), None);
@@ -434,16 +455,18 @@ mod tests {
                 .await
         );
         fake.clear();
-        let started = std::time::Instant::now();
         let page = list_with_heads(&busy, "rel/").await;
         assert!(page.objects.iter().all(|(_, m)| m.file_size == 65_536));
-        let landed = wait_count(&fake, N, |r| r.starts_with("PUT /b/.dg/facts/rel/")).await;
-        assert!(
-            landed && started.elapsed() < std::time::Duration::from_secs(4),
-            "{N} facts PUTs after {:?}: {landed}",
-            started.elapsed()
+        let landed = wait_stored(&fake, N, "b/.dg/facts/rel/").await;
+        assert!(landed, "{N} facts PUTs wait behind the cleanup");
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|r| r.contains("prefix=.dg%2Ffacts%2Fe2e"))
+                .count(),
+            0,
+            "the cleanup moved on: it was not stalled"
         );
-        fake.set_delay_ms("LIST", 0);
         let other = reader(&endpoint, "fresh-node");
         fake.clear();
         let page = list(&other, "rel/").await;
@@ -451,6 +474,7 @@ mod tests {
         assert!(page.facts_missing_keys.is_empty());
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(fake.requests().iter().filter(|r| delta_heads(r)).count(), 0);
+        fake.release_stalls();
     }
 
     /// Prod (beshu, v2.0.9): deltas written by an older toolchain carry no
@@ -488,7 +512,7 @@ mod tests {
         assert_eq!(page.objects.len(), N);
         assert!(wait_count(&fake, N, delta_heads).await);
         assert!(
-            wait_count(&fake, N, |r| r.starts_with("PUT /b/.dg/facts/rel/")).await,
+            wait_stored(&fake, N, "b/.dg/facts/rel/").await,
             "no facts written: {:?}",
             fake.requests()
         );

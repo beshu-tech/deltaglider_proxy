@@ -1774,11 +1774,13 @@ mod spool_probe_tests {
         let cache = BackendHealthCache::default();
         let runs = Arc::new(AtomicUsize::new(0));
         let (release, hold) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started) = std::sync::mpsc::channel::<()>();
         let counter = runs.clone();
         let usable = cache
             .spool_probe(
                 move || {
                     counter.fetch_add(1, SeqCst);
+                    let _ = started_tx.send(());
                     let _ = hold.recv();
                     true
                 },
@@ -1786,6 +1788,12 @@ mod spool_probe_tests {
             )
             .await;
         assert!(!usable, "timeout means unusable");
+        // On a loaded host the blocking pool may start the check after the
+        // limit passed. Wait for the start: the second call must meet a
+        // check that is running, not one that is still queued.
+        started
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the blocking check starts");
         // Past the TTL: the verdict is stale, the first check still hangs.
         *cache.spool_probe.lock().await = None;
         let counter = runs.clone();
