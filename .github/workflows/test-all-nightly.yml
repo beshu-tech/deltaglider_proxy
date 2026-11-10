@@ -38,6 +38,9 @@ jobs:
     timeout-minutes: 120
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      # The full suite opens many sockets and files at once (the other
+      # test jobs raise the same limit).
+      options: --ulimit nofile=1048576:1048576
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -203,6 +206,52 @@ jobs:
         run: cargo deny --manifest-path operator/Cargo.toml check advisories
 
 
+  # ── Platform check (F32): the release builds macOS and aarch64 only at the
+  #    tag, so a failure that only those targets see (commit 34fc5717) shows
+  #    up while releasing. `cargo check` compiles every crate and the whole
+  #    workspace (all targets) for the target without linking or running it.
+  #    It cannot run on Linux: aws-lc-sys compiles C for the target, which
+  #    needs Apple clang. Free GitHub-hosted runners (no Blacksmith); nightly
+  #    only, never the PR gate. ──
+  check-platforms:
+    name: cargo check ${{ matrix.target }} (nightly)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_INCREMENTAL: "0"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: demo/s3-browser/ui/package-lock.json
+      - name: Build demo UI (rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          targets: ${{ matrix.target }}
+      # rust-toolchain.toml pins the compiler: install the target's std for it.
+      - name: Add the target to the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: check-${{ matrix.target }}
+      - name: cargo check (all targets, all features)
+        run: cargo check --locked --all-targets --all-features --target ${{ matrix.target }}
+
   # ── QA regression pass (demo/s3-browser/ui/e2e/qa-regression.spec.ts):
   #    drives the whole admin UI + browser against the RELEASE binary in
   #    bootstrap-auth mode. Minutes long, so nightly only. ──
@@ -313,7 +362,7 @@ jobs:
   report:
     name: Report nightly status
     if: ${{ always() && github.ref == 'refs/heads/main' }}
-    needs: [test-all-default-features, coverage, tokio-unstable, supply-chain, qa-e2e, fuzz, image-and-chart]
+    needs: [test-all-default-features, coverage, tokio-unstable, supply-chain, check-platforms, qa-e2e, fuzz, image-and-chart]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

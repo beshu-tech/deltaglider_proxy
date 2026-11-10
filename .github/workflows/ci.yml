@@ -9,9 +9,11 @@ on:
 
 # On main every commit keeps its own run: release.yml refuses a tag whose
 # commit has no successful CI run, and a newer push used to cancel it.
-# Other refs still cancel their older runs.
+# Other refs still cancel their older runs. The event name is part of the
+# group: a manual dispatch on a commit that a push already runs must not
+# cancel the push run (release.yml looks for the push run of the tagged SHA).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 
 permissions:
