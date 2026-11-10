@@ -329,6 +329,7 @@ jobs:
               iam_identity_test::
               iam_mode_test::
               iam_persona_test::
+              list_edges_test::
               list_truncation_test::
               mismatch_boot_test::
               parity_test::

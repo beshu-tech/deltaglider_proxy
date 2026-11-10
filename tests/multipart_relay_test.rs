@@ -104,3 +104,43 @@ async fn an_upload_that_tries_no_delta_relays_its_parts_from_the_start() {
         );
     }
 }
+
+/// A key that a PutObject refuses fails at CreateMultipartUpload too, so a
+/// client does not upload every part before it learns of the refusal.
+#[tokio::test]
+async fn a_refused_key_fails_at_create_multipart_upload() {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+
+    let server = TestServer::filesystem().await;
+    let client = server.s3_client().await;
+    let bucket = server.bucket();
+    for key in [
+        "a/.dg/x.bin",
+        ".dg/x.bin",
+        "a//x.bin",
+        "a/x.delta",
+        "folder/",
+    ] {
+        let err = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect_err(key);
+        assert_eq!(err.code(), Some("InvalidArgument"), "{key}: {err:?}");
+        assert_eq!(
+            err.raw_response().map(|r| r.status().as_u16()),
+            Some(400),
+            "{key}"
+        );
+    }
+    // A plain key still creates.
+    client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("a/x.bin")
+        .send()
+        .await
+        .expect("a plain key creates");
+}

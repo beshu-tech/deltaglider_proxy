@@ -295,6 +295,34 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
+  # ── RSS-bounded LIST load (scripts/list-load.sh): one folder of 200,000
+  #    files, 20 concurrent LISTs of one key. The peak RSS of the release
+  #    binary must not depend on the folder size (F3, epic #142: 1.85 GB). ──
+  list-load:
+    name: LIST memory load (200k-entry folder)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          shared-key: release
+          save-if: false
+          cache-bin: "false"
+      - name: Build demo UI (rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - name: cargo build --release
+        run: scripts/ci-memwatch.sh cargo build --locked --release --bin deltaglider_proxy
+      - name: LIST load
+        env:
+          DELTAGLIDER_PROXY_BIN: ${{ github.workspace }}/target/release/deltaglider_proxy
+        run: ./scripts/list-load.sh
+
   # ── Fuzzing (fuzz/, libFuzzer): 5 minutes per target on the pinned STABLE
   #    toolchain via scripts/fuzz.sh (cargo-fuzz's coverage flags with no
   #    sanitizer: the targets are safe-Rust parsers whose bugs are panics, and
@@ -362,7 +390,7 @@ jobs:
   report:
     name: Report nightly status
     if: ${{ always() && github.ref == 'refs/heads/main' }}
-    needs: [test-all-default-features, coverage, tokio-unstable, supply-chain, check-platforms, qa-e2e, fuzz, image-and-chart]
+    needs: [test-all-default-features, coverage, tokio-unstable, supply-chain, check-platforms, qa-e2e, list-load, fuzz, image-and-chart]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

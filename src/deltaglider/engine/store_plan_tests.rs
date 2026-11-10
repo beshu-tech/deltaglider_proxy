@@ -404,15 +404,38 @@ fn tries_delta_only_when_compressing_an_eligible_key_that_fits_without_the_hint(
         for eligible in [false, true] {
             for no_delta in [false, true] {
                 for fits in [false, true] {
-                    assert_eq!(
-                        StorePlan::tries_delta(compression, eligible, no_delta, fits),
-                        compression && eligible && !no_delta && fits,
-                        "compression={compression} eligible={eligible} no_delta={no_delta} fits={fits}"
-                    );
+                    for name_fits in [false, true] {
+                        assert_eq!(
+                            StorePlan::tries_delta(
+                                compression,
+                                eligible,
+                                no_delta,
+                                fits,
+                                name_fits
+                            ),
+                            compression && eligible && !no_delta && fits && name_fits,
+                            "compression={compression} eligible={eligible} no_delta={no_delta} \
+                             fits={fits} name_fits={name_fits}"
+                        );
+                    }
                 }
             }
         }
     }
+}
+
+/// F43 (epic #142): the `.delta` form of a name is 6 bytes longer. A name
+/// of 250 bytes or more is stored whole, so the same name never succeeds
+/// as a whole object and then fails as a delta.
+#[test]
+fn a_name_too_long_for_a_delta_file_is_stored_whole() {
+    use super::store::delta_name_fits;
+    assert!(delta_name_fits(&"a".repeat(249)));
+    assert!(!delta_name_fits(&"a".repeat(250)));
+    assert!(!delta_name_fits(&"a".repeat(255)));
+    // Bytes, not characters.
+    assert!(!delta_name_fits(&"é".repeat(125)));
+    assert!(delta_name_fits(&"é".repeat(124)));
 }
 
 #[test]

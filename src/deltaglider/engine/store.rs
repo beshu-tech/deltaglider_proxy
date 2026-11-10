@@ -84,19 +84,39 @@ pub(crate) enum StorePlan {
     Passthrough { remove_fresh_baseline: bool },
 }
 
+/// The longest file name that a backend stores (bytes).
+const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// Pure: does the delta form of this file name (`name.delta`) fit in a file
+/// name of a backend? `filename` is the last segment of the key.
+pub(crate) fn delta_name_fits(filename: &str) -> bool {
+    filename.len() + ".delta".len() <= MAX_FILE_NAME_BYTES
+}
+
 impl StorePlan {
     /// Whether a PUT tries a delta at all. No: store passthrough, with no
     /// baseline. `fits_delta_limit`: the object is at most `max_object_size`,
     /// the limit of a delta. A larger object of an eligible type is stored
     /// whole on every path, as a large multipart upload already was, never
     /// refused for being too large for a delta.
+    ///
+    /// `delta_name_fits`: the file name plus `.delta` is within the 255
+    /// bytes that a name may have on a filesystem backend and on MinIO
+    /// ([`delta_name_fits`]). A key whose name is too long for a delta is
+    /// stored whole, so a PUT never fails because the second upload of a
+    /// name could be a delta (F43).
     pub(crate) fn tries_delta(
         compression_enabled: bool,
         delta_eligible: bool,
         no_delta_requested: bool,
         fits_delta_limit: bool,
+        delta_name_fits: bool,
     ) -> bool {
-        compression_enabled && delta_eligible && !no_delta_requested && fits_delta_limit
+        compression_enabled
+            && delta_eligible
+            && !no_delta_requested
+            && fits_delta_limit
+            && delta_name_fits
     }
 
     /// After the encode. S-P1-1: the ratio is checked on EVERY PUT, not only
@@ -563,6 +583,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             self.is_delta_eligible(bucket, key),
             crate::types::no_delta_requested(user_metadata),
             size <= self.max_object_size,
+            delta_name_fits(key.rsplit('/').next().unwrap_or(key)),
         )
     }
 
@@ -581,11 +602,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .is_delta_eligible(bucket, &obj_key.filename);
         let no_delta = crate::types::no_delta_requested(user_metadata);
         let fits = size <= self.max_object_size;
-        if StorePlan::tries_delta(compression, eligible, no_delta, fits) {
+        let name_fits = delta_name_fits(&obj_key.filename);
+        if StorePlan::tries_delta(compression, eligible, no_delta, fits, name_fits) {
             return true;
         }
         if no_delta {
             debug!("The PUT asks for no delta, storing as passthrough");
+        } else if compression && eligible && !name_fits {
+            debug!("The name is too long for a .delta file, storing as passthrough");
         } else if compression && eligible {
             debug!("Larger than max_object_size ({size} bytes), storing as passthrough");
         } else if compression {
