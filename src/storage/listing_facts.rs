@@ -846,6 +846,40 @@ mod tests {
         }
     }
 
+    /// F19 (epic #142): the one rule of what a listing hides. A `.dg`
+    /// directory at any depth is the proxy's; a legacy baseline is reported
+    /// apart, not hidden here; `.dgx`, `.well-known` and the like are keys.
+    #[test]
+    fn a_key_in_a_dg_directory_is_hidden_from_listings() {
+        for key in [
+            ".dg/foo",
+            "a/.dg/foo",
+            ".dg/facts/x!!1.e.1.2.e",
+            "a/b/.dg/c/d.txt",
+            ".dg/sub/x",
+        ] {
+            assert!(is_hidden_key(key), "{key}");
+        }
+        for key in [
+            ".dg/reference.bin",
+            "a/.dg/reference.bin",
+            ".dgx/a",
+            ".dg",
+            "a/.dg",
+            ".well-known/a",
+            "dg/a",
+            "a.dg/b",
+        ] {
+            assert!(!is_hidden_key(key), "{key}");
+        }
+        for path in [".dg", ".dg/", "a/.dg/", "a/.dg/b/"] {
+            assert!(has_internal_segment(path), "{path}");
+        }
+        for path in ["", ".dgx/", "a/b", "dg/"] {
+            assert!(!has_internal_segment(path), "{path}");
+        }
+    }
+
     #[test]
     fn gc_deletes_only_old_verified_entries_of_gone_objects() {
         let facts = |k: &str, etag: &str, size: u64| {
