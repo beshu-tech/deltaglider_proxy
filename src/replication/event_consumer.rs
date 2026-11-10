@@ -1242,14 +1242,16 @@ async fn drain_rule_rows(
         };
         let dbg = db.lock().await;
         // One commit for the heartbeat and the key's outcome (E6/F20).
-        let _ = dbg.atomic(|dbg| {
+        if let Err(e) = dbg.atomic(|dbg| {
             // Mid-drain heartbeat: a long drain (up to 500 engine copies) must
             // keep pinning the background pruner's staleness floor.
             let _ =
                 dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
             settle_key(dbg, replication, w, outcome, now, &mut window, failed_ids);
             Ok(())
-        });
+        }) {
+            warn!("event consumer: the outcome of a key was not saved (rolled back): {e}");
+        }
     }
 
     if let Some(why) = refused {
@@ -1307,7 +1309,7 @@ async fn drain_rule_rows(
     let dbg = db.lock().await;
     // The whole delete batch settles in ONE commit (E6/F20): the cursor, and
     // every key's failure row or cleared ledger row.
-    let _ = dbg.atomic(|dbg| {
+    if let Err(e) = dbg.atomic(|dbg| {
         let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
         for (w, msg) in unmappable {
             let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
@@ -1329,7 +1331,9 @@ async fn drain_rule_rows(
             settle_key(dbg, replication, w, result, now, &mut window, failed_ids);
         }
         Ok(())
-    });
+    }) {
+        warn!("event consumer: the outcome of a delete batch was not saved (rolled back): {e}");
+    }
     std::ops::ControlFlow::Continue(window)
 }
 

@@ -236,7 +236,7 @@ pub enum Settlement {
 /// scan of the backlog: `idx_event_outbox_status_due` for the first two
 /// (`next_attempt_at IS NULL` is an equality there), the `status` prefix of
 /// it for the third (only claimed rows: at most a batch, or a dead claim).
-/// `claim_statements_use_an_index_and_never_sort` checks the plans.
+/// `hot_statements_never_scan_or_sort` checks the plans.
 pub(crate) const SQL_CLAIM_NEW: &str = "SELECT id, occurred_at FROM event_outbox
      WHERE status = 'pending' AND next_attempt_at IS NULL
      ORDER BY occurred_at ASC, id ASC LIMIT ?1";
@@ -278,9 +278,11 @@ pub(crate) const SQL_PRUNE_FAILED_BEFORE: &str = "DELETE FROM event_outbox
              LIMIT ?3
       )";
 
-/// Every statement the dispatcher runs at each tick, by name. The plan guard
-/// (`hot_statements_never_scan_or_sort`) reads this list: a new hot
-/// statement goes here, and a statement that is not in it has no guard.
+/// Every statement over `event_outbox` whose cost can grow with the backlog,
+/// by name. The plan guard (`hot_statements_never_scan_or_sort`) reads this
+/// list: a new such statement goes here, and a statement that is not in it
+/// has no guard. (A statement by primary key or by a bounded id list, such
+/// as the claim `UPDATE`, does not grow with the backlog and is not here.)
 #[cfg(test)]
 pub(crate) const HOT_STATEMENTS: &[(&str, &str)] = &[
     ("claim new rows", SQL_CLAIM_NEW),
@@ -570,12 +572,17 @@ impl JobsDb {
         let ids = merge_claim_candidates(candidates, limit as usize);
 
         // One transaction for the whole claim: one commit (journal + fsync),
-        // not one per row.
-        let tx = self.conn.unchecked_transaction()?;
-        let mut claimed = Vec::with_capacity(ids.len());
-        for id in ids {
-            let updated = tx.execute(
-                "UPDATE event_outbox
+        // not one per row. The commit is `FULL` (one fsync per batch): the
+        // claim comes before the posts of the batch, and the sync also
+        // covers every earlier frame, the appends. After a power loss no
+        // event that left the host is missing, so no later event gets its
+        // `event.id` (receivers deduplicate on it).
+        self.durable(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut claimed = Vec::with_capacity(ids.len());
+            for id in ids {
+                let updated = tx.execute(
+                    "UPDATE event_outbox
                     SET status = 'in_progress',
                         attempts = attempts + 1,
                         claimed_by = ?,
@@ -593,16 +600,17 @@ impl JobsDb {
                             AND claimed_at <= ?
                             )
                     )",
-                params![claimant, now, id, now, stale_claimed_at],
-            )?;
-            if updated > 0 {
-                if let Some(row) = self.event_outbox_load(id)? {
-                    claimed.push(row);
+                    params![claimant, now, id, now, stale_claimed_at],
+                )?;
+                if updated > 0 {
+                    if let Some(row) = self.event_outbox_load(id)? {
+                        claimed.push(row);
+                    }
                 }
             }
-        }
-        tx.commit()?;
-        Ok(claimed)
+            tx.commit()?;
+            Ok(claimed)
+        })
     }
 
     /// Record one endpoint's outcome for an outbox row (`error = None`: success).
@@ -623,10 +631,10 @@ impl JobsDb {
             STATUS_DELIVERED
         };
         self.durable(|conn| {
-            conn.execute(
+            Ok(conn.execute(
                 SQL_RECORD_ENDPOINT,
                 params![outbox_id, endpoint_id, status, error, now],
-            )
+            )?)
         })?;
         Ok(())
     }
@@ -1599,6 +1607,29 @@ mod tests {
         assert_eq!(rows[1].key, "b");
         assert_eq!(rows[2].key, "a");
         assert_eq!(rows[0].status, STATUS_PENDING);
+    }
+
+    /// The claim commit is `FULL`, once per batch: no post of the batch leaves
+    /// the host before its rows (and every earlier append) are on disk. An
+    /// empty claim writes nothing and runs no fsync.
+    #[test]
+    fn the_claim_commits_with_full_once_per_batch() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let db = JobsDb::in_memory("test-pass").unwrap();
+        for i in 0..5 {
+            db.event_outbox_insert(&event_at(10 + i, &format!("k{i}")))
+                .unwrap();
+        }
+        let before = db.durable_runs.load(Relaxed);
+        let claimed = db.event_outbox_claim_due("w", 100, 30, 10).unwrap();
+        assert_eq!(claimed.len(), 5);
+        assert_eq!(db.durable_runs.load(Relaxed) - before, 1, "one FULL commit");
+        let before = db.durable_runs.load(Relaxed);
+        assert!(db
+            .event_outbox_claim_due("w", 100, 30, 0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.durable_runs.load(Relaxed) - before, 0);
     }
 
     #[test]

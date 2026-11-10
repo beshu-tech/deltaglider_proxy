@@ -860,6 +860,112 @@ fn a_failed_atomic_page_leaves_nothing() {
     assert_eq!(db.replication_failure_count("r").unwrap(), 0);
 }
 
+/// A panic inside `atomic` must not leave the savepoint open: the jobs DB is
+/// one shared connection, and an open savepoint would swallow every later
+/// write until the process exits (review of #156).
+#[test]
+fn a_panic_inside_atomic_leaves_no_open_savepoint() {
+    let (dir, db) = failure_db();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<(), ConfigDbError> = db.atomic(|db| {
+            replication_failure(db, 1);
+            panic!("boom inside atomic");
+        });
+    }));
+    assert!(caught.is_err(), "the panic must reach the caller");
+    assert!(db.conn.is_autocommit(), "no savepoint stays open");
+    assert_eq!(db.replication_failure_count("r").unwrap(), 0, "rolled back");
+    // Later writes commit, and a second connection sees them.
+    db.listener_cursor_advance("x", 5, 1).unwrap();
+    db.atomic(|db| {
+        replication_failure(db, 2);
+        Ok(())
+    })
+    .unwrap();
+    drop(db);
+    let db = JobsDb::open_or_create(&dir.path().join("f.db"), KEY).unwrap();
+    assert_eq!(db.listener_cursor_load("x").unwrap(), 5);
+    assert_eq!(db.replication_failure_count("r").unwrap(), 1);
+}
+
+/// A failed outermost `RELEASE` (a deferred foreign key that does not hold)
+/// rolls the page back and leaves the connection in autocommit.
+#[test]
+fn a_failed_release_rolls_back_and_leaves_autocommit() {
+    let (_dir, db) = failure_db();
+    let r: Result<(), _> = db.atomic(|db| {
+        db.conn.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+        db.conn.execute(
+            "INSERT INTO event_deliveries (outbox_id, endpoint_id, status, attempts, updated_at)
+             VALUES (999, 'e', 'delivered', 1, 1)",
+            [],
+        )?;
+        Ok(())
+    });
+    assert!(r.is_err(), "the dangling row fails the release");
+    assert!(db.conn.is_autocommit(), "no savepoint stays open");
+    db.listener_cursor_advance("x", 3, 1).unwrap();
+    assert_eq!(db.listener_cursor_load("x").unwrap(), 3);
+}
+
+/// The WAL does not keep the size of its largest transaction: after a
+/// checkpoint it is cut to `journal_size_limit`.
+#[test]
+fn the_wal_has_a_size_limit() {
+    let (_dir, db) = failure_db();
+    assert_eq!(
+        pragma_text(&db.conn, "journal_size_limit"),
+        JOURNAL_SIZE_LIMIT_BYTES.to_string()
+    );
+}
+
+/// `durable` runs its commit with `synchronous = FULL` and puts the level back.
+/// Mutation: a `durable` that calls `f` as it is leaves the level at NORMAL
+/// inside, and this test fails.
+#[test]
+fn durable_commits_with_full_and_restores_normal() {
+    let (_dir, db) = failure_db();
+    assert_eq!(pragma_text(&db.conn, "synchronous"), "1", "NORMAL before");
+    let inside = db
+        .durable(|conn| Ok(pragma_text(conn, "synchronous")))
+        .unwrap();
+    assert_eq!(inside, "2", "FULL inside");
+    assert_eq!(pragma_text(&db.conn, "synchronous"), "1", "NORMAL after");
+    // The level is restored after a failure of `f` too.
+    let r: Result<(), _> = db.durable(|_| Err(ConfigDbError::Other("x".into())));
+    assert!(r.is_err());
+    assert_eq!(pragma_text(&db.conn, "synchronous"), "1");
+}
+
+/// SQLite refuses to change the level in a transaction: `durable` there would
+/// be a silent NORMAL commit, so it is an error.
+#[test]
+fn durable_inside_atomic_is_an_error() {
+    let (_dir, db) = failure_db();
+    let r = db.atomic(|db| db.durable(|_| Ok(())));
+    match r {
+        Err(ConfigDbError::Other(m)) => assert!(m.contains("open transaction"), "{m}"),
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+    assert!(db.conn.is_autocommit());
+    assert_eq!(pragma_text(&db.conn, "synchronous"), "1");
+}
+
+/// The `adopt_from` copy is a `FULL` commit: the config DB rows are deleted
+/// right after it.
+#[test]
+fn the_adoption_copy_commits_with_full() {
+    let n = node();
+    let config = ConfigDb::open_or_create(&n.config_path, KEY).unwrap();
+    let jobs = JobsDb::open_or_create(&n.jobs_path, KEY).unwrap();
+    let before = jobs.durable_runs.load(std::sync::atomic::Ordering::Relaxed);
+    jobs.adopt_from(&config, KEY).unwrap();
+    assert_eq!(
+        jobs.durable_runs.load(std::sync::atomic::Ordering::Relaxed) - before,
+        1
+    );
+}
+
 /// Evidence for the PR (run by hand): commits per second of a failure
 /// record, rollback journal + FULL (the old open) against WAL + NORMAL.
 /// `cargo test --lib --release failure_commit_rate -- --ignored --nocapture`
