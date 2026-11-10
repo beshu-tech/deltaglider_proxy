@@ -96,7 +96,8 @@ async fn an_occupied_port_fails_the_boot_before_any_worker_starts() {
 }
 
 /// F13: a second process on the same state directory is refused with a
-/// message that names the directory; the first one keeps serving.
+/// message that names the directory; the first one keeps serving. The wait
+/// for the lock is one second here (the default is 60).
 #[tokio::test]
 async fn a_second_process_on_the_same_state_directory_is_refused() {
     let mut server = TestServer::filesystem().await;
@@ -106,12 +107,16 @@ async fn a_second_process_on_the_same_state_directory_is_refused() {
     drop(other);
     let (status, output) = server
         .spawn_expect_exit(
-            &[("DGP_LISTEN_ADDR", &format!("127.0.0.1:{other_port}"))],
+            &[
+                ("DGP_LISTEN_ADDR", &format!("127.0.0.1:{other_port}")),
+                ("DGP_STATE_LOCK_WAIT_SECS", "1"),
+            ],
             30,
         )
         .await;
     let status = status.expect("the second process must exit");
     assert!(!status.success(), "{output}");
+    assert!(output.contains("did not stop within 1 s"), "{output}");
     assert!(
         output.contains("another DeltaGlider Proxy process already uses the state directory"),
         "{output}"
@@ -123,6 +128,57 @@ async fn a_second_process_on_the_same_state_directory_is_refused() {
         health.status().as_u16(),
         200,
         "the first process must serve"
+    );
+}
+
+/// A rolling deploy: the new process starts while the old one still stops.
+/// It waits for the state directory lock, says so once, and takes over when
+/// the old process exits inside the wait.
+#[tokio::test]
+async fn a_second_process_takes_over_when_the_first_one_exits_in_time() {
+    let mut server = TestServer::filesystem().await;
+    let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_port = other.local_addr().unwrap().port();
+    drop(other);
+    let mut second = server.spawn_sibling(&[
+        ("DGP_LISTEN_ADDR", &format!("127.0.0.1:{other_port}")),
+        ("DGP_STATE_LOCK_WAIT_SECS", "60"),
+        ("RUST_LOG", "info"),
+    ]);
+    // It must wait, not exit, and say that it waits.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !second.output().contains("waiting up to 60 s") {
+        assert!(second.exited().is_none(), "{}", second.output());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no wait message:\n{}",
+            second.output()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(second.exited().is_none(), "{}", second.output());
+    server.terminate();
+    let url = format!("http://127.0.0.1:{other_port}/_/health");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Ok(r) = reqwest::get(&url).await {
+            if r.status().as_u16() == 200 {
+                break;
+            }
+        }
+        assert!(second.exited().is_none(), "{}", second.output());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second process never became healthy:\n{}",
+            second.output()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        second.output().matches("waiting up to").count(),
+        1,
+        "the wait is logged once:\n{}",
+        second.output()
     );
 }
 

@@ -1760,11 +1760,11 @@ mod tests {
             .expect("end of settle_coordination");
         let outside = format!("{}{}", &section[..settle], &section[settle_end..]);
         assert!(
-            !outside.contains("process::exit"),
+            !outside.contains("exit_with_boot_error("),
             "a coordination verdict ends the process only in settle_coordination"
         );
         assert_eq!(
-            section.matches("process::exit").count(),
+            section.matches("exit_with_boot_error(").count(),
             1,
             "settle_coordination holds the one exit"
         );
@@ -1780,7 +1780,7 @@ mod tests {
         assert!(startup.contains("settle_coordination(&validation, boot, \"config sync\""));
         assert_eq!(
             startup
-                .matches("FATAL: coordination bucket validation failed")
+                .matches("coordination bucket validation failed")
                 .count(),
             1,
             "only settle_coordination exits on a failed validation"

@@ -60,7 +60,7 @@ No key that the proxy has opens `deltaglider_config.db`. The proxy moves the dat
 2. The key file `deltaglider_config.db.key` was lost, for example because a volume was recreated without it. Restore the file from a backup and restart. On the next start, the proxy moves the preserved database back into place.
 3. You copied a database snapshot to another instance without its key. Start that instance with the same `DGP_CONFIG_DB_KEY`, or copy the key file along with the database.
 
-The admin GUI shows a recovery wizard while the database is locked. It sends the candidate to `POST /_/api/admin/recover-db`, which tests it against the preserved database without changing anything and says whether it is a config DB key or a legacy bootstrap hash. The endpoint is public but rate-limited.
+The admin GUI shows a recovery wizard while the database is locked. In Kubernetes, `/_/ready` answers `503` in this state, so the Service sends no traffic to the pod. Reach the wizard through `kubectl port-forward pod/<name> 9000:9000` (or the container port directly) and open `http://localhost:9000/_/admin`. It sends the candidate to `POST /_/api/admin/recover-db`, which tests it against the preserved database without changing anything and says whether it is a config DB key or a legacy bootstrap hash. The endpoint is public but rate-limited.
 
 ## Startup fails: `config_sync_bucket is set, but DGP_CONFIG_DB_KEY is not`
 

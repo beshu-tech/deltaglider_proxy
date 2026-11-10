@@ -222,26 +222,26 @@ pub fn validate_auth_config(config: &Config, iam_db_has_users: bool) {
             }
         }
         AuthConfigOutcome::UnrecognizedMode => {
-            error!(
-                "FATAL: Unrecognized authentication mode: \"{}\"",
+            let mut message = format!(
+                "Unrecognized authentication mode: \"{}\"\n",
                 config.authentication.as_deref().unwrap_or("")
             );
-            error!("");
             for line in AuthConfigOutcome::UnrecognizedMode
                 .fatal_help()
                 .unwrap_or_default()
             {
-                error!("{line}");
+                message.push('\n');
+                message.push_str(line);
             }
-            std::process::exit(1);
+            exit_with_boot_error(&message);
         }
         AuthConfigOutcome::Missing => {
-            error!("FATAL: No authentication configured.");
-            error!("");
+            let mut message = String::from("No authentication configured.\n");
             for line in AuthConfigOutcome::Missing.fatal_help().unwrap_or_default() {
-                error!("{line}");
+                message.push('\n');
+                message.push_str(line);
             }
-            std::process::exit(1);
+            exit_with_boot_error(&message);
         }
     }
 }
@@ -602,8 +602,7 @@ pub fn resolve_config_db_keys_or_exit(
     if let Err(e) =
         check_sync_needs_env_key(config.config_sync_bucket.as_deref(), env_key.as_deref())
     {
-        error!("FATAL: {e}");
-        std::process::exit(1);
+        exit_with_boot_error(&e);
     }
     match resolve_config_db_keys(
         &config_db_path(),
@@ -615,8 +614,7 @@ pub fn resolve_config_db_keys_or_exit(
             keys
         }
         Err(e) => {
-            error!("FATAL: {e}");
-            std::process::exit(1);
+            exit_with_boot_error(&e);
         }
     }
 }
@@ -750,11 +748,10 @@ fn init_config_db_attempt(
                         d
                     }
                     Err(e) => {
-                        error!(
-                            "FATAL: could not compute the declarative IAM diff at startup: {e}. \
+                        exit_with_boot_error(&format!(
+                            "could not compute the declarative IAM diff at startup: {e}. \
                              Refusing to start. Fix the config DB / YAML and restart."
-                        );
-                        std::process::exit(1);
+                        ));
                     }
                 };
                 match startup_declarative_action(
@@ -777,15 +774,13 @@ fn init_config_db_attempt(
                         groups,
                         providers,
                     } => {
-                        error!(
-                            "FATAL: startup declarative IAM reconcile would DELETE {users} user(s), \
+                        exit_with_boot_error(&format!(
+                            "startup declarative IAM reconcile would DELETE {users} user(s), \
                              {groups} group(s), {providers} provider(s) present in the config DB but \
                              absent from the YAML. Destructive declarative changes must be applied \
                              attended via `config apply`, not silently on a restart. If this is \
                              intentional (e.g. a first gui→declarative migration), run \
-                             `deltaglider_proxy config apply <file>` once."
-                        );
-                        std::process::exit(1);
+                             `deltaglider_proxy config apply <file>` once."));
                     }
                     StartupReconcileAction::Reconcile => {
                         // A provider an attended apply would refuse boots
@@ -808,12 +803,11 @@ fn init_config_db_attempt(
                                 stats.users_updated.len(),
                             ),
                             Err(e) => {
-                                error!(
-                                    "FATAL: declarative IAM reconcile failed at startup: {e}. \
+                                exit_with_boot_error(&format!(
+                                    "declarative IAM reconcile failed at startup: {e}. \
                                      Refusing to start in declarative mode with an IAM set that \
                                      does not match the YAML. Fix the config and restart."
-                                );
-                                std::process::exit(1);
+                                ));
                             }
                         }
                     }
@@ -868,12 +862,11 @@ fn init_config_db_attempt(
                 deltaglider_proxy::config_db::ConfigDbError::WrongPassphrase(_)
             ) =>
         {
-            error!(
+            exit_with_boot_error(&format!(
                 "Config DB {} failed to open: {e}. The file is left untouched; \
                  fix the cause and restart.",
                 db_file.display()
-            );
-            std::process::exit(1);
+            ));
         }
         Err(e) => {
             let bak_path = db_file.with_extension("db.bak");
@@ -992,36 +985,31 @@ pub fn init_jobs_db(
     let db = match JobsDb::open_live(&path, keys) {
         Ok(db) => db,
         Err(deltaglider_proxy::config_db::ConfigDbError::WrongPassphrase(why)) => {
-            error!(
-                "{}",
-                deltaglider_proxy::config_db::jobs_db::no_key_opens_the_jobs_db(&path, &why)
+            exit_with_boot_error(
+                &deltaglider_proxy::config_db::jobs_db::no_key_opens_the_jobs_db(&path, &why),
             );
-            std::process::exit(1);
         }
         Err(e) => {
-            error!(
-                "FATAL: the jobs DB {} failed to open: {e}. The file is left untouched; \
+            exit_with_boot_error(&format!(
+                "the jobs DB {} failed to open: {e}. The file is left untouched; \
                  fix the cause and restart.",
                 path.display()
-            );
-            std::process::exit(1);
+            ));
         }
     };
     {
         // Boot: nothing else holds the config DB yet.
         let Ok(cfg_db) = config_db.try_lock() else {
-            error!("FATAL: the config DB is locked during boot");
-            std::process::exit(1);
+            exit_with_boot_error("the config DB is locked during boot");
         };
         if let Err(e) = db.adopt_from(&cfg_db, keys.primary.expose()) {
-            error!(
-                "FATAL: moving the job rows from the config DB {} to the jobs DB {} failed: \
+            exit_with_boot_error(&format!(
+                "moving the job rows from the config DB {} to the jobs DB {} failed: \
                  {e}. Both files are left consistent (the move is one transaction per \
                  file); fix the cause and restart.",
                 cfg_db.local_path().display(),
                 path.display()
-            );
-            std::process::exit(1);
+            ));
         }
     }
     match db.replication_reconcile_on_boot(config.replication.max_failures_retained) {
@@ -1160,11 +1148,10 @@ fn settle_coordination(
             Some(v.clone())
         }
         Err(failure @ CasValidationFailure::NonCas) => {
-            error!(
-                "FATAL: coordination bucket validation failed ({site}): {}",
+            exit_with_boot_error(&format!(
+                "coordination bucket validation failed ({site}): {}",
                 failure.describe_for_coordination(&boot.bucket)
-            );
-            std::process::exit(1);
+            ));
         }
         Err(failure @ CasValidationFailure::Indeterminate(_)) => {
             warn!(
@@ -1647,14 +1634,12 @@ pub async fn validate_backend_write_capability(
                 group.buckets
             ),
             CapabilityVerdict::NonCas => {
-                error!(
-                    "FATAL: {}",
-                    deltaglider_proxy::coordination::capability::noncas_enforcement_message(
+                exit_with_boot_error(
+                    &deltaglider_proxy::coordination::capability::noncas_enforcement_message(
                         &name,
-                        &group.buckets
-                    )
+                        &group.buckets,
+                    ),
                 );
-                std::process::exit(1);
             }
             CapabilityVerdict::Unknown { reason } => warn!(
                 "backend capability: '{name}' could NOT be verified ({reason}) — bucket(s) \
@@ -1726,13 +1711,12 @@ pub async fn boot_backend_health_gate(
     if gating == total && total > 0 {
         match mode {
             BootProbeMode::Enforce => {
-                error!(
-                    "FATAL: ALL {total} configured storage backend(s) failed the boot health \
+                exit_with_boot_error(&format!(
+                    "ALL {total} configured storage backend(s) failed the boot health \
                      probe — the proxy has no working storage and refuses to start. Fix the \
                      backend endpoints/credentials, or set DGP_BOOT_BACKEND_PROBE=warn to \
                      start degraded anyway"
-                );
-                std::process::exit(1);
+                ));
             }
             _ => error!(
                 "ALL {total} configured storage backend(s) failed the boot health probe — \
@@ -1957,7 +1941,6 @@ pub fn spawn_config_sync_poll(
     });
 }
 
-/// Build TLS config if enabled in config.
 /// The operator-facing text of a failed bind of `addr` (pure).
 pub fn listen_error_message(addr: &std::net::SocketAddr, e: &std::io::Error) -> String {
     let hint = match e.kind() {
@@ -1985,12 +1968,105 @@ pub async fn bind_listener(addr: std::net::SocketAddr) -> Result<tokio::net::Tcp
         .map_err(|e| listen_error_message(&addr, &e))
 }
 
+/// What the boot claims before anything else runs (see [`claim_environment`]).
+pub struct ClaimedEnvironment {
+    /// The state directory lock. The caller keeps it until the process exits.
+    pub state_lock: deltaglider_proxy::data_dir_lock::DataDirLock,
+    pub listener: tokio::net::TcpListener,
+    pub rustls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+    /// The admin bootstrap password hash (made and stored if needed).
+    pub admin_password_hash: String,
+}
+
+/// THE first step of a boot: everything that can stop it for an environment
+/// reason. It runs before the first background worker spawns and before any
+/// backend write, so a boot that cannot serve never ran a job or changed the
+/// config. In order: the state directory lock (waits up to
+/// `DGP_STATE_LOCK_WAIT_SECS` for an old process), the spool, the listener,
+/// TLS, the bootstrap password hash, the xdelta3 CLI. Every failure exits
+/// through [`exit_with_boot_error`]. Source guard:
+/// `the_environment_is_claimed_before_the_first_worker_spawns`.
+pub async fn claim_environment(config: &mut Config) -> ClaimedEnvironment {
+    let db_path = deltaglider_proxy::config_db::config_db_path();
+    let dir = db_path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let wait = Duration::from_secs(config.tuning.state_lock_wait_secs);
+    // The lock wait sleeps: keep it off the async worker threads.
+    let state_lock = {
+        let dir = dir.to_path_buf();
+        let outcome = tokio::task::spawn_blocking(move || {
+            deltaglider_proxy::data_dir_lock::acquire(&dir, wait, || {
+                tracing::warn!(
+                    "another process holds the state directory lock; waiting up to {} s for it \
+                     to stop (DGP_STATE_LOCK_WAIT_SECS)",
+                    wait.as_secs()
+                )
+            })
+        })
+        .await;
+        match outcome {
+            Ok(Ok(lock)) => lock,
+            Ok(Err(e)) => exit_with_boot_error(&e),
+            Err(e) => exit_with_boot_error(&format!("the state directory lock task failed: {e}")),
+        }
+    };
+    if let Err(e) = deltaglider_proxy::deltaglider::spool::SpoolDir::shared() {
+        exit_with_boot_error(&e.to_string());
+    }
+    let listener = match bind_listener(config.listen_addr).await {
+        Ok(l) => l,
+        Err(e) => exit_with_boot_error(&e),
+    };
+    let rustls_config = match init_tls(config).await {
+        Ok(c) => c,
+        Err(e) => exit_with_boot_error(&e.to_string()),
+    };
+    let admin_password_hash = match config.ensure_bootstrap_password_hash() {
+        Ok(hash) => hash,
+        Err(e) => exit_with_boot_error(&e),
+    };
+    if !deltaglider_proxy::deltaglider::DeltaCodec::new(1).is_cli_available() {
+        exit_with_boot_error("xdelta3 CLI not found. Install xdelta3 before starting the proxy.");
+    }
+    ClaimedEnvironment {
+        state_lock,
+        listener,
+        rustls_config,
+        admin_password_hash,
+    }
+}
+
+/// Stale temp files of killed writes (F22): one background walk per
+/// filesystem data root, off the boot path. Age-based (`STALE_TEMP_MAX_AGE`):
+/// the state lock does not cover the data root, so a file that anyone may
+/// still write is never removed. Source guard:
+/// `the_boot_sweeps_stale_temp_files_in_the_background`.
+pub fn spawn_stale_temp_sweeps(config: &Config) {
+    for root in config.filesystem_roots() {
+        tokio::task::spawn_blocking(move || {
+            let removed = deltaglider_proxy::storage::sweep_stale_temp_files(
+                &root,
+                deltaglider_proxy::storage::STALE_TEMP_MAX_AGE,
+            );
+            if removed > 0 {
+                info!(
+                    "Swept {removed} stale temp file(s) of killed writes from {}",
+                    root.display()
+                );
+            }
+        });
+    }
+}
+
 /// Print a fatal boot error (Display text, never Debug) and exit.
 pub fn exit_with_boot_error(message: &str) -> ! {
-    eprintln!("FATAL: {message}");
+    tracing::error!("FATAL: {message}");
     std::process::exit(1);
 }
 
+/// Build TLS config if enabled in config.
 pub async fn init_tls(
     config: &Config,
 ) -> Result<Option<axum_server::tls_rustls::RustlsConfig>, Box<dyn std::error::Error>> {

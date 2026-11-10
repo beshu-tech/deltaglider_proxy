@@ -223,13 +223,13 @@ impl SpoolDir {
         self.max_bytes
     }
 
-    /// The directory the spool files live in.
     /// Can a spool file be made now? Re-creates a missing directory, makes
     /// and drops one temp file. Blocking, cheap: `/_/ready` runs it.
     pub fn is_usable(&self) -> bool {
         temp_in(&self.dir).is_ok()
     }
 
+    /// The directory the spool files live in.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -606,7 +606,6 @@ fn backend_share_mib(max_mib: usize, percent: u8) -> usize {
     (max_mib.saturating_mul(usize::from(percent.min(100))) / 100).max(1)
 }
 
-/// Bytes → MiB, rounded up. Budget accounting unit.
 /// A temp file in the spool directory `dir`. Somebody can remove the
 /// directory while the process runs (a tmp cleaner, an operator). The first
 /// `ENOENT` creates the directory again and tries once more, like the
@@ -622,6 +621,7 @@ pub(crate) fn temp_in(dir: &Path) -> std::io::Result<NamedTempFile> {
     }
 }
 
+/// Bytes → MiB, rounded up. Budget accounting unit.
 pub(crate) fn mib_ceil(bytes: u64) -> usize {
     const MIB: u64 = 1024 * 1024;
     bytes.div_ceil(MIB) as usize

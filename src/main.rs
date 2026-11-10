@@ -502,7 +502,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = runtime_builder.build()?;
 
     // A boot error prints as text (Display), never as `Error: Os { .. }`.
-    let outcome = runtime.block_on(async_main(cli));
+    // The state directory lock stays held until just before the process
+    // exits, past the bounded runtime shutdown: a successor must not start
+    // while a blocking task of this process still writes.
+    let mut state_lock = None;
+    let outcome = runtime.block_on(async_main(cli, &mut state_lock));
     // Dropping a runtime waits for EVERY blocking task, and an xdelta3 run
     // can last 2 hours. Wait a bounded time, then let the process exit (the
     // children see their pipes close). Source guard:
@@ -514,8 +518,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A shutdown the process asked for (`shutdown::request_exit`) ends here,
     // after the drain, with the failure code a supervisor sees.
     if let Some(code) = deltaglider_proxy::shutdown::requested_exit_code() {
+        drop(state_lock);
         std::process::exit(code);
     }
+    drop(state_lock);
     Ok(())
 }
 
@@ -536,7 +542,10 @@ fn run_cli_async<F: std::future::Future<Output = i32>>(fut: F) -> i32 {
     }
 }
 
-async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn async_main(
+    cli: Cli,
+    state_lock_slot: &mut Option<deltaglider_proxy::data_dir_lock::DataDirLock>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // --- Logging ---
     let log_reload_handle = init_tracing(&cli);
     deltaglider_proxy::background::install_panic_hook();
@@ -612,33 +621,15 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     log_startup_banner(&config);
 
-    // --- Listener, TLS, state directory, spool: FIRST ---
-    // Everything that can stop a boot for an environment reason runs before
-    // the first background worker spawns, so a boot that cannot serve never
-    // ran a job or changed the config. Source guard:
-    // `the_listener_binds_before_the_first_worker_spawns`.
-    let _state_dir_lock = {
-        let db_path = deltaglider_proxy::config_db::config_db_path();
-        let dir = db_path
-            .parent()
-            .filter(|d| !d.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        match deltaglider_proxy::data_dir_lock::acquire(dir) {
-            Ok(lock) => lock,
-            Err(e) => startup::exit_with_boot_error(&e),
-        }
-    };
-    if let Err(e) = deltaglider_proxy::deltaglider::spool::SpoolDir::shared() {
-        startup::exit_with_boot_error(&e.to_string());
-    }
-    let listener = match startup::bind_listener(config.listen_addr).await {
-        Ok(l) => l,
-        Err(e) => startup::exit_with_boot_error(&e),
-    };
-    let rustls_config = match init_tls(&config).await {
-        Ok(c) => c,
-        Err(e) => startup::exit_with_boot_error(&e.to_string()),
-    };
+    // --- State lock, spool, listener, TLS, bootstrap hash, xdelta3: FIRST ---
+    // See `startup::claim_environment`. Source guard:
+    // `the_environment_is_claimed_before_the_first_worker_spawns`.
+    let claimed = startup::claim_environment(&mut config).await;
+    // The lock lives until `main` ends the process, after the drain.
+    *state_lock_slot = Some(claimed.state_lock);
+    let listener = claimed.listener;
+    let rustls_config = claimed.rustls_config;
+    let admin_password_hash = claimed.admin_password_hash;
 
     // --- Metrics ---
     let metrics = init_metrics(&config);
@@ -727,6 +718,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         );
     } else {
+        // `claim_environment` refused this boot already; kept as a backstop.
         return Err("xdelta3 CLI not found. Install xdelta3 before starting the proxy.".into());
     }
     metrics
@@ -856,10 +848,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let iam_state = init_iam_state(&config);
 
     // --- Admin / sessions / config DB (must be before S3 router for mismatch guard) ---
-    let admin_password_hash = match config.ensure_bootstrap_password_hash() {
-        Ok(hash) => hash,
-        Err(e) => startup::exit_with_boot_error(&e),
-    };
     let session_store =
         Arc::new(SessionStore::new().with_secure_cookies(config.tuning.secure_cookies));
     spawn_periodic("session-cleanup", Duration::from_secs(300), {
@@ -1312,23 +1300,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // --- Stale temp files of killed writes (F22) ---
-    // A background walk of every filesystem data root, off the boot path.
-    // Age-based (`STALE_TEMP_MAX_AGE`): the state lock does not cover the
-    // data root, so a file that anyone may still write is never removed.
-    for root in config.filesystem_roots() {
-        tokio::task::spawn_blocking(move || {
-            let removed = deltaglider_proxy::storage::sweep_stale_temp_files(
-                &root,
-                deltaglider_proxy::storage::STALE_TEMP_MAX_AGE,
-            );
-            if removed > 0 {
-                info!(
-                    "Swept {removed} stale temp file(s) of killed writes from {}",
-                    root.display()
-                );
-            }
-        });
-    }
+    startup::spawn_stale_temp_sweeps(&config);
 
     // --- Start server ---
     let limits = deltaglider_proxy::serve::ListenerLimits::from_tuning(&config.tuning);

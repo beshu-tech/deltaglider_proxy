@@ -44,10 +44,15 @@ pub struct ReadyProbe {
     pub cache_ttl_secs: i64,
 }
 
-/// The default of `DGP_SHUTDOWN_TIMEOUT_SECS`. The Helm chart gives a pod 30 s
-/// (`terminationGracePeriodSeconds`); the drain steps before this wait take
-/// up to 10 s each, so this wait stays short.
+/// The default of `DGP_SHUTDOWN_TIMEOUT_SECS`. The drain steps before this
+/// wait take up to 10 s each, so the longest stop is 10 + 10 + 10 + 10 = 40 s.
+/// The Helm chart gives a pod 60 s (`terminationGracePeriodSeconds`), which is
+/// more than that sum.
 pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+
+/// The default of `DGP_STATE_LOCK_WAIT_SECS`: how long a new process waits
+/// for the old one to release the state directory lock.
+pub const DEFAULT_STATE_LOCK_WAIT_SECS: u64 = 60;
 
 /// The default of `DGP_BACKEND_SHARE_PERCENT`.
 pub const DEFAULT_BACKEND_SHARE_PERCENT: u8 = 75;
@@ -97,6 +102,9 @@ pub struct RuntimeTuning {
     /// time that the exit waits for tasks on the blocking pool (an xdelta3
     /// run can take 2 hours). Read before the runtime exists.
     pub shutdown_timeout_secs: u64,
+    /// `DGP_STATE_LOCK_WAIT_SECS` (0 = no wait): how long the boot waits
+    /// for another process to release the state directory lock.
+    pub state_lock_wait_secs: u64,
     /// `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`.
     pub mpu_delta_reconstruct_max_bytes: u64,
     /// `DGP_STREAM_COPY_THRESHOLD`: a passthrough copy at least this
@@ -173,6 +181,10 @@ impl RuntimeTuning {
                 DEFAULT_SHUTDOWN_TIMEOUT_SECS,
             )
             .max(1),
+            state_lock_wait_secs: parse_or(
+                "DGP_STATE_LOCK_WAIT_SECS",
+                DEFAULT_STATE_LOCK_WAIT_SECS,
+            ),
             mpu_delta_reconstruct_max_bytes: parse_or(
                 "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
                 64 * 1024 * 1024,
@@ -261,6 +273,10 @@ mod tests {
         ),
         ("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", Zero::Floor1),
         ("DGP_SHUTDOWN_TIMEOUT_SECS", Zero::Floor1),
+        (
+            "DGP_STATE_LOCK_WAIT_SECS",
+            Zero::Meaningful("the boot does not wait for the state directory lock"),
+        ),
         (
             "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
             Zero::Meaningful("no delta is rebuilt"),
@@ -374,6 +390,7 @@ mod tests {
         assert_eq!(t.spool_threshold_bytes, None);
         assert_eq!(t.spool_acquire_timeout_secs, 120);
         assert_eq!(t.shutdown_timeout_secs, DEFAULT_SHUTDOWN_TIMEOUT_SECS);
+        assert_eq!(t.state_lock_wait_secs, DEFAULT_STATE_LOCK_WAIT_SECS);
         assert_eq!(t.mpu_delta_reconstruct_max_bytes, 64 * 1024 * 1024);
         assert_eq!(
             (
@@ -419,6 +436,7 @@ mod tests {
             ("DGP_SPOOL_THRESHOLD_BYTES", "12"),
             ("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", "13"),
             ("DGP_SHUTDOWN_TIMEOUT_SECS", "17"),
+            ("DGP_STATE_LOCK_WAIT_SECS", "19"),
             ("DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES", "14"),
             ("DGP_READY_TIMEOUT_SECS", "0"),
             ("DGP_READY_RETRIES", "5"),
@@ -444,6 +462,7 @@ mod tests {
         assert_eq!(t.spool_threshold_bytes, Some(12));
         assert_eq!(t.spool_acquire_timeout_secs, 13);
         assert_eq!(t.shutdown_timeout_secs, 17);
+        assert_eq!(t.state_lock_wait_secs, 19);
         assert_eq!(t.mpu_delta_reconstruct_max_bytes, 14);
         // Clamped: at least one second, never a negative TTL.
         assert_eq!(

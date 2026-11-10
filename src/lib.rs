@@ -677,38 +677,73 @@ mod source_guards {
         out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files, test_module_lines,
     };
 
-    /// F13 (#145): the listener, the TLS config, the state-directory lock and
-    /// the spool are made BEFORE the first background worker spawns, so a
-    /// boot that cannot serve never ran a job. The source order is the proof;
-    /// `main.rs` binds nowhere else.
+    /// F13 (#145): everything that can stop a boot for an environment reason
+    /// (the state-directory lock, the spool, the listener, TLS, the bootstrap
+    /// hash, the xdelta3 CLI) is made in ONE function,
+    /// `startup::claim_environment`. That call is the first `.await` of
+    /// `async_main`, and nothing before it spawns, so a boot that cannot
+    /// serve never ran a job or wrote to a backend. A step that moves above
+    /// it (a coordination probe, a backend write) turns this red.
     #[test]
-    fn the_listener_binds_before_the_first_worker_spawns() {
+    fn the_environment_is_claimed_before_the_first_worker_spawns() {
         let main = include_str!("main.rs");
         let body = &main[main.find("async fn async_main").expect("async_main")..];
-        let first = |needle: &str| {
-            body.find(needle)
-                .unwrap_or_else(|| panic!("async_main no longer calls {needle}"))
-        };
-        // The first code line (not a comment) that spawns anything.
-        let mut offset = 0;
-        let mut first_spawn = None;
-        for line in body.split_inclusive('\n') {
-            if !line.trim_start().starts_with("//") && line.contains("spawn") {
-                first_spawn = Some(offset);
-                break;
-            }
-            offset += line.len();
-        }
-        let first_spawn = first_spawn.expect("async_main spawns workers");
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        // Code lines only: comments name the steps too.
+        let code: Vec<&str> = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let first_await = code
+            .iter()
+            .position(|l| l.contains(".await"))
+            .expect("async_main awaits");
+        assert!(
+            code[first_await].contains("startup::claim_environment("),
+            "the first `.await` of async_main must be startup::claim_environment, \
+             found: {}",
+            code[first_await].trim()
+        );
+        let first_spawn = code
+            .iter()
+            .position(|l| l.contains("spawn"))
+            .expect("async_main spawns workers");
+        assert!(
+            first_spawn > first_await,
+            "nothing in async_main may spawn before startup::claim_environment: {}",
+            code[first_spawn].trim()
+        );
+        // The function holds every step, in an order that makes the lock first.
+        let startup = include_str!("startup.rs");
+        let f = &startup[startup
+            .find("pub async fn claim_environment")
+            .expect("claim_environment")..];
+        let f = &f[..f.find("\n}\n").expect("end of claim_environment")];
+        let mut at = 0;
         for step in [
             "data_dir_lock::acquire(",
             "SpoolDir::shared()",
-            "startup::bind_listener(",
-            "init_tls(&config)",
+            "bind_listener(",
+            "init_tls(",
+            "ensure_bootstrap_password_hash()",
+            "is_cli_available()",
         ] {
+            let pos = f
+                .find(step)
+                .unwrap_or_else(|| panic!("claim_environment no longer calls {step}"));
+            assert!(pos >= at, "{step} is out of order in claim_environment");
+            at = pos;
+        }
+        // The spawn inside is the blocking lock wait, awaited at once.
+        assert_eq!(
+            f.matches("spawn").count(),
+            1,
+            "claim_environment starts no worker"
+        );
+        for outside in ["data_dir_lock::acquire(", "bind_listener(", "init_tls("] {
             assert!(
-                first(step) < first_spawn,
-                "{step} must run before the first `spawn` in async_main"
+                !body.contains(outside),
+                "async_main calls {outside} itself, not through claim_environment"
             );
         }
         assert!(
@@ -743,19 +778,27 @@ mod source_guards {
     #[test]
     fn the_boot_sweeps_stale_temp_files_in_the_background() {
         let main = include_str!("main.rs");
-        let call = main
+        let startup = include_str!("startup.rs");
+        assert!(
+            main.contains("startup::spawn_stale_temp_sweeps(&config);"),
+            "async_main no longer starts the stale temp sweeps"
+        );
+        let f = &startup[startup
+            .find("pub fn spawn_stale_temp_sweeps(config: &Config) {")
+            .expect("startup::spawn_stale_temp_sweeps")..];
+        let f = &f[..f.find("\n}\n").expect("end of the function")];
+        let call = f
             .find("sweep_stale_temp_files(")
-            .expect("main.rs no longer sweeps stale temp files");
-        let before = &main[..call];
-        let spawn = before
+            .expect("the function no longer sweeps stale temp files");
+        let spawn = f[..call]
             .rfind("spawn_blocking")
             .expect("sweep is not spawned");
         assert!(
-            call - spawn < 200 && !main[spawn..call].contains(".await"),
+            call - spawn < 200 && !f[spawn..].contains(".await"),
             "the sweep must run inside spawn_blocking, not on the boot path"
         );
         assert!(
-            main.contains("filesystem_roots()") && main.contains("STALE_TEMP_MAX_AGE"),
+            f.contains("filesystem_roots()") && f.contains("STALE_TEMP_MAX_AGE"),
             "the sweep covers every filesystem root with the stale-age rule"
         );
         let write = include_str!("storage/filesystem/write.rs");
