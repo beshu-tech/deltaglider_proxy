@@ -1,0 +1,96 @@
+---
+// QuickstartTerminal — the one command that starts the product, with a
+// copy button. Used in the home hero. The button copies the command as
+// one line (no prompt, no line continuations).
+const COMMAND =
+  'docker run --rm -it -p 9000:9000 -v dgp-data:/data -e DGP_AUTHENTICATION=none beshultd/deltaglider_proxy';
+---
+
+<div class="term">
+  <div class="term-bar">
+    <span class="term-title">Try it on localhost</span>
+    <button type="button" class="term-copy" data-copy={COMMAND} aria-label="Copy the docker run command">
+      Copy
+    </button>
+  </div>
+  <pre class="term-pre"><code><span class="term-prompt">$</span> docker run --rm -it -p 9000:9000 -v dgp-data:/data \
+    -e DGP_AUTHENTICATION=none \
+    beshultd/deltaglider_proxy</code></pre>
+</div>
+
+<script is:inline>
+  document.querySelectorAll('.term-copy').forEach((btn) => {
+    let timer = 0;
+    btn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(btn.dataset.copy || '');
+        btn.textContent = 'Copied';
+        window.umami && window.umami.track('code-copy', { page: location.pathname, block: 'hero' });
+      } catch (_) {
+        btn.textContent = 'Select the text to copy';
+      }
+      clearTimeout(timer);
+      timer = setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+    });
+  });
+</script>
+
+<style>
+  .term {
+    max-width: 36rem;
+    border: 1px solid var(--rule-strong);
+    border-radius: var(--r-md);
+    overflow: hidden;
+    background: var(--panel-dark-bg);
+    margin: 1.5rem 0 0;
+  }
+
+  .term-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.85rem;
+    padding: 0.45rem 0.5rem 0.45rem 1rem;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .term-title {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--panel-dark-ink-dim);
+  }
+
+  .term-copy {
+    font: inherit;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--panel-dark-ink);
+    background: transparent;
+    border: 1px solid var(--panel-dark-ink-dim);
+    border-radius: var(--r-sm, 6px);
+    padding: 0.3rem 0.7rem;
+    min-height: 32px;
+    cursor: pointer;
+  }
+  .term-copy:hover { color: var(--panel-dark-accent); border-color: var(--panel-dark-accent); }
+  .term-copy:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+
+  .term-pre {
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    padding: 1rem 1rem 1.1rem;
+    font-size: 0.88rem;
+    line-height: 1.65;
+    overflow-x: auto;
+  }
+
+  .term-pre code {
+    color: var(--panel-dark-ink);
+    background: transparent;
+  }
+
+  .term-prompt { color: var(--panel-dark-accent); font-weight: 700; }
+</style>
