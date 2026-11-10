@@ -15,6 +15,13 @@ pub(super) async fn create_multipart_upload(
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
         .await?;
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
+    // The key rule of PutObject, at create: a refused key (`.dg` segment, `//`,
+    // `.delta` name, folder marker) fails here, not after all parts.
+    crate::types::ObjectKey::parse(&input.bucket, &input.key)
+        .validate_data_ingest()
+        .map_err(|e| {
+            s3s::S3Error::from(crate::api::errors::S3Error::InvalidArgument(e.to_string()))
+        })?;
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let engine = svc.state.engine.load();
     let delta_limit = engine.tuning().mpu_delta_reconstruct_max_bytes;

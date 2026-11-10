@@ -253,6 +253,22 @@ impl ObjectKey {
     }
 }
 
+impl ObjectKey {
+    /// The gate of every DATA write (PutObject, CopyObject, form POST,
+    /// CreateMultipartUpload): the ingest rule, and a key that ends in `/`
+    /// is a folder marker, which only a zero-byte `store` writes. One rule,
+    /// so a refused key fails at the first request, not after all parts.
+    pub fn validate_data_ingest(&self) -> Result<(), KeyValidationError> {
+        self.validate_ingest()?;
+        if self.is_directory_marker() {
+            return Err(KeyValidationError(
+                "A key that ends in '/' is a folder marker and must have an empty body".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Display for ObjectKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.bucket, self.full_key())
