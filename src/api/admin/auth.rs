@@ -484,12 +484,34 @@ pub(super) fn session_cookie_with_headers(
     format_session_cookie(token, sessions.ttl(), secure)
 }
 
+/// The session cookie on plain HTTP.
+const SESSION_COOKIE: &str = "dgp_session";
+/// The session cookie where it is `Secure`. The `__Host-` prefix makes a
+/// browser refuse the cookie unless it is `Secure`, has `Path=/` and has no
+/// `Domain`, and refuse a sibling origin's attempt to set or overwrite it
+/// from a plain-HTTP page or a subdomain. A `Secure` cookie cannot exist on
+/// plain HTTP, so there the old name stays.
+const SESSION_COOKIE_HOST: &str = "__Host-dgp_session";
+
+/// Pure: the cookie name for a deployment that sets (or does not set) the
+/// `Secure` flag.
+fn session_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        SESSION_COOKIE_HOST
+    } else {
+        SESSION_COOKIE
+    }
+}
+
 fn format_session_cookie(token: &str, ttl: std::time::Duration, secure: bool) -> String {
     let max_age = ttl.as_secs();
-    let secure = if secure { "; Secure" } else { "" };
+    let flag = if secure { "; Secure" } else { "" };
     format!(
-        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
-        token, max_age, secure
+        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+        session_cookie_name(secure),
+        token,
+        max_age,
+        flag
     )
 }
 
@@ -519,31 +541,48 @@ pub(super) async fn auto_populate_s3_creds(
     );
 }
 
-/// Format a session cookie that clears the login token.
-pub(super) fn session_cookie_clear(sessions: &SessionStore) -> String {
-    let secure = if secure_cookies_with(sessions.secure_cookies(), None) {
-        "; Secure"
-    } else {
-        ""
-    };
-    format!(
-        "dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
-        secure
-    )
+/// The cookies that clear the login token: both names, so a browser that
+/// holds the old-name cookie (set before the deploy, or on plain HTTP) is
+/// cleared too. `__Host-` always carries `Secure`, as the prefix demands;
+/// a browser on plain HTTP ignores it.
+pub(super) fn session_cookie_clears(sessions: &SessionStore, headers: &HeaderMap) -> Vec<String> {
+    let secure = secure_cookies_with(sessions.secure_cookies(), Some(headers));
+    let plain = format!(
+        "{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        if secure { "; Secure" } else { "" }
+    );
+    let host =
+        format!("{SESSION_COOKIE_HOST}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure");
+    vec![plain, host]
 }
 
-/// Extract the `dgp_session` token from the Cookie header.
+/// Pure: the session token of a `Cookie` header value list. The `__Host-`
+/// cookie wins over the plain-named one, so a cookie that a sibling origin
+/// planted under the old name cannot displace the protected one. The plain
+/// name is still read: a session minted before the rename, and every plain-
+/// HTTP deployment, use it.
+fn session_token_from_cookies<'a>(cookies: impl Iterator<Item = &'a str>) -> Option<String> {
+    let (mut host, mut plain) = (None, None);
+    for pair in cookies.flat_map(|line| line.split(';')) {
+        let pair = pair.trim();
+        if let Some(v) = pair.strip_prefix("__Host-dgp_session=") {
+            host.get_or_insert(v);
+        } else if let Some(v) = pair.strip_prefix("dgp_session=") {
+            plain.get_or_insert(v);
+        }
+    }
+    host.or(plain).map(str::to_string)
+}
+
+/// Extract the session token from the `Cookie` headers
+/// ([`session_token_from_cookies`]).
 pub(super) fn extract_session_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .find_map(|part| {
-            let part = part.trim();
-            part.strip_prefix("dgp_session=")
-                .map(|value| value.to_string())
-        })
+    session_token_from_cookies(
+        headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok()),
+    )
 }
 
 fn request_client_ip(
@@ -668,10 +707,9 @@ pub async fn logout(State(state): State<Arc<AdminState>>, headers: HeaderMap) ->
     }
 
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(
-        header::SET_COOKIE,
-        session_cookie_clear(&state.sessions).parse().unwrap(),
-    );
+    for clear in session_cookie_clears(&state.sessions, &headers) {
+        resp_headers.append(header::SET_COOKIE, clear.parse().unwrap());
+    }
 
     (
         StatusCode::OK,
@@ -1741,6 +1779,39 @@ mod tests {
         assert!(matches!(&**shared.load(), IamState::Disabled));
     }
 
+    /// F55: where the cookie is `Secure` it carries the `__Host-` name (and
+    /// so `Path=/` and no `Domain`); on plain HTTP the old name stays,
+    /// because a browser refuses a `__Host-` cookie without `Secure`.
+    #[test]
+    fn the_session_cookie_name_follows_the_secure_flag() {
+        let ttl = std::time::Duration::from_secs(60);
+        let secure = format_session_cookie("tok", ttl, true);
+        assert_eq!(
+            secure,
+            "__Host-dgp_session=tok; HttpOnly; SameSite=Strict; Path=/; Max-Age=60; Secure"
+        );
+        assert!(!secure.contains("Domain"));
+        let plain = format_session_cookie("tok", ttl, false);
+        assert_eq!(
+            plain,
+            "dgp_session=tok; HttpOnly; SameSite=Strict; Path=/; Max-Age=60"
+        );
+        // The `__Host-` rules, for every Secure cookie we mint.
+        assert!(secure.contains("; Secure") && secure.contains("Path=/;"));
+    }
+
+    #[test]
+    fn logout_clears_both_cookie_names() {
+        let sessions = SessionStore::new().with_secure_cookies(Some(true));
+        let clears = session_cookie_clears(&sessions, &HeaderMap::new());
+        assert_eq!(clears.len(), 2);
+        assert!(clears[0].starts_with("dgp_session=;") && clears[0].ends_with("; Secure"));
+        assert!(clears[1].starts_with("__Host-dgp_session=;") && clears[1].ends_with("; Secure"));
+        let sessions = SessionStore::new().with_secure_cookies(Some(false));
+        let clears = session_cookie_clears(&sessions, &HeaderMap::new());
+        assert!(!clears[0].contains("Secure"), "{}", clears[0]);
+    }
+
     #[test]
     fn extract_session_token_from_cookie() {
         let mut headers = HeaderMap::new();
@@ -1754,6 +1825,29 @@ mod tests {
             "foo=bar; dgp_session=xyz789; baz=qux".parse().unwrap(),
         );
         assert_eq!(extract_session_token(&headers).unwrap(), "xyz789");
+
+        // The `__Host-` cookie wins over a plain-named one, in either order
+        // (a sibling origin may have planted the plain one).
+        for line in [
+            "dgp_session=planted; __Host-dgp_session=real",
+            "__Host-dgp_session=real; dgp_session=planted",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, line.parse().unwrap());
+            assert_eq!(extract_session_token(&headers).unwrap(), "real", "{line}");
+        }
+        // Two Cookie headers.
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, "dgp_session=planted".parse().unwrap());
+        headers.append(header::COOKIE, "__Host-dgp_session=real".parse().unwrap());
+        assert_eq!(extract_session_token(&headers).unwrap(), "real");
+        // A name that merely ends with ours is not ours.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            "x__Host-dgp_session=a; xdgp_session=b".parse().unwrap(),
+        );
+        assert!(extract_session_token(&headers).is_none());
 
         // No session cookie
         let mut headers = HeaderMap::new();
@@ -2045,19 +2139,11 @@ mod tests {
     /// in some impls — same SameSite avoids "ghost" cookies persisting).
     #[test]
     fn logout_cookie_is_samesite_strict() {
-        // Re-create what logout returns; the literal lives in logout()
-        // but it's a one-line format!() so we just assert the property.
-        // If logout() changes its cookie shape, this test stays accurate
-        // because we read the same env var via secure_cookies().
-        let secure = if secure_cookies_with(None, None) {
-            "; Secure"
-        } else {
-            ""
-        };
-        let expected =
-            format!("dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}");
-        assert!(expected.contains("SameSite=Strict"));
-        assert!(expected.contains("Max-Age=0"));
+        let sessions = SessionStore::new().with_secure_cookies(Some(true));
+        for clear in session_cookie_clears(&sessions, &HeaderMap::new()) {
+            assert!(clear.contains("SameSite=Strict"), "{clear}");
+            assert!(clear.contains("Max-Age=0"), "{clear}");
+        }
     }
 
     /// SEC F-04: warn only for an untrusted `X-Forwarded-Proto: https`

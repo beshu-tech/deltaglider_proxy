@@ -157,6 +157,12 @@ async fn start_idp_with_delay(discovery_delay: std::time::Duration) -> (String, 
     (issuer, ca.pem())
 }
 
+/// A `Set-Cookie` that sets the session cookie, under either of its names
+/// (`__Host-dgp_session` where it is `Secure`, `dgp_session` on plain HTTP).
+fn is_session_cookie(set_cookie: &str) -> bool {
+    set_cookie.starts_with("dgp_session=") || set_cookie.starts_with("__Host-dgp_session=")
+}
+
 /// The browser flow: authorize → IdP → callback. Returns the callback's
 /// status, its Set-Cookie values and its body.
 async fn oauth_login(
@@ -360,7 +366,7 @@ async fn oidc_login_against_a_private_idp_with_a_private_ca() {
     assert!(
         !cookies
             .iter()
-            .any(|c| c.starts_with("dgp_session=") && !c.starts_with("dgp_session=;")),
+            .any(|c| is_session_cookie(c) && !c.contains("_session=;")),
         "a refused login got a session: {cookies:?}"
     );
     let users = admin
@@ -397,7 +403,7 @@ async fn oidc_login_against_a_private_idp_with_a_private_ca() {
     assert!(
         cookies
             .iter()
-            .any(|c| c.starts_with("dgp_session=") && !c.starts_with("dgp_session=;")),
+            .any(|c| is_session_cookie(c) && !c.contains("_session=;")),
         "no session cookie: {cookies:?}"
     );
     let session: Value = browser
