@@ -143,3 +143,55 @@ async fn an_unusable_spool_dir_names_the_variable_and_the_path() {
     assert!(output.contains(bad.to_str().unwrap()), "{output}");
     assert!(!output.contains("panicked"), "{output}");
 }
+
+/// F14: three identity providers that never answer discovery must not delay
+/// the first `/_/health`. Discovery runs concurrently and off the boot path.
+#[tokio::test]
+async fn hanging_identity_providers_do_not_delay_the_boot() {
+    // An IdP that accepts connections and never answers.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            held.push(stream);
+        }
+    });
+
+    let mut server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = common::admin_http_client(&ep).await;
+    for name in ["idp-a", "idp-b", "idp-c"] {
+        // The request waits for discovery; the client gives up early, and
+        // the mutation completes anyway (the provider is saved).
+        let _ = admin
+            .post(format!("{ep}/_/api/admin/ext-auth/providers"))
+            .timeout(std::time::Duration::from_millis(500))
+            .json(&serde_json::json!({
+                "name": name, "provider_type": "oidc", "client_id": "c",
+                "client_secret": "s", "issuer_url": issuer,
+                "scopes": "openid email profile",
+                "extra_config": { "allow_local": true },
+            }))
+            .send()
+            .await;
+    }
+    let listed: serde_json::Value = admin
+        .get(format!("{ep}/_/api/admin/ext-auth/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.as_array().map(Vec::len), Some(3), "{listed}");
+
+    server.terminate();
+    let started = std::time::Instant::now();
+    server.respawn_with_env(&[]).await;
+    let boot = started.elapsed();
+    assert!(
+        boot < std::time::Duration::from_secs(8),
+        "the boot waited on identity-provider discovery: {boot:?}"
+    );
+}

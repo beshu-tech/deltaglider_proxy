@@ -1145,24 +1145,32 @@ fn settle_coordination(
 /// doubling to 60 s). A proven bucket ends the task; `NonCas` exits the
 /// process, as it does at boot.
 fn spawn_coordination_reprobe(client: aws_sdk_s3::Client, bucket: String, backend: BackendConfig) {
-    tokio::spawn(async move {
-        let mut wait = Duration::from_secs(5);
-        loop {
-            tokio::time::sleep(wait).await;
-            wait = (wait * 2).min(Duration::from_secs(60));
-            let verdict = deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(
-                &client, &bucket,
-            )
-            .await;
-            match &verdict {
-                Ok(v) => {
-                    deltaglider_proxy::coordination::if_match::record_for(&backend, v.profile());
-                    info!("Coordination bucket '{bucket}': conditional writes proven after boot");
-                    return;
-                }
-                Err(_) => {
-                    if settle_coordination(&verdict, &bucket, "background probe").is_some() {
+    spawn_supervised("coordination-reprobe", move || {
+        let (client, bucket, backend) = (client.clone(), bucket.clone(), backend.clone());
+        async move {
+            let mut wait = Duration::from_secs(5);
+            loop {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(60));
+                let verdict = deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(
+                    &client, &bucket,
+                )
+                .await;
+                match &verdict {
+                    Ok(v) => {
+                        deltaglider_proxy::coordination::if_match::record_for(
+                            &backend,
+                            v.profile(),
+                        );
+                        info!(
+                            "Coordination bucket '{bucket}': conditional writes proven after boot"
+                        );
                         return;
+                    }
+                    Err(_) => {
+                        if settle_coordination(&verdict, &bucket, "background probe").is_some() {
+                            return;
+                        }
                     }
                 }
             }

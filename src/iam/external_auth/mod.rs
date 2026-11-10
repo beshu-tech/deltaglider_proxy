@@ -45,6 +45,28 @@ pub fn validate_provider(
     oidc::validate_provider_config(issuer_url, extra_config, check_files)
 }
 
+/// Discover `providers` at once; log each result. Returns how many succeeded.
+async fn discover_providers(providers: Vec<Arc<OidcProvider>>) -> usize {
+    let results = futures::future::join_all(providers.into_iter().map(|provider| async move {
+        match provider.discover().await {
+            Ok(()) => {
+                tracing::info!("OIDC discovery completed for provider '{}'", provider.name);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "OIDC discovery failed for provider '{}': {}",
+                    provider.name,
+                    e
+                );
+                false
+            }
+        }
+    }))
+    .await;
+    results.into_iter().filter(|ok| *ok).count()
+}
+
 /// TTL for pending OAuth flows (5 minutes).
 const PENDING_AUTH_TTL: Duration = Duration::from_secs(300);
 
@@ -126,22 +148,49 @@ impl ExternalAuthManager {
         }
     }
 
-    /// Run OIDC discovery for all providers (fetch endpoints and JWKS).
-    /// Called at startup and after provider changes.
-    pub async fn discover_all(&self) {
+    /// Run OIDC discovery for all providers (fetch endpoints and JWKS),
+    /// concurrently: N hanging providers cost one timeout, not N.
+    /// Called after provider changes. Returns how many providers were
+    /// discovered.
+    pub async fn discover_all(&self) -> usize {
         let providers: Vec<Arc<OidcProvider>> =
             { self.providers.read().values().cloned().collect() };
-        for provider in providers {
-            if let Err(e) = provider.discover().await {
-                tracing::warn!(
-                    "OIDC discovery failed for provider '{}': {}",
-                    provider.name,
-                    e
-                );
-            } else {
-                tracing::info!("OIDC discovery completed for provider '{}'", provider.name);
+        discover_providers(providers).await
+    }
+
+    /// Discover the providers in the BACKGROUND (the boot path): the server
+    /// serves at once; until a provider is discovered, its login start
+    /// answers a retryable `DiscoveryPending` error. Providers that fail are
+    /// retried with backoff (5 s, doubling to 5 min); the task ends when
+    /// every provider is discovered or none is left. Bumps the version
+    /// counter after a round that published new state.
+    pub fn spawn_discovery(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        crate::background::spawn_supervised("oidc-discovery", move || {
+            let manager = Arc::clone(&manager);
+            async move {
+                let mut wait = Duration::from_secs(5);
+                loop {
+                    let pending: Vec<Arc<OidcProvider>> = manager
+                        .providers
+                        .read()
+                        .values()
+                        .filter(|p| !p.is_discovery_cached())
+                        .cloned()
+                        .collect();
+                    if pending.is_empty() {
+                        return;
+                    }
+                    let discovered = discover_providers(pending).await;
+                    if discovered > 0 {
+                        // After the discovered state is published.
+                        crate::api::admin::external_auth::bump_ext_auth_version();
+                    }
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(Duration::from_secs(300));
+                }
             }
-        }
+        });
     }
 
     /// Get a provider by name.
@@ -174,8 +223,10 @@ impl ExternalAuthManager {
 
         // Ensure discovery is cached
         if !provider.is_discovery_cached() {
-            return Err(ExternalAuthError::DiscoveryFailed(
-                "Discovery not cached. Try again shortly.".into(),
+            return Err(ExternalAuthError::DiscoveryPending(
+                "the proxy has not reached the identity provider yet; it keeps trying in the \
+                 background. Try again in a few seconds."
+                    .into(),
             ));
         }
 
@@ -288,6 +339,21 @@ mod tests {
             client_ip: None,
             redirect_to: None,
         }
+    }
+
+    /// A provider whose discovery has not finished answers the login start
+    /// with the retryable `DiscoveryPending`, never with a failure.
+    #[test]
+    fn an_undiscovered_provider_answers_a_retryable_error() {
+        let mgr = ExternalAuthManager::new();
+        mgr.rebuild(&[make_provider_config("corp", true)]);
+        let err = mgr
+            .initiate_auth("corp", "https://proxy/cb", None, None)
+            .expect_err("no discovery yet");
+        assert!(
+            matches!(err, ExternalAuthError::DiscoveryPending(_)),
+            "{err:?}"
+        );
     }
 
     /// A flood of authorize requests cannot grow the pending map past its

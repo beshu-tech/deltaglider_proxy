@@ -1194,7 +1194,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if !providers.is_empty() {
                 manager.rebuild(&providers);
                 drop(db);
-                manager.discover_all().await;
+                // Off the boot path: the server serves at once, a provider
+                // that has not answered yet gives a retryable login error.
+                manager.spawn_discovery();
                 info!(
                     "  External auth: {} provider(s) configured",
                     manager.provider_names().len()

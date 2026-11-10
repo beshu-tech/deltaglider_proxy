@@ -242,6 +242,20 @@ pub async fn oauth_authorize(
         Err(ExternalAuthError::ProviderNotFound(_)) => {
             AdminError::not_found("provider not found").into_response()
         }
+        Err(ExternalAuthError::DiscoveryPending(msg)) => {
+            tracing::warn!("OIDC discovery pending for '{}': {}", provider_name, msg);
+            let mut response = error_page(
+                "Provider Not Ready",
+                &format!("The sign-in provider '{provider_name}' is not ready yet: {msg}"),
+            )
+            .into_response();
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("5"),
+            );
+            response
+        }
         Err(ExternalAuthError::DiscoveryFailed(msg)) => {
             tracing::error!("OIDC discovery failed for '{}': {}", provider_name, msg);
             error_page(
