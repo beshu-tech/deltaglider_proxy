@@ -845,7 +845,10 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let iam_state = init_iam_state(&config);
 
     // --- Admin / sessions / config DB (must be before S3 router for mismatch guard) ---
-    let admin_password_hash = config.ensure_bootstrap_password_hash();
+    let admin_password_hash = match config.ensure_bootstrap_password_hash() {
+        Ok(hash) => hash,
+        Err(e) => startup::exit_with_boot_error(&e),
+    };
     let session_store =
         Arc::new(SessionStore::new().with_secure_cookies(config.tuning.secure_cookies));
     spawn_periodic("session-cleanup", Duration::from_secs(300), {
