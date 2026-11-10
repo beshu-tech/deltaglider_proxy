@@ -506,15 +506,31 @@ pub(crate) fn sdk_resolver_guards_name(endpoint_host: &str, name: &str) -> bool 
 ///
 /// Backend endpoints are admin-configured, and on-prem MinIO/Ceph behind
 /// internal DNS (`https://minio.corp` → 10.0.0.5) is a normal deployment. So
-/// a resolved name may point at private space; only the cloud-credential
-/// targets are refused: link-local (169.254.0.0/16 incl. IMDS, fe80::/10),
-/// AWS IPv6 IMDS, and their IPv4-embedded IPv6 forms. `BackendDev` refuses
-/// metadata only. Other kinds keep the full [`ip_is_acceptable`] policy.
+/// a resolved name may point at private space (RFC 1918, unique-local,
+/// CGNAT). Refused are the targets that are never remote storage: the
+/// cloud-credential targets (link-local 169.254.0.0/16 incl. IMDS, fe80::/10,
+/// AWS IPv6 IMDS), and this host itself (loopback, the unspecified address).
+/// A name such as `localtest.me` (A 127.0.0.1) is the literal `127.0.0.1`
+/// by another spelling, which the text check refuses. All with their
+/// IPv4-embedded IPv6 forms. `BackendDev` (`allow_local`) refuses metadata
+/// only. Other kinds keep the full [`ip_is_acceptable`] policy.
 pub(crate) fn resolved_backend_ip_refused(ip: IpAddr, kind: UrlKind) -> bool {
     match kind {
-        UrlKind::Backend => ip_is_metadata_service(ip) || ip_is_link_local(ip),
+        UrlKind::Backend => {
+            ip_is_metadata_service(ip) || ip_is_link_local(ip) || ip_is_this_host(ip)
+        }
         UrlKind::BackendDev => ip_is_metadata_service(ip),
         UrlKind::Oidc | UrlKind::Webhook => !ip_is_acceptable(ip, kind),
+    }
+}
+
+/// Loopback or unspecified (`0.0.0.0/8`, `::`), including the IPv4-embedded
+/// IPv6 forms: the address reaches a service on the proxy's own host.
+fn ip_is_this_host(ip: IpAddr) -> bool {
+    let v4 = |a: Ipv4Addr| a.is_loopback() || a.is_unspecified() || a.octets()[0] == 0;
+    match ip {
+        IpAddr::V4(a) => v4(a),
+        IpAddr::V6(a) => a.is_loopback() || a.is_unspecified() || embedded_ipv4(a).is_some_and(v4),
     }
 }
 
@@ -531,10 +547,15 @@ fn ip_is_link_local(ip: IpAddr) -> bool {
 fn refused_resolution_message(host: &str, refused: &[IpAddr], kind: UrlKind) -> String {
     let addrs: Vec<String> = refused.iter().map(IpAddr::to_string).collect();
     let fix = match kind {
-        UrlKind::Backend | UrlKind::BackendDev => {
-            "Cloud-metadata and link-local addresses are never allowed for an S3 endpoint; \
-             `allow_local: true` does NOT permit them. Point the endpoint's DNS at the \
-             storage server's real address."
+        UrlKind::Backend => {
+            "Cloud-metadata, link-local and loopback addresses are not allowed for an S3 \
+             endpoint. `allow_local: true` (DGP_BACKEND_ALLOW_LOCAL=true) permits loopback \
+             for dev and CI, and never metadata or link-local addresses. Point the \
+             endpoint's DNS at the storage server's real address."
+        }
+        UrlKind::BackendDev => {
+            "Cloud-metadata addresses are never allowed for an S3 endpoint, even with \
+             `allow_local: true`. Point the endpoint's DNS at the storage server's real address."
         }
         UrlKind::Oidc | UrlKind::Webhook => {
             "Private, loopback and metadata addresses are not allowed for this URL."
@@ -594,6 +615,49 @@ impl aws_smithy_runtime_api::client::dns::ResolveDns for SdkSsrfGuardedResolver 
             }
             Ok(safe)
         })
+    }
+}
+
+/// Query parameters whose value authenticates a request (SigV4 and SigV2
+/// presigned URLs). Compared without case.
+const SECRET_QUERY_PARAMS: [&str; 6] = [
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "signature",
+    "awsaccesskeyid",
+    "x-amz-content-sha256",
+];
+
+/// Pure: `uri` (a request target, `path?query`, or a bare query) with the
+/// value of every credential-bearing query parameter replaced by `REDACTED`.
+/// THE form of a URI in a log line or a span: a presigned URL carries a
+/// bearer capability in its query for as long as it is valid.
+pub fn redact_uri_for_log(uri: &str) -> String {
+    let Some((path, rest)) = uri.split_once('?') else {
+        return uri.to_string();
+    };
+    let (query, fragment) = match rest.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (rest, None),
+    };
+    let query = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _))
+                if SECRET_QUERY_PARAMS
+                    .iter()
+                    .any(|s| name.eq_ignore_ascii_case(s)) =>
+            {
+                format!("{name}=REDACTED")
+            }
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    match fragment {
+        Some(f) => format!("{path}?{query}#{f}"),
+        None => format!("{path}?{query}"),
     }
 }
 
@@ -973,8 +1037,13 @@ mod tests {
             ("64:ff9b::a9fe:0101", true, false),
             ("10.0.0.5", false, false),
             ("172.16.0.1", false, false),
-            ("127.0.0.1", false, false),
-            ("::1", false, false),
+            ("127.0.0.1", true, false),
+            ("127.1.2.3", true, false),
+            ("0.0.0.0", true, false),
+            ("::1", true, false),
+            ("::", true, false),
+            ("::ffff:127.0.0.1", true, false),
+            ("64:ff9b::7f00:1", true, false),
             ("fd12::5", false, false),
             ("8.8.8.8", false, false),
         ] {
@@ -1025,11 +1094,20 @@ mod tests {
         let msg = std::error::Error::source(&err).unwrap().to_string();
         assert!(msg.contains("'169.254.169.254'"), "{msg}");
         assert!(msg.contains("[169.254.169.254]"), "{msg}");
-        assert!(msg.contains("allow_local: true` does NOT permit"), "{msg}");
+        assert!(msg.contains("never metadata or link-local"), "{msg}");
         // On-prem storage behind internal DNS: a private answer is fine.
-        for ip in ["10.0.0.5", "192.168.1.9", "127.0.0.1", "fd12::5"] {
+        for ip in ["10.0.0.5", "192.168.1.9", "fd12::5"] {
             let r = SdkSsrfGuardedResolver::new(UrlKind::Backend, ip);
             assert!(r.resolve_dns(ip).await.is_ok(), "private answer {ip}");
+        }
+        // A name that resolves to this host is `127.0.0.1` spelled by DNS
+        // (`localtest.me`): refused, unless the operator opted into
+        // `allow_local`.
+        for ip in ["127.0.0.1", "::1", "0.0.0.0"] {
+            let strict = SdkSsrfGuardedResolver::new(UrlKind::Backend, ip);
+            assert!(strict.resolve_dns(ip).await.is_err(), "loopback {ip}");
+            let dev = SdkSsrfGuardedResolver::new(UrlKind::BackendDev, ip);
+            assert!(dev.resolve_dns(ip).await.is_ok(), "allow_local {ip}");
         }
         for ip in ["169.254.1.1", "fe80::1", "fd00:ec2::254"] {
             let r = SdkSsrfGuardedResolver::new(UrlKind::Backend, ip);
@@ -1121,6 +1199,47 @@ mod bucket_name_proptests {
         #[test]
         fn never_panics(name in ".{0,200}") {
             let _: Result<(), BucketNameError> = validate_bucket_name(&name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_uri_for_log;
+
+    #[test]
+    fn credential_params_lose_their_values() {
+        let cases = [
+            ("/b/k", "/b/k"),
+            ("/b/k?versionId=3", "/b/k?versionId=3"),
+            (
+                "/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AK%2F20260101%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=abc123",
+                "/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=REDACTED&X-Amz-Signature=REDACTED",
+            ),
+            ("/b/k?x-amz-signature=abc", "/b/k?x-amz-signature=REDACTED"),
+            ("/b/k?X-AMZ-SECURITY-TOKEN=t&a=1", "/b/k?X-AMZ-SECURITY-TOKEN=REDACTED&a=1"),
+            ("/b/k?AWSAccessKeyId=AK&Signature=s%2Bx&Expires=1", "/b/k?AWSAccessKeyId=REDACTED&Signature=REDACTED&Expires=1"),
+            ("?X-Amz-Signature=abc", "?X-Amz-Signature=REDACTED"),
+            ("/b/k?X-Amz-Signature", "/b/k?X-Amz-Signature"),
+            ("/b/k?a=X-Amz-Signature=1", "/b/k?a=X-Amz-Signature=1"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(redact_uri_for_log(raw), want, "{raw}");
+        }
+    }
+
+    proptest::proptest! {
+        /// No value of a credential parameter survives, whatever surrounds it.
+        #[test]
+        fn a_secret_value_never_survives(
+            value in "[A-Za-z0-9%_.~-]{8,40}",
+            name in proptest::sample::select(vec!["X-Amz-Signature", "x-amz-credential", "X-Amz-Security-Token", "Signature"]),
+            before in "[a-z]{0,6}=[a-z0-9]{0,6}",
+            after in "[a-z]{0,6}=[a-z0-9]{0,6}",
+        ) {
+            let uri = format!("/b/k?{before}&{name}={value}&{after}");
+            let out = redact_uri_for_log(&uri);
+            proptest::prop_assert!(!out.contains(&value), "{out}");
         }
     }
 }

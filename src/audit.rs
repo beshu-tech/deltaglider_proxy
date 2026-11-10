@@ -230,6 +230,17 @@ pub fn with_audit_directive(spec: &str) -> String {
     }
 }
 
+/// The log filter every place builds from a spec: the audit trail pinned at
+/// INFO ([`with_audit_directive`]), and `s3s::service` held at INFO.
+/// The s3s crate logs the whole HTTP request at DEBUG there (`debug!(?req)`:
+/// the URI with a presigned signature, and the `Authorization` header), which
+/// no redaction of ours can reach. The directive is appended last and is
+/// more specific than a crate-wide `s3s=` level, so it holds under
+/// `RUST_LOG=trace`.
+pub fn with_pinned_directives(spec: &str) -> String {
+    format!("{},s3s::service=info", with_audit_directive(spec))
+}
+
 /// Emit a structured audit log line for any mutation operation.
 ///
 /// Format: `AUDIT | action=X | user=X | target=X | ip=X | ua=X | bucket=X | path=X`

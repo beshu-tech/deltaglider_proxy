@@ -1658,3 +1658,97 @@ fn copy_source_authorized_key_is_the_key_the_engine_reads() {
     }
     assert!(checked >= 8, "only {checked} copy sources were servable");
 }
+
+// ── secrets in logs ─────────────────────────────────────────────────────
+
+/// A `MakeWriter` that keeps every byte the subscriber writes.
+#[derive(Clone, Default)]
+struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+    type Writer = LogSink;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// E10/F36: with the production log filter at its most verbose
+/// (`RUST_LOG=trace`) a presigned request logs neither its signature, nor
+/// its credential, nor the `Authorization` header of a header-signed one.
+/// Every request goes through the production router, so every layer, the
+/// TraceLayer span and s3s's own request log are in the capture.
+#[tokio::test]
+async fn a_request_never_logs_its_signature_or_credential() {
+    let h = harness().await;
+    let sink = LogSink::default();
+    let filter: tracing_subscriber::EnvFilter =
+        crate::audit::with_pinned_directives("trace,aws_sigv4=off")
+            .parse()
+            .unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(sink.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    // Callsites other tests hit first, with no subscriber, cache "never":
+    // recompute so this thread's subscriber sees them.
+    tracing::callsite::rebuild_interest_cache();
+
+    let mut secrets: Vec<String> = Vec::new();
+    for raw in [
+        get("/b/key.txt", Auth::V4Presigned(ALICE)),
+        get("/b/key.txt", v4(ALICE)),
+        get("/b/key.txt", Auth::V2Presigned(ALICE)),
+        get("/b/?list-type=2&prefix=x", Auth::V4Presigned(BOB)),
+    ] {
+        let request = build(&raw).expect("request builds");
+        let uri = request.uri().to_string();
+        // The values to look for: the signature and the credential of the
+        // presigned query, the whole `Authorization` header otherwise.
+        for pair in uri.split_once('?').map_or("", |(_, q)| q).split('&') {
+            if let Some((name, value)) = pair.split_once('=') {
+                if ["x-amz-signature", "x-amz-credential", "signature"]
+                    .contains(&name.to_ascii_lowercase().as_str())
+                {
+                    secrets.push(value.to_string());
+                }
+            }
+        }
+        if let Some(auth) = request.headers().get("authorization") {
+            let auth = auth.to_str().unwrap();
+            if let Some(sig) = auth.split("Signature=").nth(1) {
+                secrets.push(sig.to_string());
+            }
+        }
+        send(&h.prod, &raw).await.expect("sent");
+    }
+    secrets.retain(|s| s.len() >= 16);
+    assert!(
+        secrets.len() >= 4,
+        "the requests carry secrets: {secrets:?}"
+    );
+    secrets.extend([ALICE.sk.to_string(), BOB.sk.to_string()]);
+
+    let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logged.contains("request"),
+        "the capture saw the request logs:\n{logged}"
+    );
+    for secret in &secrets {
+        assert!(
+            !logged.contains(secret.as_str()),
+            "a secret reached the log: {secret}\n{logged}"
+        );
+    }
+}

@@ -60,7 +60,7 @@ pub fn init_tracing(cli: &Cli) -> reload::Handle<EnvFilter, tracing_subscriber::
         deltaglider_proxy::config::DEFAULT_LOG_LEVEL,
         cli.verbose,
     );
-    let initial_filter = EnvFilter::new(deltaglider_proxy::audit::with_audit_directive(&spec));
+    let initial_filter = EnvFilter::new(deltaglider_proxy::audit::with_pinned_directives(&spec));
 
     let (filter_layer, reload_handle) = reload::Layer::new(initial_filter);
 

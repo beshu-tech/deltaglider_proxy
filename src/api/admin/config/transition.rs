@@ -324,7 +324,7 @@ pub(crate) async fn apply_config_transition(
     // Log-level hot reload. An invalid filter is a warning: the old filter
     // stays, the config change goes through.
     if let Some((state, _, _)) = admin.filter(|_| old_cfg.log_level != new_cfg.log_level) {
-        match crate::audit::with_audit_directive(&new_cfg.log_level).parse::<EnvFilter>() {
+        match crate::audit::with_pinned_directives(&new_cfg.log_level).parse::<EnvFilter>() {
             Ok(new_filter) => {
                 if let Err(e) = state.log_reload.reload(new_filter) {
                     warnings.push(format!("Failed to reload log filter: {}", e));

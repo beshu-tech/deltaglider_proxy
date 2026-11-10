@@ -904,7 +904,7 @@ pub async fn sigv4_auth_middleware(
     debug!(
         "Incoming request: {} {} (has auth header: {})",
         request.method(),
-        request.uri(),
+        crate::security::redact_uri_for_log(&request.uri().to_string()),
         request.headers().contains_key("authorization")
     );
 
