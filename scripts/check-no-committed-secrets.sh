@@ -24,6 +24,8 @@ forbidden=$(git ls-files \
   ':(glob)**/*.zip' \
   ':(glob)**/deltaglider_config.db' \
   ':(glob)**/deltaglider_jobs.db' \
+  ':(glob)**/*.db-wal' \
+  ':(glob)**/*.db-shm' \
   ':(glob)**/*.db' \
   ':(glob)**/*.db.bak' \
   ':(glob)**/*.db.key' \
