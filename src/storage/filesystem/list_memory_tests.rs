@@ -108,6 +108,74 @@ async fn paging_a_big_folder_lists_every_key_once_within_the_bound() {
     scan::set_chunk_for_test(None);
 }
 
+/// A folder of `n` empty subfolders and one file after them: a LIST with the
+/// delimiter `_` drops every subfolder (it holds no listed key) and lists the
+/// file, so the page reads all `n` entries to return one.
+async fn engine_with_empty_folders(n: usize) -> (tempfile::TempDir, Engine) {
+    let (tmp, engine) = engine_with_folder(0).await;
+    let ds = tmp.path().join("b").join("deltaspaces").join("big");
+    for i in 0..n {
+        std::fs::create_dir(ds.join(format!("f_{i:06}"))).unwrap();
+    }
+    std::fs::write(ds.join("zz.jpg"), b"x").unwrap();
+    (tmp, engine)
+}
+
+async fn one_page_passes(engine: &Engine) -> usize {
+    scan::READ_DIR_PASSES.with(|c| c.set(0));
+    let page = engine
+        .list_objects("b", "big/", Some("_"), 1, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.objects
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>(),
+        ["big/zz.jpg"],
+        "the empty folders list nothing"
+    );
+    scan::READ_DIR_PASSES.with(|c| c.get())
+}
+
+/// Dropped entries must not make the page quadratic: each refill reads the
+/// directory again, so the chunk doubles and the passes are O(log N), not
+/// O(N / chunk). With the fixed chunk of 8 this folder took 4,001 / 8 = 501
+/// passes.
+#[tokio::test]
+async fn a_page_that_drops_many_entries_reads_the_directory_a_few_times() {
+    const N: usize = 4_000;
+    let (_tmp, engine) = engine_with_empty_folders(N).await;
+    scan::set_chunk_for_test(Some(8));
+    let passes = one_page_passes(&engine).await;
+    scan::set_chunk_for_test(None);
+    // 8 + 16 + ... + 4096 covers 4,001 entries: 10 passes. Allow slack, far
+    // below the 501 of a fixed chunk.
+    assert!(
+        passes <= 12,
+        "{passes} read_dir passes for {N} dropped entries"
+    );
+}
+
+/// The growth stops at the cap: a request holds at most the cap (+1 for the
+/// heap's spare) of one directory, and the passes beyond it are linear in
+/// N / cap.
+#[tokio::test]
+async fn the_chunk_growth_stops_at_the_cap() {
+    const N: usize = 1_000;
+    let (_tmp, engine) = engine_with_empty_folders(N).await;
+    scan::set_chunk_for_test(Some(4));
+    scan::set_cap_for_test(Some(64));
+    HELD_PEAK.with(|p| p.set(0));
+    let passes = one_page_passes(&engine).await;
+    let held = HELD_PEAK.with(|p| p.get());
+    scan::set_chunk_for_test(None);
+    scan::set_cap_for_test(None);
+    assert!(held <= 64 + 1, "{held} entries held, cap 64");
+    // 4 + 8 + 16 + 32 = 60, then 64 per pass: 1 + 4 + ceil(941 / 64) = 20.
+    assert!((15..=25).contains(&passes), "{passes} passes");
+}
+
 /// F19 + the class guard of epic #142: for random key sets (a `.dg`
 /// directory, Unicode and control characters among them) the recursive
 /// delimiter walk lists exactly the flat listing, with any chunk size and

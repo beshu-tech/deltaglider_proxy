@@ -11,6 +11,14 @@
 //! holds one chunk per open directory, whatever the directory size. The cost
 //! is one `read_dir` pass per chunk that the page reaches: a page of at most
 //! 1,000 keys reaches one or two.
+//!
+//! A caller can drop entries after the chunk (a folder that holds no listed
+//! key), so a page can read far more entries than it returns. With a fixed
+//! chunk, N such entries would cost N / `SCAN_CHUNK` passes of N entries
+//! each. Each refill therefore DOUBLES the chunk of its directory, up to
+//! [`SCAN_CHUNK_MAX`]: the passes are O(log N) up to the cap, then
+//! N / `SCAN_CHUNK_MAX`. The memory bound stays explicit: at most
+//! `SCAN_CHUNK_MAX` entries per open directory.
 
 use super::{
     fsio, io_to_storage_error, note_held, stored_name, FilesystemBackend, StorageError, StoredName,
@@ -20,8 +28,12 @@ use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-/// Entries of a directory that one scan holds at a time.
+/// Entries of a directory that the first chunk of a scan holds.
 pub(super) const SCAN_CHUNK: usize = 1024;
+
+/// The most entries that a scan holds of one directory: the chunk doubles on
+/// each refill up to this size (see the module doc).
+pub(super) const SCAN_CHUNK_MAX: usize = 65_536;
 
 #[cfg(test)]
 thread_local! {
@@ -36,6 +48,33 @@ pub(super) fn chunk_size() -> usize {
         return n;
     }
     SCAN_CHUNK
+}
+
+/// The chunk after `current` (see the module doc): doubled, within `max`.
+pub(super) fn grown(current: usize, max: usize) -> usize {
+    current.saturating_mul(2).min(max).max(current)
+}
+
+/// The cap on growth now. Tests set a small one to reach it.
+fn chunk_max() -> usize {
+    #[cfg(test)]
+    if let Some(n) = CAP_OVERRIDE.with(|c| c.get()) {
+        return n;
+    }
+    SCAN_CHUNK_MAX
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAP_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// `read_dir` passes of directory scans on this thread, for the cost
+    /// tests (a `#[tokio::test]` runs on one thread).
+    pub(super) static READ_DIR_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn set_cap_for_test(n: Option<usize>) {
+    CAP_OVERRIDE.with(|c| c.set(n));
 }
 
 #[cfg(test)]
@@ -143,6 +182,8 @@ pub(super) struct SortedDir {
     /// The key of the directory (`a/b`; empty at the bucket root).
     pub(super) key: String,
     chunk: Vec<WalkEntry>,
+    /// The size of the next chunk: doubles on each refill.
+    chunk_limit: usize,
     /// The next entry of the chunk.
     next: usize,
     /// Entries remain after the chunk.
@@ -157,13 +198,15 @@ impl SortedDir {
         key: String,
         keep: Keep<'_>,
     ) -> Result<Option<Self>, StorageError> {
-        let Some((chunk, more)) = read_chunk(path, &key, None, keep).await? else {
+        let limit = chunk_size();
+        let Some((chunk, more)) = read_chunk(path, &key, None, limit, keep).await? else {
             return Ok(None);
         };
         Ok(Some(Self {
             path: path.to_path_buf(),
             key,
             chunk,
+            chunk_limit: grown(limit, chunk_max()),
             next: 0,
             more,
         }))
@@ -177,10 +220,12 @@ impl SortedDir {
     ) -> Result<Option<WalkEntry>, StorageError> {
         if self.next >= self.chunk.len() && self.more {
             let after = self.chunk.last().map(WalkEntry::order);
-            match read_chunk(&self.path, &self.key, after, keep).await? {
+            let limit = self.chunk_limit;
+            match read_chunk(&self.path, &self.key, after, limit, keep).await? {
                 Some((chunk, more)) => {
                     self.chunk = chunk;
                     self.more = more;
+                    self.chunk_limit = grown(limit, chunk_max());
                 }
                 // The directory went away between two chunks.
                 None => {
@@ -202,20 +247,23 @@ impl SortedDir {
     }
 }
 
-/// One bounded pass over the directory: the smallest chunk of kept entries
+/// One bounded pass over the directory: the smallest `limit` kept entries
 /// after `after`.
 async fn read_chunk(
     path: &Path,
     dir_key: &str,
     after: Option<Order>,
+    limit: usize,
     keep: Keep<'_>,
 ) -> Result<Option<(Vec<WalkEntry>, bool)>, StorageError> {
+    #[cfg(test)]
+    READ_DIR_PASSES.with(|c| c.set(c.get() + 1));
     let mut dir = match fs::read_dir(path).await {
         Ok(dir) => dir,
         Err(e) if fsio::absent(&e) => return Ok(None),
         Err(e) => return Err(io_to_storage_error(e)),
     };
-    let mut smallest = Smallest::new(chunk_size(), after);
+    let mut smallest = Smallest::new(limit, after);
     while let Some(entry) = dir.next_entry().await? {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
