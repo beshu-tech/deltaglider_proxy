@@ -610,6 +610,9 @@ fn ours(state: &MarkerState) -> Option<deltaglider_proxy::storage::encrypting::c
 /// the job; the job converts everything and closes the window.
 #[tokio::test]
 async fn clients_read_the_history_through_the_window_while_the_job_converts() {
+    crate::common::expect_server_errors(
+        "a refused read of an unopened sealed object answers 500 (asserted)",
+    );
     const N: usize = 24;
     let c = Conv::start("convread", N, &[STALL], false).await;
     let (status, _) = c.get("h-00.txt").await;
@@ -667,6 +670,9 @@ async fn clients_read_the_history_through_the_window_while_the_job_converts() {
 /// closes the window.
 #[tokio::test]
 async fn a_plant_after_the_cutoff_is_refused_for_clients_and_adopted_by_the_job() {
+    crate::common::expect_server_errors(
+        "a refused read of an unopened sealed object answers 500 (asserted)",
+    );
     const N: usize = 4;
     let c = Conv::start("convplant", N, &[], false).await;
     c.node(TEST_KEY).await.open(&c.bucket).await;
@@ -730,6 +736,9 @@ async fn a_plant_after_the_cutoff_is_refused_for_clients_and_adopted_by_the_job(
 /// plaintext object planted now is still refused.
 #[tokio::test]
 async fn a_replayed_marker_does_not_serve_a_new_plant() {
+    crate::common::expect_server_errors(
+        "a refused read of an unopened sealed object answers 500 (asserted)",
+    );
     const N: usize = 8;
     let c = Conv::start(
         "convreplay",
@@ -974,6 +983,9 @@ async fn a_failed_rewrite_keeps_the_window() {
 /// stored time (grace 0 here, so a plant one second later is past it).
 #[tokio::test]
 async fn history_reads_and_a_plant_is_adopted_minio() {
+    crate::common::expect_server_errors(
+        "a refused read of an unopened sealed object answers 500 (asserted)",
+    );
     skip_unless_minio!();
     let bucket = common::unique_bucket("convminio");
     let c = Conv::start(&bucket, 4, &[("DGP_TEST_CONVERSION_GRACE_SECS", "0")], true).await;
@@ -1025,6 +1037,9 @@ async fn history_reads_and_a_plant_is_adopted_minio() {
 /// a client could not read is reported, with or without a marker.
 #[tokio::test]
 async fn a_deleted_marker_never_makes_the_job_adopt_silently() {
+    crate::common::expect_server_errors(
+        "a refused read of an unopened sealed object answers 500 (asserted)",
+    );
     const N: usize = 4;
     let c = Conv::start("convsilent", N, &[], false).await;
     c.node(TEST_KEY).await.open(&c.bucket).await;
@@ -1056,6 +1071,9 @@ async fn a_deleted_marker_never_makes_the_job_adopt_silently() {
 /// sealed as history without a report.
 #[tokio::test]
 async fn a_job_without_a_run_never_extends_a_replayed_marker() {
+    crate::common::expect_server_errors(
+        "a refused read of an unopened sealed object answers 500 (asserted)",
+    );
     const N: usize = 4;
     let c = Conv::start(
         "convreopen",
@@ -1145,6 +1163,9 @@ async fn open_window_with_an_active_job_leaves_no_marker() {
 /// closes the window, and the next restart starts nothing.
 #[tokio::test]
 async fn a_restart_with_encryption_in_the_file_starts_the_conversion() {
+    crate::common::expect_server_errors(
+        "a refused read of an unopened sealed object answers 500 (asserted)",
+    );
     const N: usize = 6;
     let mut c = Conv::start(
         "convboot",

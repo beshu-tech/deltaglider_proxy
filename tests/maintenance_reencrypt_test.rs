@@ -282,6 +282,7 @@ async fn test_gate_state_hidden_from_unauthenticated_writers() {
 
 #[tokio::test]
 async fn test_reencrypt_full_cycle() {
+    crate::common::expect_server_errors("a maintenance write gate answers 503 (asserted)");
     let bucket = "maintbkt";
     // The outbox has a reader, so it records object events and keeps them
     // for the whole test.
@@ -1102,6 +1103,7 @@ async fn review2_forged_signature_fails_auth_before_the_gate() {
 /// legitimate writer to a busy bucket gets a hard error instead of backoff.
 #[tokio::test]
 async fn review2_sdk_retry_of_a_gated_write_is_not_refused_as_replay() {
+    crate::common::expect_server_errors("a maintenance write gate answers 503 (asserted)");
     let bucket = "maintretry";
     let (server, admin) = review2_busy_bucket(bucket).await;
     let endpoint = server.endpoint();
@@ -1132,6 +1134,7 @@ async fn review2_sdk_retry_of_a_gated_write_is_not_refused_as_replay() {
 /// correctly signed form POST to a busy bucket must still be gated.
 #[tokio::test]
 async fn test_signed_form_post_to_busy_bucket_is_gated() {
+    crate::common::expect_server_errors("a maintenance write gate answers 503 (asserted)");
     use base64::Engine;
     use hmac::{Hmac, Mac};
     fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {

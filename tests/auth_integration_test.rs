@@ -3197,6 +3197,7 @@ impl aws_sdk_s3::config::Intercept for OnRetry {
 /// so the SDK's byte-identical retry is served, not refused as a replay.
 #[tokio::test]
 async fn production_defaults_sdk_retry_after_a_5xx_succeeds() {
+    crate::common::expect_server_errors("the test injects one 500 to prove the SDK retry");
     let server = TestServer::builder()
         .production_security_defaults()
         .build()

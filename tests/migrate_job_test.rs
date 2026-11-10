@@ -143,6 +143,7 @@ async fn transient_keys(admin: &reqwest::Client, endpoint: &str) -> Vec<String> 
 
 #[tokio::test]
 async fn test_migrate_full_cycle() {
+    crate::common::expect_server_errors("a maintenance write gate answers 503 (asserted)");
     let dir_a = tempfile::TempDir::new().unwrap();
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migbkt";
@@ -1214,6 +1215,9 @@ async fn test_migrate_row_reports_progress_and_status_follows_the_gate() {
 /// readable again.
 #[tokio::test]
 async fn test_migrate_moves_a_read_only_bucket_with_plaintext_history() {
+    crate::common::expect_server_errors(
+        "a refused read of an unopened sealed object answers 500 (asserted)",
+    );
     const KEY_A: &str = "a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0";
     const KEY_B: &str = "b1b2b3b4b5b6b7b8b9babbbcbdbebfc0a1a2a3a4a5a6a7a8a9aaabacadaeafb0";
     let dir_a = tempfile::TempDir::new().unwrap();

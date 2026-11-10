@@ -908,6 +908,9 @@ async fn test_chunked_encryption_range_over_final_chunk() {
 /// truncates the last frame's ciphertext by 1 byte.
 #[tokio::test]
 async fn test_chunked_truncation_detected() {
+    crate::common::expect_server_errors(
+        "a truncated ciphertext fails the GET with 500 before the first byte (asserted)",
+    );
     let server = encrypted_builder().build().await;
     let parts = vec![vec![0xABu8; 200 * 1024]; 2]; // 2 × 200 KiB, crosses chunk boundaries
     multipart_put(&server, "truncate-me.dat", &parts).await;

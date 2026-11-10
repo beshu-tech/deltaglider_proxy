@@ -129,6 +129,9 @@ fn test_sync_bucket_without_config_db_key_fails_boot() {
 
 #[tokio::test]
 async fn test_single_instance_and_marked_bucket_boot_fine() {
+    crate::common::expect_server_errors(
+        "CreateBucket answers 503 while a backend is unprobed or dead",
+    );
     let local = tempfile::tempdir().expect("local-disk dir");
     // (a) Single instance (no config_sync_bucket): the gate skips entirely —
     //     the same forced-non-CAS backend + routed bucket boots.
@@ -159,6 +162,9 @@ async fn test_single_instance_and_marked_bucket_boot_fine() {
 
 #[tokio::test]
 async fn test_hot_apply_rejects_routing_client_writable_bucket_to_noncas_backend() {
+    crate::common::expect_server_errors(
+        "CreateBucket answers 503 while a backend is unprobed or dead",
+    );
     let local = tempfile::tempdir().expect("local-disk dir");
     // Boot single-instance (gate skipped), then try to APPLY a config that
     // turns on multi-instance with the client-writable bucket still routed to
@@ -229,6 +235,9 @@ async fn test_hot_apply_rejects_routing_client_writable_bucket_to_noncas_backend
 /// exit(1)s on the persisted config.
 #[tokio::test]
 async fn test_create_bucket_on_noncas_backend_is_refused_multi_instance() {
+    crate::common::expect_server_errors(
+        "CreateBucket answers 503 while a backend is unprobed or dead",
+    );
     let local = tempfile::tempdir().expect("local-disk dir");
     let server = TestServer::builder()
         .auth("k", "s")

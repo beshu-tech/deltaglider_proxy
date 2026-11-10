@@ -237,6 +237,9 @@ async fn test_delta_with_valid_metadata_reconstructs() {
 /// A file with invalid/garbage xattr metadata should not crash the proxy.
 #[tokio::test]
 async fn test_corrupt_xattr_metadata_graceful_fallback() {
+    crate::common::expect_server_errors(
+        "corrupt xattrs may answer 200, 404 or 500 (the test accepts all three)",
+    );
     let server = TestServer::builder().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"file with garbage metadata";
@@ -290,6 +293,9 @@ async fn test_corrupt_xattr_metadata_graceful_fallback() {
 /// Metadata that's valid JSON but missing required fields should degrade gracefully.
 #[tokio::test]
 async fn test_partial_metadata_missing_fields_graceful() {
+    crate::common::expect_server_errors(
+        "partial metadata may answer 200, 404 or 500 (the test accepts all three)",
+    );
     let server = TestServer::builder().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"file with partial metadata";

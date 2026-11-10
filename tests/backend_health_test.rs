@@ -19,6 +19,9 @@ use common::TestServer;
 /// The routed bucket 503s with the backend named; healthy buckets unaffected.
 #[tokio::test]
 async fn unhealthy_backend_gates_its_buckets_with_named_503() {
+    crate::common::expect_server_errors(
+        "the health gate answers 503 for a dead backend (asserted)",
+    );
     // Absolute tempdir for the healthy filesystem backend — a relative path
     // would resolve against the spawned proxy's CWD (the repo root) and
     // leave litter behind.
@@ -383,6 +386,7 @@ buckets:
 /// does not gate (see `coordination::health` unit tests).
 #[tokio::test]
 async fn hung_backend_times_out_fast_and_is_marked_unhealthy() {
+    crate::common::expect_server_errors("a hung backend answers 503 (asserted)");
     let hang = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let port = fake_s3(hang.clone()).await;
     let disk = tempfile::tempdir().unwrap();
