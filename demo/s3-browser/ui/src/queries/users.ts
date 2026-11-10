@@ -36,6 +36,16 @@ function useInvalidateUsers() {
   };
 }
 
+/** Also the groups list: it shows each group's member ids, and a delete
+ *  removes the user from its groups, a clone can copy the memberships. */
+function useInvalidateUsersAndGroups() {
+  const qc = useQueryClient();
+  return () => {
+    qc.invalidateQueries({ queryKey: qk.users.list() });
+    qc.invalidateQueries({ queryKey: qk.groups.list() });
+  };
+}
+
 export function useCreateUser() {
   const invalidate = useInvalidateUsers();
   return useMutation<IamUser, Error, CreateUserRequest>({
@@ -58,7 +68,7 @@ export function useUpdateUser() {
 }
 
 export function useDeleteUser() {
-  const invalidate = useInvalidateUsers();
+  const invalidate = useInvalidateUsersAndGroups();
   return useMutation<void, Error, number>({
     mutationFn: deleteUser,
     onSuccess: invalidate,
@@ -72,7 +82,7 @@ interface CloneUserVars {
 }
 
 export function useCloneUser() {
-  const invalidate = useInvalidateUsers();
+  const invalidate = useInvalidateUsersAndGroups();
   return useMutation<IamUser, Error, CloneUserVars>({
     mutationFn: ({ id, name, copyGroupMemberships }) =>
       cloneUser(id, { name, copy_group_memberships: copyGroupMemberships }),
