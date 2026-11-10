@@ -192,3 +192,5 @@ mod streaming_copy_test;
 mod tls_listener_test;
 #[path = "unmanaged_objects_test.rs"]
 mod unmanaged_objects_test;
+#[path = "write_validation_wiring_test.rs"]
+mod write_validation_wiring_test;

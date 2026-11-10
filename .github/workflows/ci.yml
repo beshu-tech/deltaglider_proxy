@@ -374,6 +374,7 @@ jobs:
               replication_test::
               storage_resilience_test::
               unmanaged_objects_test::
+              write_validation_wiring_test::
           - group: 3
             filters: >-
               admin_bulk_objects_test::
