@@ -1500,34 +1500,55 @@ fn non_admin_bulk_session(
     }
 }
 
-/// Whether the principal of the session `token` may list `bucket`, the rule
-/// for bucket-scoped views on the session-light surface (the busy banner):
-/// a live admin session; an open-mode session while access is open; an
-/// IAM user (keys or OAuth) that sees the bucket, as ListBuckets does.
-pub(crate) fn session_may_list_bucket(
+impl BulkSession {
+    /// The principal a job stores for this session, and the principal a
+    /// cancel is judged for (`maintenance::delete::may_cancel`).
+    pub fn principal(&self) -> crate::maintenance::delete::Principal {
+        use crate::maintenance::delete::Principal;
+        match self {
+            BulkSession::AdminGui => Principal::Admin,
+            BulkSession::Open => Principal::Open,
+            BulkSession::IamUser {
+                access_key_id,
+                client_ip,
+            } => Principal::User {
+                access_key_id: access_key_id.clone(),
+                client_ip: *client_ip,
+            },
+        }
+    }
+}
+
+/// The session of `token` when its principal may list `bucket`, the rule for
+/// bucket-scoped views on the session-light surface (the busy banner): a
+/// live admin session; an open-mode session while access is open; an IAM
+/// user (keys or OAuth) that sees the bucket, as ListBuckets does. `None`:
+/// the view is refused.
+pub(crate) fn bucket_view_session(
     state: &AdminState,
     token: &str,
     client_ip: Option<IpAddr>,
     bucket: &str,
-) -> bool {
+) -> Option<BulkSession> {
     if admin_gui_session_ok(state, token, client_ip) {
-        return true;
+        return Some(BulkSession::AdminGui);
     }
     let iam = state.iam_state.load();
-    match non_admin_bulk_session(
+    let (session, _) = non_admin_bulk_session(
         state.sessions.auth_method(token, client_ip),
         &iam,
         client_ip,
-    ) {
-        Some((BulkSession::Open | BulkSession::AdminGui, _)) => true,
-        Some((BulkSession::IamUser { access_key_id, .. }, _)) => match iam.as_ref() {
+    )?;
+    let may = match &session {
+        BulkSession::Open | BulkSession::AdminGui => true,
+        BulkSession::IamUser { access_key_id, .. } => match iam.as_ref() {
             IamState::Iam(index) => index
-                .principal(&access_key_id)
+                .principal(access_key_id)
                 .is_some_and(|u| u.can_see_bucket(bucket)),
             _ => false,
         },
-        None => false,
-    }
+    };
+    may.then_some(session)
 }
 
 /// Audit actor for an admin session: the IAM user name when known.

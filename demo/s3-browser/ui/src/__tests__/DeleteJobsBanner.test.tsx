@@ -1,6 +1,6 @@
 /**
  * The bucket's running delete jobs: one line each, Cancel only for the jobs
- * the session may stop (an admin, or the user who started it).
+ * the server says the session may stop (`may_cancel`).
  */
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -43,9 +43,8 @@ test('one line per job, Cancel only where the session may stop it, and a cancel 
   const user = userEvent.setup();
   renderWithQuery(
     <DeleteJobsBanner
-      jobs={[job({}), job({ id: 2, triggered_by: 'ci-uploader', objects_done: 0 })]}
+      jobs={[job({ may_cancel: true }), job({ id: 2, triggered_by: 'ci-uploader', objects_done: 0, may_cancel: false })]}
       me="dana"
-      canCancel={(j) => j.triggered_by === 'dana'}
       onChanged={onChanged}
     />,
   );
@@ -59,16 +58,18 @@ test('one line per job, Cancel only where the session may stop it, and a cancel 
 });
 
 test('no running delete: no banner', () => {
-  renderWithQuery(<DeleteJobsBanner jobs={[]} me={null} canCancel={() => true} onChanged={() => {}} />);
+  renderWithQuery(<DeleteJobsBanner jobs={[]} me={null} onChanged={() => {}} />);
   expect(screen.queryByRole('status', { name: 'Running deletes' })).toBeNull();
 });
 
 test('a job that is stopping or waiting says so, with no Cancel', () => {
   renderWithQuery(
     <DeleteJobsBanner
-      jobs={[job({ status: 'cancelling' }), job({ id: 2, status: 'queued', started_at: null })]}
+      jobs={[
+        job({ status: 'cancelling', may_cancel: true }),
+        job({ id: 2, status: 'queued', started_at: null, may_cancel: true }),
+      ]}
       me="dana"
-      canCancel={() => true}
       onChanged={() => {}}
     />,
   );
@@ -78,8 +79,27 @@ test('a job that is stopping or waiting says so, with no Cancel', () => {
 
 test('a job that has not saved its total yet says it is starting', () => {
   renderWithQuery(
-    <DeleteJobsBanner jobs={[job({ objects_total: null, objects_done: 0 })]} me="dana" canCancel={() => false} onChanged={() => {}} />,
+    <DeleteJobsBanner jobs={[job({ objects_total: null, objects_done: 0 })]} me="dana" onChanged={() => {}} />,
   );
   expect(screen.getByText('Starting the delete…')).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: 'Cancel delete 1' })).toBeNull();
+});
+
+test('Cancel follows the server flag, never the name of the user who started the job', () => {
+  // `triggered_by` equals `me` on both jobs. Only the flag decides.
+  renderWithQuery(
+    <DeleteJobsBanner
+      jobs={[
+        job({ id: 1, triggered_by: 'admin', may_cancel: false }),
+        job({ id: 2, triggered_by: 'dana', may_cancel: true }),
+        job({ id: 3, triggered_by: 'dana' }),
+      ]}
+      me="admin"
+      onChanged={() => {}}
+    />,
+  );
+  expect(screen.queryByRole('button', { name: 'Cancel delete 1' })).toBeNull();
+  expect(screen.getByRole('button', { name: 'Cancel delete 2' })).toBeInTheDocument();
+  // A server that sends no flag (an older one) shows no Cancel.
+  expect(screen.queryByRole('button', { name: 'Cancel delete 3' })).toBeNull();
 });

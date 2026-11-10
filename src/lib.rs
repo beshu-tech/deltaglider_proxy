@@ -2363,6 +2363,36 @@ mod source_guards {
         );
     }
 
+    /// E10/F35, the page side: the browser shows Cancel from the server's
+    /// `may_cancel`. It never compares `triggered_by` (a display label) with
+    /// the name of the signed-in user.
+    #[test]
+    fn the_ui_never_authorises_by_a_display_name() {
+        let mut offenders = Vec::new();
+        for ext in ["ts", "tsx"] {
+            for path in crate::source_scan::files("demo/s3-browser/ui/src", ext) {
+                let file = crate::source_scan::rel(&path);
+                if file.contains("/__tests__/") || file.contains(".test.") {
+                    continue;
+                }
+                for (i, line) in crate::source_scan::read(&file).lines().enumerate() {
+                    let compares = line.contains("==") || line.contains("!=");
+                    let names_a_user = line.contains("identity")
+                        || line.contains("user.name")
+                        || line.contains("canCancel");
+                    if line.contains("triggered_by") && compares && names_a_user {
+                        offenders.push(format!("{file}:{}: {}", i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "decide a cancel from the server's `may_cancel`, not from a name:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// E10/F54: a client built with the SSRF resolver has no fallback. A
     /// failed build is an error that stops the request, never a default
     /// client (which has no resolver guard and follows redirects).

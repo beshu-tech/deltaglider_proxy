@@ -1121,22 +1121,6 @@ pub struct DeleteJobStarted {
     pub job_id: i64,
 }
 
-/// The principal a delete job acts as, from the session that starts it.
-fn job_principal(session: &BulkSession) -> crate::maintenance::delete::Principal {
-    use crate::maintenance::delete::Principal;
-    match session {
-        BulkSession::AdminGui => Principal::Admin,
-        BulkSession::Open => Principal::Open,
-        BulkSession::IamUser {
-            access_key_id,
-            client_ip,
-        } => Principal::User {
-            access_key_id: access_key_id.clone(),
-            client_ip: *client_ip,
-        },
-    }
-}
-
 /// Start a delete of folders and objects of one bucket as a server job.
 /// The job runs on the server with the session's permissions (checked
 /// again on every page); closing the browser does not stop it.
@@ -1180,7 +1164,7 @@ pub async fn start_delete_job(
     let params = DeleteParams {
         prefixes: req.prefixes.iter().map(|p| p.to_string()).collect(),
         keys: req.keys.iter().map(|k| k.to_string()).collect(),
-        principal: job_principal(&session),
+        principal: session.principal(),
         expected: req.expected,
     };
     let params = serde_json::to_string(&params).expect("params serialize");
@@ -1231,8 +1215,7 @@ pub async fn cancel_delete_job(
             .ok_or_else(|| AdminError::not_found(format!("no delete job {id}")))?;
         // By the stored principal (the IAM access key id), never by the
         // display name in `triggered_by`: that is free text.
-        if !crate::maintenance::delete::may_cancel(&job_principal(&session), job.params.as_deref())
-        {
+        if !crate::maintenance::delete::may_cancel(&session.principal(), job.params.as_deref()) {
             return Err(AdminError::forbidden(format!(
                 "AccessDenied: {} did not start delete job {id}",
                 actor.label()

@@ -88,7 +88,6 @@ export default function BrowserScreen({
         jobs={jobs.deletes}
         // A job started without an IAM user (admin password, open access) says "admin".
         me={identity?.user?.name ?? (canAdmin ? 'admin' : null)}
-        canCancel={(job) => canAdmin || (!!identity?.user && job.triggered_by === identity.user.name)}
         onChanged={jobs.refetch}
       />
       {/* A running bulk action keeps the bar (and its progress) on screen
