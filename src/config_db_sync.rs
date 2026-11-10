@@ -1567,9 +1567,10 @@ pub async fn reopen_and_rebuild_iam(
         }
     }
 
-    // Rebuild ExternalAuthManager from the new DB. Release the DB
-    // lock before the async discovery round — it can take seconds
-    // against real OIDC providers.
+    // Rebuild ExternalAuthManager from the new DB. Discovery runs in the
+    // background and is never awaited here: this path runs at the boot of
+    // an HA node and under `upload_lock`, and a hanging identity provider
+    // must stall neither.
     if let (Some(ext_auth), Some(providers)) = (external_auth.as_ref(), providers) {
         // ALWAYS rebuild — an EMPTY list means every provider was deleted on the
         // peer, and skipping the rebuild would leave the deleted provider's live
@@ -1580,7 +1581,7 @@ pub async fn reopen_and_rebuild_iam(
         ext_auth.rebuild(&providers);
         drop(db);
         if !is_empty {
-            ext_auth.discover_all().await;
+            ext_auth.spawn_discovery();
         }
         info!(
             "External auth providers rebuilt from S3-synced DB ({} providers) [{}]",
@@ -1732,6 +1733,71 @@ mod tests {
             }
             other => panic!("the dead endpoint must fail the write: {other:?}"),
         }
+    }
+
+    /// The sync path (boot of an HA node, the poller) publishes the providers
+    /// of the merged DB and never waits for their discovery: an identity
+    /// provider that accepts a connection and never answers must not hold
+    /// `upload_lock` or the boot (review F14).
+    #[tokio::test]
+    async fn the_sync_rebuild_does_not_wait_for_a_hanging_identity_provider() {
+        // An IdP that accepts connections and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        const PASS: &str = "sync-test-pass";
+        let dir = tempfile::tempdir().unwrap();
+        let live_path = dir.path().join("live.db");
+        let remote_path = dir.path().join("remote.db");
+        let live = ConfigDb::open_or_create(&live_path, PASS).unwrap();
+        {
+            let remote = ConfigDb::open_or_create(&remote_path, PASS).unwrap();
+            remote
+                .create_auth_provider(
+                    &crate::config_db::auth_providers::CreateAuthProviderRequest {
+                        name: "corp".into(),
+                        provider_type: "oidc".into(),
+                        enabled: true,
+                        priority: 0,
+                        display_name: None,
+                        client_id: Some("c".into()),
+                        client_secret: Some("s".into()),
+                        issuer_url: Some(issuer),
+                        scopes: "openid".into(),
+                        extra_config: Some(serde_json::json!({ "allow_local": true })),
+                    },
+                )
+                .unwrap();
+        }
+        let config_db = Some(Arc::new(Mutex::new(live)));
+        let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::iam::IamState::Disabled,
+        ));
+        let ext = Arc::new(ExternalAuthManager::new());
+        let started = std::time::Instant::now();
+        reopen_and_rebuild_iam(
+            &config_db,
+            PASS,
+            &iam,
+            &Some(ext.clone()),
+            None,
+            &remote_path,
+            "test",
+        )
+        .await
+        .expect("the merge applies");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the sync rebuild waited on discovery: {:?}",
+            started.elapsed()
+        );
+        assert!(ext.get_provider("corp").is_some());
+        assert!(ext.discovery_running(), "discovery runs in the background");
     }
 
     /// Only `settle_coordination` may end the process on a coordination

@@ -128,6 +128,71 @@ struct CachedDiscovery {
     fetched_at: Instant,
 }
 
+/// What a failed discovery left on the provider.
+struct DiscoveryFault {
+    /// A retry can work (the provider did not answer).
+    transient: bool,
+    message: String,
+}
+
+impl DiscoveryFault {
+    fn of(e: &ExternalAuthError) -> Self {
+        match e {
+            ExternalAuthError::DiscoveryUnreachable(m) => Self {
+                transient: true,
+                message: m.clone(),
+            },
+            ExternalAuthError::DiscoveryFailed(m) | ExternalAuthError::ConfigError(m) => Self {
+                transient: false,
+                message: m.clone(),
+            },
+            other => Self {
+                transient: false,
+                message: other.to_string(),
+            },
+        }
+    }
+
+    fn error(&self) -> ExternalAuthError {
+        if self.transient {
+            ExternalAuthError::DiscoveryUnreachable(self.message.clone())
+        } else {
+            ExternalAuthError::DiscoveryFailed(self.message.clone())
+        }
+    }
+}
+
+/// A request error that a retry can cure: the provider did not answer.
+/// A bad URL, a redirect (refused by policy) or an undecodable body will
+/// fail again.
+fn is_transport_error(e: &reqwest::Error) -> bool {
+    !(e.is_builder() || e.is_redirect() || e.is_decode())
+}
+
+/// An HTTP status that a retry can cure.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == 429 || status == 408
+}
+
+/// The discovery error of a failed request.
+fn request_error(e: &reqwest::Error) -> ExternalAuthError {
+    if is_transport_error(e) {
+        ExternalAuthError::DiscoveryUnreachable(error_chain(e))
+    } else {
+        ExternalAuthError::DiscoveryFailed(error_chain(e))
+    }
+}
+
+/// The discovery error of an unsuccessful HTTP status.
+fn status_error(status: reqwest::StatusCode, url: &str) -> ExternalAuthError {
+    let msg = format!("HTTP {status} from {url}");
+    if is_transient_status(status) {
+        ExternalAuthError::DiscoveryUnreachable(msg)
+    } else {
+        ExternalAuthError::DiscoveryFailed(msg)
+    }
+}
+
 /// An OIDC provider instance with cached discovery metadata.
 pub struct OidcProvider {
     pub name: String,
@@ -143,6 +208,8 @@ pub struct OidcProvider {
     /// `extra_config` or CA file). Every request then fails with it.
     config_error: Option<String>,
     cache: RwLock<Option<CachedDiscovery>>,
+    /// The error of the last discovery, `None` after a success.
+    last_error: RwLock<Option<DiscoveryFault>>,
 }
 
 /// The OIDC `prompt` of the authorization request: `extra_config.prompt`
@@ -269,6 +336,7 @@ impl OidcProvider {
             url_kind,
             config_error,
             cache: RwLock::new(None),
+            last_error: RwLock::new(None),
         }
     }
 
@@ -448,7 +516,21 @@ impl OidcProvider {
     }
 
     /// Fetch and cache the OIDC discovery document and JWKS.
+    /// Keeps the error for [`Self::last_discovery_error`].
     pub async fn discover(&self) -> Result<(), ExternalAuthError> {
+        let result = self.discover_inner().await;
+        *self.last_error.write() = result.as_ref().err().map(DiscoveryFault::of);
+        result
+    }
+
+    /// The error of the last discovery: `DiscoveryUnreachable` (a retry can
+    /// work) or `DiscoveryFailed` (it cannot: HTTP 4xx, a refused URL, a bad
+    /// document). `None` before the first try and after a success.
+    pub fn last_discovery_error(&self) -> Option<ExternalAuthError> {
+        self.last_error.read().as_ref().map(DiscoveryFault::error)
+    }
+
+    async fn discover_inner(&self) -> Result<(), ExternalAuthError> {
         let doc = self.fetch_discovery().await?;
         let jwks = self.fetch_jwks(&doc.jwks_uri).await?;
 
@@ -483,20 +565,13 @@ impl OidcProvider {
             .get(&url)
             .send()
             .await
-            .map_err(|e| ExternalAuthError::DiscoveryFailed(error_chain(&e)))?;
+            .map_err(|e| request_error(&e))?;
 
         if !resp.status().is_success() {
-            return Err(ExternalAuthError::DiscoveryFailed(format!(
-                "HTTP {} from {}",
-                resp.status(),
-                url
-            )));
+            return Err(status_error(resp.status(), &url));
         }
 
-        let doc: OidcDiscovery = resp
-            .json()
-            .await
-            .map_err(|e| ExternalAuthError::DiscoveryFailed(error_chain(&e)))?;
+        let doc: OidcDiscovery = resp.json().await.map_err(|e| request_error(&e))?;
 
         // RFC 8414 §3.3: the issuer in the discovery document MUST
         // match the URL the operator configured — otherwise a hostile
@@ -536,11 +611,12 @@ impl OidcProvider {
             .get(jwks_uri)
             .send()
             .await
-            .map_err(|e| ExternalAuthError::DiscoveryFailed(error_chain(&e)))?;
+            .map_err(|e| request_error(&e))?;
+        if !resp.status().is_success() {
+            return Err(status_error(resp.status(), jwks_uri));
+        }
 
-        resp.json()
-            .await
-            .map_err(|e| ExternalAuthError::DiscoveryFailed(error_chain(&e)))
+        resp.json().await.map_err(|e| request_error(&e))
     }
 
     fn validate_id_token(

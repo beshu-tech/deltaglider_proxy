@@ -67,6 +67,42 @@ async fn discover_providers(providers: Vec<Arc<OidcProvider>>) -> usize {
     results.into_iter().filter(|ok| *ok).count()
 }
 
+/// The error a login start answers for a provider that is not discovered.
+/// Pure: `last` is the error of the provider's last discovery, `running`
+/// tells whether the background task still retries.
+/// - a non-transport error (HTTP 4xx, a refused URL, a bad document) is a
+///   `DiscoveryFailed` with its cause: a retry would fail the same way;
+/// - a transport error (timeout, refused connection, HTTP 5xx) is a
+///   retryable `DiscoveryPending` only while the task runs; with no task,
+///   nothing retries, so it is a `DiscoveryFailed`;
+/// - no error and no task: nothing is discovering, so it is a failure too.
+fn discovery_verdict(last: Option<ExternalAuthError>, running: bool) -> ExternalAuthError {
+    match (last, running) {
+        (Some(ExternalAuthError::DiscoveryUnreachable(why)), true) => {
+            ExternalAuthError::DiscoveryPending(format!(
+                "the proxy has not reached the identity provider yet ({why}); it keeps trying \
+                 in the background. Try again in a few seconds."
+            ))
+        }
+        (None, true) => ExternalAuthError::DiscoveryPending(
+            "the proxy has not reached the identity provider yet; it keeps trying in the \
+             background. Try again in a few seconds."
+                .into(),
+        ),
+        (
+            Some(
+                ExternalAuthError::DiscoveryUnreachable(why)
+                | ExternalAuthError::DiscoveryFailed(why),
+            ),
+            _,
+        ) => ExternalAuthError::DiscoveryFailed(why),
+        (Some(other), _) => ExternalAuthError::DiscoveryFailed(other.to_string()),
+        (None, false) => ExternalAuthError::DiscoveryFailed(
+            "the identity provider is not discovered and no discovery is running".into(),
+        ),
+    }
+}
+
 /// TTL for pending OAuth flows (5 minutes).
 const PENDING_AUTH_TTL: Duration = Duration::from_secs(300);
 
@@ -83,6 +119,10 @@ pub struct ExternalAuthManager {
     pending: RwLock<HashMap<String, PendingAuth>>,
     /// Pending flows evicted because the map was full (log throttle).
     pending_evicted: std::sync::atomic::AtomicU64,
+    /// True while the background discovery task runs (the single flight).
+    discovery_running: std::sync::atomic::AtomicBool,
+    /// Wakes the running task after a rebuild swapped the providers.
+    discovery_kick: tokio::sync::Notify,
 }
 
 impl ExternalAuthManager {
@@ -92,6 +132,8 @@ impl ExternalAuthManager {
             providers: RwLock::new(HashMap::new()),
             pending: RwLock::new(HashMap::new()),
             pending_evicted: Default::default(),
+            discovery_running: Default::default(),
+            discovery_kick: Default::default(),
         }
     }
 
@@ -148,49 +190,75 @@ impl ExternalAuthManager {
         }
     }
 
-    /// Run OIDC discovery for all providers (fetch endpoints and JWKS),
-    /// concurrently: N hanging providers cost one timeout, not N.
-    /// Called after provider changes. Returns how many providers were
-    /// discovered.
-    pub async fn discover_all(&self) -> usize {
-        let providers: Vec<Arc<OidcProvider>> =
-            { self.providers.read().values().cloned().collect() };
-        discover_providers(providers).await
+    /// The providers whose discovery is missing or older than the cache TTL.
+    fn undiscovered(&self) -> Vec<Arc<OidcProvider>> {
+        self.providers
+            .read()
+            .values()
+            .filter(|p| !p.is_discovery_cached())
+            .cloned()
+            .collect()
     }
 
-    /// Discover the providers in the BACKGROUND (the boot path): the server
-    /// serves at once; until a provider is discovered, its login start
-    /// answers a retryable `DiscoveryPending` error. Providers that fail are
-    /// retried with backoff (5 s, doubling to 5 min); the task ends when
-    /// every provider is discovered or none is left. Bumps the version
-    /// counter after a round that published new state.
+    /// True while the background discovery task runs.
+    pub fn discovery_running(&self) -> bool {
+        self.discovery_running
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Discover the providers in the BACKGROUND. EVERY caller that publishes
+    /// a provider set (boot, config sync, admin edit, backup restore) calls
+    /// this and never awaits a discovery: a hanging identity provider must
+    /// not stall them. The server serves at once; until a provider is
+    /// discovered, its login start answers a retryable `DiscoveryPending`
+    /// (or `DiscoveryFailed` with the cause when a retry cannot help).
+    ///
+    /// Single flight: a call while the task runs starts no second task, it
+    /// wakes the running one (the providers it must retry are the ones
+    /// published now, read afresh each round). A call after the task ended
+    /// starts a new one. The task retries with backoff (5 s, doubling to
+    /// 5 min), ends when every provider is discovered or none is left, and
+    /// bumps the version counter after a round that published new state.
     pub fn spawn_discovery(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.discovery_running.swap(true, SeqCst) {
+            self.discovery_kick.notify_one();
+            return;
+        }
         let manager = Arc::clone(self);
         crate::background::spawn_supervised("oidc-discovery", move || {
             let manager = Arc::clone(&manager);
-            async move {
-                let mut wait = Duration::from_secs(5);
-                loop {
-                    let pending: Vec<Arc<OidcProvider>> = manager
-                        .providers
-                        .read()
-                        .values()
-                        .filter(|p| !p.is_discovery_cached())
-                        .cloned()
-                        .collect();
-                    if pending.is_empty() {
-                        return;
-                    }
-                    let discovered = discover_providers(pending).await;
-                    if discovered > 0 {
-                        // After the discovered state is published.
-                        crate::api::admin::external_auth::bump_ext_auth_version();
-                    }
-                    tokio::time::sleep(wait).await;
+            async move { manager.discovery_loop().await }
+        });
+    }
+
+    async fn discovery_loop(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        const FIRST_WAIT: Duration = Duration::from_secs(5);
+        let mut wait = FIRST_WAIT;
+        loop {
+            let pending = self.undiscovered();
+            if pending.is_empty() {
+                self.discovery_running.store(false, SeqCst);
+                // A rebuild that raced the clear: its caller either saw
+                // `false` and started a task (the swap below then returns
+                // true), or saw `true` and kicked us (we take the flag back).
+                if self.undiscovered().is_empty() || self.discovery_running.swap(true, SeqCst) {
+                    return;
+                }
+                continue;
+            }
+            if discover_providers(pending).await > 0 {
+                // After the discovered state is published.
+                crate::api::admin::external_auth::bump_ext_auth_version();
+            }
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {
                     wait = (wait * 2).min(Duration::from_secs(300));
                 }
+                () = self.discovery_kick.notified() => wait = FIRST_WAIT,
             }
-        });
+        }
     }
 
     /// Get a provider by name.
@@ -223,10 +291,9 @@ impl ExternalAuthManager {
 
         // Ensure discovery is cached
         if !provider.is_discovery_cached() {
-            return Err(ExternalAuthError::DiscoveryPending(
-                "the proxy has not reached the identity provider yet; it keeps trying in the \
-                 background. Try again in a few seconds."
-                    .into(),
+            return Err(discovery_verdict(
+                provider.last_discovery_error(),
+                self.discovery_running(),
             ));
         }
 
@@ -341,19 +408,127 @@ mod tests {
         }
     }
 
-    /// A provider whose discovery has not finished answers the login start
-    /// with the retryable `DiscoveryPending`, never with a failure.
+    /// The login-start answer for a provider that is not discovered.
     #[test]
-    fn an_undiscovered_provider_answers_a_retryable_error() {
-        let mgr = ExternalAuthManager::new();
-        mgr.rebuild(&[make_provider_config("corp", true)]);
-        let err = mgr
-            .initiate_auth("corp", "https://proxy/cb", None, None)
-            .expect_err("no discovery yet");
+    fn the_login_start_verdict_table() {
+        use ExternalAuthError::{
+            DiscoveryFailed as F, DiscoveryPending as P, DiscoveryUnreachable as U,
+        };
+        let u = || Some(U("timed out".into()));
+        let f = || Some(F("HTTP 404 Not Found from https://idp/x".into()));
+        // (last error, task running) -> pending?
+        let cases = [
+            (u(), true, true),
+            (None, true, true),
+            // no task retries: a transport error is a failure the user must see
+            (u(), false, false),
+            (None, false, false),
+            // a retry cannot cure it: always a failure, with the cause
+            (f(), true, false),
+            (f(), false, false),
+        ];
+        for (last, running, pending) in cases {
+            let verdict = discovery_verdict(last, running);
+            assert_eq!(
+                matches!(verdict, P(_)),
+                pending,
+                "{verdict:?} running={running}"
+            );
+            assert!(matches!(verdict, P(_) | F(_)), "{verdict:?}");
+        }
+        match discovery_verdict(f(), true) {
+            F(m) => assert!(m.contains("404"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An identity provider that answers every request with 404 and counts
+    /// the requests. Returns its issuer URL and the counter.
+    fn not_found_idp() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        (issuer, hits)
+    }
+
+    fn local_provider(name: &str, issuer: &str) -> AuthProviderConfig {
+        let mut config = make_provider_config(name, true);
+        config.issuer_url = Some(issuer.into());
+        config.extra_config = Some(serde_json::json!({ "allow_local": true }));
+        config
+    }
+
+    async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+        for _ in 0..100 {
+            if ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out: {what}");
+    }
+
+    /// Single flight: calls while the task runs start no second task; the
+    /// running task retries the providers a rebuild swapped in (not the
+    /// stale ones); a call after the task ended starts a new task; a
+    /// permanent error (HTTP 404) reaches the login start as a failure.
+    #[tokio::test]
+    async fn discovery_is_one_task_that_follows_the_rebuilt_providers() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (issuer_a, hits_a) = not_found_idp();
+        let (issuer_b, hits_b) = not_found_idp();
+        let mgr = Arc::new(ExternalAuthManager::new());
+
+        mgr.rebuild(&[local_provider("corp", &issuer_a)]);
+        for _ in 0..3 {
+            mgr.spawn_discovery();
+        }
+        assert!(mgr.discovery_running());
+        until("first round", || hits_a.load(SeqCst) >= 1).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // One task: round one, plus at most one round for the coalesced
+        // wake-up. Three stacked tasks would send three requests at once.
         assert!(
-            matches!(err, ExternalAuthError::DiscoveryPending(_)),
-            "{err:?}"
+            hits_a.load(SeqCst) <= 2,
+            "stacked tasks: {}",
+            hits_a.load(SeqCst)
         );
+        // A 404 cannot be cured: the login start says so, with the cause.
+        match mgr.initiate_auth("corp", "https://proxy/cb", None, None) {
+            Err(ExternalAuthError::DiscoveryFailed(m)) => assert!(m.contains("404"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+
+        // A rebuild swaps the provider; the running task follows at once
+        // (not after its backoff) and leaves the stale one alone.
+        let stale = hits_a.load(SeqCst);
+        mgr.rebuild(&[local_provider("corp", &issuer_b)]);
+        mgr.spawn_discovery();
+        until("the new provider is tried", || hits_b.load(SeqCst) >= 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(hits_a.load(SeqCst), stale, "the stale provider was retried");
+
+        // No provider left: the task ends, and a later call starts a new one.
+        mgr.rebuild(&[]);
+        mgr.spawn_discovery();
+        until("the task ends", || !mgr.discovery_running()).await;
+        let before = hits_b.load(SeqCst);
+        mgr.rebuild(&[local_provider("corp", &issuer_b)]);
+        mgr.spawn_discovery();
+        assert!(mgr.discovery_running());
+        until("a new task runs", || hits_b.load(SeqCst) > before).await;
     }
 
     /// A flood of authorize requests cannot grow the pending map past its

@@ -2031,7 +2031,7 @@ async fn import_backup_iam(
         .sessions
         .revoke_external_user_ids(&result.stale_user_ids);
     if let Some(ref ext_auth) = state.external_auth {
-        ext_auth.discover_all().await;
+        ext_auth.spawn_discovery();
     }
     trigger_config_sync(&state);
 
