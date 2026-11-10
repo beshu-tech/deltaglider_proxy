@@ -740,7 +740,7 @@ pub async fn bucket_status(
         &headers,
         connect_info.map(|ci| ci.0.ip()),
     );
-    let may = super::auth::extract_session_token(&headers)
+    let may = super::auth::extract_session_token(&state.sessions, &headers)
         .is_some_and(|t| super::auth::session_may_list_bucket(&state, &t, client_ip, &bucket));
     if !may {
         return Err(AdminError::forbidden(

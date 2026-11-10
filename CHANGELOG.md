@@ -22,7 +22,7 @@
 - The presigned `X-Amz-Signature`, `X-Amz-Credential` and `X-Amz-Security-Token` no longer reach the logs. The request span shows them as `REDACTED`, and `s3s::service` stays at `info` whatever the log level, because that module logs the whole request at `debug`.
 - An S3 backend endpoint name that resolves to a loopback address (for example `localtest.me`) is refused at connect time, as the literal `127.0.0.1` already was. `allow_local: true` permits loopback only. Link-local addresses (169.254.0.0/16, fe80::/10) and the cloud metadata and credential endpoints (169.254.169.254, 169.254.170.2, 169.254.170.23, fd00:ec2::254, fd00:ec2::23, and their IPv4-mapped and NAT64 forms) are refused in every policy, `allow_local` included. Private (RFC 1918) answers stay allowed for on-premises storage behind internal DNS.
 - A webhook or OIDC HTTP client that cannot be built is an error. Before, the proxy fell back to a default client without the SSRF resolver.
-- Where the session cookie is `Secure` (TLS at the proxy or behind a trusted `X-Forwarded-Proto: https`), its name is `__Host-dgp_session`. On plain HTTP the name stays `dgp_session`. The proxy still reads the old name, and logout clears both names.
+- Where the session cookie is `Secure` (TLS at the proxy or behind a trusted `X-Forwarded-Proto: https`), its name is `__Host-dgp_session`. On plain HTTP the name stays `dgp_session`. On a `Secure` request the proxy reads only the `__Host-` name, so a plain-named cookie from a sibling origin or subdomain is no session. Sessions live in memory, so every session from before the upgrade ends at the restart anyway. Logout clears both names.
 
 ### Added
 

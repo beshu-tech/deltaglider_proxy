@@ -146,7 +146,7 @@ pub async fn change_password(
     }
 
     // A session minted under the old password ends; the caller's stays.
-    let keep = super::super::auth::extract_session_token(&headers);
+    let keep = super::super::auth::extract_session_token(&state.sessions, &headers);
     let ended = state.sessions.revoke_bootstrap_except(keep.as_deref());
     audit_log(
         "change_password",
