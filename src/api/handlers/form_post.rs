@@ -8,17 +8,22 @@
 //! than headers. This module owns the entire ingest pipeline for that
 //! flow.
 //!
-//! Stages: `is_multipart_form_upload` sniffs the request so the
-//! dispatcher in `object::delete_objects` can fork cleanly between
-//! DeleteObjects XML and form upload; `parse_form_post_upload` consumes
-//! the multipart body via `multer`, extracting form fields + the single
-//! file part; `authenticate_form_post` rebuilds the SigV4 signing key,
-//! verifies the form signature in constant time, decodes and validates
-//! the policy document, and authorises the user against IAM;
-//! `handle_form_post_upload` runs auth first, then the bucket-existence gate,
-//! hands the file body to `store_client_write` (quota, the object's write
-//! lock, the `If-Match`/`If-None-Match` preconditions, the store, the
-//! object-created event), and writes the audit log.
+//! Stages, in the order of the bytes on the wire: `form_post_bucket`
+//! picks the requests the router hands here; `read_form_head` streams the
+//! multipart body through `multer` up to the file part, holding only the
+//! small fields before it (each at most [`FORM_FIELD_MAX`]) and the file
+//! part's headers; `authenticate_form_post` rebuilds the SigV4 signing key,
+//! verifies the form signature in constant time, decodes and validates the
+//! policy document (`content-length-range` only for its form), and
+//! authorises the user against IAM on the resolved key. Only then, after
+//! the client-write gates and the bucket-existence check,
+//! `ingest_form_file` reads the file once, into memory or a spool file,
+//! capped by [`form_file_cap`]; the fields after the file are read under
+//! the same small limit and ignored, as on S3. `handle_form_post_upload`
+//! hands the body to `store_client_write` (quota, the object's write lock,
+//! the `If-Match`/`If-None-Match` preconditions, the store, the
+//! object-created event) and writes the audit log. An unauthenticated
+//! form therefore costs the proxy its small fields, never its file.
 //!
 //! Lives in its own module because none of this code path is shared
 //! with the GET/PUT/HEAD/DELETE handlers in `object.rs` — the only
@@ -40,12 +45,14 @@
 use super::object_helpers::{check_client_write_allowed, store_client_write, ClientWrite};
 use super::{audit_log_s3, ensure_bucket_exists, AppState};
 use crate::api::errors::S3Error;
+use crate::deltaglider::ingest::{Destination, IngestError, IngestPlan, IngestedBody, Sha256Need};
 use crate::iam::{AuthenticatedUser, IamState, S3Action, SharedIamState};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use chrono::Utc;
+use futures::{Stream, StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -54,14 +61,191 @@ use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// The largest form field other than the file (a policy, a signature, a
+/// metadata value). The proxy holds these fields in memory.
+pub(crate) const FORM_FIELD_MAX: u64 = 64 * 1024;
+
+/// The largest sum of the field values on one side of the file (before
+/// it, and after it).
+pub(crate) const FORM_FIELDS_MAX: u64 = 1024 * 1024;
+
+/// What a form may carry beyond its file: the fields on both sides of the
+/// file, the part headers and the boundaries.
+pub(crate) const FORM_OVERHEAD: u64 = 4 * FORM_FIELDS_MAX;
+
+/// The form up to its file part: the fields before the file, and what
+/// the file part's headers say (its file name and content type).
 #[derive(Debug)]
-struct ParsedFormPost {
+struct FormHead {
     key_field: String,
     resolved_key: String,
     content_type: Option<String>,
     user_metadata: HashMap<String, String>,
-    file_data: Bytes,
     fields_ci: HashMap<String, String>,
+}
+
+/// The policy's `content-length-range`: the file length it allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LengthRange {
+    min: u64,
+    max: u64,
+}
+
+impl LengthRange {
+    /// Two ranges in one policy: a file must be in both.
+    fn and(self, other: Self) -> Self {
+        Self {
+            min: self.min.max(other.min),
+            max: self.max.min(other.max),
+        }
+    }
+}
+
+/// A verified form: its principal (`None` without authentication) and
+/// the file length its policy allows.
+struct FormAuth {
+    user: Option<Arc<AuthenticatedUser>>,
+    length_range: Option<LengthRange>,
+}
+
+/// What bounds the file of a form ([`form_file_cap`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileBound {
+    /// The largest object (`max_object_size`).
+    Limit,
+    /// The form's `Content-Length`: the file is part of the form.
+    Form,
+    /// The policy's `content-length-range` maximum.
+    Policy,
+}
+
+/// The most bytes the file of a form may have, and what sets that bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileCap {
+    bytes: u64,
+    bound: FileBound,
+}
+
+/// Pure: the cap of a form's file, the smallest of the object limit, the
+/// form's own length and the policy's `content-length-range` maximum. The
+/// ingest reserves this much and stops the file at the first byte past
+/// it; a shorter file is the file (its exact size is known after the
+/// read). On a tie the policy names the bound, so a file over the
+/// policy's maximum is refused as the policy refuses it (`AccessDenied`).
+fn form_file_cap(limit: u64, form_len: u64, range_max: Option<u64>) -> FileCap {
+    let mut cap = FileCap {
+        bytes: limit,
+        bound: FileBound::Limit,
+    };
+    if form_len < cap.bytes {
+        cap = FileCap {
+            bytes: form_len,
+            bound: FileBound::Form,
+        };
+    }
+    if let Some(max) = range_max.filter(|max| *max <= cap.bytes) {
+        cap = FileCap {
+            bytes: max,
+            bound: FileBound::Policy,
+        };
+    }
+    cap
+}
+
+/// Pure: the answer to a file longer than its cap.
+fn over_cap_refusal(cap: FileCap, bucket: &str, key: &str) -> S3Error {
+    match cap.bound {
+        FileBound::Policy => {
+            tracing::warn!(
+                "form-POST DENY | reason=content_length_range | bucket={bucket} key={key} file_len>{}",
+                cap.bytes
+            );
+            S3Error::AccessDenied
+        }
+        FileBound::Limit => S3Error::EntityTooLarge {
+            size: cap.bytes.saturating_add(1),
+            max: cap.bytes,
+        },
+        FileBound::Form => S3Error::InvalidRequest("The file part is longer than the form.".into()),
+    }
+}
+
+/// Pure: is a file of `len` bytes within the policy's range? The cap
+/// enforced the maximum while the file arrived; the minimum needs the
+/// whole file.
+fn check_file_len(
+    range: Option<LengthRange>,
+    len: u64,
+    bucket: &str,
+    key: &str,
+) -> Result<(), S3Error> {
+    match range {
+        Some(LengthRange { min, max }) if len < min || len > max => {
+            tracing::warn!(
+                "form-POST DENY | reason=content_length_range | bucket={bucket} key={key} file_len={len} range=[{min},{max}]"
+            );
+            Err(S3Error::AccessDenied)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Pure: the length a form declares (`Content-Length`). A form that
+/// declares none gets `411 MissingContentLength`; one longer than the
+/// largest object plus [`FORM_OVERHEAD`] gets `413 EntityTooLarge`. Both
+/// before a byte of it is read.
+fn form_body_len(headers: &HeaderMap, limit: u64) -> Result<u64, S3Error> {
+    let len = crate::deltaglider::ingest::declared_body_len(headers)
+        .map_err(|_| S3Error::MissingContentLength)?;
+    if len > limit.saturating_add(FORM_OVERHEAD) {
+        return Err(S3Error::EntityTooLarge {
+            size: len,
+            max: limit,
+        });
+    }
+    Ok(len)
+}
+
+/// Pure: is this part the file? S3 names it `file`; a browser marks a
+/// file input with a file name.
+fn is_file_part(lc_name: &str, file_name: Option<&str>) -> bool {
+    file_name.is_some() || lc_name == "file"
+}
+
+/// The S3 answer to a failed read of the form.
+fn form_error(e: multer::Error) -> S3Error {
+    match e {
+        multer::Error::StreamSizeExceeded { .. } | multer::Error::FieldSizeExceeded { .. } => {
+            S3Error::EntityTooLargeReason(e.to_string())
+        }
+        multer::Error::StreamReadFailed(e) => {
+            S3Error::IncompleteBody(format!("The form body ended early: {e}"))
+        }
+        e => S3Error::InvalidRequest(format!("Malformed multipart/form-data body: {e}")),
+    }
+}
+
+/// Read one field other than the file: at most [`FORM_FIELD_MAX`] bytes,
+/// and at most `budget` (what is left of [`FORM_FIELDS_MAX`] on this side
+/// of the file), in chunks as they arrive.
+async fn read_small_field(
+    mut field: multer::Field<'static>,
+    name: &str,
+    budget: &mut u64,
+) -> Result<String, S3Error> {
+    let mut value = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(form_error)? {
+        let len = value.len() as u64 + chunk.len() as u64;
+        if len > FORM_FIELD_MAX || len > *budget {
+            return Err(S3Error::InvalidArgument(format!(
+                "POST form field '{name}' is larger than {FORM_FIELD_MAX} bytes, or the form \
+                 fields together are larger than {FORM_FIELDS_MAX} bytes"
+            )));
+        }
+        value.extend_from_slice(&chunk);
+    }
+    *budget -= value.len() as u64;
+    Ok(String::from_utf8_lossy(&value).into_owned())
 }
 
 /// True iff the request looks like an S3 browser form POST
@@ -322,14 +506,17 @@ fn policy_lookup_variable(
     }
 }
 
+/// The policy check that needs no file byte: expiration, every condition
+/// against the fields before the file, the coverage of every field, and the
+/// FORM of `content-length-range`, whose range it returns (the file is
+/// checked against it while and after it arrives).
 fn validate_form_post_policy(
     policy_json: &serde_json::Value,
     fields_ci: &HashMap<String, String>,
     bucket: &str,
     key_field: &str,
     resolved_content_type: &str,
-    file_len: u64,
-) -> Result<(), S3Error> {
+) -> Result<Option<LengthRange>, S3Error> {
     let expiration = policy_json
         .get("expiration")
         .and_then(|v| v.as_str())
@@ -354,6 +541,7 @@ fn validate_form_post_policy(
     // Without this, a leaked signature over a narrow policy lets an attacker
     // smuggle an unapproved content-type or x-amz-meta-* into the stored object.
     let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut length_range: Option<LengthRange> = None;
 
     for cond in conditions {
         if let Some(obj) = cond.as_object() {
@@ -451,12 +639,8 @@ fn validate_form_post_policy(
                             "content-length-range maximum must be a non-negative integer".into(),
                         )
                     })?;
-                if file_len < min || file_len > max {
-                    tracing::warn!(
-                        "form-POST DENY | reason=content_length_range | bucket={bucket} key={key_field} file_len={file_len} range=[{min},{max}]"
-                    );
-                    return Err(S3Error::AccessDenied);
-                }
+                let range = LengthRange { min, max };
+                length_range = Some(length_range.map_or(range, |r| r.and(range)));
             }
             "starts-with" | "eq" => {
                 if arr.len() != 3 {
@@ -527,58 +711,33 @@ fn validate_form_post_policy(
         }
     }
 
-    Ok(())
+    Ok(length_range)
 }
 
-async fn parse_form_post_upload(
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Result<ParsedFormPost, S3Error> {
-    let content_type_header = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| S3Error::InvalidRequest("Missing Content-Type header".into()))?;
-    let boundary = multer::parse_boundary(content_type_header)
-        .map_err(|e| S3Error::InvalidRequest(format!("Invalid multipart boundary: {}", e)))?;
-    let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(body) });
-    let mut multipart = multer::Multipart::new(stream, boundary);
-
+/// Read the form up to its file part: the fields before it (each read
+/// under [`FORM_FIELD_MAX`]), then the file part's headers, which give
+/// `${filename}` and the file's content type. No byte of the file is read.
+/// The checks that need only these fields run here, in the order of the
+/// collected parser before: metadata size, `key`, the resolved key, the
+/// stored header fields, then the file part itself.
+async fn read_form_head(
+    multipart: &mut multer::Multipart<'static>,
+) -> Result<(FormHead, multer::Field<'static>), S3Error> {
     let mut fields_ci = HashMap::new();
     let mut user_metadata = HashMap::new();
-    let mut file_data: Option<Bytes> = None;
-    let mut file_name: Option<String> = None;
-    let mut file_content_type: Option<String> = None;
-
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        S3Error::InvalidRequest(format!("Malformed multipart/form-data body: {}", e))
-    })? {
+    let mut budget = FORM_FIELDS_MAX;
+    let mut file = None;
+    while let Some(field) = multipart.next_field().await.map_err(form_error)? {
         let name = field
             .name()
             .ok_or_else(|| S3Error::InvalidRequest("Multipart field is missing name".into()))?
             .to_string();
         let lc_name = name.to_ascii_lowercase();
-        let part_filename = field.file_name().map(str::to_string);
-        let part_content_type = field.content_type().map(|ct| ct.to_string());
-        if part_filename.is_some() || lc_name == "file" {
-            if file_data.is_some() {
-                return Err(S3Error::InvalidRequest(
-                    "POST form upload expects exactly one file part".into(),
-                ));
-            }
-            let bytes = field.bytes().await.map_err(|e| {
-                S3Error::InvalidRequest(format!("Failed reading multipart file part: {}", e))
-            })?;
-            file_data = Some(bytes);
-            file_name = part_filename;
-            file_content_type = part_content_type;
-            continue;
+        if is_file_part(&lc_name, field.file_name()) {
+            file = Some(field);
+            break;
         }
-        let value = field.text().await.map_err(|e| {
-            S3Error::InvalidRequest(format!(
-                "Failed reading multipart form field '{}': {}",
-                name, e
-            ))
-        })?;
+        let value = read_small_field(field, &name, &mut budget).await?;
         if let Some(meta_key) = lc_name.strip_prefix("x-amz-meta-") {
             user_metadata.insert(meta_key.to_string(), value.clone());
         }
@@ -596,44 +755,112 @@ async fn parse_form_post_upload(
             S3Error::InvalidArgument("POST form upload is missing required 'key' field".into())
         })?
         .to_string();
-    let resolved_key = resolve_form_key(&key_field, file_name.as_deref())?;
+    let file_name = file.as_ref().and_then(|f| f.file_name());
+    let resolved_key = resolve_form_key(&key_field, file_name)?;
     if resolved_key.is_empty() {
         return Err(S3Error::InvalidArgument(
             "POST form upload resolved object key is empty".into(),
         ));
     }
 
+    let file_content_type = file
+        .as_ref()
+        .and_then(|f| f.content_type())
+        .map(|ct| ct.to_string());
     let content_type = lookup_form_field(&fields_ci, "content-type")
         .map(str::to_string)
         .or(file_content_type);
     super::object_helpers::stored_header_fields_check(&user_metadata, content_type.as_deref())
         .map_err(S3Error::InvalidArgument)?;
-    let file_data = file_data.ok_or_else(|| {
+    let file = file.ok_or_else(|| {
         S3Error::InvalidArgument("POST form upload requires a multipart file part".into())
     })?;
 
-    Ok(ParsedFormPost {
-        key_field,
-        resolved_key,
-        content_type,
-        user_metadata,
-        file_data,
-        fields_ci,
-    })
+    Ok((
+        FormHead {
+            key_field,
+            resolved_key,
+            content_type,
+            user_metadata,
+            fields_ci,
+        },
+        file,
+    ))
 }
 
+/// Read the fields after the file under the same small limits, and ignore
+/// them, as S3 does (its sample form ends with a `submit` field). Reading
+/// them checks that the form ends well.
+async fn ignore_trailing_fields(multipart: &mut multer::Multipart<'static>) -> Result<(), S3Error> {
+    let mut budget = FORM_FIELDS_MAX;
+    while let Some(field) = multipart.next_field().await.map_err(form_error)? {
+        let name = field.name().unwrap_or_default().to_string();
+        read_small_field(field, &name, &mut budget).await?;
+    }
+    Ok(())
+}
+
+/// Read the file part once (`deltaglider::ingest`): into memory or a
+/// spool file, capped at `cap`, with the checksum of the form's
+/// `x-amz-checksum-*` field (only fields before the file count) computed
+/// on the way and checked after the last byte. Any failure drops the body:
+/// nothing is kept, and the RAM and spool budgets are whole again.
+async fn ingest_form_file(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    key: &str,
+    file: multer::Field<'static>,
+    cap: FileCap,
+    checksum_fields: &HeaderMap,
+) -> Result<IngestedBody, S3Error> {
+    let plan = IngestPlan {
+        declared: cap.bytes,
+        limit: engine.max_object_size(),
+        sha256: Sha256Need::decide(Destination::Object, None, false),
+        held_spool_mib: 0,
+        // The cap is an upper bound: the file's length is known only
+        // after it has arrived.
+        strict_length: false,
+        destination: Destination::Object,
+    };
+    let checksum_plan = crate::api::checksum::ChecksumPlan::from_headers(checksum_fields);
+    let mut sums = (!checksum_plan.is_empty()).then(|| checksum_plan.hasher());
+    let observed = file.map_err(form_error).inspect(|chunk| {
+        if let (Ok(chunk), Some(sums)) = (chunk, sums.as_mut()) {
+            sums.update(chunk);
+        }
+    });
+    let body = crate::deltaglider::ingest::ingest(engine, bucket, observed, plan)
+        .await
+        .map_err(|e| match e {
+            IngestError::TooLong { .. } => over_cap_refusal(cap, bucket, key),
+            e => crate::api::body_ingest::ingest_failure(e),
+        })?;
+    crate::api::checksum::verify_ingested(checksum_fields, None, sums, &body).await?;
+    Ok(body)
+}
+
+/// Everything about a form that is checked before its file is read: the
+/// signature, the credential scope, the policy (expiration, conditions,
+/// field coverage, the form of `content-length-range`) and IAM on the
+/// resolved key. Without authentication (open access) nothing is checked
+/// and the file has no policy range.
 fn authenticate_form_post(
     iam_state: Option<&SharedIamState>,
     bucket: &str,
-    parsed: &ParsedFormPost,
+    parsed: &FormHead,
     client_ip: Option<std::net::IpAddr>,
-) -> Result<Option<std::sync::Arc<AuthenticatedUser>>, S3Error> {
+) -> Result<FormAuth, S3Error> {
+    let open = FormAuth {
+        user: None,
+        length_range: None,
+    };
     let Some(iam_state) = iam_state else {
-        return Ok(None);
+        return Ok(open);
     };
     let snapshot = iam_state.load_full();
     if matches!(snapshot.as_ref(), IamState::Disabled) {
-        return Ok(None);
+        return Ok(open);
     }
 
     ensure_supported_form_fields(&parsed.fields_ci)?;
@@ -736,13 +963,12 @@ fn authenticate_form_post(
         .content_type
         .as_deref()
         .unwrap_or("application/octet-stream");
-    validate_form_post_policy(
+    let length_range = validate_form_post_policy(
         &policy_json,
         &parsed.fields_ci,
         bucket,
         &parsed.key_field,
         resolved_ct,
-        parsed.file_data.len() as u64,
     )?;
 
     // Build a policy context with aws:SourceIp so IP/condition-scoped Deny rules
@@ -758,25 +984,32 @@ fn authenticate_form_post(
         );
         return Err(S3Error::AccessDenied);
     }
-    Ok(Some(auth_user))
+    Ok(FormAuth {
+        user: Some(auth_user),
+        length_range,
+    })
 }
 
-/// Run the full presigned-form-POST pipeline.
-///
-/// Called from `object::delete_objects` when the dispatcher detects a
-/// `multipart/form-data` body via [`is_multipart_form_upload`]. Performs
-/// parse + auth + gate + bucket-existence checks, in that order, hands the file body
-/// to `store_client_write` (quota, write lock, preconditions, store, event), and returns a
-/// 204 No Content with the persisted object's ETag.
-pub async fn handle_form_post_upload(
+/// Run the full presigned-form-POST pipeline over the streamed form
+/// `body`: the length check, the form up to the file, authentication and
+/// the policy, the client-write gates and the bucket-existence check, all
+/// before a byte of the file is read; then the file's ingest, the
+/// policy's minimum length, the trailing fields, and `store_client_write`
+/// (quota, write lock, preconditions, store, event). Answers 204 No
+/// Content with the stored object's ETag.
+pub async fn handle_form_post_upload<S, E>(
     state: &Arc<AppState>,
     bucket: &str,
     iam_state: Option<&SharedIamState>,
     headers: &HeaderMap,
     extensions: &axum::http::Extensions,
-    body: Bytes,
+    body: S,
     peer_ip: Option<std::net::IpAddr>,
-) -> Result<Response, S3Error> {
+) -> Result<Response, S3Error>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+{
     // aws:SourceIp for the policy check: never a client-written XFF.
     let client_ip = crate::rate_limiter::extract_client_ip_with_peer(headers, peer_ip);
     // Validate the bucket name FIRST. The s3s adapter gets AWS name validation
@@ -787,12 +1020,28 @@ pub async fn handle_form_post_upload(
         tracing::warn!("form-POST DENY | reason=invalid_bucket_name | bucket={bucket} err={e:?}");
         return Err(S3Error::InvalidBucketName(bucket.to_string()));
     }
+    // Read the cap from the (hot-reloadable) engine so a runtime
+    // `max_object_size` change applies here too.
+    let engine = state.engine.load_full();
+    let limit = engine.max_object_size();
+    let form_len = form_body_len(headers, limit)?;
+    let content_type_header = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| S3Error::InvalidRequest("Missing Content-Type header".into()))?;
+    let boundary = multer::parse_boundary(content_type_header)
+        .map_err(|e| S3Error::InvalidRequest(format!("Invalid multipart boundary: {}", e)))?;
+    let constraints = multer::Constraints::new()
+        .size_limit(multer::SizeLimit::new().whole_stream(limit.saturating_add(FORM_OVERHEAD)));
+    let mut multipart = multer::Multipart::with_constraints(body, boundary, constraints);
+
     // Authenticate BEFORE the existence check: a 404 to an unauthenticated
     // caller reveals which buckets exist, and the backend round-trip would
-    // delay the health gate's fast 503 behind a backend timeout.
-    let parsed = parse_form_post_upload(headers, body).await?;
-    let auth_user = match authenticate_form_post(iam_state, bucket, &parsed, client_ip) {
-        Ok(u) => u,
+    // delay the health gate's fast 503 behind a backend timeout. And before
+    // the file: an unauthenticated form costs its small fields only.
+    let (head, file) = read_form_head(&mut multipart).await?;
+    let auth = match authenticate_form_post(iam_state, bucket, &head, client_ip) {
+        Ok(auth) => auth,
         Err(e) => {
             // Mirror the IAM middleware's PUT-denial audit so operators can see
             // form-POST 403s in the admin audit ring (not just stdout warns) —
@@ -802,7 +1051,7 @@ pub async fn handle_form_post_upload(
                 "$form_post",
                 headers,
                 bucket,
-                &parsed.resolved_key,
+                &head.resolved_key,
             );
             return Err(e);
         }
@@ -821,43 +1070,43 @@ pub async fn handle_form_post_upload(
         &format!("/{bucket}"),
     )?;
     ensure_bucket_exists(state, bucket).await?;
-    crate::api::checksum::verify_body_checksum(
-        &form_checksum_fields(&parsed.fields_ci),
-        None,
-        &parsed.file_data,
-    )?;
+    let checksum_fields = form_checksum_fields(&head.fields_ci);
+    crate::api::checksum::precheck_headers(&checksum_fields)?;
     let precondition = form_post_precondition(headers)?;
-    // The file goes through the same ingest as a PutObject body (memory or
-    // a spool file, with its hashes).
-    let engine = state.engine.load_full();
-    let body = crate::deltaglider::ingest::ingest_bytes(
+
+    // The file, read once: the same ingest as a PutObject body.
+    let cap = form_file_cap(limit, form_len, auth.length_range.map(|r| r.max));
+    let body = ingest_form_file(
         &engine,
         bucket,
-        parsed.file_data.clone(),
-        engine.max_object_size(),
-        None,
+        &head.resolved_key,
+        file,
+        cap,
+        &checksum_fields,
     )
-    .await
-    .map_err(crate::api::body_ingest::ingest_failure)?;
+    .await?;
+    check_file_len(auth.length_range, body.size(), bucket, &head.resolved_key)?;
+    ignore_trailing_fields(&mut multipart).await?;
     // The same client write as PutObject: quota, the object's write lock,
     // the preconditions, the store, the event.
     let result = store_client_write(
         state,
         ClientWrite {
             bucket,
-            key: &parsed.resolved_key,
+            key: &head.resolved_key,
             body,
-            content_type: parsed.content_type.clone(),
-            user_metadata: parsed.user_metadata.clone(),
+            content_type: head.content_type.clone(),
+            user_metadata: head.user_metadata.clone(),
             precondition: &precondition,
         },
     )
     .await?;
-    let user_name = auth_user
+    let user_name = auth
+        .user
         .as_ref()
         .map(|u| u.name.as_str())
         .unwrap_or("anonymous");
-    audit_log_s3("s3_post", user_name, headers, bucket, &parsed.resolved_key);
+    audit_log_s3("s3_post", user_name, headers, bucket, &head.resolved_key);
     let mut response = (
         StatusCode::NO_CONTENT,
         [("ETag", result.metadata.etag())],
@@ -865,15 +1114,19 @@ pub async fn handle_form_post_upload(
     )
         .into_response();
     let writer = crate::s3_adapter_s3s::Reader::for_form_writer(
-        auth_user.as_deref(),
+        auth.user.as_deref(),
         bucket,
-        &parsed.resolved_key,
+        &head.resolved_key,
     );
     for (name, value) in crate::s3_adapter_s3s::write_fact_headers(&result, writer) {
         response.headers_mut().insert(name, value);
     }
     Ok(response)
 }
+
+#[cfg(test)]
+#[path = "form_post_tests.rs"]
+mod stream_tests;
 
 #[cfg(test)]
 mod tests {

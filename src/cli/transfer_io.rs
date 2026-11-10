@@ -291,7 +291,11 @@ pub(crate) async fn copy_object(
         observed,
     };
     let fill = spool
-        .fill_from_stream(&mut stream, size, None)
+        .fill_from_stream(
+            &mut stream,
+            size,
+            crate::deltaglider::ingest::Sha256Need::Compute,
+        )
         .await
         .map_err(|e| match e {
             SpoolFillError::Source(e) => TransferError::Source(EngineError::Storage(e)),

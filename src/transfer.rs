@@ -1866,7 +1866,11 @@ async fn spooled_copy(
     // exactly the bytes the metadata names.
     use crate::deltaglider::spool::SpoolFillError;
     let fill = spool
-        .fill_from_stream(&mut stream, source_size, None)
+        .fill_from_stream(
+            &mut stream,
+            source_size,
+            crate::deltaglider::ingest::Sha256Need::Compute,
+        )
         .await
         .map_err(|e| match e {
             SpoolFillError::Source(e) => CopyError::storage("source stream error", e),

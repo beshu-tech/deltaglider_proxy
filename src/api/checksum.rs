@@ -127,6 +127,7 @@ impl From<ChecksumError> for S3Error {
 }
 
 /// Pure: does `body` hash to `expected_b64` under `algorithm`?
+#[cfg(test)]
 pub(crate) fn verify_checksum(
     algorithm: ChecksumAlgorithm,
     expected_b64: &str,
@@ -329,7 +330,34 @@ pub(crate) fn expected_checksum(
     }
 }
 
-/// THE check of a collected body against the client's checksum, if any.
+/// THE check of an ingested body against the client's checksum, if any:
+/// the digest from `sums` (the hasher of the [`ChecksumPlan`] that watched
+/// the body arrive), else computed again over the body ([`digest_of`]: an
+/// algorithm that only a trailer named).
+pub(crate) async fn verify_ingested(
+    headers: &HeaderMap,
+    trailers: Option<&HeaderMap>,
+    sums: Option<s3s::checksum::ChecksumHasher>,
+    body: &crate::deltaglider::ingest::IngestedBody,
+) -> Result<(), crate::api::S3Error> {
+    let Some((algorithm, expected)) = expected_checksum(headers, trailers)? else {
+        return Ok(());
+    };
+    let planned = sums
+        .map(|h| h.finalize())
+        .and_then(|done| computed_digest(algorithm, &done));
+    let digest = match planned {
+        Some(digest) => digest,
+        None => digest_of(algorithm, body).await.map_err(|e| {
+            crate::api::S3Error::InternalError(format!("checksum of the body: {e}"))
+        })?,
+    };
+    verify_digest(algorithm, &expected, &digest)?;
+    Ok(())
+}
+
+/// The check of a body in memory against the client's checksum, if any.
+#[cfg(test)]
 pub(crate) fn verify_body_checksum(
     headers: &HeaderMap,
     trailers: Option<&HeaderMap>,

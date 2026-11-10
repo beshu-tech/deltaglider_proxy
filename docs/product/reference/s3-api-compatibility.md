@@ -38,6 +38,15 @@ While the body arrives, the proxy computes the checksums that the request announ
 
 A body that fails any of these checks is never stored. The proxy deletes its spool file and gives its memory and spool space back at once.
 
+A browser form upload (`POST /{bucket}` with a `multipart/form-data` body) is read in the order of its fields, as a stream:
+
+- The form must declare its length in `Content-Length`, or it gets `411 MissingContentLength`. A form longer than `max_object_size` plus 4 MiB for its fields gets `413 EntityTooLarge` before the proxy reads it.
+- The proxy reads the fields before the file into memory. Each of these fields can be at most 64 KiB, and together they can be at most 1 MiB, because the proxy holds them in memory. A larger field gets `400 InvalidArgument`.
+- Before the proxy reads the first byte of the file, it checks the policy signature, the credential scope, the expiration of the policy, every policy condition, that a policy condition covers each field, the form of `content-length-range`, and the permission of the user to write the key. The key can use `${filename}`, and the proxy takes the file name and the content type of the file from the headers of the file part. So a form with a wrong signature or policy is refused without its file being read, whatever the size of the file.
+- The proxy then reads the file in the same way as a `PutObject` body: into memory up to `DGP_SPOOL_THRESHOLD_BYTES`, or else into a spool file. The proxy reserves memory or spool space for the smallest of `max_object_size`, the length of the form, and the maximum of `content-length-range`. A file that goes past the maximum of `content-length-range` is refused with `403 AccessDenied` at the first byte past it. A file shorter than the minimum is refused with `403 AccessDenied` after it has arrived.
+- An `x-amz-checksum-*` field before the file is computed while the file arrives, and a mismatch gets `400 BadDigest`.
+- The fields after the file are read, with the same limits, and ignored, as S3 ignores them. For example, the `submit` field that comes after the file in the AWS sample form is ignored. A field that the upload needs, such as `key`, `policy` or `x-amz-meta-*`, must come before the file.
+
 ### Storage facts on write responses
 
 The proxy tells the writer how it stored each object. The responses to `PutObject`, `CompleteMultipartUpload`, `CopyObject` and a browser form upload carry these headers:
@@ -175,7 +184,7 @@ These endpoints are not part of the S3 specification. The proxy serves them on t
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /{bucket}` (`multipart/form-data`) | Browser HTML-form `PostObject` upload. The embedded S3 browser uses it. SigV4 POST-policy validated; quota enforced. |
+| `POST /{bucket}` (`multipart/form-data`) | Browser HTML-form `PostObject` upload. The embedded S3 browser uses it. The proxy checks the SigV4 policy signature and the policy before it reads the file, reads the file as a stream into memory or a spool file, and ignores the fields after the file (see [How the proxy reads an upload body](#how-the-proxy-reads-an-upload-body)). The bucket quota is enforced. |
 | `HEAD /` | Connection probe used by some clients (e.g. Cyberduck); returns `200 OK`. |
 
 > The full admin API and the docs/UI live under the `/_/` prefix on the same port. `_` is not a valid S3 bucket name, so this prefix never collides with object traffic. See the [admin API reference](admin-api.md).

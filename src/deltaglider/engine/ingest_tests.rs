@@ -91,7 +91,7 @@ fn plan(declared: u64) -> IngestPlan {
     IngestPlan {
         declared,
         limit: 64 * MIB,
-        known_sha256: None,
+        sha256: crate::deltaglider::ingest::Sha256Need::Compute,
         held_spool_mib: 0,
         strict_length: true,
         destination: crate::deltaglider::ingest::Destination::Object,
@@ -345,7 +345,7 @@ async fn a_known_sha256_is_kept() {
     for len in [100usize, 2 * THRESHOLD as usize] {
         let data = body(len);
         let mut p = plan(len as u64);
-        p.known_sha256 = Some(proven);
+        p.sha256 = crate::deltaglider::ingest::Sha256Need::Known(proven);
         let got = rig.ingest(chunks(&data, 1000), p).await.unwrap();
         assert_eq!(got.hashes().sha256(), proven.to_hex(), "{len}");
         assert_eq!(got.hashes().md5(), hex::encode(Md5::digest(&data)), "{len}");

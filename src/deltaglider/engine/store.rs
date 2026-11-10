@@ -622,7 +622,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // The hashes of the body: from its ingest, else computed here.
         let (sha256, md5) = match known {
             Some(hashes) => hashes,
-            None => BodyHashes::compute(data, None).await?,
+            None => {
+                BodyHashes::compute(data, crate::deltaglider::ingest::Sha256Need::Compute).await?
+            }
         }
         .into_parts();
 

@@ -603,7 +603,8 @@ fn engine_error_maps_to_s3s_code() {
 /// an s3s verb reads `input.body` only as the body argument of
 /// `ingest_client_body` (PutObject) or `ingest_part_body` (UploadPart),
 /// the request path de-frames aws-chunked bodies only with
-/// the trailer-keeping decoder, and the form POST runs the same check.
+/// the trailer-keeping decoder, and the form POST runs the same check
+/// (`verify_ingested`, shared with them).
 #[test]
 fn every_client_body_passes_the_checksum_check() {
     use crate::source_scan::{files, prod_lines, read, rel};
@@ -646,23 +647,7 @@ fn every_client_body_passes_the_checksum_check() {
         "the scan found PutObject's and UploadPart's ingest"
     );
     let form = crate::source_scan::prod_text(&read("src/api/handlers/form_post.rs"));
-    assert!(form.contains("checksum::verify_body_checksum("));
-}
-
-/// The text of production function `name` in `file` (from its `fn` line to
-/// the next `fn` line).
-fn prod_fn_text(file: &str, name: &str) -> String {
-    let text = crate::source_scan::prod_text(&crate::source_scan::read(file));
-    let start = text
-        .find(&format!("fn {name}("))
-        .unwrap_or_else(|| panic!("{file}: no fn {name}"));
-    let rest = &text[start + 3..];
-    let end = ["\nfn ", " fn "]
-        .iter()
-        .filter_map(|p| rest.find(p))
-        .min()
-        .unwrap_or(rest.len());
-    rest[..end].to_string()
+    assert!(form.contains("checksum::verify_ingested("));
 }
 
 /// A client write reads its whole body (and checks it) BEFORE it takes the
@@ -687,10 +672,10 @@ fn client_writes_take_the_object_lock_after_the_body() {
         (
             "src/api/handlers/form_post.rs",
             "handle_form_post_upload",
-            "ingest_bytes(",
+            "ingest_form_file(",
         ),
     ] {
-        let body = prod_fn_text(file, func);
+        let body = crate::source_scan::prod_fn_text(file, func);
         let ingest_at = body
             .find(ingest)
             .unwrap_or_else(|| panic!("{file} {func}: no {ingest}"));

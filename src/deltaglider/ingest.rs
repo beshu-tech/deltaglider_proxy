@@ -52,28 +52,31 @@ impl BodyHashes {
     /// runs. CPU work: [`Self::compute`] moves a large body off the async
     /// runtime.
     pub(crate) fn of(data: &[u8], known: Option<KnownSha256>) -> Self {
-        let mut hasher = BodyHasher::new(known);
+        Self::with(data, known.into())
+    }
+
+    fn with(data: &[u8], sha256: Sha256Need) -> Self {
+        let mut hasher = BodyHasher::for_need(sha256);
         hasher.update(data);
         hasher.finish()
     }
 
-    /// [`Self::of`], on a blocking thread when the body is above
-    /// [`BLOCKING_HASH_THRESHOLD`]: a 16 MiB body takes about 10 ms per
-    /// pass, which a tokio worker must not spend.
-    pub(crate) async fn compute(
-        data: &Bytes,
-        known: Option<KnownSha256>,
-    ) -> Result<Self, EngineError> {
+    /// The hashes of `data` as `sha256` asks, on a blocking thread when the
+    /// body is above [`BLOCKING_HASH_THRESHOLD`]: a 16 MiB body takes about
+    /// 10 ms per pass, which a tokio worker must not spend.
+    pub(crate) async fn compute(data: &Bytes, sha256: Sha256Need) -> Result<Self, EngineError> {
         if data.len() <= BLOCKING_HASH_THRESHOLD {
-            return Ok(Self::of(data, known));
+            return Ok(Self::with(data, sha256));
         }
         let data = data.clone();
-        tokio::task::spawn_blocking(move || Self::of(&data, known))
+        tokio::task::spawn_blocking(move || Self::with(&data, sha256))
             .await
             .map_err(|e| EngineError::Storage(StorageError::Other(format!("hash task: {e}"))))
     }
 
-    /// The lowercase hex SHA-256.
+    /// The lowercase hex SHA-256; empty when the ingest skipped it
+    /// ([`Sha256Need::Skip`]: a multipart part, whose SHA-256 nothing
+    /// reads). An empty value matches no digest, so a check fails closed.
     pub fn sha256(&self) -> &str {
         &self.sha256
     }
@@ -99,8 +102,17 @@ pub(crate) struct BodyHasher {
 
 impl BodyHasher {
     pub(crate) fn new(known: Option<KnownSha256>) -> Self {
+        Self::for_need(known.into())
+    }
+
+    pub(crate) fn for_need(sha256: Sha256Need) -> Self {
+        let (hasher, known) = match sha256 {
+            Sha256Need::Known(k) => (None, Some(k)),
+            Sha256Need::Compute => (Some(Sha256::new()), None),
+            Sha256Need::Skip => (None, None),
+        };
         Self {
-            sha256: known.is_none().then(Sha256::new),
+            sha256: hasher,
             known,
             md5: Md5::new(),
         }
@@ -118,7 +130,7 @@ impl BodyHasher {
             sha256: match (self.known, self.sha256) {
                 (Some(k), _) => k.to_hex(),
                 (None, Some(h)) => hex::encode(h.finalize()),
-                (None, None) => unreachable!("a hasher without a known SHA-256 computes one"),
+                (None, None) => String::new(),
             },
             md5: hex::encode(self.md5.finalize()),
         }
@@ -199,7 +211,7 @@ impl IngestedBody {
         let spool = storage.file().unwrap();
         let mut stream = futures::stream::iter([Ok::<_, std::io::Error>(data)]);
         let fill = spool
-            .fill_from_stream(&mut stream, len, None)
+            .fill_from_stream(&mut stream, len, Sha256Need::Compute)
             .await
             .unwrap();
         Self::Spooled {
@@ -301,17 +313,61 @@ pub fn admit_declared<E>(plan: &IngestPlan, spool_max_bytes: u64) -> Result<(), 
     Ok(())
 }
 
+/// What the ingest does about a body's SHA-256. MD5 is always computed:
+/// it is the ETag of an object and of a multipart part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sha256Need {
+    /// Proven by the caller (a payload hash that s3s verified against the
+    /// bytes): used as is, not computed.
+    Known(KnownSha256),
+    /// Computed while the body is read.
+    Compute,
+    /// Not computed, because nothing reads it ([`BodyHashes::sha256`] is
+    /// then empty).
+    Skip,
+}
+
+impl From<Option<KnownSha256>> for Sha256Need {
+    fn from(known: Option<KnownSha256>) -> Self {
+        known.map_or(Self::Compute, Self::Known)
+    }
+}
+
+impl Sha256Need {
+    /// Pure: the SHA-256 work of a body. `verified`: the SHA-256 that s3s
+    /// proved; `signed_hex_to_check`: the request signs a hex payload hash
+    /// that the caller must compare with the body after it arrives.
+    ///
+    /// An object stores its SHA-256 in its metadata, so it always has
+    /// one. A multipart part has its own: the store keeps only its MD5
+    /// (the part ETag and the check of the relay file), and a part's
+    /// `x-amz-checksum-sha256` is computed by the checksum plan. So a part
+    /// computes it only to check a signed payload hash.
+    pub fn decide(
+        destination: Destination,
+        verified: Option<KnownSha256>,
+        signed_hex_to_check: bool,
+    ) -> Self {
+        match (verified, destination) {
+            (Some(known), _) => Self::Known(known),
+            (None, Destination::Object) => Self::Compute,
+            (None, Destination::MultipartPart) if signed_hex_to_check => Self::Compute,
+            (None, Destination::MultipartPart) => Self::Skip,
+        }
+    }
+}
+
 /// What [`ingest`] reads.
 #[derive(Debug, Clone, Copy)]
 pub struct IngestPlan {
     /// The length the request declares ([`declared_body_len`]); the
-    /// reservation and the fill cap.
+    /// reservation and the fill cap. With `strict_length: false`, an upper
+    /// bound of the body.
     pub declared: u64,
     /// The largest body this request may store.
     pub limit: u64,
-    /// The body's SHA-256, proven by the caller (a verified SigV4 payload
-    /// hash): only MD5 is computed.
-    pub known_sha256: Option<KnownSha256>,
+    /// The SHA-256 work ([`Sha256Need::decide`]).
+    pub sha256: Sha256Need,
     /// Spool budget the op holds already (the other parts of a multipart
     /// upload); such an op never waits for more.
     pub held_spool_mib: usize,
@@ -441,7 +497,7 @@ where
     }
     check_length(plan, buf.len() as u64)?;
     let data = buf.freeze();
-    let hashes = BodyHashes::compute(&data, plan.known_sha256)
+    let hashes = BodyHashes::compute(&data, plan.sha256)
         .await
         .map_err(IngestError::Engine)?;
     Ok(IngestedBody::Memory {
@@ -486,7 +542,7 @@ where
         .map_err(|e| IngestError::Engine(EngineError::Storage(e.into())))?;
     // Capped at the declared length, which the reservation covers.
     let fill = spool
-        .fill_from_stream(&mut stream, plan.declared, plan.known_sha256)
+        .fill_from_stream(&mut stream, plan.declared, plan.sha256)
         .await
         .map_err(|e| match e {
             SpoolFillError::Source(e) => IngestError::Source(e),
@@ -504,8 +560,9 @@ where
     })
 }
 
-/// [`ingest`] of a body that is in memory already (a form POST's file, a
-/// small copy source): one chunk, of exactly its length.
+/// [`ingest`] of a body that is in memory already (tests that store a
+/// body through the ingest): one chunk, of exactly its length.
+#[cfg(test)]
 pub async fn ingest_bytes<B: StorageBackend>(
     engine: &DeltaGliderEngine<B>,
     bucket: &str,
@@ -516,7 +573,7 @@ pub async fn ingest_bytes<B: StorageBackend>(
     let plan = IngestPlan {
         declared: data.len() as u64,
         limit,
-        known_sha256,
+        sha256: known_sha256.into(),
         held_spool_mib: 0,
         strict_length: true,
         destination: Destination::Object,
@@ -618,12 +675,57 @@ mod tests {
         assert!(!spool_admits(1, 16 * MIB, 99), "held above max");
     }
 
+    /// An object always has a SHA-256 (it is stored metadata); a part
+    /// computes one only to check a signed hex payload hash; a SHA-256
+    /// that s3s proved is used as is.
+    #[test]
+    fn sha256_need_truth_table() {
+        use Destination::{MultipartPart, Object};
+        let proven = KnownSha256::of(b"proven");
+        let cases = [
+            (Object, Some(proven), false, Sha256Need::Known(proven)),
+            (Object, Some(proven), true, Sha256Need::Known(proven)),
+            (Object, None, false, Sha256Need::Compute),
+            (Object, None, true, Sha256Need::Compute),
+            (MultipartPart, Some(proven), true, Sha256Need::Known(proven)),
+            (
+                MultipartPart,
+                Some(proven),
+                false,
+                Sha256Need::Known(proven),
+            ),
+            (MultipartPart, None, true, Sha256Need::Compute),
+            (MultipartPart, None, false, Sha256Need::Skip),
+        ];
+        for (destination, verified, signed, want) in cases {
+            assert_eq!(
+                Sha256Need::decide(destination, verified, signed),
+                want,
+                "{destination:?} {verified:?} {signed}"
+            );
+        }
+    }
+
+    /// A skipped SHA-256 is empty (it matches no digest), and MD5 is
+    /// computed whatever the SHA-256 work.
+    #[test]
+    fn a_skipped_sha256_is_empty_and_md5_stays() {
+        let data = b"part bytes";
+        let md5 = hex::encode(Md5::digest(data));
+        let skipped = BodyHashes::with(data, Sha256Need::Skip);
+        assert_eq!(skipped.sha256(), "");
+        assert_eq!(skipped.md5(), md5);
+        let computed = BodyHashes::with(data, Sha256Need::Compute);
+        assert_eq!(computed.sha256(), hex::encode(Sha256::digest(data)));
+        assert_eq!(computed.md5(), md5);
+    }
+
     #[test]
     fn admit_declared_truth_table() {
         let plan = |declared, limit, held| IngestPlan {
             declared,
             limit,
-            known_sha256: None,
+            sha256: Sha256Need::Compute,
             held_spool_mib: held,
             strict_length: true,
             destination: Destination::Object,

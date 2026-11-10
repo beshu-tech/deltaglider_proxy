@@ -245,7 +245,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<Option<ReadBody>, EngineError> {
         use crate::deltaglider::spool::SpoolFillError;
         let fill = spool
-            .fill_from_stream(&mut stream, size, None)
+            .fill_from_stream(
+                &mut stream,
+                size,
+                crate::deltaglider::ingest::Sha256Need::Compute,
+            )
             .await
             .map_err(|e| match e {
                 SpoolFillError::Source(e) => EngineError::Storage(e),

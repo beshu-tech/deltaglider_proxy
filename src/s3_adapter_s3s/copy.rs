@@ -261,7 +261,7 @@ pub(super) async fn read_copy_source(
     let plan = IngestPlan {
         declared: head_size,
         limit: copy_size_limit(engine),
-        known_sha256: None,
+        sha256: crate::deltaglider::ingest::Sha256Need::Compute,
         held_spool_mib: 0,
         strict_length: true,
         destination: Destination::Object,
@@ -428,7 +428,12 @@ pub(super) async fn upload_part_copy(
     let plan = crate::deltaglider::ingest::IngestPlan {
         declared: part_len,
         limit: super::multipart::part_size_limit(engine.max_object_size()),
-        known_sha256: None,
+        // No signed payload hash to check: only the part's MD5.
+        sha256: crate::deltaglider::ingest::Sha256Need::decide(
+            crate::deltaglider::ingest::Destination::MultipartPart,
+            None,
+            false,
+        ),
         held_spool_mib: admission.held_spool_mib,
         strict_length: true,
         destination: crate::deltaglider::ingest::Destination::MultipartPart,

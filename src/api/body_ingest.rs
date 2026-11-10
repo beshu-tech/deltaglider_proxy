@@ -32,7 +32,7 @@ use crate::api::checksum::{self, ChecksumPlan};
 use crate::api::handlers::AppState;
 use crate::api::S3Error;
 use crate::deltaglider::ingest::{
-    self, Destination, IngestError, IngestPlan, IngestedBody, MissingContentLength,
+    self, Destination, IngestError, IngestPlan, IngestedBody, MissingContentLength, Sha256Need,
 };
 use crate::deltaglider::KnownSha256;
 use crate::s3_adapter_s3s::BodyContext;
@@ -234,7 +234,13 @@ impl<'a> ClientBody<'a> {
         IngestPlan {
             declared: self.declared,
             limit: self.limit,
-            known_sha256: self.checks.s3s_verified_sha256,
+            sha256: Sha256Need::decide(
+                destination,
+                self.checks.s3s_verified_sha256,
+                self.checks
+                    .signed_payload_hash
+                    .is_some_and(|signed| signed.is_verifiable_hex()),
+            ),
             held_spool_mib,
             strict_length: true,
             destination,
@@ -299,18 +305,7 @@ impl<'a> ClientBody<'a> {
         let own_trailers = trailer_slot.and_then(|slot| slot.get());
         let s3s_trailers = ctx.s3s_trailers.as_ref().and_then(|t| t.read(Clone::clone));
         let trailers = own_trailers.as_ref().or(s3s_trailers.as_ref());
-        if let Some((algorithm, expected)) = checksum::expected_checksum(headers, trailers)? {
-            let planned = sums
-                .map(|h| h.finalize())
-                .and_then(|done| checksum::computed_digest(algorithm, &done));
-            let digest = match planned {
-                Some(digest) => digest,
-                None => checksum::digest_of(algorithm, &ingested)
-                    .await
-                    .map_err(|e| S3Error::InternalError(format!("checksum of the body: {e}")))?,
-            };
-            checksum::verify_digest(algorithm, &expected, &digest)?;
-        }
+        checksum::verify_ingested(headers, trailers, sums, &ingested).await?;
         if checks.s3s_verified_sha256.is_none() {
             if let Some(signed) = checks.signed_payload_hash {
                 signed.verify_against_digest(ingested.hashes().sha256())?;

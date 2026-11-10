@@ -165,6 +165,23 @@ pub(crate) mod source_scan {
             .collect()
     }
 
+    /// The text of production function `name` in `file` (from its `fn`
+    /// line to the next `fn` line).
+    pub(crate) fn prod_fn_text(file: &str, name: &str) -> String {
+        let text = prod_text(&read(file));
+        let start = text
+            .find(&format!("fn {name}("))
+            .or_else(|| text.find(&format!("fn {name}<")))
+            .unwrap_or_else(|| panic!("{file}: no fn {name}"));
+        let rest = &text[start + 3..];
+        let end = ["\nfn ", " fn "]
+            .iter()
+            .filter_map(|p| rest.find(p))
+            .min()
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
     /// Production code of `text` as one string (for multi-line matches).
     pub(crate) fn prod_text(text: &str) -> String {
         prod_lines(text)
