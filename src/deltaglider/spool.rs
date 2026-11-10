@@ -89,10 +89,12 @@ impl SpoolDir {
     /// Default dir is a DEDICATED `dgp-spool` subdir of the system temp — NOT the
     /// shared temp root (review M3.4: sweeping or filling the shared root is
     /// dangerous; a dedicated subdir we own is safe to sweep). The directory is
-    /// created if missing and SWEPT of orphans at startup (review M1.8: a hard
-    /// crash leaves spool files behind since `NamedTempFile`'s Drop never ran;
-    /// any file present at boot is from a previous process and is safe to delete
-    /// — every live spool is held by a `NamedTempFile` in THIS process).
+    /// created if missing and SWEPT of stale orphans at startup (review M1.8: a
+    /// hard crash leaves spool files behind since `NamedTempFile`'s Drop never
+    /// ran). The sweep is AGE-based (`STALE_TEMP_MAX_AGE`, the same rule as the
+    /// filesystem backend's temp sweep): the directory may be shared with
+    /// another live process, whose active spool files are fresh, so only a
+    /// file untouched for that long goes.
     #[allow(
         clippy::disallowed_methods,
         reason = "the spool's own default directory"
@@ -246,9 +248,9 @@ impl SpoolDir {
     /// whose ACTIVE spools are always freshly-touched — only files untouched for
     /// `STALE` are safe to reclaim. Best-effort; logs and continues on errors.
     fn sweep_orphans(&self) {
-        // 1h: comfortably longer than any single reconstruction, short enough to
-        // reclaim crash debris promptly.
-        self.sweep_older_than(std::time::Duration::from_secs(3600));
+        // `STALE_TEMP_MAX_AGE` (1 h): comfortably longer than any single
+        // reconstruction, short enough to reclaim crash debris promptly.
+        self.sweep_older_than(crate::storage::STALE_TEMP_MAX_AGE);
     }
 
     /// Sweep files whose mtime is at least `max_age` old. Split out for testing.
@@ -989,7 +991,7 @@ mod tests {
         let fresh = tmp.path().join("fresh");
         std::fs::write(&fresh, b"y").unwrap();
         let pool = SpoolDir::new(tmp.path().to_path_buf(), 64 * 1024 * 1024).unwrap();
-        pool.sweep_older_than(std::time::Duration::from_secs(3600));
+        pool.sweep_older_than(crate::storage::STALE_TEMP_MAX_AGE);
         assert!(fresh.exists(), "a fresh (live) spool must NOT be swept");
     }
 

@@ -272,6 +272,36 @@ fn temp_files_below(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
+/// The boot sweep removes old `.dg-tmp.*` and `.tmpXXXXXX` files. A client
+/// must not be able to store such a key, or the next boot would delete it.
+#[tokio::test]
+async fn a_client_cannot_store_a_key_that_the_temp_sweep_would_delete() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let data = server.data_dir().expect("data dir").to_path_buf();
+    let http = server.http();
+    // Passthrough names and a delta-eligible one.
+    for key in ["a/.dg-tmp.x", "a/.tmpAb12Cd", "a/.dg-tmp.y.zip"] {
+        let r = http
+            .s3_request(reqwest::Method::PUT, &format!("{ep}/{bucket}/{key}"))
+            .body(b"payload".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            r.status().is_client_error(),
+            "{key}: {} {}",
+            r.status(),
+            r.text().await.unwrap_or_default()
+        );
+    }
+    assert!(
+        temp_files_below(&data).is_empty(),
+        "a refused key left a file"
+    );
+}
+
 /// F22: a proxy killed with SIGKILL in the middle of a storage write leaves
 /// its `.dg-tmp.*` file. The next boot on the same data directory removes it
 /// when it is old, keeps a fresh one (a live writer may hold it), and LIST

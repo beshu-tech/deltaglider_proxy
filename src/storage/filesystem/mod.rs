@@ -232,7 +232,7 @@ thread_local! {
 /// `.dg-tmp.*` (current) or tempfile's default `.tmpXXXXXX` (older
 /// releases). Every other `.`-name (`.env`, `.gitignore`) is a user object:
 /// LIST shows it and DeleteBucket must not erase it.
-fn is_internal_temp_name(name: &str) -> bool {
+pub(crate) fn is_internal_temp_name(name: &str) -> bool {
     if name.starts_with(INTERNAL_TEMP_PREFIX) {
         return true;
     }
