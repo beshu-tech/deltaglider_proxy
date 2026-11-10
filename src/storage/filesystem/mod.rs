@@ -29,7 +29,7 @@ mod scan;
 mod tests;
 mod write;
 
-use scan::{collapse_key, join_key, FlatWalk, SortedDir, WalkEntry, WalkStep};
+use scan::{join_key, FlatWalk, SortedDir, WalkEntry, WalkStep};
 use write::*;
 
 pub use sweep::{sweep_stale_temp_files, STALE_TEMP_MAX_AGE};
@@ -2425,23 +2425,19 @@ impl FilesystemBackend {
                 let cp = match step {
                     WalkStep::Collapsed(cp) => cp,
                     WalkStep::File { key, path, entry } => {
-                        let Some(cp) = collapse_key(&key, prefix, delimiter) else {
-                            let Some((_, meta)) = Self::listed_entry(&path, &entry.name).await?
-                            else {
-                                continue; // not an object file, or deleted during the walk
-                            };
-                            // `x` and `x.delta` are neighbours: the newest wins.
-                            match objects.last_mut() {
-                                Some((k, m)) if *k == key => {
-                                    if meta.created_at > m.created_at {
-                                        *m = meta;
-                                    }
-                                }
-                                _ => objects.push((key, meta)),
-                            }
-                            continue;
+                        let Some((_, meta)) = Self::listed_entry(&path, &entry.name).await? else {
+                            continue; // not an object file, or deleted during the walk
                         };
-                        cp
+                        // `x` and `x.delta` are neighbours: the newest wins.
+                        match objects.last_mut() {
+                            Some((k, m)) if *k == key => {
+                                if meta.created_at > m.created_at {
+                                    *m = meta;
+                                }
+                            }
+                            _ => objects.push((key, meta)),
+                        }
+                        continue;
                     }
                 };
                 // Keys of one common prefix are neighbours; one that the

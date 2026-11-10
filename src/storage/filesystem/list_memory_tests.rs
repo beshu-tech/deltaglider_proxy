@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BUSL-1.1
+
 //! F3 (epic #142): a LIST request holds a bounded number of directory
 //! entries in memory, whatever the directory size and the delimiter. The
 //! tests count held entries (`note_held`), not wall time or RSS.

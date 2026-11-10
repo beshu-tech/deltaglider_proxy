@@ -276,17 +276,34 @@ pub(super) fn collapse_key(key: &str, prefix: &str, delimiter: &str) -> Option<S
 /// starts with `prefix` and sorts after `token`; a directory when its
 /// subtree may hold such a key. A `.dg` directory is the proxy's own and
 /// never listed (F19).
-pub(super) fn flat_keep(prefix: &str, token: &str, dir_key: &str, entry: &WalkEntry) -> bool {
+///
+/// `skip`: the common prefix just listed. Every key that starts with it is
+/// collapsed already, so it is dropped while the directory is read; without
+/// this a folder of N keys under one common prefix is read again for every
+/// chunk (N²/chunk entries).
+pub(super) fn flat_keep(
+    prefix: &str,
+    token: &str,
+    skip: Option<&str>,
+    dir_key: &str,
+    entry: &WalkEntry,
+) -> bool {
     if entry.is_dir {
         if entry.name == ".dg" {
             return false;
         }
         let below = format!("{}/", join_key(dir_key, &entry.key_name));
+        if skip.is_some_and(|s| below.starts_with(s)) {
+            return false;
+        }
         super::flat_subtree_may_match(&below, prefix, token)
     } else {
         // A marker file at the bucket root names no key.
         let key = join_key(dir_key, &entry.key_name);
-        !key.is_empty() && key.starts_with(prefix) && key.as_str() > token
+        !key.is_empty()
+            && key.starts_with(prefix)
+            && key.as_str() > token
+            && !skip.is_some_and(|s| key.starts_with(s))
     }
 }
 
@@ -310,6 +327,8 @@ pub(super) struct FlatWalk<'a> {
     prefix: &'a str,
     token: &'a str,
     delimiter: Option<&'a str>,
+    /// The last common prefix yielded (see [`flat_keep`]).
+    skip: Option<String>,
 }
 
 impl<'a> FlatWalk<'a> {
@@ -321,7 +340,7 @@ impl<'a> FlatWalk<'a> {
         token: &'a str,
         delimiter: Option<&'a str>,
     ) -> Result<Option<Self>, StorageError> {
-        let keep = |d: &str, e: &WalkEntry| flat_keep(prefix, token, d, e);
+        let keep = |d: &str, e: &WalkEntry| flat_keep(prefix, token, None, d, e);
         let Some(root) = SortedDir::open(root, root_key, &keep).await? else {
             return Ok(None);
         };
@@ -330,13 +349,15 @@ impl<'a> FlatWalk<'a> {
             prefix,
             token,
             delimiter,
+            skip: None,
         }))
     }
 
     pub(super) async fn next(&mut self) -> Result<Option<WalkStep>, StorageError> {
         let (prefix, token, delimiter) = (self.prefix, self.token, self.delimiter);
-        let keep = |d: &str, e: &WalkEntry| flat_keep(prefix, token, d, e);
         loop {
+            let skip = self.skip.clone();
+            let keep = |d: &str, e: &WalkEntry| flat_keep(prefix, token, skip.as_deref(), d, e);
             let Some(dir) = self.stack.last_mut() else {
                 return Ok(None);
             };
@@ -346,13 +367,28 @@ impl<'a> FlatWalk<'a> {
             };
             let key = join_key(&dir.key, &entry.key_name);
             let path = dir.path.join(&entry.name);
+            // An entry of the chunk that read before the last common prefix
+            // was listed.
+            let below = if entry.is_dir {
+                format!("{key}/")
+            } else {
+                key.clone()
+            };
+            if skip.as_deref().is_some_and(|s| below.starts_with(s)) {
+                continue;
+            }
             if !entry.is_dir {
+                if let Some(cp) = delimiter.and_then(|d| collapse_key(&key, prefix, d)) {
+                    self.skip = Some(cp.clone());
+                    return Ok(Some(WalkStep::Collapsed(cp)));
+                }
                 return Ok(Some(WalkStep::File { key, path, entry }));
             }
-            if let Some(cp) = delimiter.and_then(|d| collapse_key(&format!("{key}/"), prefix, d)) {
+            if let Some(cp) = delimiter.and_then(|d| collapse_key(&below, prefix, d)) {
                 // Every key below collapses to `cp`: no need to read them,
                 // only to know that one is there.
                 if FilesystemBackend::dir_has_listed_key(&path).await? {
+                    self.skip = Some(cp.clone());
                     return Ok(Some(WalkStep::Collapsed(cp)));
                 }
                 continue;

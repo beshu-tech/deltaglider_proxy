@@ -209,3 +209,62 @@ async fn a_long_name_stores_whether_or_not_it_would_be_a_delta() {
         }
     }
 }
+
+/// Pure: is `text` made only of characters that XML 1.0 allows?
+fn is_xml10(text: &str) -> bool {
+    text.chars().all(|c| {
+        matches!(c, '\t' | '\n' | '\r')
+            || ('\u{20}'..='\u{D7FF}').contains(&c)
+            || ('\u{E000}'..='\u{FFFD}').contains(&c)
+            || ('\u{10000}'..='\u{10FFFF}').contains(&c)
+    })
+}
+
+/// F39 (epic #142). S3 stores a key with a control character, and so does
+/// the filesystem backend, so the proxy does not refuse it. A default LIST
+/// body then holds the raw character, as S3's does, and a strict XML parser
+/// rejects it; the AWS SDKs ask for `encoding-type=url` by themselves, and
+/// then every body is well-formed XML 1.0. This test holds the safe mode to
+/// that, for keys of every class of XML-invalid character.
+#[tokio::test]
+async fn an_encoding_type_url_listing_is_well_formed_for_any_key() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+    let keys = [
+        "ctl/a%01b",
+        "ctl/c%08d",
+        "ctl/e%0Bf",
+        "ctl/g%1Fh",
+        "ctl/i%7Fj",
+        "ctl/k%EF%BF%BFl", // U+FFFF
+        "ctl/m%EF%BF%BEn", // U+FFFE
+        "ctl/plain",
+        "ctl/%C3%A9",
+        "ctl/%F0%9F%98%80",
+    ];
+    for key in keys {
+        let put = http
+            .put(format!("{}/{}/{key}", server.endpoint(), server.bucket()))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert!(put.status().is_success(), "{key}: {}", put.status());
+    }
+    for query in [
+        "list-type=2&encoding-type=url&prefix=ctl%2F",
+        "list-type=2&encoding-type=url&prefix=ctl%2F&delimiter=%2F",
+        "encoding-type=url&prefix=ctl%2F",
+        "list-type=2&encoding-type=url&prefix=ctl%2F&max-keys=1&start-after=ctl%2Fa",
+    ] {
+        let body = http
+            .get(format!("{}/{}?{query}", server.endpoint(), server.bucket()))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(is_xml10(&body), "{query}: {body:?}");
+    }
+}

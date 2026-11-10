@@ -79,7 +79,7 @@ The S3 backend stores keys as S3 keys, so there both objects can exist.
 | `CompleteMultipartUpload` | ✅ Full | Delta or passthrough chosen by size/eligibility; multipart ETag preserved; quota enforced. An upload that is always stored as a plain object is stored from its parts, without assembling them in memory. A completion of an upload that is already complete, with another part list, gets `404 NoSuchUpload`, as on S3. A retry that joins a completion in flight gets the same answer as the first request. |
 | `AbortMultipartUpload` | ✅ Full | Cancels the upload and reclaims state. |
 | `ListParts` | ✅ Full | `part-number-marker` continuation; `max-parts` 1 to 1000. A negative `max-parts` or `part-number-marker` gets `400 InvalidArgument`, as on S3. |
-| `ListMultipartUploads` | ✅ Full | `key-marker` + `upload-id-marker` continuation; prefix / delimiter. A negative `max-uploads` gets `400 InvalidArgument`, as on S3. |
+| `ListMultipartUploads` | ✅ Full | `key-marker` + `upload-id-marker` continuation; prefix / delimiter. A negative `max-uploads` gets `400 InvalidArgument`, as on S3, and `max-uploads=0` lists no upload and answers `<MaxUploads>0</MaxUploads>`. |
 
 ## Bucket operations
 

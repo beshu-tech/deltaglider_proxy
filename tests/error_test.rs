@@ -121,18 +121,29 @@ async fn test_entitytoolarge_response() {
 }
 
 /// A key whose file name is too long for the filesystem backend (255 bytes
-/// per segment, `.delta` included) is a client error: 400 KeyTooLongError,
-/// which SDKs do not retry. It used to be a 500, retried four times.
+/// per segment) is a client error: 400 KeyTooLongError, which SDKs do not
+/// retry. It used to be a 500, retried four times. A delta-eligible name
+/// that fits but whose `.delta` form would not is stored whole (epic #142,
+/// F43), so it does not fail on the upload that would have been a delta.
 #[tokio::test]
 async fn a_too_long_file_name_is_400_key_too_long() {
     let server = TestServer::filesystem().await;
     let http = server.http();
-    for key in [
-        // Delta-eligible: the stored name gains `.delta` and passes 255.
-        format!("{}.zip", "g".repeat(250)),
-        // Passthrough, one segment over the limit.
-        format!("dir/{}.jpg", "h".repeat(260)),
-    ] {
+    // Delta-eligible: the stored name would gain `.delta` and pass 255. It
+    // is stored whole instead, for the first upload and the second.
+    let near = format!(
+        "{}/{}/{}.zip",
+        server.endpoint(),
+        server.bucket(),
+        "g".repeat(250)
+    );
+    for body in [b"0123456789".repeat(100), b"0123456780".repeat(100)] {
+        let r = http.put(&near).body(body).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    }
+    // Passthrough, one segment over the limit.
+    let key = format!("dir/{}.jpg", "h".repeat(260));
+    {
         let url = format!("{}/{}/{}", server.endpoint(), server.bucket(), key);
         let r = http
             .put(&url)

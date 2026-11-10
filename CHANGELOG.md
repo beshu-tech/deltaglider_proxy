@@ -28,6 +28,16 @@
 - A multipart upload that the backend lost during a copy answers `503`, not `NoSuchKey`/`NoSuchUpload`. `NoSuchUpload` now means only an upload id that this proxy does not know.
 - The error text for a write whose metadata is too large now names the length of the last part of the key.
 
+### Fixed — Listing
+
+- A LIST request on the filesystem backend no longer holds a whole folder in memory. It reads a folder in sorted chunks of 1024 entries and keeps only the chunk and the page. Before, 20 concurrent LIST requests of one key in a folder of 200,000 files used 1.85 GB, and a delimiter other than `/` read the whole prefix. The result of a LIST is the same.
+- A key that has a directory named `.dg` (at any depth) is refused on write with `400 InvalidArgument`. Every listing hides such a key, with or without a delimiter, on both backends. Before, a flat LIST showed it, a delimiter LIST hid it, and DeleteBucket answered `409` for a bucket that looked empty. A key that an earlier release stored there can still be read and deleted by name. See the reserved keys table in the S3 API compatibility reference.
+- A prefix that starts with `/` lists nothing, with or without a delimiter. The filesystem backend listed the root with the `/` delimiter.
+- `max-uploads=0` in ListMultipartUploads lists no upload and answers `<MaxUploads>0</MaxUploads>` (it answered `1`).
+- Non-ASCII user metadata is answered as `=?UTF-8?B?…?=` on every backend. An S3 backend (MinIO) sent its own `q` form before.
+- A file name of 250 bytes or more is stored as a whole object, never as a delta, because its `.delta` name would pass the 255-byte limit of a file name. Before, the second upload of such a delta-eligible name failed with `400 KeyTooLongError`.
+- A backtick or a newline in an object key no longer breaks out of the code span of a Slack notification.
+
 ### Fixed — Configuration checks at the boundaries
 
 - A section PUT whose body gives an array, a string, a number or a boolean where a setting holds an object is refused with `400`. `PUT /config/section/storage` with `[]` used to answer `ok: true` and reset the backend to its default.
