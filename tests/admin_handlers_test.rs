@@ -1403,9 +1403,11 @@ async fn user_edit_with_new_keys_is_one_atomic_request() {
     let (code, v) = json_of(put(json!({ "name": "edit-a3" })).await.unwrap()).await;
     assert_eq!(code, StatusCode::OK, "{v}");
     assert_eq!(v["access_key_id"], "EDITEDKEY00001");
-    assert!(v["secret_access_key"]
-        .as_str()
-        .map_or(true, |s| s != "edited-secret-0001"));
+    assert_ne!(
+        v["secret_access_key"].as_str(),
+        Some("edited-secret-0001"),
+        "the secret is not shown again"
+    );
 
     // A bad access key id is a 400 and applies nothing.
     let (code, _) = json_of(
