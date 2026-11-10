@@ -1188,6 +1188,27 @@ async fn users_rotate_clone_delete_and_empty_name() {
         .await;
         assert_eq!(code, StatusCode::BAD_REQUEST, "{bad:?}: {v}");
     }
+    // An empty secret is refused on this path too.
+    let (code, v) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/users/{id}/rotate-keys"))
+            .json(&json!({ "secret_access_key": "" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+    let (code, v) = json_of(
+        admin
+            .put(format!("{ep}/_/api/admin/users/{id}"))
+            .json(&json!({ "secret_access_key": "" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
     let users: Value = admin
         .get(format!("{ep}/_/api/admin/users"))
         .send()
@@ -1423,7 +1444,9 @@ async fn user_edit_with_new_keys_is_one_atomic_request() {
 }
 
 /// F23 (epic #146), groups: the membership change rides on the same `PUT` as
-/// the rest of the edit; a member that does not exist applies nothing.
+/// the rest of the edit, as users to add and to remove (never the whole list:
+/// other writers change members too); a member that does not exist applies
+/// nothing.
 #[tokio::test]
 async fn group_edit_with_members_is_one_atomic_request() {
     let server = TestServer::filesystem().await;
@@ -1455,7 +1478,7 @@ async fn group_edit_with_members_is_one_atomic_request() {
 
     // One request: rename, drop one member, add another.
     let (code, v) = json_of(
-        put(json!({ "name": "gm-team2", "member_ids": [u2] }))
+        put(json!({ "name": "gm-team2", "add_member_ids": [u2], "remove_member_ids": [u1] }))
             .await
             .unwrap(),
     )
@@ -1468,7 +1491,7 @@ async fn group_edit_with_members_is_one_atomic_request() {
 
     // A member that does not exist: refused, and the rename is not applied.
     let (code, v) = json_of(
-        put(json!({ "name": "gm-team3", "member_ids": [u2, 999_999] }))
+        put(json!({ "name": "gm-team3", "add_member_ids": [999_999] }))
             .await
             .unwrap(),
     )
@@ -1479,10 +1502,98 @@ async fn group_edit_with_members_is_one_atomic_request() {
     assert_eq!(v["name"], "gm-team2", "the refused edit changed nothing");
     assert_eq!(v["member_ids"], json!([u2]));
 
-    // No `member_ids`: the members stay.
+    // No member field: the members stay.
     let (code, v) = json_of(put(json!({ "description": "d" })).await.unwrap()).await;
     assert_eq!(code, StatusCode::OK, "{v}");
     assert_eq!(v["member_ids"], json!([u2]));
+
+    // A user in both lists is a 400 and applies nothing.
+    let (code, v) = json_of(
+        put(json!({ "name": "gm-team4", "add_member_ids": [u1], "remove_member_ids": [u1] }))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+    let (_, v) = json_of(put(json!({})).await.unwrap()).await;
+    assert_eq!(v["name"], "gm-team2", "{v}");
+}
+
+/// The form of a group edit opens with the members it read. Another writer
+/// (an admin, a peer node, an OIDC login) changes the members after that. An
+/// edit that did not touch the members must keep that change, and an edit
+/// that toggled one member must change only that member.
+#[tokio::test]
+async fn group_edit_keeps_a_member_change_that_another_writer_made() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let id_of = |v: &Value| v["id"].as_i64().unwrap();
+    let dana = id_of(&create_user(&admin, &ep, "cm-dana", json!([])).await);
+    let bob = id_of(&create_user(&admin, &ep, "cm-bob", json!([])).await);
+    let carol = id_of(&create_user(&admin, &ep, "cm-carol", json!([])).await);
+    let (code, g) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/groups"))
+            .json(&json!({ "name": "cm-team", "member_ids": [dana, bob] }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{g}");
+    let gid = g["id"].as_i64().unwrap();
+    // The form reads [dana, bob]. Another writer then removes dana and adds carol.
+    let code = admin
+        .delete(format!("{ep}/_/api/admin/groups/{gid}/members/{dana}"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    let code = admin
+        .post(format!("{ep}/_/api/admin/groups/{gid}/members"))
+        .json(&json!({ "user_id": carol }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert!(code.is_success(), "{code}");
+
+    // The stale form saves a description only: no member field.
+    let (code, v) = json_of(
+        admin
+            .put(format!("{ep}/_/api/admin/groups/{gid}"))
+            .json(&json!({ "description": "edited" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let mut members: Vec<i64> = v["member_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_i64().unwrap())
+        .collect();
+    members.sort();
+    let mut expected = vec![bob, carol];
+    expected.sort();
+    assert_eq!(members, expected, "dana stays removed, carol stays: {v}");
+
+    // The stale form toggled bob off: only bob goes.
+    let (code, v) = json_of(
+        admin
+            .put(format!("{ep}/_/api/admin/groups/{gid}"))
+            .json(&json!({ "remove_member_ids": [bob] }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["member_ids"], json!([carol]), "{v}");
 }
 
 #[tokio::test]

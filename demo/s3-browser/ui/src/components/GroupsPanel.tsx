@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useId } from 'react';
 import { Button, Typography, Alert, Input, Divider, Checkbox, message } from 'antd';
 import { TeamOutlined, CopyOutlined } from '@ant-design/icons';
-import type { IamGroup, IamUser } from '../adminApi';
+import { memberDelta, type IamGroup, type IamUser } from '../adminApi';
 import { useIamMode } from '../queries/config';
 import { useGroups, useCreateGroup, useUpdateGroup, useDeleteGroup, useCloneGroup, useAddGroupMember } from '../queries/groups';
 import { useUsers } from '../queries/users';
@@ -316,9 +316,10 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
     // its Add button emits).
     group ? permissionsToRows(group.permissions) : [{ _uiId: freshPermissionRowId(), effect: 'Allow', actions: [], resources: [] }],
   );
-  const [memberIds, setMemberIds] = useState<Set<number>>(
-    () => new Set(group?.member_ids ?? []),
-  );
+  // The members as the form read them: a save sends the change against this
+  // set, never the whole list (see memberDelta).
+  const [startMemberIds] = useState<number[]>(() => group?.member_ids ?? []);
+  const [memberIds, setMemberIds] = useState<Set<number>>(() => new Set(startMemberIds));
   const [saving, setSavingState] = useState(false);
   const [deleting, setDeletingState] = useState(false);
   const [error, setError] = useState('');
@@ -353,16 +354,18 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
     setServerNameError(null);
     try {
       if (isEdit) {
-        // ONE request for the whole edit, the member list included: the
-        // server applies the member changes in the same transaction, so a
-        // refusal of any part applies none.
+        // ONE request for the whole edit, the member changes included: the
+        // server applies them in the same transaction, so a refusal of any
+        // part applies none. Only the members the admin toggled go: other
+        // writers (another admin, a peer node, an OIDC login) may have
+        // changed the rest since the form opened.
         await updateGroupMutation.mutateAsync({
           id: group.id,
           patch: {
             name: name.trim(),
             description: description.trim(),
             permissions: rowsToPermissions(permissions),
-            member_ids: [...memberIds].sort((a, b) => a - b),
+            ...memberDelta(startMemberIds, memberIds),
           },
         });
         markClean();

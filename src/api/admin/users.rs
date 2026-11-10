@@ -520,20 +520,31 @@ pub async fn update_user(
     let rebuild_result = rebuild_iam_index(&db, &state.iam_state);
     drop(db);
     tracing::info!("IAM user '{}' updated", user.name);
-    audit_log("update_user", "admin", &user.name, &headers);
     let Some(rotation) = rotation else {
         rebuild_result?;
         trigger_config_sync(&state);
+        audit_log("update_user", "admin", &user.name, &headers);
         return Ok(Json(mask_user(&user)));
     };
-    // The keys changed: the old identity's live sessions die (the revoke
-    // push carries the DB, so no separate sync trigger), also when the
-    // rebuild failed: the rotation is already durable.
-    revoke_rotated_identity(&state, &rotation.old_access_key_id).await;
-    rebuild_result?;
+    finish_key_rotation(&state, rebuild_result, &rotation.old_access_key_id).await?;
+    audit_log("update_user", "admin", &user.name, &headers);
     audit_log("rotate_keys", "admin", &user.name, &headers);
     // The full user with the new secret: shown once.
     Ok(Json(user))
+}
+
+/// THE tail of every key rotation (the edit and `rotate-keys` share it): the
+/// old identity's live sessions die (the revoke push carries the DB, so no
+/// separate sync trigger), also when the rebuild failed: the rotation is
+/// already durable. The caller audits after this returns `Ok`: a failed
+/// rebuild answers 500 and writes no audit line.
+async fn finish_key_rotation(
+    state: &Arc<AdminState>,
+    rebuild_result: Result<(), AdminError>,
+    old_access_key_id: &str,
+) -> Result<(), AdminError> {
+    revoke_rotated_identity(state, old_access_key_id).await;
+    rebuild_result
 }
 
 /// The keys of a user edit that rotates them.
@@ -559,14 +570,28 @@ fn plan_key_rotation(
         return Ok(None);
     }
     let new_key = access_key_id.unwrap_or(current_access_key_id);
-    check_access_key_id(new_key)?;
+    let secret = secret_access_key
+        .map(str::to_string)
+        .unwrap_or_else(iam::generate_secret_access_key);
+    check_rotation_keys(new_key, &secret)?;
     Ok(Some(KeyRotation {
         access_key_id: new_key.to_string(),
-        secret_access_key: secret_access_key
-            .map(str::to_string)
-            .unwrap_or_else(iam::generate_secret_access_key),
+        secret_access_key: secret,
         old_access_key_id: current_access_key_id.to_string(),
     }))
+}
+
+/// THE rule for keys that a rotation stores, on both paths: a usable access
+/// key id, and a secret that is not empty (an empty secret would sign with
+/// an empty key). 400 before anything is written.
+fn check_rotation_keys(access_key_id: &str, secret_access_key: &str) -> Result<(), AdminError> {
+    check_access_key_id(access_key_id)?;
+    if secret_access_key.trim().is_empty() {
+        return Err(AdminError::invalid(
+            "the secret access key must not be empty",
+        ));
+    }
+    Ok(())
 }
 
 /// Rotating a key does NOT invalidate already-minted session cookies:
@@ -729,27 +754,29 @@ pub async fn rotate_user_keys(
             iam::generate_secret_access_key(),
         ),
     };
-    check_access_key_id(&new_access_key)?;
+    check_rotation_keys(&new_access_key, &new_secret_key)?;
 
     // Capture the OLD key before rotation: sessions minted with it must die.
-    let old_access_key = db.get_user_by_id(user_id).ok().map(|u| u.access_key_id);
+    let old_access_key = db.get_user_by_id(user_id)?.access_key_id;
 
+    // The same write as a user edit that rotates the keys.
     let user = db
-        .rotate_keys(user_id, &new_access_key, &new_secret_key)
+        .update_user_with_keys(
+            user_id,
+            None,
+            None,
+            None,
+            Some((&new_access_key, &new_secret_key)),
+        )
         .inspect_err(|e| {
             tracing::warn!("Failed to rotate keys for user {}: {}", user_id, e);
         })?;
 
-    // Rebuild AFTER capturing the result — the old-key revocation below must
-    // run even when the rebuild errs (the rotation is already durable).
+    // Rebuild AFTER capturing the result: the old-key revocation must run
+    // even when the rebuild errs (the rotation is already durable).
     let rebuild_result = rebuild_iam_index(&db, &state.iam_state);
     drop(db);
-    // No separate trigger_config_sync: the revoke push below carries the DB.
-
-    if let Some(old_key) = old_access_key {
-        revoke_rotated_identity(&state, &old_key).await;
-    }
-    rebuild_result?;
+    finish_key_rotation(&state, rebuild_result, &old_access_key).await?;
 
     tracing::info!(
         "IAM user '{}' keys rotated (new: {})",

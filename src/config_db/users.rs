@@ -260,23 +260,6 @@ impl ConfigDb {
         Ok(())
     }
 
-    /// Rotate access keys for a user. Returns updated user with new keys.
-    pub fn rotate_keys(
-        &self,
-        user_id: i64,
-        new_access_key_id: &str,
-        new_secret_access_key: &str,
-    ) -> Result<IamUser, ConfigDbError> {
-        let rows = self.conn.execute(
-            "UPDATE users SET access_key_id = ?1, secret_access_key = ?2 WHERE id = ?3",
-            params![new_access_key_id, new_secret_access_key, user_id],
-        )?;
-        if rows == 0 {
-            return Err(ConfigDbError::NotFound(format!("User ID {}", user_id)));
-        }
-        self.get_user_by_id(user_id)
-    }
-
     /// Find a user by access_key_id.
     pub fn get_user_by_access_key(
         &self,

@@ -36,9 +36,13 @@ function useInvalidateUsers() {
   };
 }
 
-/** Also the groups list: it shows each group's member ids, and a delete
- *  removes the user from its groups, a clone can copy the memberships. */
-function useInvalidateUsersAndGroups() {
+/**
+ * THE invalidation of an IAM write that reaches both lists (F63): the groups
+ * list shows each group's member ids, a user delete removes the user from its
+ * groups, a clone can copy memberships, and a group write changes the users'
+ * inherited permissions. Users and groups mutations both use it.
+ */
+export function useInvalidateIamLists() {
   const qc = useQueryClient();
   return () => {
     qc.invalidateQueries({ queryKey: qk.users.list() });
@@ -68,7 +72,7 @@ export function useUpdateUser() {
 }
 
 export function useDeleteUser() {
-  const invalidate = useInvalidateUsersAndGroups();
+  const invalidate = useInvalidateIamLists();
   return useMutation<void, Error, number>({
     mutationFn: deleteUser,
     onSuccess: invalidate,
@@ -82,7 +86,7 @@ interface CloneUserVars {
 }
 
 export function useCloneUser() {
-  const invalidate = useInvalidateUsersAndGroups();
+  const invalidate = useInvalidateIamLists();
   return useMutation<IamUser, Error, CloneUserVars>({
     mutationFn: ({ id, name, copyGroupMemberships }) =>
       cloneUser(id, { name, copy_group_memberships: copyGroupMemberships }),

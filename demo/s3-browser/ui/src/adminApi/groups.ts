@@ -18,15 +18,35 @@ interface CreateGroupRequest {
 }
 
 /**
- * One edit of a group, in ONE request. `member_ids` is the WHOLE member list
- * the group must have afterwards; the server applies the difference in the
- * same transaction as the rest, so a refusal of any part applies none.
+ * One edit of a group, in ONE request. The member change is the users to add
+ * and to remove, never the whole list: other writers (another admin, a peer
+ * node, an OIDC login) change members too, and a whole list would undo what
+ * they did since the form opened. The server applies the change in the same
+ * transaction as the rest, so a refusal of any part applies none.
  */
-interface UpdateGroupRequest {
+export interface UpdateGroupRequest {
   name?: string;
   description?: string;
   permissions?: IamPermission[];
-  member_ids?: number[];
+  add_member_ids?: number[];
+  remove_member_ids?: number[];
+}
+
+/**
+ * The member change of a form: the members it added and removed against the
+ * list it started from. Empty (no field at all) when nothing was toggled.
+ */
+export function memberDelta(
+  start: readonly number[],
+  now: ReadonlySet<number>,
+): Pick<UpdateGroupRequest, 'add_member_ids' | 'remove_member_ids'> {
+  const was = new Set(start);
+  const add = [...now].filter((id) => !was.has(id)).sort((a, b) => a - b);
+  const remove = start.filter((id) => !now.has(id)).sort((a, b) => a - b);
+  return {
+    ...(add.length > 0 ? { add_member_ids: add } : {}),
+    ...(remove.length > 0 ? { remove_member_ids: remove } : {}),
+  };
 }
 
 export async function getGroups(): Promise<IamGroup[]> {
