@@ -1304,6 +1304,185 @@ async fn users_rotate_clone_delete_and_empty_name() {
 
 // ── Usage scanner ───────────────────────────────────────────────────────
 
+/// F23 (epic #146): a user edit is ONE request. A change of the access key
+/// rides on the same `PUT`, and a refusal of any part leaves the whole user
+/// as it was; the refusal names the access key, never the name.
+#[tokio::test]
+async fn user_edit_with_new_keys_is_one_atomic_request() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let a = create_user(&admin, &ep, "edit-a", admin_perms()).await;
+    let b = create_user(&admin, &ep, "edit-b", admin_perms()).await;
+    let id = a["id"].as_i64().unwrap();
+    let (ak, sk) = (
+        a["access_key_id"].as_str().unwrap().to_string(),
+        a["secret_access_key"].as_str().unwrap().to_string(),
+    );
+    let put = |body: Value| {
+        admin
+            .put(format!("{ep}/_/api/admin/users/{id}"))
+            .json(&body)
+            .send()
+    };
+
+    // The new access key is another user's: 409 about the key, nothing applied.
+    let (code, v) = json_of(
+        put(json!({
+            "name": "edit-a-renamed",
+            "enabled": false,
+            "access_key_id": b["access_key_id"],
+        }))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{v}");
+    let text = v["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        text.contains("access key"),
+        "the text names the access key: {text}"
+    );
+    assert!(
+        !text.starts_with("the name"),
+        "the text does not blame the name: {text}"
+    );
+    let users: Value = admin
+        .get(format!("{ep}/_/api/admin/users"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"].as_i64() == Some(id))
+        .unwrap();
+    assert_eq!(row["name"], "edit-a", "the rename was not applied");
+    assert_eq!(row["enabled"], true, "the disable was not applied");
+    assert_eq!(
+        s3_status(&server, &ak, &sk).await,
+        200,
+        "the old key still works"
+    );
+
+    // The whole edit in one request: rename, disable-free, new key and secret.
+    let (code, v) = json_of(
+        put(json!({
+            "name": "edit-a2",
+            "access_key_id": "EDITEDKEY00001",
+            "secret_access_key": "edited-secret-0001",
+        }))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "edit-a2");
+    assert_eq!(v["access_key_id"], "EDITEDKEY00001");
+    assert_eq!(
+        v["secret_access_key"], "edited-secret-0001",
+        "shown once, as on rotate"
+    );
+    assert_eq!(
+        s3_status(&server, &ak, &sk).await,
+        403,
+        "the old key is dead"
+    );
+    assert_eq!(
+        s3_status(&server, "EDITEDKEY00001", "edited-secret-0001").await,
+        200
+    );
+    assert_audited(&admin, &ep, "update_user", "edit-a2").await;
+    assert_audited(&admin, &ep, "rotate_keys", "edit-a2").await;
+
+    // An edit without keys does not show the secret and keeps the keys.
+    let (code, v) = json_of(put(json!({ "name": "edit-a3" })).await.unwrap()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["access_key_id"], "EDITEDKEY00001");
+    assert!(v["secret_access_key"]
+        .as_str()
+        .map_or(true, |s| s != "edited-secret-0001"));
+
+    // A bad access key id is a 400 and applies nothing.
+    let (code, _) = json_of(
+        put(json!({ "name": "edit-a4", "access_key_id": "HAS SPACE" }))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    let (code, v) = json_of(put(json!({})).await.unwrap()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "edit-a3", "the refused edit changed nothing");
+}
+
+/// F23 (epic #146), groups: the membership change rides on the same `PUT` as
+/// the rest of the edit; a member that does not exist applies nothing.
+#[tokio::test]
+async fn group_edit_with_members_is_one_atomic_request() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let u1 = create_user(&admin, &ep, "gm-one", json!([])).await["id"]
+        .as_i64()
+        .unwrap();
+    let u2 = create_user(&admin, &ep, "gm-two", json!([])).await["id"]
+        .as_i64()
+        .unwrap();
+    let (code, g) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/groups"))
+            .json(&json!({ "name": "gm-team", "member_ids": [u1] }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{g}");
+    let gid = g["id"].as_i64().unwrap();
+    let put = |body: Value| {
+        admin
+            .put(format!("{ep}/_/api/admin/groups/{gid}"))
+            .json(&body)
+            .send()
+    };
+
+    // One request: rename, drop one member, add another.
+    let (code, v) = json_of(
+        put(json!({ "name": "gm-team2", "member_ids": [u2] }))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "gm-team2");
+    assert_eq!(v["member_ids"], json!([u2]));
+    assert_audited(&admin, &ep, "add_member", "gm-two").await;
+    assert_audited(&admin, &ep, "remove_member", "gm-one").await;
+
+    // A member that does not exist: refused, and the rename is not applied.
+    let (code, v) = json_of(
+        put(json!({ "name": "gm-team3", "member_ids": [u2, 999_999] }))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{v}");
+    let (code, v) = json_of(put(json!({})).await.unwrap()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "gm-team2", "the refused edit changed nothing");
+    assert_eq!(v["member_ids"], json!([u2]));
+
+    // No `member_ids`: the members stay.
+    let (code, v) = json_of(put(json!({ "description": "d" })).await.unwrap()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["member_ids"], json!([u2]));
+}
+
 #[tokio::test]
 async fn usage_scan_counter_refresh_and_legacy_migrate() {
     let server = TestServer::filesystem().await;

@@ -16,7 +16,6 @@ import {
   updateUser,
   deleteUser,
   cloneUser,
-  rotateUserKeys,
   type IamUser,
   type CreateUserRequest,
   type UpdateUserRequest,
@@ -77,21 +76,6 @@ export function useCloneUser() {
   return useMutation<IamUser, Error, CloneUserVars>({
     mutationFn: ({ id, name, copyGroupMemberships }) =>
       cloneUser(id, { name, copy_group_memberships: copyGroupMemberships }),
-    onSuccess: invalidate,
-  });
-}
-
-interface RotateUserKeysVars {
-  id: number;
-  accessKeyId?: string;
-  secretAccessKey?: string;
-}
-
-export function useRotateUserKeys() {
-  const invalidate = useInvalidateUsers();
-  return useMutation<IamUser, Error, RotateUserKeysVars>({
-    mutationFn: ({ id, accessKeyId, secretAccessKey }) =>
-      rotateUserKeys(id, accessKeyId, secretAccessKey),
     onSuccess: invalidate,
   });
 }

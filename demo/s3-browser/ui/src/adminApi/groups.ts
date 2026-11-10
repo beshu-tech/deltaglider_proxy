@@ -17,10 +17,16 @@ interface CreateGroupRequest {
   permissions: IamPermission[];
 }
 
+/**
+ * One edit of a group, in ONE request. `member_ids` is the WHOLE member list
+ * the group must have afterwards; the server applies the difference in the
+ * same transaction as the rest, so a refusal of any part applies none.
+ */
 interface UpdateGroupRequest {
   name?: string;
   description?: string;
   permissions?: IamPermission[];
+  member_ids?: number[];
 }
 
 export async function getGroups(): Promise<IamGroup[]> {
@@ -54,12 +60,5 @@ export async function addGroupMember(groupId: number, userId: number): Promise<v
     method: 'POST',
     body: { user_id: userId },
     context: `Add member ${userId} to group ${groupId}`,
-  });
-}
-
-export async function removeGroupMember(groupId: number, userId: number): Promise<void> {
-  await adminRequest(`/api/admin/groups/${groupId}/members/${userId}`, {
-    method: 'DELETE',
-    context: `Remove member ${userId} from group ${groupId}`,
   });
 }

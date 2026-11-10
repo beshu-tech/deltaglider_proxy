@@ -31,6 +31,24 @@ pub struct UpdateGroupRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub permissions: Option<Vec<Permission>>,
+    /// The WHOLE member list the group must have after the edit. The
+    /// difference to the current members is applied in the same transaction
+    /// as the rest of the edit: one edit is one request, and a refusal of
+    /// any part (a user that does not exist, a name another group has)
+    /// applies none.
+    pub member_ids: Option<Vec<i64>>,
+}
+
+/// Pure: the members to add and to remove so that the group has exactly
+/// `wanted`, each list sorted and without duplicates.
+pub(crate) fn member_changes(current: &[i64], wanted: &[i64]) -> (Vec<i64>, Vec<i64>) {
+    use std::collections::BTreeSet;
+    let current: BTreeSet<i64> = current.iter().copied().collect();
+    let wanted: BTreeSet<i64> = wanted.iter().copied().collect();
+    (
+        wanted.difference(&current).copied().collect(),
+        current.difference(&wanted).copied().collect(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -217,17 +235,44 @@ pub async fn update_group(
         }
     }
 
+    // The membership part of the edit, decided BEFORE the first write.
+    let changes = match body.member_ids.as_deref() {
+        Some(wanted) => Some(member_changes(&db.get_group_members(group_id)?, wanted)),
+        None => None,
+    };
+
     let group = db
-        .update_group(
+        .update_group_with_members(
             group_id,
             body.name.as_deref(),
             body.description.as_deref(),
             normalized_perms.as_deref(),
+            changes
+                .as_ref()
+                .map(|(add, remove)| (add.as_slice(), remove.as_slice())),
         )
         .inspect_err(|e| {
             tracing::warn!("Failed to update group {}: {}", group_id, e);
-            // A rename to a name another group has → 409.
+            // A rename to a name another group has → 409; a member that does
+            // not exist → 404; nothing was applied.
         })?;
+
+    // The audit lines of the member changes: the same two the per-member
+    // endpoints write.
+    if let Some((add, remove)) = &changes {
+        for (action, ids, direction) in
+            [("add_member", add, "to"), ("remove_member", remove, "from")]
+        {
+            for &user_id in ids {
+                let target = format!(
+                    "user {} {direction} group {}",
+                    user_target(&db, user_id),
+                    group_target(&db, group_id)
+                );
+                audit_log(action, "admin", &target, &headers);
+            }
+        }
+    }
 
     rebuild_iam_index(&db, &state.iam_state)?;
     trigger_config_sync(&state);
@@ -346,4 +391,17 @@ fn user_target(db: &crate::config_db::ConfigDb, id: i64) -> String {
         .and_then(|us| us.into_iter().find(|u| u.id == id))
         .map(|u| u.name);
     super::named_target(name.as_deref(), id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::member_changes;
+
+    #[test]
+    fn member_changes_are_the_difference_to_the_wanted_list() {
+        assert_eq!(member_changes(&[1, 2, 3], &[2, 3, 4]), (vec![4], vec![1]));
+        assert_eq!(member_changes(&[], &[5, 5, 3]), (vec![3, 5], vec![]));
+        assert_eq!(member_changes(&[1, 2], &[]), (vec![], vec![1, 2]));
+        assert_eq!(member_changes(&[1, 2], &[2, 1]), (vec![], vec![]));
+    }
 }

@@ -20,7 +20,6 @@ import {
   deleteGroup,
   cloneGroup,
   addGroupMember,
-  removeGroupMember,
   type IamGroup,
 } from '../adminApi';
 import type { IamPermission } from '../adminApi';
@@ -59,7 +58,7 @@ export function useCreateGroup() {
 
 interface UpdateGroupVars {
   id: number;
-  patch: { name?: string; description?: string; permissions?: IamPermission[] };
+  patch: { name?: string; description?: string; permissions?: IamPermission[]; member_ids?: number[] };
 }
 
 export function useUpdateGroup() {
@@ -100,14 +99,6 @@ export function useAddGroupMember() {
   const invalidate = useInvalidateGroups();
   return useMutation<void, Error, GroupMemberVars>({
     mutationFn: ({ groupId, userId }) => addGroupMember(groupId, userId),
-    onSuccess: invalidate,
-  });
-}
-
-export function useRemoveGroupMember() {
-  const invalidate = useInvalidateGroups();
-  return useMutation<void, Error, GroupMemberVars>({
-    mutationFn: ({ groupId, userId }) => removeGroupMember(groupId, userId),
     onSuccess: invalidate,
   });
 }

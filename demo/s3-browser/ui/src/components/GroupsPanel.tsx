@@ -3,7 +3,7 @@ import { Button, Typography, Alert, Input, Divider, Checkbox, message } from 'an
 import { TeamOutlined, CopyOutlined } from '@ant-design/icons';
 import type { IamGroup, IamUser } from '../adminApi';
 import { useIamMode } from '../queries/config';
-import { useGroups, useCreateGroup, useUpdateGroup, useDeleteGroup, useCloneGroup, useAddGroupMember, useRemoveGroupMember } from '../queries/groups';
+import { useGroups, useCreateGroup, useUpdateGroup, useDeleteGroup, useCloneGroup, useAddGroupMember } from '../queries/groups';
 import { useUsers } from '../queries/users';
 import { useCardStyles } from './shared-styles';
 import FormField from './FormField';
@@ -303,7 +303,6 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
   const updateGroupMutation = useUpdateGroup();
   const deleteGroupMutation = useDeleteGroup();
   const addMemberMutation = useAddGroupMember();
-  const removeMemberMutation = useRemoveGroupMember();
 
   // Initialize from `group` once. The edit form is remounted with
   // `key={selectedGroup.id}` (see render site), and the create form mounts
@@ -354,27 +353,18 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
     setServerNameError(null);
     try {
       if (isEdit) {
+        // ONE request for the whole edit, the member list included: the
+        // server applies the member changes in the same transaction, so a
+        // refusal of any part applies none.
         await updateGroupMutation.mutateAsync({
           id: group.id,
           patch: {
             name: name.trim(),
             description: description.trim(),
             permissions: rowsToPermissions(permissions),
+            member_ids: [...memberIds].sort((a, b) => a - b),
           },
         });
-
-        // Sync membership: add/remove as needed
-        const currentMembers = new Set(group.member_ids);
-        for (const uid of memberIds) {
-          if (!currentMembers.has(uid)) {
-            await addMemberMutation.mutateAsync({ groupId: group.id, userId: uid });
-          }
-        }
-        for (const uid of currentMembers) {
-          if (!memberIds.has(uid)) {
-            await removeMemberMutation.mutateAsync({ groupId: group.id, userId: uid });
-          }
-        }
         markClean();
       } else {
         const created = await createGroupMutation.mutateAsync({

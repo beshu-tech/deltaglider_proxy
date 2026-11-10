@@ -33,10 +33,18 @@ export interface CreateUserRequest {
   permissions: IamPermission[];
 }
 
+/**
+ * One edit of a user, in ONE request. `access_key_id` / `secret_access_key`
+ * rotate the keys in the same transaction (a refusal of any part applies
+ * none); the answer then carries the new secret, shown once. A secret that
+ * is not given is generated.
+ */
 export interface UpdateUserRequest {
   name?: string;
   enabled?: boolean;
   permissions?: IamPermission[];
+  access_key_id?: string;
+  secret_access_key?: string;
 }
 
 export async function getUsers(): Promise<IamUser[]> {
@@ -60,18 +68,4 @@ export async function updateUser(id: number, req: UpdateUserRequest): Promise<Ia
 
 export async function deleteUser(id: number): Promise<void> {
   await adminRequest(`/api/admin/users/${id}`, { method: 'DELETE', context: `Delete user ${id}` });
-}
-
-export async function rotateUserKeys(
-  id: number,
-  accessKeyId?: string,
-  secretAccessKey?: string,
-): Promise<IamUser> {
-  const body: Record<string, string> = {};
-  if (accessKeyId) body.access_key_id = accessKeyId;
-  if (secretAccessKey) body.secret_access_key = secretAccessKey;
-  return adminJson(`/api/admin/users/${id}/rotate-keys`, {
-    method: 'POST',
-    body: Object.keys(body).length > 0 ? body : undefined,
-  });
 }
