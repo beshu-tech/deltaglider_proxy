@@ -525,7 +525,7 @@ where
             },
         ));
 
-    if state.config_db_locked {
+    if state.config_db_key_mismatch {
         tracing::error!(
             "S3 API LOCKED — all requests will be rejected until the config DB key mismatch is resolved via /_/"
         );

@@ -864,14 +864,14 @@ pub async fn sigv4_auth_middleware(
     // `ConfigDbMismatchGuard` marker is injected by `build_s3_router` when no
     // config DB key decrypts the config DB. A missing IAM extension (a
     // router built without it) fails closed: deny all.
-    let config_db_locked = request
+    let config_db_key_mismatch = request
         .extensions()
         .get::<crate::api::ConfigDbMismatchGuard>()
         .is_some();
     let deny_all = IamState::deny_all();
     let iam_state = iam_snapshot.as_deref().unwrap_or(&deny_all);
 
-    let auth_config = match classify_auth_gate(config_db_locked, iam_state) {
+    let auth_config = match classify_auth_gate(config_db_key_mismatch, iam_state) {
         AuthGateDecision::Locked => {
             // Clear 503 with a recovery hint — NOT a misleading 500.
             // The proxy must not serve data without working authentication.

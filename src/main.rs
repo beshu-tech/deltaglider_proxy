@@ -931,7 +931,7 @@ async fn async_main(
         backend_capabilities: backend_capabilities.clone(),
         backend_health: backend_health.clone(),
         encryption_witness: encryption_witness.clone(),
-        config_db_locked: config_db_mismatch,
+        config_db_key_mismatch: config_db_mismatch,
     });
     // The background writers (replication, lifecycle) ask the encryption
     // witness and the key sentinel through the maintenance gate: a refused

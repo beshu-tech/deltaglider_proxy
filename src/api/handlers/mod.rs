@@ -77,7 +77,7 @@ impl AppState {
             backend_capabilities: Default::default(),
             backend_health: Default::default(),
             encryption_witness: None,
-            config_db_locked: false,
+            config_db_key_mismatch: false,
         })
     }
 }
@@ -120,7 +120,7 @@ pub struct AppState {
     /// No config-DB key opens the config DB: the S3 API refuses every request
     /// (503 "Config database locked", `ConfigDbMismatchGuard`). Fixed at boot;
     /// `/_/ready` reads it, so both surfaces share one fact.
-    pub config_db_locked: bool,
+    pub config_db_key_mismatch: bool,
 }
 
 // ---------------------------------------------------------------------------

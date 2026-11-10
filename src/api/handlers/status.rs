@@ -467,6 +467,10 @@ fn config_db_word(mutex_word: &'static str, key_mismatch: bool) -> &'static str 
     }
 }
 
+/// How long `/_/ready` waits for the spool check before it calls the spool
+/// unusable.
+const SPOOL_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// `ready` when the lock is free within [`CONFIG_DB_READY_WAIT`], else `locked`.
 async fn lock_readiness<T>(db: &tokio::sync::Mutex<T>) -> &'static str {
     match tokio::time::timeout(CONFIG_DB_READY_WAIT, db.lock()).await {
@@ -509,7 +513,7 @@ pub async fn readiness_check(
         Some(db) => lock_readiness(db).await,
         None => "absent",
     };
-    let config_db = config_db_word(config_db_mutex, state.config_db_locked);
+    let config_db = config_db_word(config_db_mutex, state.config_db_key_mismatch);
     let jobs_db = match &state.jobs_db {
         Some(db) => lock_readiness(db).await,
         None => "absent",
@@ -529,16 +533,18 @@ pub async fn readiness_check(
     let backends_ok = live_backends_ready(&verdicts);
     let backend = if backends_ok { backend } else { "unreachable" };
     // The spool check makes and drops one temp file (and re-creates a
-    // removed directory): off the async threads.
+    // removed directory): off the async threads, single-flight, cached for
+    // a few seconds and bounded (`BackendHealthCache::spool_probe`).
     let spool_usable = {
         let engine = state.engine.load_full();
-        tokio::task::spawn_blocking(move || engine.spool_usable())
+        state
+            .backend_health
+            .spool_probe(move || engine.spool_usable(), SPOOL_READY_TIMEOUT)
             .await
-            .unwrap_or(false)
     };
     let ready = readiness_verdict(&NodeConditions {
         backends_ready: backend_verdict_is_ready(backend),
-        config_db_key_mismatch: state.config_db_locked,
+        config_db_key_mismatch: state.config_db_key_mismatch,
         config_db_wedged: config_db_mutex == "locked",
         jobs_db_wedged: jobs_db == "locked",
         spool_usable,
@@ -647,7 +653,7 @@ mod readiness_tests {
     async fn a_config_db_key_mismatch_is_not_ready() {
         let (engine, _fake) = crate::deltaglider::s3_engine().await;
         let mut state = AppState::for_tests(engine);
-        Arc::get_mut(&mut state).unwrap().config_db_locked = true;
+        Arc::get_mut(&mut state).unwrap().config_db_key_mismatch = true;
         state.backend_health.set_loop_interval(EVERY);
         let (code, Json(body)) = readiness_check(State(state)).await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -741,12 +747,12 @@ mod readiness_tests {
         }
         // The row is fed by the SAME fact the S3 router locks on.
         assert!(
-            status_src.contains("config_db_key_mismatch: state.config_db_locked"),
-            "readiness must read AppState::config_db_locked"
+            status_src.contains("config_db_key_mismatch: state.config_db_key_mismatch"),
+            "readiness must read AppState::config_db_key_mismatch"
         );
         assert!(
-            include_str!("../s3_router.rs").contains("if state.config_db_locked"),
-            "the S3 router must lock on AppState::config_db_locked"
+            include_str!("../s3_router.rs").contains("if state.config_db_key_mismatch"),
+            "the S3 router must lock on AppState::config_db_key_mismatch"
         );
     }
 
