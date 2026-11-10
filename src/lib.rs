@@ -1257,12 +1257,11 @@ mod source_guards {
                 continue;
             }
             let text = std::fs::read_to_string(&file).unwrap();
-            for (n, line) in text.lines().enumerate() {
-                let hit = TOKENS
-                    .iter()
-                    .any(|t| line.contains(&format!(".contains(\"{t}\")")));
-                if hit && !line.contains("assert") && !line.contains("TOKENS") {
-                    offenders.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+            let lines: Vec<&str> = text.lines().collect();
+            for n in text_match_lines(&text, &TOKENS) {
+                let line = lines[n - 1];
+                if !line.contains("assert") && !line.contains("TOKENS") {
+                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
                 }
             }
         }
@@ -1271,6 +1270,49 @@ mod source_guards {
             "classify errors on their type/status/code, not their text:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// 1-based lines where `text` tests a string against one of `tokens`:
+    /// `.contains("T")`, `.starts_with("T")`, `.ends_with("T")` or
+    /// `.eq_ignore_ascii_case("T")`, with a `&` or whitespace (a line break
+    /// included) around the literal. The old scan looked for the exact text
+    /// `.contains("T")` on one line, so rustfmt's line break after `(`, a
+    /// `&"T"` and `starts_with` all passed.
+    fn text_match_lines(text: &str, tokens: &[&str]) -> Vec<usize> {
+        let alt = tokens
+            .iter()
+            .map(|t| regex_lite::escape(t))
+            .collect::<Vec<_>>()
+            .join("|");
+        let re = regex_lite::Regex::new(&format!(
+            r#"\.(contains|starts_with|ends_with|eq_ignore_ascii_case)\(\s*&?\s*"({alt})"\s*,?\s*\)"#
+        ))
+        .unwrap();
+        re.find_iter(text)
+            .map(|m| text[..m.start()].matches('\n').count() + 1)
+            .collect()
+    }
+
+    #[test]
+    fn the_text_match_guard_sees_split_and_prefix_forms() {
+        let t = ["NoSuch", "Key"].concat();
+        let tokens = [t.as_str()];
+        let one = format!("if e.contains(\"{t}\") {{}}");
+        assert_eq!(text_match_lines(&one, &tokens), vec![1]);
+        // rustfmt breaks a long condition after the `(`.
+        let split = format!("x\nif message\n    .contains(\n        \"{t}\",\n    )\n{{}}");
+        assert_eq!(text_match_lines(&split, &tokens), vec![3]);
+        for method in ["starts_with", "ends_with", "eq_ignore_ascii_case"] {
+            let src = format!("if m.{method}(\"{t}\") {{}}");
+            assert_eq!(text_match_lines(&src, &tokens), vec![1], "{method}");
+        }
+        assert_eq!(
+            text_match_lines(&format!("m.contains(&\"{t}\")"), &tokens),
+            vec![1]
+        );
+        // Not a hit: another literal, or a bare mention.
+        assert!(text_match_lines("m.contains(\"other\")", &tokens).is_empty());
+        assert!(text_match_lines(&format!("let k = \"{t}\";"), &tokens).is_empty());
     }
 
     /// A request handler audits with the request's headers, so the entry
@@ -1406,28 +1448,120 @@ mod source_guards {
     /// config DB and its key file when `DGP_CONFIG` is unset) relative to
     /// its cwd. A spawn that inherits the test process's cwd writes them
     /// into the repo root, where a later dev run of the binary picks them up.
+    ///
+    /// Per spawn, not per file: the old guard compared the number of spawns
+    /// with the number of `.current_dir(` in the whole file, so an unrelated
+    /// `.current_dir(` (a `git` command) paid for a spawn that had none.
     #[test]
     fn integration_test_spawns_set_current_dir() {
-        // Built at runtime so this file does not match itself.
-        let bin_needle = format!("Command::new(env!(\"{}", "CARGO_BIN_EXE");
         let files = rust_files("tests");
         assert!(files.len() > 50, "scan found tests/ ({})", files.len());
         let mut offenders = Vec::new();
         for file in files {
             let text = std::fs::read_to_string(&file).unwrap();
-            let spawns =
-                text.matches(&bin_needle).count() + text.matches("Command::new(BIN)").count();
-            let cwds = text.matches(".current_dir(").count();
-            if spawns > cwds {
-                offenders.push(format!(
-                    "{}: {spawns} spawn(s), {cwds} current_dir",
-                    rel_path(&file)
-                ));
+            for n in spawns_without_cwd(&text) {
+                offenders.push(format!("{}:{n}", rel_path(&file)));
             }
         }
         assert!(
             offenders.is_empty(),
             "spawn the proxy with .current_dir(<temp dir>): {offenders:?}"
+        );
+    }
+
+    /// `coordination::durable_node_id` creates `<dir>/node-id` when no env
+    /// names the node. Only the boot path (`startup.rs`), which owns the data
+    /// directory, may call it; a label for a witness or a log line goes
+    /// through `node_id_label`, which never writes. A lib test that reached
+    /// the persisting form left `node-id` in the repository root.
+    #[test]
+    fn only_startup_persists_the_node_id() {
+        const ALLOWED: [&str; 2] = ["src/startup.rs", "src/coordination/mod.rs"];
+        let needle = ["durable_node", "_id("].concat();
+        let src = rust_files("src");
+        let test_files = out_of_line_test_modules(&src);
+        let mut offenders = Vec::new();
+        for file in src {
+            let rel = rel_path(&file);
+            if ALLOWED.contains(&rel.as_str()) || test_files.contains(&file) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                if line.contains(needle.as_str()) {
+                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use coordination::node_id_label (never writes) outside startup.rs:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// 1-based lines of the proxy spawns in `text` that set no `.current_dir(`
+    /// before the next spawn or the end of the enclosing function. A spawn
+    /// is `Command::new(env!("CARGO_BIN_EXE_...` or `Command::new(BIN)`.
+    fn spawns_without_cwd(text: &str) -> Vec<usize> {
+        // Built at runtime so this file does not match itself.
+        let bin_needle = format!("Command::new(env!(\"{}", "CARGO_BIN_EXE");
+        let lines: Vec<&str> = text.lines().collect();
+        let is_spawn = |l: &str| l.contains(bin_needle.as_str()) || l.contains("Command::new(BIN)");
+        let is_fn_start = |l: &str| {
+            let t = l.trim_start();
+            t.starts_with("fn ")
+                || t.starts_with("async fn ")
+                || t.starts_with("pub fn ")
+                || t.starts_with("pub async fn ")
+        };
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !is_spawn(line) {
+                continue;
+            }
+            let end = lines[i + 1..]
+                .iter()
+                .position(|l| is_spawn(l) || is_fn_start(l))
+                .map_or(lines.len(), |p| i + 1 + p);
+            if !lines[i..end].iter().any(|l| l.contains(".current_dir(")) {
+                out.push(i + 1);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_cwd_guard_checks_each_spawn() {
+        let spawn = |extra: &str| {
+            format!(
+                "Command::new(env!(\"{}_deltaglider_proxy\"))\n{extra}.spawn()",
+                "CARGO_BIN_EXE"
+            )
+        };
+        // One spawn with a cwd: fine.
+        let ok = format!("fn a() {{\n{}\n}}\n", spawn(".current_dir(tmp)\n"));
+        assert!(spawns_without_cwd(&ok).is_empty());
+        // Two spawns, one `.current_dir(` in the FILE (on a git command in
+        // another function): the second spawn has none. The count-based
+        // guard passed this.
+        let bad = format!(
+            "fn a() {{\n{}\n}}\nfn git() {{\nCommand::new(\"git\").current_dir(x);\n}}\nfn b() {{\n{}\n}}\n",
+            spawn(".current_dir(tmp)\n"),
+            spawn("")
+        );
+        assert_eq!(spawns_without_cwd(&bad).len(), 1);
+        // Two spawns in ONE function, a cwd on the first only.
+        let two = format!(
+            "fn a() {{\n{}\n{}\n}}\n",
+            spawn(".current_dir(tmp)\n"),
+            spawn("")
+        );
+        assert_eq!(spawns_without_cwd(&two).len(), 1);
+        // The `BIN` form.
+        assert_eq!(
+            spawns_without_cwd("fn a() {\nCommand::new(BIN).arg(\"x\");\n}").len(),
+            1
         );
     }
 
