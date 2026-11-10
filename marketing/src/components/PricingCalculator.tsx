@@ -440,7 +440,7 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
           <a className="btn btn-brand" href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20Enterprise%20inquiry">
             Talk to sales
           </a>
-          <a className="link-action" href="/trial">
+          <a className="link-action" href="/support">
             Start a 30-day trial
           </a>
           <button type="button" className="link-action" onClick={onCopy}>
@@ -478,7 +478,7 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
       <Warnings warnings={result.warnings} />
 
       <div className="card-ctas">
-        <a className="btn btn-brand" href="/trial">
+        <a className="btn btn-brand" href="/support">
           Start a 30-day trial
         </a>
         <a className="link-action" href="https://github.com/beshu-tech/deltaglider_proxy">

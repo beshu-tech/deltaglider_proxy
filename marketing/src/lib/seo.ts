@@ -138,7 +138,7 @@ export function softwareApplicationSchema() {
 }
 
 interface WebPageInput {
-  /** Page path starting with /, e.g. "/saas". */
+  /** Page path starting with /, e.g. "/build-artifacts". */
   path: string;
   /** Page title — should match <title>. */
   title: string;
@@ -232,14 +232,14 @@ export function trialOfferSchema({ durationDays }: TrialOfferInput) {
   return {
     '@context': 'https://schema.org',
     '@type': 'Offer',
-    '@id': `${SITE.url}/trial#offer`,
+    '@id': `${SITE.url}/support#offer`,
     name: `${durationDays}-day DeltaGlider Commercial trial`,
     description:
       'The trial includes direct engineering email, a 12-hour response SLA, and one architecture review call. The software is source-available (BUSL-1.1) and stays free under the 15 TB grant regardless.',
     price: '0',
     priceCurrency: 'USD',
     availability: 'https://schema.org/InStock',
-    url: `${SITE.url}/trial`,
+    url: `${SITE.url}/support`,
     eligibleDuration: {
       '@type': 'QuantitativeValue',
       value: durationDays,

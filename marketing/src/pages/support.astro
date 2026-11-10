@@ -1,5 +1,5 @@
 ---
-// /trial — 30-day Commercial-plan trial. The software is BUSL-1.1 and
+// /support (was /trial) — 30-day Commercial-plan trial. The software is BUSL-1.1 and
 // free under the 15 TB grant regardless; the trial is for the support
 // relationship (direct engineering email + 12h SLA + arch review call).
 // Frame C: trial the relationship, not the software. A text-only hero,
@@ -7,6 +7,7 @@
 // columns. We do NOT promise Slack
 // channels or operating migrations.
 
+import TestimonialsBlock from '../components/TestimonialsBlock.astro';
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
 import Glyph from '../components/Glyph.astro';
@@ -64,11 +65,11 @@ const timeline = [
 
 <BaseLayout title={title} description={description}>
   <Fragment slot="json-ld">
-    <JsonLd schema={webPageSchema({ path: '/trial', title, description })} />
+    <JsonLd schema={webPageSchema({ path: '/support', title, description })} />
     <JsonLd
       schema={breadcrumbListSchema([
         { name: 'DeltaGlider', path: '/' },
-        { name: 'Trial', path: '/trial' },
+        { name: 'Trial', path: '/support' },
       ])}
     />
     <JsonLd schema={trialOfferSchema({ durationDays: 30 })} />
@@ -205,6 +206,8 @@ const timeline = [
         the cheapest way for both sides to find out if we're a fit.
       </p>
     </section>
+
+    <TestimonialsBlock />
 
     <section class="cta">
       <h2>Start your trial</h2>

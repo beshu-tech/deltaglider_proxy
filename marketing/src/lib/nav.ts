@@ -9,11 +9,10 @@ export interface NavLink {
 
 /** Primary header navigation, in display order. */
 export const NAV_LINKS: readonly NavLink[] = [
-  { label: 'SaaS', href: '/saas' },
-  { label: 'Regulated', href: '/regulated' },
+  { label: 'Build artifacts', href: '/build-artifacts' },
+  { label: 'Encryption', href: '/encryption' },
   { label: 'Pricing', href: '/pricing' },
   { label: 'Docs', href: '/docs' },
-  { label: 'Trial', href: '/trial' },
   { label: 'GitHub', href: 'https://github.com/beshu-tech/deltaglider_proxy' },
 ];
 
@@ -27,10 +26,10 @@ export const FOOTER_COLUMNS: readonly FooterColumn[] = [
   {
     title: 'Product',
     links: [
-      { label: 'For SaaS', href: '/saas' },
-      { label: 'For regulated', href: '/regulated' },
+      { label: 'Build artifacts', href: '/build-artifacts' },
+      { label: 'Encryption', href: '/encryption' },
       { label: 'Pricing', href: '/pricing' },
-      { label: '30-day trial', href: '/trial' },
+      { label: 'Support trial', href: '/support' },
       { label: 'Case studies', href: '/case-studies' },
     ],
   },

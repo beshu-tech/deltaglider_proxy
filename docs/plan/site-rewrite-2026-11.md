@@ -208,11 +208,11 @@ better choice". A compare page without it is an advertisement.
 | Step | Work | Size | Depends on |
 |---|---|---|---|
 | 0 | Analytics and funnel events | done | — |
-| 1 | Hero rewrite | S | — |
-| 2 | Visual system from the September audit, tokens first | M | — |
-| 3 | Copy guard (banned words and shapes) as a vitest | S | — |
-| 4 | Home page reorder and rewrite (section 5) | M | 1, 2 |
-| 5 | Rename `/saas`, `/regulated`, `/trial`; new header; redirects | S | 4 |
+| 1 | Hero rewrite | done | — |
+| 2 | Visual system from the September audit | done before this plan (checked 2026-11-10: one typeface pair, no emoji, no orbit, no caps eyebrows) | — |
+| 3 | Copy guard as a vitest (`marketing/src/lib/copyGuard.test.ts`) | done | — |
+| 4 | Home page reorder and rewrite (section 5) | done | 1, 2 |
+| 5 | Rename `/saas`, `/regulated`, `/trial`; header; redirects | done | 4 |
 | 6 | `/how-it-works`, `/changelog` | M | 5 |
 | 7 | `/support` form | S | 5 |
 | 8 | `/will-it-work`, with the estimator if the product gets one | M | product |

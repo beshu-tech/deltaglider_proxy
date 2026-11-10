@@ -1,5 +1,5 @@
 ---
-// /saas — v5 plan §4.2.
+// /build-artifacts (was /saas) — v5 plan §4.2.
 // Cost-driven migration story for SaaS / platform teams.
 // Calculator CTA front-and-center; per-version compression table
 // (verified, publishable today); migration playbook.
@@ -11,18 +11,18 @@ import MechanismExplanation from '../components/MechanismExplanation.astro';
 import CompressionResultsTable from '../components/CompressionResultsTable.astro';
 import { webPageSchema, breadcrumbListSchema } from '../lib/seo';
 
-const title = 'DeltaGlider for SaaS: cut S3 storage cost on versioned artifacts';
+const title = 'Cut the S3 storage cost of build artifacts — DeltaGlider';
 const description =
   'An S3 proxy that stores similar builds as small binary diffs instead of full copies. Your clients keep the same S3 API. It is source-available and free up to 15 TB.';
 ---
 
 <BaseLayout title={title} description={description}>
   <Fragment slot="json-ld">
-    <JsonLd schema={webPageSchema({ path: '/saas', title, description })} />
+    <JsonLd schema={webPageSchema({ path: '/build-artifacts', title, description })} />
     <JsonLd
       schema={breadcrumbListSchema([
         { name: 'DeltaGlider', path: '/' },
-        { name: 'For SaaS', path: '/saas' },
+        { name: 'For SaaS', path: '/build-artifacts' },
       ])}
     />
   </Fragment>
@@ -41,7 +41,7 @@ const description =
 
         <div class="hero-ctas">
           <a href="/pricing#calculator" class="btn btn-primary">Calculate your savings</a>
-          <a href="/trial" class="btn">30-day trial</a>
+          <a href="/support" class="btn">30-day trial</a>
           <a href="/docs/tutorials/first-delta-savings" class="btn">docker run</a>
         </div>
       </div>
@@ -55,7 +55,7 @@ const description =
   <div class="shell">
     <MechanismExplanation />
 
-    <section class="compute-tax">
+    <section class="compute-tax" id="speed">
       <h2>What it costs in speed</h2>
 
       <p>
@@ -170,7 +170,7 @@ const description =
       <div class="playbook-footer">
         <p>
           The Commercial plan's support helps with each of these steps.
-          See <a href="/trial">/trial</a> for the 30-day trial.
+          See <a href="/support">the 30-day support trial</a>.
         </p>
       </div>
     </section>
@@ -179,7 +179,7 @@ const description =
       <h2>Next step</h2>
       <div class="hero-ctas">
         <a href="/pricing#calculator" class="btn btn-primary">Try the savings calculator</a>
-        <a href="/trial" class="btn">Start a 30-day trial</a>
+        <a href="/support" class="btn">Start a 30-day trial</a>
       </div>
     </section>
   </div>

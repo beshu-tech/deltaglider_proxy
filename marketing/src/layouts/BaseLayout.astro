@@ -121,7 +121,7 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
             send('mailto-click', { page: page(), subject });
           } else if (href.startsWith('https://github.com/beshu-tech/deltaglider_proxy')) {
             send('github-click', { page: page() });
-          } else if (href === '/trial') {
+          } else if (href === '/support') {
             send('trial-click', { page: page() });
           } else if (href.startsWith('/docs/tutorials/')) {
             send('tutorial-click', { page: page(), to: href });

@@ -1,6 +1,6 @@
 ---
 import Glyph from '../components/Glyph.astro';
-// /regulated — v5 plan §4.3.
+// /encryption (was /regulated) — v5 plan §4.3.
 // Encryption + key custody story for regulated buyers (banks,
 // gov, research). Beshu customer-segment block above the fold,
 // full testimonials, technical sections, 4-week evaluation
@@ -14,18 +14,18 @@ import CustomerSegmentBlock from '../components/CustomerSegmentBlock.astro';
 import { webPageSchema, breadcrumbListSchema } from '../lib/seo';
 
 const title =
-  'DeltaGlider for regulated buyers: encrypt before the backend on cheap S3-compatible storage';
+  'Encrypt objects before they reach the bucket — DeltaGlider';
 const description =
   'DeltaGlider encrypts objects with AES-256-GCM before they reach the bucket. Your key stays in your runtime, so the backend sees only ciphertext. Built by Beshu Tech, the team behind ReadonlyREST, used since 2017 by CERN, EU institutions, and 2× of the S&P 500 top 5.';
 ---
 
 <BaseLayout title={title} description={description}>
   <Fragment slot="json-ld">
-    <JsonLd schema={webPageSchema({ path: '/regulated', title, description })} />
+    <JsonLd schema={webPageSchema({ path: '/encryption', title, description })} />
     <JsonLd
       schema={breadcrumbListSchema([
         { name: 'DeltaGlider', path: '/' },
-        { name: 'For regulated buyers', path: '/regulated' },
+        { name: 'For regulated buyers', path: '/encryption' },
       ])}
     />
   </Fragment>
@@ -217,7 +217,7 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
           >
             Email sales@beshu.tech
           </a>
-          <a href="/trial" class="btn">Start with the 30-day trial</a>
+          <a href="/support" class="btn">Start with the 30-day trial</a>
         </div>
       </section>
     </div>

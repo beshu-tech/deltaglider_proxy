@@ -7,7 +7,9 @@
 //   DropIn       what adoption costs (one config line) + trust facts
 //   ControlPlane the other half of the product + real admin-UI screens
 //   DueDiligence the visitor's own questions, answered with links
-//   Fit          is it for MY workload (honest no's) + where to go next
+//   Fit          is it for MY workload (honest no's)
+//   Cost         what compression costs, measured
+//   Price        what you pay
 // The quickstart command lives in the hero (2026-11, docs/plan/site-rewrite-2026-11.md).
 // No section repeats another's job. Casualties of the rethink: the stats
 // band, the abstract flow diagram, the standalone gallery, the doors grid,
@@ -16,7 +18,6 @@
 
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
-import TestimonialsBlock from '../components/TestimonialsBlock.astro';
 import QuickstartTerminal from '../components/QuickstartTerminal.astro';
 import WorkloadFitTable from '../components/WorkloadFitTable.astro';
 import HeroDiagram from '../components/HeroDiagram.astro';
@@ -87,27 +88,83 @@ import {
           its 1.71&nbsp;TB build catalog through the proxy.
           <a href="/case-studies/readonlyrest-builds">Read the migration
           log</a>. For help from the engineers, there is a
-          <a href="/trial">30-day commercial trial</a>.
+          <a href="/support">30-day commercial trial</a>.
         </p>
       </div>
       <HeroDiagram />
     </div>
   </section>
 
-  {/* ======================= SEE IT IN ACTION ======================== */}
-  <DemoVideo />
-
   {/* ===================== THE CLAIM, DRAWN TO SCALE ================== */}
   <StorageScale />
+
+  {/* ============================ HONEST FIT ========================== */}
+  <section class="section section-alt">
+    <div class="shell">
+      <WorkloadFitTable />
+
+      <p class="fit-next">
+        Put your own numbers into the
+        <a href="/pricing#calculator">savings calculator</a>, or read the
+        detail <a href="/build-artifacts">for build artifacts</a>.
+      </p>
+    </div>
+  </section>
 
   {/* ============================ DROP-IN ============================= */}
   <DropIn />
 
+  {/* ============================ THE COST ============================ */}
+  <section class="section section-alt">
+    <div class="shell">
+      <h2>What it costs</h2>
+
+      <p>
+        Compression is not free. We measured these on our own artifacts,
+        in one Hetzner region, over a single stream.
+      </p>
+
+      <dl class="cost-list">
+        <div>
+          <dt>Uploads are slower</dt>
+          <dd>
+            A PUT that is stored as a delta ran at 9&nbsp;MB/s, against
+            106&nbsp;MB/s for a file stored whole. The proxy computes the
+            diff before it answers.
+          </dd>
+        </div>
+        <div>
+          <dt>Downloads are about the same</dt>
+          <dd>
+            A cold GET of a delta ran at 89&nbsp;MB/s, against
+            97&nbsp;MB/s. A warm GET showed no slowdown.
+          </dd>
+        </div>
+        <div>
+          <dt>It is one more service to run</dt>
+          <dd>
+            One binary on one port. A single instance is the supported
+            production setup; several instances behind a load balancer
+            need the routing that the Kubernetes operator sets up.
+          </dd>
+        </div>
+      </dl>
+
+      <p class="fit-next">
+        <a href="/build-artifacts#speed">The full table and the method</a>
+        · <a href="/docs/how-to/scale-out-with-the-kubernetes-operator">Running several instances</a>
+      </p>
+    </div>
+  </section>
+
   {/* ======================= THE OTHER HALF =========================== */}
   <ControlPlane />
 
+  {/* ======================= SEE IT IN ACTION ======================== */}
+  <DemoVideo />
+
   {/* ====================== DUE DILIGENCE ============================= */}
-  <section class="section section-alt">
+  <section class="section">
     <div class="shell">
       <h2>The questions you'd ask anyway</h2>
 
@@ -177,20 +234,24 @@ import {
         </article>
       </div>
 
-      <TestimonialsBlock />
     </div>
   </section>
 
-  {/* ============================ HONEST FIT ========================== */}
-  <section class="section">
+  {/* ============================= PRICE ============================== */}
+  <section class="section section-alt">
     <div class="shell">
-      <WorkloadFitTable />
+      <h2>What you pay</h2>
+
+      <p>
+        Nothing up to 15&nbsp;TB of stored data per organization, in
+        production, with every feature. Above that there is one flat
+        annual plan. The licence is BUSL-1.1, and each release becomes
+        Apache-2.0 two years after it ships.
+      </p>
 
       <p class="fit-next">
-        Then put your real numbers into the
-        <a href="/pricing">savings calculator</a>. There is more detail
-        <a href="/saas">for CI &amp; build artifacts</a> and
-        <a href="/regulated">for regulated buyers</a>.
+        <a href="/pricing">Prices and the calculator</a> ·
+        <a href="/support">30 days of support from the engineers, free</a>
       </p>
     </div>
   </section>
@@ -270,6 +331,26 @@ import {
     text-decoration: none;
   }
   .dd-link:hover { text-decoration: underline; }
+
+  .cost-list {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1.5rem 2.5rem;
+    margin: 2rem 0 0;
+  }
+  @media (min-width: 760px) {
+    .cost-list { grid-template-columns: repeat(3, 1fr); }
+  }
+  .cost-list dt {
+    font-weight: 700;
+    color: var(--ink-strong);
+    margin-bottom: 0.35rem;
+  }
+  .cost-list dd {
+    margin: 0;
+    color: var(--ink-soft);
+    line-height: 1.55;
+  }
 
   .fit-next {
     margin-top: 1.5rem;
