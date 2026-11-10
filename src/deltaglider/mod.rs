@@ -7,6 +7,9 @@ mod codec;
 mod engine;
 mod file_router;
 pub(crate) mod ingest;
+#[cfg(test)]
+#[path = "ingest_rig_tests.rs"]
+pub(crate) mod ingest_rig;
 pub mod memory_budget;
 pub(crate) mod range_spool;
 pub mod savings;
@@ -20,7 +23,7 @@ pub use engine::store::{
     BLOCKING_HASH_THRESHOLD,
 };
 pub(crate) use engine::{
-    build_raw_backend, effective_legacy_key_id, interleave_and_paginate, CounterPrior,
+    build_raw_backend, effective_legacy_key_id, interleave_and_paginate, CounterPrior, SpoolWait,
 };
 #[cfg(test)]
 pub(crate) use engine::{s3_engine, store_deltas};

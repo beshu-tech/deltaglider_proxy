@@ -8,10 +8,9 @@
 use super::multipart::adapter_test_support::service;
 use super::*;
 use crate::api::checksum::{computed_digest, ChecksumAlgorithm, ChecksumPlan};
+use crate::deltaglider::ingest_rig::{body, files_under, IngestRig, RigConfig};
 use crate::deltaglider::memory_budget::MemoryBudget;
-use crate::deltaglider::{DeltaGliderEngine, DynEngine};
-use crate::metrics::Metrics;
-use crate::storage::{DynStorageBackend, FilesystemBackend};
+use crate::deltaglider::DynEngine;
 use base64::Engine as _;
 use bytes::Bytes;
 use md5::Digest as _;
@@ -24,52 +23,25 @@ const SPOOL_MIB: usize = 16;
 const MAX_OBJECT: usize = 32 * MIB;
 
 struct Rig {
-    _dir: tempfile::TempDir,
-    spool_dir: std::path::PathBuf,
+    base: IngestRig,
     svc: DeltaGliderS3Service,
-    metrics: Arc<Metrics>,
 }
 
 impl Rig {
     async fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
-            FilesystemBackend::new(dir.path().join("data"))
-                .await
-                .unwrap(),
-        );
-        let mut config = crate::config::Config {
-            max_object_size: MAX_OBJECT as u64,
-            ..Default::default()
-        };
-        config.tuning.spool_threshold_bytes = Some(THRESHOLD as u64);
-        config.tuning.spool_acquire_timeout_secs = 1;
-        config.buckets.insert(
-            "frozen".into(),
-            crate::bucket_policy::BucketPolicyConfig {
-                quota_bytes: Some(0),
-                ..Default::default()
-            },
-        );
-        let metrics = Arc::new(Metrics::new());
-        let spool_dir = dir.path().join("spool");
-        let engine: DynEngine =
-            DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, Some(metrics.clone()))
-                .with_memory_budget(MemoryBudget::new(8 * MIB as u64))
-                .with_spool_dir(
-                    crate::deltaglider::spool::SpoolDir::new(
-                        spool_dir.clone(),
-                        (SPOOL_MIB * MIB) as u64,
-                    )
-                    .unwrap(),
-                );
-        engine.create_bucket("b").await.unwrap();
-        engine.create_bucket("frozen").await.unwrap();
+        let (base, engine) = IngestRig::build(RigConfig {
+            threshold: THRESHOLD as u64,
+            spool_bytes: (SPOOL_MIB * MIB) as u64,
+            memory: MemoryBudget::new(8 * MIB as u64),
+            max_object_size: Some(MAX_OBJECT as u64),
+            encrypted: false,
+            quotas: vec![("frozen", 0)],
+            buckets: vec!["b", "frozen"],
+        })
+        .await;
         Self {
-            _dir: dir,
-            spool_dir,
+            base,
             svc: service(AppState::for_tests(engine)),
-            metrics,
         }
     }
 
@@ -78,26 +50,12 @@ impl Rig {
     }
 
     fn bodies(&self, medium: &str, reason: &str) -> u64 {
-        self.metrics
-            .ingest_bodies_total
-            .with_label_values(&[medium, reason])
-            .get()
+        self.base.bodies(medium, reason)
     }
 
     /// Nothing held: the RAM budget, the spool budget and the spool dir.
     fn assert_restored(&self, when: &str) {
-        let engine = self.engine();
-        assert_eq!(engine.memory_budget().held_bytes(), 0, "{when}: RAM held");
-        assert_eq!(
-            engine.spool_dir().free_mib(),
-            SPOOL_MIB,
-            "{when}: spool budget held"
-        );
-        let files = files_under(&self.spool_dir);
-        assert!(
-            files.is_empty(),
-            "{when}: spool files left behind: {files:?}"
-        );
+        self.base.assert_restored(&self.engine(), when);
     }
 
     async fn put(&self, req: s3s::S3Request<s3s::dto::PutObjectInput>) -> s3s::S3Result<String> {
@@ -108,25 +66,6 @@ impl Rig {
     async fn stored(&self, key: &str) -> Option<Vec<u8>> {
         self.engine().retrieve("b", key).await.ok().map(|(d, _)| d)
     }
-}
-
-/// The regular files under `dir`, at any depth (the relay parts are in
-/// subdirectories of the spool dir).
-fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            out.extend(files_under(&path));
-        } else {
-            out.push(path);
-        }
-    }
-    out
-}
-
-fn body(n: usize) -> Vec<u8> {
-    (0..n).map(|i| (i * 31 % 251) as u8).collect()
 }
 
 type Item = Result<Bytes, std::io::Error>;
@@ -583,7 +522,7 @@ async fn an_upload_part_three_times_the_threshold_becomes_a_relay_file() {
     assert_eq!(rig.bodies("spool", "multipart_part"), 1);
     assert_eq!(rig.engine().memory_budget().peak_bytes(), 0);
     assert_eq!(rig.engine().spool_dir().free_mib(), SPOOL_MIB - 3);
-    let files = files_under(&rig.spool_dir);
+    let files = files_under(&rig.base.spool_dir);
     assert_eq!(files.len(), 1, "{files:?}");
     assert_eq!(std::fs::read(&files[0]).unwrap(), data);
 
@@ -741,7 +680,7 @@ async fn a_tampered_relay_file_fails_the_completion() {
         ))
         .await
         .unwrap();
-    let files = files_under(&rig.spool_dir);
+    let files = files_under(&rig.base.spool_dir);
     let mut swapped = data.clone();
     swapped[0] ^= 0xFF;
     std::fs::write(&files[0], &swapped).unwrap();

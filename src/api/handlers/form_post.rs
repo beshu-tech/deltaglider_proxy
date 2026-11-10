@@ -290,7 +290,7 @@ fn check_file_len(
 /// largest object plus [`FORM_OVERHEAD`] gets `413 EntityTooLarge`. Both
 /// before a byte of it is read.
 fn form_body_len(headers: &HeaderMap, limit: u64) -> Result<u64, S3Error> {
-    let len = crate::deltaglider::ingest::declared_body_len(headers)
+    let len = crate::api::body_ingest::declared_len(headers, None)
         .map_err(|_| S3Error::MissingContentLength)?;
     if len > limit.saturating_add(FORM_OVERHEAD) {
         return Err(S3Error::EntityTooLarge {
@@ -925,21 +925,19 @@ async fn ingest_form_file(
         strict_length: false,
         destination: Destination::Object,
     };
-    let checksum_plan = crate::api::checksum::ChecksumPlan::from_headers(checksum_fields);
-    let mut sums = (!checksum_plan.is_empty()).then(|| checksum_plan.hasher());
-    let observed = file.map_err(form_error).inspect(|chunk| {
-        if let (Ok(chunk), Some(sums)) = (chunk, sums.as_mut()) {
-            sums.update(chunk);
-        }
-    });
-    let body = crate::deltaglider::ingest::ingest(engine, bucket, observed, plan)
-        .await
-        .map_err(|e| match e {
+    crate::api::checksum::ingest_checked(
+        engine,
+        bucket,
+        file.map_err(form_error),
+        plan,
+        checksum_fields,
+        || None,
+        |e| match e {
             IngestError::TooLong { .. } => over_cap_refusal(cap, bucket, key),
             e => crate::api::body_ingest::ingest_failure(e),
-        })?;
-    crate::api::checksum::verify_ingested(checksum_fields, None, sums, &body).await?;
-    Ok(body)
+        },
+    )
+    .await
 }
 
 /// Everything about a form that is checked before its file is read: the
@@ -1186,8 +1184,9 @@ where
     let cap = form_file_cap(limit, form_len, auth.length_range.map(|r| r.max));
     // A form over the quota is refused before its file reaches the spool:
     // the cap is the most the file can be. The exact check runs again on
-    // the received size, in `store_client_write`.
-    crate::api::handlers::object_helpers::check_quota_for_write(
+    // the received size, in `store_client_write`, unless this one was
+    // optimistic (`exact_quota_check_after_body`).
+    let early_quota = crate::api::handlers::object_helpers::check_quota_for_write(
         state,
         bucket,
         &head.resolved_key,
@@ -1218,6 +1217,7 @@ where
             content_type: head.content_type.clone(),
             user_metadata: head.user_metadata.clone(),
             precondition: &precondition,
+            early_quota: Some(early_quota),
         },
     )
     .await?;

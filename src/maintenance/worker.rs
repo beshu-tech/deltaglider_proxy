@@ -1894,7 +1894,6 @@ mod tests {
             backend_capabilities: Default::default(),
             backend_health: Default::default(),
             encryption_witness: None,
-            ingest_memory: Default::default(),
         });
         let db = JobsDb::in_memory("testpass").unwrap();
         let id = db

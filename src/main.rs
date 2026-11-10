@@ -641,14 +641,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // job-plane lease and the config sync share the verdict.
     let coordination_check = validate_coordination_once(&config).await;
     let reference_lock = build_reference_lock(&config, &coordination_check).await;
-    // The RAM budget of request bodies: one per process, re-attached on
-    // every engine rebuild through AppState.
+    // The RAM budget of request bodies: one per process, carried from
+    // engine to engine on every rebuild (`config_apply::build_engine`).
     let ingest_memory = deltaglider_proxy::deltaglider::memory_budget::MemoryBudget::from_env();
     let engine = DynEngine::new(&config, Some(metrics.clone()))
         .await?
         .with_bucket_usage(bucket_usage.clone())
         .with_reference_lock(reference_lock.clone())
-        .with_memory_budget(ingest_memory.clone());
+        .with_memory_budget(ingest_memory);
     // #63 + browser review #24: create the buckets DECLARED in storage.buckets
     // on their backend (a filesystem dir, or an S3 CreateBucket when missing),
     // so their first write doesn't 404. Only declared intent — never on the
@@ -900,7 +900,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         backend_capabilities: backend_capabilities.clone(),
         backend_health: backend_health.clone(),
         encryption_witness: encryption_witness.clone(),
-        ingest_memory,
     });
     // The background writers (replication, lifecycle) ask the encryption
     // witness and the key sentinel through the maintenance gate: a refused

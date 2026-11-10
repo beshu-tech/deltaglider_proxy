@@ -6,7 +6,9 @@
 //! A body above [`BUFFERED_MAX`] never sits whole in RAM: an upload is
 //! copied into an engine spool file and stored with
 //! `store_spooled_delta`; a download writes the `retrieve_stream` chunks
-//! to disk; an S3-to-S3 copy spools the source stream. The engine stores
+//! to disk; an S3-to-S3 copy reads the source stream through the
+//! destination engine's ingest (memory up to its spool threshold, else a
+//! spool file). The engine stores
 //! an object above `max_object_size` whole, so the one size ceiling is
 //! `max_passthrough_object_size`.
 
@@ -253,7 +255,7 @@ pub(crate) async fn copy_object(
         .retrieve_stream(src_bucket, src_key)
         .await
         .map_err(TransferError::Source)?;
-    let (mut stream, metadata) = match resp {
+    let (stream, metadata) = match resp {
         RetrieveResponse::Buffered { data, metadata, .. } => {
             let (ct, meta) = dest_attrs(&metadata);
             return dst
@@ -267,46 +269,67 @@ pub(crate) async fn copy_object(
     };
     let size = metadata.file_size;
     let (ct, meta) = dest_attrs(&metadata);
-    if size <= BUFFERED_MAX {
-        let mut data = Vec::with_capacity(size as usize);
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| TransferError::Source(EngineError::Storage(e)))?;
-            if data.len() as u64 + chunk.len() as u64 > size {
-                return Err(TransferError::SourceChanged {
-                    expected: size,
-                    observed: data.len() as u64 + chunk.len() as u64,
-                });
-            }
-            data.extend_from_slice(&chunk);
-        }
-        return dst
-            .store(dst_bucket, dst_key, &data, ct, meta)
-            .await
-            .map_err(TransferError::Dest);
-    }
-    let spool = dst.spool_acquire(size).await.map_err(TransferError::Dest)?;
-    use crate::deltaglider::spool::SpoolFillError;
-    let changed = |observed| TransferError::SourceChanged {
-        expected: size,
-        observed,
+    // The source, read once by THE ingest of the destination engine: in
+    // memory up to its spool threshold, else into a spool file whose
+    // reservation covers the storage write's temp files too. A large
+    // delta or reference source holds a spool file of the source engine
+    // while it streams; when that is the destination engine too (`cp`,
+    // `sync`), the copy holds that budget and never waits for more.
+    use crate::deltaglider::ingest::{self, IngestError};
+    let held_spool_mib = if std::ptr::eq(src, dst) {
+        src.stream_spool_mib(&metadata)
+    } else {
+        0
     };
-    let fill = spool
-        .fill_from_stream(
-            &mut stream,
-            size,
-            crate::deltaglider::ingest::Sha256Need::Compute,
-        )
+    let plan = ingest::IngestPlan {
+        declared: size,
+        // The stored source sets the size; the store applies its limits.
+        limit: u64::MAX,
+        sha256: ingest::Sha256Need::Compute,
+        held_spool_mib,
+        strict_length: true,
+        destination: ingest::Destination::Object,
+    };
+    let body = ingest::ingest(dst, dst_bucket, stream, plan)
         .await
         .map_err(|e| match e {
-            SpoolFillError::Source(e) => TransferError::Source(EngineError::Storage(e)),
-            SpoolFillError::Write(e) => TransferError::Dest(EngineError::Storage(e.into())),
-            SpoolFillError::Overrun { written, .. } => changed(written),
+            IngestError::Source(e) => TransferError::Source(EngineError::Storage(e)),
+            IngestError::TooLong { declared } => TransferError::SourceChanged {
+                expected: size,
+                observed: declared.saturating_add(1),
+            },
+            IngestError::Incomplete { received, .. } => TransferError::SourceChanged {
+                expected: size,
+                observed: received,
+            },
+            IngestError::TooLarge { declared, limit }
+            | IngestError::SpoolTooSmall {
+                declared,
+                max_bytes: limit,
+                ..
+            } => TransferError::Dest(EngineError::TooLarge {
+                size: declared,
+                max: limit,
+            }),
+            IngestError::Engine(e) => TransferError::Dest(e),
         })?;
-    if fill.written != size {
-        return Err(changed(fill.written));
-    }
-    let hashes = Some(fill.hashes);
-    store_spooled(dst, dst_bucket, dst_key, &spool, size, ct, meta, hashes).await
+    store_ingested(dst, dst_bucket, dst_key, body, ct, meta).await
+}
+
+/// The store of an ingested body under the object's write lock.
+async fn store_ingested(
+    engine: &DynEngine,
+    bucket: &str,
+    key: &str,
+    body: crate::deltaglider::ingest::IngestedBody,
+    content_type: Option<String>,
+    user_metadata: HashMap<String, String>,
+) -> Result<StoreResult, TransferError> {
+    let lock = engine.lock_object_write(bucket, key).await;
+    engine
+        .store_ingested(&lock, bucket, key, body, content_type, user_metadata, None)
+        .await
+        .map_err(TransferError::Dest)
 }
 
 #[cfg(test)]

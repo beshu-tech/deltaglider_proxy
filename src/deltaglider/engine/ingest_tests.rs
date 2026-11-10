@@ -5,10 +5,9 @@
 //! again after a success and after each failure.
 
 use super::*;
-use crate::config::Config;
 use crate::deltaglider::ingest::{ingest, IngestError, IngestPlan, IngestedBody};
+use crate::deltaglider::ingest_rig::{body, IngestRig, RigConfig};
 use crate::deltaglider::memory_budget::MemoryBudget;
-use crate::storage::{DynStorageBackend, FilesystemBackend};
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,10 +18,8 @@ const THRESHOLD: u64 = 64 * KIB;
 const SPOOL_MIB: u64 = 8;
 
 struct Rig {
-    _dir: tempfile::TempDir,
-    spool_dir: std::path::PathBuf,
+    base: IngestRig,
     engine: DynEngine,
-    metrics: Arc<Metrics>,
 }
 
 impl Rig {
@@ -33,43 +30,17 @@ impl Rig {
     /// `encrypted`: the backend is wrapped by the proxy's encryption, so
     /// a stored body needs a ciphertext file in the spool too.
     async fn with_encryption(memory: MemoryBudget, encrypted: bool) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let fs = FilesystemBackend::new(dir.path().join("data"))
-            .await
-            .unwrap();
-        let backend: Box<DynStorageBackend<'static>> = if encrypted {
-            let key = crate::storage::EncryptionKey::from_hex(
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            )
-            .unwrap();
-            let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(
-                crate::storage::EncryptionConfig {
-                    key: Some(key),
-                    key_id: Some("kid-1".to_string()),
-                    ..Default::default()
-                },
-            )));
-            DynStorageBackend::new_box(crate::storage::EncryptingBackend::new(fs, cfg))
-        } else {
-            DynStorageBackend::new_box(fs)
-        };
-        let mut config = Config::default();
-        config.tuning.spool_threshold_bytes = Some(THRESHOLD);
-        config.tuning.spool_acquire_timeout_secs = 1;
-        let metrics = Arc::new(Metrics::new());
-        let mut engine =
-            DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, Some(metrics.clone()))
-                .with_memory_budget(memory);
-        let spool_dir = dir.path().join("spool");
-        engine.spool = Arc::new(
-            crate::deltaglider::spool::SpoolDir::new(spool_dir.clone(), SPOOL_MIB * MIB).unwrap(),
-        );
-        Self {
-            _dir: dir,
-            spool_dir,
-            engine,
-            metrics,
-        }
+        let (base, engine) = IngestRig::build(RigConfig {
+            threshold: THRESHOLD,
+            spool_bytes: SPOOL_MIB * MIB,
+            memory,
+            max_object_size: None,
+            encrypted,
+            quotas: vec![],
+            buckets: vec![],
+        })
+        .await;
+        Self { base, engine }
     }
 
     async fn ingest<S>(
@@ -84,26 +55,12 @@ impl Rig {
     }
 
     fn bodies(&self, medium: &str, reason: &str) -> u64 {
-        self.metrics
-            .ingest_bodies_total
-            .with_label_values(&[medium, reason])
-            .get()
+        self.base.bodies(medium, reason)
     }
 
     /// Nothing held: the RAM budget, the spool budget and the spool dir.
     fn assert_restored(&self, when: &str) {
-        assert_eq!(
-            self.engine.memory_budget().held_bytes(),
-            0,
-            "{when}: RAM held"
-        );
-        assert_eq!(
-            self.engine.spool.free_mib() as u64,
-            SPOOL_MIB,
-            "{when}: spool budget held"
-        );
-        let files = std::fs::read_dir(&self.spool_dir).unwrap().count();
-        assert_eq!(files, 0, "{when}: a spool file was left behind");
+        self.base.assert_restored(&self.engine, when);
     }
 }
 
@@ -116,10 +73,6 @@ fn plan(declared: u64) -> IngestPlan {
         strict_length: true,
         destination: crate::deltaglider::ingest::Destination::Object,
     }
-}
-
-fn body(n: usize) -> Vec<u8> {
-    (0..n).map(|i| (i * 31 % 251) as u8).collect()
 }
 
 /// `data` in chunks of `chunk` bytes, the way a client body arrives.

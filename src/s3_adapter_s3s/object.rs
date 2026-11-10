@@ -552,13 +552,7 @@ pub(super) async fn put_object(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::PutObjectInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::PutObjectOutput>> {
-    let body_ctx = BodyContext::of(&req);
-    let s3s_verified_sha256 =
-        s3s_verified_payload_sha256(&req.headers, &req.uri, req.credentials.is_some());
-    let signed_payload_hash = req
-        .extensions
-        .get::<crate::api::auth::SignedPayloadHash>()
-        .cloned();
+    let body_ctx = crate::api::body_ingest::BodyContext::of(&req);
     let writer = Reader::for_object(&req.extensions, &req.input.bucket, &req.input.key);
     let input = req.input;
     let engine = svc.state.engine.load();
@@ -573,18 +567,14 @@ pub(super) async fn put_object(
 
     // The body, read once and checked, before the object's write lock: the
     // lock is held for the store, never for the upload.
-    let body = crate::api::body_ingest::ingest_client_body(
+    let (body, early_quota) = crate::api::body_ingest::ingest_client_body(
         &svc.state,
         &input.bucket,
         &input.key,
         input.body,
         &body_ctx,
         engine.max_object_size(),
-        crate::api::body_ingest::ContentChecks {
-            content_md5: input.content_md5.as_deref(),
-            signed_payload_hash: signed_payload_hash.as_ref(),
-            s3s_verified_sha256,
-        },
+        input.content_md5.as_deref(),
     )
     .await?;
     let result = crate::api::handlers::object_helpers::store_client_write(
@@ -599,6 +589,7 @@ pub(super) async fn put_object(
                 if_match: input.if_match,
                 if_none_match: input.if_none_match,
             },
+            early_quota: Some(early_quota),
         },
     )
     .await?;

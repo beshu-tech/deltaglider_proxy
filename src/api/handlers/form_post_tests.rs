@@ -8,11 +8,10 @@
 //! guards of the order "signature first, file last".
 
 use super::*;
+use crate::deltaglider::ingest_rig::{body, IngestRig, RigConfig};
 use crate::deltaglider::memory_budget::MemoryBudget;
-use crate::deltaglider::{DeltaGliderEngine, DynEngine};
+use crate::deltaglider::DynEngine;
 use crate::iam::AuthConfig;
-use crate::metrics::Metrics;
-use crate::storage::{DynStorageBackend, FilesystemBackend};
 use proptest::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -174,11 +173,9 @@ fn the_policy_check_returns_the_range_and_judges_its_form() {
 // ── The handler over a filesystem engine ────────────────────────────────
 
 struct Rig {
-    _dir: tempfile::TempDir,
-    spool_dir: std::path::PathBuf,
+    base: IngestRig,
     state: Arc<AppState>,
     iam: SharedIamState,
-    metrics: Arc<Metrics>,
 }
 
 impl Rig {
@@ -188,40 +185,16 @@ impl Rig {
 
     /// `quota`: the `quota_bytes` of the bucket (`Some(0)` freezes it).
     async fn with_quota(quota: Option<u64>) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
-            FilesystemBackend::new(dir.path().join("data"))
-                .await
-                .unwrap(),
-        );
-        let mut config = crate::config::Config {
-            max_object_size: MAX_OBJECT as u64,
-            ..Default::default()
-        };
-        config.tuning.spool_threshold_bytes = Some(THRESHOLD as u64);
-        config.tuning.spool_acquire_timeout_secs = 1;
-        if quota.is_some() {
-            config.buckets.insert(
-                "bkt".into(),
-                crate::bucket_policy::BucketPolicyConfig {
-                    quota_bytes: quota,
-                    ..Default::default()
-                },
-            );
-        }
-        let metrics = Arc::new(Metrics::new());
-        let spool_dir = dir.path().join("spool");
-        let engine: DynEngine =
-            DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, Some(metrics.clone()))
-                .with_memory_budget(MemoryBudget::new(8 * MIB as u64))
-                .with_spool_dir(
-                    crate::deltaglider::spool::SpoolDir::new(
-                        spool_dir.clone(),
-                        (SPOOL_MIB * MIB) as u64,
-                    )
-                    .unwrap(),
-                );
-        engine.create_bucket("bkt").await.unwrap();
+        let (base, engine) = IngestRig::build(RigConfig {
+            threshold: THRESHOLD as u64,
+            spool_bytes: (SPOOL_MIB * MIB) as u64,
+            memory: MemoryBudget::new(8 * MIB as u64),
+            max_object_size: Some(MAX_OBJECT as u64),
+            encrypted: false,
+            quotas: quota.map(|q| ("bkt", q)).into_iter().collect(),
+            buckets: vec!["bkt"],
+        })
+        .await;
         let iam = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Legacy(
             AuthConfig {
                 access_key_id: AK.into(),
@@ -229,11 +202,9 @@ impl Rig {
             },
         )));
         Self {
-            _dir: dir,
-            spool_dir,
+            base,
             state: AppState::for_tests(engine),
             iam,
-            metrics,
         }
     }
 
@@ -242,27 +213,12 @@ impl Rig {
     }
 
     fn bodies(&self, medium: &str, reason: &str) -> u64 {
-        self.metrics
-            .ingest_bodies_total
-            .with_label_values(&[medium, reason])
-            .get()
+        self.base.bodies(medium, reason)
     }
 
     /// Nothing held: the RAM budget, the spool budget and the spool dir.
     fn assert_restored(&self, when: &str) {
-        let engine = self.engine();
-        assert_eq!(engine.memory_budget().held_bytes(), 0, "{when}: RAM held");
-        assert_eq!(
-            engine.spool_dir().free_mib(),
-            SPOOL_MIB,
-            "{when}: spool budget held"
-        );
-        let files: Vec<_> = std::fs::read_dir(&self.spool_dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        assert!(files.is_empty(), "{when}: spool files left: {files:?}");
+        self.base.assert_restored(&self.engine(), when);
     }
 
     async fn stored(&self, key: &str) -> Option<Vec<u8>> {
@@ -307,10 +263,6 @@ impl Rig {
             .collect();
         self.post(futures::stream::iter(chunks), wire.len()).await
     }
-}
-
-fn body(n: usize) -> Vec<u8> {
-    (0..n).map(|i| (i * 31 % 251) as u8).collect()
 }
 
 /// A form: the signed fields before the file, the file, the fields after.

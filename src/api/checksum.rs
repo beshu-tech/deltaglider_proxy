@@ -274,17 +274,8 @@ pub async fn digest_of(
         IngestedBody::Spooled { spool, .. } => spool.path().to_path_buf(),
     };
     tokio::task::spawn_blocking(move || {
-        use std::io::Read;
-        let mut file = std::fs::File::open(path)?;
         let mut hasher = ChecksumPlan::only(algorithm).hasher();
-        let mut buf = vec![0u8; 256 * 1024];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
+        crate::deltaglider::spool::for_each_chunk_blocking(&path, |c| hasher.update(c))?;
         Ok(computed_digest(algorithm, &hasher.finalize()).unwrap_or_default())
     })
     .await
@@ -330,11 +321,43 @@ pub(crate) fn expected_checksum(
     }
 }
 
+/// THE checksum-checked ingest of a client body (PutObject, UploadPart,
+/// form POST): the hasher of the [`ChecksumPlan`] of `headers` watches the
+/// body arrive, `deltaglider::ingest` reads it once, and
+/// [`verify_ingested`] checks it, with the trailers that `trailers` reads
+/// after the last byte. `ingest_failure` answers a failed ingest.
+pub(crate) async fn ingest_checked<S, E>(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    source: S,
+    plan: crate::deltaglider::ingest::IngestPlan,
+    headers: &HeaderMap,
+    trailers: impl FnOnce() -> Option<HeaderMap>,
+    ingest_failure: impl FnOnce(crate::deltaglider::ingest::IngestError<E>) -> S3Error,
+) -> Result<crate::deltaglider::ingest::IngestedBody, S3Error>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+{
+    use futures::StreamExt as _;
+    let checksum_plan = ChecksumPlan::from_headers(headers);
+    let mut sums = (!checksum_plan.is_empty()).then(|| checksum_plan.hasher());
+    let observed = source.inspect(|chunk| {
+        if let (Ok(chunk), Some(sums)) = (chunk, sums.as_mut()) {
+            sums.update(chunk);
+        }
+    });
+    let body = crate::deltaglider::ingest::ingest(engine, bucket, observed, plan)
+        .await
+        .map_err(ingest_failure)?;
+    verify_ingested(headers, trailers().as_ref(), sums, &body).await?;
+    Ok(body)
+}
+
 /// THE check of an ingested body against the client's checksum, if any:
 /// the digest from `sums` (the hasher of the [`ChecksumPlan`] that watched
 /// the body arrive), else computed again over the body ([`digest_of`]: an
 /// algorithm that only a trailer named).
-pub(crate) async fn verify_ingested(
+async fn verify_ingested(
     headers: &HeaderMap,
     trailers: Option<&HeaderMap>,
     sums: Option<s3s::checksum::ChecksumHasher>,

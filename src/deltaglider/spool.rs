@@ -359,7 +359,9 @@ impl SpoolDir {
     /// single reservation can't half-acquire and self-deadlock, and two
     /// concurrent ops never hold one spool while waiting for the other (each
     /// op's whole reservation is atomic). The shared permit drops when BOTH
-    /// returned `Spool`s drop.
+    /// returned `Spool`s drop. Tests only: production holds a spool already
+    /// and uses [`Self::acquire_pair_beside`] or [`Self::acquire_group`].
+    #[cfg(test)]
     pub async fn acquire_pair(
         &self,
         a_bytes: u64,
@@ -368,7 +370,7 @@ impl SpoolDir {
         self.acquire_pair_beside(None, a_bytes, b_bytes).await
     }
 
-    /// `acquire_pair` for an op that already holds the spool `held` (the
+    /// A pair of spools in ONE permit for an op that already holds the spool `held` (the
     /// streaming PUT holds its body spool, then needs ref + delta). The pair
     /// is clamped so the op's total stays within the budget. A plain
     /// `acquire_pair` there waited for budget the op held itself, until the
@@ -385,7 +387,7 @@ impl SpoolDir {
         Ok((a, b))
     }
 
-    /// [`Self::acquire_pair`] for any number of files: ONE permit for all of
+    /// Any number of spool files in ONE permit for all of
     /// them (the large delta GET needs reference + output + delta), shared
     /// by the returned spools in the order of `sizes`. The budget is
     /// released when the last of them drops.
@@ -935,9 +937,49 @@ impl Budget {
     }
 }
 
+/// THE blocking read loop over a spool or relay file: `path` in 256 KiB
+/// reads on the calling thread, each chunk handed to `chunk` in order.
+/// Returns the bytes read. It blocks: callers run it in `spawn_blocking`.
+pub(crate) fn for_each_chunk_blocking(
+    path: &Path,
+    mut chunk: impl FnMut(&[u8]),
+) -> std::io::Result<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(total);
+        }
+        total = total.saturating_add(n as u64);
+        chunk(&buf[..n]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn for_each_chunk_blocking_hands_over_every_byte_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let data: Vec<u8> = (0..600 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let mut seen = Vec::new();
+        let mut chunks = 0;
+        let n = for_each_chunk_blocking(&path, |c| {
+            chunks += 1;
+            seen.extend_from_slice(c);
+        })
+        .unwrap();
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(seen, data);
+        assert!(chunks >= 3, "256 KiB reads: {chunks}");
+        assert!(for_each_chunk_blocking(&dir.path().join("none"), |_| {}).is_err());
+    }
 
     #[test]
     fn shared_spool_is_one_budget() {

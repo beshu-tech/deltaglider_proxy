@@ -48,6 +48,7 @@ pub(crate) use list::interleave_and_paginate;
 
 pub use locking::RefWriteProof;
 pub use metadata::{ListedPageForms, StoredForms};
+pub(crate) use resources::SpoolWait;
 pub use rewrite::{Rewritten, Unconditional};
 pub(crate) use usage::CounterPrior;
 

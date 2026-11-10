@@ -275,6 +275,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<Option<ReadBody>, EngineError> {
         use futures::TryStreamExt;
         let data: Vec<u8> = stream
+            // small: the caller spools a body above the spool threshold
             .try_fold(Vec::new(), |mut acc, chunk| async move {
                 acc.extend_from_slice(&chunk);
                 Ok(acc)

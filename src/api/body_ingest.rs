@@ -28,41 +28,153 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 
-use crate::api::checksum::{self, ChecksumPlan};
+use crate::api::checksum;
+use crate::api::handlers::object_helpers::QuotaVerdict;
 use crate::api::handlers::AppState;
 use crate::api::S3Error;
 use crate::deltaglider::ingest::{
-    self, Destination, IngestError, IngestPlan, IngestedBody, MissingContentLength, Sha256Need,
+    self, Destination, IngestError, IngestPlan, IngestedBody, Sha256Need,
 };
 use crate::deltaglider::KnownSha256;
-use crate::s3_adapter_s3s::BodyContext;
 
-/// What the client says about its body besides the bytes.
-#[derive(Default)]
-pub(crate) struct ContentChecks<'a> {
-    /// The `Content-MD5` header.
-    pub content_md5: Option<&'a str>,
+/// True when s3s already removed the aws-chunked framing. It does so for
+/// every SigV4 HEADER-signed streaming request (it verifies each chunk
+/// signature while it decodes). Decoding again made every signed SDK
+/// streaming PUT / UploadPart fail with 400 (review C1). Unsigned or
+/// presigned streaming bodies still reach us framed.
+fn s3s_decoded_aws_chunked(headers: &axum::http::HeaderMap, has_credentials: bool) -> bool {
+    has_credentials
+        && headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256 "))
+}
+
+/// What the ingest of a body needs from the request besides the body: the
+/// headers (length, aws-chunked framing, `x-amz-checksum-*`) and the
+/// trailers s3s took off a body it decoded. Taken before `req.input` moves.
+pub(crate) struct BodyContext {
+    headers: axum::http::HeaderMap,
+    /// The body still carries aws-chunked framing (s3s did not decode it).
+    still_chunked: bool,
+    s3s_trailers: Option<s3s::TrailingHeaders>,
     /// The signed `x-amz-content-sha256` (any value; only a hex digest is
     /// checked).
-    pub signed_payload_hash: Option<&'a crate::api::auth::SignedPayloadHash>,
+    signed_payload_hash: Option<crate::api::auth::SignedPayloadHash>,
     /// The body's SHA-256 that s3s verifies while the body streams
-    /// (`s3s_verified_payload_sha256`): it is not computed again.
-    pub s3s_verified_sha256: Option<KnownSha256>,
+    /// ([`s3s_verified_payload_sha256`]): it is not computed again.
+    s3s_verified_sha256: Option<KnownSha256>,
 }
+
+impl BodyContext {
+    /// Everything PutObject and UploadPart know about the body before it
+    /// is read, from one place, so a new check reaches both verbs.
+    pub(crate) fn of<T>(req: &s3s::S3Request<T>) -> Self {
+        let has_credentials = req.credentials.is_some();
+        Self {
+            headers: req.headers.clone(),
+            still_chunked: !s3s_decoded_aws_chunked(&req.headers, has_credentials),
+            s3s_trailers: req.trailing_headers.clone(),
+            signed_payload_hash: req
+                .extensions
+                .get::<crate::api::auth::SignedPayloadHash>()
+                .cloned(),
+            s3s_verified_sha256: s3s_verified_payload_sha256(
+                &req.headers,
+                &req.uri,
+                has_credentials,
+            ),
+        }
+    }
+}
+
+/// The body SHA-256 that s3s verified for this request, or `None` when s3s
+/// did not verify one (then the caller hashes the body).
+///
+/// s3s 0.14 (`ops/signature.rs`) wraps the body in `UploadStream`, which
+/// fails the read when the bytes do not hash to `x-amz-content-sha256`,
+/// only on its SigV4 path with a single-chunk payload hash. It picks that
+/// path when the query has no SigV2 `Signature` (else it checks SigV2 and
+/// verifies no body) and the `Authorization` header is a unique SigV4 one.
+/// It parses the header as a single-chunk hash only when it is 64 LOWERCASE
+/// hex characters; any other non-sentinel value fails the signature
+/// (`SignatureDoesNotMatch`). So this returns the digest only when all of
+/// these hold, each one checked here, conservatively:
+///
+/// - s3s verified credentials;
+/// - no query parameter name (decoded as s3s decodes it) contains
+///   `signature` in any case (no SigV2 query; a SigV4 presigned query
+///   carries no payload hash in our middleware either);
+/// - exactly one `Authorization` header, and it starts with
+///   `AWS4-HMAC-SHA256 ` (so SigV2 header parsing does not match it);
+/// - exactly one `x-amz-content-sha256` header, 64 lowercase hex.
+///
+/// s3s hands over the de-framed body only for streaming payloads, which
+/// never match the last rule: the bytes the handler collects are the bytes
+/// s3s hashed. The contract test `s3s_verifies_the_payload_hash_we_trust`
+/// (`api/s3s_contract_tests.rs`) sends a wrong body in every shape and
+/// fails when this returns a digest that s3s did not enforce.
+pub(crate) fn s3s_verified_payload_sha256(
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    has_credentials: bool,
+) -> Option<crate::deltaglider::KnownSha256> {
+    if !has_credentials {
+        return None;
+    }
+    let target = crate::api::request_target::RequestTarget::from_uri(uri).ok()?;
+    if target
+        .query
+        .iter()
+        .any(|(name, _)| name.to_ascii_lowercase().contains("signature"))
+    {
+        return None;
+    }
+    let unique = |name: &str| {
+        let mut values = headers.get_all(name).iter();
+        let first = values.next()?;
+        values.next().is_none().then_some(first)?.to_str().ok()
+    };
+    if !unique("authorization")?.starts_with("AWS4-HMAC-SHA256 ") {
+        return None;
+    }
+    let claimed = unique("x-amz-content-sha256")?;
+    let lowercase_hex = claimed.len() == 64
+        && claimed
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !lowercase_hex {
+        return None;
+    }
+    crate::deltaglider::KnownSha256::from_verified_hex(claimed)
+}
+
+/// The request names no body length: neither `Content-Length` nor, for
+/// an aws-chunked body, `x-amz-decoded-content-length`. S3 answers
+/// `411 MissingContentLength`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MissingContentLength;
 
 /// Pure: the length the request declares for its body: the decoded length
 /// of an aws-chunked body (never its framed length), else `Content-Length`,
 /// else the exact length the transport knows (`transport_len`: a request
-/// with neither `Content-Length` nor `Transfer-Encoding` has an empty body).
+/// with neither `Content-Length` nor `Transfer-Encoding` has an empty body;
+/// `None` when the caller does not know it).
 pub(crate) fn declared_len(
     headers: &axum::http::HeaderMap,
     transport_len: Option<u64>,
 ) -> Result<u64, MissingContentLength> {
-    match ingest::declared_body_len(headers) {
-        Ok(n) => Ok(n),
-        Err(e) if crate::api::aws_chunked::is_aws_chunked(headers) => Err(e),
-        Err(e) => transport_len.ok_or(e),
+    if crate::api::aws_chunked::is_aws_chunked(headers) {
+        return crate::api::aws_chunked::get_decoded_content_length(headers)
+            .map(|n| n as u64)
+            .ok_or(MissingContentLength);
     }
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .or(transport_len)
+        .ok_or(MissingContentLength)
 }
 
 /// Pure: the digest a `Content-MD5` header names; `InvalidDigest` when it is
@@ -115,8 +227,8 @@ pub(crate) fn body_read_error(e: s3s::StdError) -> S3Error {
 }
 
 /// THE ingest of an S3 object body (PutObject): see the module docs. The
-/// bucket quota admits the declared size before the body is read.
-#[allow(clippy::too_many_arguments)]
+/// bucket quota admits the declared size before the body is read; its
+/// verdict goes to `store_client_write` (`ClientWrite::early_quota`).
 pub(crate) async fn ingest_client_body(
     state: &Arc<AppState>,
     bucket: &str,
@@ -124,18 +236,19 @@ pub(crate) async fn ingest_client_body(
     body: Option<s3s::dto::StreamingBlob>,
     ctx: &BodyContext,
     limit: u64,
-    checks: ContentChecks<'_>,
-) -> Result<IngestedBody, S3Error> {
+    content_md5: Option<&str>,
+) -> Result<(IngestedBody, QuotaVerdict), S3Error> {
     let engine = state.engine.load_full();
-    let body = ClientBody::precheck(&engine, body, ctx, limit, checks)?;
-    crate::api::handlers::object_helpers::check_quota_for_write(
+    let body = ClientBody::precheck(&engine, body, ctx, limit, content_md5)?;
+    let quota = crate::api::handlers::object_helpers::check_quota_for_write(
         state,
         bucket,
         key,
         body.declared(),
     )
     .await?;
-    body.ingest(&engine, bucket, 0, Destination::Object).await
+    let ingested = body.ingest(&engine, bucket, 0, Destination::Object).await?;
+    Ok((ingested, quota))
 }
 
 /// The part of an UploadPart: the ingest of [`ingest_client_body`], into
@@ -152,10 +265,10 @@ pub(crate) async fn ingest_part_body(
     ctx: &BodyContext,
     part: PartTarget<'_>,
     limit: u64,
-    checks: ContentChecks<'_>,
+    content_md5: Option<&str>,
 ) -> Result<(IngestedBody, crate::multipart::PartAdmission), S3Error> {
     let engine = state.engine.load_full();
-    let body = ClientBody::precheck(&engine, body, ctx, limit, checks)?;
+    let body = ClientBody::precheck(&engine, body, ctx, limit, content_md5)?;
     let admission = state.multipart.admit_part(
         part.upload_id,
         part.bucket,
@@ -188,7 +301,6 @@ pub(crate) struct PartTarget<'a> {
 pub(crate) struct ClientBody<'a> {
     body: Option<s3s::dto::StreamingBlob>,
     ctx: &'a BodyContext,
-    checks: ContentChecks<'a>,
     expected_md5: Option<Vec<u8>>,
     declared: u64,
     limit: u64,
@@ -201,11 +313,11 @@ impl<'a> ClientBody<'a> {
         body: Option<s3s::dto::StreamingBlob>,
         ctx: &'a BodyContext,
         limit: u64,
-        checks: ContentChecks<'a>,
+        content_md5: Option<&str>,
     ) -> Result<Self, S3Error> {
         use s3s::stream::ByteStream as _;
         let headers = &ctx.headers;
-        let expected_md5 = parse_content_md5(checks.content_md5)?;
+        let expected_md5 = parse_content_md5(content_md5)?;
         checksum::precheck_headers(headers)?;
         let transport_len = match &body {
             Some(b) => b.remaining_length().exact().map(|n| n as u64),
@@ -216,7 +328,6 @@ impl<'a> ClientBody<'a> {
         let this = Self {
             body,
             ctx,
-            checks,
             expected_md5,
             declared,
             limit,
@@ -243,9 +354,10 @@ impl<'a> ClientBody<'a> {
             limit: self.limit,
             sha256: Sha256Need::decide(
                 destination,
-                self.checks.s3s_verified_sha256,
-                self.checks
+                self.ctx.s3s_verified_sha256,
+                self.ctx
                     .signed_payload_hash
+                    .as_ref()
                     .is_some_and(|signed| signed.is_verifiable_hex()),
             ),
             held_spool_mib,
@@ -266,7 +378,6 @@ impl<'a> ClientBody<'a> {
         let Self {
             body,
             ctx,
-            checks,
             expected_md5,
             declared,
             ..
@@ -297,24 +408,25 @@ impl<'a> ClientBody<'a> {
         } else {
             raw
         };
-        let checksum_plan = ChecksumPlan::from_headers(headers);
-        let mut sums = (!checksum_plan.is_empty()).then(|| checksum_plan.hasher());
-        let observed = source.inspect(|chunk| {
-            if let (Ok(chunk), Some(sums)) = (chunk, sums.as_mut()) {
-                sums.update(chunk);
-            }
-        });
-        let ingested = ingest::ingest(engine, bucket, observed, plan)
-            .await
-            .map_err(ingest_failure)?;
-
-        // (3) After the body.
-        let own_trailers = trailer_slot.and_then(|slot| slot.get());
-        let s3s_trailers = ctx.s3s_trailers.as_ref().and_then(|t| t.read(Clone::clone));
-        let trailers = own_trailers.as_ref().or(s3s_trailers.as_ref());
-        checksum::verify_ingested(headers, trailers, sums, &ingested).await?;
-        if checks.s3s_verified_sha256.is_none() {
-            if let Some(signed) = checks.signed_payload_hash {
+        // (3) After the body: the checksum (in `ingest_checked`), with the
+        // trailers of our decoder, else the ones s3s took off.
+        let trailers = || {
+            trailer_slot
+                .and_then(|slot| slot.get())
+                .or_else(|| ctx.s3s_trailers.as_ref().and_then(|t| t.read(Clone::clone)))
+        };
+        let ingested = checksum::ingest_checked(
+            engine,
+            bucket,
+            source,
+            plan,
+            headers,
+            trailers,
+            ingest_failure,
+        )
+        .await?;
+        if ctx.s3s_verified_sha256.is_none() {
+            if let Some(signed) = &ctx.signed_payload_hash {
                 signed.verify_against_digest(ingested.hashes().sha256())?;
             }
         }
@@ -366,6 +478,24 @@ mod tests {
                 Some(99),
                 Err(MissingContentLength),
             ),
+            (
+                &[chunked, ("content-length", "99")],
+                None,
+                Err(MissingContentLength),
+            ),
+            (&[("content-length", "0")], None, Ok(0)),
+            // Not a number: the transport's length, else none.
+            (&[("content-length", "x")], None, Err(MissingContentLength)),
+            (&[("content-length", "-1")], None, Err(MissingContentLength)),
+            (&[("content-length", "x")], Some(4), Ok(4)),
+            (
+                &[
+                    ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+                    ("content-length", "5"),
+                ],
+                None,
+                Ok(5),
+            ),
         ];
         for (pairs, transport, want) in cases {
             assert_eq!(
@@ -374,6 +504,76 @@ mod tests {
                 "{pairs:?} {transport:?}"
             );
         }
+    }
+
+    #[test]
+    fn s3s_decodes_only_header_signed_sigv4() {
+        let mut h = axum::http::HeaderMap::new();
+        assert!(!s3s_decoded_aws_chunked(&h, false));
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256 Credential=a/b".parse().unwrap(),
+        );
+        assert!(s3s_decoded_aws_chunked(&h, true));
+        assert!(
+            !s3s_decoded_aws_chunked(&h, false),
+            "no verified credentials: s3s did not decode"
+        );
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "AWS a:b".parse().unwrap(),
+        );
+        assert!(!s3s_decoded_aws_chunked(&h, true), "SigV2 is not decoded");
+    }
+
+    /// Truth table of `s3s_verified_payload_sha256`: a digest only for a
+    /// unique SigV4 header with a unique lowercase-hex payload hash and no
+    /// SigV2 query signature.
+    #[test]
+    fn s3s_verified_payload_sha256_truth_table() {
+        let hex = "a".repeat(64);
+        let v4 = "AWS4-HMAC-SHA256 Credential=AK/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=ab";
+        let case = |auth: &[&str], sha: &[&str], query: &str, creds: bool| {
+            let mut h = axum::http::HeaderMap::new();
+            for a in auth {
+                h.append("authorization", a.parse().unwrap());
+            }
+            for s in sha {
+                h.append("x-amz-content-sha256", s.parse().unwrap());
+            }
+            let uri: axum::http::Uri = format!("/b/k{query}").parse().unwrap();
+            s3s_verified_payload_sha256(&h, &uri, creds).map(|d| d.to_hex())
+        };
+        assert_eq!(case(&[v4], &[&hex], "", true), Some(hex.clone()));
+        assert_eq!(
+            case(&[v4], &[&hex], "?x-id=PutObject", true),
+            Some(hex.clone())
+        );
+        // s3s verified no credentials.
+        assert_eq!(case(&[v4], &[&hex], "", false), None);
+        // A SigV2 query (s3s checks it and verifies no body), in any spelling.
+        for q in [
+            "?Signature=x&AWSAccessKeyId=AK&Expires=1",
+            "?%53ignature=x",
+            "?signature=x",
+            "?X-Amz-Signature=x",
+        ] {
+            assert_eq!(case(&[v4], &[&hex], q, true), None, "{q}");
+        }
+        // Not a unique SigV4 header.
+        assert_eq!(case(&["AWS AK:sig"], &[&hex], "", true), None);
+        assert_eq!(case(&[v4, v4], &[&hex], "", true), None);
+        assert_eq!(case(&[], &[&hex], "", true), None);
+        // Not a unique lowercase-hex payload hash.
+        assert_eq!(case(&[v4], &[&hex.to_uppercase()], "", true), None);
+        assert_eq!(case(&[v4], &[&hex, &hex], "", true), None);
+        assert_eq!(case(&[v4], &["UNSIGNED-PAYLOAD"], "", true), None);
+        assert_eq!(
+            case(&[v4], &["STREAMING-AWS4-HMAC-SHA256-PAYLOAD"], "", true),
+            None
+        );
+        assert_eq!(case(&[v4], &[&"a".repeat(63)], "", true), None);
+        assert_eq!(case(&[v4], &[], "", true), None);
     }
 
     #[test]

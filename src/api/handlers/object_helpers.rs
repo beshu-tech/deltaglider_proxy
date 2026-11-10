@@ -68,10 +68,13 @@ pub(crate) struct ClientWrite<'a> {
     pub content_type: Option<String>,
     pub user_metadata: std::collections::HashMap<String, String>,
     pub precondition: &'a crate::deltaglider::Precondition,
+    /// The verdict of the quota gate that ran before the body was read
+    /// (PutObject, form POST); `None` when none ran (CopyObject).
+    pub early_quota: Option<QuotaVerdict>,
 }
 
 /// THE client write of a whole body: the quota gate on the body's exact
-/// size, then the engine's conditional store (the object's write lock, the
+/// size (see [`exact_quota_check_after_body`]), then the engine's conditional store (the object's write lock, the
 /// preconditions, the store), then the `ObjectCreated` event. Every surface
 /// that stores a client body goes through here, so none of them skips the
 /// lock, the conditionals, the quota or the event.
@@ -80,7 +83,9 @@ pub(crate) async fn store_client_write(
     write: ClientWrite<'_>,
 ) -> Result<crate::types::StoreResult, S3Error> {
     let size = write.body.size();
-    check_quota_for_write(state, write.bucket, write.key, size).await?;
+    if exact_quota_check_after_body(write.early_quota) {
+        check_quota_for_write(state, write.bucket, write.key, size).await?;
+    }
     let result = state
         .engine
         .load()
@@ -196,9 +201,7 @@ pub(crate) async fn store_client_server_copy(
             .await
             .map_err(|e| match e {
                 crate::deltaglider::EngineError::Storage(StorageError::PreconditionFailed(_)) => {
-                    S3Error::SlowDown(
-                        "the copy source changed during the copy; retry the request".to_string(),
-                    )
+                    S3Error::copy_source_changed()
                 }
                 e => e.into(),
             })?
@@ -317,6 +320,30 @@ pub(crate) async fn check_client_write_allowed(
     Ok(())
 }
 
+/// What the quota gate saw when it let a write through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuotaVerdict {
+    /// The bucket has no quota.
+    Unlimited,
+    /// The write was judged against a known usage of the bucket.
+    Measured,
+    /// The usage of the bucket is not known yet (no scan result, no
+    /// scanned counter row): the write was let through, and a scan started.
+    Optimistic,
+}
+
+/// Whether a client write runs the quota gate again on its exact size,
+/// after its body was read. The contract is that the first write to a
+/// bucket whose usage is not known yet is optimistic. The gate before the
+/// body starts the usage scan, and that scan can finish while the body
+/// uploads. A second gate that saw it would refuse the write after the
+/// client sent every byte. So a write that the early gate let through
+/// optimistically is not judged again. `None`: no gate ran before the
+/// body, so the exact gate is the only one.
+pub(crate) fn exact_quota_check_after_body(early: Option<QuotaVerdict>) -> bool {
+    !matches!(early, Some(QuotaVerdict::Optimistic))
+}
+
 /// Pre-write quota gate of a write of `key`. Returns `Err` when the write
 /// would push the bucket past its `quota_bytes` policy, or when quota is
 /// set to 0 (the "freeze the bucket" override). "Used" is [`quota_used`].
@@ -330,14 +357,17 @@ pub(crate) async fn check_quota_for_write(
     bucket: &str,
     key: &str,
     incoming_bytes: u64,
-) -> Result<(), S3Error> {
+) -> Result<QuotaVerdict, S3Error> {
     let engine = state.engine.load();
     let Some(quota) = engine.bucket_policy_registry().quota_bytes(bucket) else {
-        return Ok(());
+        return Ok(QuotaVerdict::Unlimited);
     };
     let used = quota_used(state, bucket);
     let Err(reason) = quota_decision(quota, used, incoming_bytes) else {
-        return Ok(());
+        return Ok(match used {
+            Some(_) => QuotaVerdict::Measured,
+            None => QuotaVerdict::Optimistic,
+        });
     };
     if quota == 0 {
         // Frozen: no overwrite gets through either.
@@ -356,7 +386,7 @@ pub(crate) async fn check_quota_for_write(
         )
         .is_ok()
     {
-        return Ok(());
+        return Ok(QuotaVerdict::Measured);
     }
     Err(S3Error::AccessDeniedReason(reason))
 }
@@ -546,7 +576,22 @@ mod metadata_size_tests {
 
 #[cfg(test)]
 mod quota_tests {
-    use super::quota_decision;
+    use super::{exact_quota_check_after_body, quota_decision, QuotaVerdict};
+
+    /// The first write to a bucket whose usage is unknown stays optimistic
+    /// to the end: the gate after the body runs only when the gate before
+    /// it judged a known usage, found no quota, or did not run.
+    #[test]
+    fn an_optimistic_early_gate_skips_the_exact_gate() {
+        for (early, want) in [
+            (None, true),
+            (Some(QuotaVerdict::Unlimited), true),
+            (Some(QuotaVerdict::Measured), true),
+            (Some(QuotaVerdict::Optimistic), false),
+        ] {
+            assert_eq!(exact_quota_check_after_body(early), want, "{early:?}");
+        }
+    }
 
     #[test]
     fn frozen_bucket_rejects_everything() {
@@ -660,6 +705,7 @@ mod write_path_tests {
                 content_type: None,
                 user_metadata: Default::default(),
                 precondition: &crate::deltaglider::Precondition::none(),
+                early_quota: None,
             },
         )
         .await

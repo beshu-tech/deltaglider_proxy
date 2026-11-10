@@ -28,6 +28,15 @@ fn spool_error(e: std::io::Error) -> EngineError {
     }
 }
 
+/// Whether a spool reservation may queue for the budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpoolWait {
+    /// Queue for the budget, up to the acquire timeout.
+    Queue,
+    /// Take free budget now, or fail `Overloaded`.
+    Now,
+}
+
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Access the underlying storage backend (for operations that bypass the delta engine)
     pub fn storage(&self) -> &S {
@@ -136,10 +145,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         parts: bool,
         held_mib: usize,
     ) -> Result<Option<crate::deltaglider::spool::SpoolReservation>, EngineError> {
-        let need = self
-            .storage
-            .file_put_spool_bytes(bucket, bytes, parts)
-            .await;
+        let need = self.storage_spool_bytes(bucket, bytes, parts).await;
         if need == 0 {
             return Ok(None);
         }
@@ -151,30 +157,50 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// The spool reservation of an ingested body: `bytes` is the body's
     /// file plus the temp files its storage write needs
     /// ([`Self::storage_spool_extra`]), in ONE reservation, so the write
-    /// later uses it and never waits under a lock. `wait`: queue for the
-    /// budget (timed); else take free budget now, whatever the queue, or
-    /// `Overloaded` (a small body never waits behind a large one).
-    /// `held_mib`: budget the op holds already; a holder never waits.
+    /// later uses it and never waits under a lock. [`SpoolWait::Queue`]:
+    /// queue for the budget (timed); [`SpoolWait::Now`]: take free budget
+    /// now, whatever the queue, or `Overloaded` (a small body never waits
+    /// behind a large one). `held_mib`: budget the op holds already; a
+    /// holder never waits.
     pub(crate) async fn reserve_ingest_spool(
         &self,
         bytes: u64,
         held_mib: usize,
-        wait: bool,
+        wait: SpoolWait,
     ) -> Result<crate::deltaglider::spool::SpoolReservation, EngineError> {
-        if wait {
-            return self
-                .with_spool_timeout(self.spool.reserve_beside(held_mib, bytes))
-                .await;
+        match wait {
+            SpoolWait::Queue => {
+                self.with_spool_timeout(self.spool.reserve_beside(held_mib, bytes))
+                    .await
+            }
+            SpoolWait::Now => self.spool.try_reserve(bytes, held_mib).map_err(spool_error),
         }
-        self.spool.try_reserve(bytes, held_mib).map_err(spool_error)
     }
 
-    /// The spool bytes that the storage write of a body of `bytes` into
-    /// `bucket` needs beside the body (the ciphertext file of a bucket
-    /// that the proxy encrypts; `0` elsewhere).
-    pub(crate) async fn storage_spool_extra(&self, bucket: &str, bytes: u64) -> u64 {
+    /// The spool bytes that the storage write of a body of `bytes` for
+    /// `destination` in `bucket` needs beside the body: the ciphertext
+    /// file of an object in a bucket that the proxy encrypts. `0` for a
+    /// multipart part (its completion reserves for its own write) and
+    /// for a bucket without proxy encryption.
+    pub(crate) async fn storage_spool_extra(
+        &self,
+        bucket: &str,
+        destination: crate::deltaglider::ingest::Destination,
+        bytes: u64,
+    ) -> u64 {
+        match destination {
+            crate::deltaglider::ingest::Destination::Object => {
+                self.storage_spool_bytes(bucket, bytes, false).await
+            }
+            crate::deltaglider::ingest::Destination::MultipartPart => 0,
+        }
+    }
+
+    /// THE spool need of a file-streaming storage write of `bytes` into
+    /// `bucket` (`parts`: from relay parts).
+    async fn storage_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {
         self.storage
-            .file_put_spool_bytes(bucket, bytes, false)
+            .file_put_spool_bytes(bucket, bytes, parts)
             .await
     }
 
@@ -210,7 +236,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await
     }
 
-    /// `spool_acquire_pair` for an op that already holds `held` (the streaming
+    /// A pair of spools in one permit for an op that already holds `held` (the streaming
     /// PUT's body spool): the pair is clamped so the op never waits for budget
     /// it holds itself. `None`: the budget is not free now, and a holder
     /// never waits (hold-and-wait deadlock, see `SpoolDir::reserve_within`);

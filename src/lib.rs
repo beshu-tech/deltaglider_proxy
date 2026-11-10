@@ -2423,15 +2423,35 @@ mod source_guards {
     /// says why on its line or the line above (`// small: <why>`).
     /// `PutBody::into_small_bytes` refuses a file body at run time; this
     /// guard keeps the file reads out of the source.
+    /// Why the raw blob accessors of `engine/raw.rs` still read a whole
+    /// stored delta or reference into memory.
+    const RAW_BLOBS_IN_MEMORY: &str =
+        "`get_delta_raw` / `get_reference_raw` / `open_raw` feed the \
+         delta fast path of `transfer.rs` (engine-routed copies such as replication) and the \
+         re-encrypt job, which copy the stored delta and reference verbatim from memory; moving \
+         them to spool files is a follow-up in docs/plan/streaming-ingest.md";
+
     #[test]
     fn stored_bodies_are_never_heap_loaded() {
+        // Known unbounded sites, with the reason they stay: (file,
+        // offending lines, why). A stale entry fails too.
+        const PENDING: &[(&str, usize, &str)] =
+            &[("src/deltaglider/engine/raw.rs", 1, RAW_BLOBS_IN_MEMORY)];
         const SCOPE: &[&str] = &[
             "src/storage",
             "src/deltaglider",
             "src/multipart.rs",
             "src/transfer.rs",
         ];
-        let needles = [["fs::", "read("].concat()];
+        // Each needle is split so this guard does not match itself.
+        let needles = [
+            ["fs::", "read("].concat(),
+            ["read_to_", "end"].concat(),
+            ["read_to_", "string"].concat(),
+            ["try_", "collect"].concat(),
+            ["try_fold(", "Vec::new()"].concat(),
+            [".con", "cat()"].concat(),
+        ];
         let test_files = out_of_line_test_modules(&rust_files("src"));
         let mut offenders: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         for p in SCOPE {
@@ -2465,6 +2485,15 @@ mod source_guards {
                 }
             }
         }
+        for (file, count, why) in PENDING {
+            let found = offenders.remove(*file).unwrap_or_default();
+            assert_eq!(
+                found.len(),
+                *count,
+                "{file} ({why}): the pending whole-body reads changed; update PENDING:\n{}",
+                found.join("\n")
+            );
+        }
         assert!(
             offenders.is_empty(),
             "a stored body is read whole into memory; stream it, or mark a \
@@ -2487,20 +2516,29 @@ mod source_guards {
     fn whole_object_reads_are_marked_small() {
         // Known unbounded sites, with the reason they stay: (file,
         // offending lines, why). A stale entry fails too.
-        const PENDING: &[(&str, usize, &str)] = &[(
-            "src/deltaglider/engine/raw.rs",
-            2,
-            "`get_delta_raw` / `get_reference_raw` feed the delta fast path of \
-             `transfer.rs` (engine-routed copies such as replication), which copies the stored delta and \
-             reference verbatim from memory; moving that path to spool files is a \
-             follow-up in docs/plan/streaming-ingest.md",
-        )];
+        const PENDING: &[(&str, usize, &str)] = &[
+            ("src/deltaglider/engine/raw.rs", 6, RAW_BLOBS_IN_MEMORY),
+            (
+                "src/deltaglider/engine/rewrite.rs",
+                2,
+                "the re-encrypt job reads a stored delta and reference whole \
+                 (`open_raw`) to rewrite them under the new key; streaming them \
+                 through spool files is a follow-up in docs/plan/streaming-ingest.md",
+            ),
+        ];
+        // A stream collected into memory. Split so the guard does not
+        // match itself.
+        let collect = ["try_", "collect"].concat();
+        let fold = ["try_fold(", "Vec::new()"].concat();
         let needles = [
             ".retrieve(",
             ".get_object(",
             ".get_delta(",
             ".get_reference(",
             ".get_passthrough(",
+            "open_raw(",
+            collect.as_str(),
+            fold.as_str(),
         ];
         let files = rust_files("src");
         let test_files = out_of_line_test_modules(&files);

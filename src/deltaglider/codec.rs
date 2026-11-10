@@ -161,6 +161,7 @@ fn stand_down(done: &DoneFlag) {
 /// Read xdelta3's stderr to its end (it is small: the error text).
 fn drain(stderr: &mut std::process::ChildStderr) -> IoResult<Vec<u8>> {
     let mut buf = Vec::new();
+    // small: xdelta3's stderr is its error text, not object bytes
     stderr.read_to_end(&mut buf)?;
     Ok(buf)
 }
@@ -268,6 +269,7 @@ fn pipe_stdin_stdout_stderr(
             // Read with a size cap to prevent decompression bombs.
             let mut buf = Vec::new();
             let mut limited = child_stdout.take(max_stdout as u64 + 1);
+            // small: `take` caps it at max_stdout + 1 (the buffered codec)
             limited.read_to_end(&mut buf)?;
             if buf.len() > max_stdout {
                 return Err(std::io::Error::other(format!(

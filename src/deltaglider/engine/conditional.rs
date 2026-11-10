@@ -359,27 +359,49 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
         precondition: &Precondition,
     ) -> Result<StoreResult, ConditionalError> {
-        use crate::deltaglider::ingest::IngestedBody;
         let guard = self.lock_and_check(bucket, key, precondition).await?;
-        let known_prior = guard.known_prior();
-        Ok(match body {
+        Ok(self
+            .store_ingested(&guard, bucket, key, body, content_type, user_metadata, None)
+            .await?)
+    }
+
+    /// THE store of an ingested body under its object's write `lock`
+    /// (client writes, engine-routed copies, the CLI): a body in memory is
+    /// stored from its buffer (shared, never copied, down to the storage
+    /// write), a spooled one from its file with the reservation that its
+    /// ingest took for the storage writes. `multipart_etag`: the ETag of a
+    /// copied multipart source, kept.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_ingested(
+        &self,
+        lock: &ObjectWriteGuard,
+        bucket: &str,
+        key: &str,
+        body: crate::deltaglider::ingest::IngestedBody,
+        content_type: Option<String>,
+        user_metadata: HashMap<String, String>,
+        multipart_etag: Option<String>,
+    ) -> Result<StoreResult, EngineError> {
+        use crate::deltaglider::ingest::IngestedBody;
+        let known_prior = lock.known_prior();
+        match body {
             IngestedBody::Memory {
                 data,
                 hashes,
                 permit: _permit,
             } => {
                 self.store_inner(
-                    &guard,
+                    lock,
                     bucket,
                     key,
                     &data,
                     content_type,
                     user_metadata,
-                    None,
+                    multipart_etag,
                     known_prior,
                     Some(hashes),
                 )
-                .await?
+                .await
             }
             IngestedBody::Spooled {
                 spool,
@@ -388,21 +410,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 storage,
             } => {
                 self.store_spooled_delta_inner(
-                    &guard,
+                    lock,
                     bucket,
                     key,
                     &spool,
                     size,
                     content_type,
                     user_metadata,
-                    None,
+                    multipart_etag,
                     known_prior,
                     Some(hashes),
                     Some(&storage),
                 )
-                .await?
+                .await
             }
-        })
+        }
     }
 }
 

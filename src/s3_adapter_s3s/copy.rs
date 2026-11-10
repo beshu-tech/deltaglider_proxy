@@ -184,6 +184,7 @@ async fn copy_through_store(
             content_type,
             user_metadata,
             precondition: &precondition,
+            early_quota: None,
         },
     )
     .await?)
@@ -285,9 +286,7 @@ fn copy_source_ingest_failure(
     use crate::deltaglider::ingest::IngestError;
     match e {
         IngestError::TooLong { .. } | IngestError::Incomplete { .. } => {
-            crate::api::S3Error::SlowDown(
-                "the copy source changed during the copy; retry the request".to_string(),
-            )
+            crate::api::S3Error::copy_source_changed()
         }
         e => crate::api::body_ingest::ingest_failure(e),
     }
@@ -405,10 +404,7 @@ pub(super) async fn upload_part_copy(
             // threshold, or a source gone or rewritten since its HEAD (a
             // retry judges the new object).
             if source_meta.file_size > engine.spool_threshold() {
-                return Err(crate::api::S3Error::SlowDown(
-                    "the copy source changed during the copy; retry the request".to_string(),
-                )
-                .into());
+                return Err(crate::api::S3Error::copy_source_changed().into());
             }
             // small: at most the spool threshold (see above).
             let (data, _) = engine.retrieve(&source_bucket, &source_key).await?;
@@ -416,12 +412,7 @@ pub(super) async fn upload_part_copy(
                 Some((start, end)) if end < data.len() => {
                     bytes::Bytes::copy_from_slice(&data[start..=end])
                 }
-                Some(_) => {
-                    return Err(crate::api::S3Error::SlowDown(
-                        "the copy source changed during the copy; retry the request".to_string(),
-                    )
-                    .into())
-                }
+                Some(_) => return Err(crate::api::S3Error::copy_source_changed().into()),
                 None => bytes::Bytes::new(),
             };
             futures::stream::iter([Ok(part)]).boxed()

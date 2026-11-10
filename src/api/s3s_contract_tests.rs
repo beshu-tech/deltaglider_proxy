@@ -188,7 +188,7 @@ impl s3s::S3 for NopS3 {
         req: S3Request<s3s::dto::PutObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::PutObjectOutput>> {
         use futures::StreamExt as _;
-        let trusted_sha256 = crate::s3_adapter_s3s::s3s_verified_payload_sha256(
+        let trusted_sha256 = crate::api::body_ingest::s3s_verified_payload_sha256(
             &req.headers,
             &req.uri,
             req.credentials.is_some(),
@@ -311,7 +311,6 @@ async fn harness() -> Harness {
         backend_capabilities: Default::default(),
         backend_health: Default::default(),
         encryption_witness: None,
-        ingest_memory: Default::default(),
     });
     let rate_limiter = crate::rate_limiter::RateLimiter::new(
         100,

@@ -474,7 +474,7 @@ impl Metrics {
                 Opts::new(
                     "deltaglider_ingest_bodies_total",
                     "Request bodies read, by medium (memory, spool) and reason \
-                     (under_threshold, over_threshold, memory_budget)",
+                     (under_threshold, over_threshold, memory_budget, multipart_part)",
                 ),
                 &["medium", "reason"],
             )
@@ -857,7 +857,7 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     metrics
         .multipart_uploads_inflight
         .set(state.multipart.count_uploads() as f64);
-    let ingest = &state.ingest_memory;
+    let ingest = engine.memory_budget();
     metrics
         .ingest_memory_bytes
         .set(i64::try_from(ingest.held_bytes()).unwrap_or(i64::MAX));

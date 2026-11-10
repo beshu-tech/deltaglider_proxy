@@ -1360,6 +1360,42 @@ fn max_total_multipart_bytes_truth_table() {
     assert_eq!(store.max_total_multipart_bytes(), 16 << 20);
 }
 
+/// The name of the function that `line` declares: the `fn <name>(` token
+/// after any `pub`, `pub(..)`, `async`, `const` or `unsafe` prefix.
+fn fn_name(line: &str) -> Option<String> {
+    let mut rest = line.trim_start();
+    loop {
+        if let Some(r) = rest.strip_prefix("pub(") {
+            rest = r.split_once(')')?.1.trim_start();
+        } else if let Some(r) = ["pub ", "async ", "const ", "unsafe "]
+            .iter()
+            .find_map(|p| rest.strip_prefix(p))
+        {
+            rest = r.trim_start();
+        } else {
+            break;
+        }
+    }
+    let name = rest.strip_prefix("fn ")?.split(['(', '<']).next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+#[test]
+fn fn_name_reads_every_visibility_and_qualifier() {
+    for (line, want) in [
+        ("fn a(&self)", Some("a")),
+        ("    pub fn b<T>(x: T)", Some("b")),
+        ("pub(crate) fn c(&self) {", Some("c")),
+        ("pub(super) async fn d(", Some("d")),
+        ("async fn e(", Some("e")),
+        ("pub(in crate::x) const unsafe fn f(", Some("f")),
+        ("let fn_x = 1;", None),
+        ("// fn g(", None),
+    ] {
+        assert_eq!(fn_name(line).as_deref(), want, "{line}");
+    }
+}
+
 /// The `uploads` lock guards the map only: a function that takes it does
 /// no file I/O (create, rename, delete) and calls none of the helpers
 /// that do. A slow disk then never blocks every UploadPart, ListParts and
@@ -1384,20 +1420,11 @@ fn the_uploads_lock_is_never_held_for_file_io() {
     let mut offenders = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        let line = lines[i].trim_start();
-        let is_fn = (line.starts_with("fn ") || line.starts_with("pub fn "))
-            && lines[i..].iter().any(|l| l.contains('{'));
-        if !is_fn {
+        let Some(name) = fn_name(lines[i]).filter(|_| lines[i..].iter().any(|l| l.contains('{')))
+        else {
             i += 1;
             continue;
-        }
-        let name = line
-            .trim_start_matches("pub ")
-            .trim_start_matches("fn ")
-            .split(['(', '<'])
-            .next()
-            .unwrap_or("")
-            .to_string();
+        };
         // The body: from the line with the first `{` to its matching `}`.
         let mut depth = 0i64;
         let mut opened = false;

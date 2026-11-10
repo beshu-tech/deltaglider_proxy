@@ -140,29 +140,6 @@ impl ReferenceSource {
         }
     }
 
-    /// The whole body in memory. For tests and small bodies only.
-    pub async fn read_all(self) -> Result<Vec<u8>, StorageError> {
-        use futures::TryStreamExt;
-        use tokio::io::AsyncReadExt;
-        match self.content {
-            ReferenceBody::Stream(stream) => {
-                let chunks: Vec<Bytes> = stream.try_collect().await?;
-                Ok(chunks.concat())
-            }
-            ReferenceBody::Local { file, .. } => {
-                let mut out = Vec::new();
-                tokio::fs::File::from_std(file)
-                    .take(self.size.saturating_add(1))
-                    .read_to_end(&mut out)
-                    .await?;
-                if out.len() as u64 != self.size {
-                    return Err(reference_size_mismatch(self.size, out.len() as u64));
-                }
-                Ok(out)
-            }
-        }
-    }
-
     /// Write the reference to `dest` (a hardlink for a local file). Never
     /// writes more than `size` bytes: a body longer than its declared size
     /// fails, so the spool reservation bounds the disk use. Returns the
@@ -222,6 +199,38 @@ impl ReferenceSource {
                     )));
                 }
                 Ok(written)
+            }
+        }
+    }
+}
+
+/// Test-only helpers of [`ReferenceSource`]. In a `#[cfg(test)] mod` so the
+/// source guard `stored_bodies_are_never_heap_loaded` skips them.
+#[cfg(test)]
+mod reference_source_test_helpers {
+    use super::*;
+
+    impl ReferenceSource {
+        /// The whole body in memory. Tests only: production streams it.
+        pub async fn read_all(self) -> Result<Vec<u8>, StorageError> {
+            use futures::TryStreamExt;
+            use tokio::io::AsyncReadExt;
+            match self.content {
+                ReferenceBody::Stream(stream) => {
+                    let chunks: Vec<Bytes> = stream.try_collect().await?;
+                    Ok(chunks.concat())
+                }
+                ReferenceBody::Local { file, .. } => {
+                    let mut out = Vec::new();
+                    tokio::fs::File::from_std(file)
+                        .take(self.size.saturating_add(1))
+                        .read_to_end(&mut out)
+                        .await?;
+                    if out.len() as u64 != self.size {
+                        return Err(reference_size_mismatch(self.size, out.len() as u64));
+                    }
+                    Ok(out)
+                }
             }
         }
     }

@@ -291,7 +291,7 @@ All label sets are bounded:
 | `outcome` | 3 (`ok`, `error` or `cancelled`) |
 | `decision` | 3 (delta, passthrough, reference) |
 | `result` | 2 (success or failure) |
-| `reason` | 7 (see the Auth table); 3 on `deltaglider_ingest_bodies_total` |
+| `reason` | 7 (see the Auth table); 4 on `deltaglider_ingest_bodies_total` |
 | `medium` | 2 (`memory` or `spool`) |
 
 No label contains a bucket name or an object key, so no label has unbounded cardinality.

@@ -74,18 +74,9 @@ impl FileBody {
         let files = self.files.clone();
         tokio::task::spawn_blocking(move || {
             use md5::Digest;
-            use std::io::Read;
             let mut h = md5::Md5::new();
-            let mut buf = vec![0u8; READ_BUFFER];
             for (path, _) in files.iter() {
-                let mut f = std::fs::File::open(path).ok()?;
-                loop {
-                    let n = f.read(&mut buf).ok()?;
-                    if n == 0 {
-                        break;
-                    }
-                    h.update(&buf[..n]);
-                }
+                crate::deltaglider::spool::for_each_chunk_blocking(path, |c| h.update(c)).ok()?;
             }
             Some(hex::encode(h.finalize()))
         })

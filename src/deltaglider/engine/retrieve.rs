@@ -21,6 +21,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 stream, metadata, ..
             } => {
                 // Collect stream into contiguous buffer (pre-allocated to exact size).
+                // small: `retrieve` is THE whole-object read; each caller says why its object is small (`whole_object_reads_are_marked_small`)
                 let chunks: Vec<Bytes> = stream.map_err(EngineError::Storage).try_collect().await?;
                 let total_len: usize = chunks.iter().map(|b| b.len()).sum();
                 let mut data = Vec::with_capacity(total_len);
@@ -392,7 +393,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     None
                 } else {
                     use futures::TryStreamExt;
+                    // small: the delta is at most the spool threshold (the branch above)
                     let chunks: Vec<Bytes> = stream.try_collect().await?;
+                    // small: the same delta, at most the spool threshold
                     Some(chunks.concat())
                 };
                 self.retrieve_with_metadata(bucket, deltaspace_id, obj_key, meta, prefetched)

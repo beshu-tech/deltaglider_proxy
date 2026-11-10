@@ -335,6 +335,7 @@ impl EncryptionConfig {
 /// A whole stream in one buffer.
 async fn collect_stream(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
     use futures::TryStreamExt;
+    // small: the callers are the magic sniff (a few bytes) and `get_object`, the whole-object read whose callers say why their object is small
     let parts: Vec<Bytes> = stream.try_collect().await?;
     let mut buf = Vec::with_capacity(parts.iter().map(|b| b.len()).sum());
     for p in parts {

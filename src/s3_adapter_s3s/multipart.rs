@@ -47,13 +47,7 @@ pub(super) async fn upload_part(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::UploadPartInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
-    let body_ctx = BodyContext::of(&req);
-    let s3s_verified_sha256 =
-        s3s_verified_payload_sha256(&req.headers, &req.uri, req.credentials.is_some());
-    let signed_payload_hash = req
-        .extensions
-        .get::<crate::api::auth::SignedPayloadHash>()
-        .cloned();
+    let body_ctx = crate::api::body_ingest::BodyContext::of(&req);
     let input = req.input;
     // Cached briefly per bucket: one HeadBucket per upload, not per part.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
@@ -74,11 +68,7 @@ pub(super) async fn upload_part(
             part_number,
         },
         part_size_limit(max_object_size),
-        crate::api::body_ingest::ContentChecks {
-            content_md5: input.content_md5.as_deref(),
-            signed_payload_hash: signed_payload_hash.as_ref(),
-            s3s_verified_sha256,
-        },
+        input.content_md5.as_deref(),
     )
     .await?;
     let etag = svc.state.multipart.upload_part(

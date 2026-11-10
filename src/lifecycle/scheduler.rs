@@ -379,7 +379,6 @@ mod tests {
             backend_capabilities: Default::default(),
             backend_health: Default::default(),
             encryption_witness: None,
-            ingest_memory: Default::default(),
         });
         let db = Arc::new(Mutex::new(JobsDb::in_memory("test").unwrap()));
         Env {

@@ -560,6 +560,7 @@ async fn stream_copy_passthrough(
                 }
             })
             .buffer_unordered(concurrency)
+            // small: part receipts. The part bytes are retained only for a non-native backend, and this path runs only for a native-multipart destination (`copy_object_once`).
             .try_collect()
             .await;
 
@@ -1033,9 +1034,7 @@ impl CopyError {
     /// the new object).
     pub(crate) fn into_s3_error(self) -> crate::api::S3Error {
         if self.class == CopyClass::SourceChanged {
-            return crate::api::S3Error::SlowDown(
-                "the copy source changed during the copy; retry the request".to_string(),
-            );
+            return crate::api::S3Error::copy_source_changed();
         }
         match self.cause.map(|c| *c) {
             Some(CopyCause::Engine(e)) => e.into(),
@@ -1836,7 +1835,7 @@ async fn spooled_copy(
         .retrieve_stream(request.source_bucket, request.source_key)
         .await
         .map_err(|e| CopyError::engine("source retrieve_stream failed", e))?;
-    let (mut stream, meta) = match resp {
+    let (stream, meta) = match resp {
         crate::deltaglider::RetrieveResponse::Streamed {
             stream, metadata, ..
         } => (stream, metadata),
@@ -1861,37 +1860,41 @@ async fn spooled_copy(
         return Err(changed());
     }
 
-    // The stream of a large delta or reference source holds its spool
-    // file: the copy holds that budget, so it never waits for more. A copy
-    // that the budget cannot hold beside it fails now: a smaller, clamped
-    // reservation would let the fill write past the budget.
-    let held = engine.stream_spool_mib(&meta);
-    if !crate::deltaglider::ingest::spool_admits(source_size, engine.spool_max_bytes(), held) {
-        return Err(crate::deltaglider::EngineError::TooLarge {
-            size: source_size,
-            max: engine.spool_max_bytes(),
-        }
-        .into());
-    }
-    let spool = engine.spool_acquire_beside_mib(held, source_size).await?;
-    // Capped at the reservation, hashed on the way: the store must get
-    // exactly the bytes the metadata names.
-    use crate::deltaglider::spool::SpoolFillError;
-    let fill = spool
-        .fill_from_stream(
-            &mut stream,
-            source_size,
-            crate::deltaglider::ingest::Sha256Need::Compute,
-        )
+    // The source, read once by THE ingest: in memory up to the spool
+    // threshold, else into a spool file whose reservation also covers the
+    // storage write's temp files. Exactly `source_size` bytes, hashed on
+    // the way: the store must get the bytes the metadata names. The stream
+    // of a large delta or reference source holds its spool file: the copy
+    // holds that budget (`held_spool_mib`), so it never waits for more, and
+    // a copy that the budget cannot hold beside it fails now.
+    use crate::deltaglider::ingest::{self, IngestError};
+    let plan = ingest::IngestPlan {
+        declared: source_size,
+        // The stored source sets the size; the store applies its limits.
+        limit: u64::MAX,
+        sha256: ingest::Sha256Need::Compute,
+        held_spool_mib: engine.stream_spool_mib(&meta),
+        strict_length: true,
+        destination: ingest::Destination::Object,
+    };
+    let body = ingest::ingest(engine, request.destination_bucket, stream, plan)
         .await
         .map_err(|e| match e {
-            SpoolFillError::Source(e) => CopyError::storage("source stream error", e),
-            SpoolFillError::Write(e) => e.into(),
-            SpoolFillError::Overrun { .. } => changed(),
+            IngestError::Source(e) => CopyError::storage("source stream error", e),
+            IngestError::TooLong { .. } | IngestError::Incomplete { .. } => changed(),
+            IngestError::TooLarge { declared, limit }
+            | IngestError::SpoolTooSmall {
+                declared,
+                max_bytes: limit,
+                ..
+            } => crate::deltaglider::EngineError::TooLarge {
+                size: declared,
+                max: limit,
+            }
+            .into(),
+            IngestError::Engine(e) => e.into(),
         })?;
-    if fill.written != source_size
-        || (!meta.file_sha256.is_empty() && fill.hashes.sha256() != meta.file_sha256)
-    {
+    if !meta.file_sha256.is_empty() && body.hashes().sha256() != meta.file_sha256 {
         return Err(changed());
     }
 
@@ -1912,17 +1915,14 @@ async fn spooled_copy(
     crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
 
     let stored = engine
-        .store_spooled_delta(
+        .store_ingested(
             lock,
             request.destination_bucket,
             request.destination_key,
-            &spool,
-            source_size,
+            body,
             content_type,
             user_metadata,
             meta.multipart_etag.clone(),
-            // Hashed by the fill: the store does not read the spool back.
-            Some(fill.hashes),
         )
         .await
         .map_err(|e| CopyError::engine("destination spooled store failed", e))?;

@@ -657,7 +657,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             prior: &prior,
             storage: None,
         };
-        if let Some(reason) = self.decline_reason(bucket, &obj_key, &put.user_metadata, put.size) {
+        if let Some(reason) = self.decline_reason(bucket, key, &put.user_metadata, put.size) {
             // The key's write lock only (P7.4): see `write_passthrough_locked`.
             let result = self
                 .write_passthrough_locked(put.passthrough_write(reason), None)
@@ -717,26 +717,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .unwrap_or(fallback)
     }
 
-    /// [`StorePlan::decline_reason`] for this bucket and key. The caller
+    /// [`Self::write_decline_reason`] of a store, logged. The caller
     /// counts the passthrough decision once the write commits.
     fn decline_reason(
         &self,
         bucket: &str,
-        obj_key: &ObjectKey,
+        key: &str,
         user_metadata: &HashMap<String, String>,
         size: u64,
     ) -> Option<PassthroughReason> {
-        let reason = StorePlan::decline_reason(
-            self.bucket_policies.compression_enabled(bucket),
-            self.bucket_policies
-                .is_delta_eligible(bucket, &obj_key.filename),
-            crate::types::no_delta_requested(user_metadata),
-            size <= self.max_object_size,
-        );
+        let reason = self.write_decline_reason(bucket, key, user_metadata, size);
         if let Some(reason) = reason {
             debug!(
-                "No delta for {bucket}/{} ({size} bytes): {}; storing as passthrough",
-                obj_key.filename,
+                "No delta for {bucket}/{key} ({size} bytes): {}; storing as passthrough",
                 reason.slug()
             );
         }
@@ -864,27 +857,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
 
         // (2) Not delta-eligible → passthrough from the body spool.
-        if self
-            .decline_reason(bucket, &obj_key, &user_metadata, size)
-            .is_some()
-        {
+        if let Some(reason) = self.decline_reason(bucket, key, &user_metadata, size) {
             let result = self
                 .store_passthrough_file_inner(
                     lock,
                     bucket,
                     key,
-                    body.path(),
-                    Some(HashedSpool {
+                    HashedSpool {
                         spool: body,
                         sha256: &sha256,
                         md5: &md5,
                         storage,
-                    }),
+                    },
                     size,
                     content_type,
                     user_metadata,
                     multipart_etag,
                     &prior,
+                    reason,
                 )
                 .await?;
             self.count_decision("passthrough");
@@ -1676,26 +1666,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         SPOOL_HASH_READS.with(|n| n.set(n.get() + 1));
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || -> std::io::Result<(String, String, u64)> {
-            use std::io::Read;
-            let mut f = std::fs::File::open(&path)?;
-            let mut sh = Sha256::new();
-            let mut mh = Md5::new();
-            let mut observed: u64 = 0;
-            let mut buf = vec![0u8; 256 * 1024];
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                observed = observed.saturating_add(n as u64);
-                sh.update(&buf[..n]);
-                mh.update(&buf[..n]);
-            }
-            Ok((
-                hex::encode(sh.finalize()),
-                hex::encode(mh.finalize()),
-                observed,
-            ))
+            let mut hasher = crate::deltaglider::ingest::BodyHasher::new(None);
+            let observed =
+                crate::deltaglider::spool::for_each_chunk_blocking(&path, |c| hasher.update(c))?;
+            let (sha256, md5) = hasher.finish().into_parts();
+            Ok((sha256, md5, observed))
         })
         .await
         .map_err(|e| EngineError::Storage(StorageError::Other(format!("hash task: {e}"))))?
@@ -1936,90 +1911,34 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(result)
     }
 
-    /// Store a passthrough object from a local file path, computing hashes
-    /// incrementally to avoid reconstructing large multipart payloads in memory.
-    #[instrument(skip(self, lock, user_metadata, multipart_etag))]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn store_passthrough_file_with_multipart_etag(
-        &self,
-        lock: &ObjectWriteGuard,
-        bucket: &str,
-        key: &str,
-        source_path: &Path,
-        total_size: u64,
-        content_type: Option<String>,
-        user_metadata: HashMap<String, String>,
-        multipart_etag: String,
-    ) -> Result<StoreResult, EngineError> {
-        let prior = self.prior_for_counter(bucket, key).await;
-        let result = self
-            .store_passthrough_file_inner(
-                lock,
-                bucket,
-                key,
-                source_path,
-                None,
-                total_size,
-                content_type,
-                user_metadata,
-                Some(multipart_etag),
-                &prior,
-            )
-            .await?;
-        Ok(result.with_accounting(prior.replaced(), 0))
-    }
-
-    /// Body of [`Self::store_passthrough_file_with_multipart_etag`]; its commit records the counter.
+    /// The passthrough store of a spooled body that
+    /// [`Self::store_spooled_delta_inner`] declined to delta (`reason`);
+    /// its commit records the counter.
     #[allow(clippy::too_many_arguments)]
     async fn store_passthrough_file_inner(
         &self,
         lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
-        source_path: &Path,
         // The body spool this op holds, hashed and size-checked already.
-        held: Option<HashedSpool<'_>>,
+        held: HashedSpool<'_>,
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
         multipart_etag: Option<String>,
         prior: &CounterPrior,
+        reason: PassthroughReason,
     ) -> Result<StoreResult, EngineError> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
 
-        let (sha256, md5) = match &held {
-            // storage-9: the streaming PUT hashed its body already.
-            Some(h) => (h.sha256.to_string(), h.md5.to_string()),
-            None => {
-                let (sha256, md5, observed) = Self::hash_spool_file(source_path).await?;
-                if observed != total_size {
-                    return Err(EngineError::Storage(StorageError::Other(format!(
-                        "Multipart relay size mismatch: expected {}, observed {}",
-                        total_size, observed
-                    ))));
-                }
-                (sha256, md5)
-            }
-        };
-        let reason = self.parts_passthrough_reason(
-            bucket,
-            key,
-            &user_metadata,
-            total_size,
-            PassthroughReason::MultipartOverDeltaCap,
-        );
-        let carried = held.and_then(|h| h.storage);
-        let held = held.map(|h| h.spool);
+        // storage-9: the streaming PUT hashed its body already.
+        let (sha256, md5) = (held.sha256.to_string(), held.md5.to_string());
+        let source_path = held.spool.path();
         let reserved = self
-            .storage_spool(
-                carried,
-                bucket,
-                total_size,
-                held.map_or(0, crate::deltaglider::spool::Spool::reserved_mib),
-            )
+            .storage_spool(held.storage, bucket, total_size, held.spool.reserved_mib())
             .await?;
         // The key's write lock only (P7.4): see `write_passthrough_locked`.
         let write = PassthroughWrite {
@@ -2040,7 +1959,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ),
             source: PassthroughSource::File {
                 path: source_path,
-                held,
+                held: Some(held.spool),
             },
         };
         self.write_passthrough_locked(write, reserved.get()).await
@@ -2620,24 +2539,6 @@ mod counter_tests {
             .unwrap();
     }
 
-    async fn file(h: &Harness, key: &str, data: &[u8]) {
-        let f = tempfile::NamedTempFile::new().unwrap();
-        tokio::fs::write(f.path(), data).await.unwrap();
-        h.engine
-            .store_passthrough_file_with_multipart_etag(
-                &h.engine.lock_object_write(BUCKET, key).await,
-                BUCKET,
-                key,
-                f.path(),
-                data.len() as u64,
-                None,
-                HashMap::new(),
-                "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
-            )
-            .await
-            .unwrap();
-    }
-
     /// Streaming delta PUTs: a fresh baseline, a sibling delta, then an
     /// overwrite. Pre-fix the delta-win branch never recorded (count 0).
     #[tokio::test]
@@ -2666,22 +2567,17 @@ mod counter_tests {
         assert_eq!(row(&h), row(&oracle));
     }
 
-    /// Every multipart passthrough sink must net an overwrite to +0 objects.
+    /// The multipart passthrough sink must net an overwrite to +0 objects.
     #[tokio::test]
     async fn multipart_sinks_overwrite_counts_one_object() {
         let (v1, v2) = versions();
-        for sink in ["relayed", "file"] {
-            let h = harness().await;
-            for data in [&v1, &v2] {
-                match sink {
-                    "relayed" => relayed(&h, "img/a.jpg", data).await,
-                    _ => file(&h, "img/a.jpg", data).await,
-                }
-            }
-            let (count, logical, _) = row(&h);
-            assert_eq!(count, 1, "{sink}: overwrite must not add an object");
-            assert_eq!(logical, v2.len() as u64, "{sink}: logical bytes of v2 only");
+        let h = harness().await;
+        for data in [&v1, &v2] {
+            relayed(&h, "img/a.jpg", data).await;
         }
+        let (count, logical, _) = row(&h);
+        assert_eq!(count, 1, "overwrite must not add an object");
+        assert_eq!(logical, v2.len() as u64, "logical bytes of v2 only");
     }
 }
 
@@ -3476,23 +3372,8 @@ mod other_form_tests {
             )
             .await
             .unwrap();
-        let f = tempfile::NamedTempFile::new().unwrap();
-        tokio::fs::write(f.path(), &v1).await.unwrap();
-        engine
-            .store_passthrough_file_with_multipart_etag(
-                &engine.lock_object_write("b", "img/f.jpg").await,
-                "b",
-                "img/f.jpg",
-                f.path(),
-                v1.len() as u64,
-                None,
-                HashMap::new(),
-                "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
-            )
-            .await
-            .unwrap();
         let d = deletes(&fake);
-        eprintln!("6 writes of absent keys: {} DELETEs: {d:?}", d.len());
+        eprintln!("5 writes of absent keys: {} DELETEs: {d:?}", d.len());
         assert!(d.is_empty(), "{} DELETEs for absent keys: {d:?}", d.len());
 
         // An overwrite of the delta as a passthrough object drops the delta.

@@ -35,7 +35,9 @@ use sha2::Sha256;
 
 use crate::deltaglider::memory_budget::MemoryPermit;
 use crate::deltaglider::spool::{mib_ceil, Spool, SpoolFillError, SpoolReservation};
-use crate::deltaglider::{DeltaGliderEngine, EngineError, KnownSha256, BLOCKING_HASH_THRESHOLD};
+use crate::deltaglider::{
+    DeltaGliderEngine, EngineError, KnownSha256, SpoolWait, BLOCKING_HASH_THRESHOLD,
+};
 use crate::storage::{StorageBackend, StorageError};
 
 /// The hex SHA-256 and MD5 of a body. Only the code that saw the bytes
@@ -93,7 +95,10 @@ impl BodyHashes {
 }
 
 /// The incremental form of [`BodyHashes::of`]: fed the chunks of a body in
-/// order. The one place a body's SHA-256 and MD5 are computed.
+/// order. The one place a body's SHA-256 and MD5 are computed together:
+/// the ingest, the spool fill, `hash_spool_file` and the read of the relay
+/// parts feed it. (The MD5 of one relay part and the `Content-MD5` of an
+/// S3 file upload are single MD5 passes of their own.)
 pub(crate) struct BodyHasher {
     sha256: Option<Sha256>,
     known: Option<KnownSha256>,
@@ -250,37 +255,25 @@ impl Medium {
     }
 }
 
-/// Pure: the medium of a body of `declared` bytes. `ram_granted`: the RAM
-/// budget gave it a permit (asked only for a body at most `threshold`).
-pub fn medium(declared: u64, threshold: u64, ram_granted: bool) -> Medium {
-    if declared > threshold {
+/// Pure: the medium of a body of `declared` bytes for `destination`. A
+/// multipart part always goes to a spool file (it becomes a relay part).
+/// `ram_granted`: the RAM budget gave an object body a permit (asked only
+/// for one at most `threshold`).
+pub fn medium(
+    destination: Destination,
+    declared: u64,
+    threshold: u64,
+    ram_granted: bool,
+) -> Medium {
+    if destination == Destination::MultipartPart {
+        Medium::SpoolMultipartPart
+    } else if declared > threshold {
         Medium::SpoolOverThreshold
     } else if ram_granted {
         Medium::Memory
     } else {
         Medium::SpoolMemoryBudget
     }
-}
-
-/// The request names no body length: neither `Content-Length` nor, for
-/// an aws-chunked body, `x-amz-decoded-content-length`. S3 answers
-/// `411 MissingContentLength`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MissingContentLength;
-
-/// Pure: the length of the body that the request declares: the decoded
-/// length of an aws-chunked body, else `Content-Length`.
-pub fn declared_body_len(headers: &axum::http::HeaderMap) -> Result<u64, MissingContentLength> {
-    if crate::api::aws_chunked::is_aws_chunked(headers) {
-        return crate::api::aws_chunked::get_decoded_content_length(headers)
-            .map(|n| n as u64)
-            .ok_or(MissingContentLength);
-    }
-    headers
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .ok_or(MissingContentLength)
 }
 
 /// Pure: can the spool ever hold a body of `declared` bytes for an op
@@ -370,7 +363,7 @@ impl Sha256Need {
 /// What [`ingest`] reads.
 #[derive(Debug, Clone, Copy)]
 pub struct IngestPlan {
-    /// The length the request declares ([`declared_body_len`]); the
+    /// The length the request declares (`api::body_ingest::declared_len`); the
     /// reservation and the fill cap. With `strict_length: false`, an upper
     /// bound of the body.
     pub declared: u64,
@@ -484,22 +477,16 @@ where
     // An object is stored right after: its reservation also covers the
     // temp files of its storage write. A part is stored at completion,
     // which reserves for its own write.
-    let storage_extra = if plan.destination == Destination::Object {
-        engine.storage_spool_extra(bucket, plan.declared).await
-    } else {
-        0
-    };
+    let storage_extra = engine
+        .storage_spool_extra(bucket, plan.destination, plan.declared)
+        .await;
     admit_declared(&plan, engine.spool_max_bytes(), storage_extra)?;
     let threshold = engine.spool_threshold();
     let object = plan.destination == Destination::Object;
     let permit = (object && plan.declared <= threshold)
         .then(|| engine.memory_budget().try_reserve(plan.declared))
         .flatten();
-    let medium = if object {
-        medium(plan.declared, threshold, permit.is_some())
-    } else {
-        Medium::SpoolMultipartPart
-    };
+    let medium = medium(plan.destination, plan.declared, threshold, permit.is_some());
     if let Some(m) = engine.metrics() {
         m.ingest_bodies_total
             .with_label_values(&medium.labels())
@@ -510,7 +497,11 @@ where
         None => {
             let reserve = Reserve {
                 bytes: plan.declared.saturating_add(storage_extra),
-                wait: plan.declared > threshold,
+                wait: if plan.declared > threshold {
+                    SpoolWait::Queue
+                } else {
+                    SpoolWait::Now
+                },
             };
             into_spool(engine, stream, plan, reserve).await
         }
@@ -553,7 +544,7 @@ where
 /// files of its storage write), and whether it may `wait` for them.
 struct Reserve {
     bytes: u64,
-    wait: bool,
+    wait: SpoolWait,
 }
 
 async fn into_spool<B, S, E>(
@@ -644,11 +635,19 @@ mod tests {
 
     #[test]
     fn medium_truth_table() {
-        assert_eq!(medium(0, 16, true), Medium::Memory);
-        assert_eq!(medium(16, 16, true), Medium::Memory);
-        assert_eq!(medium(16, 16, false), Medium::SpoolMemoryBudget);
-        assert_eq!(medium(17, 16, true), Medium::SpoolOverThreshold);
-        assert_eq!(medium(17, 16, false), Medium::SpoolOverThreshold);
+        let object = Destination::Object;
+        assert_eq!(medium(object, 0, 16, true), Medium::Memory);
+        assert_eq!(medium(object, 16, 16, true), Medium::Memory);
+        assert_eq!(medium(object, 16, 16, false), Medium::SpoolMemoryBudget);
+        assert_eq!(medium(object, 17, 16, true), Medium::SpoolOverThreshold);
+        assert_eq!(medium(object, 17, 16, false), Medium::SpoolOverThreshold);
+        // A part is a relay file at every size.
+        for (declared, granted) in [(0, true), (16, true), (16, false), (17, false)] {
+            assert_eq!(
+                medium(Destination::MultipartPart, declared, 16, granted),
+                Medium::SpoolMultipartPart
+            );
+        }
         assert_eq!(Medium::Memory.labels(), ["memory", "under_threshold"]);
         assert_eq!(
             Medium::SpoolOverThreshold.labels(),
@@ -662,48 +661,6 @@ mod tests {
             Medium::SpoolMultipartPart.labels(),
             ["spool", "multipart_part"]
         );
-    }
-
-    fn headers(pairs: &[(&'static str, &str)]) -> axum::http::HeaderMap {
-        let mut h = axum::http::HeaderMap::new();
-        for (k, v) in pairs {
-            h.insert(*k, v.parse().unwrap());
-        }
-        h
-    }
-
-    #[test]
-    fn declared_length_truth_table() {
-        let chunked = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
-        for (pairs, want) in [
-            (vec![("content-length", "12")], Ok(12)),
-            (vec![("content-length", "0")], Ok(0)),
-            (vec![], Err(MissingContentLength)),
-            (vec![("content-length", "x")], Err(MissingContentLength)),
-            (vec![("content-length", "-1")], Err(MissingContentLength)),
-            // aws-chunked: the decoded length, never the framed one.
-            (
-                vec![
-                    ("x-amz-content-sha256", chunked),
-                    ("content-length", "99"),
-                    ("x-amz-decoded-content-length", "11"),
-                ],
-                Ok(11),
-            ),
-            (
-                vec![("x-amz-content-sha256", chunked), ("content-length", "99")],
-                Err(MissingContentLength),
-            ),
-            (
-                vec![
-                    ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
-                    ("content-length", "5"),
-                ],
-                Ok(5),
-            ),
-        ] {
-            assert_eq!(declared_body_len(&headers(&pairs)), want, "{pairs:?}");
-        }
     }
 
     #[test]

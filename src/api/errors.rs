@@ -594,6 +594,13 @@ pub fn sanitise_for_client(err: &dyn std::fmt::Display) -> String {
 const SANITISED_500: &str = "Internal server error. See server logs for details.";
 
 impl S3Error {
+    /// THE answer to a copy whose source changed while it was copied: 503
+    /// SlowDown, so the client retries, and the retry judges the new
+    /// object.
+    pub fn copy_source_changed() -> Self {
+        S3Error::SlowDown("the copy source changed during the copy; retry the request".to_string())
+    }
+
     /// True for a 500 whose cause `sanitise_for_client` already logged: a
     /// second log line would repeat only the generic client text.
     pub fn cause_is_logged(&self) -> bool {

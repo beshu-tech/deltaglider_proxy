@@ -3895,7 +3895,12 @@ async fn test_usage_cache_returns_result() {
             .send()
             .await
             .unwrap();
-        if resp.status().as_u16() == 200 {
+        // "Not cached yet" is a 200 too (`cached: false`): the scan is
+        // done when the entry carries its counts.
+        assert_eq!(resp.status().as_u16(), 200);
+        let body = resp.json::<serde_json::Value>().await.unwrap();
+        assert!(body["error"].is_null(), "the scan failed: {body}");
+        if !body["total_objects"].is_null() {
             completed = true;
             break;
         }

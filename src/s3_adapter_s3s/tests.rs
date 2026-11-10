@@ -304,26 +304,6 @@ fn sandbox_applies_to_active_content_types() {
 }
 
 #[test]
-fn s3s_decodes_only_header_signed_sigv4() {
-    let mut h = axum::http::HeaderMap::new();
-    assert!(!s3s_decoded_aws_chunked(&h, false));
-    h.insert(
-        axum::http::header::AUTHORIZATION,
-        "AWS4-HMAC-SHA256 Credential=a/b".parse().unwrap(),
-    );
-    assert!(s3s_decoded_aws_chunked(&h, true));
-    assert!(
-        !s3s_decoded_aws_chunked(&h, false),
-        "no verified credentials: s3s did not decode"
-    );
-    h.insert(
-        axum::http::header::AUTHORIZATION,
-        "AWS a:b".parse().unwrap(),
-    );
-    assert!(!s3s_decoded_aws_chunked(&h, true), "SigV2 is not decoded");
-}
-
-#[test]
 fn anonymous_response_overrides_are_refused() {
     let input = s3s::dto::GetObjectInput {
         bucket: "b".into(),
@@ -604,7 +584,7 @@ fn engine_error_maps_to_s3s_code() {
 /// `ingest_client_body` (PutObject) or `ingest_part_body` (UploadPart),
 /// the request path de-frames aws-chunked bodies only with
 /// the trailer-keeping decoder, and the form POST runs the same check
-/// (`verify_ingested`, shared with them).
+/// (`checksum::ingest_checked`, shared with them).
 #[test]
 fn every_client_body_passes_the_checksum_check() {
     use crate::source_scan::{files, prod_lines, read, rel};
@@ -647,7 +627,9 @@ fn every_client_body_passes_the_checksum_check() {
         "the scan found PutObject's and UploadPart's ingest"
     );
     let form = crate::source_scan::prod_text(&read("src/api/handlers/form_post.rs"));
-    assert!(form.contains("checksum::verify_ingested("));
+    assert!(form.contains("checksum::ingest_checked("));
+    let put = crate::source_scan::prod_text(&read("src/api/body_ingest.rs"));
+    assert!(put.contains("checksum::ingest_checked("));
 }
 
 /// A client write reads its whole body (and checks it) BEFORE it takes the
@@ -991,56 +973,6 @@ proptest::proptest! {
             proptest::prop_assert!(is_range_err, "expected InvalidRange, got {:?}", r);
         }
     }
-}
-
-/// Truth table of `s3s_verified_payload_sha256`: a digest only for a
-/// unique SigV4 header with a unique lowercase-hex payload hash and no
-/// SigV2 query signature.
-#[test]
-fn s3s_verified_payload_sha256_truth_table() {
-    let hex = "a".repeat(64);
-    let v4 = "AWS4-HMAC-SHA256 Credential=AK/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=ab";
-    let case = |auth: &[&str], sha: &[&str], query: &str, creds: bool| {
-        let mut h = axum::http::HeaderMap::new();
-        for a in auth {
-            h.append("authorization", a.parse().unwrap());
-        }
-        for s in sha {
-            h.append("x-amz-content-sha256", s.parse().unwrap());
-        }
-        let uri: axum::http::Uri = format!("/b/k{query}").parse().unwrap();
-        s3s_verified_payload_sha256(&h, &uri, creds).map(|d| d.to_hex())
-    };
-    assert_eq!(case(&[v4], &[&hex], "", true), Some(hex.clone()));
-    assert_eq!(
-        case(&[v4], &[&hex], "?x-id=PutObject", true),
-        Some(hex.clone())
-    );
-    // s3s verified no credentials.
-    assert_eq!(case(&[v4], &[&hex], "", false), None);
-    // A SigV2 query (s3s checks it and verifies no body), in any spelling.
-    for q in [
-        "?Signature=x&AWSAccessKeyId=AK&Expires=1",
-        "?%53ignature=x",
-        "?signature=x",
-        "?X-Amz-Signature=x",
-    ] {
-        assert_eq!(case(&[v4], &[&hex], q, true), None, "{q}");
-    }
-    // Not a unique SigV4 header.
-    assert_eq!(case(&["AWS AK:sig"], &[&hex], "", true), None);
-    assert_eq!(case(&[v4, v4], &[&hex], "", true), None);
-    assert_eq!(case(&[], &[&hex], "", true), None);
-    // Not a unique lowercase-hex payload hash.
-    assert_eq!(case(&[v4], &[&hex.to_uppercase()], "", true), None);
-    assert_eq!(case(&[v4], &[&hex, &hex], "", true), None);
-    assert_eq!(case(&[v4], &["UNSIGNED-PAYLOAD"], "", true), None);
-    assert_eq!(
-        case(&[v4], &["STREAMING-AWS4-HMAC-SHA256-PAYLOAD"], "", true),
-        None
-    );
-    assert_eq!(case(&[v4], &[&"a".repeat(63)], "", true), None);
-    assert_eq!(case(&[v4], &[], "", true), None);
 }
 
 #[test]

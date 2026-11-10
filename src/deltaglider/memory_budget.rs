@@ -90,6 +90,7 @@ impl MemoryBudget {
     }
 
     /// A budget that grants every request (tests).
+    #[cfg(test)]
     pub fn unbounded() -> Self {
         Self::new(u64::MAX)
     }
@@ -116,7 +117,8 @@ impl MemoryBudget {
         })
     }
 
-    /// The budget, in bytes (a multiple of KiB).
+    /// The budget, in bytes (a multiple of KiB). Tests only.
+    #[cfg(test)]
     pub fn max_bytes(&self) -> u64 {
         self.0.max_kib.saturating_mul(KIB)
     }
