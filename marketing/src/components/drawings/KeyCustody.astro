@@ -2,9 +2,16 @@
 // KeyCustody — who holds what when the proxy encrypts. The claim: the
 // key stays in your runtime; the provider stores ciphertext only.
 import StepDrawing from './StepDrawing.astro';
+
+interface Props {
+  /** A line above the drawing, e.g. the mode that it shows. */
+  lead?: string;
+}
+const { lead } = Astro.props;
 ---
 
 <StepDrawing
+  lead={lead}
   numbered={false}
   stacked
   steps={[

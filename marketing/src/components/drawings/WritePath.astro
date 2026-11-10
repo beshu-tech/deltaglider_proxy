@@ -2,10 +2,20 @@
 // WritePath — what a PUT does. The claim: the proxy keeps a delta only
 // when it saves space; everything else is stored whole.
 import StepDrawing from './StepDrawing.astro';
+
+interface Props {
+  /** The object of the example. The docs pass a name of their fixed cast. */
+  object?: string;
+  /** Size of the uploaded file; omit when the page gives none. */
+  size?: string;
+  /** What the bucket gets, e.g. "148 KB". */
+  stored?: string;
+}
+const { object = 'releases/v2.zip', size = Astro.props.object ? undefined : '91 MB', stored = '148 KB' } = Astro.props;
 ---
 
 <StepDrawing
-  lead="A client sends: <b>PUT releases/v2.zip</b> (91 MB)"
+  lead={`A client sends: <b>PUT ${object}</b>${size ? ` (${size})` : ''}`}
   steps={[
     { scene: 'upload', label: 'A laptop that sends a file',
       title: 'The client uploads the whole file',
@@ -17,7 +27,7 @@ import StepDrawing from './StepDrawing.astro';
       title: 'xdelta3 computes the delta',
       body: 'Against <code>reference.bin</code>, the first file of this folder. Never against another delta.' },
     { scene: 'store', label: 'A thin delta goes into the bucket next to the reference',
-      title: 'The bucket gets 148 KB',
+      title: `The bucket gets ${stored}`,
       body: 'If the delta is 75% of the file or more, the proxy discards it and stores the file whole.' },
   ]}
 >

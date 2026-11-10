@@ -115,6 +115,14 @@ VC-backed". Each one is checkable.
   tables for comparisons. References for the tone: sqlite.org, litestream.io,
   restic.net, the Tailscale docs. Plain, dense, dated, signed.
 
+- **Drawings in the docs**: a docs page gets a drawing only where it shows
+  the mechanism that the section explains, and only from the same set. The
+  markdown stays plain (the product viewer, GitHub and the `.md` endpoints
+  read it); `marketing/src/lib/docDrawings.ts` names the page and the
+  heading. Today: the write path in `explanation/delta-compression`, the
+  read path in `tutorials/first-delta-savings`, key custody in
+  `explanation/encryption-at-rest`. Task pages keep their screenshots.
+
 ## 4. Page set
 
 | Today | After | Why |
