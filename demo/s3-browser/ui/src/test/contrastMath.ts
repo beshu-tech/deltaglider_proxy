@@ -30,8 +30,15 @@ export function parseColor(c: string): Rgba {
 }
 
 function luminance(color: string): number {
-  const [r, g, b] = parseColor(color)
-    .slice(0, 3)
+  const [r, g, b, a] = parseColor(color);
+  // Contrast of a translucent colour depends on what is behind it; reading
+  // only r/g/b would measure it as opaque and pass it.
+  if (a < 1) throw new Error(`unparseable colour: translucent, flatten() it first: ${color}`);
+  return rel([r, g, b]);
+}
+
+function rel(rgb: number[]): number {
+  const [r, g, b] = rgb
     .map((v) => v / 255)
     .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;

@@ -33,3 +33,14 @@ test('flatten composites alpha over the background', () => {
   assert.equal(flatten('rgba(0,0,0,0.5)', '#ffffff'), '#808080');
   assert.equal(flatten('#112233', '#ffffff'), '#112233');
 });
+
+test('a translucent colour is refused: ratio() cannot measure it, flatten() it first', () => {
+  for (const c of ['rgba(255,255,255,0.1)', '#ffffff1a', '#fff1']) {
+    assert.throws(() => ratio(c, '#000000'), /translucent/, c);
+    assert.throws(() => ratio('#000000', c), /translucent/, c);
+  }
+  // Flattened, the same token measures as the low contrast it is.
+  assert.ok(ratio(flatten('rgba(255,255,255,0.1)', '#000000'), '#000000') < 1.3);
+  // An explicit alpha of 1 is opaque.
+  assert.doesNotThrow(() => ratio('rgba(255,255,255,1)', '#000000'));
+});

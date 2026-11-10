@@ -204,6 +204,16 @@ printf 'fake: %s\n' "AKIA""DOCSDANA00000001" >> "$d/doc.md"
 commit "$d"
 expect pass "secrets: documentation placeholder keys" "$d" check-no-committed-secrets.sh
 
+d="$(secret_repo sec-example-line)"
+printf 'GITHUB_TOKEN=%s  # see EXAMPLE in README\n' "ghp""_0123456789abcdefghijABCDEFGHIJ012345" > "$d/deploy.sh"
+commit "$d"
+expect fail "secrets: a real token on a line that says EXAMPLE" "$d" check-no-committed-secrets.sh "possible live secret"
+
+d="$(secret_repo sec-example-aws-line)"
+printf 'real %s and docs %s\n' "AKI""AJ7QWERTYUIOPASDF" "AKIA""IOSFODNN7""EXAMPLE" > "$d/mixed.md"
+commit "$d"
+expect fail "secrets: a real AWS id beside an EXAMPLE one on one line" "$d" check-no-committed-secrets.sh "possible live secret"
+
 secret_case "AWS access key id"   conf.yaml "access_key_id: AKI""AJ7QWERTYUIOPASDF"          "possible live secret"
 secret_case "AWS session key id"  conf.yaml "id: ASI""AJ7QWERTYUIOPASDF"                      "possible live secret"
 secret_case "GitHub token"        notes.txt "token ghp""_0123456789abcdefghijABCDEFGHIJ012345"   "possible live secret"
@@ -234,6 +244,20 @@ d="$(e2e_repo e2e-orphan review/r.spec.ts "test.skip(!process.env.REVIEW, 'Revie
 expect fail "e2e specs: skip variable that nothing sets (the REVIEW=1 spec)" "$d" check-e2e-specs-run.sh "never runs"
 d="$(e2e_repo e2e-orphan2 explore/e.spec.ts "test.skip(process.env.EXPLORE !== '1', 'x');")"
 expect fail "e2e specs: skip on a variable that nothing sets (EXPLORE)" "$d" check-e2e-specs-run.sh "never runs"
+d="$(e2e_repo e2e-comment-spec s/c.spec.ts "test.skip(!process.env.FOO, 'x');")"
+printf '# FOO: never set, see c.spec.ts\nFOO_NOTE=1 # FOO=1\n' > "$d/scripts/run.sh"
+printf 'env:\n  # FOO: never set, see c.spec.ts\n' > "$d/.github/workflows/w.yml"
+expect fail "e2e specs: variable named only in a comment" "$d" check-e2e-specs-run.sh "never runs"
+d="$(e2e_repo e2e-multiline s/m.spec.ts "test.skip(
+  !process.env.BAR,
+  'x',
+);")"
+expect fail "e2e specs: skip call split over lines" "$d" check-e2e-specs-run.sh "never runs"
+d="$(e2e_repo e2e-multiline-ok s/m.spec.ts "test.skip(
+  !process.env.QA_REGRESSION,
+  'x',
+);")"
+expect pass "e2e specs: split skip call on a variable a script sets" "$d" check-e2e-specs-run.sh
 
 if ((fail != 0)); then
   echo "FAIL: a shell guard accepts input it claims to refuse (see above)." >&2

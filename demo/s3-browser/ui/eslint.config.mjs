@@ -83,7 +83,10 @@ const THEME_SYNTAX_RULES = [
       // A bare `color: 'red'` is an AntD Tag preset (jobsView.ts), so `color`
       // counts only inside a JSX `style={{ ... }}`.
       // `transparent`, `inherit` and `currentColor` are not colours of ours.
-      selector: `:matches(Property[key.name=/^(background|backgroundColor|borderColor|borderTopColor|borderBottomColor|borderLeftColor|borderRightColor|outlineColor|fill|stroke|caretColor|accentColor)$/] > Literal[value=${NAMED_COLOR_RE}], JSXAttribute[name.name=/^(fill|stroke|stopColor|floodColor)$/] > Literal[value=${NAMED_COLOR_RE}], JSXAttribute[name.name='style'] Property[key.name='color'] > Literal[value=${NAMED_COLOR_RE}], Literal[value=/(gradient|solid|dashed|dotted|inset)[^]*\\b(${NAMED_COLORS.join('|')})\\b/i])`,
+      // A shorthand (`1px solid white`, `linear-gradient(red, ...)`) counts only as
+      // the value of a border/outline/background/boxShadow property: the same
+      // words in UI text ("Consolidated view: a green tick ...") are not a style.
+      selector: `:matches(Property[key.name=/^(background|backgroundColor|borderColor|borderTopColor|borderBottomColor|borderLeftColor|borderRightColor|outlineColor|fill|stroke|caretColor|accentColor)$/] > Literal[value=${NAMED_COLOR_RE}], JSXAttribute[name.name=/^(fill|stroke|stopColor|floodColor)$/] > Literal[value=${NAMED_COLOR_RE}], JSXAttribute[name.name='style'] Property[key.name='color'] > Literal[value=${NAMED_COLOR_RE}], Property[key.name=/^(border(Top|Bottom|Left|Right)?|outline|background(Image)?|boxShadow)$/] > Literal[value=/\\b(solid|dashed|dotted|inset|gradient)\\b.*\\b(${NAMED_COLORS.join('|')})\\b/i])`,
       message: 'No named colour (white, red, ...): use a palette token (useColors(), cssVar(), tint() from src/themeVars.ts).',
     },
 ];

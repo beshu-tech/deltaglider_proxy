@@ -53,6 +53,9 @@ const BAD: [string, string, string][] = [
   ['named colour in style color', `export const A = () => <div style={{ color: 'white' }} />;`, 'No named colour'],
   ['named colour in style background', `export const A = () => <div style={{ background: 'red' }} />;`, 'No named colour'],
   ['named colour in border shorthand', `export const A = () => <div style={{ border: '1px solid white' }} />;`, 'No named colour'],
+  ['named colour in outline shorthand', `export const A = () => <div style={{ outline: '2px dashed gold' }} />;`, 'No named colour'],
+  ['named colour in boxShadow', `export const s = { boxShadow: 'inset 0 0 4px black' };`, 'No named colour'],
+  ['named colour in background gradient', `export const s = { background: 'linear-gradient(red, blue)' };`, 'No named colour'],
   ['named colour in SVG fill', `export const A = () => <svg><path fill="black" /></svg>;`, 'No named colour'],
   ['hex-alpha concatenation', 'export const f = (c: string) => `${c}22`;', 'hex-alpha'],
 
@@ -67,6 +70,11 @@ const GOOD: [string, string][] = [
   ['transparent / inherit / currentColor', `export const A = () => <div style={{ color: 'inherit', background: 'transparent', borderColor: 'currentColor' }} />;`],
   ['named import of Button', `import { Button } from 'antd';\nexport const A = () => <Button />;`],
   ['a theme var', `export const A = () => <div style={{ color: 'var(--dg-text-primary)' }} />;`],
+  // UI text that holds a style keyword and a colour word is not a style value.
+  ['help text: "Consolidated ... green"', `export const t = 'Consolidated view: a green tick means the run is done';`],
+  ['help text: "Dashed ... red"', `export const t = 'Dashed lines show the target. The red line shows the limit.';`],
+  ['JSX text: "Inset the tan box"', `export const A = () => <p>{'Inset the tan box'}</p>;`],
+  ['style border without a named colour', `export const A = () => <div style={{ border: '1px solid var(--dg-border)' }} />;`],
   ['hover in CSS class', `export const A = () => <div className="dg-hover-surface" />;`],
 ];
 

@@ -53,12 +53,14 @@ fi
 #      8 or 9; the fake ids in docs and tests do, or spell EXAMPLE)
 #    - GitHub token (ghp_/gho_/ghu_/ghs_/ghr_ + 36, or github_pat_), GitLab
 #      glpat-, Stripe sk_live_, Google API key AIza..., Anthropic sk-ant-
-#    A line that says EXAMPLE (AWS's own documentation key) is not a hit.
+#    Only an AWS id that itself spells EXAMPLE (AWS's own documentation key)
+#    is exempt. Each match is checked alone (`-o`), so a real token on a line
+#    that says EXAMPLE, or beside an EXAMPLE id, still fails.
 patterns='xox[abprs]-[0-9]{6,}-|-----BEGIN [A-Z ]*PRIVATE KEY-----|(AKIA|ASIA)[A-Z2-7]{16}([^A-Z2-7]|$)|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|glpat-[A-Za-z0-9_-]{20}|sk_live_[0-9A-Za-z]{20,}|AIza[0-9A-Za-z_-]{35}|sk-ant-[A-Za-z0-9_-]{20,}'
-hits=$(git grep -nIE "$patterns" -- \
+hits=$(git grep -nIoE "$patterns" -- \
   ':(exclude)*.lock' \
   ':(exclude)demo/s3-browser/ui/dist/**' \
-  2>/dev/null | grep -v 'EXAMPLE' || true)
+  2>/dev/null | grep -vE ':(AKIA|ASIA)[A-Z2-7]{0,16}EXAMPLE' || true)
 if [[ -n "$hits" ]]; then
   while IFS= read -r line; do note "possible live secret: $line"; done <<<"$hits"
 fi
