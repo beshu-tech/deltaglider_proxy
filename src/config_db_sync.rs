@@ -1844,7 +1844,10 @@ mod tests {
             "fn build_encryption_witness(",
             "fn init_config_sync(",
         ] {
-            assert!(section.contains(builder), "{builder} is outside the section");
+            assert!(
+                section.contains(builder),
+                "{builder} is outside the section"
+            );
         }
         assert!(section.contains("shutdown::request_exit"));
     }

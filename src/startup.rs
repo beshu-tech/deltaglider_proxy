@@ -1280,9 +1280,12 @@ fn prove_coordination(
 ///   hard exit of this section (source guard
 ///   `only_settle_coordination_exits_the_process_on_a_coordination_verdict`).
 /// - Unknown (the probe could not run): the proxy boots, but every
-///   coordination writer fails closed (retryable `503 SlowDown` on a request
-///   path, "retry later" in the background; the config sync upload stays
-///   parked) until the background re-probe proves the bucket.
+///   coordination writer fails closed until the background re-probe proves
+///   the bucket: a delta PUT gets a retryable `503 ServiceUnavailable` (the
+///   reference lock), a write to a witnessed bucket gets `503 SlowDown`, and
+///   a background task retries later. The witness opens at its next poll
+///   (up to 30 s); the parked config sync upload goes at the next poll tick
+///   (up to 5 minutes).
 fn settle_coordination(
     verdict: &Result<
         deltaglider_proxy::config_db_sync::CoordinationValidation,
@@ -1553,8 +1556,8 @@ pub async fn build_coordination_lease(
 /// fatal, and not HERE: the later gates ([`build_coordination_lease`],
 /// `init_config_sync`, after the backend capability gate) exit on it. An
 /// unknown verdict builds the lock CLOSED: every acquire fails with a
-/// retryable error (`503 SlowDown`) until the background re-probe proves the
-/// bucket. A client-build failure is non-fatal (`None`, warn):
+/// retryable error (a delta PUT answers `503 ServiceUnavailable`) until the
+/// background re-probe proves the bucket. A client-build failure is non-fatal (`None`, warn):
 /// same "never a SPOF" stance as the lease builder — a transient blip must not
 /// wedge startup, and the single-writer routing contract still applies.
 pub async fn build_reference_lock(
