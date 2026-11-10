@@ -124,6 +124,8 @@ mod iam_variables_clone_test;
 mod large_object_e2e_test;
 #[path = "lifecycle_test.rs"]
 mod lifecycle_test;
+#[path = "list_edges_test.rs"]
+mod list_edges_test;
 #[path = "list_truncation_test.rs"]
 mod list_truncation_test;
 #[path = "logs_test.rs"]

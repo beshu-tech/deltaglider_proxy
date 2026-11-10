@@ -33,6 +33,59 @@ pub(crate) struct SelfCopyPlan {
 
 /// Metadata keys DG owns: the new metadata restates them, so stale values
 /// from the HEAD are dropped (the pre-D17 behaviour for these keys).
+/// Pure: a user-metadata value as the client wrote it. A backend answers a
+/// non-ASCII value as one RFC 2047 encoded word, and each backend picks its
+/// own form (`=?UTF-8?q?…?=` on MinIO, `=?UTF-8?B?…?=` on AWS). The proxy
+/// decodes the word, and the S3 front end encodes it again in one form (`B`),
+/// so a client gets the same header whatever the backend (F43). A value that
+/// is not exactly one UTF-8 encoded word stays as it is.
+pub(crate) fn decode_user_value(value: &str) -> String {
+    use base64::Engine as _;
+    let Some(word) = value
+        .strip_prefix("=?")
+        .and_then(|rest| rest.strip_suffix("?="))
+    else {
+        return value.to_string();
+    };
+    let mut parts = word.splitn(3, '?');
+    let (Some(charset), Some(encoding), Some(text), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return value.to_string();
+    };
+    if !charset.eq_ignore_ascii_case("utf-8") || text.contains('?') {
+        return value.to_string();
+    }
+    let bytes = match encoding {
+        "B" | "b" => base64::engine::general_purpose::STANDARD.decode(text).ok(),
+        "Q" | "q" => decode_q(text),
+        _ => None,
+    };
+    bytes
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| value.to_string())
+}
+
+/// The `Q` encoding of RFC 2047: `_` is a space, `=XX` is a byte.
+fn decode_q(text: &str) -> Option<Vec<u8>> {
+    let raw = text.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'_' => out.push(b' '),
+            b'=' => {
+                let hex = raw.get(i + 1..i + 3)?;
+                out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+                i += 2;
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
 pub(super) fn is_dg_owned_meta_key(key: &str) -> bool {
     const LEGACY: &[&str] = &[
         "tool",
@@ -337,7 +390,7 @@ impl S3Backend {
             .iter()
             .filter_map(|(k, v)| {
                 k.strip_prefix("user-")
-                    .map(|suffix| (suffix.to_string(), v.clone()))
+                    .map(|suffix| (suffix.to_string(), decode_user_value(v)))
             })
             .collect();
 
@@ -690,4 +743,53 @@ pub(super) fn check_metadata_size(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod user_value_tests {
+    use super::decode_user_value;
+    use base64::Engine as _;
+    use proptest::prelude::*;
+
+    #[test]
+    fn both_forms_of_an_encoded_word_decode_to_the_text() {
+        assert_eq!(decode_user_value("=?UTF-8?q?=C3=A9?="), "é");
+        assert_eq!(decode_user_value("=?UTF-8?B?w6k=?="), "é");
+        assert_eq!(decode_user_value("=?utf-8?q?a_b=C3=A9?="), "a bé");
+    }
+
+    #[test]
+    fn anything_else_stays_as_it_is() {
+        for v in [
+            "plain",
+            "",
+            "=?UTF-8?q?=C3=A9",
+            "=?ISO-8859-1?q?=E9?=",
+            "=?UTF-8?x?abc?=",
+            "=?UTF-8?q?=ZZ?=",
+            "=?UTF-8?q?=C3?=", // not UTF-8
+            "=?UTF-8?B?!!!?=",
+            "a =?UTF-8?q?=C3=A9?= b",
+            "=?UTF-8?q?a?b?=",
+        ] {
+            assert_eq!(decode_user_value(v), v, "{v:?}");
+        }
+    }
+
+    proptest! {
+        /// A word of either form decodes to the text, for any Unicode text.
+        #[test]
+        fn a_word_decodes_to_its_text(text in "\\PC{0,20}") {
+            let b = format!(
+                "=?UTF-8?B?{}?=",
+                base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
+            );
+            prop_assert_eq!(decode_user_value(&b), text.clone());
+            let q: String = text
+                .bytes()
+                .map(|b| format!("={b:02X}"))
+                .collect();
+            prop_assert_eq!(decode_user_value(&format!("=?UTF-8?q?{q}?=")), text);
+        }
+    }
 }

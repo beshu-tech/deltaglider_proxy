@@ -285,7 +285,8 @@ pub(super) async fn list_multipart_uploads(
     let list_scope = req.extensions.get::<ListScope>().cloned();
     let input = req.input;
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
-    let max_uploads = non_negative_arg(input.max_uploads, 1000, "max-uploads")?.clamp(1, 1000);
+    // `max-uploads=0` lists no upload and says 0, as `max-keys=0` does.
+    let max_uploads = non_negative_arg(input.max_uploads, 1000, "max-uploads")?.min(1000);
     let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
     // A bucket-level LIST like ListObjects: a Filtered caller sees only the
     // uploads of keys it may list.
@@ -295,7 +296,9 @@ pub(super) async fn list_multipart_uploads(
         }
         _ => true,
     };
-    let (uploads, is_truncated, next_key, next_upload_id) =
+    let (uploads, is_truncated, next_key, next_upload_id) = if max_uploads == 0 {
+        (Vec::new(), false, String::new(), String::new())
+    } else {
         svc.state.multipart.list_uploads_paginated(
             Some(&input.bucket),
             input.prefix.as_deref(),
@@ -303,7 +306,8 @@ pub(super) async fn list_multipart_uploads(
             input.upload_id_marker.as_deref().unwrap_or(""),
             max_uploads,
             &visible,
-        );
+        )
+    };
     let uploads = uploads
         .into_iter()
         .map(|u| s3s::dto::MultipartUpload {
