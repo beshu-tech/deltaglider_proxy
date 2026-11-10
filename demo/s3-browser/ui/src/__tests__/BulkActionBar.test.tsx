@@ -214,7 +214,7 @@ describe('copy / move destination', () => {
     expect(within(dialog).getByText('releases/old/builds/')).toBeInTheDocument();
     expect(ok).toBeEnabled();
     await user.click(ok);
-    await waitFor(() => expect(handler).toHaveBeenCalledWith('releases', 'old/builds/'));
+    await waitFor(() => expect(handler).toHaveBeenCalledWith('releases', 'old/builds/', expect.any(Function)));
     expect(await screen.findByText('2 objects moved')).toBeInTheDocument();
   });
 

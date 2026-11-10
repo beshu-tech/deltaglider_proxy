@@ -37,6 +37,8 @@ export interface BulkTransferOutcome {
   failures: TransferBatchResult['failures'];
   /** The user stopped the run; the items after the last finished batch were not sent. */
   cancelled: boolean;
+  /** Items left out because the user chose to skip the objects that already exist at the destination (absent = 0). */
+  skipped?: number;
 }
 
 interface TransferProgress {
@@ -126,6 +128,15 @@ export function transferPlanError(
 
 /** The message after a copy or move that did not throw. */
 export function bulkTransferOutcomeMessage(o: BulkTransferOutcome): { type: 'success' | 'info' | 'warning'; text: string } {
+  const shown = transferOutcomeMessage(o);
+  const skipped = o.skipped ?? 0;
+  if (skipped === 0) return shown;
+  // The user's own choice: the sources of the skipped items stay, the existing destination objects stay.
+  const text = `${shown.text.replace(/\.$/, '')}. ${count(skipped)} existing ${noun(skipped, UNIT[o.action])} at the destination ${skipped === 1 ? 'was' : 'were'} skipped.`;
+  return { ...shown, text };
+}
+
+function transferOutcomeMessage(o: BulkTransferOutcome): { type: 'success' | 'info' | 'warning'; text: string } {
   const past = o.action === 'copy' ? 'copied' : 'moved';
   const Verb = o.action === 'copy' ? 'Copy' : 'Move';
   const went = transferred(o);
@@ -157,7 +168,7 @@ export function bulkTransferOutcomeMessage(o: BulkTransferOutcome): { type: 'suc
       text: `${count(went)} of ${items} ${past}. ${count(o.failed)} failed${example}.${keptText}${why}`,
     };
   }
-  if (o.total === 0) return { type: 'info', text: `Nothing to ${o.action}.` };
+  if (o.total === 0) return { type: 'info', text: (o.skipped ?? 0) > 0 ? `Nothing was ${past}.` : `Nothing to ${o.action}.` };
   if (kept > 0) return { type: 'warning', text: `${count(went)} of ${items} ${past}.${keptText}` };
   if (inPlace > 0) return { type: 'info', text: `${count(went)} ${noun(went, unit)} ${past}.${inPlaceText}` };
   return { type: 'success', text: `${count(went)} ${noun(went, unit)} ${past}` };

@@ -10,6 +10,7 @@ import { type RowKey, splitRowKeys } from '../rowKey';
 import { type BulkAction, type BulkProgress, BulkActionFailed } from '../bulkBatches';
 import type { DeleteJobOutcome, DeletePlanSummary } from '../bulkDelete';
 import { type BulkTransferOutcome, transferInBatches, transferPlanError } from '../bulkTransfer';
+import { type ConflictResolver, findConflicts, itemsAfterChoice } from '../bulkConflicts';
 import { downloadZip as saveZip, zipPreflightError } from '../zipDownload';
 
 interface BulkOptions {
@@ -69,6 +70,19 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
           sent: (done: number, went: number) => void,
           progress: (done: number, went: number) => void,
         ) => Promise<O>;
+        /**
+         * Asked after the listing, before the first request: look at the
+         * destination and settle what to send. The items to send, or `null`
+         * to end the run with nothing done. `ctl` shows the phase in the bar.
+         */
+        prepare?: (
+          items: ExpandedItem[],
+          ctl: {
+            signal: AbortSignal;
+            checking: (checked: number, total: number) => void;
+            confirming: (total: number) => void;
+          },
+        ) => Promise<ExpandedItem[] | null>;
         /** The outcome of a run cancelled while it listed (or declined at the confirmation). */
         cancelledWhileListing: () => O;
         /** Asked after the listing, before the first request: `false` ends the run with nothing done. */
@@ -86,10 +100,19 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
       let went = 0;
       setBulkProgress({ action, phase: 'listing', listed: 0, folders: 0, keysFound: 0, stopping: false });
       try {
-        const items = await run.expand({
+        let items = await run.expand({
           signal: ctl.signal,
           onProgress: (p) => setBulkProgress({ action, phase: 'listing', ...p, stopping: stopping() }),
         });
+        if (run.prepare) {
+          const prepared = await run.prepare(items, {
+            signal: ctl.signal,
+            checking: (checked, n) => setBulkProgress({ action, phase: 'checking', checked, total: n, stopping: stopping() }),
+            confirming: (n) => setBulkProgress({ action, phase: 'confirming', total: n, stopping: false }),
+          });
+          if (prepared === null) return run.cancelledWhileListing();
+          items = prepared;
+        }
         if (run.confirm) {
           setBulkProgress({ action, phase: 'confirming', total: items.length, stopping: false });
           if (!(await run.confirm(items))) return run.cancelledWhileListing();
@@ -177,13 +200,25 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
    * the first batch: the server sees one batch at a time. For a move, the
    * server removes a batch's sources only when every copy of that batch
    * succeeded.
+   *
+   * Nothing is written over an existing object unasked (F17): after the
+   * listing, the destination keys are looked up, and when any exists
+   * `onConflicts` decides: skip those items (a move then keeps their
+   * sources), overwrite, or cancel. With no `onConflicts` an existing
+   * destination cancels the run.
    */
   const bulkTransfer = useCallback(
-    (action: 'copy' | 'move', destBucket: string, destPrefix: string): Promise<BulkTransferOutcome> => {
+    (
+      action: 'copy' | 'move',
+      destBucket: string,
+      destPrefix: string,
+      onConflicts?: ConflictResolver,
+    ): Promise<BulkTransferOutcome> => {
       // Snapshot the source bucket ONCE so the listing and the requests run
       // against the same bucket even if the user switches buckets mid-run.
       const sourceBucket = getBucket();
       const request = action === 'copy' ? bulkCopyObjects : bulkMoveObjects;
+      let skipped = 0;
       return runBulk<BulkTransferOutcome>(action, {
         expand: async (opts) => {
           // The folder's own marker key (empty suffix) is not copied.
@@ -194,8 +229,26 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
           if (problem) throw new Error(problem);
           return items;
         },
-        send: (items, signal, sent) =>
-          transferInBatches(
+        prepare: async (items, { signal, checking, confirming }) => {
+          const conflicts = await findConflicts(
+            items,
+            sourceBucket === destBucket,
+            destPrefix,
+            (pfx, after) => listAllUnderPrefix(destBucket, pfx, after),
+            { signal, onProgress: (p) => checking(p.checked, p.total) },
+          );
+          if (conflicts.length === 0) return items;
+          confirming(items.length);
+          const choice = onConflicts
+            ? await onConflicts({ action, destBucket, total: items.length, conflicts })
+            : 'cancel';
+          if (choice === 'cancel') return null;
+          const kept = itemsAfterChoice(items, conflicts, choice);
+          skipped = items.length - kept.length;
+          return kept;
+        },
+        send: async (items, signal, sent) => ({
+          ...(await transferInBatches(
             action,
             items,
             (batch) =>
@@ -206,7 +259,9 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
                 items: batch.map(({ source, relative }) => ({ source_key: source, relative })),
               }),
             { signal, onBatch: (p) => sent(p.done, p.went) },
-          ),
+          )),
+          ...(skipped > 0 ? { skipped } : {}),
+        }),
         cancelledWhileListing: () => ({
           action,
           total: 0,
@@ -223,11 +278,13 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
     [runBulk, expandSelected],
   );
   const bulkCopy = useCallback(
-    (destBucket: string, destPrefix: string) => bulkTransfer('copy', destBucket, destPrefix),
+    (destBucket: string, destPrefix: string, onConflicts?: ConflictResolver) =>
+      bulkTransfer('copy', destBucket, destPrefix, onConflicts),
     [bulkTransfer],
   );
   const bulkMove = useCallback(
-    (destBucket: string, destPrefix: string) => bulkTransfer('move', destBucket, destPrefix),
+    (destBucket: string, destPrefix: string, onConflicts?: ConflictResolver) =>
+      bulkTransfer('move', destBucket, destPrefix, onConflicts),
     [bulkTransfer],
   );
 
