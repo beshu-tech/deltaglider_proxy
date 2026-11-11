@@ -54,8 +54,9 @@ Before production, decide each of these from your workload, not the defaults:
 |---|---|---|---|
 | Codec concurrency | `DGP_CODEC_CONCURRENCY` | num_cpus × 4 (min 16) | Peak concurrent delta ops |
 | Max object size | `DGP_MAX_OBJECT_SIZE` | 100 MB | Largest object that clients upload (bigger uploads are refused with `413`) |
-| Spool threshold | `DGP_SPOOL_THRESHOLD_BYTES` | 16 MiB | Delta objects above it use spool disk instead of RAM |
-| Spool budget | `DGP_SPOOL_MAX_BYTES` | 16 GiB | Concurrent large delta operations and multipart uploads |
+| Spool threshold | `DGP_SPOOL_THRESHOLD_BYTES` | 16 MiB | Upload bodies and delta objects above it use spool disk instead of RAM |
+| Upload memory budget | `DGP_INGEST_MEMORY_MAX_BYTES` | 1 GiB | RAM for upload bodies of at most the spool threshold; a body that does not fit goes to the spool |
+| Spool budget | `DGP_SPOOL_MAX_BYTES` | 16 GiB | Concurrent uploads above the spool threshold, large delta operations and multipart uploads. A request that finds no free spool space gets `503 SlowDown` |
 | Reference cache | `DGP_CACHE_MB` | 100 MB | Number/size of hot baselines, read-heaviness |
 | Metadata cache | `DGP_METADATA_CACHE_MB` | 50 MB | LIST/HEAD volume |
 | Listing-size cache | `DGP_LIST_SIZE_CACHE_MB` | 32 MB | Number of delta objects that listings report |

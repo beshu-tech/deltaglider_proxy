@@ -103,6 +103,8 @@ You can set all settings through environment variables:
 | `DGP_LOG_LEVEL` | `deltaglider_proxy=info,tower_http=info` | Log filter (you can change it at runtime in the admin GUI) |
 | `DGP_CONFIG_SYNC_BUCKET` | *(unset)* | S3 bucket for encrypted-DB multi-instance sync. Needs `DGP_CONFIG_DB_KEY` |
 | `DGP_TLS_ENABLED` | `false` | Enable HTTPS |
+| `DGP_SPOOL_DIR` | `/tmp/dgp-spool` | Scratch directory for upload bodies larger than 16 MiB, multipart parts and large delta files. Put it on a volume with room for your concurrent large uploads |
+| `DGP_SPOOL_MAX_BYTES` | `17179869184` | Byte budget of the spool (16 GiB). A larger upload gets `413`, and one multipart object can hold at most half of it |
 
 Or mount a YAML config file:
 
@@ -136,7 +138,7 @@ The admin GUI is served at `/_/` on the same port as the S3 API:
 # Liveness (the process answers; no backend request)
 curl http://localhost:9000/_/health
 
-# Readiness (probes the storage backends and the config DB; 503 when not ready)
+# Readiness (checks the storage backends, the config DB, the jobs DB and the spool; 503 when not ready)
 curl http://localhost:9000/_/ready
 
 # Prometheus metrics (public unless DGP_METRICS_BEARER_TOKEN is set)

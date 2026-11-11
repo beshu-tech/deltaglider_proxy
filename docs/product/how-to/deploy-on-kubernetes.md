@@ -172,6 +172,8 @@ started it. For a multi-pod deployment, use the official operator instead. It de
 the consistent-hashing router that this requires: [How to scale out with the Kubernetes
 operator](scale-out-with-the-kubernetes-operator.md).
 
+The chart uses `updateStrategy.type: Recreate`. The proxy takes a lock on its state directory (the folder of `deltaglider_config.db` on the PVC), and a second process on the same directory waits up to `DGP_STATE_LOCK_WAIT_SECS` (default 60 seconds) and then exits with an error that names the directory. A rolling update starts the new pod while the old pod still runs on the same volume, so the new pod cannot start. The chart also sets `terminationGracePeriodSeconds: 60`, because a stop takes up to 40 seconds: up to 10 seconds each for the running requests, a maintenance job, the event outbox and the work on the blocking threads (`DGP_SHUTDOWN_TIMEOUT_SECS`).
+
 With config sync set up, replication rules elect one leader per rule through an S3-CAS lease in the sync bucket (default `lease_ttl: "300s"`, `heartbeat_interval: "60s"`); a dead leader's lease lapses and a peer takes over automatically. Lifecycle, maintenance, and parity audit jobs still use node-local database leases, so they may run on more than one pod. Their operations are idempotent, so this wastes work but does not corrupt data. Do not scale above one replica if each pod has its own independent `/data/deltaglider_config.db`. In that shape, each pod is an independent control plane. To run more than one instance, set up config sync and a shared `DGP_CONFIG_DB_KEY` first: [How to run multiple instances (HA)](run-multiple-instances.md).
 
 ## Turn on encryption for buckets that hold objects
@@ -187,6 +189,8 @@ When you add `aes256-gcm-proxy` to `config.inline` and run `helm upgrade`, the p
 | `auth.configDbKey` | `DGP_CONFIG_DB_KEY` when the chart creates the Secret. Leave it empty for one replica: the proxy then keeps a generated key file next to the IAM database on the PVC. Required, and the same on every replica, with config sync. |
 | `config.inline` | Canonical DeltaGlider YAML rendered into `/data/deltaglider_proxy.yaml`. |
 | `persistence.*` | PVC settings for `/data`. |
+| `tmp.sizeLimit` | Size limit of the `/tmp` `emptyDir` that holds the spool, in `Mi` or `Gi` (default `2Gi`). The chart sets `DGP_SPOOL_MAX_BYTES` to three quarters of it. |
+| `updateStrategy` / `terminationGracePeriodSeconds` | `Recreate` and `60` by default. Keep them: one process at a time may use the state directory, and a stop takes up to 40 seconds. |
 | `ingress.*` | Optional host/TLS routing. |
 | `env` / `envFrom` | Extra non-secret env and env sources. |
 | `backendCredentials.*` | Convenience S3 backend env values when the chart creates the Secret. |
@@ -206,7 +210,7 @@ curl -fsS https://s3.acme.example/_/health
 aws --endpoint-url https://s3.acme.example s3 ls
 ```
 
-The liveness probe hits `GET /_/health` (fast, no I/O); the readiness probe hits `GET /_/ready`, which really probes the storage backends and the config DB. A pod stays out of rotation when it cannot reach any of its backends. With several backends, the pod stays ready while at least one backend answers, and the buckets on a backend that is down answer `503`. A pod stuck out of `Running` usually means the PVC didn't bind or the config failed validation. `kubectl logs` shows the startup error.
+The liveness probe hits `GET /_/health` (fast, no I/O); the readiness probe hits `GET /_/ready`, which checks the storage backends, the config DB, the jobs DB and the spool directory. A pod whose config DB no key opens (`config_db: "key_mismatch"`) is not ready, so reach its recovery wizard with `kubectl port-forward pod/<name> 9000:9000`. A pod stays out of rotation when it cannot reach any of its backends. With several backends, the pod stays ready while at least one backend answers, and the buckets on a backend that is down answer `503`. A pod stuck out of `Running` usually means the PVC didn't bind or the config failed validation. `kubectl logs` shows the startup error.
 
 ## Related
 

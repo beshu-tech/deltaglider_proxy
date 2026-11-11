@@ -24,7 +24,7 @@ The proxy is a single stateful binary. Every upgrade has three steps: back up, s
 
    ```bash
    docker pull beshultd/deltaglider_proxy:2.1.0
-   docker stop dgp && docker rm dgp
+   docker stop -t 60 dgp && docker rm dgp
    docker run -d --name dgp -p 9000:9000 \
      -v dgp-data:/data \
      -e DGP_BOOTSTRAP_PASSWORD_HASH=... \
@@ -291,6 +291,66 @@ Operator 0.3.24 and later need a new ClusterRole and a new custom resource defin
 
 Apply the new `operator/deploy/crd.yaml` first, and then the new `operator/deploy/operator.yaml`. The second file holds the ClusterRole and the operator image, so you get them together ([How to scale out with the Kubernetes operator](scale-out-with-the-kubernetes-operator.md#1-install-the-operator)).
 
+## Every upload must declare its length (2.2.0)
+
+The proxy now reserves memory or spool space for an upload body before it reads the body, so it must know the length of the body first. A `PutObject` request that declares no length gets `411 MissingContentLength`, as on S3. A request declares the length in `Content-Length`, or, for an aws-chunked body, in `x-amz-decoded-content-length`. A body that is sent with plain `Transfer-Encoding: chunked` declares neither. The AWS SDKs and the usual S3 tools always send the length, so only a hand-written client can be affected.
+
+A browser form upload (`POST /{bucket}` with `multipart/form-data`) changes in two ways:
+
+- **The form must declare its length** in `Content-Length`, or it gets `411 MissingContentLength`.
+- **Every field that the upload needs must come before the file.** The proxy reads the form as a stream and ignores the fields after the file, as S3 does. A form that sends `key`, `policy`, `x-amz-signature` or `x-amz-meta-*` after the file now fails, or stores the object without that metadata. The AWS SDKs and the embedded browser put the file last.
+
+A field other than the file can be at most 64 KiB, else the form gets `400 InvalidArgument`. The same refusal applies on each side of the file separately when its fields, with their names, hold more than 1 MiB, or when it has more than 1,000 fields. See [How the proxy reads an upload body](../reference/s3-api-compatibility.md#how-the-proxy-reads-an-upload-body).
+
+## Size the spool for large uploads (2.2.0)
+
+Before this release, the proxy read the whole body of a `PutObject` request into memory. It now reads a body larger than `DGP_SPOOL_THRESHOLD_BYTES` (16 MiB by default) into a file in the spool directory (`DGP_SPOOL_DIR`), and it reads a smaller body into memory while the upload memory budget (`DGP_INGEST_MEMORY_MAX_BYTES`, 1 GiB by default) has room for it. Every multipart part now goes into a relay file in the spool too, also for an upload that can become a delta. So concurrent large uploads now use disk instead of memory. Check these points before you upgrade:
+
+1. **Put `DGP_SPOOL_DIR` on a real disk.** Each large upload holds about its own size in the spool until it is stored, and twice that in a bucket that the proxy encrypts, because the encrypted copy is written to the spool too. Do not use a tmpfs or a Kubernetes `emptyDir` without a size limit, because those use memory or can fill the disk of the node.
+2. **Set `DGP_SPOOL_MAX_BYTES` (default 16 GiB) for the large uploads that arrive at the same time.** An upload whose declared size is larger than this budget gets `413 EntityTooLarge` before its body is read, and the message names `DGP_SPOOL_MAX_BYTES`. In a bucket that the proxy encrypts, the body and its encrypted copy must fit together, so the largest upload there is about half of the budget. A copy of a large delta object holds the spool file of its source while it writes the destination, so it needs about twice its size.
+3. **Check your largest multipart object.** One multipart upload can hold at most `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` of spool space, which is half of `DGP_SPOOL_MAX_BYTES` by default (8 GiB with the default budget). A larger multipart object gets `413 EntityTooLarge`, with a message that names the variable. Raise `DGP_SPOOL_MAX_BYTES`, or set `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`, if you upload larger objects. A single part larger than 5 GiB (the S3 limit) or larger than `max_object_size` now gets `413 EntityTooLarge` before the proxy reads it.
+4. **Check the total of open multipart uploads.** The default of `DGP_MAX_TOTAL_MULTIPART_BYTES`, the spool space that all open uploads may hold together, is now half of `DGP_SPOOL_MAX_BYTES` instead of `max_object_size × DGP_MAX_MULTIPART_UPLOADS / 4`. With the default spool of 16 GiB, the total drops to 8 GiB (it was 2,500 GiB with a `max_object_size` of 10 GiB). So two concurrent uploads of 5 GiB each can get `503 SlowDown` on their later parts, and an upload that a client abandons holds its share until the idle sweep removes it, which can take up to about 65 minutes. Size the spool for the uploads that are open at the same time, or set `DGP_MAX_TOTAL_MULTIPART_BYTES`.
+5. **Give the spool a directory of its own.** The proxy creates `DGP_SPOOL_DIR` with mode `0700`. At startup, it sets an existing directory that only its group can write to (one made under umask `002`) to `0700`. A directory that another user owns, or that all users can write to (such as `/tmp` itself), now stops the proxy at startup with an error that names it.
+
+A large upload that finds the spool budget full waits for space, up to `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS`, before the proxy reads its body. That wait counts toward the request timeout of 300 seconds. The [capacity planning reference](../reference/capacity-planning.md#memory) shows how to size the memory and the spool disk.
+
+## Kubernetes: the spool, the update strategy and the stop (2.2.0)
+
+- **The spool budget follows the size of `/tmp`.** The spool lives in `/tmp`, which is an `emptyDir`, and the kubelet evicts a pod whose `emptyDir` grows past its size limit. So the Helm chart now sets `DGP_SPOOL_MAX_BYTES` to three quarters of `tmp.sizeLimit` (1.5 GiB with the default `2Gi`), and `tmp.sizeLimit` must now be given in `Mi` or `Gi`. Raise `tmp.sizeLimit` for larger or more concurrent uploads ([Size `/tmp` for the spool](deploy-on-kubernetes.md#size-tmp-for-the-spool)). The operator gives `/tmp` a size limit of 8 GiB (it had none) and sets `DGP_SPOOL_MAX_BYTES` to 6 GiB.
+- **One process per state directory.** The proxy now takes a lock on the folder of `deltaglider_config.db`. A second process on the same folder waits up to `DGP_STATE_LOCK_WAIT_SECS` (default 60 seconds) and then exits with a message that names the folder. A rolling update starts the new pod while the old pod still runs, so a deployment with one shared volume needs `updateStrategy.type: Recreate`. The Helm chart now sets it. Or give each replica its own volume.
+- **Set `terminationGracePeriodSeconds` to at least 60.** A stop now takes up to 40 seconds: up to 10 seconds each for the running requests, a running maintenance job, the event outbox, and the work on the blocking threads (`DGP_SHUTDOWN_TIMEOUT_SECS`, default 10). The Helm chart sets 60. With Docker, stop the container with `docker stop -t 60`, or set `stop_grace_period: 60s` in a compose file.
+
+## More reasons for a boot to fail (2.2.0)
+
+- **A locked state directory.** A second process on the same state directory exits after the wait of `DGP_STATE_LOCK_WAIT_SECS`, as the previous section describes. Outside Kubernetes, this happens when a systemd unit or a container starts the new process before the old one stopped, or when two proxies point at the same directory.
+- **A bootstrap password hash that the proxy cannot keep.** A proxy without a terminal that generates its bootstrap password, and cannot write the hash to `.deltaglider_bootstrap_hash`, now exits, because the admin password would be lost at the next start. Make the working directory of the proxy writable, or set `DGP_BOOTSTRAP_PASSWORD_HASH`.
+- **A `0` in a count that cannot be zero.** A `0` in `advanced.blocking_threads`, `advanced.codec_concurrency` or `advanced.filtered_list_max_engine_pages` (or in `DGP_BLOCKING_THREADS`, `DGP_CODEC_CONCURRENCY` or `DGP_FILTERED_LIST_MAX_ENGINE_PAGES`) now stops the proxy at startup with an error that names the setting. Before, `blocking_threads: 0` made the proxy panic at startup, `codec_concurrency: 0` answered every delta PUT with `503`, and `filtered_list_max_engine_pages: 0` made every filtered LIST fail. Remove the `0`. Other `DGP_*` timeouts and counts that a `0` would break, for example `DGP_REQUEST_TIMEOUT_SECS`, `DGP_MAX_CONCURRENT_REQUESTS`, `DGP_CLOCK_SKEW_SECONDS` and `DGP_SESSION_TTL_HOURS`, are now read as `1`.
+
+## Readiness and the coordination bucket (2.2.0)
+
+`GET /_/ready` now answers `503` in two more cases, because the S3 API of such a node cannot serve requests. The first is a config DB that no key opens: the body then says `config_db: "key_mismatch"`. The second is a spool directory in which the proxy cannot make a file: the new `spool` field then says `unusable` instead of `ready`. A Kubernetes Service sends no traffic to a node that answers `503`, so reach the recovery wizard of such a node through `kubectl port-forward pod/<name> 9000:9000` ([Admin API reference](../reference/admin-api.md)).
+
+A proxy with a `config_sync_bucket` used to stop when its boot probe could not reach the coordination bucket. It now starts, but it does not write to that bucket until a background probe proves that the bucket supports atomic conditional writes: the lease, the reference lock, the encryption witness and the upload of the synced config DB wait. In that time, a delta PUT answers `503 ServiceUnavailable`, because it needs the reference lock, and a write to a bucket with an encryption witness answers `503 SlowDown`. When a probe proves the bucket, these writers open without a restart. After two probes in a row that prove that the bucket has no atomic conditional writes, the proxy drains its requests and stops with exit code 1 ([Backend capability validation](backend-capability-validation.md)).
+
+## Event delivery sends more per tick (2.2.0)
+
+`advanced.event_delivery.batch_size` used to be the most events that one tick claimed. Now a tick claims one batch of `batch_size` rows after the other, for as long as the last batch was full and more than half of its rows were delivered, and for up to one `tick_interval`. Raw webhooks get up to 8 posts at the same time. So if you set a small `batch_size` with a long `tick_interval` to protect a slow receiver, that receiver now gets continuous traffic while many events wait. Set a lower `batch_size`, and put a rate limit in front of the receiver if it cannot take this load ([Event log reference](../reference/event-outbox.md)).
+
+## Outbound requests and the SSRF guard (2.2.0)
+
+- **Webhook, Slack and OIDC requests no longer use an environment proxy.** These requests ignore `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, and they connect directly. A deployment that reaches a webhook, Slack or an identity provider only through an egress proxy must allow a direct route to those hosts, or filter the traffic on the network instead.
+- **An S3 endpoint name that resolves to a loopback address needs `allow_local: true`.** This applies, for example, to an `https` endpoint that reaches a TLS sidecar or a tunnel through `/etc/hosts` or `hostAliases`. Without `allow_local: true`, every request to that backend fails with "SSRF guard: … resolved only to refused address(es)". When another backend answers, the proxy still starts; when that backend is the only one, the boot backend probe (`DGP_BOOT_BACKEND_PROBE`, default `enforce`) stops the proxy at startup. Set `allow_local: true` on that backend. Link-local addresses and the cloud metadata endpoints are refused, also with `allow_local: true`.
+
+## The jobs database keeps `-wal` and `-shm` files (2.2.0)
+
+`deltaglider_jobs.db` now runs in write-ahead-log mode, so next to it the proxy keeps `deltaglider_jobs.db-wal` and `deltaglider_jobs.db-shm` while it runs. The newest commits can be only in the `-wal` file, so a copy of `deltaglider_jobs.db` alone can miss them, and a file copy while the proxy runs can be inconsistent. Back up the three files with the proxy stopped, or take a snapshot of the whole volume at one instant ([How to back up and restore](back-up-and-restore.md)). The proxy user must be able to create these two files in the folder of the database.
+
+The jobs database also commits without waiting for the disk, except for the commits that an effect which cannot be undone depends on, such as the claim of an outbox batch before the posts. So a power loss can lose the last job commits: a lost append to the outbox is a lost event, and a lost settle is a delivery that the proxy sends again.
+
+## The session cookie has a new name over HTTPS (2.2.0)
+
+Where the admin session cookie is `Secure` (TLS at the proxy, a trusted `X-Forwarded-Proto: https`, or `DGP_SECURE_COOKIES=true`), its name is now `__Host-dgp_session`. Where the cookie is not `Secure`, the name stays `dgp_session`. An explicit `DGP_SECURE_COOKIES` decides in both directions. Sessions live in memory, so every session ends at the restart of the upgrade anyway, and users sign in again. Only a tool that reads the cookie by its name, such as a script or a load balancer rule, needs the new name ([How to serve TLS](serve-tls.md)).
+
 ## Common gotchas
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.
@@ -345,7 +405,7 @@ To move from proxy-AES to SSE-KMS as part of the upgrade, do the upgrade first a
 
 After any upgrade or migration:
 
-- [ ] `/_/health` returns HTTP 200, and `/_/ready` returns HTTP 200 (it checks the backends and the config DB).
+- [ ] `/_/health` returns HTTP 200, and `/_/ready` returns HTTP 200 (it checks the backends, the config DB, the jobs DB and the spool directory).
 - [ ] `/_/api/whoami` (with an admin session cookie, because anonymous requests do not get `version`) reports the expected `version`.
 - [ ] An existing object downloads byte-identical: `aws s3 cp s3://releases/known-file ./out && sha256sum out` matches the known checksum.
 - [ ] The admin UI logs in with the bootstrap password (or OAuth) on the first try.
