@@ -66,6 +66,20 @@ The admin GUI shows a recovery wizard while the database is locked. In Kubernete
 
 All instances that share a sync bucket share one encrypted database, so they need one key. Set `DGP_CONFIG_DB_KEY` to the same value on every instance (at least 32 characters, for example from `openssl rand -hex 32`) and restart. See [How to run multiple instances](run-multiple-instances.md).
 
+## Startup fails: `another DeltaGlider Proxy process already uses the state directory`
+
+The proxy takes a lock on its state directory, which is the folder of `deltaglider_config.db`, because two processes on one directory would corrupt the job state and the usage counters. A starting process that finds the lock held logs one warning and waits up to `DGP_STATE_LOCK_WAIT_SECS` (default 60 seconds) for the other process to stop. When the lock is still held after the wait, the proxy exits with this error, and the error names the directory and the lock file.
+
+Usually one of these happened:
+
+1. A rolling update started the new process while the old one still ran on the same volume. On Kubernetes, use `updateStrategy.type: Recreate` for a deployment with one shared volume (the Helm chart does), or give each replica its own volume.
+2. The old process does not stop within the wait, for example because it waits for a long request. Stop it first, or raise `DGP_STATE_LOCK_WAIT_SECS`.
+3. Two proxies point at the same directory by mistake. Give each one its own directory with `DGP_CONFIG`.
+
+## Startup fails: the spool directory is not private
+
+The error names `DGP_SPOOL_DIR` and says that another user owns the directory, or that other users can write to it. The spool holds plaintext upload bodies and delta files, also for buckets that the proxy encrypts, so the proxy uses only a directory that no other user can write to. It creates a new directory with mode `0700`, and it sets an existing directory that only its group can write to to `0700`. It does not change a directory that all users can write to, such as `/tmp` itself, because that would break the other users of the directory. Give `DGP_SPOOL_DIR` a directory of its own, for example `/tmp/dgp-spool` (the default) or `/data/spool`, or run `chmod 700` on the directory.
+
 ## 502 Bad Gateway / 504 Gateway Timeout on large uploads
 
 Symptom: multipart uploads of files >50 MB fail with `502` (Traefik) or `504` (Caddy / nginx). The embedded UI shows "Upload object … failed (502): Gateway returned 502 Bad Gateway." The proxy logs show `tower_http::trace::on_response: finished processing request latency=60000 ms status=400` (latency is exactly 60 000 ms).
@@ -86,6 +100,19 @@ sudo docker compose -f /data/coolify/proxy/docker-compose.yml up -d
 ```
 
 Mitigation without operator access: the embedded uploader uploads one file at a time, so that each part gets a fair share of the upload link. For typical workloads, each part then completes within the default 60 s window. For very slow links or larger parts, you must still raise the reverse-proxy timeout.
+
+## Uploads fail with 411 MissingContentLength
+
+The proxy reserves memory or spool space for an upload body before it reads the body, so the request must declare the length of its body. A `PutObject` request declares it in `Content-Length`, or in `x-amz-decoded-content-length` for an aws-chunked body. A request that sends its body with plain `Transfer-Encoding: chunked` declares neither, so it gets `411 MissingContentLength`, as on S3. A browser form upload must send `Content-Length` too. The AWS SDKs and the usual S3 tools always send the length, so check the client that sends the request, for example a script that streams from a pipe without a known size.
+
+## Uploads fail with 413 EntityTooLarge that names a spool setting
+
+The message of the error names the limit and how to raise it:
+
+- **`DGP_SPOOL_MAX_BYTES`.** The declared size of the upload is larger than the whole spool budget, so the proxy could never hold the body in a spool file. In a bucket that the proxy encrypts, the body and its encrypted copy must fit together, so the largest upload there is about half of the budget, and the message names the encryption. Raise `DGP_SPOOL_MAX_BYTES`, and make sure that `DGP_SPOOL_DIR` has that much free space.
+- **`DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`.** A multipart upload went past the spool space that one upload may hold, which is half of `DGP_SPOOL_MAX_BYTES` by default. Raise `DGP_SPOOL_MAX_BYTES`, or set `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`.
+
+A `413 EntityTooLarge` without such a name comes from `max_object_size`, or from the S3 part limit of 5 GiB for one multipart part.
 
 ## 503 SlowDown on PUT
 
@@ -108,7 +135,7 @@ A `503 ServiceUnavailable` that names a backend is a different case: see [How to
 
 ## A request returns 503 ServiceUnavailable that names no backend
 
-The message of this error is "The storage backend failed while it served this request. A retry can succeed." The S3 backend answered the proxy, but it failed while it served the request: it answered with a `500`, `502` or `504` after the SDK's own retries, or it stopped sending the body of an object. The proxy answers `503` with a `Retry-After` header, because a retry of the same request can succeed. SDKs and `curl --retry` retry it.
+The message of this error is "The storage backend failed while it served this request. A retry can succeed." The S3 backend answered the proxy, but it failed while it served the request: it answered with a `500`, `502` or `504` after the SDK's own retries, it answered `RequestTimeout` or `OperationAborted` (whatever the status code), or it stopped sending the body of an object. The proxy answers `503` with a `Retry-After` header, because a retry of the same request can succeed. SDKs and `curl --retry` retry it.
 
 When the backend stops sending the body of an object, the proxy first tries to recover by itself. It requests the rest of the object again, starting at the first byte that it did not receive. The proxy asks for the same version of the object, so it never joins two versions. The client gets the error only when these new requests fail too. A passthrough object is the exception: the proxy streams it to the client as the bytes arrive, so the `200` headers are already sent, and the response ends before its last byte instead.
 
@@ -171,6 +198,10 @@ If the routing looks right but the object still went somewhere unexpected:
 ### Startup error: "bucket 'X' routes to undefined backend 'Y'"
 
 The full message is `FATAL config error: bucket 'X' routes to undefined backend 'Y' — define the backend under storage.backends or remove the route (available: [...])`. The route `storage.buckets[X].backend` names a backend that is not in the `storage.backends` list, for example because a backend was renamed or removed. The proxy refuses to start with such a config, `config lint` refuses it with exit code 6, and an admin apply refuses it too. Define the backend again, or change or remove the route. The objects on the old backend are not affected.
+
+## Every request to one S3 backend fails with `SSRF guard: … resolved only to refused address(es)`
+
+The endpoint name of the backend resolves only to addresses that the proxy refuses. The proxy checks the resolved address of each connection, so a name that points at a refused address is refused like the address itself. A loopback address, such as an `https` endpoint that reaches a TLS sidecar or a tunnel through `/etc/hosts` or `hostAliases`, is allowed only with `allow_local: true` on that backend. Link-local addresses (169.254.0.0/16, fe80::/10) and the cloud metadata and credential endpoints are refused in every case, also with `allow_local: true`, so point the DNS name of the endpoint at the real address of the storage server. Private (RFC 1918) addresses stay allowed for storage behind internal DNS.
 
 ## S3 config sync ETag mismatch
 
