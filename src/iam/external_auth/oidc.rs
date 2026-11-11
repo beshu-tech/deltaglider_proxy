@@ -473,9 +473,7 @@ impl OidcProvider {
         // discovery-cache window (1h).
         let claims = match self.validate_id_token(&id_token_str, &jwks, pending) {
             Ok(c) => c,
-            Err(ExternalAuthError::TokenValidationFailed(msg))
-                if msg.contains("not found in JWKS") =>
-            {
+            Err(ExternalAuthError::UnknownSigningKey(_)) => {
                 tracing::info!("OIDC: kid not in cached JWKS — forcing rediscovery");
                 self.discover().await?;
                 let refreshed_jwks = {
@@ -649,9 +647,9 @@ impl OidcProvider {
         })?;
 
         // Find the matching key in JWKS
-        let jwk = jwks.find(kid).ok_or_else(|| {
-            ExternalAuthError::TokenValidationFailed(format!("Key '{}' not found in JWKS", kid))
-        })?;
+        let jwk = jwks
+            .find(kid)
+            .ok_or_else(|| ExternalAuthError::UnknownSigningKey(kid.clone()))?;
 
         let decoding_key = DecodingKey::from_jwk(jwk)
             .map_err(|e| ExternalAuthError::TokenValidationFailed(e.to_string()))?;
@@ -856,6 +854,53 @@ mod tests {
         assert!(!check(
             "https://idp.example.com",
             "https://idp.example.com/tenant"
+        ));
+    }
+
+    /// A token whose `kid` is not in the JWKS gives the typed
+    /// `UnknownSigningKey`: it is the ONLY trigger of the key-rotation
+    /// rediscovery in `exchange_code`. Any other variant here (a `map_err`
+    /// on the `find` miss) stops the retry and a rotation blocks logins.
+    #[test]
+    fn a_kid_missing_from_the_jwks_is_an_unknown_signing_key() {
+        let enc = |v: serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
+        let token_with_kid = |kid: Option<&str>| {
+            let mut header = serde_json::json!({"alg": "RS256"});
+            if let Some(k) = kid {
+                header["kid"] = serde_json::json!(k);
+            }
+            format!(
+                "{}.{}.{}",
+                enc(header),
+                enc(serde_json::json!({"iss": "https://idp.example", "aud": "c"})),
+                URL_SAFE_NO_PAD.encode(b"sig")
+            )
+        };
+        let p = OidcProvider::new(
+            "p".into(),
+            "c".into(),
+            "s".into(),
+            "https://idp.example".into(),
+            "openid".into(),
+            serde_json::json!({}),
+        );
+        let pending = PendingAuth {
+            provider_name: "p".into(),
+            nonce: None,
+            pkce_verifier: None,
+            created_at: std::time::Instant::now(),
+            client_ip: None,
+            redirect_to: None,
+        };
+        let empty = jsonwebtoken::jwk::JwkSet { keys: Vec::new() };
+        match p.validate_id_token(&token_with_kid(Some("k")), &empty, &pending) {
+            Err(ExternalAuthError::UnknownSigningKey(k)) => assert_eq!(k, "k"),
+            other => panic!("expected UnknownSigningKey, got {other:?}"),
+        }
+        // No `kid` at all is a malformed token, not a rotation: no retry.
+        assert!(matches!(
+            p.validate_id_token(&token_with_kid(None), &empty, &pending),
+            Err(ExternalAuthError::TokenValidationFailed(_))
         ));
     }
 

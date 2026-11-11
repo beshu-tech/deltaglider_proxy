@@ -522,20 +522,17 @@ mod backfill_tests {
     /// path queues it (`FactsCleanupQueue::write`).
     #[test]
     fn only_the_drain_writes_facts_objects() {
-        let writers: Vec<String> = crate::source_scan::prod_sources("src")
-            .into_iter()
-            .filter(|(_, text)| crate::source_scan::prod_text(text).contains("put_facts_object("))
-            .map(|(file, _)| file)
+        let writers: Vec<String> = crate::source_scan::ast::src()
+            .iter()
+            .filter(|s| s.prod.calls_named("put_facts_object").next().is_some())
+            .map(|s| s.rel.clone())
             .collect();
+        // Calls, not text: the definition is no call, a mention in a comment
+        // is none, and a UFCS call is one.
         assert_eq!(
             writers,
-            ["src/storage/facts_cleanup.rs", "src/storage/s3/facts.rs"],
-            "the drain and the definition"
+            ["src/storage/facts_cleanup.rs"],
+            "only the drain calls it"
         );
-        let defined =
-            crate::source_scan::prod_text(&crate::source_scan::read("src/storage/s3/facts.rs"))
-                .matches("put_facts_object(")
-                .count();
-        assert_eq!(defined, 1, "facts.rs only defines it");
     }
 }

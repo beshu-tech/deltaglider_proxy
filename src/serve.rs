@@ -675,16 +675,21 @@ mod tests {
     #[test]
     fn listeners_are_served_only_through_serve_rs() {
         let mut offenders = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            if file == "src/serve.rs" {
+        for src in crate::source_scan::ast::src() {
+            if src.rel == "src/serve.rs" {
                 continue;
             }
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                if line.contains("axum::serve(")
-                    || line.contains("axum_server::bind")
-                    || line.contains("axum_server::from_tcp")
-                {
-                    offenders.push(format!("{file}:{n}: {}", line.trim()));
+            // `axum::serve`, `axum_server::bind`, `axum_server::from_tcp`,
+            // under any path, `use` or alias; the old scan wanted that text
+            // on one line.
+            for p in &src.prod.paths {
+                let n = p.segs.len();
+                let hit = n >= 2
+                    && ((p.segs[n - 2] == "axum" && p.segs[n - 1] == "serve")
+                        || (p.segs[n - 2] == "axum_server"
+                            && matches!(p.segs[n - 1].as_str(), "bind" | "from_tcp")));
+                if hit {
+                    offenders.push(format!("{}:{}: {}", src.rel, p.line, p.segs.join("::")));
                 }
             }
         }

@@ -28,6 +28,13 @@ debug = false
 [profile.dev.package.crc32fast]
 opt-level = 3
 
+# The source guards (`src/source_scan/ast.rs`) parse every source file with
+# `syn` once per test binary; unoptimised that takes 8 s.
+[profile.dev.package.syn]
+opt-level = 3
+[profile.dev.package.proc-macro2]
+opt-level = 3
+
 # `tokio_unstable` is passed via RUSTFLAGS (nightly workflow + opt-in builds)
 # to unlock tokio's RuntimeMetrics API — the #87 runtime sampler. Declared
 # here so `unexpected_cfgs` doesn't warn on every build.
@@ -217,6 +224,12 @@ ring = "0.17"
 # (tests/common/signed_http.rs). Already in the lockfile through aws-sdk-s3.
 aws-sigv4 = "1"
 http = "1"
+# Source guards (`src/source_scan/ast.rs`) parse the production sources, so a
+# guard sees calls, paths and literals, not text lines. Already in the build
+# graph through the derive macros; dev-only. `span-locations` gives the
+# line numbers of an AST node outside a proc macro.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [[bench]]
 name = "codec"

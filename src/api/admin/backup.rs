@@ -1227,12 +1227,14 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
     }
 }
 
+/// The hydrated YAML under an EMPTY environment: a unit test never reads the
+/// runner's variables (source guard `test_modules_do_not_read_process_env`).
 #[cfg(test)]
 fn config_yaml_hydrated_for_restore(
     yaml_str: &str,
     secrets: Option<&BackupSecrets>,
 ) -> Result<String, String> {
-    hydrate_restore_doc(yaml_str, secrets, &crate::config::process_env).map(|(yaml, _)| yaml)
+    hydrate_restore_doc(yaml_str, secrets, &|_| None).map(|(yaml, _)| yaml)
 }
 
 /// The backup's config.yaml with its secrets.json values put back, ready for

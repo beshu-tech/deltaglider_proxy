@@ -1086,11 +1086,14 @@ mod tests {
             "src/config_apply.rs",
             "src/init.rs",
         ];
-        let offenders: Vec<String> = crate::source_scan::prod_sources("src")
-            .into_iter()
-            .filter(|(rel, _)| !ALLOWED.contains(&rel.as_str()))
-            .filter(|(_, text)| crate::source_scan::prod_text(text).contains(".persist_to_file("))
-            .map(|(rel, _)| rel)
+        // A call under any spelling: `cfg.persist_to_file(p)`, the UFCS
+        // `Config::persist_to_file(&cfg, p)`, a split chain. The old scan
+        // looked for the text `.persist_to_file(` in the file.
+        let offenders: Vec<String> = crate::source_scan::ast::src()
+            .iter()
+            .filter(|s| !ALLOWED.contains(&s.rel.as_str()))
+            .filter(|s| s.prod.calls_named("persist_to_file").next().is_some())
+            .map(|s| s.rel.clone())
             .collect();
         assert!(
             offenders.is_empty(),
@@ -1356,16 +1359,23 @@ mod tests {
     #[test]
     fn only_the_pipeline_calls_the_transition() {
         let mut bad = Vec::new();
-        for p in crate::source_scan::rust_files("src/api/admin") {
-            let path = p.to_string_lossy().replace('\\', "/");
-            if path.ends_with("config/write.rs") || path.ends_with("config/transition.rs") {
+        for src in crate::source_scan::ast::src() {
+            if !src.rel.starts_with("src/api/admin/")
+                || src.rel.ends_with("config/write.rs")
+                || src.rel.ends_with("config/transition.rs")
+            {
                 continue;
             }
-            let src = std::fs::read_to_string(&p).unwrap();
-            for (i, line) in src.lines().enumerate() {
-                if line.contains("apply_config_transition(") && !line.trim_start().starts_with("//")
+            // Every use as a value (a call, an alias, a function pointer); a
+            // `pub use` re-export is no call. The old scan wanted
+            // `apply_config_transition(` on a line of its own.
+            for p in src.prod.paths.iter().chain(&src.test.paths) {
+                if p.expr
+                    && p.segs
+                        .last()
+                        .is_some_and(|s| s == "apply_config_transition")
                 {
-                    bad.push(format!("{path}:{}: {}", i + 1, line.trim()));
+                    bad.push(format!("{}:{}", src.rel, p.line));
                 }
             }
         }
