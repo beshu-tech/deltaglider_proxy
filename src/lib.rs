@@ -680,7 +680,7 @@ storage:
 #[cfg(test)]
 mod source_guards {
     use crate::source_scan::{
-        out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files, test_module_lines,
+        out_of_line_test_modules, rel as rel_path, root, rust_files, test_module_lines,
     };
 
     /// F13 (#145): everything that can stop a boot for an environment reason
@@ -1598,6 +1598,7 @@ mod source_guards {
     /// - `text.to_string() == "T"` (and `to_lowercase`, ...): a comparison
     ///   of rendered text. A comparison of a structured value (`code ==
     ///   "NoSuchKey"` on `err.code()`) is not text and passes.
+    ///
     /// Words match as a case-insensitive substring (`<Code>NoSuchKey</Code>`),
     /// status numbers exactly. The old scan looked for the exact text
     /// `.contains("T")` on one line.

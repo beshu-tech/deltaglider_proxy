@@ -92,7 +92,6 @@ pub(crate) struct Field {
 /// A `==` / `!=`.
 pub(crate) struct Cmp {
     pub line: usize,
-    pub func: usize,
     pub lhs: Side,
     pub rhs: Side,
     pub in_assert: bool,
@@ -144,7 +143,6 @@ pub(crate) struct PathUse {
 /// A struct pattern `Path { field, .. }` (a destructuring read of `field`).
 pub(crate) struct PatField {
     pub line: usize,
-    pub func: usize,
     pub path_last: String,
     pub field: String,
 }
@@ -187,9 +185,6 @@ impl Facts {
 /// `base[start..end]`: the idents of the range's ends.
 pub(crate) struct Index {
     pub line: usize,
-    pub func: usize,
-    /// The last field or path segment of the indexed value (`buf` in `st.buf[..]`).
-    pub base_leaf: Option<String>,
     /// Every ident (path segment, field, method name) in the range's bounds.
     pub bound_idents: Vec<String>,
     pub ranged: bool,
@@ -199,16 +194,13 @@ pub(crate) struct Index {
 /// of the path it calls (`StatusCode::NO_CONTENT` → `NO_CONTENT`, `Json(x)` → `Json`).
 pub(crate) struct Tuple {
     pub line: usize,
-    pub func: usize,
     pub elems: Vec<String>,
 }
 
 /// A struct literal `Path { a: 1, b, ..rest }`.
 pub(crate) struct StructLit {
     pub line: usize,
-    pub func: usize,
     pub path_last: String,
-    pub fields: Vec<String>,
     pub rest: bool,
 }
 
@@ -279,7 +271,7 @@ fn cached(key: String, build: impl FnOnce() -> Vec<Source>) -> &'static [Source]
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let mut map = CACHE.get_or_init(Default::default).lock().unwrap();
     // Parsed once per test binary; the guards share the result.
-    *map.entry(key)
+    map.entry(key)
         .or_insert_with(|| Box::leak(build().into_boxed_slice()))
 }
 
@@ -797,14 +789,12 @@ impl<'ast> Visit<'ast> for Collector {
         }
         let lit = StructLit {
             line: s.path.span().start().line,
-            func,
             path_last: s
                 .path
                 .segments
                 .last()
                 .map(|x| x.ident.to_string())
                 .unwrap_or_default(),
-            fields,
             rest: s.rest.is_some(),
         };
         self.cur().struct_lits.push(lit);
@@ -825,14 +815,6 @@ impl<'ast> Visit<'ast> for Collector {
         };
         let ix = Index {
             line: i.bracket_token.span.open().start().line,
-            func: self.func(),
-            base_leaf: match &*i.expr {
-                Expr::Field(f) => match &f.member {
-                    syn::Member::Named(n) => Some(n.to_string()),
-                    _ => None,
-                },
-                other => path_leaf(other),
-            },
             bound_idents,
             ranged,
         };
@@ -855,7 +837,6 @@ impl<'ast> Visit<'ast> for Collector {
             .collect();
         let tu = Tuple {
             line: t.paren_token.span.open().start().line,
-            func: self.func(),
             elems,
         };
         self.cur().tuples.push(tu);
@@ -882,7 +863,6 @@ impl<'ast> Visit<'ast> for Collector {
         if matches!(b.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
             let cmp = Cmp {
                 line: b.op.span().start().line,
-                func: self.func(),
                 lhs: Side::of(&b.left),
                 rhs: Side::of(&b.right),
                 in_assert: self.assert_depth > 0,
@@ -1002,7 +982,6 @@ impl<'ast> Visit<'ast> for Collector {
                 if let syn::Member::Named(n) = &f.member {
                     let pf = PatField {
                         line: n.span().start().line,
-                        func: self.func(),
                         path_last: last.ident.to_string(),
                         field: n.to_string(),
                     };
