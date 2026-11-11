@@ -1087,7 +1087,7 @@ impl MigrateRun<'_> {
         destination_check(params.target, existing, more, &dest, &params.target_backend)?;
         // The gate has been rejecting NEW source writes since job creation;
         // wait out any write admitted before it armed.
-        drain_inflight_writes(self.state, bucket).await?;
+        drain_inflight_writes(self.state, self.job.id, bucket).await?;
         self.checkpoint("copy", c, None).await
     }
 

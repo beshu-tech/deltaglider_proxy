@@ -345,6 +345,8 @@ const COMPLETION_TOMBSTONE_TTL_SECS: u64 = 900;
 enum CompletionSlot {
     InFlight {
         fingerprint: u64,
+        bucket: String,
+        key: String,
         rx: tokio::sync::watch::Receiver<Option<CompletionResult>>,
         started_at: std::time::Instant,
     },
@@ -900,6 +902,12 @@ impl MultipartStore {
             // The upload is complete, so it no longer exists: S3 answers
             // NoSuchUpload to a Complete that does not match it (s3surface-17).
             Some(CompletionSlot::Done { .. }) => Err(S3Error::NoSuchUpload(upload_id.to_string())),
+            // A Complete of another bucket or key names an upload that is not
+            // its own: NoSuchUpload, as in the Done arm. Joining it answered
+            // 200 with the owner's ETag and wrote nothing (F33).
+            Some(CompletionSlot::InFlight {
+                bucket: b, key: k, ..
+            }) if b != bucket || k != key => Err(S3Error::NoSuchUpload(upload_id.to_string())),
             Some(CompletionSlot::InFlight {
                 fingerprint: f, rx, ..
             }) if *f == fingerprint => Ok(BeginComplete::Join(rx.clone())),
@@ -907,12 +915,26 @@ impl MultipartStore {
                 "another CompleteMultipartUpload with a different part list is in flight"
                     .to_string(),
             )),
+            // No completion yet: only a request for the upload's own bucket
+            // and key may own one. A Complete of an unknown id or of another
+            // key held the owner window (and the per-key lock of ITS key)
+            // until complete_parts refused it.
+            None if !self
+                .uploads
+                .read()
+                .get(upload_id)
+                .is_some_and(|u| u.bucket == bucket && u.key == key) =>
+            {
+                Err(S3Error::NoSuchUpload(upload_id.to_string()))
+            }
             None => {
                 let (tx, rx) = tokio::sync::watch::channel(None);
                 slots.insert(
                     upload_id.to_string(),
                     CompletionSlot::InFlight {
                         fingerprint,
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
                         rx,
                         started_at: std::time::Instant::now(),
                     },

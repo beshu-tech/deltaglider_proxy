@@ -170,6 +170,57 @@ async fn a_small_body_without_ram_takes_the_spool() {
     assert!(matches!(got, IngestedBody::Spooled { .. }), "{got:?}");
 }
 
+/// F57 (epic #143): "only the 1024-request cap bounds buffered bodies".
+/// The 1024-way case, measured: 1024 bodies just under the threshold at
+/// once, all held, against a RAM budget of 16 of them. The RAM held never
+/// passes the budget; the bodies past it go to the spool or are refused
+/// (retryable) at once, none waits and none is read into memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_thousand_parallel_bodies_stay_inside_the_ram_budget() {
+    const BODIES: usize = 1024;
+    let budget = 16 * THRESHOLD;
+    let rig = Rig::new(MemoryBudget::new(budget)).await;
+    let data = body(THRESHOLD as usize - 1024);
+    let results = futures::future::join_all((0..BODIES).map(|_| {
+        let (rig, data) = (&rig, &data);
+        async move {
+            rig.ingest(chunks(data, 8 * 1024), plan(data.len() as u64))
+                .await
+        }
+    }))
+    .await;
+    let memory_bodies = results
+        .iter()
+        .filter(|r| matches!(r, Ok(IngestedBody::Memory { .. })))
+        .count();
+    let spooled = results
+        .iter()
+        .filter(|r| matches!(r, Ok(IngestedBody::Spooled { .. })))
+        .count();
+    let refused = results
+        .iter()
+        .filter(|r| matches!(r, Err(IngestError::Engine(EngineError::Overloaded(_)))))
+        .count();
+    let peak = rig.engine.memory_budget().peak_bytes();
+    assert!(peak <= budget, "RAM peak {peak} over the budget {budget}");
+    assert_eq!(
+        memory_bodies as u64,
+        budget / (data.len() as u64).div_ceil(KIB) / KIB
+    );
+    assert_eq!(
+        memory_bodies + spooled + refused,
+        BODIES,
+        "every body is in memory, spooled or refused: {:?}",
+        results.iter().find(|r| !matches!(
+            r,
+            Ok(IngestedBody::Memory { .. } | IngestedBody::Spooled { .. })
+                | Err(IngestError::Engine(EngineError::Overloaded(_)))
+        ))
+    );
+    drop(results);
+    rig.assert_restored("after 1024 parallel bodies");
+}
+
 /// A small body never waits for spool budget: no RAM and no free spool
 /// is a retryable `Overloaded` at once, even with the acquire timeout.
 #[tokio::test]

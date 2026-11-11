@@ -131,6 +131,22 @@ pub static LISTING_FACTS_REQUESTS: std::sync::LazyLock<prometheus::IntCounterVec
         .expect("valid metric")
     });
 
+/// Listing-facts work that a full background queue dropped (see
+/// `storage::facts_cleanup`), by `queue`: `write` (a facts write; the LIST
+/// reports the stored size until a HEAD writes it) or `cleanup` (the facts
+/// of a deleted object; the facts GC removes them later).
+pub static LISTING_FACTS_QUEUE_DROPPED: std::sync::LazyLock<prometheus::IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "deltaglider_listing_facts_queue_dropped_total",
+                "Listing-facts writes and cleanups dropped because their queue was full",
+            ),
+            &["queue"],
+        )
+        .expect("valid metric")
+    });
+
 /// Facts LIST requests (see `storage::listing_facts`) that failed, by
 /// outcome: `retried` (sent once more), `failed` (the second failed too;
 /// the page lists stored sizes where its facts were not read).

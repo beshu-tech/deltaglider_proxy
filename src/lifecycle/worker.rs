@@ -14,10 +14,7 @@ use crate::coordination::LeaseError;
 use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome, DynEngine, ListObjectsPage};
 use crate::event_outbox::{EventKind, EventSource, NewEvent};
 use crate::job_loop::{list_retry_delay, ListFailure, Pager};
-use crate::transfer::{
-    copy_object_with_retries, ObjectTransferRequest, TransferProvenance,
-    LIFECYCLE_RULE_METADATA_KEY,
-};
+use crate::transfer::{ObjectTransferRequest, TransferProvenance, LIFECYCLE_RULE_METADATA_KEY};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use std::sync::Arc;
@@ -670,26 +667,27 @@ async fn run_or_preview(
             stopped_by = Some(stop);
             break 'pages;
         }
-        // Acquire the gate write-window BEFORE the busy check (acquire-then-
-        // recheck) so a concurrently-arming maintenance drain either waits for
-        // this page's writes or we defer below with the guards dropped (H22).
-        let _write_windows = if execute {
-            begin_write_windows(rule, maintenance_gate.as_ref())
+        // Admit the page's writes through the gate (counted, then the gate
+        // asked: acquire-then-recheck, H22/F9) so a concurrently-arming
+        // maintenance drain either waits for this page's writes or we defer
+        // with the guards dropped. Mid-run maintenance defer: if a write
+        // bucket (source or transition dest) becomes gated mid-run, stop —
+        // cursor preserved, resumes when the maintenance job clears. Mirrors
+        // the replication RunControl fix (#12); preview never writes, so it's
+        // execute-only.
+        let windows = if execute {
+            match admit_write_windows(rule, maintenance_gate.as_ref()) {
+                Ok(windows) => windows,
+                Err(why) => {
+                    info!("lifecycle rule '{}' deferring mid-run — {why}", rule.name);
+                    deferred = true;
+                    break 'pages;
+                }
+            }
         } else {
-            Vec::new()
+            // A preview writes nothing: an admission of no bucket.
+            crate::maintenance::gate::admit_all(None, &[]).map_err(|e| e.into_reason())?
         };
-        // Mid-run maintenance defer: if a write bucket (source or transition
-        // dest) becomes gated mid-run, stop — cursor preserved, resumes when the
-        // maintenance job clears. Mirrors the replication RunControl fix (#12);
-        // preview never writes, so it's execute-only.
-        if execute && maintenance_write_bucket_busy(rule, maintenance_gate.as_ref()) {
-            info!(
-                "lifecycle rule '{}' deferring mid-run — a write bucket is under maintenance",
-                rule.name
-            );
-            deferred = true;
-            break 'pages;
-        }
         if execute
             && !renew_run_lease(&db, rule, ctx.as_ref(), &mut out.failures, response_cap).await?
         {
@@ -797,7 +795,9 @@ async fn run_or_preview(
                         });
                     }
                     if execute {
-                        match plan_action(db.as_ref(), engine, rule, &key, &meta, &action).await {
+                        match plan_action(db.as_ref(), engine, &windows, rule, &key, &meta, &action)
+                            .await
+                        {
                             Ok(Planned::Delete(delete)) => deletes.push(delete),
                             Ok(Planned::Copied { bytes, delete }) => {
                                 out.write_attempts += 1;
@@ -860,6 +860,7 @@ async fn run_or_preview(
             let stopped = delete_planned(
                 db.as_ref(),
                 engine,
+                &windows,
                 rule,
                 deletes,
                 &proceed,
@@ -1218,19 +1219,21 @@ async fn run_or_preview_retain_newest(
         return Ok(out);
     }
 
-    // Register the delete window with the gate for the whole act loop so a
-    // reencrypt/migrate drain waits for it instead of racing our deletes (H22).
-    let _write_windows = begin_write_windows(rule, maintenance_gate.as_ref());
-    // Re-check after acquiring: if a job armed between collect and here, defer
-    // the entire act phase rather than delete into a bucket being rewritten.
-    if maintenance_write_bucket_busy(rule, maintenance_gate.as_ref()) {
-        info!(
-            "lifecycle rule '{}' retain-newest deferring act phase — a write bucket is under \
-             maintenance; no objects deleted this run",
-            rule.name
-        );
-        return Ok(out);
-    }
+    // Admit the delete window through the gate for the whole act loop so a
+    // reencrypt/migrate drain waits for it instead of racing our deletes
+    // (H22). If a job armed between collect and here, defer the entire act
+    // phase rather than delete into a bucket being rewritten.
+    let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
+        Ok(windows) => windows,
+        Err(why) => {
+            info!(
+                "lifecycle rule '{}' retain-newest deferring act phase — {why}; no objects \
+                 deleted this run",
+                rule.name
+            );
+            return Ok(out);
+        }
+    };
 
     // TOCTOU guard: the ranking used a snapshot taken during collect. An
     // overwrite since then is a new object that might rank in the KEEP set,
@@ -1266,6 +1269,7 @@ async fn run_or_preview_retain_newest(
     delete_planned(
         db.as_ref(),
         engine,
+        &windows,
         rule,
         deletes,
         &proceed,
@@ -1488,6 +1492,7 @@ enum Planned {
 async fn plan_action(
     db: Option<&Arc<Mutex<JobsDb>>>,
     engine: &Arc<DynEngine>,
+    windows: &crate::maintenance::gate::Admitted,
     rule: &LifecycleRule,
     key: &str,
     meta: &crate::types::FileMetadata,
@@ -1519,7 +1524,11 @@ async fn plan_action(
             if engine.write_refusal(destination_bucket).is_some() {
                 return Ok(Planned::Skipped);
             }
-            let copied = copy_object_with_retries(
+            // Bounded like a replication copy: the admission keeps the
+            // destination counted until the copy ends.
+            let copied = crate::transfer::admitted::copy_with_retries(
+                windows,
+                Some(crate::transfer::DEFAULT_OBJECT_TIMEOUT),
                 engine,
                 ObjectTransferRequest {
                     source_bucket: &rule.bucket,
@@ -1584,6 +1593,7 @@ fn copy_failure_message(
 async fn delete_planned(
     db: Option<&Arc<Mutex<JobsDb>>>,
     engine: &DynEngine,
+    windows: &crate::maintenance::gate::Admitted,
     rule: &LifecycleRule,
     deletes: Vec<PlannedDelete>,
     proceed: &(dyn Fn() -> bool + Send + Sync),
@@ -1613,16 +1623,17 @@ async fn delete_planned(
             )
         })
         .collect();
-    let outcomes = engine
-        .delete_batch(
-            &rule.bucket,
-            items,
-            DeleteHooks {
-                proceed: Some(proceed),
-                on_outcome: Some(&on_outcome),
-            },
-        )
-        .await;
+    let outcomes = crate::transfer::admitted::delete_batch(
+        windows,
+        engine,
+        &rule.bucket,
+        items,
+        DeleteHooks {
+            proceed: Some(proceed),
+            on_outcome: Some(&on_outcome),
+        },
+    )
+    .await;
     events.flush().await;
     let mut stopped = false;
     for (d, outcome) in deletes.iter().zip(outcomes) {
@@ -1823,7 +1834,18 @@ async fn execute_action(
     action: &PlannedLifecycleAction,
 ) -> Result<ActionOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let mut out = LifecycleRunOutcome::default();
-    let delete = match plan_action(db, engine, rule, key, meta, action).await? {
+    // No gate here (one action, tests): admitted uncounted, for the rule's
+    // buckets and the action's destination.
+    let mut buckets = super::planner::rule_write_buckets(rule);
+    if let PlannedLifecycleAction::Transition {
+        destination_bucket, ..
+    } = action
+    {
+        buckets.push(destination_bucket.as_str());
+    }
+    let windows =
+        crate::maintenance::gate::admit_all(None, &buckets).map_err(|e| e.into_reason())?;
+    let delete = match plan_action(db, engine, &windows, rule, key, meta, action).await? {
         Planned::Skipped => return Ok(ActionOutcome::Skipped),
         Planned::Delete(d) => Some(d),
         Planned::Copied { bytes, delete } => {
@@ -1833,7 +1855,18 @@ async fn execute_action(
         }
     };
     if let Some(d) = delete {
-        delete_planned(db, engine, rule, vec![d], &|| true, None, &mut out, 10).await?;
+        delete_planned(
+            db,
+            engine,
+            &windows,
+            rule,
+            vec![d],
+            &|| true,
+            None,
+            &mut out,
+            10,
+        )
+        .await?;
     }
     if let Some(f) = out.failures.first() {
         return Err(f.error.clone().into());
@@ -1897,23 +1930,18 @@ fn maintenance_write_bucket_busy(
         .any(|b| gate.write_blocked(b).is_some())
 }
 
-/// Register this rule's write buckets with the maintenance gate for the
+/// Admit this rule's write buckets through the maintenance gate for the
 /// duration of a write window, so a reencrypt/migrate job that arms concurrently
 /// has its drain_inflight_writes WAIT for our in-flight writes instead of racing
-/// engine.store/delete on the same key (H22). Acquire BEFORE the is_busy check
-/// so the acquire-then-recheck closes the TOCTOU: either our +1 is visible to
-/// the drain, or the busy check sees the job and we defer with guards dropped.
-fn begin_write_windows(
+/// engine.store/delete on the same key (H22). `admit_background_write` counts
+/// BEFORE it asks the gate, so either our +1 is visible to the drain, or the
+/// check sees the job and we defer (`Err`) with every guard dropped.
+fn admit_write_windows(
     rule: &LifecycleRule,
     gate: Option<&Arc<crate::maintenance::gate::MaintenanceGate>>,
-) -> Vec<crate::maintenance::gate::WriteGuard> {
-    match gate {
-        None => Vec::new(),
-        Some(gate) => super::planner::rule_write_buckets(rule)
-            .into_iter()
-            .map(|b| gate.begin_write(b))
-            .collect(),
-    }
+) -> Result<crate::maintenance::gate::Admitted, String> {
+    crate::maintenance::gate::admit_all(gate, &super::planner::rule_write_buckets(rule))
+        .map_err(|refusal| refusal.into_reason())
 }
 
 async fn renew_run_lease(
@@ -2669,6 +2697,20 @@ mod tests {
     /// must never be acted on (set-relative, no resume cursor → data loss).
     /// P4.3: the delete events of one page are one outbox insert (one
     /// commit), not one per deleted object.
+    /// Review of #166: the admission is built from the trimmed write
+    /// buckets (`rule_write_buckets`), while the delete checks the rule's
+    /// raw `bucket`: a name with spaces around it tripped the check. Both
+    /// sides compare trimmed now.
+    #[test]
+    fn a_bucket_name_with_spaces_is_covered_by_its_admission() {
+        let mut r = rule();
+        r.bucket = " b ".into();
+        let windows = super::admit_write_windows(&r, None).unwrap();
+        assert!(windows.covers(&r.bucket), "{windows:?}");
+        assert!(windows.covers("B"));
+        assert!(!windows.covers("other"));
+    }
+
     #[tokio::test]
     async fn a_page_of_deletes_appends_its_events_in_one_commit() {
         let dir = tempfile::tempdir().unwrap();
@@ -2689,9 +2731,11 @@ mod tests {
         }
         let before = crate::event_outbox::pages_written(&*db.lock().await);
         let mut out = super::LifecycleRunOutcome::default();
+        let windows = crate::maintenance::gate::admit_all(None, &["b"]).unwrap();
         let stopped = super::delete_planned(
             Some(&db),
             &engine,
+            &windows,
             &rule(),
             deletes,
             &|| true,

@@ -642,6 +642,11 @@ impl Metrics {
             .register(Box::new(crate::storage::LISTING_FACTS_READ_ERRORS.clone()))
             .expect("duplicate metric name");
         registry
+            .register(Box::new(
+                crate::storage::LISTING_FACTS_QUEUE_DROPPED.clone(),
+            ))
+            .expect("duplicate metric name");
+        registry
             .register(Box::new(crate::storage::LISTING_TOKEN_MISSES.clone()))
             .expect("duplicate metric name");
         registry

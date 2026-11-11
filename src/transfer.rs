@@ -166,6 +166,113 @@ impl ObjectTransferOutcome {
     }
 }
 
+/// The writes of the background writers (replication, lifecycle), each
+/// with the [`crate::maintenance::gate::Admitted`] proof of its destination bucket. Source guard
+/// `background_writers_are_admitted`: those modules write only through
+/// here.
+/// The per-object copy timeout of the background copies that have no
+/// configured one (lifecycle transitions): the default of
+/// `replication.object_timeout`.
+pub(crate) const DEFAULT_OBJECT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+pub(crate) mod admitted {
+    use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome, DynEngine};
+    use crate::maintenance::gate::Admitted;
+    use crate::transfer::{CopyError, ObjectTransferOutcome, ObjectTransferRequest};
+    use std::sync::Arc;
+
+    /// A write outside its admission is a bug: loud in tests, logged in
+    /// production (the write still runs: refusing it would lose data the
+    /// caller believes copied).
+    fn check(proof: &Admitted, bucket: &str) {
+        debug_assert!(
+            proof.covers(bucket),
+            "a write into '{bucket}' outside its admission"
+        );
+        if !proof.covers(bucket) {
+            tracing::error!("background write into '{bucket}' outside its admission {proof:?}");
+        }
+    }
+
+    /// Bound one copy by `timeout` (`None`: unbounded). An admitted copy
+    /// keeps its bucket counted, so a maintenance job that arms meanwhile
+    /// defers until it ends and clients get 503 on that bucket: the
+    /// timeout bounds that wait. A copy cut at it is a transient failure
+    /// (retried later: the event is held, the run records it), never a
+    /// partial object (the store commits only a whole body).
+    pub(crate) async fn bounded(
+        timeout: Option<std::time::Duration>,
+        copy: impl std::future::Future<Output = Result<ObjectTransferOutcome, CopyError>>,
+    ) -> Result<ObjectTransferOutcome, CopyError> {
+        match timeout {
+            Some(t) => tokio::time::timeout(t, copy).await.unwrap_or_else(|_| {
+                Err(CopyError::new(
+                    crate::transfer::CopyClass::Transient,
+                    format!("object copy timed out after {}s", t.as_secs()),
+                ))
+            }),
+            None => copy.await,
+        }
+    }
+
+    pub(crate) async fn copy_known(
+        proof: &Admitted,
+        timeout: Option<std::time::Duration>,
+        engine: &Arc<DynEngine>,
+        request: ObjectTransferRequest<'_>,
+        source: Option<&crate::types::FileMetadata>,
+        destination_prior: Option<&crate::deltaglider::CounterPrior>,
+    ) -> Result<ObjectTransferOutcome, CopyError> {
+        check(proof, request.destination_bucket);
+        bounded(
+            timeout,
+            crate::transfer::copy_object_known(engine, request, source, destination_prior),
+        )
+        .await
+    }
+
+    pub(crate) async fn copy_from(
+        proof: &Admitted,
+        timeout: Option<std::time::Duration>,
+        engine: &Arc<DynEngine>,
+        request: ObjectTransferRequest<'_>,
+        source: Option<&crate::types::FileMetadata>,
+    ) -> Result<ObjectTransferOutcome, CopyError> {
+        check(proof, request.destination_bucket);
+        bounded(
+            timeout,
+            crate::transfer::copy_object_from(engine, request, source),
+        )
+        .await
+    }
+
+    pub(crate) async fn copy_with_retries(
+        proof: &Admitted,
+        timeout: Option<std::time::Duration>,
+        engine: &Arc<DynEngine>,
+        request: ObjectTransferRequest<'_>,
+    ) -> Result<ObjectTransferOutcome, CopyError> {
+        check(proof, request.destination_bucket);
+        bounded(
+            timeout,
+            crate::transfer::copy_object_with_retries(engine, request),
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_batch(
+        proof: &Admitted,
+        engine: &DynEngine,
+        bucket: &str,
+        items: Vec<DeleteItem<'_>>,
+        hooks: DeleteHooks<'_>,
+    ) -> Vec<DeleteOutcome> {
+        check(proof, bucket);
+        engine.delete_batch(bucket, items, hooks).await
+    }
+}
+
 /// Copy one object; the source HEAD comes from `source` when the caller
 /// holds one (its listing or HEAD), else from one HEAD here. The copy keeps
 /// the source's created-at from that same metadata
@@ -2021,6 +2128,23 @@ async fn spooled_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review of #166: an admitted background copy keeps its bucket
+    /// counted, so a maintenance job that arms meanwhile defers until it
+    /// ends. A copy that never ends is cut at its object timeout, as a
+    /// transient (retryable) failure.
+    #[tokio::test]
+    async fn a_copy_that_never_ends_is_cut_at_its_object_timeout() {
+        let started = std::time::Instant::now();
+        let err = admitted::bounded(
+            Some(std::time::Duration::from_millis(50)),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.class, CopyClass::Transient, "{err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
     use crate::config::Config;
     use crate::deltaglider::DeltaGliderEngine;
     use crate::storage::DynStorageBackend;
