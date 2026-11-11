@@ -1420,27 +1420,64 @@ async fn record_changed(
     Ok(())
 }
 
-/// Wait for the gated bucket's in-flight S3 writes to reach zero. The
-/// gate rejects NEW writes from job creation; this waits out the ones
-/// admitted before it armed (bounded by the server request timeout — no
-/// request legitimately outlives it).
+/// Wait for the gated bucket's in-flight writes to reach zero: the S3
+/// writes admitted before the gate armed, and the background writes
+/// (replication copies and mirror deletes, lifecycle acts) that the gate
+/// counts (`admit_all`). The wait is bounded by the server's request
+/// timeout. A client request cannot outlive it, so a drain that times out
+/// on client writes alone fails the job. A background write has no
+/// request deadline (a large replication copy can run longer): a drain that
+/// times out while one is in flight DEFERS the job (`PhaseStop::Deferred`:
+/// the row goes back to `queued`, the gate stays armed, the drain runs
+/// again later).
 pub(crate) async fn drain_inflight_writes(
     state: &Arc<AppState>,
     bucket: &str,
-) -> Result<(), String> {
-    let drain_ceiling_secs = state.engine.load().tuning().request_timeout_secs;
-    let drain_deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(drain_ceiling_secs);
-    while state.maintenance_gate.inflight_writes(bucket) > 0 {
-        if std::time::Instant::now() > drain_deadline {
-            return Err(format!(
-                "in-flight writes to '{}' did not drain within {}s",
-                bucket, drain_ceiling_secs
+) -> Result<(), PhaseStop> {
+    let ceiling = std::time::Duration::from_secs(state.engine.load().tuning().request_timeout_secs);
+    drain_inflight_writes_within(&state.maintenance_gate, bucket, ceiling).await
+}
+
+/// [`drain_inflight_writes`] with its ceiling.
+pub(crate) async fn drain_inflight_writes_within(
+    gate: &crate::maintenance::gate::MaintenanceGate,
+    bucket: &str,
+    ceiling: std::time::Duration,
+) -> Result<(), PhaseStop> {
+    let deadline = std::time::Instant::now() + ceiling;
+    while gate.inflight_writes(bucket) > 0 {
+        if std::time::Instant::now() > deadline {
+            return Err(drain_timeout_stop(
+                bucket,
+                ceiling,
+                gate.inflight_background_writes(bucket),
             ));
         }
         tokio::time::sleep(std::time::Duration::from_millis(DRAIN_POLL_MS)).await;
     }
     Ok(())
+}
+
+/// Pure: how a drain that timed out stops its job. Background writes in
+/// flight: deferred (they end on their own, the job retries later). Client
+/// writes only: failed (no request outlives the request timeout).
+pub(crate) fn drain_timeout_stop(
+    bucket: &str,
+    ceiling: std::time::Duration,
+    background_inflight: i64,
+) -> PhaseStop {
+    if background_inflight > 0 {
+        PhaseStop::Deferred(format!(
+            "{background_inflight} background write(s) to '{bucket}' (replication, lifecycle) \
+             still in flight after {}s",
+            ceiling.as_secs()
+        ))
+    } else {
+        PhaseStop::Failed(format!(
+            "in-flight writes to '{bucket}' did not drain within {}s",
+            ceiling.as_secs()
+        ))
+    }
 }
 
 /// Cancellation check between pages. Maps "operator asked to cancel"
@@ -1740,6 +1777,42 @@ pub(crate) mod cost_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review of #166: background writes are now counted, and a long
+    /// replication copy has no request deadline, so a drain that waited
+    /// past its ceiling for one FAILED the migrate / re-encrypt / backfill.
+    /// It defers now; a drain stuck on client writes alone still fails.
+    #[tokio::test]
+    async fn a_drain_that_times_out_on_background_writes_defers() {
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let ceiling = std::time::Duration::from_millis(60);
+        let background = crate::maintenance::gate::admit_all(Some(&gate), &["b"]).unwrap();
+        let client = gate.begin_write("b");
+        let stop = drain_inflight_writes_within(&gate, "b", ceiling)
+            .await
+            .unwrap_err();
+        assert!(matches!(stop, PhaseStop::Deferred(_)), "{stop:?}");
+        drop(background);
+        assert_eq!(gate.inflight_background_writes("b"), 0);
+        let stop = drain_inflight_writes_within(&gate, "b", ceiling)
+            .await
+            .unwrap_err();
+        assert!(matches!(stop, PhaseStop::Failed(_)), "{stop:?}");
+        drop(client);
+        drain_inflight_writes_within(&gate, "b", ceiling)
+            .await
+            .expect("nothing in flight drains at once");
+        // After a deferral the job's next run drains once the copy ends.
+        let w = crate::maintenance::gate::admit_all(Some(&gate), &["b"]).unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drop(w);
+        });
+        drain_inflight_writes_within(&gate, "b", std::time::Duration::from_secs(5))
+            .await
+            .expect("drains once the background write ends");
+        release.await.unwrap();
+    }
     use crate::storage::DynStorageBackend;
 
     /// Finding 4: a failed save of a switch to the gate stops the run; it

@@ -14,10 +14,7 @@ use crate::coordination::LeaseError;
 use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome, DynEngine, ListObjectsPage};
 use crate::event_outbox::{EventKind, EventSource, NewEvent};
 use crate::job_loop::{list_retry_delay, ListFailure, Pager};
-use crate::transfer::{
-    copy_object_with_retries, ObjectTransferRequest, TransferProvenance,
-    LIFECYCLE_RULE_METADATA_KEY,
-};
+use crate::transfer::{ObjectTransferRequest, TransferProvenance, LIFECYCLE_RULE_METADATA_KEY};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use std::sync::Arc;
@@ -678,7 +675,7 @@ async fn run_or_preview(
         // cursor preserved, resumes when the maintenance job clears. Mirrors
         // the replication RunControl fix (#12); preview never writes, so it's
         // execute-only.
-        let _write_windows = if execute {
+        let windows = if execute {
             match admit_write_windows(rule, maintenance_gate.as_ref()) {
                 Ok(windows) => windows,
                 Err(why) => {
@@ -688,7 +685,8 @@ async fn run_or_preview(
                 }
             }
         } else {
-            Vec::new()
+            // A preview writes nothing: an admission of no bucket.
+            crate::maintenance::gate::admit_all(None, &[]).map_err(|e| e.into_reason())?
         };
         if execute
             && !renew_run_lease(&db, rule, ctx.as_ref(), &mut out.failures, response_cap).await?
@@ -797,7 +795,9 @@ async fn run_or_preview(
                         });
                     }
                     if execute {
-                        match plan_action(db.as_ref(), engine, rule, &key, &meta, &action).await {
+                        match plan_action(db.as_ref(), engine, &windows, rule, &key, &meta, &action)
+                            .await
+                        {
                             Ok(Planned::Delete(delete)) => deletes.push(delete),
                             Ok(Planned::Copied { bytes, delete }) => {
                                 out.write_attempts += 1;
@@ -860,6 +860,7 @@ async fn run_or_preview(
             let stopped = delete_planned(
                 db.as_ref(),
                 engine,
+                &windows,
                 rule,
                 deletes,
                 &proceed,
@@ -1222,7 +1223,7 @@ async fn run_or_preview_retain_newest(
     // reencrypt/migrate drain waits for it instead of racing our deletes
     // (H22). If a job armed between collect and here, defer the entire act
     // phase rather than delete into a bucket being rewritten.
-    let _write_windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
+    let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
         Ok(windows) => windows,
         Err(why) => {
             info!(
@@ -1268,6 +1269,7 @@ async fn run_or_preview_retain_newest(
     delete_planned(
         db.as_ref(),
         engine,
+        &windows,
         rule,
         deletes,
         &proceed,
@@ -1490,6 +1492,7 @@ enum Planned {
 async fn plan_action(
     db: Option<&Arc<Mutex<JobsDb>>>,
     engine: &Arc<DynEngine>,
+    windows: &crate::maintenance::gate::Admitted,
     rule: &LifecycleRule,
     key: &str,
     meta: &crate::types::FileMetadata,
@@ -1521,7 +1524,8 @@ async fn plan_action(
             if engine.write_refusal(destination_bucket).is_some() {
                 return Ok(Planned::Skipped);
             }
-            let copied = copy_object_with_retries(
+            let copied = crate::transfer::admitted::copy_with_retries(
+                windows,
                 engine,
                 ObjectTransferRequest {
                     source_bucket: &rule.bucket,
@@ -1586,6 +1590,7 @@ fn copy_failure_message(
 async fn delete_planned(
     db: Option<&Arc<Mutex<JobsDb>>>,
     engine: &DynEngine,
+    windows: &crate::maintenance::gate::Admitted,
     rule: &LifecycleRule,
     deletes: Vec<PlannedDelete>,
     proceed: &(dyn Fn() -> bool + Send + Sync),
@@ -1615,16 +1620,17 @@ async fn delete_planned(
             )
         })
         .collect();
-    let outcomes = engine
-        .delete_batch(
-            &rule.bucket,
-            items,
-            DeleteHooks {
-                proceed: Some(proceed),
-                on_outcome: Some(&on_outcome),
-            },
-        )
-        .await;
+    let outcomes = crate::transfer::admitted::delete_batch(
+        windows,
+        engine,
+        &rule.bucket,
+        items,
+        DeleteHooks {
+            proceed: Some(proceed),
+            on_outcome: Some(&on_outcome),
+        },
+    )
+    .await;
     events.flush().await;
     let mut stopped = false;
     for (d, outcome) in deletes.iter().zip(outcomes) {
@@ -1825,7 +1831,18 @@ async fn execute_action(
     action: &PlannedLifecycleAction,
 ) -> Result<ActionOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let mut out = LifecycleRunOutcome::default();
-    let delete = match plan_action(db, engine, rule, key, meta, action).await? {
+    // No gate here (one action, tests): admitted uncounted, for the rule's
+    // buckets and the action's destination.
+    let mut buckets = super::planner::rule_write_buckets(rule);
+    if let PlannedLifecycleAction::Transition {
+        destination_bucket, ..
+    } = action
+    {
+        buckets.push(destination_bucket.as_str());
+    }
+    let windows =
+        crate::maintenance::gate::admit_all(None, &buckets).map_err(|e| e.into_reason())?;
+    let delete = match plan_action(db, engine, &windows, rule, key, meta, action).await? {
         Planned::Skipped => return Ok(ActionOutcome::Skipped),
         Planned::Delete(d) => Some(d),
         Planned::Copied { bytes, delete } => {
@@ -1835,7 +1852,18 @@ async fn execute_action(
         }
     };
     if let Some(d) = delete {
-        delete_planned(db, engine, rule, vec![d], &|| true, None, &mut out, 10).await?;
+        delete_planned(
+            db,
+            engine,
+            &windows,
+            rule,
+            vec![d],
+            &|| true,
+            None,
+            &mut out,
+            10,
+        )
+        .await?;
     }
     if let Some(f) = out.failures.first() {
         return Err(f.error.clone().into());
@@ -1908,17 +1936,9 @@ fn maintenance_write_bucket_busy(
 fn admit_write_windows(
     rule: &LifecycleRule,
     gate: Option<&Arc<crate::maintenance::gate::MaintenanceGate>>,
-) -> Result<Vec<crate::maintenance::gate::WriteGuard>, String> {
-    match gate {
-        None => Ok(Vec::new()),
-        Some(gate) => super::planner::rule_write_buckets(rule)
-            .into_iter()
-            .map(|b| {
-                gate.admit_background_write(b)
-                    .map_err(|refusal| refusal.into_reason())
-            })
-            .collect(),
-    }
+) -> Result<crate::maintenance::gate::Admitted, String> {
+    crate::maintenance::gate::admit_all(gate, &super::planner::rule_write_buckets(rule))
+        .map_err(|refusal| refusal.into_reason())
 }
 
 async fn renew_run_lease(
@@ -2694,9 +2714,11 @@ mod tests {
         }
         let before = crate::event_outbox::pages_written(&*db.lock().await);
         let mut out = super::LifecycleRunOutcome::default();
+        let windows = crate::maintenance::gate::admit_all(None, &["b"]).unwrap();
         let stopped = super::delete_planned(
             Some(&db),
             &engine,
+            &windows,
             &rule(),
             deletes,
             &|| true,

@@ -915,6 +915,18 @@ impl MultipartStore {
                 "another CompleteMultipartUpload with a different part list is in flight"
                     .to_string(),
             )),
+            // No completion yet: only a request for the upload's own bucket
+            // and key may own one. A Complete of an unknown id or of another
+            // key held the owner window (and the per-key lock of ITS key)
+            // until complete_parts refused it.
+            None if !self
+                .uploads
+                .read()
+                .get(upload_id)
+                .is_some_and(|u| u.bucket == bucket && u.key == key) =>
+            {
+                Err(S3Error::NoSuchUpload(upload_id.to_string()))
+            }
             None => {
                 let (tx, rx) = tokio::sync::watch::channel(None);
                 slots.insert(

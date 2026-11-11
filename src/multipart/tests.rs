@@ -66,25 +66,26 @@ fn parts_fixture() -> Vec<(u32, String)> {
 async fn completion_registry_owner_join_tombstone_lifecycle() {
     let store = std::sync::Arc::new(MultipartStore::new(1024));
     let parts = parts_fixture();
+    let up1 = store.create("b", "k", None, Default::default()).unwrap();
 
     // First request owns the completion.
-    let owner = match store.begin_complete("up1", "b", "k", &parts).unwrap() {
+    let owner = match store.begin_complete(&up1, "b", "k", &parts).unwrap() {
         BeginComplete::Owner(p) => p,
         _ => panic!("first begin_complete must be Owner"),
     };
     // An identical retry while in flight joins.
-    let rx = match store.begin_complete("up1", "b", "k", &parts).unwrap() {
+    let rx = match store.begin_complete(&up1, "b", "k", &parts).unwrap() {
         BeginComplete::Join(rx) => rx,
         _ => panic!("identical retry must Join"),
     };
     // A different part list while in flight is refused.
     let other = vec![(1, "\"other\"".to_string())];
-    assert!(store.begin_complete("up1", "b", "k", &other).is_err());
+    assert!(store.begin_complete(&up1, "b", "k", &other).is_err());
 
     // Owner publishes success: joiner sees the etag, later retries hit the tombstone.
     owner.publish(Ok("\"final-etag\"".to_string()));
     assert_eq!(rx.borrow().clone().unwrap().unwrap(), "\"final-etag\"");
-    match store.begin_complete("up1", "b", "k", &parts).unwrap() {
+    match store.begin_complete(&up1, "b", "k", &parts).unwrap() {
         BeginComplete::AlreadyDone { etag } => assert_eq!(etag, "\"final-etag\""),
         _ => panic!("retry after success must hit the tombstone"),
     }
@@ -92,7 +93,7 @@ async fn completion_registry_owner_join_tombstone_lifecycle() {
     // too. The completed upload is gone, so the answer is NoSuchUpload.
     for (bucket, parts) in [("b", &other), ("OTHER", &parts)] {
         assert!(matches!(
-            store.begin_complete("up1", bucket, "k", parts),
+            store.begin_complete(&up1, bucket, "k", parts),
             Err(S3Error::NoSuchUpload(_))
         ));
     }
@@ -102,14 +103,15 @@ async fn completion_registry_owner_join_tombstone_lifecycle() {
 async fn completion_registry_failure_clears_slot_for_fresh_retry() {
     let store = std::sync::Arc::new(MultipartStore::new(1024));
     let parts = parts_fixture();
-    let owner = match store.begin_complete("up2", "b", "k", &parts).unwrap() {
+    let up2 = store.create("b", "k", None, Default::default()).unwrap();
+    let owner = match store.begin_complete(&up2, "b", "k", &parts).unwrap() {
         BeginComplete::Owner(p) => p,
         _ => panic!("must be Owner"),
     };
     owner.publish(Err(CompletionFailure::internal("backend exploded")));
     // Failure clears the slot: the next attempt is a fresh Owner, not a join.
     assert!(matches!(
-        store.begin_complete("up2", "b", "k", &parts).unwrap(),
+        store.begin_complete(&up2, "b", "k", &parts).unwrap(),
         BeginComplete::Owner(_)
     ));
 }
@@ -119,11 +121,12 @@ async fn completion_registry_failure_clears_slot_for_fresh_retry() {
 async fn completion_joiner_sees_the_owners_error() {
     let store = std::sync::Arc::new(MultipartStore::new(1024));
     let parts = parts_fixture();
-    let owner = match store.begin_complete("up4", "b", "k", &parts).unwrap() {
+    let up4 = store.create("b", "k", None, Default::default()).unwrap();
+    let owner = match store.begin_complete(&up4, "b", "k", &parts).unwrap() {
         BeginComplete::Owner(p) => p,
         _ => panic!("must be Owner"),
     };
-    let rx = match store.begin_complete("up4", "b", "k", &parts).unwrap() {
+    let rx = match store.begin_complete(&up4, "b", "k", &parts).unwrap() {
         BeginComplete::Join(rx) => rx,
         _ => panic!("must Join"),
     };
@@ -138,11 +141,12 @@ async fn completion_joiner_sees_the_owners_error() {
 async fn completion_publisher_drop_without_publish_unwedges_registry() {
     let store = std::sync::Arc::new(MultipartStore::new(1024));
     let parts = parts_fixture();
-    let owner = match store.begin_complete("up3", "b", "k", &parts).unwrap() {
+    let up3 = store.create("b", "k", None, Default::default()).unwrap();
+    let owner = match store.begin_complete(&up3, "b", "k", &parts).unwrap() {
         BeginComplete::Owner(p) => p,
         _ => panic!("must be Owner"),
     };
-    let rx = match store.begin_complete("up3", "b", "k", &parts).unwrap() {
+    let rx = match store.begin_complete(&up3, "b", "k", &parts).unwrap() {
         BeginComplete::Join(rx) => rx,
         _ => panic!("must Join"),
     };
@@ -152,7 +156,7 @@ async fn completion_publisher_drop_without_publish_unwedges_registry() {
         "joiner must be released"
     );
     assert!(matches!(
-        store.begin_complete("up3", "b", "k", &parts).unwrap(),
+        store.begin_complete(&up3, "b", "k", &parts).unwrap(),
         BeginComplete::Owner(_)
     ));
 }
@@ -165,22 +169,51 @@ async fn completion_publisher_drop_without_publish_unwedges_registry() {
 async fn joining_an_inflight_completion_checks_bucket_and_key() {
     let store = std::sync::Arc::new(MultipartStore::new(1024));
     let parts = parts_fixture();
-    let _owner = match store.begin_complete("up5", "b", "k", &parts).unwrap() {
+    let up5 = store.create("b", "k", None, Default::default()).unwrap();
+    let _owner = match store.begin_complete(&up5, "b", "k", &parts).unwrap() {
         BeginComplete::Owner(p) => p,
         _ => panic!("must be Owner"),
     };
     for (bucket, key) in [("other", "k"), ("b", "other")] {
         assert!(
             matches!(
-                store.begin_complete("up5", bucket, key, &parts),
+                store.begin_complete(&up5, bucket, key, &parts),
                 Err(S3Error::NoSuchUpload(_))
             ),
             "a Complete of {bucket}/{key} joined the completion of b/k"
         );
     }
     assert!(matches!(
-        store.begin_complete("up5", "b", "k", &parts).unwrap(),
+        store.begin_complete(&up5, "b", "k", &parts).unwrap(),
         BeginComplete::Join(_)
+    ));
+}
+
+/// Review of #166: with no completion in flight, any Complete became the
+/// owner, also for an unknown upload id or another bucket or key, and held
+/// the owner window until `complete_parts` refused it. Only the upload's
+/// own bucket and key may own its completion.
+#[tokio::test]
+async fn only_the_uploads_own_key_may_own_its_completion() {
+    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let parts = parts_fixture();
+    let id = store.create("b", "k", None, Default::default()).unwrap();
+    for (id, bucket, key) in [
+        ("no-such-id", "b", "k"),
+        (id.as_str(), "b", "other"),
+        (id.as_str(), "other", "k"),
+    ] {
+        assert!(
+            matches!(
+                store.begin_complete(id, bucket, key, &parts),
+                Err(S3Error::NoSuchUpload(_))
+            ),
+            "{id} {bucket}/{key} became the owner"
+        );
+    }
+    assert!(matches!(
+        store.begin_complete(&id, "b", "k", &parts).unwrap(),
+        BeginComplete::Owner(_)
     ));
 }
 
@@ -232,20 +265,21 @@ enum RegistryOp {
 fn registry_op() -> impl proptest::strategy::Strategy<Value = RegistryOp> {
     use proptest::prelude::*;
     prop_oneof![
-        3 => (0..2usize, 0..2usize, 0..2usize, 0..2usize)
+        3 => (0..3usize, 0..2usize, 0..2usize, 0..2usize)
             .prop_map(|(id, parts, bucket, key)| RegistryOp::Begin { id, parts, bucket, key }),
-        1 => (0..2usize).prop_map(|id| RegistryOp::PublishOk { id }),
-        1 => (0..2usize).prop_map(|id| RegistryOp::PublishErr { id }),
-        1 => (0..2usize).prop_map(|id| RegistryOp::DropOwner { id }),
+        1 => (0..3usize).prop_map(|id| RegistryOp::PublishOk { id }),
+        1 => (0..3usize).prop_map(|id| RegistryOp::PublishErr { id }),
+        1 => (0..3usize).prop_map(|id| RegistryOp::DropOwner { id }),
     ]
 }
 
 proptest::proptest! {
     /// Model test of the completion registry (F33): over any sequence of
-    /// Completes (two upload ids, two part lists, two buckets, two keys),
-    /// publishes and dropped owners, `begin_complete` answers what the
-    /// model says. A request joins or hits the tombstone ONLY when its
-    /// bucket, key and part list all match the slot's.
+    /// Completes (upload 0 of b0/k0, upload 1 of b1/k1, an unknown id 2; two
+    /// part lists, two buckets, two keys), publishes and dropped owners,
+    /// `begin_complete` answers what the model says. A request owns a
+    /// completion only for its upload's own bucket and key, and joins or
+    /// hits the tombstone ONLY when bucket, key and part list all match.
     #[test]
     fn begin_complete_follows_the_registry_model(
         ops in proptest::collection::vec(registry_op(), 1..40)
@@ -255,15 +289,28 @@ proptest::proptest! {
         let store = std::sync::Arc::new(MultipartStore::new(1024));
         let part_lists = [parts_fixture(), vec![(1, "\"other\"".to_string())]];
         let names = [["b0", "b1"], ["k0", "k1"]];
-        let id_of = |id: usize| format!("up-{id}");
-        let mut model: [Option<ModelSlot>; 2] = [None, None];
-        let mut owners: [Option<CompletionPublisher>; 2] = [None, None];
+        // The upload records: (bucket, key) of ids 0 and 1; id 2 is unknown.
+        let records = [Some((0usize, 0usize)), Some((1, 1)), None];
+        let ids: Vec<String> = records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| match r {
+                Some((b, k)) => store
+                    .create(names[0][*b], names[1][*k], None, Default::default())
+                    .unwrap(),
+                None => format!("unknown-{i}"),
+            })
+            .collect();
+        let id_of = |id: usize| ids[id].clone();
+        let mut model: [Option<ModelSlot>; 3] = [None, None, None];
+        let mut owners: [Option<CompletionPublisher>; 3] = [None, None, None];
         let mut published = 0;
         for op in ops {
             match op {
                 RegistryOp::Begin { id, parts, bucket, key } => {
                     let want = match &model[id] {
-                        None => ModelAnswer::Owner,
+                        None if records[id] == Some((bucket, key)) => ModelAnswer::Owner,
+                        None => ModelAnswer::NoSuchUpload,
                         Some(ModelSlot::InFlight { parts: p, bucket: b, key: k }) => {
                             if (*b, *k) != (bucket, key) {
                                 ModelAnswer::NoSuchUpload

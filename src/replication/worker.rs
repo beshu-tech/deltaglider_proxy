@@ -38,8 +38,7 @@ use crate::event_outbox::{EventKind, EventSource, NewEvent};
 use crate::job_loop::MAX_JOB_PAGES;
 use crate::metrics::{bump_peak, Metrics};
 use crate::transfer::{
-    copy_object_from, CopyStrategy, ObjectTransferRequest, TransferProvenance,
-    REPLICATION_RULE_METADATA_KEY,
+    CopyStrategy, ObjectTransferRequest, TransferProvenance, REPLICATION_RULE_METADATA_KEY,
 };
 use crate::types::FileMetadata;
 use futures::stream::StreamExt;
@@ -772,6 +771,7 @@ struct PerObjectResult {
 /// (poison-skip check, failure ring) live on the driver side.
 async fn copy_one_object(
     engine: &Arc<DynEngine>,
+    admitted: &crate::maintenance::gate::Admitted,
     rule_name: &str,
     src_bucket: &str,
     dst_bucket: &str,
@@ -807,7 +807,7 @@ async fn copy_one_object(
         // Test-only stall INSIDE the timeout scope (inert in prod) so the
         // object-timeout Elapsed arm is deterministically exercisable.
         maybe_pass_stall().await;
-        copy_object_from(engine, transfer, src_meta).await
+        crate::transfer::admitted::copy_from(admitted, engine, transfer, src_meta).await
     };
     let copy_result = match object_timeout {
         Some(timeout) => match tokio::time::timeout(timeout, copy_fut).await {

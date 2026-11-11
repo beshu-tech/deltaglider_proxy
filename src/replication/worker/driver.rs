@@ -340,13 +340,11 @@ impl<'a> WalkDriver<'a> {
                 // this +1 and drains it, or the copy sees the job and stays
                 // unsettled while the run stops as deferred. The RAII guard
                 // rides in the copy future — a kill dropping it releases it.
-                let write_guard = match s
-                    .ctrl
-                    .maintenance_gate
-                    .as_ref()
-                    .map(|g| g.admit_background_write(&s.ctrl.dest_bucket))
-                {
-                    Some(Err(refusal)) => {
+                let admitted = match crate::maintenance::gate::admit_all(
+                    s.ctrl.maintenance_gate.as_ref(),
+                    &[&s.ctrl.dest_bucket],
+                ) {
+                    Err(refusal) => {
                         self.inflight.push(Box::pin(async move {
                             DriverDone::Copy {
                                 item_id,
@@ -360,11 +358,9 @@ impl<'a> WalkDriver<'a> {
                         }));
                         return;
                     }
-                    Some(Ok(write)) => Some(write),
-                    None => None,
+                    Ok(admitted) => admitted,
                 };
                 self.inflight.push(Box::pin(async move {
-                    let _write_guard = write_guard;
                     // Guard increments objects_inflight (+peak) on entry and
                     // decrements on drop → proves the `transfers` concurrency.
                     let _obj_guard = engine.metrics().cloned().map(ObjectGuard::new);
@@ -373,6 +369,7 @@ impl<'a> WalkDriver<'a> {
                     let _inflight_reg = InFlightGuard::new(&rule_name, &abs_src, src_size);
                     let res = copy_one_object(
                         &engine,
+                        &admitted,
                         &rule_name,
                         &src_bucket,
                         &dst_bucket,

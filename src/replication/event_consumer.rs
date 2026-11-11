@@ -45,8 +45,7 @@ use crate::event_outbox::{
     current_unix_seconds, EventKind, EventOutboxRecord, EventSource, NewEvent,
 };
 use crate::transfer::{
-    copy_object_known, CopyClass, ObjectTransferRequest, TransferProvenance,
-    REPLICATION_RULE_METADATA_KEY,
+    CopyClass, ObjectTransferRequest, TransferProvenance, REPLICATION_RULE_METADATA_KEY,
 };
 
 use super::planner::{
@@ -1202,7 +1201,7 @@ async fn drain_rule_rows(
         // Admitted = counted as an in-flight write of the destination until
         // the copy ends (F9), so a job's drain waits for it. A delete is
         // admitted again by its batch (`mirror_delete`).
-        let _write = match gate.admit_background_write(&w.rule.destination.bucket) {
+        let write = match gate.admit_background_write(&w.rule.destination.bucket) {
             Ok(write) => write,
             Err(refusal) => {
                 if refusal.is_maintenance() {
@@ -1248,7 +1247,7 @@ async fn drain_rule_rows(
             }
             // Deletes are not replicated: handled.
             KeyAction::Delete | KeyAction::Noop => Ok(()),
-            KeyAction::Copy => apply_copy(engine, db, w.rule, w.bucket, w.key).await,
+            KeyAction::Copy => apply_copy(engine, db, &write, w.rule, w.bucket, w.key).await,
         };
         let dbg = db.lock().await;
         // One commit for the heartbeat and the key's outcome (E6/F20).
@@ -1544,6 +1543,7 @@ fn key_in_rule_scope(rule: &ReplicationRule, key: &str) -> bool {
 async fn apply_copy(
     engine: &Arc<crate::deltaglider::DynEngine>,
     db: &Arc<Mutex<JobsDb>>,
+    admitted: &crate::maintenance::gate::Admitted,
     rule: &ReplicationRule,
     bucket: &str,
     key: &str,
@@ -1598,8 +1598,14 @@ async fn apply_copy(
                 keep_created_at: true,
             };
             // The copy starts from the HEAD above: no second source HEAD.
-            let outcome =
-                copy_object_known(engine, transfer, Some(&src_meta), Some(&dest_prior)).await?;
+            let outcome = crate::transfer::admitted::copy_known(
+                admitted,
+                engine,
+                transfer,
+                Some(&src_meta),
+                Some(&dest_prior),
+            )
+            .await?;
             // Emit ReplicationObjectCopied so the chain is observable
             // (mirrors the reconcile worker).
             emit_replication_copied(db, rule, key, &dest_key, outcome.content_length()).await;

@@ -13,7 +13,8 @@
 //! reclaim, instead of once per key.
 
 use crate::deltaglider::{DeleteItem, DeleteOutcome, DynEngine, EngineError};
-use crate::maintenance::gate::{MaintenanceGate, WriteRefusal};
+use crate::maintenance::gate::{admit_all, MaintenanceGate, WriteRefusal};
+use crate::transfer::admitted;
 use crate::transfer::CopyClass;
 use futures::StreamExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -229,24 +230,26 @@ pub(crate) async fn delete_mirrored(
     }
     // Counted BEFORE the gate is asked (acquire-then-recheck), held until
     // the batch ends. The re-check above only read.
-    let _write = match gate.map(|g| g.admit_background_write(dst_bucket)) {
-        Some(Err(refusal)) => {
+    let proof = match admit_all(gate, &[dst_bucket]) {
+        Err(refusal) => {
             for &i in &to_delete {
                 outcomes[i] = Some(MirrorOutcome::Deferred(refusal.clone()));
             }
             to_delete.clear();
             None
         }
-        Some(Ok(write)) => Some(write),
-        None => None,
+        Ok(proof) => Some(proof),
     };
     let batch: Vec<DeleteItem<'_>> = to_delete
         .iter()
         .map(|&i| DeleteItem::new(items[i].dest_key.clone()))
         .collect();
-    let deleted = engine
-        .delete_batch(dst_bucket, batch, Default::default())
-        .await;
+    let deleted = match &proof {
+        Some(proof) => {
+            admitted::delete_batch(proof, engine, dst_bucket, batch, Default::default()).await
+        }
+        None => Vec::new(),
+    };
     for (&i, outcome) in to_delete.iter().zip(deleted) {
         outcomes[i] = Some(match outcome {
             DeleteOutcome::Deleted(_) => MirrorOutcome::Deleted { existed: true },

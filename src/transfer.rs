@@ -166,6 +166,71 @@ impl ObjectTransferOutcome {
     }
 }
 
+/// The writes of the background writers (replication, lifecycle), each
+/// with the [`crate::maintenance::gate::Admitted`] proof of its destination bucket. Source guard
+/// `background_writers_are_admitted`: those modules write only through
+/// here.
+pub(crate) mod admitted {
+    use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome, DynEngine};
+    use crate::maintenance::gate::Admitted;
+    use crate::transfer::{CopyError, ObjectTransferOutcome, ObjectTransferRequest};
+    use std::sync::Arc;
+
+    /// A write outside its admission is a bug: loud in tests, logged in
+    /// production (the write still runs: refusing it would lose data the
+    /// caller believes copied).
+    fn check(proof: &Admitted, bucket: &str) {
+        debug_assert!(
+            proof.covers(bucket),
+            "a write into '{bucket}' outside its admission"
+        );
+        if !proof.covers(bucket) {
+            tracing::error!("background write into '{bucket}' outside its admission {proof:?}");
+        }
+    }
+
+    pub(crate) async fn copy_known(
+        proof: &Admitted,
+        engine: &Arc<DynEngine>,
+        request: ObjectTransferRequest<'_>,
+        source: Option<&crate::types::FileMetadata>,
+        destination_prior: Option<&crate::deltaglider::CounterPrior>,
+    ) -> Result<ObjectTransferOutcome, CopyError> {
+        check(proof, request.destination_bucket);
+        crate::transfer::copy_object_known(engine, request, source, destination_prior).await
+    }
+
+    pub(crate) async fn copy_from(
+        proof: &Admitted,
+        engine: &Arc<DynEngine>,
+        request: ObjectTransferRequest<'_>,
+        source: Option<&crate::types::FileMetadata>,
+    ) -> Result<ObjectTransferOutcome, CopyError> {
+        check(proof, request.destination_bucket);
+        crate::transfer::copy_object_from(engine, request, source).await
+    }
+
+    pub(crate) async fn copy_with_retries(
+        proof: &Admitted,
+        engine: &Arc<DynEngine>,
+        request: ObjectTransferRequest<'_>,
+    ) -> Result<ObjectTransferOutcome, CopyError> {
+        check(proof, request.destination_bucket);
+        crate::transfer::copy_object_with_retries(engine, request).await
+    }
+
+    pub(crate) async fn delete_batch(
+        proof: &Admitted,
+        engine: &DynEngine,
+        bucket: &str,
+        items: Vec<DeleteItem<'_>>,
+        hooks: DeleteHooks<'_>,
+    ) -> Vec<DeleteOutcome> {
+        check(proof, bucket);
+        engine.delete_batch(bucket, items, hooks).await
+    }
+}
+
 /// Copy one object; the source HEAD comes from `source` when the caller
 /// holds one (its listing or HEAD), else from one HEAD here. The copy keeps
 /// the source's created-at from that same metadata

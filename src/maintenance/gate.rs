@@ -28,10 +28,14 @@
 //! ## In-flight write draining
 //!
 //! A write admitted moments BEFORE the gate armed could still land after
-//! the worker rewrote that key. The gate therefore counts in-flight S3
-//! writes per bucket; the worker waits for the gated bucket's counter to
-//! reach zero before scanning anything (bounded by the server's request
-//! timeout — no request can legitimately outlive it).
+//! the worker rewrote that key. The gate therefore counts in-flight writes
+//! per bucket: S3 write requests, admin bulk loops, and the background
+//! writers (replication, lifecycle: [`admit_all`]). The worker waits for
+//! the gated bucket's counter to reach zero before scanning anything,
+//! bounded by the server's request timeout. No client request outlives
+//! it, so a drain stuck on client writes fails the job; a background write
+//! has no request deadline, so a drain that times out while one is in
+//! flight defers the job (`maintenance::worker::drain_inflight_writes`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -64,6 +68,10 @@ pub struct MaintenanceGate {
     /// last store wins (H36). Reads stay lock-free.
     unwinding: parking_lot::Mutex<HashSet<i64>>,
     inflight_writes: DashMap<String, i64>,
+    /// Of `inflight_writes`, the background writes ([`admit_all`]): a
+    /// replication copy has no request deadline, so a drain that waits for
+    /// one past its ceiling defers instead of failing.
+    inflight_background: DashMap<String, i64>,
     /// The encryption witness of this node (multi-instance only): why it
     /// refuses writes to a bucket now. Set once at boot.
     write_refusal: std::sync::OnceLock<ProbeCell>,
@@ -86,6 +94,7 @@ impl Default for MaintenanceGate {
             busy: ArcSwap::from_pointee(HashMap::new()),
             unwinding: parking_lot::Mutex::new(HashSet::new()),
             inflight_writes: DashMap::new(),
+            inflight_background: DashMap::new(),
             write_refusal: std::sync::OnceLock::new(),
         }
     }
@@ -169,12 +178,8 @@ impl MaintenanceGate {
     pub fn admit_background_write(
         self: &Arc<Self>,
         bucket: &str,
-    ) -> Result<WriteGuard, WriteRefusal> {
-        let guard = self.begin_write(bucket);
-        match self.refusal_of(bucket) {
-            Some(refusal) => Err(refusal), // `guard` drops: no longer counted.
-            None => Ok(guard),
-        }
+    ) -> Result<Admitted, WriteRefusal> {
+        admit_all(Some(self), &[bucket])
     }
 
     /// The kind of the job that gates this bucket, if one does.
@@ -268,8 +273,70 @@ impl MaintenanceGate {
         WriteGuard {
             gate: Arc::clone(self),
             bucket: bucket.to_ascii_lowercase(),
+            background: false,
         }
     }
+
+    /// [`Self::begin_write`] for a background writer (counted apart too).
+    fn begin_background_write(self: &Arc<Self>, bucket: &str) -> WriteGuard {
+        let mut guard = self.begin_write(bucket);
+        bump(&self.inflight_background, &guard.bucket, 1);
+        guard.background = true;
+        guard
+    }
+
+    /// Of [`Self::inflight_writes`], the background writes.
+    pub fn inflight_background_writes(&self, bucket: &str) -> i64 {
+        self.inflight_background
+            .get(&bucket.to_ascii_lowercase())
+            .map(|v| *v)
+            .unwrap_or(0)
+    }
+}
+
+/// Proof that background writes into some buckets are admitted: each
+/// bucket counted as in flight, then checked ([`admit_all`]). Only the
+/// admission makes one, and the background writers' copy and delete
+/// ([`crate::transfer::admitted`]) take it by reference, so a write cannot run without a
+/// live admission of its bucket (dropping the guard before the write does
+/// not compile). The counts end when it drops.
+#[derive(Debug)]
+#[must_use = "dropping the admission ends the in-flight-write window"]
+pub struct Admitted {
+    buckets: Vec<String>,
+    /// `None` per bucket without a gate (no maintenance job can exist).
+    _guards: Vec<Option<WriteGuard>>,
+}
+
+impl Admitted {
+    /// Does this admission cover writes into `bucket`?
+    pub fn covers(&self, bucket: &str) -> bool {
+        self.buckets.iter().any(|b| b.eq_ignore_ascii_case(bucket))
+    }
+}
+
+/// THE admission of background writes into `buckets`: each is counted,
+/// THEN checked, so a maintenance job that arms at any moment either sees
+/// the count or is seen (all counts drop, `Err`). Without a gate (`None`:
+/// tests, a node with no maintenance plane) the writes are admitted
+/// uncounted.
+pub fn admit_all(
+    gate: Option<&Arc<MaintenanceGate>>,
+    buckets: &[&str],
+) -> Result<Admitted, WriteRefusal> {
+    let mut guards = Vec::with_capacity(buckets.len());
+    for bucket in buckets {
+        guards.push(gate.map(|g| g.begin_background_write(bucket)));
+    }
+    if let Some(gate) = gate {
+        if let Some(refusal) = buckets.iter().find_map(|b| gate.refusal_of(b)) {
+            return Err(refusal); // `guards` drop: no longer counted.
+        }
+    }
+    Ok(Admitted {
+        buckets: buckets.iter().map(|b| b.to_string()).collect(),
+        _guards: guards,
+    })
 }
 
 /// Why [`MaintenanceGate::admit_background_write`] refused a write. Either
@@ -307,11 +374,25 @@ impl WriteRefusal {
 pub struct WriteGuard {
     gate: Arc<MaintenanceGate>,
     bucket: String,
+    background: bool,
 }
 
 impl Drop for WriteGuard {
     fn drop(&mut self) {
+        if self.background {
+            bump(&self.gate.inflight_background, &self.bucket, -1);
+        }
         self.gate.write_finished(&self.bucket);
+    }
+}
+
+/// Add `by` to `map[key]` (lowercased already); a count at 0 goes.
+fn bump(map: &DashMap<String, i64>, key: &str, by: i64) {
+    let mut entry = map.entry(key.to_string()).or_insert(0);
+    *entry += by;
+    if *entry <= 0 {
+        drop(entry);
+        map.remove_if(key, |_, v| *v <= 0);
     }
 }
 
@@ -550,12 +631,32 @@ mod tests {
             .collect()
     }
 
-    /// The modules (key → its writer lines) that write but do not call any
-    /// of `admit` in the module or one inside it.
-    fn unadmitted(
-        sources: &[crate::source_scan::ast::Source],
-        admit: impl Fn(&str) -> &'static [&'static str],
-    ) -> Vec<String> {
+    fn background(rel: &str) -> bool {
+        rel.starts_with("src/replication/") || rel.starts_with("src/lifecycle/")
+    }
+
+    /// The writes of `transfer::admitted`, each of which takes an [`Admitted`] proof.
+    const ADMITTED_WRITES: [&str; 4] = [
+        "copy_known",
+        "copy_from",
+        "copy_with_retries",
+        "delete_batch",
+    ];
+
+    fn admitted_writes(src: &crate::source_scan::ast::Source) -> usize {
+        src.prod
+            .calls
+            .iter()
+            .filter(|c| {
+                !c.method
+                    && c.segs.iter().any(|s| s == "admitted")
+                    && ADMITTED_WRITES.iter().any(|n| c.named(n))
+            })
+            .count()
+    }
+
+    /// Offenders of the rule (see [`background_writers_are_admitted`]).
+    fn unadmitted(sources: &[crate::source_scan::ast::Source]) -> Vec<String> {
         let mut offenders = Vec::new();
         for src in sources {
             if ADMISSION_EXEMPT
@@ -565,103 +666,126 @@ mod tests {
                 continue;
             }
             let lines = writer_calls(src);
+            if background(&src.rel) {
+                // A background writer writes only through `admitted::*`: the
+                // proof is borrowed at the write, so the admission is alive
+                // there (a dropped guard does not compile).
+                if !lines.is_empty() {
+                    offenders.push(format!(
+                        "{}:{lines:?} writes without an Admitted proof (use transfer::admitted)",
+                        src.rel
+                    ));
+                }
+                if let Some(c) = src.prod.calls_named("begin_write").next() {
+                    offenders.push(format!(
+                        "{}:{} counts with begin_write and skips the re-check (use admit_all)",
+                        src.rel, c.line
+                    ));
+                }
+                continue;
+            }
             if lines.is_empty() {
                 continue;
             }
+            // A request-scoped writer (S3 adapter, admin bulk loops, which
+            // check the gate per item after counting) counts in the module
+            // or one inside it.
             let key = module_key(&src.rel);
-            let names = admit(&src.rel);
-            let admitted = sources.iter().any(|other| {
+            let names = ["admit_background_write", "admit_all", "begin_write"];
+            let counted = sources.iter().any(|other| {
                 let k = module_key(&other.rel);
                 (k == key || k.starts_with(&format!("{key}/")))
                     && names
                         .iter()
                         .any(|n| other.prod.calls_named(n).next().is_some())
             });
-            if !admitted {
+            if !counted {
                 offenders.push(format!("{}:{lines:?} (needs one of {names:?})", src.rel));
             }
         }
         offenders
     }
 
-    /// The admission a writer module must call: a background writer
-    /// (replication, lifecycle) `admit_background_write`, which counts and
-    /// then asks the gate; a request-scoped writer (S3 adapter, admin bulk
-    /// loops, which check the gate per item after counting) may count
-    /// with `begin_write`.
-    fn admission_for(rel: &str) -> &'static [&'static str] {
-        if rel.starts_with("src/replication/") || rel.starts_with("src/lifecycle/") {
-            &["admit_background_write"]
-        } else {
-            &["admit_background_write", "begin_write"]
-        }
-    }
-
     /// Source guard (F9): every non-engine module that writes through
     /// `transfer::copy_object_*` or `delete_batch` is counted by the gate,
     /// so a maintenance job's `drain_inflight_writes` waits for it. The
     /// event consumer's copies and both mirror-delete paths were not, and
-    /// the drain saw 0 while they wrote. Background writers must use
-    /// `admit_background_write` (count, then check), never a bare
-    /// `begin_write` or a check before the count.
+    /// the drain saw 0 while they wrote. A background writer (replication,
+    /// lifecycle) writes only through `transfer::admitted`, whose every write
+    /// borrows the `Admitted` proof that `admit_all` (count, then check)
+    /// makes; it never counts with a bare `begin_write`.
     #[test]
     fn background_writers_are_admitted() {
         let sources = crate::source_scan::ast::src();
-        let offenders = unadmitted(sources, admission_for);
+        let offenders = unadmitted(sources);
         assert!(
             offenders.is_empty(),
             "writers the maintenance gate does not count: {offenders:?}"
         );
-        let bare: Vec<&str> = sources
-            .iter()
-            .filter(|s| admission_for(&s.rel) == ["admit_background_write"])
-            .filter(|s| s.prod.calls_named("begin_write").next().is_some())
-            .map(|s| s.rel.as_str())
-            .collect();
-        assert!(
-            bare.is_empty(),
-            "a background writer counts with begin_write and skips the re-check: {bare:?}"
-        );
         // The scan sees the writers it is about (not vacuous).
-        let writers: Vec<&str> = sources
-            .iter()
-            .filter(|s| !writer_calls(s).is_empty())
-            .map(|s| s.rel.as_str())
-            .collect();
+        let with = |f: &dyn Fn(&crate::source_scan::ast::Source) -> bool| -> Vec<&str> {
+            sources
+                .iter()
+                .filter(|s| f(s))
+                .map(|s| s.rel.as_str())
+                .collect()
+        };
+        let admitted_writers = with(&|s| admitted_writes(s) > 0);
         for expected in [
             "src/replication/event_consumer.rs",
             "src/replication/mirror_delete.rs",
             "src/replication/worker.rs",
             "src/lifecycle/worker.rs",
-            "src/api/admin/objects.rs",
-            "src/s3_adapter_s3s/object.rs",
         ] {
             assert!(
-                writers.contains(&expected),
-                "the scan missed {expected}: {writers:?}"
+                admitted_writers.contains(&expected),
+                "the scan missed {expected}: {admitted_writers:?}"
             );
         }
-        // A writer without an admission is caught.
+        let request_writers = with(&|s| !writer_calls(s).is_empty());
+        for expected in ["src/api/admin/objects.rs", "src/s3_adapter_s3s/object.rs"] {
+            assert!(
+                request_writers.contains(&expected),
+                "the scan missed {expected}: {request_writers:?}"
+            );
+        }
+        // A background writer that writes directly or counts bare is caught,
+        // wherever its admission is; a request writer without a count too.
         let fixture = [
             crate::source_scan::ast::parse(
                 "src/replication/x.rs",
-                "async fn f(e: E) { crate::transfer::copy_object_from(e, r, None).await; \
-                 e.delete_batch(b, v, h).await; g.write_blocked(b); }",
-            ),
-            // The writer in `y`, its admission in `y/z` (the walk's shape:
-            // `worker.rs` copies, `worker/driver.rs` admits).
-            crate::source_scan::ast::parse(
-                "src/replication/y.rs",
-                "async fn f(e: E) { copy_object_known(e, r, None, None).await; }",
+                "async fn f(e: E, g: G) { let _w = g.admit_background_write(b); \
+                 crate::transfer::copy_object_from(e, r, None).await; }",
             ),
             crate::source_scan::ast::parse(
-                "src/replication/y/z.rs",
-                "async fn f(g: G) { let _w = g.admit_background_write(b); }",
+                "src/lifecycle/y.rs",
+                "async fn f(e: E, g: G) { let _w = g.begin_write(b); \
+                 admitted::delete_batch(&p, e, b, v, h).await; }",
+            ),
+            crate::source_scan::ast::parse(
+                "src/replication/ok.rs",
+                "async fn f(e: E, g: G) { let p = admit_all(g, &[b])?; \
+                 admitted::copy_known(&p, e, r, None, None).await; }",
+            ),
+            crate::source_scan::ast::parse(
+                "src/api/admin/z.rs",
+                "async fn f(e: E) { e.delete_batch(b, v, h).await; }",
             ),
         ];
-        let caught = unadmitted(&fixture, admission_for);
-        assert_eq!(caught.len(), 1, "{caught:?}");
-        assert!(caught[0].starts_with("src/replication/x.rs"), "{caught:?}");
+        let caught = unadmitted(&fixture);
+        let files: Vec<&str> = caught
+            .iter()
+            .map(|c| c.split(':').next().unwrap())
+            .collect();
+        assert_eq!(
+            files,
+            [
+                "src/replication/x.rs",
+                "src/lifecycle/y.rs",
+                "src/api/admin/z.rs"
+            ],
+            "{caught:?}"
+        );
     }
 
     /// The admission counts BEFORE it asks: a refusal leaves no count, an

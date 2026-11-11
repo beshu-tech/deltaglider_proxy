@@ -62,24 +62,61 @@ pub(crate) use status::get_peak_rss_bytes;
 /// when the request ended, so requests that timed out left more detached
 /// tasks running than the cap has slots (F56 of epic #143). The S3 router
 /// installs one per process, sized like the global cap
-/// (`max_concurrent_requests`); the request waits for a slot before it
-/// spawns (that wait counts against its deadline), and the task holds it
-/// to its end. Source guard `detached_request_work_holds_a_slot`.
+/// (`max_concurrent_requests`).
+///
+/// Use: [`DetachedWork::reserve`] a slot, then
+/// [`DetachedSlot::spawn_detached`] the task, which moves the slot into the
+/// task (no slot, no spawn). The wait for a slot counts against the
+/// request's deadline. Lock order: reserve the slot BEFORE any object write
+/// lock. A detached DeleteObjects batch holds a slot while it takes each
+/// key's object lock, so a request that held a key's lock while it waited
+/// for a slot deadlocked with it. Source guard
+/// `detached_request_work_holds_a_slot`.
+///
+/// Known limitation: the pool is global, not per backend. Detached work on
+/// one slow backend can hold every slot, and the DeleteObjects and
+/// CompleteMultipartUpload requests of the other backends then wait for a
+/// slot until their deadline (the request slots have per-backend shares,
+/// the detached slots do not).
 #[derive(Clone)]
 pub struct DetachedWork(Arc<tokio::sync::Semaphore>);
+
+/// A reserved slot of [`DetachedWork`] (empty without a router: unit tests
+/// call handlers directly).
+#[must_use = "a reserved slot does nothing until it spawns its task"]
+pub struct DetachedSlot {
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
 
 impl DetachedWork {
     pub fn new(slots: usize) -> Self {
         Self(Arc::new(tokio::sync::Semaphore::new(slots.max(1))))
     }
 
-    /// A slot for one detached task of the request with `extensions`.
-    /// `None` without a router (unit tests call handlers directly).
-    pub(crate) async fn slot(
-        extensions: &axum::http::Extensions,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let work = extensions.get::<DetachedWork>()?;
-        work.0.clone().acquire_owned().await.ok()
+    /// Wait for a slot for one detached task of the request with
+    /// `extensions`. Call it before taking any object write lock.
+    pub(crate) async fn reserve(extensions: &axum::http::Extensions) -> DetachedSlot {
+        let Some(work) = extensions.get::<DetachedWork>() else {
+            return DetachedSlot { _permit: None };
+        };
+        DetachedSlot {
+            _permit: work.0.clone().acquire_owned().await.ok(),
+        }
+    }
+}
+
+impl DetachedSlot {
+    /// THE spawn of the S3 request paths: run `task` detached, holding
+    /// this slot until it ends.
+    pub(crate) fn spawn_detached<F>(self, task: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        tokio::spawn(async move {
+            let _slot = self;
+            task.await
+        })
     }
 }
 
@@ -388,48 +425,85 @@ mod bucket_exists_tests {
 
 #[cfg(test)]
 mod detached_work_tests {
-    /// The fns of the S3 request paths that spawn a task and do not take
-    /// a [`super::DetachedWork`] slot in the same fn.
-    fn unslotted(sources: &[crate::source_scan::ast::Source]) -> Vec<String> {
-        let mut offenders = Vec::new();
-        for src in sources {
-            if !(src.rel.starts_with("src/s3_adapter_s3s/")
-                || src.rel.starts_with("src/api/handlers/"))
-            {
-                continue;
-            }
-            for spawn in src.prod.calls.iter().filter(|c| {
-                !c.method && c.segs.len() >= 2 && c.segs.ends_with(&["spawn".to_string()])
-            }) {
-                let slotted = src.prod.calls.iter().any(|c| {
-                    c.func == spawn.func
-                        && !c.method
-                        && c.segs
-                            .ends_with(&["DetachedWork".to_string(), "slot".to_string()])
-                });
-                if !slotted {
-                    offenders.push(format!(
-                        "{}:{} in {}",
+    /// The spawns that the S3 request paths may not call directly: a task
+    /// they start outlives the request, so it goes through
+    /// `DetachedSlot::spawn_detached`, which carries a slot.
+    const SPAWNS: [&str; 5] = [
+        "spawn",
+        "spawn_blocking",
+        "spawn_local",
+        "spawn_on",
+        "spawn_blocking_on",
+    ];
+
+    /// Calls that take an object write lock (directly or as the first step
+    /// of a client write); a detached slot is reserved before them.
+    const OBJECT_LOCKS: [&str; 4] = [
+        "lock_object_write",
+        "store_client_multipart_admit",
+        "store_conditional",
+        "store_client_write",
+    ];
+
+    fn in_scope(rel: &str) -> bool {
+        rel.starts_with("src/s3_adapter_s3s/") || rel.starts_with("src/api/handlers/")
+    }
+
+    /// Offenders: a spawn-family call (path or method form, any receiver:
+    /// `tokio::spawn`, `JoinSet::spawn`, `handle.spawn`, `spawn_blocking`)
+    /// outside `spawn_detached`, and a `DetachedWork::reserve` after an
+    /// object lock in the same fn.
+    fn offenders(sources: &[crate::source_scan::ast::Source]) -> Vec<String> {
+        let mut out = Vec::new();
+        for src in sources.iter().filter(|s| in_scope(&s.rel)) {
+            for c in &src.prod.calls {
+                if SPAWNS.iter().any(|n| c.named(n)) && src.fn_name(c.func) != "spawn_detached" {
+                    out.push(format!(
+                        "{}:{} {} in {}",
                         src.rel,
-                        spawn.line,
-                        src.fn_name(spawn.func)
+                        c.line,
+                        c.name,
+                        src.fn_name(c.func)
+                    ));
+                }
+            }
+            for reserve in src.prod.calls_named("reserve").filter(|c| {
+                !c.method
+                    && c.segs
+                        .ends_with(&["DetachedWork".to_string(), "reserve".to_string()])
+            }) {
+                for lock in src.prod.calls.iter().filter(|c| {
+                    c.func == reserve.func
+                        && c.pos < reserve.pos
+                        && OBJECT_LOCKS.iter().any(|n| c.named(n))
+                }) {
+                    out.push(format!(
+                        "{}:{} DetachedWork::reserve after {} (line {}) in {}",
+                        src.rel,
+                        reserve.line,
+                        lock.name,
+                        lock.line,
+                        src.fn_name(reserve.func)
                     ));
                 }
             }
         }
-        offenders
+        out
     }
 
-    /// Source guard (F56 of epic #143): request work that a request path
-    /// spawns outlives the request's slot of the global cap, so it holds a
-    /// `DetachedWork` slot, taken in the fn that spawns it.
+    /// Source guard (F56 of epic #143): request work that an S3 request
+    /// path spawns outlives the request's slot of the global cap, so it
+    /// runs through `DetachedSlot::spawn_detached` (the slot moves into the
+    /// task; a slot taken and dropped cannot spawn), and its slot is
+    /// reserved before any object write lock (deadlock with a detached
+    /// DeleteObjects batch that holds a slot and takes object locks).
     #[test]
     fn detached_request_work_holds_a_slot() {
         let sources = crate::source_scan::ast::src();
-        let offenders = unslotted(sources);
+        let found = offenders(sources);
         assert!(
-            offenders.is_empty(),
-            "detached tasks outside the DetachedWork slots: {offenders:?}"
+            found.is_empty(),
+            "detached work outside the rule: {found:?}"
         );
         // The scan sees the two detached tasks it is about.
         let spawning: Vec<String> = sources
@@ -437,9 +511,7 @@ mod detached_work_tests {
             .filter(|s| s.rel.starts_with("src/s3_adapter_s3s/"))
             .flat_map(|s| {
                 s.prod
-                    .calls
-                    .iter()
-                    .filter(|c| !c.method && c.segs.ends_with(&["spawn".to_string()]))
+                    .calls_named("spawn_detached")
                     .map(|c| s.fn_name(c.func).to_string())
                     .collect::<Vec<_>>()
             })
@@ -452,12 +524,22 @@ mod detached_work_tests {
         }
         let fixture = [crate::source_scan::ast::parse(
             "src/s3_adapter_s3s/x.rs",
-            "async fn a(e: E) { let s = crate::api::handlers::DetachedWork::slot(&e).await; \
-             tokio::spawn(async move { drop(s) }); } \
-             async fn b() { tokio::spawn(async {}); }",
+            "async fn ok(e: E) { \
+                 let s = crate::api::handlers::DetachedWork::reserve(&e).await; \
+                 let _l = store_client_multipart_admit(a).await; \
+                 s.spawn_detached(async {}); } \
+             async fn a() { tokio::spawn(async {}); } \
+             async fn b(h: H) { h.spawn_blocking(|| ()); } \
+             async fn c(j: J) { j.spawn(async {}); } \
+             async fn d() { tokio::task::spawn_blocking(|| ()); } \
+             async fn e(x: E) { let _l = store_client_multipart_admit(a).await; \
+                 let s = DetachedWork::reserve(&x).await; s.spawn_detached(async {}); }",
         )];
-        let caught = unslotted(&fixture);
-        assert_eq!(caught.len(), 1, "{caught:?}");
-        assert!(caught[0].ends_with("in b"), "{caught:?}");
+        let caught = offenders(&fixture);
+        let fns: Vec<&str> = caught
+            .iter()
+            .map(|o| o.rsplit(" in ").next().unwrap())
+            .collect();
+        assert_eq!(fns, ["a", "b", "c", "d", "e"], "{caught:?}");
     }
 }
