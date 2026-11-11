@@ -151,29 +151,13 @@ pub fn log_startup_banner(config: &Config) {
 /// debug proxy, or expects an effect a release build does not have (finding
 /// #32). `DGP_RELAY_FOREIGN_MIN_AGE_SECS` applies in every build.
 fn warn_active_test_seams() {
-    const SEAMS: &[&str] = &[
-        "DGP_TEST_COMPLETE_STALL_MS",
-        "DGP_TEST_FAIL_PART_ONCE",
-        "DGP_TEST_PART_BARRIER",
-        "DGP_TEST_PART_DELAY_MS",
-        "DGP_TEST_OBJECT_BARRIER",
-        "DGP_TEST_OBJECT_DELAY_MS",
-        "DGP_TEST_COPY_STALL_MS",
-        "DGP_TEST_MAINTENANCE_OBJECT_STALL_MS",
-        "DGP_TEST_LIFECYCLE_OBJECT_STALL_MS",
-        "DGP_TEST_READ_OTHER_FORM_STALL_MS",
-        "DGP_TEST_MAX_JOB_PAGES",
-        "DGP_TEST_FORCE_NONCAS_BACKEND",
-        "DGP_TEST_CONVERSION_GRACE_SECS",
-        "DGP_TEST_CONVERSION_WINDOW_SECS",
-        "DGP_TEST_REWRITE_STALL",
-        "DGP_TEST_COPY_OBJECT_MAX_BYTES",
-        "DGP_TEST_COPY_PART_BYTES",
-        "DGP_RELAY_FOREIGN_MIN_AGE_SECS",
-    ];
-    let active: Vec<&str> = SEAMS
+    // Every DGP_TEST_* seam (a unit test keeps the list whole), and the one
+    // non-test variable that applies in every build.
+    let seams = deltaglider_proxy::config::test_seams::SEAM_ENV_VARS
         .iter()
         .copied()
+        .chain(["DGP_RELAY_FOREIGN_MIN_AGE_SECS"]);
+    let active: Vec<&str> = seams
         .filter(|k| deltaglider_proxy::config::process_env_os(k).is_some())
         .collect();
     if !active.is_empty() {

@@ -77,9 +77,11 @@ pub struct Metrics {
     pub ingest_memory_peak_bytes: IntGauge,
     /// Request bodies read, by medium (`memory`/`spool`) and reason.
     pub ingest_bodies_total: IntCounterVec,
-    /// Passthrough bodies a re-encrypt rewrite read, by medium
-    /// (`memory`/`spool`): a rewrite reads the stored object, not a request
-    /// body, so it has its own series.
+    /// Passthrough objects that an in-place rewrite (the re-encrypt job)
+    /// read in full, by medium (`memory`/`spool`). A rewrite that finds the
+    /// object changed or gone counts none; delta and reference rewrites
+    /// count none. It reads a stored object, not a request body, so it has
+    /// its own series.
     pub rewrite_bodies_total: IntCounterVec,
 
     // -- Replication streaming-copy (Phase B) --
@@ -490,7 +492,7 @@ impl Metrics {
             IntCounterVec::new(
                 Opts::new(
                     "deltaglider_rewrite_bodies_total",
-                    "Passthrough bodies that an in-place rewrite read, by medium (memory, spool)",
+                    "Passthrough objects that an in-place rewrite read in full, by medium (memory, spool); delta and reference rewrites and rewrites that find the object changed count none",
                 ),
                 &["medium"],
             )

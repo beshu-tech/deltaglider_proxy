@@ -226,9 +226,16 @@ The proxy reads each upload body once before it stores the object. A body that i
 | `deltaglider_ingest_memory_bytes` | Gauge | — | Bytes of request bodies that the proxy holds in memory now. It never goes above `DGP_INGEST_MEMORY_MAX_BYTES` |
 | `deltaglider_ingest_memory_peak_bytes` | Gauge | — | The highest value of `deltaglider_ingest_memory_bytes` since the start |
 | `deltaglider_ingest_bodies_total` | Counter | `medium`, `reason` | Request bodies read, by where the proxy put them. `medium="memory", reason="under_threshold"`: a small body in memory. `medium="spool", reason="over_threshold"`: a body larger than `DGP_SPOOL_THRESHOLD_BYTES`. `medium="spool", reason="memory_budget"`: a small body that found the memory budget full. `medium="spool", reason="multipart_part"`: an `UploadPart` or `UploadPartCopy` body, which always goes to a spool file (a relay part) |
-| `deltaglider_rewrite_bodies_total` | Counter | `medium` | Stored objects that an in-place rewrite (the re-encrypt job) read, by where the proxy put them. `medium="memory"`: an object of at most `DGP_SPOOL_THRESHOLD_BYTES`, read into memory. `medium="spool"`: a larger object, streamed through a spool file so that its size does not use memory |
 
 A rising count of `reason="memory_budget"` means that many small uploads arrive at the same time and the memory budget is full. Those bodies still succeed, but each one costs a disk write. Raise `DGP_INGEST_MEMORY_MAX_BYTES` if the host has free memory.
+
+## Re-encrypt rewrites
+
+The re-encrypt job rewrites each stored object in place. It reads the object, seals it and writes it back under a condition on the version that it read. These requests carry no upload body, so they have their own metric.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_rewrite_bodies_total` | Counter | `medium` | Passthrough objects that an in-place rewrite read in full, by where the proxy put them. `medium="memory"`: an object of at most `DGP_SPOOL_THRESHOLD_BYTES`, read into memory. `medium="spool"`: a larger object, streamed through a spool file so that its size does not use memory. The counter does not count a rewrite of a delta or of a reference, and it does not count a rewrite that finds the object changed or deleted before it reads the object |
 
 ## Auth
 

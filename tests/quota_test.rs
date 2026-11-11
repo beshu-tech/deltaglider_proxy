@@ -336,40 +336,70 @@ async fn test_quota_zero_blocks_copy_object() {
     }
 }
 
-/// A frozen bucket (quota=0) refuses a PutObject above the spool threshold
-/// with `AccessDenied` BEFORE its body is read: the gate before the body
-/// (`ingest_client_body`) judges the declared length, so the 4 KiB body
-/// never reaches the spool (`deltaglider_ingest_bodies_total` stays 0). The
-/// exact gate after the body (`store_client_write`) would refuse it too, but
-/// only after the client sent every byte, so the answer alone cannot tell
-/// the two gates apart; the ingest counter can.
-#[tokio::test]
-async fn test_quota_zero_refuses_a_spooled_put_before_its_body() {
-    let server = TestServer::builder()
-        .bucket(BUCKET)
-        .bucket_policy(BUCKET, "quota_bytes: 0")
-        .env("DGP_SPOOL_THRESHOLD_BYTES", "1024")
-        .build()
-        .await;
-    let client = server.s3_client().await;
-    let err = client
+/// The bodies the proxy read into the spool so far (one scrape).
+async fn spooled_bodies(server: &TestServer) -> u64 {
+    common::metrics_text(&server.endpoint())
+        .await
+        .lines()
+        .filter(|l| l.starts_with("deltaglider_ingest_bodies_total{medium=\"spool\""))
+        .filter_map(|l| l.rsplit_once(' ')?.1.trim().parse::<f64>().ok())
+        .sum::<f64>() as u64
+}
+
+/// PUT 4 KiB of `big.zip` into the server's bucket; `Err`: the S3 error code.
+async fn put_4k(server: &TestServer) -> Result<(), String> {
+    server
+        .s3_client()
+        .await
         .put_object()
         .bucket(server.bucket())
         .key("big.zip")
         .body(aws_sdk_s3::primitives::ByteStream::from(vec![3u8; 4096]))
         .send()
         .await
-        .expect_err("quota=0 must reject the PutObject");
-    assert_eq!(error_code(&err), "AccessDenied", "{err:?}");
-    let metrics = common::metrics_text(&server.endpoint()).await;
-    let ingested: Vec<&str> = metrics
-        .lines()
-        .filter(|l| l.starts_with("deltaglider_ingest_bodies_total"))
-        .collect();
-    assert!(
-        ingested.iter().all(|l| l.ends_with(" 0")),
-        "the refused body was read: {ingested:?}"
+        .map(|_| ())
+        .map_err(|e| error_code(&e))
+}
+
+/// A frozen bucket (quota=0) refuses a PutObject above the spool threshold
+/// with `AccessDenied` BEFORE its body is read: the gate before the body
+/// (`ingest_client_body`) judges the declared length, so the 4 KiB body
+/// never reaches the spool. The exact gate after the body
+/// (`store_client_write`) would refuse it too, but only after the client
+/// sent every byte, so the answer alone cannot tell the two gates apart;
+/// the ingest counter can. An untouched counter emits no series, so the
+/// zero would hold for a renamed metric too: the control, the same PUT into
+/// a bucket without a quota, must count exactly one spooled body.
+#[tokio::test]
+async fn test_quota_zero_refuses_a_spooled_put_before_its_body() {
+    let control = TestServer::builder()
+        .bucket(BUCKET)
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "1024")
+        .build()
+        .await;
+    put_4k(&control).await.expect("the control PUT must store");
+    assert_eq!(
+        spooled_bodies(&control).await,
+        1,
+        "the control: the 4 KiB body is read into the spool (the series exists)"
     );
+
+    let server = TestServer::builder()
+        .bucket(BUCKET)
+        .bucket_policy(BUCKET, "quota_bytes: 0")
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "1024")
+        .build()
+        .await;
+    let err = put_4k(&server)
+        .await
+        .expect_err("quota=0 must reject the PutObject");
+    assert_eq!(err, "AccessDenied");
+    assert_eq!(
+        spooled_bodies(&server).await,
+        0,
+        "the refused body was read into the spool"
+    );
+    let client = server.s3_client().await;
     assert!(
         client
             .head_object()
