@@ -161,9 +161,13 @@ enum DriverDone {
         rel_key: String,
         res: Box<PerObjectResult>,
     },
-    /// One batch of deletes: per item, (item, deleted, error).
+    /// One batch of deletes: per item, (item, deleted, error). `deferred`:
+    /// the maintenance gate refused the items left out of `results`
+    /// (F9): they stay unsettled and the run stops as deferred.
     Deletes {
+        sent: usize,
         results: Vec<(u64, bool, Option<String>)>,
+        deferred: Option<String>,
     },
 }
 
@@ -242,6 +246,7 @@ fn to_rel_listing(
 /// `DriverDone::Deletes` for the driver to persist.
 async fn execute_deletes(
     engine: &Arc<DynEngine>,
+    gate: Option<&Arc<crate::maintenance::gate::MaintenanceGate>>,
     src_bucket: &str,
     dst_bucket: &str,
     items: Vec<(u64, super::mirror_delete::MirrorDelete)>,
@@ -252,21 +257,30 @@ async fn execute_deletes(
     let deletes: Vec<super::mirror_delete::MirrorDelete> =
         items.iter().map(|(_, d)| d.clone()).collect();
     let outcomes =
-        super::mirror_delete::delete_mirrored(engine, src_bucket, dst_bucket, &deletes).await;
+        super::mirror_delete::delete_mirrored(engine, gate, src_bucket, dst_bucket, &deletes).await;
+    let mut deferred = None;
     let results = items
         .iter()
         .zip(outcomes)
-        .map(|((item_id, _), outcome)| {
+        .filter_map(|((item_id, _), outcome)| {
             use super::mirror_delete::MirrorOutcome;
-            match outcome {
+            Some(match outcome {
                 MirrorOutcome::Deleted { existed } => (*item_id, existed, None),
                 // The source reappeared — nothing to replicate.
                 MirrorOutcome::SourceBack => (*item_id, false, None),
                 MirrorOutcome::Failed(f) => (*item_id, false, Some(f.message)),
-            }
+                MirrorOutcome::Deferred(why) => {
+                    deferred.get_or_insert_with(|| why.into_reason());
+                    return None;
+                }
+            })
         })
         .collect();
-    DriverDone::Deletes { results }
+    DriverDone::Deletes {
+        sent: items.len(),
+        results,
+        deferred,
+    }
 }
 
 /// RAII guard for one in-flight replication object. Increments
@@ -2079,6 +2093,125 @@ mod request_count_tests {
         .await
         .unwrap()
         .1
+    }
+
+    /// One run of `rule` with `gate`, while every `op` request to `dst`
+    /// stalls: true when the gate counted an in-flight write of `dst`
+    /// during the stall.
+    async fn counted_while_stalled(
+        engine: &Arc<DynEngine>,
+        fake: &FakeS3,
+        rule: &ReplicationRule,
+        gate: &Arc<crate::maintenance::gate::MaintenanceGate>,
+        op: &str,
+    ) -> (bool, RunOutcome) {
+        fake.stall(op, "dst/");
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
+        let run = run_rule(
+            db,
+            engine,
+            rule,
+            10,
+            None,
+            0,
+            "scheduler",
+            None,
+            RunConcurrency::default(),
+            Some(gate.clone()),
+            DynCoordinationLease::from_arc(Arc::new(FreeLease)),
+        );
+        let watch = async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut seen = false;
+            while !seen && tokio::time::Instant::now() < deadline {
+                seen = gate.inflight_writes("dst") > 0
+                    && fake
+                        .requests()
+                        .iter()
+                        .any(|r| r.starts_with(&format!("{op} /dst/")));
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            fake.release_stalls();
+            seen
+        };
+        let (run, seen) = tokio::join!(run, watch);
+        assert_eq!(gate.inflight_writes("dst"), 0, "the count is released");
+        (seen, run.unwrap().1)
+    }
+
+    /// F9: the walk's mirror deletes are in-flight writes of the
+    /// destination (its copies were; its deletes were not), so a
+    /// maintenance job's drain waits for them.
+    #[tokio::test]
+    async fn a_walk_mirror_delete_is_an_inflight_write() {
+        let (engine, fake) = s3_engine().await;
+        // An empty source holds every mirror delete: keep one key there,
+        // already replicated (no copy is in flight to count).
+        for (bucket, key) in [
+            ("src", "keep.bin"),
+            ("dst", "keep.bin"),
+            ("dst", "orphan.bin"),
+        ] {
+            engine
+                .store(bucket, key, b"x", None, Default::default())
+                .await
+                .unwrap();
+        }
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
+        let (seen, outcome) =
+            counted_while_stalled(&engine, &fake, &rule(true), &gate, "DELETE").await;
+        assert!(
+            seen,
+            "a walk mirror delete was never counted as in flight: {:?}",
+            fake.requests()
+        );
+        assert_eq!(outcome.totals.objects_deleted, 1);
+        assert_eq!(outcome.totals.objects_copied, 0, "only the delete wrote");
+    }
+
+    /// F9: a walk copy is counted, and a copy that the gate refuses once it
+    /// is counted stops the run as deferred (cursor kept), not failed.
+    #[tokio::test]
+    async fn a_walk_copy_is_admitted_and_a_refused_one_defers() {
+        let (engine, fake) = s3_engine().await;
+        engine
+            .store("src", "k.bin", b"x", None, Default::default())
+            .await
+            .unwrap();
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
+        let (seen, outcome) =
+            counted_while_stalled(&engine, &fake, &rule(false), &gate, "PUT").await;
+        assert!(seen, "a walk copy was never counted as in flight");
+        assert_eq!(outcome.totals.objects_copied, 1);
+
+        engine
+            .store("src", "j.bin", b"y", None, Default::default())
+            .await
+            .unwrap();
+        gate.set_busy("dst");
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
+        let (_, outcome) = run_rule(
+            db,
+            &engine,
+            &rule(false),
+            10,
+            None,
+            0,
+            "scheduler",
+            None,
+            RunConcurrency::default(),
+            Some(gate.clone()),
+            DynCoordinationLease::from_arc(Arc::new(FreeLease)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.status, "deferred");
+        assert_eq!(outcome.totals.errors, 0, "a deferral is no failure");
+        assert!(
+            engine.head("dst", "j.bin").await.is_err(),
+            "nothing written"
+        );
+        assert_eq!(gate.inflight_writes("dst"), 0);
     }
 
     /// A filesystem engine (singleton backend `default`, so its encrypting

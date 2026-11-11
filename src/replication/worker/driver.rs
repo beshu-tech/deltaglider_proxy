@@ -159,8 +159,9 @@ impl<'a> WalkDriver<'a> {
         let engine = s.engine.clone();
         let src_bucket = rule.source.bucket.clone();
         let dst_bucket = rule.destination.bucket.clone();
+        let gate = s.ctrl.maintenance_gate.clone();
         self.inflight.push(Box::pin(async move {
-            execute_deletes(&engine, &src_bucket, &dst_bucket, items).await
+            execute_deletes(&engine, gate.as_ref(), &src_bucket, &dst_bucket, items).await
         }));
     }
 
@@ -333,16 +334,35 @@ impl<'a> WalkDriver<'a> {
                 let abs_src = format!("{}{rel_key}", s.source_prefix);
                 let abs_dest = format!("{}{rel_key}", s.dest_prefix);
                 let (object_timeout, upload_concurrency) = (s.object_timeout, s.upload_concurrency);
-                // Register this dest write with the maintenance gate BEFORE
-                // it starts (H22): a migrate/re-encrypt arming the gate
-                // mid-run either sees this +1 and drains it, or the next
-                // control check defers the run. The RAII guard rides in the
-                // copy future — a kill dropping the future releases it.
-                let write_guard = s
+                // Admit this dest write through the maintenance gate BEFORE
+                // it starts (H22, F9): counted first, then the gate asked, so
+                // a migrate/re-encrypt arming the gate mid-run either sees
+                // this +1 and drains it, or the copy sees the job and stays
+                // unsettled while the run stops as deferred. The RAII guard
+                // rides in the copy future — a kill dropping it releases it.
+                let write_guard = match s
                     .ctrl
                     .maintenance_gate
                     .as_ref()
-                    .map(|g| g.begin_write(&s.ctrl.dest_bucket));
+                    .map(|g| g.admit_background_write(&s.ctrl.dest_bucket))
+                {
+                    Some(Err(refusal)) => {
+                        self.inflight.push(Box::pin(async move {
+                            DriverDone::Copy {
+                                item_id,
+                                rel_key,
+                                res: Box::new(PerObjectResult {
+                                    gated: true,
+                                    error_message: Some(refusal.into_reason()),
+                                    ..Default::default()
+                                }),
+                            }
+                        }));
+                        return;
+                    }
+                    Some(Ok(write)) => Some(write),
+                    None => None,
+                };
                 self.inflight.push(Box::pin(async move {
                     let _write_guard = write_guard;
                     // Guard increments objects_inflight (+peak) on entry and
@@ -549,8 +569,22 @@ impl<'a> WalkDriver<'a> {
                     machine.drain(walk::DrainReason::Fatal);
                 }
             }
-            DriverDone::Deletes { results } => {
-                self.counts.deletes -= results.len();
+            DriverDone::Deletes {
+                sent,
+                results,
+                deferred,
+            } => {
+                self.counts.deletes -= sent;
+                // Deletes that the gate refused once counted are no failure:
+                // they stay UNSETTLED (the resume cursor cannot pass them)
+                // and the run stops as deferred, like a gated copy.
+                if let Some(why) = deferred {
+                    if !flags.stopped_deferred {
+                        info!("replication rule '{}' deferred: {why}", rule.name);
+                        flags.stopped_deferred = true;
+                        machine.drain(walk::DrainReason::Paused);
+                    }
+                }
                 for (item_id, deleted, error) in results {
                     if deleted {
                         totals.objects_deleted += 1;

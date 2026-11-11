@@ -324,7 +324,7 @@ async fn consumer_tick(
     config: &SharedConfig,
     db: &Arc<Mutex<JobsDb>>,
     engine: &Arc<crate::deltaglider::DynEngine>,
-    gate: &crate::maintenance::gate::MaintenanceGate,
+    gate: &Arc<crate::maintenance::gate::MaintenanceGate>,
     health: Option<&crate::coordination::BackendHealthCache>,
     backoff: &mut RuleBackoff,
     replication: &crate::config_sections::ReplicationConfig,
@@ -630,7 +630,7 @@ async fn drain_once(
     config: &crate::config::SharedConfig,
     db: &Arc<Mutex<JobsDb>>,
     engine: &Arc<crate::deltaglider::DynEngine>,
-    gate: &crate::maintenance::gate::MaintenanceGate,
+    gate: &Arc<crate::maintenance::gate::MaintenanceGate>,
     health: Option<&crate::coordination::BackendHealthCache>,
     backoff: &mut RuleBackoff,
     replication: &crate::config_sections::ReplicationConfig,
@@ -784,7 +784,7 @@ async fn drain_rules(
     config: &crate::config::SharedConfig,
     db: &Arc<Mutex<JobsDb>>,
     engine: &Arc<crate::deltaglider::DynEngine>,
-    gate: &crate::maintenance::gate::MaintenanceGate,
+    gate: &Arc<crate::maintenance::gate::MaintenanceGate>,
     health: Option<&crate::coordination::BackendHealthCache>,
     backoff: &mut RuleBackoff,
     replication: &crate::config_sections::ReplicationConfig,
@@ -1120,7 +1120,7 @@ async fn drain_rule_rows(
     config: &crate::config::SharedConfig,
     db: &Arc<Mutex<JobsDb>>,
     engine: &Arc<crate::deltaglider::DynEngine>,
-    gate: &crate::maintenance::gate::MaintenanceGate,
+    gate: &Arc<crate::maintenance::gate::MaintenanceGate>,
     replication: &crate::config_sections::ReplicationConfig,
     lease: &(impl CoordinationLease + ?Sized),
     claims: &mut std::collections::HashMap<String, RuleClaim>,
@@ -1199,15 +1199,25 @@ async fn drain_rule_rows(
         // encryption witness) may last: the events are skipped, so they do
         // not pin the outbox, and the rule is made due for a catch-up walk
         // that the scheduler runs once the destination accepts writes.
-        if let Some(why) = gate.write_blocked(&w.rule.destination.bucket) {
-            if gate.busy_kind(&w.rule.destination.bucket).is_some() {
-                debug!("event consumer: rule '{}' deferred — {why}", w.rule.name);
-                hold(failed_ids, w);
-            } else {
-                refused.get_or_insert(why);
+        // Admitted = counted as an in-flight write of the destination until
+        // the copy ends (F9), so a job's drain waits for it. A delete is
+        // admitted again by its batch (`mirror_delete`).
+        let _write = match gate.admit_background_write(&w.rule.destination.bucket) {
+            Ok(write) => write,
+            Err(refusal) => {
+                if refusal.is_maintenance() {
+                    debug!(
+                        "event consumer: rule '{}' deferred — {}",
+                        w.rule.name,
+                        refusal.reason()
+                    );
+                    hold(failed_ids, w);
+                } else {
+                    refused.get_or_insert(refusal.into_reason());
+                }
+                continue;
             }
-            continue;
-        }
+        };
         super::deferral::writes_again(&w.rule.name);
         match claim_key(
             config,
@@ -1298,6 +1308,7 @@ async fn drain_rule_rows(
         Some(rule) => {
             super::mirror_delete::delete_mirrored(
                 engine,
+                Some(gate),
                 &rule.source.bucket,
                 &rule.destination.bucket,
                 &items,
@@ -1318,6 +1329,17 @@ async fn drain_rule_rows(
         for (w, outcome) in batched.into_iter().zip(outcomes) {
             use super::mirror_delete::MirrorOutcome;
             let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = match outcome {
+                // The gate refused the batch once it was counted: the key's
+                // events wait, no failure is recorded (owner decision, F9).
+                MirrorOutcome::Deferred(why) => {
+                    debug!(
+                        "event consumer: rule '{}' delete deferred — {}",
+                        w.rule.name,
+                        why.reason()
+                    );
+                    hold(failed_ids, w);
+                    continue;
+                }
                 // Deleted, already gone, or the source holds the key again (the
                 // copy path re-syncs it).
                 MirrorOutcome::Deleted { .. } | MirrorOutcome::SourceBack => Ok(()),
@@ -2302,7 +2324,7 @@ mod per_rule_cursor_tests {
         lease: &(impl CoordinationLease + ?Sized),
     ) {
         let replication = config.read().await.replication.clone();
-        let gate = crate::maintenance::gate::MaintenanceGate::default();
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
         let mut backoff = RuleBackoff::default();
         drain_once(
             config,
@@ -2331,7 +2353,7 @@ mod per_rule_cursor_tests {
         lease: &(impl CoordinationLease + ?Sized),
     ) -> u64 {
         let replication = config.read().await.replication.clone();
-        let gate = crate::maintenance::gate::MaintenanceGate::default();
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
         let mut backoff = RuleBackoff::default();
         let before = db.lock().await.conn.total_changes();
         consumer_tick(
@@ -2771,13 +2793,21 @@ storage:
         }
 
         async fn drain(&mut self, health: Option<&crate::coordination::BackendHealthCache>) {
+            let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
+            self.drain_gated(health, &gate).await;
+        }
+
+        async fn drain_gated(
+            &mut self,
+            health: Option<&crate::coordination::BackendHealthCache>,
+            gate: &Arc<crate::maintenance::gate::MaintenanceGate>,
+        ) {
             let replication = self.config.read().await.replication.clone();
-            let gate = crate::maintenance::gate::MaintenanceGate::default();
             drain_once(
                 &self.config,
                 &self.db,
                 &self.engine,
-                &gate,
+                gate,
                 health,
                 &mut self.backoff,
                 &replication,
@@ -2808,6 +2838,96 @@ storage:
         r.starts_with(&format!("GET /{bucket}"))
             && r.contains("list-type=2")
             && !r.contains("prefix=.dg%2Ffacts%2F")
+    }
+
+    /// Drain while every `op` request to `dst` stalls; true when the gate
+    /// counted an in-flight write of `dst` during the stall.
+    async fn counted_while_stalled(f: &mut Fixture, ops: &[&str]) -> bool {
+        for op in ops {
+            f.fake.stall(op, "dst/");
+        }
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
+        let fake = f.fake.clone();
+        let watch = async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut seen = false;
+            while !seen && tokio::time::Instant::now() < deadline {
+                seen = gate.inflight_writes("dst") > 0
+                    && fake
+                        .requests()
+                        .iter()
+                        .any(|r| ops.iter().any(|op| r.starts_with(&format!("{op} /dst/"))));
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            fake.release_stalls();
+            seen
+        };
+        let ((), seen) = tokio::join!(f.drain_gated(None, &gate), watch);
+        assert_eq!(gate.inflight_writes("dst"), 0, "the count is released");
+        seen
+    }
+
+    /// F9: an event-driven copy into the destination is an in-flight write,
+    /// so a maintenance job's drain waits for it. It was never counted: the
+    /// drain saw 0 and the job rewrote the bucket under the copy.
+    #[tokio::test]
+    async fn an_event_copy_is_an_inflight_write() {
+        let mut f = fixture(false).await;
+        f.put("k.bin").await;
+        assert!(
+            counted_while_stalled(&mut f, &["PUT", "COPY"]).await,
+            "an event copy was never counted as in flight"
+        );
+        assert!(f.engine.head("dst", "k.bin").await.is_ok(), "copied");
+    }
+
+    /// F9: a mirrored delete is an in-flight write of the destination too.
+    #[tokio::test]
+    async fn an_event_mirror_delete_is_an_inflight_write() {
+        let mut f = fixture(true).await;
+        f.put("k.bin").await;
+        f.drain(None).await;
+        f.engine
+            .delete_batch(
+                "src",
+                vec![crate::deltaglider::DeleteItem::new("k.bin")],
+                Default::default(),
+            )
+            .await;
+        f.event(EventKind::ObjectDeleted, "k.bin").await;
+        f.fake.clear();
+        assert!(
+            counted_while_stalled(&mut f, &["DELETE"]).await,
+            "a mirror delete was never counted as in flight"
+        );
+        assert!(f.engine.head("dst", "k.bin").await.is_err(), "deleted");
+    }
+
+    /// Owner decision (F9): a write that the gate refuses once it is
+    /// counted is deferred, not failed: its events wait (the cursor holds),
+    /// no failure is recorded, and nothing is written.
+    #[tokio::test]
+    async fn a_refused_event_write_is_deferred_not_failed() {
+        let mut f = fixture(false).await;
+        f.put("k.bin").await;
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
+        gate.set_busy("dst");
+        f.drain_gated(None, &gate).await;
+        assert_eq!(f.cursor().await, 0, "the events wait for the job");
+        assert!(
+            f.engine.head("dst", "k.bin").await.is_err(),
+            "nothing written"
+        );
+        let failures =
+            f.db.lock()
+                .await
+                .replication_recent_failures("r", 10)
+                .unwrap();
+        assert!(
+            failures.is_empty(),
+            "a deferral is no failure: {failures:?}"
+        );
+        assert_eq!(gate.inflight_writes("dst"), 0);
     }
 
     #[test]

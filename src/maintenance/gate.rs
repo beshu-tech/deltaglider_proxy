@@ -142,12 +142,39 @@ impl MaintenanceGate {
     /// `None`. Memory only. Every replication / lifecycle gate check goes
     /// through here (source guard `background_writers_ask_write_blocked`).
     pub fn write_blocked(&self, bucket: &str) -> Option<String> {
+        self.refusal_of(bucket).map(WriteRefusal::into_reason)
+    }
+
+    /// [`Self::write_blocked`], with the cause kept apart.
+    fn refusal_of(&self, bucket: &str) -> Option<WriteRefusal> {
         if let Some(kind) = self.busy_kind(bucket) {
-            return Some(format!(
+            return Some(WriteRefusal::Maintenance(format!(
                 "bucket '{bucket}' has an active maintenance job ({kind})"
-            ));
+            )));
         }
-        self.write_refusal.get().and_then(|probe| (probe.0)(bucket))
+        self.write_refusal
+            .get()
+            .and_then(|probe| (probe.0)(bucket))
+            .map(WriteRefusal::Refused)
+    }
+
+    /// THE admission of one background write (replication copy, mirror
+    /// delete, lifecycle act) into `bucket`: count it as in flight FIRST,
+    /// then ask [`Self::write_blocked`]. A maintenance job that arms at any
+    /// moment either sees the count (its drain waits for the write) or the
+    /// write sees the job (the guard drops, the caller defers). Checking
+    /// first and counting after left a window where the drain saw 0 and
+    /// the write still landed (F9). Hold the guard until the write ends.
+    /// Source guard `background_writers_are_admitted`.
+    pub fn admit_background_write(
+        self: &Arc<Self>,
+        bucket: &str,
+    ) -> Result<WriteGuard, WriteRefusal> {
+        let guard = self.begin_write(bucket);
+        match self.refusal_of(bucket) {
+            Some(refusal) => Err(refusal), // `guard` drops: no longer counted.
+            None => Ok(guard),
+        }
     }
 
     /// The kind of the job that gates this bucket, if one does.
@@ -245,8 +272,38 @@ impl MaintenanceGate {
     }
 }
 
+/// Why [`MaintenanceGate::admit_background_write`] refused a write. Either
+/// way the writer defers (the key waits), it never records a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteRefusal {
+    /// A maintenance job rewrites the bucket: it ends on its own.
+    Maintenance(String),
+    /// This node refuses writes to the bucket (the encryption witness): it
+    /// may last.
+    Refused(String),
+}
+
+impl WriteRefusal {
+    pub fn reason(&self) -> &str {
+        match self {
+            WriteRefusal::Maintenance(r) | WriteRefusal::Refused(r) => r,
+        }
+    }
+
+    pub fn into_reason(self) -> String {
+        match self {
+            WriteRefusal::Maintenance(r) | WriteRefusal::Refused(r) => r,
+        }
+    }
+
+    pub fn is_maintenance(&self) -> bool {
+        matches!(self, WriteRefusal::Maintenance(_))
+    }
+}
+
 /// Decrements the gate's in-flight-write counter on drop — cancellation-safe.
 #[must_use = "dropping the guard immediately ends the in-flight-write window"]
+#[derive(Debug)]
 pub struct WriteGuard {
     gate: Arc<MaintenanceGate>,
     bucket: String,
@@ -455,6 +512,178 @@ mod tests {
             offenders.is_empty(),
             "use MaintenanceGate::write_blocked: {offenders:?}"
         );
+    }
+
+    /// The module key of a source file: `a/b.rs` and `a/b/mod.rs` are `a/b`,
+    /// and `a/b/c.rs` is inside it.
+    fn module_key(rel: &str) -> &str {
+        let key = rel.strip_suffix(".rs").unwrap_or(rel);
+        key.strip_suffix("/mod").unwrap_or(key)
+    }
+
+    /// Code exempt from [`background_writers_are_admitted`], with why.
+    const ADMISSION_EXEMPT: [(&str, &str); 5] = [
+        ("src/deltaglider/", "the engine: its callers are admitted"),
+        ("src/storage/", "the backends: below the engine"),
+        (
+            "src/transfer.rs",
+            "the copy primitive: its callers are admitted",
+        ),
+        (
+            "src/maintenance/",
+            "the jobs that hold the gate and drain it",
+        ),
+        ("src/cli/", "offline CLI commands: no server, no gate"),
+    ];
+
+    /// The writers the gate must count, found in `src`: every call of a
+    /// `transfer::copy_object_*` fn and every `delete_batch`.
+    fn writer_calls(src: &crate::source_scan::ast::Source) -> Vec<usize> {
+        src.prod
+            .calls
+            .iter()
+            .filter(|c| {
+                (c.method && c.name == "delete_batch")
+                    || (!c.method && c.segs.last().is_some_and(|s| s.starts_with("copy_object_")))
+            })
+            .map(|c| c.line)
+            .collect()
+    }
+
+    /// The modules (key → its writer lines) that write but do not call any
+    /// of `admit` in the module or one inside it.
+    fn unadmitted(
+        sources: &[crate::source_scan::ast::Source],
+        admit: impl Fn(&str) -> &'static [&'static str],
+    ) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for src in sources {
+            if ADMISSION_EXEMPT
+                .iter()
+                .any(|(prefix, _)| src.rel.starts_with(prefix))
+            {
+                continue;
+            }
+            let lines = writer_calls(src);
+            if lines.is_empty() {
+                continue;
+            }
+            let key = module_key(&src.rel);
+            let names = admit(&src.rel);
+            let admitted = sources.iter().any(|other| {
+                let k = module_key(&other.rel);
+                (k == key || k.starts_with(&format!("{key}/")))
+                    && names
+                        .iter()
+                        .any(|n| other.prod.calls_named(n).next().is_some())
+            });
+            if !admitted {
+                offenders.push(format!("{}:{lines:?} (needs one of {names:?})", src.rel));
+            }
+        }
+        offenders
+    }
+
+    /// The admission a writer module must call: a background writer
+    /// (replication, lifecycle) `admit_background_write`, which counts and
+    /// then asks the gate; a request-scoped writer (S3 adapter, admin bulk
+    /// loops, which check the gate per item after counting) may count
+    /// with `begin_write`.
+    fn admission_for(rel: &str) -> &'static [&'static str] {
+        if rel.starts_with("src/replication/") || rel.starts_with("src/lifecycle/") {
+            &["admit_background_write"]
+        } else {
+            &["admit_background_write", "begin_write"]
+        }
+    }
+
+    /// Source guard (F9): every non-engine module that writes through
+    /// `transfer::copy_object_*` or `delete_batch` is counted by the gate,
+    /// so a maintenance job's `drain_inflight_writes` waits for it. The
+    /// event consumer's copies and both mirror-delete paths were not, and
+    /// the drain saw 0 while they wrote. Background writers must use
+    /// `admit_background_write` (count, then check), never a bare
+    /// `begin_write` or a check before the count.
+    #[test]
+    fn background_writers_are_admitted() {
+        let sources = crate::source_scan::ast::src();
+        let offenders = unadmitted(sources, admission_for);
+        assert!(
+            offenders.is_empty(),
+            "writers the maintenance gate does not count: {offenders:?}"
+        );
+        let bare: Vec<&str> = sources
+            .iter()
+            .filter(|s| admission_for(&s.rel) == ["admit_background_write"])
+            .filter(|s| s.prod.calls_named("begin_write").next().is_some())
+            .map(|s| s.rel.as_str())
+            .collect();
+        assert!(
+            bare.is_empty(),
+            "a background writer counts with begin_write and skips the re-check: {bare:?}"
+        );
+        // The scan sees the writers it is about (not vacuous).
+        let writers: Vec<&str> = sources
+            .iter()
+            .filter(|s| !writer_calls(s).is_empty())
+            .map(|s| s.rel.as_str())
+            .collect();
+        for expected in [
+            "src/replication/event_consumer.rs",
+            "src/replication/mirror_delete.rs",
+            "src/replication/worker.rs",
+            "src/lifecycle/worker.rs",
+            "src/api/admin/objects.rs",
+            "src/s3_adapter_s3s/object.rs",
+        ] {
+            assert!(
+                writers.contains(&expected),
+                "the scan missed {expected}: {writers:?}"
+            );
+        }
+        // A writer without an admission is caught.
+        let fixture = [
+            crate::source_scan::ast::parse(
+                "src/replication/x.rs",
+                "async fn f(e: E) { crate::transfer::copy_object_from(e, r, None).await; \
+                 e.delete_batch(b, v, h).await; g.write_blocked(b); }",
+            ),
+            // The writer in `y`, its admission in `y/z` (the walk's shape:
+            // `worker.rs` copies, `worker/driver.rs` admits).
+            crate::source_scan::ast::parse(
+                "src/replication/y.rs",
+                "async fn f(e: E) { copy_object_known(e, r, None, None).await; }",
+            ),
+            crate::source_scan::ast::parse(
+                "src/replication/y/z.rs",
+                "async fn f(g: G) { let _w = g.admit_background_write(b); }",
+            ),
+        ];
+        let caught = unadmitted(&fixture, admission_for);
+        assert_eq!(caught.len(), 1, "{caught:?}");
+        assert!(caught[0].starts_with("src/replication/x.rs"), "{caught:?}");
+    }
+
+    /// The admission counts BEFORE it asks: a refusal leaves no count, an
+    /// admitted write holds one until its guard drops.
+    #[test]
+    fn admit_background_write_counts_then_checks() {
+        let g = Arc::new(MaintenanceGate::new());
+        let w = g.admit_background_write("b").expect("idle bucket");
+        assert_eq!(g.inflight_writes("b"), 1);
+        g.set_busy("b");
+        let refusal = g.admit_background_write("B").unwrap_err();
+        assert!(refusal.is_maintenance(), "{refusal:?}");
+        assert_eq!(g.inflight_writes("b"), 1, "a refused write leaves no count");
+        drop(w);
+        assert_eq!(g.inflight_writes("b"), 0);
+        g.clear("b");
+        g.set_write_refusal_probe(Arc::new(|b: &str| (b == "w").then(|| "witness".into())));
+        assert_eq!(
+            g.admit_background_write("w").unwrap_err(),
+            WriteRefusal::Refused("witness".into())
+        );
+        assert_eq!(g.inflight_writes("w"), 0);
     }
 
     /// Owner decision (#10 of the P3 review): a maintenance job (re-encrypt,

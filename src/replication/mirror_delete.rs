@@ -13,6 +13,7 @@
 //! reclaim, instead of once per key.
 
 use crate::deltaglider::{DeleteItem, DeleteOutcome, DynEngine, EngineError};
+use crate::maintenance::gate::{MaintenanceGate, WriteRefusal};
 use crate::transfer::CopyClass;
 use futures::StreamExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -67,6 +68,9 @@ pub(crate) enum MirrorOutcome {
     SourceBack,
     /// The re-check or the delete failed; the destination key may remain.
     Failed(DeleteFailure),
+    /// The maintenance gate refused the delete once it was counted
+    /// (`admit_background_write`): nothing was deleted, the key waits.
+    Deferred(WriteRefusal),
 }
 
 /// The folder a key lives in: everything up to its last `/` (`""` at the
@@ -169,8 +173,12 @@ async fn source_presence(
 
 /// Delete the destination copies of `items` whose source key is still gone,
 /// re-checked folder by folder. One outcome per item, in input order.
+/// The deletes are admitted through `gate` (F9): counted as an in-flight
+/// write of `dst_bucket` while they run, or every key to delete is
+/// [`MirrorOutcome::Deferred`] when the gate refuses them.
 pub(crate) async fn delete_mirrored(
     engine: &DynEngine,
+    gate: Option<&std::sync::Arc<MaintenanceGate>>,
     src_bucket: &str,
     dst_bucket: &str,
     items: &[MirrorDelete],
@@ -219,6 +227,19 @@ pub(crate) async fn delete_mirrored(
             }
         }
     }
+    // Counted BEFORE the gate is asked (acquire-then-recheck), held until
+    // the batch ends. The re-check above only read.
+    let _write = match gate.map(|g| g.admit_background_write(dst_bucket)) {
+        Some(Err(refusal)) => {
+            for &i in &to_delete {
+                outcomes[i] = Some(MirrorOutcome::Deferred(refusal.clone()));
+            }
+            to_delete.clear();
+            None
+        }
+        Some(Ok(write)) => Some(write),
+        None => None,
+    };
     let batch: Vec<DeleteItem<'_>> = to_delete
         .iter()
         .map(|&i| DeleteItem::new(items[i].dest_key.clone()))
