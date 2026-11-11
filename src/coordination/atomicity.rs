@@ -1271,17 +1271,28 @@ mod tests {
     #[test]
     fn no_caller_judges_an_unresolved_bucket() {
         let mut offenders = Vec::new();
-        for (rel, text) in crate::source_scan::prod_sources("src") {
-            let code = crate::source_scan::prod_text(&text);
+        for src in crate::source_scan::ast::src() {
+            let rel = &src.rel;
+            let f = &src.prod;
             let here =
                 rel == "src/coordination/atomicity.rs" || rel == "src/coordination/capability.rs";
-            if !here && code.contains(".write_block(") {
+            // The method, or its UFCS form; `AdminError::write_block` is the
+            // admin error constructor of the same name.
+            let judges = f
+                .calls_named("write_block")
+                .any(|c| c.method || c.segs.len() < 2 || c.segs[c.segs.len() - 2] != "AdminError");
+            if !here && judges {
                 offenders.push(format!("{rel}: write_block outside the atomicity module"));
             }
-            if rel == "src/coordination/atomicity.rs" && code.contains("resolved_backend_name") {
+            let names = |ident: &str| {
+                f.calls_named(ident).next().is_some()
+                    || f.paths.iter().any(|p| p.segs.iter().any(|s| s == ident))
+                    || f.fields.iter().any(|x| x.name == ident)
+            };
+            if rel == "src/coordination/atomicity.rs" && names("resolved_backend_name") {
                 offenders.push(format!("{rel}: judges by resolved_backend_name"));
             }
-            if !here && code.contains("read_only_reason(") && !code.contains("BucketHome") {
+            if !here && f.calls_named("read_only_reason").next().is_some() && !names("BucketHome") {
                 offenders.push(format!("{rel}: read_only_reason without a BucketHome"));
             }
         }
