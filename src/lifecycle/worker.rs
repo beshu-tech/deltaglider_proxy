@@ -1524,8 +1524,11 @@ async fn plan_action(
             if engine.write_refusal(destination_bucket).is_some() {
                 return Ok(Planned::Skipped);
             }
+            // Bounded like a replication copy: the admission keeps the
+            // destination counted until the copy ends.
             let copied = crate::transfer::admitted::copy_with_retries(
                 windows,
+                Some(crate::transfer::DEFAULT_OBJECT_TIMEOUT),
                 engine,
                 ObjectTransferRequest {
                     source_bucket: &rule.bucket,
@@ -2694,6 +2697,20 @@ mod tests {
     /// must never be acted on (set-relative, no resume cursor → data loss).
     /// P4.3: the delete events of one page are one outbox insert (one
     /// commit), not one per deleted object.
+    /// Review of #166: the admission is built from the trimmed write
+    /// buckets (`rule_write_buckets`), while the delete checks the rule's
+    /// raw `bucket`: a name with spaces around it tripped the check. Both
+    /// sides compare trimmed now.
+    #[test]
+    fn a_bucket_name_with_spaces_is_covered_by_its_admission() {
+        let mut r = rule();
+        r.bucket = " b ".into();
+        let windows = super::admit_write_windows(&r, None).unwrap();
+        assert!(windows.covers(&r.bucket), "{windows:?}");
+        assert!(windows.covers("B"));
+        assert!(!windows.covers("other"));
+    }
+
     #[tokio::test]
     async fn a_page_of_deletes_appends_its_events_in_one_commit() {
         let dir = tempfile::tempdir().unwrap();

@@ -278,11 +278,28 @@ impl MaintenanceGate {
     }
 
     /// [`Self::begin_write`] for a background writer (counted apart too).
+    ///
+    /// Order (review of #166): the background count goes up BEFORE the
+    /// total and down AFTER it (`WriteGuard::drop`), so a drain that reads
+    /// the total, then the background count, never sees a background
+    /// write in the total that the background count misses.
     fn begin_background_write(self: &Arc<Self>, bucket: &str) -> WriteGuard {
-        let mut guard = self.begin_write(bucket);
-        bump(&self.inflight_background, &guard.bucket, 1);
-        guard.background = true;
-        guard
+        let key = bucket.to_ascii_lowercase();
+        bump(&self.inflight_background, &key, 1);
+        self.write_started(&key);
+        WriteGuard {
+            gate: Arc::clone(self),
+            bucket: key,
+            background: true,
+        }
+    }
+
+    /// A write of request work that runs on detached from its request (a
+    /// DeleteObjects batch, the store of a CompleteMultipartUpload): no
+    /// request deadline bounds it, so the drain counts it as background
+    /// (a drain that times out on it defers its job instead of failing).
+    pub fn begin_detached_write(self: &Arc<Self>, bucket: &str) -> WriteGuard {
+        self.begin_background_write(bucket)
     }
 
     /// Of [`Self::inflight_writes`], the background writes.
@@ -310,8 +327,12 @@ pub struct Admitted {
 
 impl Admitted {
     /// Does this admission cover writes into `bucket`?
+    /// Names compare trimmed and case-insensitive, as the rule's write
+    /// buckets are built (`lifecycle::planner::rule_write_buckets` trims).
     pub fn covers(&self, bucket: &str) -> bool {
-        self.buckets.iter().any(|b| b.eq_ignore_ascii_case(bucket))
+        self.buckets
+            .iter()
+            .any(|b| b.trim().eq_ignore_ascii_case(bucket.trim()))
     }
 }
 
@@ -379,10 +400,12 @@ pub struct WriteGuard {
 
 impl Drop for WriteGuard {
     fn drop(&mut self) {
+        // The total first, then the background count (see
+        // `begin_background_write`).
+        self.gate.write_finished(&self.bucket);
         if self.background {
             bump(&self.gate.inflight_background, &self.bucket, -1);
         }
-        self.gate.write_finished(&self.bucket);
     }
 }
 
@@ -617,15 +640,52 @@ mod tests {
         ("src/cli/", "offline CLI commands: no server, no gate"),
     ];
 
+    /// Is `name` a writer the gate must count: a `transfer::copy_object_*`
+    /// fn or `delete_batch`?
+    fn writer_name(name: &str) -> bool {
+        name.starts_with("copy_object_") || name == "delete_batch"
+    }
+
     /// The writers the gate must count, found in `src`: every call of a
-    /// `transfer::copy_object_*` fn and every `delete_batch`.
+    /// `transfer::copy_object_*` fn and every `delete_batch` (method, UFCS
+    /// path, or a `use … as alias` of either), but the proof-taking ones of
+    /// `transfer::admitted`.
     fn writer_calls(src: &crate::source_scan::ast::Source) -> Vec<usize> {
+        let aliases: Vec<&str> = src
+            .prod
+            .paths
+            .iter()
+            .filter(|p| p.segs.last().is_some_and(|s| writer_name(s)))
+            .filter_map(|p| p.alias.as_deref())
+            .collect();
         src.prod
             .calls
             .iter()
             .filter(|c| {
-                (c.method && c.name == "delete_batch")
-                    || (!c.method && c.segs.last().is_some_and(|s| s.starts_with("copy_object_")))
+                if c.method {
+                    return c.name == "delete_batch";
+                }
+                if c.segs.iter().any(|s| s == "admitted") {
+                    return false;
+                }
+                let last = c.segs.last().map(String::as_str).unwrap_or("");
+                writer_name(last) || (c.segs.len() == 1 && aliases.contains(&last))
+            })
+            .map(|c| c.line)
+            .collect()
+    }
+
+    /// `admit_all(None, …)` of a bucket: an uncounted proof. Only an
+    /// admission of no bucket (`admit_all(None, &[])`, a preview that writes
+    /// nothing) may pass `None` literally; a writer passes its gate.
+    fn uncounted_admissions(src: &crate::source_scan::ast::Source) -> Vec<usize> {
+        src.prod
+            .calls
+            .iter()
+            .filter(|c| !c.method && c.named("admit_all"))
+            .filter(|c| c.arg_idents.first() == Some(&Some("None".to_string())))
+            .filter(|c| {
+                c.arg_idents_all.len() > 1 || !c.arg_strings.is_empty() || !c.arg_calls.is_empty()
             })
             .map(|c| c.line)
             .collect()
@@ -665,6 +725,13 @@ mod tests {
             {
                 continue;
             }
+            let uncounted = uncounted_admissions(src);
+            if !uncounted.is_empty() {
+                offenders.push(format!(
+                    "{}:{uncounted:?} admit_all(None, …) of a bucket makes an uncounted proof",
+                    src.rel
+                ));
+            }
             let lines = writer_calls(src);
             if background(&src.rel) {
                 // A background writer writes only through `admitted::*`: the
@@ -691,7 +758,12 @@ mod tests {
             // check the gate per item after counting) counts in the module
             // or one inside it.
             let key = module_key(&src.rel);
-            let names = ["admit_background_write", "admit_all", "begin_write"];
+            let names = [
+                "admit_background_write",
+                "admit_all",
+                "begin_write",
+                "begin_detached_write",
+            ];
             let counted = sources.iter().any(|other| {
                 let k = module_key(&other.rel);
                 (k == key || k.starts_with(&format!("{key}/")))
@@ -771,6 +843,24 @@ mod tests {
                 "src/api/admin/z.rs",
                 "async fn f(e: E) { e.delete_batch(b, v, h).await; }",
             ),
+            // An aliased import and the UFCS form are writers too.
+            crate::source_scan::ast::parse(
+                "src/replication/alias.rs",
+                "use crate::transfer::copy_object_known as cp; \
+                 async fn f(e: E, g: G) { let _p = admit_all(g, &[b])?; cp(e, r, None, None).await; }",
+            ),
+            crate::source_scan::ast::parse(
+                "src/lifecycle/ufcs.rs",
+                "async fn f(e: E, g: G) { let _p = admit_all(g, &[b])?; \
+                 DynEngine::delete_batch(&e, b, v, h).await; }",
+            ),
+            // A literal `None` gate for a bucket is an uncounted proof; an
+            // admission of no bucket is not.
+            crate::source_scan::ast::parse(
+                "src/replication/none.rs",
+                "async fn f(e: E) { let p = admit_all(None, &buckets)?;\n\
+                 let q = admit_all(None, &[\"b\"])?;\n let r = admit_all(None, &[])?; }",
+            ),
         ];
         let caught = unadmitted(&fixture);
         let files: Vec<&str> = caught
@@ -782,9 +872,16 @@ mod tests {
             [
                 "src/replication/x.rs",
                 "src/lifecycle/y.rs",
-                "src/api/admin/z.rs"
+                "src/api/admin/z.rs",
+                "src/replication/alias.rs",
+                "src/lifecycle/ufcs.rs",
+                "src/replication/none.rs",
             ],
             "{caught:?}"
+        );
+        assert!(
+            caught[5].contains("[1, 2]"),
+            "the two uncounted ones: {caught:?}"
         );
     }
 

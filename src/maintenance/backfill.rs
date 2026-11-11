@@ -176,7 +176,7 @@ pub(crate) async fn execute_backfill_phases(
     }
 
     // ── Drain in-flight writes admitted before the gate armed. ──
-    drain_inflight_writes(state, &job.bucket).await?;
+    drain_inflight_writes(state, job.id, &job.bucket).await?;
 
     let mut visitor = Backfill {
         bucket: &job.bucket,

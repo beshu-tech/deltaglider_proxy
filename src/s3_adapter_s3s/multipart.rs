@@ -213,7 +213,9 @@ pub(super) async fn complete_multipart_upload(
             // The slot of the detached store (F56) BEFORE the object lock:
             // a detached DeleteObjects batch holds a slot while it takes
             // each key's object lock, so holding this key's lock while
-            // waiting for a slot deadlocked with it.
+            // waiting for a slot deadlocked with it. A Complete that the
+            // quota or a precondition then refuses waited for the slot for
+            // nothing: acceptable, the wait is bounded by its deadline.
             let slot = crate::api::handlers::DetachedWork::reserve(&extensions).await;
             // Admission (quota) + routing decisions run ONLY for the owner: a
             // tombstone/join retry must never be re-admitted — its bytes are
@@ -260,7 +262,10 @@ pub(super) async fn complete_multipart_upload(
             // The detached store is a write of the bucket until it ends, also
             // after the request is gone (client disconnect, request timeout):
             // the maintenance drain (`drain_inflight_writes`) must wait for it.
-            let gate_write = svc.state.maintenance_gate.begin_write(&input.bucket);
+            let gate_write = svc
+                .state
+                .maintenance_gate
+                .begin_detached_write(&input.bucket);
             let handle = slot.spawn_detached(async move {
                 let _gate_write = gate_write;
                 let result = run_multipart_completion(
@@ -632,6 +637,9 @@ mod multipart_cost_tests {
             .await;
         assert!(cut, "the store ended before the request was cut");
         assert_eq!(state.maintenance_gate.inflight_writes("b"), 1);
+        // No request deadline bounds it: a drain counts it as background
+        // (a timeout on it defers the job, never fails it).
+        assert_eq!(state.maintenance_gate.inflight_background_writes("b"), 1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while state.maintenance_gate.inflight_writes("b") > 0 {
             assert!(

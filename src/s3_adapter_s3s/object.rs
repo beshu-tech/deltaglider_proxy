@@ -471,7 +471,7 @@ pub(super) async fn delete_objects(
     // A slot of detached request work, held by the task (F56): the task
     // outlives the request's slot of the global cap.
     let slot = crate::api::handlers::DetachedWork::reserve(&req.extensions).await;
-    let write = state.maintenance_gate.begin_write(&bucket);
+    let write = state.maintenance_gate.begin_detached_write(&bucket);
     let batch = slot.spawn_detached(async move {
         let _write = write;
         let engine = state.engine.load_full();

@@ -1247,7 +1247,13 @@ async fn drain_rule_rows(
             }
             // Deletes are not replicated: handled.
             KeyAction::Delete | KeyAction::Noop => Ok(()),
-            KeyAction::Copy => apply_copy(engine, db, &write, w.rule, w.bucket, w.key).await,
+            KeyAction::Copy => {
+                // Bounded like a walk copy (`replication.object_timeout`): an
+                // admitted copy keeps the destination counted, so a job that
+                // arms meanwhile defers until it ends.
+                let timeout = super::scheduler::object_timeout(replication);
+                apply_copy(engine, db, &write, timeout, w.rule, w.bucket, w.key).await
+            }
         };
         let dbg = db.lock().await;
         // One commit for the heartbeat and the key's outcome (E6/F20).
@@ -1544,6 +1550,7 @@ async fn apply_copy(
     engine: &Arc<crate::deltaglider::DynEngine>,
     db: &Arc<Mutex<JobsDb>>,
     admitted: &crate::maintenance::gate::Admitted,
+    object_timeout: Option<std::time::Duration>,
     rule: &ReplicationRule,
     bucket: &str,
     key: &str,
@@ -1600,6 +1607,7 @@ async fn apply_copy(
             // The copy starts from the HEAD above: no second source HEAD.
             let outcome = crate::transfer::admitted::copy_known(
                 admitted,
+                object_timeout,
                 engine,
                 transfer,
                 Some(&src_meta),
@@ -2907,6 +2915,36 @@ storage:
             "a mirror delete was never counted as in flight"
         );
         assert!(f.engine.head("dst", "k.bin").await.is_err(), "deleted");
+    }
+
+    /// Review of #166: an event copy keeps its destination counted while
+    /// it runs, so an armed maintenance job defers (and the bucket answers
+    /// 503) for its whole length. It is bounded by
+    /// `replication.object_timeout` like a walk copy: a copy that never
+    /// ends is cut, its events are held for a retry, and the count ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_event_copy_is_cut_at_the_object_timeout() {
+        let mut f = fixture(false).await;
+        f.config.write().await.replication.object_timeout = "300ms".into();
+        f.put("k.bin").await;
+        f.fake.stall("PUT", "dst/");
+        f.fake.stall("COPY", "dst/");
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            f.drain_gated(None, &gate),
+        )
+        .await
+        .expect("a copy that never ends held the drain past its object timeout");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(
+            gate.inflight_writes("dst"),
+            0,
+            "the count ended with the copy"
+        );
+        assert_eq!(f.cursor().await, 0, "the event is held for a retry");
+        f.fake.release_stalls();
     }
 
     /// Owner decision (F9): a write that the gate refuses once it is

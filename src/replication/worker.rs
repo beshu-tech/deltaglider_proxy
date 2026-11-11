@@ -807,7 +807,8 @@ async fn copy_one_object(
         // Test-only stall INSIDE the timeout scope (inert in prod) so the
         // object-timeout Elapsed arm is deterministically exercisable.
         maybe_pass_stall().await;
-        crate::transfer::admitted::copy_from(admitted, engine, transfer, src_meta).await
+        // The walk bounds the copy itself (below, with its stall seam).
+        crate::transfer::admitted::copy_from(admitted, None, engine, transfer, src_meta).await
     };
     let copy_result = match object_timeout {
         Some(timeout) => match tokio::time::timeout(timeout, copy_fut).await {
