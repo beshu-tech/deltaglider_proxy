@@ -19,6 +19,16 @@
 //! by design: an entry that is left behind never matches a later object.
 //! The cleanup task is not the write task, so a long cleanup never delays
 //! a facts write.
+//!
+//! Both queues are bounded ([`QUEUE_CAP`] items each, F58 of epic #143):
+//! they were unbounded, so a backend that stalled the tasks let every PUT
+//! and delete of the node grow them without a limit. A full queue drops the
+//! new item, counts it in `deltaglider_listing_facts_queue_dropped_total`
+//! (label `queue`: `write` or `cleanup`) and logs a warning (the first drop
+//! and every 10,000th). Both kinds of work are best effort already: a
+//! dropped write leaves the LIST reporting the stored size until a HEAD or
+//! the healer writes the facts, a dropped cleanup leaves entries that never
+//! match a later object and that the facts GC removes.
 
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -41,6 +51,12 @@ const DEBOUNCE: Duration = Duration::from_millis(200);
 const MAX_BATCH: usize = 10_000;
 /// `DeleteObjects` takes at most 1000 keys.
 const DELETE_CHUNK: usize = 1000;
+/// Most items each queue holds (facts writes; deleted keys): ten flushes of
+/// [`MAX_BATCH`], a few tens of MB at most. See the module notes for what a
+/// full queue does.
+const QUEUE_CAP: usize = 100_000;
+/// A full queue logs its first drop and every this many after it.
+const DROP_LOG_EVERY: u64 = 10_000;
 /// Facts objects that one drain batch writes at once.
 const FACTS_WRITE_CONCURRENCY: usize = 32;
 
@@ -325,7 +341,8 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// deleted thousands of keys, and zero facts written in 30 minutes).
 pub(super) struct FactsCleanupQueue {
     writer: FactsWriter,
-    deleted: mpsc::UnboundedSender<Deleted>,
+    deleted: mpsc::Sender<Deleted>,
+    cleanup_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// The GC task never ends on its own: the queue owns it and aborts it
     /// on drop, else every engine rebuild leaked one with the old client.
     gc: Option<tokio::task::JoinHandle<()>>,
@@ -345,8 +362,13 @@ impl FactsCleanupQueue {
     /// dropped, the write task when the queue and every writer are, each
     /// after a last batch.
     pub(super) fn start(client: Client, native: NativeEncryptionPolicy) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (deleted, deleted_rx) = mpsc::unbounded_channel();
+        Self::start_with_capacity(client, native, QUEUE_CAP)
+    }
+
+    /// [`Self::start`] with queues of `cap` items each.
+    fn start_with_capacity(client: Client, native: NativeEncryptionPolicy, cap: usize) -> Self {
+        let (tx, rx) = mpsc::channel(cap);
+        let (deleted, deleted_rx) = mpsc::channel(cap);
         let rewritten: Rewritten = Default::default();
         let outstanding: Arc<Outstanding> = Default::default();
         tokio::spawn(write_drain(client.clone(), native, rx, outstanding.clone()));
@@ -357,8 +379,10 @@ impl FactsCleanupQueue {
                 tx,
                 rewritten,
                 outstanding,
+                dropped: Default::default(),
             },
             deleted,
+            cleanup_dropped: Default::default(),
             gc,
         }
     }
@@ -373,13 +397,32 @@ impl FactsCleanupQueue {
     /// server clock, when known): drop its facts soon.
     pub(super) fn enqueue(&self, bucket: &str, stored_key: &str, deleted_at: Option<i64>) {
         let pair = (bucket.to_string(), stored_key.to_string());
+        let mut marked = false;
         if let Ok(mut st) = self.writer.rewritten.lock() {
             st.rewritten.remove(&pair);
-            st.pending.insert(pair.clone());
+            marked = st.pending.insert(pair.clone());
         }
-        if self.deleted.send((pair.0, pair.1, deleted_at)).is_err() {
-            debug!("facts cleanup queue closed; {bucket}/{stored_key} keeps its entries");
+        let item = (pair.0.clone(), pair.1.clone(), deleted_at);
+        if !offer(&self.deleted, item, "cleanup", &self.cleanup_dropped) {
+            // Not queued: this call's pending mark goes (a mark of an
+            // earlier queued delete of the key stays).
+            if marked {
+                if let Ok(mut st) = self.writer.rewritten.lock() {
+                    st.pending.remove(&pair);
+                }
+            }
+            debug!("facts cleanup not queued; {bucket}/{stored_key} keeps its entries");
         }
+    }
+
+    /// Items each queue dropped because it was full: `(write, cleanup)`.
+    #[cfg(test)]
+    fn dropped(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.writer.dropped.load(Relaxed),
+            self.cleanup_dropped.load(Relaxed),
+        )
     }
 
     /// `stored_key` was written again, with the facts object `facts_key`:
@@ -411,9 +454,41 @@ impl FactsCleanupQueue {
 /// queue and every writer are dropped.
 #[derive(Clone)]
 pub(super) struct FactsWriter {
-    tx: mpsc::UnboundedSender<Write>,
+    tx: mpsc::Sender<Write>,
     rewritten: Rewritten,
     outstanding: Arc<Outstanding>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Queue `item` without waiting (the callers are request paths). `false`
+/// when it was not queued: the queue is closed, or full — then the drop is
+/// counted in `dropped` and the metric, and logged (first, then every
+/// [`DROP_LOG_EVERY`]).
+fn offer<T>(
+    tx: &mpsc::Sender<T>,
+    item: T,
+    queue: &'static str,
+    dropped: &std::sync::atomic::AtomicU64,
+) -> bool {
+    match tx.try_send(item) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            super::s3::LISTING_FACTS_QUEUE_DROPPED
+                .with_label_values(&[queue])
+                .inc();
+            if n == 1 || n % DROP_LOG_EVERY == 0 {
+                warn!(
+                    "listing facts {queue} queue full ({} items): {n} items dropped so far; \
+                     the backend is slow or unreachable (best effort: LISTs report stored \
+                     sizes, the facts GC removes stale entries)",
+                    tx.max_capacity()
+                );
+            }
+            false
+        }
+    }
 }
 
 impl FactsWriter {
@@ -429,9 +504,14 @@ impl FactsWriter {
             }
         }
         self.outstanding.add(bucket);
-        if self.tx.send((bucket.to_string(), facts_key)).is_err() {
+        if !offer(
+            &self.tx,
+            (bucket.to_string(), facts_key),
+            "write",
+            &self.dropped,
+        ) {
             self.outstanding.done(bucket, 1);
-            debug!("facts queue closed; {bucket}/{stored_key} lists its stored size");
+            debug!("facts write not queued; {bucket}/{stored_key} lists its stored size");
         }
     }
 }
@@ -439,7 +519,7 @@ impl FactsWriter {
 /// The next batch of a queue: the first item (waiting for it), then what
 /// arrives within [`DEBOUNCE`] of the previous one, up to [`MAX_BATCH`].
 /// `None` when the queue is closed and empty.
-async fn next_batch<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> Option<Vec<T>> {
+async fn next_batch<T>(rx: &mut mpsc::Receiver<T>) -> Option<Vec<T>> {
     let mut batch = vec![rx.recv().await?];
     while batch.len() < MAX_BATCH {
         match rx.try_recv() {
@@ -460,7 +540,7 @@ async fn next_batch<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> Option<Vec<T>> {
 async fn write_drain(
     client: Client,
     native: NativeEncryptionPolicy,
-    mut rx: mpsc::UnboundedReceiver<Write>,
+    mut rx: mpsc::Receiver<Write>,
     outstanding: Arc<Outstanding>,
 ) {
     while let Some(batch) = next_batch(&mut rx).await {
@@ -546,11 +626,7 @@ async fn drop_other_tokens(client: &Client, bucket: &str, stored_key: &str, keep
 }
 
 /// Remove the facts of the queued deleted stored keys.
-async fn cleanup_drain(
-    client: Client,
-    mut rx: mpsc::UnboundedReceiver<Deleted>,
-    rewritten: Rewritten,
-) {
+async fn cleanup_drain(client: Client, mut rx: mpsc::Receiver<Deleted>, rewritten: Rewritten) {
     while let Some(batch) = next_batch(&mut rx).await {
         // A rewrite marked after this point is not seen by the flush: if
         // its new entry lands before the flush lists, it can be deleted,
@@ -884,6 +960,78 @@ mod tests {
             "the facts write waited {:?} for the delete cleanup",
             queued.elapsed()
         );
+    }
+
+    /// F58 (epic #143): the facts queues were unbounded channels, so a
+    /// backend that stalled the drain tasks let every PUT and delete of the
+    /// node grow them without a limit. A full queue now drops the new item
+    /// and counts it; the outstanding count of a dropped write is given
+    /// back (DeleteBucket's settle does not wait for it), and a dropped
+    /// cleanup leaves no pending mark behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_backend_cannot_grow_the_facts_queues() {
+        const CAP: usize = 4;
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.stall("PUT", ".dg/facts/");
+        fake.stall("LIST", "b");
+        let queue = FactsCleanupQueue::start_with_capacity(
+            fake_client(&endpoint),
+            NativeEncryptionConfig::None.into(),
+            CAP,
+        );
+        // The first write and the first cleanup take their drain task into
+        // a stalled request; the queues fill behind them.
+        queue.write("b", "p/first", ".dg/facts/p/first".to_string());
+        queue.enqueue("b", "d/first.html", None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let busy = |fake: &crate::storage::fake_s3::FakeS3| {
+            let r = fake.requests();
+            r.iter().any(|r| r.starts_with("PUT /b/.dg/facts/p/first"))
+                && r.iter().any(|r| r.starts_with("GET /b/?list-type"))
+        };
+        while !busy(&fake) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the drains never sent: {:?}",
+                fake.requests()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        const MORE: usize = 50;
+        for i in 0..MORE {
+            queue.write("b", &format!("p/k{i}"), format!(".dg/facts/p/k{i}"));
+            queue.enqueue("b", &format!("d/k{i}.html"), None);
+        }
+        let (writes, cleanups) = queue.dropped();
+        assert_eq!(
+            writes,
+            (MORE - CAP) as u64,
+            "write queue held more than {CAP}"
+        );
+        assert_eq!(
+            cleanups,
+            (MORE - CAP) as u64,
+            "cleanup queue held more than {CAP}"
+        );
+        {
+            let st = queue.writer.rewritten.lock().unwrap();
+            assert!(
+                st.pending.len() <= 1 + CAP,
+                "dropped cleanups left {} pending marks",
+                st.pending.len()
+            );
+        }
+        fake.release_stalls();
+        // Only the queued writes are outstanding: settle ends once they land.
+        tokio::time::timeout(Duration::from_secs(10), queue.settle("b"))
+            .await
+            .expect("settle waited for dropped writes");
+        let puts = fake
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("PUT /b/.dg/facts/p/"))
+            .count();
+        assert_eq!(puts, 1 + CAP, "the first write and the {CAP} queued ones");
     }
 
     /// Token markers are judged like facts by the delete cleanup.
