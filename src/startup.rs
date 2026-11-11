@@ -167,6 +167,8 @@ fn warn_active_test_seams() {
         "DGP_TEST_CONVERSION_GRACE_SECS",
         "DGP_TEST_CONVERSION_WINDOW_SECS",
         "DGP_TEST_REWRITE_STALL",
+        "DGP_TEST_COPY_OBJECT_MAX_BYTES",
+        "DGP_TEST_COPY_PART_BYTES",
         "DGP_RELAY_FOREIGN_MIN_AGE_SECS",
     ];
     let active: Vec<&str> = SEAMS

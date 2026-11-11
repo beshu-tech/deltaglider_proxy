@@ -424,68 +424,20 @@ async fn a_read_only_bucket_refuses_s3_writes_and_serves_reads() {
         .is_ok());
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    use hmac::Mac;
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// A browser form POST (PostObject) signed with the test credentials.
-fn signed_form_post(endpoint: &str, bucket: &str) -> reqwest::RequestBuilder {
-    use base64::Engine;
-    let (date, amz_date) = ("20260507", "20260507T120000Z");
-    let credential = format!(
-        "{}/{date}/us-east-1/s3/aws4_request",
-        common::TEST_ACCESS_KEY
-    );
-    let policy = json!({
-        "expiration": "2099-01-01T00:00:00.000Z",
-        "conditions": [
-            { "bucket": bucket },
-            ["starts-with", "$key", "post/"],
-            { "x-amz-algorithm": "AWS4-HMAC-SHA256" },
-            { "x-amz-credential": credential },
-            { "x-amz-date": amz_date },
-            ["content-length-range", 1, 1048576]
-        ]
-    });
-    let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.to_string());
-    let k = hmac(
-        format!("AWS4{}", common::TEST_SECRET_KEY).as_bytes(),
-        date.as_bytes(),
-    );
-    let k = hmac(&hmac(&hmac(&k, b"us-east-1"), b"s3"), b"aws4_request");
-    let signature = hex::encode(hmac(&k, policy_b64.as_bytes()));
-    let form = reqwest::multipart::Form::new()
-        .text("key", "post/x.txt")
-        .text("policy", policy_b64)
-        .text("x-amz-algorithm", "AWS4-HMAC-SHA256")
-        .text("x-amz-credential", credential)
-        .text("x-amz-date", amz_date)
-        .text("x-amz-signature", signature)
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"hi".to_vec())
-                .file_name("x.txt")
-                .mime_str("text/plain")
-                .unwrap(),
-        );
-    reqwest::Client::new()
-        .post(format!("{endpoint}/{bucket}"))
-        .multipart(form)
-}
-
 /// A signed browser form POST (PostObject) into a read-only bucket: 403
 /// with the reason; into a plaintext bucket: stored (204).
 #[tokio::test]
 async fn a_read_only_bucket_refuses_form_post() {
     let dir = tempfile::tempdir().unwrap();
     let env = read_only_env("atomform", &["atomform"], &dir.path().join("flag")).await;
-    let r = signed_form_post(&env.ep(), "atomform")
-        .send()
-        .await
-        .unwrap();
+    let r = common::signed_form_post(
+        &env.ep(),
+        "atomform",
+        (common::TEST_ACCESS_KEY, common::TEST_SECRET_KEY),
+    )
+    .send()
+    .await
+    .unwrap();
     let code = r.status().as_u16();
     let text = r.text().await.unwrap();
     assert_eq!(code, 403, "{text}");
@@ -496,10 +448,14 @@ async fn a_read_only_bucket_refuses_form_post() {
         .send()
         .await
         .unwrap();
-    let r = signed_form_post(&env.ep(), "atomformplain")
-        .send()
-        .await
-        .unwrap();
+    let r = common::signed_form_post(
+        &env.ep(),
+        "atomformplain",
+        (common::TEST_ACCESS_KEY, common::TEST_SECRET_KEY),
+    )
+    .send()
+    .await
+    .unwrap();
     assert_eq!(
         r.status().as_u16(),
         204,

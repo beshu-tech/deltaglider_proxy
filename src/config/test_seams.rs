@@ -77,7 +77,19 @@ pub struct TestSeams {
     /// (delayed) probe too, so a test sees the window before the first
     /// verdict.
     pub atomicity_probe_delay_ms: u64,
+    /// `DGP_TEST_COPY_OBJECT_MAX_BYTES` (floor 5 MiB): the size above which
+    /// an S3 server-side copy is a multipart copy of UploadPartCopy
+    /// requests instead of one CopyObject (production: 5 GiB, S3's limit),
+    /// so a test of a few MiB runs that path on MinIO.
+    pub copy_object_max_bytes: Option<u64>,
+    /// `DGP_TEST_COPY_PART_BYTES` (floor 5 MiB, S3's smallest part): the
+    /// part size of a multipart server-side copy (production: 512 MiB).
+    pub copy_part_bytes: Option<u64>,
 }
+
+/// S3's smallest part: the floor of the two copy seams, so a seam never
+/// makes a copy that a real S3 would refuse.
+pub const COPY_SEAM_FLOOR_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Where the re-encrypt job's rewrite stalls (`DGP_TEST_REWRITE_STALL`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +175,10 @@ impl TestSeams {
             keep_write_gate: lookup_parse(env, "DGP_TEST_KEEP_WRITE_GATE").unwrap_or(false),
             atomicity_probe_delay_ms: lookup_parse(env, "DGP_TEST_ATOMICITY_PROBE_DELAY_MS")
                 .unwrap_or(0),
+            copy_object_max_bytes: lookup_parse::<u64>(env, "DGP_TEST_COPY_OBJECT_MAX_BYTES")
+                .filter(|n| *n >= COPY_SEAM_FLOOR_BYTES),
+            copy_part_bytes: lookup_parse::<u64>(env, "DGP_TEST_COPY_PART_BYTES")
+                .filter(|n| *n >= COPY_SEAM_FLOOR_BYTES),
         }
     }
 }
@@ -215,7 +231,11 @@ mod tests {
             ("DGP_TEST_CONVERSION_GRACE_SECS", "0"),
             ("DGP_TEST_CONVERSION_WINDOW_SECS", "30"),
             ("DGP_TEST_REWRITE_STALL", "before-lock:3000"),
+            ("DGP_TEST_COPY_OBJECT_MAX_BYTES", "5242880"),
+            ("DGP_TEST_COPY_PART_BYTES", "6291456"),
         ]);
+        assert_eq!(t.copy_object_max_bytes, Some(5 * 1024 * 1024));
+        assert_eq!(t.copy_part_bytes, Some(6 * 1024 * 1024));
         assert_eq!(
             t.rewrite_stall_at(RewriteStall::BeforeLock).map(|s| s.ms),
             Some(3000)
@@ -264,6 +284,9 @@ mod tests {
             ("DGP_TEST_MAX_JOB_PAGES", "0"),
             ("DGP_TEST_CONVERSION_GRACE_SECS", "-1"),
             ("DGP_TEST_CONVERSION_WINDOW_SECS", "0"),
+            // Under the 5 MiB floor: S3 would refuse such a part.
+            ("DGP_TEST_COPY_OBJECT_MAX_BYTES", "5242879"),
+            ("DGP_TEST_COPY_PART_BYTES", "1024"),
         ]);
         assert_eq!(t, TestSeams::default());
     }

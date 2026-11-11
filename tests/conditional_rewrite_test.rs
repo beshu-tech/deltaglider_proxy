@@ -274,6 +274,79 @@ async fn a_client_write_before_the_object_lock_survives_on_the_filesystem() {
     assert_eq!(run["errors"], 0, "{run}");
 }
 
+/// `deltaglider_rewrite_bodies_total{medium}`: the passthrough bodies that
+/// the job's rewrites read into `medium` so far.
+async fn rewrite_bodies(node: &Node, medium: &str) -> u64 {
+    let series = format!("deltaglider_rewrite_bodies_total{{medium=\"{medium}\"}}");
+    common::metrics_text(&node.server.endpoint())
+        .await
+        .lines()
+        .find_map(|l| l.strip_prefix(&series)?.trim().parse::<f64>().ok())
+        .unwrap_or(0.0) as u64
+}
+
+/// F29: the re-encrypt rewrite of a passthrough object above the spool
+/// threshold reads it through a spool file (`read_into_spool`), below it
+/// into memory. Threshold 1 KiB: `big.jpg` (4 KiB) takes the spool branch,
+/// `small.jpg` (40 bytes) the memory branch. The counter proves which branch
+/// ran, and the GETs prove that both objects survive it sealed.
+async fn the_rewrite_reads_a_large_body_through_the_spool(
+    node: &Node,
+    bucket: &str,
+    whole_backend: bool,
+) {
+    let big = common::big_passthrough_body(4096);
+    let small = OLD.to_vec();
+    assert_eq!(node.put(bucket, "big.jpg", &big).await, 200);
+    assert_eq!(node.put(bucket, "small.jpg", &small).await, 200);
+    assert_eq!(
+        rewrite_bodies(node, "spool").await,
+        0,
+        "nothing rewritten yet"
+    );
+
+    // The shared MinIO holds other tests' buckets: encrypt only this one.
+    let job = if whole_backend {
+        node.encrypt_backend().await
+    } else {
+        node.encrypt_bucket(bucket).await
+    }
+    .expect("a conversion job");
+    node.wait_done(bucket).await;
+
+    let run = node.run(job).await;
+    assert_eq!(run["objects_processed"], 2, "{run}");
+    assert_eq!(run["errors"], 0, "{run}");
+    assert_eq!(rewrite_bodies(node, "spool").await, 1, "the 4 KiB body");
+    assert_eq!(rewrite_bodies(node, "memory").await, 1, "the 40-byte body");
+    assert_eq!(node.get(bucket, "big.jpg").await, (200, big));
+    assert_eq!(node.get(bucket, "small.jpg").await, (200, small));
+}
+
+#[tokio::test]
+async fn the_rewrite_spools_a_large_body_on_minio() {
+    skip_unless_minio!();
+    let bucket = new_minio_bucket("condspool").await;
+    let node = Node::minio(&bucket, &[("DGP_SPOOL_THRESHOLD_BYTES", "1024")]).await;
+    the_rewrite_reads_a_large_body_through_the_spool(&node, &bucket, false).await;
+    assert!(
+        minio_sealed(&bucket, "big.jpg").await,
+        "the spooled body is sealed"
+    );
+    assert!(minio_sealed(&bucket, "small.jpg").await);
+}
+
+#[tokio::test]
+async fn the_rewrite_spools_a_large_body_on_the_filesystem() {
+    let server = TestServer::builder()
+        .bucket("condspoolfs")
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "1024")
+        .build()
+        .await;
+    let node = Node::new(server).await;
+    the_rewrite_reads_a_large_body_through_the_spool(&node, "condspoolfs", true).await;
+}
+
 /// Writes to `bucket` while its conversion job runs (`signal`: the stall
 /// seam's file): the status of the gate and the answer to a client PUT.
 async fn write_during_the_job(node: &Node, bucket: &str, signal: &std::path::Path) -> (Value, u16) {

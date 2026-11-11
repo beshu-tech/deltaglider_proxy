@@ -174,6 +174,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         } else {
             None
         };
+        if let Some(m) = self.metrics() {
+            m.rewrite_bodies_total
+                .with_label_values(&[if spool.is_some() { "spool" } else { "memory" }])
+                .inc();
+        }
         let opened = match self
             .storage
             .open_object(bucket, deltaspace_id, StoredObject::Passthrough(name))

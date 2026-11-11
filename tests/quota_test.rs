@@ -336,6 +336,52 @@ async fn test_quota_zero_blocks_copy_object() {
     }
 }
 
+/// A frozen bucket (quota=0) refuses a PutObject above the spool threshold
+/// with `AccessDenied` BEFORE its body is read: the gate before the body
+/// (`ingest_client_body`) judges the declared length, so the 4 KiB body
+/// never reaches the spool (`deltaglider_ingest_bodies_total` stays 0). The
+/// exact gate after the body (`store_client_write`) would refuse it too, but
+/// only after the client sent every byte, so the answer alone cannot tell
+/// the two gates apart; the ingest counter can.
+#[tokio::test]
+async fn test_quota_zero_refuses_a_spooled_put_before_its_body() {
+    let server = TestServer::builder()
+        .bucket(BUCKET)
+        .bucket_policy(BUCKET, "quota_bytes: 0")
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "1024")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    let err = client
+        .put_object()
+        .bucket(server.bucket())
+        .key("big.zip")
+        .body(aws_sdk_s3::primitives::ByteStream::from(vec![3u8; 4096]))
+        .send()
+        .await
+        .expect_err("quota=0 must reject the PutObject");
+    assert_eq!(error_code(&err), "AccessDenied", "{err:?}");
+    let metrics = common::metrics_text(&server.endpoint()).await;
+    let ingested: Vec<&str> = metrics
+        .lines()
+        .filter(|l| l.starts_with("deltaglider_ingest_bodies_total"))
+        .collect();
+    assert!(
+        ingested.iter().all(|l| l.ends_with(" 0")),
+        "the refused body was read: {ingested:?}"
+    );
+    assert!(
+        client
+            .head_object()
+            .bucket(server.bucket())
+            .key("big.zip")
+            .send()
+            .await
+            .is_err(),
+        "the refused PUT wrote nothing"
+    );
+}
+
 /// Frozen bucket (quota=0) must reject `CompleteMultipartUpload`.
 /// Without the fix, an attacker could bypass quota by initiating a
 /// multipart upload (which doesn't trigger quota checks per-part),

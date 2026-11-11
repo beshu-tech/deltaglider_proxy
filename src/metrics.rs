@@ -77,6 +77,10 @@ pub struct Metrics {
     pub ingest_memory_peak_bytes: IntGauge,
     /// Request bodies read, by medium (`memory`/`spool`) and reason.
     pub ingest_bodies_total: IntCounterVec,
+    /// Passthrough bodies a re-encrypt rewrite read, by medium
+    /// (`memory`/`spool`): a rewrite reads the stored object, not a request
+    /// body, so it has its own series.
+    pub rewrite_bodies_total: IntCounterVec,
 
     // -- Replication streaming-copy (Phase B) --
     // Deterministic high-water gauges + totals. Prove bounded memory, real
@@ -481,6 +485,18 @@ impl Metrics {
             .unwrap()
         );
 
+        let rewrite_bodies_total = register!(
+            registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "deltaglider_rewrite_bodies_total",
+                    "Passthrough bodies that an in-place rewrite read, by medium (memory, spool)",
+                ),
+                &["medium"],
+            )
+            .unwrap()
+        );
+
         // -- Replication streaming-copy (Phase B) --
         let replication_part_bytes_resident = register!(
             registry,
@@ -696,6 +712,7 @@ impl Metrics {
             ingest_memory_bytes,
             ingest_memory_peak_bytes,
             ingest_bodies_total,
+            rewrite_bodies_total,
             replication_part_bytes_resident,
             replication_part_bytes_resident_peak,
             replication_parts_inflight,

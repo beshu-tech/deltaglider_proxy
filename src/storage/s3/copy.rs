@@ -13,11 +13,27 @@ pub(super) const COPY_OBJECT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Smallest part of a copy above [`COPY_OBJECT_MAX_BYTES`].
 pub(super) const COPY_PART_BYTES: u64 = 512 * 1024 * 1024;
 
+/// The size above which a copy is multipart: [`COPY_OBJECT_MAX_BYTES`],
+/// or the test seam `DGP_TEST_COPY_OBJECT_MAX_BYTES` (debug builds only).
+fn copy_object_max_bytes() -> u64 {
+    crate::config::test_seams::test_seams()
+        .copy_object_max_bytes
+        .unwrap_or(COPY_OBJECT_MAX_BYTES)
+}
+
+/// The smallest part of a multipart copy: [`COPY_PART_BYTES`], or the test
+/// seam `DGP_TEST_COPY_PART_BYTES` (debug builds only).
+fn copy_part_bytes() -> u64 {
+    crate::config::test_seams::test_seams()
+        .copy_part_bytes
+        .unwrap_or(COPY_PART_BYTES)
+}
+
 /// Pure: the part size of a multipart copy of `size` bytes: at least
-/// [`COPY_PART_BYTES`], and large enough for at most 10 000 parts (the S3
-/// maximum).
-pub(super) fn copy_part_size(size: u64) -> u64 {
-    COPY_PART_BYTES.max(size.div_ceil(10_000))
+/// `smallest` ([`copy_part_bytes`]), and large enough for at most 10 000
+/// parts (the S3 maximum).
+pub(super) fn copy_part_size(size: u64, smallest: u64) -> u64 {
+    smallest.max(size.div_ceil(10_000))
 }
 
 /// Pure: the inclusive byte ranges of the parts of a multipart copy of
@@ -124,7 +140,7 @@ impl S3Backend {
         }
         fit_metadata(&mut headers, dst.bucket, &dst_key)?;
         let copy_source = format!("{}/{}", src.bucket, encode_copy_source_key(&src_key));
-        let copied = if size <= COPY_OBJECT_MAX_BYTES {
+        let copied = if size <= copy_object_max_bytes() {
             self.copy_single(dst.bucket, &dst_key, &copy_source, etag, &headers)
                 .await
         } else {
@@ -259,7 +275,7 @@ impl S3Backend {
     ) -> Result<String, (CopyFailure, StorageError)> {
         use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
         let mut parts = Vec::new();
-        for (i, (start, end)) in copy_part_ranges(size, copy_part_size(size))
+        for (i, (start, end)) in copy_part_ranges(size, copy_part_size(size, copy_part_bytes()))
             .into_iter()
             .enumerate()
         {
@@ -326,9 +342,12 @@ mod tests {
         assert_eq!(copy_part_ranges(10, 10), vec![(0, 9)]);
         assert_eq!(copy_part_ranges(25, 10), vec![(0, 9), (10, 19), (20, 24)]);
         let big = 5 * 1024 * 1024 * 1024 * 1024u64;
-        assert!(copy_part_ranges(big, copy_part_size(big)).len() <= 10_000);
+        assert!(copy_part_ranges(big, copy_part_size(big, COPY_PART_BYTES)).len() <= 10_000);
         let six = 6 * 1024 * 1024 * 1024u64;
-        assert_eq!(copy_part_ranges(six, copy_part_size(six)).len(), 12);
+        assert_eq!(
+            copy_part_ranges(six, copy_part_size(six, COPY_PART_BYTES)).len(),
+            12
+        );
     }
 
     #[test]

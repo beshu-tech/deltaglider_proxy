@@ -333,3 +333,58 @@ pub async fn signed_request_arrives(
         }
     }
 }
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// A browser form POST (PostObject) of the key `post/x.txt`, signed with
+/// `(access key, secret)`. The policy is valid, so a refusal comes from a
+/// gate of the handler and never from the policy.
+pub fn signed_form_post(
+    endpoint: &str,
+    bucket: &str,
+    (access_key, secret): (&str, &str),
+) -> reqwest::RequestBuilder {
+    use base64::Engine;
+    let (date, amz_date) = ("20260507", "20260507T120000Z");
+    let credential = format!("{access_key}/{date}/us-east-1/s3/aws4_request");
+    let policy = serde_json::json!({
+        "expiration": "2099-01-01T00:00:00.000Z",
+        "conditions": [
+            { "bucket": bucket },
+            ["starts-with", "$key", "post/"],
+            { "x-amz-algorithm": "AWS4-HMAC-SHA256" },
+            { "x-amz-credential": credential },
+            { "x-amz-date": amz_date },
+            ["content-length-range", 1, 1048576]
+        ]
+    });
+    let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.to_string());
+    let k = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let k = hmac_sha256(
+        &hmac_sha256(&hmac_sha256(&k, b"us-east-1"), b"s3"),
+        b"aws4_request",
+    );
+    let signature = hex::encode(hmac_sha256(&k, policy_b64.as_bytes()));
+    let form = reqwest::multipart::Form::new()
+        .text("key", "post/x.txt")
+        .text("policy", policy_b64)
+        .text("x-amz-algorithm", "AWS4-HMAC-SHA256")
+        .text("x-amz-credential", credential)
+        .text("x-amz-date", amz_date)
+        .text("x-amz-signature", signature)
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"hi".to_vec())
+                .file_name("x.txt")
+                .mime_str("text/plain")
+                .unwrap(),
+        );
+    reqwest::Client::new()
+        .post(format!("{endpoint}/{bucket}"))
+        .multipart(form)
+}
