@@ -12,14 +12,20 @@
 //! struct pattern. A production scan leaves out `#[cfg(test)]` items and
 //! `#[test]` fns the way the compiler does (no brace counting).
 //!
-//! Macro bodies are parsed as a comma list of expressions (`assert!`,
-//! `format!`, `matches!`, `tracing::info!` ...), so a call inside one is seen.
-//! A macro body that is not an expression list (`json!({..})`) is skipped.
+//! A macro body is read in three steps (`macro_body`), so a call inside one is
+//! seen: (1) a comma list of expressions (`assert!`, `format!`, `matches!`);
+//! (2) the repeat form `[x; n]` (`vec![x; n]`); (3) otherwise the body is cut
+//! at top-level `,` `;` `=>` and every part that parses as an expression
+//! is one (`tokio::select!` arms, `x = fut`), and every part that does not
+//! (a `target` key, a `field = %x` pair, `else`) goes to a token scan that finds
+//! paths, calls, method calls and field reads, groups included. No macro body
+//! is skipped.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use proc_macro2::Span;
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
+use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -446,12 +452,84 @@ pub(crate) fn calls_in(e: &Expr) -> Vec<String> {
     v.0
 }
 
-/// A macro body read as a comma list of expressions (`assert!(a, "m")`,
-/// `format!(..)`, `matches!(x, Pat)`); empty when it is not one.
+/// A macro body, split into what parses as expressions and what does not.
+#[derive(Default)]
+pub(crate) struct MacroBody {
+    pub exprs: Vec<Expr>,
+    /// Parts that are no expression (a `target` key, a `field = %x` pair, `else`):
+    /// the collector scans their tokens.
+    pub raw: Vec<TokenStream>,
+}
+
+/// Is `t` the punct `c`?
+fn is_punct(t: &TokenTree, c: char) -> bool {
+    matches!(t, TokenTree::Punct(p) if p.as_char() == c)
+}
+
+/// Cut `tokens` at every top-level `,`, `;` and `=>`. A group is one token,
+/// so a separator inside `(..)`, `[..]` or `{..}` never cuts.
+fn split_top(tokens: &TokenStream) -> Vec<TokenStream> {
+    let toks: Vec<TokenTree> = tokens.clone().into_iter().collect();
+    let mut parts = Vec::new();
+    let mut cur = TokenStream::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let arrow = is_punct(&toks[i], '=') && toks.get(i + 1).is_some_and(|t| is_punct(t, '>'));
+        if arrow {
+            parts.push(std::mem::take(&mut cur));
+            i += 2;
+        } else if is_punct(&toks[i], ',') || is_punct(&toks[i], ';') {
+            parts.push(std::mem::take(&mut cur));
+            i += 1;
+        } else {
+            cur.extend([toks[i].clone()]);
+            i += 1;
+        }
+    }
+    parts.push(cur);
+    parts.into_iter().filter(|p| !p.is_empty()).collect()
+}
+
+/// `x; n` (the inside of `vec![x; n]` and `[x; n]`).
+fn parse_repeat(tokens: &TokenStream) -> Option<Vec<Expr>> {
+    (|input: syn::parse::ParseStream| {
+        let x: Expr = input.parse()?;
+        input.parse::<syn::Token![;]>()?;
+        let n: Expr = input.parse()?;
+        Ok(vec![x, n])
+    })
+    .parse2(tokens.clone())
+    .ok()
+}
+
+/// Read a macro body: see the module docs.
+pub(crate) fn macro_body(tokens: &TokenStream) -> MacroBody {
+    if let Ok(p) = Punctuated::<Expr, syn::Token![,]>::parse_terminated.parse2(tokens.clone()) {
+        return MacroBody {
+            exprs: p.into_iter().collect(),
+            raw: Vec::new(),
+        };
+    }
+    if let Some(exprs) = parse_repeat(tokens) {
+        return MacroBody {
+            exprs,
+            raw: Vec::new(),
+        };
+    }
+    let mut body = MacroBody::default();
+    for part in split_top(tokens) {
+        match syn::parse2::<Expr>(part.clone()) {
+            Ok(e) => body.exprs.push(e),
+            Err(_) => body.raw.push(part),
+        }
+    }
+    body
+}
+
+/// The expressions of a macro body (`assert!(a, "m")`, `format!(..)`,
+/// `vec![x; n]`, the arms of a `select!`); what is no expression is not here.
 pub(crate) fn macro_exprs(m: &syn::Macro) -> Vec<Expr> {
-    m.parse_body_with(Punctuated::<Expr, syn::Token![,]>::parse_terminated)
-        .map(|p| p.into_iter().collect())
-        .unwrap_or_default()
+    macro_body(&m.tokens).exprs
 }
 
 fn is_assert_macro(m: &syn::Macro) -> bool {
@@ -477,17 +555,32 @@ struct Collector {
     fn_names: Vec<String>,
 }
 
+/// Does the cfg predicate `m` hold only when `test` is on? `test`, `all(..)`
+/// with such an operand, `any(..)` of only such operands. `not(..)`, a
+/// `feature = ".."` and any other name do not require `test`.
+fn requires_test(m: &syn::Meta) -> bool {
+    match m {
+        syn::Meta::Path(p) => p.is_ident("test"),
+        syn::Meta::NameValue(_) => false,
+        syn::Meta::List(l) => {
+            let ops = l
+                .parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+                .map(|p| p.into_iter().collect::<Vec<_>>())
+                .unwrap_or_default();
+            if l.path.is_ident("all") {
+                ops.iter().any(requires_test)
+            } else if l.path.is_ident("any") {
+                !ops.is_empty() && ops.iter().all(requires_test)
+            } else {
+                false
+            }
+        }
+    }
+}
+
 fn cfg_test(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|a| {
-        if !a.path().is_ident("cfg") {
-            return false;
-        }
-        let t = match &a.meta {
-            syn::Meta::List(l) => l.tokens.to_string(),
-            _ => String::new(),
-        };
-        // `cfg(test)` and `cfg(all(test, ..))`; `cfg(not(test))` is production.
-        t == "test" || (t.starts_with("all (") && t.contains("test") && !t.contains("not"))
+        a.path().is_ident("cfg") && a.parse_args::<syn::Meta>().is_ok_and(|m| requires_test(&m))
     })
 }
 
@@ -618,6 +711,224 @@ impl Collector {
     }
 }
 
+/// What a call site knows; `Collector::make_call` fills the rest of `Call`.
+struct CallShape<'a> {
+    line: usize,
+    pos: Pos,
+    name: String,
+    method: bool,
+    segs: Vec<String>,
+    generics: Vec<String>,
+    receiver_idents: Vec<String>,
+    root_pos: Option<Pos>,
+    root_ident: Option<String>,
+    args: &'a [&'a Expr],
+}
+
+/// Idents that start no path or call: `if (a)` is no call of `if`.
+const KEYWORDS: [&str; 22] = [
+    "if", "else", "match", "while", "for", "in", "loop", "return", "let", "move", "async", "await",
+    "break", "continue", "fn", "mut", "ref", "as", "where", "unsafe", "dyn", "impl",
+];
+
+impl Collector {
+    fn make_call(&self, s: CallShape) -> Call {
+        let a = s.args;
+        Call {
+            line: s.line,
+            pos: s.pos,
+            func: self.func(),
+            name: s.name,
+            method: s.method,
+            segs: s.segs,
+            generics: s.generics,
+            argc: a.len(),
+            arg_bools: a.iter().map(|e| as_bool(e)).collect(),
+            receiver_idents: s.receiver_idents,
+            arg_strings: a.iter().flat_map(|e| string_literals(e)).collect(),
+            arg_idents: a.iter().map(|e| as_ident(e)).collect(),
+            arg_idents_all: a.iter().flat_map(|e| idents_in(e)).collect(),
+            arg_macros: a.iter().flat_map(|e| macros_in(e)).collect(),
+            arg_calls: a.iter().flat_map(|e| calls_in(e)).collect(),
+            root_pos: s.root_pos,
+            root_ident: s.root_ident,
+            in_assert: self.assert_depth > 0,
+        }
+    }
+
+    /// Visit a macro body: its expressions as code, the rest by token scan.
+    fn visit_body(&mut self, tokens: &TokenStream) {
+        let body = macro_body(tokens);
+        for e in &body.exprs {
+            self.visit_expr(e);
+        }
+        for raw in body.raw {
+            self.scan_tokens(raw);
+        }
+    }
+
+    /// Record a call found by token scan; its arguments are what the group
+    /// parses to, and are visited as code.
+    fn scan_call(&mut self, shape: CallShape<'static>, group: &TokenStream) {
+        let body = macro_body(group);
+        let args: Vec<&Expr> = body.exprs.iter().collect();
+        let mut shape: CallShape<'_> = shape;
+        shape.args = &args;
+        let call = self.make_call(shape);
+        self.cur().calls.push(call);
+        for e in &body.exprs {
+            self.visit_expr(e);
+        }
+        for raw in body.raw {
+            self.scan_tokens(raw);
+        }
+    }
+
+    /// Token-level scan of a macro part that is no expression
+    /// (a `target` key, a `field = %x.len()` pair, `else`): records every path
+    /// (`a::b::c`), path call (`a::b(..)`), method call (`.name(..)`) and
+    /// field read (`.name`), and goes into every group. What is lost against
+    /// the AST: the receiver of a scanned method call is its previous ident.
+    fn scan_tokens(&mut self, ts: TokenStream) {
+        let toks: Vec<TokenTree> = ts.into_iter().collect();
+        let mut i = 0;
+        while i < toks.len() {
+            match &toks[i] {
+                TokenTree::Group(g) => {
+                    self.visit_body(&g.stream());
+                    i += 1;
+                }
+                TokenTree::Punct(p)
+                    if p.as_char() == '.'
+                        && !(i > 0 && is_punct(&toks[i - 1], '.'))
+                        && matches!(toks.get(i + 1), Some(TokenTree::Ident(_))) =>
+                {
+                    let TokenTree::Ident(name) = &toks[i + 1] else {
+                        unreachable!()
+                    };
+                    let recv = match i.checked_sub(1).map(|j| &toks[j]) {
+                        Some(TokenTree::Ident(r)) => Some(r.to_string()),
+                        _ => None,
+                    };
+                    let group = match toks.get(i + 2) {
+                        Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis => {
+                            Some(g.stream())
+                        }
+                        _ => None,
+                    };
+                    match group {
+                        Some(g) => {
+                            let shape = CallShape {
+                                line: name.span().start().line,
+                                pos: pos(name.span()),
+                                name: name.to_string(),
+                                method: true,
+                                segs: Vec::new(),
+                                generics: Vec::new(),
+                                receiver_idents: recv.iter().cloned().collect(),
+                                root_pos: None,
+                                root_ident: recv.clone(),
+                                args: &[],
+                            };
+                            self.scan_call(shape, &g);
+                            i += 3;
+                        }
+                        None => {
+                            let f = Field {
+                                line: name.span().start().line,
+                                func: self.func(),
+                                name: name.to_string(),
+                            };
+                            self.cur().fields.push(f);
+                            i += 2;
+                        }
+                    }
+                }
+                TokenTree::Ident(first) if !KEYWORDS.contains(&first.to_string().as_str()) => {
+                    // `a::b::c`, `a::<T>::b`: idents joined by `::`.
+                    let start = first.span();
+                    let mut segs = vec![first.to_string()];
+                    let mut j = i + 1;
+                    while j + 1 < toks.len()
+                        && is_punct(&toks[j], ':')
+                        && is_punct(&toks[j + 1], ':')
+                    {
+                        match toks.get(j + 2) {
+                            Some(TokenTree::Ident(n)) => {
+                                segs.push(n.to_string());
+                                j += 3;
+                            }
+                            Some(t) if is_punct(t, '<') => {
+                                // Skip the turbofish: balanced `<` `>`.
+                                let mut depth = 0usize;
+                                j += 2;
+                                while j < toks.len() {
+                                    if is_punct(&toks[j], '<') {
+                                        depth += 1;
+                                    } else if is_punct(&toks[j], '>') {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            j += 1;
+                                            break;
+                                        }
+                                    }
+                                    j += 1;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    let next = toks.get(j);
+                    let call_group = match next {
+                        Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis => {
+                            Some(g.stream())
+                        }
+                        _ => None,
+                    };
+                    let macro_group = match (next, toks.get(j + 1)) {
+                        (Some(bang), Some(TokenTree::Group(g))) if is_punct(bang, '!') => {
+                            Some(g.stream())
+                        }
+                        _ => None,
+                    };
+                    if segs.len() > 1 || call_group.is_some() {
+                        let u = PathUse {
+                            line: start.start().line,
+                            func: self.func(),
+                            segs: segs.clone(),
+                            alias: None,
+                            expr: true,
+                        };
+                        self.cur().paths.push(u);
+                    }
+                    if let Some(g) = call_group {
+                        let shape = CallShape {
+                            line: start.start().line,
+                            pos: pos(start),
+                            name: segs.join("::"),
+                            method: false,
+                            segs: segs.clone(),
+                            generics: Vec::new(),
+                            receiver_idents: Vec::new(),
+                            root_pos: None,
+                            root_ident: None,
+                            args: &[],
+                        };
+                        self.scan_call(shape, &g);
+                        i = j + 1;
+                    } else if let Some(g) = macro_group {
+                        self.visit_body(&g);
+                        i = j + 2;
+                    } else {
+                        i = j.max(i + 1);
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+    }
+}
+
 impl<'ast> Visit<'ast> for Collector {
     fn visit_item(&mut self, i: &'ast Item) {
         self.scoped(item_attrs(i), |c| visit::visit_item(c, i));
@@ -695,26 +1006,19 @@ impl<'ast> Visit<'ast> for Collector {
                 generic_idents(&p)
             })
             .unwrap_or_default();
-        let call = Call {
+        let args: Vec<&Expr> = m.args.iter().collect();
+        let call = self.make_call(CallShape {
             line: m.method.span().start().line,
             pos: pos(m.method.span()),
-            func: self.func(),
             name: m.method.to_string(),
             method: true,
             segs: Vec::new(),
             generics,
-            argc: m.args.len(),
-            arg_bools: m.args.iter().map(as_bool).collect(),
             receiver_idents: idents_in(&m.receiver),
-            arg_strings: m.args.iter().flat_map(string_literals).collect(),
-            arg_idents: m.args.iter().map(as_ident).collect(),
-            arg_idents_all: m.args.iter().flat_map(idents_in).collect(),
-            arg_macros: m.args.iter().flat_map(macros_in).collect(),
-            arg_calls: m.args.iter().flat_map(calls_in).collect(),
             root_pos: Self::root_pos(&m.receiver),
             root_ident: path_leaf(root),
-            in_assert: self.assert_depth > 0,
-        };
+            args: &args,
+        });
         self.cur().calls.push(call);
         visit::visit_expr_method_call(self, m);
     }
@@ -722,26 +1026,19 @@ impl<'ast> Visit<'ast> for Collector {
     fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
         if let Expr::Path(p) = &*c.func {
             let segs = expr_path_segs(p);
-            let call = Call {
+            let args: Vec<&Expr> = c.args.iter().collect();
+            let call = self.make_call(CallShape {
                 line: p.span().start().line,
                 pos: pos(c.span()),
-                func: self.func(),
                 name: segs.join("::"),
                 method: false,
-                segs,
                 generics: generic_idents(&p.path),
-                argc: c.args.len(),
-                arg_bools: c.args.iter().map(as_bool).collect(),
+                segs,
                 receiver_idents: Vec::new(),
-                arg_strings: c.args.iter().flat_map(string_literals).collect(),
-                arg_idents: c.args.iter().map(as_ident).collect(),
-                arg_idents_all: c.args.iter().flat_map(idents_in).collect(),
-                arg_macros: c.args.iter().flat_map(macros_in).collect(),
-                arg_calls: c.args.iter().flat_map(calls_in).collect(),
                 root_pos: None,
                 root_ident: None,
-                in_assert: self.assert_depth > 0,
-            };
+                args: &args,
+            });
             self.cur().calls.push(call);
         }
         visit::visit_expr_call(self, c);
@@ -1000,15 +1297,14 @@ impl<'ast> Visit<'ast> for Collector {
             self.assert_depth += 1;
         }
         let name = m.path.segments.last().map(|s| s.ident.to_string());
-        let exprs = macro_exprs(m);
-        // `matches!(value, Pattern)`: only the value is an expression.
-        let take = if name.as_deref() == Some("matches") {
-            1
+        if name.as_deref() == Some("matches") {
+            // `matches!(value, Pattern)`: only the value is an expression.
+            let body = macro_body(&m.tokens);
+            if let Some(e) = body.exprs.first() {
+                self.visit_expr(e);
+            }
         } else {
-            exprs.len()
-        };
-        for e in exprs.iter().take(take) {
-            self.visit_expr(e);
+            self.visit_body(&m.tokens);
         }
         if assert {
             self.assert_depth -= 1;
@@ -1091,6 +1387,88 @@ mod tests {
             .map(|c| (c.name.as_str(), c.in_assert))
             .collect();
         assert_eq!(c, [("contains", true), ("contains", false)]);
+    }
+
+    /// Every macro body shape shows its calls: a `select!` arm, a tracing
+    /// `target:` and `field = %x` form, a `vec![x; n]` repeat, a nested group.
+    #[test]
+    fn calls_inside_every_macro_shape_are_seen() {
+        let found = |body: &str, name: &str| {
+            let s = parse("f.rs", &format!("fn f() {{ {body} }}"));
+            s.prod.calls_named(name).count()
+        };
+        let plain = "let _ = std::env::var(\"X\");";
+        assert_eq!(found(plain, "var"), 1, "baseline");
+        for (what, body) in [
+            (
+                "select! arm body",
+                "tokio::select! { _ = tick.tick() => { let _ = std::env::var(\"X\"); } }",
+            ),
+            (
+                "select! future",
+                "tokio::select! { v = std::env::var(\"X\") => {} else => {} }",
+            ),
+            (
+                "select! guard",
+                "tokio::select! { biased; _ = f(), if std::env::var(\"X\").is_ok() => {} }",
+            ),
+            (
+                "tracing target",
+                "tracing::info!(target: \"t\", \"m {}\", std::env::var(\"X\").is_ok());",
+            ),
+            (
+                "tracing field",
+                "tracing::info!(v = %std::env::var(\"X\").unwrap(), \"m\");",
+            ),
+            ("repeat", "let _ = vec![std::env::var(\"X\"); 2];"),
+            ("array repeat", "let _ = [std::env::var(\"X\"); 2];"),
+            (
+                "json group",
+                "let _ = json!({ \"k\": std::env::var(\"X\") });",
+            ),
+        ] {
+            assert_eq!(found(body, "var"), 1, "{what}");
+        }
+        // A scanned method call and a field read are seen too.
+        let s = parse("f.rs", "fn f() { info!(n = %o.size, m = %o.name.len()); }");
+        assert_eq!(s.prod.calls_named("len").count(), 1);
+        assert!(s.prod.fields.iter().any(|f| f.name == "size"));
+        // A scanned call keeps its arguments.
+        let s = parse("f.rs", "fn f() { info!(v = %m.contains(\"A\")); }");
+        let c = s.prod.calls_named("contains").next().unwrap();
+        assert_eq!(c.arg_strings, ["A"]);
+    }
+
+    #[test]
+    fn cfg_predicates_require_test_only_when_they_must() {
+        let facts = |attr: &str| {
+            let s = parse("f.rs", &format!("{attr} fn g() {{ a.x(); }}"));
+            (s.prod.calls.len(), s.test.calls.len())
+        };
+        for (attr, test_only) in [
+            ("#[cfg(test)]", true),
+            ("#[cfg(all(test, unix))]", true),
+            ("#[cfg(all(unix, test))]", true),
+            ("#[cfg(all(unix, any(test, test)))]", true),
+            ("#[cfg(any(test, test))]", true),
+            ("#[cfg(any(test, feature = \"x\"))]", false),
+            ("#[cfg(any(test, unix))]", false),
+            ("#[cfg(not(test))]", false),
+            ("#[cfg(all(not(test), unix))]", false),
+            ("#[cfg(feature = \"test\")]", false),
+            ("#[cfg(feature = \"testing\")]", false),
+            ("#[cfg(all(feature = \"testing\", unix))]", false),
+            ("#[cfg(all(feature = \"integration-test\", unix))]", false),
+            ("#[cfg(unix)]", false),
+            ("", false),
+        ] {
+            let (prod, test) = facts(attr);
+            assert_eq!(
+                (prod, test),
+                if test_only { (0, 1) } else { (1, 0) },
+                "{attr}"
+            );
+        }
     }
 
     #[test]
