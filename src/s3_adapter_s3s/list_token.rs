@@ -20,7 +20,15 @@
 //! The token is bound to the bucket, the prefix and the delimiter of the
 //! listing (AEAD associated data): a sealed position is a cursor of ONE
 //! listing, never a probe into another bucket or prefix.
+//!
+//! A page that cannot finish the visibility proof of a folded name also
+//! seals the proof's progress (the name and its inner cursor, both hidden
+//! data) in a `dg3.` token, so the next page resumes the proof. The inner
+//! cursor is sealed with the position and bound to the same listing, so a
+//! client cannot forge or move it. A token without a proof stays a `dg2.`
+//! token, which every earlier release of this format opens.
 
+use crate::iam::listing::ProofResume;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hmac::{Hmac, Mac};
@@ -28,6 +36,16 @@ use sha2::Sha256;
 
 /// Marks a sealed token. A `dg1.` token carries a visible key in clear.
 pub(super) const SEALED_TOKEN_PREFIX: &str = "dg2.";
+
+/// Marks a sealed token that carries the progress of a name's proof.
+pub(super) const PROOF_TOKEN_PREFIX: &str = "dg3.";
+
+/// What a sealed token holds: a scan position, and the proof to go on with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SealedCursor {
+    pub position: String,
+    pub proof: Option<ProofResume>,
+}
 
 /// The HKDF `info` label of the token key.
 const KEY_LABEL: &[u8] = b"dgp-list-token-v1";
@@ -107,8 +125,12 @@ impl TokenBinding<'_> {
     /// The associated data: every field length-prefixed, so two bindings
     /// never give the same bytes. An empty delimiter is no delimiter, as
     /// for the listing.
-    fn aad(&self) -> Vec<u8> {
+    fn aad(&self, proof: bool) -> Vec<u8> {
         let mut out = KEY_LABEL.to_vec();
+        if proof {
+            // A `dg3.` payload never opens as a `dg2.` one, nor the reverse.
+            out.extend_from_slice(b"+proof");
+        }
         let delimiter = self.delimiter.filter(|d| !d.is_empty());
         for field in [Some(self.bucket), Some(self.prefix), delimiter] {
             match field {
@@ -124,19 +146,81 @@ impl TokenBinding<'_> {
     }
 }
 
+/// Pure: the plaintext of a `dg3.` token: length-prefixed position, name,
+/// and inner cursor (a flag byte, then the cursor when present).
+fn proof_payload(position: &str, proof: &ProofResume) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut put = |bytes: &[u8]| {
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(bytes);
+    };
+    put(position.as_bytes());
+    put(proof.name.as_bytes());
+    match &proof.inner {
+        Some(inner) => {
+            put(&[1]);
+            put(inner.as_bytes());
+        }
+        None => put(&[0]),
+    }
+    out
+}
+
+/// Pure: read what [`proof_payload`] wrote; `None` for any other shape.
+fn parse_proof_payload(mut bytes: &[u8]) -> Option<SealedCursor> {
+    let mut take = || -> Option<String> {
+        let len = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+        let field = bytes.get(4..4 + len)?;
+        bytes = &bytes[4 + len..];
+        String::from_utf8(field.to_vec()).ok()
+    };
+    let position = take()?;
+    let name = take()?;
+    let inner = match take()?.as_bytes() {
+        [1] => Some(take()?),
+        [0] => None,
+        _ => return None,
+    };
+    bytes.is_empty().then_some(SealedCursor {
+        position,
+        proof: Some(ProofResume { name, inner }),
+    })
+}
+
 /// Pure: seal the scan position `position` with `key` (random nonce).
+#[cfg(test)]
 pub(super) fn seal_with(key: &TokenKey, position: &str, binding: TokenBinding<'_>) -> String {
+    seal_cursor_with(
+        key,
+        &SealedCursor {
+            position: position.to_string(),
+            proof: None,
+        },
+        binding,
+    )
+}
+
+/// Pure: seal a scan position and the proof progress that goes with it.
+pub(super) fn seal_cursor_with(
+    key: &TokenKey,
+    cursor: &SealedCursor,
+    binding: TokenBinding<'_>,
+) -> String {
     use base64::Engine as _;
     use rand::RngCore;
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let cipher = Aes256Gcm::new(key.into());
-    let aad = binding.aad();
+    let aad = binding.aad(cursor.proof.is_some());
+    let (prefix, plain) = match &cursor.proof {
+        Some(proof) => (PROOF_TOKEN_PREFIX, proof_payload(&cursor.position, proof)),
+        None => (SEALED_TOKEN_PREFIX, cursor.position.as_bytes().to_vec()),
+    };
     let sealed = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
-                msg: position.as_bytes(),
+                msg: &plain,
                 aad: &aad,
             },
         )
@@ -144,7 +228,7 @@ pub(super) fn seal_with(key: &TokenKey, position: &str, binding: TokenBinding<'_
     let mut blob = nonce.to_vec();
     blob.extend_from_slice(&sealed);
     format!(
-        "{SEALED_TOKEN_PREFIX}{}",
+        "{prefix}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob)
     )
 }
@@ -160,14 +244,19 @@ pub(super) enum OpenError {
     Rejected,
 }
 
-/// Pure: the envelope bytes of a `dg2.` token, when it has the shape of
-/// one (base64url, room for a nonce and a tag).
-fn envelope(token: &str) -> Option<Vec<u8>> {
+/// Pure: the envelope bytes of a sealed token, when it has the shape of
+/// one (a known prefix, base64url, room for a nonce and a tag), and whether
+/// it carries a proof.
+fn envelope(token: &str) -> Option<(Vec<u8>, bool)> {
     use base64::Engine as _;
+    let (body, proof) = match token.strip_prefix(SEALED_TOKEN_PREFIX) {
+        Some(body) => (body, false),
+        None => (token.strip_prefix(PROOF_TOKEN_PREFIX)?, true),
+    };
     let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(token.strip_prefix(SEALED_TOKEN_PREFIX)?)
+        .decode(body)
         .ok()?;
-    (blob.len() >= NONCE_LEN + TAG_LEN).then_some(blob)
+    (blob.len() >= NONCE_LEN + TAG_LEN).then_some((blob, proof))
 }
 
 /// Pure: `true` when `s` has the shape of a sealed token. A V1 `marker`
@@ -176,16 +265,22 @@ pub(super) fn looks_sealed(s: &str) -> bool {
     envelope(s).is_some()
 }
 
+/// Pure: `true` when `s` starts like a sealed token of either kind.
+pub(super) fn has_sealed_prefix(s: &str) -> bool {
+    s.starts_with(SEALED_TOKEN_PREFIX) || s.starts_with(PROOF_TOKEN_PREFIX)
+}
+
 /// Pure: open a sealed token with the first of `keys` that opens it.
 pub(super) fn open_with(
     keys: &[TokenKey],
     token: &str,
     binding: TokenBinding<'_>,
-) -> Result<String, OpenError> {
-    let blob = envelope(token).ok_or(OpenError::Malformed)?;
+) -> Result<SealedCursor, OpenError> {
+    let (blob, proof) = envelope(token).ok_or(OpenError::Malformed)?;
     let (nonce, sealed) = blob.split_at(NONCE_LEN);
-    let aad = binding.aad();
-    keys.iter()
+    let aad = binding.aad(proof);
+    let plain = keys
+        .iter()
         .find_map(|key| {
             Aes256Gcm::new(key.into())
                 .decrypt(
@@ -197,19 +292,40 @@ pub(super) fn open_with(
                 )
                 .ok()
         })
-        .and_then(|plain| String::from_utf8(plain).ok())
-        .ok_or(OpenError::Rejected)
+        .ok_or(OpenError::Rejected)?;
+    if proof {
+        parse_proof_payload(&plain).ok_or(OpenError::Rejected)
+    } else {
+        String::from_utf8(plain)
+            .map(|position| SealedCursor {
+                position,
+                proof: None,
+            })
+            .map_err(|_| OpenError::Rejected)
+    }
 }
 
-/// Seal a scan position with the installed key.
-pub(super) fn seal(position: &str, binding: TokenBinding<'_>) -> String {
-    seal_with(&token_keys()[0], position, binding)
+/// Seal a scan position, and the proof that goes with it, with the
+/// installed key.
+pub(super) fn seal(
+    position: &str,
+    proof: Option<&ProofResume>,
+    binding: TokenBinding<'_>,
+) -> String {
+    seal_cursor_with(
+        &token_keys()[0],
+        &SealedCursor {
+            position: position.to_string(),
+            proof: proof.cloned(),
+        },
+        binding,
+    )
 }
 
 /// Open a sealed token with the installed keys. A token that does not open
 /// is `InvalidArgument`: the listing never restarts somewhere else, because
 /// two nodes with different keys would then answer the same page forever.
-pub(super) fn open(token: &str, binding: TokenBinding<'_>) -> s3s::S3Result<String> {
+pub(super) fn open(token: &str, binding: TokenBinding<'_>) -> s3s::S3Result<SealedCursor> {
     open_with(token_keys(), token, binding).map_err(|e| {
         tracing::info!(
             bucket = binding.bucket,
@@ -269,10 +385,50 @@ mod tests {
             if position.len() >= 3 {
                 assert!(!t.contains(position), "the position shows in clear");
             }
-            assert_eq!(open_with(&[key], &t, B).as_deref(), Ok(position));
+            assert_eq!(
+                open_with(&[key], &t, B).map(|c| c.position).as_deref(),
+                Ok(position)
+            );
         }
         // Random nonce: one position seals to two different tokens.
         assert_ne!(seal_with(&key, "h/10", B), seal_with(&key, "h/10", B));
+    }
+
+    #[test]
+    fn a_proof_payload_round_trips_and_refuses_other_shapes() {
+        let key = derive_list_token_key(&"k".repeat(64));
+        for (position, name, inner) in [
+            ("e.secret", "h/", Some("h/0999.pem")),
+            ("", "a/..", None),
+            ("é<&>\u{1}", "ü/", Some("")),
+        ] {
+            let cursor = SealedCursor {
+                position: position.into(),
+                proof: Some(ProofResume {
+                    name: name.into(),
+                    inner: inner.map(String::from),
+                }),
+            };
+            let t = seal_cursor_with(&key, &cursor, B);
+            assert!(t.starts_with(PROOF_TOKEN_PREFIX));
+            assert_eq!(open_with(&[key], &t, B), Ok(cursor));
+        }
+        for bad in [
+            &b""[..],
+            &[0, 0, 0, 9, 1][..],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2][..],
+        ] {
+            assert_eq!(parse_proof_payload(bad), None);
+        }
+        let mut trailing = proof_payload(
+            "p",
+            &ProofResume {
+                name: "n".into(),
+                inner: None,
+            },
+        );
+        trailing.push(0);
+        assert_eq!(parse_proof_payload(&trailing), None);
     }
 
     #[test]
@@ -301,7 +457,12 @@ mod tests {
         let t = seal_with(&key, "h/10", B);
         assert_eq!(open_with(&[other], &t, B), Err(OpenError::Rejected));
         // After a rotation the previous key still opens it.
-        assert_eq!(open_with(&[other, key], &t, B).as_deref(), Ok("h/10"));
+        assert_eq!(
+            open_with(&[other, key], &t, B)
+                .map(|c| c.position)
+                .as_deref(),
+            Ok("h/10")
+        );
         for binding in [
             TokenBinding { bucket: "c", ..B },
             TokenBinding { prefix: "p", ..B },
@@ -331,7 +492,10 @@ mod tests {
             delimiter: Some(""),
             ..B
         };
-        assert_eq!(open_with(&[key], &t, empty).as_deref(), Ok("h/10"));
+        assert_eq!(
+            open_with(&[key], &t, empty).map(|c| c.position).as_deref(),
+            Ok("h/10")
+        );
     }
 
     /// The installed keys: the primary seals; a rotation's previous key and

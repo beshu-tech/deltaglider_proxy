@@ -146,6 +146,7 @@ fn the_raw_token_fallback_is_counted() {
     assert_eq!(
         super::list::v2_cursor(Some("p/a.txt"), BINDING)
             .unwrap()
+            .map(|c| c.key)
             .as_deref(),
         Some("p/a.txt")
     );
@@ -165,12 +166,16 @@ const BINDING: super::list_token::TokenBinding<'static> = super::list_token::Tok
 #[test]
 fn v2_tokens_open_sealed_positions_and_refuse_bad_ones() {
     use super::list_token::{seal, seal_with, TokenBinding};
-    let sealed = seal("h/10", BINDING);
+    let sealed = seal("h/10", None, BINDING);
     assert_eq!(
-        super::list::v2_cursor(Some(&sealed), BINDING).unwrap(),
+        super::list::v2_cursor(Some(&sealed), BINDING)
+            .unwrap()
+            .map(|c| c.key),
         Some("h/10".to_string())
     );
-    let code = |r: s3s::S3Result<Option<String>>| r.unwrap_err().code().as_str().to_string();
+    let code = |r: s3s::S3Result<Option<super::list::ListCursor>>| {
+        r.unwrap_err().code().as_str().to_string()
+    };
     let mut changed = sealed.clone().into_bytes();
     let last = changed.len() - 1;
     changed[last] = if changed[last] == b'A' { b'B' } else { b'A' };
@@ -198,8 +203,83 @@ fn v2_tokens_open_sealed_positions_and_refuse_bad_ones() {
     );
     // The previous release's token form.
     assert_eq!(
-        super::list::v2_cursor(Some(&encode_v2_token("v/1")), BINDING).unwrap(),
+        super::list::v2_cursor(Some(&encode_v2_token("v/1")), BINDING)
+            .unwrap()
+            .map(|c| c.key),
         Some("v/1".to_string())
+    );
+}
+
+/// A page that cannot finish the proof of a folded name seals the proof's
+/// progress with the position. It opens only for its own listing, and a
+/// changed token, another key, another listing or a changed kind prefix is
+/// `InvalidArgument`, as for a position-only token.
+#[test]
+fn a_sealed_proof_cursor_round_trips_and_refuses_forgeries() {
+    use super::list_token::{seal, seal_with, TokenBinding};
+    use crate::iam::listing::ProofResume;
+    let code = |r: s3s::S3Result<Option<super::list::ListCursor>>| {
+        r.unwrap_err().code().as_str().to_string()
+    };
+    for inner in [Some("h/0999.pem".to_string()), None] {
+        let proof = ProofResume {
+            name: "h/".into(),
+            inner,
+        };
+        let t = seal("e.secret", Some(&proof), BINDING);
+        assert!(t.starts_with("dg3.") && !t.contains("secret"), "{t}");
+        let want = Some(super::list::ListCursor {
+            key: "e.secret".into(),
+            proof: Some(proof.clone()),
+        });
+        assert_eq!(super::list::v2_cursor(Some(&t), BINDING).unwrap(), want);
+        assert_eq!(
+            super::list::v1_marker_cursor(Some(&t), BINDING).unwrap(),
+            want
+        );
+        // Every changed byte, another key, another listing.
+        let body = t.strip_prefix("dg3.").unwrap();
+        for i in 0..body.len() {
+            let mut bytes = body.as_bytes().to_vec();
+            bytes[i] = if bytes[i] == b'A' { b'B' } else { b'A' };
+            let changed = format!("dg3.{}", String::from_utf8(bytes).unwrap());
+            assert_eq!(
+                code(super::list::v2_cursor(Some(&changed), BINDING)),
+                "InvalidArgument",
+                "byte {i}"
+            );
+        }
+        let other = TokenBinding {
+            prefix: "h/",
+            ..BINDING
+        };
+        assert_eq!(
+            code(super::list::v2_cursor(Some(&t), other)),
+            "InvalidArgument"
+        );
+        // The kind prefix is part of what is authenticated.
+        let as_position = format!("dg2.{body}");
+        assert_eq!(
+            code(super::list::v2_cursor(Some(&as_position), BINDING)),
+            "InvalidArgument"
+        );
+    }
+    // A position-only token cannot pass as a proof token either, and one of
+    // another key does not open.
+    let plain = seal("h/10", None, BINDING);
+    let as_proof = format!("dg3.{}", plain.strip_prefix("dg2.").unwrap());
+    assert_eq!(
+        code(super::list::v2_cursor(Some(&as_proof), BINDING)),
+        "InvalidArgument"
+    );
+    let foreign = seal_with(&[7u8; 32], "h/10", BINDING);
+    assert_eq!(
+        code(super::list::v2_cursor(Some(&foreign), BINDING)),
+        "InvalidArgument"
+    );
+    assert_eq!(
+        code(super::list::v2_cursor(Some("dg3.!!"), BINDING)),
+        "InvalidArgument"
     );
 }
 
@@ -212,13 +292,19 @@ fn v1_markers_open_sealed_positions_and_keep_plain_keys() {
     assert_eq!(v1_marker_cursor(None, BINDING).unwrap(), None);
     for key in ["v/1", "dg2.", "dg2.!!", "dg1.abc"] {
         assert_eq!(
-            v1_marker_cursor(Some(key), BINDING).unwrap().as_deref(),
+            v1_marker_cursor(Some(key), BINDING)
+                .unwrap()
+                .map(|c| c.key)
+                .as_deref(),
             Some(key)
         );
     }
-    let sealed = seal("h/10", BINDING);
+    let sealed = seal("h/10", None, BINDING);
     assert_eq!(
-        v1_marker_cursor(Some(&sealed), BINDING).unwrap().as_deref(),
+        v1_marker_cursor(Some(&sealed), BINDING)
+            .unwrap()
+            .map(|c| c.key)
+            .as_deref(),
         Some("h/10")
     );
     let foreign = seal_with(&[7u8; 32], "h/10", BINDING);
@@ -244,6 +330,7 @@ fn a_hidden_cursor_leaves_only_sealed() {
             facts_missing_keys: Vec::new(),
         },
         hidden_cursor: hidden,
+        proof: None,
     };
     let v2 = super::list::client_token(&listed("v/1", false), BINDING, encode_v2_token);
     assert_eq!(v2, Some(encode_v2_token("v/1")));
@@ -255,6 +342,7 @@ fn a_hidden_cursor_leaves_only_sealed() {
         assert_eq!(
             super::list::v2_cursor(Some(&t), BINDING)
                 .unwrap()
+                .map(|c| c.key)
                 .as_deref(),
             Some("h/10")
         );

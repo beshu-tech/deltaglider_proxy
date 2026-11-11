@@ -58,11 +58,13 @@ async fn fill(engine: &DynEngine) {
 }
 
 async fn listed(engine: &Arc<DynEngine>, metadata: bool) -> Vec<(String, FileMetadata)> {
-    client_list_page(engine, "b", "rel/", None, 1000, None, metadata, None, 50)
-        .await
-        .unwrap()
-        .page
-        .objects
+    client_list_page(
+        engine, "b", "rel/", None, 1000, None, metadata, None, 50, None,
+    )
+    .await
+    .unwrap()
+    .page
+    .objects
 }
 
 /// The storage facts of the HEAD of `key`, as the LIST names them.

@@ -91,7 +91,7 @@ pub(super) async fn list_objects(
         prefix: input.prefix.as_deref().unwrap_or(""),
         delimiter: input.delimiter.as_deref(),
     };
-    let marker = v1_marker_cursor(input.marker.as_deref(), binding)?;
+    let (marker, proof) = split_cursor(v1_marker_cursor(input.marker.as_deref(), binding)?);
     let listed = client_list_page(
         &svc.state.engine.load(),
         &input.bucket,
@@ -102,6 +102,7 @@ pub(super) async fn list_objects(
         false,
         list_scope.as_ref(),
         svc.list_budget().await,
+        proof,
     )
     .await?;
     // V1 clients send back NextMarker (or, without one, their last <Key>):
@@ -162,7 +163,8 @@ pub(super) async fn list_objects_v2(
         prefix: input.prefix.as_deref().unwrap_or(""),
         delimiter: input.delimiter.as_deref(),
     };
-    let token_cursor = v2_cursor(input.continuation_token.as_deref(), binding)?;
+    let (token_cursor, proof) =
+        split_cursor(v2_cursor(input.continuation_token.as_deref(), binding)?);
     let listed = client_list_page(
         &svc.state.engine.load(),
         &input.bucket,
@@ -173,6 +175,7 @@ pub(super) async fn list_objects_v2(
         include_metadata,
         list_scope.as_ref(),
         svc.list_budget().await,
+        proof,
     )
     .await?;
     let next_token = client_token(&listed, binding, encode_v2_token);
@@ -264,7 +267,7 @@ pub(super) fn client_token(
 ) -> Option<String> {
     let cursor = listed.page.next_continuation_token.as_deref()?;
     Some(if listed.hidden_cursor {
-        list_token::seal(cursor, binding)
+        list_token::seal(cursor, listed.proof.as_ref(), binding)
     } else {
         visible(cursor)
     })
@@ -281,19 +284,55 @@ pub static LEGACY_V2_TOKENS: std::sync::LazyLock<prometheus::IntCounter> =
         .expect("valid metric")
     });
 
-/// The engine cursor of a V2 continuation token. A sealed token (`dg2.`)
+/// Where a LIST continues: the engine cursor, and the proof of a folded
+/// name to go on with (only a sealed token carries one).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ListCursor {
+    pub key: String,
+    pub proof: Option<crate::iam::listing::ProofResume>,
+}
+
+impl ListCursor {
+    fn plain(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            proof: None,
+        }
+    }
+}
+
+impl From<list_token::SealedCursor> for ListCursor {
+    fn from(c: list_token::SealedCursor) -> Self {
+        Self {
+            key: c.position,
+            proof: c.proof,
+        }
+    }
+}
+
+/// The engine cursor and the proof of a [`ListCursor`].
+fn split_cursor(
+    cursor: Option<ListCursor>,
+) -> (Option<String>, Option<crate::iam::listing::ProofResume>) {
+    match cursor {
+        Some(c) => (Some(c.key), c.proof),
+        None => (None, None),
+    }
+}
+
+/// The cursor of a V2 continuation token. A sealed token (`dg2.`, `dg3.`)
 /// must open for this listing, else `InvalidArgument`: it never falls back
 /// to another start. Otherwise [`decode_v2_token`], with a log line and a
 /// count for the raw-key fallback.
 pub(super) fn v2_cursor(
     token: Option<&str>,
     binding: list_token::TokenBinding<'_>,
-) -> s3s::S3Result<Option<String>> {
+) -> s3s::S3Result<Option<ListCursor>> {
     let Some(token) = token else {
         return Ok(None);
     };
-    if token.starts_with(list_token::SEALED_TOKEN_PREFIX) {
-        return list_token::open(token, binding).map(Some);
+    if list_token::has_sealed_prefix(token) {
+        return list_token::open(token, binding).map(|c| Some(c.into()));
     }
     let Some(cursor) = decode_v2_token(Some(token)) else {
         return Ok(None);
@@ -306,20 +345,22 @@ pub(super) fn v2_cursor(
              accepted in this release only"
         );
     }
-    Ok(Some(cursor.key))
+    Ok(Some(ListCursor::plain(cursor.key)))
 }
 
-/// The engine cursor of a V1 `marker`. A marker is a key, except one with
+/// The cursor of a V1 `marker`. A marker is a key, except one with
 /// the shape of a sealed token (the NextMarker of a page where the filtered
 /// scan budget ran out): that one must open for this listing, else
 /// `InvalidArgument`.
 pub(super) fn v1_marker_cursor(
     marker: Option<&str>,
     binding: list_token::TokenBinding<'_>,
-) -> s3s::S3Result<Option<String>> {
+) -> s3s::S3Result<Option<ListCursor>> {
     match marker {
-        Some(m) if list_token::looks_sealed(m) => list_token::open(m, binding).map(Some),
-        other => Ok(other.map(str::to_string)),
+        Some(m) if list_token::looks_sealed(m) => {
+            list_token::open(m, binding).map(|c| Some(c.into()))
+        }
+        other => Ok(other.map(ListCursor::plain)),
     }
 }
 
@@ -408,6 +449,7 @@ pub(super) async fn client_list_page(
     metadata: bool,
     scope: Option<&ListScope>,
     budget: usize,
+    proof: Option<crate::iam::listing::ProofResume>,
 ) -> s3s::S3Result<crate::iam::listing::CallerPage> {
     if max_keys == 0 {
         ensure_listed_bucket(engine, bucket).await?;
@@ -420,10 +462,11 @@ pub(super) async fn client_list_page(
                 facts_missing_keys: Vec::new(),
             },
             hidden_cursor: false,
+            proof: None,
         });
     }
     let listed = crate::iam::listing::list_page_for_caller(
-        &**engine, bucket, prefix, delimiter, max_keys, cursor, metadata, scope, budget,
+        &**engine, bucket, prefix, delimiter, max_keys, cursor, metadata, scope, budget, proof,
     )
     .await?;
     if listed.page.objects.is_empty() && listed.page.common_prefixes.is_empty() {
