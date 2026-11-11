@@ -2313,6 +2313,159 @@ mod source_guards {
         assert!(sites >= 3, "the scan found the proven sign-ins ({sites})");
     }
 
+    /// E10/F8: an HTTP handler that checks a secret (`bcrypt::verify`,
+    /// `iam_user_secret_valid`, `probe_key`) enters a `RateLimitGuard`
+    /// BEFORE the check, in the same fn. A new password oracle without a
+    /// lockout fails here. The check fns themselves are not handlers.
+    #[test]
+    fn every_secret_check_in_a_handler_enters_a_rate_limit_guard_first() {
+        let checks = ["bcrypt::verify(", "iam_user_secret_valid(", "probe_key("];
+        let mut sites = 0;
+        for (file, text) in crate::source_scan::prod_sources("src/api") {
+            let prod = crate::source_scan::prod_text(&text);
+            for check in checks {
+                for (at, _) in prod.match_indices(check) {
+                    let fn_start = prod[..at].rfind("fn ").unwrap_or(0);
+                    let head = &prod[fn_start..at];
+                    if head.trim_end() == "fn" {
+                        continue; // the definition of the check fn
+                    }
+                    sites += 1;
+                    assert!(
+                        head.contains("RateLimitGuard::enter"),
+                        "{file}: `{check}` without a RateLimitGuard before it in its fn"
+                    );
+                }
+            }
+        }
+        assert!(sites >= 6, "the scan found the secret checks ({sites})");
+    }
+
+    /// E10/F35: `triggered_by` is a display label (a user name, an OIDC name
+    /// claim: free text). No admin handler decides ownership by comparing it;
+    /// they compare the stored principal (`maintenance::delete::may_cancel`).
+    #[test]
+    fn no_handler_authorises_by_a_display_name() {
+        let mut offenders = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src/api") {
+            let prod = crate::source_scan::prod_text(&text);
+            for (i, line) in prod.lines().enumerate() {
+                let compares = line.contains("==") || line.contains("!=");
+                if compares && (line.contains("triggered_by") || line.contains(".label()")) {
+                    offenders.push(format!("{file}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "authorise by principal, not by display label:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// E10/F35, the page side: the browser shows Cancel from the server's
+    /// `may_cancel`. It never compares `triggered_by` (a display label) with
+    /// the name of the signed-in user.
+    #[test]
+    fn the_ui_never_authorises_by_a_display_name() {
+        let mut offenders = Vec::new();
+        for ext in ["ts", "tsx"] {
+            for path in crate::source_scan::files("demo/s3-browser/ui/src", ext) {
+                let file = crate::source_scan::rel(&path);
+                if file.contains("/__tests__/") || file.contains(".test.") {
+                    continue;
+                }
+                for (i, line) in crate::source_scan::read(&file).lines().enumerate() {
+                    let compares = line.contains("==") || line.contains("!=");
+                    let names_a_user = line.contains("identity")
+                        || line.contains("user.name")
+                        || line.contains("canCancel");
+                    if line.contains("triggered_by") && compares && names_a_user {
+                        offenders.push(format!("{file}:{}: {}", i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "decide a cancel from the server's `may_cancel`, not from a name:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// E10/F54: an outbound HTTP client that an operator-supplied URL can
+    /// reach comes from ONE builder, `security::guarded_reqwest_builder`:
+    /// the SSRF resolver, no redirects, and no system proxy (a proxy would
+    /// resolve the target itself, so the connect-time address check would
+    /// never run). Nothing else builds a reqwest client, and a failed build
+    /// is an error, never a default client.
+    #[test]
+    fn outbound_http_clients_come_from_the_one_guarded_builder() {
+        // Clients that no operator-supplied URL reaches, with the reason.
+        const UNGUARDED: [(&str, &str); 2] = [
+            (
+                "src/cli/config.rs",
+                "the admin CLI signs in to the proxy URL the operator typed on the command line",
+            ),
+            (
+                "src/cli/engine_factory.rs",
+                "a 3 s health probe of the endpoint of the CLI verb the operator ran, before it connects",
+            ),
+        ];
+        const CONSTRUCTORS: [&str; 6] = [
+            "reqwest::Client::builder(",
+            "reqwest::ClientBuilder::new(",
+            "reqwest::Client::new(",
+            "reqwest::Client::default(",
+            "Client::builder(",
+            ".dns_resolver(",
+        ];
+        let mut users = 0;
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            let prod = crate::source_scan::prod_text(&text);
+            if prod.contains("guarded_reqwest_") && file != "src/security.rs" {
+                users += 1;
+                // A `.build()` followed by a default: the failed build
+                // becomes a client without the resolver.
+                for (at, _) in prod.match_indices(".build()") {
+                    let after: String = prod[at + 8..]
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .take(40)
+                        .collect();
+                    assert!(
+                        !after.starts_with(".unwrap_or_default()")
+                            && !after.starts_with(".ok().unwrap_or_default()")
+                            && !after.starts_with(".unwrap_or_else(|_|")
+                            && !after.starts_with(".unwrap_or_else(|e|")
+                            && !after.starts_with(".ok()"),
+                        "{file}: a failed client build falls back to a default client"
+                    );
+                }
+            }
+            if file == "src/security.rs" || UNGUARDED.iter().any(|(f, _)| *f == file) {
+                continue;
+            }
+            for c in CONSTRUCTORS {
+                assert!(
+                    !prod.contains(c),
+                    "{file} builds an HTTP client with `{c}`: use \
+                     `security::guarded_reqwest_builder`, or list the file in UNGUARDED with a reason"
+                );
+            }
+        }
+        assert!(users >= 2, "the scan found the guarded clients ({users})");
+        // The one builder keeps its three guards.
+        let security = crate::source_scan::prod_text(&crate::source_scan::read("src/security.rs"));
+        let at = security
+            .find("pub fn guarded_reqwest_builder")
+            .expect("the guarded builder exists");
+        let builder: String = security[at..].chars().take(900).collect();
+        for part in [".no_proxy()", ".redirect(", ".dns_resolver("] {
+            assert!(builder.contains(part), "the guarded builder lost `{part}`");
+        }
+    }
+
     /// Review A14: every admin path that can remove IAM users decides the
     /// lockout rule (`check_lockout`, or `allow_empty` for the restore)
     /// BEFORE the write, in the same function. A new path that deletes

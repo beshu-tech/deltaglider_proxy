@@ -65,6 +65,7 @@ pub(crate) async fn install_bootstrap_hash(state: &AdminState, hash: &str) -> st
 /// key does not depend on the password.
 pub async fn change_password(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<PasswordChangeRequest>,
 ) -> impl IntoResponse {
@@ -81,6 +82,23 @@ pub async fn change_password(
             ),
         );
     }
+    // This endpoint checks the bootstrap password, so it is a password
+    // oracle like login: same per-IP and per-account lockout ("bootstrap"
+    // is shared with login, so the two cannot be alternated to double the
+    // budget).
+    let guard = match crate::rate_limiter::RateLimitGuard::enter_with_account(
+        &state.rate_limiter,
+        &headers,
+        connect_info.as_ref().map(|ci| ci.0.ip()),
+        "bootstrap",
+        true,
+        "admin",
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(blocked) => return blocked.into_response(),
+    };
     let current_hash = state.password_hash.read().clone();
     let valid = match bcrypt::verify(&body.current_password, &current_hash) {
         Ok(v) => v,
@@ -94,8 +112,12 @@ pub async fn change_password(
     };
 
     if !valid {
+        guard.record_failure();
+        tracing::warn!("Failed password change from {}", guard.ip());
+        audit_log("change_password_failed", "bootstrap", "", &headers);
         return password_err(StatusCode::FORBIDDEN, "Current password is incorrect");
     }
+    guard.record_proven();
 
     // Validate new password quality
     if let Err(msg) = validate_password(&body.new_password) {
@@ -123,7 +145,15 @@ pub async fn change_password(
         );
     }
 
-    audit_log("change_password", "bootstrap", "", &headers);
+    // A session minted under the old password ends; the caller's stays.
+    let keep = super::super::auth::extract_session_token(&state.sessions, &headers);
+    let ended = state.sessions.revoke_bootstrap_except(keep.as_deref());
+    audit_log(
+        "change_password",
+        "bootstrap",
+        &format!("other_sessions_ended={ended}"),
+        &headers,
+    );
 
     (
         StatusCode::OK,

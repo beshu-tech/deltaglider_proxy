@@ -1472,6 +1472,123 @@ async fn test_delete_jobs_delete_folders_on_the_server() {
     }
 }
 
+/// F35: a delete job's cancel rule compares principals, not display names.
+/// An IAM user NAMED `admin` is not the admin session: it cannot cancel
+/// the admin's job, while a user still cancels its own.
+#[tokio::test]
+async fn test_delete_job_cancel_compares_principals_not_names() {
+    let server = TestServer::builder()
+        .auth("CANCELKEY", "CANCELSECRET")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let admin = admin_http_client(&ep).await;
+    let s3 = server.s3_client().await;
+    for key in ["a/1.txt", "b/1.txt"] {
+        s3.put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+    let connect = |name: &'static str| {
+        let admin = admin.clone();
+        let ep = ep.clone();
+        let bucket = bucket.clone();
+        async move {
+            let resp = admin
+                .post(format!("{ep}/_/api/admin/users"))
+                .json(&json!({
+                    "name": name,
+                    "permissions": [{
+                        "actions": ["read", "write", "delete", "list"],
+                        "resources": [format!("{bucket}/*")]
+                    }]
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 201);
+            let user: Value = resp.json().await.unwrap();
+            let client = reqwest::Client::builder()
+                .cookie_store(true)
+                .no_proxy()
+                .build()
+                .unwrap();
+            let resp = client
+                .post(format!("{ep}/_/api/admin/session/browser-connect"))
+                .json(&json!({
+                    "access_key_id": user["access_key_id"],
+                    "secret_access_key": user["secret_access_key"],
+                    "endpoint": ep,
+                    "bucket": "",
+                    "region": "us-east-1",
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            client
+        }
+    };
+    let start = |client: reqwest::Client, prefix: &'static str| {
+        let ep = ep.clone();
+        let bucket = bucket.clone();
+        async move {
+            let resp = client
+                .post(format!("{ep}/_/api/admin/objects/delete-jobs"))
+                .json(&json!({ "bucket": bucket, "prefixes": [prefix], "expected": 1 }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 202);
+            let started: Value = resp.json().await.unwrap();
+            started["job_id"].as_i64().unwrap()
+        }
+    };
+    let cancel = |client: reqwest::Client, id: i64| {
+        let ep = ep.clone();
+        async move {
+            client
+                .post(format!("{ep}/_/api/admin/objects/delete-jobs/{id}/cancel"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    let namesake = connect("admin").await;
+    let dana = connect("dana").await;
+    let admins_job = start(admin.clone(), "a/").await;
+    let danas_job = start(dana.clone(), "b/").await;
+    // The jobs may be done already: 403 is the ownership refusal, any
+    // other answer (200, 409 "not active") means the check passed.
+    assert_eq!(
+        cancel(namesake.clone(), admins_job).await,
+        403,
+        "a user named `admin` is not the admin session"
+    );
+    assert_ne!(
+        cancel(dana.clone(), danas_job).await,
+        403,
+        "a user cancels its own job"
+    );
+    assert_eq!(
+        cancel(dana.clone(), admins_job).await,
+        403,
+        "a user cannot cancel another principal's job"
+    );
+    assert_ne!(
+        cancel(admin.clone(), danas_job).await,
+        403,
+        "an admin cancels any job"
+    );
+}
+
 /// A delete job refuses a key that is not a folder as a prefix, and an
 /// empty selection.
 #[tokio::test]

@@ -232,7 +232,7 @@ pub async fn require_metrics_access(
     let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
     // `admin_gui_session_ok` already requires a live entry (same `entry_valid`
     // check as `validate`), so one call is the whole test.
-    let admin_session = extract_session_token(&headers)
+    let admin_session = extract_session_token(&state.sessions, &headers)
         .map(|t| admin_gui_session_ok(&state, &t, client_ip))
         .unwrap_or(false);
     if admin_session {
@@ -386,7 +386,7 @@ pub(super) fn insecure_behind_tls_proxy(
 /// session-minting boundary so an XSS-leaked cookie from before
 /// "log out + log in" can't outlive the rotation.
 pub(super) fn drop_prior_session(state: &AdminState, headers: &HeaderMap) {
-    if let Some(prior) = extract_session_token(headers) {
+    if let Some(prior) = extract_session_token(&state.sessions, headers) {
         state.sessions.remove(&prior);
     }
 }
@@ -484,12 +484,34 @@ pub(super) fn session_cookie_with_headers(
     format_session_cookie(token, sessions.ttl(), secure)
 }
 
+/// The session cookie on plain HTTP.
+const SESSION_COOKIE: &str = "dgp_session";
+/// The session cookie where it is `Secure`. The `__Host-` prefix makes a
+/// browser refuse the cookie unless it is `Secure`, has `Path=/` and has no
+/// `Domain`, and refuse a sibling origin's attempt to set or overwrite it
+/// from a plain-HTTP page or a subdomain. A `Secure` cookie cannot exist on
+/// plain HTTP, so there the old name stays.
+const SESSION_COOKIE_HOST: &str = "__Host-dgp_session";
+
+/// Pure: the cookie name for a deployment that sets (or does not set) the
+/// `Secure` flag.
+fn session_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        SESSION_COOKIE_HOST
+    } else {
+        SESSION_COOKIE
+    }
+}
+
 fn format_session_cookie(token: &str, ttl: std::time::Duration, secure: bool) -> String {
     let max_age = ttl.as_secs();
-    let secure = if secure { "; Secure" } else { "" };
+    let flag = if secure { "; Secure" } else { "" };
     format!(
-        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
-        token, max_age, secure
+        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+        session_cookie_name(secure),
+        token,
+        max_age,
+        flag
     )
 }
 
@@ -519,31 +541,59 @@ pub(super) async fn auto_populate_s3_creds(
     );
 }
 
-/// Format a session cookie that clears the login token.
-pub(super) fn session_cookie_clear(sessions: &SessionStore) -> String {
-    let secure = if secure_cookies_with(sessions.secure_cookies(), None) {
-        "; Secure"
-    } else {
-        ""
-    };
-    format!(
-        "dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
-        secure
-    )
+/// The cookies that clear the login token: both names, so a browser that
+/// holds the old-name cookie (set before the deploy, or on plain HTTP) is
+/// cleared too. `__Host-` always carries `Secure`, as the prefix demands;
+/// a browser on plain HTTP ignores it.
+pub(super) fn session_cookie_clears(sessions: &SessionStore, headers: &HeaderMap) -> Vec<String> {
+    let secure = secure_cookies_with(sessions.secure_cookies(), Some(headers));
+    let plain = format!(
+        "{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        if secure { "; Secure" } else { "" }
+    );
+    let host =
+        format!("{SESSION_COOKIE_HOST}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure");
+    vec![plain, host]
 }
 
-/// Extract the `dgp_session` token from the Cookie header.
-pub(super) fn extract_session_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .find_map(|part| {
-            let part = part.trim();
-            part.strip_prefix("dgp_session=")
-                .map(|value| value.to_string())
-        })
+/// Pure: the session token of a `Cookie` header value list, for a request
+/// where the cookie is (`secure`) or is not `Secure`. On a `Secure` request
+/// only the `__Host-` cookie counts: a plain-named one could come from a
+/// sibling origin or subdomain, which is what the prefix closes, and every
+/// session from before the rename ended at the restart (sessions live in
+/// memory). Without `Secure` the `__Host-` cookie still wins over the
+/// plain-named one.
+fn session_token_from_cookies<'a>(
+    cookies: impl Iterator<Item = &'a str>,
+    secure: bool,
+) -> Option<String> {
+    let (mut host, mut plain) = (None, None);
+    for pair in cookies.flat_map(|line| line.split(';')) {
+        let pair = pair.trim();
+        if let Some(v) = pair.strip_prefix("__Host-dgp_session=") {
+            host.get_or_insert(v);
+        } else if let Some(v) = pair.strip_prefix("dgp_session=") {
+            plain.get_or_insert(v);
+        }
+    }
+    let plain = if secure { None } else { plain };
+    host.or(plain).map(str::to_string)
+}
+
+/// Extract the session token from the `Cookie` headers
+/// ([`session_token_from_cookies`]). `Secure` is judged for THIS request,
+/// as it is when the cookie is minted.
+pub(super) fn extract_session_token(
+    sessions: &SessionStore,
+    headers: &HeaderMap,
+) -> Option<String> {
+    session_token_from_cookies(
+        headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok()),
+        secure_cookies_with(sessions.secure_cookies(), Some(headers)),
+    )
 }
 
 fn request_client_ip(
@@ -663,15 +713,14 @@ pub async fn login(
 
 /// POST /api/admin/logout — clear session.
 pub async fn logout(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> impl IntoResponse {
-    if let Some(token) = extract_session_token(&headers) {
+    if let Some(token) = extract_session_token(&state.sessions, &headers) {
         state.sessions.remove(&token);
     }
 
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(
-        header::SET_COOKIE,
-        session_cookie_clear(&state.sessions).parse().unwrap(),
-    );
+    for clear in session_cookie_clears(&state.sessions, &headers) {
+        resp_headers.append(header::SET_COOKIE, clear.parse().unwrap());
+    }
 
     (
         StatusCode::OK,
@@ -687,7 +736,7 @@ pub async fn check_session(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let client_ip = request_client_ip(&headers, connect_info.as_ref());
-    let token = extract_session_token(&headers);
+    let token = extract_session_token(&state.sessions, &headers);
     let valid = token
         .as_ref()
         .map(|t| state.sessions.validate(t, client_ip))
@@ -747,8 +796,8 @@ pub async fn whoami(
     // One session lookup answers both questions: is there a live session
     // (any kind — admin GUI, S3-browser lift, open-mode lift — may learn the
     // version; an anonymous caller may not), and who is it.
-    let session =
-        extract_session_token(&headers).and_then(|t| state.sessions.auth_method(&t, client_ip));
+    let session = extract_session_token(&state.sessions, &headers)
+        .and_then(|t| state.sessions.auth_method(&t, client_ip));
     let session_valid = session.is_some();
     let auth_method = session.as_ref().map(auth_method_label);
     let user = match session {
@@ -1257,7 +1306,7 @@ pub async fn require_session(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
     let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
-    let valid = extract_session_token(&headers)
+    let valid = extract_session_token(&state.sessions, &headers)
         .map(|t| state.sessions.validate(&t, client_ip))
         .unwrap_or(false);
 
@@ -1321,7 +1370,7 @@ pub async fn require_admin_gui_session(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
     let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
-    let Some(token) = extract_session_token(&headers) else {
+    let Some(token) = extract_session_token(&state.sessions, &headers) else {
         return Err(unauthorized());
     };
     // No LIVE session (unknown / expired / REVOKED / wrong IP) is 401 — the UI
@@ -1381,7 +1430,7 @@ pub async fn require_bulk_session(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
     let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
-    let Some(token) = extract_session_token(&headers) else {
+    let Some(token) = extract_session_token(&state.sessions, &headers) else {
         return Err(unauthorized());
     };
     if !state.sessions.validate(&token, client_ip) {
@@ -1451,34 +1500,55 @@ fn non_admin_bulk_session(
     }
 }
 
-/// Whether the principal of the session `token` may list `bucket`, the rule
-/// for bucket-scoped views on the session-light surface (the busy banner):
-/// a live admin session; an open-mode session while access is open; an
-/// IAM user (keys or OAuth) that sees the bucket, as ListBuckets does.
-pub(crate) fn session_may_list_bucket(
+impl BulkSession {
+    /// The principal a job stores for this session, and the principal a
+    /// cancel is judged for (`maintenance::delete::may_cancel`).
+    pub fn principal(&self) -> crate::maintenance::delete::Principal {
+        use crate::maintenance::delete::Principal;
+        match self {
+            BulkSession::AdminGui => Principal::Admin,
+            BulkSession::Open => Principal::Open,
+            BulkSession::IamUser {
+                access_key_id,
+                client_ip,
+            } => Principal::User {
+                access_key_id: access_key_id.clone(),
+                client_ip: *client_ip,
+            },
+        }
+    }
+}
+
+/// The session of `token` when its principal may list `bucket`, the rule for
+/// bucket-scoped views on the session-light surface (the busy banner): a
+/// live admin session; an open-mode session while access is open; an IAM
+/// user (keys or OAuth) that sees the bucket, as ListBuckets does. `None`:
+/// the view is refused.
+pub(crate) fn bucket_view_session(
     state: &AdminState,
     token: &str,
     client_ip: Option<IpAddr>,
     bucket: &str,
-) -> bool {
+) -> Option<BulkSession> {
     if admin_gui_session_ok(state, token, client_ip) {
-        return true;
+        return Some(BulkSession::AdminGui);
     }
     let iam = state.iam_state.load();
-    match non_admin_bulk_session(
+    let (session, _) = non_admin_bulk_session(
         state.sessions.auth_method(token, client_ip),
         &iam,
         client_ip,
-    ) {
-        Some((BulkSession::Open | BulkSession::AdminGui, _)) => true,
-        Some((BulkSession::IamUser { access_key_id, .. }, _)) => match iam.as_ref() {
+    )?;
+    let may = match &session {
+        BulkSession::Open | BulkSession::AdminGui => true,
+        BulkSession::IamUser { access_key_id, .. } => match iam.as_ref() {
             IamState::Iam(index) => index
-                .principal(&access_key_id)
+                .principal(access_key_id)
                 .is_some_and(|u| u.can_see_bucket(bucket)),
             _ => false,
         },
-        None => false,
-    }
+    };
+    may.then_some(session)
 }
 
 /// Audit actor for an admin session: the IAM user name when known.
@@ -1574,7 +1644,7 @@ pub async fn get_s3_session_creds(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Result<Response, AdminError> {
-    let token = extract_session_token(&headers)
+    let token = extract_session_token(&state.sessions, &headers)
         .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     let client_ip = request_client_ip(&headers, connect_info.as_ref());
     let creds = state
@@ -1602,7 +1672,7 @@ pub async fn set_s3_session_creds(
     headers: HeaderMap,
     AdminJson(creds): AdminJson<S3SessionCredentials>,
 ) -> Result<StatusCode, AdminError> {
-    let token = extract_session_token(&headers)
+    let token = extract_session_token(&state.sessions, &headers)
         .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     state.sessions.set_s3_creds(&token, creds);
     Ok(StatusCode::OK)
@@ -1613,7 +1683,7 @@ pub async fn clear_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
 ) -> Result<StatusCode, AdminError> {
-    let token = extract_session_token(&headers)
+    let token = extract_session_token(&state.sessions, &headers)
         .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     state.sessions.clear_s3_creds(&token);
     Ok(StatusCode::OK)
@@ -1741,27 +1811,100 @@ mod tests {
         assert!(matches!(&**shared.load(), IamState::Disabled));
     }
 
+    /// F55: where the cookie is `Secure` it carries the `__Host-` name (and
+    /// so `Path=/` and no `Domain`); on plain HTTP the old name stays,
+    /// because a browser refuses a `__Host-` cookie without `Secure`.
+    #[test]
+    fn the_session_cookie_name_follows_the_secure_flag() {
+        let ttl = std::time::Duration::from_secs(60);
+        let secure = format_session_cookie("tok", ttl, true);
+        assert_eq!(
+            secure,
+            "__Host-dgp_session=tok; HttpOnly; SameSite=Strict; Path=/; Max-Age=60; Secure"
+        );
+        assert!(!secure.contains("Domain"));
+        let plain = format_session_cookie("tok", ttl, false);
+        assert_eq!(
+            plain,
+            "dgp_session=tok; HttpOnly; SameSite=Strict; Path=/; Max-Age=60"
+        );
+        // The `__Host-` rules, for every Secure cookie we mint.
+        assert!(secure.contains("; Secure") && secure.contains("Path=/;"));
+    }
+
+    #[test]
+    fn logout_clears_both_cookie_names() {
+        let sessions = SessionStore::new().with_secure_cookies(Some(true));
+        let clears = session_cookie_clears(&sessions, &HeaderMap::new());
+        assert_eq!(clears.len(), 2);
+        assert!(clears[0].starts_with("dgp_session=;") && clears[0].ends_with("; Secure"));
+        assert!(clears[1].starts_with("__Host-dgp_session=;") && clears[1].ends_with("; Secure"));
+        let sessions = SessionStore::new().with_secure_cookies(Some(false));
+        let clears = session_cookie_clears(&sessions, &HeaderMap::new());
+        assert!(!clears[0].contains("Secure"), "{}", clears[0]);
+    }
+
     #[test]
     fn extract_session_token_from_cookie() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "dgp_session=abc123".parse().unwrap());
-        assert_eq!(extract_session_token(&headers).unwrap(), "abc123");
-
+        // Plain HTTP: the plain name.
+        let plain = SessionStore::new().with_secure_cookies(Some(false));
+        let get = |sessions: &SessionStore, line: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, line.parse().unwrap());
+            extract_session_token(sessions, &headers)
+        };
+        assert_eq!(get(&plain, "dgp_session=abc123").unwrap(), "abc123");
         // Multiple cookies
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            "foo=bar; dgp_session=xyz789; baz=qux".parse().unwrap(),
+        assert_eq!(
+            get(&plain, "foo=bar; dgp_session=xyz789; baz=qux").unwrap(),
+            "xyz789"
         );
-        assert_eq!(extract_session_token(&headers).unwrap(), "xyz789");
-
-        // No session cookie
+        // The `__Host-` cookie wins over a plain-named one, in either order
+        // (a sibling origin may have planted the plain one).
+        for line in [
+            "dgp_session=planted; __Host-dgp_session=real",
+            "__Host-dgp_session=real; dgp_session=planted",
+        ] {
+            assert_eq!(get(&plain, line).unwrap(), "real", "{line}");
+        }
+        // Two Cookie headers.
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "foo=bar".parse().unwrap());
-        assert!(extract_session_token(&headers).is_none());
-
+        headers.append(header::COOKIE, "dgp_session=planted".parse().unwrap());
+        headers.append(header::COOKIE, "__Host-dgp_session=real".parse().unwrap());
+        assert_eq!(extract_session_token(&plain, &headers).unwrap(), "real");
+        // A name that merely ends with ours is not ours.
+        assert!(get(&plain, "x__Host-dgp_session=a; xdgp_session=b").is_none());
+        // No session cookie
+        assert!(get(&plain, "foo=bar").is_none());
         // No cookie header at all
-        assert!(extract_session_token(&HeaderMap::new()).is_none());
+        assert!(extract_session_token(&plain, &HeaderMap::new()).is_none());
+    }
+
+    /// F55: on a `Secure` request only the `__Host-` cookie is a session. A
+    /// plain-named cookie may come from a sibling origin, which is what the
+    /// prefix closes; sessions live in memory, so none from before the
+    /// rename survives the restart.
+    #[test]
+    fn a_secure_request_reads_only_the_host_cookie() {
+        let secure = SessionStore::new().with_secure_cookies(Some(true));
+        let get = |line: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, line.parse().unwrap());
+            extract_session_token(&secure, &headers)
+        };
+        assert_eq!(get("__Host-dgp_session=real").unwrap(), "real");
+        assert_eq!(
+            get("dgp_session=planted; __Host-dgp_session=real").unwrap(),
+            "real"
+        );
+        assert!(get("dgp_session=planted").is_none());
+        assert!(get("foo=bar; dgp_session=planted").is_none());
+        // The Secure verdict is the request's: a trusted forwarded-proto header
+        // decides it when the setting is unset, as it does at login.
+        let plain = SessionStore::new().with_secure_cookies(Some(false));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "dgp_session=ok".parse().unwrap());
+        assert_eq!(extract_session_token(&plain, &headers).unwrap(), "ok");
     }
 
     #[test]
@@ -2045,19 +2188,11 @@ mod tests {
     /// in some impls — same SameSite avoids "ghost" cookies persisting).
     #[test]
     fn logout_cookie_is_samesite_strict() {
-        // Re-create what logout returns; the literal lives in logout()
-        // but it's a one-line format!() so we just assert the property.
-        // If logout() changes its cookie shape, this test stays accurate
-        // because we read the same env var via secure_cookies().
-        let secure = if secure_cookies_with(None, None) {
-            "; Secure"
-        } else {
-            ""
-        };
-        let expected =
-            format!("dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}");
-        assert!(expected.contains("SameSite=Strict"));
-        assert!(expected.contains("Max-Age=0"));
+        let sessions = SessionStore::new().with_secure_cookies(Some(true));
+        for clear in session_cookie_clears(&sessions, &HeaderMap::new()) {
+            assert!(clear.contains("SameSite=Strict"), "{clear}");
+            assert!(clear.contains("Max-Age=0"), "{clear}");
+        }
     }
 
     /// SEC F-04: warn only for an untrusted `X-Forwarded-Proto: https`

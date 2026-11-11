@@ -173,6 +173,18 @@ async fn backend_share(
     crate::deltaglider::spool::scoped(&backend, next.run(request)).await
 }
 
+/// The span of one request. The default `TraceLayer` span records the full
+/// URI: a presigned URL's signature and credential would reach every log
+/// line of the request. The URI goes in through [`redact_uri_for_log`].
+fn request_span(request: &axum::http::Request<axum::body::Body>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        uri = %crate::security::redact_uri_for_log(&request.uri().to_string()),
+        version = ?request.version(),
+    )
+}
+
 /// Build the S3-compatible router with all routes and middleware layers.
 ///
 /// Backed by the `s3s` crate, which translates wire-level S3 protocol
@@ -493,7 +505,7 @@ where
             intercept_form_post_for_s3s,
         ))
         .layer(middleware::from_fn(add_s3_request_id))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::metrics::http_metrics_middleware,

@@ -201,7 +201,9 @@ pub struct OidcProvider {
     pub issuer_url: String,
     pub scopes: String,
     pub extra_config: serde_json::Value,
-    http: reqwest::Client,
+    /// `None` when the guarded client could not be built (`config_error`
+    /// says why): there is no fallback client, so nothing is sent.
+    http: Option<reqwest::Client>,
     /// Outbound-URL policy from `extra_config.allow_local`.
     url_kind: UrlKind,
     /// Why the HTTP client could not take the configured policy (a bad
@@ -292,24 +294,16 @@ impl OidcProvider {
             Err(e) => (OidcNetPolicy::default(), Some(e)),
         };
         let url_kind = policy.url_kind();
-        // Disable redirects: the OIDC discovery + JWKS targets are
-        // operator-supplied; a redirect from a legit-looking host to
-        // 169.254.169.254 is the SSRF pivot we want to block. Callers
-        // also enforce `validate_outbound_url` before even reaching the
-        // client.
-        let mut builder = reqwest::Client::builder()
+        // The OIDC discovery + JWKS targets are operator-supplied: the one
+        // guarded builder (resolver check at connect time, no redirects, no
+        // system proxy). Callers also enforce `validate_outbound_url` before
+        // even reaching the client. `allow_local` admits private addresses;
+        // metadata and link-local stay refused.
+        let mut builder = crate::security::guarded_reqwest_builder(url_kind)
             // rustls, as in production, whatever TLS backend the build
             // unifies to (tests enable native-tls through dev-deps).
             .use_rustls_tls()
-            .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            // Close the DNS-rebinding gap: reject hostnames resolving to
-            // metadata/private addresses at connect time (the literal-IP
-            // validate_outbound_url check can't see DNS). `allow_local`
-            // admits private addresses; metadata stays refused.
-            .dns_resolver(std::sync::Arc::new(
-                crate::security::SsrfGuardedResolver::new(url_kind),
-            ));
+            .timeout(std::time::Duration::from_secs(10));
         match policy.load_ca_certs() {
             Ok(certs) => {
                 for c in certs {
@@ -318,11 +312,12 @@ impl OidcProvider {
             }
             Err(e) => config_error = config_error.or(Some(e)),
         }
+        // No fallback: a default client has no SSRF resolver.
         let http = match builder.build() {
-            Ok(c) => c,
+            Ok(c) => Some(c),
             Err(e) => {
                 config_error = config_error.or(Some(format!("HTTP client: {}", error_chain(&e))));
-                reqwest::Client::default()
+                None
             }
         };
         Self {
@@ -346,6 +341,15 @@ impl OidcProvider {
             Some(e) => Err(ExternalAuthError::ConfigError(e.clone())),
             None => Ok(()),
         }
+    }
+
+    /// THE client of every outbound request: the SSRF-guarded one, or the
+    /// construction error. Never a default client.
+    fn client(&self) -> Result<&reqwest::Client, ExternalAuthError> {
+        self.check_config()?;
+        self.http.as_ref().ok_or_else(|| {
+            ExternalAuthError::ConfigError("the HTTP client could not be built".to_string())
+        })
     }
 
     /// Generate the authorization URL for browser redirect.
@@ -436,9 +440,8 @@ impl OidcProvider {
             params.push(("code_verifier", verifier.clone()));
         }
 
-        self.check_config()?;
         let resp = self
-            .http
+            .client()?
             .post(&token_endpoint)
             .form(&params)
             .send()
@@ -561,7 +564,7 @@ impl OidcProvider {
             self.issuer_url.trim_end_matches('/')
         );
         let resp = self
-            .http
+            .client()?
             .get(&url)
             .send()
             .await
@@ -607,7 +610,7 @@ impl OidcProvider {
         validate_outbound_url(jwks_uri, self.url_kind)
             .map_err(|e| ExternalAuthError::DiscoveryFailed(format!("jwks_uri: {e}")))?;
         let resp = self
-            .http
+            .client()?
             .get(jwks_uri)
             .send()
             .await

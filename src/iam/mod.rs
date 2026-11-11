@@ -41,8 +41,8 @@ pub use declarative::{
 pub use keygen::{generate_access_key_id, generate_secret_access_key};
 pub use middleware::authorization_middleware;
 pub use permissions::{
-    normalize_permissions, user_can_see_common_prefix, user_can_see_listed_key,
-    validate_permissions,
+    deny_may_hide_keys_under, normalize_permissions, user_can_see_common_prefix,
+    user_can_see_listed_key, validate_permissions,
 };
 pub use types::*;
 

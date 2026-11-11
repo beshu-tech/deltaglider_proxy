@@ -80,6 +80,21 @@ pub fn parse_params(json: &str) -> Result<DeleteParams, String> {
     serde_json::from_str(json).map_err(|e| format!("invalid delete params: {e}"))
 }
 
+/// Pure: may `session` cancel a job that `job_params` (the job row's params
+/// JSON) says was started by its stored principal? An admin or open session
+/// cancels any job. A user cancels the jobs of the same IAM access key id.
+/// The decision never uses a display name: a user may be NAMED `admin`, and
+/// an OIDC name claim is free text. An unreadable row denies a user.
+pub fn may_cancel(session: &Principal, job_params: Option<&str>) -> bool {
+    match session {
+        Principal::Admin | Principal::Open => true,
+        Principal::User { access_key_id, .. } => matches!(
+            job_params.and_then(|p| parse_params(p).ok()).map(|p| p.principal),
+            Some(Principal::User { access_key_id: owner, .. }) if owner == *access_key_id
+        ),
+    }
+}
+
 /// Where the job is: stage 0 is the directly selected objects (`skip` of
 /// them done), stage `n` is folder `n - 1` (`after` its last handled key).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +277,49 @@ async fn persist_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user(ak: &str) -> Principal {
+        Principal::User {
+            access_key_id: ak.into(),
+            client_ip: None,
+        }
+    }
+
+    fn row(principal: Principal) -> String {
+        serde_json::to_string(&DeleteParams {
+            prefixes: vec!["a/".into()],
+            keys: vec![],
+            principal,
+            expected: 0,
+        })
+        .unwrap()
+    }
+
+    /// F35: the cancel decision table. The display name is not an input.
+    #[test]
+    fn may_cancel_compares_principals() {
+        let admin_job = row(Principal::Admin);
+        let open_job = row(Principal::Open);
+        let dana_job = row(user("AKDANA"));
+        let bad = Some("{not json");
+        #[rustfmt::skip]
+        let table: [(&Principal, Option<&str>, bool, &str); 11] = [
+            (&Principal::Admin, Some(&admin_job), true, "admin cancels an admin job"),
+            (&Principal::Admin, Some(&dana_job), true, "admin cancels a user job"),
+            (&Principal::Admin, bad, true, "admin cancels an unreadable row"),
+            (&Principal::Open, Some(&dana_job), true, "open cancels any"),
+            (&user("AKDANA"), Some(&dana_job), true, "a user cancels its own"),
+            (&user("AKOTHER"), Some(&dana_job), false, "a user cannot cancel another user's"),
+            (&user("AKADMINUSER"), Some(&admin_job), false, "a user (even one named admin) cannot cancel an admin job"),
+            (&user("AKADMINUSER"), Some(&open_job), false, "a user cannot cancel an open job"),
+            (&user("AKDANA"), None, false, "a row without params denies a user"),
+            (&user("AKDANA"), bad, false, "an unreadable row denies a user"),
+            (&user("akdana"), Some(&dana_job), false, "access key ids match exactly"),
+        ];
+        for (session, params, want, why) in table {
+            assert_eq!(may_cancel(session, params), want, "{why}");
+        }
+    }
 
     #[test]
     fn params_round_trip_with_each_principal() {

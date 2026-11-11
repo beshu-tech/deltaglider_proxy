@@ -1430,8 +1430,8 @@ mod classify_tests {
 
     /// S18: the S3 client resolves its endpoint through the SSRF guard. A
     /// name that resolves to a refused address never gets a connection. The
-    /// strict (OIDC) policy refuses loopback, so it proves the wiring; the
-    /// Backend policy allows a private/loopback answer (on-prem MinIO).
+    /// strict (OIDC) and Backend policies refuse loopback; `allow_local`
+    /// (BackendDev) connects to it.
     #[tokio::test]
     async fn s3_client_endpoint_resolution_goes_through_the_ssrf_guard() {
         use crate::security::{SdkSsrfGuardedResolver, UrlKind};
@@ -1471,10 +1471,18 @@ mod classify_tests {
             0,
             "no connection may reach a forbidden address: {err:?}"
         );
+        // F45: Backend refuses a name that resolves to this host too.
         let _ = client_for(UrlKind::Backend).list_buckets().send().await;
+        assert_eq!(
+            accepted.load(SeqCst),
+            0,
+            "Backend policy must not connect to a loopback answer"
+        );
+        // `allow_local` (BackendDev) is the dev/CI opt-in.
+        let _ = client_for(UrlKind::BackendDev).list_buckets().send().await;
         assert!(
             accepted.load(SeqCst) >= 1,
-            "Backend policy must connect to a private answer"
+            "allow_local must connect to a loopback answer"
         );
     }
 

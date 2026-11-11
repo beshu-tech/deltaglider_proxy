@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 010dcc076bb0e0c9d6aa3f6dce6429221ce15e38957c2ec0a314838922b39ed9 # shrinks to allows = ["b/se*"], denies = [], delimiter = "ec", prefix = "", max_keys = 2
+cc f5dfd64f2c366e317c806ffea2cee66fe6bd8d4c0ed0cea97c4ed517b0ae0f1f # shrinks to allows = ["b/se*", "b/c*", "b/pub/*"], denies = ["b/*/k"], delimiter = "r", prefix = "", max_keys = 1000, budget = 4

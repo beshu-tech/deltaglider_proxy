@@ -599,7 +599,7 @@ async fn async_main(
         && deltaglider_proxy::config::process_env("DGP_LOG_LEVEL").is_none()
     {
         let spec = startup::effective_log_spec(None, None, &config.log_level, cli.verbose);
-        match deltaglider_proxy::audit::with_audit_directive(&spec)
+        match deltaglider_proxy::audit::with_pinned_directives(&spec)
             .parse::<tracing_subscriber::EnvFilter>()
         {
             Ok(filter) => {

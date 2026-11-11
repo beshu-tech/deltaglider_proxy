@@ -1,6 +1,6 @@
 // Admin API client core: shared fetch glue + cross-cutting types.
 import { ApiError, isSessionExpired, normalizeUiError, parseErrorBody, throwApiError } from '../errorHandling';
-import { loginFailureMessage, retryAfterSeconds } from '../loginError';
+import { loginFailureMessage, passwordChangeLockoutMessage, retryAfterSeconds } from '../loginError';
 import type { EnvOverride } from '../envOverrides';
 import { BASE as APP_BASE } from '../urlState';
 import { requestRelogin } from '../sessionRelogin';
@@ -891,6 +891,8 @@ export function confirmHeaderMap(confirm?: ConfirmHeaders): Record<string, strin
 interface PasswordChangeResponse {
   ok: boolean;
   error?: string;
+  /** A lockout (429) says `too_many_attempts` in `error`, the wait in `retry_after_secs`. */
+  retry_after_secs?: number;
 }
 
 interface TestS3Request {
@@ -921,7 +923,15 @@ export async function changeAdminPassword(
   const path = '/api/admin/password';
   const res = await adminFetch(path, 'PUT', { current_password: currentPassword, new_password: newPassword });
   const refused = await refusalBody<PasswordChangeResponse>(res, (b) => b.ok === false);
-  if (refused) return refused;
+  if (refused) {
+    // A lockout is the shared limiter's answer: its `error` is a code, so
+    // the page gets the sentence with the wait (header, else the body).
+    if (res.status === 429 || refused.error === 'too_many_attempts') {
+      const secs = retryAfterSeconds(res.headers.get('retry-after'), refused);
+      return { ok: false, error: passwordChangeLockoutMessage(secs) };
+    }
+    return refused;
+  }
   if (!res.ok) await throwApiError(res, defaultContext(path));
   return safeJson<PasswordChangeResponse>(res);
 }
