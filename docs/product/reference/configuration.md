@@ -870,10 +870,11 @@ The proxy ignores a value that does not parse, or that is below the minimum, and
 
 ## Event delivery
 
-The proxy always appends durable object mutation events to the encrypted config
-DB when the DB is available. HTTP delivery is disabled by default. When you
-enable `advanced.event_delivery`, a background dispatcher starts, and it POSTs
-each event to every configured webhook endpoint.
+The proxy appends durable object mutation events to the encrypted jobs DB
+(`deltaglider_jobs.db`) while something reads them: event delivery with a
+target, or replication with an enabled rule. HTTP delivery is disabled by
+default. When you enable `advanced.event_delivery`, a background dispatcher
+starts, and it POSTs each event to every configured webhook endpoint.
 
 ```yaml
 # validate
@@ -900,6 +901,14 @@ advanced:
 
 `webhook_url` is the single-endpoint shortcut. `webhook_urls` adds fan-out
 endpoints, and the proxy attaches `webhook_headers` to every delivery request.
+
+`batch_size` is the number of rows that the dispatcher claims at one time, not
+the most rows that one tick delivers. Every `tick_interval`, the dispatcher
+claims one batch after the other, for as long as the last batch was full, more
+than half of its rows were delivered, and less than one `tick_interval` has
+passed. In raw format, it posts up to 8 rows at the same time. So a receiver
+gets continuous traffic while many events wait. To protect a slow receiver,
+set a lower `batch_size` and put a rate limit in front of the receiver.
 The proxy marks a row delivered only after all endpoints return 2xx. A failed
 row backs off, and you can requeue it from the admin API or UI. See [Event log](event-outbox.md)
 for payload and diagnostics details.

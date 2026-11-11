@@ -40,6 +40,10 @@ storage:
     lease_ttl: "300s"                # failover window for a dead runner (min 15s; default 5m)
     heartbeat_interval: "60s"        # lease renewal cadence (min 5s; must be < lease_ttl)
     max_failures_retained: 100       # per-rule failure ring size
+    object_timeout: "30m"            # per-object copy limit, scheduled and event-driven ("0s" = no limit)
+    object_skip_after_failures: 5    # skip an object after this many failed runs in a row (0 = never)
+    transfers: 4                     # concurrent objects per run (1-64)
+    upload_concurrency: 4            # in-flight parts per streaming object copy (1-16)
     dir_concurrency: 4               # concurrent directory listings in the reconcile walk (1-16); copies stay bounded by transfers
 
     rules:
@@ -104,7 +108,7 @@ The only guardrail is source absence: the rule deletes a destination object only
 ## Durability model
 
 - Rules are YAML-authored. Changes apply through the section PUT pipeline, and cycle detection runs on every load.
-- Runtime state lives in the encrypted config DB:
+- Runtime state lives in the encrypted jobs DB (`deltaglider_jobs.db`, next to the config DB, never synced):
     - `replication_state`: one row per rule. Scheduling state + pause flag + lifetime counters + resume cursor + leader lease columns (the node-local lease; with a coordination bucket the authoritative lease is the S3 lease object, and these columns back the run-now/worker bookkeeping on the leader). The resume cursor is a scope-stamped position in the tree traversal of the reconcile walk, so an interrupted run resumes exactly where it stopped. The proxy discards a cursor in an incompatible earlier format, and the next run starts a fresh (idempotent) pass. `INSERT OR IGNORE` on config load preserves operator-set pause + lifetime counters across reloads.
     - `replication_run_history`: append-only per-run records. CASCADE DELETE on rule removal.
     - `replication_failures`: per-object error ring, bounded by `max_failures_retained`.
@@ -145,6 +149,8 @@ Every copy goes through `engine.retrieve` → `engine.store`. That means:
 | Destination backend down | `engine.store` error. Failure row captures the error message. Run reports `errors > 0`. |
 | Destination refuses the event consumer's copies | The consumer stops the rule's drain at the first error that no object can pass (the bucket is gone, access is refused, or a quota is used up), or after 3 throttled or failed requests with nothing done. The rule's events stay in the outbox. The rule then waits 30 seconds before its next drain, and the wait doubles after each drain that stops in this way, up to 10 minutes. A drain in which a copy or a delete works ends the wait. The wait is kept in memory, so a restart ends it. |
 | Destination bucket refuses writes | A maintenance job that rewrites the destination holds the rule's events: they stay in the outbox, and the rule continues when the job ends. Any other refusal can last a long time: the bucket is read-only because it is encrypted on a backend without atomic writes, the atomic-write check of its backend is still running, or the encryption witness refuses this instance's writes. In these cases the event consumer does not keep the rule's events, so that the outbox can still be pruned. Instead, it makes the rule due. The rule's row on the Jobs page and in `GET /_/api/admin/jobs` shows `deferred`, and `detail.deferred` gives the reason. The proxy logs one warning each time the reason changes. When the destination accepts writes again, the scheduler runs the rule at its next tick. That full reconcile copies what the event consumer skipped. |
+| A copy runs longer than `object_timeout` | The proxy stops the copy and stores no partial object. The copy is a failure that is tried again later: a scheduled run records it, and an event-driven copy leaves its event in the outbox. The limit applies to scheduled runs and to the event consumer, so a maintenance job never waits for a copy without end. With `object_timeout: "0s"`, a copy has no limit. |
+| A maintenance job gates the destination bucket | Each replication write (a copy or a mirrored delete) first counts itself as an in-flight write of its destination bucket, and then checks that bucket. A migrate, re-encrypt or backfill job therefore waits for the writes that already run before it rewrites the bucket, and no write can start between the check and the count. A write that finds a job is deferred: its events wait in the outbox, or the run stops as `deferred` and resumes from its cursor later. The proxy records no failure for it. |
 | Destination HEAD fails in the event consumer | A failed HEAD request does not prove that the key is absent, so the consumer does not copy. The event stays in the outbox for a later drain. |
 | Backend marked unavailable by the health check | The scheduler, a reconcile run in progress and the event consumer defer a rule whose source backend or destination backend is unavailable. They send that backend no requests. The cursor and the events stay, and the rule continues when the backend recovers. A run-now request for such a rule answers `503` and starts no run. |
 | List fails (source bucket gone) | Entire run marked `failed` with a single "list source failed" row. |

@@ -62,7 +62,7 @@ An endpoint that needs the encrypted config DB (for example IAM users, groups, e
 | `GET` | `/_/api/whoami` | `{mode, user, external_providers, version, build_time}`. `mode` is `bootstrap`, `iam`, `open`, or `deny_all` (no IAM user, no bootstrap pair and no `authentication: none`: S3 refuses every request, and only the admin password signs in). `version` and `build_time` are present for authenticated callers only (a live session, or verified IAM credentials on `POST /_/api/iam/identity`); anonymous callers get `mode` and the provider list but nothing that identifies the build |
 | `GET` | `/_/api/docs` | Session-gated: every product doc plus `docs/product/manifest.json` as one JSON payload (`{manifest, docs: [{path, content}]}`). The embedded docs viewer fetches it at runtime; the markdown is not part of the public JS bundle |
 | `POST` | `/_/api/admin/recover-db` | Only while the config DB is locked (no key opens it): test a candidate config DB key, or a legacy bootstrap hash, against the preserved `.db.bak`. Read-only; the response names the kind of key (`key_kind`) so that the operator can set it and restart (public, rate-limited) |
-| `PUT` | `/_/api/admin/password` | Change the bootstrap password. The config DB is not re-encrypted: its key does not depend on the password |
+| `PUT` | `/_/api/admin/password` | Change the bootstrap password. The config DB is not re-encrypted: its key does not depend on the password. The request checks the current password, so it shares the sign-in lockout of `POST /_/api/admin/login`, and a locked-out address gets `429`. A wrong current password gets `403` and writes the audit entry `change_password_failed`, which never holds a password. A successful change ends every other bootstrap session; the session that sent the request stays. `409` when `DGP_BOOTSTRAP_PASSWORD_HASH` is set |
 
 ## Configuration: three scopes
 
@@ -487,7 +487,7 @@ The database part of the probe takes the lock of the config DB and the lock of t
 
 Two more conditions make the node not ready, because the S3 API cannot serve the requests of such a node. When no config DB key opens the config DB, the S3 API answers every request with `503` and the message `Config database locked`. The probe then reports `config_db: "key_mismatch"` and `503 not_ready`. The `spool` field reports whether the node can make a spool file: the proxy makes a spool directory that somebody removed again, and the field is `unusable` only when that fails. Delta uploads and large downloads need the spool, so the node is `503 not_ready` then.
 
-A full disk does not change the probe. The node still serves reads and deletes, and an upload to a full disk answers `503 SlowDown`. A load balancer that removed the node would drop all of those reads.
+A full disk does not change the probe. The node still serves reads and deletes, and an upload to a full disk answers `503 ServiceUnavailable` with a message that names the full disk. A load balancer that removed the node would drop all of those reads.
 
 The response also carries `atomic_writes` when a backend holds buckets that encrypt with the proxy: a map from each such backend to `checking` (no verdict yet), `unverified` (the probe could not reach it), `supported` or `unsupported` (its encrypted buckets are read-only). Writes to the encrypted buckets of a `checking` or `unverified` backend answer `503 SlowDown`. This state never makes the node not ready: reads and the other buckets work, and a pending check ends on its own, so a load balancer that removed the node would only lose service.
 

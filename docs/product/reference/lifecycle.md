@@ -146,6 +146,8 @@ A new enabled rule does not run at the next check. The proxy schedules its first
 
 While the backend health check marks the backend of a bucket that the rule writes to as unavailable, or a maintenance job gates one of those buckets, the scheduler does not start the rule. The rule stays due and runs at a check after the backend recovers or the job ends. The row says why in `detail.deferred`. Pause/resume state lives in the same row and survives restarts, as in replication.
 
+A run in progress counts its writes as in-flight writes of each bucket that it writes to, before it checks those buckets for a maintenance job. A migrate, re-encrypt or backfill job therefore waits for these writes before it rewrites the bucket. When a job gates one of the buckets in the middle of a run, the run stops before its next page, or between two deletes of a batch, with the status `deferred`. It keeps its cursor, and resumes after the job ends. The proxy records no failure for it. Each transition copy stops after 30 minutes, so a maintenance job never waits for a copy without end. A copy that stops in this way stores no partial object, and the run records it as a failure that the next run tries again.
+
 ## Events
 
 When a jobs DB is available, successful lifecycle deletes append a `LifecycleExpired` event to the durable event outbox with rule name, expiration age, object creation time, and content length. Successful transitions append `LifecycleTransitioned` with source/destination coordinates and copied bytes. If a transition rule also deletes the source, that source delete appends a `LifecycleExpired` event with action `transition-source-delete`.
