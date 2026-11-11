@@ -197,6 +197,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let Some(ReadBody { hashes, data }) = read_body else {
             return Ok(Rewritten::Changed);
         };
+        // Counted only now: the body was opened, matched the version and
+        // was read in full, so a Changed or NotFound rewrite counts none.
+        if let Some(m) = self.metrics() {
+            m.rewrite_bodies_total
+                .with_label_values(&[if spool.is_some() { "spool" } else { "memory" }])
+                .inc();
+        }
         let meta = rewrite_metadata(&body_meta, Some(&hashes))?;
         // The encrypting wrapper's ciphertext file, reserved now (a storage
         // write never waits for budget).

@@ -268,6 +268,54 @@ async fn test_marked_bucket_rejects_part_copy_and_complete() {
     assert_access_denied(&err, "CompleteMultipartUpload");
 }
 
+/// A signed browser form POST (PostObject) into a marked bucket answers 403
+/// with the marker message, and the same form into an unmarked bucket stores
+/// (204). The form handler calls the client-write gate itself (it does not
+/// go through the s3s adapter), so a removed call there lets the form
+/// through; this pins the call. The control row makes sure the 403 comes
+/// from the marker and not from the form.
+#[tokio::test]
+async fn test_marked_bucket_refuses_form_post() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .bucket_policy("rto-dst", "replication_target_only: true")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["rto-dst", "rto-plain"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    let creds = ("bootstrap_key", "bootstrap_secret");
+
+    let r = common::signed_form_post(&server.endpoint(), "rto-dst", creds)
+        .send()
+        .await
+        .unwrap();
+    let (status, text) = (r.status().as_u16(), r.text().await.unwrap());
+    assert_eq!(status, 403, "{text}");
+    assert!(text.contains("replication targets only"), "{text}");
+    assert!(
+        client
+            .head_object()
+            .bucket("rto-dst")
+            .key("post/x.txt")
+            .send()
+            .await
+            .is_err(),
+        "the refused form stored nothing"
+    );
+
+    let r = common::signed_form_post(&server.endpoint(), "rto-plain", creds)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        204,
+        "an unmarked bucket takes the form"
+    );
+}
+
 /// The alias hole: a marked bucket declared with an `alias` is protected under
 /// its VIRTUAL name, but a client PUT to the UNCONFIGURED real (alias) name
 /// resolves — via the cross-backend probe — onto the same protected storage.

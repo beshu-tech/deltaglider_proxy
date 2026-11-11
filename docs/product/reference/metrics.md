@@ -229,6 +229,14 @@ The proxy reads each upload body once before it stores the object. A body that i
 
 A rising count of `reason="memory_budget"` means that many small uploads arrive at the same time and the memory budget is full. Those bodies still succeed, but each one costs a disk write. Raise `DGP_INGEST_MEMORY_MAX_BYTES` if the host has free memory.
 
+## Re-encrypt rewrites
+
+The re-encrypt job rewrites each stored object in place. It reads the object, seals it and writes it back under a condition on the version that it read. These requests carry no upload body, so they have their own metric.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_rewrite_bodies_total` | Counter | `medium` | Passthrough objects that an in-place rewrite read in full, by where the proxy put them. `medium="memory"`: an object of at most `DGP_SPOOL_THRESHOLD_BYTES`, read into memory. `medium="spool"`: a larger object, streamed through a spool file so that its size does not use memory. The counter does not count a rewrite of a delta or of a reference, and it does not count a rewrite that finds the object changed or deleted before it reads the object |
+
 ## Auth
 
 | Metric | Type | Labels | Description |

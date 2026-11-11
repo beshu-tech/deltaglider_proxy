@@ -1401,3 +1401,107 @@ async fn delete_bucket_removes_old_versions_of_a_versioned_bucket() {
         "the bucket is still on MinIO"
     );
 }
+
+/// The sum of the samples of the series `name` whose labels include every
+/// `label` (e.g. `operation="UploadPartCopy"`), from one scrape.
+async fn labelled_samples(endpoint: &str, name: &str, labels: &[&str]) -> u64 {
+    common::metrics_text(endpoint)
+        .await
+        .lines()
+        .filter(|l| !l.starts_with('#') && l.starts_with(name))
+        .filter(|l| labels.iter().all(|label| l.contains(label)))
+        .filter_map(|l| l.rsplit_once(' ')?.1.trim().parse::<f64>().ok())
+        .sum::<f64>() as u64
+}
+
+/// How many S3 operations of kind `operation` the proxy sent to its
+/// backends so far (the request-duration histogram counts each one).
+async fn backend_operations(endpoint: &str, operation: &str) -> u64 {
+    labelled_samples(
+        endpoint,
+        "deltaglider_backend_request_duration_seconds_count",
+        &[&format!("operation=\"{operation}\"")],
+    )
+    .await
+}
+
+/// F29: a server-side copy above the CopyObject limit is a multipart copy
+/// (CreateMultipartUpload, UploadPartCopy per part, Complete). The 5 GiB
+/// limit and the 512 MiB part are constants in production; the test seams
+/// `DGP_TEST_COPY_OBJECT_MAX_BYTES` and `DGP_TEST_COPY_PART_BYTES` (floor
+/// 5 MiB) bring them down to a 12 MiB object, which copies as 3 parts. The
+/// UploadPartCopy count proves the branch ran (the bytes alone do not: a
+/// plain CopyObject copies them too), and the control with the production
+/// limit proves the count is the branch's and not the setup's.
+#[tokio::test]
+async fn a_copy_above_the_copy_object_limit_is_a_multipart_server_copy() {
+    skip_unless_minio!();
+    let seamed = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .env("DGP_TEST_COPY_OBJECT_MAX_BYTES", "5242880")
+        .env("DGP_TEST_COPY_PART_BYTES", "5242880")
+        .build()
+        .await;
+    let plain = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .build()
+        .await;
+    let body = common::big_passthrough_body(12 * 1024 * 1024);
+    let prefix = unique_prefix();
+
+    let mut counts = Vec::new();
+    for (name, server) in [("seamed", &seamed), ("plain", &plain)] {
+        let client = server.s3_client().await;
+        let (src, dst) = (
+            format!("{prefix}/{name}/src.dat"),
+            format!("{prefix}/{name}/dst.dat"),
+        );
+        client
+            .put_object()
+            .bucket(server.bucket())
+            .key(&src)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+            .unwrap();
+        let (parts, copies) = (
+            backend_operations(&server.endpoint(), "UploadPartCopy").await,
+            backend_operations(&server.endpoint(), "CopyObject").await,
+        );
+        client
+            .copy_object()
+            .bucket(server.bucket())
+            .key(&dst)
+            .copy_source(format!("{}/{src}", server.bucket()))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{name}: the copy must succeed: {e:?}"));
+        counts.push((
+            backend_operations(&server.endpoint(), "UploadPartCopy").await - parts,
+            backend_operations(&server.endpoint(), "CopyObject").await - copies,
+        ));
+        let got = client
+            .get_object()
+            .bucket(server.bucket())
+            .key(&dst)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(got.content_length(), Some(body.len() as i64), "{name}");
+        let got = got.body.collect().await.unwrap().into_bytes();
+        assert!(got.as_ref() == body.as_slice(), "{name}: the bytes differ");
+    }
+    // (UploadPartCopy requests, CopyObject requests)
+    assert_eq!(
+        counts[0],
+        (3, 0),
+        "12 MiB at 5 MiB a part is 3 UploadPartCopy requests and no CopyObject"
+    );
+    assert_eq!(
+        counts[1],
+        (0, 1),
+        "under the production limit the copy is one CopyObject"
+    );
+}

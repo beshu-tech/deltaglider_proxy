@@ -77,6 +77,28 @@ pub struct TestSeams {
     /// (delayed) probe too, so a test sees the window before the first
     /// verdict.
     pub atomicity_probe_delay_ms: u64,
+    /// `DGP_TEST_COPY_OBJECT_MAX_BYTES` (5 MiB to 5 GiB): the size above which
+    /// an S3 server-side copy is a multipart copy of UploadPartCopy
+    /// requests instead of one CopyObject (production: 5 GiB, S3's limit),
+    /// so a test of a few MiB runs that path on MinIO.
+    pub copy_object_max_bytes: Option<u64>,
+    /// `DGP_TEST_COPY_PART_BYTES` (5 MiB, S3's smallest part, to 5 GiB, its
+    /// largest): the part size of a multipart server-side copy (production:
+    /// 512 MiB).
+    pub copy_part_bytes: Option<u64>,
+}
+
+/// S3's smallest part: the floor of the two copy seams, so a seam never
+/// makes a copy that a real S3 would refuse.
+pub const COPY_SEAM_FLOOR_BYTES: u64 = 5 * 1024 * 1024;
+
+/// S3's limit of a CopyObject source and of a part: the ceiling of the two
+/// copy seams. A value above it is ignored (the seam stays off).
+pub const COPY_SEAM_CEILING_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Pure: a copy seam value, if it lies within what a real S3 accepts.
+fn copy_seam_bytes(v: Option<u64>) -> Option<u64> {
+    v.filter(|n| (COPY_SEAM_FLOOR_BYTES..=COPY_SEAM_CEILING_BYTES).contains(n))
 }
 
 /// Where the re-encrypt job's rewrite stalls (`DGP_TEST_REWRITE_STALL`).
@@ -163,9 +185,41 @@ impl TestSeams {
             keep_write_gate: lookup_parse(env, "DGP_TEST_KEEP_WRITE_GATE").unwrap_or(false),
             atomicity_probe_delay_ms: lookup_parse(env, "DGP_TEST_ATOMICITY_PROBE_DELAY_MS")
                 .unwrap_or(0),
+            copy_object_max_bytes: copy_seam_bytes(lookup_parse(
+                env,
+                "DGP_TEST_COPY_OBJECT_MAX_BYTES",
+            )),
+            copy_part_bytes: copy_seam_bytes(lookup_parse(env, "DGP_TEST_COPY_PART_BYTES")),
         }
     }
 }
+
+/// Every `DGP_TEST_*` variable that [`TestSeams::from_env`] reads. The
+/// startup warning for an exported seam lists these; the unit test
+/// `the_warning_list_names_every_seam_that_from_env_reads` keeps the list
+/// and the parser in step.
+pub const SEAM_ENV_VARS: &[&str] = &[
+    "DGP_TEST_COMPLETE_STALL_MS",
+    "DGP_TEST_FAIL_PART_ONCE",
+    "DGP_TEST_PART_BARRIER",
+    "DGP_TEST_PART_DELAY_MS",
+    "DGP_TEST_OBJECT_BARRIER",
+    "DGP_TEST_OBJECT_DELAY_MS",
+    "DGP_TEST_COPY_STALL_MS",
+    "DGP_TEST_MAINTENANCE_OBJECT_STALL_MS",
+    "DGP_TEST_LIFECYCLE_OBJECT_STALL_MS",
+    "DGP_TEST_READ_OTHER_FORM_STALL_MS",
+    "DGP_TEST_MAX_JOB_PAGES",
+    "DGP_TEST_FORCE_NONCAS_BACKEND",
+    "DGP_TEST_FORCE_NONCAS_WHILE_FILE",
+    "DGP_TEST_CONVERSION_GRACE_SECS",
+    "DGP_TEST_CONVERSION_WINDOW_SECS",
+    "DGP_TEST_REWRITE_STALL",
+    "DGP_TEST_KEEP_WRITE_GATE",
+    "DGP_TEST_ATOMICITY_PROBE_DELAY_MS",
+    "DGP_TEST_COPY_OBJECT_MAX_BYTES",
+    "DGP_TEST_COPY_PART_BYTES",
+];
 
 /// The seams of this process: parsed from the environment on first use in a
 /// debug build, all off in a release build.
@@ -193,6 +247,36 @@ mod tests {
         })
     }
 
+    /// The class guard: a seam that `from_env` reads but the startup warning
+    /// does not list would run silently in a debug build, and a name in the
+    /// list that nothing reads would be stale. The lookup answers `1` to
+    /// every name, so every conditional read (`DGP_TEST_PART_DELAY_MS` only
+    /// after its barrier flag) happens.
+    #[test]
+    fn the_warning_list_names_every_seam_that_from_env_reads() {
+        let asked = std::cell::RefCell::new(BTreeSet::new());
+        let _ = TestSeams::from_env(&|n: &str| {
+            asked.borrow_mut().insert(n.to_string());
+            Some("1".to_string())
+        });
+        let asked: BTreeSet<String> = asked
+            .into_inner()
+            .into_iter()
+            .filter(|n| n.starts_with("DGP_TEST_"))
+            .collect();
+        let listed: BTreeSet<String> = SEAM_ENV_VARS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            asked.difference(&listed).collect::<Vec<_>>(),
+            Vec::<&String>::new(),
+            "read by TestSeams::from_env, missing from SEAM_ENV_VARS"
+        );
+        assert_eq!(
+            listed.difference(&asked).collect::<Vec<_>>(),
+            Vec::<&String>::new(),
+            "in SEAM_ENV_VARS, read by nothing"
+        );
+    }
+
     #[test]
     fn unset_means_off() {
         assert_eq!(from(&[]), TestSeams::default());
@@ -215,7 +299,11 @@ mod tests {
             ("DGP_TEST_CONVERSION_GRACE_SECS", "0"),
             ("DGP_TEST_CONVERSION_WINDOW_SECS", "30"),
             ("DGP_TEST_REWRITE_STALL", "before-lock:3000"),
+            ("DGP_TEST_COPY_OBJECT_MAX_BYTES", "5242880"),
+            ("DGP_TEST_COPY_PART_BYTES", "6291456"),
         ]);
+        assert_eq!(t.copy_object_max_bytes, Some(5 * 1024 * 1024));
+        assert_eq!(t.copy_part_bytes, Some(6 * 1024 * 1024));
         assert_eq!(
             t.rewrite_stall_at(RewriteStall::BeforeLock).map(|s| s.ms),
             Some(3000)
@@ -264,7 +352,33 @@ mod tests {
             ("DGP_TEST_MAX_JOB_PAGES", "0"),
             ("DGP_TEST_CONVERSION_GRACE_SECS", "-1"),
             ("DGP_TEST_CONVERSION_WINDOW_SECS", "0"),
+            // Under the 5 MiB floor: S3 would refuse such a part.
+            ("DGP_TEST_COPY_OBJECT_MAX_BYTES", "5242879"),
+            ("DGP_TEST_COPY_PART_BYTES", "1024"),
         ]);
         assert_eq!(t, TestSeams::default());
+    }
+
+    #[test]
+    fn the_copy_seams_stay_between_the_s3_floor_and_ceiling() {
+        let mib5 = COPY_SEAM_FLOOR_BYTES;
+        let gib5 = COPY_SEAM_CEILING_BYTES;
+        assert_eq!(copy_seam_bytes(Some(mib5 - 1)), None);
+        assert_eq!(copy_seam_bytes(Some(mib5)), Some(mib5));
+        assert_eq!(copy_seam_bytes(Some(gib5)), Some(gib5));
+        assert_eq!(copy_seam_bytes(Some(gib5 + 1)), None);
+        assert_eq!(copy_seam_bytes(None), None);
+        // Through the parser, for both variables.
+        let over = from(&[
+            ("DGP_TEST_COPY_OBJECT_MAX_BYTES", "5368709121"),
+            ("DGP_TEST_COPY_PART_BYTES", "5368709121"),
+        ]);
+        assert_eq!(over, TestSeams::default());
+        let top = from(&[
+            ("DGP_TEST_COPY_OBJECT_MAX_BYTES", "5368709120"),
+            ("DGP_TEST_COPY_PART_BYTES", "5368709120"),
+        ]);
+        assert_eq!(top.copy_object_max_bytes, Some(gib5));
+        assert_eq!(top.copy_part_bytes, Some(gib5));
     }
 }
