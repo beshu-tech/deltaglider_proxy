@@ -110,6 +110,8 @@ pub(crate) struct Binding {
     pub name: String,
     /// Every macro in the initialiser, as `(name, tokens text)`.
     pub init_macros: Vec<(String, String)>,
+    /// Every path call in the initialiser (`HeaderMap::new`).
+    pub init_calls: Vec<String>,
     /// Position of the call at the root of `init`'s method chain.
     pub init_root_pos: Option<Pos>,
 }
@@ -603,6 +605,7 @@ impl Collector {
             func,
             name,
             init_macros: macros_in(init),
+            init_calls: calls_in(init),
             init_root_pos: Self::root_pos(init),
         });
     }
