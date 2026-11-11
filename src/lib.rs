@@ -68,6 +68,9 @@ mod test_root;
 pub(crate) mod source_scan {
     use std::path::{Path, PathBuf};
 
+    /// The `syn` view of the sources (`src/source_scan/ast.rs`).
+    pub(crate) mod ast;
+
     /// The crate root (`CARGO_MANIFEST_DIR`).
     pub(crate) fn root() -> &'static Path {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1218,32 +1221,71 @@ mod source_guards {
     /// runs in its own process and has no metrics endpoint.
     #[test]
     fn every_server_head_request_is_counted() {
-        let files = rust_files("src");
         let mut offenders = Vec::new();
-        for file in files {
-            let rel = rel_path(&file);
-            if rel.starts_with("src/cli/") || rel == "src/lib.rs" {
+        for src in crate::source_scan::ast::prod() {
+            // The CLI runs in its own process: no metrics endpoint.
+            if src.rel.starts_with("src/cli/") {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap();
-            let lines: Vec<&str> = text.lines().collect();
-            for (n, line) in lines.iter().enumerate() {
-                if !line.contains(".head_object()") || line.trim_start().starts_with("//") {
-                    continue;
-                }
-                let window = &lines[n.saturating_sub(8)..n];
-                if !window
-                    .iter()
-                    .any(|l| l.contains("BACKEND_HEAD_REQUESTS.inc()"))
-                {
-                    offenders.push(format!("{rel}:{}", n + 1));
-                }
-            }
+            offenders.extend(
+                uncounted_heads(src)
+                    .into_iter()
+                    .map(|n| format!("{}:{n}", src.rel)),
+            );
         }
         assert!(
             offenders.is_empty(),
             "increment BACKEND_HEAD_REQUESTS right before each head_object():\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// Lines of the `.head_object()` calls of `src` with no
+    /// `BACKEND_HEAD_REQUESTS.inc()` in the SAME fn, 0-8 lines above. (The
+    /// old scan took any `inc()` text 8 lines above, even one in the fn
+    /// that ends there.)
+    fn uncounted_heads(src: &crate::source_scan::ast::Source) -> Vec<usize> {
+        let f = &src.facts;
+        f.calls
+            .iter()
+            .filter(|c| c.method && c.name == "head_object" && c.argc == 0)
+            .filter(|h| {
+                !f.calls.iter().any(|i| {
+                    i.method
+                        && i.name == "inc"
+                        && i.root_ident.as_deref() == Some("BACKEND_HEAD_REQUESTS")
+                        && i.func == h.func
+                        && i.line <= h.line
+                        && h.line - i.line <= 8
+                })
+            })
+            .map(|h| h.line)
+            .collect()
+    }
+
+    #[test]
+    fn the_head_counter_guard_needs_the_increment_in_the_same_fn() {
+        use crate::source_scan::ast::{parse, Scope};
+        let n = |t: &str| uncounted_heads(&parse("f.rs", t, Scope::Prod)).len();
+        assert_eq!(
+            n("fn a() { BACKEND_HEAD_REQUESTS.inc(); c.head_object().send(); }"),
+            0
+        );
+        // An increment in the fn above (within 8 lines) counted for this one.
+        assert_eq!(
+            n("fn a() { BACKEND_HEAD_REQUESTS.inc(); }\nfn b() { c.head_object().send(); }"),
+            1
+        );
+        // An increment that is more than 8 lines up.
+        let far = format!(
+            "fn a() {{ BACKEND_HEAD_REQUESTS.inc();{}c.head_object(); }}",
+            "\n".repeat(10)
+        );
+        assert_eq!(n(&far), 1);
+        // A commented increment.
+        assert_eq!(
+            n("fn a() { // BACKEND_HEAD_REQUESTS.inc()\n c.head_object(); }"),
+            1
         );
     }
 
@@ -1255,33 +1297,81 @@ mod source_guards {
     #[test]
     fn every_s3_get_body_is_read_through_the_resuming_stream() {
         let mut offenders = Vec::new();
-        for file in rust_files("src/storage") {
-            let rel = rel_path(&file);
-            if rel == "src/storage/s3/body.rs"
-                || rel == "src/storage/fake_s3.rs"
-                || rel.ends_with("/tests.rs")
+        for src in crate::source_scan::ast::prod() {
+            // body.rs IS the resuming stream. The coordination plane (leases,
+            // locks, the config DB sync, the CAS probes) has its own client
+            // and reads small blobs, where a broken read fails the attempt
+            // on purpose.
+            if src.rel == "src/storage/s3/body.rs"
+                || src.rel == "src/storage/fake_s3.rs"
+                || src.rel.starts_with("src/coordination/")
+                || src.rel == "src/config_db_sync.rs"
             {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap();
-            for (n, line) in text.lines().enumerate() {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                let field_read = line.match_indices(".body").any(|(i, m)| {
-                    let next = line[i + m.len()..].chars().next();
-                    !next.is_some_and(|c| c == '(' || c == '_' || c.is_alphanumeric())
-                });
-                if field_read {
-                    offenders.push(format!("{rel}:{}", n + 1));
-                }
-            }
+            offenders.extend(
+                sdk_body_reads(src)
+                    .into_iter()
+                    .map(|n| format!("{}:{n}", src.rel)),
+            );
         }
         assert!(
             offenders.is_empty(),
             "read a GET response body with S3Backend::body_stream or collect_body:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// Lines where `src` reads the `body` of an S3 SDK response: a `.body`
+    /// field read or a `GetObjectOutput { body, .. }` pattern. In scope: every
+    /// file under `src/storage/` and every file that names `aws_sdk_s3`
+    /// (the old scan listed only `src/storage`, so a new file elsewhere that
+    /// used the SDK escaped). `.body(..)` is the request builder of a PUT: a
+    /// call, not a field.
+    fn sdk_body_reads(src: &crate::source_scan::ast::Source) -> Vec<usize> {
+        if !(src.rel.starts_with("src/storage/") || src.mentions("aws_sdk_s3")) {
+            return Vec::new();
+        }
+        let f = &src.facts;
+        let mut out: Vec<usize> = f
+            .fields
+            .iter()
+            .filter(|x| x.name == "body")
+            .map(|x| x.line)
+            .collect();
+        out.extend(
+            f.pat_fields
+                .iter()
+                .filter(|p| p.field == "body" && p.path_last.ends_with("Output"))
+                .map(|p| p.line),
+        );
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn the_s3_body_guard_sees_a_destructuring_and_a_file_outside_storage() {
+        use crate::source_scan::ast::{parse, Scope};
+        let n = |rel: &str, t: &str| sdk_body_reads(&parse(rel, t, Scope::Prod)).len();
+        assert_eq!(n("src/storage/x.rs", "fn f(o: O) { let b = o.body; }"), 1);
+        // A request builder, a method of the same name: not a read.
+        assert_eq!(
+            n("src/storage/x.rs", "fn f() { b.body(x); o.body_len(); }"),
+            0
+        );
+        // The destructuring form: no `.body` text anywhere.
+        assert_eq!(
+            n(
+                "src/storage/x.rs",
+                "fn f(o: O) { let GetObjectOutput { body, .. } = o; }"
+            ),
+            1
+        );
+        // A file outside `src/storage` that uses the SDK is in scope; one
+        // that does not is not (axum and s3s have bodies of their own).
+        let sdk = "use aws_sdk_s3::Client;\nfn f(o: O) { let b = o.body; }";
+        assert_eq!(n("src/cli/new.rs", sdk), 1);
+        assert_eq!(n("src/cli/new.rs", "fn f(o: O) { let b = o.body; }"), 0);
     }
 
     /// s3s replaces every header of an error response with the error's own
@@ -1385,20 +1475,13 @@ mod source_guards {
             "InvalidAccessKeyId",
             "SignatureDoesNotMatch",
         ];
-        let files = rust_files("src");
         let mut offenders = Vec::new();
-        for file in files {
-            let rel = rel_path(&file);
-            if ALLOWED.contains(&rel.as_str()) {
+        for src in crate::source_scan::ast::prod() {
+            if ALLOWED.contains(&src.rel.as_str()) {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap();
-            let lines: Vec<&str> = text.lines().collect();
-            for n in text_match_lines(&text, &TOKENS) {
-                let line = lines[n - 1];
-                if !line.contains("assert") && !line.contains("TOKENS") {
-                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
-                }
+            for (n, what) in text_matches(src, &TOKENS) {
+                offenders.push(format!("{}:{n}: {what}", src.rel));
             }
         }
         assert!(
@@ -1408,47 +1491,137 @@ mod source_guards {
         );
     }
 
-    /// 1-based lines where `text` tests a string against one of `tokens`:
-    /// `.contains("T")`, `.starts_with("T")`, `.ends_with("T")` or
-    /// `.eq_ignore_ascii_case("T")`, with a `&` or whitespace (a line break
-    /// included) around the literal. The old scan looked for the exact text
-    /// `.contains("T")` on one line, so rustfmt's line break after `(`, a
-    /// `&"T"` and `starts_with` all passed.
-    fn text_match_lines(text: &str, tokens: &[&str]) -> Vec<usize> {
-        let alt = tokens
-            .iter()
-            .map(|t| regex_lite::escape(t))
-            .collect::<Vec<_>>()
-            .join("|");
-        let re = regex_lite::Regex::new(&format!(
-            r#"\.(contains|starts_with|ends_with|eq_ignore_ascii_case)\(\s*&?\s*"({alt})"\s*,?\s*\)"#
-        ))
-        .unwrap();
-        re.find_iter(text)
-            .map(|m| text[..m.start()].matches('\n').count() + 1)
-            .collect()
+    /// `(line, what)` of every place `src` tests a string against a token
+    /// of `tokens`, outside an `assert!`:
+    /// - a text method (`contains`, `starts_with`, `find`, `strip_prefix`,
+    ///   `eq`, ...) with a literal that holds a token, wherever the literal
+    ///   sits in the arguments (`&"T"`, `["T", "U"]`, a line break);
+    /// - `text.to_string() == "T"` (and `to_lowercase`, ...): a comparison
+    ///   of rendered text. A comparison of a structured value (`code ==
+    ///   "NoSuchKey"` on `err.code()`) is not text and passes.
+    /// Words match as a case-insensitive substring (`<Code>NoSuchKey</Code>`),
+    /// status numbers exactly. The old scan looked for the exact text
+    /// `.contains("T")` on one line.
+    fn text_matches(
+        src: &crate::source_scan::ast::Source,
+        tokens: &[&str],
+    ) -> Vec<(usize, String)> {
+        const METHODS: [&str; 12] = [
+            "contains",
+            "starts_with",
+            "ends_with",
+            "eq_ignore_ascii_case",
+            "eq",
+            "ne",
+            "find",
+            "rfind",
+            "matches",
+            "strip_prefix",
+            "strip_suffix",
+            "split",
+        ];
+        const RENDERED: [&str; 5] = [
+            "to_string",
+            "to_lowercase",
+            "to_ascii_lowercase",
+            "to_uppercase",
+            "message",
+        ];
+        let hit = |lit: &str| {
+            tokens.iter().any(|t| {
+                if t.chars().all(|c| c.is_ascii_digit()) {
+                    lit == *t
+                } else {
+                    lit.to_ascii_lowercase().contains(&t.to_ascii_lowercase())
+                }
+            })
+        };
+        let mut out = Vec::new();
+        for c in &src.facts.calls {
+            if c.method && !c.in_assert && METHODS.contains(&c.name.as_str()) {
+                if let Some(l) = c.arg_strings.iter().find(|l| hit(l)) {
+                    out.push((c.line, format!(".{}(.. {l:?} ..)", c.name)));
+                }
+            }
+        }
+        for c in &src.facts.cmps {
+            if c.in_assert {
+                continue;
+            }
+            for (lit, other) in [(&c.lhs, &c.rhs), (&c.rhs, &c.lhs)] {
+                let rendered = other
+                    .method
+                    .as_deref()
+                    .is_some_and(|m| RENDERED.contains(&m));
+                if rendered {
+                    if let Some(l) = lit.strings.iter().find(|l| hit(l)) {
+                        out.push((c.line, format!("rendered text == {l:?}")));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     #[test]
-    fn the_text_match_guard_sees_split_and_prefix_forms() {
+    fn the_text_match_guard_sees_split_aliased_and_rendered_forms() {
+        use crate::source_scan::ast::{parse, Scope};
         let t = ["NoSuch", "Key"].concat();
-        let tokens = [t.as_str()];
-        let one = format!("if e.contains(\"{t}\") {{}}");
-        assert_eq!(text_match_lines(&one, &tokens), vec![1]);
+        let tokens = [t.as_str(), "404"];
+        let lines = |body: &str| -> Vec<usize> {
+            let src = parse("f.rs", &format!("fn f() {{\n{body}\n}}"), Scope::Prod);
+            text_matches(&src, &tokens)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        };
+        assert_eq!(lines(&format!("if e.contains(\"{t}\") {{}}")), [2]);
         // rustfmt breaks a long condition after the `(`.
-        let split = format!("x\nif message\n    .contains(\n        \"{t}\",\n    )\n{{}}");
-        assert_eq!(text_match_lines(&split, &tokens), vec![3]);
-        for method in ["starts_with", "ends_with", "eq_ignore_ascii_case"] {
-            let src = format!("if m.{method}(\"{t}\") {{}}");
-            assert_eq!(text_match_lines(&src, &tokens), vec![1], "{method}");
-        }
         assert_eq!(
-            text_match_lines(&format!("m.contains(&\"{t}\")"), &tokens),
-            vec![1]
+            lines(&format!(
+                "if message\n    .contains(\n        \"{t}\",\n    )\n{{}}"
+            )),
+            [3]
         );
-        // Not a hit: another literal, or a bare mention.
-        assert!(text_match_lines("m.contains(\"other\")", &tokens).is_empty());
-        assert!(text_match_lines(&format!("let k = \"{t}\";"), &tokens).is_empty());
+        for method in [
+            "starts_with",
+            "ends_with",
+            "eq_ignore_ascii_case",
+            "find",
+            "strip_prefix",
+        ] {
+            assert_eq!(
+                lines(&format!("if m.{method}(\"{t}\") {{}}")),
+                [2],
+                "{method}"
+            );
+        }
+        assert_eq!(lines(&format!("m.contains(&\"{t}\");")), [2]);
+        // Bypasses of the old one-line text scan.
+        // 1. an assert on the same line exempted the whole line;
+        assert_eq!(
+            lines(&format!(
+                "if e.contains(\"{t}\") {{ debug_assert!(true); }}"
+            )),
+            [2]
+        );
+        // 2. a literal inside a pattern list or a longer string;
+        assert_eq!(
+            lines(&format!("e.contains([\"x\", \"{t}\"].as_ref());")),
+            [2]
+        );
+        assert_eq!(lines(&format!("e.contains(\"<Code>{t}</Code>\");")), [2]);
+        // 3. rendered text compared with `==`.
+        assert_eq!(lines(&format!("if e.to_string() == \"{t}\" {{}}")), [2]);
+        assert_eq!(lines("if \"404\" != e.to_string() {}"), [2]);
+        // Not a hit: another literal, a bare mention, a structured compare,
+        // a status number inside a longer literal, an assert.
+        assert!(lines("m.contains(\"other\");").is_empty());
+        assert!(lines(&format!("let k = \"{t}\";")).is_empty());
+        assert!(lines(&format!("if code == \"{t}\" {{}}")).is_empty());
+        assert!(lines("m.contains(\"4040\");").is_empty());
+        assert!(lines(&format!("assert!(m.contains(\"{t}\"));")).is_empty());
     }
 
     /// A request handler audits with the request's headers, so the entry
@@ -1590,13 +1763,12 @@ mod source_guards {
     /// `.current_dir(` (a `git` command) paid for a spawn that had none.
     #[test]
     fn integration_test_spawns_set_current_dir() {
-        let files = rust_files("tests");
+        let files = crate::source_scan::ast::all("tests");
         assert!(files.len() > 50, "scan found tests/ ({})", files.len());
         let mut offenders = Vec::new();
-        for file in files {
-            let text = std::fs::read_to_string(&file).unwrap();
-            for n in spawns_without_cwd(&text) {
-                offenders.push(format!("{}:{n}", rel_path(&file)));
+        for src in files {
+            for n in spawns_without_cwd(src) {
+                offenders.push(format!("{}:{n}", src.rel));
             }
         }
         assert!(
@@ -1613,21 +1785,17 @@ mod source_guards {
     #[test]
     fn only_startup_persists_the_node_id() {
         const ALLOWED: [&str; 2] = ["src/startup.rs", "src/coordination/mod.rs"];
-        let needle = ["durable_node", "_id("].concat();
-        let src = rust_files("src");
-        let test_files = out_of_line_test_modules(&src);
+        let name = ["durable_node", "_id"].concat();
         let mut offenders = Vec::new();
-        for file in src {
-            let rel = rel_path(&file);
-            if ALLOWED.contains(&rel.as_str()) || test_files.contains(&file) {
+        for src in crate::source_scan::ast::prod() {
+            if ALLOWED.contains(&src.rel.as_str()) {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap();
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                if line.contains(needle.as_str()) {
-                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
-                }
-            }
+            offenders.extend(
+                names_path_leaf(src, &name)
+                    .into_iter()
+                    .map(|n| format!("{}:{n}", src.rel)),
+            );
         }
         assert!(
             offenders.is_empty(),
@@ -1636,69 +1804,147 @@ mod source_guards {
         );
     }
 
-    /// 1-based lines of the proxy spawns in `text` that set no `.current_dir(`
-    /// before the next spawn or the end of the enclosing function. A spawn
-    /// is `Command::new(env!("CARGO_BIN_EXE_...` or `Command::new(BIN)`.
-    fn spawns_without_cwd(text: &str) -> Vec<usize> {
-        // Built at runtime so this file does not match itself.
-        let bin_needle = format!("Command::new(env!(\"{}", "CARGO_BIN_EXE");
-        let lines: Vec<&str> = text.lines().collect();
-        let is_spawn = |l: &str| l.contains(bin_needle.as_str()) || l.contains("Command::new(BIN)");
-        let is_fn_start = |l: &str| {
-            let t = l.trim_start();
-            t.starts_with("fn ")
-                || t.starts_with("async fn ")
-                || t.starts_with("pub fn ")
-                || t.starts_with("pub async fn ")
-        };
-        let mut out = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if !is_spawn(line) {
-                continue;
-            }
-            let end = lines[i + 1..]
-                .iter()
-                .position(|l| is_spawn(l) || is_fn_start(l))
-                .map_or(lines.len(), |p| i + 1 + p);
-            if !lines[i..end].iter().any(|l| l.contains(".current_dir(")) {
-                out.push(i + 1);
-            }
-        }
+    /// Lines where `src` names `leaf` as the last segment of any path: a
+    /// call, a `use`, an `as` alias, a function pointer, a `<T as Tr>::leaf`.
+    /// The old scan looked for the text `leaf(` on one line.
+    fn names_path_leaf(src: &crate::source_scan::ast::Source, leaf: &str) -> Vec<usize> {
+        let mut out: Vec<usize> = src
+            .facts
+            .paths
+            .iter()
+            .filter(|p| p.segs.last().is_some_and(|s| s == leaf))
+            .map(|p| p.line)
+            .collect();
+        out.sort();
+        out.dedup();
         out
     }
 
     #[test]
-    fn the_cwd_guard_checks_each_spawn() {
-        let spawn = |extra: &str| {
-            format!(
-                "Command::new(env!(\"{}_deltaglider_proxy\"))\n{extra}.spawn()",
-                "CARGO_BIN_EXE"
-            )
-        };
-        // One spawn with a cwd: fine.
-        let ok = format!("fn a() {{\n{}\n}}\n", spawn(".current_dir(tmp)\n"));
-        assert!(spawns_without_cwd(&ok).is_empty());
-        // Two spawns, one `.current_dir(` in the FILE (on a git command in
-        // another function): the second spawn has none. The count-based
-        // guard passed this.
-        let bad = format!(
-            "fn a() {{\n{}\n}}\nfn git() {{\nCommand::new(\"git\").current_dir(x);\n}}\nfn b() {{\n{}\n}}\n",
-            spawn(".current_dir(tmp)\n"),
-            spawn("")
-        );
-        assert_eq!(spawns_without_cwd(&bad).len(), 1);
-        // Two spawns in ONE function, a cwd on the first only.
-        let two = format!(
-            "fn a() {{\n{}\n{}\n}}\n",
-            spawn(".current_dir(tmp)\n"),
-            spawn("")
-        );
-        assert_eq!(spawns_without_cwd(&two).len(), 1);
-        // The `BIN` form.
+    fn the_leaf_guard_sees_aliases_and_pointers() {
+        use crate::source_scan::ast::{parse, Scope};
+        let n = |t: &str| names_path_leaf(&parse("f.rs", t, Scope::Prod), "durable").len();
+        assert_eq!(n("fn f() { a::durable(x); }"), 1);
+        assert_eq!(n("fn f() { a::\ndurable\n(x); }"), 1, "split over lines");
         assert_eq!(
-            spawns_without_cwd("fn a() {\nCommand::new(BIN).arg(\"x\");\n}").len(),
-            1
+            n("use a::durable as d;\nfn f() { d(x); }"),
+            1,
+            "alias: the use names it"
         );
+        assert_eq!(n("fn f() { let g = a::durable; }"), 1, "function pointer");
+        assert_eq!(n("fn f() { // a::durable(x)\n let s = \"durable(\"; }"), 0);
+    }
+
+    /// 1-based lines of the proxy spawns in `src` whose builder never gets a
+    /// `.current_dir(..)`. A spawn is a `X::new(arg)` where `arg` is
+    /// `env!("CARGO_BIN_EXE_..")` or a `const`/`let` bound to it, whatever
+    /// `X` is called (`use std::process::Command as C` still counts). The cwd
+    /// is set on the builder chain (`Command::new(B).current_dir(d)`) or on
+    /// the variable the chain was bound to (`let mut c = Command::new(B);
+    /// c.current_dir(d)`) in the same fn.
+    fn spawns_without_cwd(src: &crate::source_scan::ast::Source) -> Vec<usize> {
+        let f = &src.facts;
+        let is_bin = |ms: &[(String, String)]| {
+            ms.iter()
+                .any(|(n, t)| (n == "env" || n == "option_env") && t.contains("CARGO_BIN_EXE_"))
+        };
+        let bin_names: std::collections::HashSet<&str> = f
+            .bindings
+            .iter()
+            .filter(|b| is_bin(&b.init_macros))
+            .map(|b| b.name.as_str())
+            .collect();
+        let is_spawn = |c: &crate::source_scan::ast::Call| {
+            !c.method
+                && c.segs.len() >= 2
+                && c.segs.last().is_some_and(|s| s == "new")
+                && (is_bin(&c.arg_macros)
+                    || c.arg_idents
+                        .first()
+                        .and_then(|i| i.as_deref())
+                        .is_some_and(|i| bin_names.contains(i)))
+        };
+        let has_cwd = |spawn: &crate::source_scan::ast::Call| {
+            let bound: Vec<&str> = f
+                .bindings
+                .iter()
+                .filter(|b| b.init_root_pos == Some(spawn.pos) && b.func == spawn.func)
+                .map(|b| b.name.as_str())
+                .collect();
+            f.calls.iter().any(|c| {
+                c.method
+                    && c.name == "current_dir"
+                    && (c.root_pos == Some(spawn.pos)
+                        || (c.func == spawn.func
+                            && c.root_ident.as_deref().is_some_and(|r| bound.contains(&r))))
+            })
+        };
+        f.calls
+            .iter()
+            .filter(|c| is_spawn(c) && !has_cwd(c))
+            .map(|c| c.line)
+            .collect()
+    }
+
+    #[test]
+    fn the_cwd_guard_checks_each_spawn() {
+        use crate::source_scan::ast::{parse, Scope};
+        let bad = |text: &str| spawns_without_cwd(&parse("fixture.rs", text, Scope::All)).len();
+        let bin = ["CARGO_BIN", "_EXE_deltaglider_proxy"].concat();
+        let spawn = |extra: &str| format!("Command::new(env!(\"{bin}\"))\n{extra}.spawn();");
+        // One spawn with a cwd: fine.
+        assert_eq!(
+            bad(&format!("fn a() {{ {} }}", spawn(".current_dir(tmp)\n"))),
+            0
+        );
+        // Two spawns, one `.current_dir(` in the FILE (on a git command in
+        // another function): the second spawn has none.
+        let two_fns = format!(
+            "fn a() {{ {} }}\nfn git() {{ Command::new(\"git\").current_dir(x); }}\nfn b() {{ {} }}",
+            spawn(".current_dir(tmp)\n"),
+            spawn("")
+        );
+        assert_eq!(bad(&two_fns), 1);
+        // Two spawns in ONE function, a cwd on the first only.
+        let one_fn = format!(
+            "fn a() {{ {} {} }}",
+            spawn(".current_dir(tmp)\n"),
+            spawn("")
+        );
+        assert_eq!(bad(&one_fn), 1);
+        // The `BIN` const form.
+        let konst = format!(
+            "const BIN: &str = env!(\"{bin}\");\nfn a() {{ Command::new(BIN).arg(\"x\"); }}"
+        );
+        assert_eq!(bad(&konst), 1);
+        // Bypasses of the old text guard (a window of lines holding the text
+        // `.current_dir(`):
+        // 1. an alias of the command type;
+        let alias = format!(
+            "use std::process::Command as C;\nfn a() {{ C::new(env!(\"{bin}\")).spawn(); }}"
+        );
+        assert_eq!(bad(&alias), 1, "alias");
+        // 2. a `.current_dir(` on ANOTHER command within the same fn;
+        let other = format!(
+            "fn a() {{ let mut g = Command::new(\"git\"); g.current_dir(x); {} }}",
+            spawn("")
+        );
+        assert_eq!(bad(&other), 1, "other command's cwd");
+        // 3. the text in a comment or a string.
+        let text = format!(
+            "fn a() {{ // .current_dir(\nlet _s = \".current_dir(\"; {} }}",
+            spawn("")
+        );
+        assert_eq!(bad(&text), 1, "comment/string");
+        // The cwd set through a variable, and in a split chain, both count.
+        let var = format!(
+            "fn a() {{ let mut c = Command::new(env!(\"{bin}\")); c.arg(1); c.current_dir(d); c.spawn(); }}"
+        );
+        assert_eq!(bad(&var), 0, "cwd on the bound variable");
+        let split = format!(
+            "fn a() {{ let c = Command::new(env!(\"{bin}\"))\n    .arg(1)\n    .current_dir(d); }}"
+        );
+        assert_eq!(bad(&split), 0, "cwd on a split chain");
     }
 
     /// Conversion marker P1: `FileMetadata::stored_last_modified` is the
@@ -2253,15 +2499,9 @@ mod source_guards {
     #[test]
     fn requests_share_principals_never_build_them() {
         let mut bad = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                let builds = (line.contains("AuthenticatedUser::from(")
-                    && file != "src/iam/mod.rs")
-                    || (line.contains("AuthenticatedUser::bootstrap(")
-                        && file != "src/iam/types.rs");
-                if builds {
-                    bad.push(format!("{file}:{n}: {}", line.trim()));
-                }
+        for src in crate::source_scan::ast::prod() {
+            for (n, what) in principal_builds(src) {
+                bad.push(format!("{}:{n}: {what}", src.rel));
             }
         }
         assert!(
@@ -2271,20 +2511,158 @@ mod source_guards {
         );
     }
 
+    /// `(line, what)` of the builds of an `AuthenticatedUser` in `src`
+    /// outside their one home: `AuthenticatedUser::from(..)` (home
+    /// `src/iam/mod.rs`) and `::bootstrap(..)` (home `src/iam/types.rs`).
+    /// A path call under any name the type was imported as (`use .. as AU`),
+    /// split over lines, or as `<AuthenticatedUser as From<_>>::from`, counts;
+    /// the old scan took the text `AuthenticatedUser::from(` on one line.
+    fn principal_builds(src: &crate::source_scan::ast::Source) -> Vec<(usize, String)> {
+        let f = &src.facts;
+        let mut names = vec!["AuthenticatedUser".to_string()];
+        names.extend(
+            f.paths
+                .iter()
+                .filter(|p| p.segs.last().is_some_and(|s| s == "AuthenticatedUser"))
+                .filter_map(|p| p.alias.clone()),
+        );
+        let mut out = Vec::new();
+        for c in f.calls.iter().filter(|c| !c.method && c.segs.len() >= 2) {
+            let ty = &c.segs[c.segs.len() - 2];
+            let leaf = &c.segs[c.segs.len() - 1];
+            if !names.contains(ty) {
+                continue;
+            }
+            let home = match leaf.as_str() {
+                "from" => "src/iam/mod.rs",
+                "bootstrap" => "src/iam/types.rs",
+                _ => continue,
+            };
+            if src.rel != home {
+                out.push((c.line, format!("{ty}::{leaf}(..)")));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_principal_guard_sees_aliases_and_qualified_forms() {
+        use crate::source_scan::ast::{parse, Scope};
+        let n = |rel: &str, t: &str| principal_builds(&parse(rel, t, Scope::Prod)).len();
+        assert_eq!(n("src/x.rs", "fn f() { AuthenticatedUser::from(u); }"), 1);
+        assert_eq!(
+            n("src/iam/mod.rs", "fn f() { AuthenticatedUser::from(u); }"),
+            0
+        );
+        assert_eq!(
+            n(
+                "src/iam/mod.rs",
+                "fn f() { AuthenticatedUser::bootstrap(k); }"
+            ),
+            1
+        );
+        // Bypasses of the old one-line text scan: a line break, an alias,
+        // the qualified-trait form, a full path.
+        assert_eq!(
+            n("src/x.rs", "fn f() { AuthenticatedUser\n    ::from(u); }"),
+            1
+        );
+        assert_eq!(
+            n(
+                "src/x.rs",
+                "use crate::iam::AuthenticatedUser as AU;\nfn f() { AU::from(u); }"
+            ),
+            1
+        );
+        assert_eq!(
+            n(
+                "src/x.rs",
+                "fn f() { <AuthenticatedUser as From<IamUser>>::from(u); }"
+            ),
+            1
+        );
+        assert_eq!(
+            n(
+                "src/x.rs",
+                "fn f() { crate::iam::AuthenticatedUser::from(u); }"
+            ),
+            1
+        );
+        assert_eq!(
+            n("src/x.rs", "fn f() { // AuthenticatedUser::from(u)\n }"),
+            0
+        );
+    }
+
     /// Review B5: a permission's condition block is parsed in ONE place,
     /// `iam::permissions::parse_conditions`, which save-time validation and
     /// the policy build share; a second parser would drift from it.
     #[test]
     fn condition_blocks_are_parsed_by_the_one_rule() {
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            let prod = crate::source_scan::prod_text(&text);
-            let hits = prod.matches("ConditionBlock>(").count();
-            let allowed = usize::from(file == "src/iam/permissions.rs");
-            assert!(
-                hits <= allowed,
-                "{file} parses an iam-rs ConditionBlock outside parse_conditions"
-            );
+        let mut bad = Vec::new();
+        for src in crate::source_scan::ast::prod() {
+            for (n, func) in condition_block_parsers(src) {
+                if !(src.rel == "src/iam/permissions.rs" && func == "parse_conditions") {
+                    bad.push(format!("{}:{n} (in fn {func})", src.rel));
+                }
+            }
         }
+        assert!(
+            bad.is_empty(),
+            "parse an iam-rs ConditionBlock only in iam::permissions::parse_conditions:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// `(line, enclosing fn)` of every deserialisation into an iam-rs
+    /// `ConditionBlock` in `src`: a `from_value`/`from_str`/`from_slice`/
+    /// `from_reader`/`parse`/`deserialize` call that names the type in its
+    /// turbofish, or any such call in a fn that spells the type (a typed
+    /// `let`). The old scan counted the text `ConditionBlock>(` per file and
+    /// allowed one, so a second parser in `permissions.rs` or a typed `let`
+    /// elsewhere passed.
+    fn condition_block_parsers(src: &crate::source_scan::ast::Source) -> Vec<(usize, String)> {
+        const PARSE: [&str; 6] = [
+            "from_value",
+            "from_str",
+            "from_slice",
+            "from_reader",
+            "parse",
+            "deserialize",
+        ];
+        let f = &src.facts;
+        let spells = |func: usize| {
+            f.paths
+                .iter()
+                .any(|p| p.func == func && p.segs.last().is_some_and(|s| s == "ConditionBlock"))
+        };
+        f.calls
+            .iter()
+            .filter(|c| PARSE.contains(&c.segs.last().unwrap_or(&c.name).as_str()))
+            .filter(|c| c.generics.iter().any(|g| g == "ConditionBlock") || spells(c.func))
+            .map(|c| (c.line, f.fn_name(c.func).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_condition_block_guard_sees_a_second_parser() {
+        use crate::source_scan::ast::{parse, Scope};
+        let n = |t: &str| condition_block_parsers(&parse("f.rs", t, Scope::Prod)).len();
+        assert_eq!(
+            n("fn parse_conditions() { serde_json::from_value::<iam_rs::ConditionBlock>(v); }"),
+            1
+        );
+        // Bypasses of the text count: a typed `let` and a split turbofish.
+        assert_eq!(
+            n("fn other() { let b: ConditionBlock = serde_json::from_value(v).unwrap(); }"),
+            1
+        );
+        assert_eq!(
+            n("fn other() { serde_json::from_str::<\n    iam_rs::ConditionBlock,\n>(s); }"),
+            1
+        );
+        // The type named without a parse (an evaluation) is not a parser.
+        assert_eq!(n("fn eval(b: &ConditionBlock) { b.len(); }"), 0);
     }
 
     /// Review B2: a rate-limit success clears only the account whose

@@ -91,6 +91,12 @@ pub enum ExternalAuthError {
     #[error("ID token validation failed: {0}")]
     TokenValidationFailed(String),
 
+    /// The token names a signing key (`kid`) that the cached JWKS lacks: the
+    /// provider may have rotated its keys. One rediscovery can cure it.
+    /// Its own variant, so the retry never matches on message text.
+    #[error("ID token validation failed: Key '{0}' not found in JWKS")]
+    UnknownSigningKey(String),
+
     #[error("Email not verified by provider")]
     EmailNotVerified,
 

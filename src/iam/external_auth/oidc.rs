@@ -470,9 +470,7 @@ impl OidcProvider {
         // discovery-cache window (1h).
         let claims = match self.validate_id_token(&id_token_str, &jwks, pending) {
             Ok(c) => c,
-            Err(ExternalAuthError::TokenValidationFailed(msg))
-                if msg.contains("not found in JWKS") =>
-            {
+            Err(ExternalAuthError::UnknownSigningKey(_)) => {
                 tracing::info!("OIDC: kid not in cached JWKS — forcing rediscovery");
                 self.discover().await?;
                 let refreshed_jwks = {
@@ -646,9 +644,9 @@ impl OidcProvider {
         })?;
 
         // Find the matching key in JWKS
-        let jwk = jwks.find(kid).ok_or_else(|| {
-            ExternalAuthError::TokenValidationFailed(format!("Key '{}' not found in JWKS", kid))
-        })?;
+        let jwk = jwks
+            .find(kid)
+            .ok_or_else(|| ExternalAuthError::UnknownSigningKey(kid.clone()))?;
 
         let decoding_key = DecodingKey::from_jwk(jwk)
             .map_err(|e| ExternalAuthError::TokenValidationFailed(e.to_string()))?;

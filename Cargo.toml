@@ -217,6 +217,12 @@ ring = "0.17"
 # (tests/common/signed_http.rs). Already in the lockfile through aws-sdk-s3.
 aws-sigv4 = "1"
 http = "1"
+# Source guards (`src/source_scan/ast.rs`) parse the production sources, so a
+# guard sees calls, paths and literals, not text lines. Already in the build
+# graph through the derive macros; dev-only. `span-locations` gives the
+# line numbers of an AST node outside a proc macro.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [[bench]]
 name = "codec"
