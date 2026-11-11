@@ -150,6 +150,12 @@ pub const DB_KEY_SECRET_KEY: &str = "dbKey";
 /// one, a spool budget above it gets the pod evicted.
 pub const TMP_SIZE_LIMIT_MIB: u64 = 8192;
 
+/// The grace period of a proxy pod's stop, in seconds. A proxy stop takes
+/// up to 40 s (10 s each for requests, a maintenance job, the event outbox
+/// and `DGP_SHUTDOWN_TIMEOUT_SECS` of blocking work); the Kubernetes
+/// default of 30 s would kill it first. The Helm chart uses the same value.
+pub const TERMINATION_GRACE_SECS: i64 = 60;
+
 /// Pure: the `DGP_SPOOL_MAX_BYTES` for a `/tmp` of `limit_mib`: three
 /// quarters of it, so the spool never reaches the limit (the rest is for
 /// the other files in `/tmp`).
@@ -340,6 +346,7 @@ pub fn proxy_statefulset(cr: &DeltaGliderProxy, replicas: i32) -> Value {
                         "fsGroup": 999,
                     },
                     "automountServiceAccountToken": false,
+                    "terminationGracePeriodSeconds": TERMINATION_GRACE_SECS,
                     "containers": [{
                         "name": "proxy",
                         "image": cr.image(),
@@ -622,6 +629,23 @@ mod tests {
             .unwrap();
         assert!(spool > 0 && spool < limit_bytes, "{spool} vs {limit}");
         assert_eq!(spool_max_bytes_for_tmp(4), 3 * 1024 * 1024);
+    }
+
+    /// A proxy stop takes up to 40 s, so the pod's grace period is longer
+    /// than that (the Kubernetes default of 30 s would SIGKILL a drain).
+    #[test]
+    fn proxy_pods_get_a_grace_period_longer_than_a_stop() {
+        let cr = cr(1);
+        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr, 1)).unwrap();
+        let grace = sts
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .termination_grace_period_seconds;
+        assert_eq!(grace, Some(TERMINATION_GRACE_SECS));
+        const { assert!(TERMINATION_GRACE_SECS > 40) };
     }
 
     #[test]

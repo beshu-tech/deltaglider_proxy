@@ -17,7 +17,7 @@ For each `DeltaGliderProxy` resource, the operator creates and maintains:
 
 | Object | Purpose |
 |---|---|
-| StatefulSet `<name>` | The proxy pods. Each pod gets its own persistent volume for `/data`, which holds the encrypted config database and, if you use the filesystem backend, the stored objects. `/tmp` is an `emptyDir` with a size limit of 8 GiB; it holds the spool (`DGP_SPOOL_DIR`, default `/tmp/dgp-spool`), and the operator sets `DGP_SPOOL_MAX_BYTES` to 6 GiB, three quarters of that limit, so the spool never gets the pod evicted. |
+| StatefulSet `<name>` | The proxy pods. Each pod gets its own persistent volume for `/data`, which holds the encrypted config database and, if you use the filesystem backend, the stored objects. `/tmp` is an `emptyDir` with a size limit of 8 GiB; it holds the spool (`DGP_SPOOL_DIR`, default `/tmp/dgp-spool`), and the operator sets `DGP_SPOOL_MAX_BYTES` to 6 GiB, three quarters of that limit, so the spool never gets the pod evicted. The pods get `terminationGracePeriodSeconds: 60`, because a proxy stop takes up to 40 seconds. |
 | Service `<name>-pods` (headless) | Gives every pod a stable DNS name. The router builds its hash ring from these names. |
 | ConfigMap `<name>-config` | Your inline DeltaGlider YAML, mounted into every pod at `/data/deltaglider_proxy.yaml`. |
 | Deployment `<name>-router` | The HAProxy pods that route S3 traffic by consistent hashing on the URL path. |
