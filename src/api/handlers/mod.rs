@@ -55,6 +55,34 @@ pub use status::{
 // Re-export for use by metrics module
 pub(crate) use status::get_peak_rss_bytes;
 
+/// The slots of request work that runs on after its request is gone: a
+/// DeleteObjects batch and the store of a CompleteMultipartUpload run on a
+/// detached task, so a client disconnect or the request timeout cannot cut
+/// them in half. The task gave its request's slot of the global cap back
+/// when the request ended, so requests that timed out left more detached
+/// tasks running than the cap has slots (F56 of epic #143). The S3 router
+/// installs one per process, sized like the global cap
+/// (`max_concurrent_requests`); the request waits for a slot before it
+/// spawns (that wait counts against its deadline), and the task holds it
+/// to its end. Source guard `detached_request_work_holds_a_slot`.
+#[derive(Clone)]
+pub struct DetachedWork(Arc<tokio::sync::Semaphore>);
+
+impl DetachedWork {
+    pub fn new(slots: usize) -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(slots.max(1))))
+    }
+
+    /// A slot for one detached task of the request with `extensions`.
+    /// `None` without a router (unit tests call handlers directly).
+    pub(crate) async fn slot(
+        extensions: &axum::http::Extensions,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let work = extensions.get::<DetachedWork>()?;
+        work.0.clone().acquire_owned().await.ok()
+    }
+}
+
 /// Application state shared across handlers
 #[cfg(test)]
 impl AppState {
@@ -355,5 +383,81 @@ mod bucket_exists_tests {
             assert!(matches!(err, S3Error::NoSuchBucket(_)), "{err:?}");
         }
         assert_eq!(head_buckets(&fake, "nope"), 2);
+    }
+}
+
+#[cfg(test)]
+mod detached_work_tests {
+    /// The fns of the S3 request paths that spawn a task and do not take
+    /// a [`super::DetachedWork`] slot in the same fn.
+    fn unslotted(sources: &[crate::source_scan::ast::Source]) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for src in sources {
+            if !(src.rel.starts_with("src/s3_adapter_s3s/")
+                || src.rel.starts_with("src/api/handlers/"))
+            {
+                continue;
+            }
+            for spawn in src.prod.calls.iter().filter(|c| {
+                !c.method && c.segs.len() >= 2 && c.segs.ends_with(&["spawn".to_string()])
+            }) {
+                let slotted = src.prod.calls.iter().any(|c| {
+                    c.func == spawn.func
+                        && !c.method
+                        && c.segs
+                            .ends_with(&["DetachedWork".to_string(), "slot".to_string()])
+                });
+                if !slotted {
+                    offenders.push(format!(
+                        "{}:{} in {}",
+                        src.rel,
+                        spawn.line,
+                        src.fn_name(spawn.func)
+                    ));
+                }
+            }
+        }
+        offenders
+    }
+
+    /// Source guard (F56 of epic #143): request work that a request path
+    /// spawns outlives the request's slot of the global cap, so it holds a
+    /// `DetachedWork` slot, taken in the fn that spawns it.
+    #[test]
+    fn detached_request_work_holds_a_slot() {
+        let sources = crate::source_scan::ast::src();
+        let offenders = unslotted(sources);
+        assert!(
+            offenders.is_empty(),
+            "detached tasks outside the DetachedWork slots: {offenders:?}"
+        );
+        // The scan sees the two detached tasks it is about.
+        let spawning: Vec<String> = sources
+            .iter()
+            .filter(|s| s.rel.starts_with("src/s3_adapter_s3s/"))
+            .flat_map(|s| {
+                s.prod
+                    .calls
+                    .iter()
+                    .filter(|c| !c.method && c.segs.ends_with(&["spawn".to_string()]))
+                    .map(|c| s.fn_name(c.func).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for expected in ["delete_objects", "complete_multipart_upload"] {
+            assert!(
+                spawning.iter().any(|f| f == expected),
+                "the scan missed {expected}: {spawning:?}"
+            );
+        }
+        let fixture = [crate::source_scan::ast::parse(
+            "src/s3_adapter_s3s/x.rs",
+            "async fn a(e: E) { let s = crate::api::handlers::DetachedWork::slot(&e).await; \
+             tokio::spawn(async move { drop(s) }); } \
+             async fn b() { tokio::spawn(async {}); }",
+        )];
+        let caught = unslotted(&fixture);
+        assert_eq!(caught.len(), 1, "{caught:?}");
+        assert!(caught[0].ends_with("in b"), "{caught:?}");
     }
 }

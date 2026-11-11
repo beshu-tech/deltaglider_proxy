@@ -531,6 +531,9 @@ where
     }
 
     router
+        .layer(axum::Extension(crate::api::handlers::DetachedWork::new(
+            config.tuning.max_concurrent_requests,
+        )))
         .layer(axum::Extension(replay_cache.clone()))
         .layer(axum::Extension(crate::api::auth::ReplayWindow(
             config.tuning.replay_window(),
@@ -618,6 +621,100 @@ mod backend_share_tests {
             .header("host", "localhost:9000")
             .body(axum::body::Body::empty())
             .unwrap()
+    }
+
+    fn with_body(
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        headers: &[(&str, String)],
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut b = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "localhost:9000")
+            .header("content-length", body.len().to_string());
+        for (k, v) in headers {
+            b = b.header(*k, v);
+        }
+        b.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    /// F56 (epic #143): DeleteObjects runs its batch on a detached task (so
+    /// a disconnect cannot cut a batch in half), and the task outlived the
+    /// request's slot of the global cap: with a cap of one, requests that
+    /// timed out left their batches running, more batches than slots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_delete_batches_stay_inside_the_request_cap() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let mut config = Config::from_yaml_str(&format!(
+            "storage:\n  backends:\n    - name: hetzner-fsn1\n      type: s3\n      \
+             endpoint: \"{endpoint}\"\n      region: us-east-1\n      force_path_style: true\n      \
+             access_key_id: k\n      secret_access_key: s\n      allow_local: true\n  \
+             default_backend: hetzner-fsn1\n"
+        ))
+        .unwrap();
+        config.tuning.max_concurrent_requests = 1;
+        config.tuning.request_timeout_secs = 1;
+        let app = router(&config).await;
+        let ok = |r: &axum::response::Response| r.status().is_success();
+        let created = app
+            .clone()
+            .oneshot(request("PUT", "/releases"))
+            .await
+            .unwrap();
+        assert!(ok(&created), "{:?}", created.status());
+        // Each batch deletes the keys of one folder, one after another: a
+        // batch outlives its request (every DELETE stalls up to the backend
+        // timeout).
+        const BATCHES: usize = 3;
+        const KEYS: usize = 4;
+        for i in 0..BATCHES {
+            for k in 0..KEYS {
+                let put = app
+                    .clone()
+                    .oneshot(with_body(
+                        "PUT",
+                        &format!("/releases/d{i}/k{k}.bin"),
+                        b"x".to_vec(),
+                        &[],
+                    ))
+                    .await
+                    .unwrap();
+                assert!(ok(&put), "{:?}", put.status());
+            }
+        }
+        fake.stall("DELETE", "releases/");
+        for i in 0..BATCHES {
+            let objects: String = (0..KEYS)
+                .map(|k| format!("<Object><Key>d{i}/k{k}.bin</Key></Object>"))
+                .collect();
+            let body = format!("<Delete>{objects}</Delete>").into_bytes();
+            let md5 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                <md5::Md5 as md5::Digest>::digest(&body),
+            );
+            let resp = app
+                .clone()
+                .oneshot(with_body(
+                    "POST",
+                    "/releases?delete",
+                    body,
+                    &[("content-md5", md5)],
+                ))
+                .await
+                .unwrap();
+            // The batch is stalled: the request ends at its deadline.
+            assert_eq!(resp.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+        }
+        // One batch sends one DELETE at a time: more in flight at once is
+        // more than one batch running.
+        let peak = fake.peak_in_flight("DELETE");
+        fake.release_stalls();
+        assert!(
+            peak <= 1,
+            "{peak} detached DeleteObjects batches ran at once with one request slot"
+        );
     }
 
     /// One global cap of request slots for every bucket: requests to a

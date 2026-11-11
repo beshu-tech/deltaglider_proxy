@@ -163,6 +163,7 @@ pub(super) async fn complete_multipart_upload(
     req: s3s::S3Request<s3s::dto::CompleteMultipartUploadInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
     let writer = Reader::for_object(&req.extensions, &req.input.bucket, &req.input.key);
+    let extensions = req.extensions;
     let input = req.input;
     // Defense-in-depth: the marker can be hot-applied mid-upload, so
     // Complete (the moment bytes reach the backend) re-checks.
@@ -255,8 +256,10 @@ pub(super) async fn complete_multipart_upload(
             // after the request is gone (client disconnect, request timeout):
             // the maintenance drain (`drain_inflight_writes`) must wait for it.
             let gate_write = svc.state.maintenance_gate.begin_write(&input.bucket);
+            // A slot of detached request work, held by the task (F56).
+            let slot = crate::api::handlers::DetachedWork::slot(&extensions).await;
             let handle = tokio::spawn(async move {
-                let _gate_write = gate_write;
+                let (_gate_write, _slot) = (gate_write, slot);
                 let result = run_multipart_completion(
                     &write_lock,
                     state,

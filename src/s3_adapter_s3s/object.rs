@@ -468,9 +468,12 @@ pub(super) async fn delete_objects(
     // drain waiting for the task, not just for this request.
     let state = svc.state.clone();
     let bucket = input.bucket.clone();
+    // A slot of detached request work, held by the task (F56): the task
+    // outlives the request's slot of the global cap.
+    let slot = crate::api::handlers::DetachedWork::slot(&req.extensions).await;
     let write = state.maintenance_gate.begin_write(&bucket);
     let batch = tokio::spawn(async move {
-        let _write = write;
+        let (_write, _slot) = (write, slot);
         let engine = state.engine.load_full();
         let on_outcome =
             |key: &str, outcome: &DeleteOutcome| -> futures::future::BoxFuture<'static, ()> {
