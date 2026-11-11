@@ -384,191 +384,6 @@ impl Stream for SyncStorageStream {
 
 impl s3s::stream::ByteStream for SyncStorageStream {}
 
-/// True when s3s already removed the aws-chunked framing. It does so for
-/// every SigV4 HEADER-signed streaming request (it verifies each chunk
-/// signature while it decodes). Decoding again made every signed SDK
-/// streaming PUT / UploadPart fail with 400 (review C1). Unsigned or
-/// presigned streaming bodies still reach us framed.
-fn s3s_decoded_aws_chunked(headers: &axum::http::HeaderMap, has_credentials: bool) -> bool {
-    has_credentials
-        && headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256 "))
-}
-
-/// What `collect_blob_limited` needs from the request besides the body:
-/// the headers (aws-chunked framing, `x-amz-checksum-*`) and the trailers
-/// s3s took off a body it decoded. Taken before `req.input` moves.
-pub(super) struct BodyContext {
-    headers: axum::http::HeaderMap,
-    /// The body still carries aws-chunked framing (s3s did not decode it).
-    still_chunked: bool,
-    s3s_trailers: Option<s3s::TrailingHeaders>,
-}
-
-impl BodyContext {
-    pub(super) fn of<T>(req: &s3s::S3Request<T>) -> Self {
-        Self {
-            headers: req.headers.clone(),
-            still_chunked: !s3s_decoded_aws_chunked(&req.headers, req.credentials.is_some()),
-            s3s_trailers: req.trailing_headers.clone(),
-        }
-    }
-}
-
-/// The body SHA-256 that s3s verified for this request, or `None` when s3s
-/// did not verify one (then the caller hashes the body).
-///
-/// s3s 0.14 (`ops/signature.rs`) wraps the body in `UploadStream`, which
-/// fails the read when the bytes do not hash to `x-amz-content-sha256`,
-/// only on its SigV4 path with a single-chunk payload hash. It picks that
-/// path when the query has no SigV2 `Signature` (else it checks SigV2 and
-/// verifies no body) and the `Authorization` header is a unique SigV4 one.
-/// It parses the header as a single-chunk hash only when it is 64 LOWERCASE
-/// hex characters; any other non-sentinel value fails the signature
-/// (`SignatureDoesNotMatch`). So this returns the digest only when all of
-/// these hold, each one checked here, conservatively:
-///
-/// - s3s verified credentials;
-/// - no query parameter name (decoded as s3s decodes it) contains
-///   `signature` in any case (no SigV2 query; a SigV4 presigned query
-///   carries no payload hash in our middleware either);
-/// - exactly one `Authorization` header, and it starts with
-///   `AWS4-HMAC-SHA256 ` (so SigV2 header parsing does not match it);
-/// - exactly one `x-amz-content-sha256` header, 64 lowercase hex.
-///
-/// s3s hands over the de-framed body only for streaming payloads, which
-/// never match the last rule: the bytes the handler collects are the bytes
-/// s3s hashed. The contract test `s3s_verifies_the_payload_hash_we_trust`
-/// (`api/s3s_contract_tests.rs`) sends a wrong body in every shape and
-/// fails when this returns a digest that s3s did not enforce.
-pub(crate) fn s3s_verified_payload_sha256(
-    headers: &axum::http::HeaderMap,
-    uri: &axum::http::Uri,
-    has_credentials: bool,
-) -> Option<crate::deltaglider::KnownSha256> {
-    if !has_credentials {
-        return None;
-    }
-    let target = crate::api::request_target::RequestTarget::from_uri(uri).ok()?;
-    if target
-        .query
-        .iter()
-        .any(|(name, _)| name.to_ascii_lowercase().contains("signature"))
-    {
-        return None;
-    }
-    let unique = |name: &str| {
-        let mut values = headers.get_all(name).iter();
-        let first = values.next()?;
-        values.next().is_none().then_some(first)?.to_str().ok()
-    };
-    if !unique("authorization")?.starts_with("AWS4-HMAC-SHA256 ") {
-        return None;
-    }
-    let claimed = unique("x-amz-content-sha256")?;
-    let lowercase_hex = claimed.len() == 64
-        && claimed
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if !lowercase_hex {
-        return None;
-    }
-    crate::deltaglider::KnownSha256::from_verified_hex(claimed)
-}
-
-/// THE collection of an object body (PutObject, UploadPart): bounded by
-/// `limit`, de-framed when s3s left aws-chunked framing, and checked
-/// against the client's `x-amz-checksum-*` header or trailer.
-async fn collect_blob_limited(
-    body: Option<s3s::dto::StreamingBlob>,
-    limit: u64,
-    ctx: &BodyContext,
-) -> s3s::S3Result<bytes::Bytes> {
-    let (body, own_trailers) = collect_and_unframe(body, limit, ctx).await?;
-    let s3s_trailers = ctx.s3s_trailers.as_ref().and_then(|t| t.read(Clone::clone));
-    let trailers = own_trailers.as_ref().or(s3s_trailers.as_ref());
-    crate::api::checksum::verify_body_checksum(&ctx.headers, trailers, &body)
-        .map_err(|e| s3s::S3Error::from(crate::api::S3Error::from(e)))?;
-    Ok(body)
-}
-
-/// The body bytes, and the trailers when this function removed the framing.
-async fn collect_and_unframe(
-    body: Option<s3s::dto::StreamingBlob>,
-    limit: u64,
-    ctx: &BodyContext,
-) -> s3s::S3Result<(bytes::Bytes, Option<axum::http::HeaderMap>)> {
-    let Some(mut body) = body else {
-        return Ok((bytes::Bytes::new(), None));
-    };
-    let mut out = Vec::new();
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|e| {
-            // s3s wraps the request body in a hashing reader that
-            // verifies `x-amz-content-sha256` AS THE BODY STREAMS.
-            // On mismatch, the chunk read fails with
-            // `UploadStreamError::Sha256Mismatch` (Display string
-            // `"UploadStreamError: Sha256Mismatch"`). That IS the
-            // H1 integrity check the axum adapter performs after
-            // collecting the body — surface it as the same wire
-            // error (`BadDigest`, 400) instead of a generic 500
-            // InternalError. Match-on-Display is fragile because
-            // `UploadStreamError` is private to s3s, but the
-            // alternative (downcast) needs the type to be public.
-            // If the s3s crate ever exports the type or renames the
-            // variant, the test `test_sigv4_payload_hash_mismatch_rejected`
-            // catches the drift.
-            let msg = e.to_string();
-            if msg.contains("Sha256Mismatch") {
-                tracing::warn!(
-                    "request body sha256 doesn't match x-amz-content-sha256 header — rejecting as BadDigest"
-                );
-                return s3s::s3_error!(BadDigest);
-            }
-            tracing::error!(error = ?e, "collect_blob_limited: body chunk read failed");
-            s3s::s3_error!(InternalError, "failed to read request body: {e}")
-        })?;
-        let next_len = out
-            .len()
-            .checked_add(chunk.len())
-            .ok_or_else(|| s3s::s3_error!(EntityTooLarge))?;
-        if next_len as u64 > limit {
-            return Err(s3s::s3_error!(EntityTooLarge));
-        }
-        out.extend_from_slice(&chunk);
-    }
-    let body = bytes::Bytes::from(out);
-    let headers = &ctx.headers;
-    if ctx.still_chunked && crate::api::aws_chunked::is_aws_chunked(headers) {
-        let expected_len = crate::api::aws_chunked::get_decoded_content_length(headers);
-        if expected_len.is_some_and(|len| len as u64 > limit) {
-            return Err(s3s::s3_error!(EntityTooLarge));
-        }
-        // Require x-amz-decoded-content-length for chunked bodies: without it
-        // the decoder can only frame-check, and a body truncated at a chunk
-        // boundary (with a surviving/crafted 0\r\n\r\n terminator) would pass
-        // framing yet store short. AWS SDKs always send this header for
-        // streaming uploads, so requiring it rejects only malformed inputs.
-        if expected_len.is_none() {
-            return Err(s3s::s3_error!(
-                InvalidArgument,
-                "aws-chunked transfer encoding requires x-amz-decoded-content-length"
-            ));
-        }
-        return crate::api::aws_chunked::decode_aws_chunked_with_trailers(&body, expected_len)
-            .map(|(decoded, trailers)| (decoded, Some(trailers)))
-            .ok_or_else(|| {
-                s3s::s3_error!(
-                    InvalidArgument,
-                    "Failed to decode AWS chunked transfer encoding"
-                )
-            });
-    }
-    Ok((body, None))
-}
-
 /// A live HeadBucket. Only the HeadBucket verb uses it; every other verb
 /// checks its bucket through `crate::api::handlers::ensure_bucket_exists`
 /// (guard `s3_verbs_check_buckets_through_the_cache`).
@@ -616,22 +431,6 @@ fn policy_context_for_ip(client_ip: Option<std::net::IpAddr>) -> iam_rs::Context
     let mut context = iam_rs::Context::new();
     crate::iam::permissions::insert_source_ip(&mut context, client_ip);
     context
-}
-
-fn validate_content_md5_s3s(content_md5: Option<&str>, body: &[u8]) -> s3s::S3Result<()> {
-    let Some(content_md5) = content_md5 else {
-        return Ok(());
-    };
-    use base64::Engine as _;
-    use md5::Digest as _;
-    let expected = base64::engine::general_purpose::STANDARD
-        .decode(content_md5.trim())
-        .map_err(|_| s3s::s3_error!(InvalidDigest))?;
-    let actual = md5::Md5::digest(body);
-    if actual.as_slice() != expected.as_slice() {
-        return Err(s3s::s3_error!(BadDigest));
-    }
-    Ok(())
 }
 
 fn query_flag(uri: &axum::http::Uri, key: &str, expected: &str) -> bool {
@@ -801,7 +600,7 @@ pub(crate) fn folder_of(key: &str) -> &str {
 
 /// The metadata keys that describe how an object is stored relative to its
 /// folder: hidden from every reader that [`Reader::sees_delta_facts`] refuses.
-const DELTA_FACT_KEYS: [&str; 7] = [
+const DELTA_FACT_KEYS: [&str; 8] = [
     crate::types::meta_keys::NOTE,
     crate::types::meta_keys::REF_PATH,
     crate::types::meta_keys::REF_KEY,
@@ -809,6 +608,7 @@ const DELTA_FACT_KEYS: [&str; 7] = [
     crate::types::meta_keys::DELTA_SIZE,
     crate::types::meta_keys::DELTA_CMD,
     crate::types::meta_keys::SOURCE_NAME,
+    crate::types::meta_keys::PASSTHROUGH_REASON,
 ];
 
 /// The response headers that tell a writer how its object was stored.
@@ -928,6 +728,8 @@ mod review2_tests;
 #[cfg(test)]
 mod delete_bucket_tests;
 
+#[cfg(test)]
+mod put_ingest_tests;
 /// What the read verbs send upstream, per backend and cache state.
 #[cfg(test)]
 mod read_cost_tests;

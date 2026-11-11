@@ -143,6 +143,20 @@ pub fn router_configmap(cr: &DeltaGliderProxy, proxy_replicas: i32) -> Value {
 /// Key of the config DB key in the bootstrap Secret (`DGP_CONFIG_DB_KEY` of every pod).
 pub const DB_KEY_SECRET_KEY: &str = "dbKey";
 
+/// The size limit of each proxy pod's `/tmp` emptyDir, in MiB. The proxy's
+/// spool (`DGP_SPOOL_DIR`, default `/tmp/dgp-spool`) lives there: upload
+/// bodies above the spool threshold, large delta reconstructions, multipart
+/// relay parts. Without a limit the spool could fill the node's disk; with
+/// one, a spool budget above it gets the pod evicted.
+pub const TMP_SIZE_LIMIT_MIB: u64 = 8192;
+
+/// Pure: the `DGP_SPOOL_MAX_BYTES` for a `/tmp` of `limit_mib`: three
+/// quarters of it, so the spool never reaches the limit (the rest is for
+/// the other files in `/tmp`).
+pub fn spool_max_bytes_for_tmp(limit_mib: u64) -> u64 {
+    limit_mib * 1024 * 1024 / 4 * 3
+}
+
 /// The auto-generated bootstrap Secret (`password` for the human, `hash` and `dbKey`
 /// for the pods). Create-once and NO ownerReference: `dbKey` decrypts IAM data on
 /// PVCs that survive CR deletion, so the Secret must survive too (manual teardown,
@@ -217,6 +231,11 @@ pub fn proxy_statefulset(cr: &DeltaGliderProxy, replicas: i32) -> Value {
     let mut env = vec![
         json!({ "name": "DGP_TRUST_PROXY_HEADERS", "value": "true" }),
         json!({ "name": "DGP_TRUSTED_PROXY_CIDRS", "value": cr.trusted_proxy_cidrs() }),
+        // The spool budget stays below the size limit of /tmp, where it lives.
+        json!({
+            "name": "DGP_SPOOL_MAX_BYTES",
+            "value": spool_max_bytes_for_tmp(TMP_SIZE_LIMIT_MIB).to_string(),
+        }),
     ];
     if has_config {
         env.push(json!({ "name": "DGP_CONFIG", "value": CONFIG_MOUNT }));
@@ -245,7 +264,10 @@ pub fn proxy_statefulset(cr: &DeltaGliderProxy, replicas: i32) -> Value {
         json!({ "name": "data", "mountPath": "/data" }),
         json!({ "name": "tmp", "mountPath": "/tmp" }),
     ];
-    let mut volumes = vec![json!({ "name": "tmp", "emptyDir": {} })];
+    let mut volumes = vec![json!({
+        "name": "tmp",
+        "emptyDir": { "sizeLimit": format!("{TMP_SIZE_LIMIT_MIB}Mi") },
+    })];
     if has_config {
         volume_mounts.push(json!({
             "name": "config",
@@ -571,6 +593,35 @@ mod tests {
         assert_eq!(sts_spec.replicas, Some(3));
         assert_eq!(sts_spec.service_name.as_deref(), Some("dgp-pods"));
         assert_eq!(dep.spec.unwrap().replicas, Some(2));
+    }
+
+    /// The spool budget is set below the size limit of the /tmp emptyDir
+    /// that holds the spool: a budget above it gets the pod evicted, and
+    /// /tmp without a limit can fill the node's disk.
+    #[test]
+    fn the_spool_budget_is_below_the_tmp_size_limit() {
+        let sts = proxy_statefulset(&cr(1), 1);
+        let pod = &sts["spec"]["template"]["spec"];
+        let tmp = pod["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "tmp")
+            .unwrap();
+        let limit = tmp["emptyDir"]["sizeLimit"].as_str().unwrap();
+        let limit_bytes = limit.strip_suffix("Mi").unwrap().parse::<u64>().unwrap() * 1024 * 1024;
+        let spool = pod["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "DGP_SPOOL_MAX_BYTES")
+            .expect("DGP_SPOOL_MAX_BYTES is set")["value"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(spool > 0 && spool < limit_bytes, "{spool} vs {limit}");
+        assert_eq!(spool_max_bytes_for_tmp(4), 3 * 1024 * 1024);
     }
 
     #[test]

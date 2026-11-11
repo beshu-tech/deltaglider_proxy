@@ -556,6 +556,7 @@ async fn detailed_scan(engine: &DynEngine, bucket: &str) -> Result<StatsResult, 
 
 async fn try_read_cache(engine: &DynEngine, bucket: &str, mode: Mode) -> Option<CacheDoc> {
     let key = cache_key_for(mode);
+    // small: the stats cache document (JSON counters).
     let (bytes, _) = engine.retrieve(bucket, &key).await.ok()?;
     serde_json::from_slice::<CacheDoc>(&bytes).ok()
 }

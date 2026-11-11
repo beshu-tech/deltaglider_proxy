@@ -21,6 +21,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 stream, metadata, ..
             } => {
                 // Collect stream into contiguous buffer (pre-allocated to exact size).
+                // small: `retrieve` is THE whole-object read; each caller says why its object is small (`whole_object_reads_are_marked_small`)
                 let chunks: Vec<Bytes> = stream.map_err(EngineError::Storage).try_collect().await?;
                 let total_len: usize = chunks.iter().map(|b| b.len()).sum();
                 let mut data = Vec::with_capacity(total_len);
@@ -392,7 +393,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     None
                 } else {
                     use futures::TryStreamExt;
+                    // small: the delta is at most the spool threshold (the branch above)
                     let chunks: Vec<Bytes> = stream.try_collect().await?;
+                    // small: the same delta, at most the spool threshold
                     Some(chunks.concat())
                 };
                 self.retrieve_with_metadata(bucket, deltaspace_id, obj_key, meta, prefetched)
@@ -451,63 +454,62 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     cache_hit: None,
                 })
             }
-            StorageInfo::Delta { .. } if metadata.file_size > self.spool_threshold() => {
-                // Large delta: reconstruct to a spool file (bounded memory) and
-                // stream the file to the client. Integrity is verified BEFORE the
-                // first byte ships (see retrieve_delta_spooled).
-                self.retrieve_delta_spooled(bucket, deltaspace_id, obj_key, metadata, prefetched)
+            StorageInfo::Reference { .. } | StorageInfo::Delta { .. }
+                if self.streams_from_spool(&metadata) =>
+            {
+                // Large delta or reference object: a verified spool file
+                // (bounded memory), streamed to the client. Integrity is
+                // verified BEFORE the first byte ships (retrieve_spooled).
+                self.retrieve_spooled(bucket, deltaspace_id, obj_key, metadata)
                     .await
             }
             StorageInfo::Reference { .. } | StorageInfo::Delta { .. } => {
-                let (data, cache_hit) = self
+                match self
                     .retrieve_buffered(bucket, deltaspace_id, obj_key, &metadata, prefetched)
-                    .await?;
-                debug!(
-                    "Retrieved (buffered) {} bytes for {}",
-                    data.len(),
-                    obj_key.full_key()
-                );
-                Ok(RetrieveResponse::Buffered {
-                    data,
-                    metadata,
-                    cache_hit,
-                })
+                    .await
+                {
+                    Ok((data, cache_hit)) => {
+                        debug!(
+                            "Retrieved (buffered) {} bytes for {}",
+                            data.len(),
+                            obj_key.full_key()
+                        );
+                        Ok(RetrieveResponse::Buffered {
+                            data,
+                            metadata,
+                            cache_hit,
+                        })
+                    }
+                    // A small delta whose reference is too large for memory:
+                    // decode against the verified reference file.
+                    Err(EngineError::ReferenceNotInMemory { .. }) if metadata.is_delta() => {
+                        self.retrieve_spooled(bucket, deltaspace_id, obj_key, metadata)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
     }
 
-    /// Reconstruct a large delta object to a quota'd spool file, verify its
-    /// SHA-256 BEFORE returning, then stream the spool file to the client.
+    /// Serve a large delta or reference object from a verified spool file
+    /// ([`Self::verified_object_spool`]): its SHA-256 is checked BEFORE
+    /// this returns, then the file streams to the client.
     ///
     /// Memory is bounded by the codec pump (Spike A: 73MB on a 2.5GB decode), not
-    /// the object size. The integrity gate (blocker 2) is preserved: we hash the
-    /// reconstruction as the codec writes it and compare to `metadata.file_sha256`
-    /// before the first response byte — a mismatch returns a clean S3 error, never
-    /// a truncated 200. The codec permit is released at decode-done (blocker 5),
-    /// so a slow client draining the spool never pins a codec slot.
-    ///
-    /// The verified reconstruction is shared as the range reads' is
-    /// (storage-11): concurrent GETs of one object decode it once.
-    async fn retrieve_delta_spooled(
+    /// the object size. The integrity gate (blocker 2) is preserved: a
+    /// mismatch returns a clean S3 error, never a truncated 200. The codec
+    /// permit is released at decode-done (blocker 5), so a slow client
+    /// draining the spool never pins a codec slot.
+    async fn retrieve_spooled(
         &self,
         bucket: &str,
         deltaspace_id: &str,
         obj_key: &super::ObjectKey,
         metadata: FileMetadata,
-        prefetched: Option<Vec<u8>>,
     ) -> Result<RetrieveResponse, EngineError> {
-        let key = RangeSpoolKey::object(bucket, obj_key.full_key(), metadata.file_sha256.clone());
         let out_spool = self
-            .range_spools
-            .get_or_fill(key, || {
-                self.reconstruct_delta_to_spool(
-                    bucket,
-                    deltaspace_id,
-                    obj_key,
-                    &metadata,
-                    prefetched,
-                )
-            })
+            .verified_object_spool(bucket, deltaspace_id, obj_key, &metadata)
             .await?;
 
         // Stream the verified spool file whole. This share of `out_spool` is
@@ -541,34 +543,144 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         })
     }
 
+    /// Whether [`Self::retrieve_stream`] of an object with `metadata`
+    /// serves it from a verified spool file (a delta or reference object
+    /// above the spool threshold), which its stream holds until it drops.
+    fn streams_from_spool(&self, metadata: &FileMetadata) -> bool {
+        !matches!(metadata.storage_info, StorageInfo::Passthrough)
+            && metadata.file_size > self.spool_threshold()
+    }
+
+    /// The spool budget, in MiB, that the stream of [`Self::retrieve_stream`]
+    /// for an object with `metadata` holds while it lives (`0`: the stream
+    /// holds none). A caller that reserves more spool while it reads such a
+    /// stream (a copy that ingests it) passes this as its held budget, so
+    /// it never waits for budget while it holds some (hold-and-wait).
+    pub fn stream_spool_mib(&self, metadata: &FileMetadata) -> usize {
+        if self.streams_from_spool(metadata) {
+            crate::deltaglider::spool::mib_ceil(metadata.file_size).max(1)
+        } else {
+            0
+        }
+    }
+
+    /// The verified spool file of a large delta or reference object, shared
+    /// by the whole GET, the range GETs and the copies of it: concurrent
+    /// reads fill it once (storage-11), and its SHA-256 is the object's
+    /// before any reader gets it. A delta is reconstructed
+    /// ([`Self::reconstruct_delta_to_spool`]); a reference object IS the
+    /// deltaspace's reference.bin, so it shares the verified reference
+    /// file that the delta GETs and streaming PUTs of the folder read.
+    async fn verified_object_spool(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        obj_key: &super::ObjectKey,
+        metadata: &FileMetadata,
+    ) -> Result<Arc<crate::deltaglider::spool::Spool>, EngineError> {
+        match &metadata.storage_info {
+            StorageInfo::Delta { .. } => {
+                let key =
+                    RangeSpoolKey::object(bucket, obj_key.full_key(), metadata.file_sha256.clone());
+                self.range_spools
+                    .get_or_fill(key, || {
+                        self.reconstruct_delta_to_spool(bucket, deltaspace_id, obj_key, metadata)
+                    })
+                    .await
+            }
+            StorageInfo::Reference { .. } => {
+                let key = RangeSpoolKey::reference(
+                    self.cache_key(bucket, deltaspace_id),
+                    metadata.file_sha256.clone(),
+                );
+                // Reserved BEFORE the slot: the fill runs under the slot's
+                // lock, and the streaming PUTs and delta GETs of the folder
+                // join this slot while they hold spool budget. A fill that
+                // waited for budget there would wait for them, and they for
+                // it, until the acquire timeout. A cached hit drops this
+                // reservation unused.
+                let spool = self.spool_acquire(metadata.file_size).await?;
+                self.range_spools
+                    .get_or_fill(key, move || {
+                        self.fill_reference_object(bucket, deltaspace_id, obj_key, metadata, spool)
+                    })
+                    .await
+            }
+            StorageInfo::Passthrough => Err(EngineError::Storage(StorageError::Other(
+                "a passthrough object is streamed, not spooled".into(),
+            ))),
+        }
+    }
+
+    /// The spool file of a reference object: `spool` was reserved at its
+    /// recorded size before the cache slot was taken (a GET that waits for
+    /// budget holds nothing, not even an open response or the slot), then
+    /// it is written from one read of reference.bin and checked against
+    /// the object's SHA-256.
+    async fn fill_reference_object(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        obj_key: &super::ObjectKey,
+        metadata: &FileMetadata,
+        spool: crate::deltaglider::spool::Spool,
+    ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
+        let source = self
+            .storage
+            .open_reference_source(bucket, deltaspace_id)
+            .await?;
+        if source.size != metadata.file_size {
+            return Err(changed_while_read(bucket, obj_key));
+        }
+        self.write_verified_reference(deltaspace_id, &metadata.file_sha256, source, spool)
+            .await
+    }
+
     /// Reconstruct a delta object to a quota'd spool file and verify its SHA-256
-    /// BEFORE returning. Shared by the full-GET (`retrieve_delta_spooled`) and the
-    /// range path. Returns the verified `Spool` (its `Drop` deletes the file +
-    /// releases the budget). Bounded memory (codec pump); the codec permit is
-    /// released here, at decode-done — never held across the client download.
+    /// BEFORE returning. Returns the verified `Spool` (its `Drop` deletes the
+    /// file + releases the budget). Bounded memory: the delta is read into
+    /// its own spool file (reserved with the output and reference in one
+    /// permit) BEFORE the codec slot, and xdelta3 reads it from there; the
+    /// codec permit is released at decode-done, never held across the
+    /// client download.
     async fn reconstruct_delta_to_spool(
         &self,
         bucket: &str,
         deltaspace_id: &str,
         obj_key: &super::ObjectKey,
         metadata: &FileMetadata,
-        prefetched: Option<Vec<u8>>,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
         use std::io::Write;
 
-        let (ref_file, out_spool) = self
-            .reference_file_and_out_spool(bucket, deltaspace_id, metadata)
-            .await?;
-
-        // Fetch the delta (small — it's a delta), unless the caller has it.
-        let delta = match prefetched {
-            Some(delta) => delta,
-            None => {
-                self.storage
-                    .get_delta(bucket, deltaspace_id, &obj_key.filename)
-                    .await?
-            }
-        };
+        let DecodeSpools {
+            reference: ref_file,
+            out: out_spool,
+            delta: delta_spool,
+            delta_cap,
+        } = self.decode_spools(bucket, deltaspace_id, metadata).await?;
+        let mut delta_stream = self
+            .storage
+            .open_object(
+                bucket,
+                deltaspace_id,
+                crate::storage::StoredObject::Delta(&obj_key.filename),
+            )
+            .await?
+            .stream;
+        // Unhashed: the decoded object is checked against its SHA-256.
+        delta_spool
+            .fill_unhashed(&mut delta_stream, delta_cap)
+            .await
+            .map_err(|e| match e {
+                crate::deltaglider::spool::SpoolFillError::Source(e) => EngineError::Storage(e),
+                crate::deltaglider::spool::SpoolFillError::Write(e) => {
+                    EngineError::Storage(StorageError::from(e))
+                }
+                crate::deltaglider::spool::SpoolFillError::Overrun { .. } => {
+                    changed_while_read(bucket, obj_key)
+                }
+            })?;
+        drop(delta_stream);
 
         let _permit = self
             .acquire_codec_timeout(std::time::Duration::from_secs(60))
@@ -576,6 +688,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let codec = self.codec.clone();
         let ref_path = ref_file.path().to_path_buf();
         let out_path = out_spool.path().to_path_buf();
+        let delta_path = delta_spool.path().to_path_buf();
         let decode_start = Instant::now();
         let expected_sha = metadata.file_sha256.clone();
         let key_for_err = obj_key.full_key();
@@ -622,8 +735,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 written: 0,
                 cap: output_cap,
             };
+            let delta = std::fs::File::open(&delta_path)
+                .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
             codec
-                .decode_to_writer(&ref_path, &delta[..], &mut sink)
+                .decode_to_writer(&ref_path, delta, &mut sink)
                 .map_err(EngineError::Codec)?;
             sink.flush()
                 .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
@@ -657,40 +772,65 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             });
         }
 
-        // ref_file drops here: an own reference file is deleted, a share of
-        // a cached one is released.
+        // ref_file and the delta file drop here: an own reference file is
+        // deleted, a share of a cached one is released.
+        drop(delta_spool);
         Ok(out_spool)
     }
 
-    /// The reference of a large delta GET as a local file, and the spool for
-    /// the reconstruction.
+    /// The spool files of a large delta decode: the reference as a local
+    /// file, the output, and the delta.
     ///
-    /// A delta that names its reference by `ref_sha256` reads a SHARED file:
-    /// one download, checked against that SHA-256, kept like a reconstruction
-    /// (`range_spools`: same TTL, spool budget and eviction). Concurrent GETs
-    /// wait for the one download, and later GETs of any delta of the
-    /// deltaspace read the file instead of downloading the reference again. The output spool is reserved first,
-    /// so a GET waits for budget holding nothing; the download then takes
-    /// the reference's spool beside it, without waiting (on no room, the GET
-    /// downloads its own copy as before).
+    /// The output and the delta are ONE reservation (`acquire_group`), taken
+    /// first, so a GET that waits for budget holds nothing. A delta that
+    /// names its reference by `ref_sha256` reads a SHARED reference file:
+    /// one download, checked against that SHA-256, kept like a
+    /// reconstruction (`range_spools`: same TTL, spool budget and
+    /// eviction). Concurrent GETs wait for the one download, and later GETs
+    /// of any delta of the deltaspace read the file instead of downloading
+    /// the reference again. The download takes the reference's spool beside
+    /// the reservation, without waiting (on no room, the GET downloads its
+    /// own copy).
     ///
     /// Without a `ref_sha256` (or with the cache off) nothing can verify a
-    /// shared copy: the GET downloads its own. It waits for budget only
-    /// while it holds nothing but its output spool reservation, or for ONE
-    /// reservation of both spools (two concurrent GETs never hold one while
-    /// waiting for the other).
-    async fn reference_file_and_out_spool(
+    /// shared copy: the GET downloads its own. Its spool is reserved at the
+    /// reference's own size, which the GET of the reference answers (no
+    /// HEAD), beside the reservation without waiting, so the open response
+    /// is never held while waiting. No room beside it: drop everything,
+    /// take ONE reservation for all three files, and read the reference
+    /// again (two concurrent GETs never hold one file while waiting for
+    /// another).
+    async fn decode_spools(
         &self,
         bucket: &str,
         deltaspace_id: &str,
         metadata: &FileMetadata,
-    ) -> Result<(ReferenceFile, crate::deltaglider::spool::Spool), EngineError> {
-        let ref_sha256 = match &metadata.storage_info {
-            StorageInfo::Delta { ref_sha256, .. } => ref_sha256.as_str(),
-            _ => "",
+    ) -> Result<DecodeSpools, EngineError> {
+        let (ref_sha256, delta_cap) = match &metadata.storage_info {
+            // A delta of unknown size (0: an old writer) is capped at the
+            // object's size: a kept delta is smaller than its object.
+            StorageInfo::Delta {
+                ref_sha256,
+                delta_size,
+                ..
+            } if *delta_size > 0 => (ref_sha256.as_str(), *delta_size),
+            StorageInfo::Delta { ref_sha256, .. } => (ref_sha256.as_str(), metadata.file_size),
+            _ => ("", metadata.file_size),
+        };
+        let out_and_delta_sizes = [metadata.file_size, delta_cap];
+        let out_and_delta = || self.spool_acquire_group(&out_and_delta_sizes);
+        let spools = |reference, group: Vec<crate::deltaglider::spool::Spool>| {
+            let [out, delta] = <[crate::deltaglider::spool::Spool; 2]>::try_from(group)
+                .map_err(|_| StorageError::Other("a decode reserves two spool files".into()))?;
+            Ok::<_, EngineError>(DecodeSpools {
+                reference,
+                out,
+                delta,
+                delta_cap,
+            })
         };
         if !ref_sha256.is_empty() && self.range_spools.caches() {
-            let out = self.spool_acquire(metadata.file_size).await?;
+            let group = out_and_delta().await?;
             let key = RangeSpoolKey::reference(
                 self.cache_key(bucket, deltaspace_id),
                 ref_sha256.to_string(),
@@ -698,45 +838,44 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             let shared = self
                 .range_spools
                 .get_or_fill(key, || {
-                    self.download_verified_reference(bucket, deltaspace_id, ref_sha256, &out)
+                    self.download_verified_reference(bucket, deltaspace_id, ref_sha256, &group[0])
                 })
                 .await;
             match shared {
-                Ok(file) => return Ok((ReferenceFile::Shared(file), out)),
-                Err(SharedReferenceError::NoRoom) => drop(out),
+                Ok(file) => return spools(ReferenceFile::Shared(file), group),
+                Err(SharedReferenceError::NoRoom) => drop(group),
                 Err(SharedReferenceError::Engine(e)) => return Err(e),
             }
         }
-        // This GET's own copy. The reference can be far larger than the
-        // object: its spool is reserved at its own size, which the GET of
-        // the reference answers (no HEAD). The output spool first (a GET
-        // that waits for budget holds nothing), then the reference's beside
-        // it without waiting, so the open response is never held while
-        // waiting. No room beside it: drop both, take ONE reservation for
-        // the pair at the known size, and read the reference again.
-        let out = self.spool_acquire(metadata.file_size).await?;
+        // This GET's own copy of the reference.
+        let group = out_and_delta().await?;
         let source = self
             .storage
             .open_reference_source(bucket, deltaspace_id)
             .await?;
-        match self.spool.acquire_beside(Some(&out), source.size).await {
+        match self
+            .spool
+            .acquire_beside(Some(&group[0]), source.size)
+            .await
+        {
             Ok(ref_spool) => {
                 source.write_to(ref_spool.path()).await?;
-                Ok((ReferenceFile::Own(ref_spool), out))
+                spools(ReferenceFile::Own(ref_spool), group)
             }
             Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => {
                 let ref_size = source.size;
                 drop(source);
-                drop(out);
-                let (ref_spool, out_spool) = self
-                    .spool_acquire_pair(ref_size, metadata.file_size)
+                drop(group);
+                let mut all = self
+                    .spool_acquire_group(&[ref_size, metadata.file_size, delta_cap])
                     .await?;
+                let ref_spool = all.remove(0);
                 // Materialise the reference as a seekable file WITHOUT
                 // heap-loading it (filesystem hardlink / S3 stream-to-file).
                 self.storage
                     .get_reference_to_file(bucket, deltaspace_id, ref_spool.path())
                     .await?;
-                Ok((ReferenceFile::Own(ref_spool), out_spool))
+                spools(ReferenceFile::Own(ref_spool), all)
             }
             Err(e) => Err(EngineError::Storage(StorageError::from(e))),
         }
@@ -766,33 +905,44 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
             Err(e) => return Err(EngineError::Storage(StorageError::from(e)).into()),
         };
-        source
-            .write_to(spool.path())
-            .await
-            .map_err(EngineError::from)?;
+        Ok(self
+            .write_verified_reference(deltaspace_id, ref_sha256, source, spool)
+            .await?)
+    }
+
+    /// Write `source` (reference.bin of `deltaspace_id`) into `spool` and
+    /// hand the spool back only when its SHA-256 is `ref_sha256`: nothing
+    /// reads a reference file that did not pass.
+    async fn write_verified_reference(
+        &self,
+        deltaspace_id: &str,
+        ref_sha256: &str,
+        source: crate::storage::ReferenceSource,
+        spool: crate::deltaglider::spool::Spool,
+    ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
+        source.write_to(spool.path()).await?;
         let (actual, _, _) = Self::hash_spool_file(spool.path()).await?;
         if actual != ref_sha256 {
             warn!(
-                "Reference {bucket}/{deltaspace_id} has sha256 {actual}, its deltas name \
-                 {ref_sha256}: not shared"
+                "Reference {deltaspace_id}/.dg/reference.bin has sha256 {actual}, \
+                 {ref_sha256} was expected: not used"
             );
             return Err(EngineError::ChecksumMismatch {
                 key: format!("{deltaspace_id}/.dg/reference.bin"),
                 expected: ref_sha256.to_string(),
                 actual,
-            }
-            .into());
+            });
         }
         Ok(spool)
     }
 
-    /// Serve a byte range of a large delta object from a reconstructed spool file
-    /// (blocker 6). Reconstructs once (verified), then seeks to `start` and
-    /// streams `end-start+1` bytes — no full-object re-buffer. The verified
-    /// spool is cached briefly (storage-11): the other ranges of the object
-    /// read it instead of decoding again, and a concurrent range waits for a
-    /// running decode. Returns `(stream, content_length)`.
-    pub(super) async fn retrieve_delta_range_spooled(
+    /// Serve a byte range of a large delta or reference object from its
+    /// verified spool file (blocker 6, [`Self::verified_object_spool`]):
+    /// filled once, then seek to `start` and stream `end-start+1` bytes, no
+    /// full-object re-buffer. The other ranges of the object read the same
+    /// file, and a concurrent range waits for a running fill. Returns
+    /// `(stream, content_length)`.
+    pub(super) async fn retrieve_range_spooled(
         &self,
         bucket: &str,
         deltaspace_id: &str,
@@ -803,12 +953,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), EngineError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-        let key = RangeSpoolKey::object(bucket, obj_key.full_key(), metadata.file_sha256.clone());
         let out_spool = self
-            .range_spools
-            .get_or_fill(key, || {
-                self.reconstruct_delta_to_spool(bucket, deltaspace_id, obj_key, metadata, None)
-            })
+            .verified_object_spool(bucket, deltaspace_id, obj_key, metadata)
             .await?;
 
         // Clamp the range to the object size; compute the content length.
@@ -896,12 +1042,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         if let (Some(expected), Some(actual)) = (expected_source, metadata.as_ref()) {
             if !Self::same_generation(expected, actual) {
-                return Err(EngineError::Storage(StorageError::PreconditionFailed(
-                    format!(
-                        "source changed during copy: {}/{} (size {} -> {})",
-                        bucket, key, expected.file_size, actual.file_size
-                    ),
-                )));
+                return Err(source_changed_during_copy(bucket, key, expected, actual));
             }
         }
 
@@ -913,9 +1054,30 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 m
             }
             None => {
-                // Unmanaged object — we don't know if it's passthrough.
-                // Signal caller to use the non-range path.
-                return Ok(None);
+                // Unmanaged object (no DG metadata): read the range of the
+                // plain object, as `try_unmanaged_passthrough` reads all of
+                // it. Absent: the caller's whole read answers NoSuchKey.
+                return match self
+                    .storage
+                    .open_passthrough_range(bucket, &deltaspace_id, &obj_key.filename, start, end)
+                    .await
+                {
+                    Ok(read) => {
+                        if let Some(expected) = expected_source {
+                            if !Self::same_generation(expected, &read.metadata) {
+                                return Err(source_changed_during_copy(
+                                    bucket,
+                                    key,
+                                    expected,
+                                    &read.metadata,
+                                ));
+                            }
+                        }
+                        Ok(Some((read.stream, read.len, read.metadata)))
+                    }
+                    Err(StorageError::NotFound(_)) => Ok(None),
+                    Err(e) => Err(e.into()),
+                };
             }
         };
 
@@ -969,12 +1131,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 }
                 if let Some(expected) = expected_source {
                     if !Self::same_generation(expected, &served) {
-                        return Err(EngineError::Storage(StorageError::PreconditionFailed(
-                            format!(
-                                "source changed during copy: {}/{} (size {} -> {})",
-                                bucket, key, expected.file_size, served.file_size
-                            ),
-                        )));
+                        return Err(source_changed_during_copy(bucket, key, expected, &served));
                     }
                 }
                 debug!(
@@ -986,25 +1143,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 );
                 Ok(Some((stream, content_length, served)))
             }
-            StorageInfo::Delta { .. } if metadata.file_size > self.spool_threshold() => {
-                // Large delta range: reconstruct once to a spool file (verified),
-                // then seek + stream just the requested bytes (blocker 6) — no
-                // full-object re-buffer.
+            StorageInfo::Reference { .. } | StorageInfo::Delta { .. }
+                if metadata.file_size > self.spool_threshold() =>
+            {
+                // Large delta or reference range: one verified spool file,
+                // then seek + stream just the requested bytes (blocker 6) —
+                // no full-object re-buffer.
                 let (stream, content_length) = self
-                    .retrieve_delta_range_spooled(
-                        bucket,
-                        &deltaspace_id,
-                        &obj_key,
-                        &metadata,
-                        start,
-                        end,
-                    )
+                    .retrieve_range_spooled(bucket, &deltaspace_id, &obj_key, &metadata, start, end)
                     .await?;
                 Ok(Some((stream, content_length, metadata)))
             }
             StorageInfo::Reference { .. } | StorageInfo::Delta { .. } => {
-                // Small delta/reference: signal caller to use the buffered slice
-                // path (cheap — the whole object fits comfortably in RAM).
+                // Small delta/reference (at most the spool threshold): the
+                // caller reads it whole and slices it.
                 Ok(None)
             }
         }
@@ -1046,6 +1198,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 match prefetched {
                     Some(delta) => Ok(delta),
                     None => {
+                        // small: the object is at most the spool threshold
+                        // (larger ones decode from spool files), and a kept
+                        // delta is smaller than its object.
                         self.storage
                             .get_delta(bucket, deltaspace_id, &obj_key.filename)
                             .await
@@ -1179,6 +1334,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let (data, cache_hit) = match (shared, &metadata.storage_info) {
             (Some(done), _) => done,
             (None, StorageInfo::Reference { .. }) => (
+                // small: a reference object at most the spool threshold
+                // (a larger one is served from its verified spool file).
                 self.storage.get_reference(bucket, deltaspace_id).await?,
                 None,
             ),
@@ -1191,6 +1348,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         match prefetched {
                             Some(delta) => Ok(delta),
                             None => {
+                                // small: as in `decode_against_shared_reference`.
                                 self.storage
                                     .get_delta(bucket, deltaspace_id, &obj_key.filename)
                                     .await
@@ -1211,29 +1369,38 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                             "Reference not found via internal key — trying passthrough fallback: {}/reference.bin",
                             deltaspace_id
                         );
-                        match self
+                        // The same size rule as the reference cache: one
+                        // above the spool threshold is never read into RAM.
+                        let read = self
                             .storage
-                            .get_passthrough(bucket, deltaspace_id, "reference.bin")
+                            .open_object(
+                                bucket,
+                                deltaspace_id,
+                                crate::storage::StoredObject::Passthrough("reference.bin"),
+                            )
                             .await
-                        {
-                            Ok(data) => {
-                                tracing::info!(
-                                    "Reference passthrough fallback succeeded ({} bytes)",
-                                    data.len()
-                                );
-                                let sha = hex::encode(Sha256::digest(&data));
-                                let bytes = bytes::Bytes::from(data);
-                                let cache_key = self.cache_key(bucket, deltaspace_id);
-                                self.cache.put(&cache_key, bytes.clone(), &sha);
-                                (bytes, false)
-                            }
-                            Err(_) => {
-                                return Err(EngineError::MissingReference(format!(
+                            .map_err(|_| {
+                                EngineError::MissingReference(format!(
                                     "{} (reference.bin not found via any method)",
                                     deltaspace_id
-                                )));
-                            }
+                                ))
+                            })?;
+                        let size = read.metadata.file_size;
+                        if size > self.spool_threshold() {
+                            return Err(EngineError::ReferenceNotInMemory {
+                                deltaspace: deltaspace_id.to_string(),
+                                size,
+                            });
                         }
+                        let bytes = super::metadata::collect_sized(read.stream, size).await?;
+                        tracing::info!(
+                            "Reference passthrough fallback succeeded ({} bytes)",
+                            bytes.len()
+                        );
+                        let sha = hex::encode(Sha256::digest(&bytes));
+                        let cache_key = self.cache_key(bucket, deltaspace_id);
+                        self.cache.put(&cache_key, bytes.clone(), &sha);
+                        (bytes, false)
                     }
                     Err(e) => return Err(e),
                 };
@@ -1280,18 +1447,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 (result, Some(cache_hit))
             }
             (None, StorageInfo::Passthrough) => {
-                // Callers route Passthrough to the streaming path in retrieve_stream().
-                // This arm is kept as a safe fallback rather than panicking.
-                debug_assert!(
-                    false,
-                    "retrieve_buffered called for Passthrough — should use streaming path"
-                );
-                (
-                    self.storage
-                        .get_passthrough(bucket, deltaspace_id, &obj_key.filename)
-                        .await?,
-                    None,
-                )
+                // Callers route Passthrough to the streaming path in
+                // retrieve_stream(); a passthrough object of any size is
+                // never read whole here.
+                return Err(EngineError::Storage(StorageError::Other(
+                    "a passthrough object is streamed, not buffered".into(),
+                )));
             }
         };
 
@@ -1388,6 +1549,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
 use crate::deltaglider::range_spool::RangeSpoolKey;
 
+/// The spool files of one large delta decode ([`DeltaGliderEngine::decode_spools`]).
+struct DecodeSpools {
+    reference: ReferenceFile,
+    /// The reconstruction; one reservation with `delta`.
+    out: crate::deltaglider::spool::Spool,
+    /// The delta, read from storage before the codec slot.
+    delta: crate::deltaglider::spool::Spool,
+    /// The most bytes the delta may hold (its reservation).
+    delta_cap: u64,
+}
+
 /// The reference file a large delta GET decodes against.
 enum ReferenceFile {
     /// A verified download shared through `range_spools`.
@@ -1461,6 +1633,20 @@ fn opened_form(filename: &str, metadata: &FileMetadata) -> Option<ObjectVariant>
         }
         _ => None,
     }
+}
+
+/// The 412 of a generation-pinned read (a multi-part copy) whose source
+/// is another generation than the pin.
+fn source_changed_during_copy(
+    bucket: &str,
+    key: &str,
+    expected: &FileMetadata,
+    actual: &FileMetadata,
+) -> EngineError {
+    EngineError::Storage(StorageError::PreconditionFailed(format!(
+        "source changed during copy: {}/{} (size {} -> {})",
+        bucket, key, expected.file_size, actual.file_size
+    )))
 }
 
 /// The 503 SlowDown of a read whose byte read found another version

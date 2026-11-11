@@ -9,10 +9,9 @@
 //!    page the worker persists `replication_state.continuation_token`
 //!    so a crash mid-run resumes on the next tick instead of starting
 //!    over from page 1.
-//! 2. Per-object: HEAD destination, consult planner, `engine.retrieve`
-//!    source, `engine.store_with_multipart_etag` (when source carries
-//!    one) or `engine.store` (single-PUT objects). Preserves the H1
-//!    multipart-ETag identity across replication.
+//! 2. Per-object: HEAD destination, consult planner, copy through
+//!    `crate::transfer` (engine-routed).
+//!    Preserves the H1 multipart-ETag identity across replication.
 //! 3. After the forward-copy pass, when `replicate_deletes` is true,
 //!    paginates the destination prefix and deletes any key not present
 //!    on source.

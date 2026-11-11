@@ -726,3 +726,225 @@ mod signed {
         assert_eq!(err.into_service_error().code(), Some("BadDigest"));
     }
 }
+
+// ============================================================================
+// Bodies above the spool threshold: read once into a spool file, checked
+// while they stream, with no copy of the body in RAM. The spool threshold is
+// lowered to 64 KiB so a 512 KiB body takes that path; the ingest metrics
+// (`/_/metrics`) show the medium and the RAM peak, deterministically.
+// ============================================================================
+
+mod spooled {
+    use super::common::TestServer;
+    use super::{crc64nvme_trailer, frame_unsigned_trailer};
+    use aws_sdk_s3::error::ProvideErrorMetadata as _;
+
+    const THRESHOLD: usize = 64 * 1024;
+
+    fn payload() -> Vec<u8> {
+        (0..512 * 1024usize)
+            .map(|i| ((i * 31) & 0xff) as u8)
+            .collect()
+    }
+
+    fn builder() -> super::common::TestServerBuilder {
+        TestServer::builder().env("DGP_SPOOL_THRESHOLD_BYTES", &THRESHOLD.to_string())
+    }
+
+    /// One sample of `/_/metrics` (the scrape is public in tests).
+    async fn metric(server: &TestServer, series: &str) -> f64 {
+        let text = reqwest::get(format!("{}/_/metrics", server.endpoint()))
+            .await
+            .expect("scrape")
+            .text()
+            .await
+            .unwrap();
+        text.lines()
+            .find_map(|l| l.strip_prefix(series)?.trim().parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    const SPOOLED: &str =
+        r#"deltaglider_ingest_bodies_total{medium="spool",reason="over_threshold"}"#;
+    const RAM_PEAK: &str = "deltaglider_ingest_memory_peak_bytes";
+
+    async fn get(server: &TestServer, key: &str) -> reqwest::Response {
+        let url = format!("{}/{}/{key}", server.endpoint(), server.bucket());
+        server.http().get(&url).send().await.expect("GET sends")
+    }
+
+    async fn put_framed(
+        server: &TestServer,
+        key: &str,
+        payload: &[u8],
+        trailer: &str,
+        announce: bool,
+    ) -> reqwest::Response {
+        let wire = frame_unsigned_trailer(payload, Some(trailer));
+        let url = format!("{}/{}/{key}", server.endpoint(), server.bucket());
+        let mut req = server
+            .http()
+            .put(&url)
+            .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+            .header("x-amz-decoded-content-length", payload.len().to_string())
+            .header("content-length", wire.len().to_string());
+        if announce {
+            req = req.header("x-amz-trailer", "x-amz-checksum-crc64nvme");
+        }
+        req.body(wire).send().await.expect("PUT sends")
+    }
+
+    /// A large unsigned aws-chunked body is de-framed as it streams into a
+    /// spool file; its trailer checksum is checked against the bytes as
+    /// they arrived (announced) or computed again (not announced). A wrong
+    /// one is `BadDigest` and nothing is stored.
+    #[tokio::test]
+    async fn a_large_chunked_body_is_spooled_and_its_trailer_checked() {
+        // Open access: the adapter de-frames this body itself (s3s does not).
+        let server = builder().open_access().build().await;
+        let payload = payload();
+        let right = crc64nvme_trailer(&payload);
+        let wrong = crc64nvme_trailer(b"other bytes");
+        let before = metric(&server, SPOOLED).await;
+        for (key, announce) in [("big/announced.mp4", true), ("big/late.mp4", false)] {
+            let resp = put_framed(&server, key, &payload, &right, announce).await;
+            assert!(
+                resp.status().is_success(),
+                "{key}: {} {:?}",
+                resp.status(),
+                resp.text().await.ok()
+            );
+            let got = get(&server, key).await.bytes().await.unwrap();
+            assert_eq!(got.as_ref(), payload.as_slice(), "{key}");
+
+            let bad = format!("{key}.bad");
+            let resp = put_framed(&server, &bad, &payload, &wrong, announce).await;
+            assert_eq!(resp.status(), 400, "{bad}");
+            assert!(resp
+                .text()
+                .await
+                .unwrap()
+                .contains("<Code>BadDigest</Code>"));
+            assert_eq!(get(&server, &bad).await.status(), 404, "{bad} was stored");
+        }
+        assert_eq!(metric(&server, SPOOLED).await - before, 4.0);
+        assert!(
+            metric(&server, RAM_PEAK).await <= THRESHOLD as f64,
+            "a body above the threshold was held in RAM"
+        );
+    }
+
+    /// A request that declares no body length (plain `Transfer-Encoding:
+    /// chunked`) is refused with 411 before the body is read.
+    #[tokio::test]
+    async fn a_body_without_a_length_is_411() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Open access: a raw unsigned request.
+        let server = builder().open_access().build().await;
+        let host = server.endpoint().trim_start_matches("http://").to_string();
+        let mut tcp = tokio::net::TcpStream::connect(&host).await.unwrap();
+        let req = format!(
+            "PUT /{}/no-length.txt HTTP/1.1\r\nHost: {host}\r\n\
+             x-amz-content-sha256: UNSIGNED-PAYLOAD\r\n\
+             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+             5\r\nhello\r\n0\r\n\r\n",
+            server.bucket()
+        );
+        tcp.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        tcp.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 411"), "{resp}");
+        assert!(resp.contains("MissingContentLength"), "{resp}");
+        assert_eq!(get(&server, "no-length.txt").await.status(), 404);
+    }
+
+    /// A signed SDK PutObject above the threshold: s3s checks the payload
+    /// hash as the body streams into the spool file.
+    #[tokio::test]
+    async fn a_large_signed_sdk_put_is_spooled() {
+        let server = builder().build().await;
+        let s3 = server.s3_client().await;
+        let payload = payload();
+        let before = metric(&server, SPOOLED).await;
+        s3.put_object()
+            .bucket(server.bucket())
+            .key("big/sdk.mp4")
+            .body(payload.clone().into())
+            .send()
+            .await
+            .expect("signed PUT");
+        let got = s3
+            .get_object()
+            .bucket(server.bucket())
+            .key("big/sdk.mp4")
+            .send()
+            .await
+            .expect("GET")
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(got.as_ref(), payload.as_slice());
+        assert_eq!(metric(&server, SPOOLED).await - before, 1.0);
+        assert!(metric(&server, RAM_PEAK).await <= THRESHOLD as f64);
+
+        // A wrong checksum header is still refused for a spooled body.
+        let wrong = super::b64(&<s3s::crypto::Sha256 as s3s::crypto::Checksum>::checksum(
+            b"other",
+        ));
+        let err = s3
+            .put_object()
+            .bucket(server.bucket())
+            .key("big/sdk-bad.mp4")
+            .checksum_sha256(&wrong)
+            .body(payload.into())
+            .send()
+            .await
+            .expect_err("wrong checksum");
+        assert_eq!(err.into_service_error().code(), Some("BadDigest"));
+    }
+
+    /// A presigned PUT carries no payload hash: the body is hashed while
+    /// it streams into the spool file.
+    #[tokio::test]
+    async fn a_large_presigned_put_is_spooled() {
+        let server = builder().build().await;
+        let s3 = server.s3_client().await;
+        let presigned = s3
+            .put_object()
+            .bucket(server.bucket())
+            .key("big/presigned.mp4")
+            .presigned(
+                aws_sdk_s3::presigning::PresigningConfig::expires_in(
+                    std::time::Duration::from_secs(300),
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("presign");
+        let payload = payload();
+        let before = metric(&server, SPOOLED).await;
+        let resp = reqwest::Client::new()
+            .put(presigned.uri())
+            .body(payload.clone())
+            .send()
+            .await
+            .expect("presigned PUT");
+        assert!(resp.status().is_success(), "{}", resp.status());
+        let got = s3
+            .get_object()
+            .bucket(server.bucket())
+            .key("big/presigned.mp4")
+            .send()
+            .await
+            .expect("GET")
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(got.as_ref(), payload.as_slice());
+        assert_eq!(metric(&server, SPOOLED).await - before, 1.0);
+    }
+}

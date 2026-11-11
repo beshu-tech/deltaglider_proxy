@@ -436,7 +436,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MAX_TOTAL_MULTIPART_BYTES",
-        description: "Cap on total buffered multipart bytes across all uploads (default: max_object_size * max_uploads / 4)",
+        description: "Cap on the spool space that the parts of all open multipart uploads hold together (whole MiB per part, at least 1 MiB); a part past it gets 503 SlowDown (default: half of DGP_SPOOL_MAX_BYTES)",
         example: "1073741824",
         category: "Server",
     },
@@ -544,7 +544,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_SPOOL_DIR",
-        description: "Directory for every scratch file: codec files, multipart relay parts, encrypted-write temps (default: <system temp>/dgp-spool)",
+        description: "Directory for every scratch file: codec files, multipart relay parts, encrypted-write temps; created 0700, refused when another user owns it or all users can write to it (default: <system temp>/dgp-spool)",
         example: "/var/lib/deltaglider/spool",
         category: "Delta Engine",
     },
@@ -555,6 +555,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Delta Engine",
     },
     EnvVarEntry {
+        name: "DGP_INGEST_MEMORY_MAX_BYTES",
+        description: "Most memory used for upload bodies at once; a body at most DGP_SPOOL_THRESHOLD_BYTES is read into memory while this has room, else it goes to the spool; read at startup only (default: 1 GiB; 0 = every body goes to the spool)",
+        example: "1073741824",
+        category: "Delta Engine",
+    },
+    EnvVarEntry {
         name: "DGP_LISTING_FACTS_GC",
         description: "Periodic removal (every 6 h) of S3 listing-facts entries whose object is gone (default: true)",
         example: "false",
@@ -562,13 +568,13 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
-        description: "Max spool bytes one relayed multipart upload may hold (default: half of DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)",
+        description: "Max spool bytes one multipart upload may hold, which is also the largest multipart object; a part past it gets 413 EntityTooLarge (default: half of DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)",
         example: "8589934592",
         category: "Delta Engine",
     },
     EnvVarEntry {
         name: "DGP_SPOOL_THRESHOLD_BYTES",
-        description: "Delta objects larger than this reconstruct (GET) or encode (PUT) through a spool file (default: 16 MiB, capped at max_object_size)",
+        description: "Upload bodies larger than this are read into a spool file, and delta objects larger than this reconstruct (GET) or encode (PUT) through a spool file (default: 16 MiB, capped at max_object_size)",
         example: "16777216",
         category: "Delta Engine",
     },
@@ -664,7 +670,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
-        description: "Largest multipart upload that CompleteMultipartUpload assembles in memory to try a delta. The parts of an upload stay in memory up to this total, then go to relay files in the spool. A larger upload, or one that tries no delta, is stored from its parts without a delta (default: 64 MiB)",
+        description: "Largest multipart upload for which CompleteMultipartUpload tries a delta. It decides only whether a delta is tried, not how much memory an upload uses: every part goes to a relay file in the spool, and a delta candidate is joined into one spool file and delta-encoded as a stream. A larger upload, or one that tries no delta, is stored from its parts without a delta (default: 64 MiB)",
         example: "67108864",
         category: "Delta Engine",
     },

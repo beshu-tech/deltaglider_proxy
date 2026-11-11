@@ -195,7 +195,7 @@ async fn a_raw_delta_write_drops_the_other_form_through_the_helper() {
                         "b",
                         "run",
                         "copy.zip",
-                        bytes::Bytes::copy_from_slice(&bytes),
+                        crate::storage::PutBody::Bytes(bytes::Bytes::copy_from_slice(&bytes)),
                         &meta,
                         &prior,
                     )
@@ -364,6 +364,12 @@ fn buffered_put_bodies_are_not_copied() {
     for file in [
         "src/deltaglider/engine/store.rs",
         "src/deltaglider/engine/conditional.rs",
+        "src/deltaglider/ingest.rs",
+        "src/api/body_ingest.rs",
+        "src/api/handlers/object_helpers.rs",
+        "src/s3_adapter_s3s/object.rs",
+        "src/s3_adapter_s3s/copy.rs",
+        "src/storage/encrypting/mod.rs",
         "src/storage/s3/objects.rs",
         "src/storage/s3/mod.rs",
         "src/storage/traits.rs",
@@ -397,8 +403,7 @@ async fn the_baseline_in_the_reference_cache_is_the_client_buffer() {
         .store_conditional(
             "b",
             "rel/a.zip",
-            body.clone(),
-            None,
+            crate::deltaglider::ingest::IngestedBody::hashed_from_bytes(body.clone()),
             None,
             HashMap::new(),
             &crate::deltaglider::Precondition::none(),
@@ -413,11 +418,23 @@ async fn the_baseline_in_the_reference_cache_is_the_client_buffer() {
     assert_eq!(cached.as_ptr(), body.as_ptr(), "the cache copied the body");
 }
 
-/// A client body above the spool threshold is in RAM already: the store
-/// hashes it from RAM while it writes the spool, and never reads the spool
-/// back to hash it (it read the whole body back, once per PUT).
+/// The body of a client write, as its ingest reads it: above the
+/// engine's spool threshold into a spool file, with its hashes.
+async fn ingested(
+    engine: &DynEngine,
+    data: Vec<u8>,
+    known: Option<crate::deltaglider::KnownSha256>,
+) -> crate::deltaglider::ingest::IngestedBody {
+    crate::deltaglider::ingest::ingest_bytes(engine, "b", Bytes::from(data), u64::MAX, known)
+        .await
+        .unwrap()
+}
+
+/// A client body above the spool threshold is hashed by its ingest while
+/// it is written to the spool: the store never reads the spool back to
+/// hash it (it read the whole body back, once per PUT).
 #[tokio::test]
-async fn a_large_client_put_hashes_from_ram_not_from_the_spool() {
+async fn a_large_client_put_is_hashed_by_its_ingest_not_from_the_spool() {
     let (endpoint, _fake) = crate::storage::fake_s3::start().await;
     let mut config = Config::default();
     config.tuning.spool_threshold_bytes = Some(1024);
@@ -435,8 +452,7 @@ async fn a_large_client_put_hashes_from_ram_not_from_the_spool() {
             .store_conditional(
                 "b",
                 key,
-                Bytes::from(body.clone()),
-                None,
+                ingested(&engine, body.clone(), None).await,
                 None,
                 HashMap::new(),
                 &crate::deltaglider::Precondition::none(),
@@ -483,8 +499,7 @@ async fn a_proven_sha256_is_stored_not_recomputed() {
             .store_conditional(
                 "b",
                 key,
-                Bytes::from(noise(41, size)),
-                Some(proven),
+                ingested(&engine, noise(41, size), Some(proven)).await,
                 None,
                 HashMap::new(),
                 &crate::deltaglider::Precondition::none(),
@@ -524,8 +539,7 @@ async fn put_large(engine: &DynEngine, key: &str, body: &[u8]) -> StoreResult {
         .store_conditional(
             "b",
             key,
-            Bytes::from(body.to_vec()),
-            None,
+            ingested(engine, body.to_vec(), None).await,
             None,
             HashMap::new(),
             &crate::deltaglider::Precondition::none(),
@@ -614,8 +628,7 @@ async fn a_large_put_refuses_a_corrupt_reference() {
         .store_conditional(
             "b",
             "rel/v1.zip",
-            Bytes::from(variant(&base, 1)),
-            None,
+            ingested(&engine, variant(&base, 1), None).await,
             None,
             HashMap::new(),
             &crate::deltaglider::Precondition::none(),
@@ -633,4 +646,52 @@ async fn a_large_put_refuses_a_corrupt_reference() {
         engine.head("b", "rel/v1.zip").await.is_err(),
         "nothing stored"
     );
+}
+
+/// A kept delta of a streaming PUT commits from the encode's spool file:
+/// the backend gets a file body and streams it. Before, the engine read the
+/// whole delta file into memory (up to `max_delta_ratio` x the object) and
+/// passed the bytes. A buffered PUT keeps its small delta in memory.
+#[tokio::test]
+async fn a_kept_streaming_delta_commits_from_its_spool_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let faulty = crate::storage::FaultyFs::new(
+        crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let faults = faulty.faults.clone();
+    let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
+    let mut config = Config::default();
+    config.tuning.spool_threshold_bytes = Some(1024);
+    let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
+    engine.create_bucket("b").await.unwrap();
+    let base = noise(61, 64 * 1024);
+    // The first PUT is the baseline and a delta against itself.
+    for (n, key) in [(1, "rel/a.zip"), (2, "rel/v1.zip")] {
+        let body = if n == 1 {
+            base.clone()
+        } else {
+            variant(&base, 1)
+        };
+        let r = put_large(&engine, key, &body).await;
+        assert_eq!(r.metadata.storage_info.label(), "delta");
+        assert_eq!(faults.delta_file_writes(), n, "the delta went as a file");
+    }
+    let (got, _) = engine.retrieve("b", "rel/v1.zip").await.unwrap();
+    assert_eq!(got, variant(&base, 1));
+    // The buffered PUT (below the threshold) writes its delta from memory.
+    let small = noise(62, 900);
+    engine
+        .store("b", "small/a.zip", &small, None, HashMap::new())
+        .await
+        .unwrap();
+    let mut v = small.clone();
+    v[10] ^= 1;
+    let r = engine
+        .store("b", "small/b.zip", &v, None, HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(r.metadata.storage_info.label(), "delta");
+    assert_eq!(faults.delta_file_writes(), 2, "a buffered delta is bytes");
 }

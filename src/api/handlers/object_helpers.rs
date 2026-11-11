@@ -62,91 +62,43 @@ pub(crate) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEv
 pub(crate) struct ClientWrite<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
-    /// The body as collected: shared, never copied, down to the storage write.
-    pub data: bytes::Bytes,
+    /// The body as its ingest read it: in memory (shared, never copied,
+    /// down to the storage write) or in a spool file, with its hashes.
+    pub body: crate::deltaglider::ingest::IngestedBody,
     pub content_type: Option<String>,
     pub user_metadata: std::collections::HashMap<String, String>,
     pub precondition: &'a crate::deltaglider::Precondition,
+    /// The verdict of the quota gate that ran before the body was read
+    /// (PutObject, form POST); `None` when none ran (CopyObject).
+    pub early_quota: Option<QuotaVerdict>,
 }
 
-/// THE client write of a whole body: the quota gate, then the engine's
-/// conditional store (the object's write lock, the preconditions, the
-/// store), then the `ObjectCreated` event. Every surface that stores a
-/// client body goes through here, so none of them skips the lock, the
-/// conditionals, the quota or the event.
+/// THE client write of a whole body: the quota gate on the body's exact
+/// size (see [`exact_quota_check_after_body`]), then the engine's conditional store (the object's write lock, the
+/// preconditions, the store), then the `ObjectCreated` event. Every surface
+/// that stores a client body goes through here, so none of them skips the
+/// lock, the conditionals, the quota or the event.
 pub(crate) async fn store_client_write(
     state: &Arc<AppState>,
     write: ClientWrite<'_>,
 ) -> Result<crate::types::StoreResult, S3Error> {
-    store_client_write_hashed(state, write, None).await
-}
-
-/// [`store_client_write`] of a body whose SHA-256 the caller proved
-/// (`known_sha256`): the engine stores that digest and does not hash the
-/// body for it again.
-pub(crate) async fn store_client_write_hashed(
-    state: &Arc<AppState>,
-    write: ClientWrite<'_>,
-    known_sha256: Option<crate::deltaglider::KnownSha256>,
-) -> Result<crate::types::StoreResult, S3Error> {
-    let size = write.data.len() as u64;
-    check_quota_for_write(state, write.bucket, write.key, size).await?;
+    let size = write.body.size();
+    if exact_quota_check_after_body(write.early_quota) {
+        check_quota_for_write(state, write.bucket, write.key, size).await?;
+    }
     let result = state
         .engine
         .load()
         .store_conditional(
             write.bucket,
             write.key,
-            write.data,
-            known_sha256,
+            write.body,
             write.content_type,
             write.user_metadata,
             write.precondition,
         )
         .await?;
     object_created(state, write.bucket, write.key, size, &result).await;
-    Ok(result)
-}
-
-/// One client write of a body staged in a spool file (a CopyObject of a
-/// source above the spool threshold).
-pub(crate) struct SpooledClientWrite<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub spool: &'a crate::deltaglider::spool::Spool,
-    pub size: u64,
-    pub content_type: Option<String>,
-    pub user_metadata: std::collections::HashMap<String, String>,
-    pub precondition: &'a crate::deltaglider::Precondition,
-}
-
-/// [`store_client_write`] of a spooled body: the same quota gate, write
-/// lock, preconditions and event, and the streaming store, so the body
-/// never comes into memory.
-pub(crate) async fn store_client_write_spooled(
-    state: &Arc<AppState>,
-    write: SpooledClientWrite<'_>,
-) -> Result<crate::types::StoreResult, S3Error> {
-    check_quota_for_write(state, write.bucket, write.key, write.size).await?;
-    let engine = state.engine.load();
-    let result = {
-        let guard = engine
-            .lock_and_check(write.bucket, write.key, write.precondition)
-            .await?;
-        engine
-            .store_spooled_delta(
-                &guard,
-                write.bucket,
-                write.key,
-                write.spool,
-                write.size,
-                write.content_type,
-                write.user_metadata,
-                None,
-            )
-            .await?
-    };
-    object_created(state, write.bucket, write.key, write.size, &result).await;
     Ok(result)
 }
 
@@ -213,6 +165,11 @@ pub(crate) async fn store_client_server_copy(
     copy: ClientStoredCopy<'_>,
 ) -> Result<Option<crate::types::StoreResult>, S3Error> {
     let size = copy.source_head.file_size;
+    let engine = state.engine.load_full();
+    // The destination stores the source as it is, so it tries no delta; it
+    // gives the reason that a store of the same content gives.
+    let passthrough_reason =
+        engine.write_decline_reason(copy.bucket, copy.key, &copy.user_metadata, size);
     let Some(metadata) = crate::transfer::destination_metadata(
         copy.source_head,
         crate::types::ObjectKey::parse(copy.bucket, copy.key)
@@ -222,12 +179,12 @@ pub(crate) async fn store_client_server_copy(
             content_type: copy.content_type,
             user_metadata: copy.user_metadata,
             multipart_etag: None,
+            passthrough_reason,
         },
     ) else {
         return Ok(None);
     };
     check_quota_for_write(state, copy.bucket, copy.key, size).await?;
-    let engine = state.engine.load_full();
     let result = {
         let guard = engine
             .lock_and_check(copy.bucket, copy.key, copy.precondition)
@@ -244,9 +201,7 @@ pub(crate) async fn store_client_server_copy(
             .await
             .map_err(|e| match e {
                 crate::deltaglider::EngineError::Storage(StorageError::PreconditionFailed(_)) => {
-                    S3Error::SlowDown(
-                        "the copy source changed during the copy; retry the request".to_string(),
-                    )
+                    S3Error::copy_source_changed()
                 }
                 e => e.into(),
             })?
@@ -365,6 +320,30 @@ pub(crate) async fn check_client_write_allowed(
     Ok(())
 }
 
+/// What the quota gate saw when it let a write through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuotaVerdict {
+    /// The bucket has no quota.
+    Unlimited,
+    /// The write was judged against a known usage of the bucket.
+    Measured,
+    /// The usage of the bucket is not known yet (no scan result, no
+    /// scanned counter row): the write was let through, and a scan started.
+    Optimistic,
+}
+
+/// Whether a client write runs the quota gate again on its exact size,
+/// after its body was read. The contract is that the first write to a
+/// bucket whose usage is not known yet is optimistic. The gate before the
+/// body starts the usage scan, and that scan can finish while the body
+/// uploads. A second gate that saw it would refuse the write after the
+/// client sent every byte. So a write that the early gate let through
+/// optimistically is not judged again. `None`: no gate ran before the
+/// body, so the exact gate is the only one.
+pub(crate) fn exact_quota_check_after_body(early: Option<QuotaVerdict>) -> bool {
+    !matches!(early, Some(QuotaVerdict::Optimistic))
+}
+
 /// Pre-write quota gate of a write of `key`. Returns `Err` when the write
 /// would push the bucket past its `quota_bytes` policy, or when quota is
 /// set to 0 (the "freeze the bucket" override). "Used" is [`quota_used`].
@@ -378,14 +357,17 @@ pub(crate) async fn check_quota_for_write(
     bucket: &str,
     key: &str,
     incoming_bytes: u64,
-) -> Result<(), S3Error> {
+) -> Result<QuotaVerdict, S3Error> {
     let engine = state.engine.load();
     let Some(quota) = engine.bucket_policy_registry().quota_bytes(bucket) else {
-        return Ok(());
+        return Ok(QuotaVerdict::Unlimited);
     };
     let used = quota_used(state, bucket);
     let Err(reason) = quota_decision(quota, used, incoming_bytes) else {
-        return Ok(());
+        return Ok(match used {
+            Some(_) => QuotaVerdict::Measured,
+            None => QuotaVerdict::Optimistic,
+        });
     };
     if quota == 0 {
         // Frozen: no overwrite gets through either.
@@ -404,7 +386,7 @@ pub(crate) async fn check_quota_for_write(
         )
         .is_ok()
     {
-        return Ok(());
+        return Ok(QuotaVerdict::Measured);
     }
     Err(S3Error::AccessDeniedReason(reason))
 }
@@ -594,7 +576,22 @@ mod metadata_size_tests {
 
 #[cfg(test)]
 mod quota_tests {
-    use super::quota_decision;
+    use super::{exact_quota_check_after_body, quota_decision, QuotaVerdict};
+
+    /// The first write to a bucket whose usage is unknown stays optimistic
+    /// to the end: the gate after the body runs only when the gate before
+    /// it judged a known usage, found no quota, or did not run.
+    #[test]
+    fn an_optimistic_early_gate_skips_the_exact_gate() {
+        for (early, want) in [
+            (None, true),
+            (Some(QuotaVerdict::Unlimited), true),
+            (Some(QuotaVerdict::Measured), true),
+            (Some(QuotaVerdict::Optimistic), false),
+        ] {
+            assert_eq!(exact_quota_check_after_body(early), want, "{early:?}");
+        }
+    }
 
     #[test]
     fn frozen_bucket_rejects_everything() {
@@ -702,10 +699,13 @@ mod write_path_tests {
             ClientWrite {
                 bucket: "b",
                 key,
-                data: bytes::Bytes::from(data),
+                body: crate::deltaglider::ingest::IngestedBody::hashed_from_bytes(
+                    bytes::Bytes::from(data),
+                ),
                 content_type: None,
                 user_metadata: Default::default(),
                 precondition: &crate::deltaglider::Precondition::none(),
+                early_quota: None,
             },
         )
         .await

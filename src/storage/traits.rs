@@ -140,29 +140,6 @@ impl ReferenceSource {
         }
     }
 
-    /// The whole body in memory. For tests and small bodies only.
-    pub async fn read_all(self) -> Result<Vec<u8>, StorageError> {
-        use futures::TryStreamExt;
-        use tokio::io::AsyncReadExt;
-        match self.content {
-            ReferenceBody::Stream(stream) => {
-                let chunks: Vec<Bytes> = stream.try_collect().await?;
-                Ok(chunks.concat())
-            }
-            ReferenceBody::Local { file, .. } => {
-                let mut out = Vec::new();
-                tokio::fs::File::from_std(file)
-                    .take(self.size.saturating_add(1))
-                    .read_to_end(&mut out)
-                    .await?;
-                if out.len() as u64 != self.size {
-                    return Err(reference_size_mismatch(self.size, out.len() as u64));
-                }
-                Ok(out)
-            }
-        }
-    }
-
     /// Write the reference to `dest` (a hardlink for a local file). Never
     /// writes more than `size` bytes: a body longer than its declared size
     /// fails, so the spool reservation bounds the disk use. Returns the
@@ -222,6 +199,38 @@ impl ReferenceSource {
                     )));
                 }
                 Ok(written)
+            }
+        }
+    }
+}
+
+/// Test-only helpers of [`ReferenceSource`]. In a `#[cfg(test)] mod` so the
+/// source guard `stored_bodies_are_never_heap_loaded` skips them.
+#[cfg(test)]
+mod reference_source_test_helpers {
+    use super::*;
+
+    impl ReferenceSource {
+        /// The whole body in memory. Tests only: production streams it.
+        pub async fn read_all(self) -> Result<Vec<u8>, StorageError> {
+            use futures::TryStreamExt;
+            use tokio::io::AsyncReadExt;
+            match self.content {
+                ReferenceBody::Stream(stream) => {
+                    let chunks: Vec<Bytes> = stream.try_collect().await?;
+                    Ok(chunks.concat())
+                }
+                ReferenceBody::Local { file, .. } => {
+                    let mut out = Vec::new();
+                    tokio::fs::File::from_std(file)
+                        .take(self.size.saturating_add(1))
+                        .read_to_end(&mut out)
+                        .await?;
+                    if out.len() as u64 != self.size {
+                        return Err(reference_size_mismatch(self.size, out.len() as u64));
+                    }
+                    Ok(out)
+                }
             }
         }
     }
@@ -535,9 +544,13 @@ pub enum RefWrite<'a> {
         data: &'a Bytes,
         metadata: &'a FileMetadata,
     },
+    /// The body is a local file of any size, streamed (or linked), never
+    /// loaded into memory. `spool`: where the write puts a temp file of its
+    /// own (the encrypting wrapper's ciphertext), as for [`PutBody::File`].
     PutFile {
         path: &'a Path,
         metadata: &'a FileMetadata,
+        spool: SpoolBudget<'a>,
     },
     Metadata {
         metadata: &'a FileMetadata,
@@ -563,6 +576,14 @@ impl<'a> StoredWrite<'a> {
     pub fn name(&self) -> &'a str {
         match *self {
             StoredWrite::Delta { name, .. } | StoredWrite::Passthrough { name } => name,
+        }
+    }
+
+    /// The stored object this write names.
+    pub fn object(&self) -> StoredObject<'a> {
+        match *self {
+            StoredWrite::Delta { name, .. } => StoredObject::Delta(name),
+            StoredWrite::Passthrough { name } => StoredObject::Passthrough(name),
         }
     }
 }
@@ -633,20 +654,24 @@ pub enum PutBody<'a> {
 }
 
 impl PutBody<'_> {
-    /// The whole body in memory: what a backend stores for a body shape
-    /// that it has no streaming write for. A `Bytes` body is not copied.
-    pub async fn into_bytes(self) -> Result<Bytes, StorageError> {
+    /// The local files of a `File` (one) or `Parts` (in order) body, which
+    /// a backend streams; `None` for a body in memory.
+    pub fn files(&self) -> Option<Vec<&Path>> {
+        match self {
+            PutBody::File { path, .. } => Some(vec![*path]),
+            PutBody::Parts { paths, .. } => Some(paths.iter().map(PathBuf::as_path).collect()),
+            PutBody::Bytes(_) | PutBody::Chunks(_) => None,
+        }
+    }
+
+    /// A body that is in memory already: `Bytes` (not copied) or `Chunks`
+    /// (joined). A `File` or `Parts` body is an error: it can be any size,
+    /// and every backend streams it from its files. The source guard
+    /// `stored_bodies_are_never_heap_loaded` keeps file reads out of the
+    /// storage and engine code.
+    pub fn into_small_bytes(self) -> Result<Bytes, StorageError> {
         match self {
             PutBody::Bytes(data) => Ok(data),
-            PutBody::File { path, .. } => Ok(Bytes::from(tokio::fs::read(path).await?)),
-            PutBody::Parts { paths, .. } => {
-                let mut assembled = Vec::new();
-                for path in paths {
-                    let part = tokio::fs::read(path).await?;
-                    assembled.extend_from_slice(&part);
-                }
-                Ok(Bytes::from(assembled))
-            }
             PutBody::Chunks(chunks) => {
                 let total_len: usize = chunks.iter().map(|c| c.len()).sum();
                 let mut buf = Vec::with_capacity(total_len);
@@ -655,6 +680,30 @@ impl PutBody<'_> {
                 }
                 Ok(Bytes::from(buf))
             }
+            PutBody::File { .. } | PutBody::Parts { .. } => Err(StorageError::Other(
+                "a file body is streamed from its files, never loaded into memory".into(),
+            )),
+        }
+    }
+
+    /// The whole body in memory, files included: for the test doubles that
+    /// keep what they store.
+    #[cfg(test)]
+    pub async fn read_all_for_test(self) -> Result<Bytes, StorageError> {
+        match self {
+            PutBody::File { path, .. } => {
+                // small: a test double's body.
+                Ok(Bytes::from(tokio::fs::read(path).await?))
+            }
+            PutBody::Parts { paths, .. } => {
+                let mut assembled = Vec::new();
+                for path in paths {
+                    // small: a test double's body.
+                    assembled.extend_from_slice(&tokio::fs::read(path).await?);
+                }
+                Ok(Bytes::from(assembled))
+            }
+            body => body.into_small_bytes(),
         }
     }
 }
@@ -1045,10 +1094,11 @@ pub trait StorageBackend: Send + Sync {
     /// `decode_to_writer`) needs the reference as a file xdelta3 can mmap, and a
     /// multi-GB reference must never be buffered in RAM (adversarial blocker 10).
     ///
-    /// Returns the number of bytes written. The default impl falls back to
-    /// `get_object` + write (fine for small references / backends that don't
-    /// override); the filesystem backend hardlinks (near-zero) and the S3 backend
-    /// streams the GET body to the file.
+    /// Returns the number of bytes written. The default streams
+    /// [`Self::open_reference_source`] into `dest` ([`ReferenceSource::write_to`]),
+    /// so a wrapper (the encrypting one decrypts frame by frame) never
+    /// buffers the reference; the filesystem backend hardlinks, the S3
+    /// backend streams the GET body.
     fn get_reference_to_file(
         &self,
         bucket: &str,
@@ -1056,11 +1106,10 @@ pub trait StorageBackend: Send + Sync {
         dest: &std::path::Path,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send {
         async move {
-            let data = self
-                .get_object(bucket, prefix, StoredObject::Reference)
-                .await?;
-            tokio::fs::write(dest, &data).await?;
-            Ok(data.len() as u64)
+            self.open_reference_source(bucket, prefix)
+                .await?
+                .write_to(dest)
+                .await
         }
     }
 
@@ -1225,8 +1274,9 @@ pub trait StorageBackend: Send + Sync {
     // === Object writes ===
 
     /// Store a delta or a passthrough object with its metadata, from
-    /// `body`. A backend without a streaming write for a body shape stores
-    /// [`PutBody::into_bytes`]. Callers use the names in
+    /// `body`. A `File` or `Parts` body is streamed from its files on every
+    /// backend; `Bytes` and `Chunks` are in memory already
+    /// ([`PutBody::into_small_bytes`]). Callers use the names in
     /// [`StorageBackendExt`]. No default: every wrapper must forward it
     /// with its own transform.
     fn put_object(
@@ -1912,13 +1962,14 @@ pub trait StorageBackendExt: StorageBackend {
         self.get_object(bucket, prefix, StoredObject::Passthrough(filename))
     }
 
-    /// Store a delta file with its metadata.
+    /// Store a delta with its metadata: from memory, or streamed from the
+    /// file the encode wrote (`PutBody::File`).
     fn put_delta(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: Bytes,
+        body: PutBody<'_>,
         metadata: &FileMetadata,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
@@ -1927,7 +1978,7 @@ pub trait StorageBackendExt: StorageBackend {
                 name: filename,
                 proof,
             };
-            self.put_object(bucket, prefix, target, PutBody::Bytes(data), metadata)
+            self.put_object(bucket, prefix, target, body, metadata)
                 .await
         }
     }
@@ -2056,10 +2107,15 @@ pub trait StorageBackendExt: StorageBackend {
         prefix: &str,
         path: &Path,
         metadata: &FileMetadata,
+        spool: SpoolBudget<'_>,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            let op = RefWrite::PutFile { path, metadata };
+            let op = RefWrite::PutFile {
+                path,
+                metadata,
+                spool,
+            };
             self.write_reference(bucket, prefix, op, proof).await
         }
     }

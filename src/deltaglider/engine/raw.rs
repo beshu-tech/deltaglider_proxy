@@ -87,7 +87,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         prefix: &str,
         filename: &str,
-        data: Bytes,
+        body: crate::storage::PutBody<'_>,
         metadata: &FileMetadata,
         prior: &CounterPrior,
     ) -> Result<(), StorageError> {
@@ -96,7 +96,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Inside `with_dest_prefix_lock`: the delta is only valid against the
         // reference the held cross-instance lock protects.
         let held = self.held_reference_lock(bucket, prefix, "delta")?;
-        held.put_delta(&*self.storage, bucket, prefix, filename, data, metadata)
+        held.put_delta(&*self.storage, bucket, prefix, filename, body, metadata)
             .await
             .map_err(engine_to_storage)?;
         // Mirror every engine store path: a delta write supersedes any stale
@@ -129,20 +129,30 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage.get_reference(bucket, prefix).await
     }
 
-    /// Write a deltaspace reference blob + metadata verbatim. Call it inside
+    /// Write a deltaspace reference blob + metadata verbatim, from memory
+    /// or streamed from a file. Call it inside
     /// [`Self::with_dest_prefix_lock`]: that holds the cross-instance lock
     /// the write goes through. Outside it, multi-instance refuses.
     pub async fn put_reference_raw(
         &self,
         bucket: &str,
         prefix: &str,
-        data: &Bytes,
+        body: crate::storage::PutBody<'_>,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let held = self.held_reference_lock(bucket, prefix, "reference")?;
-        held.put_reference(&*self.storage, bucket, prefix, data, metadata)
-            .await
-            .map_err(engine_to_storage)
+        let written = match body {
+            crate::storage::PutBody::File { path, spool } => {
+                held.put_reference_from_file(&*self.storage, bucket, prefix, path, metadata, spool)
+                    .await
+            }
+            body => {
+                let data = body.into_small_bytes()?;
+                held.put_reference(&*self.storage, bucket, prefix, &data, metadata)
+                    .await
+            }
+        };
+        written.map_err(engine_to_storage)
     }
 
     /// Reference metadata as a `Result` (errors propagate) — for callers that
@@ -184,7 +194,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         end: u64,
     ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), EngineError> {
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
-        self.retrieve_delta_range_spooled(bucket, &deltaspace_id, &obj_key, source_head, start, end)
+        self.retrieve_range_spooled(bucket, &deltaspace_id, &obj_key, source_head, start, end)
             .await
     }
 

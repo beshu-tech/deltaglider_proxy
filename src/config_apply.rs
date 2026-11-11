@@ -47,11 +47,14 @@ pub async fn build_engine(app: &AppState, cfg: &Config) -> Result<DynEngine, Str
     for bucket in &still_reserved {
         new_engine = new_engine.with_reserved_bucket(bucket);
     }
-    // Re-attach the usage counter and cross-instance reference lock — a
-    // rebuild must not drop either.
+    // Re-attach the usage counter, the cross-instance reference lock and
+    // the RAM budget of request bodies (one per process, carried by the
+    // running engine) — a rebuild must not drop any.
+    let memory = app.engine.load().memory_budget().clone();
     Ok(new_engine
         .with_bucket_usage(app.bucket_usage.clone())
-        .with_reference_lock(app.reference_lock.clone()))
+        .with_reference_lock(app.reference_lock.clone())
+        .with_memory_budget(memory))
 }
 
 /// Drop the runtime rows (state, cursor, lease, run history, failures,

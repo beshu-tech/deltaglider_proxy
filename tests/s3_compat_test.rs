@@ -2790,7 +2790,10 @@ async fn test_form_post_batch_under_one_signature_all_succeed() {
 async fn test_form_post_upload_routes_through_spool_store() {
     let server = TestServer::builder()
         .auth("POSTACCESSKEY", "POSTSECRETKEY123")
-        .env("DGP_SPOOL_THRESHOLD_BYTES", "1")
+        .env(
+            "DGP_SPOOL_THRESHOLD_BYTES",
+            &FORM_SPOOL_THRESHOLD.to_string(),
+        )
         .build()
         .await;
     let client = reqwest::Client::new();
@@ -2842,6 +2845,12 @@ async fn test_form_post_upload_routes_through_spool_store() {
         "spooled POST upload should return 204, got {}",
         resp.status()
     );
+    assert!(payload.len() > FORM_SPOOL_THRESHOLD);
+    assert_eq!(
+        form_metric(&server, FORM_SPOOLED).await,
+        1.0,
+        "the file streamed into a spool file"
+    );
 
     let s3 = server.s3_client().await;
     let got = s3
@@ -2857,6 +2866,82 @@ async fn test_form_post_upload_routes_through_spool_store() {
         &payload[..],
         "spooled POST upload must round-trip byte-exact"
     );
+}
+
+/// The spool threshold of the form POST tests that read a large file.
+const FORM_SPOOL_THRESHOLD: usize = 64 * 1024;
+
+const FORM_SPOOLED: &str =
+    r#"deltaglider_ingest_bodies_total{medium="spool",reason="over_threshold"}"#;
+
+/// One sample of `/_/metrics` (the scrape is public in tests).
+async fn form_metric(server: &TestServer, series: &str) -> f64 {
+    let text = reqwest::get(format!("{}/_/metrics", server.endpoint()))
+        .await
+        .expect("scrape")
+        .text()
+        .await
+        .unwrap();
+    text.lines()
+        .find_map(|l| l.strip_prefix(series)?.trim().parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// A form with a wrong signature and a large file is refused from its
+/// fields: the proxy answers `SignatureDoesNotMatch` without reading the
+/// file into memory or a spool file (it used to collect the whole form,
+/// up to `max_object_size`, before it checked the signature), and stores
+/// nothing.
+#[tokio::test]
+async fn test_form_post_bad_signature_with_a_large_file_reads_no_file() {
+    let server = TestServer::builder()
+        .auth("POSTACCESSKEY", "POSTSECRETKEY123")
+        .env(
+            "DGP_SPOOL_THRESHOLD_BYTES",
+            &FORM_SPOOL_THRESHOLD.to_string(),
+        )
+        .build()
+        .await;
+    let bucket = server.bucket();
+    let payload = vec![7u8; 4 * 1024 * 1024];
+    let boundary = "----bad-signature-boundary";
+    let mut wire = build_multipart_body(boundary, bucket, "post/bad-sig.bin", &payload);
+    // Flip the signature: the form is the same, its signature is wrong.
+    let at = wire
+        .windows(17)
+        .position(|w| w == b"x-amz-signature\"\r")
+        .expect("signature field")
+        + 20;
+    wire[at] = if wire[at] == b'0' { b'1' } else { b'0' };
+    let sent = reqwest::Client::new()
+        .post(format!("{}/{}", server.endpoint(), bucket))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(wire)
+        .send()
+        .await;
+    // The proxy may answer before the client has sent the whole file.
+    if let Ok(resp) = sent {
+        assert_eq!(resp.status().as_u16(), 403);
+        let body = resp.text().await.unwrap_or_default();
+        assert!(body.contains("SignatureDoesNotMatch"), "{body}");
+    }
+    assert_eq!(
+        form_metric(&server, FORM_SPOOLED).await,
+        0.0,
+        "no file was read into a spool file"
+    );
+    let head = server
+        .s3_client()
+        .await
+        .head_object()
+        .bucket(bucket)
+        .key("post/bad-sig.bin")
+        .send()
+        .await;
+    assert!(head.is_err(), "a refused form stores nothing");
 }
 
 #[tokio::test]
@@ -3075,6 +3160,18 @@ fn signed_post_form(
     file_bytes: &[u8],
     file_name: &str,
 ) -> reqwest::multipart::Form {
+    signed_post_form_with(bucket, key, file_bytes, file_name, &[])
+}
+
+/// [`signed_post_form`] with `extra` fields before the file (S3 reads the
+/// fields before the file and ignores those after it).
+fn signed_post_form_with(
+    bucket: &str,
+    key: &str,
+    file_bytes: &[u8],
+    file_name: &str,
+    extra: &[(&str, &str)],
+) -> reqwest::multipart::Form {
     let amz_date = "20260507T120000Z";
     let credential = "POSTACCESSKEY/20260507/us-east-1/s3/aws4_request";
     let policy = serde_json::json!({
@@ -3091,20 +3188,23 @@ fn signed_post_form(
     let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.to_string());
     let signing_key = derive_post_signing_key("POSTSECRETKEY123", "20260507", "us-east-1");
     let signature = hex::encode(hmac_sha256(&signing_key, policy_b64.as_bytes()));
-    reqwest::multipart::Form::new()
+    let mut form = reqwest::multipart::Form::new()
         .text("key", key.to_string())
         .text("policy", policy_b64)
         .text("x-amz-algorithm", "AWS4-HMAC-SHA256")
         .text("x-amz-credential", credential)
         .text("x-amz-date", amz_date)
-        .text("x-amz-signature", signature)
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(file_bytes.to_vec())
-                .file_name(file_name.to_string())
-                .mime_str("application/octet-stream")
-                .unwrap(),
-        )
+        .text("x-amz-signature", signature);
+    for (name, value) in extra {
+        form = form.text(name.to_string(), value.to_string());
+    }
+    form.part(
+        "file",
+        reqwest::multipart::Part::bytes(file_bytes.to_vec())
+            .file_name(file_name.to_string())
+            .mime_str("application/octet-stream")
+            .unwrap(),
+    )
 }
 
 /// `POST /<bucket>/<key>` (path with a nested key) must NOT be
@@ -3438,7 +3538,8 @@ fn build_multipart_body(boundary: &str, bucket: &str, key: &str, file_bytes: &[u
 
 /// Form-POST that includes `success_action_redirect` (which we
 /// explicitly reject as `NotImplemented`). Verify the rejection
-/// fires correctly and produces a 501 with a useful body.
+/// fires correctly and produces a 501 with a useful body. The same field
+/// AFTER the file is ignored, as S3 ignores every field after the file.
 #[tokio::test]
 async fn test_form_post_rejects_success_action_redirect() {
     let server = TestServer::builder()
@@ -3447,9 +3548,8 @@ async fn test_form_post_rejects_success_action_redirect() {
         .await;
     let bucket = server.bucket();
     let endpoint = server.endpoint();
-    // Take the standard signed form, then bolt on success_action_redirect.
-    let form = signed_post_form(bucket, "should-fail.bin", b"x", "x.bin")
-        .text("success_action_redirect", "https://example.com/done");
+    let redirect = ("success_action_redirect", "https://example.com/done");
+    let form = signed_post_form_with(bucket, "should-fail.bin", b"x", "x.bin", &[redirect]);
     let resp = reqwest::Client::new()
         .post(format!("{}/{}", endpoint, bucket))
         .multipart(form)
@@ -3460,6 +3560,22 @@ async fn test_form_post_rejects_success_action_redirect() {
         resp.status().as_u16(),
         501,
         "form-POST with success_action_redirect must be rejected as 501 NotImplemented, got {}",
+        resp.status()
+    );
+
+    let form = signed_post_form(bucket, "after-file.bin", b"x", "x.bin")
+        .text(redirect.0, redirect.1)
+        .text("submit", "Upload");
+    let resp = reqwest::Client::new()
+        .post(format!("{}/{}", endpoint, bucket))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        204,
+        "a field after the file is ignored, got {}",
         resp.status()
     );
 }
@@ -3779,7 +3895,12 @@ async fn test_usage_cache_returns_result() {
             .send()
             .await
             .unwrap();
-        if resp.status().as_u16() == 200 {
+        // "Not cached yet" is a 200 too (`cached: false`): the scan is
+        // done when the entry carries its counts.
+        assert_eq!(resp.status().as_u16(), 200);
+        let body = resp.json::<serde_json::Value>().await.unwrap();
+        assert!(body["error"].is_null(), "the scan failed: {body}");
+        if !body["total_objects"].is_null() {
             completed = true;
             break;
         }

@@ -123,16 +123,19 @@ async fn a_marker_key_with_a_body_is_refused() {
                 .await,
             Err(EngineError::InvalidArgument(_))
         ));
+        let relay = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(relay.path(), b"data").unwrap();
         assert!(matches!(
             engine
-                .store_passthrough_chunked(
+                .store_passthrough_relayed_parts_with_multipart_etag(
                     &engine.lock_object_write("b", "photos/").await,
                     "b",
                     "photos/",
-                    &[bytes::Bytes::from_static(b"data")],
+                    &[crate::deltaglider::RelayPart::of_file(relay.path())],
                     4,
                     None,
                     Default::default(),
+                    "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
                 )
                 .await,
             Err(EngineError::InvalidArgument(_))

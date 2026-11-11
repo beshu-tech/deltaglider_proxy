@@ -438,8 +438,17 @@ impl SignedPayloadHash {
         if !self.is_verifiable_hex() {
             return Ok(());
         }
-        let actual = hex::encode(Sha256::digest(body));
-        // `hex::encode` is lowercase; the header may be uppercase hex.
+        self.verify_against_digest(&hex::encode(Sha256::digest(body)))
+    }
+
+    /// [`Self::verify_against_body`] for a body hashed while it arrived:
+    /// `sha256_hex` is its SHA-256 in hex (either case). Constant time.
+    pub fn verify_against_digest(&self, sha256_hex: &str) -> Result<(), super::S3Error> {
+        if !self.is_verifiable_hex() {
+            return Ok(());
+        }
+        // The header may be uppercase hex.
+        let actual = sha256_hex.to_ascii_lowercase();
         let claimed = self.as_str().to_ascii_lowercase();
         let matches: bool = ConstantTimeEq::ct_eq(actual.as_bytes(), claimed.as_bytes()).into();
         if !matches {
@@ -1474,6 +1483,39 @@ mod tests {
         assert!(hash.is_verifiable_hex());
         assert!(hash.verify_against_body(body).is_ok());
         assert!(hash.verify_against_body(b"other").is_err());
+    }
+
+    /// The digest form judges exactly as the body form: the same answers
+    /// for the right digest (either case), a wrong one, and the sentinels.
+    #[test]
+    fn verify_against_digest_matches_verify_against_body() {
+        let body = b"hello";
+        let digest = hex::encode(Sha256::digest(body));
+        let other = hex::encode(Sha256::digest(b"other"));
+        for claimed in [
+            digest.clone(),
+            digest.to_ascii_uppercase(),
+            other.clone(),
+            "UNSIGNED-PAYLOAD".into(),
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".into(),
+        ] {
+            let hash = SignedPayloadHash(claimed.clone());
+            for (given, bytes) in [(&digest, &body[..]), (&other, &b"other"[..])] {
+                assert_eq!(
+                    hash.verify_against_digest(given).is_ok(),
+                    hash.verify_against_body(bytes).is_ok(),
+                    "{claimed} vs {given}"
+                );
+                assert_eq!(
+                    hash.verify_against_digest(&given.to_ascii_uppercase())
+                        .is_ok(),
+                    hash.verify_against_body(bytes).is_ok(),
+                );
+            }
+        }
+        assert!(SignedPayloadHash(digest.clone())
+            .verify_against_digest(&other)
+            .is_err());
     }
 
     #[test]

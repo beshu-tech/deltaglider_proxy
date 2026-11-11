@@ -483,7 +483,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Load a reference and check it against its own recorded SHA-256.
-    /// Returns the bytes and their SHA-256, for the cache.
+    /// Returns the bytes and their SHA-256, for the cache. A reference
+    /// above the spool threshold is not read: `ReferenceNotInMemory`, and
+    /// the caller uses the verified reference FILE instead.
     async fn load_verified_reference(
         &self,
         bucket: &str,
@@ -512,11 +514,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 }
                 other => EngineError::Storage(other),
             })?;
-        let data = {
-            use futures::TryStreamExt;
-            let chunks: Vec<Bytes> = stream.try_collect().await?;
-            chunks.concat()
-        };
+        if recorded.file_size > self.spool_threshold() {
+            return Err(EngineError::ReferenceNotInMemory {
+                deltaspace: deltaspace_id.to_string(),
+                size: recorded.file_size,
+            });
+        }
+        let data = collect_sized(stream, recorded.file_size).await?;
 
         // Validate against the reference's own recorded checksum when present.
         // An empty checksum (out-of-band / CLI-uploaded references) is
@@ -538,10 +542,31 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             });
         }
 
-        // PERF: Convert Vec→Bytes once (zero-copy ownership transfer); the
-        // cache keeps a clone (refcount increment, no memcpy).
-        Ok((Bytes::from(data), actual))
+        // The cache keeps a clone (refcount increment, no memcpy).
+        Ok((data, actual))
     }
+}
+
+/// Collect a stream of `size` bytes (the size its metadata records) into
+/// ONE buffer, allocated once. A stream longer than `size` fails: the
+/// object changed while it was read, and the buffer stays bounded.
+pub(super) async fn collect_sized(
+    mut stream: crate::storage::ByteStream,
+    size: u64,
+) -> Result<Bytes, StorageError> {
+    use futures::StreamExt;
+    let mut buf = bytes::BytesMut::with_capacity(usize::try_from(size).unwrap_or(0));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if (buf.len() + chunk.len()) as u64 > size {
+            return Err(StorageError::Throttled(format!(
+                "a stored object is longer than its recorded size ({size} bytes); \
+                 it changed while read, retry the request"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
 }
 
 /// Pure: after the reconstruction of a delta failed its checksum, can the

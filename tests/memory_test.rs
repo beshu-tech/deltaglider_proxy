@@ -3,10 +3,10 @@
 //! Memory-bounded multipart upload integration test
 //!
 //! Verifies that the server process's peak RSS stays bounded during large
-//! multipart uploads of non-delta-eligible files. The streaming pass-through
-//! path (`store_passthrough_chunked`) avoids assembling all parts into a contiguous
-//! buffer, keeping the memory spike proportional to a single part rather than
-//! the entire object.
+//! multipart uploads of non-delta-eligible files. Every part is a relay file
+//! in the spool, and the completion stores the object from those files
+//! (`store_passthrough_relayed_parts_with_multipart_etag`), so no part and no
+//! assembled object is held in memory.
 //!
 //! Uses `peak_rss_bytes` from the `/health` endpoint (backed by
 //! `getrusage(RUSAGE_SELF).ru_maxrss`) which captures even microsecond-lived
@@ -224,12 +224,13 @@ async fn test_multipart_memory_bounded() {
     // INFORMATIONAL ONLY — never gating. Raw RSS deltas flake on shared CI
     // runners.
     //
-    // The deterministic gates live elsewhere: an upload that tries no delta
-    // (this `.bin`) relays its parts to the spool from part 1
-    // (`multipart_relay_test::an_upload_that_tries_no_delta_relays_its_parts_from_the_start`),
-    // and a delta candidate is assembled in memory only up to
-    // `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`, above which it is stored from
-    // the parts. The replication copy path is pinned by
+    // The deterministic gates live elsewhere: every upload relays its parts
+    // to the spool from part 1
+    // (`multipart_relay_test::every_upload_relays_its_parts_from_the_first_part`),
+    // an UploadPart body never touches the RAM budget
+    // (`put_ingest_tests::an_upload_part_three_times_the_threshold_becomes_a_relay_file`),
+    // and a delta candidate is joined into a spool file, never assembled in
+    // memory. The replication copy path is pinned by
     // `large_object_e2e_test::memory_bounded_resident_part_bytes`. This RSS
     // spike stays an informational signal for the whole complete.
     eprintln!(

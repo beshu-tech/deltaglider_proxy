@@ -141,8 +141,15 @@ impl SpoolDir {
         Ok(SHARED.get_or_init(|| pool).clone())
     }
 
+    /// A spool rooted at `dir`, created private to this user (0700) when
+    /// missing. An existing root must be private too
+    /// (`private_dir_verdict`): a root that another user owns or can
+    /// write to lets that user replace a spool file (a relay part, a body)
+    /// between its check and its read. One that only its group can write
+    /// to is set to 0700; any other is refused, and the proxy does not
+    /// start.
     pub fn new(dir: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
-        std::fs::create_dir_all(&dir)?;
+        create_private_dir(&dir)?;
         // Accounted in MiB: small numbers for terabyte-scale budgets.
         let max_mib = mib_ceil(max_bytes).max(1);
         Ok(Self {
@@ -349,9 +356,15 @@ impl SpoolDir {
     /// `acquire` for an op that already holds the spool `held`: clamped like
     /// [`Self::acquire_pair_beside`], so the op never waits on itself.
     pub async fn acquire_beside(&self, held: Option<&Spool>, bytes: u64) -> std::io::Result<Spool> {
-        let permit = self
-            .reserve_within(bytes, held.map_or(0, Spool::reserved_mib))
-            .await?;
+        self.acquire_beside_mib(held.map_or(0, Spool::reserved_mib), bytes)
+            .await
+    }
+
+    /// [`Self::acquire_beside`] for an op whose held budget is not one
+    /// `Spool` but a number of MiB: the relay parts of a multipart upload,
+    /// which hold one reservation each.
+    pub async fn acquire_beside_mib(&self, held_mib: usize, bytes: u64) -> std::io::Result<Spool> {
+        let permit = self.reserve_within(bytes, held_mib).await?;
         let file = temp_in(&self.dir)?;
         Ok(Spool {
             file,
@@ -365,7 +378,9 @@ impl SpoolDir {
     /// single reservation can't half-acquire and self-deadlock, and two
     /// concurrent ops never hold one spool while waiting for the other (each
     /// op's whole reservation is atomic). The shared permit drops when BOTH
-    /// returned `Spool`s drop.
+    /// returned `Spool`s drop. Tests only: production holds a spool already
+    /// and uses [`Self::acquire_pair_beside`] or [`Self::acquire_group`].
+    #[cfg(test)]
     pub async fn acquire_pair(
         &self,
         a_bytes: u64,
@@ -374,7 +389,7 @@ impl SpoolDir {
         self.acquire_pair_beside(None, a_bytes, b_bytes).await
     }
 
-    /// `acquire_pair` for an op that already holds the spool `held` (the
+    /// A pair of spools in ONE permit for an op that already holds the spool `held` (the
     /// streaming PUT holds its body spool, then needs ref + delta). The pair
     /// is clamped so the op's total stays within the budget. A plain
     /// `acquire_pair` there waited for budget the op held itself, until the
@@ -385,35 +400,51 @@ impl SpoolDir {
         a_bytes: u64,
         b_bytes: u64,
     ) -> std::io::Result<(Spool, Spool)> {
+        let group = self.acquire_group_beside(held, &[a_bytes, b_bytes]).await?;
+        let [a, b] = <[Spool; 2]>::try_from(group)
+            .map_err(|_| std::io::Error::other("a pair is two spool files"))?;
+        Ok((a, b))
+    }
+
+    /// Any number of spool files in ONE permit for all of
+    /// them (the large delta GET needs reference + output + delta), shared
+    /// by the returned spools in the order of `sizes`. The budget is
+    /// released when the last of them drops.
+    pub async fn acquire_group(&self, sizes: &[u64]) -> std::io::Result<Vec<Spool>> {
+        self.acquire_group_beside(None, sizes).await
+    }
+
+    /// [`Self::acquire_group`] for an op that holds `held` (see
+    /// [`Self::acquire_pair_beside`]): clamped, and no wait for a holder.
+    pub async fn acquire_group_beside(
+        &self,
+        held: Option<&Spool>,
+        sizes: &[u64],
+    ) -> std::io::Result<Vec<Spool>> {
         let held_mib = held.map_or(0, Spool::reserved_mib);
-        // A holder of the whole budget would get the pair with 0 MiB
-        // accounted (the clamp), so the op used held + a + b on disk. The
-        // pair is optional work (the streaming PUT stores passthrough
+        let total = sizes.iter().fold(0u64, |acc, s| acc.saturating_add(*s));
+        // A holder of the whole budget would get the group with 0 MiB
+        // accounted (the clamp), so the op used held + the group on disk.
+        // The group is optional work (the streaming PUT stores passthrough
         // without it): refuse it. A storage write's own temp files
         // (`SpoolBudget`) keep the clamp, because the object cannot be
         // stored without them.
-        if held_mib > 0 && self.want_mib(a_bytes.saturating_add(b_bytes), held_mib) == 0 {
+        if held_mib > 0 && self.want_mib(total, held_mib) == 0 {
             return Err(std::io::Error::new(
                 CONTENDED,
-                "spool budget: the op holds the whole budget, no room for a delta pair",
+                "spool budget: the op holds the whole budget, no room for more spool files",
             ));
         }
-        let permit = std::sync::Arc::new(
-            self.reserve_within(a_bytes.saturating_add(b_bytes), held_mib)
-                .await?,
-        );
-        let a = temp_in(&self.dir)?;
-        let b = temp_in(&self.dir)?;
-        Ok((
-            Spool {
-                file: a,
-                _permit: SharedOrOwned::Shared(permit.clone()),
-            },
-            Spool {
-                file: b,
-                _permit: SharedOrOwned::Shared(permit),
-            },
-        ))
+        let permit = std::sync::Arc::new(self.reserve_within(total, held_mib).await?);
+        sizes
+            .iter()
+            .map(|_| {
+                Ok(Spool {
+                    file: temp_in(&self.dir)?,
+                    _permit: SharedOrOwned::Shared(permit.clone()),
+                })
+            })
+            .collect()
     }
 
     /// Reserve `bytes` for the temp files of a storage write, with no file
@@ -467,7 +498,8 @@ impl SpoolReservation {
         self.permit.num_permits()
     }
 
-    fn file(&self) -> std::io::Result<Spool> {
+    /// A temp file in the spool dir that shares this reservation.
+    pub(crate) fn file(&self) -> std::io::Result<Spool> {
         Ok(Spool {
             file: temp_in(&self.dir)?,
             _permit: SharedOrOwned::Shared(self.permit.clone()),
@@ -486,6 +518,20 @@ pub struct SpoolBudget<'a> {
     dir: &'a SpoolDir,
     held: Option<&'a Spool>,
     reserved: Option<&'a SpoolReservation>,
+}
+
+/// Manual: a [`crate::storage::RefWrite`] carries one and derives `Debug`.
+impl std::fmt::Debug for SpoolBudget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpoolBudget")
+            .field("dir", &self.dir.dir)
+            .field("held_mib", &self.held.map(Spool::reserved_mib))
+            .field(
+                "reserved_mib",
+                &self.reserved.map(SpoolReservation::reserved_mib),
+            )
+            .finish()
+    }
 }
 
 impl<'a> SpoolBudget<'a> {
@@ -534,25 +580,60 @@ impl Spool {
         self.file.path()
     }
 
-    /// Write `stream` into this spool file, hashing it (SHA-256) on the way.
-    /// At most `cap` bytes (the reservation): a longer stream stops at the
-    /// first chunk past `cap`, so a source that grew after its size was read
-    /// never overruns the spool budget. The caller judges a short stream.
-    pub async fn fill_from_stream<S>(
+    /// Write `stream` into this spool file, hashing it (MD5, and SHA-256
+    /// as `sha256` asks: a SHA-256 proven for these bytes by the caller
+    /// is used as is) on the way. At most `cap` bytes (the
+    /// reservation): a longer stream stops at the first chunk past `cap`,
+    /// so a source that grew after its size was read never overruns the
+    /// spool budget. The caller judges a short stream. The one spool writer
+    /// of the proxy: writes go through a 1 MiB buffer, so small chunks do
+    /// not each cost a trip to the blocking pool.
+    pub async fn fill_from_stream<S, E>(
         &self,
         stream: &mut S,
         cap: u64,
-    ) -> Result<SpoolFill, SpoolFillError>
+        sha256: crate::deltaglider::ingest::Sha256Need,
+    ) -> Result<SpoolFill, SpoolFillError<E>>
     where
-        S: futures::Stream<Item = Result<bytes::Bytes, crate::storage::StorageError>> + Unpin,
+        S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    {
+        let mut hasher = crate::deltaglider::ingest::BodyHasher::for_need(sha256);
+        let written = self.fill(stream, cap, Some(&mut hasher)).await?;
+        Ok(SpoolFill {
+            written,
+            hashes: hasher.finish(),
+        })
+    }
+
+    /// [`Self::fill_from_stream`] without hashes, for bytes that are checked
+    /// another way (the delta of a GET: the decoded object is checked).
+    /// The number of bytes written.
+    pub async fn fill_unhashed<S, E>(
+        &self,
+        stream: &mut S,
+        cap: u64,
+    ) -> Result<u64, SpoolFillError<E>>
+    where
+        S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    {
+        self.fill(stream, cap, None).await
+    }
+
+    async fn fill<S, E>(
+        &self,
+        stream: &mut S,
+        cap: u64,
+        mut hasher: Option<&mut crate::deltaglider::ingest::BodyHasher>,
+    ) -> Result<u64, SpoolFillError<E>>
+    where
+        S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
     {
         use futures::StreamExt;
-        use sha2::Digest;
         use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::File::create(self.path())
+        let file = tokio::fs::File::create(self.path())
             .await
             .map_err(SpoolFillError::Write)?;
-        let mut hasher = sha2::Sha256::new();
+        let mut file = tokio::io::BufWriter::with_capacity(FILL_BUFFER, file);
         let mut written: u64 = 0;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(SpoolFillError::Source)?;
@@ -560,16 +641,35 @@ impl Spool {
             if written > cap {
                 return Err(SpoolFillError::Overrun { cap, written });
             }
-            hasher.update(&chunk);
+            if let Some(h) = hasher.as_deref_mut() {
+                h.update(&chunk);
+            }
             file.write_all(&chunk)
                 .await
                 .map_err(SpoolFillError::Write)?;
         }
         file.flush().await.map_err(SpoolFillError::Write)?;
-        Ok(SpoolFill {
-            written,
-            sha256: hex::encode(hasher.finalize()),
-        })
+        Ok(written)
+    }
+
+    /// Keep the file past this `Spool`: rename it to `path` (a new name in
+    /// the spool's file system, never an existing one) and hand back the
+    /// reservation that holds its budget. A multipart part becomes a relay
+    /// part this way, with no copy and no second reservation. On an error
+    /// the temp file is deleted and the budget released.
+    pub(crate) fn keep_as(self, path: &Path) -> std::io::Result<(PathBuf, SpoolReservation)> {
+        let Spool { file, _permit } = self;
+        let dir = file
+            .path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        file.persist_noclobber(path).map_err(|e| e.error)?;
+        let permit = match _permit {
+            SharedOrOwned::Owned(p) => Arc::new(p),
+            SharedOrOwned::Shared(p) => p,
+        };
+        Ok((path.to_path_buf(), SpoolReservation { dir, permit }))
     }
 
     /// Budget this spool holds, in MiB (a pair's shared permit counts once
@@ -582,19 +682,22 @@ impl Spool {
     }
 }
 
+/// The write buffer of [`Spool::fill_from_stream`].
+const FILL_BUFFER: usize = 1024 * 1024;
+
 /// What [`Spool::fill_from_stream`] wrote.
 #[derive(Debug)]
 pub struct SpoolFill {
     pub written: u64,
-    /// Hex SHA-256 of the bytes written.
-    pub sha256: String,
+    /// The hashes of the bytes written.
+    pub hashes: crate::deltaglider::ingest::BodyHashes,
 }
 
 /// Why [`Spool::fill_from_stream`] stopped.
 #[derive(Debug)]
-pub enum SpoolFillError {
+pub enum SpoolFillError<E> {
     /// The source stream failed.
-    Source(crate::storage::StorageError),
+    Source(E),
     /// Writing the spool file failed.
     Write(std::io::Error),
     /// The stream is longer than `cap`: the source changed after its size
@@ -624,6 +727,81 @@ pub(crate) fn temp_in(dir: &Path) -> std::io::Result<NamedTempFile> {
 }
 
 /// Bytes → MiB, rounded up. Budget accounting unit.
+/// What [`private_dir_verdict`] decides about an existing spool root.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DirVerdict {
+    /// Ours, and nobody else can write to it.
+    Private,
+    /// Ours, and only its group can write to it (a directory that an older
+    /// release or a test made under umask 002): set it to 0700.
+    Tighten,
+    /// Not usable as the spool root.
+    Refuse(String),
+}
+
+/// Pure: may a directory owned by `owner` with permission bits `mode` be
+/// the spool root of the user `me`? Only when `me` owns it and no other
+/// user can write to it. A root that only its group can write to is made
+/// private; a world-writable or sticky one (a shared temp root) is
+/// refused, because changing its mode would break its other users.
+pub(crate) fn private_dir_verdict(owner: u32, me: u32, mode: u32) -> DirVerdict {
+    if owner != me {
+        return DirVerdict::Refuse(format!(
+            "it is owned by uid {owner}, not by this process (uid {me}); give DGP_SPOOL_DIR \
+             a directory of its own"
+        ));
+    }
+    if mode & 0o1002 != 0 {
+        return DirVerdict::Refuse(format!(
+            "other users can write to it (mode {:o}); give DGP_SPOOL_DIR a directory of its \
+             own, or run `chmod 700` on it",
+            mode & 0o7777
+        ));
+    }
+    if mode & 0o020 != 0 {
+        return DirVerdict::Tighten;
+    }
+    DirVerdict::Private
+}
+
+/// Create `dir` (and missing parents) with mode 0700, then judge it with
+/// [`private_dir_verdict`]: a pre-existing root keeps a private mode, has
+/// its group write bit removed, or is refused.
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = std::fs::metadata(dir)?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    match private_dir_verdict(meta.uid(), me, meta.mode()) {
+        DirVerdict::Private => Ok(()),
+        DirVerdict::Tighten => {
+            tracing::warn!(
+                "spool directory {} was writable by its group (mode {:o}); setting it to 700",
+                dir.display(),
+                meta.mode() & 0o7777
+            );
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        }
+        DirVerdict::Refuse(why) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "the spool directory {} is not private: {why}",
+                dir.display()
+            ),
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
 pub(crate) fn mib_ceil(bytes: u64) -> usize {
     const MIB: u64 = 1024 * 1024;
     bytes.div_ceil(MIB) as usize
@@ -793,15 +971,120 @@ impl Budget {
     }
 }
 
+/// THE blocking read loop over a spool or relay file: `path` in 256 KiB
+/// reads on the calling thread, each chunk handed to `chunk` in order.
+/// Returns the bytes read. It blocks: callers run it in `spawn_blocking`.
+pub(crate) fn for_each_chunk_blocking(
+    path: &Path,
+    mut chunk: impl FnMut(&[u8]),
+) -> std::io::Result<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(total);
+        }
+        total = total.saturating_add(n as u64);
+        chunk(&buf[..n]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn for_each_chunk_blocking_hands_over_every_byte_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let data: Vec<u8> = (0..600 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let mut seen = Vec::new();
+        let mut chunks = 0;
+        let n = for_each_chunk_blocking(&path, |c| {
+            chunks += 1;
+            seen.extend_from_slice(c);
+        })
+        .unwrap();
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(seen, data);
+        assert!(chunks >= 3, "256 KiB reads: {chunks}");
+        assert!(for_each_chunk_blocking(&dir.path().join("none"), |_| {}).is_err());
+    }
 
     #[test]
     fn shared_spool_is_one_budget() {
         let a = SpoolDir::shared().unwrap();
         let b = SpoolDir::shared().unwrap();
         assert!(Arc::ptr_eq(&a.budget, &b.budget), "one budget per process");
+    }
+
+    #[test]
+    fn private_dir_verdict_truth_table() {
+        use DirVerdict::*;
+        let refused = |v: DirVerdict| matches!(v, Refuse(_));
+        assert_eq!(private_dir_verdict(1000, 1000, 0o40700), Private);
+        assert_eq!(private_dir_verdict(1000, 1000, 0o40755), Private);
+        assert_eq!(private_dir_verdict(0, 0, 0o40700), Private);
+        assert_eq!(private_dir_verdict(1000, 1000, 0o40770), Tighten);
+        assert_eq!(private_dir_verdict(1000, 1000, 0o40775), Tighten);
+        let Refuse(why) = private_dir_verdict(0, 1000, 0o40700) else {
+            panic!("another owner")
+        };
+        assert!(why.contains("uid 0"), "{why}");
+        assert!(refused(private_dir_verdict(1000, 1000, 0o40777)));
+        assert!(refused(private_dir_verdict(1000, 1000, 0o40702)));
+        // A sticky dir is a shared temp root, even when ours (root's /tmp).
+        assert!(refused(private_dir_verdict(0, 0, 0o41777)));
+        assert!(refused(private_dir_verdict(1000, 1000, 0o41700)));
+    }
+
+    /// A new root is created 0700; an existing private root is kept as
+    /// it is; one only its group can write to is made 0700; a root that
+    /// other users can write to is refused with a message that names it.
+    #[cfg(unix)]
+    #[test]
+    fn the_spool_root_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("a/spool");
+        SpoolDir::new(fresh.clone(), 1 << 20).unwrap();
+        assert_eq!(mode(&fresh), 0o700);
+
+        let kept = dir.path().join("kept");
+        std::fs::create_dir(&kept).unwrap();
+        set(&kept, 0o750);
+        SpoolDir::new(kept.clone(), 1 << 20).unwrap();
+        assert_eq!(
+            mode(&kept),
+            0o750,
+            "an existing private root keeps its mode"
+        );
+
+        let group = dir.path().join("group");
+        std::fs::create_dir(&group).unwrap();
+        set(&group, 0o775);
+        SpoolDir::new(group.clone(), 1 << 20).unwrap();
+        assert_eq!(mode(&group), 0o700, "a group-writable root is made private");
+
+        for open in [0o777, 0o703, 0o1777] {
+            let shared = dir.path().join(format!("shared-{open:o}"));
+            std::fs::create_dir(&shared).unwrap();
+            set(&shared, open);
+            let err = SpoolDir::new(shared.clone(), 1 << 20)
+                .err()
+                .expect("refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("not private"), "{err}");
+            assert_eq!(mode(&shared), open, "a refused root is not changed");
+        }
     }
 
     #[test]
@@ -823,32 +1106,71 @@ mod tests {
             futures::stream::iter(
                 parts
                     .iter()
-                    .map(|p| Ok(bytes::Bytes::from_static(p)))
+                    .map(|p| Ok::<_, std::io::Error>(bytes::Bytes::from_static(p)))
                     .collect::<Vec<_>>(),
             )
         };
 
         let spool = pool.acquire(10).await.unwrap();
         let fill = spool
-            .fill_from_stream(&mut chunks(&[b"hello ", b"spool"]), 11)
+            .fill_from_stream(
+                &mut chunks(&[b"hello ", b"spool"]),
+                11,
+                crate::deltaglider::ingest::Sha256Need::Compute,
+            )
             .await
             .unwrap();
         assert_eq!(fill.written, 11);
         assert_eq!(
-            fill.sha256,
+            fill.hashes.sha256(),
             hex::encode(sha2::Sha256::digest(b"hello spool"))
+        );
+        assert_eq!(
+            fill.hashes.md5(),
+            hex::encode(<md5::Md5 as md5::Digest>::digest(b"hello spool"))
         );
         assert_eq!(std::fs::read(spool.path()).unwrap(), b"hello spool");
 
+        // A SHA-256 the caller proved is taken as is; MD5 is still computed.
+        let proven = crate::deltaglider::KnownSha256::of(b"proven elsewhere");
+        let fill = spool
+            .fill_from_stream(
+                &mut chunks(&[b"hello ", b"spool"]),
+                11,
+                crate::deltaglider::ingest::Sha256Need::Known(proven),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fill.hashes.sha256(), proven.to_hex());
+        assert_eq!(
+            fill.hashes.md5(),
+            hex::encode(<md5::Md5 as md5::Digest>::digest(b"hello spool"))
+        );
+
         // Short: the caller judges it.
         let fill = spool
-            .fill_from_stream(&mut chunks(&[b"abc"]), 11)
+            .fill_from_stream(
+                &mut chunks(&[b"abc"]),
+                11,
+                crate::deltaglider::ingest::Sha256Need::Compute,
+            )
             .await
             .unwrap();
         assert_eq!(fill.written, 3);
+        assert_eq!(
+            spool
+                .fill_unhashed(&mut chunks(&[b"ab", b"c"]), 11)
+                .await
+                .unwrap(),
+            3
+        );
 
         let grown = spool
-            .fill_from_stream(&mut chunks(&[b"12345", b"67890", b"x"]), 10)
+            .fill_from_stream(
+                &mut chunks(&[b"12345", b"67890", b"x"]),
+                10,
+                crate::deltaglider::ingest::Sha256Need::Compute,
+            )
             .await;
         assert!(
             matches!(
@@ -869,7 +1191,13 @@ mod tests {
             Ok(bytes::Bytes::from_static(b"ok")),
             Err(crate::storage::StorageError::Other("reset".into())),
         ]);
-        let err = spool.fill_from_stream(&mut failing, 10).await;
+        let err = spool
+            .fill_from_stream(
+                &mut failing,
+                10,
+                crate::deltaglider::ingest::Sha256Need::Compute,
+            )
+            .await;
         assert!(matches!(err, Err(SpoolFillError::Source(_))), "{err:?}");
     }
 
@@ -1062,6 +1390,40 @@ mod tests {
             .err()
             .expect("a full holder must not get an unaccounted pair");
         assert_eq!(err.kind(), CONTENDED);
+    }
+
+    /// A group (the large delta GET: reference + output + delta) is ONE
+    /// reservation: all files or none, released when the last one drops,
+    /// and a holder of the whole budget gets no group.
+    #[tokio::test]
+    async fn acquire_group_is_one_reservation_for_every_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 8 * 1024 * 1024).unwrap();
+        let mib = 1024 * 1024;
+        let group = pool
+            .acquire_group(&[3 * mib, 3 * mib, 2 * mib])
+            .await
+            .unwrap();
+        assert_eq!(group.len(), 3);
+        assert_eq!(pool.free_mib(), 0, "the sum is reserved at once");
+        let mut paths: Vec<_> = group.iter().map(|s| s.path().to_path_buf()).collect();
+        paths.dedup();
+        assert_eq!(paths.len(), 3, "three distinct files");
+        let mut group = group;
+        group.truncate(1);
+        assert_eq!(
+            pool.free_mib(),
+            0,
+            "a file of the group keeps the reservation"
+        );
+        let err = pool
+            .acquire_group_beside(Some(&group[0]), &[mib, mib])
+            .await
+            .err()
+            .expect("a holder of the whole budget gets no more files");
+        assert_eq!(err.kind(), CONTENDED);
+        drop(group);
+        assert_eq!(pool.free_mib(), 8, "the last file releases the reservation");
     }
 
     #[tokio::test]

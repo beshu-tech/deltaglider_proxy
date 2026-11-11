@@ -122,7 +122,7 @@ impl S3Backend {
         if let Some(marker) = self.native_encryption.for_bucket(dst.bucket).marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
-        check_metadata_size(&headers, dst.bucket, &dst_key)?;
+        fit_metadata(&mut headers, dst.bucket, &dst_key)?;
         let copy_source = format!("{}/{}", src.bucket, encode_copy_source_key(&src_key));
         let copied = if size <= COPY_OBJECT_MAX_BYTES {
             self.copy_single(dst.bucket, &dst_key, &copy_source, etag, &headers)

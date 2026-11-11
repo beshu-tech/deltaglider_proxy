@@ -75,7 +75,7 @@ mod backend_tests {
                 "ghost",
                 "ns",
                 "f.delta",
-                bytes::Bytes::from_static(b"x"),
+                crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"x")),
                 &dummy_metadata("f.delta"),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -311,7 +311,7 @@ mod backend_tests {
                 "bucket",
                 "a/b",
                 "file.bin",
-                bytes::Bytes::from_static(b"delta"),
+                crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"delta")),
                 &dummy_metadata("file.bin"),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -550,7 +550,7 @@ mod backend_tests {
                             "bucket",
                             prefix,
                             "x.zip",
-                            bytes::Bytes::from_static(b"d"),
+                            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"d")),
                             &dummy_metadata("x.zip"),
                             crate::deltaglider::RefWriteProof::for_tests()
                         )
@@ -625,7 +625,7 @@ mod backend_tests {
                 "bucket",
                 "a",
                 ".dg-tmp.x.zip",
-                bytes::Bytes::from_static(b"d"),
+                crate::storage::traits::PutBody::Bytes(bytes::Bytes::from_static(b"d")),
                 &dummy_metadata(".dg-tmp.x.zip"),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
@@ -949,6 +949,16 @@ mod backend_tests {
         assert!(matches!(err, StorageError::NotFound(_)));
     }
 
+    fn spool_of(tmp: &tempfile::TempDir) -> crate::deltaglider::spool::SpoolDir {
+        crate::deltaglider::spool::SpoolDir::new(tmp.path().join("spool"), 64 << 20).unwrap()
+    }
+
+    fn unheld(
+        sd: &crate::deltaglider::spool::SpoolDir,
+    ) -> crate::deltaglider::spool::SpoolBudget<'_> {
+        crate::deltaglider::spool::SpoolBudget::new(sd, None, None)
+    }
+
     fn ref_meta(len: usize) -> FileMetadata {
         FileMetadata::new_reference(
             "reference.bin".into(),
@@ -987,6 +997,7 @@ mod backend_tests {
                 "d",
                 &missing,
                 &ref_meta(3),
+                unheld(&spool_of(&tmp)),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
             .await
@@ -1018,6 +1029,7 @@ mod backend_tests {
                 "d",
                 &src,
                 &ref_meta(8),
+                unheld(&spool_of(&tmp)),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )
             .await
@@ -1527,7 +1539,7 @@ async fn listing_fixture() -> (tempfile::TempDir, FilesystemBackend) {
             "b",
             "x",
             file,
-            bytes::Bytes::from_static(b"ddd"),
+            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"ddd")),
             &delta(named),
             proof,
         )
@@ -2016,5 +2028,132 @@ mod put_if_unchanged_tests {
             .unwrap();
         assert_eq!(rewrite(&b, &v).await, WriteIf::Changed);
         assert!(b.get_passthrough("releases", "p", "a.txt").await.is_err());
+    }
+
+    fn delta_meta(body: &[u8]) -> FileMetadata {
+        FileMetadata::new_delta(
+            "app.zip".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            body.len() as u64 + 100,
+            "reference.bin".into(),
+            "1".repeat(64),
+            body.len() as u64,
+            None,
+        )
+    }
+
+    /// A delta and the reference from a local file of any size: copied
+    /// into place with their metadata (never loaded into memory), on a
+    /// plain write and on a conditional rewrite. The version check is the
+    /// same as for a body in memory.
+    #[tokio::test]
+    async fn deltas_and_the_reference_are_written_from_files() {
+        use crate::deltaglider::RefWriteProof;
+        let tmp = tempfile::tempdir().unwrap();
+        let b = FilesystemBackend::new(tmp.path().join("data"))
+            .await
+            .unwrap();
+        b.create_bucket("releases").await.unwrap();
+        let sd =
+            crate::deltaglider::spool::SpoolDir::new(tmp.path().join("spool"), 64 << 20).unwrap();
+        let spool = crate::deltaglider::spool::SpoolBudget::new(&sd, None, None);
+        let src = tmp.path().join("src");
+        let first: Vec<u8> = (0..300_000u32).map(|n| (n % 251) as u8).collect();
+        std::fs::write(&src, &first).unwrap();
+        let proof = RefWriteProof::for_tests();
+
+        let target = crate::storage::StoredWrite::Delta {
+            name: "app.zip",
+            proof,
+        };
+        let body = PutBody::File { path: &src, spool };
+        b.put_object("releases", "p", target, body, &delta_meta(&first))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.get_delta("releases", "p", "app.zip").await.unwrap(),
+            first
+        );
+        let stored = b
+            .get_delta_metadata("releases", "p", "app.zip")
+            .await
+            .unwrap();
+        assert_eq!(stored.file_size, delta_meta(&first).file_size);
+
+        let version = b
+            .head_object("releases", "p", StoredObject::Delta("app.zip"))
+            .await
+            .unwrap()
+            .backend_version
+            .unwrap();
+        let second = b"the second delta".to_vec();
+        std::fs::write(&src, &second).unwrap();
+        let target = RewriteTarget::Delta {
+            name: "app.zip",
+            proof,
+        };
+        let body = || PutBody::File { path: &src, spool };
+        let meta = delta_meta(&second);
+        let w = b.put_if_unchanged("releases", "p", target, body(), &meta, &version);
+        assert_eq!(w.await.unwrap(), WriteIf::Written);
+        assert_eq!(
+            b.get_delta("releases", "p", "app.zip").await.unwrap(),
+            second
+        );
+        let w = b.put_if_unchanged("releases", "p", target, body(), &meta, &version);
+        assert_eq!(w.await.unwrap(), WriteIf::Changed, "the version is gone");
+
+        let rmeta = FileMetadata::new_reference(
+            "reference.bin".into(),
+            "app.zip".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            second.len() as u64,
+            None,
+        );
+        b.put_reference_from_file("releases", "p", &src, &rmeta, spool, proof)
+            .await
+            .unwrap();
+        let version = b
+            .head_object("releases", "p", StoredObject::Reference)
+            .await
+            .unwrap()
+            .backend_version
+            .unwrap();
+        std::fs::write(&src, &first).unwrap();
+        let target = RewriteTarget::Reference { proof };
+        let w = b.put_if_unchanged("releases", "p", target, body(), &rmeta, &version);
+        assert_eq!(w.await.unwrap(), WriteIf::Written);
+        assert_eq!(b.get_reference("releases", "p").await.unwrap(), first);
+        assert_eq!(sd.free_mib(), 64, "no spool is used on the filesystem");
+    }
+
+    /// A file body is never loaded into memory: `into_small_bytes` refuses
+    /// it, so a backend that has no streaming write for it fails instead
+    /// of buffering an object of any size.
+    #[tokio::test]
+    async fn a_file_body_is_not_small_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd =
+            crate::deltaglider::spool::SpoolDir::new(tmp.path().join("spool"), 1 << 20).unwrap();
+        let spool = crate::deltaglider::spool::SpoolBudget::new(&sd, None, None);
+        let path = tmp.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let paths = [path.clone()];
+        assert!(PutBody::File { path: &path, spool }
+            .into_small_bytes()
+            .is_err());
+        assert!(PutBody::Parts {
+            paths: &paths,
+            spool
+        }
+        .into_small_bytes()
+        .is_err());
+        let chunks = [Bytes::from_static(b"a"), Bytes::from_static(b"b")];
+        assert_eq!(
+            &PutBody::Chunks(&chunks).into_small_bytes().unwrap()[..],
+            b"ab"
+        );
     }
 }

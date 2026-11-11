@@ -679,8 +679,34 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             spool,
             range_spools,
             tuning: config.tuning.clone(),
+            memory: Default::default(),
             encryption: EngineEncryption::default(),
         }
+    }
+
+    /// Attach the RAM budget of request bodies (builder; `AppState` owns
+    /// the one budget and re-attaches it on every engine rebuild, so a
+    /// config reload never grants a second budget). Without it the engine
+    /// has a budget of its own at the default size.
+    pub fn with_memory_budget(
+        mut self,
+        budget: crate::deltaglider::memory_budget::MemoryBudget,
+    ) -> Self {
+        self.memory = budget;
+        self
+    }
+
+    /// A spool of its own (tests that check the budget is whole again).
+    #[cfg(test)]
+    pub(crate) fn with_spool_dir(mut self, spool: crate::deltaglider::spool::SpoolDir) -> Self {
+        self.spool = Arc::new(spool);
+        self
+    }
+
+    /// The engine's spool (tests).
+    #[cfg(test)]
+    pub(crate) fn spool_dir(&self) -> &crate::deltaglider::spool::SpoolDir {
+        &self.spool
     }
 
     /// Attach the per-instance usage counter (builder; called once at startup

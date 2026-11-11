@@ -134,9 +134,14 @@ async fn test_quota_second_put_enforced() {
         .build()
         .await;
 
-    // First PUT: 20 KB (optimistic, no cached data) — it triggers a background
-    // scan via check_quota → get_or_scan (cache empty → enqueue).
-    put_sized(&server, "seed.bin", 20000).await.ok();
+    // First PUT: 20 KB, over the quota, but optimistic (no usage known
+    // yet): its quota check, on the declared length before the body,
+    // triggers a background scan via check_quota → get_or_scan (cache
+    // empty → enqueue). That scan can finish while the body uploads; the
+    // write stays optimistic all the same (`exact_quota_check_after_body`).
+    put_sized(&server, "seed.bin", 20000)
+        .await
+        .expect("the first PUT to an unscanned bucket is optimistic");
 
     // Signal-driven poll: wait for a scan to complete (bounded, non-panicking),
     // then probe. Replaces the old blind sleep(500ms)×N loop while preserving

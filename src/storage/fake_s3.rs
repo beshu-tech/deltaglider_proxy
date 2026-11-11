@@ -984,6 +984,9 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
         )
         .route("/:bucket", axum::routing::any(on_bucket_handler.clone()))
         .route("/:bucket/", axum::routing::any(on_bucket_handler))
+        // S3 takes bodies of any size; axum's 2 MiB default refused a
+        // streamed object PUT with 413.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
                 let f = on_chunked.clone();

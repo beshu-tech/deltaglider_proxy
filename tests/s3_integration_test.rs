@@ -18,12 +18,10 @@
 
 use crate::common;
 
-use bytes::Bytes;
 use common::{
     generate_binary, get_bytes, head_headers, list_objects_raw, minio_endpoint_url, mutate_binary,
     put_and_get_storage_type, S3Requests, TestServer, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
 };
-use deltaglider_proxy::multipart::MultipartStore;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -1535,34 +1533,6 @@ async fn test_startup_sweeps_orphan_relay_artifacts() {
         "startup sweep should remove the old relay root's orphan {:?}",
         legacy_dir
     );
-}
-
-#[test]
-fn test_completing_timeout_reclaims_stuck_upload() {
-    let store = MultipartStore::new(10 * 1024 * 1024);
-    let id = store
-        .create_with_relay_policy("b", "large.zip", None, HashMap::new(), Some(1024), false)
-        .expect("create upload");
-    let etag = store
-        .upload_part(&id, "b", "large.zip", 1, Bytes::from(vec![0u8; 2048]))
-        .expect("upload part");
-    let _ = store
-        .complete(&id, "b", "large.zip", &[(1, etag)])
-        .expect("complete to completing state");
-    assert_eq!(
-        store.count_uploads(),
-        1,
-        "upload should be tracked before sweep"
-    );
-    std::thread::sleep(Duration::from_millis(5));
-
-    let report = store.cleanup_expired(Duration::from_secs(3600), Duration::from_millis(1));
-    assert_eq!(
-        report.swept_completing_uploads, 1,
-        "sweep should reclaim stuck completing upload"
-    );
-    assert!(report.reclaimed_bytes >= 2048);
-    assert_eq!(store.count_uploads(), 0, "upload should be removed");
 }
 
 #[tokio::test]

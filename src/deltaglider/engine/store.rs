@@ -5,8 +5,10 @@
 use super::conditional::ObjectWriteGuard;
 use super::usage::CounterPrior;
 use super::*;
+use crate::deltaglider::ingest::BodyHashes;
 use crate::deltaglider::spool::SpoolBudget;
 use crate::storage::{MultipartUpload, ObjectVariant, StorageBackend, UploadedPart};
+use crate::types::PassthroughReason;
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
@@ -50,6 +52,107 @@ struct HashedSpool<'a> {
     spool: &'a crate::deltaglider::spool::Spool,
     sha256: &'a str,
     md5: &'a str,
+    /// The reservation the ingest of this body took for its storage writes.
+    storage: Option<&'a crate::deltaglider::spool::SpoolReservation>,
+}
+
+/// One part of a multipart upload, kept in a relay file: its path and the
+/// MD5 and size recorded when the part arrived. The store checks both in a
+/// read of the files of its own (`read_relay_parts`): a file that changed
+/// on disk between UploadPart and Complete fails the store, and nothing is
+/// stored. That check is a separate read from the one that uploads the
+/// files (`put_passthrough_parts` opens them again; on S3 it checks only
+/// their size), so a file replaced between the two reads would be stored.
+/// The spool root is private to the proxy's user (`SpoolDir::new` creates
+/// it 0700 and refuses one that other users can write to), so only that
+/// user can replace a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayPart {
+    pub path: PathBuf,
+    pub md5: [u8; 16],
+    pub size: u64,
+}
+
+impl RelayPart {
+    /// The relay part of the file at `path` as it is now (tests).
+    #[cfg(test)]
+    pub(crate) fn of_file(path: &Path) -> Self {
+        // small: test fixture parts.
+        let data = std::fs::read(path).unwrap();
+        Self {
+            path: path.to_path_buf(),
+            md5: Md5::digest(&data).into(),
+            size: data.len() as u64,
+        }
+    }
+}
+
+/// Read the relay `parts` in order, ONCE, through a 1 MiB buffer: hash the
+/// object (SHA-256 and MD5), check each part against the MD5 and size it
+/// was received with and the total against `expected`, and copy the bytes
+/// to `sink` when there is one (the join of a delta candidate).
+async fn read_relay_parts(
+    parts: &[RelayPart],
+    expected: u64,
+    mut sink: Option<&mut tokio::fs::File>,
+) -> Result<BodyHashes, EngineError> {
+    use tokio::io::AsyncWriteExt;
+    let io = |e: std::io::Error| EngineError::Storage(StorageError::from(e));
+    let mut whole = crate::deltaglider::ingest::BodyHasher::new(None);
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut total = 0u64;
+    for (i, part) in parts.iter().enumerate() {
+        let mut file = tokio::fs::File::open(&part.path).await.map_err(io)?;
+        let mut md5 = Md5::new();
+        let mut size = 0u64;
+        loop {
+            let n = file.read(&mut buf).await.map_err(io)?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            md5.update(chunk);
+            whole.update(chunk);
+            size = size.saturating_add(n as u64);
+            if let Some(sink) = sink.as_deref_mut() {
+                sink.write_all(chunk).await.map_err(io)?;
+            }
+        }
+        let md5: [u8; 16] = md5.finalize().into();
+        if size != part.size || md5 != part.md5 {
+            return Err(EngineError::Storage(StorageError::Other(format!(
+                "multipart relay part {} failed its integrity check: the file changed on \
+                 disk since UploadPart",
+                i + 1
+            ))));
+        }
+        total = total.saturating_add(size);
+    }
+    if let Some(sink) = sink {
+        sink.flush().await.map_err(io)?;
+    }
+    if total != expected {
+        return Err(EngineError::Storage(StorageError::Other(format!(
+            "Multipart relay size mismatch: expected {expected}, observed {total}"
+        ))));
+    }
+    Ok(whole.finish())
+}
+
+/// The spool reservation of one storage write's temp files: the one the
+/// ingest of the body carried, or one taken for this write.
+enum StorageSpool<'a> {
+    Carried(&'a crate::deltaglider::spool::SpoolReservation),
+    Own(Option<crate::deltaglider::spool::SpoolReservation>),
+}
+
+impl StorageSpool<'_> {
+    fn get(&self) -> Option<&crate::deltaglider::spool::SpoolReservation> {
+        match self {
+            StorageSpool::Carried(r) => Some(r),
+            StorageSpool::Own(r) => r.as_ref(),
+        }
+    }
 }
 
 impl PassthroughMultipartHandle {
@@ -73,7 +176,7 @@ pub(crate) enum EncodeOutcome {
 }
 
 /// How a PUT is stored. Pure: both delta-eligible PUT paths (buffered and
-/// streaming) decide through [`Self::tries_delta`] and [`Self::decide`], and
+/// streaming) decide through [`Self::decline_reason`] and [`Self::decide`], and
 /// commit through one pipeline (`store_delta_eligible`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorePlan {
@@ -81,7 +184,11 @@ pub(crate) enum StorePlan {
     Delta,
     /// Store the body as it is. `remove_fresh_baseline`: this PUT created
     /// the baseline, and no delta uses it.
-    Passthrough { remove_fresh_baseline: bool },
+    Passthrough {
+        remove_fresh_baseline: bool,
+        /// Why the delta was not kept (the `dg-passthrough-reason`).
+        reason: PassthroughReason,
+    },
 }
 
 /// The longest file name that a backend stores (bytes).
@@ -94,29 +201,39 @@ pub(crate) fn delta_name_fits(filename: &str) -> bool {
 }
 
 impl StorePlan {
-    /// Whether a PUT tries a delta at all. No: store passthrough, with no
-    /// baseline. `fits_delta_limit`: the object is at most `max_object_size`,
-    /// the limit of a delta. A larger object of an eligible type is stored
-    /// whole on every path, as a large multipart upload already was, never
-    /// refused for being too large for a delta.
+    /// Whether a PUT tries a delta at all: `None` = it tries one, else why
+    /// it stores whole. `fits_delta_limit`: the object is at most
+    /// `max_object_size`, the limit of a delta. A larger object of an
+    /// eligible type is stored whole on every path, never refused for being
+    /// too large for a delta. One rule for the answer and the stored reason,
+    /// so they cannot differ. The order is the order of the checks: a
+    /// disabled bucket outranks a hint, and a hint outranks a file type.
     ///
     /// `delta_name_fits`: the file name plus `.delta` is within the 255
     /// bytes that a name may have on a filesystem backend and on MinIO
     /// ([`delta_name_fits`]). A key whose name is too long for a delta is
     /// stored whole, so a PUT never fails because the second upload of a
     /// name could be a delta (F43).
-    pub(crate) fn tries_delta(
+    pub(crate) fn decline_reason(
         compression_enabled: bool,
         delta_eligible: bool,
         no_delta_requested: bool,
         fits_delta_limit: bool,
         delta_name_fits: bool,
-    ) -> bool {
-        compression_enabled
-            && delta_eligible
-            && !no_delta_requested
-            && fits_delta_limit
-            && delta_name_fits
+    ) -> Option<PassthroughReason> {
+        if !compression_enabled {
+            Some(PassthroughReason::CompressionDisabled)
+        } else if no_delta_requested {
+            Some(PassthroughReason::NoDeltaRequested)
+        } else if !delta_eligible {
+            Some(PassthroughReason::NotDeltaEligible)
+        } else if !fits_delta_limit {
+            Some(PassthroughReason::OverMaxObjectSize)
+        } else if !delta_name_fits {
+            Some(PassthroughReason::DeltaNameTooLong)
+        } else {
+            None
+        }
     }
 
     /// After the encode. S-P1-1: the ratio is checked on EVERY PUT, not only
@@ -129,56 +246,22 @@ impl StorePlan {
         max_ratio: f32,
         fresh_baseline: bool,
     ) -> Self {
-        let keep = match outcome {
-            EncodeOutcome::Encoded { delta_len } => {
-                DeltaCodec::compression_ratio(size as usize, delta_len as usize) < max_ratio
-            }
-            EncodeOutcome::OverCap | EncodeOutcome::NoSpool => false,
+        let (keep, reason) = match outcome {
+            EncodeOutcome::Encoded { delta_len } => (
+                DeltaCodec::compression_ratio(size as usize, delta_len as usize) < max_ratio,
+                PassthroughReason::DeltaRatioOverLimit,
+            ),
+            EncodeOutcome::OverCap => (false, PassthroughReason::DeltaRatioOverLimit),
+            EncodeOutcome::NoSpool => (false, PassthroughReason::DeltaUnavailable),
         };
         if keep {
             StorePlan::Delta
         } else {
             StorePlan::Passthrough {
                 remove_fresh_baseline: fresh_baseline,
+                reason,
             }
         }
-    }
-}
-
-/// The hex SHA-256 and MD5 of a body, computed by a caller that held it.
-pub(super) struct BodyHashes {
-    pub(super) sha256: String,
-    pub(super) md5: String,
-}
-
-impl BodyHashes {
-    /// Hash `data`; a `known` SHA-256 is used as is, so only the MD5 pass
-    /// runs. CPU work: [`Self::compute`] moves a large body off the async
-    /// runtime.
-    fn of(data: &[u8], known: Option<KnownSha256>) -> Self {
-        Self {
-            sha256: match known {
-                Some(k) => k.to_hex(),
-                None => hex::encode(Sha256::digest(data)),
-            },
-            md5: hex::encode(Md5::digest(data)),
-        }
-    }
-
-    /// [`Self::of`], on a blocking thread when the body is above
-    /// [`BLOCKING_HASH_THRESHOLD`]: a 16 MiB body takes about 10 ms per
-    /// pass, which a tokio worker must not spend.
-    pub(super) async fn compute(
-        data: &Bytes,
-        known: Option<KnownSha256>,
-    ) -> Result<Self, EngineError> {
-        if data.len() <= BLOCKING_HASH_THRESHOLD {
-            return Ok(Self::of(data, known));
-        }
-        let data = data.clone();
-        tokio::task::spawn_blocking(move || Self::of(&data, known))
-            .await
-            .map_err(|e| EngineError::Storage(StorageError::Other(format!("hash task: {e}"))))
     }
 }
 
@@ -262,10 +345,13 @@ struct PutObject<'a> {
     multipart_etag: Option<String>,
     /// What the key held before: the commit records the counter against it.
     prior: &'a CounterPrior,
+    /// The reservation the ingest of a spooled body took for its storage
+    /// writes (see [`HashedSpool::storage`]).
+    storage: Option<&'a crate::deltaglider::spool::SpoolReservation>,
 }
 
 impl PutObject<'_> {
-    fn passthrough_write(&self) -> PassthroughWrite<'_> {
+    fn passthrough_write(&self, reason: PassthroughReason) -> PassthroughWrite<'_> {
         PassthroughWrite {
             lock: self.lock,
             bucket: self.bucket,
@@ -280,6 +366,7 @@ impl PutObject<'_> {
                 self.content_type.clone(),
                 self.user_metadata.clone(),
                 self.multipart_etag.clone(),
+                reason,
             ),
             source: match self.body {
                 PutBody::Buffered(data) => PassthroughSource::Bytes(data),
@@ -302,9 +389,11 @@ fn passthrough_metadata(
     content_type: Option<String>,
     user_metadata: HashMap<String, String>,
     multipart_etag: Option<String>,
+    reason: PassthroughReason,
 ) -> FileMetadata {
     let mut metadata =
-        FileMetadata::new_passthrough(filename.to_string(), sha256, md5, size, content_type);
+        FileMetadata::new_passthrough(filename.to_string(), sha256, md5, size, content_type)
+            .with_passthrough_reason(reason);
     metadata.set_user_metadata(user_metadata);
     metadata.multipart_etag = multipart_etag;
     metadata
@@ -335,7 +424,9 @@ struct PassthroughWrite<'a> {
 
 /// The delta the encode produced, where it lives until the commit.
 enum EncodedDelta {
-    InRam(Vec<u8>),
+    /// The buffered encode's delta (its body is at most the spool
+    /// threshold, so the delta is too).
+    InRam(Bytes),
     /// On the delta spool of the (ref, delta) pair.
     Spooled {
         _ref_spool: crate::deltaglider::spool::Spool,
@@ -346,17 +437,38 @@ enum EncodedDelta {
 }
 
 impl EncodedDelta {
-    /// The delta bytes, for the commit (a kept delta is below the cap).
-    async fn into_bytes(self) -> Result<Vec<u8>, EngineError> {
+    /// Spool budget this delta holds, in MiB (the pair's one permit).
+    fn held_mib(&self) -> usize {
         match self {
-            EncodedDelta::InRam(delta) => Ok(delta),
-            EncodedDelta::Spooled { delta_spool, .. } => Ok(tokio::fs::read(delta_spool.path())
-                .await
-                .map_err(StorageError::from)?),
-            EncodedDelta::None => Err(EngineError::Storage(StorageError::Other(
-                "store plan kept a delta that the encode did not produce".into(),
-            ))),
+            EncodedDelta::Spooled { delta_spool, .. } => delta_spool.reserved_mib(),
+            EncodedDelta::InRam(_) | EncodedDelta::None => 0,
         }
+    }
+
+    /// The delta as a storage body: the buffer, or its spool file, which
+    /// the backend streams (never read into memory). `dir` and `reserved`
+    /// serve the storage write's own temp file (the encrypting wrapper's
+    /// ciphertext), as for every file write.
+    fn body<'a>(
+        &'a self,
+        dir: &'a crate::deltaglider::spool::SpoolDir,
+        reserved: Option<&'a crate::deltaglider::spool::SpoolReservation>,
+    ) -> Result<crate::storage::PutBody<'a>, EngineError> {
+        match self {
+            EncodedDelta::InRam(delta) => Ok(crate::storage::PutBody::Bytes(delta.clone())),
+            EncodedDelta::Spooled { delta_spool, .. } => Ok(crate::storage::PutBody::File {
+                path: delta_spool.path(),
+                spool: SpoolBudget::new(dir, Some(delta_spool), reserved),
+            }),
+            EncodedDelta::None => Err(Self::missing()),
+        }
+    }
+
+    /// The store plan kept a delta that the encode did not produce.
+    fn missing() -> EngineError {
+        EngineError::Storage(StorageError::Other(
+            "store plan kept a delta that the encode did not produce".into(),
+        ))
     }
 }
 
@@ -391,12 +503,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         .await
     }
 
-    /// Multipart-aware variant of [`Self::store`]. The `multipart_etag` is
-    /// persisted alongside the object so HEAD/GET/LIST return it verbatim
-    /// (H1 correctness fix). All other semantics are identical.
-    #[instrument(skip(self, lock, data, user_metadata, multipart_etag))]
+    /// [`Self::store`] that persists `multipart_etag` with the object, so
+    /// HEAD/GET/LIST return it verbatim. Tests only: production writes
+    /// with a multipart ETag go through [`Self::store_known_prior`] or the
+    /// relayed-parts stores.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub async fn store_with_multipart_etag(
+    pub(crate) async fn store_with_multipart_etag(
         &self,
         lock: &ObjectWriteGuard,
         bucket: &str,
@@ -422,8 +535,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         .await
     }
 
-    /// [`Self::store`] (with `multipart_etag`: [`Self::store_with_multipart_etag`])
-    /// for a caller that read what the key holds already: `known_prior`
+    /// [`Self::store`], with an optional `multipart_etag`, for a caller that read what the key holds already: `known_prior`
     /// replaces the write's own prior read (`CounterPrior`), so the write
     /// sends no HEAD for it and no DELETE for a stored form that the read
     /// found absent. `None` reads it here. A plain prior only from a
@@ -503,7 +615,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
         known_prior: Option<CounterPrior>,
-        known_sha256: Option<KnownSha256>,
+        known: Option<BodyHashes>,
     ) -> Result<StoreResult, EngineError> {
         // Invalidate stale metadata on overwrite (before the write, so concurrent
         // readers don't see outdated metadata during the write window).
@@ -530,8 +642,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // counter is best-effort and reconciled by Refresh.
         let prior = self.prior_or_read(bucket, key, known_prior).await;
 
-        // Calculate hashes (the SHA-256 only when the caller does not know it).
-        let BodyHashes { sha256, md5 } = BodyHashes::compute(data, known_sha256).await?;
+        // The hashes of the body: from its ingest, else computed here.
+        let (sha256, md5) = match known {
+            Some(hashes) => hashes,
+            None => {
+                BodyHashes::compute(data, crate::deltaglider::ingest::Sha256Need::Compute).await?
+            }
+        }
+        .into_parts();
 
         info!(
             "Storing {}/{} ({} bytes, sha256={})",
@@ -555,11 +673,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             user_metadata,
             multipart_etag,
             prior: &prior,
+            storage: None,
         };
-        if !self.tries_delta(bucket, &obj_key, &put.user_metadata, put.size) {
+        if let Some(reason) = self.decline_reason(bucket, key, &put.user_metadata, put.size) {
             // The key's write lock only (P7.4): see `write_passthrough_locked`.
             let result = self
-                .write_passthrough_locked(put.passthrough_write(), None)
+                .write_passthrough_locked(put.passthrough_write(reason), None)
                 .await?;
             self.count_decision("passthrough");
             // Passthrough creates no reference baseline; only overwrite-net.
@@ -569,7 +688,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Whether a write of `size` bytes to `key` in `bucket` with
-    /// `user_metadata` tries a delta (the `StorePlan::tries_delta` rule).
+    /// `user_metadata` tries a delta (the `StorePlan::decline_reason` rule).
     /// Multipart completion asks before it assembles the parts; counts nothing.
     pub fn write_tries_delta(
         &self,
@@ -578,7 +697,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: &HashMap<String, String>,
         size: u64,
     ) -> bool {
-        StorePlan::tries_delta(
+        self.write_decline_reason(bucket, key, user_metadata, size)
+            .is_none()
+    }
+
+    /// Why a write of `size` bytes to `key` in `bucket` tries no delta, or
+    /// `None` when it tries one: the reason that the object then stores as
+    /// `dg-passthrough-reason`.
+    pub fn write_decline_reason(
+        &self,
+        bucket: &str,
+        key: &str,
+        user_metadata: &HashMap<String, String>,
+        size: u64,
+    ) -> Option<PassthroughReason> {
+        StorePlan::decline_reason(
             self.bucket_policies.compression_enabled(bucket),
             self.is_delta_eligible(bucket, key),
             crate::types::no_delta_requested(user_metadata),
@@ -587,37 +720,39 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         )
     }
 
-    /// [`StorePlan::tries_delta`] for this bucket and key. The caller counts
-    /// the passthrough decision once the write commits.
-    fn tries_delta(
+    /// The reason of a passthrough write that a multipart store makes from
+    /// its parts: the reason the write tries no delta, else the one that
+    /// only a multipart upload has (it tries a delta but is larger than
+    /// `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`, or the spool is busy).
+    fn parts_passthrough_reason(
         &self,
         bucket: &str,
-        obj_key: &ObjectKey,
+        key: &str,
         user_metadata: &HashMap<String, String>,
         size: u64,
-    ) -> bool {
-        let compression = self.bucket_policies.compression_enabled(bucket);
-        let eligible = self
-            .bucket_policies
-            .is_delta_eligible(bucket, &obj_key.filename);
-        let no_delta = crate::types::no_delta_requested(user_metadata);
-        let fits = size <= self.max_object_size;
-        let name_fits = delta_name_fits(&obj_key.filename);
-        if StorePlan::tries_delta(compression, eligible, no_delta, fits, name_fits) {
-            return true;
+        fallback: PassthroughReason,
+    ) -> PassthroughReason {
+        self.write_decline_reason(bucket, key, user_metadata, size)
+            .unwrap_or(fallback)
+    }
+
+    /// [`Self::write_decline_reason`] of a store, logged. The caller
+    /// counts the passthrough decision once the write commits.
+    fn decline_reason(
+        &self,
+        bucket: &str,
+        key: &str,
+        user_metadata: &HashMap<String, String>,
+        size: u64,
+    ) -> Option<PassthroughReason> {
+        let reason = self.write_decline_reason(bucket, key, user_metadata, size);
+        if let Some(reason) = reason {
+            debug!(
+                "No delta for {bucket}/{key} ({size} bytes): {}; storing as passthrough",
+                reason.slug()
+            );
         }
-        if no_delta {
-            debug!("The PUT asks for no delta, storing as passthrough");
-        } else if compression && eligible && !name_fits {
-            debug!("The name is too long for a .delta file, storing as passthrough");
-        } else if compression && eligible {
-            debug!("Larger than max_object_size ({size} bytes), storing as passthrough");
-        } else if compression {
-            debug!("File type not delta-eligible, storing as passthrough");
-        } else {
-            debug!("Compression disabled for bucket '{bucket}', storing as passthrough");
-        }
-        false
+        reason
     }
 
     /// `known` when the caller read the key already, else the read of
@@ -651,6 +786,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ///    spool, capped at `ratio_threshold × size`.
     ///
     /// The caller owns `body` (a `Spool`); it lives until this returns.
+    /// `known_hashes`: the hashes of the body, from the fill that wrote the
+    /// spool ([`crate::deltaglider::spool::Spool::fill_from_stream`]); with
+    /// them the spool is not read back to hash it. `None` hashes the file.
     #[allow(clippy::too_many_arguments)]
     pub async fn store_spooled_delta(
         &self,
@@ -662,6 +800,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
+        known_hashes: Option<BodyHashes>,
     ) -> Result<StoreResult, EngineError> {
         self.store_spooled_delta_inner(
             lock,
@@ -673,6 +812,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             user_metadata,
             multipart_etag,
             None,
+            known_hashes,
             None,
         )
         .await
@@ -680,7 +820,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Body of [`Self::store_spooled_delta`]. The commit records the counter;
     /// this attaches the accounting to the result. `known_prior`: as for
-    /// [`Self::store_inner`].
+    /// [`Self::store_inner`]. `storage`: the reservation the ingest of the
+    /// body took for its storage writes; the writes use it before they
+    /// reserve anything.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn store_spooled_delta_inner(
         &self,
@@ -694,10 +836,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         multipart_etag: Option<String>,
         known_prior: Option<CounterPrior>,
         known_hashes: Option<BodyHashes>,
+        storage: Option<&crate::deltaglider::spool::SpoolReservation>,
     ) -> Result<StoreResult, EngineError> {
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
-        // An object above max_object_size never tries a delta (`tries_delta`):
+        // An object above max_object_size never tries a delta (`decline_reason`):
         // it is stored whole, so the one ceiling here is the passthrough one.
         if size > self.max_passthrough_object_size {
             return Err(EngineError::TooLarge {
@@ -715,10 +858,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // A caller that hashed the body from RAM while it wrote the spool
         // passes the hashes: the spool is not read back (it was, in full,
         // per PUT). The size check then reads the file's length.
-        let (sha256, md5, observed) = match known_hashes {
-            Some(h) => (
-                h.sha256,
-                h.md5,
+        let (sha256, md5, observed) = match known_hashes.map(BodyHashes::into_parts) {
+            Some((sha256, md5)) => (
+                sha256,
+                md5,
                 tokio::fs::metadata(body.path())
                     .await
                     .map_err(|e| EngineError::Storage(StorageError::from(e)))?
@@ -733,23 +876,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
 
         // (2) Not delta-eligible → passthrough from the body spool.
-        if !self.tries_delta(bucket, &obj_key, &user_metadata, size) {
+        if let Some(reason) = self.decline_reason(bucket, key, &user_metadata, size) {
             let result = self
                 .store_passthrough_file_inner(
                     lock,
                     bucket,
                     key,
-                    body.path(),
-                    Some(HashedSpool {
+                    HashedSpool {
                         spool: body,
                         sha256: &sha256,
                         md5: &md5,
-                    }),
+                        storage,
+                    },
                     size,
                     content_type,
                     user_metadata,
                     multipart_etag,
                     &prior,
+                    reason,
                 )
                 .await?;
             self.count_decision("passthrough");
@@ -771,6 +915,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             user_metadata,
             multipart_etag,
             prior: &prior,
+            storage,
         };
         self.store_delta_eligible(put).await
     }
@@ -862,6 +1007,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<(StoreResult, bool), EngineError> {
         let max_ratio = self.bucket_policies.max_delta_ratio(put.bucket);
         let (outcome, delta) = match put.body {
+            // The reference is too large for the RAM reference cache: the
+            // decision uses the size that the lock's read gave, no request.
+            PutBody::Buffered(data) if ref_meta.file_size > self.spool_threshold() => {
+                self.encode_memory_body_spooled(&put, data, ref_meta, max_ratio)
+                    .await?
+            }
             PutBody::Buffered(data) => self.encode_buffered(&put, data, ref_meta).await?,
             PutBody::Spooled(body) => {
                 self.encode_spooled(&put, body, ref_meta, fresh_baseline, max_ratio)
@@ -880,9 +1031,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         match StorePlan::decide(put.size, outcome, max_ratio, fresh_baseline) {
             StorePlan::Delta => {
-                let delta = delta.into_bytes().await?;
+                let EncodeOutcome::Encoded { delta_len } = outcome else {
+                    return Err(EncodedDelta::missing());
+                };
+                // A spooled delta exists only beside a held body spool, so
+                // this reservation for the storage write's temp file never
+                // waits under the lock (a holder never waits).
+                let reserved = match &delta {
+                    EncodedDelta::Spooled { .. } => {
+                        let held_mib =
+                            put.body.held().map_or(0, |b| b.reserved_mib()) + delta.held_mib();
+                        self.storage_spool(put.storage, put.bucket, delta_len, held_mib)
+                            .await?
+                    }
+                    EncodedDelta::InRam(_) | EncodedDelta::None => StorageSpool::Own(None),
+                };
+                let body = delta.body(&self.spool, reserved.get())?;
                 let result = self
-                    .commit_delta(&put, ref_meta, delta, fresh_baseline, xnode)
+                    .commit_delta(&put, ref_meta, body, delta_len, fresh_baseline, xnode)
                     .await?;
                 if let (true, PutBody::Spooled(body)) = (fresh_baseline, &put.body) {
                     self.seed_shared_reference(put.bucket, put.deltaspace_id, body, ref_meta)
@@ -892,6 +1058,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
             StorePlan::Passthrough {
                 remove_fresh_baseline,
+                reason,
             } => {
                 debug!(
                     "Delta for {}/{} not kept ({outcome:?}, max ratio {max_ratio:.2}); storing as passthrough",
@@ -903,16 +1070,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // never waits (a holder never waits): safe under the lock.
                 let reserved = match put.body {
                     PutBody::Spooled(body) => {
-                        self.reserve_storage_spool(put.bucket, put.size, false, body.reserved_mib())
+                        self.storage_spool(put.storage, put.bucket, put.size, body.reserved_mib())
                             .await?
                     }
-                    PutBody::Buffered(_) => None,
+                    PutBody::Buffered(_) => StorageSpool::Own(None),
                 };
                 // Write passthrough FIRST, then clean up. This prevents
                 // transient 404s on concurrent GETs during strategy
                 // transition.
                 let result = self
-                    .write_passthrough_locked(put.passthrough_write(), reserved.as_ref())
+                    .write_passthrough_locked(put.passthrough_write(reason), reserved.get())
                     .await?;
                 self.count_decision("passthrough");
                 let removed = remove_fresh_baseline
@@ -1008,8 +1175,39 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let delta_len = delta.len() as u64;
         Ok((
             EncodeOutcome::Encoded { delta_len },
-            EncodedDelta::InRam(delta),
+            EncodedDelta::InRam(Bytes::from(delta)),
         ))
+    }
+
+    /// A body in memory against a reference above the spool threshold: the
+    /// body goes to a spool file and the streaming encode reads both from
+    /// files (the reference through the folder's verified shared file).
+    /// This runs under the deltaspace lock, so the body spool is taken
+    /// without waiting; with no budget free now the PUT keeps no delta
+    /// (`NoSpool`: stored whole as `delta-unavailable`).
+    async fn encode_memory_body_spooled(
+        &self,
+        put: &PutObject<'_>,
+        data: &Bytes,
+        ref_meta: &FileMetadata,
+        max_ratio: f32,
+    ) -> Result<(EncodeOutcome, EncodedDelta), EngineError> {
+        let body = match self.spool.try_acquire(put.size) {
+            Ok(body) => body,
+            Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => {
+                debug!(
+                    "PUT {}/{}: no spool for the large-reference encode",
+                    put.bucket, put.key
+                );
+                return Ok((EncodeOutcome::NoSpool, EncodedDelta::None));
+            }
+            Err(e) => return Err(EngineError::Storage(StorageError::from(e))),
+        };
+        tokio::fs::write(body.path(), data)
+            .await
+            .map_err(StorageError::from)?;
+        self.encode_spooled(put, &body, ref_meta, false, max_ratio)
+            .await
     }
 
     /// The streaming encode: body spool → delta spool, stopped at the ratio
@@ -1172,6 +1370,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         })
     }
 
+    /// The spool reservation of a storage write of `bytes`: the one the
+    /// ingest of the body `carried`, else a new one. The op holds
+    /// `held_mib` already, so that one never waits (a holder never waits):
+    /// safe under the locks.
+    async fn storage_spool<'r>(
+        &self,
+        carried: Option<&'r crate::deltaglider::spool::SpoolReservation>,
+        bucket: &str,
+        bytes: u64,
+        held_mib: usize,
+    ) -> Result<StorageSpool<'r>, EngineError> {
+        if let Some(r) = carried {
+            return Ok(StorageSpool::Carried(r));
+        }
+        Ok(StorageSpool::Own(
+            self.reserve_storage_spool(bucket, bytes, false, held_mib)
+                .await?,
+        ))
+    }
+
     /// Write this PUT's body as the deltaspace baseline.
     async fn write_baseline(
         &self,
@@ -1204,6 +1422,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
             PutBody::Spooled(body) => {
                 // Streamed into place from the spool (no heap-load — M1.4).
+                // The body spool makes this op a holder, so the reservation
+                // for the storage write's own temp file never waits.
+                let reserved = self
+                    .storage_spool(put.storage, put.bucket, put.size, body.reserved_mib())
+                    .await?;
                 xnode
                     .put_reference_from_file(
                         &*self.storage,
@@ -1211,6 +1434,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         put.deltaspace_id,
                         body.path(),
                         &metadata,
+                        SpoolBudget::new(&self.spool, Some(body), reserved.get()),
                     )
                     .await?;
                 self.record_reference(put.bucket, put.size as i64);
@@ -1246,16 +1470,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Commit the encoded delta: write it (only valid against the reference
     /// we locked), then drop an older passthrough variant of the key.
+    /// `delta`: in memory or the encode's spool file, `delta_len` bytes.
     /// `fresh_baseline`: this PUT created the reference the delta uses.
     async fn commit_delta(
         &self,
         put: &PutObject<'_>,
         ref_meta: &FileMetadata,
-        delta: Vec<u8>,
+        delta: crate::storage::PutBody<'_>,
+        delta_len: u64,
         fresh_baseline: bool,
         xnode: &super::ReferenceLockGuard,
     ) -> Result<StoreResult, EngineError> {
-        let delta = Bytes::from(delta);
         let mut metadata = FileMetadata::new_delta(
             put.obj_key.filename.clone(),
             put.sha256.clone(),
@@ -1263,7 +1488,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             put.size,
             "reference.bin".to_string(),
             ref_meta.file_sha256.clone(),
-            delta.len() as u64,
+            delta_len,
             put.content_type.clone(),
         );
         metadata.set_user_metadata(put.user_metadata.clone());
@@ -1274,7 +1499,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 put.bucket,
                 put.deltaspace_id,
                 &put.obj_key.filename,
-                delta.clone(),
+                delta,
                 &metadata,
             )
             .await?;
@@ -1289,7 +1514,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .inc();
             }
             m.delta_bytes_saved_total
-                .inc_by(put.size.saturating_sub(delta.len() as u64));
+                .inc_by(put.size.saturating_sub(delta_len));
         });
         self.drop_other_form(
             put.lock,
@@ -1302,7 +1527,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         .await;
         self.metadata_cache
             .insert(put.bucket, put.key, metadata.clone());
-        Ok(StoreResult::new(metadata, delta.len() as u64))
+        Ok(StoreResult::new(metadata, delta_len))
     }
 
     /// Write a passthrough object, then drop an older delta variant of the
@@ -1432,9 +1657,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             size,
             ref_meta.content_type.clone(),
         );
-        // counter: unchanged (the same bytes under repaired metadata).
+        // counter: unchanged (the same bytes under repaired metadata). The
+        // heal holds its spool, so this reservation never waits.
+        let reserved = self
+            .reserve_storage_spool(bucket, size, false, spool.reserved_mib())
+            .await?;
         xnode
-            .put_reference_from_file(&*self.storage, bucket, deltaspace_id, spool.path(), &healed)
+            .put_reference_from_file(
+                &*self.storage,
+                bucket,
+                deltaspace_id,
+                spool.path(),
+                &healed,
+                SpoolBudget::new(&self.spool, Some(&spool), reserved.as_ref()),
+            )
             .await?;
         self.cache
             .invalidate(&self.cache_key(bucket, deltaspace_id));
@@ -1449,26 +1685,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         SPOOL_HASH_READS.with(|n| n.set(n.get() + 1));
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || -> std::io::Result<(String, String, u64)> {
-            use std::io::Read;
-            let mut f = std::fs::File::open(&path)?;
-            let mut sh = Sha256::new();
-            let mut mh = Md5::new();
-            let mut observed: u64 = 0;
-            let mut buf = vec![0u8; 256 * 1024];
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                observed = observed.saturating_add(n as u64);
-                sh.update(&buf[..n]);
-                mh.update(&buf[..n]);
-            }
-            Ok((
-                hex::encode(sh.finalize()),
-                hex::encode(mh.finalize()),
-                observed,
-            ))
+            let mut hasher = crate::deltaglider::ingest::BodyHasher::new(None);
+            let observed =
+                crate::deltaglider::spool::for_each_chunk_blocking(&path, |c| hasher.update(c))?;
+            let (sha256, md5) = hasher.finish().into_parts();
+            Ok((sha256, md5, observed))
         })
         .await
         .map_err(|e| EngineError::Storage(StorageError::Other(format!("hash task: {e}"))))?
@@ -1478,70 +1699,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Whether `key`'s file type is one that `bucket` tries to store as a delta.
     pub fn is_delta_eligible(&self, bucket: &str, key: &str) -> bool {
         self.bucket_policies.is_delta_eligible(bucket, key)
-    }
-
-    /// Store a non-delta-eligible object from pre-split chunks without assembling
-    /// into a contiguous buffer. Computes SHA256 and MD5 incrementally.
-    #[instrument(skip(self, lock, chunks, user_metadata))]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn store_passthrough_chunked(
-        &self,
-        lock: &ObjectWriteGuard,
-        bucket: &str,
-        key: &str,
-        chunks: &[Bytes],
-        total_size: u64,
-        content_type: Option<String>,
-        user_metadata: HashMap<String, String>,
-    ) -> Result<StoreResult, EngineError> {
-        let prior = self.prior_for_counter(bucket, key).await;
-        let result = self
-            .store_passthrough_chunked_inner(
-                lock,
-                bucket,
-                key,
-                chunks,
-                total_size,
-                content_type,
-                user_metadata,
-                None,
-                &prior,
-            )
-            .await?;
-        Ok(result.with_accounting(prior.replaced(), 0))
-    }
-
-    /// Multipart-aware variant of [`Self::store_passthrough_chunked`]. The
-    /// `multipart_etag` is persisted on metadata so HEAD/GET/LIST return
-    /// it verbatim (H1 correctness fix).
-    #[instrument(skip(self, lock, chunks, user_metadata, multipart_etag))]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn store_passthrough_chunked_with_multipart_etag(
-        &self,
-        lock: &ObjectWriteGuard,
-        bucket: &str,
-        key: &str,
-        chunks: &[Bytes],
-        total_size: u64,
-        content_type: Option<String>,
-        user_metadata: HashMap<String, String>,
-        multipart_etag: String,
-    ) -> Result<StoreResult, EngineError> {
-        let prior = self.prior_for_counter(bucket, key).await;
-        let result = self
-            .store_passthrough_chunked_inner(
-                lock,
-                bucket,
-                key,
-                chunks,
-                total_size,
-                content_type,
-                user_metadata,
-                Some(multipart_etag),
-                &prior,
-            )
-            .await?;
-        Ok(result.with_accounting(prior.replaced(), 0))
     }
 
     /// Guard a PASSTHROUGH store against the passthrough ceiling (64 GiB
@@ -1562,87 +1719,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn store_passthrough_chunked_inner(
-        &self,
-        lock: &ObjectWriteGuard,
-        bucket: &str,
-        key: &str,
-        chunks: &[Bytes],
-        total_size: u64,
-        content_type: Option<String>,
-        user_metadata: HashMap<String, String>,
-        multipart_etag: Option<String>,
-        prior: &CounterPrior,
-    ) -> Result<StoreResult, EngineError> {
-        self.ensure_within_passthrough_ceiling(total_size)?;
-
-        // Invalidate stale metadata on overwrite
-        self.metadata_cache.invalidate(bucket, key);
-
-        let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
-
-        // Compute SHA256 + MD5 incrementally across chunks
-        let mut sha256_hasher = Sha256::new();
-        let mut md5_hasher = Md5::new();
-        for chunk in chunks {
-            sha256_hasher.update(chunk);
-            md5_hasher.update(chunk);
-        }
-        let sha256 = hex::encode(sha256_hasher.finalize());
-        let md5 = hex::encode(md5_hasher.finalize());
-
-        info!(
-            "Storing chunked {}/{} ({} bytes, {} chunks, sha256={})",
-            bucket,
-            key,
-            total_size,
-            chunks.len(),
-            &sha256[..8]
-        );
-
-        // The key's write lock only (P7.4): see `write_passthrough_locked`.
-        let mut metadata = FileMetadata::new_passthrough(
-            obj_key.filename.clone(),
-            sha256,
-            md5,
-            total_size,
-            content_type,
-        );
-        metadata.set_user_metadata(user_metadata);
-        metadata.multipart_etag = multipart_etag;
-
-        self.storage
-            .put_passthrough_chunked(bucket, &deltaspace_id, &obj_key.filename, chunks, &metadata)
-            .await?;
-        // Committed: count it before the next await.
-        self.record_commit(bucket, prior, &metadata);
-        self.drop_other_form(
-            lock,
-            bucket,
-            &deltaspace_id,
-            &obj_key.filename,
-            ObjectVariant::Passthrough,
-            prior,
-        )
-        .await;
-
-        let result = StoreResult::new(metadata, total_size);
-        self.metadata_cache
-            .insert(bucket, key, result.metadata.clone());
-        Ok(result)
-    }
-
-    /// Store a passthrough object from relayed multipart part files without
-    /// materializing an assembled temporary file.
-    #[instrument(skip(self, lock, part_paths, user_metadata, multipart_etag))]
+    /// Store a passthrough object from the relay part files of a multipart
+    /// upload, without joining them into one file.
+    #[instrument(skip(self, lock, parts, user_metadata, multipart_etag))]
     #[allow(clippy::too_many_arguments)]
     pub async fn store_passthrough_relayed_parts_with_multipart_etag(
         &self,
         lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
-        part_paths: &[PathBuf],
+        parts: &[RelayPart],
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
@@ -1654,15 +1740,122 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 lock,
                 bucket,
                 key,
-                part_paths,
+                parts,
                 total_size,
                 content_type,
                 user_metadata,
                 multipart_etag,
                 &prior,
+                PassthroughReason::MultipartOverDeltaCap,
             )
             .await?;
         Ok(result.with_accounting(prior.replaced(), 0))
+    }
+
+    /// Store a multipart upload that tries a delta, WITHOUT holding the
+    /// object in RAM. The relay parts join into ONE spool file (a 1 MiB
+    /// buffer, so memory does not grow with the object), and the streaming
+    /// delta store runs on that file, as it does for a large PutObject.
+    /// Spool use peaks at twice the object: the relay parts and the joined
+    /// file. The join hashes the object, so the delta store does not read
+    /// the joined file again for its hashes.
+    ///
+    /// The delta is optional work. When other requests use the spool budget
+    /// (the relay parts are this upload's own share, so it never waits for
+    /// that), or the budget cannot hold the joined file beside the parts,
+    /// the object is stored whole from its parts with the reason
+    /// `delta-unavailable`.
+    #[instrument(skip(self, lock, parts, user_metadata, multipart_etag))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_relayed_parts_delta_with_multipart_etag(
+        &self,
+        lock: &ObjectWriteGuard,
+        bucket: &str,
+        key: &str,
+        parts: &[RelayPart],
+        total_size: u64,
+        content_type: Option<String>,
+        user_metadata: HashMap<String, String>,
+        multipart_etag: String,
+    ) -> Result<StoreResult, EngineError> {
+        // Completion decided this before the call; the config can change
+        // between the decision and now, and a write that tries no delta must
+        // not reach the delta pipeline.
+        if !self.write_tries_delta(bucket, key, &user_metadata, total_size) {
+            return self
+                .store_passthrough_relayed_parts_with_multipart_etag(
+                    lock,
+                    bucket,
+                    key,
+                    parts,
+                    total_size,
+                    content_type,
+                    user_metadata,
+                    multipart_etag,
+                )
+                .await;
+        }
+        let parts_mib = crate::deltaglider::spool::mib_ceil(total_size);
+        let joined = match self.spool_acquire_beside_mib(parts_mib, total_size).await {
+            // The reservation is clamped to what the budget holds beside the
+            // parts: never write a joined file larger than it.
+            Ok(joined) if joined.reserved_mib() >= parts_mib => Some(joined),
+            Ok(_) => {
+                debug!("The spool cannot hold a joined {bucket}/{key} beside its parts; storing it whole");
+                None
+            }
+            Err(EngineError::Overloaded(why)) => {
+                debug!("No spool for a delta of {bucket}/{key} ({why}); storing it whole");
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(joined) = joined else {
+            let prior = self.prior_for_counter(bucket, key).await;
+            let result = self
+                .store_passthrough_relayed_parts_inner(
+                    lock,
+                    bucket,
+                    key,
+                    parts,
+                    total_size,
+                    content_type,
+                    user_metadata,
+                    multipart_etag,
+                    &prior,
+                    PassthroughReason::DeltaUnavailable,
+                )
+                .await?;
+            return Ok(result.with_accounting(prior.replaced(), 0));
+        };
+        let hashes = Self::join_parts_into(joined.path(), parts, total_size).await?;
+        self.store_spooled_delta(
+            lock,
+            bucket,
+            key,
+            &joined,
+            total_size,
+            content_type,
+            user_metadata,
+            Some(multipart_etag),
+            Some(hashes),
+        )
+        .await
+    }
+
+    /// Append `parts`, in order, to the file at `out` (see
+    /// [`read_relay_parts`]); the object's hashes.
+    async fn join_parts_into(
+        out: &Path,
+        parts: &[RelayPart],
+        expected: u64,
+    ) -> Result<BodyHashes, EngineError> {
+        let mut sink = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(out)
+            .await
+            .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
+        read_relay_parts(parts, expected, Some(&mut sink)).await
     }
 
     /// Body of [`Self::store_passthrough_relayed_parts_with_multipart_etag`]; its commit records the counter.
@@ -1672,44 +1865,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
-        part_paths: &[PathBuf],
+        parts: &[RelayPart],
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
         multipart_etag: String,
         prior: &CounterPrior,
+        fallback_reason: PassthroughReason,
     ) -> Result<StoreResult, EngineError> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
 
-        let mut sha256_hasher = Sha256::new();
-        let mut md5_hasher = Md5::new();
-        let mut observed = 0u64;
-        let mut buf = vec![0u8; 1024 * 1024];
-        for path in part_paths {
-            let mut file = tokio::fs::File::open(path)
-                .await
-                .map_err(StorageError::from)?;
-            loop {
-                let n = file.read(&mut buf).await.map_err(StorageError::from)?;
-                if n == 0 {
-                    break;
-                }
-                observed = observed.saturating_add(n as u64);
-                sha256_hasher.update(&buf[..n]);
-                md5_hasher.update(&buf[..n]);
-            }
-        }
-        if observed != total_size {
-            return Err(EngineError::Storage(StorageError::Other(format!(
-                "Multipart relay size mismatch: expected {}, observed {}",
-                total_size, observed
-            ))));
-        }
-        let sha256 = hex::encode(sha256_hasher.finalize());
-        let md5 = hex::encode(md5_hasher.finalize());
+        let (sha256, md5) = read_relay_parts(parts, total_size, None)
+            .await?
+            .into_parts();
         // The relay parts hold spool budget (the multipart store reserves it
         // per part), so this op is a holder and never waits.
         let parts_mib = crate::deltaglider::spool::mib_ceil(total_size);
@@ -1717,22 +1888,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .reserve_storage_spool(bucket, total_size, true, parts_mib)
             .await?;
         // The key's write lock only (P7.4): see `write_passthrough_locked`.
+        let reason =
+            self.parts_passthrough_reason(bucket, key, &user_metadata, total_size, fallback_reason);
         let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
             sha256,
             md5,
             total_size,
             content_type,
-        );
+        )
+        .with_passthrough_reason(reason);
         metadata.set_user_metadata(user_metadata);
         metadata.multipart_etag = Some(multipart_etag);
 
+        let paths: Vec<PathBuf> = parts.iter().map(|p| p.path.clone()).collect();
         self.storage
             .put_passthrough_parts(
                 bucket,
                 &deltaspace_id,
                 &obj_key.filename,
-                part_paths,
+                &paths,
                 &metadata,
                 SpoolBudget::new(&self.spool, None, reserved.as_ref()),
             )
@@ -1755,82 +1930,34 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(result)
     }
 
-    /// Store a passthrough object from a local file path, computing hashes
-    /// incrementally to avoid reconstructing large multipart payloads in memory.
-    #[instrument(skip(self, lock, user_metadata, multipart_etag))]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn store_passthrough_file_with_multipart_etag(
-        &self,
-        lock: &ObjectWriteGuard,
-        bucket: &str,
-        key: &str,
-        source_path: &Path,
-        total_size: u64,
-        content_type: Option<String>,
-        user_metadata: HashMap<String, String>,
-        multipart_etag: String,
-    ) -> Result<StoreResult, EngineError> {
-        let prior = self.prior_for_counter(bucket, key).await;
-        let result = self
-            .store_passthrough_file_inner(
-                lock,
-                bucket,
-                key,
-                source_path,
-                None,
-                total_size,
-                content_type,
-                user_metadata,
-                Some(multipart_etag),
-                &prior,
-            )
-            .await?;
-        Ok(result.with_accounting(prior.replaced(), 0))
-    }
-
-    /// Body of [`Self::store_passthrough_file_with_multipart_etag`]; its commit records the counter.
+    /// The passthrough store of a spooled body that
+    /// [`Self::store_spooled_delta_inner`] declined to delta (`reason`);
+    /// its commit records the counter.
     #[allow(clippy::too_many_arguments)]
     async fn store_passthrough_file_inner(
         &self,
         lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
-        source_path: &Path,
         // The body spool this op holds, hashed and size-checked already.
-        held: Option<HashedSpool<'_>>,
+        held: HashedSpool<'_>,
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
         multipart_etag: Option<String>,
         prior: &CounterPrior,
+        reason: PassthroughReason,
     ) -> Result<StoreResult, EngineError> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(lock, bucket, key)?;
 
-        let (sha256, md5) = match &held {
-            // storage-9: the streaming PUT hashed its body already.
-            Some(h) => (h.sha256.to_string(), h.md5.to_string()),
-            None => {
-                let (sha256, md5, observed) = Self::hash_spool_file(source_path).await?;
-                if observed != total_size {
-                    return Err(EngineError::Storage(StorageError::Other(format!(
-                        "Multipart relay size mismatch: expected {}, observed {}",
-                        total_size, observed
-                    ))));
-                }
-                (sha256, md5)
-            }
-        };
-        let held = held.map(|h| h.spool);
+        // storage-9: the streaming PUT hashed its body already.
+        let (sha256, md5) = (held.sha256.to_string(), held.md5.to_string());
+        let source_path = held.spool.path();
         let reserved = self
-            .reserve_storage_spool(
-                bucket,
-                total_size,
-                false,
-                held.map_or(0, crate::deltaglider::spool::Spool::reserved_mib),
-            )
+            .storage_spool(held.storage, bucket, total_size, held.spool.reserved_mib())
             .await?;
         // The key's write lock only (P7.4): see `write_passthrough_locked`.
         let write = PassthroughWrite {
@@ -1847,14 +1974,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 content_type,
                 user_metadata,
                 multipart_etag,
+                reason,
             ),
             source: PassthroughSource::File {
                 path: source_path,
-                held,
+                held: Some(held.spool),
             },
         };
-        self.write_passthrough_locked(write, reserved.as_ref())
-            .await
+        self.write_passthrough_locked(write, reserved.get()).await
     }
 
     /// Begin a streaming passthrough multipart upload (Phase B). Gated on
@@ -1880,13 +2007,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // object metadata only at create time (its complete takes none), so
         // empty hashes here made every reader fall back to a foreign-object
         // HEAD (no Content-Type, no user metadata, the `<md5>-N` ETag).
+        let reason = self.parts_passthrough_reason(
+            bucket,
+            key,
+            &facts.user_metadata,
+            total_size,
+            PassthroughReason::MultipartOverDeltaCap,
+        );
         let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
             facts.sha256,
             facts.md5,
             total_size,
             facts.content_type,
-        );
+        )
+        .with_passthrough_reason(reason);
         metadata.set_user_metadata(facts.user_metadata);
         metadata.multipart_etag = facts.multipart_etag;
 
@@ -2146,17 +2281,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(true);
         }
 
-        let (reference, _cache_hit) = self
-            .get_reference_cached(bucket, deltaspace_id, &ref_meta.file_sha256)
-            .await?;
-        let source_file = self.codec_source_spool_now(reference.len())?;
-        let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
-            EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
-        })?;
-        let delta = self
-            .codec
-            .encode_spooled(&source_file, &reference, &reference)?;
-        drop(_codec_permit);
+        // The object's bytes ARE the reference: its delta is the reference
+        // encoded against itself (a few copy instructions).
+        let delta = if ref_meta.file_size > self.spool_threshold() {
+            self.self_delta_from_file(bucket, deltaspace_id, &ref_meta)
+                .await?
+        } else {
+            let (reference, _cache_hit) = self
+                .get_reference_cached(bucket, deltaspace_id, &ref_meta.file_sha256)
+                .await?;
+            let source_file = self.codec_source_spool_now(reference.len())?;
+            let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
+                EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
+            })?;
+            self.codec
+                .encode_spooled(&source_file, &reference, &reference)?
+        };
 
         let delta_meta = FileMetadata::new_delta(
             filename.to_string(),
@@ -2177,7 +2317,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 bucket,
                 deltaspace_id,
                 filename,
-                Bytes::from(delta),
+                crate::storage::PutBody::Bytes(Bytes::from(delta)),
                 &delta_meta,
             )
             .await?;
@@ -2198,6 +2338,46 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.cache.invalidate(&cache_key);
 
         Ok(true)
+    }
+
+    /// The delta of a reference above the spool threshold against itself,
+    /// from a spool file (the reference cache holds no reference this
+    /// large). Under the deltaspace lock: the spool is taken without
+    /// waiting (a full budget is SlowDown), and the file is checked
+    /// against the reference's SHA-256 before the encode.
+    async fn self_delta_from_file(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        ref_meta: &FileMetadata,
+    ) -> Result<Vec<u8>, EngineError> {
+        let file = self.codec_source_spool_now(ref_meta.file_size as usize)?;
+        self.storage
+            .get_reference_to_file(bucket, deltaspace_id, file.path())
+            .await?;
+        let (actual, _, _) = Self::hash_spool_file(file.path()).await?;
+        if actual != ref_meta.file_sha256 {
+            return Err(EngineError::ChecksumMismatch {
+                key: format!("{deltaspace_id}/.dg/reference.bin"),
+                expected: ref_meta.file_sha256.clone(),
+                actual,
+            });
+        }
+        let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
+            EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
+        })?;
+        let codec = self.codec.clone();
+        let path = file.path().to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, EngineError> {
+            let target = std::fs::File::open(&path).map_err(StorageError::from)?;
+            let mut delta = Vec::new();
+            codec
+                .encode_from_reader(&path, target, &mut delta)
+                .map_err(EngineError::Codec)?;
+            Ok(delta)
+        })
+        .await
+        .map_err(|e| EngineError::Storage(StorageError::Other(format!("encode task: {e}"))))?
     }
 
     /// Batch-migrate all legacy reference objects in a bucket. Visits only
@@ -2350,6 +2530,7 @@ mod counter_tests {
                 None,
                 HashMap::new(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2358,54 +2539,20 @@ mod counter_tests {
     async fn relayed(h: &Harness, key: &str, data: &[u8]) {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = data.split_at(data.len() / 2);
-        let paths = vec![dir.path().join("p1"), dir.path().join("p2")];
+        let paths = [dir.path().join("p1"), dir.path().join("p2")];
         tokio::fs::write(&paths[0], a).await.unwrap();
         tokio::fs::write(&paths[1], b).await.unwrap();
+        let parts: Vec<RelayPart> = paths.iter().map(|p| RelayPart::of_file(p)).collect();
         h.engine
             .store_passthrough_relayed_parts_with_multipart_etag(
                 &h.engine.lock_object_write(BUCKET, key).await,
                 BUCKET,
                 key,
-                &paths,
+                &parts,
                 data.len() as u64,
                 None,
                 HashMap::new(),
                 "\"0123456789abcdef0123456789abcdef-2\"".to_string(),
-            )
-            .await
-            .unwrap();
-    }
-
-    async fn file(h: &Harness, key: &str, data: &[u8]) {
-        let f = tempfile::NamedTempFile::new().unwrap();
-        tokio::fs::write(f.path(), data).await.unwrap();
-        h.engine
-            .store_passthrough_file_with_multipart_etag(
-                &h.engine.lock_object_write(BUCKET, key).await,
-                BUCKET,
-                key,
-                f.path(),
-                data.len() as u64,
-                None,
-                HashMap::new(),
-                "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
-            )
-            .await
-            .unwrap();
-    }
-
-    async fn chunked(h: &Harness, key: &str, data: &[u8]) {
-        let chunks: Vec<Bytes> = data.chunks(64 * 1024).map(Bytes::copy_from_slice).collect();
-        h.engine
-            .store_passthrough_chunked_with_multipart_etag(
-                &h.engine.lock_object_write(BUCKET, key).await,
-                BUCKET,
-                key,
-                &chunks,
-                data.len() as u64,
-                None,
-                HashMap::new(),
-                "\"0123456789abcdef0123456789abcdef-3\"".to_string(),
             )
             .await
             .unwrap();
@@ -2439,23 +2586,17 @@ mod counter_tests {
         assert_eq!(row(&h), row(&oracle));
     }
 
-    /// Every multipart passthrough sink must net an overwrite to +0 objects.
+    /// The multipart passthrough sink must net an overwrite to +0 objects.
     #[tokio::test]
     async fn multipart_sinks_overwrite_counts_one_object() {
         let (v1, v2) = versions();
-        for sink in ["relayed", "file", "chunked"] {
-            let h = harness().await;
-            for data in [&v1, &v2] {
-                match sink {
-                    "relayed" => relayed(&h, "img/a.jpg", data).await,
-                    "file" => file(&h, "img/a.jpg", data).await,
-                    _ => chunked(&h, "img/a.jpg", data).await,
-                }
-            }
-            let (count, logical, _) = row(&h);
-            assert_eq!(count, 1, "{sink}: overwrite must not add an object");
-            assert_eq!(logical, v2.len() as u64, "{sink}: logical bytes of v2 only");
+        let h = harness().await;
+        for data in [&v1, &v2] {
+            relayed(&h, "img/a.jpg", data).await;
         }
+        let (count, logical, _) = row(&h);
+        assert_eq!(count, 1, "overwrite must not add an object");
+        assert_eq!(logical, v2.len() as u64, "logical bytes of v2 only");
     }
 }
 
@@ -2513,6 +2654,7 @@ mod no_delta_hint_tests {
                 v2.len() as u64,
                 None,
                 with_hint(),
+                None,
                 None,
             )
             .await
@@ -2651,6 +2793,7 @@ mod spool_budget_tests {
                 data.len() as u64,
                 None,
                 HashMap::new(),
+                None,
                 None,
             );
             tokio::time::timeout(std::time::Duration::from_secs(10), put)
@@ -2830,6 +2973,7 @@ mod review2_tests {
             None,
             HashMap::new(),
             None,
+            None,
         );
         let b = engine.store_spooled_delta(
             &lock_b,
@@ -2839,6 +2983,7 @@ mod review2_tests {
             v.len() as u64,
             None,
             HashMap::new(),
+            None,
             None,
         );
         let (ra, rb) = tokio::time::timeout(
@@ -2895,7 +3040,17 @@ mod review2_tests {
             let put = move |key: &'static str, body| async move {
                 let lock = engine.lock_object_write("b", key).await;
                 engine
-                    .store_spooled_delta(&lock, "b", key, body, size, None, HashMap::new(), None)
+                    .store_spooled_delta(
+                        &lock,
+                        "b",
+                        key,
+                        body,
+                        size,
+                        None,
+                        HashMap::new(),
+                        None,
+                        None,
+                    )
                     .await
             };
             let (ra, rb) = tokio::time::timeout(
@@ -2925,10 +3080,97 @@ mod review2_tests {
                 None,
                 HashMap::new(),
                 None,
+                None,
             )
             .await
             .unwrap();
         let (got, _) = engine.retrieve("b", "x/a.png").await.unwrap();
+        assert_eq!(got, v);
+    }
+
+    /// The ingest of a body reserves the storage write's temp files with the
+    /// body, and the store uses that reservation: with the rest of the spool
+    /// taken by others, an encrypted streaming PUT still stores (it no
+    /// longer asks for new budget under its locks, where a full budget was
+    /// a SlowDown).
+    #[tokio::test]
+    async fn an_ingested_body_carries_the_spool_of_its_storage_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = encrypted_engine(&tmp, 4 * 1024 * 1024)
+            .await
+            .with_memory_budget(crate::deltaglider::memory_budget::MemoryBudget::new(0));
+        let v = vec![5u8; 1_500_000];
+        let body = crate::deltaglider::ingest::ingest_bytes(
+            &engine,
+            "b",
+            Bytes::from(v.clone()),
+            u64::MAX,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                body,
+                crate::deltaglider::ingest::IngestedBody::Spooled { .. }
+            ),
+            "{body:?}"
+        );
+        let others = engine
+            .spool
+            .try_acquire((engine.spool.free_mib() * 1024 * 1024) as u64)
+            .unwrap();
+        assert_eq!(engine.spool.free_mib(), 0, "the rest of the spool is taken");
+        engine
+            .store_conditional(
+                "b",
+                "x/a.png",
+                body,
+                None,
+                HashMap::new(),
+                &crate::deltaglider::Precondition::none(),
+            )
+            .await
+            .expect("the ciphertext temp uses the ingest's reservation");
+        drop(others);
+        assert_eq!(engine.spool.free_mib(), 4, "every reservation released");
+        let (got, _) = engine.retrieve("b", "x/a.png").await.unwrap();
+        assert_eq!(got, v);
+    }
+
+    /// A kept delta of a streaming PUT on an encrypting backend commits
+    /// from its spool file: the wrapper encrypts the file into a spool
+    /// file of its own (reserved without waiting, beside the body and the
+    /// delta) and the delta reads back.
+    #[tokio::test]
+    async fn encrypted_streaming_delta_commits_from_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = encrypted_engine(&tmp, 64 * 1024 * 1024).await;
+        let base: Vec<u8> = (0..1_500_000u32).map(|n| (n % 251) as u8).collect();
+        let mut v = base.clone();
+        v[700_000..700_100].fill(9);
+        for (key, body) in [("rel/a.zip", &base), ("rel/b.zip", &v)] {
+            let spool = engine.spool_acquire(body.len() as u64).await.unwrap();
+            tokio::fs::write(spool.path(), body).await.unwrap();
+            let lock = engine.lock_object_write("b", key).await;
+            engine
+                .store_spooled_delta(
+                    &lock,
+                    "b",
+                    key,
+                    &spool,
+                    body.len() as u64,
+                    None,
+                    HashMap::new(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let head = engine.head("b", "rel/b.zip").await.unwrap();
+        assert_eq!(head.storage_info.label(), "delta");
+        let (got, _) = engine.retrieve("b", "rel/b.zip").await.unwrap();
         assert_eq!(got, v);
     }
 
@@ -2993,9 +3235,10 @@ mod review2_tests {
     async fn encrypted_relayed_store_never_waits_for_budget() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = encrypted_engine(&tmp, 4 * 1024 * 1024).await;
-        let part = tmp.path().join("part1");
+        let path = tmp.path().join("part1");
         let v = vec![5u8; 1024 * 1024];
-        tokio::fs::write(&part, &v).await.unwrap();
+        tokio::fs::write(&path, &v).await.unwrap();
+        let part = RelayPart::of_file(&path);
         let (engine_ref, part_ref, size) = (&engine, &part, v.len() as u64);
         let store = move || async move {
             let lock = engine_ref.lock_object_write("b", "x/a.png").await;
@@ -3129,30 +3372,18 @@ mod other_form_tests {
                 None,
                 HashMap::new(),
                 None,
+                None,
             )
             .await
             .unwrap();
-        let chunks: Vec<Bytes> = v1.chunks(64 * 1024).map(Bytes::copy_from_slice).collect();
+        let relay = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(relay.path(), &v1).await.unwrap();
         engine
-            .store_passthrough_chunked(
+            .store_passthrough_relayed_parts_with_multipart_etag(
                 &engine.lock_object_write("b", "img/c.jpg").await,
                 "b",
                 "img/c.jpg",
-                &chunks,
-                v1.len() as u64,
-                None,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
-        let f = tempfile::NamedTempFile::new().unwrap();
-        tokio::fs::write(f.path(), &v1).await.unwrap();
-        engine
-            .store_passthrough_file_with_multipart_etag(
-                &engine.lock_object_write("b", "img/f.jpg").await,
-                "b",
-                "img/f.jpg",
-                f.path(),
+                &[RelayPart::of_file(relay.path())],
                 v1.len() as u64,
                 None,
                 HashMap::new(),
@@ -3161,7 +3392,7 @@ mod other_form_tests {
             .await
             .unwrap();
         let d = deletes(&fake);
-        eprintln!("6 writes of absent keys: {} DELETEs: {d:?}", d.len());
+        eprintln!("5 writes of absent keys: {} DELETEs: {d:?}", d.len());
         assert!(d.is_empty(), "{} DELETEs for absent keys: {d:?}", d.len());
 
         // An overwrite of the delta as a passthrough object drops the delta.

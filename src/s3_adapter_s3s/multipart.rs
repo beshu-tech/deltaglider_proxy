@@ -10,8 +10,8 @@ pub(super) async fn create_multipart_upload(
     req: s3s::S3Request<s3s::dto::CreateMultipartUploadInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CreateMultipartUploadOutput>> {
     let input = req.input;
-    // Earliest reject: parts are staged in-memory, but refusing at
-    // create saves the client uploading them at all (403-before-404).
+    // Earliest reject: refusing at create saves the client uploading the
+    // parts at all (403-before-404).
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
         .await?;
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
@@ -23,22 +23,11 @@ pub(super) async fn create_multipart_upload(
             s3s::S3Error::from(crate::api::errors::S3Error::InvalidArgument(e.to_string()))
         })?;
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
-    let engine = svc.state.engine.load();
-    let delta_limit = engine.tuning().mpu_delta_reconstruct_max_bytes;
-    let user_metadata = input.metadata.unwrap_or_default();
-    // A write that tries no delta is never assembled in memory: its parts go
-    // to relay files from the first one. Completion decides again (the config
-    // can change mid-upload) and reads relay files either way.
-    // The size is unknown here: 0 asks only about the type, the bucket and
-    // the hint.
-    let relay_now = !engine.write_tries_delta(&input.bucket, &input.key, &user_metadata, 0);
-    let upload_id = svc.state.multipart.create_with_relay_policy(
+    let upload_id = svc.state.multipart.create(
         &input.bucket,
         &input.key,
         input.content_type.clone(),
-        user_metadata,
-        Some(delta_limit),
-        relay_now,
+        input.metadata.unwrap_or_default(),
     )?;
     Ok(s3s::S3Response::new(
         s3s::dto::CreateMultipartUploadOutput {
@@ -50,25 +39,52 @@ pub(super) async fn create_multipart_upload(
     ))
 }
 
+/// S3's limit on one request body that is not a PutObject: a part
+/// (UploadPart, UploadPartCopy) and the source of a CopyObject.
+pub(super) const S3_MAX_SINGLE_TRANSFER_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Pure: the largest part, S3's 5 GiB, and never above `max_object_size`
+/// (no object may be larger). A part above it is `EntityTooLarge`, from
+/// its declared length, before a byte is read.
+pub(super) fn part_size_limit(max_object_size: u64) -> u64 {
+    S3_MAX_SINGLE_TRANSFER_BYTES.min(max_object_size)
+}
+
 pub(super) async fn upload_part(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::UploadPartInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
-    let body_ctx = BodyContext::of(&req);
+    let body_ctx = crate::api::body_ingest::BodyContext::of(&req);
     let input = req.input;
     // Cached briefly per bucket: one HeadBucket per upload, not per part.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let max_object_size = svc.state.engine.load().max_object_size();
     // Review C9: the store's per-upload cap follows the live config.
     svc.state.multipart.set_max_object_size(max_object_size);
-    let data = collect_blob_limited(input.body, max_object_size, &body_ctx).await?;
-    validate_content_md5_s3s(input.content_md5.as_deref(), &data)?;
+    let part_number = u32::try_from(input.part_number).unwrap_or(0);
+    // The part goes straight to a spool file, read once and checked, and
+    // the multipart store keeps that file as the part.
+    let (body, admission) = crate::api::body_ingest::ingest_part_body(
+        &svc.state,
+        input.body,
+        &body_ctx,
+        crate::api::body_ingest::PartTarget {
+            upload_id: &input.upload_id,
+            bucket: &input.bucket,
+            key: &input.key,
+            part_number,
+        },
+        part_size_limit(max_object_size),
+        input.content_md5.as_deref(),
+    )
+    .await?;
     let etag = svc.state.multipart.upload_part(
         &input.upload_id,
         &input.bucket,
         &input.key,
-        input.part_number as u32,
-        data,
+        part_number,
+        body,
+        admission,
     )?;
     Ok(s3s::S3Response::new(s3s::dto::UploadPartOutput {
         e_tag: Some(parse_s3s_etag(&etag)?),
@@ -221,7 +237,7 @@ pub(super) async fn complete_multipart_upload(
                 .multipart
                 .user_metadata(&input.upload_id)
                 .unwrap_or_default();
-            let force_chunked_passthrough = completion_stores_from_parts(
+            let stores_whole = completion_stores_from_parts(
                 &svc.state.engine.load(),
                 &input.bucket,
                 &input.key,
@@ -248,7 +264,7 @@ pub(super) async fn complete_multipart_upload(
                     key,
                     upload_id,
                     parts,
-                    force_chunked_passthrough,
+                    stores_whole,
                 )
                 .await
                 .map_err(s3s::S3Error::from);
@@ -272,8 +288,8 @@ pub(super) async fn complete_multipart_upload(
 }
 
 /// Whether CompleteMultipartUpload stores the parts as they are, never
-/// assembled into one buffer: the write tries no delta, or it is too large
-/// to rebuild for one.
+/// joined into one file: the write tries no delta, or it is larger than
+/// `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`.
 pub(super) fn completion_stores_from_parts(
     engine: &crate::deltaglider::DynEngine,
     bucket: &str,
@@ -367,7 +383,7 @@ pub(super) async fn run_multipart_completion(
     key: String,
     upload_id: String,
     requested_parts: Vec<(u32, String)>,
-    force_chunked_passthrough: bool,
+    stores_whole: bool,
 ) -> Result<(String, crate::types::StoreResult), crate::api::S3Error> {
     // Deterministic chaos hook for tests: hold the store window open.
     let stall_ms = crate::config::test_seams::test_seams().complete_stall_ms;
@@ -375,75 +391,48 @@ pub(super) async fn run_multipart_completion(
         tokio::time::sleep(std::time::Duration::from_millis(stall_ms)).await;
     }
     let engine = state.engine.load();
-    let (etag, result) = if force_chunked_passthrough {
-        let completed =
-            state
-                .multipart
-                .complete_passthrough(&upload_id, &bucket, &key, &requested_parts)?;
-        let etag = completed.etag.clone();
-        let store_result = match completed.payload {
-            crate::multipart::PassthroughPayload::Chunks(parts) => {
-                engine
-                    .store_passthrough_chunked_with_multipart_etag(
-                        write_lock,
-                        &bucket,
-                        &key,
-                        &parts,
-                        completed.total_size,
-                        completed.content_type,
-                        completed.user_metadata,
-                        etag.clone(),
-                    )
-                    .await
-            }
-            crate::multipart::PassthroughPayload::RelayedParts(paths) => {
-                // Protect the relay part files from the idle-TTL sweeper while the
-                // store reads them (H18) — a slow remote store can exceed
-                // completing_timeout.
-                let _store_guard = state.multipart.store_guard(&upload_id);
-                engine
-                    .store_passthrough_relayed_parts_with_multipart_etag(
-                        write_lock,
-                        &bucket,
-                        &key,
-                        &paths,
-                        completed.total_size,
-                        completed.content_type,
-                        completed.user_metadata,
-                        etag.clone(),
-                    )
-                    .await
-            }
-        };
-        match store_result {
-            Ok(result) => (etag, result),
-            Err(e) => {
-                state.multipart.rollback_upload(&upload_id);
-                return Err(e.into());
-            }
-        }
-    } else {
-        let completed = state
-            .multipart
-            .complete(&upload_id, &bucket, &key, &requested_parts)?;
-        let etag = completed.etag.clone();
-        match engine
-            .store_with_multipart_etag(
+    let completed = state
+        .multipart
+        .complete_parts(&upload_id, &bucket, &key, &requested_parts)?;
+    let etag = completed.etag.clone();
+    // Protect the relay part files from the idle-TTL sweeper while the store
+    // reads them (H18): a slow remote store can exceed completing_timeout.
+    let store_guard = state.multipart.store_guard(&upload_id);
+    let stored = if stores_whole {
+        engine
+            .store_passthrough_relayed_parts_with_multipart_etag(
                 write_lock,
                 &bucket,
                 &key,
-                &completed.data,
+                &completed.parts,
+                completed.total_size,
                 completed.content_type,
                 completed.user_metadata,
                 etag.clone(),
             )
             .await
-        {
-            Ok(result) => (etag, result),
-            Err(e) => {
-                state.multipart.rollback_upload(&upload_id);
-                return Err(e.into());
-            }
+    } else {
+        // A delta candidate: the parts are joined into one spool file and
+        // delta-encoded as a stream, whatever the size of the upload.
+        engine
+            .store_relayed_parts_delta_with_multipart_etag(
+                write_lock,
+                &bucket,
+                &key,
+                &completed.parts,
+                completed.total_size,
+                completed.content_type,
+                completed.user_metadata,
+                etag.clone(),
+            )
+            .await
+    };
+    drop(store_guard);
+    let result = match stored {
+        Ok(result) => result,
+        Err(e) => {
+            state.multipart.rollback_upload(&upload_id);
+            return Err(e.into());
         }
     };
     state.multipart.finish_upload(&upload_id);
@@ -608,15 +597,11 @@ mod multipart_cost_tests {
             .multipart
             .create("b", "a/photo.jpg", None, Default::default())
             .unwrap();
-        let etag = state
-            .multipart
-            .upload_part(
-                &id,
-                "b",
-                "a/photo.jpg",
-                1,
-                bytes::Bytes::from(vec![7u8; 1024]),
-            )
+        let etag = upload_part(&svc, request(part(&id, 1)))
+            .await
+            .unwrap()
+            .output
+            .e_tag
             .unwrap();
         let input = s3s::dto::CompleteMultipartUploadInput::builder()
             .bucket("b".into())
@@ -625,7 +610,7 @@ mod multipart_cost_tests {
             .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
                 parts: Some(vec![s3s::dto::CompletedPart {
                     part_number: Some(1),
-                    e_tag: Some(parse_s3s_etag(&etag).unwrap()),
+                    e_tag: Some(etag),
                     ..Default::default()
                 }]),
             }))

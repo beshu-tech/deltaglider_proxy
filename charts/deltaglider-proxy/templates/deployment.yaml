@@ -60,6 +60,11 @@ spec:
             - name: DGP_CONFIG
               value: {{ .Values.config.mountPath | quote }}
             {{- end }}
+            {{- if .Values.tmp.sizeLimit }}
+            # The spool lives in /tmp: its budget stays below the size limit.
+            - name: DGP_SPOOL_MAX_BYTES
+              value: {{ include "deltaglider-proxy.spoolMaxBytes" . | quote }}
+            {{- end }}
             {{- range .Values.env }}
             - {{- toYaml . | nindent 14 }}
             {{- end }}

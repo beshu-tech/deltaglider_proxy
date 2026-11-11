@@ -42,6 +42,9 @@ pub mod meta_keys {
     pub const REF_SHA256: &str = "dg-ref-sha256";
     pub const DELTA_SIZE: &str = "dg-delta-size";
     pub const DELTA_CMD: &str = "dg-delta-cmd";
+    /// Why an object is stored whole: one `PassthroughReason` slug. Present
+    /// only on a passthrough object that the proxy decided to store whole.
+    pub const PASSTHROUGH_REASON: &str = "dg-passthrough-reason";
     /// LIST only (`metadata=true`), never stored: `true` on the delta whose
     /// bytes are its folder's reference baseline (file SHA-256 = reference
     /// SHA-256). HEAD readers derive the same fact from the two hashes.
@@ -62,6 +65,7 @@ pub mod meta_keys {
     pub const H_REF_SHA256: &str = concat!("x-amz-meta-", "dg-ref-sha256");
     pub const H_DELTA_SIZE: &str = concat!("x-amz-meta-", "dg-delta-size");
     pub const H_DELTA_CMD: &str = concat!("x-amz-meta-", "dg-delta-cmd");
+    pub const H_PASSTHROUGH_REASON: &str = concat!("x-amz-meta-", "dg-passthrough-reason");
     pub const ENCRYPTED: &str = "dg-encrypted";
     pub const H_ENCRYPTED: &str = concat!("x-amz-meta-", "dg-encrypted");
     /// The seal of a format-v2 encrypted object (issue #120): a user-metadata
@@ -346,6 +350,13 @@ pub struct FileMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multipart_etag: Option<String>,
 
+    /// Why the proxy stored this object whole instead of as a delta: the
+    /// slug of a [`PassthroughReason`]. `None` on every other object, and on
+    /// a passthrough object that an older release or a foreign writer wrote.
+    /// A slug that this release does not know is kept as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_reason: Option<String>,
+
     /// Creation timestamp (UTC ISO8601)
     pub created_at: DateTime<Utc>,
 
@@ -415,6 +426,58 @@ impl fmt::Debug for ListingTokenMaker {
         } else {
             "ListingTokenMaker(none)"
         })
+    }
+}
+
+/// Why the proxy stored an object whole (passthrough) instead of as a delta.
+/// The slug is the value of `dg-passthrough-reason`; the table in
+/// `docs/product/reference/` names each one. A decision point returns one of
+/// these and nothing else writes the header, so the set stays closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassthroughReason {
+    /// The file type is not on the bucket's delta-eligible list.
+    NotDeltaEligible,
+    /// Compression is switched off for the bucket.
+    CompressionDisabled,
+    /// The PUT carried the `dg-no-delta` hint.
+    NoDeltaRequested,
+    /// The object is larger than `max_object_size`, the limit of a delta.
+    OverMaxObjectSize,
+    /// The file name plus `.delta` is longer than a backend allows (255 bytes).
+    DeltaNameTooLong,
+    /// A multipart upload larger than `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`.
+    MultipartOverDeltaCap,
+    /// The delta was not smaller than `max_delta_ratio` allows.
+    DeltaRatioOverLimit,
+    /// The proxy had no spool space to try a delta now (a busy proxy).
+    DeltaUnavailable,
+}
+
+impl PassthroughReason {
+    /// Every reason, for the tests that cover the whole set.
+    pub const ALL: [Self; 8] = [
+        Self::NotDeltaEligible,
+        Self::CompressionDisabled,
+        Self::NoDeltaRequested,
+        Self::OverMaxObjectSize,
+        Self::DeltaNameTooLong,
+        Self::MultipartOverDeltaCap,
+        Self::DeltaRatioOverLimit,
+        Self::DeltaUnavailable,
+    ];
+
+    /// The value of the `dg-passthrough-reason` header.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::NotDeltaEligible => "not-delta-eligible",
+            Self::CompressionDisabled => "compression-disabled",
+            Self::NoDeltaRequested => "no-delta-requested",
+            Self::OverMaxObjectSize => "over-max-object-size",
+            Self::DeltaNameTooLong => "delta-name-too-long",
+            Self::MultipartOverDeltaCap => "multipart-over-delta-cap",
+            Self::DeltaRatioOverLimit => "delta-ratio-over-limit",
+            Self::DeltaUnavailable => "delta-unavailable",
+        }
     }
 }
 
@@ -495,6 +558,7 @@ impl FileMetadata {
             file_size: size,
             md5,
             multipart_etag: None,
+            passthrough_reason: None,
             created_at: Utc::now(),
             content_type,
             user_metadata: HashMap::new(),
@@ -528,6 +592,7 @@ impl FileMetadata {
             file_size,
             md5,
             multipart_etag: None,
+            passthrough_reason: None,
             created_at: Self::object_created_at(),
             content_type,
             user_metadata: HashMap::new(),
@@ -558,6 +623,7 @@ impl FileMetadata {
             file_size: size,
             md5,
             multipart_etag: None,
+            passthrough_reason: None,
             created_at: Self::object_created_at(),
             content_type,
             user_metadata: HashMap::new(),
@@ -566,6 +632,15 @@ impl FileMetadata {
             stored_last_modified: None,
             backend_version: None,
         }
+    }
+
+    /// `self` with the reason it is stored whole. Only a passthrough object
+    /// has one: any other storage type keeps `None`.
+    pub fn with_passthrough_reason(mut self, reason: PassthroughReason) -> Self {
+        if matches!(self.storage_info, StorageInfo::Passthrough) {
+            self.passthrough_reason = Some(reason.slug().to_string());
+        }
+        self
     }
 
     /// Create best-effort fallback metadata for an object that exists in storage
@@ -586,6 +661,7 @@ impl FileMetadata {
             file_size: size,
             md5,
             multipart_etag: None,
+            passthrough_reason: None,
             created_at,
             content_type,
             user_metadata: HashMap::new(),
@@ -605,6 +681,7 @@ impl FileMetadata {
             file_size: 0,
             md5: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
             multipart_etag: None,
+            passthrough_reason: None,
             created_at: Utc::now(),
             content_type: Some("application/x-directory".to_string()),
             user_metadata: HashMap::new(),
@@ -669,6 +746,9 @@ impl FileMetadata {
             }
             StorageInfo::Passthrough => {
                 map.insert(mk::NOTE.to_string(), "passthrough".to_string());
+                if let Some(ref reason) = self.passthrough_reason {
+                    map.insert(mk::PASSTHROUGH_REASON.to_string(), reason.clone());
+                }
             }
         }
 
@@ -1339,5 +1419,84 @@ mod key_path_proptests {
             let key = format!("{pre}/../{post}");
             prop_assert!(ObjectKey::validate_prefix(&key).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod passthrough_reason_tests {
+    use super::*;
+
+    fn passthrough() -> FileMetadata {
+        FileMetadata::new_passthrough("a".into(), "s".into(), "m".into(), 1, None)
+    }
+
+    /// The slugs are the wire values: unique, lowercase kebab-case.
+    #[test]
+    fn every_slug_is_unique_kebab_case() {
+        let slugs: std::collections::HashSet<_> =
+            PassthroughReason::ALL.iter().map(|r| r.slug()).collect();
+        assert_eq!(slugs.len(), PassthroughReason::ALL.len());
+        for slug in slugs {
+            assert!(
+                !slug.is_empty()
+                    && slug.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                    && !slug.starts_with('-')
+                    && !slug.ends_with('-'),
+                "{slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_passthrough_object_writes_its_reason_as_a_header() {
+        let meta = passthrough().with_passthrough_reason(PassthroughReason::MultipartOverDeltaCap);
+        let map = meta.to_bare_metadata_map();
+        assert_eq!(
+            map.get(meta_keys::PASSTHROUGH_REASON).map(String::as_str),
+            Some("multipart-over-delta-cap")
+        );
+        assert_eq!(
+            map.get(meta_keys::NOTE).map(String::as_str),
+            Some("passthrough")
+        );
+    }
+
+    /// Only a passthrough object has a reason: a delta or a reference
+    /// asked to carry one keeps none.
+    #[test]
+    fn only_a_passthrough_object_takes_a_reason() {
+        let delta = FileMetadata::new_delta(
+            "a".into(),
+            "s".into(),
+            "m".into(),
+            10,
+            "reference.bin".into(),
+            "r".into(),
+            5,
+            None,
+        )
+        .with_passthrough_reason(PassthroughReason::DeltaRatioOverLimit);
+        assert_eq!(delta.passthrough_reason, None);
+        assert!(!delta
+            .to_bare_metadata_map()
+            .contains_key(meta_keys::PASSTHROUGH_REASON));
+    }
+
+    /// The xattr form (serde) keeps the reason, and an object stored by an
+    /// older release (no field) reads back with none.
+    #[test]
+    fn the_reason_round_trips_and_is_optional_on_read() {
+        let meta = passthrough().with_passthrough_reason(PassthroughReason::NotDeltaEligible);
+        let json = serde_json::to_string(&meta).unwrap();
+        let round: FileMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round.passthrough_reason.as_deref(),
+            Some("not-delta-eligible")
+        );
+
+        let bare = serde_json::to_string(&passthrough()).unwrap();
+        assert!(!bare.contains("passthrough_reason"), "{bare}");
+        let old: FileMetadata = serde_json::from_str(&bare).unwrap();
+        assert_eq!(old.passthrough_reason, None);
     }
 }

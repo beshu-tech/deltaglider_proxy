@@ -403,26 +403,12 @@ where
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map(|ci| ci.0.ip());
 
-        // Consume the body, bounded by `max_object_size`: `to_bytes` aborts
-        // as soon as the collected body exceeds the limit, chunked or not.
-        // Read the cap from the (hot-reloadable) engine so a runtime
-        // `max_object_size` change applies here too. No S3 route uses an
-        // axum body extractor, so `DefaultBodyLimit` would bound nothing.
-        let max_body = state.engine.load().max_object_size() as usize;
+        // The form streams into the handler: it reads the small fields up
+        // to the file, checks the signature and the policy, and only then
+        // reads the file (into memory or a spool file, capped). An
+        // unauthenticated form never costs more than the form bytes before
+        // its file, which the handler bounds on the stream (FORM_SIDE_MAX).
         let (parts, body) = request.into_parts();
-        let body_bytes = match axum::body::to_bytes(body, max_body).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("form-POST body collection failed or exceeded limit: {e}");
-                // Proper S3 XML error (EntityTooLarge) so SDKs/Cyberduck parse it,
-                // matching the PUT path's collect_blob_limited behaviour.
-                return crate::api::S3Error::EntityTooLarge {
-                    size: 0,
-                    max: max_body as u64,
-                }
-                .into_response();
-            }
-        };
 
         // Hand off to the same handler the axum adapter uses. Identical
         // behaviour by construction.
@@ -432,7 +418,7 @@ where
             iam_state.as_ref(),
             &parts.headers,
             &parts.extensions,
-            body_bytes,
+            body.into_data_stream(),
             peer_ip,
         )
         .await

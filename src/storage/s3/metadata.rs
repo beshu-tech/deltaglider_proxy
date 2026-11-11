@@ -395,6 +395,12 @@ impl S3Backend {
             .collect();
 
         let multipart_etag = get_value(&["dg-multipart-etag"]);
+        // Only a passthrough object carries a reason; ignore a stray one.
+        let passthrough_reason = if matches!(storage_info, StorageInfo::Passthrough) {
+            get_value(&[mk::PASSTHROUGH_REASON])
+        } else {
+            None
+        };
         Ok(FileMetadata {
             tool,
             original_name,
@@ -402,6 +408,7 @@ impl S3Backend {
             file_size,
             md5,
             multipart_etag,
+            passthrough_reason,
             created_at,
             // Use the empty-skipping `get_value` (not raw `headers.get`): an
             // object stored with no/blank content-type leaves an empty
@@ -714,15 +721,25 @@ pub(super) fn check_key_sendable(key: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Pure: whether the headers of a write (the proxy's own `dg-*` metadata
-/// plus the client's) fit S3's 2 KB limit. Over it is `MetadataTooLarge`
-/// (400): the client's metadata can pass the adapter's 2 KB gate while the
-/// proxy's own fields push the total over, and that is not a server fault.
-pub(super) fn check_metadata_size(
-    headers: &HashMap<String, String>,
+/// Pure: fit the headers of a write (the proxy's own `dg-*` metadata plus
+/// the client's) into S3's 2 KB limit. The advisory `dg-passthrough-reason`
+/// is left out when the total is over the limit with it: it only explains
+/// why an object is stored whole, so it never makes a write fail (a write,
+/// or a copy of an older object, that fitted before it existed still fits).
+/// Over the limit without it is `MetadataTooLarge` (400): the client's
+/// metadata can pass the adapter's 2 KB gate while the proxy's own fields
+/// push the total over, and that is not a server fault. Every S3 write
+/// that sends metadata calls this, right before it sends.
+pub(super) fn fit_metadata(
+    headers: &mut HashMap<String, String>,
     bucket: &str,
     key: &str,
 ) -> Result<(), StorageError> {
+    let size =
+        |h: &HashMap<String, String>| -> usize { h.iter().map(|(k, v)| k.len() + v.len()).sum() };
+    if size(headers) > S3_USER_METADATA_MAX_BYTES {
+        headers.remove(crate::types::meta_keys::PASSTHROUGH_REASON);
+    }
     check_key_sendable(key)?;
     // The key's name also travels as a header VALUE (`dg-original-name`),
     // in the form the client sent it, whatever the stored key looks like.
@@ -733,7 +750,7 @@ pub(super) fn check_metadata_size(
                 .to_string(),
         ));
     }
-    let total: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
+    let total = size(headers);
     if total > S3_USER_METADATA_MAX_BYTES {
         return Err(StorageError::MetadataTooLarge(format!(
             "the metadata of {bucket}/{key} is {total} bytes with the proxy's own fields \

@@ -71,7 +71,7 @@ The codec semaphore limits the number of concurrent xdelta3 encode and decode su
 Behavior differs by operation:
 
 - **GET (decode)**: waits up to 60 seconds for a codec slot, then returns `503 SlowDown`.
-- **PUT (encode)**: fails immediately with `503 SlowDown` when no slot is available, so queued uploads do not hold large request bodies in memory while waiting.
+- **PUT (encode)**: fails immediately with `503 SlowDown` when no slot is available, because a waiting upload would keep its body (in memory or in a spool file) for as long as it waits.
 
 ## HTTP concurrency limit
 
@@ -109,7 +109,7 @@ The proxy applies a deadline to each S3 API request. A request that exceeds the 
 
 ## Multipart upload limit
 
-The proxy caps the number of concurrent in-progress multipart uploads. The proxy holds the parts of each upload until completion, in memory or in relay files in `DGP_SPOOL_DIR`, so the limit bounds the memory and the spool space that abandoned or excessive uploads can take. A CreateMultipartUpload request past the limit gets `503 SlowDown`.
+The proxy caps the number of concurrent in-progress multipart uploads. The proxy holds the parts of each upload until completion, in relay files in `DGP_SPOOL_DIR`, so the limit bounds the spool space that abandoned or excessive uploads can take. A CreateMultipartUpload request past the limit gets `503 SlowDown`.
 
 | Setting | Default | Env var |
 |---------|---------|---------|

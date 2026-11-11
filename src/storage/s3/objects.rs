@@ -2,6 +2,7 @@
 
 //! Object reads, writes and deletes, fenced and plain.
 
+use super::file_body::FileBody;
 use super::*;
 use crate::coordination::if_match::IfMatchRequest;
 
@@ -177,7 +178,7 @@ impl S3Backend {
         let acl = self.object_acl_for_copy(bucket, key).await;
         // The bucket's own native mode (issue #116).
         let native = self.native_encryption.for_bucket(bucket);
-        let plan = self_copy_plan(
+        let mut plan = self_copy_plan(
             head,
             acl.as_ref(),
             self.metadata_to_headers(metadata),
@@ -187,7 +188,7 @@ impl S3Backend {
         // The copy restates the object's own client metadata next to the
         // new DG fields: over S3's limit is a clean MetadataTooLarge, not
         // the backend's error.
-        check_metadata_size(&plan.metadata, bucket, key)?;
+        fit_metadata(&mut plan.metadata, bucket, key)?;
 
         let mut request = self
             .bulk_client
@@ -377,7 +378,7 @@ impl S3Backend {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
 
-        check_metadata_size(&headers, bucket, key)?;
+        fit_metadata(&mut headers, bucket, key)?;
 
         let mut backoff = UNIDENTIFIED_400_BACKOFF_MS.iter();
         for attempt in 0.. {
@@ -491,24 +492,19 @@ impl S3Backend {
         unreachable!("retry loop must return on every path")
     }
 
-    /// Put an object to S3 from a source file path with metadata headers.
-    /// Uses ByteStream::from_path to avoid buffering the full payload in memory.
+    /// Put an object to S3 from local files with metadata headers: one
+    /// file, or ordered part files sent as one object. The body streams
+    /// from the files ([`FileBody`]), never buffered in memory.
     pub(super) async fn put_object_file_with_metadata(
         &self,
         bucket: &str,
         key: &str,
-        source_path: &std::path::Path,
+        files: &[&std::path::Path],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        self.put_object_file_with_metadata_fenced(
-            bucket,
-            key,
-            source_path,
-            metadata,
-            &RefFence::Unfenced,
-        )
-        .await
-        .map(|_| ())
+        self.put_object_file_with_metadata_fenced(bucket, key, files, metadata, &RefFence::Unfenced)
+            .await
+            .map(|_| ())
     }
 
     /// A fenced PUT met a refused condition. When an earlier attempt of the
@@ -548,14 +544,14 @@ impl S3Backend {
         &self,
         bucket: &str,
         key: &str,
-        source_path: &std::path::Path,
+        files: &[&std::path::Path],
         metadata: &FileMetadata,
         fence: &RefFence,
     ) -> Result<Option<String>, StorageError> {
         self.put_object_file_with_metadata_fenced_with(
             bucket,
             key,
-            source_path,
+            files,
             metadata,
             fence,
             OnUnsupported::Unfenced,
@@ -564,13 +560,14 @@ impl S3Backend {
         .stored(bucket, key)
     }
 
-    /// The fenced PUT of a file body, with a refused condition as an
-    /// outcome ([`FencedPut`]).
+    /// The fenced PUT of a file body (one file or ordered parts), with a
+    /// refused condition as an outcome ([`FencedPut`]). Every attempt
+    /// reads the files again from their start.
     pub(super) async fn put_object_file_with_metadata_fenced_with(
         &self,
         bucket: &str,
         key: &str,
-        source_path: &std::path::Path,
+        files: &[&std::path::Path],
         metadata: &FileMetadata,
         fence: &RefFence,
         on_unsupported: OnUnsupported,
@@ -581,68 +578,50 @@ impl S3Backend {
         if let Some(marker) = native.marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
-        check_metadata_size(&headers, bucket, key)?;
+        fit_metadata(&mut headers, bucket, key)?;
 
-        // The stored size for the listing-size cache: what this PUT sends.
-        let stored_size = tokio::fs::metadata(source_path).await.ok().map(|m| m.len());
+        // The sizes this PUT sends: the listing facts and the upload
+        // deadline use their total.
+        let body = FileBody::open(files).await?;
+        let stored_size = body.len();
         let mut backoff = UNIDENTIFIED_400_BACKOFF_MS.iter();
         loop {
-            let body = ByteStream::from_path(source_path.to_path_buf())
-                .await
-                .map_err(|e| {
-                    StorageError::S3(format!("Failed to open source file stream: {}", e))
-                })?;
             let mut request = self
                 .bulk_client
                 .put_object()
                 .bucket(bucket)
                 .key(key)
-                .body(body)
+                .body(body.byte_stream())
                 .content_type("application/octet-stream");
             for (k, v) in &headers {
                 request = request.metadata(k.clone(), v.clone());
             }
             request = apply_native_encryption(request, &native);
             request = apply_put_fence(request, &fence, self.if_match_dialect());
-            let sent = match self.upload_config(stored_size.unwrap_or(0)) {
+            let sent = match self.upload_config(stored_size) {
                 Some(c) => request.customize().config_override(c).send().await,
                 None => request.send().await,
             };
 
             match sent {
                 Ok(resp) => {
-                    if let Some(size) = stored_size {
-                        self.remember_listed_facts(
-                            bucket,
-                            key,
-                            resp.e_tag().unwrap_or_default(),
-                            size,
-                            metadata,
-                        );
-                        self.persist_listing_facts(
-                            bucket,
-                            key,
-                            resp.e_tag().unwrap_or_default(),
-                            size,
-                            metadata,
-                        );
-                    }
+                    let etag = resp.e_tag().unwrap_or_default();
+                    self.remember_listed_facts(bucket, key, etag, stored_size, metadata);
+                    self.persist_listing_facts(bucket, key, etag, stored_size, metadata);
                     return Ok(FencedPut::Stored(resp.e_tag().map(str::to_string)));
                 }
                 Err(e) => {
                     let signal = crate::coordination::cas::sdk_error_signal(&e);
                     match fenced_write_verdict(&fence, &signal) {
                         FencedWriteVerdict::Lost => {
-                            let Some(md5) = md5_hex_of_file(source_path).await else {
+                            let Some(md5) = body.md5_hex().await else {
                                 return Ok(FencedPut::Lost);
                             };
                             let Some(etag) = self.own_write(bucket, key, &md5).await else {
                                 return Ok(FencedPut::Lost);
                             };
-                            if let Some(size) = stored_size {
-                                self.remember_listed_facts(bucket, key, &etag, size, metadata);
-                                self.persist_listing_facts(bucket, key, &etag, size, metadata);
-                            }
+                            self.remember_listed_facts(bucket, key, &etag, stored_size, metadata);
+                            self.persist_listing_facts(bucket, key, &etag, stored_size, metadata);
                             return Ok(FencedPut::Stored(Some(etag)));
                         }
                         FencedWriteVerdict::Unsupported
@@ -864,29 +843,6 @@ pub(super) fn user_metadata_equal(
 /// multipart or SSE-KMS ETag never is, so those stay lost fences.
 pub(super) fn etag_is_body_md5(etag: &str, body_md5_hex: &str) -> bool {
     !body_md5_hex.is_empty() && etag.trim_matches('"').eq_ignore_ascii_case(body_md5_hex)
-}
-
-/// MD5 of a file, hex; `None` when it cannot be read.
-pub(super) async fn md5_hex_of_file(path: &std::path::Path) -> Option<String> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        use md5::Digest;
-        use std::io::Read;
-        let mut f = std::fs::File::open(path).ok()?;
-        let mut h = md5::Md5::new();
-        let mut buf = vec![0u8; 256 * 1024];
-        loop {
-            let n = f.read(&mut buf).ok()?;
-            if n == 0 {
-                break;
-            }
-            h.update(&buf[..n]);
-        }
-        Some(hex::encode(h.finalize()))
-    })
-    .await
-    .ok()
-    .flatten()
 }
 
 /// Pure: the fence for a reference.bin that a HEAD found. A HEAD with no

@@ -134,12 +134,66 @@ mod classify_tests {
     fn metadata_over_the_s3_limit_is_metadata_too_large() {
         let mut h = HashMap::new();
         h.insert("dg-x".to_string(), "v".repeat(2000));
-        assert!(check_metadata_size(&h, "b", "k").is_ok());
+        assert!(fit_metadata(&mut h, "b", "k").is_ok());
         h.insert("user".to_string(), "v".repeat(100));
         assert!(matches!(
-            check_metadata_size(&h, "b", "k"),
+            fit_metadata(&mut h, "b", "k"),
             Err(StorageError::MetadataTooLarge(_))
         ));
+    }
+
+    /// The advisory `dg-passthrough-reason` never makes a write fail: at
+    /// the limit with it, it stays; one byte over, it is left out and the
+    /// write fits; over the limit without it is still MetadataTooLarge.
+    /// The headers come from the write path (`metadata_to_headers` of a
+    /// passthrough object with a reason), as for a PUT and a copy.
+    #[test]
+    fn the_passthrough_reason_is_dropped_before_a_write_fails() {
+        use crate::types::{meta_keys, PassthroughReason};
+        let reason = meta_keys::PASSTHROUGH_REASON;
+        // Headers of a passthrough object whose client metadata pads the
+        // total to `total` bytes.
+        let headers = |total: usize| {
+            let meta = FileMetadata::new_passthrough("k".into(), "s".into(), "m".into(), 1, None)
+                .with_passthrough_reason(PassthroughReason::DeltaRatioOverLimit);
+            let mut h = meta.to_bare_metadata_map();
+            let size = |h: &HashMap<String, String>| -> usize {
+                h.iter().map(|(k, v)| k.len() + v.len()).sum()
+            };
+            let pad = total - size(&h) - "user-pad".len();
+            h.insert("user-pad".into(), "v".repeat(pad));
+            assert_eq!(size(&h), total);
+            h
+        };
+        let limit = S3_USER_METADATA_MAX_BYTES;
+
+        let mut at = headers(limit);
+        fit_metadata(&mut at, "b", "k").unwrap();
+        assert!(at.contains_key(reason), "at the limit the reason stays");
+
+        let mut over = headers(limit + 1);
+        let reason_len = reason.len() + over[reason].len();
+        fit_metadata(&mut over, "b", "k").unwrap();
+        assert!(!over.contains_key(reason), "over the limit it is dropped");
+
+        // Over the limit without the reason: the write still fails.
+        let mut too_large = headers(limit + reason_len + 1);
+        assert!(matches!(
+            fit_metadata(&mut too_large, "b", "k"),
+            Err(StorageError::MetadataTooLarge(_))
+        ));
+        // Exactly at the limit once the reason is gone: it fits.
+        let mut edge = headers(limit + reason_len);
+        fit_metadata(&mut edge, "b", "k").unwrap();
+        assert!(!edge.contains_key(reason));
+
+        // An object without a reason at the limit is unchanged.
+        let mut plain = headers(limit);
+        plain.remove(reason);
+        plain.insert("user-x".into(), "v".repeat(reason_len - "user-x".len()));
+        let before = plain.clone();
+        fit_metadata(&mut plain, "b", "k").unwrap();
+        assert_eq!(plain, before);
     }
 
     #[test]
@@ -1775,7 +1829,7 @@ mod facts_off_the_put_path_tests {
             "b",
             "v1",
             "a.zip",
-            bytes::Bytes::from_static(b"0123456789"),
+            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"0123456789")),
             &delta_meta(),
             crate::deltaglider::RefWriteProof::for_tests(),
         )
@@ -1812,7 +1866,7 @@ mod facts_off_the_put_path_tests {
             "b",
             "v1",
             "a.zip",
-            bytes::Bytes::from_static(b"0123456789"),
+            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"0123456789")),
             &delta_meta(),
             crate::deltaglider::RefWriteProof::for_tests(),
         )

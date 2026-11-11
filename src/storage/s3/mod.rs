@@ -26,6 +26,7 @@ mod client;
 mod copy;
 mod errors;
 mod facts;
+mod file_body;
 pub(in crate::storage) mod heal;
 mod listing;
 mod metadata;
@@ -811,9 +812,9 @@ impl StorageBackend for S3Backend {
                     data.len()
                 );
             }
-            RefWrite::PutFile { path, metadata } => {
-                // Stream the file body to S3 (ByteStream::from_path) — never heap-load it.
-                self.put_object_file_with_metadata(bucket, &key, path, metadata)
+            RefWrite::PutFile { path, metadata, .. } => {
+                // Streamed from the file, never heap-loaded.
+                self.put_object_file_with_metadata(bucket, &key, &[path], metadata)
                     .await?;
                 debug!("Stored reference from file for {}/{}", bucket, prefix);
             }
@@ -845,8 +846,8 @@ impl StorageBackend for S3Backend {
                 self.put_object_with_metadata_fenced(bucket, &key, data.clone(), metadata, fence)
                     .await?
             }
-            RefWrite::PutFile { path, metadata } => {
-                self.put_object_file_with_metadata_fenced(bucket, &key, path, metadata, fence)
+            RefWrite::PutFile { path, metadata, .. } => {
+                self.put_object_file_with_metadata_fenced(bucket, &key, &[path], metadata, fence)
                     .await?
             }
             RefWrite::Metadata { metadata } => {
@@ -874,40 +875,40 @@ impl StorageBackend for S3Backend {
         body: PutBody<'_>,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let (key, label) = match target {
-            StoredWrite::Delta { name, .. } => (self.delta_key(prefix, name), "delta"),
-            StoredWrite::Passthrough { name } => {
-                (self.passthrough_key(prefix, name), "passthrough")
-            }
+        let key = self.object_key(prefix, target.object());
+        let label = match target {
+            StoredWrite::Delta { .. } => "delta",
+            StoredWrite::Passthrough { .. } => "passthrough",
         };
-        let data = match (target, body) {
-            (StoredWrite::Passthrough { name }, PutBody::File { path, .. }) => {
-                self.put_object_file_with_metadata(bucket, &key, path, metadata)
+        // A file or parts stream from disk as one PUT; a body in memory
+        // (bytes, chunks) is one PUT of the buffer.
+        let sent = match body.files() {
+            Some(files) => {
+                self.put_object_file_with_metadata(bucket, &key, &files, metadata)
                     .await?;
-                debug!(
-                    "Stored passthrough from file for {}/{}/{} ({:?})",
-                    bucket, prefix, name, path
-                );
-                return Ok(());
+                format!("from {} file(s)", files.len())
             }
-            // A delta, parts and chunks: one PUT of the whole body.
-            (_, body) => body.into_bytes().await?,
+            None => {
+                let data = body.into_small_bytes()?;
+                let len = data.len();
+                self.put_object_with_metadata(bucket, &key, data, metadata)
+                    .await?;
+                format!("{len} bytes")
+            }
         };
-        self.put_object_with_metadata(bucket, &key, data.clone(), metadata)
-            .await?;
         debug!(
-            "Stored {} for {}/{}/{} ({} bytes)",
+            "Stored {} for {}/{}/{} ({})",
             label,
             bucket,
             prefix,
             target.name(),
-            data.len()
+            sent
         );
         Ok(())
     }
 
-    /// One PUT with `If-Match: version`: a body in memory, or a passthrough
-    /// file streamed from disk.
+    /// One PUT with `If-Match: version`: a body in memory, or a file
+    /// streamed from disk (any target).
     #[instrument(skip(self, target, body, metadata))]
     async fn put_if_unchanged(
         &self,
@@ -918,24 +919,24 @@ impl StorageBackend for S3Backend {
         metadata: &FileMetadata,
         version: &str,
     ) -> Result<crate::storage::WriteIf, StorageError> {
-        use crate::storage::{RewriteTarget, WriteIf};
+        use crate::storage::WriteIf;
         use objects::{FencedPut, OnUnsupported};
         let key = self.object_key(prefix, target.object());
         let fence = RefFence::ETag(version.to_string());
-        let put = match (target, body) {
-            (RewriteTarget::Passthrough { .. }, PutBody::File { path, .. }) => {
+        let put = match body.files() {
+            Some(files) => {
                 self.put_object_file_with_metadata_fenced_with(
                     bucket,
                     &key,
-                    path,
+                    &files,
                     metadata,
                     &fence,
                     OnUnsupported::Report,
                 )
                 .await?
             }
-            (_, body) => {
-                let data = body.into_bytes().await?;
+            None => {
+                let data = body.into_small_bytes()?;
                 self.put_object_with_metadata_fenced_with(
                     bucket,
                     &key,
@@ -1172,7 +1173,7 @@ impl StorageBackend for S3Backend {
         if let Some(marker) = native.marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
-        check_metadata_size(&headers, bucket, &key)?;
+        fit_metadata(&mut headers, bucket, &key)?;
 
         let mut request = self
             .client

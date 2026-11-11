@@ -3,15 +3,22 @@
 //! Multipart upload state, held in memory: a restart loses every open
 //! upload, and clients handle that.
 //!
-//! A part stays in memory while the upload's total is at most
-//! `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`; after that it goes to a relay file
-//! in the spool. An upload that tries no delta relays from its first part.
-//! CompleteMultipartUpload assembles a delta candidate (it tries a delta and
-//! its total is within the cap) in memory and passes it to `engine.store()`;
-//! every other upload is stored from its parts.
+//! Every part is a relay file in the spool: UploadPart ingests the body
+//! straight into a spool file (`Destination::MultipartPart`), and the
+//! store keeps that file as the part ([`MultipartStore::upload_part`]),
+//! with the spool budget its ingest reserved. No part is held in memory.
+//! CompleteMultipartUpload hands the relay parts to the engine
+//! ([`MultipartStore::complete_parts`]), which reads each file once and
+//! checks it against the MD5 and size recorded here.
+//!
+//! The `uploads` lock guards the map only: no function that takes it does
+//! file I/O (source guard `the_uploads_lock_is_never_held_for_file_io`).
+//! A part's file is renamed into place before the lock, and a replaced or
+//! refused part's file is deleted after it.
 
 use crate::api::S3Error;
-use bytes::{Bytes, BytesMut};
+use crate::deltaglider::ingest::IngestedBody;
+use crate::deltaglider::RelayPart;
 use chrono::{DateTime, Duration, Utc};
 
 /// Per-part listing entry used by ListParts. Previously defined in
@@ -39,23 +46,27 @@ use parking_lot::RwLock;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use tempfile::NamedTempFile;
 
-use crate::deltaglider::spool::{mib_ceil, SpoolDir, SpoolReservation, CONTENDED};
+use crate::deltaglider::spool::{mib_ceil, SpoolDir, SpoolReservation};
+use std::sync::Arc;
 
 /// Relay root, under the spool dir (it was under the system temp dir).
 const RELAY_ROOT_DIR: &str = "deltaglider-mpu-relay";
 
-/// Env var: the relay bytes one multipart upload may hold in the spool.
+/// Env var: the relay bytes one multipart upload may hold in the spool,
+/// which is also the largest multipart object.
 pub const RELAY_UPLOAD_MAX_ENV: &str = "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES";
+
+/// Env var: the relay bytes all open uploads may hold together.
+pub const MAX_TOTAL_MULTIPART_ENV: &str = "DGP_MAX_TOTAL_MULTIPART_BYTES";
 
 /// Pure: the relay bytes one upload may hold, for a spool of
 /// `spool_max_bytes` and the configured `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`
 /// (`None` = unset). Default: half of the spool, so one upload never pins
 /// the budget of every other request. `0` = no per-upload cap (only the
-/// global budget). `None` in the result means no cap.
+/// global budget). `None` in the result means no cap. Every part is a
+/// relay part, so this is the largest multipart object too.
 pub fn relay_upload_cap(spool_max_bytes: u64, configured: Option<u64>) -> Option<u64> {
     match configured {
         Some(0) => None,
@@ -64,49 +75,102 @@ pub fn relay_upload_cap(spool_max_bytes: u64, configured: Option<u64>) -> Option
     }
 }
 
-/// Data for a single uploaded part
-enum PartPayload {
-    InMemory(Bytes),
-    /// A relay file in the spool dir, and the spool budget it holds until
-    /// the part is dropped (overwrite, abort, complete, sweep). The
-    /// reservation is never read: it is held for its Drop.
-    RelayedFile(PathBuf, #[allow(dead_code)] SpoolReservation),
+/// Pure: the part bytes all open uploads may hold together, for a spool of
+/// `spool_max_bytes` and the configured `DGP_MAX_TOTAL_MULTIPART_BYTES`
+/// (`None` = unset). Every part is a spool file, so the default is half of
+/// the spool: open uploads never pin the budget of every other request.
+pub fn max_total_multipart_bytes(spool_max_bytes: u64, configured: Option<u64>) -> u64 {
+    configured.unwrap_or(spool_max_bytes / 2)
 }
 
-impl PartPayload {
-    /// Load the part bytes. For a RELAYED file, re-hash the content and verify it
-    /// against the MD5 recorded at UploadPart time (`expected_md5`). The relay dir
-    /// lives under a fixed world-known temp path; on a shared host a local attacker
-    /// who pre-creates it owns the parent and could swap a 0600 part file between
-    /// UploadPart and Complete. Re-verifying on read closes that substitution
-    /// (the stored object would otherwise carry attacker bytes under a valid ETag).
-    fn load_bytes(&self, expected_md5: &[u8; 16]) -> Result<Bytes, S3Error> {
-        match self {
-            Self::InMemory(bytes) => Ok(bytes.clone()),
-            Self::RelayedFile(path, _) => {
-                let bytes = fs::read(path).map(Bytes::from).map_err(|e| {
-                    S3Error::InternalError(format!("Failed to read relayed part: {}", e))
-                })?;
-                let actual: [u8; 16] = Md5::digest(&bytes).into();
-                if &actual != expected_md5 {
-                    return Err(S3Error::InternalError(
-                        "relayed multipart part failed integrity check (content changed on disk \
-                         since upload)"
-                            .to_string(),
-                    ));
-                }
-                Ok(bytes)
+/// Pure: the spool budget, in bytes, that a part of `size` bytes holds.
+/// The spool reserves whole MiB, at least one per file, so the caps count
+/// this and not the part's bytes: counted in bytes, 10,000 parts of one
+/// byte passed a cap of a few KiB while they held 10,000 MiB of the spool.
+pub fn part_charge(size: u64) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    (mib_ceil(size).max(1) as u64).saturating_mul(MIB)
+}
+
+/// The charges ([`part_charge`]) of the parts that were admitted and are
+/// still streaming: counted against the caps from their admission until
+/// they are kept or dropped ([`AdmittedPart`]), so parallel parts cannot
+/// pass the caps together.
+#[derive(Default)]
+struct Admitted {
+    total: u64,
+    by_upload: HashMap<String, u64>,
+}
+
+impl Admitted {
+    fn of(&self, upload_id: &str) -> u64 {
+        self.by_upload.get(upload_id).copied().unwrap_or(0)
+    }
+
+    fn add(&mut self, upload_id: &str, charge: u64) {
+        self.total = self.total.saturating_add(charge);
+        *self.by_upload.entry(upload_id.to_string()).or_default() += charge;
+    }
+
+    fn release(&mut self, upload_id: &str, charge: u64) {
+        self.total = self.total.saturating_sub(charge);
+        if let Some(held) = self.by_upload.get_mut(upload_id) {
+            *held = held.saturating_sub(charge);
+            if *held == 0 {
+                self.by_upload.remove(upload_id);
             }
         }
     }
 }
 
+/// RAII: the charge of an admitted part, released when it is kept
+/// ([`MultipartStore::upload_part`]) or when it is dropped (a failed
+/// ingest, a dropped request future, an abort).
+#[must_use = "the part's admission ends when this is dropped"]
+pub struct AdmittedPart {
+    admitted: Arc<parking_lot::Mutex<Admitted>>,
+    upload_id: String,
+    charge: u64,
+}
+
+impl AdmittedPart {
+    /// Release the charge under the caller's lock of `admitted`.
+    fn release_in(&mut self, admitted: &mut Admitted) {
+        admitted.release(&self.upload_id, std::mem::take(&mut self.charge));
+    }
+}
+
+impl Drop for AdmittedPart {
+    fn drop(&mut self) {
+        if self.charge > 0 {
+            let charge = std::mem::take(&mut self.charge);
+            self.admitted.lock().release(&self.upload_id, charge);
+        }
+    }
+}
+
+/// One received part: its relay file and what was recorded when it
+/// arrived.
 struct PartData {
-    payload: PartPayload,
+    path: PathBuf,
+    /// The spool budget the relay file holds until the part is dropped
+    /// (overwrite, abort, complete, sweep): held for its Drop, after the
+    /// file is deleted ([`discard_part`]).
+    budget: SpoolReservation,
     md5_hex: String,
     md5_raw: [u8; 16],
     size: u64,
     uploaded_at: DateTime<Utc>,
+}
+
+impl PartData {
+    fn relay_part(&self) -> RelayPart {
+        RelayPart {
+            path: self.path.clone(),
+            md5: self.md5_raw,
+            size: self.size,
+        }
+    }
 }
 
 /// Lifecycle state of a multipart upload. Replaces the old
@@ -121,7 +185,7 @@ struct PartData {
 ///                   upload_part ↻       abort
 ///                      │                 │
 ///                      ▼                 ▼
-///   [create] ─▶ Open ─▶─ begin_complete ─▶─ Completing
+///   [create] ─▶ Open ─▶─ complete_parts ─▶─ Completing
 ///                │                            │
 ///                │                            ├── finish_upload ──▶ (removed)
 ///                │                            └── rollback_upload ──▶ Open
@@ -132,14 +196,14 @@ struct PartData {
 /// Invariants enforced by callers:
 /// - `upload_part` rejects unless state is `Open`.
 /// - `abort` rejects when state is `Completing` (409 Conflict).
-/// - `begin_complete` only returns parts if state was `Open`; atomically
+/// - `complete_parts` only returns parts if state was `Open`; atomically
 ///   flips to `Completing` under the write lock.
 /// - `finish_upload` / `rollback_upload` terminate `Completing` state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MultipartState {
     /// Accepting UploadPart calls. Abort is allowed.
     Open,
-    /// `begin_complete` has validated and handed off parts; `engine.store*`
+    /// `complete_parts` has validated and handed off parts; `engine.store*`
     /// is in flight. New UploadParts and aborts are refused.
     Completing,
 }
@@ -158,7 +222,6 @@ struct MultipartUpload {
     user_metadata: HashMap<String, String>,
     parts: HashMap<u32, PartData>,
     state: MultipartState,
-    relay_strategy: RelayStrategy,
     /// True while the engine store for this upload is actively running. The
     /// idle-TTL sweeper (`cleanup_expired`) must NOT reclaim a Completing upload
     /// whose store is in flight — a slow store to a remote backend can exceed
@@ -167,11 +230,6 @@ struct MultipartUpload {
     /// is separately bounded (request timeout + codec watchdog), so this flag
     /// can never wedge an upload forever.
     store_in_progress: bool,
-}
-
-enum RelayStrategy {
-    InMemory { relay_threshold_bytes: Option<u64> },
-    Relayed { relay_dir: PathBuf },
 }
 
 /// RAII: clears an upload's `store_in_progress` flag on drop so a store that
@@ -188,26 +246,27 @@ impl Drop for StoreInProgressGuard {
     }
 }
 
-/// Result of assembling a completed multipart upload
+/// The validated parts of an upload that `complete_parts` handed to the
+/// store: relay files in the requested order, with their recorded MD5 and
+/// size (no file is read here).
 #[derive(Debug)]
-pub struct CompletedUpload {
-    pub data: Bytes,
-    pub etag: String,
-    pub content_type: Option<String>,
-    pub user_metadata: HashMap<String, String>,
-}
-
-pub enum PassthroughPayload {
-    Chunks(Vec<Bytes>),
-    RelayedParts(Vec<PathBuf>),
-}
-
-pub struct CompletedPassthrough {
-    pub payload: PassthroughPayload,
+pub struct CompletedParts {
+    pub parts: Vec<RelayPart>,
     pub etag: String,
     pub total_size: u64,
     pub content_type: Option<String>,
     pub user_metadata: HashMap<String, String>,
+}
+
+/// What [`MultipartStore::admit_part`] found for a part that may be read,
+/// and its charge against the caps until [`MultipartStore::upload_part`]
+/// keeps it (or it is dropped).
+#[must_use = "the part's admission ends when this is dropped"]
+pub struct PartAdmission {
+    /// The spool budget the upload holds already (its relay parts): its
+    /// ingest never waits for more.
+    pub held_spool_mib: usize,
+    part: AdmittedPart,
 }
 
 /// Summary of one multipart sweeper run.
@@ -228,7 +287,7 @@ impl MultipartSweepReport {
 
 /// Internal: validated parts from the shared validation step.
 struct ValidatedParts {
-    part_data: Vec<Bytes>,
+    parts: Vec<RelayPart>,
     etag: String,
     total_size: u64,
 }
@@ -239,27 +298,6 @@ fn default_max_uploads() -> usize {
     crate::config::env_parse_with_default("DGP_MAX_MULTIPART_UPLOADS", 1000)
 }
 
-/// Default global cap on total in-flight multipart bytes across all uploads.
-/// Overridable via `DGP_MAX_TOTAL_MULTIPART_BYTES` env var. Protects against
-/// the C3 DoS where an attacker opens many uploads and sends many large
-/// parts without completing — pre-fix the only cap was `max_object_size`
-/// per upload at complete-time, leaving `max_object_size * max_uploads`
-/// bytes of RAM reachable.
-///
-/// Default formula: `max_object_size * (max_uploads / 4)`. The /4 is a
-/// safety margin so legitimate multi-uploader workloads still fit while
-/// attackers hit the ceiling before they can saturate memory.
-fn default_max_total_multipart_bytes(max_object_size: u64, max_uploads: usize) -> u64 {
-    // Allow operator override (absolute bytes). Routed through env_parse
-    // for consistent warn-on-invalid behaviour.
-    if let Some(n) = crate::config::env_parse::<u64>("DGP_MAX_TOTAL_MULTIPART_BYTES") {
-        return n;
-    }
-    // Default: max_object_size * (max_uploads / 4), clamped to at least
-    // max_object_size (one full upload must always fit).
-    max_object_size.saturating_mul((max_uploads.max(4) / 4) as u64)
-}
-
 /// TTL before an idle (no recent UploadPart activity) multipart upload is
 /// garbage-collected. Overridable via `DGP_MULTIPART_IDLE_TTL_HOURS`.
 /// Default 24h — matches AWS's default abort-incomplete-multipart-upload
@@ -268,7 +306,6 @@ fn default_multipart_idle_ttl_hours() -> i64 {
     crate::config::env_parse_with_default("DGP_MULTIPART_IDLE_TTL_HOURS", 24)
 }
 
-/// Thread-safe in-memory store for multipart upload state
 /// Outcome of a completion, shareable with retried Complete requests.
 pub type CompletionResult = Result<String, CompletionFailure>;
 
@@ -377,6 +414,7 @@ pub fn completion_fingerprint(parts: &[(u32, String)]) -> u64 {
     h.finish()
 }
 
+/// Thread-safe in-memory store for multipart upload state.
 pub struct MultipartStore {
     uploads: RwLock<HashMap<String, MultipartUpload>>,
     /// CompleteMultipartUpload registry: in-flight completions + success tombstones.
@@ -385,12 +423,17 @@ pub struct MultipartStore {
     /// adapter refreshes it from the live engine on every part and complete.
     max_object_size: std::sync::atomic::AtomicU64,
     max_uploads: usize,
-    /// Global in-flight bytes across all uploads. Kept consistent with
-    /// the sum of `MultipartUpload.parts[*].size` — updated under the
-    /// same write lock that mutates the parts map. Checked before each
-    /// UploadPart accepts bytes (C3 DoS fix).
+    /// The spool budget that the kept parts of all uploads hold, in bytes:
+    /// the sum of [`part_charge`] of every `MultipartUpload.parts[*]`,
+    /// updated under the same write lock that mutates the parts map.
+    /// Checked, with `admitted`, before each UploadPart is read and again
+    /// when it is kept (C3 DoS fix).
     in_flight_bytes: std::sync::atomic::AtomicU64,
-    max_total_multipart_bytes: u64,
+    /// The charges of the parts admitted and still streaming.
+    admitted: Arc<parking_lot::Mutex<Admitted>>,
+    /// `DGP_MAX_TOTAL_MULTIPART_BYTES` as read at construction (`None`:
+    /// half of the spool, see [`max_total_multipart_bytes`]).
+    max_total_configured: Option<u64>,
     idle_ttl: Duration,
     /// Relay part files live in this spool's dir and hold its budget.
     spool: SpoolDir,
@@ -398,20 +441,27 @@ pub struct MultipartStore {
     relay_upload_max: Option<u64>,
 }
 
+/// Pure-ish: 400 InvalidArgument for a part number outside S3's range.
+fn check_part_number(part_number: u32) -> Result<(), S3Error> {
+    if !(1..=10000).contains(&part_number) {
+        return Err(S3Error::InvalidArgument(
+            "Part number must be between 1 and 10000".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl MultipartStore {
     pub fn new(max_object_size: u64) -> Self {
-        let max_uploads = default_max_uploads();
-        let max_total_multipart_bytes =
-            default_max_total_multipart_bytes(max_object_size, max_uploads);
-        let idle_ttl_hours = default_multipart_idle_ttl_hours();
         Self {
             uploads: RwLock::new(HashMap::new()),
             completions: parking_lot::Mutex::new(HashMap::new()),
             max_object_size: std::sync::atomic::AtomicU64::new(max_object_size),
-            max_uploads,
+            max_uploads: default_max_uploads(),
             in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
-            max_total_multipart_bytes,
-            idle_ttl: Duration::hours(idle_ttl_hours),
+            admitted: Default::default(),
+            max_total_configured: crate::config::env_parse::<u64>(MAX_TOTAL_MULTIPART_ENV),
+            idle_ttl: Duration::hours(default_multipart_idle_ttl_hours()),
             spool: shared_spool(),
             relay_upload_max: crate::config::env_parse(RELAY_UPLOAD_MAX_ENV),
         }
@@ -442,15 +492,11 @@ impl MultipartStore {
         idle_ttl: Duration,
     ) -> Self {
         Self {
-            uploads: RwLock::new(HashMap::new()),
-            completions: parking_lot::Mutex::new(HashMap::new()),
-            max_object_size: std::sync::atomic::AtomicU64::new(max_object_size),
             max_uploads: 1000,
-            in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
-            max_total_multipart_bytes,
+            max_total_configured: Some(max_total_multipart_bytes),
             idle_ttl,
-            spool: shared_spool(),
             relay_upload_max: None,
+            ..Self::new(max_object_size)
         }
     }
 
@@ -459,6 +505,11 @@ impl MultipartStore {
     pub(crate) fn in_flight_bytes(&self) -> u64 {
         self.in_flight_bytes
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The spool the relay parts live in.
+    pub fn spool(&self) -> &SpoolDir {
+        &self.spool
     }
 
     /// Per-upload byte cap in force now.
@@ -474,6 +525,11 @@ impl MultipartStore {
             .store(max_object_size, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The part bytes all open uploads may hold together.
+    fn max_total_multipart_bytes(&self) -> u64 {
+        max_total_multipart_bytes(self.spool.max_bytes(), self.max_total_configured)
+    }
+
     /// Create a new multipart upload, returns the upload ID.
     /// Returns `S3Error::SlowDown` if the maximum number of concurrent uploads is reached.
     pub fn create(
@@ -482,23 +538,6 @@ impl MultipartStore {
         key: &str,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
-    ) -> Result<String, S3Error> {
-        self.create_with_relay_policy(bucket, key, content_type, user_metadata, None, false)
-    }
-
-    /// Create a new multipart upload with optional relay policy.
-    /// - `relay_threshold_bytes`: when set, promote in-memory parts to relayed
-    ///   files once cumulative uploaded bytes exceed this threshold.
-    /// - `always_relay_passthrough`: start directly in relay mode.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_with_relay_policy(
-        &self,
-        bucket: &str,
-        key: &str,
-        content_type: Option<String>,
-        user_metadata: HashMap<String, String>,
-        relay_threshold_bytes: Option<u64>,
-        always_relay_passthrough: bool,
     ) -> Result<String, S3Error> {
         let now = Utc::now();
 
@@ -527,15 +566,6 @@ impl MultipartStore {
             user_metadata,
             parts: HashMap::new(),
             state: MultipartState::Open,
-            relay_strategy: if always_relay_passthrough {
-                RelayStrategy::Relayed {
-                    relay_dir: self.relay_dir_for_upload(&upload_id),
-                }
-            } else {
-                RelayStrategy::InMemory {
-                    relay_threshold_bytes,
-                }
-            },
             store_in_progress: false,
         };
 
@@ -543,127 +573,146 @@ impl MultipartStore {
         Ok(upload_id)
     }
 
-    /// Upload a part, returns the quoted ETag (MD5 hex).
+    /// May a part of `declared` bytes be read for this upload? The checks
+    /// that `upload_part` runs again when it keeps the part, run here on
+    /// the declared size BEFORE the body is read: a part for an unknown,
+    /// aborted or completing upload, or one past a cap, is refused before
+    /// up to 5 GiB of it reach the spool. An admitted part counts against
+    /// the caps from now on, while it streams ([`PartAdmission`]).
+    pub fn admit_part(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+        part_number: u32,
+        declared: u64,
+    ) -> Result<PartAdmission, S3Error> {
+        check_part_number(part_number)?;
+        let uploads = self.uploads.read();
+        let upload = open_upload(uploads.get(upload_id), upload_id, bucket, key)?;
+        // Check and count under one lock: two parallel parts cannot both
+        // pass a cap that only one of them fits.
+        let mut admitted = self.admitted.lock();
+        self.check_part_caps(upload, &admitted, part_number, declared)?;
+        let charge = part_charge(declared);
+        admitted.add(upload_id, charge);
+        Ok(PartAdmission {
+            held_spool_mib: upload.parts.values().map(|p| p.budget.reserved_mib()).sum(),
+            part: AdmittedPart {
+                admitted: self.admitted.clone(),
+                upload_id: upload_id.to_string(),
+                charge,
+            },
+        })
+    }
+
+    /// Keep an ingested part as a relay part, returns the quoted ETag (MD5
+    /// hex). `body` is the part's spool file (`IngestedBody::Spooled`,
+    /// see [`Self::admit_part`]); it is renamed into the upload's relay dir
+    /// with its reservation, so the part costs no copy and no second
+    /// reservation. The rename runs before the `uploads` lock, the map
+    /// update under it, and the file of a replaced or refused part is
+    /// deleted after it.
     pub fn upload_part(
         &self,
         upload_id: &str,
         bucket: &str,
         key: &str,
         part_number: u32,
-        data: Bytes,
+        body: IngestedBody,
+        admission: PartAdmission,
     ) -> Result<String, S3Error> {
-        if !(1..=10000).contains(&part_number) {
-            return Err(S3Error::InvalidArgument(
-                "Part number must be between 1 and 10000".to_string(),
+        check_part_number(part_number)?;
+        let IngestedBody::Spooled {
+            spool,
+            size,
+            hashes,
+            storage,
+        } = body
+        else {
+            return Err(S3Error::InternalError(
+                "a multipart part must be ingested into a spool file".to_string(),
             ));
+        };
+        // The spool file shares this reservation; `keep_as` keeps it.
+        drop(storage);
+        let md5_hex = hashes.md5().to_string();
+        let mut md5_raw = [0u8; 16];
+        hex::decode_to_slice(&md5_hex, &mut md5_raw)
+            .map_err(|e| S3Error::InternalError(format!("part MD5: {e}")))?;
+        let relay_dir = self.relay_dir_for_upload(upload_id);
+        let kept = fs::create_dir_all(&relay_dir)
+            .and_then(|()| spool.keep_as(&relay_dir.join(relay_part_name(part_number))));
+        let (path, budget) = match kept {
+            Ok(kept) => kept,
+            // An abort removed the dir between the two steps.
+            Err(_) if !self.has_upload(upload_id) => {
+                self.forget_relay_dir(upload_id);
+                return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+            }
+            Err(e) => {
+                return Err(S3Error::InternalError(format!(
+                    "Failed to keep relay part: {e}"
+                )))
+            }
+        };
+        let part = PartData {
+            path,
+            budget,
+            md5_hex,
+            md5_raw,
+            size,
+            uploaded_at: Utc::now(),
+        };
+        let etag = format!("\"{}\"", part.md5_hex);
+        match self.insert_part(upload_id, bucket, key, part_number, part, admission.part) {
+            Ok(replaced) => {
+                if let Some(old) = replaced {
+                    discard_part(old);
+                }
+                Ok(etag)
+            }
+            Err((err, refused)) => {
+                discard_part(refused);
+                // The upload is gone (aborted while the part streamed): the
+                // dir this part re-created goes too.
+                if !self.has_upload(upload_id) {
+                    self.forget_relay_dir(upload_id);
+                }
+                Err(err)
+            }
         }
+    }
 
-        let md5_raw: [u8; 16] = Md5::digest(&data).into();
-        let md5_hex = hex::encode(md5_raw);
-        let etag = format!("\"{}\"", md5_hex);
-        let size = data.len() as u64;
-
+    /// The map half of [`Self::upload_part`], under the `uploads` lock:
+    /// the part's admission charge is released, the checks of
+    /// [`Self::admit_part`] run again on the received size, then the
+    /// insert. The part this one replaces, or this part when it is refused,
+    /// is handed back for the caller to delete AFTER the lock.
+    #[allow(clippy::result_large_err)]
+    fn insert_part(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+        part_number: u32,
+        part: PartData,
+        mut admission: AdmittedPart,
+    ) -> Result<Option<PartData>, (S3Error, PartData)> {
         let mut uploads = self.uploads.write();
-        let upload = uploads
-            .get_mut(upload_id)
-            .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
-
-        // Validate bucket+key match
-        if upload.bucket != bucket || upload.key != key {
-            return Err(S3Error::NoSuchUpload(upload_id.to_string()));
-        }
-
-        // C4 security fix: parts can only be uploaded while the upload is
-        // Open. Once CompleteMultipartUpload has started (state=Completing),
-        // accepting new parts would race with the in-flight `engine.store*`.
-        if upload.state != MultipartState::Open {
-            return Err(S3Error::InvalidRequest(
-                "Upload is in the process of being completed; no more parts can be added"
-                    .to_string(),
-            ));
-        }
-
-        // C3 DoS fix: enforce size caps BEFORE buffering the part. Two
-        // gates, checked in order:
-        //
-        // 1. Per-upload cap (max_object_size) — prevents one upload from
-        //    assembling more bytes than a single object is allowed to be.
-        //    Overwrite semantics: recompute cumulative from existing parts
-        //    MINUS the old size of `part_number` (if any) PLUS the new
-        //    size. Without the subtraction, re-uploading a part would
-        //    double-count.
-        //
-        // 2. Global cap (max_total_multipart_bytes) — prevents many
-        //    uploads from collectively exhausting heap. Rejects with
-        //    SlowDown so AWS SDKs back off and retry.
-        let old_part_size = upload.parts.get(&part_number).map(|p| p.size).unwrap_or(0);
-        let cumulative_after = upload
-            .parts
-            .values()
-            .map(|p| p.size)
-            .sum::<u64>()
-            .saturating_sub(old_part_size)
-            .saturating_add(size);
-
-        let max_object_size = self.max_object_size();
-        if cumulative_after > max_object_size {
-            return Err(S3Error::EntityTooLarge {
-                size: cumulative_after,
-                max: max_object_size,
-            });
-        }
-
-        // Compute the global delta we'd contribute (signed on overwrite).
-        let delta: i64 = size as i64 - old_part_size as i64;
-        if delta > 0 {
-            let new_total = self
-                .in_flight_bytes
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_add(delta as u64);
-            if new_total > self.max_total_multipart_bytes {
-                return Err(S3Error::SlowDown(format!(
-                    "Multipart in-flight bytes cap reached ({} / {} bytes)",
-                    new_total, self.max_total_multipart_bytes
-                )));
-            }
-        }
-
-        let should_promote_to_relay = match &upload.relay_strategy {
-            RelayStrategy::InMemory {
-                relay_threshold_bytes: Some(threshold),
-            } => cumulative_after > *threshold,
-            RelayStrategy::InMemory {
-                relay_threshold_bytes: None,
-            } => false,
-            RelayStrategy::Relayed { .. } => false,
+        let mut admitted = self.admitted.lock();
+        admission.release_in(&mut admitted);
+        let upload = match open_upload_mut(uploads.get_mut(upload_id), upload_id, bucket, key) {
+            Ok(upload) => upload,
+            Err(e) => return Err((e, part)),
         };
-        if should_promote_to_relay {
-            self.promote_upload_to_relay(upload)?;
-        }
-
-        let payload = match &upload.relay_strategy {
-            RelayStrategy::InMemory { .. } => PartPayload::InMemory(data),
-            RelayStrategy::Relayed { relay_dir } => {
-                let budget = self.reserve_relay_part(upload, size, Some(part_number))?;
-                let path = part_path(relay_dir, part_number);
-                write_part_file(&path, &data)?;
-                PartPayload::RelayedFile(path, budget)
-            }
+        let delta = match self.check_part_caps(upload, &admitted, part_number, part.size) {
+            Ok(delta) => delta,
+            Err(e) => return Err((e, part)),
         };
-
         // Overwrite semantics: re-uploading same part_number replaces previous data.
-        upload.parts.insert(
-            part_number,
-            PartData {
-                payload,
-                md5_hex,
-                md5_raw,
-                size,
-                uploaded_at: Utc::now(),
-            },
-        );
+        let replaced = upload.parts.insert(part_number, part);
         upload.last_activity = Utc::now();
-
         // Update global counter AFTER the insert so concurrent readers see
         // a consistent view (counter ≥ actual bytes in map at any moment).
         if delta >= 0 {
@@ -673,8 +722,90 @@ impl MultipartStore {
             self.in_flight_bytes
                 .fetch_sub((-delta) as u64, std::sync::atomic::Ordering::Relaxed);
         }
+        Ok(replaced)
+    }
 
-        Ok(etag)
+    /// The caps a part of `size` bytes must pass (C3 DoS fix); the change
+    /// of the global held bytes it makes. Overwrite semantics: the part it
+    /// replaces no longer counts. `admitted`: the parts admitted and still
+    /// streaming (not this one), which count against the spool caps.
+    ///
+    /// 1. Per upload: `max_object_size`, on the part bytes (EntityTooLarge).
+    /// 2. Global: `DGP_MAX_TOTAL_MULTIPART_BYTES` across all uploads, on
+    ///    the spool budget held ([`part_charge`]; SlowDown, so SDKs back off
+    ///    and retry).
+    /// 3. Per upload: the spool budget it may hold ([`relay_upload_cap`],
+    ///    EntityTooLarge naming the variable). A part that went past it was
+    ///    written anyway, so the disk use of one upload grew without a bound
+    ///    while it pinned the budget of every other request.
+    fn check_part_caps(
+        &self,
+        upload: &MultipartUpload,
+        admitted: &Admitted,
+        part_number: u32,
+        size: u64,
+    ) -> Result<i64, S3Error> {
+        let old_part_size = upload.parts.get(&part_number).map(|p| p.size);
+        let others = upload
+            .parts
+            .values()
+            .map(|p| p.size)
+            .sum::<u64>()
+            .saturating_sub(old_part_size.unwrap_or(0));
+        let cumulative_after = others.saturating_add(size);
+
+        let max_object_size = self.max_object_size();
+        if cumulative_after > max_object_size {
+            return Err(S3Error::EntityTooLarge {
+                size: cumulative_after,
+                max: max_object_size,
+            });
+        }
+
+        // The spool budget: whole MiB per part.
+        let charge = part_charge(size);
+        let old_charge = old_part_size.map_or(0, part_charge);
+        let delta: i64 = charge as i64 - old_charge as i64;
+        if delta > 0 {
+            let new_total = self
+                .in_flight_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(admitted.total)
+                .saturating_add(delta as u64);
+            let cap = self.max_total_multipart_bytes();
+            if new_total > cap {
+                return Err(S3Error::SlowDown(format!(
+                    "Multipart uploads would hold {new_total} bytes of spool budget, over the cap \
+                     of {cap} bytes ({MAX_TOTAL_MULTIPART_ENV}; each part holds whole MiB, at \
+                     least one)"
+                )));
+            }
+        }
+
+        if let Some(cap) = relay_upload_cap(self.spool.max_bytes(), self.relay_upload_max) {
+            let held_after = upload
+                .parts
+                .values()
+                .map(|p| part_charge(p.size))
+                .sum::<u64>()
+                .saturating_sub(old_charge)
+                .saturating_add(admitted.of(&upload.upload_id))
+                .saturating_add(charge);
+            if held_after > cap {
+                return Err(S3Error::EntityTooLargeReason(format!(
+                    "this multipart upload would hold {held_after} bytes of spool budget for its \
+                     relay parts (each part holds whole MiB, at least one); one upload may hold \
+                     at most {cap} bytes ({RELAY_UPLOAD_MAX_ENV}, default half of \
+                     DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)"
+                )));
+            }
+        }
+        Ok(delta)
+    }
+
+    /// Whether the upload exists (Open or Completing).
+    fn has_upload(&self, upload_id: &str) -> bool {
+        self.uploads.read().contains_key(upload_id)
     }
 
     /// The user metadata the upload was created with: its store hints decide
@@ -693,26 +824,26 @@ impl MultipartStore {
             .map(|p| p.size)
     }
 
-    /// Begin completion: validate parts, atomically transition to
-    /// `Completing`, and return the assembled buffer. After this call
-    /// the upload is reserved — new UploadParts AND abort are refused
-    /// (409) until the caller invokes `finish_upload` or
-    /// `rollback_upload`. This closes the C4 complete/abort race.
+    /// Begin completion: validate the requested parts, atomically flip
+    /// the upload to `Completing`, and hand back its relay parts in order
+    /// (no file is read). After this call the upload is reserved — new
+    /// UploadParts AND abort are refused (409) until the caller invokes
+    /// `finish_upload` or `rollback_upload`. This closes the C4
+    /// complete/abort race.
     ///
     /// On validation failure the state is NOT changed (upload stays
     /// `Open` so the client can retry with corrected part metadata).
-    pub fn complete(
+    pub fn complete_parts(
         &self,
         upload_id: &str,
         bucket: &str,
         key: &str,
         requested_parts: &[(u32, String)], // (part_number, etag)
-    ) -> Result<CompletedUpload, S3Error> {
+    ) -> Result<CompletedParts, S3Error> {
         let mut uploads = self.uploads.write();
 
         // Refuse if the upload is already Completing — only one complete
-        // may be in flight at a time. Double-complete returns 404 to
-        // preserve the prior contract.
+        // may be in flight at a time.
         if let Some(u) = uploads.get(upload_id) {
             if u.state == MultipartState::Completing {
                 return Err(S3Error::InvalidRequest(
@@ -722,80 +853,17 @@ impl MultipartStore {
         }
 
         let (validated, upload) =
-            self.validate_parts(&uploads, upload_id, bucket, key, requested_parts, true)?;
-
-        let mut assembled = BytesMut::new();
-        for part in &validated.part_data {
-            assembled.extend_from_slice(part);
-        }
-
-        let result = CompletedUpload {
-            data: assembled.freeze(),
-            etag: validated.etag,
-            content_type: upload.content_type.clone(),
-            user_metadata: upload.user_metadata.clone(),
-        };
-
-        // Flip to Completing under the same write lock that performed the
-        // validation — atomic with respect to `abort` and `upload_part`.
-        if let Some(u) = uploads.get_mut(upload_id) {
-            u.state = MultipartState::Completing;
-            u.last_activity = Utc::now();
-        }
-
-        Ok(result)
-    }
-
-    /// Begin-complete variant optimized for passthrough storage.
-    ///
-    /// In relay mode this assembles a temporary file under the upload's relay
-    /// directory, allowing callers to stream the final payload into storage.
-    pub fn complete_passthrough(
-        &self,
-        upload_id: &str,
-        bucket: &str,
-        key: &str,
-        requested_parts: &[(u32, String)],
-    ) -> Result<CompletedPassthrough, S3Error> {
-        let mut uploads = self.uploads.write();
-
-        if let Some(u) = uploads.get(upload_id) {
-            if u.state == MultipartState::Completing {
-                return Err(S3Error::InvalidRequest(
-                    "Upload is already being completed".to_string(),
-                ));
-            }
-        }
-
-        let hydrate_part_data = uploads
-            .get(upload_id)
-            .map(|u| matches!(u.relay_strategy, RelayStrategy::InMemory { .. }))
-            .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
-        let (validated, upload) = self.validate_parts(
-            &uploads,
-            upload_id,
-            bucket,
-            key,
-            requested_parts,
-            hydrate_part_data,
-        )?;
-
-        let payload = match &upload.relay_strategy {
-            RelayStrategy::InMemory { .. } => PassthroughPayload::Chunks(validated.part_data),
-            RelayStrategy::Relayed { relay_dir: _ } => {
-                let ordered_paths = ordered_relay_part_paths(requested_parts, upload)?;
-                PassthroughPayload::RelayedParts(ordered_paths)
-            }
-        };
-
-        let result = CompletedPassthrough {
-            payload,
+            self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
+        let result = CompletedParts {
+            parts: validated.parts,
             etag: validated.etag,
             total_size: validated.total_size,
             content_type: upload.content_type.clone(),
             user_metadata: upload.user_metadata.clone(),
         };
 
+        // Flip to Completing under the same write lock that performed the
+        // validation — atomic with respect to `abort` and `upload_part`.
         if let Some(u) = uploads.get_mut(upload_id) {
             u.state = MultipartState::Completing;
             u.last_activity = Utc::now();
@@ -946,21 +1014,40 @@ impl MultipartStore {
 
     /// Finalise a completed upload after `engine.store*` succeeds.
     /// Removes the upload from the map. This is the terminal state.
-    /// Semantically equivalent to the previous `remove_upload`.
     ///
     /// Also releases the upload's bytes from the global in-flight counter
-    /// so new uploads can reclaim headroom (C3 DoS fix).
+    /// so new uploads can reclaim headroom (C3 DoS fix), and deletes its
+    /// relay files.
     pub fn finish_upload(&self, upload_id: &str) {
-        if let Some(u) = self.uploads.write().remove(upload_id) {
-            let _ = self.release_bytes(&u);
-            cleanup_relay_dir_for_upload(&u);
+        if let Some(upload) = self.take_upload(upload_id) {
+            self.discard_upload(upload);
         }
     }
 
-    /// Return the sum of all part sizes for this upload — used by the
-    /// in-flight counter on release paths.
+    /// Remove an upload from the map, under the `uploads` lock only.
+    fn take_upload(&self, upload_id: &str) -> Option<MultipartUpload> {
+        self.uploads.write().remove(upload_id)
+    }
+
+    /// Drop a removed upload: its bytes leave the global in-flight counter,
+    /// its relay dir is deleted, then its parts release their spool budget.
+    /// Never under the `uploads` lock.
+    fn discard_upload(&self, upload: MultipartUpload) -> u64 {
+        let freed = self.release_bytes(&upload);
+        self.forget_relay_dir(&upload.upload_id);
+        drop(upload);
+        freed
+    }
+
+    /// Delete the relay dir of `upload_id` (best effort).
+    fn forget_relay_dir(&self, upload_id: &str) {
+        let _ = fs::remove_dir_all(self.relay_dir_for_upload(upload_id));
+    }
+
+    /// Return the spool budget the upload's parts hold ([`part_charge`]),
+    /// and take it off the global counter — used on release paths.
     fn release_bytes(&self, upload: &MultipartUpload) -> u64 {
-        let freed: u64 = upload.parts.values().map(|p| p.size).sum();
+        let freed: u64 = upload.parts.values().map(|p| part_charge(p.size)).sum();
         if freed > 0 {
             self.in_flight_bytes
                 .fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
@@ -971,8 +1058,9 @@ impl MultipartStore {
     /// Shared validation for complete variants.
     ///
     /// Looks up the upload, validates part ordering and ETags, enforces size limits,
-    /// and computes the S3-compatible multipart ETag. Returns validated part data
-    /// and a reference to the upload (for content_type / user_metadata).
+    /// and computes the S3-compatible multipart ETag. Returns the relay parts in the
+    /// requested order and a reference to the upload (for content_type /
+    /// user_metadata). No I/O: the store reads and checks the files.
     fn validate_parts<'a>(
         &self,
         uploads: &'a HashMap<String, MultipartUpload>,
@@ -980,7 +1068,6 @@ impl MultipartStore {
         bucket: &str,
         key: &str,
         requested_parts: &[(u32, String)],
-        hydrate_part_data: bool,
     ) -> Result<(ValidatedParts, &'a MultipartUpload), S3Error> {
         let upload = uploads
             .get(upload_id)
@@ -1005,7 +1092,7 @@ impl MultipartStore {
         // Validate each part exists and ETags match; compute total size
         let mut total_size: u64 = 0;
         let mut md5_concat = Vec::new();
-        let mut part_data = Vec::with_capacity(requested_parts.len());
+        let mut parts = Vec::with_capacity(requested_parts.len());
 
         for (part_number, requested_etag) in requested_parts {
             let part = upload.parts.get(part_number).ok_or_else(|| {
@@ -1031,9 +1118,7 @@ impl MultipartStore {
             }
 
             md5_concat.extend_from_slice(&part.md5_raw);
-            if hydrate_part_data {
-                part_data.push(part.payload.load_bytes(&part.md5_raw)?);
-            }
+            parts.push(part.relay_part());
         }
 
         // S3-compatible multipart ETag: MD5(concat of part MD5 raw bytes)-N
@@ -1042,7 +1127,7 @@ impl MultipartStore {
 
         Ok((
             ValidatedParts {
-                part_data,
+                parts,
                 etag,
                 total_size,
             },
@@ -1058,6 +1143,19 @@ impl MultipartStore {
     /// "aborted" even though the object actually lands. Clients
     /// should wait for the CompleteMultipartUpload response instead.
     pub fn abort(&self, upload_id: &str, bucket: &str, key: &str) -> Result<(), S3Error> {
+        let removed = self.take_for_abort(upload_id, bucket, key)?;
+        // Release this upload's bytes from the global counter (C3 DoS fix).
+        self.discard_upload(removed);
+        Ok(())
+    }
+
+    /// The map half of [`Self::abort`], under the `uploads` lock.
+    fn take_for_abort(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<MultipartUpload, S3Error> {
         let mut uploads = self.uploads.write();
         let upload = uploads
             .get(upload_id)
@@ -1072,14 +1170,9 @@ impl MultipartStore {
                 "Cannot abort: upload is currently being completed".to_string(),
             ));
         }
-
-        // Release this upload's bytes from the global counter (C3 DoS fix).
-        if let Some(removed) = uploads.remove(upload_id) {
-            drop(uploads); // release write lock before touching atomic
-            let _ = self.release_bytes(&removed);
-            cleanup_relay_dir_for_upload(&removed);
-        }
-        Ok(())
+        uploads
+            .remove(upload_id)
+            .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))
     }
 
     /// Return the number of in-flight uploads targeting `bucket`.
@@ -1101,7 +1194,7 @@ impl MultipartStore {
     ///
     /// **Refuses** if any upload is in `Completing` state. A
     /// `Completing` upload is mid-flight on `engine.store_*` and holds
-    /// borrowed buffers / relay-dir paths that the handler is still
+    /// relay-dir paths that the handler is still
     /// reading; tearing those down here while the storage write is
     /// in-progress causes a P0-class race (the storage layer's
     /// `create_dir_all` silently recreates the bucket inside the
@@ -1113,38 +1206,31 @@ impl MultipartStore {
     /// On refusal: returns `Err(count_completing)` — never partially
     /// purges so the caller's bookkeeping is all-or-nothing.
     pub fn purge_uploads_for_bucket(&self, bucket: &str) -> Result<usize, usize> {
-        // Collect `Open` uploads under the write lock; refuse and
-        // release the lock if any `Completing` upload is targeting
-        // this bucket. Atomic check-and-purge.
-        let removed: Vec<MultipartUpload> = {
-            let mut uploads = self.uploads.write();
-
-            let completing_count = uploads
-                .values()
-                .filter(|u| u.bucket == bucket && u.state == MultipartState::Completing)
-                .count();
-            if completing_count > 0 {
-                return Err(completing_count);
-            }
-
-            let mut removed = Vec::new();
-            uploads.retain(|_, u| {
-                if u.bucket == bucket {
-                    removed.push(take_upload_for_cleanup(u));
-                    return false;
-                }
-                true
-            });
-            removed
-        };
-
+        let removed = self.take_uploads_for_bucket(bucket)?;
         let removed_count = removed.len();
         for upload in removed {
-            let _ = self.release_bytes(&upload);
-            cleanup_relay_dir_for_upload(&upload);
+            self.discard_upload(upload);
         }
-
         Ok(removed_count)
+    }
+
+    /// The map half of [`Self::purge_uploads_for_bucket`], under the
+    /// `uploads` lock: an atomic check-and-remove.
+    fn take_uploads_for_bucket(&self, bucket: &str) -> Result<Vec<MultipartUpload>, usize> {
+        let mut uploads = self.uploads.write();
+        let completing_count = uploads
+            .values()
+            .filter(|u| u.bucket == bucket && u.state == MultipartState::Completing)
+            .count();
+        if completing_count > 0 {
+            return Err(completing_count);
+        }
+        let ids: Vec<String> = uploads
+            .values()
+            .filter(|u| u.bucket == bucket)
+            .map(|u| u.upload_id.clone())
+            .collect();
+        Ok(ids.iter().filter_map(|id| uploads.remove(id)).collect())
     }
 
     /// List parts for an upload. Validates bucket+key match.
@@ -1285,6 +1371,24 @@ impl MultipartStore {
         completing_timeout: std::time::Duration,
     ) -> MultipartSweepReport {
         self.prune_completion_tombstones(completing_timeout);
+        let mut report = MultipartSweepReport::default();
+        for u in self.take_expired(max_age, completing_timeout) {
+            if u.state == MultipartState::Completing {
+                report.swept_completing_uploads += 1;
+            } else {
+                report.swept_open_uploads += 1;
+            }
+            report.reclaimed_bytes += self.discard_upload(u);
+        }
+        report
+    }
+
+    /// The map half of [`Self::cleanup_expired`], under the `uploads` lock.
+    fn take_expired(
+        &self,
+        max_age: std::time::Duration,
+        completing_timeout: std::time::Duration,
+    ) -> Vec<MultipartUpload> {
         let now = Utc::now();
         let max_age_cutoff = now - Duration::from_std(max_age).unwrap_or(Duration::hours(1));
         let idle_cutoff = now - self.idle_ttl;
@@ -1296,59 +1400,34 @@ impl MultipartStore {
         } else {
             max_age_cutoff
         };
-
-        // Collect + remove under write lock, then release bytes without it.
-        let expired: Vec<MultipartUpload> = {
-            let mut uploads = self.uploads.write();
-            let mut expired = Vec::new();
-            uploads.retain(|_, u| {
+        let mut uploads = self.uploads.write();
+        let expired: Vec<String> = uploads
+            .values()
+            .filter(|u| {
                 if u.state == MultipartState::Completing {
                     // Never reclaim an upload whose engine store is in flight —
                     // sweeping it deletes the relay parts the store is reading,
                     // losing them permanently on retry (H18). Bounded elsewhere.
-                    if u.last_activity <= completing_cutoff && !u.store_in_progress {
-                        expired.push(take_upload_for_cleanup(u));
-                        return false;
-                    }
-                } else if u.last_activity <= cutoff {
-                    expired.push(take_upload_for_cleanup(u));
-                    return false;
+                    u.last_activity <= completing_cutoff && !u.store_in_progress
+                } else {
+                    u.last_activity <= cutoff
                 }
-                true
-            });
-            expired
-        };
-
-        let mut report = MultipartSweepReport::default();
-        for u in expired {
-            if u.state == MultipartState::Completing {
-                report.swept_completing_uploads += 1;
-            } else {
-                report.swept_open_uploads += 1;
-            }
-            report.reclaimed_bytes += self.release_bytes(&u);
-            cleanup_relay_dir_for_upload(&u);
-        }
-        report
+            })
+            .map(|u| u.upload_id.clone())
+            .collect();
+        expired.iter().filter_map(|id| uploads.remove(id)).collect()
     }
 
     /// Remove orphan relay temp artifacts that don't belong to a currently-
-    /// tracked relayed upload. `min_age` guards the promotion race for the
-    /// PERIODIC sweep (H19) — pass a grace period there; startup passes ZERO
-    /// (no concurrent uploads exist yet).
+    /// tracked upload. `min_age` guards the race with a part whose relay dir
+    /// is made before its upload is in the snapshot, for the PERIODIC sweep
+    /// (H19) — pass a grace period there; startup passes ZERO (no concurrent
+    /// uploads exist yet).
     pub fn sweep_orphan_relay_artifacts(
         &self,
         min_age: std::time::Duration,
     ) -> MultipartSweepReport {
-        let active_relay_dirs: HashSet<PathBuf> = self
-            .uploads
-            .read()
-            .values()
-            .filter_map(|u| match &u.relay_strategy {
-                RelayStrategy::Relayed { relay_dir } => Some(relay_dir.clone()),
-                RelayStrategy::InMemory { .. } => None,
-            })
-            .collect();
+        let active_relay_dirs = self.active_relay_dirs();
         let (mut dirs_removed, mut files_removed) =
             cleanup_orphan_relay_entries_at(&self.relay_root_dir(), &active_relay_dirs, min_age);
 
@@ -1387,83 +1466,18 @@ impl MultipartStore {
         }
     }
 
+    /// The relay dirs of every tracked upload.
+    fn active_relay_dirs(&self) -> HashSet<PathBuf> {
+        self.uploads
+            .read()
+            .keys()
+            .map(|id| self.relay_dir_for_upload(id))
+            .collect()
+    }
+
     /// Current number of tracked uploads (Open + Completing).
     pub fn count_uploads(&self) -> usize {
         self.uploads.read().len()
-    }
-
-    fn promote_upload_to_relay(&self, upload: &mut MultipartUpload) -> Result<(), S3Error> {
-        let relay_dir = self.relay_dir_for_upload(&upload.upload_id);
-        fs::create_dir_all(&relay_dir).map_err(|e| {
-            S3Error::InternalError(format!("Failed to create multipart relay directory: {}", e))
-        })?;
-        let in_memory: Vec<u32> = upload
-            .parts
-            .iter()
-            .filter(|(_, p)| matches!(p.payload, PartPayload::InMemory(_)))
-            .map(|(n, _)| *n)
-            .collect();
-        for part_number in in_memory {
-            let size = upload.parts[&part_number].size;
-            let budget = self.reserve_relay_part(upload, size, None)?;
-            let part = upload.parts.get_mut(&part_number).expect("collected above");
-            if let PartPayload::InMemory(bytes) = &part.payload {
-                let path = part_path(&relay_dir, part_number);
-                write_part_file(&path, bytes)?;
-                part.payload = PartPayload::RelayedFile(path, budget);
-            }
-        }
-        upload.relay_strategy = RelayStrategy::Relayed { relay_dir };
-        Ok(())
-    }
-
-    /// Spool budget for one relay part of `size` bytes. Never waits: this
-    /// runs under the uploads lock, and an upload that holds relay parts is
-    /// a holder (the review2 rule). A full budget is a retryable SlowDown.
-    ///
-    /// One upload holds at most [`relay_upload_cap`] of the budget. The
-    /// reservation used to be clamped to what the upload did not hold yet,
-    /// so once an upload held the whole budget every further part reserved
-    /// 0 MiB and was written anyway: the disk use of one upload grew without
-    /// a bound while it pinned the budget of every other request.
-    fn reserve_relay_part(
-        &self,
-        upload: &MultipartUpload,
-        size: u64,
-        replacing: Option<u32>,
-    ) -> Result<SpoolReservation, S3Error> {
-        let held: u64 = upload
-            .parts
-            .iter()
-            .filter(|(n, p)| {
-                Some(**n) != replacing && matches!(p.payload, PartPayload::RelayedFile(..))
-            })
-            .map(|(_, p)| p.size)
-            .sum();
-        let want = held.saturating_add(size);
-        if let Some(cap) = relay_upload_cap(self.spool.max_bytes(), self.relay_upload_max) {
-            if want > cap {
-                return Err(S3Error::EntityTooLargeReason(format!(
-                    "this multipart upload would hold {want} bytes of relay parts in the spool; \
-                     one upload may hold at most {cap} bytes ({RELAY_UPLOAD_MAX_ENV}, default \
-                     half of DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)"
-                )));
-            }
-        }
-        let reservation = self.spool.try_reserve(size, mib_ceil(held)).map_err(|e| {
-            if e.kind() == CONTENDED {
-                S3Error::SlowDown(format!("spool budget in use by other requests: {e}"))
-            } else {
-                S3Error::InternalError(format!("spool reservation failed: {e}"))
-            }
-        })?;
-        // Never write a part the reservation does not cover.
-        if reservation.reserved_mib() < mib_ceil(size) {
-            return Err(S3Error::SlowDown(
-                "spool budget in use by other requests".to_string(),
-            ));
-        }
-        Ok(reservation)
     }
 
     /// Parent of all per-process relay roots on this host.
@@ -1484,6 +1498,58 @@ impl MultipartStore {
     }
 }
 
+/// The upload `found` as `upload_id`, if it is Open and is for
+/// `bucket`/`key`: UploadPart's precondition.
+fn open_upload<'a>(
+    found: Option<&'a MultipartUpload>,
+    upload_id: &str,
+    bucket: &str,
+    key: &str,
+) -> Result<&'a MultipartUpload, S3Error> {
+    let upload = found.ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
+    // Validate bucket+key match
+    if upload.bucket != bucket || upload.key != key {
+        return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+    }
+    // C4 security fix: parts can only be uploaded while the upload is
+    // Open. Once CompleteMultipartUpload has started (state=Completing),
+    // accepting new parts would race with the in-flight `engine.store*`.
+    if upload.state != MultipartState::Open {
+        return Err(S3Error::InvalidRequest(
+            "Upload is in the process of being completed; no more parts can be added".to_string(),
+        ));
+    }
+    Ok(upload)
+}
+
+/// [`open_upload`] for the write half.
+fn open_upload_mut<'a>(
+    found: Option<&'a mut MultipartUpload>,
+    upload_id: &str,
+    bucket: &str,
+    key: &str,
+) -> Result<&'a mut MultipartUpload, S3Error> {
+    open_upload(found.as_deref(), upload_id, bucket, key)?;
+    found.ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))
+}
+
+/// The relay file name of a part: unique per attempt, so a part that
+/// replaces another never writes over the file the old one still names.
+fn relay_part_name(part_number: u32) -> String {
+    format!(
+        "part-{part_number:05}-{}.bin",
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Delete a dropped part's relay file, then release its spool budget
+/// (the budget never comes back before the disk does). Never under the
+/// `uploads` lock.
+fn discard_part(part: PartData) {
+    let _ = fs::remove_file(&part.path);
+    drop(part);
+}
+
 /// The relay parent of releases before the relay moved into the spool. Only
 /// swept (its roots are crash debris or an older process's uploads).
 #[allow(
@@ -1496,98 +1562,6 @@ fn legacy_relay_parent_dir() -> PathBuf {
 
 fn shared_spool() -> SpoolDir {
     SpoolDir::shared().unwrap_or_else(|e| panic!("failed to init spool dir: {e}"))
-}
-
-fn part_path(relay_dir: &Path, part_number: u32) -> PathBuf {
-    relay_dir.join(format!("part-{:05}.bin", part_number))
-}
-
-fn write_part_file(path: &Path, data: &Bytes) -> Result<(), S3Error> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| S3Error::InternalError("Multipart relay path has no parent".to_string()))?;
-    fs::create_dir_all(parent)
-        .map_err(|e| S3Error::InternalError(format!("Failed to create relay directory: {}", e)))?;
-    let mut tmp = NamedTempFile::new_in(parent)
-        .map_err(|e| S3Error::InternalError(format!("Failed to create relay tmp file: {}", e)))?;
-    tmp.write_all(data)
-        .map_err(|e| S3Error::InternalError(format!("Failed to write relay part: {}", e)))?;
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| S3Error::InternalError(format!("Failed to sync relay part: {}", e)))?;
-    tmp.persist(path).map_err(|e| {
-        S3Error::InternalError(format!("Failed to persist relay part: {}", e.error))
-    })?;
-    Ok(())
-}
-
-fn ordered_relay_part_paths(
-    requested_parts: &[(u32, String)],
-    upload: &MultipartUpload,
-) -> Result<Vec<PathBuf>, S3Error> {
-    let mut paths = Vec::with_capacity(requested_parts.len());
-    for (part_number, _) in requested_parts {
-        let part = upload.parts.get(part_number).ok_or_else(|| {
-            S3Error::InvalidPart(format!("Part {} has not been uploaded", part_number))
-        })?;
-        match &part.payload {
-            PartPayload::RelayedFile(path, _) => {
-                // Re-verify content vs the MD5 recorded at UploadPart before the
-                // engine streams these paths (the streamed path never re-hashes
-                // against the per-part digest). Closes the shared-host local-
-                // attacker part-substitution the buffered load_bytes now guards.
-                let bytes = fs::read(path).map_err(|e| {
-                    S3Error::InternalError(format!("Failed to read relayed part: {}", e))
-                })?;
-                let actual: [u8; 16] = Md5::digest(&bytes).into();
-                if actual != part.md5_raw {
-                    return Err(S3Error::InternalError(
-                        "relayed multipart part failed integrity check (content changed on disk \
-                         since upload)"
-                            .to_string(),
-                    ));
-                }
-                paths.push(path.clone());
-            }
-            PartPayload::InMemory(_) => {
-                return Err(S3Error::InternalError(
-                    "Relay upload contains in-memory part unexpectedly".to_string(),
-                ))
-            }
-        }
-    }
-    Ok(paths)
-}
-
-fn cleanup_relay_dir_for_upload(upload: &MultipartUpload) {
-    if let RelayStrategy::Relayed { relay_dir } = &upload.relay_strategy {
-        let _ = fs::remove_dir_all(relay_dir);
-    }
-}
-
-fn take_upload_for_cleanup(upload: &mut MultipartUpload) -> MultipartUpload {
-    MultipartUpload {
-        upload_id: upload.upload_id.clone(),
-        bucket: upload.bucket.clone(),
-        key: upload.key.clone(),
-        created_at: upload.created_at,
-        last_activity: upload.last_activity,
-        content_type: upload.content_type.clone(),
-        user_metadata: upload.user_metadata.clone(),
-        parts: std::mem::take(&mut upload.parts),
-        state: upload.state,
-        relay_strategy: match &upload.relay_strategy {
-            RelayStrategy::InMemory {
-                relay_threshold_bytes,
-            } => RelayStrategy::InMemory {
-                relay_threshold_bytes: *relay_threshold_bytes,
-            },
-            RelayStrategy::Relayed { relay_dir } => RelayStrategy::Relayed {
-                relay_dir: relay_dir.clone(),
-            },
-        },
-        store_in_progress: upload.store_in_progress,
-    }
 }
 
 /// Remove relay artifacts under `relay_root` that don't belong to a currently-

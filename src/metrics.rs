@@ -69,6 +69,15 @@ pub struct Metrics {
     pub multipart_sweep_last_reclaimed_bytes: Gauge,
     pub multipart_uploads_inflight: Gauge,
 
+    // -- Request body ingest (`deltaglider::ingest`) --
+    /// Bytes of request bodies held in memory now (set at scrape from the
+    /// RAM budget).
+    pub ingest_memory_bytes: IntGauge,
+    /// The most bytes of request bodies held in memory at once.
+    pub ingest_memory_peak_bytes: IntGauge,
+    /// Request bodies read, by medium (`memory`/`spool`) and reason.
+    pub ingest_bodies_total: IntCounterVec,
+
     // -- Replication streaming-copy (Phase B) --
     // Deterministic high-water gauges + totals. Prove bounded memory, real
     // part/object concurrency, and per-part resume without clock/RSS gating.
@@ -442,6 +451,36 @@ impl Metrics {
             .unwrap()
         );
 
+        // -- Request body ingest --
+        let ingest_memory_bytes = register!(
+            registry,
+            IntGauge::new(
+                "deltaglider_ingest_memory_bytes",
+                "Bytes of request bodies held in memory now (DGP_INGEST_MEMORY_MAX_BYTES budget)",
+            )
+            .unwrap()
+        );
+        let ingest_memory_peak_bytes = register!(
+            registry,
+            IntGauge::new(
+                "deltaglider_ingest_memory_peak_bytes",
+                "High-water bytes of request bodies held in memory at once",
+            )
+            .unwrap()
+        );
+        let ingest_bodies_total = register!(
+            registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "deltaglider_ingest_bodies_total",
+                    "Request bodies read, by medium (memory, spool) and reason \
+                     (under_threshold, over_threshold, memory_budget, multipart_part)",
+                ),
+                &["medium", "reason"],
+            )
+            .unwrap()
+        );
+
         // -- Replication streaming-copy (Phase B) --
         let replication_part_bytes_resident = register!(
             registry,
@@ -654,6 +693,9 @@ impl Metrics {
             multipart_sweep_last_uploads_reclaimed,
             multipart_sweep_last_reclaimed_bytes,
             multipart_uploads_inflight,
+            ingest_memory_bytes,
+            ingest_memory_peak_bytes,
+            ingest_bodies_total,
             replication_part_bytes_resident,
             replication_part_bytes_resident_peak,
             replication_parts_inflight,
@@ -815,6 +857,13 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     metrics
         .multipart_uploads_inflight
         .set(state.multipart.count_uploads() as f64);
+    let ingest = engine.memory_budget();
+    metrics
+        .ingest_memory_bytes
+        .set(i64::try_from(ingest.held_bytes()).unwrap_or(i64::MAX));
+    metrics
+        .ingest_memory_peak_bytes
+        .set(i64::try_from(ingest.peak_bytes()).unwrap_or(i64::MAX));
     if let Some(db) = &state.jobs_db {
         crate::event_outbox::OUTBOX_QUEUED_EVENTS
             .set(crate::event_outbox::queued_events(db) as i64);

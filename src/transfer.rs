@@ -409,13 +409,10 @@ async fn copy_object_once(
     // deltas; this closes it now that the store side streams (Phase 4).
     let source_size = source_head.file_size;
     if source_size > engine.spool_threshold() {
-        if let Some(outcome) =
-            spooled_copy(engine, lock, &request, source_head, source_size).await?
-        {
-            return Ok(outcome);
-        }
+        return spooled_copy(engine, lock, &request, source_head, source_size).await;
     }
 
+    // small: the source's HEAD size is at most the spool threshold.
     let (data, meta) = engine
         .retrieve(request.source_bucket, request.source_key)
         .await
@@ -632,6 +629,7 @@ async fn stream_copy_passthrough(
                 }
             })
             .buffer_unordered(concurrency)
+            // small: part receipts. The part bytes are retained only for a non-native backend, and this path runs only for a native-multipart destination (`copy_object_once`).
             .try_collect()
             .await;
 
@@ -1108,9 +1106,7 @@ impl CopyError {
     /// the new object).
     pub(crate) fn into_s3_error(self) -> crate::api::S3Error {
         if self.class == CopyClass::SourceChanged {
-            return crate::api::S3Error::SlowDown(
-                "the copy source changed during the copy; retry the request".to_string(),
-            );
+            return crate::api::S3Error::copy_source_changed();
         }
         match self.cause.map(|c| *c) {
             Some(CopyCause::Engine(e)) => e.into(),
@@ -1381,6 +1377,11 @@ pub(crate) struct DestinationFields {
     /// The multipart ETag the destination keeps (`None`: its ETag is the
     /// MD5 of the content).
     pub multipart_etag: Option<String>,
+    /// Why the destination stores a passthrough source whole: the reason a
+    /// store of the same content under the destination key gives
+    /// ([`DynEngine::write_decline_reason`]). Only a copy that ships the
+    /// stored file as it is sets it; a delta copy has none.
+    pub passthrough_reason: Option<crate::types::PassthroughReason>,
 }
 
 impl DestinationFields {
@@ -1405,6 +1406,7 @@ impl DestinationFields {
             content_type: source.content_type.clone(),
             user_metadata,
             multipart_etag: source.multipart_etag.clone(),
+            passthrough_reason: None,
         }
     }
 }
@@ -1456,6 +1458,9 @@ pub(crate) fn destination_metadata(
     };
     meta.set_user_metadata(fields.user_metadata);
     meta.multipart_etag = fields.multipart_etag;
+    if let Some(reason) = fields.passthrough_reason {
+        meta = meta.with_passthrough_reason(reason);
+    }
     strip_encryption_markers(&mut meta.user_metadata);
     Some(meta)
 }
@@ -1471,15 +1476,18 @@ async fn server_side_copy(
     source_head: &crate::types::FileMetadata,
     prior: Option<&crate::deltaglider::CounterPrior>,
 ) -> Result<Option<ObjectTransferOutcome>, CopyError> {
-    let fields = DestinationFields::of_transfer(&request, source_head);
-    if engine.write_tries_delta(
+    let mut fields = DestinationFields::of_transfer(&request, source_head);
+    // The destination stores the source as it is only when it tries no
+    // delta; the reason it gives is the one a store of the content gives.
+    let Some(reason) = engine.write_decline_reason(
         request.destination_bucket,
         request.destination_key,
         &fields.user_metadata,
         source_head.file_size,
-    ) {
+    ) else {
         return Ok(None);
-    }
+    };
+    fields.passthrough_reason = Some(reason);
     let dest = crate::types::ObjectKey::parse(request.destination_bucket, request.destination_key);
     let Some(metadata) = destination_metadata(source_head, &dest.filename, fields) else {
         return Ok(None);
@@ -1548,6 +1556,7 @@ pub(crate) async fn client_delta_copy(
         content_type,
         user_metadata,
         multipart_etag: None,
+        passthrough_reason: None,
     };
     let Some(shipped) =
         delta_passthrough_copy(engine, lock, request, source_head, None, fields).await?
@@ -1737,7 +1746,7 @@ async fn delta_passthrough_copy(
                     .put_reference_raw(
                         &dest_bucket,
                         &dest_prefix2,
-                        &Bytes::from(ref_data),
+                        crate::storage::PutBody::Bytes(Bytes::from(ref_data)),
                         &ref_meta,
                     )
                     .await?;
@@ -1751,7 +1760,7 @@ async fn delta_passthrough_copy(
                     &dest_bucket,
                     &dest_prefix2,
                     &dest_filename2,
-                    Bytes::from(delta_bytes),
+                    crate::storage::PutBody::Bytes(Bytes::from(delta_bytes)),
                     &meta,
                     &counter_prior,
                 )
@@ -1862,7 +1871,7 @@ async fn heal_stripped_dest_delta(
                     bucket,
                     &dest_key.prefix,
                     &dest_key.filename,
-                    Bytes::from(delta_bytes),
+                    crate::storage::PutBody::Bytes(Bytes::from(delta_bytes)),
                     meta,
                     // A re-stamp of a stored delta: no read says the
                     // passthrough form is absent.
@@ -1888,18 +1897,25 @@ async fn spooled_copy(
     request: &ObjectTransferRequest<'_>,
     source_head: &crate::types::FileMetadata,
     source_size: u64,
-) -> Result<Option<ObjectTransferOutcome>, CopyError> {
+) -> Result<ObjectTransferOutcome, CopyError> {
     // Stream the (reconstructed) source to a spool file — bounded memory.
+    // Every large source streams (a large delta or reference object from
+    // its verified spool file). A buffered answer is an object that is
+    // small now: it changed since the HEAD, which the size check below
+    // reports. It is not read a second time.
     let resp = engine
         .retrieve_stream(request.source_bucket, request.source_key)
         .await
         .map_err(|e| CopyError::engine("source retrieve_stream failed", e))?;
-    let (mut stream, meta) = match resp {
+    let (stream, meta) = match resp {
         crate::deltaglider::RetrieveResponse::Streamed {
             stream, metadata, ..
         } => (stream, metadata),
-        // Buffered (small) source — let the caller's buffered path handle it.
-        crate::deltaglider::RetrieveResponse::Buffered { .. } => return Ok(None),
+        crate::deltaglider::RetrieveResponse::Buffered { data, metadata, .. } => {
+            let once: crate::storage::ByteStream =
+                Box::pin(futures::stream::once(async move { Ok(Bytes::from(data)) }));
+            (once, metadata)
+        }
     };
 
     // Same generation as the HEAD? (The size below is the HEAD's.)
@@ -1916,21 +1932,41 @@ async fn spooled_copy(
         return Err(changed());
     }
 
-    let spool = engine.spool_acquire(source_size).await?;
-    // Capped at the reservation, hashed on the way: the store must get
-    // exactly the bytes the metadata names.
-    use crate::deltaglider::spool::SpoolFillError;
-    let fill = spool
-        .fill_from_stream(&mut stream, source_size)
+    // The source, read once by THE ingest: in memory up to the spool
+    // threshold, else into a spool file whose reservation also covers the
+    // storage write's temp files. Exactly `source_size` bytes, hashed on
+    // the way: the store must get the bytes the metadata names. The stream
+    // of a large delta or reference source holds its spool file: the copy
+    // holds that budget (`held_spool_mib`), so it never waits for more, and
+    // a copy that the budget cannot hold beside it fails now.
+    use crate::deltaglider::ingest::{self, IngestError};
+    let plan = ingest::IngestPlan {
+        declared: source_size,
+        // The stored source sets the size; the store applies its limits.
+        limit: u64::MAX,
+        sha256: ingest::Sha256Need::Compute,
+        held_spool_mib: engine.stream_spool_mib(&meta),
+        strict_length: true,
+        destination: ingest::Destination::Object,
+    };
+    let body = ingest::ingest(engine, request.destination_bucket, stream, plan)
         .await
         .map_err(|e| match e {
-            SpoolFillError::Source(e) => CopyError::storage("source stream error", e),
-            SpoolFillError::Write(e) => e.into(),
-            SpoolFillError::Overrun { .. } => changed(),
+            IngestError::Source(e) => CopyError::storage("source stream error", e),
+            IngestError::TooLong { .. } | IngestError::Incomplete { .. } => changed(),
+            IngestError::TooLarge { declared, limit }
+            | IngestError::SpoolTooSmall {
+                declared,
+                max_bytes: limit,
+                ..
+            } => crate::deltaglider::EngineError::TooLarge {
+                size: declared,
+                max: limit,
+            }
+            .into(),
+            IngestError::Engine(e) => e.into(),
         })?;
-    if fill.written != source_size
-        || (!meta.file_sha256.is_empty() && fill.sha256 != meta.file_sha256)
-    {
+    if !meta.file_sha256.is_empty() && body.hashes().sha256() != meta.file_sha256 {
         return Err(changed());
     }
 
@@ -1951,12 +1987,11 @@ async fn spooled_copy(
     crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
 
     let stored = engine
-        .store_spooled_delta(
+        .store_ingested(
             lock,
             request.destination_bucket,
             request.destination_key,
-            &spool,
-            source_size,
+            body,
             content_type,
             user_metadata,
             meta.multipart_etag.clone(),
@@ -1974,13 +2009,13 @@ async fn spooled_copy(
     .await?;
 
     let label = source_head.storage_info.label();
-    Ok(Some(ObjectTransferOutcome {
+    Ok(ObjectTransferOutcome {
         bytes_copied: source_size as usize,
         strategy: CopyStrategy::Reconstructed,
         source_storage_label: label,
         source_file_size: source_size,
         bytes_egress_saved: 0,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -2096,8 +2131,7 @@ mod tests {
                 CopyClass::SourceChanged,
                 "a changed source must be retryable: {e}"
             ),
-            Ok(None) => {}
-            Ok(Some(_)) => {
+            Ok(_) => {
                 let (got, _) = engine.retrieve("dst", "big.bin").await.unwrap();
                 assert!(
                     got == old || got == new,
@@ -2927,7 +2961,7 @@ mod multipart_abort_tests {
             body: crate::storage::PutBody<'_>,
             _: &FileMetadata,
         ) -> Result<(), StorageError> {
-            body.into_bytes().await?;
+            body.read_all_for_test().await?;
             Err(nope())
         }
 
@@ -2940,7 +2974,7 @@ mod multipart_abort_tests {
             _: &FileMetadata,
             _: &str,
         ) -> Result<crate::storage::WriteIf, StorageError> {
-            body.into_bytes().await?;
+            body.read_all_for_test().await?;
             Err(nope())
         }
 
@@ -3224,7 +3258,7 @@ mod multipart_abort_tests {
             body: crate::storage::PutBody<'_>,
             m: &FileMetadata,
         ) -> Result<(), StorageError> {
-            let body = crate::storage::PutBody::Bytes(body.into_bytes().await?);
+            let body = crate::storage::PutBody::Bytes(body.read_all_for_test().await?);
             self.0.put_object(b, p, t, body, m).await
         }
 
@@ -3237,7 +3271,7 @@ mod multipart_abort_tests {
             m: &FileMetadata,
             v: &str,
         ) -> Result<crate::storage::WriteIf, StorageError> {
-            let body = crate::storage::PutBody::Bytes(body.into_bytes().await?);
+            let body = crate::storage::PutBody::Bytes(body.read_all_for_test().await?);
             self.0.put_if_unchanged(b, p, t, body, m, v).await
         }
 
@@ -3499,6 +3533,9 @@ mod request_count_tests {
 
     /// Requests that start with `prefix`, without the background listing
     /// facts upkeep under `.dg/` (it races the assertions).
+    /// Requests that start with `prefix`, without the listing-facts
+    /// upkeep (`.dg/` writes and their listings), which the earlier
+    /// writes of a fixture can still send in the background.
     fn count(fake: &FakeS3, prefix: &str) -> usize {
         fake.requests()
             .iter()

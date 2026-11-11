@@ -299,7 +299,7 @@ mod wrapper_tests {
                 "b",
                 p,
                 "app.zip",
-                Bytes::from(data.clone()),
+                crate::storage::PutBody::Bytes(Bytes::from(data.clone())),
                 &dmeta("app.zip", &data),
                 RefWriteProof::for_tests(),
             )
@@ -390,6 +390,142 @@ mod wrapper_tests {
         );
     }
 
+    /// A delta and the reference written from a file (plainly and as a
+    /// conditional rewrite) are stored as v2 bodies of exactly
+    /// `stored_len` bytes with sealed metadata, and read back identical.
+    #[tokio::test]
+    async fn file_bodies_of_deltas_and_the_reference_round_trip_sealed() {
+        use crate::storage::{RewriteTarget, StoredWrite, WriteIf};
+        let r = fs(keyed(key(1), "kid-1")).await;
+        let sd = r.spool();
+        let proof = RefWriteProof::for_tests();
+        for size in [0usize, 1, F, F + 1, 3 * F + 5] {
+            let p = format!("f{size}");
+            let p = p.as_str();
+            let data = body_of(size);
+            let src = r.dir.path().join(format!("src{size}"));
+            std::fs::write(&src, &data).unwrap();
+            let file = || PutBody::File {
+                path: &src,
+                spool: SpoolBudget::new(&sd, None, None),
+            };
+            let target = StoredWrite::Delta {
+                name: "app.zip",
+                proof,
+            };
+            r.w.put_object("b", p, target, file(), &dmeta("app.zip", &data))
+                .await
+                .unwrap();
+            r.w.put_reference_from_file(
+                "b",
+                p,
+                &src,
+                &rmeta(&data),
+                SpoolBudget::new(&sd, None, None),
+                proof,
+            )
+            .await
+            .unwrap();
+            let want_wire = v2::stored_len(size as u64).unwrap() as usize;
+            for object in [StoredObject::Delta("app.zip"), StoredObject::Reference] {
+                let at = format!("size {size} {object:?}");
+                let wire = r.w.inner.get_object("b", p, object).await.unwrap();
+                assert_eq!(wire.len(), want_wire, "{at}");
+                let raw = r.w.inner.head_object("b", p, object).await.unwrap();
+                assert!(has_seal(&raw), "{at}: no seal");
+                assert_eq!(r.w.get_object("b", p, object).await.unwrap(), data, "{at}");
+            }
+            let shown = r.w.get_delta_metadata("b", p, "app.zip").await.unwrap();
+            assert_eq!(shown.file_size, size as u64 + 1000, "the sealed facts");
+
+            // A conditional rewrite of each from a file.
+            let again = body_of(size + 3);
+            std::fs::write(&src, &again).unwrap();
+            for (object, meta) in [
+                (StoredObject::Delta("app.zip"), dmeta("app.zip", &again)),
+                (StoredObject::Reference, rmeta(&again)),
+            ] {
+                let target = match object {
+                    StoredObject::Delta(name) => RewriteTarget::Delta { name, proof },
+                    _ => RewriteTarget::Reference { proof },
+                };
+                let raw = r.w.inner.head_object("b", p, object).await.unwrap();
+                let version = raw.backend_version.unwrap();
+                let w =
+                    r.w.put_if_unchanged("b", p, target, file(), &meta, &version);
+                assert_eq!(w.await.unwrap(), WriteIf::Written, "size {size} {object:?}");
+                assert_eq!(r.w.get_object("b", p, object).await.unwrap(), again);
+                assert!(has_seal(
+                    &r.w.inner.head_object("b", p, object).await.unwrap()
+                ));
+            }
+        }
+        assert_eq!(sd.free_mib(), 256, "every ciphertext file is gone");
+    }
+
+    /// A sealed delta and a sealed reference are decrypted frame by frame
+    /// as the caller reads them (one frame of memory, whatever the size),
+    /// not read and decrypted whole first: the first frames reach the
+    /// caller before a damaged last frame fails the read. The default
+    /// `get_reference_to_file` streams the plaintext too.
+    #[tokio::test]
+    async fn sealed_deltas_and_references_are_read_frame_by_frame() {
+        let r = fs(keyed(key(1), "kid-1")).await;
+        let data = body_of(4 * F + 3);
+        let proof = RefWriteProof::for_tests();
+        r.w.put_delta(
+            "b",
+            "p",
+            "app.zip",
+            crate::storage::PutBody::Bytes(Bytes::from(data.clone())),
+            &dmeta("app.zip", &data),
+            proof,
+        )
+        .await
+        .unwrap();
+        r.w.put_reference("b", "p", Bytes::from(data.clone()), &rmeta(&data), proof)
+            .await
+            .unwrap();
+        let out = r.dir.path().join("ref.out");
+        let written = r.w.get_reference_to_file("b", "p", &out).await.unwrap();
+        assert_eq!(written, data.len() as u64);
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            data,
+            "the plaintext, not the stored body"
+        );
+
+        let stored = |name: &str| r.dir.path().join("data/b/deltaspaces/p").join(name);
+        for (object, file) in [
+            (StoredObject::Delta("app.zip"), stored("app.zip.delta")),
+            (StoredObject::Reference, stored("reference.bin")),
+        ] {
+            let read = r.w.open_object("b", "p", object).await.unwrap();
+            let chunks: Vec<Bytes> = read.stream.try_collect().await.unwrap();
+            assert!(
+                chunks.len() > 1,
+                "{object:?}: one buffer of the whole object"
+            );
+            assert!(
+                chunks.iter().all(|c| c.len() <= F),
+                "{object:?}: a chunk above a frame"
+            );
+            assert_eq!(chunks.concat(), data);
+
+            // Damage the last frame: the first frame still reaches the
+            // caller, then the read fails.
+            let mut wire = std::fs::read(&file).unwrap();
+            let last = wire.len() - 2;
+            wire[last] ^= 1;
+            std::fs::write(&file, &wire).unwrap();
+            let mut read = r.w.open_object("b", "p", object).await.unwrap().stream;
+            let first = read.try_next().await.unwrap().unwrap();
+            assert_eq!(first[..], data[..first.len()], "{object:?}");
+            let rest: Result<Vec<Bytes>, _> = read.try_collect().await;
+            assert!(rest.is_err(), "{object:?}: a damaged frame was served");
+        }
+    }
+
     // ── A spy backend: one passthrough object in memory ──
 
     struct CountingBackend {
@@ -400,8 +536,11 @@ mod wrapper_tests {
         fail_meta_reads: std::sync::atomic::AtomicBool,
         /// Spool whose free budget `put_passthrough_file` records.
         probe_spool: Option<crate::deltaglider::spool::SpoolDir>,
-        /// (source path, free spool MiB) per `put_passthrough_file` call.
+        /// (source path, free spool MiB) per write of a file body: any
+        /// `put_object`, `put_if_unchanged` or reference `PutFile`.
         file_puts: Mutex<Vec<(std::path::PathBuf, usize)>>,
+        /// The metadata of each of those writes.
+        file_put_meta: Mutex<Vec<FileMetadata>>,
         /// What `listing_tokens` answers.
         tokens: Mutex<Vec<Option<crate::storage::ListedToken>>>,
         /// What `keep_listing_token` was handed.
@@ -417,9 +556,21 @@ mod wrapper_tests {
                 fail_meta_reads: Default::default(),
                 probe_spool: None,
                 file_puts: Mutex::new(Vec::new()),
+                file_put_meta: Mutex::new(Vec::new()),
                 tokens: Mutex::new(Vec::new()),
                 kept: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Record a write of the file `path`: the free budget while the
+        /// write reads it, and its metadata.
+        fn record_file_put(&self, path: &std::path::Path, m: &FileMetadata) {
+            let free = self.probe_spool.as_ref().map_or(0, |s| s.free_mib());
+            self.file_puts
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), free));
+            self.file_put_meta.lock().unwrap().push(m.clone());
         }
 
         fn slice(&self, start: u64, end: u64) -> Result<Vec<u8>, StorageError> {
@@ -469,10 +620,16 @@ mod wrapper_tests {
             &self,
             _: &str,
             _: &str,
-            _: crate::storage::RefWrite<'_>,
+            op: crate::storage::RefWrite<'_>,
             _: &RefWriteProof,
         ) -> Result<(), StorageError> {
-            Err(cb_err())
+            match op {
+                crate::storage::RefWrite::PutFile { path, metadata, .. } => {
+                    self.record_file_put(path, metadata);
+                    Ok(())
+                }
+                _ => Err(cb_err()),
+            }
         }
         async fn write_reference_fenced(
             &self,
@@ -650,18 +807,14 @@ mod wrapper_tests {
             body: crate::storage::PutBody<'_>,
             m: &FileMetadata,
         ) -> Result<(), StorageError> {
+            if let crate::storage::PutBody::File { path, .. } = body {
+                self.record_file_put(path, m);
+                return Ok(());
+            }
             if let crate::storage::StoredWrite::Delta { .. } = t {
                 return Err(cb_err());
             }
-            if let crate::storage::PutBody::File { path, .. } = body {
-                let free = self.probe_spool.as_ref().map_or(0, |s| s.free_mib());
-                self.file_puts
-                    .lock()
-                    .unwrap()
-                    .push((path.to_path_buf(), free));
-                return Ok(());
-            }
-            let data = body.into_bytes().await?;
+            let data = body.read_all_for_test().await?;
             *self.bytes.lock().unwrap() = data.to_vec();
             *self.metadata.lock().unwrap() = Some(m.clone());
             Ok(())
@@ -673,10 +826,14 @@ mod wrapper_tests {
             _: &str,
             _: crate::storage::RewriteTarget<'_>,
             body: crate::storage::PutBody<'_>,
-            _: &FileMetadata,
+            m: &FileMetadata,
             _: &str,
         ) -> Result<crate::storage::WriteIf, StorageError> {
-            body.into_bytes().await?;
+            if let crate::storage::PutBody::File { path, .. } = body {
+                self.record_file_put(path, m);
+                return Ok(crate::storage::WriteIf::Written);
+            }
+            body.read_all_for_test().await?;
             Err(cb_err())
         }
 
@@ -1309,7 +1466,7 @@ mod wrapper_tests {
                 "b",
                 "p",
                 "x",
-                x.clone(),
+                crate::storage::PutBody::Bytes(x.clone()),
                 &dmeta("x", b"x"),
                 RefWriteProof::for_tests(),
             )
@@ -1383,7 +1540,7 @@ mod wrapper_tests {
                 "b",
                 "p",
                 "f",
-                b(),
+                crate::storage::PutBody::Bytes(b()),
                 &forge(dmeta("f", &body)),
                 RefWriteProof::for_tests(),
             )
@@ -1475,7 +1632,7 @@ mod wrapper_tests {
                 "b",
                 "p",
                 "d",
-                Bytes::from(data.clone()),
+                crate::storage::PutBody::Bytes(Bytes::from(data.clone())),
                 &dmeta("d", &data),
                 RefWriteProof::for_tests(),
             )
@@ -1624,7 +1781,7 @@ mod wrapper_tests {
             "b",
             "p",
             "x",
-            Bytes::from(delta.clone()),
+            crate::storage::PutBody::Bytes(Bytes::from(delta.clone())),
             &dmeta("x", &delta),
             RefWriteProof::for_tests(),
         )
@@ -1637,7 +1794,7 @@ mod wrapper_tests {
                 "b",
                 "p",
                 "y",
-                Bytes::from(body),
+                crate::storage::PutBody::Bytes(Bytes::from(body)),
                 &raw,
                 RefWriteProof::for_tests(),
             )
@@ -2119,6 +2276,83 @@ mod wrapper_tests {
         assert_eq!(sd.free_mib(), 64);
     }
 
+    /// A delta, the reference and every conditional rewrite from a file
+    /// are encrypted into a spool file too, never read into memory: the
+    /// inner backend gets the ciphertext file in the spool dir while it
+    /// holds budget, sealed for the object it is. They were read whole
+    /// and sealed in memory (twice the object).
+    #[tokio::test]
+    async fn encrypted_delta_and_reference_file_writes_are_inside_the_spool_budget() {
+        use crate::storage::{RewriteTarget, StoredWrite};
+        let dir = tempfile::tempdir().unwrap();
+        let sd = test_spool(&dir);
+        let wrapper = probe_wrapper(&sd);
+        let body = vec![9u8; 3 * MIB];
+        let src = dir.path().join("src");
+        std::fs::write(&src, &body).unwrap();
+        let proof = RefWriteProof::for_tests();
+        let delta = dmeta("app.zip", &body);
+        let reference = rmeta(&body);
+        let file = || PutBody::File {
+            path: &src,
+            spool: unheld(&sd),
+        };
+
+        let target = StoredWrite::Delta {
+            name: "app.zip",
+            proof,
+        };
+        wrapper
+            .put_object("b", "p", target, file(), &delta)
+            .await
+            .unwrap();
+        wrapper
+            .put_reference_from_file("b", "p", &src, &reference, unheld(&sd), proof)
+            .await
+            .unwrap();
+        let fence = crate::storage::RefFence::Unfenced;
+        let op = crate::storage::RefWrite::PutFile {
+            path: &src,
+            metadata: &reference,
+            spool: unheld(&sd),
+        };
+        wrapper
+            .write_reference_fenced("b", "p", op, &fence, proof)
+            .await
+            .unwrap();
+        for (target, meta) in [
+            (
+                RewriteTarget::Delta {
+                    name: "app.zip",
+                    proof,
+                },
+                &delta,
+            ),
+            (RewriteTarget::Reference { proof }, &reference),
+        ] {
+            let w = wrapper.put_if_unchanged("b", "p", target, file(), meta, "v1");
+            assert_eq!(w.await.unwrap(), crate::storage::WriteIf::Written);
+        }
+
+        let puts = wrapper.inner.file_puts.lock().unwrap().clone();
+        let metas = wrapper.inner.file_put_meta.lock().unwrap().clone();
+        assert_eq!(puts.len(), 5, "every write got a file: {puts:?}");
+        for ((path, free), meta) in puts.iter().zip(&metas) {
+            assert_eq!(
+                path.parent(),
+                Some(sd.dir()),
+                "the ciphertext is a spool file"
+            );
+            assert!(
+                *free <= 64 - 4,
+                "the ciphertext holds its budget: {free} MiB free"
+            );
+            assert!(has_seal(meta), "the write is sealed");
+            assert!(meta.md5.is_empty(), "no MD5 in clear");
+        }
+        assert_eq!(sd.free_mib(), 64, "budget released after the writes");
+    }
+
     /// The review2 rule: a storage write never waits for spool budget. It
     /// runs under the engine's deltaspace lock, and other ops hold budget
     /// while they wait for that lock. With the budget taken, the write fails
@@ -2461,7 +2695,7 @@ mod read_request_tests {
                 "b",
                 "p",
                 "a.bin",
-                Bytes::from(body.clone()),
+                crate::storage::PutBody::Bytes(Bytes::from(body.clone())),
                 &dmeta("a.bin", &body),
                 crate::deltaglider::RefWriteProof::for_tests(),
             )

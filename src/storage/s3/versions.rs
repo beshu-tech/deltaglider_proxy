@@ -164,6 +164,7 @@ impl S3Backend {
                 state.map(|s| (key, s))
             })
             .buffer_unordered(PURGE_PARALLEL)
+            // small: (key, version, sealed state) rows of one page, not object bytes
             .try_collect()
             .await?;
         let judged: Vec<(String, String, Option<bool>)> = stream::iter(candidates)
@@ -172,6 +173,7 @@ impl S3Backend {
                 state.map(|s| (key, version, s))
             })
             .buffer_unordered(PURGE_PARALLEL)
+            // small: (key, version, sealed state) rows of one page, not object bytes
             .try_collect()
             .await?;
 

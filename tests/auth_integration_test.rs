@@ -1997,17 +1997,65 @@ async fn test_unsigned_extra_header_is_tolerated() {
 /// Build a valid signed PUT for `body_to_sign`, then send a DIFFERENT
 /// body. Pre-fix the proxy stored the wrong body silently — the
 /// signature was valid because it's computed over the canonical
-/// request which only sees the header value, not the body.
+/// request which only sees the header value, not the body. A body above
+/// the spool threshold streams into a spool file and fails the same way:
+/// s3s checks the hash while the body streams, nothing needs it whole.
 #[tokio::test]
 async fn test_sigv4_payload_hash_mismatch_rejected() {
     let server = TestServer::builder()
         .auth("hash-key", "hash-secret-1234567890")
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "65536")
         .build()
         .await;
+    let large_signed = vec![1u8; 256 * 1024];
+    let large_actual = vec![2u8; 256 * 1024];
+    for (key, signed_body, actual_body) in [
+        (
+            "h1-mismatch.bin",
+            &b"the body the client signed"[..],
+            &b"a different body the attacker sent"[..],
+        ),
+        (
+            "h1-mismatch-large.bin",
+            &large_signed[..],
+            &large_actual[..],
+        ),
+    ] {
+        let resp = signed_put_with_other_body(&server, key, signed_body, actual_body).await;
+        // Pre-fix: 200 (silently stores actual_body).
+        // Post-fix: 400 BadDigest.
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "H1 REGRESSION: {key}: PUT with body mismatching signed hash must reject with 400, got {}",
+            resp.status()
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("BadDigest"),
+            "{key}: expected BadDigest error code, got body: {}",
+            body
+        );
+        let head = server
+            .s3_client()
+            .await
+            .head_object()
+            .bucket(server.bucket())
+            .key(key)
+            .send()
+            .await;
+        assert!(head.is_err(), "{key}: a refused body was stored");
+    }
+}
 
-    let signed_body: &[u8] = b"the body the client signed";
-    let actual_body: &[u8] = b"a different body the attacker sent";
-
+/// A PUT signed (SigV4 header, single-chunk payload hash) for
+/// `signed_body` that sends `actual_body`.
+async fn signed_put_with_other_body(
+    server: &TestServer,
+    key: &str,
+    signed_body: &[u8],
+    actual_body: &[u8],
+) -> reqwest::Response {
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let date = &timestamp[..8];
     let region = "us-east-1";
@@ -2021,7 +2069,7 @@ async fn test_sigv4_payload_hash_mismatch_rejected() {
         .unwrap_or(&endpoint);
 
     let payload_hash = sha256_hex(signed_body);
-    let path = format!("/{}/{}", server.bucket(), "h1-mismatch.bin");
+    let path = format!("/{}/{}", server.bucket(), key);
 
     let canonical_headers = format!(
         "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
@@ -2046,7 +2094,7 @@ async fn test_sigv4_payload_hash_mismatch_rejected() {
         "hash-key", credential_scope, signed_headers, signature
     );
 
-    let resp = reqwest::Client::new()
+    reqwest::Client::new()
         .put(format!("{}{}", endpoint, path))
         .header("authorization", auth_header)
         .header("x-amz-date", timestamp)
@@ -2055,22 +2103,7 @@ async fn test_sigv4_payload_hash_mismatch_rejected() {
         .body(actual_body.to_vec())
         .send()
         .await
-        .expect("send mismatched body");
-
-    // Pre-fix: 200 (silently stores actual_body).
-    // Post-fix: 400 BadDigest.
-    assert_eq!(
-        resp.status().as_u16(),
-        400,
-        "H1 REGRESSION: PUT with body mismatching signed hash must reject with 400, got {}",
-        resp.status()
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("BadDigest"),
-        "expected BadDigest error code, got body: {}",
-        body
-    );
+        .expect("send mismatched body")
 }
 
 /// UNSIGNED-PAYLOAD must continue to accept arbitrary body content

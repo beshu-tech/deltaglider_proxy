@@ -217,6 +217,18 @@ Read the line in this order:
 | `deltaglider_multipart_sweep_last_uploads_reclaimed` | Gauge | — | Uploads reclaimed in the latest sweep run |
 | `deltaglider_multipart_sweep_last_reclaimed_bytes` | Gauge | — | Bytes reclaimed in the latest sweep run |
 
+## Request bodies
+
+The proxy reads each upload body once before it stores the object. A body that is at most `DGP_SPOOL_THRESHOLD_BYTES` (16 MiB by default) is read into memory when the memory budget for request bodies (`DGP_INGEST_MEMORY_MAX_BYTES`, 1 GiB by default) has room for its declared length. Every other body is written to a file in the spool directory (`DGP_SPOOL_DIR`) from its first byte.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_ingest_memory_bytes` | Gauge | — | Bytes of request bodies that the proxy holds in memory now. It never goes above `DGP_INGEST_MEMORY_MAX_BYTES` |
+| `deltaglider_ingest_memory_peak_bytes` | Gauge | — | The highest value of `deltaglider_ingest_memory_bytes` since the start |
+| `deltaglider_ingest_bodies_total` | Counter | `medium`, `reason` | Request bodies read, by where the proxy put them. `medium="memory", reason="under_threshold"`: a small body in memory. `medium="spool", reason="over_threshold"`: a body larger than `DGP_SPOOL_THRESHOLD_BYTES`. `medium="spool", reason="memory_budget"`: a small body that found the memory budget full. `medium="spool", reason="multipart_part"`: an `UploadPart` or `UploadPartCopy` body, which always goes to a spool file (a relay part) |
+
+A rising count of `reason="memory_budget"` means that many small uploads arrive at the same time and the memory budget is full. Those bodies still succeed, but each one costs a disk write. Raise `DGP_INGEST_MEMORY_MAX_BYTES` if the host has free memory.
+
 ## Auth
 
 | Metric | Type | Labels | Description |
@@ -279,7 +291,8 @@ All label sets are bounded:
 | `outcome` | 3 (`ok`, `error` or `cancelled`) |
 | `decision` | 3 (delta, passthrough, reference) |
 | `result` | 2 (success or failure) |
-| `reason` | 7 (see the Auth table) |
+| `reason` | 7 (see the Auth table); 4 on `deltaglider_ingest_bodies_total` |
+| `medium` | 2 (`memory` or `spool`) |
 
 No label contains a bucket name or an object key, so no label has unbounded cardinality.
 

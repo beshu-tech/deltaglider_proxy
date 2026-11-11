@@ -202,7 +202,12 @@ async fn fast_path_seed_holds_the_lock() {
     let res: Result<(), EngineError> = engine
         .with_dest_prefix_lock("releases", "v1", || async {
             Ok(engine
-                .put_reference_raw("releases", "v1", &bytes::Bytes::from_static(b"abc"), &meta)
+                .put_reference_raw(
+                    "releases",
+                    "v1",
+                    crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"abc")),
+                    &meta,
+                )
                 .await?)
         })
         .await;
@@ -211,7 +216,12 @@ async fn fast_path_seed_holds_the_lock() {
 
     // Outside the scope, multi-instance refuses the raw write.
     assert!(engine
-        .put_reference_raw("releases", "v1", &bytes::Bytes::from_static(b"abc"), &meta)
+        .put_reference_raw(
+            "releases",
+            "v1",
+            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"abc")),
+            &meta
+        )
         .await
         .is_err());
     // The same for a raw delta (review 4 coordination-5): outside the
@@ -232,7 +242,7 @@ async fn fast_path_seed_holds_the_lock() {
             "releases",
             "v1",
             "app.zip",
-            bytes::Bytes::from_static(b"abc"),
+            crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"abc")),
             &delta_meta,
             &super::usage::CounterPrior::Unknown,
         )
@@ -588,7 +598,7 @@ impl crate::storage::StorageBackend for FencingFs {
         body: crate::storage::PutBody<'_>,
         m: &Meta,
     ) -> Result<(), StorageError> {
-        let body = crate::storage::PutBody::Bytes(body.into_bytes().await?);
+        let body = crate::storage::PutBody::Bytes(body.read_all_for_test().await?);
         if matches!(t, crate::storage::StoredWrite::Delta { .. })
             && self.peer_race_on_delta.swap(false, Ordering::SeqCst)
         {
@@ -607,7 +617,7 @@ impl crate::storage::StorageBackend for FencingFs {
         m: &Meta,
         v: &str,
     ) -> Result<crate::storage::WriteIf, StorageError> {
-        let body = crate::storage::PutBody::Bytes(body.into_bytes().await?);
+        let body = crate::storage::PutBody::Bytes(body.read_all_for_test().await?);
         self.inner.put_if_unchanged(b, p, t, body, m, v).await
     }
 
@@ -683,9 +693,13 @@ impl crate::storage::StorageBackend for FencingFs {
                     .put_reference(b, p, data.clone(), metadata, proof)
                     .await?
             }
-            RefWrite::PutFile { path, metadata } => {
+            RefWrite::PutFile {
+                path,
+                metadata,
+                spool,
+            } => {
                 self.inner
-                    .put_reference_from_file(b, p, path, metadata, proof)
+                    .put_reference_from_file(b, p, path, metadata, spool, proof)
                     .await?
             }
             RefWrite::Metadata { metadata } => {

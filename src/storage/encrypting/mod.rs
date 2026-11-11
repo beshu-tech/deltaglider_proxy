@@ -63,7 +63,7 @@ use super::traits::{
     PutBody, RangeRead, ReferenceSource, StorageBackend, StorageBackendExt, StorageError,
     StoredObject, StoredWrite, UploadedPart,
 };
-use crate::deltaglider::spool::SpoolBudget;
+use crate::deltaglider::spool::{Spool, SpoolBudget};
 use crate::types::FileMetadata;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -335,6 +335,7 @@ impl EncryptionConfig {
 /// A whole stream in one buffer.
 async fn collect_stream(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
     use futures::TryStreamExt;
+    // small: the callers are the magic sniff (a few bytes) and `get_object`, the whole-object read whose callers say why their object is small
     let parts: Vec<Bytes> = stream.try_collect().await?;
     let mut buf = Vec::with_capacity(parts.iter().map(|b| b.len()).sum());
     for p in parts {
@@ -1693,38 +1694,22 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             .await
     }
 
-    /// Encrypt the files `parts` into a spool file and store it as the
-    /// passthrough object `filename`.
+    /// Encrypt the files `parts` (in order) of `object` into a spool file:
+    /// the ciphertext file, and the sealed metadata it is stored with. The
+    /// file holds spool budget from `spool`, which never waits.
     #[allow(clippy::too_many_arguments)]
-    async fn put_encrypted_files(
+    async fn encrypt_into_spool(
         &self,
-        site: Arc<v2::SiteKey>,
+        site: &Arc<v2::SiteKey>,
         bucket: &str,
         prefix: &str,
-        filename: &str,
-        parts: &[std::path::PathBuf],
+        object: StoredObject<'_>,
+        parts: Vec<std::path::PathBuf>,
         metadata: &FileMetadata,
         spool: SpoolBudget<'_>,
-    ) -> Result<(), StorageError> {
-        let at = (bucket, prefix, filename);
-        self.put_encrypted_files_if(site, at, parts, metadata, spool, None)
-            .await
-            .map(drop)
-    }
-
-    /// [`Self::put_encrypted_files`]; with `version`, the store is
-    /// [`StorageBackend::put_if_unchanged`] on it.
-    async fn put_encrypted_files_if(
-        &self,
-        site: Arc<v2::SiteKey>,
-        (bucket, prefix, filename): (&str, &str, &str),
-        parts: &[std::path::PathBuf],
-        metadata: &FileMetadata,
-        spool: SpoolBudget<'_>,
-        version: Option<&str>,
-    ) -> Result<super::traits::WriteIf, StorageError> {
+    ) -> Result<(Spool, FileMetadata), StorageError> {
         let mut plain_len = 0u64;
-        for p in parts {
+        for p in &parts {
             plain_len += tokio::fs::metadata(p)
                 .await
                 .map_err(io_to_storage_error)?
@@ -1733,32 +1718,83 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         let wire_len = v2::stored_len(plain_len).ok_or_else(|| {
             StorageError::Encryption("object too large for the encryption format".into())
         })?;
-        let object = StoredObject::Passthrough(filename);
-        let (sealer, stored) = self.seal_new(&site, bucket, prefix, object, metadata, plain_len)?;
+        let (sealer, stored) = self.seal_new(site, bucket, prefix, object, metadata, plain_len)?;
         let ct = spool.file(wire_len).await.map_err(spool_error)?;
-        let written = Self::encrypt_files(parts.to_vec(), ct.path().to_path_buf(), sealer).await?;
+        let written = Self::encrypt_files(parts, ct.path().to_path_buf(), sealer).await?;
         if written != plain_len {
             return Err(StorageError::Other(format!(
                 "a source file changed while it was encrypted ({plain_len} → {written} bytes)"
             )));
         }
+        Ok((ct, stored))
+    }
+
+    /// A `File` or `Parts` body of any object: encrypted into a spool file
+    /// (256 KiB reads, never the whole object), then stored by the inner
+    /// backend from that file. Where the bucket writes plaintext, the body
+    /// goes to the inner backend as it is, without markers.
+    async fn put_file_body(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        write: FileWrite<'_>,
+        body: PutBody<'_>,
+        metadata: &FileMetadata,
+    ) -> Result<super::traits::WriteIf, StorageError> {
+        let Some(site) = self.write_key(bucket)? else {
+            let plain = without_markers(metadata);
+            return self
+                .store_file_write(bucket, prefix, write, body, &plain)
+                .await;
+        };
+        let (parts, spool) = match body {
+            PutBody::File { path, spool } => (vec![path.to_path_buf()], spool),
+            PutBody::Parts { paths, spool } => (paths.to_vec(), spool),
+            PutBody::Bytes(_) | PutBody::Chunks(_) => {
+                return Err(StorageError::Other(
+                    "put_file_body takes a file or parts body".into(),
+                ))
+            }
+        };
+        let (ct, stored) = self
+            .encrypt_into_spool(
+                &site,
+                bucket,
+                prefix,
+                write.object(),
+                parts,
+                metadata,
+                spool,
+            )
+            .await?;
         let body = PutBody::File {
             path: ct.path(),
             spool: spool.holding(&ct),
         };
-        match version {
-            Some(version) => {
-                let target = super::traits::RewriteTarget::Passthrough { name: filename };
+        self.store_file_write(bucket, prefix, write, body, &stored)
+            .await
+    }
+
+    /// The inner write of a [`FileWrite`].
+    async fn store_file_write(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        write: FileWrite<'_>,
+        body: PutBody<'_>,
+        metadata: &FileMetadata,
+    ) -> Result<super::traits::WriteIf, StorageError> {
+        match write {
+            FileWrite::Put(target) => {
                 self.inner
-                    .put_if_unchanged(bucket, prefix, target, body, &stored, version)
-                    .await
-            }
-            None => {
-                let target = StoredWrite::Passthrough { name: filename };
-                self.inner
-                    .put_object(bucket, prefix, target, body, &stored)
+                    .put_object(bucket, prefix, target, body, metadata)
                     .await?;
                 Ok(super::traits::WriteIf::Written)
+            }
+            FileWrite::IfUnchanged(target, version) => {
+                self.inner
+                    .put_if_unchanged(bucket, prefix, target, body, metadata, version)
+                    .await
             }
         }
     }
@@ -1900,18 +1936,63 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     }
 }
 
+/// Where [`EncryptingBackend::put_file_body`] stores: a plain write or a
+/// conditional rewrite.
+#[derive(Clone, Copy)]
+enum FileWrite<'a> {
+    Put(StoredWrite<'a>),
+    IfUnchanged(super::traits::RewriteTarget<'a>, &'a str),
+}
+
+impl<'a> FileWrite<'a> {
+    fn object(&self) -> StoredObject<'a> {
+        match self {
+            FileWrite::Put(target) => target.object(),
+            FileWrite::IfUnchanged(target, _) => target.object(),
+        }
+    }
+}
+
 /// A reference write as the inner backend stores it.
-enum SealedRefWrite {
+enum SealedRefWrite<'a> {
     Put(bytes::Bytes, FileMetadata),
+    /// A file body: the caller's own file where the bucket writes
+    /// plaintext, else the ciphertext spool file.
+    PutFile {
+        file: SealedFile<'a>,
+        metadata: FileMetadata,
+        spool: SpoolBudget<'a>,
+    },
     Metadata(FileMetadata),
     Delete,
 }
 
-impl SealedRefWrite {
+enum SealedFile<'a> {
+    Plain(&'a std::path::Path),
+    Cipher(Spool),
+}
+
+impl SealedRefWrite<'_> {
     fn op(&self) -> super::traits::RefWrite<'_> {
         use super::traits::RefWrite;
         match self {
             Self::Put(data, metadata) => RefWrite::Put { data, metadata },
+            Self::PutFile {
+                file,
+                metadata,
+                spool,
+            } => {
+                let spool: SpoolBudget<'_> = *spool;
+                let (path, spool) = match file {
+                    SealedFile::Plain(path) => (*path, spool),
+                    SealedFile::Cipher(ct) => (ct.path(), spool.holding(ct)),
+                };
+                RefWrite::PutFile {
+                    path,
+                    metadata,
+                    spool,
+                }
+            }
             Self::Metadata(metadata) => RefWrite::Metadata { metadata },
             Self::Delete => RefWrite::Delete,
         }
@@ -1920,13 +2001,14 @@ impl SealedRefWrite {
 
 impl<B: StorageBackend> EncryptingBackend<B> {
     /// The transformation of a reference write, fenced or not: seal a
-    /// body, re-seal a metadata-only write.
-    async fn seal_reference_write(
+    /// body (a file is encrypted into a spool file, never read into
+    /// memory), re-seal a metadata-only write.
+    async fn seal_reference_write<'a>(
         &self,
         b: &str,
         p: &str,
-        op: super::traits::RefWrite<'_>,
-    ) -> Result<SealedRefWrite, StorageError> {
+        op: super::traits::RefWrite<'a>,
+    ) -> Result<SealedRefWrite<'a>, StorageError> {
         use super::traits::RefWrite;
         Ok(match op {
             RefWrite::Put { data, metadata } => {
@@ -1934,12 +2016,29 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                     self.seal_bytes(b, p, StoredObject::Reference, data, metadata)?;
                 SealedRefWrite::Put(body, stored)
             }
-            RefWrite::PutFile { path, metadata } => {
-                let data = bytes::Bytes::from(tokio::fs::read(path).await?);
-                let (body, stored) =
-                    self.seal_bytes(b, p, StoredObject::Reference, &data, metadata)?;
-                SealedRefWrite::Put(body, stored)
-            }
+            RefWrite::PutFile {
+                path,
+                metadata,
+                spool,
+            } => match self.write_key(b)? {
+                Some(site) => {
+                    let parts = vec![path.to_path_buf()];
+                    let reference = StoredObject::Reference;
+                    let (ct, stored) = self
+                        .encrypt_into_spool(&site, b, p, reference, parts, metadata, spool)
+                        .await?;
+                    SealedRefWrite::PutFile {
+                        file: SealedFile::Cipher(ct),
+                        metadata: stored,
+                        spool,
+                    }
+                }
+                None => SealedRefWrite::PutFile {
+                    file: SealedFile::Plain(path),
+                    metadata: without_markers(metadata),
+                    spool,
+                },
+            },
             RefWrite::Metadata { metadata } => {
                 let raw = self.inner.get_reference_metadata(b, p).await?;
                 SealedRefWrite::Metadata(self.reseal(
@@ -2112,9 +2211,10 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
 
     /// A body in memory is sealed whole. A file or parts are encrypted
     /// into a spool file (256 KiB reads, never the whole object; the
-    /// ciphertext file holds spool budget), chunks as they come (one 64
-    /// KiB window and one frame of working memory), then handed to the
-    /// inner backend.
+    /// ciphertext file holds spool budget), chunks of a passthrough as
+    /// they come (one 64 KiB window and one frame of working memory), then
+    /// handed to the inner backend. Any target: a delta from a file is
+    /// encrypted from the file too.
     async fn put_object(
         &self,
         bucket: &str,
@@ -2124,52 +2224,14 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.check_write(bucket).await?;
-        let name = match target {
-            StoredWrite::Delta { name, .. } => {
-                let data = body.into_bytes().await?;
-                let object = StoredObject::Delta(name);
-                let (body, stored) = self.seal_bytes(bucket, prefix, object, &data, metadata)?;
-                return self
-                    .inner
-                    .put_object(bucket, prefix, target, PutBody::Bytes(body), &stored)
-                    .await;
-            }
-            StoredWrite::Passthrough { name } => name,
-        };
-        match body {
-            PutBody::Bytes(data) => {
-                let object = StoredObject::Passthrough(name);
-                let (body, stored) = self.seal_bytes(bucket, prefix, object, &data, metadata)?;
-                self.inner
-                    .put_object(bucket, prefix, target, PutBody::Bytes(body), &stored)
+        match (body, target) {
+            (body @ (PutBody::File { .. } | PutBody::Parts { .. }), _) => {
+                let write = FileWrite::Put(target);
+                self.put_file_body(bucket, prefix, write, body, metadata)
                     .await
+                    .map(drop)
             }
-            PutBody::File { path, spool } => {
-                let Some(site) = self.write_key(bucket)? else {
-                    let body = PutBody::File { path, spool };
-                    let plain = without_markers(metadata);
-                    return self
-                        .inner
-                        .put_object(bucket, prefix, target, body, &plain)
-                        .await;
-                };
-                let parts = [path.to_path_buf()];
-                self.put_encrypted_files(site, bucket, prefix, name, &parts, metadata, spool)
-                    .await
-            }
-            PutBody::Parts { paths, spool } => {
-                let Some(site) = self.write_key(bucket)? else {
-                    let body = PutBody::Parts { paths, spool };
-                    let plain = without_markers(metadata);
-                    return self
-                        .inner
-                        .put_object(bucket, prefix, target, body, &plain)
-                        .await;
-                };
-                self.put_encrypted_files(site, bucket, prefix, name, paths, metadata, spool)
-                    .await
-            }
-            PutBody::Chunks(chunks) => {
+            (PutBody::Chunks(chunks), StoredWrite::Passthrough { name }) => {
                 let Some(site) = self.write_key(bucket)? else {
                     let body = PutBody::Chunks(chunks);
                     let plain = without_markers(metadata);
@@ -2181,14 +2243,21 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
                 self.put_encrypted_chunks(site, bucket, prefix, name, chunks, metadata)
                     .await
             }
+            (body, _) => {
+                let data = body.into_small_bytes()?;
+                let (body, stored) =
+                    self.seal_bytes(bucket, prefix, target.object(), &data, metadata)?;
+                self.inner
+                    .put_object(bucket, prefix, target, PutBody::Bytes(body), &stored)
+                    .await
+            }
         }
     }
 
     /// Sealed (or written as plaintext, with no markers, where the bucket
     /// writes plaintext) as `put_object` and `write_reference` do, then
     /// stored by the inner backend on the same condition. A file is
-    /// encrypted into a spool file; parts and chunks are not a rewrite's
-    /// body and are collected.
+    /// encrypted into a spool file whatever the target.
     async fn put_if_unchanged(
         &self,
         bucket: &str,
@@ -2199,23 +2268,13 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
         version: &str,
     ) -> Result<super::traits::WriteIf, StorageError> {
         self.check_write(bucket).await?;
-        if let (super::traits::RewriteTarget::Passthrough { name }, PutBody::File { path, spool }) =
-            (target, &body)
-        {
-            if let Some(site) = self.write_key(bucket)? {
-                let parts = [path.to_path_buf()];
-                let at = (bucket, prefix, name);
-                return self
-                    .put_encrypted_files_if(site, at, &parts, metadata, *spool, Some(version))
-                    .await;
-            }
-            let plain = without_markers(metadata);
+        if matches!(body, PutBody::File { .. } | PutBody::Parts { .. }) {
+            let write = FileWrite::IfUnchanged(target, version);
             return self
-                .inner
-                .put_if_unchanged(bucket, prefix, target, body, &plain, version)
+                .put_file_body(bucket, prefix, write, body, metadata)
                 .await;
         }
-        let data = body.into_bytes().await?;
+        let data = body.into_small_bytes()?;
         let (sealed, stored) = self.seal_bytes(bucket, prefix, target.object(), &data, metadata)?;
         self.inner
             .put_if_unchanged(
@@ -2281,9 +2340,11 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
 
     /// The inner read carries the stored metadata and the stored size, so
     /// the read rule needs no HEAD of its own, and a sealed object of the
-    /// wrong stored size fails before the first byte. References and deltas
-    /// (bounded by the object size limit) are decrypted whole; a passthrough
-    /// streams frame by frame. Returns the PRESENTED metadata.
+    /// wrong stored size fails before the first byte. A sealed body of any
+    /// form is decrypted frame by frame as the caller reads it: one frame
+    /// of memory, whatever the object size. Each frame is authenticated
+    /// before it is served, and a cut or extended body fails at its end.
+    /// Returns the PRESENTED metadata.
     async fn open_object(
         &self,
         bucket: &str,
@@ -2295,16 +2356,9 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
         if let Some(body) = &opened.sealed {
             v2::check_stored_len(read.stored_total, body.len)?;
         }
-        let stream: ByteStream = match (&opened.sealed, object) {
-            (Some(body), StoredObject::Reference | StoredObject::Delta(_)) => {
-                let wire = collect_stream(read.stream).await?;
-                let plain = body.opener().open_all(&wire, body.len)?;
-                Box::pin(futures::stream::once(async { Ok(Bytes::from(plain)) }))
-            }
-            (Some(body), StoredObject::Passthrough(_)) => {
-                open_body_stream(read.stream, body).await?
-            }
-            (None, _) => sniff_dge_magic(read.stream),
+        let stream: ByteStream = match &opened.sealed {
+            Some(body) => open_body_stream(read.stream, body).await?,
+            None => sniff_dge_magic(read.stream),
         };
         Ok(ObjectRead {
             stream,
