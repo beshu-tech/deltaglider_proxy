@@ -314,7 +314,7 @@ impl MaintenanceGate {
 /// Proof that background writes into some buckets are admitted: each
 /// bucket counted as in flight, then checked ([`admit_all`]). Only the
 /// admission makes one, and the background writers' copy and delete
-/// ([`crate::transfer::admitted`]) take it by reference, so a write cannot run without a
+/// (`crate::transfer::admitted`) take it by reference, so a write cannot run without a
 /// live admission of its bucket (dropping the guard before the write does
 /// not compile). The counts end when it drops.
 #[derive(Debug)]

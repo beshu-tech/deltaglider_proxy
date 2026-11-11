@@ -64,8 +64,8 @@ pub(crate) use status::get_peak_rss_bytes;
 /// installs one per process, sized like the global cap
 /// (`max_concurrent_requests`).
 ///
-/// Use: [`DetachedWork::reserve`] a slot, then
-/// [`DetachedSlot::spawn_detached`] the task, which moves the slot into the
+/// Use: `DetachedWork::reserve` a slot, then
+/// `DetachedSlot::spawn_detached` the task, which moves the slot into the
 /// task (no slot, no spawn). The wait for a slot counts against the
 /// request's deadline. Lock order: reserve the slot BEFORE any object write
 /// lock. A detached DeleteObjects batch holds a slot while it takes each
