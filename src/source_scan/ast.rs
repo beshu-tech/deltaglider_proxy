@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BUSL-1.1
+
 //! The AST view of the sources, for the source guards that must not be
 //! fooled by formatting.
 //!
