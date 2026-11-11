@@ -157,6 +157,177 @@ async fn completion_publisher_drop_without_publish_unwedges_registry() {
     ));
 }
 
+/// F33 (epic #143): a Complete for another bucket or key joined an
+/// in-flight completion on its upload id and its part list alone, and got
+/// 200 with the owner's ETag while nothing was written under its name. It
+/// is NoSuchUpload, like the same request after the completion (`Done`).
+#[tokio::test]
+async fn joining_an_inflight_completion_checks_bucket_and_key() {
+    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let parts = parts_fixture();
+    let _owner = match store.begin_complete("up5", "b", "k", &parts).unwrap() {
+        BeginComplete::Owner(p) => p,
+        _ => panic!("must be Owner"),
+    };
+    for (bucket, key) in [("other", "k"), ("b", "other")] {
+        assert!(
+            matches!(
+                store.begin_complete("up5", bucket, key, &parts),
+                Err(S3Error::NoSuchUpload(_))
+            ),
+            "a Complete of {bucket}/{key} joined the completion of b/k"
+        );
+    }
+    assert!(matches!(
+        store.begin_complete("up5", "b", "k", &parts).unwrap(),
+        BeginComplete::Join(_)
+    ));
+}
+
+/// What the registry model says one `begin_complete` answers.
+#[derive(Debug, Clone, PartialEq)]
+enum ModelAnswer {
+    Owner,
+    Join,
+    AlreadyDone(String),
+    NoSuchUpload,
+    InvalidRequest,
+}
+
+/// The model of one upload id's completion slot.
+#[derive(Debug, Clone)]
+enum ModelSlot {
+    InFlight {
+        parts: usize,
+        bucket: usize,
+        key: usize,
+    },
+    Done {
+        parts: usize,
+        bucket: usize,
+        key: usize,
+        etag: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum RegistryOp {
+    Begin {
+        id: usize,
+        parts: usize,
+        bucket: usize,
+        key: usize,
+    },
+    PublishOk {
+        id: usize,
+    },
+    PublishErr {
+        id: usize,
+    },
+    DropOwner {
+        id: usize,
+    },
+}
+
+fn registry_op() -> impl proptest::strategy::Strategy<Value = RegistryOp> {
+    use proptest::prelude::*;
+    prop_oneof![
+        3 => (0..2usize, 0..2usize, 0..2usize, 0..2usize)
+            .prop_map(|(id, parts, bucket, key)| RegistryOp::Begin { id, parts, bucket, key }),
+        1 => (0..2usize).prop_map(|id| RegistryOp::PublishOk { id }),
+        1 => (0..2usize).prop_map(|id| RegistryOp::PublishErr { id }),
+        1 => (0..2usize).prop_map(|id| RegistryOp::DropOwner { id }),
+    ]
+}
+
+proptest::proptest! {
+    /// Model test of the completion registry (F33): over any sequence of
+    /// Completes (two upload ids, two part lists, two buckets, two keys),
+    /// publishes and dropped owners, `begin_complete` answers what the
+    /// model says. A request joins or hits the tombstone ONLY when its
+    /// bucket, key and part list all match the slot's.
+    #[test]
+    fn begin_complete_follows_the_registry_model(
+        ops in proptest::collection::vec(registry_op(), 1..40)
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let _rt = rt.enter();
+        let store = std::sync::Arc::new(MultipartStore::new(1024));
+        let part_lists = [parts_fixture(), vec![(1, "\"other\"".to_string())]];
+        let names = [["b0", "b1"], ["k0", "k1"]];
+        let id_of = |id: usize| format!("up-{id}");
+        let mut model: [Option<ModelSlot>; 2] = [None, None];
+        let mut owners: [Option<CompletionPublisher>; 2] = [None, None];
+        let mut published = 0;
+        for op in ops {
+            match op {
+                RegistryOp::Begin { id, parts, bucket, key } => {
+                    let want = match &model[id] {
+                        None => ModelAnswer::Owner,
+                        Some(ModelSlot::InFlight { parts: p, bucket: b, key: k }) => {
+                            if (*b, *k) != (bucket, key) {
+                                ModelAnswer::NoSuchUpload
+                            } else if *p != parts {
+                                ModelAnswer::InvalidRequest
+                            } else {
+                                ModelAnswer::Join
+                            }
+                        }
+                        Some(ModelSlot::Done { parts: p, bucket: b, key: k, etag }) => {
+                            if (*p, *b, *k) == (parts, bucket, key) {
+                                ModelAnswer::AlreadyDone(etag.clone())
+                            } else {
+                                ModelAnswer::NoSuchUpload
+                            }
+                        }
+                    };
+                    let got = match store.begin_complete(
+                        &id_of(id),
+                        names[0][bucket],
+                        names[1][key],
+                        &part_lists[parts],
+                    ) {
+                        Ok(BeginComplete::Owner(p)) => {
+                            owners[id] = Some(p);
+                            model[id] = Some(ModelSlot::InFlight { parts, bucket, key });
+                            ModelAnswer::Owner
+                        }
+                        Ok(BeginComplete::Join(_)) => ModelAnswer::Join,
+                        Ok(BeginComplete::AlreadyDone { etag }) => ModelAnswer::AlreadyDone(etag),
+                        Err(S3Error::NoSuchUpload(_)) => ModelAnswer::NoSuchUpload,
+                        Err(S3Error::InvalidRequest(_)) => ModelAnswer::InvalidRequest,
+                        Err(e) => panic!("unexpected {e:?}"),
+                    };
+                    proptest::prop_assert_eq!(got, want);
+                }
+                RegistryOp::PublishOk { id } => {
+                    if let Some(owner) = owners[id].take() {
+                        published += 1;
+                        let etag = format!("\"e{published}\"");
+                        owner.publish(Ok(etag.clone()));
+                        let Some(ModelSlot::InFlight { parts, bucket, key }) = model[id].take()
+                        else {
+                            panic!("an owner without an in-flight slot");
+                        };
+                        model[id] = Some(ModelSlot::Done { parts, bucket, key, etag });
+                    }
+                }
+                RegistryOp::PublishErr { id } => {
+                    if let Some(owner) = owners[id].take() {
+                        owner.publish(Err(CompletionFailure::internal("x")));
+                        model[id] = None;
+                    }
+                }
+                RegistryOp::DropOwner { id } => {
+                    if owners[id].take().is_some() {
+                        model[id] = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn completion_fingerprint_is_order_sensitive_and_content_sensitive() {
     let a = completion_fingerprint(&parts_fixture());
@@ -1397,10 +1568,12 @@ fn fn_name_reads_every_visibility_and_qualifier() {
 }
 
 /// The `uploads` lock guards the map only: a function that takes it does
-/// no file I/O (create, rename, delete) and calls none of the helpers
-/// that do. A slow disk then never blocks every UploadPart, ListParts and
-/// Complete of the node. Each such function names `self.uploads` and is
-/// checked here.
+/// no file I/O (create, rename, delete, read, fsync), hashes no part data,
+/// and calls none of the helpers that do. A slow disk then never blocks
+/// every UploadPart, ListParts and Complete of the node (F10 of epic #143:
+/// the part was written, fsynced and its MD5 computed under the lock).
+/// Each such function names `self.uploads` and is checked here; the
+/// runtime bound is `parallel_parts_never_hold_the_lock_or_the_reactor`.
 #[test]
 fn the_uploads_lock_is_never_held_for_file_io() {
     let text = crate::source_scan::prod_text(&crate::source_scan::read("src/multipart.rs"));
@@ -1415,6 +1588,13 @@ fn the_uploads_lock_is_never_held_for_file_io() {
         "create_dir",
         "discard_",
         "forget_relay_dir",
+        "read_to_end",
+        "sync_all",
+        "sync_data",
+        "Md5",
+        "Sha256",
+        "digest(",
+        "Hasher",
     ];
     let mut locking = Vec::new();
     let mut offenders = Vec::new();
