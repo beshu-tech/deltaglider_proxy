@@ -1976,20 +1976,20 @@ mod per_key_lockout_tests {
     #[test]
     fn the_s3_surfaces_never_lock_out_an_address() {
         let mut offenders = Vec::new();
-        for rel in ["src/api/auth.rs", "src/api/s3_router.rs"] {
-            let text = crate::source_scan::read(rel);
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                let code = line.split("//").next().unwrap_or("");
-                for call in [
-                    ".record_failure(",
-                    ".lockout_remaining(",
-                    ".is_limited(",
-                    ".progressive_delay(",
-                    ".failure_count(",
-                ] {
-                    if code.contains(call) {
-                        offenders.push(format!("{rel}:{n}: {}", line.trim()));
-                    }
+        for src in crate::source_scan::ast::src() {
+            if !["src/api/auth.rs", "src/api/s3_router.rs"].contains(&src.rel.as_str()) {
+                continue;
+            }
+            // A method call, or its UFCS form; a comment names none.
+            for name in [
+                "record_failure",
+                "lockout_remaining",
+                "is_limited",
+                "progressive_delay",
+                "failure_count",
+            ] {
+                for c in src.prod.calls_named(name) {
+                    offenders.push(format!("{}:{}: {name}(..)", src.rel, c.line));
                 }
             }
         }

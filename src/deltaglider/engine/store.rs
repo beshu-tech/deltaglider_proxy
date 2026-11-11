@@ -3187,28 +3187,22 @@ mod other_form_tests {
     #[test]
     fn writes_drop_the_other_form_through_one_helper() {
         let mut sites = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src/deltaglider/engine") {
-            let lines = crate::source_scan::prod_lines(&text);
-            let mut inside_helper = false;
-            for (n, line) in &lines {
-                let trimmed = line.trim_start();
-                if line.contains("async fn drop_other_form(") {
-                    inside_helper = true;
-                } else if inside_helper && (trimmed.starts_with("///") || trimmed.contains("fn ")) {
-                    // The next item.
-                    inside_helper = false;
-                }
-                let calls = [
-                    ".delete_delta_idempotent(",
-                    ".delete_passthrough_idempotent(",
-                ]
-                .iter()
-                .any(|c| line.contains(c));
-                if calls && !inside_helper {
-                    sites.push(format!("{file}:{n}"));
+        for src in crate::source_scan::ast::src() {
+            if !src.rel.starts_with("src/deltaglider/engine/") {
+                continue;
+            }
+            // A call of either delete outside the fn `drop_other_form`, under
+            // any layout (the old scan tracked "inside the helper" by lines of
+            // text between its signature and the next `fn `).
+            for name in ["delete_delta_idempotent", "delete_passthrough_idempotent"] {
+                for c in src.prod.calls_named(name) {
+                    if src.fn_name(c.func) != "drop_other_form" {
+                        sites.push(format!("{}:{}", src.rel, c.line));
+                    }
                 }
             }
         }
+        sites.sort();
         // The legacy-reference migration deletes the passthrough form that
         // it has just converted to a delta.
         assert_eq!(

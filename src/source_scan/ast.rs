@@ -31,6 +31,17 @@ fn pos(span: Span) -> Pos {
     (s.line, s.column)
 }
 
+impl Call {
+    /// Is this a call of `name`: the method name, or the last path segment?
+    pub(crate) fn named(&self, name: &str) -> bool {
+        if self.method {
+            self.name == name
+        } else {
+            self.segs.last().is_some_and(|s| s == name)
+        }
+    }
+}
+
 /// A method call (`recv.name(args)`) or a path call (`a::b(args)`).
 pub(crate) struct Call {
     /// 1-based line of the method name, or of the start of the path.
@@ -55,6 +66,8 @@ pub(crate) struct Call {
     pub arg_strings: Vec<String>,
     /// Per argument: the ident when it is a plain path (`&x`, `x`).
     pub arg_idents: Vec<Option<String>>,
+    /// Every ident in the arguments (path segments, fields, methods).
+    pub arg_idents_all: Vec<String>,
     /// Every macro in the arguments, as `(name, tokens text)`.
     pub arg_macros: Vec<(String, String)>,
     /// Every path call in the arguments, as its `::`-joined segments.
@@ -701,6 +714,7 @@ impl<'ast> Visit<'ast> for Collector {
             receiver_idents: idents_in(&m.receiver),
             arg_strings: m.args.iter().flat_map(string_literals).collect(),
             arg_idents: m.args.iter().map(as_ident).collect(),
+            arg_idents_all: m.args.iter().flat_map(idents_in).collect(),
             arg_macros: m.args.iter().flat_map(macros_in).collect(),
             arg_calls: m.args.iter().flat_map(calls_in).collect(),
             root_pos: Self::root_pos(&m.receiver),
@@ -727,6 +741,7 @@ impl<'ast> Visit<'ast> for Collector {
                 receiver_idents: Vec::new(),
                 arg_strings: c.args.iter().flat_map(string_literals).collect(),
                 arg_idents: c.args.iter().map(as_ident).collect(),
+                arg_idents_all: c.args.iter().flat_map(idents_in).collect(),
                 arg_macros: c.args.iter().flat_map(macros_in).collect(),
                 arg_calls: c.args.iter().flat_map(calls_in).collect(),
                 root_pos: None,
