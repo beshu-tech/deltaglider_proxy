@@ -47,12 +47,18 @@ pub(crate) struct Call {
     pub generics: Vec<String>,
     /// Number of arguments.
     pub argc: usize,
+    /// Per argument: `Some(b)` when it is the literal `true`/`false`.
+    pub arg_bools: Vec<Option<bool>>,
+    /// Method calls: every ident in the receiver chain (fields, methods, path segments).
+    pub receiver_idents: Vec<String>,
     /// Every string literal in the arguments (any depth, macro bodies too).
     pub arg_strings: Vec<String>,
     /// Per argument: the ident when it is a plain path (`&x`, `x`).
     pub arg_idents: Vec<Option<String>>,
     /// Every macro in the arguments, as `(name, tokens text)`.
     pub arg_macros: Vec<(String, String)>,
+    /// Every path call in the arguments, as its `::`-joined segments.
+    pub arg_calls: Vec<String>,
     /// Method calls: position of the call at the root of the receiver chain
     /// (`Command::new(x).arg(y).current_dir(z)` → the `Command::new` call).
     pub root_pos: Option<Pos>,
@@ -115,6 +121,9 @@ pub(crate) struct PathUse {
     pub func: usize,
     pub segs: Vec<String>,
     pub alias: Option<String>,
+    /// An expression path (`IamState::Disabled` as a value), not a pattern,
+    /// a type or a `use`.
+    pub expr: bool,
 }
 
 /// A struct pattern `Path { field, .. }` (a destructuring read of `field`).
@@ -133,11 +142,74 @@ pub(crate) struct Facts {
     pub bindings: Vec<Binding>,
     pub paths: Vec<PathUse>,
     pub pat_fields: Vec<PatField>,
-    /// `fn_names[id - 1]` is the name of fn `id`.
-    pub fn_names: Vec<String>,
+    pub struct_lits: Vec<StructLit>,
+    pub indexes: Vec<Index>,
+    pub tuples: Vec<Tuple>,
+    /// `&mut x.field`, `x.field = ..`, `x.field += ..`.
+    pub field_writes: Vec<Field>,
 }
 
 impl Facts {
+    /// Every call whose method name, or last path segment, is `name`.
+    pub(crate) fn calls_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Call> {
+        self.calls.iter().filter(move |c| {
+            if c.method {
+                c.name == name
+            } else {
+                c.segs.last().is_some_and(|s| s == name)
+            }
+        })
+    }
+
+    /// Does any path start at `ident` (`use aws_sdk_s3::..`, `aws_sdk_s3::Client`)?
+    pub(crate) fn mentions(&self, ident: &str) -> bool {
+        self.paths
+            .iter()
+            .any(|p| p.segs.first().is_some_and(|s| s == ident))
+    }
+}
+
+/// `base[start..end]`: the idents of the range's ends.
+pub(crate) struct Index {
+    pub line: usize,
+    pub func: usize,
+    /// The last field or path segment of the indexed value (`buf` in `st.buf[..]`).
+    pub base_leaf: Option<String>,
+    /// Every ident (path segment, field, method name) in the range's bounds.
+    pub bound_idents: Vec<String>,
+    pub ranged: bool,
+}
+
+/// A tuple expression `(a, b(..), c)`: per element, the leaf of its path or
+/// of the path it calls (`StatusCode::NO_CONTENT` → `NO_CONTENT`, `Json(x)` → `Json`).
+pub(crate) struct Tuple {
+    pub line: usize,
+    pub func: usize,
+    pub elems: Vec<String>,
+}
+
+/// A struct literal `Path { a: 1, b, ..rest }`.
+pub(crate) struct StructLit {
+    pub line: usize,
+    pub func: usize,
+    pub path_last: String,
+    pub fields: Vec<String>,
+    pub rest: bool,
+}
+
+/// One parsed file. The facts of production code and of test code (a
+/// `#[cfg(test)]` item, a `#[test]` fn, or a whole test file) are apart, so a
+/// guard names the code it is about without counting braces.
+pub(crate) struct Source {
+    /// Path relative to the crate root, `/` separators.
+    pub rel: String,
+    pub prod: Facts,
+    pub test: Facts,
+    /// `fn_names[id - 1]` is the name of fn `id`.
+    fn_names: Vec<String>,
+}
+
+impl Source {
     pub(crate) fn fn_name(&self, id: usize) -> &str {
         if id == 0 {
             ""
@@ -147,35 +219,19 @@ impl Facts {
     }
 }
 
-/// One parsed file.
-pub(crate) struct Source {
-    /// Path relative to the crate root, `/` separators.
-    pub rel: String,
-    pub facts: Facts,
+/// Parse `text` as the production-or-test file `rel`. Fixtures of the
+/// guards use this.
+pub(crate) fn parse(rel: &str, text: &str) -> Source {
+    parse_as(rel, text, false)
 }
 
-impl Source {
-    /// Does any path in the file start at `ident` (`use aws_sdk_s3::..`,
-    /// `aws_sdk_s3::Client`)?
-    pub(crate) fn mentions(&self, ident: &str) -> bool {
-        self.facts
-            .paths
-            .iter()
-            .any(|p| p.segs.first().is_some_and(|s| s == ident))
-    }
+/// Parse `text` as a file that is test code throughout (`tests/*.rs`, an
+/// out-of-line `#[cfg(test)] mod x;`): everything lands in `Source::test`.
+pub(crate) fn parse_test_file(rel: &str, text: &str) -> Source {
+    parse_as(rel, text, true)
 }
 
-/// Which items a scan sees.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Scope {
-    /// Production code: `#[cfg(test)]` items and `#[test]` fns are left out.
-    Prod,
-    /// Everything (the files of `tests/`, where every fn is a test).
-    All,
-}
-
-/// Parse `text` as the file `rel`. Fixtures of the guards use this.
-pub(crate) fn parse(rel: &str, text: &str, scope: Scope) -> Source {
+fn parse_as(rel: &str, text: &str, test_file: bool) -> Source {
     let file = syn::parse_file(text).unwrap_or_else(|e| {
         let at = e.span().start();
         panic!(
@@ -184,15 +240,21 @@ pub(crate) fn parse(rel: &str, text: &str, scope: Scope) -> Source {
         )
     });
     let mut c = Collector {
-        skip_tests: scope == Scope::Prod,
+        test_depth: usize::from(test_file),
         func: vec![0],
         assert_depth: 0,
-        facts: Facts::default(),
+        in_expr_path: 0,
+        in_pat_path: false,
+        prod: Facts::default(),
+        test: Facts::default(),
+        fn_names: Vec::new(),
     };
     c.visit_file(&file);
     Source {
         rel: rel.to_string(),
-        facts: c.facts,
+        prod: c.prod,
+        test: c.test,
+        fn_names: c.fn_names,
     }
 }
 
@@ -206,32 +268,50 @@ fn cached(key: String, build: impl FnOnce() -> Vec<Source>) -> &'static [Source]
         .or_insert_with(|| Box::leak(build().into_boxed_slice()))
 }
 
-/// Every production source file of `src/` (the out-of-line test modules are
-/// left out), parsed once, `#[cfg(test)]` items removed.
-pub(crate) fn prod() -> &'static [Source] {
-    cached("prod:src".into(), || {
-        super::prod_sources("src")
-            .into_iter()
-            .map(|(rel, text)| parse(&rel, &text, Scope::Prod))
-            .collect()
-    })
-}
-
-/// Every `.rs` file under `dir` (relative to the crate root), all items.
-pub(crate) fn all(dir: &str) -> &'static [Source] {
-    cached(format!("all:{dir}"), || {
-        super::rust_files(dir)
+/// Every `.rs` file of `src/`, parsed once per test binary. A file that an
+/// out-of-line `#[cfg(test)] mod x;` names is test code throughout.
+pub(crate) fn src() -> &'static [Source] {
+    cached("src".into(), || {
+        let files = super::rust_files("src");
+        let tests = super::out_of_line_test_modules(&files);
+        files
             .into_iter()
             .map(|f| {
-                parse(
-                    &super::rel(&f),
-                    &std::fs::read_to_string(&f).unwrap(),
-                    Scope::All,
-                )
+                let text = std::fs::read_to_string(&f).unwrap();
+                parse_as(&super::rel(&f), &text, tests.contains(&f))
             })
             .collect()
     })
 }
+
+/// Every `.rs` file under `tests/` (test code throughout), parsed once.
+pub(crate) fn tests() -> &'static [Source] {
+    cached("tests".into(), || {
+        super::rust_files("tests")
+            .into_iter()
+            .map(|f| {
+                let text = std::fs::read_to_string(&f).unwrap();
+                parse_test_file(&super::rel(&f), &text)
+            })
+            .collect()
+    })
+}
+
+/// Methods that test a string against a literal.
+pub(crate) const TEXT_METHODS: [&str; 12] = [
+    "contains",
+    "starts_with",
+    "ends_with",
+    "eq_ignore_ascii_case",
+    "eq",
+    "ne",
+    "find",
+    "rfind",
+    "matches",
+    "strip_prefix",
+    "strip_suffix",
+    "split",
+];
 
 // ----- expression helpers ---------------------------------------------------
 
@@ -260,6 +340,35 @@ pub(crate) fn as_ident(e: &Expr) -> Option<String> {
         Expr::Group(g) => as_ident(&g.expr),
         _ => None,
     }
+}
+
+/// `Some(b)` when `e` is the literal `true` / `false`.
+fn as_bool(e: &Expr) -> Option<bool> {
+    match e {
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Bool(b),
+            ..
+        }) => Some(b.value),
+        _ => None,
+    }
+}
+
+/// Every ident in `e`: path segments, field names, method names.
+pub(crate) fn idents_in(e: &Expr) -> Vec<String> {
+    struct V(Vec<String>);
+    impl<'ast> Visit<'ast> for V {
+        fn visit_ident(&mut self, i: &'ast syn::Ident) {
+            self.0.push(i.to_string());
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            for e in macro_exprs(m) {
+                self.visit_expr(&e);
+            }
+        }
+    }
+    let mut v = V(Vec::new());
+    v.visit_expr(e);
+    v.0
 }
 
 /// The last segment of `e` when it is a path (`crate::m::X` → `X`).
@@ -307,6 +416,27 @@ pub(crate) fn macros_in(e: &Expr) -> Vec<(String, String)> {
     v.0
 }
 
+/// Every path call inside `e` (`HeaderMap::new()` → `HeaderMap::new`).
+pub(crate) fn calls_in(e: &Expr) -> Vec<String> {
+    struct V(Vec<String>);
+    impl<'ast> Visit<'ast> for V {
+        fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+            if let Expr::Path(p) = &*c.func {
+                self.0.push(expr_path_segs(p).join("::"));
+            }
+            visit::visit_expr_call(self, c);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            for e in macro_exprs(m) {
+                self.visit_expr(&e);
+            }
+        }
+    }
+    let mut v = V(Vec::new());
+    v.visit_expr(e);
+    v.0
+}
+
 /// A macro body read as a comma list of expressions (`assert!(a, "m")`,
 /// `format!(..)`, `matches!(x, Pat)`); empty when it is not one.
 pub(crate) fn macro_exprs(m: &syn::Macro) -> Vec<Expr> {
@@ -325,11 +455,17 @@ fn is_assert_macro(m: &syn::Macro) -> bool {
 // ----- the collector ----------------------------------------------------------
 
 struct Collector {
-    skip_tests: bool,
+    /// > 0 inside a `#[cfg(test)]` item or a `#[test]` fn.
+    test_depth: usize,
     /// Stack of fn ids; the last one is the enclosing fn (0 = none).
     func: Vec<usize>,
     assert_depth: usize,
-    facts: Facts,
+    /// > 0 while visiting the path of an `ExprPath` (recorded whole there).
+    in_expr_path: usize,
+    in_pat_path: bool,
+    prod: Facts,
+    test: Facts,
+    fn_names: Vec<String>,
 }
 
 fn cfg_test(attrs: &[Attribute]) -> bool {
@@ -416,8 +552,17 @@ fn expr_path_segs(p: &syn::ExprPath) -> Vec<String> {
 }
 
 impl Collector {
-    fn hidden(&self, attrs: &[Attribute]) -> bool {
-        self.skip_tests && (cfg_test(attrs) || test_attr(attrs))
+    fn is_test(attrs: &[Attribute]) -> bool {
+        cfg_test(attrs) || test_attr(attrs)
+    }
+
+    /// The facts of the code being visited.
+    fn cur(&mut self) -> &mut Facts {
+        if self.test_depth > 0 {
+            &mut self.test
+        } else {
+            &mut self.prod
+        }
     }
 
     fn func(&self) -> usize {
@@ -425,8 +570,8 @@ impl Collector {
     }
 
     fn enter(&mut self, name: &syn::Ident) {
-        self.facts.fn_names.push(name.to_string());
-        self.func.push(self.facts.fn_names.len());
+        self.fn_names.push(name.to_string());
+        self.func.push(self.fn_names.len());
     }
 
     fn leave(&mut self) {
@@ -439,13 +584,33 @@ impl Collector {
             _ => None,
         }
     }
+
+    /// Visit `body` as test code when `attrs` say so.
+    fn scoped(&mut self, attrs: &[Attribute], body: impl FnOnce(&mut Self)) {
+        let test = Self::is_test(attrs);
+        if test {
+            self.test_depth += 1;
+        }
+        body(self);
+        if test {
+            self.test_depth -= 1;
+        }
+    }
+
+    fn bind(&mut self, name: String, init: &Expr) {
+        let func = self.func();
+        self.cur().bindings.push(Binding {
+            func,
+            name,
+            init_macros: macros_in(init),
+            init_root_pos: Self::root_pos(init),
+        });
+    }
 }
 
 impl<'ast> Visit<'ast> for Collector {
     fn visit_item(&mut self, i: &'ast Item) {
-        if !self.hidden(item_attrs(i)) {
-            visit::visit_item(self, i);
-        }
+        self.scoped(item_attrs(i), |c| visit::visit_item(c, i));
     }
 
     fn visit_impl_item(&mut self, i: &'ast ImplItem) {
@@ -455,9 +620,7 @@ impl<'ast> Visit<'ast> for Collector {
             ImplItem::Macro(m) => &m.attrs,
             _ => &[][..],
         };
-        if !self.hidden(attrs) {
-            visit::visit_impl_item(self, i);
-        }
+        self.scoped(attrs, |c| visit::visit_impl_item(c, i));
     }
 
     fn visit_trait_item(&mut self, i: &'ast TraitItem) {
@@ -467,9 +630,7 @@ impl<'ast> Visit<'ast> for Collector {
             TraitItem::Macro(m) => &m.attrs,
             _ => &[][..],
         };
-        if !self.hidden(attrs) {
-            visit::visit_trait_item(self, i);
-        }
+        self.scoped(attrs, |c| visit::visit_trait_item(c, i));
     }
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
@@ -491,22 +652,12 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
-        self.facts.bindings.push(Binding {
-            func: self.func(),
-            name: i.ident.to_string(),
-            init_macros: macros_in(&i.expr),
-            init_root_pos: Self::root_pos(&i.expr),
-        });
+        self.bind(i.ident.to_string(), &i.expr);
         visit::visit_item_const(self, i);
     }
 
     fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
-        self.facts.bindings.push(Binding {
-            func: self.func(),
-            name: i.ident.to_string(),
-            init_macros: macros_in(&i.expr),
-            init_root_pos: Self::root_pos(&i.expr),
-        });
+        self.bind(i.ident.to_string(), &i.expr);
         visit::visit_item_static(self, i);
     }
 
@@ -517,12 +668,7 @@ impl<'ast> Visit<'ast> for Collector {
                 pat = &t.pat;
             }
             if let Pat::Ident(id) = pat {
-                self.facts.bindings.push(Binding {
-                    func: self.func(),
-                    name: id.ident.to_string(),
-                    init_macros: macros_in(&init.expr),
-                    init_root_pos: Self::root_pos(&init.expr),
-                });
+                self.bind(id.ident.to_string(), &init.expr);
             }
         }
         visit::visit_local(self, l);
@@ -530,37 +676,42 @@ impl<'ast> Visit<'ast> for Collector {
 
     fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
         let root = chain_root(&m.receiver);
-        self.facts.calls.push(Call {
+        let generics = m
+            .turbofish
+            .as_ref()
+            .map(|t| {
+                let mut p = syn::Path::from(m.method.clone());
+                p.segments[0].arguments = syn::PathArguments::AngleBracketed(t.clone());
+                generic_idents(&p)
+            })
+            .unwrap_or_default();
+        let call = Call {
             line: m.method.span().start().line,
             pos: pos(m.method.span()),
             func: self.func(),
             name: m.method.to_string(),
             method: true,
             segs: Vec::new(),
-            generics: m
-                .turbofish
-                .as_ref()
-                .map(|t| {
-                    let mut p = syn::Path::from(m.method.clone());
-                    p.segments[0].arguments = syn::PathArguments::AngleBracketed(t.clone());
-                    generic_idents(&p)
-                })
-                .unwrap_or_default(),
+            generics,
             argc: m.args.len(),
+            arg_bools: m.args.iter().map(as_bool).collect(),
+            receiver_idents: idents_in(&m.receiver),
             arg_strings: m.args.iter().flat_map(string_literals).collect(),
             arg_idents: m.args.iter().map(as_ident).collect(),
             arg_macros: m.args.iter().flat_map(macros_in).collect(),
+            arg_calls: m.args.iter().flat_map(calls_in).collect(),
             root_pos: Self::root_pos(&m.receiver),
             root_ident: path_leaf(root),
             in_assert: self.assert_depth > 0,
-        });
+        };
+        self.cur().calls.push(call);
         visit::visit_expr_method_call(self, m);
     }
 
     fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
         if let Expr::Path(p) = &*c.func {
             let segs = expr_path_segs(p);
-            self.facts.calls.push(Call {
+            let call = Call {
                 line: p.span().start().line,
                 pos: pos(c.span()),
                 func: self.func(),
@@ -569,59 +720,213 @@ impl<'ast> Visit<'ast> for Collector {
                 segs,
                 generics: generic_idents(&p.path),
                 argc: c.args.len(),
+                arg_bools: c.args.iter().map(as_bool).collect(),
+                receiver_idents: Vec::new(),
                 arg_strings: c.args.iter().flat_map(string_literals).collect(),
                 arg_idents: c.args.iter().map(as_ident).collect(),
                 arg_macros: c.args.iter().flat_map(macros_in).collect(),
+                arg_calls: c.args.iter().flat_map(calls_in).collect(),
                 root_pos: None,
                 root_ident: None,
                 in_assert: self.assert_depth > 0,
-            });
+            };
+            self.cur().calls.push(call);
         }
         visit::visit_expr_call(self, c);
     }
 
     fn visit_expr_field(&mut self, f: &'ast syn::ExprField) {
         if let syn::Member::Named(n) = &f.member {
-            self.facts.fields.push(Field {
+            let field = Field {
                 line: n.span().start().line,
                 func: self.func(),
                 name: n.to_string(),
-            });
+            };
+            self.cur().fields.push(field);
         }
         visit::visit_expr_field(self, f);
     }
 
+    fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+        self.field_write(&a.left);
+        visit::visit_expr_assign(self, a);
+    }
+
+    fn visit_expr_reference(&mut self, r: &'ast syn::ExprReference) {
+        if r.mutability.is_some() {
+            self.field_write(&r.expr);
+        }
+        visit::visit_expr_reference(self, r);
+    }
+
+    fn visit_expr_struct(&mut self, s: &'ast syn::ExprStruct) {
+        let fields: Vec<String> = s
+            .fields
+            .iter()
+            .filter_map(|f| match &f.member {
+                syn::Member::Named(n) => Some(n.to_string()),
+                _ => None,
+            })
+            .collect();
+        let func = self.func();
+        for name in &fields {
+            let line = s.path.span().start().line;
+            self.cur().field_writes.push(Field {
+                line,
+                func,
+                name: name.clone(),
+            });
+        }
+        let lit = StructLit {
+            line: s.path.span().start().line,
+            func,
+            path_last: s
+                .path
+                .segments
+                .last()
+                .map(|x| x.ident.to_string())
+                .unwrap_or_default(),
+            fields,
+            rest: s.rest.is_some(),
+        };
+        self.cur().struct_lits.push(lit);
+        visit::visit_expr_struct(self, s);
+    }
+
+    fn visit_expr_index(&mut self, i: &'ast syn::ExprIndex) {
+        let (ranged, bound_idents) = match &*i.index {
+            Expr::Range(r) => (
+                true,
+                r.start
+                    .iter()
+                    .chain(r.end.iter())
+                    .flat_map(|b| idents_in(b))
+                    .collect(),
+            ),
+            other => (false, idents_in(other)),
+        };
+        let ix = Index {
+            line: i.bracket_token.span.open().start().line,
+            func: self.func(),
+            base_leaf: match &*i.expr {
+                Expr::Field(f) => match &f.member {
+                    syn::Member::Named(n) => Some(n.to_string()),
+                    _ => None,
+                },
+                other => path_leaf(other),
+            },
+            bound_idents,
+            ranged,
+        };
+        self.cur().indexes.push(ix);
+        visit::visit_expr_index(self, i);
+    }
+
+    fn visit_expr_tuple(&mut self, t: &'ast syn::ExprTuple) {
+        let elems = t
+            .elems
+            .iter()
+            .map(|e| match e {
+                Expr::Call(c) => match &*c.func {
+                    Expr::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+                    _ => None,
+                },
+                other => path_leaf(other),
+            })
+            .map(|x| x.unwrap_or_default())
+            .collect();
+        let tu = Tuple {
+            line: t.paren_token.span.open().start().line,
+            func: self.func(),
+            elems,
+        };
+        self.cur().tuples.push(tu);
+        visit::visit_expr_tuple(self, t);
+    }
+
     fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
+        let compound = matches!(
+            b.op,
+            syn::BinOp::AddAssign(_)
+                | syn::BinOp::SubAssign(_)
+                | syn::BinOp::MulAssign(_)
+                | syn::BinOp::DivAssign(_)
+                | syn::BinOp::BitOrAssign(_)
+                | syn::BinOp::BitAndAssign(_)
+                | syn::BinOp::ShlAssign(_)
+                | syn::BinOp::ShrAssign(_)
+                | syn::BinOp::RemAssign(_)
+                | syn::BinOp::BitXorAssign(_)
+        );
+        if compound {
+            self.field_write(&b.left);
+        }
         if matches!(b.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
-            self.facts.cmps.push(Cmp {
+            let cmp = Cmp {
                 line: b.op.span().start().line,
                 func: self.func(),
                 lhs: Side::of(&b.left),
                 rhs: Side::of(&b.right),
                 in_assert: self.assert_depth > 0,
-            });
+            };
+            self.cur().cmps.push(cmp);
         }
         visit::visit_expr_binary(self, b);
     }
 
     fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
-        self.facts.paths.push(PathUse {
-            line: p.span().start().line,
-            func: self.func(),
-            segs: expr_path_segs(p),
-            alias: None,
-        });
+        // A pattern path is recorded by `visit_pat`, as no value.
+        if !self.in_pat_path {
+            let u = PathUse {
+                line: p.span().start().line,
+                func: self.func(),
+                segs: expr_path_segs(p),
+                alias: None,
+                expr: true,
+            };
+            self.cur().paths.push(u);
+        }
+        self.in_expr_path += 1;
         visit::visit_expr_path(self, p);
+        self.in_expr_path -= 1;
+    }
+
+    fn visit_pat(&mut self, p: &'ast Pat) {
+        if let Pat::Path(ep) = p {
+            // `X::Unit` in a pattern is no value.
+            let u = PathUse {
+                line: ep.span().start().line,
+                func: self.func(),
+                segs: expr_path_segs(ep),
+                alias: None,
+                expr: false,
+            };
+            self.cur().paths.push(u);
+            self.in_expr_path += 1;
+            self.in_pat_path = true;
+            visit::visit_pat(self, p);
+            self.in_pat_path = false;
+            self.in_expr_path -= 1;
+        } else {
+            visit::visit_pat(self, p);
+        }
     }
 
     fn visit_path(&mut self, p: &'ast syn::Path) {
-        self.facts.paths.push(PathUse {
-            line: p.span().start().line,
-            func: self.func(),
-            segs: segs_of(p),
-            alias: None,
-        });
+        // The path of an `ExprPath` is recorded whole by `visit_expr_path`.
+        if self.in_expr_path == 0 {
+            let u = PathUse {
+                line: p.span().start().line,
+                func: self.func(),
+                segs: segs_of(p),
+                alias: None,
+                expr: false,
+            };
+            self.cur().paths.push(u);
+        }
+        let saved = std::mem::take(&mut self.in_expr_path);
         visit::visit_path(self, p);
+        self.in_expr_path = saved;
     }
 
     fn visit_use_tree(&mut self, t: &'ast syn::UseTree) {
@@ -660,12 +965,14 @@ impl<'ast> Visit<'ast> for Collector {
         }
         let mut out = Vec::new();
         leaves(t, &mut Vec::new(), &mut out);
+        let func = self.func();
         for (segs, alias, line) in out {
-            self.facts.paths.push(PathUse {
+            self.cur().paths.push(PathUse {
                 line,
-                func: self.func(),
+                func,
                 segs,
                 alias,
+                expr: false,
             });
         }
         // Not `visit::visit_use_tree`: the leaves are recorded whole above.
@@ -675,12 +982,13 @@ impl<'ast> Visit<'ast> for Collector {
         if let Some(last) = p.path.segments.last() {
             for f in &p.fields {
                 if let syn::Member::Named(n) = &f.member {
-                    self.facts.pat_fields.push(PatField {
+                    let pf = PatField {
                         line: n.span().start().line,
                         func: self.func(),
                         path_last: last.ident.to_string(),
                         field: n.to_string(),
-                    });
+                    };
+                    self.cur().pat_fields.push(pf);
                 }
             }
         }
@@ -692,8 +1000,16 @@ impl<'ast> Visit<'ast> for Collector {
         if assert {
             self.assert_depth += 1;
         }
-        for e in macro_exprs(m) {
-            self.visit_expr(&e);
+        let name = m.path.segments.last().map(|s| s.ident.to_string());
+        let exprs = macro_exprs(m);
+        // `matches!(value, Pattern)`: only the value is an expression.
+        let take = if name.as_deref() == Some("matches") {
+            1
+        } else {
+            exprs.len()
+        };
+        for e in exprs.iter().take(take) {
+            self.visit_expr(e);
         }
         if assert {
             self.assert_depth -= 1;
@@ -702,34 +1018,56 @@ impl<'ast> Visit<'ast> for Collector {
     }
 }
 
+impl Collector {
+    /// Record `e` as a field written (`x.field = ..`, `&mut x.field`).
+    fn field_write(&mut self, e: &Expr) {
+        if let Expr::Field(f) = e {
+            if let syn::Member::Named(n) = &f.member {
+                let w = Field {
+                    line: n.span().start().line,
+                    func: self.func(),
+                    name: n.to_string(),
+                };
+                self.cur().field_writes.push(w);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn src(text: &str) -> Source {
-        parse("fixture.rs", text, Scope::Prod)
-    }
-
     #[test]
-    fn cfg_test_items_and_test_fns_are_left_out_of_a_prod_scan() {
-        let s = src("fn prod() { a.one(); }\n\
+    fn cfg_test_items_and_test_fns_are_test_facts() {
+        let s = parse(
+            "fixture.rs",
+            "fn prod() { a.one(); }\n\
              #[cfg(test)] fn only_in_tests() { a.two(); }\n\
              fn also_prod() { a.three(); }\n\
              #[cfg(test)] mod tests { fn t() { a.four(); } }\n\
              #[test] fn unit() { a.five(); }\n\
              #[cfg(not(test))] fn real() { a.six(); }\n\
-             impl X { #[cfg(test)] fn h(&self) { a.seven(); } fn p(&self) { a.eight(); } }\n");
-        let names: Vec<&str> = s.facts.calls.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["one", "three", "six", "eight"]);
-        let all = parse("f.rs", "#[test] fn unit() { a.five(); }", Scope::All);
-        assert_eq!(all.facts.calls.len(), 1, "an All scan keeps test fns");
+             impl X { #[cfg(test)] fn h(&self) { a.seven(); } fn p(&self) { a.eight(); } }\n",
+        );
+        let names = |f: &Facts| f.calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&s.prod), ["one", "three", "six", "eight"]);
+        assert_eq!(names(&s.test), ["two", "four", "five", "seven"]);
+        let t = parse_test_file("f.rs", "fn helper() { a.x(); }");
+        assert!(
+            t.prod.calls.is_empty() && t.test.calls.len() == 1,
+            "a test file"
+        );
     }
 
     #[test]
     fn calls_carry_line_fn_and_chain_root_even_when_split() {
-        let s = src("fn f() {\n    let c = Command::new(B)\n        .arg(1)\n        .current_dir(d);\n    c.arg(2)\n        .current_dir(e);\n}\n");
+        let s = parse(
+            "fixture.rs",
+            "fn f() {\n    let c = Command::new(B)\n        .arg(1)\n        .current_dir(d);\n    c.arg(2)\n        .current_dir(e);\n}\n",
+        );
         let cwd: Vec<&Call> = s
-            .facts
+            .prod
             .calls
             .iter()
             .filter(|c| c.name == "current_dir")
@@ -738,14 +1076,17 @@ mod tests {
         assert_eq!(cwd[0].line, 4, "the line of the method name");
         assert!(cwd[0].root_pos.is_some(), "rooted at Command::new");
         assert_eq!(cwd[1].root_ident.as_deref(), Some("c"));
-        assert_eq!(s.facts.fn_name(cwd[0].func), "f");
+        assert_eq!(s.fn_name(cwd[0].func), "f");
     }
 
     #[test]
     fn calls_inside_macros_and_asserts_are_seen() {
-        let s = src("fn f() { assert!(x.contains(\"A\")); println!(\"{}\", y.contains(\"B\")); }");
+        let s = parse(
+            "fixture.rs",
+            "fn f() { assert!(x.contains(\"A\")); println!(\"{}\", y.contains(\"B\")); }",
+        );
         let c: Vec<(&str, bool)> = s
-            .facts
+            .prod
             .calls
             .iter()
             .map(|c| (c.name.as_str(), c.in_assert))
@@ -754,27 +1095,59 @@ mod tests {
     }
 
     #[test]
-    fn paths_see_aliases_and_qualified_forms() {
-        let s = src("use a::b::Cmd as C;\nfn f() { C::new(1); <T as From<u8>>::from(1); }");
-        assert!(s
-            .facts
+    fn paths_see_aliases_qualified_forms_and_patterns() {
+        let s = parse(
+            "fixture.rs",
+            "use a::b::Cmd as C;\nfn f() { C::new(1); <T as From<u8>>::from(1); let _ = X::Unit; if let X::Unit = v {} matches!(v, X::Unit); }",
+        );
+        let p = &s.prod;
+        assert!(p
             .paths
             .iter()
             .any(|p| p.segs == ["a", "b", "Cmd"] && p.alias.as_deref() == Some("C")));
-        assert!(s.facts.calls.iter().any(|c| c.segs == ["T", "from"]));
-        assert!(s.mentions("a"));
+        assert!(p.calls.iter().any(|c| c.segs == ["T", "from"]));
+        assert!(p.mentions("a"));
+        // `X::Unit` is a value once; the pattern and the `matches!` arm are not.
+        let values = p
+            .paths
+            .iter()
+            .filter(|p| p.expr && p.segs == ["X", "Unit"])
+            .count();
+        assert_eq!(values, 1);
     }
 
     #[test]
-    fn struct_patterns_and_field_reads_are_facts() {
-        let s = src("fn f(o: O) { let O { body, .. } = o; let _ = o.body; let _ = o.body(); }");
-        assert_eq!(s.facts.pat_fields.len(), 1);
-        assert_eq!(s.facts.fields.len(), 1, "o.body() is a call, not a field");
+    fn struct_patterns_field_reads_and_writes_are_facts() {
+        let s = parse(
+            "fixture.rs",
+            "fn f(o: O, n: u8) { let O { body, .. } = o; let _ = o.body; let _ = o.body(); \
+             o.t = 1; o.u += 1; g(&mut o.v); let _ = O { w: 1, n, ..d }; }",
+        );
+        let p = &s.prod;
+        assert_eq!(p.pat_fields.len(), 1);
+        assert_eq!(
+            p.fields.iter().filter(|f| f.name == "body").count(),
+            1,
+            "o.body() is a call"
+        );
+        let mut w: Vec<&str> = p.field_writes.iter().map(|f| f.name.as_str()).collect();
+        w.sort();
+        assert_eq!(
+            w,
+            ["n", "t", "u", "v", "w"],
+            "assign, compound, &mut, literal, shorthand"
+        );
+        assert_eq!(p.struct_lits.len(), 1);
+        assert!(p.struct_lits[0].rest);
     }
 
     #[test]
     fn the_whole_tree_parses() {
-        assert!(prod().len() > 100, "syn parsed the production sources");
-        assert!(all("tests").len() > 50, "syn parsed tests/");
+        assert!(src().len() > 100, "syn parsed the sources");
+        assert!(tests().len() > 50, "syn parsed tests/");
+        assert!(
+            src().iter().any(|s| !s.test.calls.is_empty()),
+            "test code is split out"
+        );
     }
 }

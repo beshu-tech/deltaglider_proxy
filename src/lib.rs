@@ -871,20 +871,10 @@ mod source_guards {
     /// `s3 sync --delete` deleted such client files.
     #[test]
     fn reference_keys_are_matched_by_the_one_rule() {
-        let text_match = |code: &str| {
-            ["ends_with(", "contains("]
-                .iter()
-                .any(|m| code.contains(&format!("{m}\"reference.bin")))
-        };
-        assert!(text_match(r#"k.ends_with("reference.bin")"#));
-        assert!(text_match(r#"k.contains("reference.bin")"#));
-        assert!(!text_match("crate::types::is_reference_key(k)"));
         let mut bad = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                if text_match(line.split("//").next().unwrap_or("")) {
-                    bad.push(format!("{file}:{n}"));
-                }
+        for src in crate::source_scan::ast::src() {
+            for (n, what) in reference_text_matches(&src.prod) {
+                bad.push(format!("{}:{n}: {what}", src.rel));
             }
         }
         assert!(bad.is_empty(), "use types::is_reference_key: {bad:?}");
@@ -892,6 +882,84 @@ mod source_guards {
         assert!(crate::types::is_reference_key("reference.bin"));
         assert!(!crate::types::is_reference_key("docs/api-reference.bin"));
         assert!(!crate::types::is_reference_key("reference.bin/x"));
+    }
+
+    /// Does `lit` name `reference.bin` without a `/` right before it? The
+    /// segment-anchored `"/reference.bin"` is a correct test of the last
+    /// segment; a bare `"reference.bin"` suffix also takes `api-reference.bin`.
+    fn unanchored_reference(lit: &str) -> bool {
+        lit.match_indices("reference.bin")
+            .any(|(i, _)| !lit[..i].ends_with('/'))
+    }
+
+    /// `(line, what)` of every text test of a key against `reference.bin`:
+    /// a text method (`ends_with`, `contains`, `strip_suffix`, `rsplit`, ...)
+    /// with a literal that names it, however the call is laid out, and a `==`
+    /// against `.to_string()` / `.as_str()` text of it. The old scan wanted
+    /// `ends_with("reference.bin` or `contains("reference.bin` on one line.
+    fn reference_text_matches(f: &crate::source_scan::ast::Facts) -> Vec<(usize, String)> {
+        let mut out: Vec<(usize, String)> = f
+            .calls
+            .iter()
+            .filter(|c| {
+                c.method && crate::source_scan::ast::TEXT_METHODS.contains(&c.name.as_str())
+            })
+            .filter(|c| c.arg_strings.iter().any(|l| unanchored_reference(l)))
+            .map(|c| (c.line, format!(".{}(\"..reference.bin..\")", c.name)))
+            .collect();
+        out.extend(
+            f.cmps
+                .iter()
+                .filter(|c| {
+                    [&c.lhs, &c.rhs]
+                        .iter()
+                        .any(|side| side.strings.iter().any(|l| unanchored_reference(l)))
+                        && [&c.lhs, &c.rhs].iter().any(|side| {
+                            side.method
+                                .as_deref()
+                                .is_some_and(|m| matches!(m, "to_string" | "as_str" | "as_ref"))
+                        })
+                })
+                .map(|c| (c.line, "key == \"..reference.bin\"".to_string())),
+        );
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn the_reference_key_guard_sees_split_and_other_text_methods() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| reference_text_matches(&parse("f.rs", t).prod).len();
+        assert_eq!(n("fn f() { k.ends_with(\"reference.bin\"); }"), 1);
+        assert_eq!(n("fn f() { k.contains(\"x-reference.bin\"); }"), 1);
+        assert_eq!(
+            n("fn f() { k.ends_with(\"/reference.bin\"); }"),
+            0,
+            "anchored"
+        );
+        assert_eq!(
+            n("fn f() { k.contains(\"/.dg/reference.bin\"); }"),
+            0,
+            "anchored"
+        );
+        // Bypasses of the one-line scan.
+        assert_eq!(
+            n("fn f() { k\n    .ends_with(\n        \"reference.bin\",\n    ); }"),
+            1,
+            "split"
+        );
+        assert_eq!(
+            n("fn f() { k.strip_suffix(\"reference.bin\"); }"),
+            1,
+            "strip_suffix"
+        );
+        assert_eq!(
+            n("fn f() { if k.as_str() == \"x-reference.bin\" {} }"),
+            1,
+            "=="
+        );
+        assert_eq!(n("fn f() { crate::types::is_reference_key(k); }"), 0);
+        assert_eq!(n("fn f() { // k.ends_with(\"reference.bin\")\n }"), 0);
     }
 
     /// #120: the v1 at-rest formats have no reader and no writer. Their
@@ -1019,14 +1087,12 @@ mod source_guards {
     #[test]
     fn open_or_legacy_iam_state_is_built_in_one_place() {
         let mut bad = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            if file == "src/iam/mod.rs" {
+        for src in crate::source_scan::ast::src() {
+            if src.rel == "src/iam/mod.rs" {
                 continue;
             }
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                if builds_open_or_legacy_state(line) {
-                    bad.push(format!("{file}:{n}: {}", line.trim()));
-                }
+            for (n, what) in open_or_legacy_state_values(&src.prod) {
+                bad.push(format!("{}:{n}: {what}", src.rel));
             }
         }
         assert!(
@@ -1036,41 +1102,54 @@ mod source_guards {
         );
     }
 
-    /// A line that names `IamState::Disabled` / `IamState::Legacy(` outside
-    /// a pattern (left of `=>`, `matches!`, `if let`, let-else).
-    fn builds_open_or_legacy_state(line: &str) -> bool {
-        let pattern_line = ["matches!(", "if let ", "let IamState"]
+    /// `(line, what)` of every VALUE `IamState::Disabled` or
+    /// `IamState::Legacy` in `f`: a unit use, a call (`Legacy(pair)`), a
+    /// function pointer (`.map(IamState::Legacy)`). A pattern (a `match`
+    /// arm, `if let`, `let .. else`, `matches!`) is no value, wherever it
+    /// stands in the file; the old scan told them apart by `=>` and a few
+    /// words on the same line.
+    fn open_or_legacy_state_values(f: &crate::source_scan::ast::Facts) -> Vec<(usize, String)> {
+        f.paths
             .iter()
-            .any(|p| line.contains(p));
-        let arm = line.find("=>");
-        ["IamState::Disabled", "IamState::Legacy("].iter().any(|t| {
-            line.match_indices(t)
-                .any(|(at, _)| !pattern_line && arm.is_none_or(|a| at > a))
-        })
+            .filter(|p| p.expr && p.segs.len() >= 2)
+            .filter(|p| {
+                let n = p.segs.len();
+                p.segs[n - 2] == "IamState"
+                    && matches!(p.segs[n - 1].as_str(), "Disabled" | "Legacy")
+            })
+            .map(|p| (p.line, p.segs[p.segs.len() - 2..].join("::")))
+            .collect()
     }
 
     #[test]
     fn the_iam_state_guard_sees_an_arm_that_builds_open_access() {
-        assert!(builds_open_or_legacy_state(
-            "            None => IamState::Disabled,"
-        ));
-        assert!(builds_open_or_legacy_state(
-            "    let s = IamState::Legacy(pair);"
-        ));
-        assert!(!builds_open_or_legacy_state(
-            "        IamState::Disabled => false,"
-        ));
-        assert!(!builds_open_or_legacy_state(
-            "    if let IamState::Legacy(ref a) = **cur {"
-        ));
-        assert!(!builds_open_or_legacy_state(
-            "    matches!(s, IamState::Disabled)"
-        ));
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| open_or_legacy_state_values(&parse("f.rs", t).prod).len();
+        assert_eq!(
+            n("fn f() { let s = match k { None => IamState::Disabled, _ => x }; }"),
+            1
+        );
+        assert_eq!(n("fn f() { let s = IamState::Legacy(pair); }"), 1);
+        assert_eq!(
+            n("fn f() { let s = pair.map(IamState::Legacy); }"),
+            1,
+            "function pointer"
+        );
+        // The old scan skipped any line with `if let` or `matches!(`, so a
+        // value built on such a line passed.
+        assert_eq!(
+            n("fn f() { let s = if let Some(p) = pair { IamState::Legacy(p) } else { IamState::Disabled }; }"),
+            2
+        );
+        assert_eq!(n("fn f() { let b = matches!(s, IamState::Disabled); }"), 0);
+        assert_eq!(
+            n("fn f() { match s { IamState::Disabled => 1, IamState::Legacy(_) => 2, _ => 3 }; }"),
+            0
+        );
+        assert_eq!(n("fn f() { if let IamState::Legacy(a) = &s {} }"), 0);
+        assert_eq!(n("fn f() { // IamState::Disabled\n }"), 0);
     }
 
-    /// The operator and the Helm chart default to the proxy image of this
-    /// version. v2.0.1 shipped while both still pointed at 2.0.0, so Helm and
-    /// operator users did not get the fix. release-prep.sh stamps these pins.
     #[test]
     fn deployment_pins_follow_the_proxy_version() {
         // The release PR commits every file release-prep.sh stamps: a hand
@@ -1222,7 +1301,7 @@ mod source_guards {
     #[test]
     fn every_server_head_request_is_counted() {
         let mut offenders = Vec::new();
-        for src in crate::source_scan::ast::prod() {
+        for src in crate::source_scan::ast::src() {
             // The CLI runs in its own process: no metrics endpoint.
             if src.rel.starts_with("src/cli/") {
                 continue;
@@ -1245,7 +1324,7 @@ mod source_guards {
     /// old scan took any `inc()` text 8 lines above, even one in the fn
     /// that ends there.)
     fn uncounted_heads(src: &crate::source_scan::ast::Source) -> Vec<usize> {
-        let f = &src.facts;
+        let f = &src.prod;
         f.calls
             .iter()
             .filter(|c| c.method && c.name == "head_object" && c.argc == 0)
@@ -1265,8 +1344,8 @@ mod source_guards {
 
     #[test]
     fn the_head_counter_guard_needs_the_increment_in_the_same_fn() {
-        use crate::source_scan::ast::{parse, Scope};
-        let n = |t: &str| uncounted_heads(&parse("f.rs", t, Scope::Prod)).len();
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| uncounted_heads(&parse("f.rs", t)).len();
         assert_eq!(
             n("fn a() { BACKEND_HEAD_REQUESTS.inc(); c.head_object().send(); }"),
             0
@@ -1297,7 +1376,7 @@ mod source_guards {
     #[test]
     fn every_s3_get_body_is_read_through_the_resuming_stream() {
         let mut offenders = Vec::new();
-        for src in crate::source_scan::ast::prod() {
+        for src in crate::source_scan::ast::src() {
             // body.rs IS the resuming stream. The coordination plane (leases,
             // locks, the config DB sync, the CAS probes) has its own client
             // and reads small blobs, where a broken read fails the attempt
@@ -1329,10 +1408,10 @@ mod source_guards {
     /// used the SDK escaped). `.body(..)` is the request builder of a PUT: a
     /// call, not a field.
     fn sdk_body_reads(src: &crate::source_scan::ast::Source) -> Vec<usize> {
-        if !(src.rel.starts_with("src/storage/") || src.mentions("aws_sdk_s3")) {
+        if !(src.rel.starts_with("src/storage/") || src.prod.mentions("aws_sdk_s3")) {
             return Vec::new();
         }
-        let f = &src.facts;
+        let f = &src.prod;
         let mut out: Vec<usize> = f
             .fields
             .iter()
@@ -1351,8 +1430,8 @@ mod source_guards {
 
     #[test]
     fn the_s3_body_guard_sees_a_destructuring_and_a_file_outside_storage() {
-        use crate::source_scan::ast::{parse, Scope};
-        let n = |rel: &str, t: &str| sdk_body_reads(&parse(rel, t, Scope::Prod)).len();
+        use crate::source_scan::ast::parse;
+        let n = |rel: &str, t: &str| sdk_body_reads(&parse(rel, t)).len();
         assert_eq!(n("src/storage/x.rs", "fn f(o: O) { let b = o.body; }"), 1);
         // A request builder, a method of the same name: not a read.
         assert_eq!(
@@ -1385,25 +1464,12 @@ mod source_guards {
     #[test]
     fn s3s_error_headers_go_through_error_with_headers() {
         let mut offenders = Vec::new();
-        for file in rust_files("src") {
-            let rel = rel_path(&file);
-            if rel.ends_with("/tests.rs") || rel.ends_with("_tests.rs") || rel == "src/lib.rs" {
-                continue;
-            }
-            let text = std::fs::read_to_string(&file).unwrap();
-            let lines: Vec<&str> = text.lines().collect();
-            for (n, line) in lines.iter().enumerate() {
-                if line.trim_start().starts_with("//") || !line.contains(".set_headers(") {
-                    continue;
-                }
-                let in_helper = rel == "src/s3_adapter_s3s/mod.rs"
-                    && lines[..n]
-                        .iter()
-                        .rev()
-                        .find(|l| l.contains("fn "))
-                        .is_some_and(|l| l.contains("fn error_with_headers("));
+        for src in crate::source_scan::ast::src() {
+            for c in src.prod.calls_named("set_headers") {
+                let in_helper = src.rel == "src/s3_adapter_s3s/mod.rs"
+                    && src.fn_name(c.func) == "error_with_headers";
                 if !in_helper {
-                    offenders.push(format!("{rel}:{}", n + 1));
+                    offenders.push(format!("{}:{}", src.rel, c.line));
                 }
             }
         }
@@ -1421,27 +1487,60 @@ mod source_guards {
     /// `code` that way.
     #[test]
     fn no_byte_index_string_excerpts() {
-        let files = rust_files("src");
-        // Built at runtime so this test's own source is no hit.
-        let needle = [".len()", ".min("].concat();
-        // Byte buffers, not strings: slicing them anywhere is fine.
-        const BYTES: [&str; 1] = ["hex::encode(&st.buf[.."];
         let mut offenders = Vec::new();
-        for file in files {
-            let text = std::fs::read_to_string(&file).unwrap();
-            for (n, line) in text.lines().enumerate() {
-                if line.contains("[..")
-                    && line.contains(needle.as_str())
-                    && !BYTES.iter().any(|b| line.contains(b))
-                {
-                    offenders.push(format!("{}:{}", file.display(), n + 1));
-                }
-            }
+        for src in crate::source_scan::ast::src() {
+            offenders.extend(
+                byte_index_excerpts(&src.prod)
+                    .into_iter()
+                    .map(|n| format!("{}:{n}", src.rel)),
+            );
         }
         assert!(
             offenders.is_empty(),
             "use security::str_prefix for string excerpts:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// Lines of `s[..s.len().min(n)]`-shaped slices in `f`: a range whose
+    /// bounds use both `len` and `min` (`n.min(s.len())`,
+    /// `std::cmp::min(s.len(), n)`). The old scan took `[..` and `.len()`
+    /// and `.min(` on one line, so `cmp::min` and a line break passed.
+    fn byte_index_excerpts(f: &crate::source_scan::ast::Facts) -> Vec<usize> {
+        f.indexes
+            .iter()
+            .filter(|i| i.ranged)
+            .filter(|i| {
+                i.bound_idents.iter().any(|x| x == "len")
+                    && i.bound_idents.iter().any(|x| x == "min")
+            })
+            .map(|i| i.line)
+            .collect()
+    }
+
+    #[test]
+    fn the_excerpt_guard_sees_cmp_min_and_split_forms() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| byte_index_excerpts(&parse("f.rs", t).prod).len();
+        assert_eq!(n("fn f() { &s[..s.len().min(40)]; }"), 1);
+        assert_eq!(n("fn f() { &s[..40.min(s.len())]; }"), 1);
+        assert_eq!(
+            n("fn f() { &s[..std::cmp::min(s.len(), 40)]; }"),
+            1,
+            "cmp::min"
+        );
+        assert_eq!(
+            n("fn f() { &s[..\n    s.len()\n        .min(40)]; }"),
+            1,
+            "split"
+        );
+        assert_eq!(
+            n("fn f() { &s[..len]; &s[2..s.len()]; &s[..n.min(8)]; }"),
+            0
+        );
+        assert_eq!(
+            n("fn f() { let c = crate::security::str_prefix(s, 40); }"),
+            0
         );
     }
 
@@ -1476,7 +1575,7 @@ mod source_guards {
             "SignatureDoesNotMatch",
         ];
         let mut offenders = Vec::new();
-        for src in crate::source_scan::ast::prod() {
+        for src in crate::source_scan::ast::src() {
             if ALLOWED.contains(&src.rel.as_str()) {
                 continue;
             }
@@ -1506,20 +1605,6 @@ mod source_guards {
         src: &crate::source_scan::ast::Source,
         tokens: &[&str],
     ) -> Vec<(usize, String)> {
-        const METHODS: [&str; 12] = [
-            "contains",
-            "starts_with",
-            "ends_with",
-            "eq_ignore_ascii_case",
-            "eq",
-            "ne",
-            "find",
-            "rfind",
-            "matches",
-            "strip_prefix",
-            "strip_suffix",
-            "split",
-        ];
         const RENDERED: [&str; 5] = [
             "to_string",
             "to_lowercase",
@@ -1537,14 +1622,17 @@ mod source_guards {
             })
         };
         let mut out = Vec::new();
-        for c in &src.facts.calls {
-            if c.method && !c.in_assert && METHODS.contains(&c.name.as_str()) {
+        for c in &src.prod.calls {
+            if c.method
+                && !c.in_assert
+                && crate::source_scan::ast::TEXT_METHODS.contains(&c.name.as_str())
+            {
                 if let Some(l) = c.arg_strings.iter().find(|l| hit(l)) {
                     out.push((c.line, format!(".{}(.. {l:?} ..)", c.name)));
                 }
             }
         }
-        for c in &src.facts.cmps {
+        for c in &src.prod.cmps {
             if c.in_assert {
                 continue;
             }
@@ -1566,11 +1654,11 @@ mod source_guards {
 
     #[test]
     fn the_text_match_guard_sees_split_aliased_and_rendered_forms() {
-        use crate::source_scan::ast::{parse, Scope};
+        use crate::source_scan::ast::parse;
         let t = ["NoSuch", "Key"].concat();
         let tokens = [t.as_str(), "404"];
         let lines = |body: &str| -> Vec<usize> {
-            let src = parse("f.rs", &format!("fn f() {{\n{body}\n}}"), Scope::Prod);
+            let src = parse("f.rs", &format!("fn f() {{\n{body}\n}}"));
             text_matches(&src, &tokens)
                 .into_iter()
                 .map(|(n, _)| n)
@@ -1763,11 +1851,11 @@ mod source_guards {
     /// `.current_dir(` (a `git` command) paid for a spawn that had none.
     #[test]
     fn integration_test_spawns_set_current_dir() {
-        let files = crate::source_scan::ast::all("tests");
+        let files = crate::source_scan::ast::tests();
         assert!(files.len() > 50, "scan found tests/ ({})", files.len());
         let mut offenders = Vec::new();
         for src in files {
-            for n in spawns_without_cwd(src) {
+            for n in spawns_without_cwd(&src.test) {
                 offenders.push(format!("{}:{n}", src.rel));
             }
         }
@@ -1787,7 +1875,7 @@ mod source_guards {
         const ALLOWED: [&str; 2] = ["src/startup.rs", "src/coordination/mod.rs"];
         let name = ["durable_node", "_id"].concat();
         let mut offenders = Vec::new();
-        for src in crate::source_scan::ast::prod() {
+        for src in crate::source_scan::ast::src() {
             if ALLOWED.contains(&src.rel.as_str()) {
                 continue;
             }
@@ -1809,7 +1897,7 @@ mod source_guards {
     /// The old scan looked for the text `leaf(` on one line.
     fn names_path_leaf(src: &crate::source_scan::ast::Source, leaf: &str) -> Vec<usize> {
         let mut out: Vec<usize> = src
-            .facts
+            .prod
             .paths
             .iter()
             .filter(|p| p.segs.last().is_some_and(|s| s == leaf))
@@ -1822,8 +1910,8 @@ mod source_guards {
 
     #[test]
     fn the_leaf_guard_sees_aliases_and_pointers() {
-        use crate::source_scan::ast::{parse, Scope};
-        let n = |t: &str| names_path_leaf(&parse("f.rs", t, Scope::Prod), "durable").len();
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| names_path_leaf(&parse("f.rs", t), "durable").len();
         assert_eq!(n("fn f() { a::durable(x); }"), 1);
         assert_eq!(n("fn f() { a::\ndurable\n(x); }"), 1, "split over lines");
         assert_eq!(
@@ -1842,8 +1930,7 @@ mod source_guards {
     /// is set on the builder chain (`Command::new(B).current_dir(d)`) or on
     /// the variable the chain was bound to (`let mut c = Command::new(B);
     /// c.current_dir(d)`) in the same fn.
-    fn spawns_without_cwd(src: &crate::source_scan::ast::Source) -> Vec<usize> {
-        let f = &src.facts;
+    fn spawns_without_cwd(f: &crate::source_scan::ast::Facts) -> Vec<usize> {
         let is_bin = |ms: &[(String, String)]| {
             ms.iter()
                 .any(|(n, t)| (n == "env" || n == "option_env") && t.contains("CARGO_BIN_EXE_"))
@@ -1888,8 +1975,8 @@ mod source_guards {
 
     #[test]
     fn the_cwd_guard_checks_each_spawn() {
-        use crate::source_scan::ast::{parse, Scope};
-        let bad = |text: &str| spawns_without_cwd(&parse("fixture.rs", text, Scope::All)).len();
+        use crate::source_scan::ast::parse;
+        let bad = |text: &str| spawns_without_cwd(&parse("fixture.rs", text).prod).len();
         let bin = ["CARGO_BIN", "_EXE_deltaglider_proxy"].concat();
         let spawn = |extra: &str| format!("Command::new(env!(\"{bin}\"))\n{extra}.spawn();");
         // One spawn with a cwd: fine.
@@ -2499,7 +2586,7 @@ mod source_guards {
     #[test]
     fn requests_share_principals_never_build_them() {
         let mut bad = Vec::new();
-        for src in crate::source_scan::ast::prod() {
+        for src in crate::source_scan::ast::src() {
             for (n, what) in principal_builds(src) {
                 bad.push(format!("{}:{n}: {what}", src.rel));
             }
@@ -2518,7 +2605,7 @@ mod source_guards {
     /// split over lines, or as `<AuthenticatedUser as From<_>>::from`, counts;
     /// the old scan took the text `AuthenticatedUser::from(` on one line.
     fn principal_builds(src: &crate::source_scan::ast::Source) -> Vec<(usize, String)> {
-        let f = &src.facts;
+        let f = &src.prod;
         let mut names = vec!["AuthenticatedUser".to_string()];
         names.extend(
             f.paths
@@ -2547,8 +2634,8 @@ mod source_guards {
 
     #[test]
     fn the_principal_guard_sees_aliases_and_qualified_forms() {
-        use crate::source_scan::ast::{parse, Scope};
-        let n = |rel: &str, t: &str| principal_builds(&parse(rel, t, Scope::Prod)).len();
+        use crate::source_scan::ast::parse;
+        let n = |rel: &str, t: &str| principal_builds(&parse(rel, t)).len();
         assert_eq!(n("src/x.rs", "fn f() { AuthenticatedUser::from(u); }"), 1);
         assert_eq!(
             n("src/iam/mod.rs", "fn f() { AuthenticatedUser::from(u); }"),
@@ -2600,7 +2687,7 @@ mod source_guards {
     #[test]
     fn condition_blocks_are_parsed_by_the_one_rule() {
         let mut bad = Vec::new();
-        for src in crate::source_scan::ast::prod() {
+        for src in crate::source_scan::ast::src() {
             for (n, func) in condition_block_parsers(src) {
                 if !(src.rel == "src/iam/permissions.rs" && func == "parse_conditions") {
                     bad.push(format!("{}:{n} (in fn {func})", src.rel));
@@ -2630,7 +2717,7 @@ mod source_guards {
             "parse",
             "deserialize",
         ];
-        let f = &src.facts;
+        let f = &src.prod;
         let spells = |func: usize| {
             f.paths
                 .iter()
@@ -2640,14 +2727,14 @@ mod source_guards {
             .iter()
             .filter(|c| PARSE.contains(&c.segs.last().unwrap_or(&c.name).as_str()))
             .filter(|c| c.generics.iter().any(|g| g == "ConditionBlock") || spells(c.func))
-            .map(|c| (c.line, f.fn_name(c.func).to_string()))
+            .map(|c| (c.line, src.fn_name(c.func).to_string()))
             .collect()
     }
 
     #[test]
     fn the_condition_block_guard_sees_a_second_parser() {
-        use crate::source_scan::ast::{parse, Scope};
-        let n = |t: &str| condition_block_parsers(&parse("f.rs", t, Scope::Prod)).len();
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| condition_block_parsers(&parse("f.rs", t)).len();
         assert_eq!(
             n("fn parse_conditions() { serde_json::from_value::<iam_rs::ConditionBlock>(v); }"),
             1
