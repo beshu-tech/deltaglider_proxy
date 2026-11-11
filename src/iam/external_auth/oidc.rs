@@ -854,6 +854,53 @@ mod tests {
         ));
     }
 
+    /// A token whose `kid` is not in the JWKS gives the typed
+    /// `UnknownSigningKey`: it is the ONLY trigger of the key-rotation
+    /// rediscovery in `exchange_code`. Any other variant here (a `map_err`
+    /// on the `find` miss) stops the retry and a rotation blocks logins.
+    #[test]
+    fn a_kid_missing_from_the_jwks_is_an_unknown_signing_key() {
+        let enc = |v: serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
+        let token_with_kid = |kid: Option<&str>| {
+            let mut header = serde_json::json!({"alg": "RS256"});
+            if let Some(k) = kid {
+                header["kid"] = serde_json::json!(k);
+            }
+            format!(
+                "{}.{}.{}",
+                enc(header),
+                enc(serde_json::json!({"iss": "https://idp.example", "aud": "c"})),
+                URL_SAFE_NO_PAD.encode(b"sig")
+            )
+        };
+        let p = OidcProvider::new(
+            "p".into(),
+            "c".into(),
+            "s".into(),
+            "https://idp.example".into(),
+            "openid".into(),
+            serde_json::json!({}),
+        );
+        let pending = PendingAuth {
+            provider_name: "p".into(),
+            nonce: None,
+            pkce_verifier: None,
+            created_at: std::time::Instant::now(),
+            client_ip: None,
+            redirect_to: None,
+        };
+        let empty = jsonwebtoken::jwk::JwkSet { keys: Vec::new() };
+        match p.validate_id_token(&token_with_kid(Some("k")), &empty, &pending) {
+            Err(ExternalAuthError::UnknownSigningKey(k)) => assert_eq!(k, "k"),
+            other => panic!("expected UnknownSigningKey, got {other:?}"),
+        }
+        // No `kid` at all is a malformed token, not a rotation: no retry.
+        assert!(matches!(
+            p.validate_id_token(&token_with_kid(None), &empty, &pending),
+            Err(ExternalAuthError::TokenValidationFailed(_))
+        ));
+    }
+
     #[test]
     fn google_shows_its_account_chooser_unless_configured_otherwise() {
         use serde_json::json;
