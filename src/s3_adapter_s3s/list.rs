@@ -320,7 +320,7 @@ fn split_cursor(
     }
 }
 
-/// The cursor of a V2 continuation token. A sealed token (`dg2.`, `dg3.`)
+/// The cursor of a V2 continuation token. A sealed token (`dg2.`, with or without a proof)
 /// must open for this listing, else `InvalidArgument`: it never falls back
 /// to another start. Otherwise [`decode_v2_token`], with a log line and a
 /// count for the raw-key fallback.
@@ -331,7 +331,7 @@ pub(super) fn v2_cursor(
     let Some(token) = token else {
         return Ok(None);
     };
-    if list_token::has_sealed_prefix(token) {
+    if token.starts_with(list_token::SEALED_TOKEN_PREFIX) {
         return list_token::open(token, binding).map(|c| Some(c.into()));
     }
     let Some(cursor) = decode_v2_token(Some(token)) else {
