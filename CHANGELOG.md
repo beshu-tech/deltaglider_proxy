@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.2.0 — 2026-11-11
+
 ### Upgrade steps for the next release
 
 - **Send a length with every upload body.** A `PutObject` that declares no body length (neither `Content-Length` nor, for an aws-chunked body, `x-amz-decoded-content-length`), such as a body sent with plain `Transfer-Encoding: chunked`, now gets `411 MissingContentLength`, as on S3. The proxy needs the length to reserve memory or spool space for the body before it reads it. AWS SDKs and the usual S3 tools always send it.
