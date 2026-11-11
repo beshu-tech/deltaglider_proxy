@@ -1575,11 +1575,12 @@ mod source_guards {
             "SignatureDoesNotMatch",
         ];
         let mut offenders = Vec::new();
+        let names = named_strings(crate::source_scan::ast::src());
         for src in crate::source_scan::ast::src() {
             if ALLOWED.contains(&src.rel.as_str()) {
                 continue;
             }
-            for (n, what) in text_matches(src, &TOKENS) {
+            for (n, what) in text_matches(src, &TOKENS, &names) {
                 offenders.push(format!("{}:{n}: {what}", src.rel));
             }
         }
@@ -1590,14 +1591,59 @@ mod source_guards {
         );
     }
 
+    /// The strings a name stands for: every `const` and `static` item of
+    /// `srcs`, by name (the last segment of its path), with the strings of
+    /// the names its initialiser uses (`const A: &str = B;`), four deep.
+    fn named_strings<'a>(
+        srcs: impl IntoIterator<Item = &'a crate::source_scan::ast::Source>,
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        use std::collections::HashMap;
+        let mut raw: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+        for src in srcs {
+            for b in src.prod.bindings.iter().chain(&src.test.bindings) {
+                if b.item {
+                    let e = raw.entry(b.name.clone()).or_default();
+                    e.0.extend(b.init_strings.iter().cloned());
+                    e.1.extend(b.init_idents.iter().cloned());
+                }
+            }
+        }
+        let mut out: HashMap<String, Vec<String>> =
+            raw.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect();
+        for _ in 0..4 {
+            for (name, (_, idents)) in &raw {
+                let more: Vec<String> = idents
+                    .iter()
+                    .filter(|i| *i != name)
+                    .flat_map(|i| out.get(i).cloned().unwrap_or_default())
+                    .collect();
+                let e = out.get_mut(name).unwrap();
+                for m in more {
+                    if !e.contains(&m) {
+                        e.push(m);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// `(line, what)` of every place `src` tests a string against a token
     /// of `tokens`, outside an `assert!`:
     /// - a text method (`contains`, `starts_with`, `find`, `strip_prefix`,
     ///   `eq`, ...) with a literal that holds a token, wherever the literal
-    ///   sits in the arguments (`&"T"`, `["T", "U"]`, a line break);
+    ///   sits in the arguments (`&"T"`, `["T", "U"]`, a line break). A name
+    ///   in the arguments stands for its string: a `const`/`static` item
+    ///   anywhere in the crate (`names`), or a `let` of the same fn
+    ///   (`let k = "T"; m.contains(k)`);
     /// - `text.to_string() == "T"` (and `to_lowercase`, ...): a comparison
-    ///   of rendered text. A comparison of a structured value (`code ==
-    ///   "NoSuchKey"` on `err.code()`) is not text and passes.
+    ///   of rendered text, the other side a literal or a name as above. A
+    ///   comparison of a structured value (`code == "NoSuchKey"` on
+    ///   `err.code()`) is not text and passes;
+    /// - rendered text (`to_string()`, `message()` ...) tested against a
+    ///   value whose string the guard cannot find (a fn parameter, a call):
+    ///   the guard cannot tell it from a token, so it fails closed. Case
+    ///   folding (`to_lowercase`) is no Display text and is exempt.
     ///
     /// Words match as a case-insensitive substring (`<Code>NoSuchKey</Code>`),
     /// status numbers exactly. The old scan looked for the exact text
@@ -1605,6 +1651,7 @@ mod source_guards {
     fn text_matches(
         src: &crate::source_scan::ast::Source,
         tokens: &[&str],
+        names: &std::collections::HashMap<String, Vec<String>>,
     ) -> Vec<(usize, String)> {
         const RENDERED: [&str; 5] = [
             "to_string",
@@ -1612,6 +1659,19 @@ mod source_guards {
             "to_ascii_lowercase",
             "to_uppercase",
             "message",
+        ];
+        // Display text: tested against an unknown value, the guard fails
+        // closed. Case folding (`to_lowercase` of an e-mail) is no Display.
+        const DISPLAY: [&str; 2] = ["to_string", "message"];
+        // The methods that compare the whole receiver with an argument.
+        const COMPARE: [&str; 7] = [
+            "contains",
+            "starts_with",
+            "ends_with",
+            "eq_ignore_ascii_case",
+            "eq",
+            "ne",
+            "strip_prefix",
         ];
         let hit = |lit: &str| {
             tokens.iter().any(|t| {
@@ -1622,15 +1682,51 @@ mod source_guards {
                 }
             })
         };
+        // The strings that `idents` (of code in fn `func`) stand for.
+        let resolve = |func: usize, idents: &[String]| -> Vec<String> {
+            let mut out = Vec::new();
+            for i in idents {
+                out.extend(names.get(i).cloned().unwrap_or_default());
+                for b in src
+                    .prod
+                    .bindings
+                    .iter()
+                    .filter(|b| !b.item && b.plain && b.func == func && &b.name == i)
+                {
+                    out.extend(b.init_strings.iter().cloned());
+                    for k in &b.init_idents {
+                        out.extend(names.get(k).cloned().unwrap_or_default());
+                    }
+                }
+            }
+            out
+        };
         let mut out = Vec::new();
         for c in &src.prod.calls {
-            if c.method
-                && !c.in_assert
-                && crate::source_scan::ast::TEXT_METHODS.contains(&c.name.as_str())
+            if !c.method
+                || c.in_assert
+                || !crate::source_scan::ast::TEXT_METHODS.contains(&c.name.as_str())
             {
-                if let Some(l) = c.arg_strings.iter().find(|l| hit(l)) {
-                    out.push((c.line, format!(".{}(.. {l:?} ..)", c.name)));
-                }
+                continue;
+            }
+            let named = resolve(c.func, &c.arg_idents_all);
+            if let Some(l) = c.arg_strings.iter().chain(&named).find(|l| hit(l)) {
+                out.push((c.line, format!(".{}(.. {l:?} ..)", c.name)));
+            } else if COMPARE.contains(&c.name.as_str())
+                && c.receiver_idents
+                    .iter()
+                    .any(|r| DISPLAY.contains(&r.as_str()))
+                && c.arg_strings.is_empty()
+                && named.is_empty()
+                && !c.arg_idents_all.is_empty()
+            {
+                out.push((
+                    c.line,
+                    format!(
+                        ".{}(..) of rendered text with a value that has no known string",
+                        c.name
+                    ),
+                ));
             }
         }
         for c in &src.prod.cmps {
@@ -1642,14 +1738,29 @@ mod source_guards {
                     .method
                     .as_deref()
                     .is_some_and(|m| RENDERED.contains(&m));
-                if rendered {
-                    if let Some(l) = lit.strings.iter().find(|l| hit(l)) {
-                        out.push((c.line, format!("rendered text == {l:?}")));
-                    }
+                if !rendered {
+                    continue;
+                }
+                let named = resolve(c.func, &lit.idents);
+                if let Some(l) = lit.strings.iter().chain(&named).find(|l| hit(l)) {
+                    out.push((c.line, format!("rendered text == {l:?}")));
+                } else if !lit.literal
+                    && lit.strings.is_empty()
+                    && named.is_empty()
+                    && other
+                        .method
+                        .as_deref()
+                        .is_some_and(|m| DISPLAY.contains(&m))
+                {
+                    out.push((
+                        c.line,
+                        "rendered text == a value that has no known string".to_string(),
+                    ));
                 }
             }
         }
         out.sort();
+        out.dedup();
         out
     }
 
@@ -1660,7 +1771,7 @@ mod source_guards {
         let tokens = [t.as_str(), "404"];
         let lines = |body: &str| -> Vec<usize> {
             let src = parse("f.rs", &format!("fn f() {{\n{body}\n}}"));
-            text_matches(&src, &tokens)
+            text_matches(&src, &tokens, &named_strings([&src]))
                 .into_iter()
                 .map(|(n, _)| n)
                 .collect()
@@ -1711,6 +1822,62 @@ mod source_guards {
         assert!(lines(&format!("if code == \"{t}\" {{}}")).is_empty());
         assert!(lines("m.contains(\"4040\");").is_empty());
         assert!(lines(&format!("assert!(m.contains(\"{t}\"));")).is_empty());
+    }
+
+    /// A token held in a name is still a token; text of an error tested
+    /// against a value with no known string fails closed.
+    #[test]
+    fn the_text_match_guard_resolves_names_and_fails_closed() {
+        use crate::source_scan::ast::parse;
+        let t = ["NoSuch", "Key"].concat();
+        let tokens = [t.as_str(), "404"];
+        let file = |text: &str| -> usize {
+            let src = parse("f.rs", text);
+            text_matches(&src, &tokens, &named_strings([&src])).len()
+        };
+        let f = |item: &str, body: &str| file(&format!("{item}\nfn f(e: &E) -> bool {{ {body} }}"));
+        // A `const`/`static` item, through `&`, a path, a chain, a `concat!`.
+        let konst = format!("const K: &str = \"{t}\";");
+        assert_eq!(f(&konst, "e.to_string().contains(K)"), 1, "const");
+        assert_eq!(f(&konst, "e.to_string().contains(&K)"), 1, "&const");
+        assert_eq!(f(&konst, "e.to_string().contains(self::K)"), 1, "path");
+        assert_eq!(f(&konst, "e.to_string() == K"), 1, "== const");
+        assert_eq!(f(&konst, "K == e.to_string()"), 1, "const ==");
+        assert_eq!(
+            f(&format!("static K: &str = \"{t}\";"), "m.starts_with(K)"),
+            1,
+            "static"
+        );
+        assert_eq!(
+            f(&format!("{konst}\nconst L: &str = K;"), "m.contains(L)"),
+            1,
+            "const of a const"
+        );
+        assert_eq!(
+            f(
+                "const K: &str = concat!(\"NoSuch\", \"Key\");",
+                "m.contains(K)"
+            ),
+            1,
+            "concat!"
+        );
+        assert_eq!(f("", &format!("let k = \"{t}\"; m.contains(k)")), 1, "let");
+        assert_eq!(
+            f(&konst, "let k = K; m.contains(k)"),
+            1,
+            "let bound to a const"
+        );
+        // A const that holds no token passes.
+        assert_eq!(f("const K: &str = \"other\";", "m.contains(K)"), 0);
+        // Rendered text against a value with no known string: closed.
+        assert_eq!(f("", "e.to_string().contains(needle)"), 1, "unknown ident");
+        assert_eq!(f("", "e.to_string() == other()"), 1, "unknown call");
+        assert_eq!(f("", "e.message().starts_with(&p.prefix)"), 1, "a field");
+        // A structured value and a plain text compare are no error text.
+        assert_eq!(f("", "name.contains(needle)"), 0);
+        assert_eq!(f("", "e.to_string().contains('x')"), 0, "a char");
+        assert_eq!(f("", "e.code() == other()"), 0);
+        assert_eq!(f("", "e.to_lowercase().ends_with(&suffix)"), 0, "case fold");
     }
 
     /// A request handler audits with the request's headers, so the entry

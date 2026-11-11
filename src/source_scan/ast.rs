@@ -100,6 +100,7 @@ pub(crate) struct Field {
 /// A `==` / `!=`.
 pub(crate) struct Cmp {
     pub line: usize,
+    pub func: usize,
     pub lhs: Side,
     pub rhs: Side,
     pub in_assert: bool,
@@ -110,6 +111,10 @@ pub(crate) struct Side {
     pub strings: Vec<String>,
     /// The outermost method name (`x.to_string()` → `to_string`).
     pub method: Option<String>,
+    /// The side is a string literal (after `&` and `(..)`).
+    pub literal: bool,
+    /// Every ident of the side (path segments, fields, methods).
+    pub idents: Vec<String>,
 }
 
 impl Side {
@@ -120,6 +125,8 @@ impl Side {
                 Expr::MethodCall(m) => Some(m.method.to_string()),
                 _ => None,
             },
+            literal: is_str_lit(e),
+            idents: idents_in(e),
         }
     }
 }
@@ -128,6 +135,15 @@ impl Side {
 pub(crate) struct Binding {
     pub func: usize,
     pub name: String,
+    /// A `const` or `static` item (visible crate-wide), not a `let`.
+    pub item: bool,
+    /// The initialiser is a literal, a path or a `concat!` (after `&`, `(..)`):
+    /// the binding IS that text, not a value computed from it.
+    pub plain: bool,
+    /// Every string literal in the initialiser (a `concat!` adds its joined text).
+    pub init_strings: Vec<String>,
+    /// Every ident in the initialiser (`const A: &str = B;` → `B`).
+    pub init_idents: Vec<String>,
     /// Every macro in the initialiser, as `(name, tokens text)`.
     pub init_macros: Vec<(String, String)>,
     /// Every path call in the initialiser (`HeaderMap::new`).
@@ -354,6 +370,32 @@ pub(crate) fn as_ident(e: &Expr) -> Option<String> {
         Expr::Paren(p) => as_ident(&p.expr),
         Expr::Group(g) => as_ident(&g.expr),
         _ => None,
+    }
+}
+
+/// Is `e` a string literal, after `&` and `(..)`?
+fn is_str_lit(e: &Expr) -> bool {
+    match e {
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(_),
+            ..
+        }) => true,
+        Expr::Reference(r) => is_str_lit(&r.expr),
+        Expr::Paren(p) => is_str_lit(&p.expr),
+        Expr::Group(g) => is_str_lit(&g.expr),
+        _ => false,
+    }
+}
+
+/// Is `e` a literal, a path or a `concat!`, after `&` and `(..)`?
+fn is_plain(e: &Expr) -> bool {
+    match e {
+        Expr::Lit(_) | Expr::Path(_) => true,
+        Expr::Macro(m) => m.mac.path.is_ident("concat"),
+        Expr::Reference(r) => is_plain(&r.expr),
+        Expr::Paren(p) => is_plain(&p.expr),
+        Expr::Group(g) => is_plain(&g.expr),
+        _ => false,
     }
 }
 
@@ -699,12 +741,21 @@ impl Collector {
         }
     }
 
-    fn bind(&mut self, name: String, init: &Expr) {
+    fn bind(&mut self, name: String, init: &Expr, item: bool) {
         let func = self.func();
+        let init_macros = macros_in(init);
+        let mut init_strings = string_literals(init);
+        if init_macros.iter().any(|(n, _)| n == "concat") {
+            init_strings.push(init_strings.concat());
+        }
         self.cur().bindings.push(Binding {
             func,
             name,
-            init_macros: macros_in(init),
+            item,
+            plain: is_plain(init),
+            init_strings,
+            init_idents: idents_in(init),
+            init_macros,
             init_calls: calls_in(init),
             init_root_pos: Self::root_pos(init),
         });
@@ -973,12 +1024,12 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
-        self.bind(i.ident.to_string(), &i.expr);
+        self.bind(i.ident.to_string(), &i.expr, true);
         visit::visit_item_const(self, i);
     }
 
     fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
-        self.bind(i.ident.to_string(), &i.expr);
+        self.bind(i.ident.to_string(), &i.expr, true);
         visit::visit_item_static(self, i);
     }
 
@@ -989,7 +1040,7 @@ impl<'ast> Visit<'ast> for Collector {
                 pat = &t.pat;
             }
             if let Pat::Ident(id) = pat {
-                self.bind(id.ident.to_string(), &init.expr);
+                self.bind(id.ident.to_string(), &init.expr, false);
             }
         }
         visit::visit_local(self, l);
@@ -1162,6 +1213,7 @@ impl<'ast> Visit<'ast> for Collector {
         if matches!(b.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
             let cmp = Cmp {
                 line: b.op.span().start().line,
+                func: self.func(),
                 lhs: Side::of(&b.left),
                 rhs: Side::of(&b.right),
                 in_assert: self.assert_depth > 0,
