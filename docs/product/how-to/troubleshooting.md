@@ -73,7 +73,7 @@ The proxy takes a lock on its state directory, which is the folder of `deltaglid
 Usually one of these happened:
 
 1. A rolling update started the new process while the old one still ran on the same volume. On Kubernetes, use `updateStrategy.type: Recreate` for a deployment with one shared volume (the Helm chart does), or give each replica its own volume.
-2. The old process does not stop within the wait, for example because it waits for a long request. Stop it first, or raise `DGP_STATE_LOCK_WAIT_SECS`.
+2. The old process takes longer to stop than the wait, for example because `DGP_SHUTDOWN_TIMEOUT_SECS` is raised, or because `DGP_STATE_LOCK_WAIT_SECS` is below about 40 seconds (a stop takes up to 40 seconds). Stop the old process first, or raise `DGP_STATE_LOCK_WAIT_SECS`.
 3. Two proxies point at the same directory by mistake. Give each one its own directory with `DGP_CONFIG`.
 
 ## Startup fails: the spool directory is not private
@@ -201,7 +201,7 @@ The full message is `FATAL config error: bucket 'X' routes to undefined backend 
 
 ## Every request to one S3 backend fails with `SSRF guard: … resolved only to refused address(es)`
 
-The endpoint name of the backend resolves only to addresses that the proxy refuses. The proxy checks the resolved address of each connection, so a name that points at a refused address is refused like the address itself. A loopback address, such as an `https` endpoint that reaches a TLS sidecar or a tunnel through `/etc/hosts` or `hostAliases`, is allowed only with `allow_local: true` on that backend. Link-local addresses (169.254.0.0/16, fe80::/10) and the cloud metadata and credential endpoints are refused in every case, also with `allow_local: true`, so point the DNS name of the endpoint at the real address of the storage server. Private (RFC 1918) addresses stay allowed for storage behind internal DNS.
+The endpoint name of the backend resolves only to addresses that the proxy refuses. The proxy checks the resolved address of each connection, so a name that points at a refused address is refused like the address itself. A loopback address, such as an `https` endpoint that reaches a TLS sidecar or a tunnel through `/etc/hosts` or `hostAliases`, is allowed only with `allow_local: true` on that backend. When such a backend is the only backend, the proxy does not start, because the boot backend probe (`DGP_BOOT_BACKEND_PROBE`, default `enforce`) finds no backend that answers; the startup error then names this message. Link-local addresses (169.254.0.0/16, fe80::/10) and the cloud metadata and credential endpoints are refused in every case, also with `allow_local: true`, so point the DNS name of the endpoint at the real address of the storage server. Private (RFC 1918) addresses stay allowed for storage behind internal DNS.
 
 ## S3 config sync ETag mismatch
 

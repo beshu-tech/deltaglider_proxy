@@ -45,7 +45,7 @@ The environment variables `DGP_TLS_ENABLED=true`, `DGP_TLS_CERT` and `DGP_TLS_KE
 
 With TLS at the proxy, the admin session cookies carry the `Secure` flag automatically. This is true whether you enable TLS in the YAML file, in the admin UI, or with `DGP_TLS_ENABLED`.
 
-A `Secure` session cookie is named `__Host-dgp_session`. A browser accepts a cookie with this prefix only from the exact host, over HTTPS, so a page on a sibling subdomain or on plain HTTP cannot set or replace it. On a `Secure` request, the proxy reads only that name. On plain HTTP, the cookie keeps the name `dgp_session`, because a browser refuses a `__Host-` cookie without `Secure`. The same rule applies behind a reverse proxy: the name follows the `Secure` flag, which `DGP_SECURE_COOKIES` and a trusted `X-Forwarded-Proto: https` decide.
+A `Secure` session cookie is named `__Host-dgp_session`. A browser accepts a cookie with this prefix only from the exact host, over HTTPS. On a `Secure` request, the proxy reads only that name. Where the cookie is not `Secure`, it keeps the name `dgp_session`, because a browser refuses a `__Host-` cookie without `Secure`. The name follows the `Secure` flag: TLS at the proxy or a trusted `X-Forwarded-Proto: https` sets it, and an explicit `DGP_SECURE_COOKIES` (`true` or `false`) decides in both directions.
 
 When the proxy faces the internet directly, keep `DGP_TRUST_PROXY_HEADERS=false` (the default). Otherwise clients can spoof `X-Forwarded-For` and bypass rate limiting. `DGP_TRUST_PROXY_HEADERS`, `DGP_TRUSTED_PROXY_CIDRS` and `DGP_SECURE_COOKIES` exist only as environment variables. The YAML file and the admin UI cannot set them.
 

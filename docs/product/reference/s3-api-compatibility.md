@@ -91,9 +91,11 @@ The longest key that the proxy stores depends on the backend of the bucket:
 | Backend | Limit | Why |
 |---|---|---|
 | S3 | 1024 bytes for the whole key | The S3 limit. A backend that refuses the key answers `KeyTooLongError`, and the proxy passes that on. On an S3 backend, a key that is only spaces, or that holds a control character (a tab or a newline), is refused with `400 InvalidArgument`, because the proxy keeps the name of the key in a metadata header. A key that MinIO refuses for another reason, such as a segment of more than 255 bytes, gets the same `400`. |
-| Filesystem | 255 bytes for each part of the key between `/` characters | Each part becomes a directory or file name, and file systems such as ext4 and XFS limit one name to 255 bytes. A delta-compressed object is stored with a `.delta` suffix, and that suffix must fit in the same 255 bytes. So the proxy stores an object whose file name has 250 bytes or more as a whole object, never as a delta, and its `x-amz-meta-dg-passthrough-reason` is `delta-name-too-long`. |
+| Filesystem | 255 bytes for each part of the key between `/` characters | Each part becomes a directory or file name, and file systems such as ext4 and XFS limit one name to 255 bytes. A delta-compressed object is stored with a `.delta` suffix, so its last part has 249 bytes or fewer (see below). |
 
 A key over the limit gets `400 KeyTooLongError`. SDKs do not retry a 400.
+
+On every backend, the proxy stores an object whose file name (the last part of the key) has 250 bytes or more as a whole object, never as a delta, because the `.delta` suffix would make the name longer than 255 bytes. Its `x-amz-meta-dg-passthrough-reason` is `delta-name-too-long`.
 
 ### A key and a folder with the same name (filesystem backend)
 
