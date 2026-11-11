@@ -133,11 +133,26 @@ fn human_size(bytes: i64) -> String {
     }
 }
 
-/// Slack escapes `&`, `<`, `>` in message text (mrkdwn).
+/// Make `s` safe to put in Slack message text (mrkdwn), and in a code span.
+///
+/// Slack asks for `&`, `<`, `>` as entities. A backtick cannot be escaped in
+/// mrkdwn: one in a key would end the code span and let the rest of the key
+/// format the message (F44), so it becomes the look-alike U+02CB. A control
+/// character (a newline starts a new mrkdwn line, where `>` or three
+/// backticks mean something) becomes U+FFFD.
 fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '`' => out.push('\u{02CB}'),
+            c if c.is_control() => out.push('\u{FFFD}'),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Build the Slack message body (without `channel`/`username` — the delivery
@@ -249,6 +264,59 @@ mod tests {
             slack_include_globs: include.iter().map(|s| s.to_string()).collect(),
             slack_exclude_globs: exclude.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
+        }
+    }
+
+    /// F44 (epic #142): the key sits in one code span. A backtick in the
+    /// key closed the span and let the rest of the key format the message.
+    #[test]
+    fn a_backtick_in_a_key_does_not_end_the_code_span() {
+        let msg = slack_message(
+            &rec("ObjectCreated", "b", "x`*bold*<!channel>", json!({})),
+            &cfg_with(&[], &[], &[]),
+        );
+        let section = msg["blocks"][1]["text"]["text"].as_str().unwrap();
+        assert_eq!(section.matches('`').count(), 2, "{section}");
+        assert!(!section.contains("<!channel>"), "{section}");
+    }
+
+    proptest::proptest! {
+        /// For any key, bucket and payload text: the section holds exactly
+        /// the two backticks of its code span, no raw `<`, `>` or `&` that
+        /// is not an entity, and no control character (a newline would
+        /// start a new mrkdwn line). The whole message is JSON that parses
+        /// back to itself.
+        #[test]
+        fn a_key_cannot_break_the_message(
+            key in "\\PC*|[\\x00-\\x7f`*_~<>&\\n\\r]{0,30}",
+            bucket in "[ -~]{0,20}",
+            storage in "[ -~`\\n]{0,10}",
+        ) {
+            let msg = slack_message(
+                &rec("ObjectCreated", &bucket, &key, json!({"storage_type": storage})),
+                &cfg_with(&[], &[], &[]),
+            );
+            let section = msg["blocks"][1]["text"]["text"].as_str().unwrap();
+            proptest::prop_assert_eq!(section.matches('`').count(), 2, "{}", section);
+            for text in [
+                section,
+                msg["text"].as_str().unwrap(),
+                msg["blocks"][2]["elements"][0]["text"].as_str().unwrap(),
+            ] {
+                proptest::prop_assert!(!text.chars().any(|c| c == '\r'), "{text:?}");
+                let stripped = text
+                    .replace("&amp;", "")
+                    .replace("&lt;", "")
+                    .replace("&gt;", "");
+                proptest::prop_assert!(
+                    !stripped.contains(['<', '>', '&']),
+                    "{text:?}"
+                );
+            }
+            // Only the block text may hold a newline: the one we add.
+            proptest::prop_assert!(section.matches('\n').count() <= 1, "{section:?}");
+            let round: Value = serde_json::from_str(&msg.to_string()).unwrap();
+            proptest::prop_assert_eq!(round, msg);
         }
     }
 

@@ -203,7 +203,28 @@ impl ConfigDb {
         enabled: Option<bool>,
         permissions: Option<&[Permission]>,
     ) -> Result<IamUser, ConfigDbError> {
+        self.update_user_with_keys(user_id, name, enabled, permissions, None)
+    }
+
+    /// [`Self::update_user`] and, when `keys` is `Some((access_key_id,
+    /// secret_access_key))`, a key rotation: ONE transaction, so a refusal of
+    /// any part (a name or an access key that another user has) leaves the
+    /// whole user as it was.
+    pub fn update_user_with_keys(
+        &self,
+        user_id: i64,
+        name: Option<&str>,
+        enabled: Option<bool>,
+        permissions: Option<&[Permission]>,
+        keys: Option<(&str, &str)>,
+    ) -> Result<IamUser, ConfigDbError> {
         let tx = self.conn.unchecked_transaction()?;
+        if let Some((access_key_id, secret_access_key)) = keys {
+            tx.execute(
+                "UPDATE users SET access_key_id = ?1, secret_access_key = ?2 WHERE id = ?3",
+                params![access_key_id, secret_access_key, user_id],
+            )?;
+        }
         if let Some(n) = name {
             tx.execute(
                 "UPDATE users SET name = ?1 WHERE id = ?2",
@@ -237,23 +258,6 @@ impl ConfigDb {
             return Err(ConfigDbError::NotFound(format!("User ID {}", user_id)));
         }
         Ok(())
-    }
-
-    /// Rotate access keys for a user. Returns updated user with new keys.
-    pub fn rotate_keys(
-        &self,
-        user_id: i64,
-        new_access_key_id: &str,
-        new_secret_access_key: &str,
-    ) -> Result<IamUser, ConfigDbError> {
-        let rows = self.conn.execute(
-            "UPDATE users SET access_key_id = ?1, secret_access_key = ?2 WHERE id = ?3",
-            params![new_access_key_id, new_secret_access_key, user_id],
-        )?;
-        if rows == 0 {
-            return Err(ConfigDbError::NotFound(format!("User ID {}", user_id)));
-        }
-        self.get_user_by_id(user_id)
     }
 
     /// Find a user by access_key_id.

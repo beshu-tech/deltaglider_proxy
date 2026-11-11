@@ -585,6 +585,18 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Delta Engine",
     },
     EnvVarEntry {
+        name: "DGP_SHUTDOWN_TIMEOUT_SECS",
+        description: "Seconds that the exit waits for running blocking tasks (an xdelta3 run) after the drain steps; then the process exits (default: 10, minimum 1)",
+        example: "10",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_STATE_LOCK_WAIT_SECS",
+        description: "Seconds that a starting process waits for another process to release the state directory lock before it exits (default: 60; 0 = do not wait)",
+        example: "60",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_RATE_LIMIT_MAX_ATTEMPTS",
         description: "Max failed auth attempts before IP lockout (default: 100)",
         example: "100",

@@ -2087,8 +2087,7 @@ async fn config_other_surfaces_answer_as_the_golden_file() {
 #[tokio::test]
 async fn test_read_only_config_file_is_reported() {
     use std::os::unix::fs::PermissionsExt;
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
+    if common::running_as_root() {
         common::root_skip("test_read_only_config_file_is_reported");
         return;
     }

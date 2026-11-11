@@ -7,8 +7,10 @@
 //   DropIn       what adoption costs (one config line) + trust facts
 //   ControlPlane the other half of the product + real admin-UI screens
 //   DueDiligence the visitor's own questions, answered with links
-//   Fit          is it for MY workload (honest no's) + where to go next
-//   Quickstart   let me touch it
+//   Fit          is it for MY workload (honest no's)
+//   Cost         what compression costs, measured
+//   Price        what you pay
+// The quickstart command lives in the hero (2026-11, docs/plan/site-rewrite-2026-11.md).
 // No section repeats another's job. Casualties of the rethink: the stats
 // band, the abstract flow diagram, the standalone gallery, the doors grid,
 // and the alternatives comparison table — each either re-told a neighbour's
@@ -16,7 +18,8 @@
 
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
-import TestimonialsBlock from '../components/TestimonialsBlock.astro';
+import ReadPath from '../components/drawings/ReadPath.astro';
+import QuickstartTerminal from '../components/QuickstartTerminal.astro';
 import WorkloadFitTable from '../components/WorkloadFitTable.astro';
 import HeroDiagram from '../components/HeroDiagram.astro';
 import DemoVideo from '../components/DemoVideo.astro';
@@ -31,7 +34,7 @@ import {
 ---
 
 <BaseLayout
-  title="DeltaGlider Proxy — the object storage control plane"
+  title="DeltaGlider — an S3 proxy that stores versioned binaries in 60–95% less space"
   description="An S3 proxy that spots similar files and stores them as small binary diffs instead of full copies. The S3 API stays the same and clients don't change. It adds IAM, SSO, and replication on any S3-compatible backend, and encryption on every backend with atomic writes. Source-available and free up to 15 TB."
 >
   <Fragment slot="json-ld">
@@ -48,57 +51,134 @@ import {
       <div class="hero-copy">
         <span class="hero-eyebrow">
           <span class="hero-eyebrow-dot"></span>
-          Written in Rust · Kubernetes-ready · free up to 15 TB
+          Free up to 15 TB · one binary · written in Rust
         </span>
 
-        <h1>The object storage control&nbsp;plane</h1>
+        <h1>Store every build, backup and release in 60–95% less&nbsp;space</h1>
 
         <p class="hero-lede">
-          An S3 proxy in front of your bucket, with the same API and no
-          changes to your clients:
+          DeltaGlider is an S3 proxy in front of the bucket you already
+          have. It stores similar files as small binary diffs, and your
+          clients keep the same S3 API.
         </p>
 
-        <ul class="hero-points">
-          <li>Similar files are stored as small binary diffs instead of full copies.</li>
-          <li>The proxy applies AES-256 before the bytes reach the bucket, and the key never leaves you.</li>
-          <li>You get the same S3 API on AWS, Hetzner, Wasabi, or MinIO, with cross-cloud replication.</li>
-          <li>Per-user IAM, SSO, and audit logs work on any backend.</li>
-        </ul>
+        <QuickstartTerminal />
+
+        <p class="hero-after-term">
+          Then open <code>http://localhost:9000/_/</code>, or point any S3
+          SDK at <code>http://localhost:9000</code>. Open access is for a
+          first look on localhost only.
+        </p>
 
         <div class="hero-ctas">
-          <a href="/trial" class="btn btn-brand">Start free trial</a>
-          <a href="#demo-video" class="btn">90s&nbsp;video</a>
+          <a href="/docs/tutorials/first-delta-savings" class="btn btn-brand">Follow the tutorial</a>
+          <a href="/pricing#calculator" class="btn">Estimate your savings</a>
           <a href="https://github.com/beshu-tech/deltaglider_proxy" class="btn btn-ghost">GitHub</a>
         </div>
 
+        <p class="hero-also">
+          The same binary encrypts objects with AES-256 before they reach
+          the bucket, gives each user SSO and their own S3 permissions,
+          keeps an audit log, and replicates between AWS, Hetzner, Wasabi
+          and MinIO.
+        </p>
+
         <p class="hero-trust">
-          Built by Beshu Tech (the
-          <a href="https://readonlyrest.com">ReadonlyREST</a> team), which
-          <a href="/case-studies/readonlyrest-builds">serves its own
-          1.71&nbsp;TB build catalog through the proxy in production</a>.
-          Our engineers write it with Claude as a coding aid, and we say
-          so in the
-          <a href="https://github.com/beshu-tech/deltaglider_proxy/commits/main">commit trailers</a>.
+          In production: Beshu Tech (the
+          <a href="https://readonlyrest.com">ReadonlyREST</a> team) serves
+          its 1.71&nbsp;TB build catalog through the proxy.
+          <a href="/case-studies/readonlyrest-builds">Read the migration
+          log</a>. For help from the engineers, there is a
+          <a href="/support">30-day commercial trial</a>.
         </p>
       </div>
       <HeroDiagram />
     </div>
   </section>
 
-  {/* ======================= SEE IT IN ACTION ======================== */}
-  <DemoVideo />
-
   {/* ===================== THE CLAIM, DRAWN TO SCALE ================== */}
   <StorageScale />
+
+  {/* ========================= THE SAFETY CLAIM ======================= */}
+  <section class="section section-tight">
+    <div class="shell">
+      <h2>You always get back the file you sent</h2>
+
+      <ReadPath />
+
+      <p class="fit-next">
+        <a href="/how-it-works">What a write does, and what lands in your bucket</a>
+      </p>
+    </div>
+  </section>
+
+  {/* ============================ HONEST FIT ========================== */}
+  <section class="section section-alt">
+    <div class="shell">
+      <WorkloadFitTable />
+
+      <p class="fit-next">
+        Put your own numbers into the
+        <a href="/pricing#calculator">savings calculator</a>, or read the
+        detail <a href="/build-artifacts">for build artifacts</a>.
+      </p>
+    </div>
+  </section>
 
   {/* ============================ DROP-IN ============================= */}
   <DropIn />
 
+  {/* ============================ THE COST ============================ */}
+  <section class="section section-alt">
+    <div class="shell">
+      <h2>What it costs</h2>
+
+      <p>
+        Compression is not free. We measured these on our own artifacts,
+        in one Hetzner region, over a single stream.
+      </p>
+
+      <dl class="cost-list">
+        <div>
+          <dt>Uploads are slower</dt>
+          <dd>
+            A PUT that is stored as a delta ran at 9&nbsp;MB/s, against
+            106&nbsp;MB/s for a file stored whole. The proxy computes the
+            diff before it answers.
+          </dd>
+        </div>
+        <div>
+          <dt>Downloads are about the same</dt>
+          <dd>
+            A cold GET of a delta ran at 89&nbsp;MB/s, against
+            97&nbsp;MB/s. A warm GET showed no slowdown.
+          </dd>
+        </div>
+        <div>
+          <dt>It is one more service to run</dt>
+          <dd>
+            One binary on one port. A single instance is the supported
+            production setup; several instances behind a load balancer
+            need the routing that the Kubernetes operator sets up.
+          </dd>
+        </div>
+      </dl>
+
+      <p class="fit-next">
+        <a href="/build-artifacts#speed">The full table and the method</a>
+        · <a href="/docs/how-to/scale-out-with-the-kubernetes-operator">Running several instances</a>
+      </p>
+    </div>
+  </section>
+
   {/* ======================= THE OTHER HALF =========================== */}
   <ControlPlane />
 
+  {/* ======================= SEE IT IN ACTION ======================== */}
+  <DemoVideo />
+
   {/* ====================== DUE DILIGENCE ============================= */}
-  <section class="section section-alt">
+  <section class="section">
     <div class="shell">
       <h2>The questions you'd ask anyway</h2>
 
@@ -168,89 +248,52 @@ import {
         </article>
       </div>
 
-      <TestimonialsBlock />
     </div>
   </section>
 
-  {/* ============================ HONEST FIT ========================== */}
-  <section class="section">
-    <div class="shell">
-      <WorkloadFitTable />
-
-      <p class="fit-next">
-        Then put your real numbers into the
-        <a href="/pricing">savings calculator</a>. There is more detail
-        <a href="/saas">for CI &amp; build artifacts</a> and
-        <a href="/regulated">for regulated buyers</a>.
-      </p>
-    </div>
-  </section>
-
-  {/* ============================ QUICKSTART ========================== */}
+  {/* ============================= PRICE ============================== */}
   <section class="section section-alt">
     <div class="shell">
-      <h2>Touch it in 60 seconds</h2>
-
-      <div class="term">
-        <div class="term-bar" aria-hidden="true">
-          <span class="term-title">shell</span>
-        </div>
-        <pre class="term-pre"><code><span class="term-prompt">$</span> docker run --rm -it -p 9000:9000 -v dgp-data:/data \
-    -e DGP_AUTHENTICATION=none \
-    beshultd/deltaglider_proxy</code></pre>
-      </div>
+      <h2>What you pay</h2>
 
       <p>
-        Open <code>http://localhost:9000/_/</code> for the browser, or
-        point any S3 SDK at <code>http://localhost:9000</code>. Open
-        access is meant for a first look on localhost;
-        <a href="/docs/tutorials/secure-your-proxy">the second tutorial
-        locks it down</a>.
+        Nothing up to 15&nbsp;TB of stored data per organization, in
+        production, with every feature. Above that there is one flat
+        annual plan. The licence is BUSL-1.1, and each release becomes
+        Apache-2.0 two years after it ships.
       </p>
 
-      <div class="hero-ctas">
-        <a href="/docs/tutorials/first-delta-savings" class="btn btn-brand">Full tutorial</a>
-        <a href="/trial" class="btn">30-day support trial</a>
-        <a href="https://github.com/beshu-tech/deltaglider_proxy" class="btn btn-ghost">GitHub</a>
-      </div>
+      <p class="fit-next">
+        <a href="/pricing">Prices and the calculator</a> ·
+        <a href="/support">30 days of support from the engineers, free</a>
+      </p>
     </div>
   </section>
+
 </BaseLayout>
 
 <style>
-  .hero-points {
-    list-style: none;
-    margin: 0.9rem 0 0;
-    padding: 0;
-    display: grid;
-    gap: 0.55rem;
-    max-width: 33rem;
+  /* The headline is a sentence, so it gets a wider measure and a
+     smaller size than the display default. */
+  .hero h1 {
+    max-width: 19ch;
+    font-size: clamp(2.1rem, 4.4vw, 3.25rem);
+    line-height: 1.08;
   }
 
-  .hero-points li {
-    margin: 0;
-    max-width: none;
+  .hero-after-term,
+  .hero-also {
     color: var(--ink-soft);
-    font-size: 1.02rem;
+    font-size: 0.95rem;
     line-height: 1.55;
-    padding-left: 1.1rem;
-    position: relative;
+    max-width: 36rem;
+    margin: 0.9rem 0 0;
   }
 
-  .hero-points li::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 0.62em;
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--brand);
-  }
+  .hero-also { margin-top: 1.75rem; }
 
-  .hero-points strong {
-    color: var(--ink-strong);
-  }
+  .hero .hero-ctas { margin-top: 1.5rem; }
+  .hero .hero-trust { max-width: 36rem; margin-top: 1.25rem; }
 
   .dd-grid {
     display: grid;
@@ -303,52 +346,30 @@ import {
   }
   .dd-link:hover { text-decoration: underline; }
 
+  .cost-list {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1.5rem 2.5rem;
+    margin: 2rem 0 0;
+  }
+  @media (min-width: 760px) {
+    .cost-list { grid-template-columns: repeat(3, 1fr); }
+  }
+  .cost-list dt {
+    font-weight: 700;
+    color: var(--ink-strong);
+    margin-bottom: 0.35rem;
+  }
+  .cost-list dd {
+    margin: 0;
+    color: var(--ink-soft);
+    line-height: 1.55;
+  }
+
   .fit-next {
     margin-top: 1.5rem;
     color: var(--ink-soft);
   }
-
-  /* quickstart terminal window */
-  .term {
-    max-width: var(--measure-wide);
-    border: 1px solid var(--rule-strong);
-    border-radius: var(--r-md);
-    overflow: hidden;
-    background: var(--panel-dark-bg);
-    margin: 1.75rem 0;
-  }
-
-  .term-bar {
-    display: flex;
-    align-items: center;
-    gap: 0.85rem;
-    padding: 0.75rem 1.25rem;
-    border-bottom: 1px solid var(--rule);
-  }
-
-  .term-title {
-    font-family: var(--font-mono);
-    font-size: 0.8rem;
-    color: var(--panel-dark-ink-dim);
-  }
-
-  .term-pre {
-    margin: 0;
-    border: 0;
-    border-radius: 0;
-    background: transparent;
-    box-shadow: none;
-    padding: 1.4rem 1.5rem 1.5rem;
-    font-size: 1.02rem;
-    line-height: 1.7;
-  }
-
-  .term-pre code {
-    color: var(--panel-dark-ink);
-    background: transparent;
-  }
-
-  .term-prompt { color: var(--panel-dark-accent); font-weight: 700; }
 
   /* Phones: 2.4rem card padding left a 270 px text column; the links get
      44 px rows. */
@@ -357,6 +378,5 @@ import {
     .dd-card::before { font-size: 5.5rem; top: -1.1rem; }
     .dd-q { font-size: 1.3rem; max-width: none; padding-right: 3.5rem; }
     .dd-link { display: inline-block; padding: 0.6rem 0; }
-    .term-pre { padding: 1.1rem 1rem 1.2rem; font-size: 0.9rem; }
   }
 </style>

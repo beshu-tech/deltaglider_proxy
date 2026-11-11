@@ -23,7 +23,7 @@ pub async fn list_sessions(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let own = super::auth::extract_session_token(&headers);
+    let own = super::auth::extract_session_token(&state.sessions, &headers);
     let mut sessions = state.sessions.list();
     for s in &mut sessions {
         s.current = own
@@ -44,7 +44,7 @@ pub async fn revoke_session(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AdminError> {
-    if let Some(own) = super::auth::extract_session_token(&headers) {
+    if let Some(own) = super::auth::extract_session_token(&state.sessions, &headers) {
         if state.sessions.session_id_matches(&own, &id) {
             return Err(AdminError::invalid("use logout to end your own session"));
         }

@@ -38,6 +38,8 @@ mod aws_chunked_upload_test;
 mod backend_capability_gate_test;
 #[path = "backend_health_test.rs"]
 mod backend_health_test;
+#[path = "boot_resilience_test.rs"]
+mod boot_resilience_test;
 #[path = "bootstrap_password_hash_invariant_test.rs"]
 mod bootstrap_password_hash_invariant_test;
 #[path = "browser_session_connect_test.rs"]
@@ -122,6 +124,8 @@ mod iam_variables_clone_test;
 mod large_object_e2e_test;
 #[path = "lifecycle_test.rs"]
 mod lifecycle_test;
+#[path = "list_edges_test.rs"]
+mod list_edges_test;
 #[path = "list_truncation_test.rs"]
 mod list_truncation_test;
 #[path = "logs_test.rs"]
@@ -190,3 +194,5 @@ mod streaming_copy_test;
 mod tls_listener_test;
 #[path = "unmanaged_objects_test.rs"]
 mod unmanaged_objects_test;
+#[path = "write_validation_wiring_test.rs"]
+mod write_validation_wiring_test;

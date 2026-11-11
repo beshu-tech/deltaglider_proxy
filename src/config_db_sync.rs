@@ -159,9 +159,11 @@ pub struct ConfigDbSync {
     /// strictly ordered; cross-node conflicts still use the reconcile path.
     upload_lock: tokio::sync::Mutex<()>,
     health: parking_lot::Mutex<SyncHealth>,
-    /// The `If-Match` form of the bucket ([`Self::use_profile`], from the
-    /// coordination-bucket validation): the upload's compare-and-swap.
-    if_match: parking_lot::Mutex<crate::coordination::if_match::IfMatchDialect>,
+    /// What the coordination-bucket validation proved ([`Self::use_profile`]),
+    /// shared with the other coordination writers: the upload's
+    /// compare-and-swap uses its `If-Match` form. While it is unknown, the
+    /// upload fails closed and stays parked.
+    profile: crate::coordination::if_match::ProfileCell,
 }
 
 impl ConfigDbSync {
@@ -218,7 +220,7 @@ impl ConfigDbSync {
             needs_upload: AtomicBool::new(pending.is_some()),
             upload_lock: tokio::sync::Mutex::new(()),
             health: parking_lot::Mutex::new(SyncHealth::default()),
-            if_match: Default::default(),
+            profile: Default::default(),
         })
         .inspect(|s: &Self| s.publish_health())
     }
@@ -226,7 +228,14 @@ impl ConfigDbSync {
     /// Use what the validation of the bucket found: the upload sends its
     /// `If-Match` in that dialect.
     pub fn use_profile(&self, profile: crate::coordination::if_match::ConditionalProfile) {
-        *self.if_match.lock() = profile.if_match;
+        self.profile.prove(profile);
+    }
+
+    /// Read the profile from the process-wide `cell` on every upload (the
+    /// production wiring: the background re-probe proves the cell later).
+    pub fn with_profile_cell(mut self, cell: crate::coordination::if_match::ProfileCell) -> Self {
+        self.profile = cell;
+        self
     }
 
     /// The primary config DB key (the key of the local DB after boot).
@@ -659,6 +668,13 @@ impl ConfigDbSync {
             ));
         }
 
+        // No conditional write on a guess: until a probe proved the bucket,
+        // the upload is refused (the caller parks it and retries later).
+        let profile = self
+            .profile
+            .proven()
+            .map_err(|e| UploadError::Other(e.to_string()))?;
+
         // Snapshot the ETag we expect the remote object to still carry. This is
         // the compare half of the compare-and-swap.
         let expected_etag = self.last_etag.read().await.clone();
@@ -673,8 +689,7 @@ impl ConfigDbSync {
         put = match &expected_etag {
             Some(etag) => {
                 use crate::coordination::if_match::IfMatchRequest;
-                let dialect = *self.if_match.lock();
-                put.if_match_etag(etag, dialect)
+                put.if_match_etag(etag, profile.if_match)
             }
             None => put.if_none_match("*"),
         };
@@ -774,8 +789,12 @@ impl ConfigDbSync {
 
     /// Boot-time gate: PROVE the coordination bucket enforces atomic
     /// conditional writes (`If-None-Match: *`) before any HA feature hinges on
-    /// it. Returns `Err` on a bucket that can't be trusted — the caller CRASHES
-    /// the process (a silent-clobber coordination bucket is a data-loss trap).
+    /// it. Returns `Err` on a bucket that can't be trusted. The boot judges it
+    /// (`settle_coordination` in `startup.rs`): `NonCas` crashes the
+    /// process (a silent-clobber coordination bucket is a data-loss trap);
+    /// `Indeterminate` (the probe could not run) boots with every
+    /// coordination writer closed until a background re-probe
+    /// ([`reprobe_step`]) proves the bucket.
     ///
     /// Design (simple + 16-node-concurrency-safe):
     ///  1. WITNESS fast-path — if `.deltaglider/coordination-witness.json` exists
@@ -791,7 +810,9 @@ impl ConfigDbSync {
     ///     a free live-fire CAS test, and either way the witness now exists. A
     ///     STALE witness is refreshed with a plain overwrite (CAS already proven
     ///     in step 2; the timestamp bump isn't CAS-critical).
-    pub async fn validate_coordination_bucket(&self) -> Result<CoordinationValidation, String> {
+    pub async fn validate_coordination_bucket(
+        &self,
+    ) -> Result<CoordinationValidation, CasValidationFailure> {
         let validation = validate_coordination_bucket_with(&self.s3_client, &self.bucket).await;
         if let Ok(v) = &validation {
             self.use_profile(v.profile());
@@ -805,10 +826,51 @@ impl ConfigDbSync {
 pub async fn validate_coordination_bucket_with(
     client: &Client,
     bucket: &str,
-) -> Result<CoordinationValidation, String> {
-    validate_cas_bucket(client, bucket, COORDINATION_WITNESS_KEY)
-        .await
-        .map_err(|failure| match failure {
+) -> Result<CoordinationValidation, CasValidationFailure> {
+    validate_cas_bucket(client, bucket, COORDINATION_WITNESS_KEY).await
+}
+
+/// How many NonCas verdicts in a row the background re-probe takes as
+/// final. One could be a mixed answer of a bucket behind a flapping proxy;
+/// two in a row is a verdict.
+pub const REPROBE_NONCAS_LIMIT: u32 = 2;
+
+/// What the background re-probe does with its latest verdict (pure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReprobeStep {
+    /// The bucket is proven: enable the coordination writers and stop.
+    Proven,
+    /// Not decided yet: wait, then probe again. `noncas_streak` is the
+    /// number of NonCas verdicts in a row, this one included.
+    Again { noncas_streak: u32 },
+    /// The bucket is not CAS, twice in a row: HA coordination is unsafe.
+    /// Shut down gracefully with a failure exit code.
+    Shutdown,
+}
+
+/// THE re-probe rule for the coordination bucket (pure). `streak` is the
+/// number of NonCas verdicts in a row BEFORE this one. An `Indeterminate`
+/// verdict resets the streak: the probe could not run, so it says nothing.
+pub fn reprobe_step(
+    verdict: &Result<CoordinationValidation, CasValidationFailure>,
+    streak: u32,
+) -> ReprobeStep {
+    match verdict {
+        Ok(_) => ReprobeStep::Proven,
+        Err(CasValidationFailure::Indeterminate(_)) => ReprobeStep::Again { noncas_streak: 0 },
+        Err(CasValidationFailure::NonCas) if streak + 1 >= REPROBE_NONCAS_LIMIT => {
+            ReprobeStep::Shutdown
+        }
+        Err(CasValidationFailure::NonCas) => ReprobeStep::Again {
+            noncas_streak: streak + 1,
+        },
+    }
+}
+
+impl CasValidationFailure {
+    /// The operator-facing text of a failed validation of `bucket`.
+    pub fn describe_for_coordination(&self, bucket: &str) -> String {
+        match self {
             CasValidationFailure::NonCas => format!(
                 "Coordination bucket '{bucket}' does NOT enforce atomic conditional writes \
                  (If-None-Match). HA coordination (leases, single-writer locks) would be \
@@ -816,8 +878,11 @@ pub async fn validate_coordination_bucket_with(
                  (>=2024-09), or Ceph/Hetzner; Backblaze B2 (501) and old MinIO/SeaweedFS \
                  (silent overwrite) are NOT supported."
             ),
-            CasValidationFailure::Indeterminate(e) => e,
-        })
+            CasValidationFailure::Indeterminate(e) => {
+                format!("Coordination bucket '{bucket}' could not be probed: {e}")
+            }
+        }
+    }
 }
 
 /// Why a CAS validation did not pass. `NonCas` is DEFINITIVE (the backend
@@ -1067,12 +1132,14 @@ fn db_upload_deadline(
     })
 }
 
-/// Node identifier for witness provenance: THE durable node id the leases
-/// and locks use (`DGP_NODE_ID`, `HOSTNAME`, else the persisted id), so a
-/// witness names the same node they do. Purely diagnostic.
+/// Node identifier for witness provenance: the node id the leases and locks
+/// use (`DGP_NODE_ID`, `HOSTNAME`, else the persisted id), so a witness names
+/// the same node they do. Purely diagnostic, so it only READS the persisted
+/// id: the leases' startup path creates it, and a probe that runs before (or
+/// without) it never writes into the working directory.
 fn node_id() -> String {
     let db = crate::config_db::config_db_path();
-    crate::coordination::durable_node_id(db.parent().unwrap_or_else(|| std::path::Path::new(".")))
+    crate::coordination::node_id_label(db.parent().unwrap_or_else(|| std::path::Path::new(".")))
 }
 
 /// Is this HeadObject error "the config DB object does not exist yet"?
@@ -1502,9 +1569,10 @@ pub async fn reopen_and_rebuild_iam(
         }
     }
 
-    // Rebuild ExternalAuthManager from the new DB. Release the DB
-    // lock before the async discovery round — it can take seconds
-    // against real OIDC providers.
+    // Rebuild ExternalAuthManager from the new DB. Discovery runs in the
+    // background and is never awaited here: this path runs at the boot of
+    // an HA node and under `upload_lock`, and a hanging identity provider
+    // must stall neither.
     if let (Some(ext_auth), Some(providers)) = (external_auth.as_ref(), providers) {
         // ALWAYS rebuild — an EMPTY list means every provider was deleted on the
         // peer, and skipping the rebuild would leave the deleted provider's live
@@ -1515,7 +1583,7 @@ pub async fn reopen_and_rebuild_iam(
         ext_auth.rebuild(&providers);
         drop(db);
         if !is_empty {
-            ext_auth.discover_all().await;
+            ext_auth.spawn_discovery();
         }
         info!(
             "External auth providers rebuilt from S3-synced DB ({} providers) [{}]",
@@ -1610,6 +1678,213 @@ mod iam_rebuild_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proven() -> Result<CoordinationValidation, CasValidationFailure> {
+        Ok(CoordinationValidation::Probed {
+            profile: Default::default(),
+        })
+    }
+
+    #[test]
+    fn the_reprobe_step_table() {
+        let unknown = || Err(CasValidationFailure::Indeterminate("timeout".into()));
+        let noncas = || Err(CasValidationFailure::NonCas);
+        // (verdict, streak before, want)
+        let cases = [
+            (proven(), 0, ReprobeStep::Proven),
+            (proven(), 1, ReprobeStep::Proven),
+            (unknown(), 0, ReprobeStep::Again { noncas_streak: 0 }),
+            // an unknown verdict between two NonCas verdicts breaks the streak
+            (unknown(), 1, ReprobeStep::Again { noncas_streak: 0 }),
+            (noncas(), 0, ReprobeStep::Again { noncas_streak: 1 }),
+            (noncas(), 1, ReprobeStep::Shutdown),
+        ];
+        for (verdict, streak, want) in cases {
+            assert_eq!(reprobe_step(&verdict, streak), want, "{verdict:?} {streak}");
+        }
+    }
+
+    /// A writer with no proven profile refuses (retryable); a proven cell
+    /// writes. The upload sends nothing before the check.
+    #[tokio::test]
+    async fn an_upload_with_an_unknown_profile_refuses_and_a_proven_one_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cell = crate::coordination::if_match::ProfileCell::unknown();
+        let sync = ConfigDbSync::new(
+            &dead_s3_backend(),
+            "coord".into(),
+            "db".into(),
+            dir.path().join("config.db"),
+            crate::config_db::ConfigDbKeys::primary_only(&"k".repeat(40)),
+            false,
+        )
+        .await
+        .unwrap()
+        .with_profile_cell(cell.clone());
+        match sync.upload(vec![1, 2, 3]).await {
+            Err(UploadError::Other(e)) => {
+                assert_eq!(e, crate::coordination::if_match::NOT_PROVEN)
+            }
+            other => panic!("an unknown profile must refuse: {other:?}"),
+        }
+        cell.prove(Default::default());
+        // Proven: the write is attempted, and fails on the dead endpoint.
+        match sync.upload(vec![1, 2, 3]).await {
+            Err(UploadError::Other(e)) => {
+                assert_ne!(e, crate::coordination::if_match::NOT_PROVEN)
+            }
+            other => panic!("the dead endpoint must fail the write: {other:?}"),
+        }
+    }
+
+    /// The sync path (boot of an HA node, the poller) publishes the providers
+    /// of the merged DB and never waits for their discovery: an identity
+    /// provider that accepts a connection and never answers must not hold
+    /// `upload_lock` or the boot (review F14).
+    #[tokio::test]
+    async fn the_sync_rebuild_does_not_wait_for_a_hanging_identity_provider() {
+        // An IdP that accepts connections and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        const PASS: &str = "sync-test-pass";
+        let dir = tempfile::tempdir().unwrap();
+        let live_path = dir.path().join("live.db");
+        let remote_path = dir.path().join("remote.db");
+        let live = ConfigDb::open_or_create(&live_path, PASS).unwrap();
+        {
+            let remote = ConfigDb::open_or_create(&remote_path, PASS).unwrap();
+            remote
+                .create_auth_provider(
+                    &crate::config_db::auth_providers::CreateAuthProviderRequest {
+                        name: "corp".into(),
+                        provider_type: "oidc".into(),
+                        enabled: true,
+                        priority: 0,
+                        display_name: None,
+                        client_id: Some("c".into()),
+                        client_secret: Some("s".into()),
+                        issuer_url: Some(issuer),
+                        scopes: "openid".into(),
+                        extra_config: Some(serde_json::json!({ "allow_local": true })),
+                    },
+                )
+                .unwrap();
+        }
+        let config_db = Some(Arc::new(Mutex::new(live)));
+        let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::iam::IamState::Disabled,
+        ));
+        let ext = Arc::new(ExternalAuthManager::new());
+        let started = std::time::Instant::now();
+        reopen_and_rebuild_iam(
+            &config_db,
+            PASS,
+            &iam,
+            &Some(ext.clone()),
+            None,
+            &remote_path,
+            "test",
+        )
+        .await
+        .expect("the merge applies");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the sync rebuild waited on discovery: {:?}",
+            started.elapsed()
+        );
+        assert!(ext.get_provider("corp").is_some());
+        assert!(ext.discovery_running(), "discovery runs in the background");
+    }
+
+    /// Only `settle_coordination` may end the process on a coordination
+    /// verdict, and the re-probe never does: it asks for a graceful
+    /// shutdown. A hand-written `process::exit` in the coordination section
+    /// of `startup.rs` would bring F12 back (a transient blip kills the
+    /// pod), and an exit in the re-probe would skip the drain.
+    #[test]
+    fn only_settle_coordination_exits_the_process_on_a_coordination_verdict() {
+        let startup = include_str!("startup.rs");
+        let from = startup
+            .find("// ---- coordination boot (guarded) ----")
+            .expect("section start marker");
+        let to = startup
+            .find("// ---- end coordination boot ----")
+            .expect("section end marker");
+        let section = &startup[from..to];
+        let settle = section
+            .find("fn settle_coordination(")
+            .expect("settle_coordination");
+        let settle_end = section[settle..]
+            // A closing brace at column 0 (written as an escape: the source
+            // scan counts braces, even in strings).
+            .find(&format!("\n{}\n", '\u{7d}'))
+            .map(|i| settle + i)
+            .expect("end of settle_coordination");
+        let outside = format!("{}{}", &section[..settle], &section[settle_end..]);
+        assert!(
+            !outside.contains("exit_with_boot_error(") && !outside.contains("process::exit("),
+            "a coordination verdict ends the process only in settle_coordination"
+        );
+        assert_eq!(
+            section.matches("exit_with_boot_error(").count()
+                + section.matches("process::exit(").count(),
+            1,
+            "settle_coordination holds the one exit"
+        );
+        // The section holds every coordination builder: a builder outside it
+        // would escape the scan.
+        for builder in [
+            "fn validate_coordination_once(",
+            "fn build_coordination_lease(",
+            "fn build_reference_lock(",
+            "fn build_encryption_witness(",
+            "fn init_config_sync(",
+        ] {
+            assert!(
+                section.contains(builder),
+                "{builder} is outside the section"
+            );
+        }
+        assert!(section.contains("shutdown::request_exit"));
+    }
+
+    /// Every boot site judges the coordination verdict through
+    /// `settle_coordination`.
+    #[test]
+    fn boot_sites_judge_the_coordination_bucket_through_one_rule() {
+        let startup = include_str!("startup.rs");
+        assert!(startup.contains("settle_coordination(&validation, boot, \"lease build\""));
+        assert!(startup.contains("settle_coordination(&validation, boot, \"config sync\""));
+        assert_eq!(
+            startup
+                .matches("coordination bucket validation failed")
+                .count(),
+            1,
+            "only settle_coordination exits on a failed validation"
+        );
+    }
+
+    /// Every coordination writer is built over the one shared profile cell
+    /// (a writer with a private copy never sees the re-probe's verdict).
+    #[test]
+    fn every_coordination_writer_reads_the_shared_profile_cell() {
+        let startup = include_str!("startup.rs");
+        assert!(
+            startup
+                .matches(".with_profile_cell(boot.profile.clone())")
+                .count()
+                >= 4,
+            "S3Lease, S3ReferenceLock, EncryptionWitness and ConfigDbSync each take the cell"
+        );
+        assert!(!startup.contains(".with_profile(profile)"));
+        assert!(!startup.contains("with_if_match"));
+    }
 
     fn dead_s3_backend() -> BackendConfig {
         BackendConfig::S3 {

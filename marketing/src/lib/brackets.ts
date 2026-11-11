@@ -56,7 +56,7 @@ export const BRACKETS: readonly Bracket[] = [
     priceUsd: 0,
     priceLabel: 'Free, 30 days',
     description:
-      'For 30 days you get the full Commercial plan: direct engineering email, a 12h response SLA, and one architecture review call. See /trial.',
+      'For 30 days you get the full Commercial plan: direct engineering email, a 12h response SLA, and one architecture review call. See /support.',
   },
   {
     id: 'commercial',

@@ -503,27 +503,29 @@ impl JobsDb {
         failure: LifecycleFailureInsert<'_>,
         max_retained: u32,
     ) -> Result<(), ConfigDbError> {
-        self.conn.execute(
-            "INSERT INTO lifecycle_failures
+        // The insert and the ring prune are ONE commit (E6/F20).
+        self.atomic(|db| {
+            db.conn.execute(
+                "INSERT INTO lifecycle_failures
                 (rule_name, run_id, occurred_at, bucket, object_key, error_message)
              VALUES (?, ?, ?, ?, ?, ?)",
-            params![
-                rule_name,
-                failure.run_id,
-                failure.occurred_at,
-                failure.bucket,
-                failure.object_key,
-                failure.error_message
-            ],
-        )?;
-        job_store::prune_failure_ring(
-            &self.conn,
-            "lifecycle_failures",
-            "rule_name",
-            &rule_name,
-            max_retained,
-        )?;
-        Ok(())
+                params![
+                    rule_name,
+                    failure.run_id,
+                    failure.occurred_at,
+                    failure.bucket,
+                    failure.object_key,
+                    failure.error_message
+                ],
+            )?;
+            job_store::prune_failure_ring(
+                &db.conn,
+                "lifecycle_failures",
+                "rule_name",
+                &rule_name,
+                max_retained,
+            )
+        })
     }
 
     pub fn lifecycle_recent_failures(

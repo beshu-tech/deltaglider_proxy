@@ -35,6 +35,18 @@ struct Fault {
     status: StatusCode,
     code: String,
     remaining: u32,
+    /// Requests this rule answered so far ([`FakeS3::faulted`]).
+    hits: usize,
+}
+
+/// Requests of `op` that must be in flight together, one whose path
+/// contains each of `paths` ([`FakeS3::rendezvous`]).
+struct Rendezvous {
+    op: String,
+    paths: Vec<String>,
+    met: bool,
+    /// A request waited 10 s in vain: the later ones pass at once.
+    gave_up: bool,
 }
 
 #[derive(Default)]
@@ -50,6 +62,16 @@ pub(crate) struct FakeS3 {
     /// whether a client sends requests concurrently.
     in_flight: parking_lot::Mutex<HashMap<String, (usize, usize)>>,
     faults: parking_lot::Mutex<Vec<Fault>>,
+    /// Stall rules (`op`, path substring): a matching request waits until
+    /// [`FakeS3::release_stalls`] ([`FakeS3::stall`]).
+    stalls: parking_lot::Mutex<Vec<(String, String)>>,
+    stalls_released: std::sync::atomic::AtomicBool,
+    /// Rendezvous rules and the requests in flight with their paths
+    /// ([`FakeS3::rendezvous`]).
+    rendezvous: parking_lot::Mutex<Vec<Rendezvous>>,
+    live: parking_lot::Mutex<Vec<(String, String)>>,
+    rendezvous_changed: tokio::sync::Notify,
+    stalls_changed: tokio::sync::Notify,
     /// Object ACL requests (`?acl`) answer 501 NotImplemented, as on a
     /// backend that does not serve ACLs ([`FakeS3::set_acl_unsupported`]).
     acl_unsupported: std::sync::atomic::AtomicBool,
@@ -93,6 +115,42 @@ impl FakeS3 {
         self.delays.lock().insert(op.to_string(), ms);
     }
 
+    /// Hold every request of operation `op` whose path contains
+    /// `path_contains` until [`FakeS3::release_stalls`]. A stall is a
+    /// cleanup that never ends, with no wall-clock length to out-run.
+    pub(crate) fn stall(&self, op: &str, path_contains: &str) {
+        self.stalls
+            .lock()
+            .push((op.to_string(), path_contains.to_string()));
+    }
+
+    /// Hold each request of operation `op` until requests are in flight
+    /// together, one whose path contains each of `paths` (once; the later
+    /// ones pass). That overlap is then a fact the test waits for, not a
+    /// race against a delay on a loaded host. A client that never overlaps
+    /// them waits 10 s; [`FakeS3::rendezvous_met`] then says false.
+    pub(crate) fn rendezvous(&self, op: &str, paths: &[&str]) {
+        self.rendezvous.lock().push(Rendezvous {
+            op: op.to_string(),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            met: false,
+            gave_up: false,
+        });
+    }
+
+    /// True when the requests of the rendezvous on `op` were in flight
+    /// together.
+    pub(crate) fn rendezvous_met(&self, op: &str) -> bool {
+        self.rendezvous.lock().iter().any(|r| r.op == op && r.met)
+    }
+
+    /// Let the stalled requests go, and stall no more.
+    pub(crate) fn release_stalls(&self) {
+        self.stalls_released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stalls_changed.notify_waiters();
+    }
+
     /// The most requests of operation `op` that were in flight at once.
     pub(crate) fn peak_in_flight(&self, op: &str) -> usize {
         self.in_flight.lock().get(op).map_or(0, |(_, peak)| *peak)
@@ -108,7 +166,22 @@ impl FakeS3 {
             status: StatusCode::from_u16(status).unwrap(),
             code: code.to_string(),
             remaining: times,
+            hits: 0,
         });
+    }
+
+    /// How many requests of `op` whose path contains `path_contains` the
+    /// fault rules answered with an error so far. A request is logged when
+    /// it ARRIVES, but a rule is applied only after the request's waits: a
+    /// test that removes a rule ([`FakeS3::clear_faults`]) once the requests
+    /// arrived can let the last ones through. It waits on this count.
+    pub(crate) fn faulted(&self, op: &str, path_contains: &str) -> usize {
+        self.faults
+            .lock()
+            .iter()
+            .filter(|f| f.op == op && f.path_contains == path_contains)
+            .map(|f| f.hits)
+            .sum()
     }
 
     /// Send object GET bodies chunked, with no Content-Length header.
@@ -163,6 +236,42 @@ impl FakeS3 {
         self.peak_in_flight("DELETE")
     }
 
+    /// Wait for the rendezvous of `op`, if one is armed and not met.
+    async fn meet(&self, op: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let notified = self.rendezvous_changed.notified();
+            {
+                let live = self.live.lock();
+                let mut rules = self.rendezvous.lock();
+                let Some(rule) = rules
+                    .iter_mut()
+                    .find(|r| r.op == op && !r.met && !r.gave_up)
+                else {
+                    return;
+                };
+                let together = rule.paths.iter().all(|p| {
+                    live.iter()
+                        .any(|(o, path)| o == op && path.contains(p.as_str()))
+                });
+                if together {
+                    rule.met = true;
+                    drop(rules);
+                    drop(live);
+                    self.rendezvous_changed.notify_waiters();
+                    return;
+                }
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                if let Some(rule) = self.rendezvous.lock().iter_mut().find(|r| r.op == op) {
+                    rule.gave_up = true;
+                }
+                self.rendezvous_changed.notify_waiters();
+                return;
+            }
+        }
+    }
+
     /// Count the request as in flight for the operation's delay, then
     /// apply the first matching fault rule.
     async fn enter(&self, op: &str, path: &str) -> Option<(StatusCode, Vec<u8>)> {
@@ -172,12 +281,41 @@ impl FakeS3 {
             e.0 += 1;
             e.1 = e.1.max(e.0);
         }
+        self.live.lock().push((op.to_string(), path.to_string()));
+        self.rendezvous_changed.notify_waiters();
+        self.meet(op).await;
+        let stalled = self
+            .stalls
+            .lock()
+            .iter()
+            .any(|(o, p)| o == op && path.contains(p.as_str()));
+        while stalled
+            && !self
+                .stalls_released
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let notified = self.stalls_changed.notified();
+            // Re-check after arming the wait: a release in between wakes no one.
+            if self
+                .stalls_released
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+            notified.await;
+        }
         let delay = self.delays.lock().get(op).copied().unwrap_or(0);
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         }
         if let Some(e) = self.in_flight.lock().get_mut(op) {
             e.0 -= 1;
+        }
+        {
+            let mut live = self.live.lock();
+            if let Some(i) = live.iter().position(|(o, p)| o == op && p == path) {
+                live.swap_remove(i);
+            }
         }
         let mut faults = self.faults.lock();
         let fault = faults
@@ -186,6 +324,7 @@ impl FakeS3 {
         if fault.remaining != u32::MAX {
             fault.remaining -= 1;
         }
+        fault.hits += 1;
         Some((
             fault.status,
             format!(
@@ -212,6 +351,18 @@ impl FakeS3 {
                 modified: chrono::Utc::now().timestamp(),
             },
         );
+    }
+
+    /// How many objects are stored under `prefix` (`bucket/key` form). A
+    /// request is recorded when it arrives; an object is stored when its
+    /// PUT ends. A test that reads an object back waits on this, not on
+    /// the request log.
+    pub(crate) fn stored_count(&self, prefix: &str) -> usize {
+        self.objects
+            .lock()
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .count()
     }
 
     /// Set the `Last-Modified` (unix seconds) of the stored `bucket/key`.

@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Modal, Input, Alert, Typography, Select } from 'antd';
 import { listBuckets, getBucket } from '../s3client';
 import { useColors } from '../ThemeContext';
 import { pluralize } from '../utils';
+import type { RowKey } from '../rowKey';
 import { SPACE } from './shared-styles';
 import { normalizeDestPrefix, destinationIsSource, keyPathError, initialDestPrefix } from './destPrefix';
 
@@ -17,8 +18,8 @@ interface Props {
   loading: boolean;
   /** The folder the user is browsing; the destination path starts there. */
   currentPrefix?: string;
-  /** Selection keys (`folder:<prefix>` for folders) — used to refuse a copy onto itself. */
-  selectionKeys?: Iterable<string>;
+  /** The checked rows — used to refuse a copy onto itself. */
+  selectionKeys?: Iterable<RowKey>;
 }
 
 /** "Move 3 objects" / "Copy 1 object" — shared by the modal title and OK button. */
@@ -47,7 +48,10 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
 
   // The keys at the moment the picker opens: the effect must not reset the
   // path when the selection object changes identity.
-  const keysText = [...selectionKeys].join('\n');
+  const keys = [...selectionKeys];
+  const keysRef = useRef(keys);
+  keysRef.current = keys;
+  const keysText = JSON.stringify(keys);
   useEffect(() => {
     if (open) {
       listBuckets().then(bs => setBuckets(bs.filter(b => !b.unavailable).map(b => b.name))).catch(() => {});
@@ -58,7 +62,7 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
       // Start from the folder being browsed (copies usually go next to, or
       // below, where the user already is), or its parent when the
       // selection lives there: the picker never opens blocked.
-      setDestPrefix(initialDestPrefix(bucket, keysText ? keysText.split('\n') : [], currentPrefix));
+      setDestPrefix(initialDestPrefix(bucket, keysRef.current, currentPrefix));
     }
   }, [open, currentPrefix, keysText]);
 

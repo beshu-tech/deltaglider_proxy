@@ -54,6 +54,10 @@ allow = [
     "BUSL-1.1",
     # Permissive data license carried by webpki-roots (transitive via reqwest/rustls).
     "CDLA-Permissive-2.0",
+    # sqlcipher-src (bundled SQLCipher, rusqlite 0.41): SQLite's public-domain
+    # "blessing" and libtomcrypt's WTFPL. Both are permissive.
+    "blessing",
+    "WTFPL",
 ]
 confidence-threshold = 0.8
 

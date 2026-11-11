@@ -297,13 +297,13 @@ async fn a_subfolder_with_objects_does_not_keep_the_parent_reference() {
 /// `scan_deltaspace_lite`.
 #[test]
 fn only_the_efficiency_verify_endpoint_scans_with_heads() {
-    let callers: Vec<String> = crate::source_scan::prod_sources("src")
-        .into_iter()
-        .filter(|(file, text)| {
-            !file.starts_with("src/storage/")
-                && crate::source_scan::prod_text(text).contains(".scan_deltaspace(")
+    let callers: Vec<String> = crate::source_scan::ast::src()
+        .iter()
+        .filter(|s| {
+            !s.rel.starts_with("src/storage/")
+                && s.prod.calls_named("scan_deltaspace").next().is_some()
         })
-        .map(|(file, _)| file)
+        .map(|s| s.rel.clone())
         .collect();
     assert_eq!(callers, ["src/api/admin/delta_efficiency.rs"]);
 }

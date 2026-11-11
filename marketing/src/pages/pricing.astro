@@ -40,14 +40,14 @@ const customTiers = BRACKETS.filter((b) => b.id === 'enterprise' || b.id === 'oe
 
 /**
  * Special-case the trial-row description so the in-table link
- * to /trial keeps working. brackets.ts holds plain text only.
+ * to /support keeps working. brackets.ts holds plain text only.
  */
 function renderDescription(id: string, description: string): string {
   let html = description;
   if (id === 'trial') {
     html = html.replace(
-      'See /trial',
-      'See <a href="/trial">/trial</a>',
+      'See /support',
+      'See <a href="/support">/support</a>',
     );
   }
 
@@ -357,7 +357,7 @@ function renderDescription(id: string, description: string): string {
           <p>
             Yes. The 30-day trial gives you the Commercial plan's support
             regardless of your size, so you can try it before you need
-            it. See <a href="/trial">/trial</a>.
+            it. See <a href="/support">the support trial</a>.
           </p>
         </div>
 
@@ -400,11 +400,11 @@ function renderDescription(id: string, description: string): string {
     </section>
 
     <section class="cta">
-      <h2>Get started</h2>
+      <h2>Next step</h2>
 
       <div class="hero-ctas">
-        <a href="/trial" class="btn btn-primary">Start a 30-day trial</a>
-        <a href="/docs/tutorials/first-delta-savings" class="btn">Run it free</a>
+        <a href="/docs/tutorials/first-delta-savings" class="btn btn-primary">Run it free</a>
+        <a href="/support" class="btn">30-day support trial</a>
         <a
           href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20Sales%20inquiry"
           class="btn"

@@ -552,6 +552,9 @@ body.shell-wide { --shell: 1400px; }
 .docs-landing-head .docs-landing-lede {
   font-size: 1.08rem; line-height: 1.6; color: var(--ink-strong); margin: 0 0 14px;
 }
+/* The one drawing of the landing: where the proxy sits. */
+.docs-landing-draw { max-width: 640px; margin: 0 0 30px; }
+.docs-landing-draw .dg-draw { margin-top: 1.5rem; }
 .docs-landing-head .docs-landing-sub { font-size: 0.95rem; margin: 0 0 22px; }
 .docs-landing-head .docs-landing-sub kbd {
   font-family: var(--doc-label); font-size: 0.72rem; color: var(--ink-500);

@@ -89,10 +89,12 @@ impl SpoolDir {
     /// Default dir is a DEDICATED `dgp-spool` subdir of the system temp — NOT the
     /// shared temp root (review M3.4: sweeping or filling the shared root is
     /// dangerous; a dedicated subdir we own is safe to sweep). The directory is
-    /// created if missing and SWEPT of orphans at startup (review M1.8: a hard
-    /// crash leaves spool files behind since `NamedTempFile`'s Drop never ran;
-    /// any file present at boot is from a previous process and is safe to delete
-    /// — every live spool is held by a `NamedTempFile` in THIS process).
+    /// created if missing and SWEPT of stale orphans at startup (review M1.8: a
+    /// hard crash leaves spool files behind since `NamedTempFile`'s Drop never
+    /// ran). The sweep is AGE-based (`STALE_TEMP_MAX_AGE`, the same rule as the
+    /// filesystem backend's temp sweep): the directory may be shared with
+    /// another live process, whose active spool files are fresh, so only a
+    /// file untouched for that long goes.
     #[allow(
         clippy::disallowed_methods,
         reason = "the spool's own default directory"
@@ -107,7 +109,18 @@ impl SpoolDir {
             "DGP_BACKEND_SHARE_PERCENT",
             crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT,
         );
-        let pool = Self::new(dir, max_bytes)?.with_backend_share(share);
+        let pool = Self::new(dir.clone(), max_bytes)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "the spool directory '{}' (set by DGP_SPOOL_DIR, default: dgp-spool in \
+                         the system temp dir) is not usable: {e}",
+                        dir.display()
+                    ),
+                )
+            })?
+            .with_backend_share(share);
         pool.sweep_orphans();
         Ok(pool)
     }
@@ -219,6 +232,12 @@ impl SpoolDir {
         self.max_bytes
     }
 
+    /// Can a spool file be made now? Re-creates a missing directory, makes
+    /// and drops one temp file. Blocking, cheap: `/_/ready` runs it.
+    pub fn is_usable(&self) -> bool {
+        temp_in(&self.dir).is_ok()
+    }
+
     /// The directory the spool files live in.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -236,9 +255,9 @@ impl SpoolDir {
     /// whose ACTIVE spools are always freshly-touched — only files untouched for
     /// `STALE` are safe to reclaim. Best-effort; logs and continues on errors.
     fn sweep_orphans(&self) {
-        // 1h: comfortably longer than any single reconstruction, short enough to
-        // reclaim crash debris promptly.
-        self.sweep_older_than(std::time::Duration::from_secs(3600));
+        // `STALE_TEMP_MAX_AGE` (1 h): comfortably longer than any single
+        // reconstruction, short enough to reclaim crash debris promptly.
+        self.sweep_older_than(crate::storage::STALE_TEMP_MAX_AGE);
     }
 
     /// Sweep files whose mtime is at least `max_age` old. Split out for testing.
@@ -346,7 +365,7 @@ impl SpoolDir {
     /// which hold one reservation each.
     pub async fn acquire_beside_mib(&self, held_mib: usize, bytes: u64) -> std::io::Result<Spool> {
         let permit = self.reserve_within(bytes, held_mib).await?;
-        let file = NamedTempFile::new_in(&self.dir)?;
+        let file = temp_in(&self.dir)?;
         Ok(Spool {
             file,
             _permit: SharedOrOwned::Owned(permit),
@@ -421,7 +440,7 @@ impl SpoolDir {
             .iter()
             .map(|_| {
                 Ok(Spool {
-                    file: NamedTempFile::new_in(&self.dir)?,
+                    file: temp_in(&self.dir)?,
                     _permit: SharedOrOwned::Shared(permit.clone()),
                 })
             })
@@ -482,7 +501,7 @@ impl SpoolReservation {
     /// A temp file in the spool dir that shares this reservation.
     pub(crate) fn file(&self) -> std::io::Result<Spool> {
         Ok(Spool {
-            file: NamedTempFile::new_in(&self.dir)?,
+            file: temp_in(&self.dir)?,
             _permit: SharedOrOwned::Shared(self.permit.clone()),
         })
     }
@@ -547,7 +566,7 @@ impl<'a> SpoolBudget<'a> {
             .dir
             .try_permit(bytes, self.held.map_or(0, Spool::reserved_mib))?;
         Ok(Spool {
-            file: NamedTempFile::new_in(&self.dir.dir)?,
+            file: temp_in(&self.dir.dir)?,
             _permit: SharedOrOwned::Owned(permit),
         })
     }
@@ -690,6 +709,21 @@ pub enum SpoolFillError<E> {
 /// 1 MiB; 100 % or more is the whole budget).
 fn backend_share_mib(max_mib: usize, percent: u8) -> usize {
     (max_mib.saturating_mul(usize::from(percent.min(100))) / 100).max(1)
+}
+
+/// A temp file in the spool directory `dir`. Somebody can remove the
+/// directory while the process runs (a tmp cleaner, an operator). The first
+/// `ENOENT` creates the directory again and tries once more, like the
+/// filesystem backend does for a folder that a DELETE pruned. Any other
+/// error, and a second `ENOENT`, go to the caller.
+pub(crate) fn temp_in(dir: &Path) -> std::io::Result<NamedTempFile> {
+    match NamedTempFile::new_in(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+            NamedTempFile::new_in(dir)
+        }
+        other => other,
+    }
 }
 
 /// Bytes → MiB, rounded up. Budget accounting unit.
@@ -1190,6 +1224,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_removed_dir_is_made_again_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("spool");
+        let pool = SpoolDir::new(dir.clone(), 8 << 20).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let spool = pool.acquire(1).await.expect("the dir is made again");
+        assert!(spool.path().starts_with(&dir));
+        drop(spool);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(pool.try_acquire(1).is_ok());
+        assert!(pool.is_usable());
+    }
+
+    #[test]
+    fn a_dir_that_cannot_exist_is_not_usable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("spool");
+        let pool = SpoolDir::new(dir.clone(), 8 << 20).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        // A file where the directory belongs: create_dir_all fails.
+        std::fs::write(&dir, b"x").unwrap();
+        assert!(!pool.is_usable());
+    }
+
+    #[tokio::test]
     async fn acquire_creates_a_writable_file_in_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let pool = SpoolDir::new(tmp.path().to_path_buf(), 64 * 1024 * 1024).unwrap();
@@ -1260,7 +1319,7 @@ mod tests {
         let fresh = tmp.path().join("fresh");
         std::fs::write(&fresh, b"y").unwrap();
         let pool = SpoolDir::new(tmp.path().to_path_buf(), 64 * 1024 * 1024).unwrap();
-        pool.sweep_older_than(std::time::Duration::from_secs(3600));
+        pool.sweep_older_than(crate::storage::STALE_TEMP_MAX_AGE);
         assert!(fresh.exists(), "a fresh (live) spool must NOT be swept");
     }
 

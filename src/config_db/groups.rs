@@ -178,7 +178,35 @@ impl ConfigDb {
         description: Option<&str>,
         permissions: Option<&[Permission]>,
     ) -> Result<Group, ConfigDbError> {
+        self.update_group_with_members(group_id, name, description, permissions, None)
+    }
+
+    /// [`Self::update_group`] and, when `members` is `Some((add, remove))`,
+    /// the membership change: ONE transaction, so a user that does not
+    /// exist (or a name another group has) leaves the whole group as it was.
+    pub fn update_group_with_members(
+        &self,
+        group_id: i64,
+        name: Option<&str>,
+        description: Option<&str>,
+        permissions: Option<&[Permission]>,
+        members: Option<(&[i64], &[i64])>,
+    ) -> Result<Group, ConfigDbError> {
         let tx = self.conn.unchecked_transaction()?;
+        if let Some((add, remove)) = members {
+            for user_id in remove {
+                tx.execute(
+                    "DELETE FROM group_members WHERE group_id = ?1 AND user_id = ?2",
+                    params![group_id, user_id],
+                )?;
+            }
+            for user_id in add {
+                tx.execute(
+                    "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?1, ?2)",
+                    params![group_id, user_id],
+                )?;
+            }
+        }
         if let Some(n) = name {
             tx.execute(
                 "UPDATE groups SET name = ?1 WHERE id = ?2",

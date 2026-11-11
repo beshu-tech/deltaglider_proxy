@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { test } from 'vitest';
-import { collectDroppedFiles, type EntryLike, type ReaderLike, type DataTransferLike } from '../droppedFiles';
+import { collectDroppedFiles, skippedDropMessage, type EntryLike, type ReaderLike, type DataTransferLike } from '../droppedFiles';
 
 // ── Mock builders (callback-based, like the real FileSystem*Entry API) ──────
 const mkFile = (name: string, content = 'x'): File => new File([content], name, { type: 'text/plain' });
@@ -103,4 +105,51 @@ test('mixed drop: one real folder entry + one null-entry item with getAsFile', a
   };
   const out = await collectDroppedFiles(dt);
   assert.deepEqual(out.map((f) => f.name).sort(), ['d/in.txt', 'loose.txt'], 'entry + loose item both collected');
+});
+
+// F62 (epic #146): a file or folder that could not be read was skipped with a
+// console.warn only: the user saw a partial upload and no word why. The
+// caller now learns the skipped paths and tells the user.
+test('skipped paths are reported to the caller, not only to the console', async () => {
+  const realWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const skipped: string[][] = [];
+    const out = await collectDroppedFiles(
+      {
+        items: [itemFor(dirEntry('d', [[brokenFileEntry('bad'), fileEntry('good.txt')]])), itemFor(brokenFileEntry('top.bin'))],
+        files: [],
+      },
+      (paths) => skipped.push(paths),
+    );
+    assert.deepEqual(out.map((f) => f.name), ['d/good.txt']);
+    assert.deepEqual(skipped, [['d/bad', 'top.bin']], 'one report, with every skipped path in drop order');
+  } finally {
+    console.warn = realWarn;
+  }
+});
+
+test('a drop with nothing skipped reports nothing', async () => {
+  const skipped: string[][] = [];
+  await collectDroppedFiles({ items: [itemFor(fileEntry('a.txt'))], files: [] }, (p) => skipped.push(p));
+  assert.deepEqual(skipped, []);
+});
+
+test('the message says how many were skipped and names the first ones', () => {
+  assert.equal(
+    skippedDropMessage(['d/bad']),
+    '1 dropped item could not be read and was not added: d/bad.',
+  );
+  assert.equal(
+    skippedDropMessage(['a', 'b', 'c', 'd', 'e']),
+    '5 dropped items could not be read and were not added: a, b, c and 2 more.',
+  );
+});
+
+test('both drop handlers tell the user what was skipped', () => {
+  for (const file of ['components/DropZone.tsx', 'components/UploadPage.tsx']) {
+    const text = readFileSync(join(__dirname, '..', file), 'utf8');
+    assert.match(text, /collectDroppedFiles\([^)]*,\s*\(?\w+\)?\s*=>/s, `${file} passes a skipped-paths handler`);
+    assert.match(text, /skippedDropMessage\(/, `${file} words the skip`);
+  }
 });

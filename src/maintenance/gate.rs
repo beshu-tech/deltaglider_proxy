@@ -442,12 +442,13 @@ mod tests {
     #[test]
     fn background_writers_ask_write_blocked() {
         let mut offenders = Vec::new();
-        for (rel, text) in crate::source_scan::prod_sources("src") {
-            if !(rel.starts_with("src/replication") || rel.starts_with("src/lifecycle")) {
+        for src in crate::source_scan::ast::src() {
+            if !(src.rel.starts_with("src/replication") || src.rel.starts_with("src/lifecycle")) {
                 continue;
             }
-            if crate::source_scan::prod_text(&text).contains(".is_busy(") {
-                offenders.push(rel);
+            // A method call or the UFCS form `MaintenanceGate::is_busy(&g, b)`.
+            if src.prod.calls_named("is_busy").next().is_some() {
+                offenders.push(src.rel.clone());
             }
         }
         assert!(

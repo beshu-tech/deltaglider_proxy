@@ -10,6 +10,12 @@
  * The admin pages come from the sidebar links themselves, so a new page is
  * checked without an edit here.
  *
+ * One test per theme (style x mode), so each has its own time limit. The
+ * whole sweep in ONE test took 4.7 min against a 5 min limit; past it the
+ * nightly (#153) failed with `Test timeout` and `RangeError: Invalid string
+ * length` (the report builder choking on the interrupted call), naming no
+ * page. A step that outlasts STEP_LIMIT_MS now fails with its own name.
+ *
  * Run with the other QA specs: `npm run e2e:qa` (scripts/qa-e2e.sh starts
  * the proxy). Without QA_REGRESSION=1 the spec skips itself.
  */
@@ -24,8 +30,26 @@ const SECRET_KEY = process.env.QA_SECRET_KEY ?? 'qa-admin-secret-0123456789';
 const BUCKET = `qa-a11y-${Date.now().toString(36)}`;
 const TAGS = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
 
+/** One page (settle + scan + its popups) must end within this. */
+const STEP_LIMIT_MS = 60_000;
+/** One theme: every page, light or dark, one style. */
+const THEME_LIMIT_MS = 240_000;
+
 test.skip(!process.env.QA_REGRESSION, 'QA pass: run with `npm run e2e:qa`');
-test.describe.configure({ timeout: 300_000 });
+test.describe.configure({ timeout: THEME_LIMIT_MS });
+
+/** Fail with `where` when `work` does not end within `ms`. */
+async function within<T>(where: string, ms: number, work: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${where}: not finished within ${ms / 1000} s`)), ms);
+  });
+  try {
+    return await Promise.race([work(), limit]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** One line per serious/critical violation: rule, impact, first targets. */
 async function violations(page: Page, where: string): Promise<string[]> {
@@ -33,6 +57,9 @@ async function violations(page: Page, where: string): Promise<string[]> {
   // and stale listboxes that no user sees. Scan the settled page. rc-motion
   // sets its `*-enter`/`*-appear` class a frame after the click, so an empty
   // getAnimations() alone can pass before the fade starts: wait for both.
+  // An infinite animation (a spinner, a pulse) never ends and is ignored by
+  // name; a finite one that outlasts the timeout FAILS the spec: scanning an
+  // unsettled page would hide or invent violations.
   await page
     .waitForFunction(
       () => {
@@ -40,12 +67,17 @@ async function violations(page: Page, where: string): Promise<string[]> {
         const moving = [...document.querySelectorAll('[class*="ant-"]')].some((el) =>
           motion.test(typeof el.className === 'string' ? el.className : ''),
         );
-        return !moving && document.getAnimations().every((a) => a.playState !== 'running');
+        const finiteRunning = document
+          .getAnimations()
+          .some((a) => a.playState === 'running' && a.effect?.getComputedTiming().iterations !== Infinity);
+        return !moving && !finiteRunning;
       },
       null,
-      { timeout: 5_000, polling: 'raf' },
+      { timeout: 10_000, polling: 'raf' },
     )
-    .catch(() => {});
+    .catch((e: unknown) => {
+      throw new Error(`${where}: the page did not settle within 10 s (a finite animation or an ant-* motion class is still running): ${String(e)}`);
+    });
   const result = await new AxeBuilder({ page })
     .withTags(TAGS)
     // Monaco draws its own editor surface; its internals are not ours to fix.
@@ -100,7 +132,7 @@ async function settle(page: Page) {
   await expect(page.locator('.ant-skeleton-active, .ant-spin-spinning')).toHaveCount(0, { timeout: 15_000 }).catch(() => {});
 }
 
-test('axe: no serious or critical violation on any page, both themes', async ({ page }) => {
+test.beforeAll(async () => {
   const s3 = new S3Client({
     endpoint: BASE,
     region: 'us-east-1',
@@ -111,36 +143,39 @@ test('axe: no serious or critical violation on any page, both themes', async ({ 
   for (const key of ['builds/app-v1.zip', 'builds/app-v2.zip', 'notes.txt']) {
     await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: `${key}\n`.repeat(64) }));
   }
+});
 
-  await page.setViewportSize({ width: 1440, height: 900 });
-  const found: string[] = [];
-  await page.goto('/_/browse');
-  for (const style of STYLES) {
-    for (const mode of MODES) {
+for (const style of STYLES) {
+  for (const mode of MODES) {
+    test(`axe: no serious or critical violation on any page, ${style}/${mode}`, async ({ page }) => {
+      await page.setViewportSize({ width: 1440, height: 900 });
+      const found: string[] = [];
+      await page.goto('/_/browse');
       await setTheme(page, style, mode);
       await page.reload();
       await expect(page.getByLabel('Admin password', { exact: true })).toBeVisible({ timeout: 30_000 });
-      found.push(...(await violations(page, `${style}/${mode} sign-in`)));
-    }
-  }
-  await signIn(page);
-  await page.goto('/_/admin/dashboard');
-  const nav = page.getByRole('navigation', { name: 'Admin navigation' });
-  await expect(nav).toBeVisible({ timeout: 30_000 });
-  const adminPaths = await nav.locator('a[href]').evaluateAll((as) => as.map((a) => a.getAttribute('href') as string));
-  expect(adminPaths.length).toBeGreaterThan(10);
-  const paths = [`/_/browse/${BUCKET}/`, `/_/browse/${BUCKET}/builds/`, '/_/upload', ...adminPaths];
+      found.push(...(await within(`${style}/${mode} sign-in`, STEP_LIMIT_MS, () => violations(page, `${style}/${mode} sign-in`))));
 
-  for (const style of STYLES) {
-    for (const mode of MODES) {
-      await setTheme(page, style, mode);
+      await signIn(page);
+      await page.goto('/_/admin/dashboard');
+      const nav = page.getByRole('navigation', { name: 'Admin navigation' });
+      await expect(nav).toBeVisible({ timeout: 30_000 });
+      const adminPaths = await nav.locator('a[href]').evaluateAll((as) => as.map((a) => a.getAttribute('href') as string));
+      expect(adminPaths.length).toBeGreaterThan(10);
+      const paths = [`/_/browse/${BUCKET}/`, `/_/browse/${BUCKET}/builds/`, '/_/upload', ...adminPaths];
+
       for (const path of paths) {
-        await page.goto(path);
-        await settle(page);
-        found.push(...(await violations(page, `${style}/${mode} ${path}`)));
-        found.push(...(await popupViolations(page, `${style}/${mode} ${path}`)));
+        const where = `${style}/${mode} ${path}`;
+        const started = Date.now();
+        await within(where, STEP_LIMIT_MS, async () => {
+          await page.goto(path);
+          await settle(page);
+          found.push(...(await violations(page, where)));
+          found.push(...(await popupViolations(page, where)));
+        });
+        console.log(`a11y ${where}: ${((Date.now() - started) / 1000).toFixed(1)} s`);
       }
-    }
+      expect(found, found.join('\n')).toEqual([]);
+    });
   }
-  expect(found, found.join('\n')).toEqual([]);
-});
+}

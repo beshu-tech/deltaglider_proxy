@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import type { S3Object } from './types';
 import useSelection from './useSelection';
 import { useBrowserLocation, type NavigateUrl } from './browser/useBrowserLocation';
@@ -56,6 +56,12 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
 
   const { objects: visibleObjects, folders: visibleFolders } = visible;
   const { toggleAll: toggleAllOf } = selection;
+  // A checked row is a row the user can see (F18): the filter box and the
+  // "show system files" switch drop the checked rows they hide, so the count,
+  // the bulk actions and "select all" never include a hidden row.
+  useEffect(() => {
+    reconcile(visibleObjects, visibleFolders);
+  }, [reconcile, visibleObjects, visibleFolders]);
   const toggleAll = useCallback(
     () => toggleAllOf(visibleObjects, visibleFolders),
     [toggleAllOf, visibleObjects, visibleFolders],

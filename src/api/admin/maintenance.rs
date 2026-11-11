@@ -56,6 +56,12 @@ pub struct MaintenanceJobView {
     /// the bucket status, which reads the gate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub writes_blocked: Option<bool>,
+    /// Whether the asking session may cancel this job. Set only by the
+    /// bucket status, for its delete jobs, from the stored principal
+    /// (`maintenance::delete::may_cancel`): the browser shows Cancel from
+    /// this flag and never decides it from a name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub may_cancel: Option<bool>,
     // NO `last_error` here: this view is readable by non-admin browser
     // sessions, and worker errors can embed object keys + raw backend
     // error strings. The busy banner needs status/phase/counts only;
@@ -83,6 +89,7 @@ impl From<MaintenanceJob> for MaintenanceJobView {
             bytes_done: j.bytes_done,
             percent,
             writes_blocked: None,
+            may_cancel: None,
             triggered_by: j.triggered_by,
             created_at: j.created_at,
             started_at: j.started_at,
@@ -740,13 +747,9 @@ pub async fn bucket_status(
         &headers,
         connect_info.map(|ci| ci.0.ip()),
     );
-    let may = super::auth::extract_session_token(&headers)
-        .is_some_and(|t| super::auth::session_may_list_bucket(&state, &t, client_ip, &bucket));
-    if !may {
-        return Err(AdminError::forbidden(
-            "the session may not list this bucket",
-        ));
-    }
+    let viewer = super::auth::extract_session_token(&state.sessions, &headers)
+        .and_then(|t| super::auth::bucket_view_session(&state, &t, client_ip, &bucket))
+        .ok_or_else(|| AdminError::forbidden("the session may not list this bucket"))?;
     let jobs = super::with_jobs_db(&state, "read bucket maintenance status", |db| {
         db.maintenance_active_jobs_for_bucket(&bucket.to_ascii_lowercase())
     })
@@ -769,6 +772,99 @@ pub async fn bucket_status(
         "writes_blocked": busy,
         // The bucket's running deletes: they do not hold it, so several
         // run next to each other and next to `active`.
-        "deletes": deletes.into_iter().map(MaintenanceJobView::from).collect::<Vec<_>>(),
+        "deletes": delete_job_views(deletes, &viewer.principal()),
     })))
+}
+
+/// Pure: the delete jobs of a bucket as the viewer sees them, each with
+/// whether the viewer may cancel it.
+fn delete_job_views(
+    jobs: Vec<MaintenanceJob>,
+    viewer: &crate::maintenance::delete::Principal,
+) -> Vec<MaintenanceJobView> {
+    jobs.into_iter()
+        .map(|j| {
+            let may = crate::maintenance::delete::may_cancel(viewer, j.params.as_deref());
+            MaintenanceJobView {
+                may_cancel: Some(may),
+                ..MaintenanceJobView::from(j)
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod delete_view_tests {
+    use super::*;
+    use crate::maintenance::delete::{DeleteParams, Principal};
+
+    fn user(ak: &str) -> Principal {
+        Principal::User {
+            access_key_id: ak.into(),
+            client_ip: None,
+        }
+    }
+
+    fn delete_job(id: i64, owner: Principal, triggered_by: &str) -> MaintenanceJob {
+        MaintenanceJob {
+            id,
+            kind: crate::maintenance::delete::KIND.into(),
+            bucket: "releases".into(),
+            status: "running".into(),
+            phase: "delete".into(),
+            objects_total: None,
+            objects_done: 0,
+            objects_skipped: 0,
+            objects_failed: 0,
+            bytes_done: 0,
+            continuation_token: None,
+            last_error: None,
+            triggered_by: Some(triggered_by.into()),
+            params: Some(
+                serde_json::to_string(&DeleteParams {
+                    prefixes: vec!["a/".into()],
+                    keys: vec![],
+                    principal: owner,
+                    expected: 0,
+                })
+                .unwrap(),
+            ),
+            created_at: 1,
+            started_at: None,
+            finished_at: None,
+            updated_at: 1,
+            objects_adopted: 0,
+            objects_changed: 0,
+        }
+    }
+
+    /// The flag follows the stored principal, never the display label: a
+    /// user NAMED `admin` may not cancel the admin's job, and a user whose
+    /// name changed still cancels its own.
+    #[test]
+    fn may_cancel_follows_the_stored_principal_not_the_label() {
+        let jobs = || {
+            vec![
+                delete_job(1, Principal::Admin, "admin"),
+                delete_job(2, user("AKDANA"), "dana"),
+                delete_job(3, user("AKDANA"), "renamed"),
+            ]
+        };
+        let flags = |viewer: Principal| {
+            delete_job_views(jobs(), &viewer)
+                .iter()
+                .map(|v| v.may_cancel)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(flags(Principal::Admin), [Some(true); 3]);
+        assert_eq!(flags(user("AKDANA")), [Some(false), Some(true), Some(true)]);
+        // A user named `admin`: the label of job 1 says `admin`, the
+        // principal says otherwise.
+        assert_eq!(
+            flags(user("AKNAMEDADMIN")),
+            [Some(false), Some(false), Some(false)]
+        );
+        let json = serde_json::to_value(&delete_job_views(jobs(), &Principal::Admin)[0]).unwrap();
+        assert_eq!(json["may_cancel"], true);
+    }
 }

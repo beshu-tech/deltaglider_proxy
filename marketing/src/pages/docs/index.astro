@@ -3,6 +3,7 @@
 // manifest, so it mirrors the in-product docs landing exactly.
 import DocsLayout from '../../layouts/DocsLayout.astro';
 import Glyph from '../../components/Glyph.astro';
+import WhereItSits from '../../components/drawings/WhereItSits.astro';
 import { docsByGroup } from '../../lib/docs';
 
 const groups = docsByGroup();
@@ -32,6 +33,7 @@ const GROUP_GLYPHS: Record<string, any> = {
       your client code. The proxy is source-available (BUSL-1.1) and free
       up to 15 TB.
     </p>
+    <div class="docs-landing-draw"><WhereItSits /></div>
     <p class="docs-landing-sub">
       Press <kbd>⌘K</kbd> to search.
     </p>

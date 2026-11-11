@@ -1,0 +1,45 @@
+---
+// ReadPath — what a GET of a delta-stored object does. The claim: the
+// SHA-256 check runs before the first byte leaves the proxy.
+import StepDrawing from './StepDrawing.astro';
+
+interface Props {
+  /** The object of the example. The docs pass a name of their fixed cast. */
+  object?: string;
+  size?: string;
+  /** Size of the stored delta, e.g. "148 KB". */
+  delta?: string;
+  /** A closing sentence about the scale of the drawing. */
+  scale?: string;
+}
+const own = !Astro.props.object;
+const {
+  object = 'releases/v2.zip',
+  size = '91 MB',
+  delta = '148 KB',
+  scale = own ? 'The drawing is not to scale: the delta is 1/600 the size of the reference.' : 'The drawing is not to scale.',
+} = Astro.props;
+const name = object.split('/').pop();
+---
+
+<StepDrawing
+  lead={`A client asks: <b>GET ${object}</b>`}
+  steps={[
+    { scene: 'bucket', label: 'A bucket that holds a large reference file and a thin delta file',
+      title: 'The bucket holds two files',
+      body: `<code>reference.bin</code>, ${size}, and <code>${name}.delta</code>, ${delta}.` },
+    { scene: 'rebuild', label: 'The reference and the delta go into xdelta3, and the whole file comes out',
+      title: 'The proxy rebuilds the file',
+      body: `<code>xdelta3</code> applies the delta to the reference. Out come the ${size} of ${name}.` },
+    { scene: 'check', label: 'Two equal hash strips above a shield with a check mark', focus: true,
+      title: 'The SHA-256 check',
+      body: 'The hash of the rebuilt file must equal the hash recorded at upload. No match: an error, and 0 bytes sent.' },
+    { scene: 'client', label: 'A laptop that shows the whole file',
+      title: `The client gets ${name}`,
+      body: `${size}, the same bytes that it uploaded.` },
+  ]}
+>
+  <strong>The check runs before the first byte leaves the proxy.</strong>
+  A client never receives a file that differs from the one it uploaded.
+  {scale}
+</StepDrawing>

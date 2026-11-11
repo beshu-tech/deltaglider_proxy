@@ -174,16 +174,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<(ObjectKey, String), EngineError> {
         let obj_key = ObjectKey::parse(bucket, key);
         obj_key
-            .validate_ingest()
+            .validate_data_ingest()
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        // A folder marker is stored only by `store` (zero bytes, through
-        // `put_directory_marker`). Every other ingest path would write a data
-        // object under the marker's name, so they all refuse it here.
-        if obj_key.is_directory_marker() {
-            return Err(EngineError::InvalidArgument(
-                "A key that ends in '/' is a folder marker and must have an empty body".to_string(),
-            ));
-        }
         let deltaspace_id = obj_key.deltaspace_id();
         lock.covers(bucket, &deltaspace_id, &obj_key.filename)?;
         Ok((obj_key, deltaspace_id))
@@ -416,25 +408,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return self.head_with_forms(bucket, key).await;
         };
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
-        let read = match form {
-            ObjectVariant::Delta if !obj_key.filename.is_empty() => {
-                self.storage
-                    .get_delta_metadata(bucket, &deltaspace_id, &obj_key.filename)
-                    .await
-            }
-            ObjectVariant::Delta => return self.head_with_forms(bucket, key).await,
-            ObjectVariant::Passthrough => {
-                self.storage
-                    .get_passthrough_metadata(bucket, &deltaspace_id, &obj_key.filename)
-                    .await
-            }
-        };
+        // A delta form of a key with no filename names nothing to read.
+        if form == ObjectVariant::Delta && obj_key.filename.is_empty() {
+            return self.head_with_forms(bucket, key).await;
+        }
+        // The one place that reads a stored form (guard
+        // `the_two_stored_forms_are_read_together_in_one_place`).
+        let read = self
+            .stored_form_metadata(bucket, &deltaspace_id, &obj_key.filename, form)
+            .await;
         match read {
-            Ok(meta) => {
+            Ok(Some(meta)) => {
                 self.metadata_cache.insert(bucket, key, meta.clone());
                 Ok((meta, StoredForms::only(form)))
             }
-            Err(StorageError::NotFound(_)) => self.head_with_forms(bucket, key).await,
+            Ok(None) => self.head_with_forms(bucket, key).await,
             Err(e) => Err(e.into()),
         }
     }
@@ -638,39 +626,38 @@ mod head_cost_tests {
         assert_eq!(fake.requests().len(), 2, "{:?}", fake.requests());
     }
 
-    /// Line `i` reads the metadata of one form: by its `StorageBackendExt`
-    /// name, or by `head_object` with `form` in the call.
-    fn reads_metadata(lines: &[(usize, &str)], i: usize, name: &str, form: &str) -> bool {
-        let line = lines[i].1;
-        line.contains(name)
-            || (line.contains(".head_object(")
-                && lines[i..lines.len().min(i + 4)]
-                    .iter()
-                    .any(|(_, l)| l.contains(form)))
+    /// Does `c` read the metadata of one form: the `StorageBackendExt`
+    /// method `name`, or `head_object` with `form` (`Delta`, `Passthrough`,
+    /// `Reference`: the `StoredObject` variant) among its arguments?
+    fn reads_form(c: &crate::source_scan::ast::Call, name: &str, form: &str) -> bool {
+        c.named(name) || (c.named("head_object") && c.arg_idents_all.iter().any(|i| i == form))
     }
 
     /// Both stored forms of an object are read together in one place
     /// (`resolve_stored_forms`): `delete.rs` kept its own copy of the
-    /// parallel HEADs and the newest-wins rule.
+    /// parallel HEADs and the newest-wins rule. A fn that reads both
+    /// (wherever it puts the two reads) is a second copy.
     #[test]
     fn the_two_stored_forms_are_read_together_in_one_place() {
         let mut sites = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src/deltaglider/engine") {
-            let lines = crate::source_scan::prod_lines(&text);
-            for (i, (n, _)) in lines.iter().enumerate() {
-                if !reads_metadata(&lines, i, ".get_delta_metadata(", "StoredObject::Delta") {
-                    continue;
-                }
-                let both = (i.saturating_sub(6)..lines.len().min(i + 6)).any(|j| {
-                    reads_metadata(
-                        &lines,
-                        j,
-                        ".get_passthrough_metadata(",
-                        "StoredObject::Passthrough",
-                    )
-                });
-                if both {
-                    sites.push((file.clone(), *n));
+        for src in crate::source_scan::ast::src() {
+            if !src.rel.starts_with("src/deltaglider/engine/") {
+                continue;
+            }
+            let f = &src.prod;
+            let mut fns: Vec<usize> = f.calls.iter().map(|c| c.func).collect();
+            fns.sort();
+            fns.dedup();
+            for func in fns {
+                let reads = |name: &str, form: &str| {
+                    f.calls
+                        .iter()
+                        .any(|c| c.func == func && reads_form(c, name, form))
+                };
+                if reads("get_delta_metadata", "Delta")
+                    && reads("get_passthrough_metadata", "Passthrough")
+                {
+                    sites.push((src.rel.clone(), src.fn_name(func).to_string()));
                 }
             }
         }
@@ -690,24 +677,24 @@ mod head_cost_tests {
     fn engine_code_reads_a_reference_once() {
         const ALLOWED: [&str; 0] = [];
         let mut sites = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src/deltaglider/engine") {
-            let lines = crate::source_scan::prod_lines(&text);
-            for (i, (n, line)) in lines.iter().enumerate() {
-                // `reference_fence` then the metadata: the shape the
-                // cross-instance acquire had (reference_fence_with_metadata).
-                if !line.contains(".has_reference(") && !line.contains(".reference_fence(") {
-                    continue;
-                }
-                let then_reads = (i..lines.len().min(i + 15)).any(|j| {
-                    reads_metadata(
-                        &lines,
-                        j,
-                        ".get_reference_metadata(",
-                        "StoredObject::Reference",
-                    )
+        for src in crate::source_scan::ast::src() {
+            if !src.rel.starts_with("src/deltaglider/engine/") {
+                continue;
+            }
+            let f = &src.prod;
+            // `has_reference` / `reference_fence`, then in the same fn the
+            // reference metadata: two HEADs on S3.
+            for ask in f
+                .calls_named("has_reference")
+                .chain(f.calls_named("reference_fence"))
+            {
+                let then_reads = f.calls.iter().any(|c| {
+                    c.func == ask.func
+                        && c.pos > ask.pos
+                        && reads_form(c, "get_reference_metadata", "Reference")
                 });
                 if then_reads {
-                    sites.push((file.clone(), *n));
+                    sites.push((src.rel.clone(), ask.line));
                 }
             }
         }

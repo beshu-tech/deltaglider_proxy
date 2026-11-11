@@ -1241,10 +1241,17 @@ async fn drain_rule_rows(
             KeyAction::Copy => apply_copy(engine, db, w.rule, w.bucket, w.key).await,
         };
         let dbg = db.lock().await;
-        // Mid-drain heartbeat: a long drain (up to 500 engine copies) must
-        // keep pinning the background pruner's staleness floor.
-        let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
-        settle_key(&dbg, replication, w, outcome, now, &mut window, failed_ids);
+        // One commit for the heartbeat and the key's outcome (E6/F20).
+        if let Err(e) = dbg.atomic(|dbg| {
+            // Mid-drain heartbeat: a long drain (up to 500 engine copies) must
+            // keep pinning the background pruner's staleness floor.
+            let _ =
+                dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
+            settle_key(dbg, replication, w, outcome, now, &mut window, failed_ids);
+            Ok(())
+        }) {
+            warn!("event consumer: the outcome of a key was not saved (rolled back): {e}");
+        }
     }
 
     if let Some(why) = refused {
@@ -1300,25 +1307,32 @@ async fn drain_rule_rows(
         None => Vec::new(),
     };
     let dbg = db.lock().await;
-    let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
-    for (w, msg) in unmappable {
-        let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
-        settle_key(&dbg, replication, w, Err(err), now, &mut window, failed_ids);
-    }
-    for (w, outcome) in batched.into_iter().zip(outcomes) {
-        use super::mirror_delete::MirrorOutcome;
-        let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = match outcome {
-            // Deleted, already gone, or the source holds the key again (the
-            // copy path re-syncs it).
-            MirrorOutcome::Deleted { .. } | MirrorOutcome::SourceBack => Ok(()),
-            MirrorOutcome::Failed(f) if f.key_unusable => {
-                Err(Box::new(PermanentKeyError(f.message)))
-            }
-            MirrorOutcome::Failed(f) => Err(Box::new(crate::transfer::CopyError::new(
-                f.class, f.message,
-            ))),
-        };
-        settle_key(&dbg, replication, w, result, now, &mut window, failed_ids);
+    // The whole delete batch settles in ONE commit (E6/F20): the cursor, and
+    // every key's failure row or cleared ledger row.
+    if let Err(e) = dbg.atomic(|dbg| {
+        let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
+        for (w, msg) in unmappable {
+            let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
+            settle_key(dbg, replication, w, Err(err), now, &mut window, failed_ids);
+        }
+        for (w, outcome) in batched.into_iter().zip(outcomes) {
+            use super::mirror_delete::MirrorOutcome;
+            let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = match outcome {
+                // Deleted, already gone, or the source holds the key again (the
+                // copy path re-syncs it).
+                MirrorOutcome::Deleted { .. } | MirrorOutcome::SourceBack => Ok(()),
+                MirrorOutcome::Failed(f) if f.key_unusable => {
+                    Err(Box::new(PermanentKeyError(f.message)))
+                }
+                MirrorOutcome::Failed(f) => Err(Box::new(crate::transfer::CopyError::new(
+                    f.class, f.message,
+                ))),
+            };
+            settle_key(dbg, replication, w, result, now, &mut window, failed_ids);
+        }
+        Ok(())
+    }) {
+        warn!("event consumer: the outcome of a delete batch was not saved (rolled back): {e}");
     }
     std::ops::ControlFlow::Continue(window)
 }

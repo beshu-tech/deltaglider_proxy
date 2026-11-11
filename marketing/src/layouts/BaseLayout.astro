@@ -77,16 +77,70 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
     <meta property="og:image" content={ogImageUrl} />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="DeltaGlider: the object storage control plane, free up to 15 TB." />
+    <meta property="og:image:alt" content="DeltaGlider: store every build, backup and release in 60–95% less space. Free up to 15 TB." />
     <meta property="og:locale" content="en_GB" />
 
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content={title} />
     <meta name="twitter:description" content={description} />
     <meta name="twitter:image" content={ogImageUrl} />
-    <meta name="twitter:image:alt" content="DeltaGlider: the object storage control plane, free up to 15 TB." />
+    <meta name="twitter:image:alt" content="DeltaGlider: store every build, backup and release in 60–95% less space. Free up to 15 TB." />
 
     <meta name="generator" content={Astro.generator} />
+
+    {/* Umami Cloud: cookieless page views + the funnel events below.
+        Production builds only, so `astro dev` sends nothing. */}
+    {import.meta.env.PROD && (
+      <script
+        defer
+        src="https://cloud.umami.is/script.js"
+        data-website-id="9029ecb2-741d-4ac3-b580-7e28da9c6b9e"
+        data-domains="deltaglider.com"
+      ></script>
+    )}
+    <script is:inline>
+      // Funnel events, one delegated rule for every page. A blocked or
+      // absent Umami script makes each of these a no-op.
+      (() => {
+        const send = (name, data) => {
+          try { window.umami && window.umami.track(name, data); } catch (_) {}
+        };
+        const page = () => location.pathname;
+        document.addEventListener('click', (e) => {
+          if (!(e.target instanceof Element)) return;
+          // The docs copy button uses the clipboard API: no `copy` event.
+          if (e.target.closest('.docs-copy-btn')) {
+            send('code-copy', { page: page() });
+            return;
+          }
+          const a = e.target.closest('a[href]');
+          if (!a) return;
+          const href = a.getAttribute('href') || '';
+          if (href.startsWith('mailto:')) {
+            const subject = decodeURIComponent((href.split('subject=')[1] || '').split('&')[0]);
+            send('mailto-click', { page: page(), subject });
+          } else if (href.startsWith('https://github.com/beshu-tech/deltaglider_proxy')) {
+            send('github-click', { page: page() });
+          } else if (href === '/support') {
+            send('trial-click', { page: page() });
+          } else if (href.startsWith('/docs/tutorials/')) {
+            send('tutorial-click', { page: page(), to: href });
+          }
+        });
+        // Text copied out of a code block (the `docker run` command).
+        document.addEventListener('copy', (e) => {
+          const el = e.target instanceof Element ? e.target : null;
+          if (el && el.closest('pre, code')) send('code-copy', { page: page() });
+        });
+        // First change of a calculator input, once per page view.
+        let calcUsed = false;
+        document.addEventListener('input', (e) => {
+          if (calcUsed || !(e.target instanceof Element) || !e.target.closest('.calc')) return;
+          calcUsed = true;
+          send('calculator-use', { page: page() });
+        });
+      })();
+    </script>
 
     <slot name="json-ld" />
     {/* Page-scoped head extras (e.g. docs-only display fonts). */}

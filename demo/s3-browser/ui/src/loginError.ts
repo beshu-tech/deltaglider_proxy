@@ -24,6 +24,20 @@ export function retryAfterSeconds(
   return typeof fromBody === 'number' && Number.isFinite(fromBody) && fromBody >= 0 ? fromBody : null;
 }
 
+/** "45 s" or "9 min": the wait of a lockout, rounded up. */
+function waitText(secs: number): string {
+  return secs < 60 ? `${Math.max(1, secs)} s` : `${Math.ceil(secs / 60)} min`;
+}
+
+/**
+ * The sentence for a lockout (429) of a password change: the same limiter as
+ * sign-in, but the text says passwords, not sign-in attempts.
+ */
+export function passwordChangeLockoutMessage(secs: number | null): string {
+  if (secs === null) return 'Too many wrong passwords. Wait a few minutes, then try again.';
+  return `Too many wrong passwords. Try again in ${waitText(secs)}.`;
+}
+
 export function loginFailureMessage(f: {
   status: number;
   error?: string;
@@ -34,8 +48,7 @@ export function loginFailureMessage(f: {
     if (secs === null || secs === undefined) {
       return 'Too many sign-in attempts. Wait a few minutes, then try again.';
     }
-    const wait = secs < 60 ? `${Math.max(1, secs)} s` : `${Math.ceil(secs / 60)} min`;
-    return `Too many sign-in attempts. Try again in ${wait}.`;
+    return `Too many sign-in attempts. Try again in ${waitText(secs)}.`;
   }
   const detail = f.error && f.error !== 'Login failed' ? f.error : 'wrong password.';
   return `Login failed: ${detail}`;

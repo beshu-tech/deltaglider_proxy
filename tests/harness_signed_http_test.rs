@@ -61,3 +61,79 @@ async fn open_access_server_gets_an_unsigned_client() {
         .status()
         .is_success());
 }
+
+/// A proxy with one bucket on a dead backend: a request to it answers 503.
+async fn server_with_a_dead_backend_bucket() -> TestServer {
+    // The healthy disk keeps the boot alive: the boot probe refuses to start
+    // a proxy whose only backend is dead.
+    let good_dir = tempfile::tempdir().expect("tempdir").keep();
+    TestServer::builder()
+        .extra_yaml_storage_section(&format!(
+            r#"
+backends:
+  - name: deadb2
+    type: s3
+    endpoint: "http://127.0.0.1:1"
+    region: us-east-1
+    access_key_id: x
+    secret_access_key: y
+    allow_local: true
+  - name: gooddisk
+    type: filesystem
+    path: {}
+buckets:
+  doomed:
+    backend: deadb2
+"#,
+            good_dir.display()
+        ))
+        .env("DGP_BOOT_BACKEND_PROBE", "enforce")
+        .build()
+        .await
+}
+
+async fn list_the_doomed_bucket(server: &TestServer) -> u16 {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    let err = server
+        .s3_client()
+        .await
+        .list_objects_v2()
+        .bucket("doomed")
+        .send()
+        .await
+        .expect_err("a dead backend cannot list");
+    assert_eq!(err.code(), Some("ServiceUnavailable"), "{err:?}");
+    503
+}
+
+/// F27: a 5xx the test did not declare fails it when the server drops. The
+/// request itself "passed" (the test expects the error), so only the counter
+/// can tell.
+#[tokio::test]
+#[should_panic(expected = "request(s) with a 5xx")]
+async fn an_undeclared_5xx_fails_the_test_when_the_server_drops() {
+    let server = server_with_a_dead_backend_bucket().await;
+    list_the_doomed_bucket(&server).await;
+}
+
+#[tokio::test]
+async fn a_declared_5xx_does_not_fail_the_test() {
+    common::expect_server_errors("the test lists a bucket on a dead backend (503)");
+    let server = server_with_a_dead_backend_bucket().await;
+    list_the_doomed_bucket(&server).await;
+}
+
+/// A server that answered no 5xx (a 404 is a client error) drops cleanly.
+#[tokio::test]
+async fn a_server_with_only_client_errors_drops_cleanly() {
+    let server = TestServer::builder().build().await;
+    let missing = server
+        .s3_client()
+        .await
+        .get_object()
+        .bucket(server.bucket())
+        .key("absent")
+        .send()
+        .await;
+    assert!(missing.is_err());
+}

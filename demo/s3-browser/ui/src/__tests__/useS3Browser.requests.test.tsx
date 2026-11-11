@@ -30,6 +30,7 @@ vi.mock('../s3client', () => ({
 }));
 
 import useS3Browser from '../useS3Browser';
+import { folderRowKey } from '../rowKey';
 
 const SAVINGS = '/_/api/admin/deltaspace/savings';
 const LIST = '/_/api/admin/objects/list';
@@ -140,7 +141,7 @@ describe('savings chip', () => {
     const { result } = mount();
     await waitFor(() => expect(result.current.deltaSummary?.savingsPct).toBe(90));
     const before = savingsCalls().length;
-    act(() => result.current.toggleKey('folder:builds/nightly/'));
+    act(() => result.current.toggleKey(folderRowKey('builds/nightly/')));
     await act(async () => {
       await result.current.bulkDelete();
     });

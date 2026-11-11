@@ -5,8 +5,8 @@ import react from '@astrojs/react';
 
 // 301 redirects. Two generations of moves live here:
 //  - the legacy marketing URLs (v5 plan §6.1): /artifact-storage,
-//    /minio-migration, /s3-to-hetzner-wasabi → /saas; /multi-cloud-control-plane
-//    → /regulated.
+//    /minio-migration, /s3-to-hetzner-wasabi → /build-artifacts;
+//    /multi-cloud-control-plane → /encryption.
 //  - the Diátaxis docs restructure (2026-06): every pre-restructure docs URL
 //    301s to its new home. /docs/faq kept its slug (42-faq.md → faq.md).
 // The sitemap filter below derives from this map — add a redirect, and its
@@ -27,10 +27,15 @@ const REDIRECTS = {
   '/docs/auth/rate-limiting': '/docs/reference/rate-limits',
   '/docs/reference/how-delta-works': '/docs/explanation/delta-compression',
   '/docs/reference/encryption-at-rest': '/docs/explanation/encryption-at-rest',
-  '/artifact-storage': '/saas',
-  '/minio-migration': '/saas',
-  '/s3-to-hetzner-wasabi': '/saas',
-  '/multi-cloud-control-plane': '/regulated',
+  '/artifact-storage': '/build-artifacts',
+  '/minio-migration': '/build-artifacts',
+  '/s3-to-hetzner-wasabi': '/build-artifacts',
+  '/multi-cloud-control-plane': '/encryption',
+  // 2026-11 renames: pages are named for the problem, not the buyer
+  // (docs/plan/site-rewrite-2026-11.md).
+  '/saas': '/build-artifacts',
+  '/regulated': '/encryption',
+  '/trial': '/support',
 };
 
 // https://docs.astro.build/en/reference/configuration-reference/
@@ -43,7 +48,7 @@ export default defineConfig({
   // Build to dist/ — matches the existing GH Pages workflow
   // (.github/workflows/marketing-pages.yml uploads marketing/dist).
   build: {
-    format: 'directory', // /saas/ instead of /saas.html
+    format: 'directory', // /pricing/ instead of /pricing.html
   },
 
   redirects: REDIRECTS,

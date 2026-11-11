@@ -31,6 +31,39 @@ pub struct UpdateGroupRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub permissions: Option<Vec<Permission>>,
+    /// Users to add to the group, and users to remove from it. A change,
+    /// never the whole list: other writers (another admin, a peer node
+    /// through the config sync, every OIDC login) change members too, and a
+    /// whole list would undo their changes. They apply in the same
+    /// transaction as the rest of the edit: one edit is one request, and a
+    /// refusal of any part (a user that does not exist, a name another group
+    /// has) applies none. A user in both lists is a 400.
+    #[serde(default)]
+    pub add_member_ids: Vec<i64>,
+    #[serde(default)]
+    pub remove_member_ids: Vec<i64>,
+}
+
+/// Pure: the members to add and to remove for an edit, judged against the
+/// group's live members (`current`): a user that is a member already is not
+/// added, a user that is not a member is not removed. Each list is sorted
+/// and without duplicates. `Err` names a user that is in both lists.
+pub(crate) fn member_changes(
+    current: &[i64],
+    add: &[i64],
+    remove: &[i64],
+) -> Result<(Vec<i64>, Vec<i64>), i64> {
+    use std::collections::BTreeSet;
+    let current: BTreeSet<i64> = current.iter().copied().collect();
+    let add: BTreeSet<i64> = add.iter().copied().collect();
+    let remove: BTreeSet<i64> = remove.iter().copied().collect();
+    if let Some(both) = add.intersection(&remove).next() {
+        return Err(*both);
+    }
+    Ok((
+        add.difference(&current).copied().collect(),
+        remove.intersection(&current).copied().collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -217,21 +250,56 @@ pub async fn update_group(
         }
     }
 
+    // The membership part of the edit, decided BEFORE the first write.
+    let changes = if body.add_member_ids.is_empty() && body.remove_member_ids.is_empty() {
+        None
+    } else {
+        Some(
+            member_changes(
+                &db.get_group_members(group_id)?,
+                &body.add_member_ids,
+                &body.remove_member_ids,
+            )
+            .map_err(|user| {
+                AdminError::invalid(format!(
+                    "user {user} is in both add_member_ids and remove_member_ids"
+                ))
+            })?,
+        )
+    };
+
     let group = db
-        .update_group(
+        .update_group_with_members(
             group_id,
             body.name.as_deref(),
             body.description.as_deref(),
             normalized_perms.as_deref(),
+            changes
+                .as_ref()
+                .map(|(add, remove)| (add.as_slice(), remove.as_slice())),
         )
         .inspect_err(|e| {
             tracing::warn!("Failed to update group {}: {}", group_id, e);
-            // A rename to a name another group has → 409.
+            // A rename to a name another group has → 409; a member that does
+            // not exist → 404; nothing was applied.
         })?;
+
+    // The audit lines of the member changes (the same two the per-member
+    // endpoints write), built once under the lock: ONE user load, ONE group
+    // lookup. They are written after the rebuild and the sync trigger, like
+    // every other IAM write: a failed rebuild answers 500 and audits nothing.
+    let member_audit = changes
+        .as_ref()
+        .map(|(add, remove)| member_audit_lines(&db, group_id, add, remove))
+        .unwrap_or_default();
 
     rebuild_iam_index(&db, &state.iam_state)?;
     trigger_config_sync(&state);
+    drop(db);
 
+    for (action, target) in &member_audit {
+        audit_log(action, "admin", target, &headers);
+    }
     tracing::info!("IAM group '{}' updated", group.name);
     audit_log("update_group", "admin", &group.name, &headers);
     Ok(Json(group))
@@ -346,4 +414,53 @@ fn user_target(db: &crate::config_db::ConfigDb, id: i64) -> String {
         .and_then(|us| us.into_iter().find(|u| u.id == id))
         .map(|u| u.name);
     super::named_target(name.as_deref(), id)
+}
+
+/// The `(action, target)` audit lines of an edit's member changes, with one
+/// user load and one group lookup for all of them.
+fn member_audit_lines(
+    db: &crate::config_db::ConfigDb,
+    group_id: i64,
+    add: &[i64],
+    remove: &[i64],
+) -> Vec<(&'static str, String)> {
+    let names: std::collections::HashMap<i64, String> = db
+        .load_users()
+        .map(|users| users.into_iter().map(|u| (u.id, u.name)).collect())
+        .unwrap_or_default();
+    let group = group_target(db, group_id);
+    let mut lines = Vec::with_capacity(add.len() + remove.len());
+    for (action, ids, direction) in [("add_member", add, "to"), ("remove_member", remove, "from")] {
+        for &id in ids {
+            let user = super::named_target(names.get(&id).map(String::as_str), id);
+            lines.push((action, format!("user {user} {direction} group {group}")));
+        }
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::member_changes;
+
+    #[test]
+    fn member_changes_judge_the_edit_against_the_live_members() {
+        // 1 is a member and not added again; 9 is no member and not removed.
+        assert_eq!(
+            member_changes(&[1, 2], &[1, 4], &[2, 9]),
+            Ok((vec![4], vec![2]))
+        );
+        assert_eq!(
+            member_changes(&[], &[5, 5, 3], &[]),
+            Ok((vec![3, 5], vec![]))
+        );
+        assert_eq!(
+            member_changes(&[1, 2], &[], &[2, 1]),
+            Ok((vec![], vec![1, 2]))
+        );
+        // Members that nobody names stay as they are.
+        assert_eq!(member_changes(&[1, 2, 3], &[], &[]), Ok((vec![], vec![])));
+        // A user in both lists is refused.
+        assert_eq!(member_changes(&[1], &[2], &[2]), Err(2));
+    }
 }

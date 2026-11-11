@@ -9,7 +9,9 @@
 //! one-method [`Lister`], so the algebra is tested without storage.
 
 use crate::deltaglider::{EngineError, ListObjectsPage};
-use crate::iam::{user_can_see_common_prefix, user_can_see_listed_key, ListScope};
+use crate::iam::{
+    deny_may_hide_keys_under, user_can_see_common_prefix, user_can_see_listed_key, ListScope,
+};
 use std::future::Future;
 
 /// The engine calls the listing algebra makes: one LIST page.
@@ -135,6 +137,21 @@ pub(crate) struct CallerPage {
     /// it leaves the process only sealed. When `false`, the token is the
     /// last entry of the page, which the caller sees anyway.
     pub hidden_cursor: bool,
+    /// The proof of a folded name that this page left unfinished (it is
+    /// `None` for a plain scan position). It travels with the token, sealed,
+    /// and the next page resumes the proof there.
+    pub proof: Option<ProofResume>,
+}
+
+/// Where the proof of one folded name stands (see [`visible_key_under`]):
+/// every key at or before `inner` under the name was read, and none of them
+/// is visible. `inner` is `None` when the proof has not read a key yet. The
+/// value names hidden keys, so it leaves the process only sealed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ProofResume {
+    /// The folded name, or for a roll-up the visible prefix being proved.
+    pub name: String,
+    pub inner: Option<String>,
 }
 
 /// One part of a filtered LIST (review S12). A prefix-scoped user's listing
@@ -171,6 +188,13 @@ fn list_targets(prefix: &str, delimiter: Option<&str>, visible: &[String]) -> Ve
         return vec![ListTarget::Scan(prefix.to_string())];
     }
     let delimiter = delimiter.filter(|d| !d.is_empty());
+    // A delimiter of several characters can straddle the end of a visible
+    // prefix (`se` + `cret/` at delimiter `ec`): listing the prefix would
+    // then fold at other points than listing the request. Only a one-
+    // character delimiter folds the same way, so read the request itself.
+    if delimiter.is_some_and(|d| d.chars().count() > 1) {
+        return vec![ListTarget::Scan(prefix.to_string())];
+    }
     let mut targets: Vec<ListTarget> = Vec::new();
     for v in visible {
         let Some(rest) = v.strip_prefix(prefix) else {
@@ -195,6 +219,85 @@ fn list_targets(prefix: &str, delimiter: Option<&str>, visible: &[String]) -> Ve
     }
     targets.sort_by(|a, b| a.start().cmp(b.start()));
     targets
+}
+
+/// What the proof of one folded name found.
+#[derive(Debug, PartialEq, Eq)]
+enum Proof {
+    /// A key that the user may see lies under the name.
+    Visible,
+    /// Every key under the name is hidden: the name is not shown.
+    NotVisible,
+    /// The budget ran out before the end of the keys under the name. The
+    /// name is not decided: the caller ends its page and the next page goes
+    /// on from `inner` (the last key read, `None` when none was read).
+    Undecided { inner: Option<String> },
+}
+
+/// Does a key that `user` may see lie under `folded` (a name a delimiter
+/// folded keys into)? Reads the keys under it, lite, within the request's
+/// scan budget. THE rule for a folded name that a Deny may touch
+/// ([`deny_may_hide_keys_under`]): the name of a protected key is shown only
+/// when a visible key lies under it too (S3 shows a folded name only for
+/// keys the caller may list). A proof that the budget cannot finish is
+/// [`Proof::Undecided`]: the scan then stops before the name and the next
+/// page resumes the proof at `inner` (`from`). A name is never decided by
+/// the budget, only by the keys.
+///
+/// A resumed proof (`resumed`) reads at least one engine page whatever the
+/// budget is, so its position strictly advances in every request and the
+/// proof ends.
+///
+/// The engine refuses a prefix with a `..` segment, and a folded name can
+/// end in one (`a/..` of `a/..x/k` at delimiter `.`). The proof then reads
+/// the parent folder and keeps the keys that start with the name.
+async fn visible_key_under<L: Lister>(
+    lister: &L,
+    bucket: &str,
+    folded: &str,
+    user: &crate::iam::AuthenticatedUser,
+    context: &iam_rs::Context,
+    budget: &mut usize,
+    resumed: Option<Option<String>>,
+) -> Result<Proof, EngineError> {
+    let listed = if crate::types::ObjectKey::validate_prefix(folded).is_ok() {
+        folded
+    } else {
+        &folded[..folded.rfind('/').map_or(0, |i| i + 1)]
+    };
+    if crate::types::ObjectKey::validate_prefix(listed).is_err() {
+        return Ok(Proof::NotVisible);
+    }
+    let mut at_least_one = resumed.is_some();
+    let mut cursor: Option<String> = resumed.flatten();
+    while *budget > 0 || at_least_one {
+        at_least_one = false;
+        let (page, requests) = lister
+            .list_lite(
+                bucket,
+                listed,
+                None,
+                FILTERED_SCAN_PAGE_KEYS,
+                cursor.as_deref(),
+            )
+            .await?;
+        *budget = budget.saturating_sub(scan_cost(requests));
+        for (key, _) in &page.objects {
+            if key.starts_with(folded) {
+                if user_can_see_listed_key(user, bucket, key, context) {
+                    return Ok(Proof::Visible);
+                }
+            } else if key.as_str() > folded {
+                // Keys come in order: no key under the name follows.
+                return Ok(Proof::NotVisible);
+            }
+        }
+        match page.next_continuation_token {
+            Some(next) if page.is_truncated => cursor = Some(next),
+            _ => return Ok(Proof::NotVisible),
+        }
+    }
+    Ok(Proof::Undecided { inner: cursor })
 }
 
 /// One LIST page as the caller may see it. THE listing path for V1 and V2.
@@ -239,6 +342,7 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
     metadata: bool,
     scope: Option<&ListScope>,
     budget: usize,
+    proof: Option<ProofResume>,
 ) -> Result<CallerPage, EngineError> {
     let Some(Visibility { user, context }) = Visibility::of(scope) else {
         return Ok(CallerPage {
@@ -246,6 +350,7 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
                 .list(bucket, prefix, delimiter, max_keys, cursor, metadata)
                 .await?,
             hidden_cursor: false,
+            proof: None,
         });
     };
     let mut budget = budget;
@@ -261,6 +366,7 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
         context,
         want,
         &mut budget,
+        proof,
     )
     .await?;
     let found = scan.objects.len() + scan.prefixes.len();
@@ -295,6 +401,7 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
     Ok(CallerPage {
         page: lister.finish(bucket, page, metadata).await?,
         hidden_cursor: budget_spent,
+        proof: if budget_spent { scan.proof } else { None },
     })
 }
 
@@ -342,6 +449,7 @@ pub(crate) async fn list_keys_for_caller<L: Lister>(
                     context,
                     want,
                     &mut budget,
+                    None,
                 )
                 .await?;
                 if scan.resume.is_some() && scan.objects.len() < want {
@@ -406,6 +514,17 @@ impl<'a> Visibility<'a> {
     }
 }
 
+/// The progress of the resumed proof when it is the proof of `name`: its
+/// inner cursor (`None` for a proof that has read nothing). `None` for any
+/// other name.
+fn take_resume(pending: &mut Option<ProofResume>, name: &str) -> Option<Option<String>> {
+    if pending.as_ref().is_some_and(|p| p.name == name) {
+        pending.take().map(|p| p.inner)
+    } else {
+        None
+    }
+}
+
 /// What a filtered scan read.
 struct Scanned {
     /// The visible objects and common prefixes, in key order. There can be
@@ -419,6 +538,9 @@ struct Scanned {
     /// with a position when it holds `want` visible entries, or when the
     /// budget runs out first.
     resume: Option<String>,
+    /// With `resume`: the proof of a folded name that the scan left
+    /// unfinished, which the next page goes on with.
+    proof: Option<ProofResume>,
 }
 
 /// The scan of a filtered listing: the visible entries after `cursor`,
@@ -429,10 +551,15 @@ struct Scanned {
 /// read N budgets for one LIST.
 ///
 /// The scan position always moves past `cursor` before the budget can stop
-/// the scan, so a client that follows the tokens always gets to the end. A
-/// roll-up target that the scan starts is finished: its probes are bounded
-/// by the policy, not by the data, and a position inside it cannot be
-/// written as a key.
+/// the scan, so a client that follows the tokens always gets to the end.
+///
+/// The proof of a folded name (a Deny may hide keys under it) can need more
+/// requests than the budget holds. The scan then stops before the name and
+/// returns the proof's progress (`Scanned::proof`); the next request passes
+/// it back as `resume`, and its proof reads at least one more engine page.
+/// A name is never dropped for the budget, and what is shown never depends
+/// on where a client starts. The progress is a hidden position and a hidden
+/// name, so it leaves the process only sealed.
 #[allow(clippy::too_many_arguments)]
 async fn scan_visible<L: Lister>(
     lister: &L,
@@ -444,6 +571,7 @@ async fn scan_visible<L: Lister>(
     context: &iam_rs::Context,
     want: usize,
     budget: &mut usize,
+    resume: Option<ProofResume>,
 ) -> Result<Scanned, EngineError> {
     let visible = crate::iam::permissions::visible_key_prefixes(user, bucket);
     let mut targets = list_targets(prefix, delimiter, &visible);
@@ -463,7 +591,10 @@ async fn scan_visible<L: Lister>(
         prefixes: std::collections::BTreeSet::new(),
         facts_missing: std::collections::HashSet::new(),
         resume: None,
+        proof: None,
     };
+    // The proof to go on with, until the scan reaches its name.
+    let mut pending = resume;
     // Where the scan is: every key at or before it was read.
     let mut position: Option<String> = cursor.map(str::to_string);
     let moved = |position: &Option<String>| position.as_deref() != cursor;
@@ -488,6 +619,7 @@ async fn scan_visible<L: Lister>(
             // Stopped before this target: the listing goes on after the
             // scan position.
             scan.resume = position;
+            scan.proof = pending;
             return Ok(scan);
         }
         match target {
@@ -495,13 +627,55 @@ async fn scan_visible<L: Lister>(
                 common_prefix,
                 probes,
             } => {
-                for probe in probes {
-                    let (page, requests) =
-                        lister.list_lite(bucket, &probe, delimiter, 1, None).await?;
-                    *budget = budget.saturating_sub(scan_cost(requests));
-                    if !page.objects.is_empty() || !page.common_prefixes.is_empty() {
-                        scan.prefixes.insert(common_prefix.clone());
-                        break;
+                if deny_may_hide_keys_under(user, bucket, &common_prefix) {
+                    // A Deny may protect keys under the name: one probe key
+                    // could be a hidden one. Look for a visible key under
+                    // each visible prefix: every visible key lies under one.
+                    // A resumed proof skips the probes before its own: they
+                    // held no visible key.
+                    let mut skipping = pending.as_ref().is_some_and(|p| probes.contains(&p.name));
+                    let mut proof = Proof::NotVisible;
+                    let mut proved = String::new();
+                    for probe in &probes {
+                        let resumed = take_resume(&mut pending, probe);
+                        if skipping && resumed.is_none() {
+                            continue;
+                        }
+                        skipping = false;
+                        proof = visible_key_under(
+                            lister, bucket, probe, user, context, budget, resumed,
+                        )
+                        .await?;
+                        if proof != Proof::NotVisible {
+                            proved = probe.clone();
+                            break;
+                        }
+                    }
+                    match proof {
+                        Proof::Visible => {
+                            scan.prefixes.insert(common_prefix.clone());
+                        }
+                        // Stop before the name: the next page goes on with
+                        // the proof.
+                        Proof::Undecided { inner } => {
+                            scan.resume = Some(position.unwrap_or_default());
+                            scan.proof = Some(ProofResume {
+                                name: proved,
+                                inner,
+                            });
+                            return Ok(scan);
+                        }
+                        Proof::NotVisible => {}
+                    }
+                } else {
+                    for probe in probes {
+                        let (page, requests) =
+                            lister.list_lite(bucket, &probe, delimiter, 1, None).await?;
+                        *budget = budget.saturating_sub(scan_cost(requests));
+                        if !page.objects.is_empty() || !page.common_prefixes.is_empty() {
+                            scan.prefixes.insert(common_prefix.clone());
+                            break;
+                        }
                     }
                 }
                 position = Some(common_prefix);
@@ -511,6 +685,7 @@ async fn scan_visible<L: Lister>(
                     // Stopped inside this scan: the listing goes on after
                     // the scan position.
                     scan.resume = position;
+                    scan.proof = pending;
                     return Ok(scan);
                 }
                 // Lite: no listing facts and no HEAD for the hidden keys.
@@ -535,16 +710,56 @@ async fn scan_visible<L: Lister>(
                     .chain(page.common_prefixes.last().cloned())
                     .max();
                 scan.facts_missing.extend(page.facts_missing_keys);
+                // The names of the page, in key order, each decided in turn.
+                let mut folded_names = page.common_prefixes;
+                folded_names.sort();
+                let mut cut: Option<(String, String, Option<String>)> = None;
+                for folded in &folded_names {
+                    if !user_can_see_common_prefix(user, bucket, folded, context) {
+                        continue;
+                    }
+                    if !deny_may_hide_keys_under(user, bucket, folded) {
+                        scan.prefixes.insert(folded.clone());
+                        continue;
+                    }
+                    let resumed = take_resume(&mut pending, folded);
+                    match visible_key_under(lister, bucket, folded, user, context, budget, resumed)
+                        .await?
+                    {
+                        Proof::Visible => {
+                            scan.prefixes.insert(folded.clone());
+                        }
+                        Proof::NotVisible => {}
+                        Proof::Undecided { inner } => {
+                            // The last entry before the name: where the next
+                            // page starts. It lists the name first, and its
+                            // proof goes on at `inner`.
+                            let before = page
+                                .objects
+                                .iter()
+                                .map(|(k, _)| k)
+                                .chain(folded_names.iter())
+                                .filter(|k| *k < folded)
+                                .max()
+                                .cloned()
+                                .or_else(|| position.clone());
+                            cut = Some((folded.clone(), before.unwrap_or_default(), inner));
+                            break;
+                        }
+                    }
+                }
+                let below = cut.as_ref().map(|(name, _, _)| name.as_str());
                 scan.objects.extend(
                     page.objects
                         .into_iter()
+                        .filter(|(key, _)| below.is_none_or(|name| key.as_str() < name))
                         .filter(|(key, _)| user_can_see_listed_key(user, bucket, key, context)),
                 );
-                scan.prefixes.extend(
-                    page.common_prefixes
-                        .into_iter()
-                        .filter(|p| user_can_see_common_prefix(user, bucket, p, context)),
-                );
+                if let Some((name, before, inner)) = cut {
+                    scan.resume = Some(before);
+                    scan.proof = Some(ProofResume { name, inner });
+                    return Ok(scan);
+                }
                 if more {
                     position = page.next_continuation_token;
                 } else {
@@ -630,16 +845,38 @@ mod tests {
             ..rule(effect, &[res])
         };
         let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
-        let got = list_page_for_caller(&lister, "b", "", None, 1, None, false, Some(&scope), 2)
-            .await
-            .unwrap();
+        let got = list_page_for_caller(
+            &lister,
+            "b",
+            "",
+            None,
+            1,
+            None,
+            false,
+            Some(&scope),
+            2,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(got.page.objects.is_empty() && got.page.is_truncated);
         assert!(got.hidden_cursor);
         assert_eq!(got.page.next_continuation_token.as_deref(), Some("h/1999"));
         assert_eq!(calls(&lister), 2);
-        let got = list_page_for_caller(&lister, "b", "", None, 1, None, false, Some(&scope), 6)
-            .await
-            .unwrap();
+        let got = list_page_for_caller(
+            &lister,
+            "b",
+            "",
+            None,
+            1,
+            None,
+            false,
+            Some(&scope),
+            6,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(got.page.objects[0].0, "v");
         assert!(!got.page.is_truncated && !got.hidden_cursor);
         assert_eq!(calls(&lister), 2 + 6);
@@ -664,6 +901,7 @@ mod tests {
             false,
             Some(scope),
             budget,
+            None,
         )
         .await
         .ok()
@@ -783,10 +1021,21 @@ mod tests {
             ..rule(effect, &[res])
         };
         let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
-        let page = list_page_for_caller(&lister, "b", "", None, 10, None, false, Some(&scope), 10)
-            .await
-            .unwrap()
-            .page;
+        let page = list_page_for_caller(
+            &lister,
+            "b",
+            "",
+            None,
+            10,
+            None,
+            false,
+            Some(&scope),
+            10,
+            None,
+        )
+        .await
+        .unwrap()
+        .page;
         assert_eq!(
             page.facts_missing_keys,
             vec!["v/1".to_string(), "v/2".to_string()]
@@ -871,6 +1120,7 @@ mod tests {
             false,
             Some(&scope),
             TEST_BUDGET,
+            None,
         )
         .await
         .unwrap()
@@ -886,6 +1136,7 @@ mod tests {
             false,
             Some(&scope),
             TEST_BUDGET,
+            None,
         )
         .await;
         assert_eq!(
@@ -970,10 +1221,41 @@ mod tests {
         max_keys: u32,
         scope: &ListScope,
     ) -> Vec<String> {
+        walk_with_budget(engine, prefix, delimiter, max_keys, scope, TEST_BUDGET).await
+    }
+
+    async fn walk_with_budget(
+        engine: &crate::deltaglider::DynEngine,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        scope: &ListScope,
+        budget: usize,
+    ) -> Vec<String> {
+        pages_from(engine, prefix, delimiter, max_keys, scope, budget, None)
+            .await
+            .into_iter()
+            .flat_map(|(entries, _)| entries)
+            .collect()
+    }
+
+    /// The pages of a filtered listing, each as (sorted entries, truncated),
+    /// from `start_after` to the end.
+    async fn pages_from(
+        engine: &crate::deltaglider::DynEngine,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        scope: &ListScope,
+        budget: usize,
+        start_after: Option<&str>,
+    ) -> Vec<(Vec<String>, bool)> {
         let mut out = Vec::new();
-        let mut token: Option<String> = None;
-        for _ in 0..100 {
-            let page = list_page_for_caller(
+        let mut token: Option<String> = start_after.map(str::to_string);
+        let mut proof: Option<ProofResume> = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let listed = list_page_for_caller(
                 engine,
                 "b",
                 prefix,
@@ -982,20 +1264,27 @@ mod tests {
                 token.as_deref(),
                 false,
                 Some(scope),
-                TEST_BUDGET,
+                budget,
+                proof.take(),
             )
             .await
-            .unwrap()
-            .page;
+            .unwrap();
+            proof = listed.proof;
+            let page = listed.page;
             let mut entries: Vec<String> = page.objects.into_iter().map(|(k, _)| k).collect();
             entries.extend(page.common_prefixes);
             entries.sort();
             assert!(entries.len() <= max_keys as usize);
-            out.extend(entries);
+            out.push((entries, page.is_truncated));
             if !page.is_truncated {
                 return out;
             }
             token = page.next_continuation_token;
+            // Every page makes progress: no state of the paging repeats.
+            assert!(
+                seen.insert((token.clone(), proof.clone())),
+                "the paging repeated a state"
+            );
         }
         panic!("listing did not end");
     }
@@ -1059,9 +1348,20 @@ mod tests {
             ..rule(effect, &[res])
         };
         let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
-        let first = list_page_for_caller(&engine, "b", "", None, 1, None, false, Some(&scope), 1)
-            .await
-            .unwrap();
+        let first = list_page_for_caller(
+            &engine,
+            "b",
+            "",
+            None,
+            1,
+            None,
+            false,
+            Some(&scope),
+            1,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(first.page.objects.is_empty() && first.page.is_truncated);
         assert!(first.hidden_cursor);
         let cursor = first.page.next_continuation_token.unwrap();
@@ -1075,6 +1375,7 @@ mod tests {
             false,
             Some(&scope),
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1102,9 +1403,20 @@ mod tests {
             read("Allow", "b/b/*"),
             read("Deny", "b/a/*"),
         ]);
-        let got = list_page_for_caller(&lister, "b", "", None, 1, None, false, Some(&scope), 2)
-            .await
-            .unwrap();
+        let got = list_page_for_caller(
+            &lister,
+            "b",
+            "",
+            None,
+            1,
+            None,
+            false,
+            Some(&scope),
+            2,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             got.page.objects.is_empty() && got.hidden_cursor,
             "the request read past its page budget: {:?}",
@@ -1177,6 +1489,7 @@ mod tests {
             false,
             Some(&scope),
             TEST_BUDGET,
+            None,
         )
         .await
         .expect("the listing must not fail on the write-only prefix")
@@ -1290,6 +1603,7 @@ mod tests {
                 false,
                 Some(&scope),
                 50,
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("after {} keys at {cursor:?}: {e:?}", seen.len()))
@@ -1361,10 +1675,20 @@ mod tests {
         let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/h/*"])]);
         fake.clear();
         let budget = 4;
-        let got =
-            list_page_for_caller(&engine, "b", "", None, 1, None, false, Some(&scope), budget)
-                .await
-                .unwrap();
+        let got = list_page_for_caller(
+            &engine,
+            "b",
+            "",
+            None,
+            1,
+            None,
+            false,
+            Some(&scope),
+            budget,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(got.page.objects.is_empty() && got.hidden_cursor);
         let lists = scope_lists(&fake);
         eprintln!(
@@ -1400,6 +1724,7 @@ mod tests {
                 false,
                 scope,
                 50,
+                None,
             )
             .await
             .unwrap()
@@ -1478,6 +1803,7 @@ mod tests {
                     false,
                     Some(&scope),
                     TEST_BUDGET,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1536,6 +1862,7 @@ mod tests {
                         false,
                         Some(&scope),
                         budget,
+                        None,
                     )
                     .await
                     .unwrap();
@@ -1573,10 +1900,21 @@ mod tests {
         put_raw_many(&endpoint, (0..3).map(|i| format!("v/{i}.zip"))).await;
         let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/a/*"])]);
         fake.clear();
-        let page = list_page_for_caller(&engine, "b", "", None, 2, None, true, Some(&scope), 64)
-            .await
-            .unwrap()
-            .page;
+        let page = list_page_for_caller(
+            &engine,
+            "b",
+            "",
+            None,
+            2,
+            None,
+            true,
+            Some(&scope),
+            64,
+            None,
+        )
+        .await
+        .unwrap()
+        .page;
         let keys: Vec<&str> = page.objects.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["v/0.zip", "v/1.zip"]);
         assert!(
@@ -1585,5 +1923,300 @@ mod tests {
             heads(&fake)
         );
         assert_eq!(facts_lists(&fake), 0, "listing facts read for hidden keys");
+    }
+
+    /// The oracle of a listing: the visible keys under `prefix`, folded at
+    /// `delimiter` like S3 does. A name appears only when some visible key
+    /// lies under it.
+    fn oracle(
+        keys: &[&str],
+        scope: &ListScope,
+        prefix: &str,
+        delimiter: Option<&str>,
+    ) -> Vec<String> {
+        let ListScope::Filtered { user, context } = scope else {
+            unreachable!()
+        };
+        let mut out = std::collections::BTreeSet::new();
+        for key in keys {
+            let Some(rest) = key.strip_prefix(prefix) else {
+                continue;
+            };
+            if !user_can_see_listed_key(user, "b", key, context) {
+                continue;
+            }
+            match delimiter
+                .filter(|d| !d.is_empty())
+                .and_then(|d| rest.find(d).map(|i| i + d.len()))
+            {
+                Some(end) => out.insert(format!("{prefix}{}", &rest[..end])),
+                None => out.insert(key.to_string()),
+            };
+        }
+        out.into_iter().collect()
+    }
+
+    /// F34: a custom delimiter folds `secret/k` into `sec`; the folded name
+    /// is a prefix of a Deny-protected key and must not be shown when no
+    /// visible key lies under it.
+    #[tokio::test]
+    async fn a_custom_delimiter_never_rolls_up_a_denied_name() {
+        let keys = ["secret/k", "sector.txt", "pub/a", "sedan/x"];
+        let (_dir, engine) = fs_engine(&keys).await;
+        let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/secret/*"])]);
+        // `sec` holds `sector.txt` (visible): shown, with `sedan/x`. `secr`, `secre` and
+        // `secret` have no visible key under them: not shown.
+        for (prefix, delimiter, shown) in [
+            ("se", "c", vec!["sec", "sedan/x"]),
+            ("se", "r", vec!["sector", "sedan/x"]),
+            ("secr", "e", vec![]),
+            ("secre", "t", vec![]),
+        ] as [(&str, &str, Vec<&str>); 4]
+        {
+            let got = walk(&engine, prefix, Some(delimiter), 1000, &scope).await;
+            assert_eq!(got, shown, "prefix={prefix:?} delimiter={delimiter:?}");
+            assert_eq!(got, oracle(&keys, &scope, prefix, Some(delimiter)));
+        }
+    }
+
+    /// A Deny with a leading wildcard may hide keys under every folded name,
+    /// so each name costs a proof. A proof that the budget cannot pay must
+    /// stop the page before the name, never drop the name: the next page
+    /// decides it, and a client that follows the tokens lists every folder.
+    #[tokio::test]
+    async fn a_wildcard_deny_never_loses_a_folder_past_the_budget() {
+        let keys: Vec<String> = (0..40).map(|i| format!("f{i:02}/x")).collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (_dir, engine) = fs_engine(&refs).await;
+        let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/*.pem"])]);
+        let want: Vec<String> = (0..40).map(|i| format!("f{i:02}/")).collect();
+        for max_keys in [1, 7, 1000] {
+            assert_eq!(
+                walk(&engine, "", Some("/"), max_keys, &scope).await,
+                want,
+                "max_keys={max_keys}"
+            );
+        }
+    }
+
+    /// The roll-up proof reads the user's visible prefixes, not the whole
+    /// folded name: hidden keys outside the grant spend no budget.
+    #[tokio::test]
+    async fn a_rollup_proof_reads_only_the_visible_prefix() {
+        let mut keys: Vec<String> = (0..2500).map(|i| format!("a/hid/{i:05}")).collect();
+        keys.push("a/pub/y".into());
+        let lister = counting(keys);
+        let scope = scoped(vec![
+            rule("Allow", &["b/a/pub/*"]),
+            rule("Deny", &["b/a/pub/x/*"]),
+        ]);
+        let got = list_page_for_caller(
+            &lister,
+            "b",
+            "",
+            Some("/"),
+            10,
+            None,
+            false,
+            Some(&scope),
+            2,
+            None,
+        )
+        .await
+        .unwrap()
+        .page;
+        assert_eq!(got.common_prefixes, vec!["a/".to_string()]);
+        assert!(!got.is_truncated);
+    }
+
+    /// A folded name that ends in a `..` segment (`a/..` of `a/..x/k` at
+    /// delimiter `.`) is not a prefix the engine accepts. It is a name like
+    /// any other: shown when a visible key lies under it, never an error.
+    #[tokio::test]
+    async fn a_folded_name_with_a_dot_dot_segment_is_decided_like_any_name() {
+        let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/*/k"])]);
+        let (_dir, engine) = fs_engine(&["a/..x/k", "a/.y"]).await;
+        assert_eq!(
+            walk(&engine, "a/.", Some("."), 1000, &scope).await,
+            ["a/.y"]
+        );
+        let (_dir, engine) = fs_engine(&["a/..x/k", "a/..x/j", "a/.y"]).await;
+        assert_eq!(
+            walk(&engine, "a/.", Some("."), 1000, &scope).await,
+            ["a/..", "a/.y"]
+        );
+    }
+
+    /// The keys of a folder whose hidden keys outnumber one engine page.
+    fn big_hidden_folder(name: &str, hidden: usize, visible: &[&str]) -> Vec<String> {
+        let mut keys: Vec<String> = (0..hidden).map(|i| format!("{name}/{i:04}.pem")).collect();
+        keys.extend(visible.iter().map(|v| format!("{name}/{v}")));
+        keys
+    }
+
+    /// A proof that one request cannot finish goes on in the next page. With
+    /// the smallest budget (one backend request) and a small page, a wildcard
+    /// Deny over many folders and one folder with more hidden keys than the
+    /// budget reads: every allowed folder comes exactly once, no hidden one
+    /// comes, and the paging ends.
+    #[tokio::test]
+    async fn a_proof_past_the_budget_goes_on_in_the_next_page() {
+        let mut keys: Vec<String> = (0..6).map(|i| format!("a{i}/x")).collect();
+        keys.extend(big_hidden_folder("h", 1100, &["zz"]));
+        keys.push("m/only.pem".into());
+        keys.push("z/y".into());
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (_dir, engine) = fs_engine(&refs).await;
+        let scope = scoped(vec![rule("Allow", &["b/*"]), rule("Deny", &["b/*.pem"])]);
+        let want: Vec<String> = ["a0/", "a1/", "a2/", "a3/", "a4/", "a5/", "h/", "z/"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(oracle(&refs, &scope, "", Some("/")), want);
+        for budget in [1, 2] {
+            for max_keys in [1, 2, 3] {
+                assert_eq!(
+                    walk_with_budget(&engine, "", Some("/"), max_keys, &scope, budget).await,
+                    want,
+                    "budget={budget} max_keys={max_keys}"
+                );
+            }
+        }
+    }
+
+    /// `start-after` is the client's. The answer for a start point must not
+    /// change at a hidden key (review 2d, re-review): the first page is the
+    /// same for every start between visible entries, whatever hidden keys lie
+    /// there, and the whole listing is the oracle's names after the start.
+    #[tokio::test]
+    async fn start_after_probing_around_hidden_keys_shows_no_difference() {
+        let mut keys: Vec<String> = vec!["a/x".into(), "e.secret".into(), "z/y".into()];
+        keys.extend(big_hidden_folder("h", 1100, &[]));
+        keys.sort();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (_dir, engine) = fs_engine(&refs).await;
+        let scope = scoped(vec![
+            rule("Allow", &["b/*"]),
+            rule("Deny", &["b/h/*.pem"]),
+            rule("Deny", &["b/e.*"]),
+        ]);
+        let all = oracle(&refs, &scope, "", Some("/"));
+        assert_eq!(all, ["a/", "z/"]);
+        let mut first_shapes = Vec::new();
+        for start in ["", "a/x", "d", "e.secres", "e.secret", "e.secreu", "g"] {
+            let pages = pages_from(&engine, "", Some("/"), 10, &scope, 2, Some(start)).await;
+            let got: Vec<String> = pages.iter().flat_map(|(e, _)| e.clone()).collect();
+            let want: Vec<String> = all.iter().filter(|n| n.as_str() > start).cloned().collect();
+            assert_eq!(got, want, "start={start:?}");
+            if ["d", "e.secres", "e.secret", "e.secreu", "g"].contains(&start) {
+                first_shapes.push((start, pages[0].clone()));
+            }
+        }
+        let first = &first_shapes[0].1;
+        for (start, shape) in &first_shapes {
+            assert_eq!(shape, first, "the first page differs at start={start:?}");
+        }
+    }
+
+    /// The roll-up arm resumes too: a visible prefix whose Deny hides more
+    /// keys than the budget reads, followed by a second prefix that holds
+    /// the visible key. One backend request per page, and `c/` still comes.
+    #[tokio::test]
+    async fn a_rollup_proof_past_the_budget_goes_on_in_the_next_page() {
+        let mut keys = big_hidden_folder("c/a", 1100, &[]);
+        keys.push("c/pub/k".into());
+        keys.push("zz".into());
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (_dir, engine) = fs_engine(&refs).await;
+        let scope = scoped(vec![
+            rule("Allow", &["b/c/a/*", "b/c/pub/*"]),
+            rule("Deny", &["b/c/a/*.pem", "b/c/pub/x/*"]),
+        ]);
+        assert_eq!(oracle(&refs, &scope, "", Some("/")), ["c/"]);
+        for budget in [1, 2] {
+            assert_eq!(
+                walk_with_budget(&engine, "", Some("/"), 1, &scope, budget).await,
+                ["c/"],
+                "budget={budget}"
+            );
+        }
+        // No visible key under either prefix: the name never shows.
+        let (_dir, engine) = fs_engine(
+            &big_hidden_folder("c/a", 1100, &[])
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        )
+        .await;
+        assert!(walk_with_budget(&engine, "", Some("/"), 1, &scope, 1)
+            .await
+            .is_empty());
+    }
+
+    mod differential {
+        use super::*;
+        use proptest::prelude::*;
+
+        const KEYS: [&str; 14] = [
+            "a/x",
+            "a/secret/k",
+            "a/sector",
+            "secret/k",
+            "secret/j/z",
+            "sector.txt",
+            "sedan/x",
+            "se/c/d",
+            "pub/a",
+            "pub/b/c",
+            "ccc",
+            "c/c/c",
+            "abc/abc",
+            "zz",
+        ];
+        const ALLOWS: [&str; 6] = ["b/*", "b/a/*", "b/pub/*", "b/se*", "b/c*", "b/abc/*"];
+        const DENIES: [&str; 7] = [
+            "b/secret/*",
+            "b/a/secret/*",
+            "b/sec*",
+            "b/se/*",
+            "b/c/*",
+            "b/*/k",
+            "b/abc/abc",
+        ];
+        const DELIMS: [&str; 7] = ["/", "c", "e", "r", "a", "ec", "t/"];
+        const PREFIXES: [&str; 9] = ["", "s", "se", "sec", "secr", "a/", "a/s", "c", "ab"];
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(300))]
+            /// A filtered LIST equals the fold of the visible keys for any
+            /// delimiter, request prefix and Allow/Deny mix: no folded name
+            /// is shown unless a visible key lies under it.
+            #[test]
+            fn a_filtered_list_equals_the_fold_of_the_visible_keys(
+                allows in proptest::collection::vec(proptest::sample::select(&ALLOWS[..]), 1..4),
+                denies in proptest::collection::vec(proptest::sample::select(&DENIES[..]), 0..3),
+                delimiter in proptest::sample::select(&DELIMS[..]),
+                prefix in proptest::sample::select(&PREFIXES[..]),
+                max_keys in prop_oneof![Just(2u32), Just(1000u32)],
+                // A small budget runs out inside most listings of these 14
+                // keys; 16 never.
+                budget in prop_oneof![1usize..=8, Just(TEST_BUDGET)],
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(async {
+                    let (_dir, engine) = fs_engine(&KEYS).await;
+                    let mut perms: Vec<_> = allows.iter().map(|a| rule("Allow", &[a])).collect();
+                    perms.extend(denies.iter().map(|d| rule("Deny", &[d])));
+                    let scope = scoped(perms);
+                    let got = walk_with_budget(&engine, prefix, Some(delimiter), max_keys, &scope, budget).await;
+                    let want = oracle(&KEYS, &scope, prefix, Some(delimiter));
+                    prop_assert_eq!(
+                        got, want,
+                        "allows={:?} denies={:?} delimiter={:?} prefix={:?} budget={}",
+                        allows, denies, delimiter, prefix, budget
+                    );
+                    Ok(())
+                })?;
+            }
+        }
     }
 }

@@ -127,6 +127,9 @@ pub struct TestServer {
     production_security: bool,
     /// The listener speaks HTTPS (see [`TestServerBuilder::tls`]).
     tls: bool,
+    /// Name of the test thread that spawned the server, for the 5xx check
+    /// ([`expect_server_errors`]).
+    test_name: Option<String>,
 }
 
 /// The proxy child command every spawn path shares (first spawn and both
@@ -274,6 +277,7 @@ impl TestServer {
             extra_env,
             production_security,
             tls,
+            test_name: std::thread::current().name().map(str::to_string),
         };
         server.wait_ready().await;
         // The SDK client does not trust the test certificate; TLS tests
@@ -864,7 +868,95 @@ impl TestServerBuilder {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
+        // Never panic while a panic unwinds: that aborts the test binary and
+        // hides the first failure.
+        if !std::thread::panicking() {
+            self.assert_no_server_errors();
+        }
         stop_child(&mut self.process);
+    }
+}
+
+/// Per-server 5xx counter (E1 / F27). The proxy counts every response in
+/// `deltaglider_http_requests_total{status=..}`. A test that sees the server
+/// answer 5xx without declaring it ([`TestServer::expect_server_errors`])
+/// fails when the server stops, restarts or drops: an intermittent 5xx must
+/// not hide behind a client retry or an assertion that only looks at the body.
+///
+/// Pure: the 5xx request count in a Prometheus text scrape.
+pub fn count_5xx(metrics_text: &str) -> u64 {
+    fault_lines(metrics_text)
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .map(|v| v as u64)
+        .sum()
+}
+
+/// The request-counter lines of 5xx faults. `501 NotImplemented` is the
+/// proxy's deliberate answer to an S3 feature it does not offer, not a fault.
+fn fault_lines(metrics_text: &str) -> impl Iterator<Item = &str> {
+    metrics_text
+        .lines()
+        .filter(|l| l.starts_with("deltaglider_http_requests_total{"))
+        .filter(|l| l.contains("status=\"5") && !l.contains("status=\"501\""))
+}
+
+/// Scrape `/_/metrics` of a plain-HTTP proxy on `port`. `None` when the proxy
+/// is gone or does not answer 200 (a bearer token, an admission block).
+fn scrape_metrics(port: u16) -> Option<String> {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut conn = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+    conn.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    conn.write_all(b"GET /_/metrics HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .ok()?;
+    let mut raw = String::new();
+    conn.read_to_string(&mut raw).ok()?;
+    raw.split_once(' ')
+        .is_some_and(|(_, rest)| rest.starts_with("200"))
+        .then_some(raw)
+}
+
+/// Tests that declared deliberate 5xx answers, by test thread name (libtest
+/// names the thread after the test).
+static DECLARED_SERVER_ERRORS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Declare that the CALLING TEST makes its servers answer 5xx on purpose (a
+/// failing backend, a closed write gate, a refused read). Call it first in the
+/// test body, on the test thread. `why` is the reason, for the reader.
+/// Without it, any 5xx fails the test (see [`count_5xx`]).
+pub fn expect_server_errors(why: &str) {
+    assert!(!why.trim().is_empty(), "say why the server may answer 5xx");
+    let name = std::thread::current()
+        .name()
+        .map(str::to_string)
+        .expect("expect_server_errors runs on the test thread");
+    DECLARED_SERVER_ERRORS.lock().unwrap().push(name);
+}
+
+impl TestServer {
+    /// Fail when the running proxy answered any 5xx and the test did not
+    /// declare it. Skipped for a TLS listener (the scrape is plain HTTP) and
+    /// when the metrics endpoint is not reachable.
+    fn assert_no_server_errors(&self) {
+        let declared = self.test_name.as_ref().is_some_and(|n| {
+            DECLARED_SERVER_ERRORS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|d| d == n)
+        });
+        if self.tls || declared {
+            return;
+        }
+        if let Some(text) = scrape_metrics(self.port) {
+            let n = count_5xx(&text);
+            assert!(
+                n == 0,
+                "the proxy answered {n} request(s) with a 5xx during this test; fix the cause, \
+                 or call `common::expect_server_errors(\"why\")` first in the test if it provokes it:\n{}",
+                fault_lines(&text).collect::<Vec<_>>().join("\n")
+            );
+        }
     }
 }
 
@@ -901,10 +993,50 @@ fn sigterm_then_wait(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// A second proxy process of a test (see [`TestServer::spawn_sibling`]).
+/// Killed when dropped.
+pub struct SiblingProcess {
+    child: Child,
+    out: std::path::PathBuf,
+    err: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl SiblingProcess {
+    /// Send it SIGTERM and do not wait.
+    pub fn sigterm(&self) {
+        // SAFETY: plain kill(2) on our own child's pid.
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+    }
+
+    /// Its exit status when it has exited.
+    pub fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().expect("try_wait")
+    }
+
+    /// Everything it printed so far (stdout and stderr).
+    pub fn output(&self) -> String {
+        format!(
+            "{}\n{}",
+            std::fs::read_to_string(&self.out).unwrap_or_default(),
+            std::fs::read_to_string(&self.err).unwrap_or_default()
+        )
+    }
+}
+
+impl Drop for SiblingProcess {
+    fn drop(&mut self) {
+        stop_child(&mut self.child);
+    }
+}
+
 impl TestServer {
     /// Stop the proxy process (the data dir and config stay). A test edits
     /// on-disk state here, then calls `respawn_with_env`.
     pub fn kill(&mut self) {
+        self.assert_no_server_errors();
         stop_child(&mut self.process);
     }
 
@@ -959,10 +1091,35 @@ impl TestServer {
         (status, output)
     }
 
+    /// Start a second proxy process on the SAME config file and state
+    /// directory with `extra` env vars (give it its own `DGP_LISTEN_ADDR`),
+    /// and leave it running. The caller polls it and reads its output.
+    pub fn spawn_sibling(&self, extra: &[(&str, &str)]) -> SiblingProcess {
+        let mut cmd = proxy_command(&self.config_path, self.production_security);
+        for (key, value) in &self.extra_env {
+            cmd.env(key, value);
+        }
+        for (key, value) in extra {
+            cmd.env(key, value);
+        }
+        let dir = tempfile::tempdir().expect("output dir");
+        let (out, err) = (dir.path().join("out"), dir.path().join("err"));
+        cmd.stdout(std::fs::File::create(&out).expect("stdout file"))
+            .stderr(std::fs::File::create(&err).expect("stderr file"));
+        let child = cmd.spawn().expect("spawn sibling proxy");
+        SiblingProcess {
+            child,
+            out,
+            err,
+            _dir: dir,
+        }
+    }
+
     /// Kill + respawn against the SAME config file, data dir, and port —
     /// with `extra` env vars applied AFTER the default `env_remove` calls
     /// (so a test can inject e.g. `DGP_BOOTSTRAP_PASSWORD_HASH`).
     pub async fn respawn_with_env(&mut self, extra: &[(&str, &str)]) {
+        self.assert_no_server_errors();
         stop_child(&mut self.process);
         // Poll until the kernel releases the listening socket. A fixed
         // sleep was racy on slow hosts (EADDRINUSE); bounded to ~2s so a
@@ -1005,6 +1162,12 @@ pub fn env_flag_on(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
 }
 
+/// Is the test process root? Root ignores mode bits.
+pub fn running_as_root() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
 /// A fault-injection test that needs mode bits (an unreadable file, a
 /// read-only directory) proves nothing as root: root ignores them. Such a
 /// test calls this and returns. The skip is loud, and a run that sets
@@ -1020,6 +1183,20 @@ pub fn root_skip(test: &str) {
 #[cfg(test)]
 mod flag_tests {
     use super::env_flag_on;
+
+    #[test]
+    fn count_5xx_sums_only_server_errors() {
+        let text = "# HELP deltaglider_http_requests_total x\n\
+            deltaglider_http_requests_total{method=\"GET\",operation=\"get\",status=\"200\"} 7\n\
+            deltaglider_http_requests_total{method=\"GET\",operation=\"get\",status=\"404\"} 3\n\
+            deltaglider_http_requests_total{method=\"PUT\",operation=\"put\",status=\"503\"} 2\n\
+            deltaglider_http_requests_total{method=\"GET\",operation=\"list\",status=\"500\"} 1\n\
+            deltaglider_http_requests_total{method=\"PUT\",operation=\"x\",status=\"501\"} 4\n\
+            deltaglider_other_total{status=\"500\"} 9\n";
+        // 501 NotImplemented is an answer, not a fault.
+        assert_eq!(super::count_5xx(text), 3);
+        assert_eq!(super::count_5xx(""), 0);
+    }
 
     #[test]
     fn env_flag_truth_table() {

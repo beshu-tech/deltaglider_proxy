@@ -349,7 +349,12 @@ mod tests {
         std::fs::set_permissions(ro.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
         std::fs::set_permissions(spare.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
         if std::fs::write(ro.path().join("probe"), b"x").is_ok() {
-            return; // root ignores mode bits
+            // Root ignores mode bits; fails closed under DGP_TEST_REQUIRE_NONROOT.
+            // The permissions are restored first so the tempdirs clean up.
+            std::fs::set_permissions(ro.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(spare.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::test_root::root_skip("a_failed_strict_rollback_keeps_config_and_engine_in_step");
+            return;
         }
         let result = mutator
             .mutate_and_apply_strict("test flip", |c| {

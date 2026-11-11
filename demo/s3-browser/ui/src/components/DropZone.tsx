@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
-import { Typography, theme } from 'antd';
+import { Typography, message, theme } from 'antd';
 import { CloudUploadOutlined } from '@ant-design/icons';
-import { collectDroppedFiles } from '../droppedFiles';
+import { collectDroppedFiles, skippedDropMessage } from '../droppedFiles';
 import { SPACE } from './shared-styles';
 import { Z } from '../theme';
 
@@ -43,7 +43,7 @@ export default function DropZone({ onDrop, prefix }: Props) {
       // collectDroppedFiles MUST be invoked synchronously (the DataTransfer
       // items are only readable during the event); it walks dropped FOLDERS
       // into their real files, then resolves async.
-      collectDroppedFiles(e.dataTransfer).then((files) => {
+      collectDroppedFiles(e.dataTransfer, (skipped) => message.warning(skippedDropMessage(skipped))).then((files) => {
         if (files.length > 0) onDrop(files);
       });
     };

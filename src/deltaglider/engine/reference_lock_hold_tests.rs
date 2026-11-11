@@ -279,11 +279,17 @@ async fn fast_path_seed_holds_the_lock() {
 /// tests only: no production file calls it.
 #[test]
 fn production_code_never_writes_unguarded() {
-    let needle = ["RefWriteProof::", "unguarded("].concat();
-    let offenders: Vec<String> = crate::source_scan::prod_sources("src")
-        .into_iter()
-        .filter(|(_, text)| crate::source_scan::prod_text(text).contains(needle.as_str()))
-        .map(|(rel, _)| rel)
+    // Any path that ends in `RefWriteProof::unguarded` (a call, an alias, a
+    // function pointer); the old scan wanted that text in the file.
+    let offenders: Vec<String> = crate::source_scan::ast::src()
+        .iter()
+        .filter(|s| {
+            s.prod.paths.iter().any(|p| {
+                let n = p.segs.len();
+                n >= 2 && p.segs[n - 2] == "RefWriteProof" && p.segs[n - 1] == "unguarded"
+            })
+        })
+        .map(|s| s.rel.clone())
         .collect();
     assert!(
         offenders.is_empty(),

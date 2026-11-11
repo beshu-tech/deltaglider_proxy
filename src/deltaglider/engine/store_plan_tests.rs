@@ -412,12 +412,21 @@ fn a_put_tries_a_delta_only_when_compressing_an_eligible_key_that_fits_without_t
         for eligible in [false, true] {
             for no_delta in [false, true] {
                 for fits in [false, true] {
-                    let reason = StorePlan::decline_reason(compression, eligible, no_delta, fits);
-                    assert_eq!(
-                        reason.is_none(),
-                        compression && eligible && !no_delta && fits,
-                        "compression={compression} eligible={eligible} no_delta={no_delta} fits={fits}"
-                    );
+                    for name_fits in [false, true] {
+                        let reason = StorePlan::decline_reason(
+                            compression,
+                            eligible,
+                            no_delta,
+                            fits,
+                            name_fits,
+                        );
+                        assert_eq!(
+                            reason.is_none(),
+                            compression && eligible && !no_delta && fits && name_fits,
+                            "compression={compression} eligible={eligible} no_delta={no_delta} \
+                             fits={fits} name_fits={name_fits}"
+                        );
+                    }
                 }
             }
         }
@@ -429,11 +438,41 @@ fn a_put_tries_a_delta_only_when_compressing_an_eligible_key_that_fits_without_t
 fn the_decline_reason_names_the_first_failed_check() {
     use crate::types::PassthroughReason as R;
     let why = StorePlan::decline_reason;
-    assert_eq!(why(false, false, true, false), Some(R::CompressionDisabled));
-    assert_eq!(why(true, false, true, false), Some(R::NoDeltaRequested));
-    assert_eq!(why(true, false, false, false), Some(R::NotDeltaEligible));
-    assert_eq!(why(true, true, false, false), Some(R::OverMaxObjectSize));
-    assert_eq!(why(true, true, false, true), None);
+    assert_eq!(
+        why(false, false, true, false, false),
+        Some(R::CompressionDisabled)
+    );
+    assert_eq!(
+        why(true, false, true, false, false),
+        Some(R::NoDeltaRequested)
+    );
+    assert_eq!(
+        why(true, false, false, false, false),
+        Some(R::NotDeltaEligible)
+    );
+    assert_eq!(
+        why(true, true, false, false, false),
+        Some(R::OverMaxObjectSize)
+    );
+    assert_eq!(
+        why(true, true, false, true, false),
+        Some(R::DeltaNameTooLong)
+    );
+    assert_eq!(why(true, true, false, true, true), None);
+}
+
+/// F43 (epic #142): the `.delta` form of a name is 6 bytes longer. A name
+/// of 250 bytes or more is stored whole, so the same name never succeeds
+/// as a whole object and then fails as a delta.
+#[test]
+fn a_name_too_long_for_a_delta_file_is_stored_whole() {
+    use super::store::delta_name_fits;
+    assert!(delta_name_fits(&"a".repeat(249)));
+    assert!(!delta_name_fits(&"a".repeat(250)));
+    assert!(!delta_name_fits(&"a".repeat(255)));
+    // Bytes, not characters.
+    assert!(!delta_name_fits(&"é".repeat(125)));
+    assert!(delta_name_fits(&"é".repeat(124)));
 }
 
 #[test]

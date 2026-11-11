@@ -20,14 +20,45 @@
 //! The token is bound to the bucket, the prefix and the delimiter of the
 //! listing (AEAD associated data): a sealed position is a cursor of ONE
 //! listing, never a probe into another bucket or prefix.
+//!
+//! A page that cannot finish the visibility proof of a folded name also
+//! seals the proof's progress (the name and its inner cursor, both hidden
+//! data), so the next page resumes the proof. The inner cursor is sealed
+//! with the position and bound to the same listing, so a client cannot
+//! forge or move it.
+//!
+//! Both kinds of token start with `dg2.`. The kind is part of the
+//! authenticated associated data (`+proof`), not of the prefix. An earlier
+//! release knows only `dg2.` tokens without a proof: it opens a proof token
+//! with the plain associated data, fails, and answers `InvalidArgument`. A
+//! new prefix would be read there as a raw start key (a V2 token) or a plain
+//! marker (V1), and the listing would go on from a meaningless key.
+//!
+//! The plaintext of a proof token has a fixed size: the position, the name
+//! and the inner cursor can each name a hidden key, and the length of a
+//! sealed message shows the length of its plaintext. Each field is padded to
+//! the longest S3 key ([`PROOF_FIELD_LEN`]).
 
+use crate::iam::listing::ProofResume;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-/// Marks a sealed token. A `dg1.` token carries a visible key in clear.
+/// Marks a sealed token, with or without a proof. A `dg1.` token carries a
+/// visible key in clear.
 pub(super) const SEALED_TOKEN_PREFIX: &str = "dg2.";
+
+/// The size of each secret field of a proof token: the longest S3 key, in
+/// bytes. A longer field (not possible for a key) is kept whole, not cut.
+const PROOF_FIELD_LEN: usize = 1024;
+
+/// What a sealed token holds: a scan position, and the proof to go on with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SealedCursor {
+    pub position: String,
+    pub proof: Option<ProofResume>,
+}
 
 /// The HKDF `info` label of the token key.
 const KEY_LABEL: &[u8] = b"dgp-list-token-v1";
@@ -107,8 +138,13 @@ impl TokenBinding<'_> {
     /// The associated data: every field length-prefixed, so two bindings
     /// never give the same bytes. An empty delimiter is no delimiter, as
     /// for the listing.
-    fn aad(&self) -> Vec<u8> {
+    fn aad(&self, proof: bool) -> Vec<u8> {
         let mut out = KEY_LABEL.to_vec();
+        if proof {
+            // A proof payload never opens as a position, nor the reverse,
+            // and an earlier release (plain associated data only) refuses it.
+            out.extend_from_slice(b"+proof");
+        }
         let delimiter = self.delimiter.filter(|d| !d.is_empty());
         for field in [Some(self.bucket), Some(self.prefix), delimiter] {
             match field {
@@ -124,19 +160,85 @@ impl TokenBinding<'_> {
     }
 }
 
+/// Pure: the plaintext of a proof token, of one size for every input: a
+/// flag byte (inner cursor present), then the position, the name and the
+/// inner cursor, each as a length, the bytes and zeros up to
+/// [`PROOF_FIELD_LEN`].
+fn proof_payload(position: &str, proof: &ProofResume) -> Vec<u8> {
+    let mut out = vec![u8::from(proof.inner.is_some())];
+    for field in [
+        position,
+        proof.name.as_str(),
+        proof.inner.as_deref().unwrap_or(""),
+    ] {
+        out.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        out.extend_from_slice(field.as_bytes());
+        out.resize(out.len() + PROOF_FIELD_LEN.saturating_sub(field.len()), 0);
+    }
+    out
+}
+
+/// Pure: read what [`proof_payload`] wrote; `None` for any other shape.
+fn parse_proof_payload(bytes: &[u8]) -> Option<SealedCursor> {
+    let (&flag, mut rest) = bytes.split_first()?;
+    let mut take = || -> Option<String> {
+        let len = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let field = rest.get(4..4 + len)?;
+        let padding = rest.get(4 + len..4 + len + PROOF_FIELD_LEN.saturating_sub(len))?;
+        if padding.iter().any(|b| *b != 0) {
+            return None;
+        }
+        rest = &rest[4 + len + padding.len()..];
+        String::from_utf8(field.to_vec()).ok()
+    };
+    let position = take()?;
+    let name = take()?;
+    let inner = take()?;
+    let inner = match flag {
+        1 => Some(inner),
+        0 if inner.is_empty() => None,
+        _ => return None,
+    };
+    rest.is_empty().then_some(SealedCursor {
+        position,
+        proof: Some(ProofResume { name, inner }),
+    })
+}
+
 /// Pure: seal the scan position `position` with `key` (random nonce).
+#[cfg(test)]
 pub(super) fn seal_with(key: &TokenKey, position: &str, binding: TokenBinding<'_>) -> String {
+    seal_cursor_with(
+        key,
+        &SealedCursor {
+            position: position.to_string(),
+            proof: None,
+        },
+        binding,
+    )
+}
+
+/// Pure: seal a scan position and the proof progress that goes with it.
+pub(super) fn seal_cursor_with(
+    key: &TokenKey,
+    cursor: &SealedCursor,
+    binding: TokenBinding<'_>,
+) -> String {
     use base64::Engine as _;
     use rand::RngCore;
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let cipher = Aes256Gcm::new(key.into());
-    let aad = binding.aad();
+    let aad = binding.aad(cursor.proof.is_some());
+    let plain = match &cursor.proof {
+        Some(proof) => proof_payload(&cursor.position, proof),
+        None => cursor.position.as_bytes().to_vec(),
+    };
     let sealed = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
-                msg: position.as_bytes(),
+                msg: &plain,
                 aad: &aad,
             },
         )
@@ -160,8 +262,8 @@ pub(super) enum OpenError {
     Rejected,
 }
 
-/// Pure: the envelope bytes of a `dg2.` token, when it has the shape of
-/// one (base64url, room for a nonce and a tag).
+/// Pure: the envelope bytes of a sealed token, when it has the shape of
+/// one (`dg2.`, base64url, room for a nonce and a tag).
 fn envelope(token: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
     let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -176,17 +278,18 @@ pub(super) fn looks_sealed(s: &str) -> bool {
     envelope(s).is_some()
 }
 
-/// Pure: open a sealed token with the first of `keys` that opens it.
+/// Pure: open a sealed token with the first of `keys` that opens it. The
+/// kind is the associated data that opens it: a position, else a proof.
 pub(super) fn open_with(
     keys: &[TokenKey],
     token: &str,
     binding: TokenBinding<'_>,
-) -> Result<String, OpenError> {
+) -> Result<SealedCursor, OpenError> {
     let blob = envelope(token).ok_or(OpenError::Malformed)?;
     let (nonce, sealed) = blob.split_at(NONCE_LEN);
-    let aad = binding.aad();
-    keys.iter()
-        .find_map(|key| {
+    let decrypt = |proof: bool| {
+        let aad = binding.aad(proof);
+        keys.iter().find_map(|key| {
             Aes256Gcm::new(key.into())
                 .decrypt(
                     Nonce::from_slice(nonce),
@@ -197,19 +300,40 @@ pub(super) fn open_with(
                 )
                 .ok()
         })
-        .and_then(|plain| String::from_utf8(plain).ok())
-        .ok_or(OpenError::Rejected)
+    };
+    if let Some(plain) = decrypt(false) {
+        return String::from_utf8(plain)
+            .map(|position| SealedCursor {
+                position,
+                proof: None,
+            })
+            .map_err(|_| OpenError::Rejected);
+    }
+    let plain = decrypt(true).ok_or(OpenError::Rejected)?;
+    parse_proof_payload(&plain).ok_or(OpenError::Rejected)
 }
 
-/// Seal a scan position with the installed key.
-pub(super) fn seal(position: &str, binding: TokenBinding<'_>) -> String {
-    seal_with(&token_keys()[0], position, binding)
+/// Seal a scan position, and the proof that goes with it, with the
+/// installed key.
+pub(super) fn seal(
+    position: &str,
+    proof: Option<&ProofResume>,
+    binding: TokenBinding<'_>,
+) -> String {
+    seal_cursor_with(
+        &token_keys()[0],
+        &SealedCursor {
+            position: position.to_string(),
+            proof: proof.cloned(),
+        },
+        binding,
+    )
 }
 
 /// Open a sealed token with the installed keys. A token that does not open
 /// is `InvalidArgument`: the listing never restarts somewhere else, because
 /// two nodes with different keys would then answer the same page forever.
-pub(super) fn open(token: &str, binding: TokenBinding<'_>) -> s3s::S3Result<String> {
+pub(super) fn open(token: &str, binding: TokenBinding<'_>) -> s3s::S3Result<SealedCursor> {
     open_with(token_keys(), token, binding).map_err(|e| {
         tracing::info!(
             bucket = binding.bucket,
@@ -269,10 +393,137 @@ mod tests {
             if position.len() >= 3 {
                 assert!(!t.contains(position), "the position shows in clear");
             }
-            assert_eq!(open_with(&[key], &t, B).as_deref(), Ok(position));
+            assert_eq!(
+                open_with(&[key], &t, B).map(|c| c.position).as_deref(),
+                Ok(position)
+            );
         }
         // Random nonce: one position seals to two different tokens.
         assert_ne!(seal_with(&key, "h/10", B), seal_with(&key, "h/10", B));
+    }
+
+    #[test]
+    fn a_proof_payload_round_trips_and_refuses_other_shapes() {
+        let key = derive_list_token_key(&"k".repeat(64));
+        for (position, name, inner) in [
+            ("e.secret", "h/", Some("h/0999.pem")),
+            ("", "a/..", None),
+            ("é<&>\u{1}", "ü/", Some("")),
+        ] {
+            let cursor = SealedCursor {
+                position: position.into(),
+                proof: Some(ProofResume {
+                    name: name.into(),
+                    inner: inner.map(String::from),
+                }),
+            };
+            let t = seal_cursor_with(&key, &cursor, B);
+            assert!(t.starts_with(SEALED_TOKEN_PREFIX));
+            assert_eq!(open_with(&[key], &t, B), Ok(cursor));
+        }
+        for bad in [
+            &b""[..],
+            &[0, 0, 0, 9, 1][..],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2][..],
+        ] {
+            assert_eq!(parse_proof_payload(bad), None);
+        }
+        let mut trailing = proof_payload(
+            "p",
+            &ProofResume {
+                name: "n".into(),
+                inner: None,
+            },
+        );
+        trailing.push(0);
+        assert_eq!(parse_proof_payload(&trailing), None);
+    }
+
+    /// The length of a proof token does not depend on the folded name, the
+    /// inner cursor or the position (all can name hidden keys), nor on
+    /// whether the inner cursor is set.
+    #[test]
+    fn a_proof_token_has_one_length() {
+        let key = derive_list_token_key(&"k".repeat(64));
+        let token = |position: &str, name: &str, inner: Option<&str>| {
+            seal_cursor_with(
+                &key,
+                &SealedCursor {
+                    position: position.into(),
+                    proof: Some(ProofResume {
+                        name: name.into(),
+                        inner: inner.map(String::from),
+                    }),
+                },
+                B,
+            )
+        };
+        let reference = token("e", "h/", Some("h/0"));
+        // About 4.2 KB: far under the 8 KB request-line limit of common proxies.
+        assert!(reference.len() < 4300, "{}", reference.len());
+        for (position, name, inner) in [
+            ("e.secret", "hidden-folder/", Some("hidden-folder/0999.pem")),
+            ("", "a/..", None),
+            ("é<&>", "ü/", Some("")),
+            (
+                &"p".repeat(1024),
+                &"n".repeat(1024),
+                Some(&"i".repeat(1024)[..]),
+            ),
+        ] {
+            assert_eq!(
+                token(position, name, inner).len(),
+                reference.len(),
+                "{position:?} {name:?} {inner:?}"
+            );
+        }
+    }
+
+    /// The kind of a token is authenticated data: a proof payload sealed as
+    /// a position never reads as a proof, and a position sealed as a proof
+    /// is refused. An older release, which opens with the plain data only,
+    /// therefore refuses every proof token.
+    #[test]
+    fn the_kind_is_part_of_the_authenticated_data() {
+        use base64::Engine as _;
+        let key = derive_list_token_key(&"k".repeat(64));
+        let raw = |plain: &[u8], proof: bool| {
+            let nonce = [9u8; NONCE_LEN];
+            let aad = B.aad(proof);
+            let sealed = Aes256Gcm::new((&key).into())
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: plain,
+                        aad: &aad,
+                    },
+                )
+                .unwrap();
+            let mut blob = nonce.to_vec();
+            blob.extend_from_slice(&sealed);
+            format!(
+                "{SEALED_TOKEN_PREFIX}{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob)
+            )
+        };
+        let payload = proof_payload(
+            "p",
+            &ProofResume {
+                name: "n".into(),
+                inner: None,
+            },
+        );
+        // Under the proof data a payload is a proof; under the plain data it
+        // is only a position string.
+        let as_proof = open_with(&[key], &raw(&payload, true), B).unwrap();
+        assert!(as_proof.proof.is_some());
+        let as_position = open_with(&[key], &raw(&payload, false), B).unwrap();
+        assert!(as_position.proof.is_none());
+        // A position under the proof data is not a proof payload.
+        assert_eq!(
+            open_with(&[key], &raw(b"h/10", true), B),
+            Err(OpenError::Rejected)
+        );
     }
 
     #[test]
@@ -301,7 +552,12 @@ mod tests {
         let t = seal_with(&key, "h/10", B);
         assert_eq!(open_with(&[other], &t, B), Err(OpenError::Rejected));
         // After a rotation the previous key still opens it.
-        assert_eq!(open_with(&[other, key], &t, B).as_deref(), Ok("h/10"));
+        assert_eq!(
+            open_with(&[other, key], &t, B)
+                .map(|c| c.position)
+                .as_deref(),
+            Ok("h/10")
+        );
         for binding in [
             TokenBinding { bucket: "c", ..B },
             TokenBinding { prefix: "p", ..B },
@@ -331,7 +587,10 @@ mod tests {
             delimiter: Some(""),
             ..B
         };
-        assert_eq!(open_with(&[key], &t, empty).as_deref(), Ok("h/10"));
+        assert_eq!(
+            open_with(&[key], &t, empty).map(|c| c.position).as_deref(),
+            Ok("h/10")
+        );
     }
 
     /// The installed keys: the primary seals; a rotation's previous key and

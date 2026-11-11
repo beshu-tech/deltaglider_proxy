@@ -83,6 +83,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.spool.max_bytes()
     }
 
+    /// Can the engine make a spool file now? (Re-creates a removed spool
+    /// directory.) Blocking: call it from `spawn_blocking`.
+    pub fn spool_usable(&self) -> bool {
+        self.spool.is_usable()
+    }
+
     /// The env-only settings this engine was built with.
     pub fn tuning(&self) -> &crate::config::RuntimeTuning {
         &self.tuning

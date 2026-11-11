@@ -262,9 +262,10 @@ impl From<ConfigDbError> for AdminError {
 fn db_error_message(status: StatusCode, e: &ConfigDbError) -> String {
     match (status, e) {
         (StatusCode::CONFLICT, ConfigDbError::Sqlite(rusqlite::Error::SqliteFailure(_, msg))) => {
+            let subject = unique_violation_subject(msg.as_deref());
             match msg {
-                Some(m) => format!("the name is already in use ({m})"),
-                None => "the name is already in use".to_string(),
+                Some(m) => format!("{subject} ({m})"),
+                None => subject.to_string(),
             }
         }
         (StatusCode::NOT_FOUND, ConfigDbError::Sqlite(rusqlite::Error::SqliteFailure(..))) => {
@@ -272,6 +273,23 @@ fn db_error_message(status: StatusCode, e: &ConfigDbError) -> String {
         }
         (StatusCode::NOT_FOUND, ConfigDbError::Sqlite(_)) => "not found".to_string(),
         _ => e.to_string(),
+    }
+}
+
+/// Pure: what a UNIQUE violation says is already in use. SQLite names the
+/// column (`UNIQUE constraint failed: users.access_key_id`): a clash on the
+/// access key is not a clash on the name. A violation that names no column
+/// we know keeps the generic words.
+fn unique_violation_subject(sqlite_message: Option<&str>) -> &'static str {
+    let columns = sqlite_message
+        .and_then(|m| m.split_once("UNIQUE constraint failed:"))
+        .map_or("", |(_, cols)| cols);
+    if columns.contains("access_key_id") {
+        "the access key id is already in use"
+    } else if columns.contains("name") || columns.is_empty() {
+        "the name is already in use"
+    } else {
+        "a value that must be unique is already in use"
     }
 }
 
@@ -489,6 +507,25 @@ mod tests {
                 "the name is already in use (UNIQUE constraint failed: groups.name)"
             )
         );
+    }
+
+    #[test]
+    fn a_unique_violation_names_the_column_in_conflict() {
+        for (sqlite, said) in [
+            (Some("UNIQUE constraint failed: users.name"), "the name is already in use"),
+            (Some("UNIQUE constraint failed: groups.name"), "the name is already in use"),
+            (
+                Some("UNIQUE constraint failed: users.access_key_id"),
+                "the access key id is already in use",
+            ),
+            (
+                Some("UNIQUE constraint failed: external_identities.provider_id, external_identities.external_sub"),
+                "a value that must be unique is already in use",
+            ),
+            (None, "the name is already in use"),
+        ] {
+            assert_eq!(unique_violation_subject(sqlite), said, "{sqlite:?}");
+        }
     }
 
     #[test]

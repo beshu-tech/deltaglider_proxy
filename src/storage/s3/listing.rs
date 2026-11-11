@@ -23,8 +23,8 @@ impl S3ListedObject {
     /// lightweight representation.  Returns `None` if the object has no key.
     pub(super) fn from_s3_object(object: aws_sdk_s3::types::Object) -> Option<Self> {
         let key = object.key?;
-        // Listing facts are internal index entries, never objects.
-        if listing_facts::is_facts_key(&key) {
+        // Listing facts and the `.dg` directory are internal, never objects.
+        if listing_facts::is_hidden_key(&key) {
             return None;
         }
         let last_modified = object.last_modified.and_then(|dt| {
@@ -718,8 +718,9 @@ impl S3Backend {
             if let Some(cps) = response.common_prefixes {
                 for cp in cps {
                     if let Some(p) = cp.prefix {
-                        let last_seg = p.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-                        if last_seg == ".dg" || listing_facts::is_internal_common_prefix(&p) {
+                        if listing_facts::has_internal_segment(&p)
+                            || listing_facts::is_internal_common_prefix(&p)
+                        {
                             continue;
                         }
                         all_common_prefixes.insert(p);
@@ -1127,6 +1128,86 @@ mod delegated_cost_tests {
             .unwrap()
             .unwrap();
         assert_eq!(page.reference_prefixes, None);
+    }
+
+    /// F19 + the class guard of epic #142 (S3 backend): keys that an older
+    /// release stored under a `.dg` directory are listed nowhere, flat or
+    /// with a delimiter, and the recursive delimiter walk equals the flat
+    /// listing at every page size. Unicode and a dot-dir stay
+    /// ordinary keys.
+    #[tokio::test]
+    async fn a_dg_directory_is_hidden_the_same_way_flat_and_with_a_delimiter() {
+        let keys: Vec<String> = [
+            ".dg/foo",
+            ".dg/reference.bin",
+            "a/.dg/bar",
+            "a/.dg/reference.bin",
+            "a/x",
+            "a-b/y",
+            "a_b/z",
+            ".dgx/k",
+            ".well-known/w",
+            "é/u",
+            "top",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (s3, _fake) = backend_with_keys(&keys).await;
+        let want: Vec<String> = [
+            ".dgx/k",
+            ".well-known/w",
+            "a-b/y",
+            "a/x",
+            "a_b/z",
+            "top",
+            "é/u",
+        ]
+        .map(String::from)
+        .to_vec();
+        for max_keys in [1u32, 2, 3, 1000] {
+            let mut flat = Vec::new();
+            let mut token: Option<String> = None;
+            loop {
+                let page = s3
+                    .list_objects_delegated("b", "", None, max_keys, token.as_deref())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                flat.extend(page.objects.into_iter().map(|(k, _)| k));
+                if !page.is_truncated {
+                    break;
+                }
+                token = page.next_continuation_token;
+            }
+            assert_eq!(flat, want, "flat, max_keys {max_keys}");
+            let mut walked = Vec::new();
+            let mut todo = vec![String::new()];
+            while let Some(prefix) = todo.pop() {
+                let mut token: Option<String> = None;
+                loop {
+                    let page = s3
+                        .list_objects_delegated("b", &prefix, Some("/"), max_keys, token.as_deref())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    walked.extend(page.objects.into_iter().map(|(k, _)| k));
+                    todo.extend(page.common_prefixes);
+                    if !page.is_truncated {
+                        break;
+                    }
+                    token = page.next_continuation_token;
+                }
+            }
+            walked.sort();
+            assert_eq!(walked, want, "walk, max_keys {max_keys}");
+        }
+        // Asked for by name, the proxy's directory still lists nothing.
+        let page = s3
+            .list_objects_delegated("b", ".dg/", None, 1000, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(page.objects.is_empty(), "{:?}", page.objects);
     }
 
     /// A page reports the requests it sent (its pages and its probes), so

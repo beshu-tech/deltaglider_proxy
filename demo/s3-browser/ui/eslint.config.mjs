@@ -45,6 +45,10 @@ const ANTD_DEPRECATED = [
   ["JSXOpeningElement[name.name='Collapse'] > JSXAttribute[name.name='destroyInactivePanel']", 'use destroyOnHidden.'],
 ];
 
+/** CSS named colours (not transparent / inherit / currentColor). */
+const NAMED_COLORS = ('aliceblue antiquewhite aqua aquamarine azure beige bisque black blanchedalmond blue blueviolet brown burlywood cadetblue chartreuse chocolate coral cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen darkgrey darkkhaki darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon darkseagreen darkslateblue darkslategray darkslategrey darkturquoise darkviolet deeppink deepskyblue dimgray dimgrey dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro ghostwhite gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory khaki lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan lightgoldenrodyellow lightgray lightgreen lightgrey lightpink lightsalmon lightseagreen lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen magenta maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen mediumslateblue mediumspringgreen mediumturquoise mediumvioletred midnightblue mintcream mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered orchid palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum powderblue purple rebeccapurple red rosybrown royalblue saddlebrown salmon sandybrown seagreen seashell sienna silver skyblue slateblue slategray slategrey snow springgreen steelblue tan teal thistle tomato turquoise violet wheat white whitesmoke yellow yellowgreen').split(' ');
+const NAMED_COLOR_RE = `/^(${NAMED_COLORS.join('|')})$/i`;
+
 /** Theme rules: colours from the palette, hover in CSS (see the CLAUDE.md styling section). */
 const THEME_SYNTAX_RULES = [
     {
@@ -67,6 +71,23 @@ const THEME_SYNTAX_RULES = [
       // colour across a theme flip.
       selector: "JSXAttribute[name.name=/^onMouse(Enter|Leave|Over|Out)$/] AssignmentExpression > MemberExpression.left[object.property.name='style']",
       message: 'Hover styling belongs in CSS: use a dg-hover-* class from theme.css, not an onMouseEnter style write.',
+    },
+    {
+      // The same write without an assignment: Object.assign(el.style, {...}) and el.style.setProperty(...).
+      selector:
+        "JSXAttribute[name.name=/^onMouse(Enter|Leave|Over|Out)$/] :matches(CallExpression[callee.object.name='Object'][callee.property.name='assign'][arguments.0.property.name='style'], CallExpression[callee.property.name='setProperty'][callee.object.property.name='style'])",
+      message: 'Hover styling belongs in CSS: use a dg-hover-* class from theme.css, not an onMouseEnter style write.',
+    },
+    {
+      // A named CSS colour is a literal like #fff: it skips the theme switch.
+      // A bare `color: 'red'` is an AntD Tag preset (jobsView.ts), so `color`
+      // counts only inside a JSX `style={{ ... }}`.
+      // `transparent`, `inherit` and `currentColor` are not colours of ours.
+      // A shorthand (`1px solid white`, `linear-gradient(red, ...)`) counts only as
+      // the value of a border/outline/background/boxShadow property: the same
+      // words in UI text ("Consolidated view: a green tick ...") are not a style.
+      selector: `:matches(Property[key.name=/^(background|backgroundColor|borderColor|borderTopColor|borderBottomColor|borderLeftColor|borderRightColor|outlineColor|fill|stroke|caretColor|accentColor)$/] > Literal[value=${NAMED_COLOR_RE}], JSXAttribute[name.name=/^(fill|stroke|stopColor|floodColor)$/] > Literal[value=${NAMED_COLOR_RE}], JSXAttribute[name.name='style'] Property[key.name='color'] > Literal[value=${NAMED_COLOR_RE}], Property[key.name=/^(border(Top|Bottom|Left|Right)?|outline|background(Image)?|boxShadow)$/] > Literal[value=/\\b(solid|dashed|dotted|inset|gradient)\\b.*\\b(${NAMED_COLORS.join('|')})\\b/i])`,
+      message: 'No named colour (white, red, ...): use a palette token (useColors(), cssVar(), tint() from src/themeVars.ts).',
     },
 ];
 
@@ -91,6 +112,21 @@ const UI_RULES = {
           message: 'Use components/SimpleAutoComplete: AntD points aria-activedescendant at a missing option (`_list_-1`).',
         },
       ],
+      // The same components through a deep import (`antd/es/tooltip`, `antd/lib/popover`).
+      patterns: [
+        {
+          group: ['antd/es/tooltip', 'antd/es/tooltip/*', 'antd/lib/tooltip', 'antd/lib/tooltip/*', 'antd/es/popover', 'antd/es/popover/*', 'antd/lib/popover', 'antd/lib/popover/*'],
+          message: 'theme.css hides every AntD tooltip/popover — use a native title or <HoverHint>.',
+        },
+        {
+          group: ['antd/es/dropdown', 'antd/es/dropdown/*', 'antd/lib/dropdown', 'antd/lib/dropdown/*'],
+          message: 'Use components/KeyboardDropdown: it focuses the menu on open and marks the trigger as a menu button.',
+        },
+        {
+          group: ['antd/es/auto-complete', 'antd/es/auto-complete/*', 'antd/lib/auto-complete', 'antd/lib/auto-complete/*'],
+          message: 'Use components/SimpleAutoComplete: AntD points aria-activedescendant at a missing option (`_list_-1`).',
+        },
+      ],
     },
   ],
   'no-restricted-syntax': [
@@ -98,6 +134,16 @@ const UI_RULES = {
     {
       selector: "JSXAttribute[name.name='ellipsis'] Property[key.name='tooltip']",
       message: 'ellipsis.tooltip renders an AntD tooltip, which theme.css hides — pass a native title instead.',
+    },
+    {
+      // `import * as antd from 'antd'` hides every named import from the import rules above.
+      selector: "ImportDeclaration[source.value=/^antd(\\/|$)/] > ImportNamespaceSpecifier",
+      message: 'Import the AntD components you use by name: a namespace import bypasses the Tooltip/Popover/Dropdown/AutoComplete rules.',
+    },
+    {
+      // window.navigator.clipboard / globalThis.navigator.clipboard: the object is not the bare `navigator`.
+      selector: "MemberExpression[property.name='clipboard'][object.type='MemberExpression'][object.property.name='navigator']",
+      message: 'Use useCopyToClipboard — navigator.clipboard is undefined on plain HTTP.',
     },
     {
       // Safari < 16.4 cannot parse a lookbehind: one in the bundle breaks the whole app.
@@ -136,6 +182,12 @@ const UI_RULES = {
         "JSXOpeningElement[name.name='Button'] JSXAttribute[name.name='style'] Property[key.name=/^(background|backgroundColor)$/]:matches([value.name=/^ACCENT_/], [value.property.name=/^ACCENT_/])",
       message: 'No ACCENT_* fill on <Button>: use type="primary" / danger, whose colours contrast.test.ts checks.',
     },
+    {
+      // F6 (epic #146): an object may be named `folder:abc/`. The kind of a row is never
+      // read from key text: rowKey.ts makes and parses row keys.
+      selector: ":matches(Literal[value=/^folder:/], TemplateElement[value.raw=/^folder:/])",
+      message: 'Do not build or parse `folder:` text: a row\'s kind comes from parseRowKey / folderRowKey / objectRowKey in src/rowKey.ts.',
+    },
     ...THEME_SYNTAX_RULES,
     // AntD 6 deprecated props: each one floods the dev console with a warning.
     ...ANTD_DEPRECATED.map(([selector, message]) => ({ selector, message: `AntD 6 deprecation: ${message}` })),
@@ -150,6 +202,12 @@ const UI_RULES = {
     'error',
     { object: 'window', property: 'localStorage', message: 'Use src/safeStorage.ts.' },
     { object: 'window', property: 'sessionStorage', message: 'Use src/safeStorage.ts.' },
+    { object: 'globalThis', property: 'localStorage', message: 'Use src/safeStorage.ts.' },
+    { object: 'globalThis', property: 'sessionStorage', message: 'Use src/safeStorage.ts.' },
+    { object: 'self', property: 'localStorage', message: 'Use src/safeStorage.ts.' },
+    { object: 'self', property: 'sessionStorage', message: 'Use src/safeStorage.ts.' },
+    { object: 'globalThis', property: 'confirm', message: 'Use confirmDialog from src/confirmDialog.ts.' },
+    { object: 'self', property: 'confirm', message: 'Use confirmDialog from src/confirmDialog.ts.' },
     { object: 'window', property: 'confirm', message: 'Use confirmDialog from src/confirmDialog.ts: window.confirm blocks the page and ignores the theme.' },
     {
       object: 'navigator',
@@ -224,9 +282,9 @@ export default tseslint.config(
     files: ['src/safeStorage.ts'],
     rules: { 'no-restricted-properties': 'off', 'no-restricted-globals': 'off' },
   },
-  // The one sanctioned Enter/Space activation handler.
+  // The one sanctioned Enter/Space activation handler, and the one row-key module.
   {
-    files: ['src/keyboard.ts'],
+    files: ['src/keyboard.ts', 'src/rowKey.ts'],
     rules: { 'no-restricted-syntax': 'off' },
   },
   // Colour literals are allowed only here, each for a stated reason:

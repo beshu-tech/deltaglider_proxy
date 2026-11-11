@@ -424,6 +424,18 @@ impl SessionStore {
         !targets.is_empty()
     }
 
+    /// End every bootstrap-password session except `keep` (the one that
+    /// rotated the password). A session minted under the old password must
+    /// not outlive it. Returns the count ended.
+    pub fn revoke_bootstrap_except(&self, keep: Option<&str>) -> usize {
+        let mut sessions = self.sessions.write();
+        let before = sessions.len();
+        sessions.retain(|token, info| {
+            !matches!(info.auth_method, AuthMethod::Bootstrap) || Some(token.as_str()) == keep
+        });
+        before - sessions.len()
+    }
+
     /// End every external-login session bound to one of `user_ids`. A sync
     /// merge moves or deletes a user id; a live session that still carries the
     /// old id would otherwise resolve to whoever holds that id now.

@@ -873,14 +873,14 @@ pub async fn sigv4_auth_middleware(
     // `ConfigDbMismatchGuard` marker is injected by `build_s3_router` when no
     // config DB key decrypts the config DB. A missing IAM extension (a
     // router built without it) fails closed: deny all.
-    let config_db_locked = request
+    let config_db_key_mismatch = request
         .extensions()
         .get::<crate::api::ConfigDbMismatchGuard>()
         .is_some();
     let deny_all = IamState::deny_all();
     let iam_state = iam_snapshot.as_deref().unwrap_or(&deny_all);
 
-    let auth_config = match classify_auth_gate(config_db_locked, iam_state) {
+    let auth_config = match classify_auth_gate(config_db_key_mismatch, iam_state) {
         AuthGateDecision::Locked => {
             // Clear 503 with a recovery hint — NOT a misleading 500.
             // The proxy must not serve data without working authentication.
@@ -913,7 +913,7 @@ pub async fn sigv4_auth_middleware(
     debug!(
         "Incoming request: {} {} (has auth header: {})",
         request.method(),
-        request.uri(),
+        crate::security::redact_uri_for_log(&request.uri().to_string()),
         request.headers().contains_key("authorization")
     );
 
@@ -2018,20 +2018,20 @@ mod per_key_lockout_tests {
     #[test]
     fn the_s3_surfaces_never_lock_out_an_address() {
         let mut offenders = Vec::new();
-        for rel in ["src/api/auth.rs", "src/api/s3_router.rs"] {
-            let text = crate::source_scan::read(rel);
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                let code = line.split("//").next().unwrap_or("");
-                for call in [
-                    ".record_failure(",
-                    ".lockout_remaining(",
-                    ".is_limited(",
-                    ".progressive_delay(",
-                    ".failure_count(",
-                ] {
-                    if code.contains(call) {
-                        offenders.push(format!("{rel}:{n}: {}", line.trim()));
-                    }
+        for src in crate::source_scan::ast::src() {
+            if !["src/api/auth.rs", "src/api/s3_router.rs"].contains(&src.rel.as_str()) {
+                continue;
+            }
+            // A method call, or its UFCS form; a comment names none.
+            for name in [
+                "record_failure",
+                "lockout_remaining",
+                "is_limited",
+                "progressive_delay",
+                "failure_count",
+            ] {
+                for c in src.prod.calls_named(name) {
+                    offenders.push(format!("{}:{}: {name}(..)", src.rel, c.line));
                 }
             }
         }

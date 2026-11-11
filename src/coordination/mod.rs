@@ -62,6 +62,26 @@ pub fn durable_node_id(dir: &std::path::Path) -> String {
 
 /// [`durable_node_id`] over an injected environment.
 pub fn durable_node_id_with(env: crate::config::EnvLookup, dir: &std::path::Path) -> String {
+    resolve_node_id(env, dir, true)
+}
+
+/// The node id as a read-only LABEL (a witness body, a log line): the same
+/// resolution as [`durable_node_id`], but it never creates `<dir>/node-id`.
+/// A call that can run before the process has a data directory of its own
+/// (a unit test, a CLI probe) must not write into the working directory:
+/// without `HOSTNAME` the first such call left a `node-id` file in the
+/// repository root. With no env and no file it returns an id that is stable
+/// for this process only.
+pub fn node_id_label(dir: &std::path::Path) -> String {
+    node_id_label_with(&crate::config::process_env, dir)
+}
+
+/// [`node_id_label`] over an injected environment.
+pub fn node_id_label_with(env: crate::config::EnvLookup, dir: &std::path::Path) -> String {
+    resolve_node_id(env, dir, false)
+}
+
+fn resolve_node_id(env: crate::config::EnvLookup, dir: &std::path::Path, persist: bool) -> String {
     for var in ["DGP_NODE_ID", "HOSTNAME"] {
         if let Some(id) = crate::config::lookup_parse::<String>(env, var) {
             if !id.trim().is_empty() {
@@ -75,6 +95,12 @@ pub fn durable_node_id_with(env: crate::config::EnvLookup, dir: &std::path::Path
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
+    }
+    if !persist {
+        static PROCESS_LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        return PROCESS_LABEL
+            .get_or_init(|| format!("node-{}", uuid::Uuid::new_v4()))
+            .clone();
     }
     let generated = format!("node-{}", uuid::Uuid::new_v4());
     // Best-effort persist; if the write fails we still return a valid (if
@@ -142,6 +168,30 @@ mod node_identity_tests {
             generated,
             "persisted"
         );
+    }
+
+    #[test]
+    fn the_label_never_writes_the_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = |_: &str| None::<String>;
+        let label = node_id_label_with(&none, dir.path());
+        assert!(label.starts_with("node-"));
+        assert_eq!(
+            node_id_label_with(&none, dir.path()),
+            label,
+            "stable per process"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "a label must not create <dir>/node-id"
+        );
+        // It still follows the node id that the leases persisted.
+        let durable = durable_node_id_with(&none, dir.path());
+        assert_eq!(node_id_label_with(&none, dir.path()), durable);
+        // The env wins, as for the durable id.
+        let pinned = |k: &str| (k == "DGP_NODE_ID").then(|| "pinned".to_string());
+        assert_eq!(node_id_label_with(&pinned, dir.path()), "pinned");
     }
 
     #[test]

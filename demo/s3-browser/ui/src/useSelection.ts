@@ -1,18 +1,22 @@
 import { useState, useCallback } from 'react';
 import type { S3Object } from './types';
+import { type RowKey, folderRowKey, objectRowKey } from './rowKey';
 
-/** Selection key of a folder row (object rows use the object key). */
-const folderKey = (f: string) => `folder:${f}`;
+/** The row keys of the given folders and objects (see `rowKey.ts`). */
+function rowKeysOf(objects: S3Object[], folders: string[]): Set<RowKey> {
+  return new Set<RowKey>([...folders.map(folderRowKey), ...objects.map((o) => objectRowKey(o.key))]);
+}
 
 /**
  * Checked rows of the object browser, independent of data fetching. The
- * caller passes the visible rows to `toggleAll` and the fresh listing to
- * `reconcile`, so this hook can run before the listing hook.
+ * caller passes the visible rows to `toggleAll` and to `reconcile`, so this
+ * hook can run before the listing hook. A checked row is always a row that
+ * is shown: `reconcile` drops the rest (a refresh, a filter, a folder change).
  */
 export default function useSelection() {
-  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const [selectedKeys, setSelectedKeys] = useState<Set<RowKey>>(new Set());
 
-  const toggleKey = useCallback((key: string) => {
+  const toggleKey = useCallback((key: RowKey) => {
     setSelectedKeys((prev) => {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
@@ -21,20 +25,22 @@ export default function useSelection() {
     });
   }, []);
 
+  /** Check every shown row, or, when every shown row is checked, none. */
   const toggleAll = useCallback((objects: S3Object[], folders: string[]) => {
     setSelectedKeys((prev) => {
-      const allKeys = [...folders.map(folderKey), ...objects.map((o) => o.key)];
-      return prev.size === allKeys.length ? new Set() : new Set(allKeys);
+      const shown = rowKeysOf(objects, folders);
+      const allChecked = shown.size > 0 && [...shown].every((k) => prev.has(k));
+      return allChecked ? new Set() : shown;
     });
   }, []);
 
-  /** Prune stale keys after data refresh. */
-  const reconcile = useCallback((freshObjects: S3Object[], freshFolders: string[]) => {
+  /** Keep only the checked rows that are in the given rows. */
+  const reconcile = useCallback((shownObjects: S3Object[], shownFolders: string[]) => {
     setSelectedKeys((prev) => {
-      const validKeys = new Set([...freshObjects.map((o) => o.key), ...freshFolders.map(folderKey)]);
-      const next = new Set<string>();
+      const shown = rowKeysOf(shownObjects, shownFolders);
+      const next = new Set<RowKey>();
       for (const k of prev) {
-        if (validKeys.has(k)) next.add(k);
+        if (shown.has(k)) next.add(k);
       }
       return next.size === prev.size ? prev : next;
     });

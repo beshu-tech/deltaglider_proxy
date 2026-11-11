@@ -56,7 +56,9 @@ if [[ "${SKIP_CHECK_MESSAGE:-}" == *"[skip-integration]"* ]]; then
     while IFS= read -r path; do
       [[ -z "$path" ]] && continue
       docs_only_path "$path" || fail "[skip-integration] but ${before:0:12}..${after:0:12} changes $path (only *.md, docs/**, CHANGELOG.md may skip)"
-    done < <(git diff --name-only "$before" "$after")
+    # --no-renames: a rename `src/a.rs -> docs/a.md` lists BOTH paths (a delete
+    # and an add). With rename detection only the new, docs-only path shows.
+    done < <(git diff --no-renames --name-only "$before" "$after")
   fi
 fi
 

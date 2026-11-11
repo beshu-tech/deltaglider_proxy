@@ -6,8 +6,12 @@
  * it cannot read this window, the in-memory S3 credentials or the session
  * cookie, whatever its scripts do. An injected CSP decides what it may load:
  * nothing from the network unless the user allows remote content, and no
- * script unless the user allows scripts. Even with scripts on, it cannot
- * send requests (`connect-src 'none'`).
+ * script unless the user allows scripts. `connect-src 'none'` stops fetch,
+ * XHR and WebSocket, but NOT a navigation of the frame itself: a script that
+ * sets `location.href` makes the browser request that address (Chromium
+ * sends it, with the sandbox and this CSP in place; no sandbox flag and no
+ * supported CSP directive blocks it). So with scripts on, the page can send
+ * a request; `isolationNote` says so, and the words never claim otherwise.
  */
 
 export interface HtmlPreviewOptions {
@@ -20,6 +24,24 @@ export interface HtmlPreviewOptions {
 /** Flags of the iframe `sandbox` attribute. Never `allow-same-origin`. */
 export function sandboxFlags({ scripts }: HtmlPreviewOptions): string {
   return scripts ? 'allow-scripts' : '';
+}
+
+/**
+ * What the preview tells the user about its limits (F48, epic #146). It must
+ * stay true: with scripts on, the page can send a request by moving itself to
+ * another address; with remote content on, its images, fonts, styles and
+ * media load from other https sites, and each load is a request.
+ */
+export function isolationNote({ scripts, remote }: HtmlPreviewOptions): string {
+  const base = 'The page runs isolated from this console: it cannot read your session or credentials.';
+  const remoteNote = remote
+    ? ' Remote content is on, so the page loads images, fonts and styles from other https sites, which sends requests.'
+    : '';
+  return scripts
+    ? `${base} Scripts are on, so the page can still send a request by moving itself to another address.${remoteNote}`
+    : remote
+      ? `${base}${remoteNote}`
+      : `${base} Scripts are off, so the page cannot send requests by itself.`;
 }
 
 /** The Content-Security-Policy that the preview injects into the page. */

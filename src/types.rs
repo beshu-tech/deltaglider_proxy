@@ -238,6 +238,37 @@ impl ObjectKey {
                 "Key must not contain empty path segments ('//')".to_string(),
             ));
         }
+        // `.dg` is the proxy's own directory name at any depth (F19): a
+        // listing never shows what is stored there, so a client key there
+        // would be stored but invisible, and would keep DeleteBucket from
+        // succeeding on a bucket that looks empty.
+        let internal = crate::storage::listing_facts::INTERNAL_DIR;
+        if crate::storage::listing_facts::has_internal_segment(&self.prefix)
+            || self.filename == internal
+        {
+            return Err(KeyValidationError(format!(
+                "Object key '{}' is refused: '{internal}' is a reserved directory name, \
+                 because the proxy keeps its own files there and never lists them. See \
+                 {RESERVED_KEYS_DOC_URL}",
+                self.full_key()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl ObjectKey {
+    /// The gate of every DATA write (PutObject, CopyObject, form POST,
+    /// CreateMultipartUpload): the ingest rule, and a key that ends in `/`
+    /// is a folder marker, which only a zero-byte `store` writes. One rule,
+    /// so a refused key fails at the first request, not after all parts.
+    pub fn validate_data_ingest(&self) -> Result<(), KeyValidationError> {
+        self.validate_ingest()?;
+        if self.is_directory_marker() {
+            return Err(KeyValidationError(
+                "A key that ends in '/' is a folder marker and must have an empty body".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -412,6 +443,8 @@ pub enum PassthroughReason {
     NoDeltaRequested,
     /// The object is larger than `max_object_size`, the limit of a delta.
     OverMaxObjectSize,
+    /// The file name plus `.delta` is longer than a backend allows (255 bytes).
+    DeltaNameTooLong,
     /// A multipart upload larger than `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`.
     MultipartOverDeltaCap,
     /// The delta was not smaller than `max_delta_ratio` allows.
@@ -422,11 +455,12 @@ pub enum PassthroughReason {
 
 impl PassthroughReason {
     /// Every reason, for the tests that cover the whole set.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::NotDeltaEligible,
         Self::CompressionDisabled,
         Self::NoDeltaRequested,
         Self::OverMaxObjectSize,
+        Self::DeltaNameTooLong,
         Self::MultipartOverDeltaCap,
         Self::DeltaRatioOverLimit,
         Self::DeltaUnavailable,
@@ -439,6 +473,7 @@ impl PassthroughReason {
             Self::CompressionDisabled => "compression-disabled",
             Self::NoDeltaRequested => "no-delta-requested",
             Self::OverMaxObjectSize => "over-max-object-size",
+            Self::DeltaNameTooLong => "delta-name-too-long",
             Self::MultipartOverDeltaCap => "multipart-over-delta-cap",
             Self::DeltaRatioOverLimit => "delta-ratio-over-limit",
             Self::DeltaUnavailable => "delta-unavailable",
@@ -1129,12 +1164,45 @@ mod tests {
             assert!(k.validate_object().is_err(), "{key}");
             assert!(k.validate_ingest().is_err(), "{key}");
         }
+    }
+
+    /// F19 (epic #142): `.dg` is the proxy's own directory name at any
+    /// depth. A PUT refuses it (a listing never shows what is there); a
+    /// read or delete of an existing key stays possible, so a bucket that an
+    /// older release filled can be cleaned.
+    #[test]
+    fn a_dg_directory_is_refused_at_ingest_at_any_depth() {
+        for key in [
+            ".dg/other.txt",
+            "a/.dg/facts/x",
+            "a/.dg/x",
+            "a/b/.dg/c/d",
+            ".dg/",
+            "a/.dg",
+            ".dg",
+        ] {
+            let k = ObjectKey::parse("b", key);
+            let e = k.validate_ingest().unwrap_err().to_string();
+            assert!(e.contains("reserved directory name"), "{key}: {e}");
+        }
+        for key in [
+            ".dgx/a",
+            ".dg-x",
+            "a/.dg.txt",
+            ".well-known/a",
+            "dg/a",
+            "a.dg/b",
+        ] {
+            assert!(
+                ObjectKey::parse("b", key).validate_ingest().is_ok(),
+                "{key}"
+            );
+        }
+        // Reads and deletes only refuse the facts namespace.
         assert!(ObjectKey::parse("b", ".dg/other.txt")
-            .validate_ingest()
+            .validate_object()
             .is_ok());
-        assert!(ObjectKey::parse("b", "a/.dg/facts/x")
-            .validate_ingest()
-            .is_ok());
+        assert!(ObjectKey::parse("b", "a/.dg/x").validate_object().is_ok());
     }
 
     /// Explore #13: the refusal names the rule it applies and links the

@@ -1215,9 +1215,9 @@ async fn an_access_section_round_trip_keeps_declarative_secrets() {
     );
 }
 
-/// Review A8: OIDC discovery runs after the config write guard is released.
-/// Under the guard, every LIST and config read waited for it, up to 10 s
-/// per provider.
+/// Review A8: OIDC discovery runs in the background, never under the config
+/// write guard. The apply answers at once with an IdP that never answers,
+/// and every LIST and config read stays fast.
 #[tokio::test]
 async fn a_provider_discovery_does_not_hold_the_config_lock() {
     // An issuer that accepts the TCP connection and never answers: the
@@ -1257,11 +1257,14 @@ async fn a_provider_discovery_does_not_hold_the_config_lock() {
         let (admin, endpoint) = (admin.clone(), endpoint.clone());
         tokio::spawn(async move { apply_access_section(&admin, &endpoint, body).await })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    // Discovery runs in the background: the apply answers at once although
+    // the IdP never answers.
+    let applied = tokio::time::timeout(std::time::Duration::from_secs(5), put).await;
     assert!(
-        !put.is_finished(),
-        "the apply must still wait for the discovery"
+        applied.is_ok(),
+        "the apply waited for a hanging identity provider"
     );
+    applied.unwrap().unwrap();
 
     let started = std::time::Instant::now();
     let read = admin
@@ -1287,9 +1290,12 @@ async fn a_provider_discovery_does_not_hold_the_config_lock() {
         "a read waited for the discovery: config {config_read:?}, LIST {list:?}"
     );
 
-    put.await.unwrap();
+    // The provider set is published with the answer (version bump); the
+    // discovery of the hanging IdP goes on in the background. A slow IdP that
+    // answers is covered by `oidc_login_test` (2 s discovery).
     assert!(
         get_ext_auth_version(&admin, &endpoint).await > before,
-        "the apply returned before the discovery bumped the version"
+        "the apply did not publish the provider set"
     );
+    drop(blackhole);
 }

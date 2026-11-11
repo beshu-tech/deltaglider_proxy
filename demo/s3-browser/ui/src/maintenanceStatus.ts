@@ -28,6 +28,12 @@ export interface MaintenanceJobView {
    * its clean-up after the switch, no longer blocks writes.
    */
   writes_blocked?: boolean;
+  /**
+   * Whether this session may cancel the job (only the bucket status sends it,
+   * for delete jobs). The server decides from the stored principal; the page
+   * never compares names.
+   */
+  may_cancel?: boolean;
   // No last_error: this projection is readable by non-admin browser
   // sessions; error detail is admin-tier only (the jobs API).
   triggered_by: string | null;

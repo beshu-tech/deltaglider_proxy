@@ -743,8 +743,7 @@ async fn backend_and_rule_writes_answer_as_the_golden_file() {
 #[tokio::test]
 async fn rule_delete_that_cannot_persist_changes_nothing() {
     use std::os::unix::fs::PermissionsExt;
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
+    if common::running_as_root() {
         // Root ignores the directory mode: nothing to test here.
         common::root_skip("rule_delete_that_cannot_persist_changes_nothing");
         return;
@@ -886,6 +885,71 @@ async fn password_change_verifies_validates_persists_and_audits() {
     let hash = std::fs::read_to_string(&hash_file).expect("the new hash is persisted");
     assert!(bcrypt::verify(new_pw, hash.trim()).unwrap(), "{hash}");
     assert_audited(&fresh, &ep, "change_password", "").await;
+}
+
+/// F8: the password endpoint is a password oracle like login. It shares the
+/// login lockout and audits each failure (never the password).
+#[tokio::test]
+async fn password_change_is_throttled_audited_and_ends_other_sessions() {
+    let server = TestServer::builder()
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "3")
+        .env("DGP_RATE_LIMIT_WINDOW_SECS", "60")
+        .env("DGP_RATE_LIMIT_LOCKOUT_SECS", "60")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let put = |cur: &str| {
+        admin
+            .put(format!("{ep}/_/api/admin/password"))
+            .json(&json!({ "current_password": cur, "new_password": "a-new-strong-password-1" }))
+            .send()
+    };
+    let mut codes = Vec::new();
+    for i in 0..6 {
+        codes.push(put(&format!("wrong-guess-{i}")).await.unwrap().status());
+    }
+    assert_eq!(codes[0], StatusCode::FORBIDDEN, "{codes:?}");
+    assert!(
+        codes.contains(&StatusCode::TOO_MANY_REQUESTS),
+        "guesses are throttled: {codes:?}"
+    );
+    let entries = audit(&admin, &ep).await;
+    assert!(
+        entries.iter().any(|(a, _)| a == "change_password_failed"),
+        "a failed guess is audited: {entries:?}"
+    );
+    assert!(
+        entries.iter().all(|(_, t)| !t.contains("wrong-guess")),
+        "the guess never reaches the audit log: {entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn password_rotation_ends_the_other_bootstrap_sessions() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let other = admin_http_client(&ep).await;
+    assert!(session_valid(&other, &ep).await);
+    let resp = admin
+        .put(format!("{ep}/_/api/admin/password"))
+        .json(&json!({
+            "current_password": common::TEST_BOOTSTRAP_PASSWORD,
+            "new_password": "a-new-strong-password-1"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        session_valid(&admin, &ep).await,
+        "the session that rotated stays"
+    );
+    assert!(
+        !session_valid(&other, &ep).await,
+        "another bootstrap session ends at the rotation"
+    );
 }
 
 #[tokio::test]
@@ -1188,6 +1252,27 @@ async fn users_rotate_clone_delete_and_empty_name() {
         .await;
         assert_eq!(code, StatusCode::BAD_REQUEST, "{bad:?}: {v}");
     }
+    // An empty secret is refused on this path too.
+    let (code, v) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/users/{id}/rotate-keys"))
+            .json(&json!({ "secret_access_key": "" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+    let (code, v) = json_of(
+        admin
+            .put(format!("{ep}/_/api/admin/users/{id}"))
+            .json(&json!({ "secret_access_key": "" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
     let users: Value = admin
         .get(format!("{ep}/_/api/admin/users"))
         .send()
@@ -1303,6 +1388,277 @@ async fn users_rotate_clone_delete_and_empty_name() {
 }
 
 // ── Usage scanner ───────────────────────────────────────────────────────
+
+/// F23 (epic #146): a user edit is ONE request. A change of the access key
+/// rides on the same `PUT`, and a refusal of any part leaves the whole user
+/// as it was; the refusal names the access key, never the name.
+#[tokio::test]
+async fn user_edit_with_new_keys_is_one_atomic_request() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let a = create_user(&admin, &ep, "edit-a", admin_perms()).await;
+    let b = create_user(&admin, &ep, "edit-b", admin_perms()).await;
+    let id = a["id"].as_i64().unwrap();
+    let (ak, sk) = (
+        a["access_key_id"].as_str().unwrap().to_string(),
+        a["secret_access_key"].as_str().unwrap().to_string(),
+    );
+    let put = |body: Value| {
+        admin
+            .put(format!("{ep}/_/api/admin/users/{id}"))
+            .json(&body)
+            .send()
+    };
+
+    // The new access key is another user's: 409 about the key, nothing applied.
+    let (code, v) = json_of(
+        put(json!({
+            "name": "edit-a-renamed",
+            "enabled": false,
+            "access_key_id": b["access_key_id"],
+        }))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{v}");
+    let text = v["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        text.contains("access key"),
+        "the text names the access key: {text}"
+    );
+    assert!(
+        !text.starts_with("the name"),
+        "the text does not blame the name: {text}"
+    );
+    let users: Value = admin
+        .get(format!("{ep}/_/api/admin/users"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"].as_i64() == Some(id))
+        .unwrap();
+    assert_eq!(row["name"], "edit-a", "the rename was not applied");
+    assert_eq!(row["enabled"], true, "the disable was not applied");
+    assert_eq!(
+        s3_status(&server, &ak, &sk).await,
+        200,
+        "the old key still works"
+    );
+
+    // The whole edit in one request: rename, disable-free, new key and secret.
+    let (code, v) = json_of(
+        put(json!({
+            "name": "edit-a2",
+            "access_key_id": "EDITEDKEY00001",
+            "secret_access_key": "edited-secret-0001",
+        }))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "edit-a2");
+    assert_eq!(v["access_key_id"], "EDITEDKEY00001");
+    assert_eq!(
+        v["secret_access_key"], "edited-secret-0001",
+        "shown once, as on rotate"
+    );
+    assert_eq!(
+        s3_status(&server, &ak, &sk).await,
+        403,
+        "the old key is dead"
+    );
+    assert_eq!(
+        s3_status(&server, "EDITEDKEY00001", "edited-secret-0001").await,
+        200
+    );
+    assert_audited(&admin, &ep, "update_user", "edit-a2").await;
+    assert_audited(&admin, &ep, "rotate_keys", "edit-a2").await;
+
+    // An edit without keys does not show the secret and keeps the keys.
+    let (code, v) = json_of(put(json!({ "name": "edit-a3" })).await.unwrap()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["access_key_id"], "EDITEDKEY00001");
+    assert_ne!(
+        v["secret_access_key"].as_str(),
+        Some("edited-secret-0001"),
+        "the secret is not shown again"
+    );
+
+    // A bad access key id is a 400 and applies nothing.
+    let (code, _) = json_of(
+        put(json!({ "name": "edit-a4", "access_key_id": "HAS SPACE" }))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    let (code, v) = json_of(put(json!({})).await.unwrap()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "edit-a3", "the refused edit changed nothing");
+}
+
+/// F23 (epic #146), groups: the membership change rides on the same `PUT` as
+/// the rest of the edit, as users to add and to remove (never the whole list:
+/// other writers change members too); a member that does not exist applies
+/// nothing.
+#[tokio::test]
+async fn group_edit_with_members_is_one_atomic_request() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let u1 = create_user(&admin, &ep, "gm-one", json!([])).await["id"]
+        .as_i64()
+        .unwrap();
+    let u2 = create_user(&admin, &ep, "gm-two", json!([])).await["id"]
+        .as_i64()
+        .unwrap();
+    let (code, g) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/groups"))
+            .json(&json!({ "name": "gm-team", "member_ids": [u1] }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{g}");
+    let gid = g["id"].as_i64().unwrap();
+    let put = |body: Value| {
+        admin
+            .put(format!("{ep}/_/api/admin/groups/{gid}"))
+            .json(&body)
+            .send()
+    };
+
+    // One request: rename, drop one member, add another.
+    let (code, v) = json_of(
+        put(json!({ "name": "gm-team2", "add_member_ids": [u2], "remove_member_ids": [u1] }))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "gm-team2");
+    assert_eq!(v["member_ids"], json!([u2]));
+    assert_audited(&admin, &ep, "add_member", "gm-two").await;
+    assert_audited(&admin, &ep, "remove_member", "gm-one").await;
+
+    // A member that does not exist: refused, and the rename is not applied.
+    let (code, v) = json_of(
+        put(json!({ "name": "gm-team3", "add_member_ids": [999_999] }))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{v}");
+    let (code, v) = json_of(put(json!({})).await.unwrap()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "gm-team2", "the refused edit changed nothing");
+    assert_eq!(v["member_ids"], json!([u2]));
+
+    // No member field: the members stay.
+    let (code, v) = json_of(put(json!({ "description": "d" })).await.unwrap()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["member_ids"], json!([u2]));
+
+    // A user in both lists is a 400 and applies nothing.
+    let (code, v) = json_of(
+        put(json!({ "name": "gm-team4", "add_member_ids": [u1], "remove_member_ids": [u1] }))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+    let (_, v) = json_of(put(json!({})).await.unwrap()).await;
+    assert_eq!(v["name"], "gm-team2", "{v}");
+}
+
+/// The form of a group edit opens with the members it read. Another writer
+/// (an admin, a peer node, an OIDC login) changes the members after that. An
+/// edit that did not touch the members must keep that change, and an edit
+/// that toggled one member must change only that member.
+#[tokio::test]
+async fn group_edit_keeps_a_member_change_that_another_writer_made() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let id_of = |v: &Value| v["id"].as_i64().unwrap();
+    let dana = id_of(&create_user(&admin, &ep, "cm-dana", json!([])).await);
+    let bob = id_of(&create_user(&admin, &ep, "cm-bob", json!([])).await);
+    let carol = id_of(&create_user(&admin, &ep, "cm-carol", json!([])).await);
+    let (code, g) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/groups"))
+            .json(&json!({ "name": "cm-team", "member_ids": [dana, bob] }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{g}");
+    let gid = g["id"].as_i64().unwrap();
+    // The form reads [dana, bob]. Another writer then removes dana and adds carol.
+    let code = admin
+        .delete(format!("{ep}/_/api/admin/groups/{gid}/members/{dana}"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    let code = admin
+        .post(format!("{ep}/_/api/admin/groups/{gid}/members"))
+        .json(&json!({ "user_id": carol }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert!(code.is_success(), "{code}");
+
+    // The stale form saves a description only: no member field.
+    let (code, v) = json_of(
+        admin
+            .put(format!("{ep}/_/api/admin/groups/{gid}"))
+            .json(&json!({ "description": "edited" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let mut members: Vec<i64> = v["member_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_i64().unwrap())
+        .collect();
+    members.sort();
+    let mut expected = vec![bob, carol];
+    expected.sort();
+    assert_eq!(members, expected, "dana stays removed, carol stays: {v}");
+
+    // The stale form toggled bob off: only bob goes.
+    let (code, v) = json_of(
+        admin
+            .put(format!("{ep}/_/api/admin/groups/{gid}"))
+            .json(&json!({ "remove_member_ids": [bob] }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["member_ids"], json!([carol]), "{v}");
+}
 
 #[tokio::test]
 async fn usage_scan_counter_refresh_and_legacy_migrate() {
@@ -1440,10 +1796,17 @@ async fn oauth_authorize_reports_an_unreachable_provider_and_crud_errors() {
         .send()
         .await
         .unwrap();
+    // A DNS failure can be a resolver blip, so it stays retryable: 503 with
+    // Retry-After while the background task retries. The page names the cause.
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(resp.headers().contains_key("retry-after"));
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("Provider Unavailable") && body.contains("dead-idp"),
-        "an unreachable IdP gets an explanation page: {body}"
+        body.contains("Provider Not Ready")
+            && body.contains("dead-idp")
+            && body.contains("has not reached the identity provider yet (")
+            && body.contains("does-not-exist.invalid"),
+        "an unreachable IdP gets an explanation page with the cause: {body}"
     );
     let resp = anon
         .get(format!("{ep}/_/api/admin/oauth/authorize/ghost"))

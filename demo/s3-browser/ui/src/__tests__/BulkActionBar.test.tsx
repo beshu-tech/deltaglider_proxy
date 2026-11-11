@@ -18,6 +18,7 @@ vi.mock('../s3client', () => ({
 }));
 
 import BulkActionBar from '../components/BulkActionBar';
+import { folderRowKey, objectRowKey } from '../rowKey';
 
 type Op = (b: string, p: string) => Promise<BulkTransferOutcome>;
 const transferred = (action: 'copy' | 'move', over: Partial<BulkTransferOutcome> = {}): BulkTransferOutcome => ({
@@ -36,7 +37,7 @@ function bar(props: Partial<Parameters<typeof BulkActionBar>[0]> = {}) {
     <BulkActionBar
       selectedCount={2}
       currentPrefix="builds/"
-      selectionKeys={['builds/app.zip', 'folder:builds/nightly/']}
+      selectionKeys={[objectRowKey('builds/app.zip'), folderRowKey('builds/nightly/')]}
       {...props}
     />,
   );
@@ -213,7 +214,7 @@ describe('copy / move destination', () => {
     expect(within(dialog).getByText('releases/old/builds/')).toBeInTheDocument();
     expect(ok).toBeEnabled();
     await user.click(ok);
-    await waitFor(() => expect(handler).toHaveBeenCalledWith('releases', 'old/builds/'));
+    await waitFor(() => expect(handler).toHaveBeenCalledWith('releases', 'old/builds/', expect.any(Function)));
     expect(await screen.findByText('2 objects moved')).toBeInTheDocument();
   });
 

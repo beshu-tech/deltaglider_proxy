@@ -258,6 +258,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         ObjectKey::validate_prefix(prefix)
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
 
+        // The proxy stores no key that starts with `/` (it strips leading
+        // slashes), so such a prefix names no key. The filesystem backend
+        // read `/` as the root directory (F43).
+        if prefix_names_no_key(prefix) {
+            let page = ListObjectsPage {
+                objects: Vec::new(),
+                common_prefixes: Vec::new(),
+                is_truncated: false,
+                next_continuation_token: None,
+                facts_missing_keys: Vec::new(),
+            };
+            let extras = ListedExtras {
+                forms: crate::storage::ListedForms::Unreported,
+                reference_prefixes: None,
+            };
+            return Ok((page, 0, extras));
+        }
+
         // Fast path: delegate listing to the storage backend (S3 pages
         // natively — with OR without a delimiter — so we never materialise
         // the whole prefix just to cut one page out of it).
@@ -594,6 +612,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             })
         }
     }
+}
+
+/// Pure: no stored key starts with `/` (`ObjectKey::parse` strips leading
+/// slashes), so a prefix that does names no key.
+pub(crate) fn prefix_names_no_key(prefix: &str) -> bool {
+    prefix.starts_with('/')
 }
 
 /// What a storage listing reported besides its page.

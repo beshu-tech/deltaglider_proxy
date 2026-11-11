@@ -686,27 +686,29 @@ impl JobsDb {
         failure: FailureInsert<'_>,
         max_retained: u32,
     ) -> Result<(), ConfigDbError> {
-        self.conn.execute(
-            "INSERT INTO replication_failures
+        // The insert and the ring prune are ONE commit (E6/F20).
+        self.atomic(|db| {
+            db.conn.execute(
+                "INSERT INTO replication_failures
                 (rule_name, run_id, occurred_at, source_key, dest_key, error_message)
              VALUES (?, ?, ?, ?, ?, ?)",
-            params![
-                rule_name,
-                failure.run_id,
-                failure.occurred_at,
-                failure.source_key,
-                failure.dest_key,
-                failure.error_message
-            ],
-        )?;
-        job_store::prune_failure_ring(
-            &self.conn,
-            "replication_failures",
-            "rule_name",
-            &rule_name,
-            max_retained,
-        )?;
-        Ok(())
+                params![
+                    rule_name,
+                    failure.run_id,
+                    failure.occurred_at,
+                    failure.source_key,
+                    failure.dest_key,
+                    failure.error_message
+                ],
+            )?;
+            job_store::prune_failure_ring(
+                &db.conn,
+                "replication_failures",
+                "rule_name",
+                &rule_name,
+                max_retained,
+            )
+        })
     }
 
     /// Record one consecutive failure for a single (rule, source_key).
@@ -719,23 +721,25 @@ impl JobsDb {
         err: &str,
         now: i64,
     ) -> Result<u32, ConfigDbError> {
-        self.conn.execute(
-            "INSERT INTO replication_object_failures
+        self.atomic(|db| {
+            db.conn.execute(
+                "INSERT INTO replication_object_failures
                 (rule_name, source_key, consecutive_failures, last_error, last_failed_at)
              VALUES (?, ?, 1, ?, ?)
              ON CONFLICT(rule_name, source_key) DO UPDATE SET
                 consecutive_failures = consecutive_failures + 1,
                 last_error           = excluded.last_error,
                 last_failed_at       = excluded.last_failed_at",
-            params![rule, key, err, now],
-        )?;
-        let count: i64 = self.conn.query_row(
-            "SELECT consecutive_failures FROM replication_object_failures
+                params![rule, key, err, now],
+            )?;
+            let count: i64 = db.conn.query_row(
+                "SELECT consecutive_failures FROM replication_object_failures
              WHERE rule_name = ? AND source_key = ?",
-            params![rule, key],
-            |r| r.get(0),
-        )?;
-        Ok(count.max(0) as u32)
+                params![rule, key],
+                |r| r.get(0),
+            )?;
+            Ok(count.max(0) as u32)
+        })
     }
 
     /// Clear the consecutive-failure ledger row for a (rule, source_key).
@@ -932,22 +936,24 @@ impl JobsDb {
         error_message: &str,
         max_retained: u32,
     ) -> Result<(), ConfigDbError> {
-        self.conn.execute(
-            "DELETE FROM replication_failures
+        self.atomic(|db| {
+            db.conn.execute(
+                "DELETE FROM replication_failures
               WHERE rule_name = ? AND run_id IS NULL AND source_key = ?",
-            params![rule_name, source_key],
-        )?;
-        self.replication_record_failure(
-            rule_name,
-            FailureInsert {
-                run_id: None,
-                occurred_at,
-                source_key,
-                dest_key,
-                error_message,
-            },
-            max_retained,
-        )
+                params![rule_name, source_key],
+            )?;
+            db.replication_record_failure(
+                rule_name,
+                FailureInsert {
+                    run_id: None,
+                    occurred_at,
+                    source_key,
+                    dest_key,
+                    error_message,
+                },
+                max_retained,
+            )
+        })
     }
 
     /// The newest run of a rule (running or settled), if any.

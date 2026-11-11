@@ -454,7 +454,7 @@ fn read_rows(conn: &Connection, schema: &str, table: &str) -> Result<Vec<Row>, C
         )));
     }
     let mut stmt = conn.prepare(&format!("SELECT * FROM {schema}.{table}"))?;
-    let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+    let cols: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
     let rows = stmt
         .query_map([], |r| {
             let mut row = Row::new();
@@ -2378,7 +2378,13 @@ mod review3_tests {
         });
         let local = open(&t.local);
         local
-            .rotate_keys(user_id(&local, "u1"), "AKROTATED0001", "fresh")
+            .update_user_with_keys(
+                user_id(&local, "u1"),
+                None,
+                None,
+                None,
+                Some(("AKROTATED0001", "fresh")),
+            )
             .unwrap();
         tick();
         {
@@ -2460,13 +2466,25 @@ mod review3_tests {
         });
         let local = open(&t.local);
         local
-            .rotate_keys(user_id(&local, "u1"), "AKSHARED00001", "x1")
+            .update_user_with_keys(
+                user_id(&local, "u1"),
+                None,
+                None,
+                None,
+                Some(("AKSHARED00001", "x1")),
+            )
             .unwrap();
         tick();
         {
             let remote = open(&t.remote);
             remote
-                .rotate_keys(user_id(&remote, "u2"), "AKSHARED00001", "x2")
+                .update_user_with_keys(
+                    user_id(&remote, "u2"),
+                    None,
+                    None,
+                    None,
+                    Some(("AKSHARED00001", "x2")),
+                )
                 .unwrap();
         }
         let report = local

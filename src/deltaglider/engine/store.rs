@@ -191,6 +191,15 @@ pub(crate) enum StorePlan {
     },
 }
 
+/// The longest file name that a backend stores (bytes).
+const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// Pure: does the delta form of this file name (`name.delta`) fit in a file
+/// name of a backend? `filename` is the last segment of the key.
+pub(crate) fn delta_name_fits(filename: &str) -> bool {
+    filename.len() + ".delta".len() <= MAX_FILE_NAME_BYTES
+}
+
 impl StorePlan {
     /// Whether a PUT tries a delta at all: `None` = it tries one, else why
     /// it stores whole. `fits_delta_limit`: the object is at most
@@ -199,11 +208,18 @@ impl StorePlan {
     /// too large for a delta. One rule for the answer and the stored reason,
     /// so they cannot differ. The order is the order of the checks: a
     /// disabled bucket outranks a hint, and a hint outranks a file type.
+    ///
+    /// `delta_name_fits`: the file name plus `.delta` is within the 255
+    /// bytes that a name may have on a filesystem backend and on MinIO
+    /// ([`delta_name_fits`]). A key whose name is too long for a delta is
+    /// stored whole, so a PUT never fails because the second upload of a
+    /// name could be a delta (F43).
     pub(crate) fn decline_reason(
         compression_enabled: bool,
         delta_eligible: bool,
         no_delta_requested: bool,
         fits_delta_limit: bool,
+        delta_name_fits: bool,
     ) -> Option<PassthroughReason> {
         if !compression_enabled {
             Some(PassthroughReason::CompressionDisabled)
@@ -213,6 +229,8 @@ impl StorePlan {
             Some(PassthroughReason::NotDeltaEligible)
         } else if !fits_delta_limit {
             Some(PassthroughReason::OverMaxObjectSize)
+        } else if !delta_name_fits {
+            Some(PassthroughReason::DeltaNameTooLong)
         } else {
             None
         }
@@ -698,6 +716,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             self.is_delta_eligible(bucket, key),
             crate::types::no_delta_requested(user_metadata),
             size <= self.max_object_size,
+            delta_name_fits(key.rsplit('/').next().unwrap_or(key)),
         )
     }
 
@@ -3399,28 +3418,22 @@ mod other_form_tests {
     #[test]
     fn writes_drop_the_other_form_through_one_helper() {
         let mut sites = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src/deltaglider/engine") {
-            let lines = crate::source_scan::prod_lines(&text);
-            let mut inside_helper = false;
-            for (n, line) in &lines {
-                let trimmed = line.trim_start();
-                if line.contains("async fn drop_other_form(") {
-                    inside_helper = true;
-                } else if inside_helper && (trimmed.starts_with("///") || trimmed.contains("fn ")) {
-                    // The next item.
-                    inside_helper = false;
-                }
-                let calls = [
-                    ".delete_delta_idempotent(",
-                    ".delete_passthrough_idempotent(",
-                ]
-                .iter()
-                .any(|c| line.contains(c));
-                if calls && !inside_helper {
-                    sites.push(format!("{file}:{n}"));
+        for src in crate::source_scan::ast::src() {
+            if !src.rel.starts_with("src/deltaglider/engine/") {
+                continue;
+            }
+            // A call of either delete outside the fn `drop_other_form`, under
+            // any layout (the old scan tracked "inside the helper" by lines of
+            // text between its signature and the next `fn `).
+            for name in ["delete_delta_idempotent", "delete_passthrough_idempotent"] {
+                for c in src.prod.calls_named(name) {
+                    if src.fn_name(c.func) != "drop_other_form" {
+                        sites.push(format!("{}:{}", src.rel, c.line));
+                    }
                 }
             }
         }
+        sites.sort();
         // The legacy-reference migration deletes the passthrough form that
         // it has just converted to a delta.
         assert_eq!(

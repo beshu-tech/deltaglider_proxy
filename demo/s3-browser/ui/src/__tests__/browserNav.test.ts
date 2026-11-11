@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'vitest';
 import { rowKeysFor, nextCursor, buildRows, sortRows, orderedRowKeys, sameKeyOrder, type SortState } from '../browserNav';
 import type { S3Object } from '../types';
+import { type RowKey, folderRowKey as F, objectRowKey as O } from '../rowKey';
 
 // Test fixtures only ever need `key` (and `size`/`lastModified` where noted);
 // the other S3Object fields are irrelevant to the pure row/cursor logic here.
@@ -12,7 +13,7 @@ test('rowKeysFor: folders first (prefixed), then object keys', () => {
   const objects = [obj({ key: 'a/x.txt' }), obj({ key: 'a/y.txt' })];
   assert.deepEqual(
     rowKeysFor(folders, objects),
-    ['folder:a/', 'folder:b/', 'a/x.txt', 'a/y.txt'],
+    [F('a/'), F('b/'), O('a/x.txt'), O('a/y.txt')],
     'folders (prefixed) precede object keys, in order',
   );
   assert.deepEqual(rowKeysFor([], []), [], 'empty in, empty out');
@@ -24,30 +25,30 @@ const keys = rowKeysFor(folders, objects); // 4 rows
 
 test('nextCursor: empty list -> null', () => {
   assert.equal(nextCursor([], null, 1), null, 'empty list yields null');
-  assert.equal(nextCursor([], 'x', 1), null, 'empty list yields null even with a stale cursor');
+  assert.equal(nextCursor([], O('x'), 1), null, 'empty list yields null even with a stale cursor');
 });
 
 test('nextCursor: first move from "no cursor"', () => {
-  assert.equal(nextCursor(keys, null, 1), 'folder:a/', '↓ from nothing → first row');
-  assert.equal(nextCursor(keys, null, -1), 'a/y.txt', '↑ from nothing → last row');
+  assert.equal(nextCursor(keys, null, 1), F('a/'), '↓ from nothing → first row');
+  assert.equal(nextCursor(keys, null, -1), O('a/y.txt'), '↑ from nothing → last row');
 });
 
 test('nextCursor: stepping + clamping (no wraparound)', () => {
-  assert.equal(nextCursor(keys, 'folder:a/', 1), 'folder:b/', '↓ advances one');
-  assert.equal(nextCursor(keys, 'folder:b/', 1), 'a/x.txt', '↓ crosses folder→object boundary');
-  assert.equal(nextCursor(keys, 'folder:a/', -1), 'folder:a/', '↑ at top clamps (no wrap)');
-  assert.equal(nextCursor(keys, 'a/y.txt', 1), 'a/y.txt', '↓ at bottom clamps (no wrap)');
-  assert.equal(nextCursor(keys, 'a/x.txt', -1), 'folder:b/', '↑ crosses object→folder boundary');
+  assert.equal(nextCursor(keys, F('a/'), 1), F('b/'), '↓ advances one');
+  assert.equal(nextCursor(keys, F('b/'), 1), O('a/x.txt'), '↓ crosses folder→object boundary');
+  assert.equal(nextCursor(keys, F('a/'), -1), F('a/'), '↑ at top clamps (no wrap)');
+  assert.equal(nextCursor(keys, O('a/y.txt'), 1), O('a/y.txt'), '↓ at bottom clamps (no wrap)');
+  assert.equal(nextCursor(keys, O('a/x.txt'), -1), F('b/'), '↑ crosses object→folder boundary');
 });
 
 test('nextCursor: Home / End', () => {
-  assert.equal(nextCursor(keys, 'a/x.txt', 'first'), 'folder:a/', 'Home → first row');
-  assert.equal(nextCursor(keys, 'folder:a/', 'last'), 'a/y.txt', 'End → last row');
+  assert.equal(nextCursor(keys, O('a/x.txt'), 'first'), F('a/'), 'Home → first row');
+  assert.equal(nextCursor(keys, F('a/'), 'last'), O('a/y.txt'), 'End → last row');
 });
 
 test('nextCursor: stale cursor (key no longer present) behaves like "no cursor"', () => {
-  assert.equal(nextCursor(keys, 'gone', 1), 'folder:a/', 'stale cursor + ↓ → first row');
-  assert.equal(nextCursor(keys, 'gone', -1), 'a/y.txt', 'stale cursor + ↑ → last row');
+  assert.equal(nextCursor(keys, O('gone'), 1), F('a/'), 'stale cursor + ↓ → first row');
+  assert.equal(nextCursor(keys, O('gone'), -1), O('a/y.txt'), 'stale cursor + ↑ → last row');
 });
 
 test('sortRows: ONE ordering shared by Table, enrichment, cursor, keyboard', () => {
@@ -64,7 +65,7 @@ test('sortRows: ONE ordering shared by Table, enrichment, cursor, keyboard', () 
     ],
     'p/',
   );
-  const keysOf = (rs: { key: string }[]) => rs.map((r) => r.key);
+  const keysOf = (rs: { rowKey: RowKey }[]) => rs.map((r) => r.rowKey);
   const noSize = () => 0;
   assert.deepEqual(
     keysOf(rows),
@@ -84,7 +85,7 @@ test('sortRows: ONE ordering shared by Table, enrichment, cursor, keyboard', () 
   // name: numeric-aware, folders interleave with files.
   assert.deepEqual(
     keysOf(sortRows(rows, { column: 'name', order: 'ascend' }, noSize)),
-    ['p/a.txt', 'folder:p/b2/', 'p/b3', 'folder:p/b10/', 'p/c.txt'],
+    [O('p/a.txt'), F('p/b2/'), O('p/b3'), F('p/b10/'), O('p/c.txt')],
   );
   assert.deepEqual(
     keysOf(sortRows(rows, { column: 'name', order: 'descend' }, noSize)),
@@ -94,36 +95,36 @@ test('sortRows: ONE ordering shared by Table, enrichment, cursor, keyboard', () 
   // in BOTH directions (AntD negates, it does not reverse).
   assert.deepEqual(
     keysOf(sortRows(rows, { column: 'size', order: 'ascend' }, noSize)),
-    ['folder:p/b10/', 'folder:p/b2/', 'p/b3', 'p/c.txt', 'p/a.txt'],
+    [F('p/b10/'), F('p/b2/'), O('p/b3'), O('p/c.txt'), O('p/a.txt')],
   );
   assert.deepEqual(
     keysOf(sortRows(rows, { column: 'size', order: 'descend' }, noSize)),
-    ['p/a.txt', 'p/c.txt', 'folder:p/b10/', 'folder:p/b2/', 'p/b3'],
+    [O('p/a.txt'), O('p/c.txt'), F('p/b10/'), F('p/b2/'), O('p/b3')],
   );
   // size: a scanned folder size is used.
   assert.deepEqual(
     keysOf(sortRows(rows, { column: 'size', order: 'descend' }, (f) => (f === 'p/b2/' ? 1000 : 0))),
-    ['folder:p/b2/', 'p/a.txt', 'p/c.txt', 'folder:p/b10/', 'p/b3'],
+    [F('p/b2/'), O('p/a.txt'), O('p/c.txt'), F('p/b10/'), O('p/b3')],
   );
   // modified: folders have no timestamp → first ascending, last descending.
   assert.deepEqual(
     keysOf(sortRows(rows, { column: 'modified', order: 'ascend' }, noSize)),
-    ['folder:p/b10/', 'folder:p/b2/', 'p/c.txt', 'p/a.txt', 'p/b3'],
+    [F('p/b10/'), F('p/b2/'), O('p/c.txt'), O('p/a.txt'), O('p/b3')],
   );
   assert.deepEqual(
     keysOf(sortRows(rows, { column: 'modified', order: 'descend' }, noSize)),
-    ['p/b3', 'p/a.txt', 'p/c.txt', 'folder:p/b10/', 'folder:p/b2/'],
+    [O('p/b3'), O('p/a.txt'), O('p/c.txt'), F('p/b10/'), F('p/b2/')],
   );
   // Keyboard ↓ walks the SORTED order.
   const sortedKeys = keysOf(sortRows(rows, { column: 'size', order: 'descend' } satisfies SortState, noSize));
-  assert.equal(nextCursor(sortedKeys, 'p/a.txt', 1), 'p/c.txt', '↓ follows the sorted order');
+  assert.equal(nextCursor(sortedKeys, O('p/a.txt'), 1), O('p/c.txt'), '↓ follows the sorted order');
 });
 
 test('sameKeyOrder: an equal report must not replace the stored order', () => {
   assert.equal(sameKeyOrder(null, []), false, 'first report is always stored');
-  assert.equal(sameKeyOrder(['a', 'b'], ['a', 'b']), true);
-  assert.equal(sameKeyOrder(['a', 'b'], ['b', 'a']), false);
-  assert.equal(sameKeyOrder(['a'], ['a', 'b']), false);
+  assert.equal(sameKeyOrder([O('a'), O('b')], [O('a'), O('b')]), true);
+  assert.equal(sameKeyOrder([O('a'), O('b')], [O('b'), O('a')]), false);
+  assert.equal(sameKeyOrder([O('a')], [O('a'), O('b')]), false);
 });
 
 test('orderedRowKeys: reported table order, or the unsorted fallback', () => {
@@ -137,13 +138,13 @@ test('orderedRowKeys: reported table order, or the unsorted fallback', () => {
     'p/',
   );
   const noSize = () => 0;
-  const base = rows.map((r) => r.key);
-  const sortedKeys = sortRows(rows, { column: 'size', order: 'descend' }, noSize).map((r) => r.key);
+  const base = rows.map((r) => r.rowKey);
+  const sortedKeys = sortRows(rows, { column: 'size', order: 'descend' }, noSize).map((r) => r.rowKey);
   assert.deepEqual(orderedRowKeys(base, null), base, 'nothing reported → unsorted');
   assert.deepEqual(orderedRowKeys(base, sortedKeys), sortedKeys, 'reported permutation wins');
   assert.deepEqual(orderedRowKeys(base, sortedKeys.slice(1)), base, 'stale (shorter) report → unsorted');
   assert.deepEqual(
-    orderedRowKeys(base, [...sortedKeys.slice(1), 'gone']),
+    orderedRowKeys(base, [...sortedKeys.slice(1), O('gone')]),
     base,
     'stale report naming a missing row → unsorted',
   );

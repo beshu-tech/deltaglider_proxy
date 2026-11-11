@@ -339,6 +339,7 @@ async fn minio_probes_the_quoted_if_match_form() {
 /// itself needs them, N2) answers the same PUT with 503.
 #[tokio::test]
 async fn a_gated_job_keeps_the_write_gate() {
+    crate::common::expect_server_errors("a maintenance write gate answers 503 (asserted)");
     skip_unless_minio!();
     let bucket = new_minio_bucket("condnoncas").await;
     // The job holds each object 5 s before its write, so the status read

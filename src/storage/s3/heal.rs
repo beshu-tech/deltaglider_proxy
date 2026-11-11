@@ -263,14 +263,38 @@ mod tests {
     /// backend on the same fake with another listing-cache scope (another
     /// node, or this one after a restart).
     async fn deltas_without_facts(dir: &str, n: usize) -> (DynEngine, Arc<FakeS3>, String) {
+        deltas_without_facts_slow(dir, n, 0).await
+    }
+
+    /// [`deltas_without_facts`] on a fake whose PUTs wait `put_delay_ms`
+    /// before they answer: the slow host, made certain.
+    async fn deltas_without_facts_slow(
+        dir: &str,
+        n: usize,
+        put_delay_ms: u64,
+    ) -> (DynEngine, Arc<FakeS3>, String) {
         let (endpoint, fake) = crate::storage::fake_s3::start().await;
         fake.fail("PUT", "/.dg/facts/", 500, "InternalError", u32::MAX);
+        fake.set_put_delay_ms(put_delay_ms);
         let writer = engine_on(test_support::for_test_endpoint(&endpoint));
         writer.create_bucket("b").await.unwrap();
         crate::deltaglider::store_deltas(&writer, dir, n).await;
-        // The writer's facts PUTs all failed before the faults go away.
-        assert!(wait_count(&fake, n, |r| r.starts_with("PUT /b/.dg/facts/")).await);
+        // Every facts PUT must be ANSWERED with its 500 before the fault
+        // goes away. The request log shows a PUT when it ARRIVES; one that
+        // arrived but is not answered yet would succeed after the fault is
+        // gone, and its object would have durable facts: no miss, no
+        // healer HEAD (nightly #153, 1 run in ~40 on one starved core).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while fake.faulted("PUT", "/.dg/facts/") < n {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} of {n} facts PUTs failed",
+                fake.faulted("PUT", "/.dg/facts/")
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         fake.clear_faults();
+        fake.set_put_delay_ms(0);
         (reader(&endpoint, "other-node"), fake, endpoint)
     }
 
@@ -301,6 +325,21 @@ mod tests {
         false
     }
 
+    /// Wait until `n` objects are STORED under `prefix` (`bucket/key`
+    /// form). [`wait_count`] sees a PUT when it arrives, before the fake
+    /// stores the object: a node that lists right after it can still miss
+    /// the facts.
+    async fn wait_stored(fake: &FakeS3, n: usize, prefix: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if fake.stored_count(prefix) >= n {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
     fn delta_heads(r: &str) -> bool {
         r.starts_with("HEAD /b/") && r.ends_with(".delta")
     }
@@ -314,6 +353,18 @@ mod tests {
             .list_objects("b", prefix, None, 1000, None, false)
             .await
             .unwrap()
+    }
+
+    /// The setup helper leaves NO durable facts, whatever the host load:
+    /// with every PUT answered 100 ms late, a facts PUT that had only
+    /// ARRIVED when the fault was removed was stored (nightly #153:
+    /// `healing_is_bounded_and_heads_each_object_once` saw no HEAD).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_setup_leaves_no_durable_facts_on_a_slow_backend() {
+        let (_, fake, _) = deltas_without_facts_slow("rel", 12, 100).await;
+        // Past the 100 ms of every PUT still in flight.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(fake.stored_count("b/.dg/facts/"), 0);
     }
 
     /// A delta without durable facts made every LIST of its page read the
@@ -347,7 +398,7 @@ mod tests {
             "{:?}",
             fake.requests()
         );
-        assert!(wait_count(&fake, 5, |r| r.starts_with("PUT /b/.dg/facts/")).await);
+        assert!(wait_stored(&fake, 5, "b/.dg/facts/").await);
         // This node: from its process cache, no request but the LIST.
         fake.clear();
         let page = list(&engine, "rel/").await;
@@ -370,7 +421,11 @@ mod tests {
         fake.set_delay_ms("HEAD", 30);
         fake.clear();
         list(&engine, "rel/").await;
-        assert!(wait_count(&fake, 24, delta_heads).await);
+        assert!(
+            wait_count(&fake, 24, delta_heads).await,
+            "{:#?}",
+            fake.requests()
+        );
         assert!(fake.peak_in_flight("HEAD") <= HEAL_CONCURRENCY);
         list(&engine, "rel/").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -416,14 +471,20 @@ mod tests {
     /// and every node and restart missed the deltas again. Now they land
     /// at once, and another node lists every delta from the facts: no miss,
     /// no HEAD.
+    ///
+    /// The cleanup's first LIST is stalled and never answers until the end
+    /// of the test: the cleanup cannot finish, whatever the host load, so
+    /// facts that land can not have waited for it. (A wall-clock bound on
+    /// "at once" failed on a loaded host.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn facts_converge_while_a_long_delete_cleanup_runs() {
         const N: usize = 20;
         let (_, fake, endpoint) = deltas_without_facts("rel", N).await;
         let mut s3 = test_support::for_test_endpoint(&endpoint);
         s3.list_cache_scope = test_support::test_scope(&endpoint, "busy-node");
-        fake.set_delay_ms("LIST", 150);
-        // 40 deleted keys, one per directory: 40 facts LISTs, 6 s.
+        fake.stall("LIST", "prefix=.dg%2Ffacts%2Fe2e");
+        // 40 deleted keys, one per directory: 40 facts LISTs, the first
+        // one never answered.
         for i in 0..40 {
             s3.facts_cleanup
                 .enqueue("b", &format!("e2e/run{i:03}/index.html"), None);
@@ -434,16 +495,18 @@ mod tests {
                 .await
         );
         fake.clear();
-        let started = std::time::Instant::now();
         let page = list_with_heads(&busy, "rel/").await;
         assert!(page.objects.iter().all(|(_, m)| m.file_size == 65_536));
-        let landed = wait_count(&fake, N, |r| r.starts_with("PUT /b/.dg/facts/rel/")).await;
-        assert!(
-            landed && started.elapsed() < std::time::Duration::from_secs(4),
-            "{N} facts PUTs after {:?}: {landed}",
-            started.elapsed()
+        let landed = wait_stored(&fake, N, "b/.dg/facts/rel/").await;
+        assert!(landed, "{N} facts PUTs wait behind the cleanup");
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|r| r.contains("prefix=.dg%2Ffacts%2Fe2e"))
+                .count(),
+            0,
+            "the cleanup moved on: it was not stalled"
         );
-        fake.set_delay_ms("LIST", 0);
         let other = reader(&endpoint, "fresh-node");
         fake.clear();
         let page = list(&other, "rel/").await;
@@ -451,6 +514,7 @@ mod tests {
         assert!(page.facts_missing_keys.is_empty());
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(fake.requests().iter().filter(|r| delta_heads(r)).count(), 0);
+        fake.release_stalls();
     }
 
     /// Prod (beshu, v2.0.9): deltas written by an older toolchain carry no
@@ -488,7 +552,7 @@ mod tests {
         assert_eq!(page.objects.len(), N);
         assert!(wait_count(&fake, N, delta_heads).await);
         assert!(
-            wait_count(&fake, N, |r| r.starts_with("PUT /b/.dg/facts/rel/")).await,
+            wait_stored(&fake, N, "b/.dg/facts/rel/").await,
             "no facts written: {:?}",
             fake.requests()
         );

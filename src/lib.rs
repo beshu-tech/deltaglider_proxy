@@ -23,6 +23,7 @@ pub mod config_db_sync;
 pub mod config_sections;
 pub mod coordination;
 pub mod cors;
+pub mod data_dir_lock;
 pub mod deltaglider;
 pub mod event_delivery;
 pub mod event_outbox;
@@ -56,6 +57,9 @@ pub mod types;
 pub mod usage_scanner;
 pub mod zip_stream;
 
+#[cfg(test)]
+mod test_root;
+
 /// THE source scanner that every source guard uses: one file walker and one
 /// definition of "production lines". A guard that cut a file at its first
 /// `#[cfg(test)]` stopped at the first test-only ITEM (a `#[cfg(test)] fn`)
@@ -63,6 +67,9 @@ pub mod zip_stream;
 #[cfg(test)]
 pub(crate) mod source_scan {
     use std::path::{Path, PathBuf};
+
+    /// The `syn` view of the sources (`src/source_scan/ast.rs`).
+    pub(crate) mod ast;
 
     /// The crate root (`CARGO_MANIFEST_DIR`).
     pub(crate) fn root() -> &'static Path {
@@ -693,6 +700,138 @@ mod source_guards {
         out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files, test_module_lines,
     };
 
+    /// F13 (#145): everything that can stop a boot for an environment reason
+    /// (the state-directory lock, the spool, the listener, TLS, the bootstrap
+    /// hash, the xdelta3 CLI) is made in ONE function,
+    /// `startup::claim_environment`. That call is the first `.await` of
+    /// `async_main`, and nothing before it spawns, so a boot that cannot
+    /// serve never ran a job or wrote to a backend. A step that moves above
+    /// it (a coordination probe, a backend write) turns this red.
+    #[test]
+    fn the_environment_is_claimed_before_the_first_worker_spawns() {
+        let main = include_str!("main.rs");
+        let body = &main[main.find("async fn async_main").expect("async_main")..];
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        // Code lines only: comments name the steps too.
+        let code: Vec<&str> = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let first_await = code
+            .iter()
+            .position(|l| l.contains(".await"))
+            .expect("async_main awaits");
+        assert!(
+            code[first_await].contains("startup::claim_environment("),
+            "the first `.await` of async_main must be startup::claim_environment, \
+             found: {}",
+            code[first_await].trim()
+        );
+        let first_spawn = code
+            .iter()
+            .position(|l| l.contains("spawn"))
+            .expect("async_main spawns workers");
+        assert!(
+            first_spawn > first_await,
+            "nothing in async_main may spawn before startup::claim_environment: {}",
+            code[first_spawn].trim()
+        );
+        // The function holds every step, in an order that makes the lock first.
+        let startup = include_str!("startup.rs");
+        let f = &startup[startup
+            .find("pub async fn claim_environment")
+            .expect("claim_environment")..];
+        let f = &f[..f.find("\n}\n").expect("end of claim_environment")];
+        let mut at = 0;
+        for step in [
+            "data_dir_lock::acquire(",
+            "SpoolDir::shared()",
+            "bind_listener(",
+            "init_tls(",
+            "ensure_bootstrap_password_hash()",
+            "is_cli_available()",
+        ] {
+            let pos = f
+                .find(step)
+                .unwrap_or_else(|| panic!("claim_environment no longer calls {step}"));
+            assert!(pos >= at, "{step} is out of order in claim_environment");
+            at = pos;
+        }
+        // The spawn inside is the blocking lock wait, awaited at once.
+        assert_eq!(
+            f.matches("spawn").count(),
+            1,
+            "claim_environment starts no worker"
+        );
+        for outside in ["data_dir_lock::acquire(", "bind_listener(", "init_tls("] {
+            assert!(
+                !body.contains(outside),
+                "async_main calls {outside} itself, not through claim_environment"
+            );
+        }
+        assert!(
+            !main.contains("TcpListener::bind"),
+            "main.rs binds only through startup::bind_listener, before the workers"
+        );
+    }
+
+    /// F59 (#145): the exit never waits for the blocking pool without a
+    /// bound. A plain drop of the runtime waits for every blocking task
+    /// (the codec ceiling is 2 hours). The bound is `shutdown_timeout`, read
+    /// from `DGP_SHUTDOWN_TIMEOUT_SECS`.
+    #[test]
+    fn the_runtime_never_waits_for_blocking_tasks_without_a_bound() {
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains("runtime.shutdown_timeout(")
+                && main.contains("tuning.shutdown_timeout_secs"),
+            "main.rs must end the runtime with shutdown_timeout"
+        );
+        assert_eq!(
+            main.matches("Builder::new_multi_thread()").count(),
+            1,
+            "one runtime, one bounded exit"
+        );
+    }
+
+    /// F22 (#145): every filesystem data root gets the stale-temp sweep at
+    /// boot, in a background task (never awaited on the boot path), with the
+    /// age rule of `STALE_TEMP_MAX_AGE`. Only `filesystem/sweep.rs` decides
+    /// who is stale; `.dg-tmp.` is made by one function (`internal_temp_in`).
+    #[test]
+    fn the_boot_sweeps_stale_temp_files_in_the_background() {
+        let main = include_str!("main.rs");
+        let startup = include_str!("startup.rs");
+        assert!(
+            main.contains("startup::spawn_stale_temp_sweeps(&config);"),
+            "async_main no longer starts the stale temp sweeps"
+        );
+        let f = &startup[startup
+            .find("pub fn spawn_stale_temp_sweeps(config: &Config) {")
+            .expect("startup::spawn_stale_temp_sweeps")..];
+        let f = &f[..f.find("\n}\n").expect("end of the function")];
+        let call = f
+            .find("sweep_stale_temp_files(")
+            .expect("the function no longer sweeps stale temp files");
+        let spawn = f[..call]
+            .rfind("spawn_blocking")
+            .expect("sweep is not spawned");
+        assert!(
+            call - spawn < 200 && !f[spawn..].contains(".await"),
+            "the sweep must run inside spawn_blocking, not on the boot path"
+        );
+        assert!(
+            f.contains("filesystem_roots()") && f.contains("STALE_TEMP_MAX_AGE"),
+            "the sweep covers every filesystem root with the stale-age rule"
+        );
+        let write = include_str!("storage/filesystem/write.rs");
+        assert_eq!(
+            write.matches(".prefix(INTERNAL_TEMP_PREFIX)").count(),
+            1,
+            "one function names the temp files"
+        );
+    }
+
     /// #120: production code names the `dg-sealed` key only where a sealed
     /// object is handled: the encrypting wrapper (which seals and opens),
     /// the key's definition, and the inner-backend code that must recognise
@@ -749,20 +888,10 @@ mod source_guards {
     /// `s3 sync --delete` deleted such client files.
     #[test]
     fn reference_keys_are_matched_by_the_one_rule() {
-        let text_match = |code: &str| {
-            ["ends_with(", "contains("]
-                .iter()
-                .any(|m| code.contains(&format!("{m}\"reference.bin")))
-        };
-        assert!(text_match(r#"k.ends_with("reference.bin")"#));
-        assert!(text_match(r#"k.contains("reference.bin")"#));
-        assert!(!text_match("crate::types::is_reference_key(k)"));
         let mut bad = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                if text_match(line.split("//").next().unwrap_or("")) {
-                    bad.push(format!("{file}:{n}"));
-                }
+        for src in crate::source_scan::ast::src() {
+            for (n, what) in reference_text_matches(&src.prod) {
+                bad.push(format!("{}:{n}: {what}", src.rel));
             }
         }
         assert!(bad.is_empty(), "use types::is_reference_key: {bad:?}");
@@ -770,6 +899,84 @@ mod source_guards {
         assert!(crate::types::is_reference_key("reference.bin"));
         assert!(!crate::types::is_reference_key("docs/api-reference.bin"));
         assert!(!crate::types::is_reference_key("reference.bin/x"));
+    }
+
+    /// Does `lit` name `reference.bin` without a `/` right before it? The
+    /// segment-anchored `"/reference.bin"` is a correct test of the last
+    /// segment; a bare `"reference.bin"` suffix also takes `api-reference.bin`.
+    fn unanchored_reference(lit: &str) -> bool {
+        lit.match_indices("reference.bin")
+            .any(|(i, _)| !lit[..i].ends_with('/'))
+    }
+
+    /// `(line, what)` of every text test of a key against `reference.bin`:
+    /// a text method (`ends_with`, `contains`, `strip_suffix`, `rsplit`, ...)
+    /// with a literal that names it, however the call is laid out, and a `==`
+    /// against `.to_string()` / `.as_str()` text of it. The old scan wanted
+    /// `ends_with("reference.bin` or `contains("reference.bin` on one line.
+    fn reference_text_matches(f: &crate::source_scan::ast::Facts) -> Vec<(usize, String)> {
+        let mut out: Vec<(usize, String)> = f
+            .calls
+            .iter()
+            .filter(|c| {
+                c.method && crate::source_scan::ast::TEXT_METHODS.contains(&c.name.as_str())
+            })
+            .filter(|c| c.arg_strings.iter().any(|l| unanchored_reference(l)))
+            .map(|c| (c.line, format!(".{}(\"..reference.bin..\")", c.name)))
+            .collect();
+        out.extend(
+            f.cmps
+                .iter()
+                .filter(|c| {
+                    [&c.lhs, &c.rhs]
+                        .iter()
+                        .any(|side| side.strings.iter().any(|l| unanchored_reference(l)))
+                        && [&c.lhs, &c.rhs].iter().any(|side| {
+                            side.method
+                                .as_deref()
+                                .is_some_and(|m| matches!(m, "to_string" | "as_str" | "as_ref"))
+                        })
+                })
+                .map(|c| (c.line, "key == \"..reference.bin\"".to_string())),
+        );
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn the_reference_key_guard_sees_split_and_other_text_methods() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| reference_text_matches(&parse("f.rs", t).prod).len();
+        assert_eq!(n("fn f() { k.ends_with(\"reference.bin\"); }"), 1);
+        assert_eq!(n("fn f() { k.contains(\"x-reference.bin\"); }"), 1);
+        assert_eq!(
+            n("fn f() { k.ends_with(\"/reference.bin\"); }"),
+            0,
+            "anchored"
+        );
+        assert_eq!(
+            n("fn f() { k.contains(\"/.dg/reference.bin\"); }"),
+            0,
+            "anchored"
+        );
+        // Bypasses of the one-line scan.
+        assert_eq!(
+            n("fn f() { k\n    .ends_with(\n        \"reference.bin\",\n    ); }"),
+            1,
+            "split"
+        );
+        assert_eq!(
+            n("fn f() { k.strip_suffix(\"reference.bin\"); }"),
+            1,
+            "strip_suffix"
+        );
+        assert_eq!(
+            n("fn f() { if k.as_str() == \"x-reference.bin\" {} }"),
+            1,
+            "=="
+        );
+        assert_eq!(n("fn f() { crate::types::is_reference_key(k); }"), 0);
+        assert_eq!(n("fn f() { // k.ends_with(\"reference.bin\")\n }"), 0);
     }
 
     /// #120: the v1 at-rest formats have no reader and no writer. Their
@@ -897,14 +1104,12 @@ mod source_guards {
     #[test]
     fn open_or_legacy_iam_state_is_built_in_one_place() {
         let mut bad = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            if file == "src/iam/mod.rs" {
+        for src in crate::source_scan::ast::src() {
+            if src.rel == "src/iam/mod.rs" {
                 continue;
             }
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                if builds_open_or_legacy_state(line) {
-                    bad.push(format!("{file}:{n}: {}", line.trim()));
-                }
+            for (n, what) in open_or_legacy_state_values(&src.prod) {
+                bad.push(format!("{}:{n}: {what}", src.rel));
             }
         }
         assert!(
@@ -914,41 +1119,54 @@ mod source_guards {
         );
     }
 
-    /// A line that names `IamState::Disabled` / `IamState::Legacy(` outside
-    /// a pattern (left of `=>`, `matches!`, `if let`, let-else).
-    fn builds_open_or_legacy_state(line: &str) -> bool {
-        let pattern_line = ["matches!(", "if let ", "let IamState"]
+    /// `(line, what)` of every VALUE `IamState::Disabled` or
+    /// `IamState::Legacy` in `f`: a unit use, a call (`Legacy(pair)`), a
+    /// function pointer (`.map(IamState::Legacy)`). A pattern (a `match`
+    /// arm, `if let`, `let .. else`, `matches!`) is no value, wherever it
+    /// stands in the file; the old scan told them apart by `=>` and a few
+    /// words on the same line.
+    fn open_or_legacy_state_values(f: &crate::source_scan::ast::Facts) -> Vec<(usize, String)> {
+        f.paths
             .iter()
-            .any(|p| line.contains(p));
-        let arm = line.find("=>");
-        ["IamState::Disabled", "IamState::Legacy("].iter().any(|t| {
-            line.match_indices(t)
-                .any(|(at, _)| !pattern_line && arm.is_none_or(|a| at > a))
-        })
+            .filter(|p| p.expr && p.segs.len() >= 2)
+            .filter(|p| {
+                let n = p.segs.len();
+                p.segs[n - 2] == "IamState"
+                    && matches!(p.segs[n - 1].as_str(), "Disabled" | "Legacy")
+            })
+            .map(|p| (p.line, p.segs[p.segs.len() - 2..].join("::")))
+            .collect()
     }
 
     #[test]
     fn the_iam_state_guard_sees_an_arm_that_builds_open_access() {
-        assert!(builds_open_or_legacy_state(
-            "            None => IamState::Disabled,"
-        ));
-        assert!(builds_open_or_legacy_state(
-            "    let s = IamState::Legacy(pair);"
-        ));
-        assert!(!builds_open_or_legacy_state(
-            "        IamState::Disabled => false,"
-        ));
-        assert!(!builds_open_or_legacy_state(
-            "    if let IamState::Legacy(ref a) = **cur {"
-        ));
-        assert!(!builds_open_or_legacy_state(
-            "    matches!(s, IamState::Disabled)"
-        ));
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| open_or_legacy_state_values(&parse("f.rs", t).prod).len();
+        assert_eq!(
+            n("fn f() { let s = match k { None => IamState::Disabled, _ => x }; }"),
+            1
+        );
+        assert_eq!(n("fn f() { let s = IamState::Legacy(pair); }"), 1);
+        assert_eq!(
+            n("fn f() { let s = pair.map(IamState::Legacy); }"),
+            1,
+            "function pointer"
+        );
+        // The old scan skipped any line with `if let` or `matches!(`, so a
+        // value built on such a line passed.
+        assert_eq!(
+            n("fn f() { let s = if let Some(p) = pair { IamState::Legacy(p) } else { IamState::Disabled }; }"),
+            2
+        );
+        assert_eq!(n("fn f() { let b = matches!(s, IamState::Disabled); }"), 0);
+        assert_eq!(
+            n("fn f() { match s { IamState::Disabled => 1, IamState::Legacy(_) => 2, _ => 3 }; }"),
+            0
+        );
+        assert_eq!(n("fn f() { if let IamState::Legacy(a) = &s {} }"), 0);
+        assert_eq!(n("fn f() { // IamState::Disabled\n }"), 0);
     }
 
-    /// The operator and the Helm chart default to the proxy image of this
-    /// version. v2.0.1 shipped while both still pointed at 2.0.0, so Helm and
-    /// operator users did not get the fix. release-prep.sh stamps these pins.
     #[test]
     fn deployment_pins_follow_the_proxy_version() {
         // The release PR commits every file release-prep.sh stamps: a hand
@@ -1099,32 +1317,71 @@ mod source_guards {
     /// runs in its own process and has no metrics endpoint.
     #[test]
     fn every_server_head_request_is_counted() {
-        let files = rust_files("src");
         let mut offenders = Vec::new();
-        for file in files {
-            let rel = rel_path(&file);
-            if rel.starts_with("src/cli/") || rel == "src/lib.rs" {
+        for src in crate::source_scan::ast::src() {
+            // The CLI runs in its own process: no metrics endpoint.
+            if src.rel.starts_with("src/cli/") {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap();
-            let lines: Vec<&str> = text.lines().collect();
-            for (n, line) in lines.iter().enumerate() {
-                if !line.contains(".head_object()") || line.trim_start().starts_with("//") {
-                    continue;
-                }
-                let window = &lines[n.saturating_sub(8)..n];
-                if !window
-                    .iter()
-                    .any(|l| l.contains("BACKEND_HEAD_REQUESTS.inc()"))
-                {
-                    offenders.push(format!("{rel}:{}", n + 1));
-                }
-            }
+            offenders.extend(
+                uncounted_heads(src)
+                    .into_iter()
+                    .map(|n| format!("{}:{n}", src.rel)),
+            );
         }
         assert!(
             offenders.is_empty(),
             "increment BACKEND_HEAD_REQUESTS right before each head_object():\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// Lines of the `.head_object()` calls of `src` with no
+    /// `BACKEND_HEAD_REQUESTS.inc()` in the SAME fn, 0-8 lines above. (The
+    /// old scan took any `inc()` text 8 lines above, even one in the fn
+    /// that ends there.)
+    fn uncounted_heads(src: &crate::source_scan::ast::Source) -> Vec<usize> {
+        let f = &src.prod;
+        f.calls
+            .iter()
+            .filter(|c| c.method && c.name == "head_object" && c.argc == 0)
+            .filter(|h| {
+                !f.calls.iter().any(|i| {
+                    i.method
+                        && i.name == "inc"
+                        && i.root_ident.as_deref() == Some("BACKEND_HEAD_REQUESTS")
+                        && i.func == h.func
+                        && i.line <= h.line
+                        && h.line - i.line <= 8
+                })
+            })
+            .map(|h| h.line)
+            .collect()
+    }
+
+    #[test]
+    fn the_head_counter_guard_needs_the_increment_in_the_same_fn() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| uncounted_heads(&parse("f.rs", t)).len();
+        assert_eq!(
+            n("fn a() { BACKEND_HEAD_REQUESTS.inc(); c.head_object().send(); }"),
+            0
+        );
+        // An increment in the fn above (within 8 lines) counted for this one.
+        assert_eq!(
+            n("fn a() { BACKEND_HEAD_REQUESTS.inc(); }\nfn b() { c.head_object().send(); }"),
+            1
+        );
+        // An increment that is more than 8 lines up.
+        let far = format!(
+            "fn a() {{ BACKEND_HEAD_REQUESTS.inc();{}c.head_object(); }}",
+            "\n".repeat(10)
+        );
+        assert_eq!(n(&far), 1);
+        // A commented increment.
+        assert_eq!(
+            n("fn a() { // BACKEND_HEAD_REQUESTS.inc()\n c.head_object(); }"),
+            1
         );
     }
 
@@ -1136,33 +1393,81 @@ mod source_guards {
     #[test]
     fn every_s3_get_body_is_read_through_the_resuming_stream() {
         let mut offenders = Vec::new();
-        for file in rust_files("src/storage") {
-            let rel = rel_path(&file);
-            if rel == "src/storage/s3/body.rs"
-                || rel == "src/storage/fake_s3.rs"
-                || rel.ends_with("/tests.rs")
+        for src in crate::source_scan::ast::src() {
+            // body.rs IS the resuming stream. The coordination plane (leases,
+            // locks, the config DB sync, the CAS probes) has its own client
+            // and reads small blobs, where a broken read fails the attempt
+            // on purpose.
+            if src.rel == "src/storage/s3/body.rs"
+                || src.rel == "src/storage/fake_s3.rs"
+                || src.rel.starts_with("src/coordination/")
+                || src.rel == "src/config_db_sync.rs"
             {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap();
-            for (n, line) in text.lines().enumerate() {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                let field_read = line.match_indices(".body").any(|(i, m)| {
-                    let next = line[i + m.len()..].chars().next();
-                    !next.is_some_and(|c| c == '(' || c == '_' || c.is_alphanumeric())
-                });
-                if field_read {
-                    offenders.push(format!("{rel}:{}", n + 1));
-                }
-            }
+            offenders.extend(
+                sdk_body_reads(src)
+                    .into_iter()
+                    .map(|n| format!("{}:{n}", src.rel)),
+            );
         }
         assert!(
             offenders.is_empty(),
             "read a GET response body with S3Backend::body_stream or collect_body:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// Lines where `src` reads the `body` of an S3 SDK response: a `.body`
+    /// field read or a `GetObjectOutput { body, .. }` pattern. In scope: every
+    /// file under `src/storage/` and every file that names `aws_sdk_s3`
+    /// (the old scan listed only `src/storage`, so a new file elsewhere that
+    /// used the SDK escaped). `.body(..)` is the request builder of a PUT: a
+    /// call, not a field.
+    fn sdk_body_reads(src: &crate::source_scan::ast::Source) -> Vec<usize> {
+        if !(src.rel.starts_with("src/storage/") || src.prod.mentions("aws_sdk_s3")) {
+            return Vec::new();
+        }
+        let f = &src.prod;
+        let mut out: Vec<usize> = f
+            .fields
+            .iter()
+            .filter(|x| x.name == "body")
+            .map(|x| x.line)
+            .collect();
+        out.extend(
+            f.pat_fields
+                .iter()
+                .filter(|p| p.field == "body" && p.path_last.ends_with("Output"))
+                .map(|p| p.line),
+        );
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn the_s3_body_guard_sees_a_destructuring_and_a_file_outside_storage() {
+        use crate::source_scan::ast::parse;
+        let n = |rel: &str, t: &str| sdk_body_reads(&parse(rel, t)).len();
+        assert_eq!(n("src/storage/x.rs", "fn f(o: O) { let b = o.body; }"), 1);
+        // A request builder, a method of the same name: not a read.
+        assert_eq!(
+            n("src/storage/x.rs", "fn f() { b.body(x); o.body_len(); }"),
+            0
+        );
+        // The destructuring form: no `.body` text anywhere.
+        assert_eq!(
+            n(
+                "src/storage/x.rs",
+                "fn f(o: O) { let GetObjectOutput { body, .. } = o; }"
+            ),
+            1
+        );
+        // A file outside `src/storage` that uses the SDK is in scope; one
+        // that does not is not (axum and s3s have bodies of their own).
+        let sdk = "use aws_sdk_s3::Client;\nfn f(o: O) { let b = o.body; }";
+        assert_eq!(n("src/cli/new.rs", sdk), 1);
+        assert_eq!(n("src/cli/new.rs", "fn f(o: O) { let b = o.body; }"), 0);
     }
 
     /// s3s replaces every header of an error response with the error's own
@@ -1176,25 +1481,12 @@ mod source_guards {
     #[test]
     fn s3s_error_headers_go_through_error_with_headers() {
         let mut offenders = Vec::new();
-        for file in rust_files("src") {
-            let rel = rel_path(&file);
-            if rel.ends_with("/tests.rs") || rel.ends_with("_tests.rs") || rel == "src/lib.rs" {
-                continue;
-            }
-            let text = std::fs::read_to_string(&file).unwrap();
-            let lines: Vec<&str> = text.lines().collect();
-            for (n, line) in lines.iter().enumerate() {
-                if line.trim_start().starts_with("//") || !line.contains(".set_headers(") {
-                    continue;
-                }
-                let in_helper = rel == "src/s3_adapter_s3s/mod.rs"
-                    && lines[..n]
-                        .iter()
-                        .rev()
-                        .find(|l| l.contains("fn "))
-                        .is_some_and(|l| l.contains("fn error_with_headers("));
+        for src in crate::source_scan::ast::src() {
+            for c in src.prod.calls_named("set_headers") {
+                let in_helper = src.rel == "src/s3_adapter_s3s/mod.rs"
+                    && src.fn_name(c.func) == "error_with_headers";
                 if !in_helper {
-                    offenders.push(format!("{rel}:{}", n + 1));
+                    offenders.push(format!("{}:{}", src.rel, c.line));
                 }
             }
         }
@@ -1212,27 +1504,60 @@ mod source_guards {
     /// `code` that way.
     #[test]
     fn no_byte_index_string_excerpts() {
-        let files = rust_files("src");
-        // Built at runtime so this test's own source is no hit.
-        let needle = [".len()", ".min("].concat();
-        // Byte buffers, not strings: slicing them anywhere is fine.
-        const BYTES: [&str; 1] = ["hex::encode(&st.buf[.."];
         let mut offenders = Vec::new();
-        for file in files {
-            let text = std::fs::read_to_string(&file).unwrap();
-            for (n, line) in text.lines().enumerate() {
-                if line.contains("[..")
-                    && line.contains(needle.as_str())
-                    && !BYTES.iter().any(|b| line.contains(b))
-                {
-                    offenders.push(format!("{}:{}", file.display(), n + 1));
-                }
-            }
+        for src in crate::source_scan::ast::src() {
+            offenders.extend(
+                byte_index_excerpts(&src.prod)
+                    .into_iter()
+                    .map(|n| format!("{}:{n}", src.rel)),
+            );
         }
         assert!(
             offenders.is_empty(),
             "use security::str_prefix for string excerpts:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// Lines of `s[..s.len().min(n)]`-shaped slices in `f`: a range whose
+    /// bounds use both `len` and `min` (`n.min(s.len())`,
+    /// `std::cmp::min(s.len(), n)`). The old scan took `[..` and `.len()`
+    /// and `.min(` on one line, so `cmp::min` and a line break passed.
+    fn byte_index_excerpts(f: &crate::source_scan::ast::Facts) -> Vec<usize> {
+        f.indexes
+            .iter()
+            .filter(|i| i.ranged)
+            .filter(|i| {
+                i.bound_idents.iter().any(|x| x == "len")
+                    && i.bound_idents.iter().any(|x| x == "min")
+            })
+            .map(|i| i.line)
+            .collect()
+    }
+
+    #[test]
+    fn the_excerpt_guard_sees_cmp_min_and_split_forms() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| byte_index_excerpts(&parse("f.rs", t).prod).len();
+        assert_eq!(n("fn f() { &s[..s.len().min(40)]; }"), 1);
+        assert_eq!(n("fn f() { &s[..40.min(s.len())]; }"), 1);
+        assert_eq!(
+            n("fn f() { &s[..std::cmp::min(s.len(), 40)]; }"),
+            1,
+            "cmp::min"
+        );
+        assert_eq!(
+            n("fn f() { &s[..\n    s.len()\n        .min(40)]; }"),
+            1,
+            "split"
+        );
+        assert_eq!(
+            n("fn f() { &s[..len]; &s[2..s.len()]; &s[..n.min(8)]; }"),
+            0
+        );
+        assert_eq!(
+            n("fn f() { let c = crate::security::str_prefix(s, 40); }"),
+            0
         );
     }
 
@@ -1266,21 +1591,14 @@ mod source_guards {
             "InvalidAccessKeyId",
             "SignatureDoesNotMatch",
         ];
-        let files = rust_files("src");
         let mut offenders = Vec::new();
-        for file in files {
-            let rel = rel_path(&file);
-            if ALLOWED.contains(&rel.as_str()) {
+        let names = named_strings(crate::source_scan::ast::src());
+        for src in crate::source_scan::ast::src() {
+            if ALLOWED.contains(&src.rel.as_str()) {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap();
-            for (n, line) in text.lines().enumerate() {
-                let hit = TOKENS
-                    .iter()
-                    .any(|t| line.contains(&format!(".contains(\"{t}\")")));
-                if hit && !line.contains("assert") && !line.contains("TOKENS") {
-                    offenders.push(format!("{rel}:{}: {}", n + 1, line.trim()));
-                }
+            for (n, what) in text_matches(src, &TOKENS, &names) {
+                offenders.push(format!("{}:{n}: {what}", src.rel));
             }
         }
         assert!(
@@ -1288,6 +1606,295 @@ mod source_guards {
             "classify errors on their type/status/code, not their text:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// The strings a name stands for: every `const` and `static` item of
+    /// `srcs`, by name (the last segment of its path), with the strings of
+    /// the names its initialiser uses (`const A: &str = B;`), four deep.
+    fn named_strings<'a>(
+        srcs: impl IntoIterator<Item = &'a crate::source_scan::ast::Source>,
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        use std::collections::HashMap;
+        let mut raw: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+        for src in srcs {
+            for b in src.prod.bindings.iter().chain(&src.test.bindings) {
+                if b.item {
+                    let e = raw.entry(b.name.clone()).or_default();
+                    e.0.extend(b.init_strings.iter().cloned());
+                    e.1.extend(b.init_idents.iter().cloned());
+                }
+            }
+        }
+        let mut out: HashMap<String, Vec<String>> =
+            raw.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect();
+        for _ in 0..4 {
+            for (name, (_, idents)) in &raw {
+                let more: Vec<String> = idents
+                    .iter()
+                    .filter(|i| *i != name)
+                    .flat_map(|i| out.get(i).cloned().unwrap_or_default())
+                    .collect();
+                let e = out.get_mut(name).unwrap();
+                for m in more {
+                    if !e.contains(&m) {
+                        e.push(m);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `(line, what)` of every place `src` tests a string against a token
+    /// of `tokens`, outside an `assert!`:
+    /// - a text method (`contains`, `starts_with`, `find`, `strip_prefix`,
+    ///   `eq`, ...) with a literal that holds a token, wherever the literal
+    ///   sits in the arguments (`&"T"`, `["T", "U"]`, a line break). A name
+    ///   in the arguments stands for its string: a `const`/`static` item
+    ///   anywhere in the crate (`names`), or a `let` of the same fn
+    ///   (`let k = "T"; m.contains(k)`);
+    /// - `text.to_string() == "T"` (and `to_lowercase`, ...): a comparison
+    ///   of rendered text, the other side a literal or a name as above. A
+    ///   comparison of a structured value (`code == "NoSuchKey"` on
+    ///   `err.code()`) is not text and passes;
+    /// - rendered text (`to_string()`, `message()` ...) tested against a
+    ///   value whose string the guard cannot find (a fn parameter, a call):
+    ///   the guard cannot tell it from a token, so it fails closed. Case
+    ///   folding (`to_lowercase`) is no Display text and is exempt.
+    ///
+    /// Words match as a case-insensitive substring (`<Code>NoSuchKey</Code>`),
+    /// status numbers exactly. The old scan looked for the exact text
+    /// `.contains("T")` on one line.
+    fn text_matches(
+        src: &crate::source_scan::ast::Source,
+        tokens: &[&str],
+        names: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Vec<(usize, String)> {
+        const RENDERED: [&str; 5] = [
+            "to_string",
+            "to_lowercase",
+            "to_ascii_lowercase",
+            "to_uppercase",
+            "message",
+        ];
+        // Display text: tested against an unknown value, the guard fails
+        // closed. Case folding (`to_lowercase` of an e-mail) is no Display.
+        const DISPLAY: [&str; 2] = ["to_string", "message"];
+        // The methods that compare the whole receiver with an argument.
+        const COMPARE: [&str; 7] = [
+            "contains",
+            "starts_with",
+            "ends_with",
+            "eq_ignore_ascii_case",
+            "eq",
+            "ne",
+            "strip_prefix",
+        ];
+        let hit = |lit: &str| {
+            tokens.iter().any(|t| {
+                if t.chars().all(|c| c.is_ascii_digit()) {
+                    lit == *t
+                } else {
+                    lit.to_ascii_lowercase().contains(&t.to_ascii_lowercase())
+                }
+            })
+        };
+        // The strings that `idents` (of code in fn `func`) stand for.
+        let resolve = |func: usize, idents: &[String]| -> Vec<String> {
+            let mut out = Vec::new();
+            for i in idents {
+                out.extend(names.get(i).cloned().unwrap_or_default());
+                for b in src
+                    .prod
+                    .bindings
+                    .iter()
+                    .filter(|b| !b.item && b.plain && b.func == func && &b.name == i)
+                {
+                    out.extend(b.init_strings.iter().cloned());
+                    for k in &b.init_idents {
+                        out.extend(names.get(k).cloned().unwrap_or_default());
+                    }
+                }
+            }
+            out
+        };
+        let mut out = Vec::new();
+        for c in &src.prod.calls {
+            if !c.method
+                || c.in_assert
+                || !crate::source_scan::ast::TEXT_METHODS.contains(&c.name.as_str())
+            {
+                continue;
+            }
+            let named = resolve(c.func, &c.arg_idents_all);
+            if let Some(l) = c.arg_strings.iter().chain(&named).find(|l| hit(l)) {
+                out.push((c.line, format!(".{}(.. {l:?} ..)", c.name)));
+            } else if COMPARE.contains(&c.name.as_str())
+                && c.receiver_idents
+                    .iter()
+                    .any(|r| DISPLAY.contains(&r.as_str()))
+                && c.arg_strings.is_empty()
+                && named.is_empty()
+                && !c.arg_idents_all.is_empty()
+            {
+                out.push((
+                    c.line,
+                    format!(
+                        ".{}(..) of rendered text with a value that has no known string",
+                        c.name
+                    ),
+                ));
+            }
+        }
+        for c in &src.prod.cmps {
+            if c.in_assert {
+                continue;
+            }
+            for (lit, other) in [(&c.lhs, &c.rhs), (&c.rhs, &c.lhs)] {
+                let rendered = other
+                    .method
+                    .as_deref()
+                    .is_some_and(|m| RENDERED.contains(&m));
+                if !rendered {
+                    continue;
+                }
+                let named = resolve(c.func, &lit.idents);
+                if let Some(l) = lit.strings.iter().chain(&named).find(|l| hit(l)) {
+                    out.push((c.line, format!("rendered text == {l:?}")));
+                } else if !lit.literal
+                    && lit.strings.is_empty()
+                    && named.is_empty()
+                    && other
+                        .method
+                        .as_deref()
+                        .is_some_and(|m| DISPLAY.contains(&m))
+                {
+                    out.push((
+                        c.line,
+                        "rendered text == a value that has no known string".to_string(),
+                    ));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn the_text_match_guard_sees_split_aliased_and_rendered_forms() {
+        use crate::source_scan::ast::parse;
+        let t = ["NoSuch", "Key"].concat();
+        let tokens = [t.as_str(), "404"];
+        let lines = |body: &str| -> Vec<usize> {
+            let src = parse("f.rs", &format!("fn f() {{\n{body}\n}}"));
+            text_matches(&src, &tokens, &named_strings([&src]))
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        };
+        assert_eq!(lines(&format!("if e.contains(\"{t}\") {{}}")), [2]);
+        // rustfmt breaks a long condition after the `(`.
+        assert_eq!(
+            lines(&format!(
+                "if message\n    .contains(\n        \"{t}\",\n    )\n{{}}"
+            )),
+            [3]
+        );
+        for method in [
+            "starts_with",
+            "ends_with",
+            "eq_ignore_ascii_case",
+            "find",
+            "strip_prefix",
+        ] {
+            assert_eq!(
+                lines(&format!("if m.{method}(\"{t}\") {{}}")),
+                [2],
+                "{method}"
+            );
+        }
+        assert_eq!(lines(&format!("m.contains(&\"{t}\");")), [2]);
+        // Bypasses of the old one-line text scan.
+        // 1. an assert on the same line exempted the whole line;
+        assert_eq!(
+            lines(&format!(
+                "if e.contains(\"{t}\") {{ debug_assert!(true); }}"
+            )),
+            [2]
+        );
+        // 2. a literal inside a pattern list or a longer string;
+        assert_eq!(
+            lines(&format!("e.contains([\"x\", \"{t}\"].as_ref());")),
+            [2]
+        );
+        assert_eq!(lines(&format!("e.contains(\"<Code>{t}</Code>\");")), [2]);
+        // 3. rendered text compared with `==`.
+        assert_eq!(lines(&format!("if e.to_string() == \"{t}\" {{}}")), [2]);
+        assert_eq!(lines("if \"404\" != e.to_string() {}"), [2]);
+        // Not a hit: another literal, a bare mention, a structured compare,
+        // a status number inside a longer literal, an assert.
+        assert!(lines("m.contains(\"other\");").is_empty());
+        assert!(lines(&format!("let k = \"{t}\";")).is_empty());
+        assert!(lines(&format!("if code == \"{t}\" {{}}")).is_empty());
+        assert!(lines("m.contains(\"4040\");").is_empty());
+        assert!(lines(&format!("assert!(m.contains(\"{t}\"));")).is_empty());
+    }
+
+    /// A token held in a name is still a token; text of an error tested
+    /// against a value with no known string fails closed.
+    #[test]
+    fn the_text_match_guard_resolves_names_and_fails_closed() {
+        use crate::source_scan::ast::parse;
+        let t = ["NoSuch", "Key"].concat();
+        let tokens = [t.as_str(), "404"];
+        let file = |text: &str| -> usize {
+            let src = parse("f.rs", text);
+            text_matches(&src, &tokens, &named_strings([&src])).len()
+        };
+        let f = |item: &str, body: &str| file(&format!("{item}\nfn f(e: &E) -> bool {{ {body} }}"));
+        // A `const`/`static` item, through `&`, a path, a chain, a `concat!`.
+        let konst = format!("const K: &str = \"{t}\";");
+        assert_eq!(f(&konst, "e.to_string().contains(K)"), 1, "const");
+        assert_eq!(f(&konst, "e.to_string().contains(&K)"), 1, "&const");
+        assert_eq!(f(&konst, "e.to_string().contains(self::K)"), 1, "path");
+        assert_eq!(f(&konst, "e.to_string() == K"), 1, "== const");
+        assert_eq!(f(&konst, "K == e.to_string()"), 1, "const ==");
+        assert_eq!(
+            f(&format!("static K: &str = \"{t}\";"), "m.starts_with(K)"),
+            1,
+            "static"
+        );
+        assert_eq!(
+            f(&format!("{konst}\nconst L: &str = K;"), "m.contains(L)"),
+            1,
+            "const of a const"
+        );
+        assert_eq!(
+            f(
+                "const K: &str = concat!(\"NoSuch\", \"Key\");",
+                "m.contains(K)"
+            ),
+            1,
+            "concat!"
+        );
+        assert_eq!(f("", &format!("let k = \"{t}\"; m.contains(k)")), 1, "let");
+        assert_eq!(
+            f(&konst, "let k = K; m.contains(k)"),
+            1,
+            "let bound to a const"
+        );
+        // A const that holds no token passes.
+        assert_eq!(f("const K: &str = \"other\";", "m.contains(K)"), 0);
+        // Rendered text against a value with no known string: closed.
+        assert_eq!(f("", "e.to_string().contains(needle)"), 1, "unknown ident");
+        assert_eq!(f("", "e.to_string() == other()"), 1, "unknown call");
+        assert_eq!(f("", "e.message().starts_with(&p.prefix)"), 1, "a field");
+        // A structured value and a plain text compare are no error text.
+        assert_eq!(f("", "name.contains(needle)"), 0);
+        assert_eq!(f("", "e.to_string().contains('x')"), 0, "a char");
+        assert_eq!(f("", "e.code() == other()"), 0);
+        assert_eq!(f("", "e.to_lowercase().ends_with(&suffix)"), 0, "case fold");
     }
 
     /// A request handler audits with the request's headers, so the entry
@@ -1298,65 +1905,23 @@ mod source_guards {
     #[test]
     fn request_audits_carry_the_request_headers() {
         const ALLOWED: [(&str, &str); 0] = [];
-        let mut files = rust_files("src/s3_adapter_s3s");
-        files.extend(rust_files("src/api"));
-        let empty = ["HeaderMap", "::new()"].concat();
         let mut offenders = Vec::new();
         let mut allowed_hits = std::collections::BTreeSet::new();
-        for file in files {
-            let rel = rel_path(&file);
-            let text = std::fs::read_to_string(&file).unwrap();
-            let lines: Vec<&str> = text.lines().collect();
-            let prod = prod_mask(&text);
-            for (i, line) in lines.iter().enumerate() {
-                if !prod[i] {
-                    continue;
-                }
-                let Some(at) = line.find("audit_log(") else {
-                    continue;
-                };
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                // The call's arguments, until its parentheses balance.
-                let mut depth = 0i64;
-                let mut args = String::new();
-                'scan: for (k, l) in lines[i..].iter().enumerate() {
-                    for c in l[if k == 0 { at } else { 0 }..].chars() {
-                        args.push(c);
-                        match c {
-                            '(' => depth += 1,
-                            ')' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break 'scan;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                // An empty map inline, or a local bound to one just above.
-                let bound_empty = lines[i.saturating_sub(10)..i].iter().find_map(|l| {
-                    let l = l.trim();
-                    let rest = l.strip_prefix("let ")?;
-                    let (name, value) = rest.split_once('=')?;
-                    value
-                        .contains(empty.as_str())
-                        .then(|| name.trim().to_string())
-                });
-                let uses_empty = args.contains(empty.as_str())
-                    || bound_empty.is_some_and(|n| args.contains(&format!("&{n}")));
-                if !uses_empty {
-                    continue;
-                }
-                if ALLOWED.iter().any(|(f, _)| *f == rel) {
-                    allowed_hits.insert(rel.clone());
+        let mut audits = 0;
+        for src in crate::source_scan::ast::src() {
+            if !(src.rel.starts_with("src/s3_adapter_s3s/") || src.rel.starts_with("src/api/")) {
+                continue;
+            }
+            audits += src.prod.calls_named("audit_log").count();
+            for n in audits_with_empty_headers(src) {
+                if ALLOWED.iter().any(|(f, _)| *f == src.rel) {
+                    allowed_hits.insert(src.rel.clone());
                 } else {
-                    offenders.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+                    offenders.push(format!("{}:{n}", src.rel));
                 }
             }
         }
+        assert!(audits > 20, "scan found the audit calls ({audits})");
         assert!(
             offenders.is_empty(),
             "pass the request's headers to audit_log, not an empty map:\n{}",
@@ -1368,6 +1933,51 @@ mod source_guards {
                 "{f} ({why}) no longer audits with an empty map: drop it from ALLOWED"
             );
         }
+    }
+
+    /// Lines of the `audit_log(..)` calls of `src` that pass an empty
+    /// `HeaderMap`: built in the argument (`&HeaderMap::new()`), or a local
+    /// of the same fn bound to one (`let h = HeaderMap::new();`). The old
+    /// scan balanced parentheses over lines of text and looked ten lines up
+    /// for the `let`.
+    fn audits_with_empty_headers(src: &crate::source_scan::ast::Source) -> Vec<usize> {
+        let f = &src.prod;
+        let empty = |c: &str| c.ends_with("HeaderMap::new") || c.ends_with("HeaderMap::default");
+        f.calls_named("audit_log")
+            .filter(|c| {
+                c.arg_calls.iter().any(|x| empty(x))
+                    || c.arg_idents.iter().flatten().any(|name| {
+                        f.bindings.iter().any(|b| {
+                            b.func == c.func
+                                && &b.name == name
+                                && b.init_calls.iter().any(|x| empty(x))
+                        })
+                    })
+            })
+            .map(|c| c.line)
+            .collect()
+    }
+
+    #[test]
+    fn the_audit_guard_sees_a_far_binding_and_an_inline_map() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| audits_with_empty_headers(&parse("f.rs", t)).len();
+        assert_eq!(
+            n("fn f() { audit_log(\"a\", u, t, &HeaderMap::new()); }"),
+            1
+        );
+        assert_eq!(
+            n("fn f() { let h = HeaderMap::new(); audit_log(\"a\", u, t, &h); }"),
+            1
+        );
+        // The binding is 30 lines above: the ten-line look-back missed it.
+        let far = format!(
+            "fn f() {{ let h = HeaderMap::new();{}audit_log(\"a\", u, t, &h); }}",
+            "\n".repeat(30)
+        );
+        assert_eq!(n(&far), 1, "far binding");
+        assert_eq!(n("fn f(h: &HeaderMap) { audit_log(\"a\", u, t, h); }"), 0);
+        assert_eq!(n("fn f() { let h = HeaderMap::new(); }\nfn g(h: &HeaderMap) { audit_log(\"a\", u, t, h); }"), 0);
     }
 
     /// `deltaglider_proxy.example.yaml` is the canonical example: every
@@ -1423,29 +2033,275 @@ mod source_guards {
     /// config DB and its key file when `DGP_CONFIG` is unset) relative to
     /// its cwd. A spawn that inherits the test process's cwd writes them
     /// into the repo root, where a later dev run of the binary picks them up.
+    ///
+    /// Per spawn, not per file: the old guard compared the number of spawns
+    /// with the number of `.current_dir(` in the whole file, so an unrelated
+    /// `.current_dir(` (a `git` command) paid for a spawn that had none.
     #[test]
     fn integration_test_spawns_set_current_dir() {
-        // Built at runtime so this file does not match itself.
-        let bin_needle = format!("Command::new(env!(\"{}", "CARGO_BIN_EXE");
-        let files = rust_files("tests");
+        let files = crate::source_scan::ast::tests();
         assert!(files.len() > 50, "scan found tests/ ({})", files.len());
         let mut offenders = Vec::new();
-        for file in files {
-            let text = std::fs::read_to_string(&file).unwrap();
-            let spawns =
-                text.matches(&bin_needle).count() + text.matches("Command::new(BIN)").count();
-            let cwds = text.matches(".current_dir(").count();
-            if spawns > cwds {
-                offenders.push(format!(
-                    "{}: {spawns} spawn(s), {cwds} current_dir",
-                    rel_path(&file)
-                ));
+        let bins = binary_path_names(files);
+        for src in files {
+            for n in spawns_without_cwd(&src.test, &bins) {
+                offenders.push(format!("{}:{n}", src.rel));
             }
         }
         assert!(
             offenders.is_empty(),
             "spawn the proxy with .current_dir(<temp dir>): {offenders:?}"
         );
+    }
+
+    /// `coordination::durable_node_id` creates `<dir>/node-id` when no env
+    /// names the node. Only the boot path (`startup.rs`), which owns the data
+    /// directory, may call it; a label for a witness or a log line goes
+    /// through `node_id_label`, which never writes. A lib test that reached
+    /// the persisting form left `node-id` in the repository root.
+    #[test]
+    fn only_startup_persists_the_node_id() {
+        const ALLOWED: [&str; 2] = ["src/startup.rs", "src/coordination/mod.rs"];
+        let name = ["durable_node", "_id"].concat();
+        let mut offenders = Vec::new();
+        for src in crate::source_scan::ast::src() {
+            if ALLOWED.contains(&src.rel.as_str()) {
+                continue;
+            }
+            offenders.extend(
+                names_path_leaf(src, &name)
+                    .into_iter()
+                    .map(|n| format!("{}:{n}", src.rel)),
+            );
+        }
+        assert!(
+            offenders.is_empty(),
+            "use coordination::node_id_label (never writes) outside startup.rs:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Lines where `src` names `leaf` as the last segment of any path: a
+    /// call, a `use`, an `as` alias, a function pointer, a `<T as Tr>::leaf`.
+    /// The old scan looked for the text `leaf(` on one line.
+    fn names_path_leaf(src: &crate::source_scan::ast::Source, leaf: &str) -> Vec<usize> {
+        let mut out: Vec<usize> = src
+            .prod
+            .paths
+            .iter()
+            .filter(|p| p.segs.last().is_some_and(|s| s == leaf))
+            .map(|p| p.line)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn the_leaf_guard_sees_aliases_and_pointers() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| names_path_leaf(&parse("f.rs", t), "durable").len();
+        assert_eq!(n("fn f() { a::durable(x); }"), 1);
+        assert_eq!(n("fn f() { a::\ndurable\n(x); }"), 1, "split over lines");
+        assert_eq!(
+            n("use a::durable as d;\nfn f() { d(x); }"),
+            1,
+            "alias: the use names it"
+        );
+        assert_eq!(n("fn f() { let g = a::durable; }"), 1, "function pointer");
+        assert_eq!(n("fn f() { // a::durable(x)\n let s = \"durable(\"; }"), 0);
+    }
+
+    /// Is one of `ms` `env!("CARGO_BIN_EXE_..")`?
+    fn names_bin_exe(ms: &[(String, String)]) -> bool {
+        ms.iter()
+            .any(|(n, t)| (n == "env" || n == "option_env") && t.contains("CARGO_BIN_EXE_"))
+    }
+
+    /// The names that stand for the path of the proxy binary, in all of
+    /// `files`: a `const`/`let` bound to `env!("CARGO_BIN_EXE_..")` (or to
+    /// a value built from it, `PathBuf::from(env!(..))`), one bound to a
+    /// name or a call of a name of this set (`let b = bin();`,
+    /// `let c = b.clone();`), and a fn whose tail or `return` is one of
+    /// those, to a fixed point. A helper `fn proxy_bin() -> &'static str {
+    /// env!(..) }` in `tests/common/` is one.
+    fn binary_path_names(
+        files: &[crate::source_scan::ast::Source],
+    ) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        loop {
+            let before = names.len();
+            for src in files {
+                for f in [&src.prod, &src.test] {
+                    for b in &f.bindings {
+                        if names_bin_exe(&b.init_value_macros)
+                            || b.init_root.as_ref().is_some_and(|r| names.contains(r))
+                        {
+                            names.insert(b.name.clone());
+                        }
+                    }
+                    for v in &f.fn_values {
+                        if names_bin_exe(&v.macros)
+                            || v.root.as_ref().is_some_and(|r| names.contains(r))
+                        {
+                            names.insert(v.name.clone());
+                        }
+                    }
+                }
+            }
+            if names.len() == before {
+                return names;
+            }
+        }
+    }
+
+    /// 1-based lines of the proxy spawns in `src` whose builder never gets a
+    /// `.current_dir(..)`. A spawn is a `X::new(arg)` where `arg` holds
+    /// `env!("CARGO_BIN_EXE_..")` or a name of `bins` (a `const`, a `let`,
+    /// a fn returning the path, `bin.clone()`), whatever `X` is called
+    /// (`use std::process::Command as C` still counts). The cwd
+    /// is set on the builder chain (`Command::new(B).current_dir(d)`) or on
+    /// the variable the chain was bound to (`let mut c = Command::new(B);
+    /// c.current_dir(d)`) in the same fn.
+    fn spawns_without_cwd(
+        f: &crate::source_scan::ast::Facts,
+        bins: &std::collections::HashSet<String>,
+    ) -> Vec<usize> {
+        let is_spawn = |c: &crate::source_scan::ast::Call| {
+            !c.method
+                && c.segs.len() >= 2
+                && c.segs.last().is_some_and(|s| s == "new")
+                && (names_bin_exe(&c.arg_macros)
+                    || c.arg_idents_all.iter().any(|i| bins.contains(i)))
+        };
+        let has_cwd = |spawn: &crate::source_scan::ast::Call| {
+            let bound: Vec<&str> = f
+                .bindings
+                .iter()
+                .filter(|b| b.init_root_pos == Some(spawn.pos) && b.func == spawn.func)
+                .map(|b| b.name.as_str())
+                .collect();
+            f.calls.iter().any(|c| {
+                c.method
+                    && c.name == "current_dir"
+                    && (c.root_pos == Some(spawn.pos)
+                        || (c.func == spawn.func
+                            && c.root_ident.as_deref().is_some_and(|r| bound.contains(&r))))
+            })
+        };
+        f.calls
+            .iter()
+            .filter(|c| is_spawn(c) && !has_cwd(c))
+            .map(|c| c.line)
+            .collect()
+    }
+
+    #[test]
+    fn the_cwd_guard_checks_each_spawn() {
+        use crate::source_scan::ast::parse;
+        let bad_in = |texts: &[&str]| {
+            let files: Vec<_> = texts.iter().map(|t| parse("fixture.rs", t)).collect();
+            let bins = binary_path_names(&files);
+            files
+                .iter()
+                .map(|s| spawns_without_cwd(&s.prod, &bins).len())
+                .sum::<usize>()
+        };
+        let bad = |text: &str| bad_in(&[text]);
+        let bin = ["CARGO_BIN", "_EXE_deltaglider_proxy"].concat();
+        let spawn = |extra: &str| format!("Command::new(env!(\"{bin}\"))\n{extra}.spawn();");
+        // One spawn with a cwd: fine.
+        assert_eq!(
+            bad(&format!("fn a() {{ {} }}", spawn(".current_dir(tmp)\n"))),
+            0
+        );
+        // Two spawns, one `.current_dir(` in the FILE (on a git command in
+        // another function): the second spawn has none.
+        let two_fns = format!(
+            "fn a() {{ {} }}\nfn git() {{ Command::new(\"git\").current_dir(x); }}\nfn b() {{ {} }}",
+            spawn(".current_dir(tmp)\n"),
+            spawn("")
+        );
+        assert_eq!(bad(&two_fns), 1);
+        // Two spawns in ONE function, a cwd on the first only.
+        let one_fn = format!(
+            "fn a() {{ {} {} }}",
+            spawn(".current_dir(tmp)\n"),
+            spawn("")
+        );
+        assert_eq!(bad(&one_fn), 1);
+        // The `BIN` const form.
+        let konst = format!(
+            "const BIN: &str = env!(\"{bin}\");\nfn a() {{ Command::new(BIN).arg(\"x\"); }}"
+        );
+        assert_eq!(bad(&konst), 1);
+        // Bypasses of the old text guard (a window of lines holding the text
+        // `.current_dir(`):
+        // 1. an alias of the command type;
+        let alias = format!(
+            "use std::process::Command as C;\nfn a() {{ C::new(env!(\"{bin}\")).spawn(); }}"
+        );
+        assert_eq!(bad(&alias), 1, "alias");
+        // 2. a `.current_dir(` on ANOTHER command within the same fn;
+        let other = format!(
+            "fn a() {{ let mut g = Command::new(\"git\"); g.current_dir(x); {} }}",
+            spawn("")
+        );
+        assert_eq!(bad(&other), 1, "other command's cwd");
+        // 3. the text in a comment or a string.
+        let text = format!(
+            "fn a() {{ // .current_dir(\nlet _s = \".current_dir(\"; {} }}",
+            spawn("")
+        );
+        assert_eq!(bad(&text), 1, "comment/string");
+        // The cwd set through a variable, and in a split chain, both count.
+        let var = format!(
+            "fn a() {{ let mut c = Command::new(env!(\"{bin}\")); c.arg(1); c.current_dir(d); c.spawn(); }}"
+        );
+        assert_eq!(bad(&var), 0, "cwd on the bound variable");
+        let split = format!(
+            "fn a() {{ let c = Command::new(env!(\"{bin}\"))\n    .arg(1)\n    .current_dir(d); }}"
+        );
+        assert_eq!(bad(&split), 0, "cwd on a split chain");
+        // A helper that returns the path hides the `env!` from the spawn.
+        let helper = format!("fn proxy_bin() -> &'static str {{ env!(\"{bin}\") }}\n");
+        for (what, text) in [
+            ("tail", format!("{helper}fn a() {{ Command::new(proxy_bin()).spawn(); }}")),
+            (
+                "return",
+                format!("fn pb() -> String {{ if x {{ return env!(\"{bin}\").into(); }} y }}\nfn a() {{ Command::new(pb()).spawn(); }}"),
+            ),
+            (
+                "PathBuf::from",
+                format!("fn pb() -> PathBuf {{ PathBuf::from(env!(\"{bin}\")) }}\nfn a() {{ Command::new(pb()).spawn(); }}"),
+            ),
+            (
+                "clone of a let",
+                format!("fn a() {{ let b = env!(\"{bin}\"); Command::new(b.clone()).spawn(); }}"),
+            ),
+            (
+                "let bound to the helper",
+                format!("{helper}fn a() {{ let b = proxy_bin(); Command::new(&b).spawn(); }}"),
+            ),
+            (
+                "helper of a helper",
+                format!("{helper}fn pb2() -> &'static str {{ proxy_bin() }}\nfn a() {{ Command::new(pb2()).spawn(); }}"),
+            ),
+        ] {
+            assert_eq!(bad(&text), 1, "{what}");
+        }
+        // The helper in another file (`tests/common/mod.rs`).
+        let user = "fn a() { Command::new(proxy_bin()).spawn(); }";
+        assert_eq!(
+            bad_in(&[helper.as_str(), user]),
+            1,
+            "helper in another file"
+        );
+        // A helper spawn that sets the cwd, and an unrelated fn, pass.
+        let ok = format!("{helper}fn a() {{ Command::new(proxy_bin()).current_dir(d).spawn(); }}");
+        assert_eq!(bad(&ok), 0);
+        let other = format!("{helper}fn a() {{ Command::new(\"git\").arg(other()).spawn(); }}");
+        assert_eq!(bad(&other), 0, "not the proxy binary");
     }
 
     /// Conversion marker P1: `FileMetadata::stored_last_modified` is the
@@ -1474,40 +2330,20 @@ mod source_guards {
             "src/storage/s3/listing.rs",
             "src/storage/filesystem/mod.rs",
         ];
-        let assigns = |code: &str| -> bool {
-            code.match_indices(field).any(|(i, _)| {
-                let rest = code[i + field.len()..].trim_start();
-                let before = code[..i].trim_end();
-                let assign = rest.starts_with('=') && !rest.starts_with("==");
-                // A struct-literal field init; not the declaration.
-                let init =
-                    rest.starts_with(':') && !rest.starts_with("::") && !before.ends_with("pub");
-                assign || init
-            })
-        };
-        for (line, hit) in [
-            (format!("m.{field} = Some(t);"), true),
-            (format!("{field}: None,"), true),
-            (format!("    pub {field}: Option<DateTime<Utc>>,"), false),
-            (format!("assert_eq!(m.{field}, x);"), false),
-            (format!("if m.{field} == x {{}}"), false),
-        ] {
-            assert_eq!(assigns(&line), hit, "{line}");
-        }
         let mut bad = Vec::new();
-        for dir in ["src", "tests"] {
-            for path in rust_files(dir) {
-                let file = rel_path(&path);
-                if ALLOWED.contains(&file.as_str()) {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&path).unwrap();
-                for (n, line) in text.lines().enumerate() {
-                    let code = line.split("//").next().unwrap_or("");
-                    if assigns(code) {
-                        bad.push(format!("{file}:{}: {}", n + 1, line.trim()));
-                    }
-                }
+        for src in crate::source_scan::ast::src()
+            .iter()
+            .chain(crate::source_scan::ast::tests())
+        {
+            if ALLOWED.contains(&src.rel.as_str()) {
+                continue;
+            }
+            for f in [&src.prod, &src.test] {
+                bad.extend(
+                    field_writes(f, field)
+                        .into_iter()
+                        .map(|n| format!("{}:{n}", src.rel)),
+                );
             }
         }
         assert!(
@@ -1516,44 +2352,210 @@ mod source_guards {
         );
     }
 
+    /// Lines where `f` writes the field `name`: `x.name = ..`, `x.name += ..`,
+    /// `&mut x.name` (`mem::replace`, `take`), and a struct literal that
+    /// names it, with a value (`name: v`) or shorthand (`name,`). The old
+    /// scan wanted `name =` or `name:` on one line: the shorthand form and
+    /// `&mut x.name` passed.
+    fn field_writes(f: &crate::source_scan::ast::Facts, name: &str) -> Vec<usize> {
+        f.field_writes
+            .iter()
+            .filter(|w| w.name == name)
+            .map(|w| w.line)
+            .collect()
+    }
+
+    #[test]
+    fn the_field_write_guard_sees_shorthand_and_mut_borrows() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| field_writes(&parse("f.rs", t).prod, "stored_last_modified").len();
+        assert_eq!(n("fn f() { m.stored_last_modified = Some(t); }"), 1);
+        assert_eq!(n("fn f() { M { stored_last_modified: None, ..d }; }"), 1);
+        // Bypasses of the text scan.
+        assert_eq!(
+            n("fn f() { M { stored_last_modified, ..d }; }"),
+            1,
+            "shorthand"
+        );
+        assert_eq!(
+            n("fn f() { std::mem::replace(&mut m.stored_last_modified, x); }"),
+            1,
+            "&mut"
+        );
+        // Reads and the declaration are no write.
+        assert_eq!(n("fn f() { assert_eq!(m.stored_last_modified, x); if m.stored_last_modified == x {} }"), 0);
+        assert_eq!(n("struct M { pub stored_last_modified: Option<u8> }"), 0);
+    }
+
     /// Conversion marker P3: the job's read rule serves plaintext that a
     /// client may not read. Only the re-encrypt job enters it: the proof
     /// that opens the scope is made in `maintenance/worker.rs` alone, and
     /// production code enters the scope nowhere else.
     #[test]
     fn only_the_conversion_job_reads_as_the_job() {
-        let made = ["ConversionReadProof", " { _private"].concat();
-        let entered = ["as_conversion", "_job("].concat();
-        let for_tests = ["ConversionReadProof::", "for_tests("].concat();
         let mut bad = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            let code = crate::source_scan::prod_text(&text);
-            if code.contains(made.as_str()) && file != "src/maintenance/worker.rs" {
-                bad.push(format!("{file}: makes the proof"));
-            }
-            let enters = code.matches(entered.as_str()).count();
-            // The re-encrypt and the migrate job (the definition has
-            // generics before `(`).
-            let allowed = 2 * usize::from(file == "src/maintenance/worker.rs");
-            if enters != allowed {
-                bad.push(format!("{file}: enters the job's scope {enters} time(s)"));
-            }
-            if code.contains(for_tests.as_str()) {
-                bad.push(format!("{file}: the test proof in production code"));
-            }
+        for src in crate::source_scan::ast::src() {
+            bad.extend(conversion_scope_breaches(src));
         }
         assert!(bad.is_empty(), "the conversion job's read rule: {bad:?}");
     }
 
-    /// Is `FileMetadata {` at `idx` a struct literal (not a type position
-    /// such as `-> FileMetadata {`, `impl FileMetadata {`)?
-    fn is_file_metadata_literal(line: &str, idx: usize) -> bool {
-        let before = line[..idx]
-            .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
-            .trim_end();
-        !["->", "impl", "struct", "for", "enum"]
+    /// Breaches of the conversion job's read rule in `src`: the proof made
+    /// (`ConversionReadProof { .. }`) outside `maintenance/worker.rs`, its
+    /// scope entered (`as_conversion_job(..)`) anywhere but the job
+    /// dispatcher `run_job` of that file (the re-encrypt and the migrate
+    /// arm), the test proof (`for_tests()`) in production code. The old scan
+    /// counted the text `as_conversion_job(` per file.
+    fn conversion_scope_breaches(src: &crate::source_scan::ast::Source) -> Vec<String> {
+        let f = &src.prod;
+        let mut bad = Vec::new();
+        if src.rel != "src/maintenance/worker.rs" {
+            for l in f
+                .struct_lits
+                .iter()
+                .filter(|l| l.path_last == "ConversionReadProof")
+            {
+                bad.push(format!("{}:{}: makes the proof", src.rel, l.line));
+            }
+        }
+        for c in f.calls_named("as_conversion_job") {
+            let home = src.rel == "src/maintenance/worker.rs" && src.fn_name(c.func) == "run_job";
+            if !home {
+                bad.push(format!("{}:{}: enters the job's scope", src.rel, c.line));
+            }
+        }
+        for c in f.calls.iter().filter(|c| {
+            !c.method
+                && c.segs.len() >= 2
+                && c.segs[c.segs.len() - 2] == "ConversionReadProof"
+                && c.segs[c.segs.len() - 1] == "for_tests"
+        }) {
+            bad.push(format!(
+                "{}:{}: the test proof in production code",
+                src.rel, c.line
+            ));
+        }
+        bad
+    }
+
+    #[test]
+    fn the_conversion_guard_sees_a_second_entry() {
+        use crate::source_scan::ast::parse;
+        let n = |rel: &str, t: &str| conversion_scope_breaches(&parse(rel, t)).len();
+        let enter = "fn run_job() { conversion::as_conversion_job(P, fut).await; }";
+        assert_eq!(n("src/maintenance/worker.rs", enter), 0);
+        // The same file, another fn: the per-file count passed it while the
+        // total stayed 2.
+        let other =
+            "fn run_job() { as_conversion_job(P, a); }\nfn sweep() { as_conversion_job(P, b); }";
+        assert_eq!(n("src/maintenance/worker.rs", other), 1);
+        assert_eq!(n("src/x.rs", enter), 1);
+        assert_eq!(
+            n(
+                "src/x.rs",
+                "fn f() { ConversionReadProof { _private: () }; }"
+            ),
+            1
+        );
+        assert_eq!(
+            n("src/x.rs", "fn f() { ConversionReadProof::for_tests(); }"),
+            1
+        );
+        assert_eq!(n("src/x.rs", "fn f() { // as_conversion_job(P, a)\n }"), 0);
+    }
+
+    /// `(line, what)` of the fixture shapes that test code `f` builds by
+    /// hand: a `FileMetadata { .. }` struct literal, and (integration tests
+    /// only) DG metadata written onto a stored object: `.metadata("dg-..")`,
+    /// `.insert("dg-..")`, `.header("x-amz-meta-dg-..")`, `xattr::set(..)`.
+    /// The `dg-no-delta` store hint is no stored metadata. The old scan read
+    /// lines of text (and decided `FileMetadata {` by the word before it), so
+    /// a call split over lines passed.
+    fn hand_built_fixtures(
+        f: &crate::source_scan::ast::Facts,
+        integration: bool,
+    ) -> Vec<(usize, String)> {
+        let mut out: Vec<(usize, String)> = f
+            .struct_lits
             .iter()
-            .any(|t| before.ends_with(t))
+            .filter(|l| l.path_last == "FileMetadata")
+            .map(|l| (l.line, "FileMetadata { .. }".to_string()))
+            .collect();
+        if integration {
+            let no_delta = crate::types::meta_keys::NO_DELTA;
+            for c in &f.calls {
+                let dg = |l: &String| {
+                    (l.starts_with("dg-") || l.starts_with("x-amz-meta-dg-"))
+                        && !l.ends_with(no_delta)
+                };
+                let hand_written = c.method
+                    && matches!(c.name.as_str(), "metadata" | "insert" | "header")
+                    && c.arg_strings.iter().any(dg);
+                let xattr = !c.method
+                    && c.segs.len() >= 2
+                    && c.segs[c.segs.len() - 2] == "xattr"
+                    && c.segs[c.segs.len() - 1] == "set";
+                if hand_written || xattr {
+                    out.push((c.line, format!("{}(..)", c.name)));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn the_fixture_guard_sees_literals_and_split_metadata_calls() {
+        use crate::source_scan::ast::parse_test_file;
+        let n = |integration: bool, t: &str| {
+            hand_built_fixtures(&parse_test_file("f.rs", t).test, integration).len()
+        };
+        assert_eq!(n(false, "fn f() { let m = FileMetadata { a: 1 }; }"), 1);
+        assert_eq!(
+            n(
+                false,
+                "fn f() -> FileMetadata { FileMetadata::new_passthrough(1) }"
+            ),
+            0
+        );
+        assert_eq!(
+            n(
+                false,
+                "impl FileMetadata { fn f() {} }\nstruct FileMetadata { a: u8 }"
+            ),
+            0
+        );
+        // A literal behind a type alias or a path: seen by its last segment.
+        assert_eq!(
+            n(false, "fn f() { crate::types::FileMetadata { a: 1 }; }"),
+            1
+        );
+        assert_eq!(n(true, "fn f() { b.metadata(\"dg-tool\", \"x\"); }"), 1);
+        // Split over lines: the one-line scan missed it.
+        assert_eq!(
+            n(
+                true,
+                "fn f() { b\n    .metadata(\n        \"dg-tool\",\n        v,\n    ); }"
+            ),
+            1
+        );
+        assert_eq!(
+            n(
+                true,
+                "fn f() { h.insert(\"x-amz-meta-dg-sha256\", v); xattr::set(p, k, v); }"
+            ),
+            2
+        );
+        assert_eq!(
+            n(true, "fn f() { b.metadata(\"dg-no-delta\", \"true\"); }"),
+            0,
+            "the store hint"
+        );
+        assert_eq!(
+            n(false, "fn f() { b.metadata(\"dg-tool\", \"x\"); }"),
+            0,
+            "unit tests only"
+        );
     }
 
     /// An S3 client in an integration test never retries. The SDK default is
@@ -1620,6 +2622,106 @@ mod source_guards {
         assert!(checked >= 4, "scan found the MinIO steps ({checked})");
     }
 
+    /// A fault test that injects its fault with mode bits (`0o000`, `0o5xx`,
+    /// `0o4xx`) proves nothing as root, and CI runs as root. Such a test
+    /// reports the skip through `root_skip` (`tests/common/server.rs`, or
+    /// `crate::test_root` in the lib), which fails under
+    /// `DGP_TEST_REQUIRE_NONROOT`, so the non-root CI job turns a silent
+    /// skip into a red test. A hand-written `return` after `geteuid()` is
+    /// the silent skip; only the two helpers may call `geteuid`.
+    #[test]
+    fn test_mode_bit_fault_tests_skip_through_root_skip() {
+        let geteuid = ["get", "euid("].concat();
+        let helpers = ["src/test_root.rs", "tests/common/server.rs"];
+        let denies =
+            ["0o000", "0o400", "0o444", "0o500", "0o555"].map(|m| ["from_mode(", m, ")"].concat());
+        let mut files = rust_files("tests");
+        let lib_files = rust_files("src");
+        let test_files = out_of_line_test_modules(&lib_files);
+        let mut offenders = Vec::new();
+        let mut faulting = 0;
+        let mut scanned: Vec<(String, String)> = Vec::new();
+        files.retain(|f| f.extension().is_some_and(|e| e == "rs"));
+        for f in &files {
+            scanned.push((rel_path(f), std::fs::read_to_string(f).unwrap()));
+        }
+        for f in &lib_files {
+            let text = std::fs::read_to_string(f).unwrap();
+            let body = if test_files.contains(f) {
+                text.clone()
+            } else {
+                test_module_lines(&text)
+                    .into_iter()
+                    .map(|(_, l)| l)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            scanned.push((rel_path(f), body));
+        }
+        for (rel, body) in &scanned {
+            let uses_root_skip = body.contains("root_skip(");
+            for (n, line) in body.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(geteuid.as_str()) && !helpers.contains(&rel.as_str()) {
+                    offenders.push(format!("{rel}:{}: call root_skip, not geteuid", n + 1));
+                }
+                if denies.iter().any(|d| line.contains(d.as_str())) {
+                    faulting += 1;
+                    if !uses_root_skip {
+                        offenders
+                            .push(format!("{rel}:{}: mode-bit fault without root_skip", n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            faulting >= 6,
+            "scan found the mode-bit fault tests ({faulting})"
+        );
+        assert!(offenders.is_empty(), "{offenders:#?}");
+    }
+
+    /// Every test that reports a root skip runs in the non-root CI job
+    /// (`test-nonroot` in ci.yml), where `DGP_TEST_REQUIRE_NONROOT=1` turns
+    /// the skip into a failure. A new `root_skip("name")` not listed there
+    /// would skip silently in CI forever.
+    #[test]
+    fn test_every_root_skip_runs_in_the_nonroot_ci_job() {
+        let ci = std::fs::read_to_string(root().join(".github/workflows/ci.yml")).unwrap();
+        let job = ci
+            .split("\n  test-nonroot:")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  test-delta:").next())
+            .expect("ci.yml has the test-nonroot job");
+        assert!(
+            job.contains("DGP_TEST_REQUIRE_NONROOT=1"),
+            "the job sets the flag"
+        );
+        let call = regex_lite::Regex::new(r#"root_skip\(\s*"([A-Za-z0-9_]+)""#).unwrap();
+        let mut names = Vec::new();
+        for file in rust_files("tests").into_iter().chain(rust_files("src")) {
+            let rel = rel_path(&file);
+            if rel == "src/lib.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            for c in call.captures_iter(&text) {
+                names.push((rel.clone(), c[1].to_string()));
+            }
+        }
+        assert!(names.len() >= 6, "scan found the root skips ({names:?})");
+        let missing: Vec<_> = names
+            .iter()
+            .filter(|(_, n)| !job.contains(n.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "add these tests to the test-nonroot job in ci.yml: {missing:?}"
+        );
+    }
+
     /// Test fixtures come from the real write path or a recorded fixture,
     /// never from a hand-built shape production does not emit: such
     /// fixtures kept C1 (open-access only), D14 (schema gate) and D17
@@ -1646,52 +2748,18 @@ mod source_guards {
                 "writes corrupt xattrs to test graceful degradation",
             ),
         ];
-        // Built at runtime so this file's own text is no hit.
-        let hand_written_meta = [
-            [".metadata(\"", "dg-"].concat(),
-            ["insert(\"", "dg-"].concat(),
-            [".header(\"x-amz-meta-", "dg-"].concat(),
-            ["insert(\"x-amz-meta-", "dg-"].concat(),
-            ["xattr::", "set("].concat(),
-        ];
-        let literal = ["FileMetadata", " {"].concat();
-        let src = rust_files("src");
-        let test_files = out_of_line_test_modules(&src);
-        let integration = rust_files("tests");
-        assert!(!integration.is_empty(), "scan found tests/");
         let mut offenders = Vec::new();
         let mut allowed_hits = std::collections::BTreeSet::new();
-        for file in src.iter().chain(&integration) {
-            let rel = rel_path(file);
-            if rel == "src/lib.rs" {
-                continue;
-            }
-            let is_integration = rel.starts_with("tests/");
-            let text = std::fs::read_to_string(file).unwrap();
-            let lines: Vec<(usize, &str)> = if is_integration || test_files.contains(file) {
-                text.lines().enumerate().map(|(i, l)| (i + 1, l)).collect()
-            } else {
-                test_module_lines(&text)
-            };
-            for (n, line) in lines {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                let struct_literal = line
-                    .match_indices(literal.as_str())
-                    .any(|(i, _)| is_file_metadata_literal(line, i));
-                // The no-delta hint is a store instruction the engine drops,
-                // never stored metadata.
-                let meta_write = is_integration
-                    && hand_written_meta.iter().any(|x| line.contains(x.as_str()))
-                    && !line.contains(crate::types::meta_keys::NO_DELTA);
-                if !(struct_literal || meta_write) {
-                    continue;
-                }
-                if ALLOWED.iter().any(|(f, _)| *f == rel) {
-                    allowed_hits.insert(rel.clone());
+        for src in crate::source_scan::ast::src()
+            .iter()
+            .chain(crate::source_scan::ast::tests())
+        {
+            let integration = src.rel.starts_with("tests/");
+            for (n, what) in hand_built_fixtures(&src.test, integration) {
+                if ALLOWED.iter().any(|(f, _)| *f == src.rel) {
+                    allowed_hits.insert(src.rel.clone());
                 } else {
-                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
+                    offenders.push(format!("{}:{n}: {what}", src.rel));
                 }
             }
         }
@@ -1708,22 +2776,6 @@ mod source_guards {
                 "{f} ({why}) no longer hand-builds metadata: drop it from ALLOWED"
             );
         }
-    }
-
-    #[test]
-    fn file_metadata_literal_detection() {
-        let lit = |l: &str| {
-            let i = l.find("FileMetadata {").unwrap();
-            is_file_metadata_literal(l, i)
-        };
-        assert!(lit("        FileMetadata {"));
-        assert!(lit("    let m = crate::types::FileMetadata {"));
-        assert!(lit("        Ok(FileMetadata {"));
-        assert!(!lit("    fn meta() -> FileMetadata {"));
-        assert!(!lit("    fn meta() -> crate::types::FileMetadata {"));
-        assert!(!lit("impl FileMetadata {"));
-        assert!(!lit("pub struct FileMetadata {"));
-        assert!(!lit("impl Default for FileMetadata {"));
     }
 
     /// A lockout answer names the wait (`Blocked`: 429, `Retry-After`, the
@@ -1767,7 +2819,11 @@ mod source_guards {
     /// lock, plus two reads that are not config.
     #[test]
     fn test_modules_do_not_read_process_env() {
-        const ALLOWED: [(&str, &str); 7] = [
+        const ALLOWED: [(&str, &str); 8] = [
+            (
+                "src/test_root.rs",
+                "reads DGP_TEST_REQUIRE_NONROOT (read-only flag of the non-root CI job)",
+            ),
             (
                 "src/api/admin/auth.rs",
                 "cookie-flag env parsing, under LOCK",
@@ -1797,46 +2853,23 @@ mod source_guards {
                 "reads HOME to prove it is NOT expanded",
             ),
         ];
-        // Built at runtime so this file's own text is no hit.
-        let needles = [
-            ["env::", "var("].concat(),
-            ["env::", "var_os("].concat(),
-            ["env::", "vars("].concat(),
-            ["env_", "bool("].concat(),
-            ["env_", "parse("].concat(),
-            ["env_", "parse_with_default("].concat(),
-            ["config::", "process_env"].concat(),
-        ];
-        let files = rust_files("src");
-        let test_files = out_of_line_test_modules(&files);
-        assert!(
-            !test_files.is_empty(),
-            "scan found the out-of-line test modules"
-        );
         let mut offenders = Vec::new();
         let mut allowed_hits = std::collections::BTreeSet::new();
-        for file in files {
-            let rel = rel_path(&file);
-            let text = std::fs::read_to_string(&file).unwrap();
-            // A `#[cfg(test)] mod x;` file is test code throughout.
-            let lines: Vec<(usize, &str)> = if test_files.contains(&file) {
-                text.lines().enumerate().map(|(i, l)| (i + 1, l)).collect()
-            } else {
-                test_module_lines(&text)
-            };
-            for (n, line) in lines {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                if needles.iter().any(|x| line.contains(x.as_str())) {
-                    if ALLOWED.iter().any(|(f, _)| *f == rel) {
-                        allowed_hits.insert(rel.clone());
-                    } else {
-                        offenders.push(format!("{rel}:{n}: {}", line.trim()));
-                    }
+        for src in crate::source_scan::ast::src() {
+            for (n, what) in env_reads(&src.test, false) {
+                if ALLOWED.iter().any(|(f, _)| *f == src.rel) {
+                    allowed_hits.insert(src.rel.clone());
+                } else {
+                    offenders.push(format!("{}:{n}: {what}", src.rel));
                 }
             }
         }
+        assert!(
+            crate::source_scan::ast::src()
+                .iter()
+                .any(|s| !s.test.calls.is_empty()),
+            "scan found test code"
+        );
         assert!(
             offenders.is_empty(),
             "unit tests read the process env; inject an EnvLookup instead, or \
@@ -1852,6 +2885,55 @@ mod source_guards {
         }
     }
 
+    /// `(line, what)` of every read of the process environment in `f`: a
+    /// path that ends in `env::var` / `env::var_os` / `env::vars`, a use of
+    /// one of those (`use std::env::var;`, with or without `as`), the
+    /// `env_bool` / `env_parse` / `env_parse_with_default` helpers, and
+    /// `config::process_env`. A path anywhere counts, not only a call: the
+    /// old scan looked for the text `env::var(` on one line, so `use
+    /// std::env::var; var("X")` and a split call passed.
+    fn env_reads(f: &crate::source_scan::ast::Facts, lookups: bool) -> Vec<(usize, String)> {
+        let mut out: Vec<(usize, String)> = f
+            .paths
+            .iter()
+            .filter(|p| {
+                let n = p.segs.len();
+                let last = p.segs.last().map(String::as_str).unwrap_or("");
+                (n >= 2 && p.segs[n - 2] == "env" && matches!(last, "var" | "var_os" | "vars"))
+                    || matches!(last, "env_bool" | "env_parse" | "env_parse_with_default")
+                    || (lookups && last == "lookup_parse")
+                    || (n >= 2 && p.segs[n - 2] == "config" && last == "process_env")
+            })
+            .map(|p| (p.line, p.segs.join("::")))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn the_env_guard_sees_imports_and_split_calls() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| env_reads(&parse("f.rs", t).prod, false).len();
+        assert_eq!(n("fn f() { std::env::var(\"X\"); }"), 1);
+        assert_eq!(n("fn f() { env_bool(\"X\", false); }"), 1);
+        // Bypasses of the one-line text scan.
+        assert_eq!(
+            n("use std::env::var as v;\nfn f() { v(\"X\"); }"),
+            1,
+            "alias"
+        );
+        assert_eq!(
+            n("use std::env::{self, var};\nfn f() { var(\"X\"); }"),
+            1,
+            "group import"
+        );
+        assert_eq!(n("fn f() { std::env\n    ::var(\"X\"); }"), 1, "split");
+        assert_eq!(n("fn f() { crate::config::process_env(\"X\"); }"), 1);
+        assert_eq!(n("fn f() { let s = \"env::var(\"; // env::var(\n}"), 0);
+        assert_eq!(n("fn f() { other::var(1); config::load(); }"), 0);
+    }
+
     /// P7.1: the request principal is an `Arc<AuthenticatedUser>` in the
     /// request extensions, read and written only through
     /// `iam::request_principal` / `iam::insert_request_principal`. A reader
@@ -1861,24 +2943,17 @@ mod source_guards {
     /// a test that read the wrong slot compared nothing.
     #[test]
     fn the_request_principal_slot_has_one_reader_and_one_writer() {
-        let typed = regex_lite::Regex::new(r"(get|get_mut|remove|insert)::<[^;]*AuthenticatedUser")
-            .unwrap();
-        // The shapes that read the wrong slot before P7.1.
-        assert!(typed.is_match("    let u = req.extensions.get::<AuthenticatedUser>().cloned();"));
-        assert!(typed.is_match("cx.extensions_mut().get::<crate::iam::AuthenticatedUser>();"));
-        assert!(!typed.is_match("    let u = crate::iam::request_principal(&req.extensions);"));
         let mut bad = Vec::new();
-        for dir in ["src", "tests"] {
-            for path in rust_files(dir) {
-                let file = rel_path(&path);
-                if file == "src/iam/types.rs" || file == "src/lib.rs" {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&path).unwrap();
-                for (n, line) in text.lines().enumerate() {
-                    if typed.is_match(line) {
-                        bad.push(format!("{file}:{}: {}", n + 1, line.trim()));
-                    }
+        for src in crate::source_scan::ast::src()
+            .iter()
+            .chain(crate::source_scan::ast::tests())
+        {
+            if src.rel == "src/iam/types.rs" {
+                continue;
+            }
+            for f in [&src.prod, &src.test] {
+                for n in typed_principal_slot_uses(f) {
+                    bad.push(format!("{}:{n}", src.rel));
                 }
             }
         }
@@ -1889,6 +2964,49 @@ mod source_guards {
         );
     }
 
+    /// Lines of `get::<..AuthenticatedUser..>` / `get_mut` / `remove` /
+    /// `insert` calls in `f`: a typed access of the extensions slot that
+    /// names the wrong type. The turbofish may hold a path
+    /// (`crate::iam::AuthenticatedUser`), sit on its own line, or be an
+    /// `Arc<..>` of it. The old scan was a regex over one line.
+    fn typed_principal_slot_uses(f: &crate::source_scan::ast::Facts) -> Vec<usize> {
+        f.calls
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.segs.last().unwrap_or(&c.name).as_str(),
+                    "get" | "get_mut" | "remove" | "insert"
+                )
+            })
+            .filter(|c| c.generics.iter().any(|g| g == "AuthenticatedUser"))
+            .map(|c| c.line)
+            .collect()
+    }
+
+    #[test]
+    fn the_principal_slot_guard_sees_paths_and_split_turbofish() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| typed_principal_slot_uses(&parse("f.rs", t).prod).len();
+        assert_eq!(
+            n("fn f() { req.extensions.get::<AuthenticatedUser>(); }"),
+            1
+        );
+        assert_eq!(
+            n("fn f() { cx.extensions_mut().get::<crate::iam::AuthenticatedUser>(); }"),
+            1
+        );
+        // A split turbofish and an Arc: the one-line regex passed both.
+        assert_eq!(
+            n("fn f() { e.get::<\n    std::sync::Arc<AuthenticatedUser>,\n>(); }"),
+            1
+        );
+        assert_eq!(
+            n("fn f() { crate::iam::request_principal(&req.extensions); }"),
+            0
+        );
+        assert_eq!(n("fn f() { req.extensions.get::<Other>(); }"), 0);
+    }
+
     /// P7.1: a request never deep-copies a principal. The IAM index builds
     /// one per user (`IamIndex::principal`) and the bootstrap principal is
     /// built once per key (`AuthenticatedUser::bootstrap_shared`); only the
@@ -1896,15 +3014,9 @@ mod source_guards {
     #[test]
     fn requests_share_principals_never_build_them() {
         let mut bad = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                let builds = (line.contains("AuthenticatedUser::from(")
-                    && file != "src/iam/mod.rs")
-                    || (line.contains("AuthenticatedUser::bootstrap(")
-                        && file != "src/iam/types.rs");
-                if builds {
-                    bad.push(format!("{file}:{n}: {}", line.trim()));
-                }
+        for src in crate::source_scan::ast::src() {
+            for (n, what) in principal_builds(src) {
+                bad.push(format!("{}:{n}: {what}", src.rel));
             }
         }
         assert!(
@@ -1914,20 +3026,158 @@ mod source_guards {
         );
     }
 
+    /// `(line, what)` of the builds of an `AuthenticatedUser` in `src`
+    /// outside their one home: `AuthenticatedUser::from(..)` (home
+    /// `src/iam/mod.rs`) and `::bootstrap(..)` (home `src/iam/types.rs`).
+    /// A path call under any name the type was imported as (`use .. as AU`),
+    /// split over lines, or as `<AuthenticatedUser as From<_>>::from`, counts;
+    /// the old scan took the text `AuthenticatedUser::from(` on one line.
+    fn principal_builds(src: &crate::source_scan::ast::Source) -> Vec<(usize, String)> {
+        let f = &src.prod;
+        let mut names = vec!["AuthenticatedUser".to_string()];
+        names.extend(
+            f.paths
+                .iter()
+                .filter(|p| p.segs.last().is_some_and(|s| s == "AuthenticatedUser"))
+                .filter_map(|p| p.alias.clone()),
+        );
+        let mut out = Vec::new();
+        for c in f.calls.iter().filter(|c| !c.method && c.segs.len() >= 2) {
+            let ty = &c.segs[c.segs.len() - 2];
+            let leaf = &c.segs[c.segs.len() - 1];
+            if !names.contains(ty) {
+                continue;
+            }
+            let home = match leaf.as_str() {
+                "from" => "src/iam/mod.rs",
+                "bootstrap" => "src/iam/types.rs",
+                _ => continue,
+            };
+            if src.rel != home {
+                out.push((c.line, format!("{ty}::{leaf}(..)")));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_principal_guard_sees_aliases_and_qualified_forms() {
+        use crate::source_scan::ast::parse;
+        let n = |rel: &str, t: &str| principal_builds(&parse(rel, t)).len();
+        assert_eq!(n("src/x.rs", "fn f() { AuthenticatedUser::from(u); }"), 1);
+        assert_eq!(
+            n("src/iam/mod.rs", "fn f() { AuthenticatedUser::from(u); }"),
+            0
+        );
+        assert_eq!(
+            n(
+                "src/iam/mod.rs",
+                "fn f() { AuthenticatedUser::bootstrap(k); }"
+            ),
+            1
+        );
+        // Bypasses of the old one-line text scan: a line break, an alias,
+        // the qualified-trait form, a full path.
+        assert_eq!(
+            n("src/x.rs", "fn f() { AuthenticatedUser\n    ::from(u); }"),
+            1
+        );
+        assert_eq!(
+            n(
+                "src/x.rs",
+                "use crate::iam::AuthenticatedUser as AU;\nfn f() { AU::from(u); }"
+            ),
+            1
+        );
+        assert_eq!(
+            n(
+                "src/x.rs",
+                "fn f() { <AuthenticatedUser as From<IamUser>>::from(u); }"
+            ),
+            1
+        );
+        assert_eq!(
+            n(
+                "src/x.rs",
+                "fn f() { crate::iam::AuthenticatedUser::from(u); }"
+            ),
+            1
+        );
+        assert_eq!(
+            n("src/x.rs", "fn f() { // AuthenticatedUser::from(u)\n }"),
+            0
+        );
+    }
+
     /// Review B5: a permission's condition block is parsed in ONE place,
     /// `iam::permissions::parse_conditions`, which save-time validation and
     /// the policy build share; a second parser would drift from it.
     #[test]
     fn condition_blocks_are_parsed_by_the_one_rule() {
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            let prod = crate::source_scan::prod_text(&text);
-            let hits = prod.matches("ConditionBlock>(").count();
-            let allowed = usize::from(file == "src/iam/permissions.rs");
-            assert!(
-                hits <= allowed,
-                "{file} parses an iam-rs ConditionBlock outside parse_conditions"
-            );
+        let mut bad = Vec::new();
+        for src in crate::source_scan::ast::src() {
+            for (n, func) in condition_block_parsers(src) {
+                if !(src.rel == "src/iam/permissions.rs" && func == "parse_conditions") {
+                    bad.push(format!("{}:{n} (in fn {func})", src.rel));
+                }
+            }
         }
+        assert!(
+            bad.is_empty(),
+            "parse an iam-rs ConditionBlock only in iam::permissions::parse_conditions:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// `(line, enclosing fn)` of every deserialisation into an iam-rs
+    /// `ConditionBlock` in `src`: a `from_value`/`from_str`/`from_slice`/
+    /// `from_reader`/`parse`/`deserialize` call that names the type in its
+    /// turbofish, or any such call in a fn that spells the type (a typed
+    /// `let`). The old scan counted the text `ConditionBlock>(` per file and
+    /// allowed one, so a second parser in `permissions.rs` or a typed `let`
+    /// elsewhere passed.
+    fn condition_block_parsers(src: &crate::source_scan::ast::Source) -> Vec<(usize, String)> {
+        const PARSE: [&str; 6] = [
+            "from_value",
+            "from_str",
+            "from_slice",
+            "from_reader",
+            "parse",
+            "deserialize",
+        ];
+        let f = &src.prod;
+        let spells = |func: usize| {
+            f.paths
+                .iter()
+                .any(|p| p.func == func && p.segs.last().is_some_and(|s| s == "ConditionBlock"))
+        };
+        f.calls
+            .iter()
+            .filter(|c| PARSE.contains(&c.segs.last().unwrap_or(&c.name).as_str()))
+            .filter(|c| c.generics.iter().any(|g| g == "ConditionBlock") || spells(c.func))
+            .map(|c| (c.line, src.fn_name(c.func).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_condition_block_guard_sees_a_second_parser() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| condition_block_parsers(&parse("f.rs", t)).len();
+        assert_eq!(
+            n("fn parse_conditions() { serde_json::from_value::<iam_rs::ConditionBlock>(v); }"),
+            1
+        );
+        // Bypasses of the text count: a typed `let` and a split turbofish.
+        assert_eq!(
+            n("fn other() { let b: ConditionBlock = serde_json::from_value(v).unwrap(); }"),
+            1
+        );
+        assert_eq!(
+            n("fn other() { serde_json::from_str::<\n    iam_rs::ConditionBlock,\n>(s); }"),
+            1
+        );
+        // The type named without a parse (an evaluation) is not a parser.
+        assert_eq!(n("fn eval(b: &ConditionBlock) { b.len(); }"), 0);
     }
 
     /// Review B2: a rate-limit success clears only the account whose
@@ -1936,24 +3186,230 @@ mod source_guards {
     /// per-IP count (`RateLimiter::record_success` is gone).
     #[test]
     fn a_rate_limit_success_follows_a_proven_secret() {
-        let checks = ["bcrypt::verify(", "iam_user_secret_valid(", "probe_key("];
         let mut sites = 0;
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            let prod = crate::source_scan::prod_text(&text);
-            for (at, _) in prod.match_indices(".record_proven()") {
-                let fn_start = prod[..at].rfind("fn ").unwrap_or(0);
-                let body = &prod[fn_start..at];
-                if file == "src/rate_limiter.rs" {
-                    continue;
-                }
+        let mut bad = Vec::new();
+        for src in crate::source_scan::ast::src() {
+            if src.rel == "src/rate_limiter.rs" {
+                continue;
+            }
+            for c in src.prod.calls_named("record_proven") {
                 sites += 1;
-                assert!(
-                    body.contains("enter_with_account(") && checks.iter().any(|c| body.contains(c)),
-                    "{file}: record_proven() without an account guard and a secret check before it"
-                );
+                if !proven_before(&src.prod, c) {
+                    bad.push(format!("{}:{}", src.rel, c.line));
+                }
             }
         }
         assert!(sites >= 3, "the scan found the proven sign-ins ({sites})");
+        assert!(
+            bad.is_empty(),
+            "record_proven() without an account guard and a secret check before it in its fn: {bad:?}"
+        );
+    }
+
+    /// Is there, in the fn of `c` and before it, an `enter_with_account(..)`
+    /// AND a secret check (`bcrypt::verify`, `iam_user_secret_valid`,
+    /// `probe_key`)? A mention in a comment or a string is no call, and a
+    /// call in an earlier fn is no proof (the old scan took the text between
+    /// the last `fn ` and the call).
+    fn proven_before(
+        f: &crate::source_scan::ast::Facts,
+        c: &crate::source_scan::ast::Call,
+    ) -> bool {
+        let before = |name: &str| {
+            f.calls_named(name)
+                .any(|o| o.func == c.func && o.pos < c.pos)
+        };
+        before("enter_with_account")
+            && (f.calls.iter().any(|o| {
+                o.func == c.func
+                    && o.pos < c.pos
+                    && o.segs.len() >= 2
+                    && o.segs[o.segs.len() - 2] == "bcrypt"
+                    && o.segs[o.segs.len() - 1] == "verify"
+            }) || before("iam_user_secret_valid")
+                || before("probe_key"))
+    }
+
+    #[test]
+    fn the_proven_secret_guard_needs_the_checks_in_the_same_fn() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| {
+            let s = parse("f.rs", t);
+            s.prod
+                .calls_named("record_proven")
+                .filter(|c| !proven_before(&s.prod, c))
+                .count()
+        };
+        let ok = "fn a() { g.enter_with_account(x); bcrypt::verify(p, h); g.record_proven(); }";
+        assert_eq!(n(ok), 0);
+        assert_eq!(
+            n("fn a() { g.enter_with_account(x); g.record_proven(); }"),
+            1,
+            "no secret check"
+        );
+        // The checks sit in the fn above: the text between `fn ` and the call held none.
+        assert_eq!(
+            n("fn a() { g.enter_with_account(x); bcrypt::verify(p, h); }\nfn b() { g.record_proven(); }"),
+            1
+        );
+        // A comment that names the checks.
+        assert_eq!(
+            n("fn a() { // enter_with_account( bcrypt::verify(\n g.record_proven(); }"),
+            1
+        );
+    }
+
+    /// E10/F8: an HTTP handler that checks a secret (`bcrypt::verify`,
+    /// `iam_user_secret_valid`, `probe_key`) enters a `RateLimitGuard`
+    /// BEFORE the check, in the same fn. A new password oracle without a
+    /// lockout fails here. The check fns themselves are not handlers.
+    #[test]
+    fn every_secret_check_in_a_handler_enters_a_rate_limit_guard_first() {
+        let checks = ["bcrypt::verify(", "iam_user_secret_valid(", "probe_key("];
+        let mut sites = 0;
+        for (file, text) in crate::source_scan::prod_sources("src/api") {
+            let prod = crate::source_scan::prod_text(&text);
+            for check in checks {
+                for (at, _) in prod.match_indices(check) {
+                    let fn_start = prod[..at].rfind("fn ").unwrap_or(0);
+                    let head = &prod[fn_start..at];
+                    if head.trim_end() == "fn" {
+                        continue; // the definition of the check fn
+                    }
+                    sites += 1;
+                    assert!(
+                        head.contains("RateLimitGuard::enter"),
+                        "{file}: `{check}` without a RateLimitGuard before it in its fn"
+                    );
+                }
+            }
+        }
+        assert!(sites >= 6, "the scan found the secret checks ({sites})");
+    }
+
+    /// E10/F35: `triggered_by` is a display label (a user name, an OIDC name
+    /// claim: free text). No admin handler decides ownership by comparing it;
+    /// they compare the stored principal (`maintenance::delete::may_cancel`).
+    #[test]
+    fn no_handler_authorises_by_a_display_name() {
+        let mut offenders = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src/api") {
+            let prod = crate::source_scan::prod_text(&text);
+            for (i, line) in prod.lines().enumerate() {
+                let compares = line.contains("==") || line.contains("!=");
+                if compares && (line.contains("triggered_by") || line.contains(".label()")) {
+                    offenders.push(format!("{file}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "authorise by principal, not by display label:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// E10/F35, the page side: the browser shows Cancel from the server's
+    /// `may_cancel`. It never compares `triggered_by` (a display label) with
+    /// the name of the signed-in user.
+    #[test]
+    fn the_ui_never_authorises_by_a_display_name() {
+        let mut offenders = Vec::new();
+        for ext in ["ts", "tsx"] {
+            for path in crate::source_scan::files("demo/s3-browser/ui/src", ext) {
+                let file = crate::source_scan::rel(&path);
+                if file.contains("/__tests__/") || file.contains(".test.") {
+                    continue;
+                }
+                for (i, line) in crate::source_scan::read(&file).lines().enumerate() {
+                    let compares = line.contains("==") || line.contains("!=");
+                    let names_a_user = line.contains("identity")
+                        || line.contains("user.name")
+                        || line.contains("canCancel");
+                    if line.contains("triggered_by") && compares && names_a_user {
+                        offenders.push(format!("{file}:{}: {}", i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "decide a cancel from the server's `may_cancel`, not from a name:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// E10/F54: an outbound HTTP client that an operator-supplied URL can
+    /// reach comes from ONE builder, `security::guarded_reqwest_builder`:
+    /// the SSRF resolver, no redirects, and no system proxy (a proxy would
+    /// resolve the target itself, so the connect-time address check would
+    /// never run). Nothing else builds a reqwest client, and a failed build
+    /// is an error, never a default client.
+    #[test]
+    fn outbound_http_clients_come_from_the_one_guarded_builder() {
+        // Clients that no operator-supplied URL reaches, with the reason.
+        const UNGUARDED: [(&str, &str); 2] = [
+            (
+                "src/cli/config.rs",
+                "the admin CLI signs in to the proxy URL the operator typed on the command line",
+            ),
+            (
+                "src/cli/engine_factory.rs",
+                "a 3 s health probe of the endpoint of the CLI verb the operator ran, before it connects",
+            ),
+        ];
+        const CONSTRUCTORS: [&str; 6] = [
+            "reqwest::Client::builder(",
+            "reqwest::ClientBuilder::new(",
+            "reqwest::Client::new(",
+            "reqwest::Client::default(",
+            "Client::builder(",
+            ".dns_resolver(",
+        ];
+        let mut users = 0;
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            let prod = crate::source_scan::prod_text(&text);
+            if prod.contains("guarded_reqwest_") && file != "src/security.rs" {
+                users += 1;
+                // A `.build()` followed by a default: the failed build
+                // becomes a client without the resolver.
+                for (at, _) in prod.match_indices(".build()") {
+                    let after: String = prod[at + 8..]
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .take(40)
+                        .collect();
+                    assert!(
+                        !after.starts_with(".unwrap_or_default()")
+                            && !after.starts_with(".ok().unwrap_or_default()")
+                            && !after.starts_with(".unwrap_or_else(|_|")
+                            && !after.starts_with(".unwrap_or_else(|e|")
+                            && !after.starts_with(".ok()"),
+                        "{file}: a failed client build falls back to a default client"
+                    );
+                }
+            }
+            if file == "src/security.rs" || UNGUARDED.iter().any(|(f, _)| *f == file) {
+                continue;
+            }
+            for c in CONSTRUCTORS {
+                assert!(
+                    !prod.contains(c),
+                    "{file} builds an HTTP client with `{c}`: use \
+                     `security::guarded_reqwest_builder`, or list the file in UNGUARDED with a reason"
+                );
+            }
+        }
+        assert!(users >= 2, "the scan found the guarded clients ({users})");
+        // The one builder keeps its three guards.
+        let security = crate::source_scan::prod_text(&crate::source_scan::read("src/security.rs"));
+        let at = security
+            .find("pub fn guarded_reqwest_builder")
+            .expect("the guarded builder exists");
+        let builder: String = security[at..].chars().take(900).collect();
+        for part in [".no_proxy()", ".redirect(", ".dns_resolver("] {
+            assert!(builder.contains(part), "the guarded builder lost `{part}`");
+        }
     }
 
     /// Review A14: every admin path that can remove IAM users decides the
@@ -1962,31 +3418,88 @@ mod source_guards {
     /// users without it fails here.
     #[test]
     fn every_user_removing_path_checks_the_lockout_rule_first() {
-        let writers = [
-            ".delete_user(",
-            "reconcile_declarative_iam(",
-            ".restore_iam(",
-        ];
         let mut sites = 0;
-        for (file, text) in crate::source_scan::prod_sources("src/api") {
-            let prod = crate::source_scan::prod_text(&text);
-            for w in writers {
-                for (at, _) in prod.match_indices(w) {
-                    let fn_start = prod[..at].rfind("fn ").unwrap_or(0);
-                    let before = &prod[fn_start..at];
-                    sites += 1;
-                    assert!(
-                        before.contains("check_lockout(")
-                            || before.contains("import_lockout_check(")
-                            || before.contains("allow_empty"),
-                        "{file}: `{w}` without a lockout decision before it in its fn"
-                    );
-                }
+        let mut bad = Vec::new();
+        for src in crate::source_scan::ast::src() {
+            if !src.rel.starts_with("src/api/") {
+                continue;
             }
+            for (n, what) in user_removals_without_lockout(src) {
+                bad.push(format!("{}:{n}: `{what}`", src.rel));
+            }
+            sites += user_removal_calls(&src.prod).count();
         }
         assert!(
             sites >= 4,
             "the scan found the user-removing sites ({sites})"
+        );
+        assert!(
+            bad.is_empty(),
+            "a user-removing call without a lockout decision before it in its fn:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    fn user_removal_calls(
+        f: &crate::source_scan::ast::Facts,
+    ) -> impl Iterator<Item = &crate::source_scan::ast::Call> {
+        ["delete_user", "reconcile_declarative_iam", "restore_iam"]
+            .into_iter()
+            .flat_map(|w| f.calls_named(w))
+    }
+
+    /// `(line, call)` of the user-removing calls of `src` (`delete_user`,
+    /// `reconcile_declarative_iam`, `restore_iam`) with no lockout decision
+    /// before them in their fn: a call of `check_lockout` /
+    /// `import_lockout_check`, or a use of `allow_empty`. The old scan took
+    /// the text between the last `fn ` and the call, so a comment or a
+    /// string that named the check passed.
+    fn user_removals_without_lockout(
+        src: &crate::source_scan::ast::Source,
+    ) -> Vec<(usize, String)> {
+        let f = &src.prod;
+        user_removal_calls(f)
+            .filter(|c| {
+                let call = |name: &str| {
+                    f.calls_named(name)
+                        .any(|o| o.func == c.func && o.pos < c.pos)
+                };
+                let allow = f.paths.iter().any(|p| {
+                    p.func == c.func
+                        && p.line <= c.line
+                        && p.segs.last().is_some_and(|s| s == "allow_empty")
+                }) || f
+                    .fields
+                    .iter()
+                    .any(|x| x.func == c.func && x.line <= c.line && x.name == "allow_empty");
+                !(call("check_lockout") || call("import_lockout_check") || allow)
+            })
+            .map(|c| (c.line, c.name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn the_lockout_guard_ignores_comments_and_earlier_fns() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| user_removals_without_lockout(&parse("src/api/x.rs", t)).len();
+        assert_eq!(n("fn a() { check_lockout(&db)?; db.delete_user(1); }"), 0);
+        assert_eq!(n("fn a() { db.delete_user(1); }"), 1);
+        assert_eq!(n("fn a() { db.restore_iam(z, allow_empty); }"), 0);
+        // The text scan accepted a comment or a string that names the check.
+        assert_eq!(
+            n("fn a() { // check_lockout(\n db.delete_user(1); }"),
+            1,
+            "comment"
+        );
+        assert_eq!(
+            n("fn a() { let _s = \"check_lockout(\"; db.delete_user(1); }"),
+            1,
+            "string"
+        );
+        // The check sits in the fn above.
+        assert_eq!(
+            n("fn a() { check_lockout(&db); }\nfn b() { db.delete_user(1); }"),
+            1
         );
     }
 
@@ -1997,18 +3510,26 @@ mod source_guards {
     #[test]
     fn declarative_reconcile_rebuilds_the_live_providers() {
         let mut reconcilers = 0;
-        for (file, text) in crate::source_scan::prod_sources("src/api/admin") {
-            let prod = crate::source_scan::prod_text(&text);
-            if prod.contains("crate::iam::reconcile_declarative_iam(") {
+        let mut bad = Vec::new();
+        for src in crate::source_scan::ast::src() {
+            if !src.rel.starts_with("src/api/admin/") {
+                continue;
+            }
+            let f = &src.prod;
+            if f.calls_named("reconcile_declarative_iam").next().is_some() {
                 reconcilers += 1;
-                assert!(
-                    prod.contains("rebuild_external_auth(")
-                        || prod.contains("publish_provider_set("),
-                    "{file} reconciles declarative IAM without rebuilding the providers"
-                );
+                if f.calls_named("rebuild_external_auth").next().is_none()
+                    && f.calls_named("publish_provider_set").next().is_none()
+                {
+                    bad.push(src.rel.clone());
+                }
             }
         }
         assert!(reconcilers >= 2, "the scan found the reconcile call sites");
+        assert!(
+            bad.is_empty(),
+            "{bad:?} reconcile declarative IAM without rebuilding the providers"
+        );
     }
 
     /// A walk of every directory with one request per directory is the HEAD
@@ -2019,19 +3540,14 @@ mod source_guards {
     /// a reference calls `list_deltaspaces`.
     #[test]
     fn a_reference_walk_lists_only_the_reference_prefixes() {
-        // (The delta-efficiency scan was the one caller; it now groups one
-        // listing of the bucket by directory.)
-        const ALLOWED: &[&str] = &[];
         let mut offenders = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
+        for src in crate::source_scan::ast::src() {
             // The trait, its implementations and their forwarders.
-            if file.starts_with("src/storage/") || ALLOWED.contains(&file.as_str()) {
+            if src.rel.starts_with("src/storage/") {
                 continue;
             }
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                if line.contains(".list_deltaspaces(") && !line.trim_start().starts_with("//") {
-                    offenders.push(format!("{file}:{n}"));
-                }
+            for c in src.prod.calls_named("list_deltaspaces") {
+                offenders.push(format!("{}:{}", src.rel, c.line));
             }
         }
         assert!(
@@ -2042,86 +3558,41 @@ mod source_guards {
         );
     }
 
-    /// The last argument of every `list_objects(` call in `src`, with its
-    /// 1-based line. Calls span lines; `//` comments inside them are
-    /// dropped. A definition (`fn list_objects(`) and a mention in a comment
-    /// are no call.
-    fn list_objects_last_args(src: &str) -> Vec<(usize, String)> {
-        let mut out = Vec::new();
-        let mut from = 0;
-        while let Some(at) = src[from..].find("list_objects(") {
-            let start = from + at;
-            let open = start + "list_objects".len();
-            from = open + 1;
-            let before = &src[..start];
-            let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-            // `fn list_objects(` is the definition; `bulk_list_objects(` is
-            // another method.
-            if before[line_start..].contains("//")
-                || before.ends_with("fn ")
-                || before
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
-            {
-                continue;
-            }
-            let mut depth = 0i32;
-            let Some(close) = src[open..].char_indices().find_map(|(i, c)| {
-                depth += match c {
-                    '(' | '[' | '{' => 1,
-                    ')' | ']' | '}' => -1,
-                    _ => 0,
-                };
-                (depth == 0).then_some(open + i)
-            }) else {
-                continue;
-            };
-            let args: String = src[open + 1..close]
-                .lines()
-                .map(|l| l.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let mut depth = 0i32;
-            let mut parts = vec![String::new()];
-            for c in args.chars() {
-                match c {
-                    '(' | '[' | '{' => depth += 1,
-                    ')' | ']' | '}' => depth -= 1,
-                    ',' if depth == 0 => {
-                        parts.push(String::new());
-                        continue;
-                    }
-                    _ => {}
-                }
-                parts.last_mut().unwrap().push(c);
-            }
-            let last = parts
-                .iter()
-                .map(|p| p.trim())
-                .rfind(|p| !p.is_empty())
-                .unwrap_or("")
-                .to_string();
-            let line = src[..open].lines().count();
-            out.push((line, last));
-        }
-        out
+    /// The `list_objects(..)` calls of `f` whose last argument (the
+    /// `metadata` flag) is not the literal `false`, with their lines. A
+    /// definition (`fn list_objects(`), a method of another name
+    /// (`bulk_list_objects`) and a mention in a comment are no call. A
+    /// variable (`metadata`) or `true` is a breach: the flag must be a
+    /// literal `false`, or a reader cannot tell it from a HEAD per object.
+    fn list_objects_with_metadata(f: &crate::source_scan::ast::Facts) -> Vec<(usize, String)> {
+        f.calls_named("list_objects")
+            .filter(|c| c.arg_bools.last() != Some(&Some(false)))
+            .map(|c| {
+                (
+                    c.line,
+                    "the last argument is not the literal `false`".to_string(),
+                )
+            })
+            .collect()
     }
 
     #[test]
     fn the_metadata_listing_guard_reads_multiline_calls() {
+        use crate::source_scan::ast::parse;
         let src = "fn list_objects(a: u32, metadata: bool) {}\n\
-                   //! Cost: walks `engine.list_objects(prefix)` paginated.\n\
+                   // Cost: walks `engine.list_objects(prefix)` paginated.\n\
+                   fn f() {\n\
                    let p = engine.list_objects(\n    b,\n    p,\n    None,\n    1000,\n    \
                    None,\n    true, // metadata=true\n);\n\
                    let q = engine.list_objects(&b, \"\", None, 10, t.as_deref(), false).await;\n\
                    let r = engine.list_objects(b, &f(x, y), None, n, None, metadata);\n\
-                   let s = storage.bulk_list_objects(b, p).await;";
-        let got: Vec<String> = list_objects_last_args(src)
+                   let s = storage.bulk_list_objects(b, p).await;\n\
+                   }";
+        let got: Vec<usize> = list_objects_with_metadata(&parse("f.rs", src).prod)
             .into_iter()
-            .map(|(_, a)| a)
+            .map(|(n, _)| n)
             .collect();
-        assert_eq!(got, ["true", "false", "metadata"]);
+        assert_eq!(got, [4, 13], "the `true` call and the variable one");
     }
 
     /// Cockroach scan (ui.md A, limits #5): the savings chip listed with
@@ -2135,16 +3606,14 @@ mod source_guards {
         const SCOPE: &[&str] = &["src/api/admin", "src/usage_scanner.rs"];
         const ALLOWED: &[(&str, &str)] = &[];
         let mut offenders = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            if !SCOPE.iter().any(|s| file.starts_with(s)) || ALLOWED.iter().any(|(f, _)| *f == file)
+        for src in crate::source_scan::ast::src() {
+            if !SCOPE.iter().any(|s| src.rel.starts_with(s))
+                || ALLOWED.iter().any(|(f, _)| *f == src.rel)
             {
                 continue;
             }
-            let prod = crate::source_scan::prod_text(&text);
-            for (line, last) in list_objects_last_args(&prod) {
-                if last != "false" {
-                    offenders.push(format!("{file} (production line {line}): {last}"));
-                }
+            for (line, why) in list_objects_with_metadata(&src.prod) {
+                offenders.push(format!("{}:{line}: {why}", src.rel));
             }
         }
         assert!(
@@ -2164,39 +3633,50 @@ mod source_guards {
     ) -> (std::collections::BTreeSet<String>, Vec<String>) {
         let mut files = std::collections::BTreeSet::new();
         let mut offenders = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
-            if file.starts_with("src/deltaglider/engine/") {
+        for src in crate::source_scan::ast::src() {
+            if src.rel.starts_with("src/deltaglider/engine/") {
                 continue;
             }
-            let lines = crate::source_scan::prod_lines(&text);
-            for (i, (n, line)) in lines.iter().enumerate() {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                for call in [".delete(", ".delete_if("] {
-                    let Some(at) = line.find(call) else {
-                        continue;
-                    };
-                    let receiver = if line[..at].trim().is_empty() {
-                        lines[i.saturating_sub(3)..i]
-                            .iter()
-                            .map(|(_, l)| *l)
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    } else {
-                        line[..at].to_string()
-                    };
-                    if !receiver.contains("engine") {
-                        continue;
-                    }
-                    files.insert(file.clone());
-                    if !allowed.contains(&file.as_str()) {
-                        offenders.push(format!("{file}:{n}: {}", line.trim()));
-                    }
+            for line in engine_key_deletes(&src.prod) {
+                files.insert(src.rel.clone());
+                if !allowed.contains(&src.rel.as_str()) {
+                    offenders.push(format!("{}:{line}", src.rel));
                 }
             }
         }
         (files, offenders)
+    }
+
+    /// Lines of the `.delete(..)` / `.delete_if(..)` calls in `f` whose
+    /// receiver chain names an engine (any field, variable or method with
+    /// `engine` in its name), wherever the chain is broken over lines. The
+    /// old scan looked at the receiver text on the line, or on the three
+    /// lines above when the call started its line.
+    fn engine_key_deletes(f: &crate::source_scan::ast::Facts) -> Vec<usize> {
+        f.calls
+            .iter()
+            .filter(|c| c.method && matches!(c.name.as_str(), "delete" | "delete_if"))
+            .filter(|c| c.receiver_idents.iter().any(|i| i.contains("engine")))
+            .map(|c| c.line)
+            .collect()
+    }
+
+    #[test]
+    fn the_engine_delete_guard_sees_a_long_receiver_chain() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| engine_key_deletes(&parse("f.rs", t).prod).len();
+        assert_eq!(n("fn f() { engine.delete(b, k).await; }"), 1);
+        assert_eq!(
+            n("fn f() { state.engine.load().delete_if(b, k, c).await; }"),
+            1
+        );
+        // The engine is named 6 lines above the call: the 3-line look-back missed it.
+        let far = format!(
+            "fn f() {{ state\n    .engine{}\n    .delete(b, k); }}",
+            "\n    .load()".repeat(6)
+        );
+        assert_eq!(n(&far), 1, "far receiver");
+        assert_eq!(n("fn f() { map.delete(k); cache.delete_if(k, c); }"), 0);
     }
 
     /// More than one key goes through `DeltaGliderEngine::delete_batch`: it
@@ -2249,30 +3729,82 @@ mod source_guards {
     #[test]
     fn replication_runs_check_the_backend_health_gate() {
         let mut offenders = Vec::new();
-        for (file, text) in crate::source_scan::prod_sources("src") {
+        for src in crate::source_scan::ast::src() {
             // The definition and its gated twin.
-            if file == "src/replication/worker.rs" {
+            if src.rel == "src/replication/worker.rs" {
                 continue;
             }
-            let in_replication = file.starts_with("src/replication/");
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                let code = line.trim_start();
-                if code.starts_with("//") {
-                    continue;
-                }
-                let ungated = code.contains("replication::run_rule(")
-                    || (in_replication
-                        && code.contains("run_rule(")
-                        && !code.contains("fn run_rule("));
-                if ungated {
-                    offenders.push(format!("{file}:{n}: {code}"));
-                }
+            for n in ungated_replication_runs(src) {
+                offenders.push(format!("{}:{n}", src.rel));
             }
         }
         assert!(
             offenders.is_empty(),
             "start a replication run with run_rule_gated and a RunHealthGate:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// Lines where `src` names `replication::run_rule` (any path that ends
+    /// in `replication::run_rule`, a `use` or an alias included), or, inside
+    /// `src/replication/`, a bare `run_rule`. The old scan wanted the text
+    /// `replication::run_rule(` on one line (or `run_rule(` in the module),
+    /// so `use crate::replication::run_rule as go; go(..)` passed.
+    fn ungated_replication_runs(src: &crate::source_scan::ast::Source) -> Vec<usize> {
+        let in_replication = src.rel.starts_with("src/replication/");
+        let mut out: Vec<usize> = src
+            .prod
+            .paths
+            .iter()
+            .filter(|p| {
+                let n = p.segs.len();
+                p.segs.last().is_some_and(|s| s == "run_rule")
+                    && ((n >= 2 && p.segs[n - 2] == "replication") || (in_replication && p.expr))
+            })
+            .map(|p| p.line)
+            .collect();
+        out.extend(
+            src.prod
+                .calls_named("run_rule")
+                .filter(|c| c.method)
+                .map(|c| c.line),
+        );
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn the_replication_gate_guard_sees_an_import_and_an_alias() {
+        use crate::source_scan::ast::parse;
+        let n = |rel: &str, t: &str| ungated_replication_runs(&parse(rel, t)).len();
+        assert_eq!(
+            n(
+                "src/api/x.rs",
+                "fn f() { crate::replication::run_rule(a); }"
+            ),
+            1
+        );
+        assert_eq!(
+            n(
+                "src/api/x.rs",
+                "fn f() { crate::replication::run_rule_gated(a, g); }"
+            ),
+            0
+        );
+        assert_eq!(
+            n(
+                "src/api/x.rs",
+                "use crate::replication::run_rule as go;\nfn f() { go(a); }"
+            ),
+            1,
+            "alias"
+        );
+        assert_eq!(n("src/replication/y.rs", "fn f() { run_rule(a); }"), 1);
+        assert_eq!(
+            n("src/api/x.rs", "fn f() { run_rule(a); }"),
+            0,
+            "another run_rule"
         );
     }
 
@@ -2293,22 +3825,14 @@ mod source_guards {
     #[test]
     fn if_match_headers_go_through_one_helper() {
         const HELPER: &str = "src/coordination/if_match.rs";
-        let src = rust_files("src");
-        let test_files = out_of_line_test_modules(&src);
-        let needles = [
-            [".if_", "match("].concat(),
-            [".copy_source_if_", "match("].concat(),
-        ];
         let mut offenders = Vec::new();
-        for file in src {
-            let rel = rel_path(&file);
-            if rel == HELPER || test_files.contains(&file) {
+        for src in crate::source_scan::ast::src() {
+            if src.rel == HELPER {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap();
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                if needles.iter().any(|needle| line.contains(needle.as_str())) {
-                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
+            for name in ["if_match", "copy_source_if_match"] {
+                for c in src.prod.calls_named(name).filter(|c| c.method) {
+                    offenders.push(format!("{}:{}: .{name}(..)", src.rel, c.line));
                 }
             }
         }
@@ -2321,28 +3845,10 @@ mod source_guards {
 
     #[test]
     fn no_content_responses_carry_no_body() {
-        let src = rust_files("src");
-        let test_files = out_of_line_test_modules(&src);
-        let needle = ["NO_CONTENT", ", Json("].concat();
         let mut offenders = Vec::new();
-        for file in src {
-            if test_files.contains(&file) {
-                continue;
-            }
-            let text = std::fs::read_to_string(&file).unwrap();
-            let tests: std::collections::BTreeSet<usize> = test_module_lines(&text)
-                .into_iter()
-                .map(|(n, _)| n)
-                .collect();
-            let code: String = text
-                .lines()
-                .enumerate()
-                .filter(|(i, l)| !tests.contains(&(i + 1)) && !l.trim_start().starts_with("//"))
-                .map(|(_, l)| l.trim())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if code.contains(needle.as_str()) {
-                offenders.push(rel_path(&file));
+        for src in crate::source_scan::ast::src() {
+            for n in no_content_with_body(&src.prod) {
+                offenders.push(format!("{}:{n}", src.rel));
             }
         }
         assert!(
@@ -2351,70 +3857,137 @@ mod source_guards {
         );
     }
 
+    /// Lines of the tuple responses `(StatusCode::NO_CONTENT, .., Json(..))`
+    /// in `f`: a `NO_CONTENT` status with a `Json` body, whatever sits
+    /// between them and however the tuple is laid out. The old scan joined
+    /// the file's code lines and looked for the text `NO_CONTENT, Json(`.
+    fn no_content_with_body(f: &crate::source_scan::ast::Facts) -> Vec<usize> {
+        f.tuples
+            .iter()
+            .filter(|t| {
+                t.elems.iter().any(|e| e == "NO_CONTENT") && t.elems.iter().any(|e| e == "Json")
+            })
+            .map(|t| t.line)
+            .collect()
+    }
+
+    #[test]
+    fn the_no_content_guard_sees_a_header_between_status_and_body() {
+        use crate::source_scan::ast::parse;
+        let n = |t: &str| no_content_with_body(&parse("f.rs", t).prod).len();
+        assert_eq!(
+            n("fn f() { (StatusCode::NO_CONTENT, Json(x)).into_response(); }"),
+            1
+        );
+        assert_eq!(
+            n("fn f() { (StatusCode::NO_CONTENT, headers, Json(x)); }"),
+            1,
+            "a header between"
+        );
+        assert_eq!(
+            n("fn f() { (StatusCode::NO_CONTENT,\n    Json(\n x)); }"),
+            1,
+            "split"
+        );
+        assert_eq!(
+            n("fn f() { StatusCode::NO_CONTENT.into_response(); (StatusCode::OK, Json(x)); }"),
+            0
+        );
+    }
+
+    /// The request path is everything under these roots, so a NEW file there
+    /// is guarded by default (the old guard listed the request-path files by
+    /// hand, and a new one escaped).
+    fn in_request_path(rel: &str) -> bool {
+        const ROOTS: &[&str] = &[
+            "src/s3_adapter_s3s/",
+            "src/api/",
+            "src/deltaglider/",
+            "src/maintenance/",
+        ];
+        ROOTS.iter().any(|r| rel.starts_with(r))
+    }
+
+    #[test]
+    fn a_new_request_path_file_is_in_scope_of_the_env_guard() {
+        use crate::source_scan::ast::parse;
+        assert!(in_request_path("src/api/handlers/brand_new.rs"));
+        assert!(in_request_path("src/deltaglider/engine/brand_new.rs"));
+        assert!(!in_request_path("src/cli/cp.rs"));
+        let read = "fn f() { crate::config::env_parse_with_default(\"X\", 1); }";
+        assert_eq!(
+            env_reads(&parse("src/api/handlers/brand_new.rs", read).prod, true).len(),
+            1
+        );
+    }
+
     #[test]
     fn request_path_reads_no_env() {
-        const REQUEST_PATH: &[&str] = &[
-            "src/s3_adapter_s3s",
-            "src/api/handlers",
-            "src/api/auth.rs",
-            "src/api/s3_router.rs",
-            "src/api/s3s_hooks.rs",
-            "src/api/admin/csrf.rs",
-            "src/api/admin/savings.rs",
-            "src/api/admin/config/field_level.rs",
-            "src/api/admin/config/password.rs",
-            "src/deltaglider/engine",
-            "src/deltaglider/ingest.rs",
-            "src/deltaglider/codec.rs",
-            "src/maintenance/worker.rs",
+        // A file of the request path that reads the environment on purpose
+        // (it runs at boot, at config apply or at engine build, never per
+        // request) is named here with its reason.
+        const BOOT_TIME: &[(&str, &str)] = &[
+            (
+                "src/api/admin/auth.rs",
+                "DGP_METRICS_BEARER_TOKEN, read once into a OnceLock",
+            ),
+            (
+                "src/api/admin/backup.rs",
+                "a restore resolves its ${env:NAME} refs (an admin operation)",
+            ),
+            (
+                "src/api/admin/config/mod.rs",
+                "a config apply re-applies the env overrides (an admin operation)",
+            ),
+            (
+                "src/api/admin/config/transition.rs",
+                "a config apply checks DGP_CONFIG_DB_KEY (an admin operation)",
+            ),
+            (
+                "src/deltaglider/engine/construction.rs",
+                "engine BUILD: warns once that a key is not from env",
+            ),
+            (
+                "src/deltaglider/memory_budget.rs",
+                "MemoryBudget::from_env runs once, where the process builds its AppState",
+            ),
+            (
+                "src/deltaglider/spool.rs",
+                "SpoolDir::from_env runs once, in startup::claim_environment",
+            ),
         ];
-        // Engine BUILD, not a request: warns once that a key is not from env.
-        const ALLOWED: &[&str] = &["src/deltaglider/engine/construction.rs"];
-        let needles = [
-            ["env::", "var"].concat(),
-            ["env_", "bool("].concat(),
-            ["env_", "parse"].concat(),
-            ["lookup_", "parse("].concat(),
-            ["config::", "process_env"].concat(),
-        ];
-        let files: Vec<_> = REQUEST_PATH
-            .iter()
-            .flat_map(|p| {
-                if p.ends_with(".rs") {
-                    vec![root().join(p)]
-                } else {
-                    rust_files(p)
-                }
-            })
-            .collect();
-        assert!(files.len() > REQUEST_PATH.len(), "scan found the files");
-        let test_files = out_of_line_test_modules(&rust_files("src"));
         let mut offenders = Vec::new();
-        for file in files {
-            let rel = rel_path(&file);
-            if test_files.contains(&file) || ALLOWED.contains(&rel.as_str()) {
+        let mut allowed_hits = std::collections::BTreeSet::new();
+        let mut scanned = 0;
+        for src in crate::source_scan::ast::src() {
+            if !in_request_path(&src.rel) {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).unwrap();
-            let tests: std::collections::BTreeSet<usize> = test_module_lines(&text)
-                .into_iter()
-                .map(|(n, _)| n)
-                .collect();
-            for (i, line) in text.lines().enumerate() {
-                if tests.contains(&(i + 1)) || line.trim_start().starts_with("//") {
-                    continue;
-                }
-                if needles.iter().any(|x| line.contains(x.as_str())) {
-                    offenders.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+            scanned += 1;
+            for (n, what) in env_reads(&src.prod, true) {
+                if BOOT_TIME.iter().any(|(f, _)| *f == src.rel) {
+                    allowed_hits.insert(src.rel.clone());
+                } else {
+                    offenders.push(format!("{}:{n}: {what}", src.rel));
                 }
             }
         }
+        assert!(
+            scanned > 40,
+            "scan found the request-path files ({scanned})"
+        );
         assert!(
             offenders.is_empty(),
             "the request path reads the environment; add the setting to \
              config::RuntimeTuning (or parse it where its owner is built):\n{}",
             offenders.join("\n")
         );
+        for (f, why) in BOOT_TIME {
+            assert!(
+                allowed_hits.contains(*f),
+                "{f} ({why}) no longer reads env: drop it from BOOT_TIME"
+            );
+        }
     }
 
     /// A stored body (a spool file, relay parts, a ciphertext temp file)

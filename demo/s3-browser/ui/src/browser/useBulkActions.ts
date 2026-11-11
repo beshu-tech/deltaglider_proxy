@@ -2,17 +2,25 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { message } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
-import { getBucket } from '../s3client';
+import { getBucket, listDirectKeys } from '../s3client';
 import { bulkCopyObjects, startDeleteJob, bulkMoveObjects, bulkZipDownloadUrl, listAllUnderPrefix } from '../adminApi';
 import { isSessionExpired } from '../errorHandling';
 import { type ExpandedItem, MAX_BULK_OBJECTS, expandSelection } from '../bulkSelection';
+import { type RowKey, splitRowKeys } from '../rowKey';
 import { type BulkAction, type BulkProgress, BulkActionFailed } from '../bulkBatches';
 import type { DeleteJobOutcome, DeletePlanSummary } from '../bulkDelete';
-import { type BulkTransferOutcome, transferInBatches, transferPlanError } from '../bulkTransfer';
+import {
+  type BulkTransferOutcome,
+  type TransferBatchResult,
+  mergeBatchResults,
+  transferInBatches,
+  transferPlanError,
+} from '../bulkTransfer';
+import { type ConflictResolver, findConflicts, overwriteSources } from '../bulkConflicts';
 import { downloadZip as saveZip, zipPreflightError } from '../zipDownload';
 
 interface BulkOptions {
-  selectedKeys: Set<string>;
+  selectedKeys: Set<RowKey>;
   clearSelection: () => void;
   /** Reload the listing only (after each batch of a move). */
   refresh: () => void;
@@ -68,6 +76,19 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
           sent: (done: number, went: number) => void,
           progress: (done: number, went: number) => void,
         ) => Promise<O>;
+        /**
+         * Asked after the listing, before the first request: look at the
+         * destination and settle what to send. The items to send, or `null`
+         * to end the run with nothing done. `ctl` shows the phase in the bar.
+         */
+        prepare?: (
+          items: ExpandedItem[],
+          ctl: {
+            signal: AbortSignal;
+            checking: (checked: number, total: number) => void;
+            confirming: (total: number) => void;
+          },
+        ) => Promise<ExpandedItem[] | null>;
         /** The outcome of a run cancelled while it listed (or declined at the confirmation). */
         cancelledWhileListing: () => O;
         /** Asked after the listing, before the first request: `false` ends the run with nothing done. */
@@ -85,10 +106,19 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
       let went = 0;
       setBulkProgress({ action, phase: 'listing', listed: 0, folders: 0, keysFound: 0, stopping: false });
       try {
-        const items = await run.expand({
+        let items = await run.expand({
           signal: ctl.signal,
           onProgress: (p) => setBulkProgress({ action, phase: 'listing', ...p, stopping: stopping() }),
         });
+        if (run.prepare) {
+          const prepared = await run.prepare(items, {
+            signal: ctl.signal,
+            checking: (checked, n) => setBulkProgress({ action, phase: 'checking', checked, total: n, stopping: stopping() }),
+            confirming: (n) => setBulkProgress({ action, phase: 'confirming', total: n, stopping: false }),
+          });
+          if (prepared === null) return run.cancelledWhileListing();
+          items = prepared;
+        }
         if (run.confirm) {
           setBulkProgress({ action, phase: 'confirming', total: items.length, stopping: false });
           if (!(await run.confirm(items))) return run.cancelledWhileListing();
@@ -143,11 +173,7 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
     (confirm?: (plan: DeletePlanSummary) => Promise<boolean>): Promise<DeleteJobOutcome> => {
       // Snapshot the bucket: a bucket switch mid-run must not move the delete.
       const bucket = getBucket();
-      const selection = [...selectedKeys];
-      const prefixes = [
-        ...new Set(selection.filter((k) => k.startsWith('folder:') && k !== 'folder:').map((k) => k.slice('folder:'.length))),
-      ];
-      const keys = selection.filter((k) => !k.startsWith('folder:'));
+      const { prefixes, keys } = splitRowKeys(selectedKeys);
       return runBulk<DeleteJobOutcome>('delete', {
         expand: (opts) => expandSelected(bucket, opts),
         confirm:
@@ -180,13 +206,33 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
    * the first batch: the server sees one batch at a time. For a move, the
    * server removes a batch's sources only when every copy of that batch
    * succeeded.
+   *
+   * Nothing is written over an existing object unasked (F17), and the
+   * SERVER keeps that promise: every item that the user did not allow to
+   * replace an object goes with `no_overwrite`, which the server judges
+   * under the destination's write lock (so an object that appears after the
+   * check, or one this user cannot list, is never replaced). After the
+   * listing, the destination folders are listed once each as a preview, and
+   * when an existing destination turns up `onConflicts` decides: skip (those
+   * items go conditionally and the server leaves them; a move then keeps
+   * their sources), overwrite (only those items go unconditionally), or
+   * cancel. With no `onConflicts` an existing destination cancels the run.
+   * A destination folder that cannot be listed does not fail the run: its
+   * items go conditionally too, and the result says how many were skipped.
    */
   const bulkTransfer = useCallback(
-    (action: 'copy' | 'move', destBucket: string, destPrefix: string): Promise<BulkTransferOutcome> => {
+    (
+      action: 'copy' | 'move',
+      destBucket: string,
+      destPrefix: string,
+      onConflicts?: ConflictResolver,
+    ): Promise<BulkTransferOutcome> => {
       // Snapshot the source bucket ONCE so the listing and the requests run
       // against the same bucket even if the user switches buckets mid-run.
       const sourceBucket = getBucket();
       const request = action === 'copy' ? bulkCopyObjects : bulkMoveObjects;
+      // The sources the user allowed to replace an existing object.
+      let replace = new Set<string>();
       return runBulk<BulkTransferOutcome>(action, {
         expand: async (opts) => {
           // The folder's own marker key (empty suffix) is not copied.
@@ -197,17 +243,42 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
           if (problem) throw new Error(problem);
           return items;
         },
-        send: (items, signal, sent) =>
+        prepare: async (items, { signal, checking, confirming }) => {
+          const { conflicts } = await findConflicts(
+            items,
+            sourceBucket === destBucket,
+            destPrefix,
+            (folder, after) => listDirectKeys(destBucket, folder, after),
+            { signal, onProgress: (p) => checking(p.checked, p.total) },
+          );
+          if (conflicts.length === 0) return items;
+          confirming(items.length);
+          const choice = onConflicts
+            ? await onConflicts({ action, destBucket, total: items.length, conflicts })
+            : 'cancel';
+          if (choice === 'cancel') return null;
+          replace = overwriteSources(conflicts, choice);
+          return items;
+        },
+        send: async (items, signal, sent) =>
           transferInBatches(
             action,
             items,
-            (batch) =>
-              request({
+            async (batch) => {
+              const body = (part: typeof batch, noOverwrite: boolean) => ({
                 source_bucket: sourceBucket,
                 dest_bucket: destBucket,
                 dest_prefix: destPrefix,
-                items: batch.map(({ source, relative }) => ({ source_key: source, relative })),
-              }),
+                items: part.map(({ source, relative }) => ({ source_key: source, relative })),
+                no_overwrite: noOverwrite,
+              });
+              const mayReplace = batch.filter((i) => replace.has(i.source));
+              const mayNot = batch.filter((i) => !replace.has(i.source));
+              const answers: TransferBatchResult[] = [];
+              if (mayNot.length > 0) answers.push(await request(body(mayNot, true)));
+              if (mayReplace.length > 0) answers.push(await request(body(mayReplace, false)));
+              return mergeBatchResults(answers);
+            },
             { signal, onBatch: (p) => sent(p.done, p.went) },
           ),
         cancelledWhileListing: () => ({
@@ -226,11 +297,13 @@ export function useBulkActions({ selectedKeys, clearSelection, refresh, mutate }
     [runBulk, expandSelected],
   );
   const bulkCopy = useCallback(
-    (destBucket: string, destPrefix: string) => bulkTransfer('copy', destBucket, destPrefix),
+    (destBucket: string, destPrefix: string, onConflicts?: ConflictResolver) =>
+      bulkTransfer('copy', destBucket, destPrefix, onConflicts),
     [bulkTransfer],
   );
   const bulkMove = useCallback(
-    (destBucket: string, destPrefix: string) => bulkTransfer('move', destBucket, destPrefix),
+    (destBucket: string, destPrefix: string, onConflicts?: ConflictResolver) =>
+      bulkTransfer('move', destBucket, destPrefix, onConflicts),
     [bulkTransfer],
   );
 

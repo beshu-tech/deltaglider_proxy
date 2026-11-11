@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'vitest';
-import { buildPreviewDocument, isHtmlKey, previewCsp, sandboxFlags } from '../components/htmlPreviewRules';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { buildPreviewDocument, isHtmlKey, isolationNote, previewCsp, sandboxFlags } from '../components/htmlPreviewRules';
 
 const ALL = [
   { scripts: false, remote: false },
@@ -22,7 +24,7 @@ describe('sandbox', () => {
 });
 
 describe('csp', () => {
-  test.each(ALL)('the page can never send a request or submit a form (%o)', (opts) => {
+  test.each(ALL)('fetch, XHR, WebSocket and form posts are blocked (%o)', (opts) => {
     const csp = previewCsp(opts);
     expect(csp).toContain("default-src 'none'");
     expect(csp).toContain("connect-src 'none'");
@@ -79,4 +81,39 @@ test.each([
   ['page.html.gz', false],
 ])('isHtmlKey(%s) = %s', (key, want) => {
   expect(isHtmlKey(key)).toBe(want);
+});
+
+/**
+ * F48 (epic #146): with scripts on, `location.href = …` makes the browser
+ * request that address (checked in Chromium: the request reaches the server
+ * with this sandbox and CSP in place). The words must not say otherwise.
+ */
+describe('what the preview says about its limits', () => {
+  test('with scripts on it admits that the page can send a request', () => {
+    const note = isolationNote({ scripts: true, remote: false });
+    expect(note).toMatch(/can still send a request/);
+    expect(note).not.toMatch(/cannot send requests/);
+  });
+  test('with scripts off it claims only what holds', () => {
+    expect(isolationNote({ scripts: false, remote: false })).toMatch(/cannot send requests by itself/);
+  });
+  test('with remote content on it does not claim the page cannot send requests', () => {
+    // previewCsp lets img/media/font/style load from https: each load is a request.
+    for (const scripts of [false, true]) {
+      const note = isolationNote({ scripts, remote: true });
+      expect(note).toMatch(/loads images, fonts and styles from other https sites, which sends requests/);
+      expect(note).not.toMatch(/cannot send requests/);
+    }
+    expect(previewCsp({ scripts: false, remote: true })).toMatch(/img-src [^;]*https:/);
+  });
+  test('it always says the page cannot read the session or credentials', () => {
+    for (const opts of ALL) expect(isolationNote(opts)).toMatch(/cannot read your session or credentials/);
+  });
+  test('no component says, without a condition, that the page cannot send requests', () => {
+    const dir = join(__dirname, '..', 'components');
+    for (const name of readdirSync(dir).filter((n) => /\.tsx?$/.test(n))) {
+      const text = readFileSync(join(dir, name), 'utf8');
+      expect(text, name).not.toMatch(/cannot send requests(?! by itself)/);
+    }
+  });
 });

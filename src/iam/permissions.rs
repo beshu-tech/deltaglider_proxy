@@ -959,6 +959,21 @@ fn deny_can_hide_keys_under(perm: &Permission, bucket: &str, prefix: &str) -> bo
         })
 }
 
+/// Pure: may a Deny statement of `user` hide some key of `bucket` under
+/// `prefix`? When it may, the NAME `prefix` cannot be judged alone: a folded
+/// listing name (`sec` for `secret/k` at delimiter `c`) is a prefix of the
+/// protected key, and shows it unless a visible key lies under the name.
+/// Conditions are not evaluated (a Deny that MAY fire counts).
+pub fn deny_may_hide_keys_under(
+    user: &super::AuthenticatedUser,
+    bucket: &str,
+    prefix: &str,
+) -> bool {
+    user.permissions()
+        .iter()
+        .any(|p| deny_can_hide_keys_under(p, bucket, prefix))
+}
+
 fn can_list_prefix_with_context(
     user: &super::AuthenticatedUser,
     bucket: &str,

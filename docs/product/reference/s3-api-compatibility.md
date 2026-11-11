@@ -73,6 +73,7 @@ When the proxy stores an object as it is, instead of as a delta, it records the 
 | `compression-disabled` | Compression is switched off for the bucket. |
 | `no-delta-requested` | The request carried the `dg-no-delta` hint. |
 | `over-max-object-size` | The object is larger than `max_object_size`, the largest size for which the proxy tries a delta. |
+| `delta-name-too-long` | The file name of the key, with `.delta` added, is longer than the 255 bytes that a backend allows for a name, so the proxy did not try a delta. |
 | `multipart-over-delta-cap` | The object came from a multipart upload that is larger than `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`, so the proxy did not try a delta. |
 | `delta-ratio-over-limit` | The proxy computed a delta, but the delta was not smaller than `max_delta_ratio` allows. |
 | `delta-unavailable` | The proxy had no spool space to try a delta at that moment, because other requests used it. A later upload of the same content can still become a delta. |
@@ -121,7 +122,7 @@ The S3 backend stores keys as S3 keys, so there both objects can exist.
 | `CompleteMultipartUpload` | ✅ Full | Delta or passthrough chosen by size/eligibility; multipart ETag preserved; quota enforced. An upload that is stored as a plain object is stored from its relay files, without joining them. A completion of an upload that is already complete, with another part list, gets `404 NoSuchUpload`, as on S3. A retry that joins a completion in flight gets the same answer as the first request. |
 | `AbortMultipartUpload` | ✅ Full | Cancels the upload and reclaims state. |
 | `ListParts` | ✅ Full | `part-number-marker` continuation; `max-parts` 1 to 1000. A negative `max-parts` or `part-number-marker` gets `400 InvalidArgument`, as on S3. |
-| `ListMultipartUploads` | ✅ Full | `key-marker` + `upload-id-marker` continuation; prefix / delimiter. A negative `max-uploads` gets `400 InvalidArgument`, as on S3. |
+| `ListMultipartUploads` | ✅ Full | `key-marker` + `upload-id-marker` continuation; prefix / delimiter. A negative `max-uploads` gets `400 InvalidArgument`, as on S3, and `max-uploads=0` lists no upload and answers `<MaxUploads>0</MaxUploads>`. |
 
 ## Bucket operations
 
@@ -158,6 +159,7 @@ The proxy stores its own files next to your objects, so a few object keys are re
 | A file name of `reference.bin`, in any prefix (for example `docs/reference.bin`) | Refuses the request. A prefix segment named `reference.bin/` is allowed. | The proxy stores the delta baseline of each prefix under this file name. |
 | A file name that ends in `.delta` (for example `backups/db.sql.delta`) | Refuses the request. | The proxy stores delta-encoded objects under this suffix. |
 | A key under `.dg/facts/` at the root of the bucket | Refuses a write. | The S3 backend keeps its listing facts under this prefix. |
+| A key that has a directory named `.dg` at any depth (for example `.dg/notes.txt` or `releases/.dg/x`), or a file name of `.dg` | Refuses a write. A read or a delete of such a key that an earlier release stored works, but no listing shows it. | The proxy keeps its own files in directories with this name and never lists them. A key there would be stored but invisible, and it would stop DeleteBucket on a bucket that looks empty. |
 | A key that starts with `/` (for example `/leading.txt`) | Removes the leading slashes, so the object is stored and listed as `leading.txt`. | The proxy derives the storage path from the key. S3 stores the slash as part of the key. |
 | A key that contains an empty segment (`a//b`) | Refuses a write. A read or a delete of such a key works, so that an object that was stored before this rule can be removed. | An empty segment is almost always a path-join error in the client. |
 | A key that contains a `..` segment, or a file name of `.` or `..` | Refuses the request. | These segments would leave the object's prefix on a filesystem backend. |

@@ -24,10 +24,29 @@ use std::sync::{Arc, Mutex};
 const CLIENT_ID: &str = "dgp-test-client";
 const CLIENT_SECRET: &str = "dgp-test-client-secret-value";
 
+/// How the IdP rotates its signing key.
+#[derive(Clone, Copy, PartialEq)]
+enum Rotation {
+    /// One key, `k1`, for ever.
+    None,
+    /// The first token is signed with a new key `k2`; the JWKS lists `k2`
+    /// (and not `k1`) from then on: a routine rotation.
+    Published,
+    /// The first token is signed with `k2`, which no JWKS ever lists.
+    Unpublished,
+}
+
 struct Idp {
     issuer: String,
     signing_pem: String,
     jwk: Value,
+    rotation: Rotation,
+    rotated_pem: String,
+    rotated_jwk: Value,
+    /// Tokens issued so far.
+    token_calls: std::sync::atomic::AtomicUsize,
+    /// JWKS requests after the first token was issued.
+    jwks_after_token: std::sync::atomic::AtomicUsize,
     /// Authorization code → nonce.
     codes: Mutex<HashMap<String, String>>,
     /// How long the discovery document takes to answer.
@@ -46,7 +65,17 @@ async fn discovery(State(idp): State<Arc<Idp>>) -> Json<Value> {
 }
 
 async fn jwks(State(idp): State<Arc<Idp>>) -> Json<Value> {
-    Json(json!({ "keys": [idp.jwk] }))
+    use std::sync::atomic::Ordering::SeqCst;
+    let after_token = idp.token_calls.load(SeqCst) > 0;
+    if after_token {
+        idp.jwks_after_token.fetch_add(1, SeqCst);
+    }
+    let key = if after_token && idp.rotation == Rotation::Published {
+        &idp.rotated_jwk
+    } else {
+        &idp.jwk
+    };
+    Json(json!({ "keys": [key] }))
 }
 
 /// Approves at once: redirects back with a code bound to the nonce.
@@ -86,10 +115,16 @@ async fn token(
         "iat": now, "exp": now + 300, "nonce": nonce,
         "email": "alice@acme.example", "email_verified": true, "name": "Alice",
     });
+    let (kid, pem) = match idp.rotation {
+        Rotation::None => ("k1", &idp.signing_pem),
+        _ => ("k2", &idp.rotated_pem),
+    };
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    header.kid = Some("k1".into());
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(idp.signing_pem.as_bytes()).unwrap();
+    header.kid = Some(kid.into());
+    let key = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
     let id_token = jsonwebtoken::encode(&header, &claims, &key).unwrap();
+    idp.token_calls
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Json(json!({ "access_token": "at", "token_type": "Bearer", "id_token": id_token }))
         .into_response()
 }
@@ -101,6 +136,14 @@ async fn start_idp() -> (String, String) {
 }
 
 async fn start_idp_with_delay(discovery_delay: std::time::Duration) -> (String, String) {
+    let (issuer, ca_pem, _) = start_idp_inner(discovery_delay, Rotation::None).await;
+    (issuer, ca_pem)
+}
+
+async fn start_idp_inner(
+    discovery_delay: std::time::Duration,
+    rotation: Rotation,
+) -> (String, String, Arc<Idp>) {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -123,16 +166,24 @@ async fn start_idp_with_delay(discovery_delay: std::time::Duration) -> (String, 
     );
 
     let signing = rcgen::KeyPair::generate().unwrap(); // P-256
-    let raw = signing.public_key_raw(); // 0x04 || X || Y
-    let jwk = json!({
-        "kty": "EC", "crv": "P-256", "kid": "k1", "alg": "ES256", "use": "sig",
-        "x": URL_SAFE_NO_PAD.encode(&raw[1..33]),
-        "y": URL_SAFE_NO_PAD.encode(&raw[33..65]),
-    });
+    let rotated = rcgen::KeyPair::generate().unwrap();
+    let jwk_of = |key: &rcgen::KeyPair, kid: &str| {
+        let raw = key.public_key_raw(); // 0x04 || X || Y
+        json!({
+            "kty": "EC", "crv": "P-256", "kid": kid, "alg": "ES256", "use": "sig",
+            "x": URL_SAFE_NO_PAD.encode(&raw[1..33]),
+            "y": URL_SAFE_NO_PAD.encode(&raw[33..65]),
+        })
+    };
     let idp = Arc::new(Idp {
         issuer: issuer.clone(),
         signing_pem: signing.serialize_pem(),
-        jwk,
+        jwk: jwk_of(&signing, "k1"),
+        rotation,
+        rotated_pem: rotated.serialize_pem(),
+        rotated_jwk: jwk_of(&rotated, "k2"),
+        token_calls: Default::default(),
+        jwks_after_token: Default::default(),
         codes: Mutex::new(HashMap::new()),
         discovery_delay,
     });
@@ -141,7 +192,7 @@ async fn start_idp_with_delay(discovery_delay: std::time::Duration) -> (String, 
         .route("/jwks", get(jwks))
         .route("/authorize", get(authorize))
         .route("/token", post(token))
-        .with_state(idp);
+        .with_state(idp.clone());
     let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
         leaf.pem().into_bytes(),
         leaf_key.serialize_pem().into_bytes(),
@@ -154,7 +205,13 @@ async fn start_idp_with_delay(discovery_delay: std::time::Duration) -> (String, 
             .await
             .unwrap();
     });
-    (issuer, ca.pem())
+    (issuer, ca.pem(), idp)
+}
+
+/// A `Set-Cookie` that sets the session cookie, under either of its names
+/// (`__Host-dgp_session` where it is `Secure`, `dgp_session` on plain HTTP).
+fn is_session_cookie(set_cookie: &str) -> bool {
+    set_cookie.starts_with("dgp_session=") || set_cookie.starts_with("__Host-dgp_session=")
 }
 
 /// The browser flow: authorize → IdP → callback. Returns the callback's
@@ -360,7 +417,7 @@ async fn oidc_login_against_a_private_idp_with_a_private_ca() {
     assert!(
         !cookies
             .iter()
-            .any(|c| c.starts_with("dgp_session=") && !c.starts_with("dgp_session=;")),
+            .any(|c| is_session_cookie(c) && !c.contains("_session=;")),
         "a refused login got a session: {cookies:?}"
     );
     let users = admin
@@ -397,7 +454,7 @@ async fn oidc_login_against_a_private_idp_with_a_private_ca() {
     assert!(
         cookies
             .iter()
-            .any(|c| c.starts_with("dgp_session=") && !c.starts_with("dgp_session=;")),
+            .any(|c| is_session_cookie(c) && !c.contains("_session=;")),
         "no session cookie: {cookies:?}"
     );
     let session: Value = browser
@@ -522,13 +579,14 @@ async fn oauth_authorize_does_not_reset_the_brute_force_counter() {
     );
 }
 
-/// B041/B090/B092: a client that disconnects drops the handler future. A
-/// mutating admin request must still run to its end. The provider set is
-/// rebuilt before the slow discovery, so a dropped request lost the steps
-/// after it: the version bump that this test waits for, and the push to the
-/// other nodes.
+/// B041/B090/B092, now by design: a provider edit publishes the provider set
+/// and starts discovery in the background, so a slow identity provider (2 s
+/// here) does not hold the admin request. The request answers at once, so
+/// there is no dropped request to lose the steps after the rebuild: the
+/// version bump comes with the answer, and a login start works once the
+/// background discovery is done.
 #[tokio::test]
-async fn a_dropped_admin_request_still_completes_its_mutation() {
+async fn a_slow_identity_provider_does_not_hold_the_provider_edit() {
     let (issuer, ca_pem) = start_idp_with_delay(std::time::Duration::from_secs(2)).await;
     let dir = tempfile::tempdir().unwrap();
     let ca_path = dir.path().join("idp-ca.pem");
@@ -537,9 +595,10 @@ async fn a_dropped_admin_request_still_completes_its_mutation() {
     let ep = server.endpoint();
     let admin = admin_http_client(&ep).await;
     let before = crate::common::get_ext_auth_version(&admin, &ep).await;
-    let impatient = admin
+    let started = std::time::Instant::now();
+    let created = admin
         .post(format!("{ep}/_/api/admin/ext-auth/providers"))
-        .timeout(std::time::Duration::from_millis(500))
+        .timeout(std::time::Duration::from_secs(10))
         .json(&json!({
             "name": "corp", "provider_type": "oidc", "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET, "issuer_url": issuer,
@@ -547,17 +606,117 @@ async fn a_dropped_admin_request_still_completes_its_mutation() {
             "extra_config": { "allow_local": true, "ca_cert_path": ca_path.display().to_string() },
         }))
         .send()
-        .await;
-    assert!(impatient.is_err(), "the client was meant to give up first");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        .await
+        .expect("the edit answers");
+    assert_eq!(created.status(), 201);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "the edit waited for discovery: {:?}",
+        started.elapsed()
+    );
+    assert!(crate::common::get_ext_auth_version(&admin, &ep).await > before);
+    // The background discovery ends: the login start redirects to the IdP.
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        if crate::common::get_ext_auth_version(&admin, &ep).await > before {
+        let r = anon
+            .get(format!("{ep}/_/api/admin/oauth/authorize/corp"))
+            .send()
+            .await
+            .unwrap();
+        if r.status() == 307 {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the dropped request never finished its mutation (provider set not rebuilt)"
+            "the login start never worked: {}",
+            r.status()
         );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
+}
+
+/// Signs in through an IdP with `rotation`. Returns the callback's status,
+/// whether it set a session, and the IdP (for its counters).
+async fn login_through_rotating_idp(rotation: Rotation) -> (u16, bool, Arc<Idp>) {
+    let (issuer, ca_pem, idp) = start_idp_inner(std::time::Duration::ZERO, rotation).await;
+    let dir = tempfile::tempdir().unwrap();
+    let ca_path = dir.path().join("idp-ca.pem");
+    std::fs::write(&ca_path, &ca_pem).unwrap();
+    let server = TestServer::builder().build().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let r = admin
+        .post(format!("{ep}/_/api/admin/ext-auth/providers"))
+        .json(&json!({
+            "name": "corp", "provider_type": "oidc", "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET, "issuer_url": issuer,
+            "scopes": "openid email profile",
+            "extra_config": { "allow_local": true, "ca_cert_path": ca_path.display().to_string() },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let r = admin
+        .post(format!("{ep}/_/api/admin/groups"))
+        .json(&json!({ "name": "Engineering", "permissions": [] }))
+        .send()
+        .await
+        .unwrap();
+    let gid = r.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let r = admin
+        .post(format!("{ep}/_/api/admin/ext-auth/mappings"))
+        .json(&json!({ "match_type": "email_domain", "match_value": "acme.example", "group_id": gid }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let browser = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let (status, cookies, _) = oauth_login(&browser, &ep, &issuer).await;
+    let session = cookies
+        .iter()
+        .any(|c| c.starts_with("dgp_session=") && !c.starts_with("dgp_session=;"));
+    (status, session, idp)
+}
+
+/// The IdP rotated its key after the proxy cached the JWKS: the first ID
+/// token carries a `kid` that the cached JWKS lacks (`UnknownSigningKey`).
+/// The proxy fetches the JWKS once more and the login succeeds. Without
+/// the one retry a rotation blocks every login for the discovery-cache
+/// window (1 h).
+#[tokio::test]
+async fn a_key_rotation_at_the_idp_costs_one_jwks_refresh_not_the_login() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (status, session, idp) = login_through_rotating_idp(Rotation::Published).await;
+    assert_eq!(status, 302, "the login must survive the rotation");
+    assert!(session, "no session after the rotation");
+    assert_eq!(
+        idp.jwks_after_token.load(SeqCst),
+        1,
+        "one JWKS refresh after the unknown kid"
+    );
+}
+
+/// A `kid` that the refreshed JWKS does not list either is refused after
+/// that ONE refresh: no loop, no session.
+#[tokio::test]
+async fn an_unlisted_signing_key_is_refused_after_exactly_one_jwks_refresh() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (status, session, idp) = login_through_rotating_idp(Rotation::Unpublished).await;
+    assert!(!session, "a token signed by an unlisted key got a session");
+    assert_ne!(status, 302, "the login was accepted");
+    assert_eq!(
+        idp.jwks_after_token.load(SeqCst),
+        1,
+        "exactly one JWKS refresh"
+    );
 }

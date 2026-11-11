@@ -32,7 +32,7 @@ pub use encrypting::{
 };
 #[cfg(test)]
 pub(crate) use filesystem::fault::{fail_io, Fault, FaultPoint, Faults, FaultyFs, Hook};
-pub use filesystem::FilesystemBackend;
+pub use filesystem::{sweep_stale_temp_files, FilesystemBackend, STALE_TEMP_MAX_AGE};
 pub use routing::RoutingBackend;
 #[cfg(test)]
 pub(crate) use s3::backend_request_samples;

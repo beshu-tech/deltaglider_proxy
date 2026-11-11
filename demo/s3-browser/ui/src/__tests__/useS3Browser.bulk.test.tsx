@@ -27,6 +27,8 @@ vi.mock('../s3client', () => ({
   setBucket: () => {},
   headObject: async () => ({ storageType: 'passthrough', storedSize: 1 }),
   listBuckets: async () => [{ name: 'releases' }],
+  // The destination is empty.
+  listDirectKeys: async () => ({ keys: [], truncated: false }),
   listObjects: async () => {
     listing.loads++;
     return { objects: listing.objects, folders: listing.folders, isTruncated: false };
@@ -35,6 +37,7 @@ vi.mock('../s3client', () => ({
 
 import useS3Browser from '../useS3Browser';
 import BulkActionBar from '../components/BulkActionBar';
+import { folderRowKey, objectRowKey } from '../rowKey';
 
 const COPY = '/_/api/admin/objects/copy';
 const MOVE = '/_/api/admin/objects/move';
@@ -65,34 +68,32 @@ async function mountBrowser() {
 }
 
 function selectFileAndFolder(result: { current: ReturnType<typeof useS3Browser> }) {
-  act(() => result.current.toggleKey('builds/app-1.0.zip'));
-  act(() => result.current.toggleKey('folder:builds/nightly/'));
+  act(() => result.current.toggleKey(objectRowKey('builds/app-1.0.zip')));
+  act(() => result.current.toggleKey(folderRowKey('builds/nightly/')));
   expect(result.current.selectedKeys.size).toBe(2);
 }
 
 describe('selection', () => {
   test('toggleKey toggles; toggleAll selects every visible row, then none', async () => {
     const { result } = await mountBrowser();
-    act(() => result.current.toggleKey('builds/app-1.0.zip'));
-    act(() => result.current.toggleKey('builds/app-1.0.zip'));
+    act(() => result.current.toggleKey(objectRowKey('builds/app-1.0.zip')));
+    act(() => result.current.toggleKey(objectRowKey('builds/app-1.0.zip')));
     expect(result.current.selectedKeys.size).toBe(0);
     act(() => result.current.toggleAll());
-    expect([...result.current.selectedKeys].sort()).toEqual([
-      'builds/app-1.0.zip',
-      'builds/app-1.1.zip',
-      'folder:builds/nightly/',
-    ]);
+    expect([...result.current.selectedKeys].sort()).toEqual(
+      [objectRowKey('builds/app-1.0.zip'), objectRowKey('builds/app-1.1.zip'), folderRowKey('builds/nightly/')].sort(),
+    );
     act(() => result.current.toggleAll());
     expect(result.current.selectedKeys.size).toBe(0);
   });
 
   test('a refresh drops selected keys that no longer exist', async () => {
     const { result } = await mountBrowser();
-    act(() => result.current.toggleKey('builds/app-1.0.zip'));
-    act(() => result.current.toggleKey('builds/app-1.1.zip'));
+    act(() => result.current.toggleKey(objectRowKey('builds/app-1.0.zip')));
+    act(() => result.current.toggleKey(objectRowKey('builds/app-1.1.zip')));
     listing.objects = listing.objects.filter((o) => o.key !== 'builds/app-1.0.zip');
     act(() => result.current.mutate());
-    await waitFor(() => expect([...result.current.selectedKeys]).toEqual(['builds/app-1.1.zip']));
+    await waitFor(() => expect([...result.current.selectedKeys]).toEqual([objectRowKey('builds/app-1.1.zip')]));
   });
 });
 
@@ -121,6 +122,8 @@ describe.each([
       source_bucket: 'releases',
       dest_bucket: 'archive',
       dest_prefix: 'old/',
+      // Nothing was confirmed as replaceable: the server must not overwrite.
+      no_overwrite: true,
       items: [
         { source_key: 'builds/app-1.0.zip', relative: 'app-1.0.zip' },
         // The folder keeps its own name under the destination.
@@ -195,7 +198,7 @@ describe('bulkDelete', () => {
     });
     http.on('POST', DELETE_JOB, json({ job_id: 9 }, 202));
     const { result } = await mountBrowser();
-    act(() => result.current.toggleKey('folder:builds/nightly/'));
+    act(() => result.current.toggleKey(folderRowKey('builds/nightly/')));
     const confirm = vi.fn(async () => true);
     const outcome = await act(() => result.current.bulkDelete(confirm));
     expect(confirm).toHaveBeenCalledWith({ objects: 10_001, folders: 1, files: 0 });
@@ -236,7 +239,7 @@ describe('bulkDelete', () => {
       const s3 = useS3Browser({ bucket: 'releases', prefix: 'builds/', q: '', object: '', navigateUrl: () => {} });
       return (
         <>
-          <button onClick={() => s3.toggleKey('folder:builds/nightly/')}>pick</button>
+          <button onClick={() => s3.toggleKey(folderRowKey('builds/nightly/'))}>pick</button>
           {(s3.selectedKeys.size > 0 || s3.bulkRunning) && (
             <BulkActionBar
               selectedCount={s3.selectedKeys.size}

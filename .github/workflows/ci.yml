@@ -9,9 +9,11 @@ on:
 
 # On main every commit keeps its own run: release.yml refuses a tag whose
 # commit has no successful CI run, and a newer push used to cancel it.
-# Other refs still cancel their older runs.
+# Other refs still cancel their older runs. The event name is part of the
+# group: a manual dispatch on a commit that a push already runs must not
+# cancel the push run (release.yml looks for the push run of the tagged SHA).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -133,6 +135,12 @@ jobs:
           fi
       - name: Memory-derived cargo parallelism truth table
         run: ./scripts/test-cargo-jobs.sh
+      # Must-fail fixtures: each shell guard refuses a known-bad input.
+      - name: Shell-guard self-tests
+        run: ./scripts/test-guards.sh
+      # A Playwright spec that skips on a variable nobody sets never runs.
+      - name: Every e2e spec can run
+        run: ./scripts/check-e2e-specs-run.sh
 
   verify-spdx-headers:
     name: SPDX license headers
@@ -321,6 +329,7 @@ jobs:
               iam_identity_test::
               iam_mode_test::
               iam_persona_test::
+              list_edges_test::
               list_truncation_test::
               mismatch_boot_test::
               parity_test::
@@ -366,6 +375,7 @@ jobs:
               replication_test::
               storage_resilience_test::
               unmanaged_objects_test::
+              write_validation_wiring_test::
           - group: 3
             filters: >-
               admin_bulk_objects_test::
@@ -373,6 +383,7 @@ jobs:
               atomic_writes_gate_test::
               backend_capability_gate_test::
               backend_health_test::
+              boot_resilience_test::
               browser_session_connect_test::
               bucket_existence_test::
               bucket_usage_test::
@@ -452,6 +463,70 @@ jobs:
         run: |
           mc rm --recursive --force local/deltaglider-test/ 2>/dev/null || true
           mc rm --recursive --force local/deltaglider-data/ 2>/dev/null || true
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio-ci 2>/dev/null || true
+
+  # The fault tests below inject their fault with mode bits (an unreadable file,
+  # a read-only directory). Root ignores mode bits, and the jobs above run as
+  # root, so there they only print "SKIPPED AS ROOT". This job runs them as a
+  # non-root user with DGP_TEST_REQUIRE_NONROOT=1: `root_skip()` then fails
+  # instead of skipping. Guard `test_every_root_skip_runs_in_the_nonroot_ci_job`
+  # keeps this list in step with the tests.
+  test-nonroot:
+    name: Fault tests as non-root
+    runs-on: ubuntu-latest
+    needs: build-ui
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      options: --ulimit nofile=1048576:1048576
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          shared-key: test
+          save-if: false
+          cache-bin: "false"
+      - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
+        with:
+          name: ui-dist
+          path: demo/s3-browser/ui/dist
+      - name: Start MinIO for tests
+        run: |
+          docker run -d --name minio-ci --network container:$(hostname) \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            -e MINIO_KMS_SECRET_KEY=dgp-test-key:mbmnuALQu7bPqu79OjbARJ3l6zlJ/wQE2tGSfmdqA/k= \
+            pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46 server /data
+          for i in $(seq 1 30); do
+            mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null && break
+            sleep 1
+          done
+          mc mb --ignore-existing local/deltaglider-test
+          mc mb --ignore-existing local/deltaglider-data
+          echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
+          echo "DGP_TEST_REQUIRE_MINIO=1" >> $GITHUB_ENV
+      - name: Run the mode-bit fault tests as a non-root user
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          useradd --create-home --uid 1001 nonroot
+          chown -R nonroot "$GITHUB_WORKSPACE" /usr/local/cargo /usr/local/rustup
+          setpriv --reuid=nonroot --regid=nonroot --init-groups \
+            env HOME=/home/nonroot DGP_TEST_REQUIRE_NONROOT=1 sh -ec '
+              test "$(id -u)" != 0
+              cargo test --locked --lib -- \
+                a_read_only_dir_is_not_writable \
+                a_failed_strict_rollback_keeps_config_and_engine_in_step
+              cargo test --locked --test all -- \
+                sync_delete_keeps_remote_copies_of_unreadable_local_files \
+                rule_delete_that_cannot_persist_changes_nothing \
+                test_read_only_config_file_is_reported \
+                a_failed_rewrite_keeps_the_window'
       - name: Stop MinIO
         if: always()
         run: docker rm -f minio-ci 2>/dev/null || true

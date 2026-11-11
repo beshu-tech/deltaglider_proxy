@@ -228,6 +228,12 @@ pub struct BackendHealthCache {
     /// The last live `/_/ready` backend probe and when it ended. Behind an
     /// async mutex: concurrent probes wait for the one that runs.
     ready_probe: tokio::sync::Mutex<Option<(std::time::Instant, &'static str)>>,
+    /// The last `/_/ready` spool check and when it ended (same single flight
+    /// as `ready_probe`).
+    spool_probe: tokio::sync::Mutex<Option<(std::time::Instant, bool)>>,
+    /// A spool check runs on the blocking pool now (it may outlive its
+    /// timeout on a stalled filesystem; no second one starts meanwhile).
+    spool_check_running: Arc<std::sync::atomic::AtomicBool>,
     /// Fires when a backend's verdict turns healthy from unhealthy: the
     /// atomicity watch probes a backend that it could not verify again at
     /// once (`coordination::atomicity::spawn_watch`).
@@ -497,6 +503,40 @@ impl BackendHealthCache {
         let verdict = probe.await;
         *last = Some((std::time::Instant::now(), verdict));
         verdict
+    }
+
+    /// The `/_/ready` spool check. The check does disk I/O (a temp file in
+    /// the spool directory), so on a stalled filesystem it can hang for ever.
+    /// Therefore: one single flight whose verdict serves every probe for
+    /// [`READY_PROBE_TTL`] (an anonymous flood runs it once, not once per
+    /// request); a bound of `limit` on the wait (timeout = unusable); and no
+    /// second blocking call while a timed-out one still runs (each would pin
+    /// a blocking-pool thread).
+    pub async fn spool_probe(
+        &self,
+        check: impl FnOnce() -> bool + Send + 'static,
+        limit: std::time::Duration,
+    ) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut last = self.spool_probe.lock().await;
+        if let Some((at, usable)) = *last {
+            if at.elapsed() < READY_PROBE_TTL {
+                return usable;
+            }
+        }
+        let usable = if self.spool_check_running.swap(true, SeqCst) {
+            false
+        } else {
+            let running = Arc::clone(&self.spool_check_running);
+            let task = tokio::task::spawn_blocking(move || {
+                let usable = check();
+                running.store(false, SeqCst);
+                usable
+            });
+            matches!(tokio::time::timeout(limit, task).await, Ok(Ok(true)))
+        };
+        *last = Some((std::time::Instant::now(), usable));
+        usable
     }
 
     /// Drop entries for backends no longer in the config (post-apply hygiene).
@@ -1690,5 +1730,84 @@ mod probe_label_tests {
             .send()
             .await;
         assert!(samples("health") > health);
+    }
+}
+
+#[cfg(test)]
+mod spool_probe_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
+
+    /// N concurrent `/_/ready` requests run the blocking spool check once;
+    /// the verdict then serves the TTL.
+    #[tokio::test]
+    async fn concurrent_ready_requests_run_the_spool_check_once() {
+        let cache = Arc::new(BackendHealthCache::default());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let calls = (0..32).map(|_| {
+            let cache = cache.clone();
+            let runs = runs.clone();
+            tokio::spawn(async move {
+                cache
+                    .spool_probe(
+                        move || {
+                            runs.fetch_add(1, SeqCst);
+                            std::thread::sleep(Duration::from_millis(150));
+                            true
+                        },
+                        Duration::from_secs(5),
+                    )
+                    .await
+            })
+        });
+        for answer in futures::future::join_all(calls).await {
+            assert!(answer.unwrap());
+        }
+        assert_eq!(runs.load(SeqCst), 1);
+    }
+
+    /// A check that never returns (a stalled filesystem) is unusable after
+    /// the limit, and no second blocking call starts while it hangs.
+    #[tokio::test]
+    async fn a_hung_spool_check_is_unusable_and_pins_one_thread() {
+        let cache = BackendHealthCache::default();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started) = std::sync::mpsc::channel::<()>();
+        let counter = runs.clone();
+        let usable = cache
+            .spool_probe(
+                move || {
+                    counter.fetch_add(1, SeqCst);
+                    let _ = started_tx.send(());
+                    let _ = hold.recv();
+                    true
+                },
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(!usable, "timeout means unusable");
+        // On a loaded host the blocking pool may start the check after the
+        // limit passed. Wait for the start: the second call must meet a
+        // check that is running, not one that is still queued.
+        started
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the blocking check starts");
+        // Past the TTL: the verdict is stale, the first check still hangs.
+        *cache.spool_probe.lock().await = None;
+        let counter = runs.clone();
+        let usable = cache
+            .spool_probe(
+                move || {
+                    counter.fetch_add(1, SeqCst);
+                    true
+                },
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(!usable);
+        assert_eq!(runs.load(SeqCst), 1, "no second blocking call");
+        drop(release);
     }
 }

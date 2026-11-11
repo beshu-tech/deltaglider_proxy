@@ -1,12 +1,12 @@
 ---
-import Glyph from '../components/Glyph.astro';
-// /regulated — v5 plan §4.3.
+// /encryption (was /regulated) — v5 plan §4.3.
 // Encryption + key custody story for regulated buyers (banks,
 // gov, research). Beshu customer-segment block above the fold,
 // full testimonials, technical sections, 4-week evaluation
 // framework. Dropped consultancy CTA per v5; routes to the
 // Commercial plan instead.
 
+import KeyCustody from '../components/drawings/KeyCustody.astro';
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
 import TestimonialsBlock from '../components/TestimonialsBlock.astro';
@@ -14,18 +14,18 @@ import CustomerSegmentBlock from '../components/CustomerSegmentBlock.astro';
 import { webPageSchema, breadcrumbListSchema } from '../lib/seo';
 
 const title =
-  'DeltaGlider for regulated buyers: encrypt before the backend on cheap S3-compatible storage';
+  'Encrypt objects before they reach the bucket — DeltaGlider';
 const description =
   'DeltaGlider encrypts objects with AES-256-GCM before they reach the bucket. Your key stays in your runtime, so the backend sees only ciphertext. Built by Beshu Tech, the team behind ReadonlyREST, used since 2017 by CERN, EU institutions, and 2× of the S&P 500 top 5.';
 ---
 
 <BaseLayout title={title} description={description}>
   <Fragment slot="json-ld">
-    <JsonLd schema={webPageSchema({ path: '/regulated', title, description })} />
+    <JsonLd schema={webPageSchema({ path: '/encryption', title, description })} />
     <JsonLd
       schema={breadcrumbListSchema([
         { name: 'DeltaGlider', path: '/' },
-        { name: 'For regulated buyers', path: '/regulated' },
+        { name: 'Encryption', path: '/encryption' },
       ])}
     />
   </Fragment>
@@ -51,31 +51,8 @@ const description =
         </p>
       </div>
 
-      <div class="enc-visual" aria-hidden="true">
-        <div class="enc-pane enc-pane--yours">
-          <span class="enc-tag">Your runtime</span>
-          <div class="enc-file">
-            <Glyph name="file" bare size={20} />
-            acme-db-20260611.dump · 2.1 GB
-          </div>
-          <div class="enc-keyrow">
-            <span class="enc-key-chip"><Glyph name="key" bare size={18} /> AES-256 key</span>
-            <span class="enc-key-note">lives here and is never uploaded.</span>
-          </div>
-        </div>
-
-        <div class="enc-arrow">
-          <span class="enc-arrow-label">encrypt, then upload</span>
-          <span class="enc-arrow-line"></span>
-        </div>
-
-        <div class="enc-pane enc-pane--theirs">
-          <span class="enc-tag enc-tag--theirs">What the provider stores</span>
-          <pre class="enc-cipher">9f 2e 41 c7 88 0a d3 5b 6c e1 74 92 fb 08 1d a6
-33 c9 5e 07 b4 8f 2a d1 66 0b 9c e8 45 71 af 12
-de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
-          <span class="enc-cipher-note">ciphertext only, on Hetzner, AWS, or any backend with atomic writes</span>
-        </div>
+      <div class="enc-draw">
+        <KeyCustody />
       </div>
     </div>
   </section>
@@ -217,7 +194,7 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
           >
             Email sales@beshu.tech
           </a>
-          <a href="/trial" class="btn">Start with the 30-day trial</a>
+          <a href="/support" class="btn">Start with the 30-day trial</a>
         </div>
       </section>
     </div>
@@ -246,124 +223,11 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
   }
   @media (max-width: 599px) {
     .reg-hero-grid { gap: 2rem; }
-    .enc-pane { padding: 1.25rem; }
-    .enc-file { font-size: 0.95rem; }
   }
 
   .reg-hero-copy h1 {
     max-width: 22ch;
     font-size: clamp(2.2rem, 3.6vw, 3.3rem);
-  }
-
-  .enc-visual {
-    display: flex;
-    flex-direction: column;
-    gap: 1.1rem;
-  }
-
-  .enc-pane {
-    border-radius: 16px;
-    padding: 1.8rem 2rem;
-    border: 1px solid var(--rule-strong);
-    background: var(--bg-card);
-    box-shadow: var(--shadow-md);
-  }
-
-  .enc-pane--yours {
-    border-color: var(--brand-glow);
-    box-shadow: none;
-  }
-
-  .enc-tag {
-    display: block;
-    font-size: var(--fs-label);
-    font-weight: 700;
-    color: var(--brand-dark);
-    margin-bottom: 1rem;
-  }
-  .enc-tag--theirs { color: var(--ink-faint); }
-
-  .enc-file {
-    display: flex;
-    align-items: center;
-    gap: 0.7rem;
-    font-family: var(--font-mono);
-    font-size: 1.05rem;
-    color: var(--ink-strong);
-    padding: 0.85rem 1rem;
-    border: 1px solid var(--rule);
-    border-radius: 10px;
-    background: var(--surface-tint);
-    margin-bottom: 0.9rem;
-    white-space: nowrap;
-    overflow: hidden;
-  }
-
-  .enc-keyrow {
-    display: flex;
-    align-items: center;
-    gap: 0.7rem;
-    flex-wrap: wrap;
-  }
-  .enc-key-chip {
-    font-family: var(--font-mono);
-    font-size: 0.95rem;
-    font-weight: 700;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    color: var(--brand);
-    padding: 0.45rem 0.8rem;
-    border: 1px solid var(--brand-line);
-    border-radius: var(--r-pill);
-    background: var(--brand-tint);
-  }
-  .enc-key-note { color: var(--ink-soft); font-size: 0.95rem; }
-
-  .enc-arrow {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    padding: 0 0.5rem;
-  }
-  .enc-arrow-label {
-    font-family: var(--font-mono);
-    font-size: 0.9rem;
-    color: var(--brand-dark);
-    white-space: nowrap;
-  }
-  .enc-arrow-line {
-    flex: 1;
-    height: 2px;
-    background: var(--ink-faint);
-    position: relative;
-  }
-  .enc-arrow-line::after {
-    content: '';
-    position: absolute;
-    right: -1px;
-    top: 50%;
-    transform: translateY(-50%);
-    border-left: 8px solid var(--rule-strong);
-    border-top: 5px solid transparent;
-    border-bottom: 5px solid transparent;
-  }
-
-  .enc-cipher {
-    margin: 0 0 0.8rem;
-    padding: 1rem 1.1rem;
-    font-size: 0.98rem;
-    line-height: 1.8;
-    color: var(--panel-dark-ink-dim);
-    background: var(--panel-dark-bg);
-    border: 1px solid var(--rule);
-    border-radius: 10px;
-    box-shadow: none;
-    overflow: hidden;
-  }
-  .enc-cipher-note {
-    font-size: 0.95rem;
-    color: var(--ink-soft);
   }
 
   .content-layout {

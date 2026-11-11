@@ -1461,6 +1461,10 @@ fn rekey_file_hooked(
             path.display()
         )));
     }
+    // A WAL file (the jobs DB) keeps committed pages in `<path>-wal` until a
+    // checkpoint: a copy of the main file alone would miss them. Move them
+    // into the main file and empty the WAL BEFORE the copy.
+    checkpoint_wal(path, old)?;
     let result = (|| -> Result<(), ConfigDbError> {
         std::fs::copy(path, &tmp).map_err(ConfigDbError::Io)?;
         {
@@ -1468,6 +1472,12 @@ fn rekey_file_hooked(
             conn.pragma_update(None, "key", old)?;
             conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
                 r.get::<_, i32>(0)
+            })?;
+            // The copy is rekeyed on the rollback journal: it leaves no
+            // `-wal` of its own beside it, and the next open of the live
+            // file sets WAL again.
+            conn.pragma_update_and_check(None, "journal_mode", "DELETE", |r| {
+                r.get::<_, String>(0)
             })?;
             conn.pragma_update(None, "rekey", new)?;
         }
@@ -1481,6 +1491,14 @@ fn rekey_file_hooked(
             .and_then(|f| f.sync_all())
             .map_err(ConfigDbError::Io)?;
         std::fs::rename(&tmp, path).map_err(ConfigDbError::Io)?;
+        // The old file's WAL and shared-memory index (empty after the
+        // checkpoint) do not belong to the new file: SQLite would replay
+        // frames of another file into it.
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.file_name().unwrap_or_default().to_os_string();
+            name.push(suffix);
+            let _ = std::fs::remove_file(path.with_file_name(name));
+        }
         if let Some(dir) = path.parent() {
             // Make the rename durable; best effort (not every FS allows it).
             let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
@@ -1491,6 +1509,28 @@ fn rekey_file_hooked(
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Move every committed page of a WAL file into the main file and empty the
+/// `-wal` (`wal_checkpoint(TRUNCATE)`). A no-op for a file in the rollback
+/// journal. A checkpoint that cannot finish (a reader holds the WAL: `busy`)
+/// is an error: the caller must not copy a main file that lacks pages.
+fn checkpoint_wal(path: &Path, key: &str) -> Result<(), ConfigDbError> {
+    let conn = crate::sqlite_open::open(path)?;
+    conn.pragma_update(None, "key", key)?;
+    conn.pragma_update(None, "busy_timeout", "5000")?;
+    let (busy, _log, _moved): (i64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+    if busy != 0 {
+        return Err(ConfigDbError::Other(format!(
+            "Cannot re-encrypt {}: its write-ahead log is in use and could not be \
+             checkpointed",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1854,7 +1894,9 @@ mod tests {
             .create_user("user1", "AKOLD001", "old-secret", true, &[])
             .unwrap();
 
-        let rotated = db.rotate_keys(user.id, "AKNEW001", "new-secret").unwrap();
+        let rotated = db
+            .update_user_with_keys(user.id, None, None, None, Some(("AKNEW001", "new-secret")))
+            .unwrap();
 
         assert_eq!(rotated.access_key_id, "AKNEW001");
         assert_eq!(rotated.secret_access_key, "new-secret");

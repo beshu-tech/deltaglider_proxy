@@ -336,11 +336,10 @@ const FORBIDDEN_SUFFIXES: &[&str] = &[".internal", ".local", ".localdomain"];
 const DEV_ALLOWED: &[&str] = &["localhost", "ip6-localhost", "ip6-loopback"];
 
 pub(crate) fn ip_is_acceptable(ip: IpAddr, kind: UrlKind) -> bool {
-    // Cloud instance-metadata services are NEVER acceptable, even in
-    // BackendDev mode — pointing the S3 backend at IMDS is the cloud-
-    // takeover pivot we're explicitly blocking, and it's never a
-    // legitimate dev use case.
-    if ip_is_metadata_service(ip) {
+    // Cloud credential targets are NEVER acceptable, even in BackendDev
+    // mode — pointing the S3 backend at IMDS is the cloud-takeover pivot
+    // we're explicitly blocking, and it's never a legitimate dev use case.
+    if ip_is_credential_target(ip) {
         return false;
     }
     let private = match ip {
@@ -354,18 +353,39 @@ pub(crate) fn ip_is_acceptable(ip: IpAddr, kind: UrlKind) -> bool {
     matches!(kind, UrlKind::BackendDev)
 }
 
-/// AWS IMDS over IPv6 (Nitro instances).
-const AWS_IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+/// AWS IMDS over IPv6 (Nitro instances) and the EKS Pod Identity agent over
+/// IPv6.
+const METADATA_V6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+    Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0023),
+];
+
+/// Cloud instance-metadata and container-credential endpoints (IPv4):
+/// AWS IMDS, Azure IMDS and the GCP metadata server (all 169.254.169.254),
+/// the ECS task-role endpoint (169.254.170.2) and the EKS Pod Identity agent
+/// (169.254.170.23).
+const METADATA_V4: [[u8; 4]; 3] = [
+    [169, 254, 169, 254],
+    [169, 254, 170, 2],
+    [169, 254, 170, 23],
+];
 
 fn ip_is_metadata_service(ip: IpAddr) -> bool {
     match ip {
-        // AWS IMDSv1/IMDSv2, Azure IMDS, GCP metadata server (all same v4).
-        IpAddr::V4(v4) => v4.octets() == [169, 254, 169, 254],
+        IpAddr::V4(v4) => METADATA_V4.contains(&v4.octets()),
         IpAddr::V6(v6) => {
-            v6 == AWS_IMDS_V6
-                || embedded_ipv4(v6).is_some_and(|m| m.octets() == [169, 254, 169, 254])
+            METADATA_V6.contains(&v6)
+                || embedded_ipv4(v6).is_some_and(|m| METADATA_V4.contains(&m.octets()))
         }
     }
+}
+
+/// An address that hands out cloud credentials or that no storage server
+/// lives on: every metadata endpoint and all link-local space (169.254.0.0/16,
+/// fe80::/10), with their IPv4-embedded IPv6 forms. Refused in EVERY policy:
+/// `allow_local` opens loopback, never these.
+fn ip_is_credential_target(ip: IpAddr) -> bool {
+    ip_is_metadata_service(ip) || ip_is_link_local(ip)
 }
 
 /// The IPv4 address an IPv6 address carries, for every transition form
@@ -469,6 +489,29 @@ impl SsrfGuardedResolver {
     }
 }
 
+/// THE builder of an outbound HTTP client that an operator-supplied URL can
+/// reach (webhook, Slack, OIDC discovery and token requests). Three guards:
+/// the [`SsrfGuardedResolver`] (a name that resolves to a refused address
+/// fails at connect time), no redirects (a redirect could bounce a request
+/// that passed [`validate_outbound_url`] onto a private or metadata address),
+/// and no system proxy (`HTTP(S)_PROXY`, `ALL_PROXY`): with a proxy, only the
+/// proxy host is resolved here, the proxy resolves the target, and the
+/// connect-time address check never runs. A source guard
+/// (`outbound_http_clients_come_from_the_one_guarded_builder`) refuses any
+/// other client builder.
+pub fn guarded_reqwest_builder(kind: UrlKind) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver::new(kind)))
+}
+
+/// [`guarded_reqwest_builder`], built. A build error is an error: there is no
+/// fallback to a client without the guards.
+pub fn guarded_reqwest_client(kind: UrlKind) -> Result<reqwest::Client, reqwest::Error> {
+    guarded_reqwest_builder(kind).build()
+}
+
 impl reqwest::dns::Resolve for SsrfGuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let kind = self.kind;
@@ -506,15 +549,30 @@ pub(crate) fn sdk_resolver_guards_name(endpoint_host: &str, name: &str) -> bool 
 ///
 /// Backend endpoints are admin-configured, and on-prem MinIO/Ceph behind
 /// internal DNS (`https://minio.corp` → 10.0.0.5) is a normal deployment. So
-/// a resolved name may point at private space; only the cloud-credential
-/// targets are refused: link-local (169.254.0.0/16 incl. IMDS, fe80::/10),
-/// AWS IPv6 IMDS, and their IPv4-embedded IPv6 forms. `BackendDev` refuses
-/// metadata only. Other kinds keep the full [`ip_is_acceptable`] policy.
+/// a resolved name may point at private space (RFC 1918, unique-local,
+/// CGNAT). Refused are the targets that are never remote storage: the
+/// cloud-credential targets (link-local 169.254.0.0/16 incl. IMDS, the ECS
+/// and EKS credential endpoints, fe80::/10, the AWS IPv6 endpoints), and this host itself (loopback, the unspecified address).
+/// A name such as `localtest.me` (A 127.0.0.1) is the literal `127.0.0.1`
+/// by another spelling, which the text check refuses. All with their
+/// IPv4-embedded IPv6 forms. `BackendDev` (`allow_local`) refuses the
+/// credential targets too ([`ip_is_credential_target`]) and opens loopback
+/// only. Other kinds keep the full [`ip_is_acceptable`] policy.
 pub(crate) fn resolved_backend_ip_refused(ip: IpAddr, kind: UrlKind) -> bool {
     match kind {
-        UrlKind::Backend => ip_is_metadata_service(ip) || ip_is_link_local(ip),
-        UrlKind::BackendDev => ip_is_metadata_service(ip),
+        UrlKind::Backend => ip_is_credential_target(ip) || ip_is_this_host(ip),
+        UrlKind::BackendDev => ip_is_credential_target(ip),
         UrlKind::Oidc | UrlKind::Webhook => !ip_is_acceptable(ip, kind),
+    }
+}
+
+/// Loopback or unspecified (`0.0.0.0/8`, `::`), including the IPv4-embedded
+/// IPv6 forms: the address reaches a service on the proxy's own host.
+fn ip_is_this_host(ip: IpAddr) -> bool {
+    let v4 = |a: Ipv4Addr| a.is_loopback() || a.is_unspecified() || a.octets()[0] == 0;
+    match ip {
+        IpAddr::V4(a) => v4(a),
+        IpAddr::V6(a) => a.is_loopback() || a.is_unspecified() || embedded_ipv4(a).is_some_and(v4),
     }
 }
 
@@ -531,10 +589,16 @@ fn ip_is_link_local(ip: IpAddr) -> bool {
 fn refused_resolution_message(host: &str, refused: &[IpAddr], kind: UrlKind) -> String {
     let addrs: Vec<String> = refused.iter().map(IpAddr::to_string).collect();
     let fix = match kind {
-        UrlKind::Backend | UrlKind::BackendDev => {
-            "Cloud-metadata and link-local addresses are never allowed for an S3 endpoint; \
-             `allow_local: true` does NOT permit them. Point the endpoint's DNS at the \
-             storage server's real address."
+        UrlKind::Backend => {
+            "Cloud-metadata, link-local and loopback addresses are not allowed for an S3 \
+             endpoint. `allow_local: true` (DGP_BACKEND_ALLOW_LOCAL=true) permits loopback \
+             for dev and CI, and never metadata or link-local addresses. Point the \
+             endpoint's DNS at the storage server's real address."
+        }
+        UrlKind::BackendDev => {
+            "Cloud-metadata and link-local addresses are never allowed for an S3 endpoint, \
+             even with `allow_local: true`. Point the endpoint's DNS at the storage \
+             server's real address."
         }
         UrlKind::Oidc | UrlKind::Webhook => {
             "Private, loopback and metadata addresses are not allowed for this URL."
@@ -594,6 +658,56 @@ impl aws_smithy_runtime_api::client::dns::ResolveDns for SdkSsrfGuardedResolver 
             }
             Ok(safe)
         })
+    }
+}
+
+/// Query parameters whose value authenticates a request (SigV4 and SigV2
+/// presigned URLs). Compared without case.
+const SECRET_QUERY_PARAMS: [&str; 6] = [
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "signature",
+    "awsaccesskeyid",
+    "x-amz-content-sha256",
+];
+
+/// Pure: is `raw_name` (a query parameter name as it came on the wire) a
+/// credential-bearing one? The SigV4 path decodes names before it uses them,
+/// so `X-Amz-%53ignature` authenticates: compare the decoded name, lossy.
+fn is_secret_query_param(raw_name: &str) -> bool {
+    let name =
+        String::from_utf8_lossy(&urlencoding::decode_binary(raw_name.as_bytes())).into_owned();
+    SECRET_QUERY_PARAMS
+        .iter()
+        .any(|s| name.eq_ignore_ascii_case(s))
+}
+
+/// Pure: `uri` (a request target, `path?query`, or a bare query) with the
+/// value of every credential-bearing query parameter replaced by `REDACTED`.
+/// THE form of a URI in a log line or a span: a presigned URL carries a
+/// bearer capability in its query for as long as it is valid.
+pub fn redact_uri_for_log(uri: &str) -> String {
+    let Some((path, rest)) = uri.split_once('?') else {
+        return uri.to_string();
+    };
+    let (query, fragment) = match rest.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (rest, None),
+    };
+    let query = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _)) if is_secret_query_param(name) => {
+                format!("{name}=REDACTED")
+            }
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    match fragment {
+        Some(f) => format!("{path}?{query}#{f}"),
+        None => format!("{path}?{query}"),
     }
 }
 
@@ -963,18 +1077,29 @@ mod tests {
         // (address, refused for Backend, refused for BackendDev)
         for (a, backend, dev) in [
             ("169.254.169.254", true, true),
-            ("169.254.10.20", true, false),
-            ("fe80::1", true, false),
+            ("169.254.170.2", true, true),
+            ("169.254.170.23", true, true),
+            ("169.254.10.20", true, true),
+            ("fe80::1", true, true),
+            ("fe80::a:b", true, true),
             ("fd00:ec2::254", true, true),
+            ("fd00:ec2::23", true, true),
+            ("::ffff:169.254.170.2", true, true),
+            ("64:ff9b::a9fe:aa17", true, true),
             ("64:ff9b::a9fe:a9fe", true, true),
             ("2002:a9fe:a9fe::", true, true),
             ("::a9fe:a9fe", true, true),
             ("::ffff:169.254.169.254", true, true),
-            ("64:ff9b::a9fe:0101", true, false),
+            ("64:ff9b::a9fe:0101", true, true),
             ("10.0.0.5", false, false),
             ("172.16.0.1", false, false),
-            ("127.0.0.1", false, false),
-            ("::1", false, false),
+            ("127.0.0.1", true, false),
+            ("127.1.2.3", true, false),
+            ("0.0.0.0", true, false),
+            ("::1", true, false),
+            ("::", true, false),
+            ("::ffff:127.0.0.1", true, false),
+            ("64:ff9b::7f00:1", true, false),
             ("fd12::5", false, false),
             ("8.8.8.8", false, false),
         ] {
@@ -988,6 +1113,25 @@ mod tests {
                 dev,
                 "{a}"
             );
+        }
+        // The literal check (`validate_outbound_url`) agrees, in every kind:
+        // `allow_local` never opens a link-local or credential address.
+        for a in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "169.254.170.23",
+            "169.254.10.20",
+            "fe80::1",
+            "fd00:ec2::254",
+            "fd00:ec2::23",
+            "::ffff:169.254.170.2",
+        ] {
+            for kind in [UrlKind::Backend, UrlKind::BackendDev] {
+                assert!(!ip_is_acceptable(ip(a), kind), "{a} {kind:?}");
+            }
+        }
+        for a in ["127.0.0.1", "::1", "10.0.0.5"] {
+            assert!(ip_is_acceptable(ip(a), UrlKind::BackendDev), "{a}");
         }
         // OIDC/webhook keep the strict policy.
         assert!(resolved_backend_ip_refused(ip("10.0.0.5"), UrlKind::Oidc));
@@ -1025,17 +1169,28 @@ mod tests {
         let msg = std::error::Error::source(&err).unwrap().to_string();
         assert!(msg.contains("'169.254.169.254'"), "{msg}");
         assert!(msg.contains("[169.254.169.254]"), "{msg}");
-        assert!(msg.contains("allow_local: true` does NOT permit"), "{msg}");
+        assert!(msg.contains("never metadata or link-local"), "{msg}");
         // On-prem storage behind internal DNS: a private answer is fine.
-        for ip in ["10.0.0.5", "192.168.1.9", "127.0.0.1", "fd12::5"] {
+        for ip in ["10.0.0.5", "192.168.1.9", "fd12::5"] {
             let r = SdkSsrfGuardedResolver::new(UrlKind::Backend, ip);
             assert!(r.resolve_dns(ip).await.is_ok(), "private answer {ip}");
         }
-        for ip in ["169.254.1.1", "fe80::1", "fd00:ec2::254"] {
+        // A name that resolves to this host is `127.0.0.1` spelled by DNS
+        // (`localtest.me`): refused, unless the operator opted into
+        // `allow_local`.
+        for ip in ["127.0.0.1", "::1", "0.0.0.0"] {
+            let strict = SdkSsrfGuardedResolver::new(UrlKind::Backend, ip);
+            assert!(strict.resolve_dns(ip).await.is_err(), "loopback {ip}");
+            let dev = SdkSsrfGuardedResolver::new(UrlKind::BackendDev, ip);
+            assert!(dev.resolve_dns(ip).await.is_ok(), "allow_local {ip}");
+        }
+        for ip in ["169.254.1.1", "fe80::1", "fd00:ec2::254", "169.254.170.2"] {
             let r = SdkSsrfGuardedResolver::new(UrlKind::Backend, ip);
             assert!(r.resolve_dns(ip).await.is_err(), "metadata/link-local {ip}");
+            let dev = SdkSsrfGuardedResolver::new(UrlKind::BackendDev, ip);
+            assert!(dev.resolve_dns(ip).await.is_err(), "allow_local {ip}");
         }
-        // Dev allows private space but never metadata.
+        // Dev allows private space but never metadata or link-local.
         let dev = SdkSsrfGuardedResolver::new(UrlKind::BackendDev, "10.0.0.1");
         assert!(dev.resolve_dns("10.0.0.1").await.is_ok());
         let dev = SdkSsrfGuardedResolver::new(UrlKind::BackendDev, "169.254.169.254");
@@ -1121,6 +1276,58 @@ mod bucket_name_proptests {
         #[test]
         fn never_panics(name in ".{0,200}") {
             let _: Result<(), BucketNameError> = validate_bucket_name(&name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_uri_for_log;
+
+    #[test]
+    fn credential_params_lose_their_values() {
+        let cases = [
+            ("/b/k", "/b/k"),
+            ("/b/k?versionId=3", "/b/k?versionId=3"),
+            (
+                "/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AK%2F20260101%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=abc123",
+                "/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=REDACTED&X-Amz-Signature=REDACTED",
+            ),
+            ("/b/k?x-amz-signature=abc", "/b/k?x-amz-signature=REDACTED"),
+            ("/b/k?X-AMZ-SECURITY-TOKEN=t&a=1", "/b/k?X-AMZ-SECURITY-TOKEN=REDACTED&a=1"),
+            ("/b/k?AWSAccessKeyId=AK&Signature=s%2Bx&Expires=1", "/b/k?AWSAccessKeyId=REDACTED&Signature=REDACTED&Expires=1"),
+            ("?X-Amz-Signature=abc", "?X-Amz-Signature=REDACTED"),
+            ("/b/k?X-Amz-Signature", "/b/k?X-Amz-Signature"),
+            ("/b/k?a=X-Amz-Signature=1", "/b/k?a=X-Amz-Signature=1"),
+            // The signature check decodes names, so an encoded name still authenticates.
+            ("/b/k?X-Amz-%53ignature=abc", "/b/k?X-Amz-%53ignature=REDACTED"),
+            ("/b/k?x%2Damz%2Dsignature=abc&a=1", "/b/k?x%2Damz%2Dsignature=REDACTED&a=1"),
+            ("/b/k?%58-Amz-Credential=c", "/b/k?%58-Amz-Credential=REDACTED"),
+            ("/b/k?%53ignature=%2f", "/b/k?%53ignature=REDACTED"),
+            ("/b/k?Sig%6eature%00=abc", "/b/k?Sig%6eature%00=abc"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(redact_uri_for_log(raw), want, "{raw}");
+        }
+    }
+
+    proptest::proptest! {
+        /// No value of a credential parameter survives, whatever surrounds it.
+        #[test]
+        fn a_secret_value_never_survives(
+            value in "[A-Za-z0-9%_.~-]{8,40}",
+            name in proptest::sample::select(vec!["X-Amz-Signature", "x-amz-credential", "X-Amz-Security-Token", "Signature"]),
+            before in "[a-z]{0,6}=[a-z0-9]{0,6}",
+            after in "[a-z]{0,6}=[a-z0-9]{0,6}",
+        ) {
+            let uri = format!("/b/k?{before}&{name}={value}&{after}");
+            let out = redact_uri_for_log(&uri);
+            proptest::prop_assert!(!out.contains(&value), "{out}");
+            // The same name with every character percent-encoded.
+            let encoded: String = name.bytes().map(|b| format!("%{b:02X}")).collect();
+            let uri = format!("/b/k?{before}&{encoded}={value}&{after}");
+            let out = redact_uri_for_log(&uri);
+            proptest::prop_assert!(!out.contains(&value), "{out}");
         }
     }
 }

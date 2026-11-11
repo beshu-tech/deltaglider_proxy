@@ -25,6 +25,7 @@ const listing = vi.hoisted(() => ({ loads: 0 }));
 
 vi.mock('../s3client', () => ({
   hasCredentials: () => true,
+  listDirectKeys: async () => ({ keys: [], truncated: false }),
   getBucket: () => 'releases',
   setBucket: () => {},
   headObject: async () => ({ storageType: 'passthrough', storedSize: 1 }),
@@ -37,6 +38,7 @@ vi.mock('../s3client', () => ({
 
 import useS3Browser from '../useS3Browser';
 import BulkActionBar from '../components/BulkActionBar';
+import { folderRowKey } from '../rowKey';
 
 const LIST = '/_/api/admin/objects/list';
 const PATH = { copy: '/_/api/admin/objects/copy', move: '/_/api/admin/objects/move' } as const;
@@ -82,7 +84,7 @@ async function mountBrowser() {
 type Browser = { current: ReturnType<typeof useS3Browser> };
 
 function start(result: Browser, op: 'copy' | 'move', destPrefix = 'old/') {
-  act(() => result.current.toggleKey('folder:builds/nightly/'));
+  act(() => result.current.toggleKey(folderRowKey('builds/nightly/')));
   let run!: Promise<BulkTransferOutcome>;
   act(() => {
     run = op === 'copy' ? result.current.bulkCopy('archive', destPrefix) : result.current.bulkMove('archive', destPrefix);
@@ -137,7 +139,7 @@ describe.each(['copy', 'move'] as const)('bulk %s', (op) => {
     await expect(run).resolves.toMatchObject({ total: 1201, succeeded: 500, cancelled: true });
     expect(http.callsTo('POST', PATH[op])).toHaveLength(1);
     await waitFor(() => expect(result.current.bulkRunning).toBe(false));
-    expect([...result.current.selectedKeys]).toEqual(['folder:builds/nightly/']);
+    expect([...result.current.selectedKeys]).toEqual([folderRowKey('builds/nightly/')]);
   });
 
   test('a failure mid-run says how many objects went before it', async () => {
@@ -196,7 +198,7 @@ describe.each(['copy', 'move'] as const)('bulk %s', (op) => {
     });
     http.on('POST', PATH[op], json({ succeeded: 0, failed: 0, failures: [], deleted: 0 }));
     const { result } = await mountBrowser();
-    for (const f of folders) act(() => result.current.toggleKey(`folder:${f}`));
+    for (const f of folders) act(() => result.current.toggleKey(folderRowKey(f)));
     await act(async () => {
       await expect(
         op === 'copy' ? result.current.bulkCopy('archive', 'old/') : result.current.bulkMove('archive', 'old/'),
@@ -213,7 +215,7 @@ describe.each(['copy', 'move'] as const)('bulk %s', (op) => {
     http.on('GET', LIST, json({ keys: [...BIG, 'builds/nightly/x/nightly/0000.zip'], truncated: false }));
     http.on('POST', PATH[op], json({ succeeded: 0, failed: 0, failures: [], deleted: 0 }));
     const { result } = await mountBrowser();
-    act(() => result.current.toggleKey('folder:builds/nightly/'));
+    act(() => result.current.toggleKey(folderRowKey('builds/nightly/')));
     await act(async () => {
       const run = op === 'copy' ? result.current.bulkCopy('releases', 'builds/nightly/x/') : result.current.bulkMove('releases', 'builds/nightly/x/');
       await expect(run).rejects.toThrow(/builds\/nightly\/x\/nightly\/0000\.zip/);
@@ -230,7 +232,7 @@ test('a ZIP of more than 10,000 objects stops listing more folders', async () =>
     return json({ keys: Array.from({ length: 400 }, (_, i) => `${prefix}${i}.zip`), truncated: false });
   });
   const { result } = await mountBrowser();
-  for (let i = 0; i < 30; i++) act(() => result.current.toggleKey(`folder:builds/f${String(i).padStart(2, '0')}/`));
+  for (let i = 0; i < 30; i++) act(() => result.current.toggleKey(folderRowKey(`builds/f${String(i).padStart(2, '0')}/`)));
   await act(async () => {
     await expect(result.current.downloadZip()).rejects.toThrow(/more than 10,000 objects/);
   });
@@ -256,7 +258,7 @@ test('wired to the action bar: the copy closes the picker, shows its progress, a
     const s3 = useS3Browser({ bucket: 'releases', prefix: 'builds/', q: '', object: '', navigateUrl: () => {} });
     return (
       <>
-        <button onClick={() => s3.toggleKey('folder:builds/nightly/')}>pick</button>
+        <button onClick={() => s3.toggleKey(folderRowKey('builds/nightly/'))}>pick</button>
         {(s3.selectedKeys.size > 0 || s3.bulkRunning) && (
           <BulkActionBar
             selectedCount={s3.selectedKeys.size}

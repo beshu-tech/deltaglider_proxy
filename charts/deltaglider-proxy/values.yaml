@@ -64,10 +64,14 @@ topologySpreadConstraints: []
 priorityClassName: ""
 runtimeClassName: ""
 
-terminationGracePeriodSeconds: 30
+# More than the longest stop: 10 s for requests, 10 s for a maintenance job,
+# 10 s for the event outbox and 10 s (DGP_SHUTDOWN_TIMEOUT_SECS) for blocking work.
+terminationGracePeriodSeconds: 60
 
+# One process per state directory: a new pod must not start while the old one
+# runs on the same volume.
 updateStrategy:
-  type: RollingUpdate
+  type: Recreate
 
 probes:
   liveness:

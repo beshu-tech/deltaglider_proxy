@@ -11,19 +11,17 @@ interface Props {
   jobs: MaintenanceJobView[];
   /** The signed-in user's name: the line names who started a job only when it is someone else. */
   me: string | null;
-  /** May this session stop the job? The server allows an admin, and a user its own jobs. */
-  canCancel: (job: MaintenanceJobView) => boolean;
   /** After a cancel request: read the bucket status again. */
   onChanged: () => void;
 }
 
 /**
  * The bucket's running delete jobs, one line each, with Cancel for the
- * jobs this session may stop. A delete holds no gate, so the bucket stays
+ * jobs this session may stop (`may_cancel`, decided by the server). A delete holds no gate, so the bucket stays
  * writable and the line is calm (blue), not the amber of a job that
  * blocks writes.
  */
-export default function DeleteJobsBanner({ jobs, me, canCancel, onChanged }: Props) {
+export default function DeleteJobsBanner({ jobs, me, onChanged }: Props) {
   const [stopping, setStopping] = useState<number | null>(null);
   if (jobs.length === 0) return null;
   const cancel = async (id: number) => {
@@ -67,7 +65,7 @@ export default function DeleteJobsBanner({ jobs, me, canCancel, onChanged }: Pro
                 style={{ margin: '4px 0 0', maxWidth: 420 }}
               />
             </div>
-            {canCancel(job) && job.status !== 'cancelling' && (
+            {job.may_cancel === true && job.status !== 'cancelling' && (
               <Button
                 size="small"
                 onClick={() => void cancel(job.id)}

@@ -313,7 +313,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
             {numberField(numbers, {
               label: 'Batch size',
               yamlPath: 'advanced.event_delivery.batch_size',
-              help: 'Most events claimed per tick, from 1 to 500.',
+              help: 'Most events claimed per batch, from 1 to 500. A tick claims more batches while they come back full.',
               value: form.batch_size,
               min: 1,
               max: 500,
@@ -388,7 +388,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
             {numberField(numbers, {
               label: 'Prune batch',
               yamlPath: 'advanced.event_delivery.prune_batch',
-              help: 'Max delivered rows pruned per tick.',
+              help: 'Most rows one prune round deletes. A tick repeats the round while it deletes this many.',
               value: form.prune_batch,
               min: 0,
               onChange: (n) => setField({ prune_batch: n }),

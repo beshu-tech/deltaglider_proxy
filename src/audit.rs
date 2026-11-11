@@ -230,6 +230,22 @@ pub fn with_audit_directive(spec: &str) -> String {
     }
 }
 
+/// The log filter every place builds from a spec: the audit trail pinned at
+/// INFO ([`with_audit_directive`]), and `s3s::service` and `s3s::ops` held at
+/// INFO. The s3s crate logs the whole HTTP request at DEBUG in `s3s::service`
+/// (`debug!(?req)`: the URI with a presigned signature, and the
+/// `Authorization` header), and `s3s::ops::signature` logs the valid
+/// signature of a request (`expected=`) when its check fails. No redaction of
+/// ours can reach either. The directives are appended last and are more
+/// specific than a crate-wide `s3s=` level, so they hold under
+/// `RUST_LOG=trace`.
+pub fn with_pinned_directives(spec: &str) -> String {
+    format!(
+        "{},s3s::service=info,s3s::ops=info",
+        with_audit_directive(spec)
+    )
+}
+
 /// Emit a structured audit log line for any mutation operation.
 ///
 /// Format: `AUDIT | action=X | user=X | target=X | ip=X | ua=X | bucket=X | path=X`
@@ -298,6 +314,67 @@ mod audit_filter_tests {
                 .parse()
                 .unwrap();
         assert!(f.to_string().contains("deltaglider_proxy::audit=info"));
+    }
+}
+
+#[cfg(test)]
+mod pinned_directive_tests {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// E10/F36: the s3s modules that log the request or the expected
+    /// signature at DEBUG stay at INFO under any operator level, `trace`
+    /// included. `s3s::ops::signature` logs `expected=` (the valid
+    /// signature of the request) when s3s's own check disagrees with ours.
+    #[test]
+    fn s3s_request_and_signature_logs_stay_at_info_under_trace() {
+        let sink = Sink::default();
+        let filter: tracing_subscriber::EnvFilter =
+            super::with_pinned_directives("trace").parse().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(sink.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        tracing::debug!(target: "s3s::service", "service-debug SECRET1");
+        tracing::debug!(target: "s3s::ops", "ops-debug SECRET2");
+        tracing::debug!(target: "s3s::ops::signature", "signature-debug SECRET3");
+        tracing::trace!(target: "s3s::ops::signature", "signature-trace SECRET4");
+        tracing::debug!(target: "other_crate", "other-debug");
+        tracing::info!(target: "s3s::ops::signature", "signature-info");
+        let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        for hidden in ["SECRET1", "SECRET2", "SECRET3", "SECRET4"] {
+            assert!(
+                !logged.contains(hidden),
+                "{hidden} reached the log:\n{logged}"
+            );
+        }
+        assert!(
+            logged.contains("other-debug"),
+            "trace still works elsewhere:\n{logged}"
+        );
+        assert!(logged.contains("signature-info"), "info stays:\n{logged}");
     }
 }
 

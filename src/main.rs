@@ -23,7 +23,6 @@ use deltaglider_proxy::storage::StorageBackend;
 use deltaglider_proxy::usage_scanner::UsageScanner;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
 use tracing::info;
 
 /// Version string including build timestamp for --version output
@@ -502,7 +501,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let runtime = runtime_builder.build()?;
 
-    runtime.block_on(async_main(cli))
+    // A boot error prints as text (Display), never as `Error: Os { .. }`.
+    // The state directory lock stays held until just before the process
+    // exits, past the bounded runtime shutdown: a successor must not start
+    // while a blocking task of this process still writes.
+    let mut state_lock = None;
+    let outcome = runtime.block_on(async_main(cli, &mut state_lock));
+    // Dropping a runtime waits for EVERY blocking task, and an xdelta3 run
+    // can last 2 hours. Wait a bounded time, then let the process exit (the
+    // children see their pipes close). Source guard:
+    // `the_runtime_never_waits_for_blocking_tasks_without_a_bound`.
+    runtime.shutdown_timeout(Duration::from_secs(pre_config.tuning.shutdown_timeout_secs));
+    if let Err(e) = outcome {
+        startup::exit_with_boot_error(&e.to_string());
+    }
+    // A shutdown the process asked for (`shutdown::request_exit`) ends here,
+    // after the drain, with the failure code a supervisor sees.
+    if let Some(code) = deltaglider_proxy::shutdown::requested_exit_code() {
+        drop(state_lock);
+        std::process::exit(code);
+    }
+    drop(state_lock);
+    Ok(())
 }
 
 /// Run a single async CLI subcommand on its own small tokio runtime.
@@ -522,7 +542,10 @@ fn run_cli_async<F: std::future::Future<Output = i32>>(fut: F) -> i32 {
     }
 }
 
-async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn async_main(
+    cli: Cli,
+    state_lock_slot: &mut Option<deltaglider_proxy::data_dir_lock::DataDirLock>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // --- Logging ---
     let log_reload_handle = init_tracing(&cli);
     deltaglider_proxy::background::install_panic_hook();
@@ -537,7 +560,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Config::load()
     };
     if let Some(ref addr) = cli.listen {
-        config.listen_addr = addr.parse()?;
+        config.listen_addr = addr.parse().map_err(|e| {
+            format!("--listen '{addr}' is not a valid socket address (host:port): {e}")
+        })?;
     }
 
     // FATAL config-graph errors: a bucket routed to an undefined backend or
@@ -574,7 +599,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         && deltaglider_proxy::config::process_env("DGP_LOG_LEVEL").is_none()
     {
         let spec = startup::effective_log_spec(None, None, &config.log_level, cli.verbose);
-        match deltaglider_proxy::audit::with_audit_directive(&spec)
+        match deltaglider_proxy::audit::with_pinned_directives(&spec)
             .parse::<tracing_subscriber::EnvFilter>()
         {
             Ok(filter) => {
@@ -595,6 +620,16 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log_startup_banner(&config);
+
+    // --- State lock, spool, listener, TLS, bootstrap hash, xdelta3: FIRST ---
+    // See `startup::claim_environment`. Source guard:
+    // `the_environment_is_claimed_before_the_first_worker_spawns`.
+    let claimed = startup::claim_environment(&mut config).await;
+    // The lock lives until `main` ends the process, after the drain.
+    *state_lock_slot = Some(claimed.state_lock);
+    let listener = claimed.listener;
+    let rustls_config = claimed.rustls_config;
+    let admin_password_hash = claimed.admin_password_hash;
 
     // --- Metrics ---
     let metrics = init_metrics(&config);
@@ -687,6 +722,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         );
     } else {
+        // `claim_environment` refused this boot already; kept as a backstop.
         return Err("xdelta3 CLI not found. Install xdelta3 before starting the proxy.".into());
     }
     metrics
@@ -816,7 +852,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let iam_state = init_iam_state(&config);
 
     // --- Admin / sessions / config DB (must be before S3 router for mismatch guard) ---
-    let admin_password_hash = config.ensure_bootstrap_password_hash();
     let session_store =
         Arc::new(SessionStore::new().with_secure_cookies(config.tuning.secure_cookies));
     spawn_periodic("session-cleanup", Duration::from_secs(300), {
@@ -900,6 +935,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         backend_capabilities: backend_capabilities.clone(),
         backend_health: backend_health.clone(),
         encryption_witness: encryption_witness.clone(),
+        config_db_key_mismatch: config_db_mismatch,
     });
     // The background writers (replication, lifecycle) ask the encryption
     // witness and the key sentinel through the maintenance gate: a refused
@@ -1110,7 +1146,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             rate_limiter: &rate_limiter,
             replay_cache: &replay_cache,
             config: &config,
-            config_db_mismatch,
             public_prefix_snapshot: &public_prefix_snapshot,
             admission_chain: &admission_chain,
             shared_config: &shared_config,
@@ -1165,7 +1200,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if !providers.is_empty() {
                 manager.rebuild(&providers);
                 drop(db);
-                manager.discover_all().await;
+                // Off the boot path: the server serves at once, a provider
+                // that has not answered yet gives a retryable login error.
+                manager.spawn_discovery();
                 info!(
                     "  External auth: {} provider(s) configured",
                     manager.provider_names().len()
@@ -1240,9 +1277,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         job_plane,
     });
 
-    // --- TLS ---
-    let rustls_config = init_tls(&config).await?;
-
     // --- Merge UI + security headers ---
     let app = demo::ui_router(admin_state)
         .merge(app)
@@ -1269,6 +1303,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
 
+    // --- Stale temp files of killed writes (F22) ---
+    startup::spawn_stale_temp_sweeps(&config);
+
     // --- Start server ---
     let limits = deltaglider_proxy::serve::ListenerLimits::from_tuning(&config.tuning);
     if let Some(rustls_config) = rustls_config {
@@ -1280,7 +1317,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .graceful_shutdown(Some(deltaglider_proxy::serve::GRACEFUL_SHUTDOWN_DEADLINE));
         });
 
-        let listener = TcpListener::bind(&config.listen_addr).await?;
         info!(
             "DeltaGlider Proxy listening on https://{}",
             config.listen_addr
@@ -1294,7 +1330,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // for the failure mode.
         deltaglider_proxy::serve::serve_tls(listener, rustls_config, handle, app, limits).await?;
     } else {
-        let listener = TcpListener::bind(&config.listen_addr).await?;
         info!(
             "DeltaGlider Proxy listening on http://{}",
             config.listen_addr

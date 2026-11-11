@@ -594,6 +594,49 @@ mod backend_tests {
         assert!(backend.bulk_list_objects("bucket", "a/").await.is_ok());
     }
 
+    /// The boot sweep deletes `.dg-tmp.*` and `.tmpXXXXXX` files that are old
+    /// enough. That is safe only because no client can store a key with such
+    /// a file name: the backend refuses it on every write path (passthrough
+    /// and delta-eligible names alike).
+    #[tokio::test]
+    async fn a_key_with_a_temp_file_name_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        for filename in [".dg-tmp.x", ".tmpAb12Cd", ".dg-tmp.x.zip"] {
+            let put = backend
+                .put_passthrough(
+                    "bucket",
+                    "a",
+                    filename,
+                    bytes::Bytes::from_static(b"x"),
+                    &dummy_metadata(filename),
+                )
+                .await;
+            assert!(
+                matches!(put, Err(StorageError::InvalidKey(_))),
+                "passthrough {filename}: {put:?}"
+            );
+        }
+        let delta = backend
+            .put_delta(
+                "bucket",
+                "a",
+                ".dg-tmp.x.zip",
+                crate::storage::traits::PutBody::Bytes(bytes::Bytes::from_static(b"d")),
+                &dummy_metadata(".dg-tmp.x.zip"),
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
+            .await;
+        assert!(
+            matches!(delta, Err(StorageError::InvalidKey(_))),
+            "delta: {delta:?}"
+        );
+        assert!(!tmp.path().join("bucket/a").exists(), "nothing was written");
+    }
+
     #[tokio::test]
     async fn test_delegated_list_shows_dot_dirs_hides_dg_and_temp_files() {
         let tmp = tempfile::tempdir().expect("tempdir");

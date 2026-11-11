@@ -49,7 +49,14 @@ fn review2_region_value_in_two_fields_stays_uncoupled() {
 /// `error: unrecognized subcommand '<pw>'`.
 #[test]
 fn review2_first_run_banner_advises_a_command_that_parses() {
-    let lines = first_run_banner("pw", "hash", false);
+    let lines = first_run_banner(
+        "pw",
+        "hash",
+        false,
+        None,
+        std::path::Path::new(".deltaglider_bootstrap_hash"),
+    )
+    .unwrap();
     assert!(
         !lines
             .iter()

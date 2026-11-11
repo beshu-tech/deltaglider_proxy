@@ -12,6 +12,10 @@ import { docContent } from '../../lib/docContent';
 import { renderDoc, extractSummary, extractToc } from '../../lib/renderDoc';
 import { markdownUrl } from '../../lib/llms';
 import { SITE } from '../../lib/seo';
+import { DOC_DRAWINGS, splitForDrawings, type DocPart } from '../../lib/docDrawings';
+import WritePath from '../../components/drawings/WritePath.astro';
+import ReadPath from '../../components/drawings/ReadPath.astro';
+import KeyCustody from '../../components/drawings/KeyCustody.astro';
 
 const GH_BLOB = 'https://github.com/beshu-tech/deltaglider_proxy/blob/main/docs/product';
 
@@ -100,6 +104,12 @@ if (showToc && html) {
   const mobileToc = `<details class="docs-toc-mobile" data-pagefind-ignore><summary>On this page</summary><ul>${items}</ul></details>`;
   html = html.replace('</h1>', `</h1>${mobileToc}`);
 }
+
+// The page as HTML parts with its drawings between them (docDrawings.ts).
+// The examples use the fixed cast of the docs.
+const FW = 'releases/firmware/widget-3000/fw-1.4.1.tar';
+const parts: DocPart[] =
+  props.kind === 'doc' && html ? splitForDrawings(html, DOC_DRAWINGS[props.path] ?? []) : [];
 ---
 
 <DocsLayout title={title} description={description} activeSlug={activeSlug} hasToc={showToc} markdownUrl={mdUrl || undefined}>
@@ -145,8 +155,14 @@ if (showToc && html) {
       <div
         class="docs-prose"
         data-pagefind-body
-        set:html={html}
-      />
+      >
+        {parts.map((p) =>
+          'html' in p ? <Fragment set:html={p.html} />
+          : p.drawing === 'write-path' ? <WritePath object={FW} stored="about 60 KB" />
+          : p.drawing === 'read-path' ? <ReadPath object={FW} size="5.0 MiB" delta="a few hundred bytes" />
+          : <KeyCustody lead="The mode <b>aes256-gcm-proxy</b>" />
+        )}
+      </div>
 
       {(prev || next) && (
         <nav class="docs-pager" aria-label="Document navigation">

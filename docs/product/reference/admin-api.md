@@ -214,11 +214,11 @@ A config write that makes a bucket that holds objects start to encrypt with a pr
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` / `POST` | `/_/api/admin/users` | List / create |
-| `PUT` / `DELETE` | `/_/api/admin/users/:id` | Update / delete (`409` for the last user when no other credential is left) |
+| `PUT` / `DELETE` | `/_/api/admin/users/:id` | Update / delete (`409` for the last user when no other credential is left). The update also takes `access_key_id` and `secret_access_key`: the edit then rotates the keys in the same transaction, and the answer carries the new secret once |
 | `POST` | `/_/api/admin/users/:id/rotate-keys` | Rotate access keys |
 | `POST` | `/_/api/admin/users/:id/clone` | Clone a user (new keys, copied permissions) |
 | `GET` / `POST` | `/_/api/admin/groups` | List / create |
-| `PUT` / `DELETE` | `/_/api/admin/groups/:id` | Update / delete |
+| `PUT` / `DELETE` | `/_/api/admin/groups/:id` | Update / delete. The update also takes `add_member_ids` and `remove_member_ids`, the users to add to the group and to remove from it. The proxy applies them in the same transaction as the rest of the edit. A request never sends the whole member list, because other writers change members too. A user in both lists is refused with `400` |
 | `POST` | `/_/api/admin/groups/:id/clone` | Clone a group |
 | `POST` | `/_/api/admin/groups/:id/members` | Add user to group |
 | `DELETE` | `/_/api/admin/groups/:id/members/:user_id` | Remove user from group |
@@ -304,8 +304,8 @@ Server-side helpers behind the embedded S3 browser's bulk actions.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/_/api/admin/objects/list` | List all keys under a bucket/prefix |
-| `POST` | `/_/api/admin/objects/copy` | Server-side copy of selected objects |
-| `POST` | `/_/api/admin/objects/move` | Server-side move (copy + delete) |
+| `POST` | `/_/api/admin/objects/copy` | Server-side copy of selected objects. With `"no_overwrite": true` the proxy writes no destination key that holds an object. It checks each item while it holds the write lock of that key. It reports the items it left out in `skipped` and `skipped_items`, and does not count them as failures |
+| `POST` | `/_/api/admin/objects/move` | Server-side move (copy + delete). It takes `no_overwrite` as the copy does. The source of a skipped item is not deleted |
 | `POST` | `/_/api/admin/objects/delete` | Bulk delete selected objects |
 | `POST` | `/_/api/admin/objects/delete-jobs` | Start a delete job: folders of any size and selected objects, deleted on the server |
 | `POST` | `/_/api/admin/objects/delete-jobs/:id/cancel` | Stop a delete job |
@@ -484,6 +484,10 @@ With `config_sync_bucket` set, the answer also has `encryption_witness: {status}
 The proxy probes the backend directly in three cases: when the health loop is off (`DGP_BACKEND_HEALTH_INTERVAL_SECS=0` or `DGP_BOOT_BACKEND_PROBE=off`), when the loop has not finished its first round after a start, and when a result is older than twice the interval (for example, because a probe round hangs). That direct probe is a bounded, retried `ListBuckets`, so a brief provider latency spike does not flip readiness to a paging `503`: it reports not-ready only if every attempt fails. One direct probe answers every readiness check for the next 5 seconds, and the checks that arrive while it runs wait for its answer, so many load balancers that check at the same time send one request to the backend. Tune the direct probe with `DGP_READY_TIMEOUT_SECS` (per attempt, default 3) and `DGP_READY_RETRIES` (extra attempts, default 2). Raise the timeout for a storage provider with a long tail latency. Raise the retries to ride out short blips.
 
 The database part of the probe takes the lock of the config DB and the lock of the jobs DB, one after the other. The IAM sync and the admin API hold the lock of the config DB. Every S3 write holds the lock of the jobs DB for a moment, because it appends an event to the outbox, and replication, lifecycle, maintenance jobs and event delivery hold it too. So the probe waits up to one second for each lock. A node whose lock is only busy stays ready. Only a lock that stays held for longer than that wait reports `config_db: "locked"` or `jobs_db: "locked"`, and `503 not_ready`. A field is `absent` when the instance has no such database open.
+
+Two more conditions make the node not ready, because the S3 API cannot serve the requests of such a node. When no config DB key opens the config DB, the S3 API answers every request with `503` and the message `Config database locked`. The probe then reports `config_db: "key_mismatch"` and `503 not_ready`. The `spool` field reports whether the node can make a spool file: the proxy makes a spool directory that somebody removed again, and the field is `unusable` only when that fails. Delta uploads and large downloads need the spool, so the node is `503 not_ready` then.
+
+A full disk does not change the probe. The node still serves reads and deletes, and an upload to a full disk answers `503 SlowDown`. A load balancer that removed the node would drop all of those reads.
 
 The response also carries `atomic_writes` when a backend holds buckets that encrypt with the proxy: a map from each such backend to `checking` (no verdict yet), `unverified` (the probe could not reach it), `supported` or `unsupported` (its encrypted buckets are read-only). Writes to the encrypted buckets of a `checking` or `unverified` backend answer `503 SlowDown`. This state never makes the node not ready: reads and the other buckets work, and a pending check ends on its own, so a load balancer that removed the node would only lose service.
 

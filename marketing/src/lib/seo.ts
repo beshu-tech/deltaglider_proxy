@@ -14,7 +14,7 @@ export const SITE = {
   productName: 'DeltaGlider — S3-compatible storage compression',
   /** Default description for pages that don't override it. */
   description:
-    'The object storage control plane: delta compression, routing across backends, replication and IAM, behind the same S3 API your apps already use. It is source-available (BUSL-1.1) and free up to 15 TB. Built by Beshu Tech.',
+    'An S3 proxy that stores versioned binaries as small binary diffs, in front of the bucket you already have. It adds encryption, IAM, SSO and replication behind the same S3 API. It is source-available (BUSL-1.1) and free up to 15 TB. Built by Beshu Tech.',
   /** Path to the default Open Graph preview image (1200x630). */
   ogImage: '/og-default.jpg',
   /** Repo URL (also used for sameAs in SoftwareApplication). */
@@ -138,7 +138,7 @@ export function softwareApplicationSchema() {
 }
 
 interface WebPageInput {
-  /** Page path starting with /, e.g. "/saas". */
+  /** Page path starting with /, e.g. "/build-artifacts". */
   path: string;
   /** Page title — should match <title>. */
   title: string;
@@ -232,14 +232,14 @@ export function trialOfferSchema({ durationDays }: TrialOfferInput) {
   return {
     '@context': 'https://schema.org',
     '@type': 'Offer',
-    '@id': `${SITE.url}/trial#offer`,
+    '@id': `${SITE.url}/support#offer`,
     name: `${durationDays}-day DeltaGlider Commercial trial`,
     description:
       'The trial includes direct engineering email, a 12-hour response SLA, and one architecture review call. The software is source-available (BUSL-1.1) and stays free under the 15 TB grant regardless.',
     price: '0',
     priceCurrency: 'USD',
     availability: 'https://schema.org/InStock',
-    url: `${SITE.url}/trial`,
+    url: `${SITE.url}/support`,
     eligibleDuration: {
       '@type': 'QuantitativeValue',
       value: durationDays,
