@@ -2025,8 +2025,9 @@ mod source_guards {
         let files = crate::source_scan::ast::tests();
         assert!(files.len() > 50, "scan found tests/ ({})", files.len());
         let mut offenders = Vec::new();
+        let bins = binary_path_names(files);
         for src in files {
-            for n in spawns_without_cwd(&src.test) {
+            for n in spawns_without_cwd(&src.test, &bins) {
                 offenders.push(format!("{}:{n}", src.rel));
             }
         }
@@ -2094,33 +2095,67 @@ mod source_guards {
         assert_eq!(n("fn f() { // a::durable(x)\n let s = \"durable(\"; }"), 0);
     }
 
+    /// Is one of `ms` `env!("CARGO_BIN_EXE_..")`?
+    fn names_bin_exe(ms: &[(String, String)]) -> bool {
+        ms.iter()
+            .any(|(n, t)| (n == "env" || n == "option_env") && t.contains("CARGO_BIN_EXE_"))
+    }
+
+    /// The names that stand for the path of the proxy binary, in all of
+    /// `files`: a `const`/`let` bound to `env!("CARGO_BIN_EXE_..")` (or to
+    /// a value built from it, `PathBuf::from(env!(..))`), one bound to a
+    /// name or a call of a name of this set (`let b = bin();`,
+    /// `let c = b.clone();`), and a fn whose tail or `return` is one of
+    /// those, to a fixed point. A helper `fn proxy_bin() -> &'static str {
+    /// env!(..) }` in `tests/common/` is one.
+    fn binary_path_names(
+        files: &[crate::source_scan::ast::Source],
+    ) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        loop {
+            let before = names.len();
+            for src in files {
+                for f in [&src.prod, &src.test] {
+                    for b in &f.bindings {
+                        if names_bin_exe(&b.init_value_macros)
+                            || b.init_root.as_ref().is_some_and(|r| names.contains(r))
+                        {
+                            names.insert(b.name.clone());
+                        }
+                    }
+                    for v in &f.fn_values {
+                        if names_bin_exe(&v.macros)
+                            || v.root.as_ref().is_some_and(|r| names.contains(r))
+                        {
+                            names.insert(v.name.clone());
+                        }
+                    }
+                }
+            }
+            if names.len() == before {
+                return names;
+            }
+        }
+    }
+
     /// 1-based lines of the proxy spawns in `src` whose builder never gets a
-    /// `.current_dir(..)`. A spawn is a `X::new(arg)` where `arg` is
-    /// `env!("CARGO_BIN_EXE_..")` or a `const`/`let` bound to it, whatever
-    /// `X` is called (`use std::process::Command as C` still counts). The cwd
+    /// `.current_dir(..)`. A spawn is a `X::new(arg)` where `arg` holds
+    /// `env!("CARGO_BIN_EXE_..")` or a name of `bins` (a `const`, a `let`,
+    /// a fn returning the path, `bin.clone()`), whatever `X` is called
+    /// (`use std::process::Command as C` still counts). The cwd
     /// is set on the builder chain (`Command::new(B).current_dir(d)`) or on
     /// the variable the chain was bound to (`let mut c = Command::new(B);
     /// c.current_dir(d)`) in the same fn.
-    fn spawns_without_cwd(f: &crate::source_scan::ast::Facts) -> Vec<usize> {
-        let is_bin = |ms: &[(String, String)]| {
-            ms.iter()
-                .any(|(n, t)| (n == "env" || n == "option_env") && t.contains("CARGO_BIN_EXE_"))
-        };
-        let bin_names: std::collections::HashSet<&str> = f
-            .bindings
-            .iter()
-            .filter(|b| is_bin(&b.init_macros))
-            .map(|b| b.name.as_str())
-            .collect();
+    fn spawns_without_cwd(
+        f: &crate::source_scan::ast::Facts,
+        bins: &std::collections::HashSet<String>,
+    ) -> Vec<usize> {
         let is_spawn = |c: &crate::source_scan::ast::Call| {
             !c.method
                 && c.segs.len() >= 2
                 && c.segs.last().is_some_and(|s| s == "new")
-                && (is_bin(&c.arg_macros)
-                    || c.arg_idents
-                        .first()
-                        .and_then(|i| i.as_deref())
-                        .is_some_and(|i| bin_names.contains(i)))
+                && (names_bin_exe(&c.arg_macros)
+                    || c.arg_idents_all.iter().any(|i| bins.contains(i)))
         };
         let has_cwd = |spawn: &crate::source_scan::ast::Call| {
             let bound: Vec<&str> = f
@@ -2147,7 +2182,15 @@ mod source_guards {
     #[test]
     fn the_cwd_guard_checks_each_spawn() {
         use crate::source_scan::ast::parse;
-        let bad = |text: &str| spawns_without_cwd(&parse("fixture.rs", text).prod).len();
+        let bad_in = |texts: &[&str]| {
+            let files: Vec<_> = texts.iter().map(|t| parse("fixture.rs", t)).collect();
+            let bins = binary_path_names(&files);
+            files
+                .iter()
+                .map(|s| spawns_without_cwd(&s.prod, &bins).len())
+                .sum::<usize>()
+        };
+        let bad = |text: &str| bad_in(&[text]);
         let bin = ["CARGO_BIN", "_EXE_deltaglider_proxy"].concat();
         let spawn = |extra: &str| format!("Command::new(env!(\"{bin}\"))\n{extra}.spawn();");
         // One spawn with a cwd: fine.
@@ -2203,6 +2246,45 @@ mod source_guards {
             "fn a() {{ let c = Command::new(env!(\"{bin}\"))\n    .arg(1)\n    .current_dir(d); }}"
         );
         assert_eq!(bad(&split), 0, "cwd on a split chain");
+        // A helper that returns the path hides the `env!` from the spawn.
+        let helper = format!("fn proxy_bin() -> &'static str {{ env!(\"{bin}\") }}\n");
+        for (what, text) in [
+            ("tail", format!("{helper}fn a() {{ Command::new(proxy_bin()).spawn(); }}")),
+            (
+                "return",
+                format!("fn pb() -> String {{ if x {{ return env!(\"{bin}\").into(); }} y }}\nfn a() {{ Command::new(pb()).spawn(); }}"),
+            ),
+            (
+                "PathBuf::from",
+                format!("fn pb() -> PathBuf {{ PathBuf::from(env!(\"{bin}\")) }}\nfn a() {{ Command::new(pb()).spawn(); }}"),
+            ),
+            (
+                "clone of a let",
+                format!("fn a() {{ let b = env!(\"{bin}\"); Command::new(b.clone()).spawn(); }}"),
+            ),
+            (
+                "let bound to the helper",
+                format!("{helper}fn a() {{ let b = proxy_bin(); Command::new(&b).spawn(); }}"),
+            ),
+            (
+                "helper of a helper",
+                format!("{helper}fn pb2() -> &'static str {{ proxy_bin() }}\nfn a() {{ Command::new(pb2()).spawn(); }}"),
+            ),
+        ] {
+            assert_eq!(bad(&text), 1, "{what}");
+        }
+        // The helper in another file (`tests/common/mod.rs`).
+        let user = "fn a() { Command::new(proxy_bin()).spawn(); }";
+        assert_eq!(
+            bad_in(&[helper.as_str(), user]),
+            1,
+            "helper in another file"
+        );
+        // A helper spawn that sets the cwd, and an unrelated fn, pass.
+        let ok = format!("{helper}fn a() {{ Command::new(proxy_bin()).current_dir(d).spawn(); }}");
+        assert_eq!(bad(&ok), 0);
+        let other = format!("{helper}fn a() {{ Command::new(\"git\").arg(other()).spawn(); }}");
+        assert_eq!(bad(&other), 0, "not the proxy binary");
     }
 
     /// Conversion marker P1: `FileMetadata::stored_last_modified` is the

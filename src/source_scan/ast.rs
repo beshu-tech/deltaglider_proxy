@@ -144,6 +144,11 @@ pub(crate) struct Binding {
     pub init_strings: Vec<String>,
     /// Every ident in the initialiser (`const A: &str = B;` → `B`).
     pub init_idents: Vec<String>,
+    /// The name the initialiser passes through: `f` in `f(a)`, `x` in
+    /// `x.clone()` (see `value_root`).
+    pub init_root: Option<String>,
+    /// The macros that ARE the initialiser's value (see `value_macros`).
+    pub init_value_macros: Vec<(String, String)>,
     /// Every macro in the initialiser, as `(name, tokens text)`.
     pub init_macros: Vec<(String, String)>,
     /// Every path call in the initialiser (`HeaderMap::new`).
@@ -164,6 +169,14 @@ pub(crate) struct PathUse {
     pub expr: bool,
 }
 
+/// What a fn evaluates to: its tail expression and every `return expr`.
+pub(crate) struct FnValue {
+    pub name: String,
+    pub macros: Vec<(String, String)>,
+    /// The name the value passes through (see `value_root`).
+    pub root: Option<String>,
+}
+
 /// A struct pattern `Path { field, .. }` (a destructuring read of `field`).
 pub(crate) struct PatField {
     pub line: usize,
@@ -180,6 +193,7 @@ pub(crate) struct Facts {
     pub paths: Vec<PathUse>,
     pub pat_fields: Vec<PatField>,
     pub struct_lits: Vec<StructLit>,
+    pub fn_values: Vec<FnValue>,
     pub indexes: Vec<Index>,
     pub tuples: Vec<Tuple>,
     /// `&mut x.field`, `x.field = ..`, `x.field += ..`.
@@ -357,6 +371,61 @@ pub(crate) fn chain_root(e: &Expr) -> &Expr {
         Expr::Try(t) => chain_root(&t.expr),
         Expr::Await(a) => chain_root(&a.base),
         _ => e,
+    }
+}
+
+/// Methods and wrappers that pass a path or string through unchanged.
+const CONVERSIONS: [&str; 8] = [
+    "clone",
+    "to_owned",
+    "to_string",
+    "into",
+    "as_str",
+    "as_ref",
+    "to_path_buf",
+    "as_path",
+];
+
+/// The macros that ARE the value of `e`: `e` is the macro (`env!(..)`),
+/// `String::from(..)`/`PathBuf::from(..)` of it, or a conversion of those
+/// (`env!(..).into()`). A macro deep in a block, a struct literal or the
+/// argument of another call (`Command::new(env!(..))`) is not the value.
+pub(crate) fn value_macros(e: &Expr) -> Vec<(String, String)> {
+    match e {
+        Expr::Macro(_) => macros_in(e),
+        Expr::MethodCall(m) if CONVERSIONS.contains(&m.method.to_string().as_str()) => {
+            value_macros(&m.receiver)
+        }
+        Expr::Call(c) if c.args.len() == 1 && call_leaf(c).as_deref() == Some("from") => {
+            value_macros(&c.args[0])
+        }
+        Expr::Reference(r) => value_macros(&r.expr),
+        Expr::Paren(p) => value_macros(&p.expr),
+        Expr::Group(g) => value_macros(&g.expr),
+        _ => Vec::new(),
+    }
+}
+
+fn call_leaf(c: &syn::ExprCall) -> Option<String> {
+    match &*c.func {
+        Expr::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+        _ => None,
+    }
+}
+
+/// The name that `e` passes through: `x`, `&x`, `x.clone()`, `f()` (a call
+/// of the path `f`). `None` after any other method: `x.len()` is no `x`.
+pub(crate) fn value_root(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Path(p) if p.qself.is_none() => p.path.segments.last().map(|s| s.ident.to_string()),
+        Expr::Call(c) => call_leaf(c),
+        Expr::MethodCall(m) if CONVERSIONS.contains(&m.method.to_string().as_str()) => {
+            value_root(&m.receiver)
+        }
+        Expr::Reference(r) => value_root(&r.expr),
+        Expr::Paren(p) => value_root(&p.expr),
+        Expr::Group(g) => value_root(&g.expr),
+        _ => None,
     }
 }
 
@@ -722,6 +791,27 @@ impl Collector {
         self.func.pop();
     }
 
+    /// Record `e` as a value of the enclosing fn (its tail or a `return`).
+    fn fn_value(&mut self, e: &Expr) {
+        let func = self.func();
+        if func == 0 {
+            return;
+        }
+        let v = FnValue {
+            name: self.fn_names[func - 1].clone(),
+            macros: value_macros(e),
+            root: value_root(e),
+        };
+        self.cur().fn_values.push(v);
+    }
+
+    /// The tail expression of a fn body, as a value.
+    fn tail_value(&mut self, b: &syn::Block) {
+        if let Some(syn::Stmt::Expr(e, None)) = b.stmts.last() {
+            self.fn_value(e);
+        }
+    }
+
     fn root_pos(e: &Expr) -> Option<Pos> {
         match chain_root(e) {
             Expr::Call(c) => Some(pos(c.span())),
@@ -755,6 +845,8 @@ impl Collector {
             plain: is_plain(init),
             init_strings,
             init_idents: idents_in(init),
+            init_root: value_root(init),
+            init_value_macros: value_macros(init),
             init_macros,
             init_calls: calls_in(init),
             init_root_pos: Self::root_pos(init),
@@ -1007,12 +1099,14 @@ impl<'ast> Visit<'ast> for Collector {
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         self.enter(&i.sig.ident);
+        self.tail_value(&i.block);
         visit::visit_item_fn(self, i);
         self.leave();
     }
 
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         self.enter(&i.sig.ident);
+        self.tail_value(&i.block);
         visit::visit_impl_item_fn(self, i);
         self.leave();
     }
@@ -1093,6 +1187,13 @@ impl<'ast> Visit<'ast> for Collector {
             self.cur().calls.push(call);
         }
         visit::visit_expr_call(self, c);
+    }
+
+    fn visit_expr_return(&mut self, r: &'ast syn::ExprReturn) {
+        if let Some(e) = &r.expr {
+            self.fn_value(e);
+        }
+        visit::visit_expr_return(self, r);
     }
 
     fn visit_expr_field(&mut self, f: &'ast syn::ExprField) {
