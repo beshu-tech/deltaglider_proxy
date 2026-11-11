@@ -53,8 +53,9 @@ services:
       # The working directory. It holds the generated bootstrap password hash
       # (.deltaglider_bootstrap_hash) when DGP_BOOTSTRAP_PASSWORD_HASH is unset,
       # and the object data if you use a `filesystem: /data` backend. Object data
-      # of the S3 backend is not here. Delta scratch files go to the spool
-      # (DGP_SPOOL_DIR, default /tmp/dgp-spool), not to this volume.
+      # of the S3 backend is not here. Scratch files (upload bodies above 16 MiB,
+      # delta files, multipart parts) go to the spool (DGP_SPOOL_DIR, default
+      # /tmp/dgp-spool), not to this volume.
       - dgp-data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/_/health"]
@@ -62,6 +63,9 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    # A stop takes up to 40 s (requests, a maintenance job, the event outbox,
+    # blocking work). Docker's default of 10 s would kill the proxy before.
+    stop_grace_period: 60s
     restart: unless-stopped
 
 volumes:
