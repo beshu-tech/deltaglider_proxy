@@ -478,7 +478,7 @@ fn offer<T>(
             super::s3::LISTING_FACTS_QUEUE_DROPPED
                 .with_label_values(&[queue])
                 .inc();
-            if n == 1 || n % DROP_LOG_EVERY == 0 {
+            if n == 1 || n.is_multiple_of(DROP_LOG_EVERY) {
                 warn!(
                     "listing facts {queue} queue full ({} items): {n} items dropped so far; \
                      the backend is slow or unreachable (best effort: LISTs report stored \
