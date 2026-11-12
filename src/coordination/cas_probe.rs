@@ -209,6 +209,8 @@ const RETRYABLE_CODES: &[&str] = &[
     // A full store or an account over its quota is the store's state, not a
     // wrong configuration.
     "QuotaExceeded",
+    // MinIO: a full bucket quota (`400`).
+    "XMinioAdminBucketQuotaExceeded",
     "StorageQuotaExceeded",
     "storage_cap_exceeded",
     "RequestTimeTooSkewed",
@@ -536,6 +538,8 @@ mod write_refusal_tests {
             (Some(307), "TemporaryRedirect", Indeterminate),
             // A full store is its state, not the configuration.
             (Some(403), "QuotaExceeded", Indeterminate),
+            // MinIO answers a full bucket quota with this code (measured).
+            (Some(400), "XMinioAdminBucketQuotaExceeded", Indeterminate),
             (Some(507), "", Indeterminate),
             (Some(400), "storage_cap_exceeded", Indeterminate),
             (Some(409), "OperationAborted", Indeterminate),
@@ -550,7 +554,7 @@ mod write_refusal_tests {
     }
 
     #[test]
-    fn only_three_codes_may_propagate() {
+    fn only_four_codes_may_propagate() {
         for code in [
             "AccessDenied",
             "InvalidAccessKeyId",

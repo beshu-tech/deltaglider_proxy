@@ -143,13 +143,41 @@ pub fn pull_failure_confirms_local_db(failure: PullFailure) -> bool {
     )
 }
 
-/// Pure: the kind of a merge error text (the text of the error that
-/// `reopen_and_rebuild_iam` returns).
-pub fn classify_merge_error(text: &str) -> PullFailure {
-    if text.starts_with(crate::config_db::ROLLBACK_REFUSED_PREFIX) {
-        PullFailure::RefusedAsRollback
-    } else {
-        PullFailure::Other
+/// Pure: the kind of a merge error. Only a copy refused by SYNC GENERATION
+/// (exact, v29 and later) is a rollback that confirms the local database; the
+/// row-age rule of a copy from before v29 is a guess with a tolerance, so it
+/// keeps the node unconfirmed.
+pub fn merge_failure_kind(error: &crate::config_db::ConfigDbError) -> PullFailure {
+    use crate::config_db::{ConfigDbError, RollbackBy};
+    match error {
+        ConfigDbError::RollbackRefused {
+            by: RollbackBy::Generation,
+            ..
+        } => PullFailure::RefusedAsRollback,
+        _ => PullFailure::Other,
+    }
+}
+
+/// Why `reopen_and_rebuild_iam` did not apply a downloaded copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeError {
+    pub failure: PullFailure,
+    pub message: String,
+}
+
+impl std::fmt::Display for MergeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Any other failure of the rebuild is not a verdict on the copy.
+impl From<String> for MergeError {
+    fn from(message: String) -> Self {
+        Self {
+            failure: PullFailure::Other,
+            message,
+        }
     }
 }
 
@@ -1798,10 +1826,9 @@ async fn pull_locked(
     let applied = merged.is_ok();
     match &merged {
         Ok(()) => sync.record_pull(Ok(())),
-        Err(e) => sync.record_pull_failure(
-            classify_merge_error(e),
-            format!("the IAM merge failed: {e}"),
-        ),
+        Err(e) => {
+            sync.record_pull_failure(e.failure, format!("the IAM merge failed: {}", e.message))
+        }
     }
     // Commit the ETag only on a successful merge so a failure retries.
     if applied {
@@ -1844,7 +1871,7 @@ pub async fn reopen_and_rebuild_iam(
     sessions: Option<&Arc<crate::session::SessionStore>>,
     downloaded: &std::path::Path,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), MergeError> {
     let Some(db_arc) = config_db else {
         // No live DB (legacy/open mode) — nothing to merge into. Drop the temp.
         // Treat as applied (there's no IAM to converge), so we don't re-download.
@@ -1875,7 +1902,10 @@ pub async fn reopen_and_rebuild_iam(
                 "Config DB S3 sync ({}): failed to merge IAM after download: {}",
                 context, e
             );
-            return Err(e.to_string());
+            return Err(MergeError {
+                failure: merge_failure_kind(&e),
+                message: e.to_string(),
+            });
         }
     };
     if !report.base_used {
@@ -2142,14 +2172,33 @@ mod tests {
                 "{failure:?}"
             );
         }
-        // The typed refusal of the merge is told from any other merge error.
-        let rollback = crate::config_db::ConfigDbError::RollbackRefused("old".into());
-        assert_eq!(
-            classify_merge_error(&rollback.to_string()),
-            RefusedAsRollback
-        );
-        let other = crate::config_db::ConfigDbError::Other("disk full".into());
-        assert_eq!(classify_merge_error(&other.to_string()), Other);
+    }
+
+    /// A merge error confirms the local database only when the copy is
+    /// refused by sync GENERATION. The row-age rule of a copy from before v29
+    /// (a 5-minute tolerance, a guess) and any other error keep it
+    /// unconfirmed.
+    #[test]
+    fn only_a_refusal_by_generation_is_a_rollback_that_confirms() {
+        use crate::config_db::{ConfigDbError, RollbackBy};
+        use PullFailure::*;
+        let refused = |by| ConfigDbError::RollbackRefused {
+            by,
+            detail: "old".into(),
+        };
+        // (error, failure kind, confirms)
+        for (error, kind, confirms) in [
+            (refused(RollbackBy::Generation), RefusedAsRollback, true),
+            (refused(RollbackBy::RowAge), Other, false),
+            (ConfigDbError::Other("disk full".into()), Other, false),
+            (ConfigDbError::Refused("no".into()), Other, false),
+        ] {
+            assert_eq!(merge_failure_kind(&error), kind, "{error}");
+            assert_eq!(pull_failure_confirms_local_db(kind), confirms, "{error}");
+        }
+        // The kind travels with the error: no text is matched.
+        let from_text = MergeError::from("synced copy refused as a rollback".to_string());
+        assert_eq!(from_text.failure, Other);
     }
 
     /// A refused copy confirms the database at its first pull, and its error
