@@ -17,11 +17,51 @@
 //! relay parts and the encrypting wrapper's temps (see `SpoolBudget`).
 //!
 //! Configured via `DGP_SPOOL_DIR` (default = system temp dir) and
-//! `DGP_SPOOL_MAX_BYTES` (default 16 GiB).
+//! `DGP_SPOOL_MAX_BYTES` (default `auto`: derived once at boot from the free
+//! space of the directory, see `config::limits`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
+
+/// What the spool measured at boot: the inputs of the auto-sized limits
+/// (`config::limits::derive_limits`). Fixed for the life of the process.
+#[derive(Debug, Clone)]
+pub struct BootLimits {
+    pub dir: PathBuf,
+    pub facts: crate::config::limits::DiskFacts,
+    /// How the budget was found (for a log line and an EntityTooLarge message).
+    pub budget_note: String,
+    /// The text of `DGP_SPOOL_MAX_BYTES` when it did not parse.
+    pub spool_invalid: Option<String>,
+}
+
+static SHARED: std::sync::OnceLock<SpoolDir> = std::sync::OnceLock::new();
+
+/// Set by the boot ([`SpoolDir::claim_shared`]). A spool that a unit test or
+/// the CLI built on first use also measures its disk, but only the boot's
+/// measure drives the limits of a [`crate::config::Config`]: a test must not
+/// see its limits change with the order of the tests.
+static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How the budget of the process-wide spool was found (`auto: 50% of 46 GiB
+/// free on /tmp/dgp-spool at boot`, `set explicitly`), for an EntityTooLarge message. Does
+/// not create the spool.
+pub fn shared_budget_note() -> String {
+    SHARED
+        .get()
+        .map_or("set explicitly", |p| p.budget_note())
+        .to_string()
+}
+
+/// The disk facts that the booted process measured; `None` before the boot
+/// claimed the spool.
+pub fn boot_limits() -> Option<BootLimits> {
+    if !CLAIMED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    SHARED.get().and_then(|p| p.boot().cloned())
+}
 
 tokio::task_local! {
     /// The backend whose share of the budget a request's spool counts
@@ -60,6 +100,9 @@ pub struct SpoolDir {
     dir: PathBuf,
     budget: Arc<Budget>,
     max_bytes: u64,
+    /// The disk facts behind the budget; `None` for a spool built with a
+    /// fixed size (`new`).
+    boot: Option<Arc<BootLimits>>,
     /// The most of the budget (MiB) that the reservations made in one
     /// backend's scope may hold together.
     share_mib: usize,
@@ -99,7 +142,12 @@ pub struct Spool {
 }
 
 impl SpoolDir {
-    /// Build from env: `DGP_SPOOL_DIR` + `DGP_SPOOL_MAX_BYTES` (default 16 GiB).
+    /// Build from env: `DGP_SPOOL_DIR` + `DGP_SPOOL_MAX_BYTES` (`auto`, a
+    /// percent of the free space, or bytes; default `auto`). The budget is
+    /// derived here, once, AFTER the orphan sweep (the files that stay are
+    /// counted as free), by `config::limits::derive_limits`. `data_roots`
+    /// are the filesystem backend roots and the data directory: a spool on
+    /// their device gets a smaller `auto` share.
     ///
     /// Default dir is a DEDICATED `dgp-spool` subdir of the system temp — NOT the
     /// shared temp root (review M3.4: sweeping or filling the shared root is
@@ -114,29 +162,70 @@ impl SpoolDir {
         clippy::disallowed_methods,
         reason = "the spool's own default directory"
     )]
-    pub fn from_env() -> std::io::Result<Self> {
+    pub fn from_env(data_roots: &[PathBuf]) -> std::io::Result<Self> {
         let dir = crate::config::process_env_os("DGP_SPOOL_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("dgp-spool"));
-        let max_bytes: u64 =
-            crate::config::env_parse_with_default("DGP_SPOOL_MAX_BYTES", 16 * 1024 * 1024 * 1024);
+        let (setting, invalid) = crate::config::limits::parse_spool_setting(
+            crate::config::process_env("DGP_SPOOL_MAX_BYTES").as_deref(),
+        );
+        if let Some(raw) = &invalid {
+            tracing::warn!("{}", crate::config::limits::invalid_spool_message(raw));
+        }
         let share: u8 = crate::config::env_parse_with_default(
             "DGP_BACKEND_SHARE_PERCENT",
             crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT,
         );
-        let pool = Self::new(dir.clone(), max_bytes)
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "the spool directory '{}' (set by DGP_SPOOL_DIR, default: dgp-spool in \
-                         the system temp dir) is not usable: {e}",
-                        dir.display()
-                    ),
-                )
-            })?
+        Self::build(
+            dir,
+            setting,
+            invalid,
+            share,
+            data_roots,
+            &crate::config::process_env,
+        )
+    }
+
+    /// [`Self::from_env`] with its inputs given: create and sweep the
+    /// directory, THEN measure its disk (the files that stay count as free),
+    /// derive the budget, and build the pool.
+    pub(crate) fn build(
+        dir: PathBuf,
+        setting: crate::config::limits::SpoolSetting,
+        invalid: Option<String>,
+        share: u8,
+        data_roots: &[PathBuf],
+        env: crate::config::EnvLookup,
+    ) -> std::io::Result<Self> {
+        let unusable = |e: std::io::Error| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "the spool directory '{}' (set by DGP_SPOOL_DIR, default: dgp-spool in \
+                     the system temp dir) is not usable: {e}",
+                    dir.display()
+                ),
+            )
+        };
+        // Create and sweep first: the budget counts what stays.
+        Self::new(dir.clone(), 0).map_err(unusable)?.sweep_orphans();
+        let facts = crate::config::limits::measure_disk_facts(&dir, data_roots, env);
+        let (effective, _warnings) = crate::config::limits::derive_limits(
+            facts,
+            crate::config::limits::ExplicitLimits {
+                spool: setting,
+                ..Default::default()
+            },
+        );
+        let mut pool = Self::new(dir.clone(), effective.spool_budget)
+            .map_err(unusable)?
             .with_backend_share(share);
-        pool.sweep_orphans();
+        pool.boot = Some(Arc::new(BootLimits {
+            budget_note: effective.spool_note(&dir),
+            dir,
+            facts,
+            spool_invalid: invalid,
+        }));
         Ok(pool)
     }
 
@@ -146,14 +235,41 @@ impl SpoolDir {
     /// budget while the old engine's requests still held the first, and
     /// re-ran the sweep each time.
     pub fn shared() -> std::io::Result<Self> {
-        static SHARED: std::sync::OnceLock<SpoolDir> = std::sync::OnceLock::new();
+        Self::shared_with(&[])
+    }
+
+    fn shared_with(data_roots: &[PathBuf]) -> std::io::Result<Self> {
         if let Some(pool) = SHARED.get() {
             return Ok(pool.clone());
         }
-        let pool = Self::from_env()?;
+        let pool = Self::from_env(data_roots)?;
         // A racing first caller may win; either way every caller gets the
         // one stored pool.
         Ok(SHARED.get_or_init(|| pool).clone())
+    }
+
+    /// The boot's own call of [`Self::shared`]: it knows the data
+    /// directories, and it publishes what the spool measured
+    /// ([`boot_limits`]) so that the config derives its limits from it.
+    /// Source guard: `the_environment_is_claimed_before_the_first_worker_spawns`.
+    pub fn claim_shared(data_roots: &[PathBuf]) -> std::io::Result<Self> {
+        let pool = Self::shared_with(data_roots)?;
+        CLAIMED.store(true, std::sync::atomic::Ordering::Release);
+        Ok(pool)
+    }
+
+    /// What this spool measured at boot (`None` for a spool of fixed size).
+    pub fn boot(&self) -> Option<&BootLimits> {
+        self.boot.as_deref()
+    }
+
+    /// How the budget was found, for an error message: `auto: 50% of 46
+    /// GiB free on /tmp/dgp-spool at boot`, or `set explicitly`. A spool of
+    /// fixed size gives `set explicitly`.
+    pub fn budget_note(&self) -> &str {
+        self.boot
+            .as_deref()
+            .map_or("set explicitly", |b| b.budget_note.as_str())
     }
 
     /// A spool rooted at `dir`, created private to this user (0700) when
@@ -171,6 +287,7 @@ impl SpoolDir {
             dir,
             budget: Budget::new(max_mib),
             max_bytes,
+            boot: None,
             share_mib: backend_share_mib(
                 max_mib,
                 crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT,

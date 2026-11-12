@@ -114,7 +114,7 @@ fn export_reemits_refs_and_never_the_secrets() {
 fn persist_reemits_refs_even_after_runtime_mutation() {
     let mut cfg = load_template();
     // Simulate a GUI tweak: a non-secret change via the admin API.
-    cfg.max_object_size = 42 * 1024 * 1024;
+    cfg.max_object_size = (42 * 1024 * 1024).into();
     let dir = std::env::temp_dir().join(format!("dgp-envref-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("cfg.yaml");
@@ -131,7 +131,7 @@ fn persist_reemits_refs_even_after_runtime_mutation() {
     // The persisted file must re-load against the same env (boot path).
     let (re_expanded, _) = expand_env_with_recording(&persisted, lookup).unwrap();
     let re = Config::from_yaml_str(&re_expanded).unwrap();
-    assert_eq!(re.max_object_size, 44040192);
+    assert_eq!(re.max_object_size_bytes(), 44040192);
     assert_eq!(re.iam_users[0].secret_access_key, "ci-secret-456");
 }
 

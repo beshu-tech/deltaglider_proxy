@@ -639,6 +639,19 @@ mod tests {
         assert_eq!(spool_max_bytes_for_tmp(4), 3 * 1024 * 1024);
     }
 
+    /// The proxy warns at boot when an explicit spool budget is above 90% of
+    /// the free space. The free space of `/tmp` is at most its size limit, so
+    /// the operator's three quarters never raises that warning (the proxy's
+    /// own table test `the_chart_and_operator_spool_value_raises_no_warning`
+    /// holds the other half).
+    #[test]
+    fn the_spool_value_stays_below_the_proxy_free_space_warning() {
+        for limit_mib in [64, 256, 1024, 2048, 10 * 1024] {
+            let limit = limit_mib * 1024 * 1024;
+            assert!(spool_max_bytes_for_tmp(limit_mib) <= limit / 100 * 90);
+        }
+    }
+
     /// A proxy stop takes up to 55 s, so the pod's grace period is longer
     /// than that (the Kubernetes default of 30 s would SIGKILL a drain).
     #[test]

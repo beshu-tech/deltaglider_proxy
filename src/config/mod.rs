@@ -21,6 +21,7 @@ pub mod env_overrides;
 pub mod env_shadow;
 mod expansion;
 pub(crate) mod lenient;
+pub mod limits;
 
 pub use env::*;
 pub use expansion::*;
@@ -142,9 +143,12 @@ pub struct Config {
     #[serde(default = "default_max_delta_ratio")]
     pub max_delta_ratio: f32,
 
-    /// Maximum object size in bytes (xdelta3 memory constraint)
-    #[serde(default = "default_max_object_size")]
-    pub max_object_size: u64,
+    /// Maximum object size in bytes (xdelta3 memory constraint), or `auto`
+    /// (default): the effective per-upload limit of the spool
+    /// ([`limits::derive_limits`]). Read the effective value with
+    /// [`Config::max_object_size_bytes`].
+    #[serde(default)]
+    pub max_object_size: limits::BytesOrAuto,
 
     /// Maximum passthrough object size for the streaming multipart paths
     /// (Phase B). Decoupled from `max_object_size` (which gates the
@@ -1043,10 +1047,6 @@ pub(crate) fn default_max_delta_ratio() -> f32 {
     0.75
 }
 
-pub(crate) fn default_max_object_size() -> u64 {
-    100 * 1024 * 1024 // 100MB
-}
-
 pub(crate) fn default_max_passthrough_object_size() -> u64 {
     64 * 1024 * 1024 * 1024 // 64 GiB
 }
@@ -1117,7 +1117,7 @@ impl Default for Config {
             listen_addr: default_listen_addr(),
             backend: BackendConfig::default(),
             max_delta_ratio: default_max_delta_ratio(),
-            max_object_size: default_max_object_size(),
+            max_object_size: limits::BytesOrAuto::Auto,
             max_passthrough_object_size: default_max_passthrough_object_size(),
             range_spool_ttl_secs: default_range_spool_ttl_secs(),
             cache_size_mb: default_cache_size_mb(),
@@ -1568,6 +1568,103 @@ impl Config {
                 )
             }
         };
+        self.resolve_limits_with(env);
+    }
+
+    /// Derive the effective limits of this snapshot from what the spool
+    /// measured at boot (see [`limits::derive_limits`]) and store them in
+    /// [`RuntimeTuning::limits`]. Runs on every load and apply, so a changed
+    /// `max_object_size` takes effect; the budget does not change, because
+    /// the disk facts are those of the boot. Before the boot claimed the
+    /// spool it leaves `None`.
+    pub fn resolve_limits(&mut self) {
+        self.resolve_limits_with(&process_env);
+    }
+
+    /// [`Self::resolve_limits`] over an injected lookup (which variables are
+    /// set decides the source label of each value).
+    pub(crate) fn resolve_limits_with(&mut self, env: EnvLookup) {
+        self.resolve_limits_from(crate::deltaglider::spool::boot_limits(), env);
+    }
+
+    /// The rule of [`Self::resolve_limits`] over given boot facts (`None`:
+    /// not measured yet).
+    pub(crate) fn resolve_limits_from(
+        &mut self,
+        boot: Option<crate::deltaglider::spool::BootLimits>,
+        env: EnvLookup,
+    ) {
+        let env_set: Vec<&'static str> = limits::LIMIT_ENV_VARS
+            .iter()
+            .copied()
+            .filter(|v| env(v).is_some())
+            .collect();
+        let s3_backend = self.has_s3_backend();
+        let s3_proxy_encrypted = self.s3_proxy_encrypted();
+        // The roots of the boot: the filesystem backends and the state
+        // directory.
+        let mut roots = self.filesystem_roots();
+        if let Some(state_dir) = crate::config_db::config_db_path().parent() {
+            let dir = if state_dir.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                state_dir
+            };
+            roots.push(dir.to_path_buf());
+        }
+        self.tuning.limits = boot.map(|boot| {
+            // The disk facts are those of the boot. Only this is asked
+            // again: did a filesystem backend come onto the spool's device?
+            let shares_device_now =
+                !boot.facts.shares_device_with_data && limits::shares_device(&boot.dir, &roots);
+            let (effective, warnings) = limits::derive_limits(
+                boot.facts,
+                limits::ExplicitLimits {
+                    spool: self.tuning.spool_max,
+                    per_upload: self.tuning.multipart_relay_upload_max,
+                    total_multipart: self.tuning.multipart_total_max,
+                    max_object_size: self.max_object_size,
+                    s3_backend,
+                    s3_proxy_encrypted,
+                    shares_device_now,
+                },
+            );
+            // Log once per change: not again on each later apply while the
+            // condition holds.
+            static SHARE_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let now = warnings.contains(&limits::LimitWarning::ShareChangesAtRestart);
+            if limits::share_change_is_new(&SHARE_WARNED, now) {
+                tracing::warn!(
+                    "[limits] {}",
+                    limits::LimitWarning::ShareChangesAtRestart.message(&boot.dir)
+                );
+            }
+            limits::ResolvedLimits {
+                effective,
+                warnings,
+                dir: boot.dir,
+                facts: boot.facts,
+                env_set,
+                spool_invalid: boot.spool_invalid,
+            }
+        });
+    }
+
+    /// The effective `max_object_size` in bytes: the number the operator
+    /// set, or, for `auto`, the per-upload limit of the spool (the
+    /// default of earlier releases, 100 MiB, before the boot measured it).
+    pub fn max_object_size_bytes(&self) -> u64 {
+        match self.max_object_size {
+            limits::BytesOrAuto::Bytes(n) => n,
+            limits::BytesOrAuto::Auto => self
+                .tuning
+                .limits
+                .as_ref()
+                .map_or(limits::UNMEASURED_MAX_OBJECT_SIZE, |l| {
+                    l.effective.max_object_size
+                }),
+        }
     }
 
     /// Re-apply the env overrides to an edited config that is about to
@@ -2273,6 +2370,31 @@ impl Config {
                 .map(|b| (b.name.as_str(), &b.backend))
                 .collect()
         }
+    }
+
+    /// Does an S3 backend host a bucket that the proxy encrypts
+    /// (`aes256-gcm-proxy`)? Its ciphertext is larger than the plaintext, so
+    /// one 5 GiB backend PUT holds less plaintext.
+    pub fn s3_proxy_encrypted(&self) -> bool {
+        let pes = self.proxy_encrypted_storage();
+        let hosts: std::collections::BTreeSet<&str> = pes
+            .sites
+            .iter()
+            .map(String::as_str)
+            .chain(pes.buckets.values().map(String::as_str))
+            .collect();
+        self.effective_backends()
+            .iter()
+            .any(|(name, b)| matches!(b, BackendConfig::S3 { .. }) && hosts.contains(name))
+    }
+
+    /// Does any configured backend (see [`Self::effective_backends`]) use S3?
+    /// An S3 backend stores a client object with ONE PUT request, which takes
+    /// at most 5 GiB.
+    pub fn has_s3_backend(&self) -> bool {
+        self.effective_backends()
+            .iter()
+            .any(|(_, b)| matches!(b, BackendConfig::S3 { .. }))
     }
 
     /// The root folder of every filesystem backend that runs (see

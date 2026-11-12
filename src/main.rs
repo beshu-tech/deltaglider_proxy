@@ -741,7 +741,7 @@ async fn async_main(
         .set(engine.cache_max_capacity() as f64);
 
     // --- Multipart uploads ---
-    let multipart = Arc::new(MultipartStore::new(config.max_object_size));
+    let multipart = Arc::new(MultipartStore::new(config.max_object_size_bytes()));
     let multipart_sweep_interval_secs: u64 =
         env_parse_with_default("DGP_MULTIPART_SWEEP_INTERVAL_SECS", 300);
     let multipart_sweep_max_age_secs: u64 =

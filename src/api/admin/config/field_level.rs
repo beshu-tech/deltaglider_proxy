@@ -45,7 +45,14 @@ pub struct ConfigResponse {
     backend_force_path_style: Option<bool>,
     // Compression
     max_delta_ratio: f32,
+    /// The effective `max_object_size` in bytes (for `auto`, the derived one).
     max_object_size: u64,
+    /// The effective limits (spool budget, per-upload, total multipart,
+    /// `max_object_size`), each with its value, its source (`auto`,
+    /// `explicit`, `env`) and the inputs in words, plus the disk facts and
+    /// the warnings of the derivation. `null` before the spool measured its
+    /// disk at boot.
+    limits: Option<crate::config::limits::LimitsReport>,
     cache_size_mb: usize,
     metadata_cache_mb: usize,
     codec_concurrency: usize,
@@ -581,7 +588,8 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
             backend_force_path_style,
             // Compression
             max_delta_ratio: cfg.max_delta_ratio,
-            max_object_size: cfg.max_object_size,
+            max_object_size: cfg.max_object_size_bytes(),
+            limits: cfg.tuning.limits.as_ref().map(|l| l.report()),
             cache_size_mb: cfg.cache_size_mb,
             metadata_cache_mb: cfg.metadata_cache_mb,
             codec_concurrency: cfg.effective_codec_concurrency(),
@@ -747,7 +755,7 @@ fn build_patch(
         cfg.max_delta_ratio = ratio;
     }
     if let Some(size) = body.max_object_size {
-        cfg.max_object_size = size;
+        cfg.max_object_size = size.into();
     }
     if let Some(ref key) = body.access_key_id {
         cfg.access_key_id = if key.is_empty() {

@@ -109,10 +109,14 @@ pub fn log_startup_banner(config: &Config) {
     }
 
     info!("  Max delta ratio: {}", config.max_delta_ratio);
-    info!(
-        "  Max object size: {} MB",
-        config.max_object_size / 1024 / 1024
-    );
+    match config.max_object_size {
+        deltaglider_proxy::config::limits::BytesOrAuto::Auto => {
+            info!("  Max object size: auto (derived from the spool budget)")
+        }
+        deltaglider_proxy::config::limits::BytesOrAuto::Bytes(n) => {
+            info!("  Max object size: {} MB", n / 1024 / 1024)
+        }
+    }
     if config.metadata_cache_mb == 0 {
         warn!("[cache] In-memory metadata cache is DISABLED (0 MB). Every HEAD/LIST will query storage.");
     } else {
@@ -2037,6 +2041,22 @@ pub struct ClaimedEnvironment {
     pub admin_password_hash: String,
 }
 
+/// The boot log line of the effective limits and the warnings of the
+/// derivation (never fatal). Quiet when the spool has no boot facts.
+fn log_effective_limits(config: &Config, spool: &deltaglider_proxy::deltaglider::spool::SpoolDir) {
+    let Some(resolved) = &config.tuning.limits else {
+        return;
+    };
+    info!(
+        "[limits] {} (free space measured once, at boot; a restart measures again)",
+        resolved.effective.boot_line(&resolved.dir)
+    );
+    debug_assert_eq!(resolved.effective.spool_budget, spool.max_bytes());
+    for w in resolved.warning_messages() {
+        warn!("[limits] {w}");
+    }
+}
+
 /// THE first step of a boot: everything that can stop it for an environment
 /// reason. It runs before the first background worker spawns and before any
 /// backend write, so a boot that cannot serve never ran a job or changed the
@@ -2078,9 +2098,16 @@ pub async fn claim_environment(config: &mut Config) -> ClaimedEnvironment {
             Err(e) => exit_with_boot_error(&format!("the state directory lock task failed: {e}")),
         }
     };
-    if let Err(e) = deltaglider_proxy::deltaglider::spool::SpoolDir::shared() {
-        exit_with_boot_error(&e.to_string());
-    }
+    // The spool sweeps its directory, then measures the disk: the limits of
+    // this process derive from that one measure (`config::limits`).
+    let mut data_roots = config.filesystem_roots();
+    data_roots.push(dir.to_path_buf());
+    let spool = match deltaglider_proxy::deltaglider::spool::SpoolDir::claim_shared(&data_roots) {
+        Ok(spool) => spool,
+        Err(e) => exit_with_boot_error(&e.to_string()),
+    };
+    config.resolve_limits();
+    log_effective_limits(config, &spool);
     let listener = match bind_listener(config.listen_addr).await {
         Ok(l) => l,
         Err(e) => exit_with_boot_error(&e),

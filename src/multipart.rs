@@ -71,7 +71,7 @@ pub fn relay_upload_cap(spool_max_bytes: u64, configured: Option<u64>) -> Option
     match configured {
         Some(0) => None,
         Some(n) => Some(n),
-        None => Some((spool_max_bytes / 2).max(1024 * 1024)),
+        None => Some(crate::config::limits::default_per_upload(spool_max_bytes)),
     }
 }
 
@@ -80,7 +80,7 @@ pub fn relay_upload_cap(spool_max_bytes: u64, configured: Option<u64>) -> Option
 /// (`None` = unset). Every part is a spool file, so the default is half of
 /// the spool: open uploads never pin the budget of every other request.
 pub fn max_total_multipart_bytes(spool_max_bytes: u64, configured: Option<u64>) -> u64 {
-    configured.unwrap_or(spool_max_bytes / 2)
+    configured.unwrap_or_else(|| crate::config::limits::default_total_multipart(spool_max_bytes))
 }
 
 /// Pure: the spool budget, in bytes, that a part of `size` bytes holds.
@@ -917,10 +917,18 @@ impl MultipartStore {
                 .saturating_add(delta as u64);
             let cap = self.max_total_multipart_bytes();
             if new_total > cap {
+                let origin = if self.max_total_configured.is_some() {
+                    "set explicitly".to_string()
+                } else {
+                    format!(
+                        "auto: half of the spool budget; DGP_SPOOL_MAX_BYTES is {}",
+                        self.spool.budget_note()
+                    )
+                };
                 return Err(S3Error::SlowDown(format!(
                     "Multipart uploads would hold {new_total} bytes of spool budget, over the cap \
-                     of {cap} bytes ({MAX_TOTAL_MULTIPART_ENV}; each part holds whole MiB, at \
-                     least one)"
+                     of {cap} bytes ({MAX_TOTAL_MULTIPART_ENV}, {origin}; each part holds whole \
+                     MiB, at least one)"
                 )));
             }
         }
@@ -935,11 +943,19 @@ impl MultipartStore {
                 .saturating_add(admitted.of(&upload.upload_id))
                 .saturating_add(charge);
             if held_after > cap {
+                let origin = if self.relay_upload_max.is_some() {
+                    "set explicitly".to_string()
+                } else {
+                    format!(
+                        "auto: half of the spool budget; DGP_SPOOL_MAX_BYTES is {}",
+                        self.spool.budget_note()
+                    )
+                };
                 return Err(S3Error::EntityTooLargeReason(format!(
                     "this multipart upload would hold {held_after} bytes of spool budget for its \
                      relay parts (each part holds whole MiB, at least one); one upload may hold \
-                     at most {cap} bytes ({RELAY_UPLOAD_MAX_ENV}, default half of \
-                     DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)"
+                     at most {cap} bytes ({RELAY_UPLOAD_MAX_ENV}, {origin}; 0 = no per-upload \
+                     cap). Set {RELAY_UPLOAD_MAX_ENV} or DGP_SPOOL_MAX_BYTES to change it"
                 )));
             }
         }

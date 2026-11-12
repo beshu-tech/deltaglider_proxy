@@ -436,7 +436,8 @@ impl<E: std::fmt::Display> std::fmt::Display for IngestError<E> {
             } => write!(
                 f,
                 "a body of {declared} bytes does not fit the spool budget \
-                 (DGP_SPOOL_MAX_BYTES = {max_bytes})"
+                 (DGP_SPOOL_MAX_BYTES = {max_bytes}, {})",
+                super::spool::shared_budget_note()
             ),
             Self::SpoolTooSmall {
                 declared,
@@ -447,8 +448,9 @@ impl<E: std::fmt::Display> std::fmt::Display for IngestError<E> {
                 "a body of {declared} bytes needs {} bytes of spool: the body and the \
                  {storage_extra} bytes of its encrypted copy (the bucket is encrypted by the \
                  proxy, so its uploads need about twice their size in spool space). That does \
-                 not fit the spool budget (DGP_SPOOL_MAX_BYTES = {max_bytes})",
-                declared.saturating_add(*storage_extra)
+                 not fit the spool budget (DGP_SPOOL_MAX_BYTES = {max_bytes}, {})",
+                declared.saturating_add(*storage_extra),
+                super::spool::shared_budget_note()
             ),
             Self::TooLong { declared } => {
                 write!(f, "the body is longer than its declared {declared} bytes")

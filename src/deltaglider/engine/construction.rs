@@ -660,10 +660,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Self {
             storage,
             codec: Arc::new(
-                DeltaCodec::new(config.max_object_size as usize).with_timeouts(config.tuning.codec),
+                DeltaCodec::new(config.max_object_size_bytes() as usize)
+                    .with_timeouts(config.tuning.codec),
             ),
             cache: ReferenceCache::new(config.cache_size_mb),
-            max_object_size: config.max_object_size,
+            max_object_size: config.max_object_size_bytes(),
             max_passthrough_object_size: config.max_passthrough_object_size,
             codec_semaphore: Arc::new(Semaphore::new(codec_concurrency)),
             prefix_locks: shared_prefix_locks(),

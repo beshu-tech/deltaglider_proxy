@@ -2238,7 +2238,7 @@ mod tests {
         let state = Arc::new(AppState {
             engine: arc_swap::ArcSwap::from_pointee(engine),
             multipart: Arc::new(crate::multipart::MultipartStore::new(
-                config.max_object_size,
+                config.max_object_size_bytes(),
             )),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             usage_scanner: Arc::new(crate::usage_scanner::UsageScanner::new()),

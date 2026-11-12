@@ -789,7 +789,7 @@ mod source_guards {
         let mut at = 0;
         for step in [
             "data_dir_lock::acquire(",
-            "SpoolDir::shared()",
+            "SpoolDir::claim_shared(",
             "bind_listener(",
             "init_tls(",
             "ensure_bootstrap_password_hash()",

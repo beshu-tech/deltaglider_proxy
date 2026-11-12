@@ -287,7 +287,7 @@ fn check_file_len(
 
 /// Pure: the length a form declares (`Content-Length`). A form that
 /// declares none gets `411 MissingContentLength`; one longer than the
-/// largest object plus [`FORM_OVERHEAD`] gets `413 EntityTooLarge`. Both
+/// largest object plus [`FORM_OVERHEAD`] gets `400 EntityTooLarge`. Both
 /// before a byte of it is read.
 fn form_body_len(headers: &HeaderMap, limit: u64) -> Result<u64, S3Error> {
     let len = crate::api::body_ingest::declared_len(headers, None)
