@@ -219,20 +219,18 @@ fn backend_error_code<E: std::fmt::Debug + ProvideErrorMetadata>(e: &SdkError<E>
 /// lets the probe of a CommonPrefix show the prefix unchecked; every other
 /// error (a `503` SlowDown, a timeout, an auth error) is the error of the
 /// page, as a failed page request is.
-pub(super) fn refuses_prefix_as_a_name(status: Option<u16>, code: &str) -> bool {
-    matches!(code, "XMinioInvalidResourceName" | "InvalidResourceName")
-        || (status == Some(400) && code == "InvalidArgument")
+///
+/// `InvalidArgument` is NOT such an answer: a backend gives it for a bad
+/// continuation token or `max-keys` too, and that is a fault of the page.
+pub(super) fn refuses_prefix_as_a_name(code: &str) -> bool {
+    code == "XMinioInvalidResourceName"
 }
 
 /// [`refuses_prefix_as_a_name`] for an SDK error.
 pub(super) fn sdk_refuses_prefix_as_a_name<E: std::fmt::Debug + ProvideErrorMetadata>(
     e: &SdkError<E>,
 ) -> bool {
-    let status = match e {
-        SdkError::ServiceError(svc) => Some(svc.raw().status().as_u16()),
-        _ => None,
-    };
-    refuses_prefix_as_a_name(status, backend_error_code(e))
+    refuses_prefix_as_a_name(backend_error_code(e))
 }
 
 /// THE mapping from a backend's answer — the op, the HTTP status (`None` =
@@ -454,28 +452,21 @@ mod prefix_refusal_tests {
     /// the prefix unchecked. Every other answer is an error of the page.
     #[test]
     fn only_a_name_refusal_lets_the_probe_show_a_prefix() {
-        let table: &[(Option<u16>, &str, bool)] = &[
-            (Some(400), "XMinioInvalidResourceName", true),
-            (Some(400), "InvalidResourceName", true),
-            (Some(400), "InvalidArgument", true),
-            // `InvalidArgument` needs the 400.
-            (Some(500), "InvalidArgument", false),
-            (None, "InvalidArgument", false),
-            (Some(503), "SlowDown", false),
-            (Some(500), "InternalError", false),
-            (Some(403), "AccessDenied", false),
-            (Some(403), "SignatureDoesNotMatch", false),
-            (Some(404), "NoSuchBucket", false),
-            (Some(400), "RequestTimeout", false),
-            (Some(400), "", false),
-            (None, "", false),
+        let table: &[(&str, bool)] = &[
+            ("XMinioInvalidResourceName", true),
+            // A bad continuation token or `max-keys` gets this code too.
+            ("InvalidArgument", false),
+            ("InvalidResourceName", false),
+            ("SlowDown", false),
+            ("InternalError", false),
+            ("AccessDenied", false),
+            ("SignatureDoesNotMatch", false),
+            ("NoSuchBucket", false),
+            ("RequestTimeout", false),
+            ("", false),
         ];
-        for (status, code, want) in table {
-            assert_eq!(
-                refuses_prefix_as_a_name(*status, code),
-                *want,
-                "{status:?} {code}"
-            );
+        for (code, want) in table {
+            assert_eq!(refuses_prefix_as_a_name(code), *want, "{code}");
         }
     }
 }

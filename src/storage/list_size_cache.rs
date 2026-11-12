@@ -258,9 +258,8 @@ const UNWRITTEN_LOG_EVERY: u64 = 10_000;
 /// the number of entries: it cannot say "empty" while an entry is there (a
 /// lost repair), and it cannot stay "not empty" after the last entry left.
 /// [`any_unwritten`] reads it with one atomic load, so a LIST page pays
-/// nothing, and takes no lock, when no write was refused. (A moka cache gave a
-/// count that drifted under `insert` and `remove` racing on one key, in both
-/// directions.) Eviction is O(1) amortised: the oldest key leaves when the
+/// nothing, and takes no lock, when no write was refused. Eviction is O(1)
+/// amortised: the oldest key leaves when the
 /// registry is full, and an expired key leaves when the registry is touched;
 /// the queue of keys drops the stale ones (re-marked or removed) as it meets
 /// them and is compacted when stale keys outnumber the cap.
@@ -466,11 +465,15 @@ mod unwritten_registry_tests {
             registry.mark(key, value);
         }
         let kept_n = live(&registry);
-        let dropped = metric() - before;
         assert_eq!(kept_n as u64, CAP, "the registry holds its cap");
         assert_eq!(
-            dropped,
+            registry.dropped.load(std::sync::atomic::Ordering::Relaxed),
             N as u64 - CAP,
+            "every entry dropped for room is counted"
+        );
+        // The metric is process-wide: another test can add to it.
+        assert!(
+            metric() - before >= N as u64 - CAP,
             "the metric counts every entry dropped for room"
         );
         assert_eq!(kept_n, entries(&registry));
@@ -482,6 +485,23 @@ mod unwritten_registry_tests {
         assert!(registry.remove(&newest).is_none());
         assert_eq!(live(&registry), kept_n - 1);
         assert_eq!(live(&registry), entries(&registry));
+    }
+
+    /// The queue of keys stays bounded while a live entry sits at its head:
+    /// the head stops the expiry pass, so only the compaction drops the
+    /// stale keys behind it.
+    #[test]
+    fn the_queue_stays_bounded_behind_a_live_head() {
+        let registry = Registry::new(8, UNWRITTEN_TTL);
+        let (head, head_value) = entry(0);
+        registry.mark(head.clone(), head_value);
+        for _ in 0..10_000 {
+            let (key, value) = entry(1);
+            registry.mark(key, value);
+        }
+        assert!(registry.inner.lock().order.len() <= 8 * 2 + 16 + 1);
+        assert_eq!(live(&registry), 2);
+        assert!(registry.remove(&head).is_some(), "the head is still live");
     }
 
     /// The queue of keys stays bounded when the same keys are marked and
@@ -523,8 +543,7 @@ mod unwritten_registry_tests {
     }
 
     /// An entry that expired and was not touched since: `remove` finds it
-    /// gone, and the count is zero (a hand-kept count went to `usize::MAX`
-    /// when `remove` and the expiry both subtracted). A registry that is only
+    /// gone, and the count is zero. A registry that is only
     /// touched by a `remove` of ANOTHER key drops it too, so a stale entry
     /// does not keep every LIST on the slow path for ever.
     #[test]
@@ -544,8 +563,7 @@ mod unwritten_registry_tests {
 
     /// The repair is never lost: with one entry counted, marking the same
     /// object again and then removing it must leave the count at what is
-    /// there (the old `mark` left 0 with a live entry, so `any()` was false
-    /// and the facts write was never offered).
+    /// there, so that `any()` stays true and the facts write is offered.
     #[test]
     fn marking_again_then_removing_keeps_the_count_true() {
         let registry = Registry::new(100, UNWRITTEN_TTL);
@@ -564,7 +582,7 @@ mod unwritten_registry_tests {
     /// Real threads mark and remove the same keys. At every end of a round:
     /// a live entry means `any()`; once pending work has run the count is
     /// the number of entries; and once everything is removed `any()` is
-    /// false. (The old count was off in both directions in 200 of 200 rounds.)
+    /// false.
     #[test]
     fn the_count_survives_marks_racing_removes() {
         for round in 0..40u64 {
