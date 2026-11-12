@@ -175,6 +175,10 @@ pub enum ProbeErrorKind {
 pub struct ProbeError {
     pub kind: ProbeErrorKind,
     pub detail: String,
+    /// A refusal that a new bucket or a new access key can still cause
+    /// ([`code_may_propagate`]): the boot waits a short time before it
+    /// takes the refusal as final.
+    pub propagates: bool,
 }
 
 impl std::fmt::Display for ProbeError {
@@ -190,6 +194,7 @@ impl From<String> for ProbeError {
         Self {
             kind: ProbeErrorKind::Indeterminate,
             detail,
+            propagates: false,
         }
     }
 }
@@ -198,6 +203,9 @@ impl From<String> for ProbeError {
 /// the HTTP status they come with.
 const RETRYABLE_CODES: &[&str] = &[
     "RequestTimeout",
+    "TemporaryRedirect",
+    "OperationAborted",
+    "ExpiredToken",
     "RequestTimeTooSkewed",
     concat!("Slow", "Down"),
     "Throttling",
@@ -208,22 +216,32 @@ const RETRYABLE_CODES: &[&str] = &[
     "InternalError",
 ];
 
+/// Codes of a refusal that a new bucket or a new access key can still
+/// cause: they take a moment to reach every part of the store.
+const PROPAGATING_CODES: &[&str] = &["AccessDenied", "InvalidAccessKeyId", "NoSuchBucket"];
+
+/// Pure: can a bucket or a key that was made a moment ago explain `code`?
+pub fn code_may_propagate(code: &str) -> bool {
+    PROPAGATING_CODES.contains(&code)
+}
+
 /// Pure: what the answer to the probe's first, UNCONDITIONAL write says.
 /// `status` is the HTTP status (`None`: no HTTP answer), `code` the S3
-/// error code (empty when the answer has none).
+/// error code that the answer's XML body carries (empty when it has none:
+/// an ingress, a WAF or a proxy answered, not the store).
 ///
-/// A 3xx or 4xx answer is the backend's statement about the request: the
-/// bucket is missing (`NoSuchBucket`), the key is unknown
-/// (`InvalidAccessKeyId`), the signature or the region is wrong, the
-/// credentials may not write (`AccessDenied`), the bucket lives elsewhere
-/// (`PermanentRedirect`). The exceptions are the answers that depend on
-/// load or on time (408, 429, the codes in `RETRYABLE_CODES`). Everything
-/// else (no answer, 5xx) is indeterminate.
+/// Definitive ONLY for a parsed S3 error code that no retry changes, on a
+/// 3xx or 4xx status: the bucket is missing (`NoSuchBucket`), the key is
+/// unknown (`InvalidAccessKeyId`), the signature or the region is wrong,
+/// the credentials may not write (`AccessDenied`), the bucket lives
+/// elsewhere (`PermanentRedirect`). Everything else is indeterminate: no
+/// answer, 5xx, no S3 code, 408, 429 and the codes in `RETRYABLE_CODES`
+/// (answers that depend on load, on time or on a token).
 pub fn classify_write_refusal(status: Option<u16>, code: &str) -> ProbeErrorKind {
     let Some(status) = status else {
         return ProbeErrorKind::Indeterminate;
     };
-    if RETRYABLE_CODES.contains(&code) || matches!(status, 408 | 429) {
+    if code.is_empty() || RETRYABLE_CODES.contains(&code) || matches!(status, 408 | 429) {
         return ProbeErrorKind::Indeterminate;
     }
     match status {
@@ -360,9 +378,11 @@ pub async fn probe_cas(
         .await
         .map_err(|e| {
             let (status, code) = answer_of(&e);
+            let kind = classify_write_refusal(status, &code);
             ProbeError {
-                kind: classify_write_refusal(status, &code),
+                kind,
                 detail: format!("probe could not write to '{bucket}': {e:?}"),
+                propagates: kind == ProbeErrorKind::Misconfigured && code_may_propagate(&code),
             }
         })?;
     let etag = first.e_tag().unwrap_or_default().to_string();
@@ -479,10 +499,8 @@ mod write_refusal_tests {
             (Some(403), "AllAccessDisabled", Misconfigured),
             (Some(400), "AuthorizationHeaderMalformed", Misconfigured),
             (Some(400), "InvalidBucketName", Misconfigured),
-            (Some(400), "ExpiredToken", Misconfigured),
             (Some(301), "PermanentRedirect", Misconfigured),
             (Some(405), "MethodNotAllowed", Misconfigured),
-            (Some(404), "", Misconfigured),
             // A later attempt can get another answer.
             (None, "", Indeterminate),
             (None, "NoSuchBucket", Indeterminate),
@@ -497,6 +515,14 @@ mod write_refusal_tests {
             (Some(400), "Throttling", Indeterminate),
             (Some(403), "RequestTimeTooSkewed", Indeterminate),
             (Some(200), "", Indeterminate),
+            // No S3 error code: an ingress or a WAF answered, not the store.
+            (Some(404), "", Indeterminate),
+            (Some(403), "", Indeterminate),
+            (Some(301), "", Indeterminate),
+            // A token or a redirect that a retry changes.
+            (Some(400), "ExpiredToken", Indeterminate),
+            (Some(307), "TemporaryRedirect", Indeterminate),
+            (Some(409), "OperationAborted", Indeterminate),
         ];
         for (status, code, want) in table {
             assert_eq!(
@@ -504,6 +530,16 @@ mod write_refusal_tests {
                 *want,
                 "status {status:?} code {code:?}"
             );
+        }
+    }
+
+    #[test]
+    fn only_three_codes_may_propagate() {
+        for code in ["AccessDenied", "InvalidAccessKeyId", "NoSuchBucket"] {
+            assert!(code_may_propagate(code), "{code}");
+        }
+        for code in ["SignatureDoesNotMatch", "PermanentRedirect", "", "SlowDown"] {
+            assert!(!code_may_propagate(code), "{code}");
         }
     }
 

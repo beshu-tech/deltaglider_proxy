@@ -346,6 +346,7 @@ where
     let mut builder = S3ServiceBuilder::new(s3);
     builder.set_auth(DeltaGliderS3sAuth {
         iam_state: iam_state.clone(),
+        coordination: state.coordination.clone(),
     });
     builder.set_access(access);
     builder.set_config(crate::api::s3s_hooks::s3s_config(

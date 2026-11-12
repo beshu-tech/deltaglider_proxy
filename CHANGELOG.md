@@ -4,15 +4,16 @@
 
 ### Upgrade steps for the next release
 
-- **A coordination bucket that the backend refuses stops the boot.** A missing bucket, an unknown access key, a wrong signature or credentials that may not write now end the boot with exit code 1 and a message that names the bucket and `config_sync_bucket`. A probe without an answer (timeout, connection error, `5xx`) still lets the proxy start (and a later refusal never stops a running node), but the node is not ready: `/_/ready` answers `503` with `coordination: "unproven"` and `iam_sync: "unconfirmed"`, and the S3 API answers `503` to IAM users until one sync of the IAM database ends well or `DGP_IAM_SERVE_UNCONFIRMED=true` is set. The bootstrap key pair and open access are served.
-- **A restore that changes the admin password ends the other admin sessions.** The session that restores stays.
-- **A backend host that resolves to loopback is refused at start and at apply**, with a message that names the backend and `allow_local`.
-- **`DGP_OUTBOUND_USE_SYSTEM_PROXY=true`** sends webhook, Slack and OIDC requests through the system proxy. The default (direct) is unchanged. With the proxy, the address check of the target cannot run.
+- **A coordination bucket that the backend refuses stops the boot.** An S3 error that no retry changes (a missing bucket, an unknown access key, a wrong signature, no right to write) ends the boot with exit code 1 and a message that names the bucket and `config_sync_bucket`. For a missing bucket, an unknown key and `AccessDenied` the boot first tries every 5 seconds for 30 seconds. No answer, a `5xx`, throttling, and a `3xx` or `4xx` without an S3 error body still let the proxy start, and a running proxy never exits on a later refusal. `/_/ready` shows `coordination: "unproven"` as information; the node stays ready.
+- **IAM users wait for the first good sync.** With a `config_sync_bucket`, a request that is judged against the IAM database (an IAM key pair, `login-as`, browser connect, OAuth sign-in, the admin session of an IAM user) answers `503` until one sync ends well, or until `DGP_IAM_SERVE_UNCONFIRMED=true` is set. Public prefixes, preflight requests and the `HEAD /` probe are served. `/_/ready` answers `503` with `iam_sync: "unconfirmed"` only while the node refuses IAM users. The sync client is built again with backoff when its build fails.
+- **A change of the admin password hash ends the other admin sessions.** This includes a backup restore; the session that restores stays.
+- **A backend host that resolves only to refused addresses stops the start and refuses an apply**, with a message that names the backend and `allow_local`, also for a backend that no bucket uses.
+- **`DGP_OUTBOUND_USE_SYSTEM_PROXY=true`** sends webhook, Slack and OIDC requests through the system proxy (`NO_PROXY` applies). The default (direct) is unchanged. With the proxy, the address check of the target cannot run.
 - **The spool directory is made with mode `0700`** also when the proxy makes it again after a removal.
 
 ### Changed
 
-- A filesystem LIST now holds at most about `2 x 65,536 + depth x 1,024` directory entries for one request, because the chunk of a nested directory halves with each level.
+- A filesystem LIST holds at most `65,536 + depth x 1,024` directory entries for one request: the levels of a nested tree share one budget.
 
 ## v2.2.0 — 2026-11-11
 

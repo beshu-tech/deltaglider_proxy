@@ -861,7 +861,10 @@ pub async fn resolve_iam_identity(
     .await?;
 
     let iam_state = state.iam_state.load();
-    let Some(user) = (match &**iam_state {
+    let Ok(iam_view) = state.credential_view(&iam_state) else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+    };
+    let Some(user) = (match iam_view {
         IamState::Iam(index) => index.get(&body.access_key_id).cloned(),
         _ => None,
     }) else {
@@ -968,7 +971,8 @@ async fn session_user_info(
 
 async fn resolve_effective_iam_user(state: &AdminState, access_key_id: &str) -> Option<IamUser> {
     let iam_state = state.iam_state.load();
-    if let IamState::Iam(index) = &**iam_state {
+    let iam_view = state.credential_view(&iam_state).ok()?;
+    if let IamState::Iam(index) = iam_view {
         if let Some(user) = index.get(access_key_id) {
             return Some(user.clone());
         }
@@ -1002,8 +1006,11 @@ pub async fn login_as(
     // access_key_id without any rate limit. The account dimension is
     // the AKID being attempted.
     let iam_state = state.iam_state.load();
+    let Ok(iam_view) = state.credential_view(&iam_state) else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+    };
     let known =
-        matches!(&**iam_state, IamState::Iam(index) if index.get(&body.access_key_id).is_some());
+        matches!(iam_view, IamState::Iam(index) if index.get(&body.access_key_id).is_some());
     let guard = crate::rate_limiter::RateLimitGuard::enter_with_account(
         &state.rate_limiter,
         &req_headers,
@@ -1014,7 +1021,7 @@ pub async fn login_as(
     )
     .await?;
 
-    let user = match &**iam_state {
+    let user = match iam_view {
         IamState::Iam(index) => index.get(&body.access_key_id),
         _ => None,
     };
@@ -1051,7 +1058,7 @@ pub async fn login_as(
         access_key_id: body.access_key_id.clone(),
     };
     let client_ip = request_client_ip(&req_headers, connect_info.as_ref());
-    if !session_principal_is_admin(&auth_method, &iam_state, client_ip) {
+    if !session_principal_is_admin(&auth_method, iam_view, client_ip) {
         return Err(StatusCode::FORBIDDEN.into());
     }
 
@@ -1116,9 +1123,12 @@ pub async fn browser_session_connect(
     let iam_state = state.iam_state.load();
     let access_key_id = body.access_key_id.trim();
     let secret_access_key = body.secret_access_key.as_str();
+    let Ok(iam_view) = state.credential_view(&iam_state) else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+    };
 
     // IAM multi-user only: legacy/bootstrap use the password connect path; open mode is separate.
-    let IamState::Iam(index) = &**iam_state else {
+    let IamState::Iam(index) = iam_view else {
         guard.record_failure();
         audit_log(
             "browser_session_connect_denied",
@@ -1353,7 +1363,13 @@ fn admin_gui_session_ok(state: &AdminState, token: &str, client_ip: Option<IpAdd
         .sessions
         .admin_gui_auth_method(token, client_ip)
         .is_some_and(|method| {
-            session_principal_is_admin(&method, &state.iam_state.load(), client_ip)
+            let iam = state.iam_state.load();
+            match state.credential_view(&iam) {
+                Ok(view) => session_principal_is_admin(&method, view, client_ip),
+                // An IAM user's rights are not known until the database is
+                // confirmed; the bootstrap password does not depend on it.
+                Err(_) => matches!(method, AuthMethod::Bootstrap),
+            }
         })
 }
 
@@ -1445,11 +1461,13 @@ pub async fn require_bulk_session(
             .unwrap_or_else(|| "admin".to_string());
         (BulkSession::AdminGui, actor)
     } else {
-        match non_admin_bulk_session(
-            state.sessions.auth_method(&token, client_ip),
-            &iam,
-            client_ip,
-        ) {
+        match state.credential_view(&iam).ok().and_then(|view| {
+            non_admin_bulk_session(
+                state.sessions.auth_method(&token, client_ip),
+                view,
+                client_ip,
+            )
+        }) {
             Some(pair) => pair,
             None => return Err(admin_session_required()),
         }
@@ -1534,14 +1552,12 @@ pub(crate) fn bucket_view_session(
         return Some(BulkSession::AdminGui);
     }
     let iam = state.iam_state.load();
-    let (session, _) = non_admin_bulk_session(
-        state.sessions.auth_method(token, client_ip),
-        &iam,
-        client_ip,
-    )?;
+    let iam = state.credential_view(&iam).ok()?;
+    let (session, _) =
+        non_admin_bulk_session(state.sessions.auth_method(token, client_ip), iam, client_ip)?;
     let may = match &session {
         BulkSession::Open | BulkSession::AdminGui => true,
-        BulkSession::IamUser { access_key_id, .. } => match iam.as_ref() {
+        BulkSession::IamUser { access_key_id, .. } => match iam {
             IamState::Iam(index) => index
                 .principal(access_key_id)
                 .is_some_and(|u| u.can_see_bucket(bucket)),

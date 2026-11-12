@@ -626,7 +626,7 @@ async fn transition_gates(
     // A backend host that resolves only to refused addresses would fail
     // every request: refuse the apply that makes one.
     if forward {
-        let unreachable = new_cfg.backend_resolution_errors().await;
+        let unreachable = new_cfg.backend_resolution_errors(Some(old_cfg)).await;
         if !unreachable.is_empty() {
             return Err(format!("config refused: {}", unreachable.join("; ")).into());
         }

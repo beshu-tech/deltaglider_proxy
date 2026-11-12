@@ -52,6 +52,104 @@ async fn an_unreachable_coordination_bucket_does_not_stop_the_boot() {
     assert_eq!(body["iam_sync"], "unconfirmed", "{body}");
 }
 
+/// A node that restarts while the coordination store is down cannot tell
+/// whether its local IAM database is current. It answers `503` to the logins
+/// that the database would judge and is not ready; the operator override
+/// serves the local copy. No pull ever ended well in the
+/// restarted process, so only the rule decides.
+#[tokio::test]
+async fn a_restart_during_a_sync_outage_refuses_iam_logins_until_the_override() {
+    skip_unless_minio!();
+    common::expect_server_errors("the coordination store is down during this test");
+    let key = format!(".deltaglider/outage-ci-{}.db", uuid::Uuid::new_v4());
+    let mut server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .config_sync_bucket(common::MINIO_BUCKET)
+        .config_sync_object_key(&key)
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = common::admin_http_client(&ep).await;
+    let user: serde_json::Value = admin
+        .post(format!("{ep}/_/api/admin/users"))
+        .json(&serde_json::json!({
+            "name": "dana",
+            "permissions": [{ "actions": ["*"], "resources": ["*"] }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let login = serde_json::json!({
+        "access_key_id": user["access_key_id"],
+        "secret_access_key": user["secret_access_key"],
+    });
+
+    // Restart with the store down.
+    let down = dropping_endpoint();
+    let outage = [
+        ("DGP_S3_ENDPOINT", down.as_str()),
+        ("DGP_BOOT_BACKEND_PROBE", "warn"),
+        ("DGP_BE_AWS_ACCESS_KEY_ID", common::MINIO_ACCESS_KEY),
+        ("DGP_BE_AWS_SECRET_ACCESS_KEY", common::MINIO_SECRET_KEY),
+    ];
+    server.respawn_with_env(&outage).await;
+    let ready = reqwest::get(format!("{ep}/_/ready")).await.unwrap();
+    assert_eq!(ready.status().as_u16(), 503);
+    let body: serde_json::Value = ready.json().await.unwrap();
+    assert_eq!(body["iam_sync"], "unconfirmed", "{body}");
+    let fresh = || {
+        reqwest::Client::builder()
+            .cookie_store(true)
+            .no_proxy()
+            .build()
+            .unwrap()
+    };
+    let refused = fresh()
+        .post(format!("{ep}/_/api/admin/login-as"))
+        .json(&login)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status().as_u16(), 503);
+    let refused = fresh()
+        .post(format!("{ep}/_/api/admin/session/browser-connect"))
+        .json(&serde_json::json!({
+            "access_key_id": user["access_key_id"],
+            "secret_access_key": user["secret_access_key"],
+            "endpoint": ep,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status().as_u16(), 503);
+
+    // The operator accepts the local copy.
+    let mut served = outage.to_vec();
+    served.push(("DGP_IAM_SERVE_UNCONFIRMED", "true"));
+    server.respawn_with_env(&served).await;
+    // The node is still not ready, but for its unreachable backend (the
+    // dropped endpoint is the data backend too), not for its IAM users.
+    let body: serde_json::Value = reqwest::get(format!("{ep}/_/ready"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["iam_sync"], "unconfirmed_override", "{body}");
+    let ok = fresh()
+        .post(format!("{ep}/_/api/admin/login-as"))
+        .json(&login)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
+}
+
 /// A coordination bucket that the backend refuses (here: it does not
 /// exist) ends the boot with a message that names the bucket and the
 /// setting. Without that, the node would boot, and every delta write would
@@ -74,7 +172,7 @@ async fn a_missing_coordination_bucket_ends_the_boot() {
                 ("DGP_CONFIG_DB_KEY", "a-test-key-for-the-sync-bucket"),
                 ("DGP_STATE_LOCK_WAIT_SECS", "5"),
             ],
-            60,
+            120,
         )
         .await;
     let status = status.expect("the proxy must exit");

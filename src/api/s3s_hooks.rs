@@ -16,12 +16,21 @@ use crate::iam::{IamState, SharedIamState};
 #[derive(Clone)]
 pub struct DeltaGliderS3sAuth {
     pub iam_state: SharedIamState,
+    /// The coordination status (`Default`: no coordination bucket).
+    pub coordination: crate::coordination::CoordinationStatus,
 }
 
 #[async_trait::async_trait]
 impl S3Auth for DeltaGliderS3sAuth {
     async fn get_secret_key(&self, access_key: &str) -> s3s::S3Result<SecretKey> {
-        match self.iam_state.load().as_ref() {
+        let iam = self.iam_state.load();
+        // The users of an unconfirmed IAM database are not looked up (the
+        // SigV4 middleware refuses first; this is the second gate).
+        let iam = self
+            .coordination
+            .credential_view(&iam)
+            .map_err(|_| s3s::s3_error!(ServiceUnavailable))?;
+        match iam {
             IamState::Disabled => {
                 // s3s verifies every signed request, open mode included (it
                 // needs the secret to read aws-chunked bodies). Open mode

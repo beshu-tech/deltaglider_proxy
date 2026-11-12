@@ -447,34 +447,48 @@ mod tests {
     }
 
     /// Only `install_bootstrap_hash` writes the live bootstrap hash (state
-    /// file and login verifier) in the admin API, so only it must end the
-    /// sessions of the old password. A second writer would skip that rule.
+    /// file and login verifier) while the server runs, so only it must end
+    /// the sessions of the old password, and it does so inside its own body.
+    /// The two other writers run before any session exists: the boot's first
+    /// hash and the offline `--set-bootstrap-password` command. A new writer
+    /// anywhere in `src/` fails here.
     #[test]
     fn only_install_bootstrap_hash_writes_the_live_hash() {
-        let mut hits = Vec::new();
-        for path in crate::source_scan::rust_files("src/api") {
-            let rel = crate::source_scan::rel(&path);
-            let text = crate::source_scan::prod_text(&crate::source_scan::read(&rel));
-            for needle in [
-                concat!("write_bootstrap_", "hash_file("),
-                concat!("password_hash", ".write()"),
-            ] {
-                if text.contains(needle) {
-                    hits.push(format!("{rel}: {needle}"));
+        const BOOT: [(&str, &str); 2] = [
+            ("src/config/mod.rs", "ensure_bootstrap_password_hash"),
+            ("src/main.rs", "main"),
+        ];
+        let mut writers = Vec::new();
+        for (rel, text) in crate::source_scan::prod_sources("src") {
+            let prod = crate::source_scan::prod_mask(&text);
+            for (at, line) in text.lines().enumerate() {
+                if !prod[at] || line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let writes = line.contains(concat!("write_bootstrap_", "hash_file("))
+                    && !line.contains("pub fn ")
+                    || line.contains(concat!("password_hash", ".write()"));
+                if writes {
+                    writers.push((rel.clone(), crate::source_scan::enclosing_fn(&text, at).0));
                 }
             }
         }
-        let own = "src/api/admin/config/password.rs";
+        writers.retain(|(f, func)| !BOOT.iter().any(|(bf, bfn)| bf == f && bfn == func));
+        let own = "src/api/admin/config/password.rs".to_string();
         assert_eq!(
-            hits,
+            writers,
             vec![
-                format!("{own}: {}", concat!("write_bootstrap_", "hash_file(")),
-                format!("{own}: {}", concat!("password_hash", ".write()")),
+                (own.clone(), "install_bootstrap_hash".to_string()),
+                (own, "install_bootstrap_hash".to_string()),
             ],
-            "a second writer of the bootstrap hash must go through install_bootstrap_hash"
+            "a writer of the bootstrap hash outside install_bootstrap_hash skips the session rule"
         );
-        let body = crate::source_scan::prod_text(include_str!("password.rs"));
-        assert!(body.contains("revoke_bootstrap_except"));
+        let body =
+            crate::source_scan::fn_body(include_str!("password.rs"), "install_bootstrap_hash");
+        assert!(
+            body.contains("revoke_bootstrap_except"),
+            "install_bootstrap_hash must end the other bootstrap sessions itself"
+        );
     }
 
     #[test]

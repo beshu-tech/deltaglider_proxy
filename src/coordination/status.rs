@@ -17,16 +17,27 @@ use super::if_match::ProfileCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[derive(Debug)]
 struct Inner {
     profile: ProfileCell,
     iam_confirmed: AtomicBool,
     /// `DGP_IAM_SERVE_UNCONFIRMED`: the operator accepts the local copy.
     serve_unconfirmed: bool,
+    /// The live IAM state, once the boot has one: readiness asks it where
+    /// the credentials of the S3 API come from.
+    iam: std::sync::OnceLock<crate::iam::SharedIamState>,
 }
 
 /// The env var that ends the refusal of an unconfirmed IAM database.
 pub const SERVE_UNCONFIRMED_ENV: &str = "DGP_IAM_SERVE_UNCONFIRMED";
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("iam_confirmed", &self.iam_confirmed)
+            .field("serve_unconfirmed", &self.serve_unconfirmed)
+            .finish_non_exhaustive()
+    }
+}
 
 /// The coordination state of this process. `Default` = no coordination
 /// bucket (single instance). Cheap to clone; every clone shares one state.
@@ -40,6 +51,7 @@ impl CoordinationStatus {
             profile,
             iam_confirmed: AtomicBool::new(false),
             serve_unconfirmed,
+            iam: std::sync::OnceLock::new(),
         })))
     }
 
@@ -54,6 +66,26 @@ impl CoordinationStatus {
         if let Some(i) = &self.0 {
             i.iam_confirmed.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Give the status the live IAM state (once, at boot).
+    pub fn attach_iam(&self, iam: crate::iam::SharedIamState) {
+        if let Some(i) = &self.0 {
+            let _ = i.iam.set(iam);
+        }
+    }
+
+    /// Would the S3 API refuse the users of the IAM database now? True only
+    /// when the rule ([`stale_iam_service`]) refuses: the credentials come
+    /// from the IAM database AND no sync confirmed it AND the operator did
+    /// not accept the local copy. Without an attached IAM state the source
+    /// is taken as the IAM database.
+    pub fn refuses_iam_users(&self) -> bool {
+        let source = match self.0.as_ref().and_then(|i| i.iam.get()) {
+            Some(iam) => credential_source(&iam.load()),
+            None => CredentialSource::IamDatabase,
+        };
+        stale_iam_service(self.iam_sync(), source) == StaleIamService::Refuse
     }
 
     /// The sync state of the IAM database.
@@ -123,6 +155,55 @@ pub fn stale_iam_service(sync: IamSync, source: CredentialSource) -> StaleIamSer
     }
 }
 
+/// The IAM database is not confirmed against the coordination bucket: no
+/// credential or principal may be judged against it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IamUnconfirmed;
+
+/// Where the credentials of a request come from, by IAM state (pure).
+pub fn credential_source(iam: &crate::iam::IamState) -> CredentialSource {
+    match iam {
+        crate::iam::IamState::Disabled => CredentialSource::Open,
+        crate::iam::IamState::Legacy(_) => CredentialSource::Bootstrap,
+        crate::iam::IamState::Iam(_) => CredentialSource::IamDatabase,
+    }
+}
+
+impl CoordinationStatus {
+    /// THE gate on the IAM index. The IAM state is the one a credential or a
+    /// principal (a key pair, a login-as, a browser-connect, an OAuth user,
+    /// an admin session of an IAM user) may be judged against: the state
+    /// itself, or `Err` while [`stale_iam_service`] refuses. Code that
+    /// reads the users of an `IamState::Iam` to judge somebody takes it
+    /// from here (source guard
+    /// `every_credential_read_of_the_iam_index_goes_through_the_gate`).
+    /// Requests that read no IAM database (anonymous, public prefix, OPTIONS,
+    /// `HEAD /`) never call it.
+    pub fn credential_view<'a>(
+        &self,
+        iam: &'a crate::iam::IamState,
+    ) -> Result<&'a crate::iam::IamState, IamUnconfirmed> {
+        match stale_iam_service(self.iam_sync(), credential_source(iam)) {
+            StaleIamService::Serve => Ok(iam),
+            StaleIamService::Refuse => Err(IamUnconfirmed),
+        }
+    }
+}
+
+/// [`CoordinationStatus::credential_view`] for a router that may carry no
+/// status: that case fails CLOSED for IAM users, as a missing IAM extension
+/// denies all.
+pub fn credential_view_or_closed<'a>(
+    status: Option<&CoordinationStatus>,
+    iam: &'a crate::iam::IamState,
+) -> Result<&'a crate::iam::IamState, IamUnconfirmed> {
+    match status {
+        Some(s) => s.credential_view(iam),
+        None if credential_source(iam) == CredentialSource::IamDatabase => Err(IamUnconfirmed),
+        None => Ok(iam),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +254,151 @@ mod tests {
         assert_eq!(over.iam_sync(), IamSync::Overridden);
         over.confirm_iam();
         assert_eq!(over.iam_sync(), IamSync::Confirmed);
+    }
+
+    #[test]
+    fn the_credential_view_follows_the_rule() {
+        use crate::iam::{IamIndex, IamState};
+        let iam = IamState::Iam(IamIndex::from_users(vec![]));
+        let open = IamState::Disabled;
+        let unconfirmed = CoordinationStatus::with_bucket(ProfileCell::unknown(), false);
+        assert_eq!(
+            unconfirmed.credential_view(&iam).err(),
+            Some(IamUnconfirmed)
+        );
+        assert!(unconfirmed.credential_view(&open).is_ok());
+        let over = CoordinationStatus::with_bucket(ProfileCell::unknown(), true);
+        assert!(over.credential_view(&iam).is_ok());
+        unconfirmed.confirm_iam();
+        assert!(unconfirmed.credential_view(&iam).is_ok());
+        assert!(CoordinationStatus::default().credential_view(&iam).is_ok());
+        // No status at all: IAM users fail closed, the rest is served.
+        assert!(credential_view_or_closed(None, &iam).is_err());
+        assert!(credential_view_or_closed(None, &open).is_ok());
+    }
+
+    #[test]
+    fn only_a_node_that_refuses_users_is_not_ready_for_them() {
+        use crate::iam::{IamIndex, IamState};
+        use arc_swap::ArcSwap;
+        let attach = |s: &CoordinationStatus, iam: IamState| {
+            s.attach_iam(Arc::new(ArcSwap::from_pointee(iam)));
+        };
+        let unconfirmed = CoordinationStatus::with_bucket(ProfileCell::unknown(), false);
+        attach(&unconfirmed, IamState::Iam(IamIndex::from_users(vec![])));
+        assert!(unconfirmed.refuses_iam_users());
+        // The credentials come from elsewhere: nothing to refuse.
+        let open = CoordinationStatus::with_bucket(ProfileCell::unknown(), false);
+        attach(&open, IamState::Disabled);
+        assert!(!open.refuses_iam_users());
+        let over = CoordinationStatus::with_bucket(ProfileCell::unknown(), true);
+        attach(&over, IamState::Iam(IamIndex::from_users(vec![])));
+        assert!(!over.refuses_iam_users());
+        unconfirmed.confirm_iam();
+        assert!(!unconfirmed.refuses_iam_users());
+        assert!(!CoordinationStatus::default().refuses_iam_users());
+    }
+
+    /// THE guard of the IAM index: every function outside `src/iam/` that
+    /// reads the users of an `IamState::Iam` (a key pair, a login, a
+    /// principal, an admin session of an IAM user) takes them from
+    /// [`CoordinationStatus::credential_view`], so a new authentication
+    /// path cannot skip the rule of an unconfirmed database. The exempt
+    /// functions judge nobody; each has its reason.
+    #[test]
+    fn every_credential_read_of_the_iam_index_goes_through_the_gate() {
+        // (file, function, why it needs no gate)
+        const EXEMPT: &[(&str, &str, &str)] = &[
+            (
+                "src/api/admin/auth.rs",
+                "whoami_mode",
+                "a label of the mode, no user",
+            ),
+            (
+                "src/api/admin/auth.rs",
+                "non_admin_bulk_session",
+                "its caller passes the gated view",
+            ),
+            (
+                "src/api/admin/auth.rs",
+                "session_principal_is_admin",
+                "its callers pass the gated view",
+            ),
+            (
+                "src/api/admin/auth.rs",
+                "session_actor_label",
+                "an audit label of an admitted session",
+            ),
+            (
+                "src/api/admin/auth.rs",
+                "bucket_view_session",
+                "reads the view that the gate returned",
+            ),
+            (
+                "src/api/admin/objects.rs",
+                "for_user",
+                "its callers pass the gated view",
+            ),
+            (
+                "src/api/admin/config/mod.rs",
+                "remove_bootstrap_credentials",
+                "a warning text, no login",
+            ),
+            (
+                "src/api/auth.rs",
+                "classify_auth_gate",
+                "picks the path; the Iam path calls the gate before it reads a user",
+            ),
+            (
+                "src/api/admin/users.rs",
+                "",
+                "the admin edits users; it judges nobody",
+            ),
+            (
+                "src/api/admin/users.rs",
+                "when_empty",
+                "the empty-IAM outcome, no user",
+            ),
+            ("src/startup.rs", "", "boot state, judges nobody"),
+            (
+                "src/config_db_sync.rs",
+                "",
+                "the sync rebuilds the index, judges nobody",
+            ),
+        ];
+        let mut offenders = Vec::new();
+        let mut gated = 0;
+        for (rel, text) in crate::source_scan::prod_sources("src") {
+            if rel.starts_with("src/iam/") || rel == "src/coordination/status.rs" {
+                continue;
+            }
+            let prod = crate::source_scan::prod_mask(&text);
+            for (at, line) in text.lines().enumerate() {
+                if !prod[at]
+                    || line.trim_start().starts_with("//")
+                    || !line.contains("IamState::Iam(")
+                {
+                    continue;
+                }
+                let (name, body) = crate::source_scan::enclosing_fn(&text, at);
+                if body.contains("credential_view") {
+                    gated += 1;
+                    continue;
+                }
+                let exempt = EXEMPT
+                    .iter()
+                    .any(|(f, n, _)| *f == rel && (n.is_empty() || *n == name));
+                if !exempt {
+                    offenders.push(format!("{rel}:{} in fn {name}", at + 1));
+                }
+            }
+        }
+        assert!(gated >= 5, "the scan found the gated reads ({gated})");
+        assert!(
+            offenders.is_empty(),
+            "these functions read the users of the IAM index without credential_view:\n{}",
+            offenders.join("\n")
+        );
     }
 
     #[test]

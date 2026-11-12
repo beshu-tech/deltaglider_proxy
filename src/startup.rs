@@ -1264,9 +1264,11 @@ fn prove_coordination(
 /// in the log line. Returns the validation when the bucket is proven.
 ///
 /// - Proven: the shared profile cell is set and the writers open.
-/// - `NonCas`: the boot exits. A coordination bucket that clobbers is a
-///   data-loss trap, and no probe mode changes that. This is the ONLY
-///   hard exit of this section (source guard
+/// - `NonCas`, or `Misconfigured` (the backend refused the probe's write and
+///   no retry changes it: missing bucket, unknown key, no right to write;
+///   the boot already waited for a refusal that can propagate): the boot
+///   exits. A coordination bucket that clobbers is a data-loss trap, and
+///   no probe mode changes that. This is the ONLY hard exit of this section (source guard
 ///   `only_settle_coordination_exits_the_process_on_a_coordination_verdict`).
 /// - Unknown (the probe could not run): the proxy boots, but every
 ///   coordination writer fails closed until the background re-probe proves
@@ -1289,7 +1291,9 @@ fn settle_coordination(
             prove_coordination(boot, v.profile());
             Some(v.clone())
         }
-        Err(failure @ (CasValidationFailure::NonCas | CasValidationFailure::Misconfigured(_))) => {
+        Err(
+            failure @ (CasValidationFailure::NonCas | CasValidationFailure::Misconfigured { .. }),
+        ) => {
             exit_with_boot_error(&format!(
                 "coordination bucket validation failed ({site}): {}",
                 failure.describe_for_coordination(&boot.bucket)
@@ -1320,7 +1324,9 @@ static REPROBE_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// - `NonCas` twice in a row: the process shuts down gracefully with a
 ///   failure exit code ([`deltaglider_proxy::shutdown::request_exit`]),
 ///   so a supervisor sees it and the drain still runs;
-/// - anything else: probe again.
+/// - anything else, a refused write (`Misconfigured`) included: probe
+///   again. A running node never exits on a refusal; it stays not ready
+///   for what needs the bucket, and each change of verdict is logged.
 ///
 /// Never a hard exit: that would skip the drain.
 fn start_coordination_reprobe(boot: &CoordinationBoot) {
@@ -1337,7 +1343,7 @@ fn start_coordination_reprobe(boot: &CoordinationBoot) {
         let (profile, bucket, backend) = (profile.clone(), bucket.clone(), backend.clone());
         async move {
             let mut failures: u32 = 0;
-            let mut definitive_streak: u32 = 0;
+            let mut noncas_streak: u32 = 0;
             let mut last_word = "";
             loop {
                 failures = failures.saturating_add(1);
@@ -1375,7 +1381,7 @@ fn start_coordination_reprobe(boot: &CoordinationBoot) {
                     }
                     last_word = word;
                 }
-                match reprobe_step(&verdict, definitive_streak) {
+                match reprobe_step(&verdict, noncas_streak) {
                     ReprobeStep::Proven => {
                         if let Ok(v) = &verdict {
                             profile.prove(v.profile());
@@ -1390,9 +1396,7 @@ fn start_coordination_reprobe(boot: &CoordinationBoot) {
                         );
                         return;
                     }
-                    ReprobeStep::Again {
-                        definitive_streak: n,
-                    } => definitive_streak = n,
+                    ReprobeStep::Again { noncas_streak: n } => noncas_streak = n,
                     ReprobeStep::Shutdown => {
                         error!(
                             "FATAL: coordination bucket '{bucket}' does NOT enforce atomic \
@@ -1451,9 +1455,11 @@ pub async fn validate_coordination_once(config: &Config) -> CoordinationBoot {
             return boot;
         }
     };
-    let validation =
-        deltaglider_proxy::config_db_sync::validate_coordination_bucket_with(&client, &boot.bucket)
-            .await;
+    let validation = deltaglider_proxy::config_db_sync::validate_coordination_bucket_at_boot(
+        &client,
+        &boot.bucket,
+    )
+    .await;
     if let Ok(v) = &validation {
         prove_coordination(&boot, v.profile());
     }
@@ -1574,8 +1580,8 @@ pub async fn build_coordination_lease(
 /// zero S3 traffic). With a coordination bucket set, build a CAS client against
 /// it and return an [`S3ReferenceLock`] over the shared profile cell
 /// (`boot.profile`): the lock must know what the bucket enforces (`If-Match`
-/// dialect, `If-Match` on DELETE) before it writes. Only a `NonCas` verdict is
-/// fatal, and not HERE: the later gates ([`build_coordination_lease`],
+/// dialect, `If-Match` on DELETE) before it writes. Only a definitive verdict
+/// (`NonCas`, `Misconfigured`) is fatal, and not HERE: the later gates ([`build_coordination_lease`],
 /// `init_config_sync`, after the backend capability gate) exit on it. An
 /// unknown verdict builds the lock CLOSED: every acquire fails with a
 /// retryable error (a delta PUT answers `503 ServiceUnavailable`) until the
@@ -1687,12 +1693,18 @@ pub async fn build_encryption_witness(
         &boot.verdict,
         ConfigDbSync::build_client(coordination_backend(config)).await,
     ) {
-        (Some(Err(e @ deltaglider_proxy::config_db_sync::CasValidationFailure::NonCas)), _) => {
-            Err(format!(
-                "the coordination bucket failed validation ({})",
-                e.describe_for_coordination(&sync_bucket)
-            ))
-        }
+        (
+            Some(Err(
+                e @ (deltaglider_proxy::config_db_sync::CasValidationFailure::NonCas
+                | deltaglider_proxy::config_db_sync::CasValidationFailure::Misconfigured {
+                    ..
+                }),
+            )),
+            _,
+        ) => Err(format!(
+            "the coordination bucket failed validation ({})",
+            e.describe_for_coordination(&sync_bucket)
+        )),
         (_, Err(e)) => Err(format!("the coordination client could not be built ({e})")),
         (_, Ok(c)) => Ok(c),
     };
@@ -1779,26 +1791,94 @@ pub async fn init_config_sync(
             deltaglider_proxy::config_db_sync::DEFAULT_CONFIG_SYNC_OBJECT_KEY.to_string()
         });
 
-    let sync = match ConfigDbSync::new(
-        coordination_backend(config),
-        sync_bucket.clone(),
-        object_key,
-        db_file,
-        db_keys.clone(),
-        accept_legacy_sync(),
-    )
-    .await
-    {
-        Ok(s) => Arc::new(
-            s.with_profile_cell(boot.profile.clone())
-                .with_status(boot.status.clone()),
-        ),
+    let build = || async {
+        ConfigDbSync::new(
+            coordination_backend(config),
+            sync_bucket.clone(),
+            object_key.clone(),
+            db_file.clone(),
+            db_keys.clone(),
+            accept_legacy_sync(),
+        )
+        .await
+        .map(|s| {
+            Arc::new(
+                s.with_profile_cell(boot.profile.clone())
+                    .with_status(boot.status.clone()),
+            )
+        })
+    };
+    let sync = match build().await {
+        Ok(s) => s,
         Err(e) => {
             error!(
-                "Config DB S3 sync: failed to initialize: {e}. The IAM database stays \
-                 unconfirmed and the node not ready until a restart with a working \
-                 coordination backend"
+                "Config DB S3 sync: failed to initialize: {e}. The IAM database is not \
+                 confirmed, so the S3 API refuses IAM users and the node is not ready; the \
+                 build is retried every 5 s, doubling to 60 s. \
+                 DGP_IAM_SERVE_UNCONFIRMED=true serves the local IAM database meanwhile"
             );
+            // The node recovers alone: the same builder, with backoff, then
+            // the periodic sync on what it built. (Admin changes upload
+            // only through a sync built at boot: restart to get that back.)
+            let keys = db_keys.clone();
+            let db = db_file.clone();
+            let (config_db, iam_state) = (config_db.clone(), iam_state.clone());
+            let (external_auth, sessions) = (external_auth.clone(), sessions.clone());
+            let backend = coordination_backend(config).clone();
+            let (bucket, key) = (sync_bucket.clone(), object_key.clone());
+            let (profile, status) = (boot.profile.clone(), boot.status.clone());
+            spawn_supervised("config-sync-init-retry", move || {
+                let (db, keys, backend, bucket, key) = (
+                    db.clone(),
+                    keys.clone(),
+                    backend.clone(),
+                    bucket.clone(),
+                    key.clone(),
+                );
+                let (config_db, iam_state) = (config_db.clone(), iam_state.clone());
+                let (external_auth, sessions) = (external_auth.clone(), sessions.clone());
+                let (profile, status) = (profile.clone(), status.clone());
+                async move {
+                    let mut failures: u32 = 0;
+                    let sync = loop {
+                        failures = failures.saturating_add(1);
+                        tokio::time::sleep(
+                            deltaglider_proxy::coordination::atomicity::unknown_recheck_delay(
+                                failures,
+                            ),
+                        )
+                        .await;
+                        match ConfigDbSync::new(
+                            &backend,
+                            bucket.clone(),
+                            key.clone(),
+                            db.clone(),
+                            keys.clone(),
+                            accept_legacy_sync(),
+                        )
+                        .await
+                        {
+                            Ok(s) => {
+                                break Arc::new(
+                                    s.with_profile_cell(profile.clone())
+                                        .with_status(status.clone()),
+                                )
+                            }
+                            Err(e) => warn!("Config DB S3 sync: build failed again: {e}"),
+                        }
+                    };
+                    info!("Config DB S3 sync: built after {failures} failed attempt(s)");
+                    deltaglider_proxy::config_db_sync::run_poll_loop(
+                        sync,
+                        config_db,
+                        keys.primary.expose().to_string(),
+                        iam_state,
+                        external_auth,
+                        sessions,
+                    )
+                    .await;
+                }
+            });
             return None;
         }
     };
@@ -1927,62 +2007,15 @@ pub fn spawn_config_sync_poll(
         let sessions = sessions.clone();
         let db_key = db_key.clone();
         async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(300));
-            // Skip the immediate first tick (startup sync already ran)
-            tick.tick().await;
-            let mut unconfirmed_rounds: u32 = 0;
-            loop {
-                // While no sync confirmed the IAM database, the S3 API refuses
-                // its users: try again soon (5 s, doubling to 60 s), not at
-                // the 5-minute tick.
-                if sync.iam_confirmed() {
-                    tick.tick().await;
-                } else {
-                    unconfirmed_rounds = unconfirmed_rounds.saturating_add(1);
-                    tokio::time::sleep(
-                        deltaglider_proxy::coordination::atomicity::unknown_recheck_delay(
-                            unconfirmed_rounds,
-                        ),
-                    )
-                    .await;
-                }
-                match deltaglider_proxy::config_db_sync::pull_and_merge(
-                    &sync,
-                    &db_arc,
-                    db_key.expose(),
-                    &iam,
-                    &ext_auth,
-                    Some(&sessions),
-                    "periodic poll",
-                )
-                .await
-                {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        tracing::debug!("Config DB S3 sync poll: no changes");
-                    }
-                    Err(e) => {
-                        warn!("Config DB S3 sync poll failed: {}", e);
-                    }
-                }
-                // Flush an upload that exhausted its retries earlier — a parked
-                // revocation/mutation must not wait for the next admin action.
-                if sync.take_needs_upload() {
-                    if let Err(e) = deltaglider_proxy::config_db_sync::upload_with_reconcile(
-                        &sync,
-                        &db_arc,
-                        db_key.expose(),
-                        &iam,
-                        &ext_auth,
-                        Some(&sessions),
-                        "poll flush",
-                    )
-                    .await
-                    {
-                        warn!("Config DB S3 sync poll: pending upload flush failed: {}", e);
-                    }
-                }
-            }
+            deltaglider_proxy::config_db_sync::run_poll_loop(
+                sync,
+                db_arc,
+                db_key.expose().to_string(),
+                iam,
+                ext_auth,
+                sessions,
+            )
+            .await;
         }
     });
 }

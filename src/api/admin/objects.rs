@@ -315,8 +315,11 @@ impl BulkActor {
                 client_ip,
             } => (access_key_id, *client_ip),
         };
-        Self::for_user(&state.iam_state.load(), access_key_id, client_ip)
-            .map_err(AdminError::forbidden)
+        let iam = state.iam_state.load();
+        let view = state.credential_view(&iam).map_err(|_| {
+            AdminError::forbidden("AccessDenied: the credential store is not ready")
+        })?;
+        Self::for_user(view, access_key_id, client_ip).map_err(AdminError::forbidden)
     }
 
     /// The actor of a stored principal (a delete job), against the IAM

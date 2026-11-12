@@ -528,8 +528,17 @@ pub fn install_outbound_egress(via_system_proxy: bool) {
 /// (`outbound_http_clients_come_from_the_one_guarded_builder`) refuses any
 /// other client builder.
 pub fn guarded_reqwest_builder(kind: UrlKind) -> reqwest::ClientBuilder {
+    guarded_reqwest_builder_for(kind, OUTBOUND_EGRESS.get().copied().unwrap_or_default())
+}
+
+/// [`guarded_reqwest_builder`] for an egress given by the caller (the
+/// process-wide one is the wrapper's business).
+pub fn guarded_reqwest_builder_for(
+    kind: UrlKind,
+    egress: OutboundEgress,
+) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-    match OUTBOUND_EGRESS.get().copied().unwrap_or_default() {
+    match egress {
         OutboundEgress::Direct => builder
             .no_proxy()
             .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver::new(kind))),
@@ -1116,6 +1125,45 @@ mod tests {
         // A public literal → at least one acceptable addr → Ok.
         let ok = resolve("8.8.8.8").await.expect("public addr accepted");
         assert!(ok.count() >= 1);
+    }
+
+    /// Both arms of the egress. Direct: the resolver guard is on, so a name
+    /// that resolves to loopback fails at connect time. System proxy: no
+    /// resolver guard (it would judge the proxy's own address), so with no
+    /// proxy in the environment the same request goes through.
+    #[tokio::test]
+    async fn the_egress_decides_whether_the_resolver_guard_is_on() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+            }
+        });
+        let url = format!("http://localhost:{port}/");
+        let direct = guarded_reqwest_builder_for(UrlKind::Webhook, OutboundEgress::Direct)
+            .build()
+            .unwrap();
+        let err = direct
+            .get(&url)
+            .send()
+            .await
+            .expect_err("the guard refuses");
+        assert!(format!("{err:?}").contains("SSRF guard"), "{err:?}");
+        let proxied = guarded_reqwest_builder_for(UrlKind::Webhook, OutboundEgress::SystemProxy)
+            .build()
+            .unwrap();
+        // Redirects stay off in both arms.
+        match proxied.get(&url).send().await {
+            Ok(r) => assert_eq!(r.status(), 200),
+            // A proxy in this host's environment may answer instead; the
+            // resolver guard is never what refuses.
+            Err(e) => assert!(!format!("{e:?}").contains("SSRF guard"), "{e:?}"),
+        }
+        assert_eq!(OutboundEgress::default(), OutboundEgress::Direct);
     }
 
     /// A host is refused up front only when EVERY address it resolves to is

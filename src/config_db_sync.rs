@@ -834,12 +834,77 @@ impl ConfigDbSync {
     pub async fn validate_coordination_bucket(
         &self,
     ) -> Result<CoordinationValidation, CasValidationFailure> {
-        let validation = validate_coordination_bucket_with(&self.s3_client, &self.bucket).await;
+        let validation = validate_coordination_bucket_at_boot(&self.s3_client, &self.bucket).await;
         if let Ok(v) = &validation {
             self.use_profile(v.profile());
         }
         validation
     }
+}
+
+/// How long the boot waits before it takes a refusal that can be a
+/// propagation delay (a bucket or an access key made a moment ago) as final.
+pub const BOOT_REFUSAL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+/// The pause between two tries inside that window.
+pub const BOOT_REFUSAL_STEP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Pure: does the boot try again? Only for a refusal that can propagate
+/// ([`crate::coordination::cas_probe::code_may_propagate`]), and only while
+/// `waited` is inside `window`.
+pub fn boot_retries_refusal(
+    failure: &CasValidationFailure,
+    waited: std::time::Duration,
+    window: std::time::Duration,
+) -> bool {
+    matches!(
+        failure,
+        CasValidationFailure::Misconfigured {
+            propagates: true,
+            ..
+        }
+    ) && waited < window
+}
+
+/// Run `validate` at boot: a refusal that can be a propagation delay is
+/// tried again every `step` for up to `window` (each try is logged), then
+/// it is final. Any other answer returns at once.
+pub async fn validate_with_grace<F, Fut>(
+    mut validate: F,
+    window: std::time::Duration,
+    step: std::time::Duration,
+) -> Result<CoordinationValidation, CasValidationFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<CoordinationValidation, CasValidationFailure>>,
+{
+    let started = std::time::Instant::now();
+    loop {
+        let verdict = validate().await;
+        match &verdict {
+            Err(failure) if boot_retries_refusal(failure, started.elapsed(), window) => {
+                warn!(
+                    "Coordination bucket refused the probe's write; trying again in {step:?} \
+                     (a new bucket or key can take a moment to propagate): {failure:?}"
+                );
+                tokio::time::sleep(step).await;
+            }
+            _ => return verdict,
+        }
+    }
+}
+
+/// [`validate_coordination_bucket_with`] for the boot: with the grace of
+/// [`validate_with_grace`].
+pub async fn validate_coordination_bucket_at_boot(
+    client: &Client,
+    bucket: &str,
+) -> Result<CoordinationValidation, CasValidationFailure> {
+    validate_with_grace(
+        || validate_coordination_bucket_with(client, bucket),
+        BOOT_REFUSAL_GRACE,
+        BOOT_REFUSAL_STEP,
+    )
+    .await
 }
 
 /// [`ConfigDbSync::validate_coordination_bucket`] with a caller's client:
@@ -854,16 +919,16 @@ pub async fn validate_coordination_bucket_with(
 /// How many no-conditional-writes verdicts in a row the background re-probe
 /// takes as final. One could be a mixed answer of a bucket behind a flapping proxy;
 /// two in a row is a verdict.
-pub const REPROBE_DEFINITIVE_LIMIT: u32 = 2;
+pub const REPROBE_NONCAS_LIMIT: u32 = 2;
 
 /// What the background re-probe does with its latest verdict (pure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReprobeStep {
     /// The bucket is proven: enable the coordination writers and stop.
     Proven,
-    /// Not decided yet: wait, then probe again. `definitive_streak` is the
+    /// Not decided yet: wait, then probe again. `noncas_streak` is the
     /// number of definitive failures in a row, this one included.
-    Again { definitive_streak: u32 },
+    Again { noncas_streak: u32 },
     /// No conditional writes, twice in a row: HA coordination is unsafe.
     /// Shut down gracefully with a failure exit code. (A refused write is
     /// never a reason to stop a running node.)
@@ -880,19 +945,15 @@ pub fn reprobe_step(
 ) -> ReprobeStep {
     match verdict {
         Ok(_) => ReprobeStep::Proven,
-        Err(CasValidationFailure::Indeterminate(_)) => ReprobeStep::Again {
-            definitive_streak: 0,
-        },
+        Err(CasValidationFailure::Indeterminate(_)) => ReprobeStep::Again { noncas_streak: 0 },
         // A refused write never stops a RUNNING node: only the boot exits on
         // a definitive answer. The node stays not ready and the re-probe logs.
-        Err(CasValidationFailure::Misconfigured(_)) => ReprobeStep::Again {
-            definitive_streak: 0,
-        },
-        Err(CasValidationFailure::NonCas) if streak + 1 >= REPROBE_DEFINITIVE_LIMIT => {
+        Err(CasValidationFailure::Misconfigured { .. }) => ReprobeStep::Again { noncas_streak: 0 },
+        Err(CasValidationFailure::NonCas) if streak + 1 >= REPROBE_NONCAS_LIMIT => {
             ReprobeStep::Shutdown
         }
         Err(CasValidationFailure::NonCas) => ReprobeStep::Again {
-            definitive_streak: streak + 1,
+            noncas_streak: streak + 1,
         },
     }
 }
@@ -905,7 +966,7 @@ pub fn verdict_word(
     match verdict {
         Ok(_) => "proven",
         Err(CasValidationFailure::NonCas) => "no_conditional_writes",
-        Err(CasValidationFailure::Misconfigured(_)) => "write_refused",
+        Err(CasValidationFailure::Misconfigured { .. }) => "write_refused",
         Err(CasValidationFailure::Indeterminate(_)) => "unreachable",
     }
 }
@@ -921,7 +982,7 @@ impl CasValidationFailure {
                  (>=2024-09), or Ceph/Hetzner; Backblaze B2 (501) and old MinIO/SeaweedFS \
                  (silent overwrite) are NOT supported."
             ),
-            CasValidationFailure::Misconfigured(e) => format!(
+            CasValidationFailure::Misconfigured { detail: e, .. } => format!(
                 "Coordination bucket '{bucket}' (config_sync_bucket / DGP_CONFIG_SYNC_BUCKET) \
                  refused the probe's write. Check that the bucket exists on the coordination \
                  backend and that the backend's credentials may write to it: {e}"
@@ -948,7 +1009,12 @@ impl CasValidationFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CasValidationFailure {
     NonCas,
-    Misconfigured(String),
+    /// `propagates`: a new bucket or key can still explain it (the boot
+    /// waits a short time before it takes it as final).
+    Misconfigured {
+        detail: String,
+        propagates: bool,
+    },
     Indeterminate(String),
 }
 
@@ -956,7 +1022,10 @@ impl From<crate::coordination::cas_probe::ProbeError> for CasValidationFailure {
     fn from(e: crate::coordination::cas_probe::ProbeError) -> Self {
         use crate::coordination::cas_probe::ProbeErrorKind;
         match e.kind {
-            ProbeErrorKind::Misconfigured => Self::Misconfigured(e.detail),
+            ProbeErrorKind::Misconfigured => Self::Misconfigured {
+                detail: e.detail,
+                propagates: e.propagates,
+            },
             ProbeErrorKind::Indeterminate => Self::Indeterminate(e.detail),
         }
     }
@@ -1479,6 +1548,112 @@ pub async fn pull_and_merge(
     .await
 }
 
+/// What the periodic sync waits before its next round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollWait {
+    /// The regular 5-minute tick.
+    Tick,
+    /// The IAM database is not confirmed: try again soon.
+    Backoff(std::time::Duration),
+}
+
+/// THE wait of the periodic sync (pure). While no sync confirmed the IAM
+/// database the S3 API refuses its users, so the next round comes after
+/// 5 s, doubling to 60 s (`rounds` counts the unconfirmed rounds so far,
+/// from 1), not after the 5-minute tick.
+pub fn poll_wait(confirmed: bool, rounds: u32) -> PollWait {
+    if confirmed {
+        PollWait::Tick
+    } else {
+        PollWait::Backoff(crate::coordination::atomicity::unknown_recheck_delay(
+            rounds,
+        ))
+    }
+}
+
+/// One round of the periodic sync: pull and merge, then flush an upload
+/// that exhausted its retries earlier (a parked revocation or mutation
+/// must not wait for the next admin action). A pull that ends well
+/// confirms the IAM database in the process status.
+pub async fn poll_round(
+    sync: &ConfigDbSync,
+    config_db: &Option<Arc<Mutex<ConfigDb>>>,
+    db_key: &str,
+    iam_state: &SharedIamState,
+    external_auth: &Option<Arc<ExternalAuthManager>>,
+    sessions: Option<&Arc<crate::session::SessionStore>>,
+) {
+    match pull_and_merge(
+        sync,
+        config_db,
+        db_key,
+        iam_state,
+        external_auth,
+        sessions,
+        "periodic poll",
+    )
+    .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => tracing::debug!("Config DB S3 sync poll: no changes"),
+        Err(e) => warn!("Config DB S3 sync poll failed: {}", e),
+    }
+    if sync.take_needs_upload() {
+        if let Err(e) = upload_with_reconcile(
+            sync,
+            config_db,
+            db_key,
+            iam_state,
+            external_auth,
+            sessions,
+            "poll flush",
+        )
+        .await
+        {
+            warn!("Config DB S3 sync poll: pending upload flush failed: {}", e);
+        }
+    }
+}
+
+/// THE periodic sync: for ever, wait ([`poll_wait`]), then one round
+/// ([`poll_round`]). Used by the boot's sync and by the one that the boot
+/// builds later when its first build failed.
+pub async fn run_poll_loop(
+    sync: Arc<ConfigDbSync>,
+    config_db: Option<Arc<Mutex<ConfigDb>>>,
+    db_key: String,
+    iam_state: SharedIamState,
+    external_auth: Option<Arc<ExternalAuthManager>>,
+    sessions: Arc<crate::session::SessionStore>,
+) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+    // The first tick is immediate: the startup sync already ran.
+    tick.tick().await;
+    let mut rounds: u32 = 0;
+    loop {
+        rounds = if sync.iam_confirmed() {
+            0
+        } else {
+            rounds.saturating_add(1)
+        };
+        match poll_wait(sync.iam_confirmed(), rounds) {
+            PollWait::Tick => {
+                tick.tick().await;
+            }
+            PollWait::Backoff(wait) => tokio::time::sleep(wait).await,
+        }
+        poll_round(
+            &sync,
+            &config_db,
+            &db_key,
+            &iam_state,
+            &external_auth,
+            Some(&sessions),
+        )
+        .await;
+    }
+}
+
 /// `pull_and_merge` for a caller that already holds the upload lock.
 async fn pull_locked(
     sync: &ConfigDbSync,
@@ -1745,6 +1920,102 @@ mod iam_rebuild_tests {
 mod tests {
     use super::*;
 
+    /// A TCP front for `target` that drops every connection while `up` is
+    /// false and forwards it while true: the shape of a coordination
+    /// store that is down, then back.
+    async fn flaky_front(target: String, up: Arc<AtomicBool>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target = target.trim_start_matches("http://").to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                if !up.load(Ordering::SeqCst) {
+                    continue; // dropped
+                }
+                let target = target.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The node recovers alone. The pulls fail while the coordination
+    /// store is down: the IAM database stays unconfirmed (the wait is the
+    /// short backoff, the node is not ready, an IAM user gets the 503).
+    /// When the store is back, the next round of the periodic sync confirms
+    /// the database: the node is ready again, with no restart and no manual
+    /// confirmation.
+    #[tokio::test]
+    async fn the_periodic_sync_confirms_the_iam_database_when_the_store_returns() {
+        use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+        use crate::iam::{IamIndex, IamState};
+        let (fake_endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let up = Arc::new(AtomicBool::new(false));
+        let endpoint = flaky_front(fake_endpoint, up.clone()).await;
+        let status = CoordinationStatus::with_bucket(ProfileCell::unknown(), false);
+        let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Iam(
+            IamIndex::from_users(vec![]),
+        )));
+        status.attach_iam(iam.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let sync = ConfigDbSync::new(
+            &BackendConfig::S3 {
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("k".into()),
+                secret_access_key: Some("s".into()),
+                allow_local: true,
+                session_token: None,
+            },
+            "b".into(),
+            "k.db".into(),
+            dir.path().join("deltaglider_config.db"),
+            crate::config_db::ConfigDbKeys::primary_only(&"k".repeat(40)),
+            false,
+        )
+        .await
+        .unwrap()
+        .with_status(status.clone());
+        let sessions = Arc::new(crate::session::SessionStore::new());
+        let key = "k".repeat(40);
+        let round = || poll_round(&sync, &None, &key, &iam, &None, Some(&sessions));
+
+        round().await;
+        assert!(!sync.iam_confirmed(), "a failed pull confirms nothing");
+        assert!(status.refuses_iam_users());
+        assert!(status.credential_view(&iam.load()).is_err());
+        assert_eq!(
+            poll_wait(sync.iam_confirmed(), 1),
+            PollWait::Backoff(std::time::Duration::from_secs(5))
+        );
+
+        up.store(true, Ordering::SeqCst);
+        round().await;
+        assert!(sync.iam_confirmed(), "the next round confirms the database");
+        assert!(!status.refuses_iam_users());
+        assert!(status.credential_view(&iam.load()).is_ok());
+        assert_eq!(poll_wait(sync.iam_confirmed(), 0), PollWait::Tick);
+    }
+
+    #[test]
+    fn the_poll_wait_backs_off_while_unconfirmed() {
+        use std::time::Duration;
+        let secs = |s| PollWait::Backoff(Duration::from_secs(s));
+        assert_eq!(poll_wait(true, 0), PollWait::Tick);
+        assert_eq!(poll_wait(true, 9), PollWait::Tick);
+        for (rounds, want) in [(1, 5), (2, 10), (3, 20), (4, 40), (5, 60), (50, 60)] {
+            assert_eq!(poll_wait(false, rounds), secs(want), "round {rounds}");
+        }
+    }
+
     fn proven() -> Result<CoordinationValidation, CasValidationFailure> {
         Ok(CoordinationValidation::Probed {
             profile: Default::default(),
@@ -1755,8 +2026,13 @@ mod tests {
     fn the_reprobe_step_table() {
         let unknown = || Err(CasValidationFailure::Indeterminate("timeout".into()));
         let noncas = || Err(CasValidationFailure::NonCas);
-        let refused = || Err(CasValidationFailure::Misconfigured("NoSuchBucket".into()));
-        let again = |definitive_streak| ReprobeStep::Again { definitive_streak };
+        let refused = || {
+            Err(CasValidationFailure::Misconfigured {
+                detail: "NoSuchBucket".into(),
+                propagates: true,
+            })
+        };
+        let again = |noncas_streak| ReprobeStep::Again { noncas_streak };
         // (verdict, streak before, want)
         let cases = [
             (proven(), 0, ReprobeStep::Proven),
@@ -1776,12 +2052,84 @@ mod tests {
         }
     }
 
+    /// The boot waits only for a refusal that can propagate, only inside the
+    /// window, and stops at the first answer that is not one.
+    #[tokio::test]
+    async fn the_boot_waits_only_for_a_refusal_that_can_propagate() {
+        use std::time::Duration;
+        let refusal = |propagates| CasValidationFailure::Misconfigured {
+            detail: "d".into(),
+            propagates,
+        };
+        let secs = Duration::from_secs;
+        assert!(boot_retries_refusal(&refusal(true), secs(0), secs(30)));
+        assert!(boot_retries_refusal(&refusal(true), secs(29), secs(30)));
+        assert!(!boot_retries_refusal(&refusal(true), secs(30), secs(30)));
+        assert!(!boot_retries_refusal(&refusal(false), secs(0), secs(30)));
+        assert!(!boot_retries_refusal(
+            &CasValidationFailure::NonCas,
+            secs(0),
+            secs(30)
+        ));
+
+        // Two refusals, then the bucket is there: the boot goes on.
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let out = validate_with_grace(
+            || async {
+                if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(refusal(true))
+                } else {
+                    proven()
+                }
+            },
+            secs(30),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(out.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // A refusal that stays is final once the window ends.
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let out = validate_with_grace(
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(refusal(true))
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        )
+        .await;
+        assert!(matches!(
+            out,
+            Err(CasValidationFailure::Misconfigured { .. })
+        ));
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+
+        // A refusal that cannot propagate is not retried.
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let out = validate_with_grace(
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(refusal(false))
+            },
+            secs(30),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(out.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn each_verdict_has_its_own_word() {
         let words = [
             verdict_word(&proven()),
             verdict_word(&Err(CasValidationFailure::NonCas)),
-            verdict_word(&Err(CasValidationFailure::Misconfigured("x".into()))),
+            verdict_word(&Err(CasValidationFailure::Misconfigured {
+                detail: "x".into(),
+                propagates: false,
+            })),
             verdict_word(&Err(CasValidationFailure::Indeterminate("x".into()))),
         ];
         let distinct: std::collections::HashSet<_> = words.iter().collect();
@@ -1797,11 +2145,15 @@ mod tests {
             CasValidationFailure::from(ProbeError {
                 kind,
                 detail: "d".into(),
+                propagates: false,
             })
         };
         assert_eq!(
             of(ProbeErrorKind::Misconfigured),
-            CasValidationFailure::Misconfigured("d".into())
+            CasValidationFailure::Misconfigured {
+                detail: "d".into(),
+                propagates: false
+            }
         );
         assert_eq!(
             of(ProbeErrorKind::Indeterminate),

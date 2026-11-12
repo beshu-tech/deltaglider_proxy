@@ -267,6 +267,10 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with(Default::default()).await
+}
+
+async fn harness_with(coordination: crate::coordination::CoordinationStatus) -> Harness {
     use s3s::service::S3ServiceBuilder;
 
     let iam: crate::iam::SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Iam(
@@ -312,7 +316,7 @@ async fn harness() -> Harness {
         backend_health: Default::default(),
         encryption_witness: None,
         config_db_key_mismatch: false,
-        coordination: Default::default(),
+        coordination: coordination.clone(),
     });
     let rate_limiter = crate::rate_limiter::RateLimiter::new(
         100,
@@ -339,7 +343,10 @@ async fn harness() -> Harness {
     );
 
     let mut builder = S3ServiceBuilder::new(NopS3);
-    builder.set_auth(DeltaGliderS3sAuth { iam_state: iam });
+    builder.set_auth(DeltaGliderS3sAuth {
+        iam_state: iam,
+        coordination,
+    });
     builder.set_access(RecordingAccess);
     builder.set_config(crate::api::s3s_hooks::s3s_config(
         crate::config::RuntimeTuning::default().clock_skew_secs,
@@ -1278,6 +1285,68 @@ enum BodyCheck {
 /// the digest. The invariant in `violations` (a trusted digest always
 /// matches the delivered body) runs on every row and on the generated
 /// requests.
+/// A node whose IAM database no sync confirmed refuses the requests that
+/// are judged against it (a key pair, signed or presigned, and a form
+/// POST) with a retryable 503, and serves the ones that read no IAM
+/// database: public prefix, CORS preflight, the `HEAD /` probe. One
+/// confirmation (or the operator override) opens the users again.
+#[tokio::test]
+async fn an_unconfirmed_iam_database_refuses_only_what_it_judges() {
+    use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+    let status = CoordinationStatus::with_bucket(ProfileCell::unknown(), false);
+    let h = harness_with(status.clone()).await;
+    let code = |raw: RawRequest| {
+        let h = &h;
+        async move { run(h, &raw).await.expect("a request").status }
+    };
+    let key = format!("/{PUBLIC_BUCKET}/other/k");
+    let public = format!("/{PUBLIC_BUCKET}/{PUBLIC_PREFIX}k");
+
+    assert_eq!(
+        code(get(&key, v4(ALICE))).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        code(get(&key, Auth::V4Presigned(ALICE))).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let mut form = form_post(&format!("/{PUBLIC_BUCKET}"));
+    form.headers
+        .push(("content-length".into(), form.body.len().to_string()));
+    assert_eq!(code(form).await, StatusCode::SERVICE_UNAVAILABLE);
+    // No IAM database is read: these are served.
+    // `NopS3` answers 501 to what reaches it: 501 = served.
+    assert_eq!(
+        code(get(&public, Auth::None)).await,
+        StatusCode::NOT_IMPLEMENTED
+    );
+    assert_ne!(
+        code(req(Method::OPTIONS, &key, &[], Auth::None)).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_ne!(
+        code(req(Method::HEAD, "/", &[], Auth::None)).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    // A sync confirms the database: the users are judged again.
+    status.confirm_iam();
+    assert_eq!(
+        code(get(&key, v4(ALICE))).await,
+        StatusCode::NOT_IMPLEMENTED
+    );
+
+    // The operator override serves the local copy.
+    let over = CoordinationStatus::with_bucket(ProfileCell::unknown(), true);
+    let h = harness_with(over).await;
+    assert_eq!(
+        run(&h, &get(&key, v4(ALICE)))
+            .await
+            .expect("a request")
+            .status,
+        StatusCode::NOT_IMPLEMENTED
+    );
+}
+
 #[tokio::test]
 async fn s3s_verifies_the_payload_hash_we_trust() {
     use BodyCheck::*;

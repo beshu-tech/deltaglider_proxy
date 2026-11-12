@@ -176,6 +176,62 @@ async fn the_chunk_growth_stops_at_the_cap() {
     assert!((15..=25).contains(&passes), "{passes} passes");
 }
 
+/// One budget for the whole request. Four nested folders hold 150 keys each
+/// (every level is wider than the cap). The walk reads each level in chunks
+/// of at most the budget minus what its ancestors hold: the request never
+/// holds the cap once per level, and the keys come out in order, page after
+/// page, with nothing lost or repeated.
+#[tokio::test]
+async fn a_nested_wide_tree_holds_one_budget_and_lists_in_order() {
+    const LEVELS: usize = 4;
+    const PER_LEVEL: usize = 150;
+    const BUDGET: usize = 64;
+    const FLOOR: usize = 4;
+    let (tmp, engine) = engine_with_folder(0).await;
+    let mut dir = tmp.path().join("b").join("deltaspaces").join("big");
+    let mut want: Vec<String> = Vec::new();
+    let mut key_dir = "big".to_string();
+    for level in 0..LEVELS {
+        for i in 0..PER_LEVEL {
+            std::fs::write(dir.join(format!("f{i:03}.jpg")), b"x").unwrap();
+            want.push(format!("{key_dir}/f{i:03}.jpg"));
+        }
+        if level + 1 < LEVELS {
+            dir = dir.join("s");
+            std::fs::create_dir_all(&dir).unwrap();
+            key_dir = format!("{key_dir}/s");
+        }
+    }
+    want.sort();
+
+    scan::set_chunk_for_test(Some(FLOOR));
+    scan::set_cap_for_test(Some(BUDGET));
+    for max_keys in [40, 1000] {
+        let mut got: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut peak = 0;
+        loop {
+            HELD_PEAK.with(|p| p.set(0));
+            let page = engine
+                .list_objects("b", "big/", None, max_keys, token.as_deref(), false)
+                .await
+                .unwrap();
+            peak = peak.max(HELD_PEAK.with(|p| p.get()));
+            got.extend(page.objects.into_iter().map(|(k, _)| k));
+            if !page.is_truncated {
+                break;
+            }
+            token = page.next_continuation_token;
+        }
+        assert_eq!(got, want, "max_keys {max_keys}");
+        // The budget, one floor and the heap's spare entry per level.
+        let bound = BUDGET + LEVELS * (FLOOR + 1);
+        assert!(peak <= bound, "peak {peak} > {bound}, max_keys {max_keys}");
+    }
+    scan::set_chunk_for_test(None);
+    scan::set_cap_for_test(None);
+}
+
 /// F19 + the class guard of epic #142: for random key sets (a `.dg`
 /// directory, Unicode and control characters among them) the recursive
 /// delimiter walk lists exactly the flat listing, with any chunk size and

@@ -635,8 +635,16 @@ pub async fn oauth_callback(
         &req_headers,
         connect_info.as_ref().map(|ci| ci.0.ip()),
     );
-    let is_admin =
-        super::auth::session_principal_is_admin(&auth_method, &state.iam_state.load(), client_ip);
+    // The user is judged against the IAM index only once it is confirmed.
+    let iam = state.iam_state.load();
+    let Ok(iam_view) = state.credential_view(&iam) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The credential store is not ready yet; retry later.",
+        )
+            .into_response();
+    };
+    let is_admin = super::auth::session_principal_is_admin(&auth_method, iam_view, client_ip);
     let session_kind = if is_admin {
         crate::session::SessionKind::AdminGui
     } else {

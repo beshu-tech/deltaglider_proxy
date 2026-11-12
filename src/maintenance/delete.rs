@@ -228,7 +228,12 @@ pub(crate) async fn execute_delete_phases(
         if let Some(why) = state.maintenance_gate.write_blocked(bucket) {
             return Err(PhaseStop::Deferred(why));
         }
-        let actor = BulkActor::for_principal(&deps.iam.load(), &params.principal)?;
+        let iam = deps.iam.load();
+        let view = state
+            .coordination
+            .credential_view(&iam)
+            .map_err(|_| PhaseStop::Deferred("the credential store is not ready".into()))?;
+        let actor = BulkActor::for_principal(view, &params.principal)?;
         let budget = config.read().await.filtered_list_max_engine_pages;
         let Some((keys, next)) = next_page(state, budget, bucket, &params, &actor, &cursor).await?
         else {

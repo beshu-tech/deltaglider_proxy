@@ -517,17 +517,18 @@ impl Config {
         errors
     }
 
-    /// FATAL errors of the S3 backends whose endpoint HOST resolves only to
-    /// addresses that the connect-time guard refuses (a name that points at
-    /// this host's loopback without `allow_local`, or at a link-local or
-    /// metadata address). Every request to such a backend would fail, so
-    /// boot and apply refuse the config and name the backend and the
-    /// setting. A name that does not resolve, or not in time, says nothing:
-    /// DNS may come up later. Needs I/O, so it is apart from
-    /// [`Self::check_fatal`].
-    pub async fn backend_resolution_errors(&self) -> Vec<String> {
-        let mut errors = Vec::new();
+    /// The S3 backends whose endpoint HOST is a name, as `(name, host,
+    /// kind)`. With `previous`, only the backends whose definition is new or
+    /// changed against it. Pure.
+    pub(crate) fn resolution_targets(
+        &self,
+        previous: Option<&Config>,
+    ) -> Vec<(String, String, crate::security::UrlKind)> {
+        let mut out = Vec::new();
         for (name, backend) in self.effective_backends() {
+            if previous.is_some_and(|old| old.backend_by_name(name) == Some(backend)) {
+                continue;
+            }
             let BackendConfig::S3 {
                 endpoint: Some(ep),
                 allow_local,
@@ -542,26 +543,53 @@ impl Config {
             else {
                 continue;
             };
-            let host = host.trim_matches(['[', ']']);
+            let host = host.trim_matches(['[', ']']).to_string();
             if host.parse::<std::net::IpAddr>().is_ok() {
                 continue; // a literal address: the text check judged it
             }
-            let lookup = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                tokio::net::lookup_host((host, 0)),
-            )
-            .await;
-            let Ok(Ok(addrs)) = lookup else { continue };
-            let ips: Vec<std::net::IpAddr> = addrs.map(|sa| sa.ip()).collect();
-            let kind = crate::storage::s3_endpoint_kind(*allow_local);
-            if let Some(e) = crate::security::backend_resolution_error(host, &ips, kind) {
-                errors.push(format!(
-                    "backend '{name}': endpoint host '{host}' (backend setting \
-                     `allow_local`, env DGP_BACKEND_ALLOW_LOCAL): {e}"
-                ));
-            }
+            out.push((
+                name.to_string(),
+                host,
+                crate::storage::s3_endpoint_kind(*allow_local),
+            ));
         }
-        errors
+        out
+    }
+
+    /// FATAL errors of the S3 backends whose endpoint HOST resolves only to
+    /// addresses that the connect-time guard refuses (a name that points at
+    /// this host's loopback without `allow_local`, or at a link-local or
+    /// metadata address). Every request to such a backend would fail, so
+    /// boot and apply refuse the config and name the backend and the
+    /// setting. A defined backend that no bucket uses counts too. All the
+    /// lookups run at once under one deadline of 5 s; a name that does not
+    /// resolve in time says nothing: DNS may come up later. `previous`: an
+    /// apply judges only the backends it adds or changes. Needs I/O, so it is
+    /// apart from [`Self::check_fatal`].
+    pub async fn backend_resolution_errors(&self, previous: Option<&Config>) -> Vec<String> {
+        let lookups =
+            self.resolution_targets(previous)
+                .into_iter()
+                .map(|(name, host, kind)| async move {
+                    let found = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        tokio::net::lookup_host((host.as_str(), 0)),
+                    )
+                    .await;
+                    let Ok(Ok(addrs)) = found else { return None };
+                    let ips: Vec<std::net::IpAddr> = addrs.map(|sa| sa.ip()).collect();
+                    crate::security::backend_resolution_error(&host, &ips, kind).map(|e| {
+                        format!(
+                            "backend '{name}': endpoint host '{host}' (backend setting \
+                         `allow_local`, env DGP_BACKEND_ALLOW_LOCAL): {e}"
+                        )
+                    })
+                });
+        futures::future::join_all(lookups)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// `advanced` count settings where 0 stops the proxy: `blocking_threads: 0`
@@ -776,7 +804,7 @@ mod backend_resolution_tests {
             backend: s3("https://localhost:9000", false),
             ..Default::default()
         };
-        let errors = cfg.backend_resolution_errors().await;
+        let errors = cfg.backend_resolution_errors(None).await;
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(
             errors[0].contains("backend 'default'")
@@ -786,13 +814,60 @@ mod backend_resolution_tests {
             errors[0]
         );
         cfg.backend = s3("https://localhost:9000", true);
-        assert!(cfg.backend_resolution_errors().await.is_empty());
+        assert!(cfg.backend_resolution_errors(None).await.is_empty());
         // A literal address is judged by the text check, not here.
         cfg.backend = s3("https://127.0.0.1:9000", false);
-        assert!(cfg.backend_resolution_errors().await.is_empty());
+        assert!(cfg.backend_resolution_errors(None).await.is_empty());
         cfg.backend = BackendConfig::Filesystem {
             path: "/data".into(),
         };
-        assert!(cfg.backend_resolution_errors().await.is_empty());
+        assert!(cfg.backend_resolution_errors(None).await.is_empty());
+    }
+
+    /// An apply judges only the backends it adds or changes; the boot judges
+    /// every defined backend, also one that no bucket uses.
+    #[test]
+    fn an_apply_judges_only_the_backends_it_changes() {
+        let named = |name: &str, ep: &str| NamedBackendConfig {
+            name: name.into(),
+            backend: s3(ep, false),
+            encryption: Default::default(),
+        };
+        let old = Config {
+            backends: vec![named("hetzner-fsn1", "https://s3.example.org")],
+            ..Default::default()
+        };
+        let same = old.clone();
+        assert!(same.resolution_targets(Some(&old)).is_empty());
+        let added = Config {
+            backends: vec![
+                named("hetzner-fsn1", "https://s3.example.org"),
+                named("aws-dr", "https://dr.example.org"),
+            ],
+            ..Default::default()
+        };
+        let targets = added.resolution_targets(Some(&old));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "aws-dr");
+        // The boot has no previous config: every backend with a host name.
+        assert_eq!(added.resolution_targets(None).len(), 2);
+    }
+
+    /// The two call sites are the rule: remove the boot call or the apply
+    /// call and an unreachable backend runs again.
+    #[test]
+    fn boot_and_apply_both_run_the_resolution_check() {
+        let main = crate::source_scan::prod_text(&crate::source_scan::read("src/main.rs"));
+        assert!(
+            main.contains("config.backend_resolution_errors(None)"),
+            "the boot must refuse a backend host that resolves only to refused addresses"
+        );
+        let apply = crate::source_scan::prod_text(&crate::source_scan::read(
+            "src/api/admin/config/transition.rs",
+        ));
+        assert!(
+            apply.contains("new_cfg.backend_resolution_errors(Some(old_cfg))"),
+            "an apply must refuse a new or changed backend host that resolves only to refused addresses"
+        );
     }
 }
