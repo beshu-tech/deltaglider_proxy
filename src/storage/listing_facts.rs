@@ -107,24 +107,6 @@ pub fn is_internal_common_prefix(p: &str) -> bool {
 /// (see [`is_hidden_key`], [`shows_in_listing`]).
 pub const INTERNAL_DIR: &str = ".dg";
 
-/// The file name of a delta baseline: `<folder>/reference.bin` (a release
-/// before 2.0 kept it at `<folder>/.dg/reference.bin`, which has the same
-/// file name). THE name: every place that tells a baseline from an object
-/// (the S3 classifier, the filesystem walk, the bucket-empty check) uses
-/// [`is_baseline_name`] / [`is_baseline_key`].
-pub const BASELINE_FILE: &str = "reference.bin";
-
-/// Is this file name a delta baseline?
-pub fn is_baseline_name(name: &str) -> bool {
-    name == BASELINE_FILE
-}
-
-/// Is this raw backend key a delta baseline (its last segment is
-/// [`BASELINE_FILE`])?
-pub fn is_baseline_key(key: &str) -> bool {
-    is_baseline_name(key.rsplit('/').next().unwrap_or(key))
-}
-
 /// Does a path (a key's directory part, a prefix, a common prefix) go
 /// through a `.dg` directory, at any depth?
 pub fn has_internal_segment(path: &str) -> bool {
@@ -138,7 +120,29 @@ pub fn has_internal_segment(path: &str) -> bool {
 /// filesystem walk and the bucket-empty check all follow it (differential
 /// test `s3_and_the_filesystem_list_the_same_keys`).
 pub fn is_own_file(key: &str) -> bool {
-    is_facts_key(key) || is_baseline_key(key)
+    is_facts_key(key) || crate::types::is_reference_key(key)
+}
+
+/// A CommonPrefix that no client write can ever extend: a key below it has a
+/// `.dg` directory, and every write path refuses such a key at ingest
+/// (`ObjectKey::validate_ingest`). Only such a prefix is remembered by the
+/// probe (`S3Backend::holds_listed_key`): the remembered answer stays true
+/// whatever the clients write, on every node, with no invalidation. A prefix
+/// like `a/r` or `.` can gain a key at any time and is probed again each time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnwritablePrefix<'a>(&'a str);
+
+impl<'a> UnwritablePrefix<'a> {
+    /// `Some` when a complete `.dg` directory lies in `prefix` (the part
+    /// before its last `/`; `.dg` alone could still be `.dgx`).
+    pub fn of(prefix: &'a str) -> Option<Self> {
+        let dir = prefix.rsplit_once('/').map_or("", |(dir, _)| dir);
+        has_internal_segment(dir).then_some(Self(prefix))
+    }
+
+    pub fn as_str(&self) -> &'a str {
+        self.0
+    }
 }
 
 /// The listing facts alone (a baseline is reported apart by the S3
@@ -174,7 +178,8 @@ pub fn may_hold_only_own_keys(p: &str) -> bool {
         .any(|start| {
             let tail = &p[start..];
             !tail.is_empty()
-                && (BASELINE_FILE.starts_with(tail) || (start == 0 && FACTS_ROOT.starts_with(tail)))
+                && (crate::types::REFERENCE_FILE_NAME.starts_with(tail)
+                    || (start == 0 && FACTS_ROOT.starts_with(tail)))
         })
 }
 
@@ -951,7 +956,10 @@ mod tests {
             "a/b/reference.bin",
         ] {
             assert!(!shows_in_listing(key), "{key}");
-            assert!(is_own_file(key) && is_baseline_key(key), "{key}");
+            assert!(
+                is_own_file(key) && crate::types::is_reference_key(key),
+                "{key}"
+            );
         }
         for key in [
             "a/reference.bin.delta",
@@ -968,21 +976,37 @@ mod tests {
         }
     }
 
-    /// The S3 listing and facts code tells a baseline from an object only
-    /// through [`is_baseline_name`] / [`is_baseline_key`]: a literal compare
-    /// would be a second copy of the rule (the legacy `.dg/reference.bin`
-    /// copy was wrong for the baselines of today).
+    /// Which prefixes the probe may remember (`UnwritablePrefix`): only those
+    /// below a complete `.dg` directory, where no client write can add a key.
     #[test]
-    fn s3_code_has_no_second_copy_of_the_baseline_rule() {
-        for file in ["src/storage/s3/listing.rs", "src/storage/s3/facts.rs"] {
-            let text = crate::source_scan::prod_text(&crate::source_scan::read(file));
-            for needle in [
-                "== \"reference.bin\"",
-                "Some(\"reference.bin\")",
-                ".dg/reference.bin",
-            ] {
-                assert!(!text.contains(needle), "{file} compares {needle}");
-            }
+    fn only_a_prefix_below_a_dg_directory_is_unwritable() {
+        for p in [
+            ".dg/",
+            ".dg/f",
+            ".dg/facts/",
+            "a/.dg/",
+            "a/.dg/x",
+            "a/.dg/b/c",
+        ] {
+            assert_eq!(UnwritablePrefix::of(p).map(|u| u.as_str()), Some(p), "{p}");
+        }
+        for p in [
+            "",
+            ".",
+            ".d",
+            ".dg",
+            ".dgx/",
+            "a/",
+            "a/r",
+            "a/.",
+            "a/.dg",
+            ".env",
+            "r",
+            "dg/",
+            ".well-known/",
+            "a/.hidden",
+        ] {
+            assert_eq!(UnwritablePrefix::of(p), None, "{p}");
         }
     }
 

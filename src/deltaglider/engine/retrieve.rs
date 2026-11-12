@@ -1509,7 +1509,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             Err(e) => return Err(EngineError::Storage(e)),
         };
         // Inject warning into metadata for UI display if this looks like a delta artifact
-        if obj_key.filename.ends_with(".delta") || obj_key.filename == "reference.bin" {
+        if obj_key.filename.ends_with(".delta")
+            || obj_key.filename == crate::types::REFERENCE_FILE_NAME
+        {
             meta.user_metadata.insert(
                 "dg-warning".to_string(),
                 "Missing DG metadata — delta features disabled. Re-copy with --metadata flag."

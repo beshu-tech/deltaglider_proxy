@@ -1338,3 +1338,73 @@ async fn test_copy_object_destination_conditionals_on_every_write_path() {
         }
     }
 }
+
+/// L2 (#171) on MinIO: a delimiter other than `/` over keys that start with a
+/// dot or have a `/.x` segment. MinIO refuses a LIST whose prefix is `.` or
+/// `a/.` (`XMinioInvalidResourceName`), so a check of such a prefix must never
+/// fail the client's LIST (it answered `500`). The prefixes are shown.
+#[tokio::test]
+async fn test_a_delimiter_list_over_dot_keys_does_not_fail_on_minio() {
+    skip_unless_minio!();
+    let bucket = common::unique_bucket("dotlist");
+    let server = TestServer::builder()
+        .bucket(&bucket)
+        .s3_endpoint(&common::minio_endpoint_url())
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for key in [".env", ".well-known/x", "a/.hidden", "top.txt", "a/x"] {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+    for (prefix, delimiter, want) in [
+        ("", ".", vec![".", "a/.", "a/x", "top."]),
+        ("a/", ".", vec!["a/.", "a/x"]),
+        (
+            "",
+            "/.",
+            vec![".env", ".well-known/x", "a/.", "a/x", "top.txt"],
+        ),
+    ] {
+        let mut got: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = client
+                .list_objects_v2()
+                .bucket(&bucket)
+                .prefix(prefix)
+                .delimiter(delimiter)
+                .set_continuation_token(token.clone())
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{prefix:?} {delimiter:?}: {e:?}"));
+            got.extend(
+                page.contents()
+                    .iter()
+                    .filter_map(|o| o.key())
+                    .map(String::from),
+            );
+            got.extend(
+                page.common_prefixes()
+                    .iter()
+                    .filter_map(|p| p.prefix())
+                    .map(String::from),
+            );
+            if page.is_truncated().unwrap_or(false) {
+                token = page.next_continuation_token().map(String::from);
+            } else {
+                break;
+            }
+        }
+        got.sort();
+        let mut want: Vec<String> = want.into_iter().map(String::from).collect();
+        want.sort();
+        assert_eq!(got, want, "{prefix:?} {delimiter:?}");
+    }
+}

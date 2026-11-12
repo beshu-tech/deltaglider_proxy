@@ -233,25 +233,8 @@ pub fn mark_sealed(id: &StoredObjectId<'_>) {
 /// LIST meets it. An entry that the cache evicts for room is counted
 /// (`deltaglider_listing_facts_queue_dropped_total{queue="unwritten"}`) and
 /// logged (the first, then every 10,000th).
-static UNWRITTEN: LazyLock<Cache<String, Unwritten>> = LazyLock::new(|| {
-    Cache::builder()
-        .max_capacity(UNWRITTEN_CAP)
-        .time_to_live(UNWRITTEN_TTL)
-        .eviction_listener(|_key, _value, cause| {
-            LIVE_UNWRITTEN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            if cause == moka::notification::RemovalCause::Size {
-                note_unwritten_dropped();
-            }
-        })
-        .build()
-});
-
-/// Entries of [`UNWRITTEN`], for the free question [`any_unwritten`] (the
-/// cache's own count is only eventually exact).
-static LIVE_UNWRITTEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Entries of [`UNWRITTEN`] dropped for room, for the log's rate limit.
-static UNWRITTEN_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UNWRITTEN: LazyLock<Registry> =
+    LazyLock::new(|| Registry::new(UNWRITTEN_CAP, UNWRITTEN_TTL));
 
 #[derive(Clone)]
 struct Unwritten {
@@ -267,17 +250,88 @@ const UNWRITTEN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3
 /// The registry logs its first drop and every this many after it.
 const UNWRITTEN_LOG_EVERY: u64 = 10_000;
 
-fn note_unwritten_dropped() {
-    let n = UNWRITTEN_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    super::s3::LISTING_FACTS_QUEUE_DROPPED
-        .with_label_values(&["unwritten"])
-        .inc();
-    if n == 1 || n.is_multiple_of(UNWRITTEN_LOG_EVERY) {
-        tracing::warn!(
-            "the registry of refused listing-facts writes is full ({UNWRITTEN_CAP} entries): \
-             {n} entries dropped so far; those objects list their stored size on other nodes \
-             until a HEAD or the healer writes their facts"
-        );
+/// The refused-writes cache with an exact count of its entries.
+///
+/// The count (`live`) answers [`any_unwritten`] with one atomic load, so a LIST
+/// page pays nothing when no write was refused, and no housekeeping call
+/// runs on the request path. It is exact because each entry leaves it once:
+/// a fresh insert counts one, an explicit removal (`take`, `forget`) takes
+/// one, and the eviction listener takes one for expiry and for room (an
+/// explicit removal and a replacement are the caller's, not the listener's).
+struct Registry {
+    cache: Cache<String, Unwritten>,
+    live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Entries dropped for room, for the log's rate limit (the listener owns
+    /// a clone; the tests read this one).
+    #[cfg_attr(not(test), allow(dead_code))]
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Registry {
+    fn new(cap: u64, ttl: std::time::Duration) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (listener_live, listener_dropped) = (live.clone(), dropped.clone());
+        let cache = Cache::builder()
+            .max_capacity(cap)
+            .time_to_live(ttl)
+            .eviction_listener(move |_key, _value, cause| {
+                use moka::notification::RemovalCause::{Expired, Size};
+                match cause {
+                    Expired => {
+                        listener_live.fetch_sub(1, Relaxed);
+                    }
+                    Size => {
+                        listener_live.fetch_sub(1, Relaxed);
+                        let n = listener_dropped.fetch_add(1, Relaxed) + 1;
+                        super::s3::LISTING_FACTS_QUEUE_DROPPED
+                            .with_label_values(&["unwritten"])
+                            .inc();
+                        if n == 1 || n.is_multiple_of(UNWRITTEN_LOG_EVERY) {
+                            tracing::warn!(
+                                "the registry of refused listing-facts writes is full ({cap} \
+                                 entries): {n} entries dropped so far; those objects list their \
+                                 stored size on other nodes until a HEAD or the healer writes \
+                                 their facts"
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            })
+            .build();
+        Registry {
+            cache,
+            live,
+            dropped,
+        }
+    }
+
+    fn mark(&self, key: String, value: Unwritten) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // `is_fresh` is true for exactly one of the threads that race to
+        // insert the same key.
+        if self
+            .cache
+            .entry(key.clone())
+            .or_insert(value.clone())
+            .is_fresh()
+        {
+            self.live.fetch_add(1, Relaxed);
+        } else {
+            self.cache.insert(key, value);
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.live.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    fn remove(&self, key: &str) -> Option<Unwritten> {
+        let entry = self.cache.remove(key)?;
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        Some(entry)
     }
 }
 
@@ -288,8 +342,7 @@ fn object_key(scope: &str, bucket: &str, key: &str) -> String {
 
 /// Note that the write of `facts_key` for the stored object `id` was refused.
 pub fn mark_unwritten(id: &StoredObjectId<'_>, facts_key: String) {
-    LIVE_UNWRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    UNWRITTEN.insert(
+    UNWRITTEN.mark(
         object_key(id.scope, id.bucket, id.key),
         Unwritten {
             etag: bare_etag(id.etag).to_string(),
@@ -300,14 +353,9 @@ pub fn mark_unwritten(id: &StoredObjectId<'_>, facts_key: String) {
 }
 
 /// Are any facts writes refused and not offered again? A LIST asks first,
-/// so that it costs nothing when the answer is no.
+/// so that it costs nothing when the answer is no: one atomic load.
 pub fn any_unwritten() -> bool {
-    if LIVE_UNWRITTEN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-        return false;
-    }
-    // Let expired and replaced entries settle, so the count is the truth.
-    UNWRITTEN.run_pending_tasks();
-    LIVE_UNWRITTEN.load(std::sync::atomic::Ordering::Relaxed) > 0
+    UNWRITTEN.any()
 }
 
 /// The facts key of a refused write of the stored object `id`, removed: the
@@ -321,8 +369,89 @@ pub fn take_unwritten(id: &StoredObjectId<'_>) -> Option<String> {
 /// The stored object was deleted, or written again with a write that went
 /// into the queue: its refused write (if any) is moot.
 pub fn forget_unwritten(scope: &str, bucket: &str, key: &str) {
-    if LIVE_UNWRITTEN.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-        UNWRITTEN.invalidate(&object_key(scope, bucket, key));
+    if UNWRITTEN.any() {
+        UNWRITTEN.remove(&object_key(scope, bucket, key));
+    }
+}
+
+#[cfg(test)]
+mod unwritten_registry_tests {
+    use super::*;
+
+    fn entry(n: usize) -> (String, Unwritten) {
+        (
+            object_key("scope", "b", &format!("k{n}")),
+            Unwritten {
+                etag: "e".into(),
+                size: 1,
+                facts_key: format!("facts{n}"),
+            },
+        )
+    }
+
+    /// The count of the registry is exact, and a full registry drops its
+    /// entries with a count in `deltaglider_listing_facts_queue_dropped_total
+    /// {queue="unwritten"}`: every entry is live or dropped.
+    #[test]
+    fn a_full_registry_counts_every_entry_it_drops() {
+        const CAP: u64 = 4;
+        const N: usize = 40;
+        let registry = Registry::new(CAP, UNWRITTEN_TTL);
+        let metric = || {
+            super::super::s3::LISTING_FACTS_QUEUE_DROPPED
+                .with_label_values(&["unwritten"])
+                .get()
+        };
+        let before = metric();
+        assert!(!registry.any());
+        for n in 0..N {
+            let (key, value) = entry(n);
+            registry.mark(key, value);
+        }
+        registry.cache.run_pending_tasks();
+        let dropped = registry.dropped.load(std::sync::atomic::Ordering::Relaxed);
+        let live = registry.live.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(dropped >= (N as u64 - CAP), "{dropped} dropped of {N}");
+        assert_eq!(
+            live as u64 + dropped,
+            N as u64,
+            "every entry is live or dropped"
+        );
+        assert_eq!(live as u64, registry.cache.entry_count());
+        assert!(metric() - before >= dropped, "the metric counts the drops");
+        assert!(registry.any() == (live > 0));
+        // An explicit removal takes exactly one from the count.
+        let kept = (0..N)
+            .map(entry)
+            .find(|(key, _)| registry.cache.contains_key(key))
+            .expect("a kept entry");
+        assert!(registry.remove(&kept.0).is_some());
+        assert!(registry.remove(&kept.0).is_none());
+        assert_eq!(
+            registry.live.load(std::sync::atomic::Ordering::Relaxed),
+            live - 1
+        );
+    }
+
+    /// Marking an object again (a newer version refused) replaces its entry
+    /// and does not count it twice.
+    #[test]
+    fn a_second_mark_of_one_object_counts_once() {
+        let registry = Registry::new(100, UNWRITTEN_TTL);
+        let (key, value) = entry(1);
+        registry.mark(key.clone(), value);
+        let newer = Unwritten {
+            etag: "e2".into(),
+            size: 2,
+            facts_key: "facts-new".into(),
+        };
+        registry.mark(key.clone(), newer);
+        assert_eq!(registry.live.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            registry.remove(&key).map(|u| u.facts_key).as_deref(),
+            Some("facts-new")
+        );
+        assert!(!registry.any());
     }
 }
 

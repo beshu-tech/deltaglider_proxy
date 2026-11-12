@@ -460,7 +460,7 @@ impl S3Backend {
     /// The deltaspace whose reference is stored at `key`: the inverse of
     /// [`Self::reference_key`]. `None` for any other key.
     fn deltaspace_of_reference_key(key: &str) -> Option<&str> {
-        if key == "reference.bin" {
+        if key == crate::types::REFERENCE_FILE_NAME {
             Some("")
         } else {
             key.strip_suffix("/reference.bin")

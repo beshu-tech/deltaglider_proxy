@@ -173,7 +173,7 @@ pub fn is_user_object_key(key: &str) -> bool {
     // Storage-layer delta artifacts. The engine listing usually hides these,
     // but filter defensively at the source boundary.
     let filename = key.rsplit('/').next().unwrap_or(key);
-    if filename == "reference.bin" || filename.ends_with(".delta") {
+    if crate::types::is_reference_key(key) || filename.ends_with(".delta") {
         return false;
     }
     true

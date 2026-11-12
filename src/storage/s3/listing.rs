@@ -138,7 +138,7 @@ impl S3Backend {
             }
 
             // Internal deltaspace file: never a user-visible object.
-            if listing_facts::is_baseline_name(filename) {
+            if crate::types::is_reference_key(&obj.key) {
                 baselines.push((obj.key.clone(), obj.size));
                 continue;
             }
@@ -384,7 +384,7 @@ impl S3Backend {
     pub(super) fn lite_metadata_from_listed(obj: &S3ListedObject) -> FileMetadata {
         let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
         let is_delta = filename.ends_with(".delta");
-        let is_reference = listing_facts::is_baseline_name(filename);
+        let is_reference = crate::types::is_reference_key(&obj.key);
         let original_name = filename.trim_end_matches(".delta").to_string();
         let storage_info = if is_delta {
             StorageInfo::delta_stub(obj.size)
@@ -503,8 +503,7 @@ pub(super) fn list_anchor<'a>(
     let token = continuation_token.unwrap_or("");
     let mut candidates: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for key in raw_keys {
-        let filename = key.rsplit('/').next().unwrap_or(key);
-        if listing_facts::is_baseline_name(filename) {
+        if crate::types::is_reference_key(key) {
             continue;
         }
         // Strip ALL trailing `.delta` (not just one) so this matches the
@@ -651,13 +650,14 @@ const PROBE_REQUESTS_MAX: u32 = 6;
 /// `PROBES_PER_PAGE x PROBE_REQUESTS_MAX` (the common case is 2 for the root
 /// `.dg/`, 0 once it is remembered).
 pub(super) const PROBES_PER_PAGE: u32 = 8;
-/// How long a prefix with no listed key is remembered. A key cannot be
-/// written below it through the proxy, so only a writer outside the proxy can
-/// make the answer stale, and it shows up in at most this long.
+/// How long an [`UnwritablePrefix`] with no listed key is remembered. No
+/// client write adds a key below it (every write path refuses a `.dg`
+/// directory), so only an older release writing at the same time could make
+/// the answer stale, and it shows in at most this long.
 const OWN_ONLY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Prefixes (`scope\0bucket\0prefix`) found to hold only the proxy's own
-/// files.
+/// [`UnwritablePrefix`]es (`scope\0bucket\0prefix`) found to hold only the
+/// proxy's own files. Nothing else is stored here: see `holds_listed_key`.
 static OWN_ONLY_PREFIXES: std::sync::LazyLock<moka::sync::Cache<String, ()>> =
     std::sync::LazyLock::new(|| {
         moka::sync::Cache::builder()
@@ -690,8 +690,14 @@ impl S3Backend {
     ///   two ranges, past the facts (`start_after = PAST_FACTS`, one request
     ///   when nothing lies there) and up to the first facts key. The facts
     ///   (hundreds, in a busy bucket) are never paged through.
-    /// * A prefix with no listed key is remembered for `OWN_ONLY_TTL`, so the
-    ///   next LIST of the level sends no probe.
+    /// * A prefix with no listed key is remembered for `OWN_ONLY_TTL` ONLY
+    ///   when it is an [`UnwritablePrefix`] (below a `.dg` directory, where
+    ///   no client write adds a key), so the next LIST of the level sends no
+    ///   probe and the answer cannot go stale. Any other prefix (`a/r`, `.`)
+    ///   is probed each time: a client can write a key under it at any moment.
+    /// * A probe that fails (the backend refuses the prefix: MinIO answers
+    ///   `XMinioInvalidResourceName` for `prefix=.`) never fails the LIST: the
+    ///   prefix is shown, as past the budget.
     ///
     /// `requests` counts what this sends (the page's total).
     async fn holds_listed_key(
@@ -700,13 +706,17 @@ impl S3Backend {
         prefix: &str,
         requests: &mut u32,
         budget: &mut u32,
-    ) -> Result<bool, StorageError> {
-        let cache_key = format!("{}\0{bucket}\0{prefix}", self.list_cache_scope);
-        if OWN_ONLY_PREFIXES.contains_key(&cache_key) {
-            return Ok(false);
+    ) -> bool {
+        let remembered = listing_facts::UnwritablePrefix::of(prefix)
+            .map(|u| format!("{}\0{bucket}\0{}", self.list_cache_scope, u.as_str()));
+        if remembered
+            .as_ref()
+            .is_some_and(|key| OWN_ONLY_PREFIXES.contains_key(key))
+        {
+            return false;
         }
         if *budget == 0 {
-            return Ok(true);
+            return true;
         }
         *budget -= 1;
         let mut sent = 0u32;
@@ -723,18 +733,21 @@ impl S3Backend {
             {
                 Ok(ProbeVerdict::Listed) | Ok(ProbeVerdict::GaveUp) => {
                     *requests += sent;
-                    return Ok(true);
+                    return true;
                 }
                 Ok(ProbeVerdict::Nothing) => {}
                 Err(e) => {
                     *requests += sent;
-                    return Err(e);
+                    debug!("probe of prefix {prefix:?} in {bucket} failed, showing it: {e}");
+                    return true;
                 }
             }
         }
         *requests += sent;
-        OWN_ONLY_PREFIXES.insert(cache_key, ());
-        Ok(false)
+        if let Some(key) = remembered {
+            OWN_ONLY_PREFIXES.insert(key, ());
+        }
+        false
     }
 
     /// One range of [`Self::holds_listed_key`]: pages of `PROBE_PAGE` keys
@@ -877,7 +890,7 @@ impl S3Backend {
                                     &mut upstream_requests,
                                     &mut probe_budget,
                                 )
-                                .await?
+                                .await
                         {
                             continue;
                         }
@@ -1113,7 +1126,7 @@ pub(super) fn short_page_anchor<'a>(
     }
     let mut entries: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for key in raw_keys {
-        if listing_facts::is_baseline_key(key) {
+        if crate::types::is_reference_key(key) {
             continue;
         }
         entries.insert(key.trim_end_matches(".delta"));
@@ -1511,45 +1524,136 @@ mod delegated_cost_tests {
             &["x.zip", "d/y", "d/reference.bin"],
         ];
         for keys in sets {
-            // S3: the keys, plus the facts that every bucket has.
-            let mut s3_keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
-            s3_keys.push(".dg/facts/x!!1.e.1.2.e".into());
-            s3_keys.push(".dg/facts/y!!1.e.1.2.e".into());
-            let (s3, _fake) = backend_with_keys(&s3_keys).await;
-            // The filesystem: raw files, listed from their stat.
-            let dir = tempfile::tempdir().unwrap();
-            let fs = crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
-                .await
-                .unwrap();
-            fs.create_bucket("b").await.unwrap();
-            let root = dir.path().join("b").join("deltaspaces");
-            for key in keys.iter() {
-                let path = root.join(key);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, b"x").unwrap();
-            }
-            for prefix in ["", "a/", "a/.", ".dg/", ".d", "d/", "a/b/", "r", "a/r"] {
-                for delimiter in [
-                    None,
-                    Some("/"),
-                    Some("."),
-                    Some("r"),
-                    Some("e"),
-                    Some("-"),
-                    Some("_"),
-                ] {
-                    for max_keys in [1u32, 1000] {
-                        let ctx = format!("{keys:?} {prefix:?} {delimiter:?} {max_keys}");
-                        let (s3_objects, s3_prefixes) =
-                            walk_pages(&s3, prefix, delimiter, max_keys).await;
-                        let (fs_objects, fs_prefixes) =
-                            walk_pages(&fs, prefix, delimiter, max_keys).await;
-                        assert_eq!(s3_objects, fs_objects, "objects: {ctx}");
-                        assert_eq!(s3_prefixes, fs_prefixes, "prefixes: {ctx}");
-                    }
+            assert_same_listings(keys).await;
+        }
+    }
+
+    /// Both backends hold `keys` (S3 also the listing facts that every bucket
+    /// has, the filesystem raw files listed from their stat); every prefix,
+    /// delimiter (one or several characters) and page size lists the same.
+    ///
+    /// KNOWN LIMIT, kept OUT of these key sets: a `.delta` stored name. A
+    /// delimiter that occurs inside the suffix `.delta` makes S3 return a
+    /// prefix of the STORED name (`d/y.delta` with `.` gives `d/y.`; a
+    /// delimiter `l` hides `a/x.zip.delta` behind `a/x.zip.del`), where the
+    /// filesystem lists the key. That is older than this work and is not
+    /// fixed here.
+    async fn assert_same_listings(keys: &[&str]) {
+        let mut s3_keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        s3_keys.push(".dg/facts/x!!1.e.1.2.e".into());
+        s3_keys.push(".dg/facts/y!!1.e.1.2.e".into());
+        let (s3, _fake) = backend_with_keys(&s3_keys).await;
+        let dir = tempfile::tempdir().unwrap();
+        let fs = crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        fs.create_bucket("b").await.unwrap();
+        let root = dir.path().join("b").join("deltaspaces");
+        for key in keys.iter() {
+            let path = root.join(key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+        for prefix in [
+            "", "a/", "a/.", ".dg/", ".d", "d/", "a/b/", "r", "a/r", "ref",
+        ] {
+            for delimiter in [
+                None,
+                Some("/"),
+                Some("."),
+                Some("r"),
+                Some("e"),
+                Some("-"),
+                Some("_"),
+                Some("ref"),
+                Some("/."),
+                Some("re"),
+                Some(".d"),
+                Some("dg"),
+                Some("/r"),
+                Some("/ref"),
+            ] {
+                for max_keys in [1u32, 2, 3, 1000] {
+                    let ctx = format!("{keys:?} {prefix:?} {delimiter:?} {max_keys}");
+                    let (s3_objects, s3_prefixes) =
+                        walk_pages(&s3, prefix, delimiter, max_keys).await;
+                    let (fs_objects, fs_prefixes) =
+                        walk_pages(&fs, prefix, delimiter, max_keys).await;
+                    assert_eq!(s3_objects, fs_objects, "objects: {ctx}");
+                    assert_eq!(s3_prefixes, fs_prefixes, "prefixes: {ctx}");
                 }
             }
         }
+    }
+
+    /// The same, over generated key sets: names that make the folders, files
+    /// and delimiters meet (`r`, `ref`, `re`, `.dg`, `reference.bin`, a dot
+    /// file). A set where a folder holds ONLY a baseline is skipped (the one
+    /// known difference, `an_s3_listing_shows_a_folder_with_only_a_baseline`).
+    #[tokio::test]
+    async fn s3_and_the_filesystem_list_generated_key_sets_the_same() {
+        let dirs = ["a", "b", ".dg", "dg", "r", "ref"];
+        let files = ["x", "reference.bin", "y.txt", ".k", "r1", "re"];
+        let mut seed: u64 = 0x1234_5678_9abc_def1;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut sets = 0;
+        for _ in 0..30 {
+            let mut keys: std::collections::BTreeSet<String> = Default::default();
+            for _ in 0..3 + (next() % 7) as usize {
+                let depth = (next() % 3) as usize;
+                let mut parts: Vec<&str> = (0..depth)
+                    .map(|_| dirs[(next() % dirs.len() as u64) as usize])
+                    .collect();
+                parts.push(files[(next() % files.len() as u64) as usize]);
+                keys.insert(parts.join("/"));
+            }
+            // A key that is also the folder of another key cannot exist.
+            let all: Vec<String> = keys.iter().cloned().collect();
+            let keys: Vec<String> = all
+                .iter()
+                .filter(|k| !all.iter().any(|o| o.starts_with(&format!("{k}/"))))
+                .cloned()
+                .collect();
+            let only_a_baseline = keys.iter().any(|k| {
+                crate::types::is_reference_key(k) && {
+                    let folder = k.trim_end_matches(crate::types::REFERENCE_FILE_NAME);
+                    !folder.is_empty()
+                        && !keys
+                            .iter()
+                            .any(|o| o.starts_with(folder) && !crate::types::is_reference_key(o))
+                }
+            });
+            if only_a_baseline {
+                continue;
+            }
+            sets += 1;
+            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            assert_same_listings(&refs).await;
+        }
+        assert!(
+            sets >= 10,
+            "only {sets} of 30 generated sets were comparable"
+        );
+    }
+
+    /// A KNOWN LIMIT older than this work, pinned so that a fix is a decision
+    /// and the compatibility page stays true: a delimiter inside the suffix
+    /// `.delta` of a stored name gives a prefix of the stored name.
+    #[tokio::test]
+    async fn a_delimiter_inside_the_delta_suffix_gives_a_prefix_of_the_stored_name() {
+        let keys = vec!["d/y.delta".to_string(), "a/x.zip.delta".to_string()];
+        let (s3, _fake) = backend_with_keys(&keys).await;
+        let (objects, prefixes) = walk_pages(&s3, "", Some("."), 1000).await;
+        assert!(objects.is_empty(), "{objects:?}");
+        assert!(prefixes.contains(&"d/y.".to_string()), "{prefixes:?}");
+        let (objects, prefixes) = walk_pages(&s3, "a/", Some("l"), 1000).await;
+        assert!(objects.is_empty(), "{objects:?}");
+        assert_eq!(prefixes, ["a/x.zip.del"]);
     }
 
     /// The one case where the backends differ: a folder that holds ONLY a
@@ -1652,6 +1756,124 @@ mod delegated_cost_tests {
             lists(&fake),
             1 + PROBES_PER_PAGE as usize,
             "{:?}",
+            fake.requests()
+        );
+    }
+
+    /// The listing a client must see: the objects and CommonPrefixes of the
+    /// LISTED keys (not the proxy's own files) for `prefix` and `delimiter`.
+    fn model_listing(
+        keys: &[&str],
+        prefix: &str,
+        delimiter: &str,
+    ) -> (Vec<String>, std::collections::BTreeSet<String>) {
+        let mut objects = Vec::new();
+        let mut prefixes = std::collections::BTreeSet::new();
+        for k in keys
+            .iter()
+            .filter(|k| listing_facts::shows_in_listing(k) && k.starts_with(prefix))
+        {
+            let rest = &k[prefix.len()..];
+            match rest.find(delimiter) {
+                Some(i) => {
+                    prefixes.insert(format!("{prefix}{}{delimiter}", &rest[..i]));
+                }
+                None => objects.push(k.to_string()),
+            }
+        }
+        objects.sort();
+        (objects, prefixes)
+    }
+
+    /// A LIST must not depend on what an earlier LIST found: a client writes
+    /// a key under a prefix that held only the proxy's own files a moment
+    /// ago, and the next LIST shows it. (A remembered answer is kept only for
+    /// a prefix below `.dg`, where no client write adds a key.)
+    #[tokio::test]
+    async fn a_key_written_after_a_probe_shows_in_the_next_list() {
+        let facts = ".dg/facts/x!!1.e.1.2.e";
+        // (keys before, prefix, delimiter, key written, name)
+        let cases: &[(&[&str], &str, &str, &str)] = &[
+            (&[facts, "a/reference.bin", "a/x"], "", "r", "a/readme"),
+            (&[facts, "a/reference.bin", "a/x"], "a/", "r", "a/readme"),
+            (&[facts, "top"], "", ".", ".env"),
+            (&[facts, "top"], "", ".", ".well-known/x"),
+            (&[facts, "a/reference.bin", "a/x"], "a/", ".", "a/.hidden"),
+            (&[facts, "reference.bin", "top"], "", "r", "readme"),
+        ];
+        for (keys, prefix, delimiter, written) in cases {
+            let owned: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+            let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+            let http = reqwest::Client::new();
+            for k in &owned {
+                http.put(format!("{endpoint}/b/{k}"))
+                    .body("x")
+                    .send()
+                    .await
+                    .unwrap();
+            }
+            let s3 = test_support::for_test_endpoint(&endpoint);
+            let before = walk_pages(&s3, prefix, Some(delimiter), 1000).await;
+            let ctx = format!("{keys:?} {prefix:?} {delimiter:?} then {written:?}");
+            let (want_objects, want_prefixes) = model_listing(keys, prefix, delimiter);
+            assert_eq!(before.0, want_objects, "before: {ctx}");
+            assert_eq!(
+                before
+                    .1
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                want_prefixes,
+                "before: {ctx}"
+            );
+            http.put(format!("{endpoint}/b/{written}"))
+                .body("x")
+                .send()
+                .await
+                .unwrap();
+            let mut all: Vec<&str> = keys.to_vec();
+            all.push(written);
+            let (want_objects, want_prefixes) = model_listing(&all, prefix, delimiter);
+            let after = walk_pages(&s3, prefix, Some(delimiter), 1000).await;
+            assert_eq!(after.0, want_objects, "after: {ctx}");
+            assert_eq!(
+                after
+                    .1
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                want_prefixes,
+                "after: {ctx}"
+            );
+        }
+    }
+
+    /// A probe that fails never fails the LIST: the prefix is shown. MinIO
+    /// answers `XMinioInvalidResourceName` for a probe of `prefix=.`.
+    #[tokio::test]
+    async fn a_failed_probe_shows_the_prefix_and_not_an_error() {
+        let keys = vec![
+            ".dg/facts/x!!1.e.1.2.e".to_string(),
+            "a/reference.bin".to_string(),
+            "a/x".to_string(),
+        ];
+        let (s3, fake) = backend_with_keys(&keys).await;
+        // The probes ask for 16 keys; the page itself for more.
+        fake.fail(
+            "LIST",
+            "max-keys=16",
+            400,
+            "XMinioInvalidResourceName",
+            u32::MAX,
+        );
+        let (objects, prefixes) = walk_pages(&s3, "", Some("r"), 1000).await;
+        assert_eq!(objects, ["a/x"]);
+        assert_eq!(prefixes, ["a/r"], "shown: the probe could not tell");
+        let (_, prefixes) = walk_pages(&s3, "", Some("."), 1000).await;
+        assert_eq!(prefixes, [".", "a/reference."], "{prefixes:?}");
+        assert!(
+            fake.faulted("LIST", "max-keys=16") > 0,
+            "the probes ran: {:?}",
             fake.requests()
         );
     }

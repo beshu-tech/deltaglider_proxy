@@ -409,8 +409,7 @@ pub fn is_internal_key(key: &str) -> bool {
         || key == ".dg"
         || key.starts_with(".dg/")
         || key.contains("/.dg/")
-        || key.ends_with("/reference.bin")
-        || key == "reference.bin"
+        || crate::types::is_reference_key(key)
         || key.ends_with(".delta")
 }
 

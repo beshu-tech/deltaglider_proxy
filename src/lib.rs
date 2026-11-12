@@ -983,7 +983,22 @@ mod source_guards {
                 })
                 .map(|c| (c.line, "key == \"..reference.bin\"".to_string())),
         );
+        // A bare file name against the whole literal (`name == "reference.bin"`)
+        // is a second copy of the rule too: it is `types::REFERENCE_FILE_NAME`
+        // (the listing hides baselines through the one rule, and the S3 and
+        // filesystem listings must agree: `s3_and_the_filesystem_list_the_same_keys`).
+        out.extend(
+            f.cmps
+                .iter()
+                .filter(|c| {
+                    [&c.lhs, &c.rhs]
+                        .iter()
+                        .any(|side| side.strings.iter().any(|l| l == "reference.bin"))
+                })
+                .map(|c| (c.line, "name == \"reference.bin\"".to_string())),
+        );
         out.sort();
+        out.dedup();
         out
     }
 

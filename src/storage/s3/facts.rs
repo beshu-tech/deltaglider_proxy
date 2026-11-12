@@ -71,7 +71,7 @@ impl S3Backend {
         stored_size: u64,
         meta: &FileMetadata,
     ) {
-        if listing_facts::is_baseline_key(key) {
+        if crate::types::is_reference_key(key) {
             return;
         }
         // A sealed object has no facts in clear: its listing token, made by
@@ -456,7 +456,7 @@ pub(super) fn listed_stored_key(user_key: &str, meta: &FileMetadata) -> Option<S
 /// object `id` (see [`S3Backend::remember_listed_facts`]). Baselines are
 /// never listed to clients, so they get no entry.
 pub(super) fn remember_facts(id: &StoredObjectId<'_>, meta: &FileMetadata) {
-    if listing_facts::is_baseline_key(id.key) {
+    if crate::types::is_reference_key(id.key) {
         return;
     }
     if let Some(facts) = LogicalFacts::of(meta) {
@@ -484,7 +484,7 @@ pub(super) fn backfill_facts(
     if !list_size_cache::take_missing_facts(id) {
         return;
     }
-    if listing_facts::is_baseline_key(id.key) {
+    if crate::types::is_reference_key(id.key) {
         return;
     }
     if let Some(facts_key) = listing_facts::asked_facts_key(id.key, id.etag, id.size, &facts) {

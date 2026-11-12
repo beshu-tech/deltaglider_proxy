@@ -115,7 +115,7 @@ fn stored_name(name: &str) -> StoredName<'_> {
     use super::traits::ObjectVariant;
     if is_internal_temp_name(name) {
         StoredName::Internal
-    } else if crate::storage::listing_facts::is_baseline_name(name) {
+    } else if name == crate::types::REFERENCE_FILE_NAME {
         StoredName::Reference
     } else if let Some(stem) = name.strip_suffix(".delta") {
         StoredName::Object {
@@ -762,9 +762,7 @@ impl FilesystemBackend {
                         return Ok(true);
                     }
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !is_internal_temp_name(name)
-                        && !crate::storage::listing_facts::is_baseline_name(name)
-                    {
+                    if !is_internal_temp_name(name) && name != crate::types::REFERENCE_FILE_NAME {
                         return Ok(true);
                     }
                 }
@@ -929,7 +927,7 @@ impl FilesystemBackend {
             while let Some(entry) = entries.next_entry().await? {
                 if entry.file_type().await?.is_dir() {
                     Self::find_references_recursive(base_dir, &entry.path(), prefixes).await?;
-                } else if entry.file_name() == "reference.bin" {
+                } else if entry.file_name() == crate::types::REFERENCE_FILE_NAME {
                     if let Ok(relative) = current_dir.strip_prefix(base_dir) {
                         prefixes.push(relative.to_string_lossy().into_owned());
                     }
@@ -965,7 +963,7 @@ impl FilesystemBackend {
 
                 // A baseline is never a user object; report its stored size
                 // (one local stat, the walk already reads each file's xattrs).
-                if name == "reference.bin" {
+                if name == crate::types::REFERENCE_FILE_NAME {
                     let md = match entry.metadata().await {
                         Ok(md) => md,
                         Err(e) if fsio::absent(&e) => continue,
