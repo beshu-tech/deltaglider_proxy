@@ -233,6 +233,10 @@ pub struct RouterDeps<'a> {
     pub admission_chain: &'a crate::admission::SharedAdmissionChain,
     /// The live, hot-reloaded config.
     pub shared_config: &'a crate::config::SharedConfig,
+    /// The slots of work that outlives its request (see
+    /// [`crate::api::handlers::DetachedWork`]). The caller keeps a clone to
+    /// wait for the work at shutdown.
+    pub detached: &'a crate::api::handlers::DetachedWork,
 }
 
 /// [`build_s3_router`] with the `S3` impl and the s3s access hook given
@@ -252,6 +256,7 @@ where
         public_prefix_snapshot,
         admission_chain,
         shared_config,
+        detached,
     } = deps;
     use crate::api::s3s_hooks::DeltaGliderS3sAuth;
     use axum::error_handling::HandleError;
@@ -531,9 +536,7 @@ where
     }
 
     router
-        .layer(axum::Extension(crate::api::handlers::DetachedWork::new(
-            config.tuning.max_concurrent_requests,
-        )))
+        .layer(axum::Extension(detached.clone()))
         .layer(axum::Extension(replay_cache.clone()))
         .layer(axum::Extension(crate::api::auth::ReplayWindow(
             config.tuning.replay_window(),
@@ -611,6 +614,9 @@ mod backend_share_tests {
             public_prefix_snapshot: &snapshot,
             admission_chain: &chain,
             shared_config: &shared_config,
+            detached: &crate::api::handlers::DetachedWork::new(
+                config.tuning.max_concurrent_requests,
+            ),
         })
     }
 

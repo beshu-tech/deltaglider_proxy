@@ -1458,8 +1458,9 @@ pub(crate) async fn drain_inflight_writes_within(
             // Read the background count, then the total once more: a write
             // that ended between the two reads is no reason to fail.
             let background = gate.inflight_background_writes(bucket);
+            let unverified = gate.inflight_unverified_writes(bucket);
             let total = gate.inflight_writes(bucket);
-            return match drain_timeout_stop(bucket, ceiling, total, background) {
+            return match drain_timeout_stop(bucket, ceiling, total, background, unverified) {
                 Some(stop) => Err(stop),
                 None => Ok(()),
             };
@@ -1480,10 +1481,14 @@ pub(crate) fn drain_timeout_stop(
     ceiling: std::time::Duration,
     total_inflight: i64,
     background_inflight: i64,
+    unverified_inflight: i64,
 ) -> Option<PhaseStop> {
     if total_inflight <= 0 {
         None
-    } else if background_inflight > 0 {
+    } else if background_inflight > 0 || unverified_inflight >= total_inflight {
+        // Unverified request writes are not yet admitted: the check
+        // refuses or admits them within milliseconds. Only these in
+        // flight is a retry, never a failure.
         Some(PhaseStop::Deferred(format!(
             "{background_inflight} background write(s) to '{bucket}' (replication, lifecycle, \
              detached DeleteObjects or CompleteMultipartUpload) still in flight after {}s",
@@ -1802,38 +1807,108 @@ mod tests {
     fn drain_timeout_stop_truth_table() {
         let c = std::time::Duration::from_secs(1);
         assert!(
-            drain_timeout_stop("b", c, 0, 0).is_none(),
+            drain_timeout_stop("b", c, 0, 0, 0).is_none(),
             "drained on the re-read"
         );
         assert!(
-            drain_timeout_stop("b", c, 0, 1).is_none(),
+            drain_timeout_stop("b", c, 0, 1, 0).is_none(),
             "drained on the re-read"
         );
         assert!(matches!(
-            drain_timeout_stop("b", c, 2, 1),
+            drain_timeout_stop("b", c, 2, 1, 0),
             Some(PhaseStop::Deferred(_))
         ));
         assert!(matches!(
-            drain_timeout_stop("b", c, 1, 0),
+            drain_timeout_stop("b", c, 1, 0, 0),
+            Some(PhaseStop::Failed(_))
+        ));
+        // Only writes that the check has not yet admitted: retry.
+        assert!(matches!(
+            drain_timeout_stop("b", c, 2, 0, 2),
+            Some(PhaseStop::Deferred(_))
+        ));
+        // A verified request write beside them: still a failure.
+        assert!(matches!(
+            drain_timeout_stop("b", c, 2, 0, 1),
             Some(PhaseStop::Failed(_))
         ));
     }
 
     /// The background count rises before the total and falls after it, so
-    /// a reader that sees a background write in the total sees it in the
-    /// background count too.
+    /// a reader that reads the background count first and the total second
+    /// never finds more background writes in the total than it counted.
+    /// Two phases keep one side of the guard still while a reader checks the
+    /// other side: only guards starting (the count only rises), only guards
+    /// ending (it only falls). A guard that moved the counts in the other
+    /// order is caught by the reader.
     #[test]
     fn a_background_guard_moves_its_counts_in_order() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const GUARDS: usize = 20_000;
         let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
-        let w = gate.begin_detached_write("b");
+
+        // Reads (background, total) in the order of the drain; the total
+        // holds nothing but background writes here.
+        let reader = |gate: Arc<crate::maintenance::gate::MaintenanceGate>,
+                      stop: Arc<AtomicBool>| {
+            std::thread::spawn(move || {
+                let mut broken = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let background = gate.inflight_background_writes("b");
+                    let total = gate.inflight_writes("b");
+                    // Falling: total(t2) <= background(t2) <= background(t1).
+                    broken += u32::from(total > background);
+                }
+                broken
+            })
+        };
+        // Rising: read the total first; every write in it has its
+        // background count already, and the count only rises.
+        let rising_reader = |gate: Arc<crate::maintenance::gate::MaintenanceGate>,
+                             stop: Arc<AtomicBool>| {
+            std::thread::spawn(move || {
+                let mut broken = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let total = gate.inflight_writes("b");
+                    let background = gate.inflight_background_writes("b");
+                    broken += u32::from(total > background);
+                }
+                broken
+            })
+        };
+
+        // Phase 1: guards only start.
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = rising_reader(gate.clone(), stop.clone());
+        let guards: Vec<_> = (0..GUARDS)
+            .map(|_| gate.begin_detached_write("b"))
+            .collect();
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(
+            watcher.join().unwrap(),
+            0,
+            "a total above the background count: the total rose first"
+        );
         assert_eq!(
             (
                 gate.inflight_writes("b"),
                 gate.inflight_background_writes("b")
             ),
-            (1, 1)
+            (GUARDS as i64, GUARDS as i64)
         );
-        drop(w);
+
+        // Phase 2: guards only end.
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = reader(gate.clone(), stop.clone());
+        for guard in guards {
+            drop(guard);
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(
+            watcher.join().unwrap(),
+            0,
+            "a total above the background count: the background count fell first"
+        );
         assert_eq!(
             (
                 gate.inflight_writes("b"),

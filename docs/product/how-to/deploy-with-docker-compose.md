@@ -101,7 +101,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-    stop_grace_period: 60s                 # a stop can take up to 40 s
+    stop_grace_period: 60s                 # a stop can take up to 55 s
     restart: unless-stopped
 
 volumes:
@@ -152,7 +152,7 @@ To manage IAM users and groups from the YAML instead of the admin GUI, set `acce
 
 The `dgp-config` volume holds the encrypted config DB (`deltaglider_config.db`) with your IAM users, groups, and OAuth providers. Next to it, the volume holds the key file `deltaglider_config.db.key` that the proxy generates on the first start. The database is useless without that key. Back up both (see [How to back up and restore](back-up-and-restore.md)). With an S3 backend, object data lives in the backend, not in these volumes, and the `dgp-data` volume holds objects only when you use the filesystem backend. The proxy writes its temporary files (upload bodies larger than 16 MiB, delta encoding and reconstruction of large objects, multipart parts) to the spool directory, which is `/tmp/dgp-spool` in the container unless you set `DGP_SPOOL_DIR`. Concurrent large uploads each hold about their size there until they are stored, so point `DGP_SPOOL_DIR` at a volume, for example `/data/spool`, if the container file system is small, and set `DGP_SPOOL_MAX_BYTES` (default 16 GiB) below the free space of that volume. The proxy makes the directory private to its user (mode `0700`) and does not start when another user owns it.
 
-The compose file sets `stop_grace_period: 60s`. When the proxy gets the stop signal, it waits up to 10 seconds each for the running requests, a running maintenance job, the event outbox and the work on its blocking threads, so a stop can take up to 40 seconds. Docker kills a container 10 seconds after the stop signal by default, which would cut these steps short.
+The compose file sets `stop_grace_period: 60s`. When the proxy gets the stop signal, it waits up to 10 seconds each for the running requests, a running maintenance job, the event outbox and the work on its blocking threads, and up to 15 seconds for the work that outlives its request (a DeleteObjects batch or the store of a CompleteMultipartUpload), so a stop can take up to 55 seconds. Docker kills a container 10 seconds after the stop signal by default, which would cut these steps short.
 
 ## Verify
 

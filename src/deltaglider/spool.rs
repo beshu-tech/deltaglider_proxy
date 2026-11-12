@@ -39,6 +39,21 @@ pub async fn scoped<F: std::future::Future>(backend: &str, fut: F) -> F::Output 
     SPOOL_SCOPE.scope(Arc::from(backend), fut).await
 }
 
+/// The backend scope the caller runs in, if any. A task that outlives its
+/// request (`tokio::spawn`) does not inherit it: capture it here and run
+/// the task through [`scoped_in`].
+pub fn current_scope() -> Option<Arc<str>> {
+    SPOOL_SCOPE.try_with(Arc::clone).ok()
+}
+
+/// [`scoped`] for a scope captured with [`current_scope`] (`None`: no scope).
+pub async fn scoped_in<F: std::future::Future>(scope: Option<Arc<str>>, fut: F) -> F::Output {
+    match scope {
+        Some(scope) => SPOOL_SCOPE.scope(scope, fut).await,
+        None => fut.await,
+    }
+}
+
 /// A byte-budget-gated pool of temp spool bytes.
 #[derive(Clone)]
 pub struct SpoolDir {

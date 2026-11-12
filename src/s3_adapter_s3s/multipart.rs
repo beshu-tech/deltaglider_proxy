@@ -239,7 +239,18 @@ pub(super) async fn complete_multipart_upload(
                     if_none_match: input.if_none_match.clone(),
                 },
             )
-            .await?;
+            .await;
+            // A refusal before the store (quota, precondition) is the
+            // owner's answer: publish it, so a joined retry gets the same
+            // status, not an internal error from the dropped publisher.
+            let write_lock = match write_lock {
+                Ok(lock) => lock,
+                Err(refusal) => {
+                    let refusal = s3s::S3Error::from(refusal);
+                    publisher.publish(Err(crate::multipart::failure_before_store(Some(&refusal))));
+                    return Err(refusal);
+                }
+            };
             let user_metadata = svc
                 .state
                 .multipart
@@ -409,6 +420,8 @@ pub(super) async fn run_multipart_completion(
     // Protect the relay part files from the idle-TTL sweeper while the store
     // reads them (H18): a slow remote store can exceed completing_timeout.
     let store_guard = state.multipart.store_guard(&upload_id);
+    // Armed from here: an error, a panic or a drop rolls the upload back.
+    let completing = state.multipart.completing_guard(&upload_id);
     let stored = if stores_whole {
         engine
             .store_passthrough_relayed_parts_with_multipart_etag(
@@ -441,12 +454,10 @@ pub(super) async fn run_multipart_completion(
     drop(store_guard);
     let result = match stored {
         Ok(result) => result,
-        Err(e) => {
-            state.multipart.rollback_upload(&upload_id);
-            return Err(e.into());
-        }
+        Err(e) => return Err(e.into()),
     };
     state.multipart.finish_upload(&upload_id);
+    completing.finish();
     crate::api::handlers::object_helpers::store_client_multipart_commit(
         &state, &bucket, &key, &result,
     )
@@ -593,6 +604,82 @@ mod multipart_cost_tests {
             .filter(|r| *r == "HEAD /b/" || r.starts_with("HEAD /b/?"))
             .count();
         assert_eq!(head_buckets, 1, "{:?}", fake.requests());
+    }
+
+    /// The owner of a Complete that the precondition refuses (412) before
+    /// its store answers a retry that joined meanwhile with the same 412,
+    /// not an internal error from the dropped publisher.
+    #[tokio::test]
+    async fn a_joined_complete_gets_the_refusal_of_its_owner() {
+        let (engine, _fake) = crate::deltaglider::s3_engine().await;
+        engine
+            .store(
+                "b",
+                "a/photo.jpg",
+                b"already here",
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let state = AppState::for_tests(engine);
+        let svc = Arc::new(service(state.clone()));
+        let id = state
+            .multipart
+            .create("b", "a/photo.jpg", None, Default::default())
+            .unwrap();
+        let etag = upload_part(&svc, request(part(&id, 1)))
+            .await
+            .unwrap()
+            .output
+            .e_tag
+            .unwrap();
+        let input = || {
+            s3s::dto::CompleteMultipartUploadInput::builder()
+                .bucket("b".into())
+                .key("a/photo.jpg".into())
+                .upload_id(id.clone())
+                .if_none_match(Some(s3s::dto::ETagCondition::Any))
+                .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
+                    parts: Some(vec![s3s::dto::CompletedPart {
+                        part_number: Some(1),
+                        e_tag: Some(etag.clone()),
+                        ..Default::default()
+                    }]),
+                }))
+                .build()
+                .unwrap()
+        };
+        // The object's lock is held: the owner waits in its admission.
+        let lock = state
+            .engine
+            .load()
+            .lock_object_write("b", "a/photo.jpg")
+            .await;
+        let owner = tokio::spawn({
+            let svc = svc.clone();
+            let input = input();
+            async move { complete_multipart_upload(&svc, request(input)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let joiner = tokio::spawn({
+            let svc = svc.clone();
+            let input = input();
+            async move { complete_multipart_upload(&svc, request(input)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(lock);
+        let owner = owner.await.unwrap().expect_err("the precondition refuses");
+        let joiner = joiner
+            .await
+            .unwrap()
+            .expect_err("the joiner is refused too");
+        assert_eq!(*owner.code(), s3s::S3ErrorCode::PreconditionFailed);
+        assert_eq!(
+            (joiner.code().clone(), joiner.status_code()),
+            (owner.code().clone(), owner.status_code()),
+            "the joiner gets the answer of the owner"
+        );
     }
 
     /// A CompleteMultipartUpload whose request is gone (client disconnect,

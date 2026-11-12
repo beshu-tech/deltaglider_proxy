@@ -246,6 +246,33 @@ impl Drop for StoreInProgressGuard {
     }
 }
 
+/// RAII: rolls an upload back from `Completing` to `Open` on drop unless
+/// [`Self::finish`]ed. The store of a Complete ends in `finish_upload`
+/// (success) or here: an error, a panic and a dropped future all leave the
+/// upload `Open`, so the client's retry does not wait for the
+/// `Completing` timeout.
+#[must_use = "the rollback runs when the guard is dropped"]
+pub struct CompletingGuard {
+    store: std::sync::Arc<MultipartStore>,
+    upload_id: String,
+    finished: bool,
+}
+
+impl CompletingGuard {
+    /// The store succeeded and `finish_upload` ended the `Completing` state.
+    pub fn finish(mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for CompletingGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.store.rollback_upload(&self.upload_id);
+        }
+    }
+}
+
 /// The validated parts of an upload that `complete_parts` handed to the
 /// store: relay files in the requested order, with their recorded MD5 and
 /// size (no file is read here).
@@ -315,6 +342,9 @@ pub type CompletionResult = Result<String, CompletionFailure>;
 pub struct CompletionFailure {
     pub code: s3s::S3ErrorCode,
     pub message: Option<String>,
+    /// The owner's explicit status (a code that has no status of its own,
+    /// such as a quota refusal, carries it here).
+    pub status: Option<axum::http::StatusCode>,
 }
 
 impl CompletionFailure {
@@ -322,6 +352,7 @@ impl CompletionFailure {
         Self {
             code: err.code().clone(),
             message: err.message().map(str::to_string),
+            status: err.status_code(),
         }
     }
 
@@ -329,15 +360,41 @@ impl CompletionFailure {
         Self {
             code: s3s::S3ErrorCode::InternalError,
             message: Some(message.to_string()),
+            status: None,
+        }
+    }
+
+    /// What a joined retry gets when the owner's request ended before it
+    /// published (a request timeout, a client disconnect, a cancel): the
+    /// store did not run, so the retry is safe. 503, never a 500.
+    pub fn owner_gone() -> Self {
+        Self {
+            code: s3s::S3ErrorCode::SlowDown,
+            message: Some(
+                "the request that completes this upload ended before it finished; retry".into(),
+            ),
+            status: Some(axum::http::StatusCode::SERVICE_UNAVAILABLE),
         }
     }
 
     pub fn to_s3s(&self) -> s3s::S3Error {
-        match &self.message {
+        let mut err = match &self.message {
             Some(message) => s3s::S3Error::with_message(self.code.clone(), message.clone()),
             None => s3s::S3Error::new(self.code.clone()),
+        };
+        if let Some(status) = self.status {
+            err.set_status_code(status);
         }
+        err
     }
+}
+
+/// Pure: what the owner of a Complete publishes when its request ends
+/// WITHOUT running the store: `Err` is the owner's own answer (a quota
+/// 403, a precondition 412), shared as it is; no answer (the request was
+/// dropped) is [`CompletionFailure::owner_gone`].
+pub fn failure_before_store(answer: Option<&s3s::S3Error>) -> CompletionFailure {
+    answer.map_or_else(CompletionFailure::owner_gone, CompletionFailure::of)
 }
 
 const COMPLETION_TOMBSTONE_TTL_SECS: u64 = 900;
@@ -367,8 +424,8 @@ pub enum BeginComplete {
 }
 
 /// Held by the owning completion task; publishes the outcome to joiners and
-/// the tombstone. Dropping without publishing (panic/abort) publishes an error
-/// and clears the slot so later attempts aren't wedged.
+/// the tombstone. Dropping without publishing (cancel/abort) publishes
+/// [`CompletionFailure::owner_gone`] and clears the slot so later attempts aren't wedged.
 pub struct CompletionPublisher {
     store: std::sync::Arc<MultipartStore>,
     upload_id: String,
@@ -397,9 +454,7 @@ impl Drop for CompletionPublisher {
     fn drop(&mut self) {
         if !self.published {
             self.store.clear_completion_slot(&self.upload_id);
-            let _ = self.tx.send(Some(Err(CompletionFailure::internal(
-                "completion task aborted before finishing",
-            ))));
+            let _ = self.tx.send(Some(Err(failure_before_store(None))));
         }
     }
 }
@@ -1009,6 +1064,16 @@ impl MultipartStore {
     pub fn rollback_upload(&self, upload_id: &str) {
         if let Some(u) = self.uploads.write().get_mut(upload_id) {
             u.state = MultipartState::Open;
+        }
+    }
+
+    /// The rollback guard of an upload that `complete_parts` flipped to
+    /// `Completing` (see [`CompletingGuard`]).
+    pub fn completing_guard(self: &std::sync::Arc<Self>, upload_id: &str) -> CompletingGuard {
+        CompletingGuard {
+            store: std::sync::Arc::clone(self),
+            upload_id: upload_id.to_string(),
+            finished: false,
         }
     }
 

@@ -590,7 +590,8 @@ async fn run_copy_loop(
     // RAII: releases the drain slot even if this handler future is dropped
     // (admin closes the browser mid-bulk-copy) — straight-line write_finished
     // would leak the counter and wedge every later job on the bucket (H12).
-    let _write = gate.begin_write(&req.dest_bucket);
+    let write = gate.begin_write(&req.dest_bucket);
+    let write = &write;
     let mut folders: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
     for (idx, it) in req.items.iter().enumerate() {
         let dk = dest_key(&req.dest_prefix, &it.relative);
@@ -635,12 +636,11 @@ async fn run_copy_loop(
                         }),
                     Ok(()) => {
                         copy_one(
+                            write,
                             s3,
                             engine,
-                            &req.source_bucket,
-                            &it.source_key,
-                            &req.dest_bucket,
-                            &dk,
+                            (&req.source_bucket, &it.source_key),
+                            (&req.dest_bucket, &dk),
                             req.no_overwrite,
                         )
                         .await
@@ -664,7 +664,6 @@ async fn run_copy_loop(
         .into_iter()
         .flatten()
         .collect();
-    drop(_write);
     outcomes.sort_by_key(|(idx, _)| *idx);
     let skipped = outcomes
         .iter()
@@ -744,12 +743,12 @@ impl CopyFault {
 /// multipart ETags), then an `ObjectCopied` outbox event. Returns the
 /// source's metadata as read before the copy.
 async fn copy_one(
+    // The caller's count of the write: a copy runs only inside one.
+    _write: &crate::maintenance::gate::WriteGuard,
     s3: &Arc<AppState>,
     engine: &Arc<crate::deltaglider::DynEngine>,
-    src_bucket: &str,
-    src_key: &str,
-    dst_bucket: &str,
-    dst_key: &str,
+    (src_bucket, src_key): (&str, &str),
+    (dst_bucket, dst_key): (&str, &str),
     no_overwrite: bool,
 ) -> Result<crate::types::FileMetadata, CopyFault> {
     let head = engine

@@ -351,6 +351,10 @@ The jobs database also commits without waiting for the disk, except for the comm
 
 Where the admin session cookie is `Secure` (TLS at the proxy, a trusted `X-Forwarded-Proto: https`, or `DGP_SECURE_COOKIES=true`), its name is now `__Host-dgp_session`. Where the cookie is not `Secure`, the name stays `dgp_session`. An explicit `DGP_SECURE_COOKIES` decides in both directions. Sessions live in memory, so every session ends at the restart of the upgrade anyway, and users sign in again. Only a tool that reads the cookie by its name, such as a script or a load balancer rule, needs the new name ([How to serve TLS](serve-tls.md)).
 
+## A stop waits for detached work (2.2.1)
+
+A `DeleteObjects` batch and the store of a `CompleteMultipartUpload` run on after their request ends, so that a client disconnect cannot cut an object in half. Before this release, a stop did not wait for them: SIGTERM could end the process in the middle of a batch or a store. Now the proxy waits for this work, up to 15 seconds, after it stopped accepting requests. It logs a warning with the number of tasks that it cut when the 15 seconds pass; the clients retry those requests. A stop now takes up to 55 seconds: 10 for the running requests, 15 for detached work, 10 for a maintenance job, 10 for the event outbox and `DGP_SHUTDOWN_TIMEOUT_SECS` (default 10) for blocking work. A `terminationGracePeriodSeconds` or `stop_grace_period` of 60 seconds, as the Helm chart, the operator and the compose example set, still holds. Keep it at 60 or more.
+
 ## Common gotchas
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.

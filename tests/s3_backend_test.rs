@@ -1505,3 +1505,117 @@ async fn a_copy_above_the_copy_object_limit_is_a_multipart_server_copy() {
         "under the production limit the copy is one CopyObject"
     );
 }
+
+/// A multipart server-side copy whose future is dropped (the 30-minute cut
+/// of a copy, a killed run) leaves no multipart upload on the destination:
+/// the abort guard of `copy_parts` aborts it. The source is 100 MiB and the
+/// parts are 5 MiB, so the copy takes 20 UploadPartCopy requests; the test
+/// cuts it as soon as MinIO lists the upload. Before the guard, the upload
+/// and its parts stayed until somebody aborted them.
+#[tokio::test]
+async fn a_dropped_multipart_copy_leaves_no_upload_behind() {
+    use deltaglider_proxy::storage::{
+        ObjectAt, ObjectVariant, S3Backend, StorageBackend, StorageBackendExt,
+    };
+    use deltaglider_proxy::types::FileMetadata;
+    skip_unless_minio!();
+    const MIB: usize = 1024 * 1024;
+    let raw = minio_client().await;
+    let bucket = common::unique_bucket("copy-drop");
+    raw.create_bucket().bucket(&bucket).send().await.unwrap();
+
+    let cfg: deltaglider_proxy::config::BackendConfig = serde_yaml::from_str(&format!(
+        "type: s3\nendpoint: \"{}\"\nregion: us-east-1\nforce_path_style: true\n\
+         access_key_id: {}\nsecret_access_key: {}\nallow_local: true\n",
+        common::minio_endpoint_url(),
+        common::MINIO_ACCESS_KEY,
+        common::MINIO_SECRET_KEY
+    ))
+    .unwrap();
+    let backend = std::sync::Arc::new(
+        S3Backend::new(
+            &cfg,
+            deltaglider_proxy::storage::NativeEncryptionConfig::None,
+        )
+        .await
+        .unwrap()
+        .with_copy_limits(5 * MIB as u64, 5 * MIB as u64),
+    );
+    let body = common::big_passthrough_body(100 * MIB);
+    let meta = FileMetadata::new_passthrough(
+        "src.dat".into(),
+        "0".repeat(64),
+        "0".repeat(32),
+        body.len() as u64,
+        None,
+    );
+    backend
+        .put_passthrough(&bucket, "p", "src.dat", body.into(), &meta)
+        .await
+        .unwrap();
+    let source = backend
+        .get_passthrough_metadata(&bucket, "p", "src.dat")
+        .await
+        .unwrap();
+    let mut target = source.clone();
+    target.original_name = "dst.dat".into();
+
+    let copy = tokio::spawn({
+        let (backend, bucket) = (backend.clone(), bucket.clone());
+        async move {
+            backend
+                .copy_within(
+                    ObjectVariant::Passthrough,
+                    ObjectAt {
+                        bucket: &bucket,
+                        prefix: "p",
+                        filename: "src.dat",
+                    },
+                    ObjectAt {
+                        bucket: &bucket,
+                        prefix: "p",
+                        filename: "dst.dat",
+                    },
+                    &source,
+                    &target,
+                )
+                .await
+        }
+    });
+    let in_progress = || async {
+        raw.list_multipart_uploads()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap()
+            .uploads()
+            .len()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while in_progress().await == 0 {
+        assert!(
+            !copy.is_finished(),
+            "the copy ended before the test saw its upload"
+        );
+        assert!(std::time::Instant::now() < deadline, "no upload appeared");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    copy.abort();
+    assert!(copy.await.unwrap_err().is_cancelled(), "the copy was cut");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while in_progress().await > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped copy left its multipart upload on the destination"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let _ = raw
+        .delete_object()
+        .bucket(&bucket)
+        .key("p/src.dat")
+        .send()
+        .await;
+    let _ = raw.delete_bucket().bucket(&bucket).send().await;
+}

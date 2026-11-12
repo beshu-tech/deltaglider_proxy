@@ -172,7 +172,7 @@ started it. For a multi-pod deployment, use the official operator instead. It de
 the consistent-hashing router that this requires: [How to scale out with the Kubernetes
 operator](scale-out-with-the-kubernetes-operator.md).
 
-The chart uses `updateStrategy.type: Recreate`. The proxy takes a lock on its state directory (the folder of `deltaglider_config.db` on the PVC), and a second process on the same directory waits up to `DGP_STATE_LOCK_WAIT_SECS` (default 60 seconds) and then exits with an error that names the directory. A rolling update starts the new pod while the old pod still runs on the same volume, so the new pod cannot start. The chart also sets `terminationGracePeriodSeconds: 60`, because a stop takes up to 40 seconds: up to 10 seconds each for the running requests, a maintenance job, the event outbox and the work on the blocking threads (`DGP_SHUTDOWN_TIMEOUT_SECS`).
+The chart uses `updateStrategy.type: Recreate`. The proxy takes a lock on its state directory (the folder of `deltaglider_config.db` on the PVC), and a second process on the same directory waits up to `DGP_STATE_LOCK_WAIT_SECS` (default 60 seconds) and then exits with an error that names the directory. A rolling update starts the new pod while the old pod still runs on the same volume, so the new pod cannot start. The chart also sets `terminationGracePeriodSeconds: 60`, because a stop takes up to 55 seconds: up to 10 seconds each for the running requests, a maintenance job, the event outbox and the work on the blocking threads (`DGP_SHUTDOWN_TIMEOUT_SECS`), and up to 15 seconds for the work that outlives its request (a DeleteObjects batch or the store of a CompleteMultipartUpload).
 
 With config sync set up, replication rules elect one leader per rule through an S3-CAS lease in the sync bucket (default `lease_ttl: "300s"`, `heartbeat_interval: "60s"`); a dead leader's lease lapses and a peer takes over automatically. Lifecycle, maintenance, and parity audit jobs still use node-local database leases, so they may run on more than one pod. Their operations are idempotent, so this wastes work but does not corrupt data. Do not scale above one replica if each pod has its own independent `/data/deltaglider_config.db`. In that shape, each pod is an independent control plane. To run more than one instance, set up config sync and a shared `DGP_CONFIG_DB_KEY` first: [How to run multiple instances (HA)](run-multiple-instances.md).
 
@@ -190,7 +190,7 @@ When you add `aes256-gcm-proxy` to `config.inline` and run `helm upgrade`, the p
 | `config.inline` | Canonical DeltaGlider YAML rendered into `/data/deltaglider_proxy.yaml`. |
 | `persistence.*` | PVC settings for `/data`. |
 | `tmp.sizeLimit` | Size limit of the `/tmp` `emptyDir` that holds the spool, in `Mi` or `Gi` (default `2Gi`). The chart sets `DGP_SPOOL_MAX_BYTES` to three quarters of it. |
-| `updateStrategy` / `terminationGracePeriodSeconds` | `Recreate` and `60` by default. Keep them: one process at a time may use the state directory, and a stop takes up to 40 seconds. |
+| `updateStrategy` / `terminationGracePeriodSeconds` | `Recreate` and `60` by default. Keep them: one process at a time may use the state directory, and a stop takes up to 55 seconds. |
 | `ingress.*` | Optional host/TLS routing. |
 | `env` / `envFrom` | Extra non-secret env and env sources. |
 | `backendCredentials.*` | Convenience S3 backend env values when the chart creates the Secret. |

@@ -1698,3 +1698,63 @@ fn the_uploads_lock_is_never_held_for_file_io() {
         );
     }
 }
+
+/// What the owner of a Complete publishes when its request ends without the
+/// store: its own refusal as it is (code and status), else a retryable 503.
+#[test]
+fn failure_before_store_table() {
+    use axum::http::StatusCode;
+    use s3s::S3ErrorCode as C;
+    let mut quota = s3s::S3Error::with_message(C::Custom("QuotaExceeded".into()), "full");
+    quota.set_status_code(StatusCode::FORBIDDEN);
+    let mut precondition = s3s::S3Error::with_message(C::PreconditionFailed, "etag");
+    precondition.set_status_code(StatusCode::PRECONDITION_FAILED);
+    let slow = s3s::S3Error::with_message(C::SlowDown, "later");
+    let table: [(Option<&s3s::S3Error>, C, Option<StatusCode>); 4] = [
+        (
+            Some(&quota),
+            C::Custom("QuotaExceeded".into()),
+            Some(StatusCode::FORBIDDEN),
+        ),
+        (
+            Some(&precondition),
+            C::PreconditionFailed,
+            Some(StatusCode::PRECONDITION_FAILED),
+        ),
+        (Some(&slow), C::SlowDown, slow.status_code()),
+        (None, C::SlowDown, Some(StatusCode::SERVICE_UNAVAILABLE)),
+    ];
+    for (answer, code, status) in table {
+        let seen = failure_before_store(answer).to_s3s();
+        assert_eq!(seen.code(), &code);
+        assert_eq!(seen.status_code(), status, "{code:?}");
+    }
+}
+
+/// A Complete whose store panics (or whose task is dropped) leaves the
+/// upload `Open`, not `Completing` until the timeout.
+#[tokio::test]
+async fn a_completing_guard_rolls_back_on_unwind_and_not_after_finish() {
+    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let id = store.create("b", "k", None, Default::default()).unwrap();
+    let state_of = |store: &MultipartStore| store.uploads.read().get(&id).map(|u| u.state);
+    let flip = |store: &MultipartStore| {
+        store.uploads.write().get_mut(&id).unwrap().state = MultipartState::Completing;
+    };
+
+    flip(&store);
+    let task = tokio::spawn({
+        let store = store.clone();
+        let id = id.clone();
+        async move {
+            let _guard = store.completing_guard(&id);
+            panic!("the store panicked");
+        }
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    assert_eq!(state_of(&store), Some(MultipartState::Open));
+
+    flip(&store);
+    store.completing_guard(&id).finish();
+    assert_eq!(state_of(&store), Some(MultipartState::Completing));
+}

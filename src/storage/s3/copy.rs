@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::coordination::if_match::IfMatchRequest;
+use crate::storage::mpu_guard::MpuAbortGuard;
 
 /// S3's limit on the source of one CopyObject request.
 pub(super) const COPY_OBJECT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -78,6 +79,17 @@ fn failure_of<E: ProvideErrorMetadata>(e: &SdkError<E>) -> CopyFailure {
     copy_failure(status, e.code())
 }
 
+/// What a multipart copy copies, and how.
+#[derive(Clone, Copy)]
+struct PartsCopy<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    copy_source: &'a str,
+    source_etag: &'a str,
+    size: u64,
+    part_bytes: u64,
+}
+
 impl S3Backend {
     /// See [`StorageBackend::copy_within`].
     pub(super) async fn copy_object_within(
@@ -140,12 +152,22 @@ impl S3Backend {
         }
         fit_metadata(&mut headers, dst.bucket, &dst_key)?;
         let copy_source = format!("{}/{}", src.bucket, encode_copy_source_key(&src_key));
-        let copied = if size <= copy_object_max_bytes() {
+        let (object_max, part_bytes) = self
+            .copy_limits
+            .unwrap_or_else(|| (copy_object_max_bytes(), copy_part_bytes()));
+        let copied = if size <= object_max {
             self.copy_single(dst.bucket, &dst_key, &copy_source, etag, &headers)
                 .await
         } else {
-            self.copy_parts(dst.bucket, &dst_key, &copy_source, etag, size, &headers)
-                .await
+            let plan = PartsCopy {
+                bucket: dst.bucket,
+                key: &dst_key,
+                copy_source: &copy_source,
+                source_etag: etag,
+                size,
+                part_bytes,
+            };
+            self.copy_parts(&plan, &headers).await
         };
         match copied {
             Ok(new_etag) => {
@@ -216,16 +238,13 @@ impl S3Backend {
 
     /// A copy above the CopyObject limit: a multipart upload whose parts
     /// are UploadPartCopy requests, each conditional on the source ETag.
-    /// Aborted on any failure.
+    /// Aborted on any failure and when the future is dropped.
     async fn copy_parts(
         &self,
-        bucket: &str,
-        key: &str,
-        copy_source: &str,
-        source_etag: &str,
-        size: u64,
+        plan: &PartsCopy<'_>,
         headers: &HashMap<String, String>,
     ) -> Result<String, (CopyFailure, StorageError)> {
+        let (bucket, key) = (plan.bucket, plan.key);
         let mut create = self
             .bulk_client
             .create_multipart_upload()
@@ -248,34 +267,49 @@ impl S3Backend {
                 StorageError::Other("CreateMultipartUpload returned no upload id".into()),
             ));
         };
-        let result = self
-            .copy_part_list(bucket, key, copy_source, source_etag, size, &upload_id)
-            .await;
-        if result.is_err() {
-            let _ = self
-                .bulk_client
-                .abort_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(&upload_id)
-                .send()
-                .await;
+        // Armed until Complete returned Ok: an error and a dropped future
+        // (the `bounded` cut, a killed run) both abort the upload.
+        let guard = {
+            let client = self.bulk_client.clone();
+            let (bucket, key, upload_id) = (bucket.to_string(), key.to_string(), upload_id.clone());
+            MpuAbortGuard::new(move || async move {
+                let _ = client
+                    .abort_multipart_upload()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await;
+            })
+        };
+        match self.copy_part_list(plan, &upload_id).await {
+            Ok(etag) => {
+                guard.disarm();
+                Ok(etag)
+            }
+            Err(e) => {
+                guard.abort().await;
+                Err(e)
+            }
         }
-        result
     }
 
     async fn copy_part_list(
         &self,
-        bucket: &str,
-        key: &str,
-        copy_source: &str,
-        source_etag: &str,
-        size: u64,
+        plan: &PartsCopy<'_>,
         upload_id: &str,
     ) -> Result<String, (CopyFailure, StorageError)> {
+        let PartsCopy {
+            bucket,
+            key,
+            copy_source,
+            source_etag,
+            size,
+            part_bytes,
+        } = *plan;
         use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
         let mut parts = Vec::new();
-        for (i, (start, end)) in copy_part_ranges(size, copy_part_size(size, copy_part_bytes()))
+        for (i, (start, end)) in copy_part_ranges(size, copy_part_size(size, part_bytes))
             .into_iter()
             .enumerate()
         {

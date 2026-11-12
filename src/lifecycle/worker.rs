@@ -667,27 +667,6 @@ async fn run_or_preview(
             stopped_by = Some(stop);
             break 'pages;
         }
-        // Admit the page's writes through the gate (counted, then the gate
-        // asked: acquire-then-recheck, H22/F9) so a concurrently-arming
-        // maintenance drain either waits for this page's writes or we defer
-        // with the guards dropped. Mid-run maintenance defer: if a write
-        // bucket (source or transition dest) becomes gated mid-run, stop —
-        // cursor preserved, resumes when the maintenance job clears. Mirrors
-        // the replication RunControl fix (#12); preview never writes, so it's
-        // execute-only.
-        let windows = if execute {
-            match admit_write_windows(rule, maintenance_gate.as_ref()) {
-                Ok(windows) => windows,
-                Err(why) => {
-                    info!("lifecycle rule '{}' deferring mid-run — {why}", rule.name);
-                    deferred = true;
-                    break 'pages;
-                }
-            }
-        } else {
-            // A preview writes nothing: an admission of no bucket.
-            crate::maintenance::gate::admit_all(None, &[]).map_err(|e| e.into_reason())?
-        };
         if execute
             && !renew_run_lease(&db, rule, ctx.as_ref(), &mut out.failures, response_cap).await?
         {
@@ -795,6 +774,19 @@ async fn run_or_preview(
                         });
                     }
                     if execute {
+                        // ONE admission per object (counted, then the gate
+                        // asked): a maintenance job that arms during the page
+                        // waits for at most this object's copy, and the next
+                        // object defers the run. The cursor stays before the
+                        // page, so the resume plans it again.
+                        let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
+                            Ok(windows) => windows,
+                            Err(why) => {
+                                info!("lifecycle rule '{}' deferring mid-page: {why}", rule.name);
+                                deferred = true;
+                                break;
+                            }
+                        };
                         match plan_action(db.as_ref(), engine, &windows, rule, &key, &meta, &action)
                             .await
                         {
@@ -851,12 +843,26 @@ async fn run_or_preview(
         if let Some(ctx) = ctx.as_ref() {
             ctx.publish(&out);
         }
-        if stopped_by.is_some() {
+        if stopped_by.is_some() || deferred {
             // Copies already made stay; the page's deletes do not run.
             break 'pages;
         }
 
         if !deletes.is_empty() {
+            // The admission of the page's delete batch: `proceed` asks the
+            // gate again before each key, so a job that arms meanwhile waits
+            // for one key's delete.
+            let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
+                Ok(windows) => windows,
+                Err(why) => {
+                    info!(
+                        "lifecycle rule '{}' deferring before its deletes: {why}",
+                        rule.name
+                    );
+                    deferred = true;
+                    break 'pages;
+                }
+            };
             let stopped = delete_planned(
                 db.as_ref(),
                 engine,
@@ -2659,6 +2665,77 @@ mod tests {
             state.next_due_at <= before + 120,
             "due again soon, not one delay later: {}",
             state.next_due_at - before
+        );
+    }
+
+    /// A maintenance job that arms while a page is copied waits for ONE
+    /// object's copy: every object has its own admission, so the object
+    /// after the arm defers the run. The gate here refuses from the
+    /// third object on (a job armed in the middle of the page).
+    #[tokio::test]
+    async fn a_gate_armed_mid_page_stops_the_run_at_the_next_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        let keys = ["x/1.bin", "x/2.bin", "x/3.bin", "x/4.bin", "x/5.bin"];
+        store_all(&engine, &keys).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rule = LifecycleRule {
+            name: "mid-page".into(),
+            expire_after: Some("1ms".into()),
+            action: crate::config_sections::LifecycleAction::Transition(
+                crate::config_sections::LifecycleTransitionAction {
+                    destination: crate::config_sections::LifecycleDestination {
+                        bucket: "dst".into(),
+                        prefix: "cold/".into(),
+                    },
+                    delete_source_after_success: false,
+                },
+            ),
+            ..rule()
+        };
+        let copied = |engine: Arc<DynEngine>| async move {
+            let mut n = 0;
+            for key in keys {
+                n += usize::from(engine.head("dst", &format!("cold/{key}")).await.is_ok());
+            }
+            n
+        };
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        // Each object asks the gate once for "dst" (its admission): the
+        // third ask is the one after the job armed.
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        gate.set_write_refusal_probe(Arc::new(move |bucket: &str| {
+            (bucket == "dst" && asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= 3)
+                .then(|| "a job armed mid-page".to_string())
+        }));
+        let db = jobs_db();
+        db.lock()
+            .await
+            .lifecycle_ensure_state(&rule.name, 0)
+            .unwrap();
+        let out = super::run_rule(
+            Some(db.clone()),
+            &engine,
+            &rule,
+            10,
+            "scheduler",
+            3600,
+            None,
+            Some(gate.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.status, "deferred", "{out:?}");
+        assert_eq!(
+            copied(engine.clone()).await,
+            2,
+            "no object is copied after the gate armed: {out:?}"
+        );
+        assert_eq!((out.objects_copied, out.errors), (2, 0), "{out:?}");
+        assert_eq!(
+            gate.inflight_writes("dst"),
+            0,
+            "no admission outlives the run"
         );
     }
 

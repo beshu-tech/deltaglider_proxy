@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Upgrade steps for the next release
+
+- **A stop now waits for detached work, so it can take up to 55 seconds.** A `DeleteObjects` batch and the store of a `CompleteMultipartUpload` run on after their request ends. A stop now waits for them up to 15 seconds (after the 10 seconds for requests) and logs how many tasks it cut. Keep `terminationGracePeriodSeconds` and `stop_grace_period` at 60 seconds or more.
+
+### Fixed
+
+- A lifecycle run takes one write admission for each object it copies, not one for each page. A maintenance job that arms in the middle of a page now waits for one object copy at most, and the run defers at the next object.
+- A multipart upload that the proxy opens on a backend for its own writes (a streaming copy, an UploadPartCopy copy above 5 GiB) is aborted when the copy is cut, for example by the 30-minute limit of one object copy or by a killed run. One guard type covers every such upload and stays armed until Complete returns `Ok`, so a cut during the Complete request leaves no parts on the destination either.
+- A `DeleteObjects` batch or a `CompleteMultipartUpload` store that runs after its request counts its spool space against the same backend share as its request (`DGP_BACKEND_SHARE_PERCENT`).
+- A retried `CompleteMultipartUpload` that joins a Complete whose owner was refused before the store (quota `403`, precondition `412`) gets the owner's status and code, not `500`. When the owner's request ends before it publishes, the retry gets `503 SlowDown`.
+- An upload whose Complete store panics goes back to open at once, not after `DGP_MULTIPART_COMPLETING_TIMEOUT_SECS`.
+- A write request that the maintenance gate refuses no longer counts as in flight, so clients that retry the `503` cannot keep a maintenance drain waiting. A drain that times out with only unchecked requests in flight defers its job (it retries) instead of failing it.
+
 ## v2.2.0 — 2026-11-11
 
 ### Upgrade steps for the next release
