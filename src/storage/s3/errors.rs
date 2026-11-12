@@ -213,6 +213,26 @@ fn backend_error_code<E: std::fmt::Debug + ProvideErrorMetadata>(e: &SdkError<E>
     ""
 }
 
+/// Pure: does a LIST answer say that the backend refuses the PREFIX as a
+/// name, whatever the bucket holds? MinIO answers `XMinioInvalidResourceName`
+/// (status 400) to `prefix=.` and `prefix=a/.`. This is the only answer that
+/// lets the probe of a CommonPrefix show the prefix unchecked; every other
+/// error (a `503` SlowDown, a timeout, an auth error) is the error of the
+/// page, as a failed page request is.
+///
+/// `InvalidArgument` is NOT such an answer: a backend gives it for a bad
+/// continuation token or `max-keys` too, and that is a fault of the page.
+pub(super) fn refuses_prefix_as_a_name(code: &str) -> bool {
+    code == "XMinioInvalidResourceName"
+}
+
+/// [`refuses_prefix_as_a_name`] for an SDK error.
+pub(super) fn sdk_refuses_prefix_as_a_name<E: std::fmt::Debug + ProvideErrorMetadata>(
+    e: &SdkError<E>,
+) -> bool {
+    refuses_prefix_as_a_name(backend_error_code(e))
+}
+
 /// THE mapping from a backend's answer — the op, the HTTP status (`None` =
 /// none came), the structured error code, whether the response body broke
 /// off — to a [`StorageError`]. Pure: the table test over every
@@ -421,5 +441,32 @@ pub(super) fn classify_create_bucket_conflict(
         Some("BucketAlreadyOwnedByYou") => Some(Ok(())),
         Some("BucketAlreadyExists") => Some(Err(StorageError::AlreadyExists(bucket.to_string()))),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod prefix_refusal_tests {
+    use super::refuses_prefix_as_a_name;
+
+    /// Only an answer that refuses the PREFIX as a name lets a probe show
+    /// the prefix unchecked. Every other answer is an error of the page.
+    #[test]
+    fn only_a_name_refusal_lets_the_probe_show_a_prefix() {
+        let table: &[(&str, bool)] = &[
+            ("XMinioInvalidResourceName", true),
+            // A bad continuation token or `max-keys` gets this code too.
+            ("InvalidArgument", false),
+            ("InvalidResourceName", false),
+            ("SlowDown", false),
+            ("InternalError", false),
+            ("AccessDenied", false),
+            ("SignatureDoesNotMatch", false),
+            ("NoSuchBucket", false),
+            ("RequestTimeout", false),
+            ("", false),
+        ];
+        for (code, want) in table {
+            assert_eq!(refuses_prefix_as_a_name(code), *want, "{code}");
+        }
     }
 }

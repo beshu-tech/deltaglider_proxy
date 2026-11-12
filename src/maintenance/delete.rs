@@ -55,9 +55,15 @@ pub enum Principal {
     /// Open access: no per-key check while IAM stays off.
     Open,
     /// An IAM user, and the address its session came from (`aws:SourceIp`).
+    /// `user_id` is the user's database id: it stays the same when the keys
+    /// rotate, so the owner still cancels the job and the job still acts as
+    /// the user (A2, #171). A row from an older release has none; it is
+    /// judged by `access_key_id`.
     User {
         access_key_id: String,
         client_ip: Option<IpAddr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<i64>,
     },
 }
 
@@ -82,15 +88,25 @@ pub fn parse_params(json: &str) -> Result<DeleteParams, String> {
 
 /// Pure: may `session` cancel a job that `job_params` (the job row's params
 /// JSON) says was started by its stored principal? An admin or open session
-/// cancels any job. A user cancels the jobs of the same IAM access key id.
-/// The decision never uses a display name: a user may be NAMED `admin`, and
-/// an OIDC name claim is free text. An unreadable row denies a user.
+/// cancels any job. A user cancels the jobs of the same IAM user: the same
+/// database id, which a key rotation keeps; a row without an id (an older
+/// release) is judged by the access key id. The decision never uses a
+/// display name: a user may be NAMED `admin`, and an OIDC name claim is free
+/// text. An unreadable row denies a user.
 pub fn may_cancel(session: &Principal, job_params: Option<&str>) -> bool {
     match session {
         Principal::Admin | Principal::Open => true,
-        Principal::User { access_key_id, .. } => matches!(
+        Principal::User {
+            access_key_id,
+            user_id,
+            ..
+        } => matches!(
             job_params.and_then(|p| parse_params(p).ok()).map(|p| p.principal),
-            Some(Principal::User { access_key_id: owner, .. }) if owner == *access_key_id
+            Some(Principal::User { access_key_id: owner_key, user_id: owner_id, .. })
+                if match (user_id, owner_id) {
+                    (Some(session_id), Some(owner_id)) => *session_id == owner_id,
+                    _ => owner_key == *access_key_id,
+                }
         ),
     }
 }
@@ -287,6 +303,15 @@ mod tests {
         Principal::User {
             access_key_id: ak.into(),
             client_ip: None,
+            user_id: None,
+        }
+    }
+
+    fn user_with_id(ak: &str, id: i64) -> Principal {
+        Principal::User {
+            access_key_id: ak.into(),
+            client_ip: None,
+            user_id: Some(id),
         }
     }
 
@@ -326,6 +351,38 @@ mod tests {
         }
     }
 
+    /// A2 (#171): the owner cancels after a key rotation (same id, new key);
+    /// a different user that holds the old key id does not.
+    #[test]
+    fn the_owner_cancels_after_a_key_rotation() {
+        let job_before_rotation = row(user_with_id("AKOLD", 7));
+        #[rustfmt::skip]
+        let table: [(Principal, bool, &str); 5] = [
+            (user_with_id("AKNEW", 7), true, "same id, rotated key"),
+            (user_with_id("AKOLD", 7), true, "same id, same key"),
+            (user_with_id("AKOLD", 8), false, "another user that holds the old key id"),
+            (user_with_id("AKNEW", 8), false, "another user"),
+            (user("AKOLD"), true, "a session without an id falls back to the key"),
+        ];
+        for (session, want, why) in table {
+            assert_eq!(
+                may_cancel(&session, Some(&job_before_rotation)),
+                want,
+                "{why}"
+            );
+        }
+        // A row of an older release has no id: judged by the key.
+        let old_row = row(user("AKOLD"));
+        assert!(may_cancel(&user_with_id("AKOLD", 7), Some(&old_row)));
+        assert!(!may_cancel(&user_with_id("AKNEW", 7), Some(&old_row)));
+        // The old row format (no `user_id`) still parses.
+        let legacy = r#"{"prefixes":["a/"],"keys":[],"principal":{"type":"user","access_key_id":"AK","client_ip":null}}"#;
+        assert!(matches!(
+            parse_params(legacy).unwrap().principal,
+            Principal::User { user_id: None, .. }
+        ));
+    }
+
     #[test]
     fn params_round_trip_with_each_principal() {
         for principal in [
@@ -334,6 +391,7 @@ mod tests {
             Principal::User {
                 access_key_id: "AK".into(),
                 client_ip: Some("10.0.0.1".parse().unwrap()),
+                user_id: Some(4),
             },
         ] {
             let p = DeleteParams {

@@ -173,7 +173,7 @@ pub fn is_user_object_key(key: &str) -> bool {
     // Storage-layer delta artifacts. The engine listing usually hides these,
     // but filter defensively at the source boundary.
     let filename = key.rsplit('/').next().unwrap_or(key);
-    if filename == "reference.bin" || filename.ends_with(".delta") {
+    if crate::types::is_reference_key(key) || filename.ends_with(".delta") {
         return false;
     }
     true
@@ -1931,6 +1931,28 @@ mod tests {
         assert!(!is_user_object_key("ror/libs/foo.delta"));
         // a key that merely CONTAINS "reference.bin" as a substring is fine
         assert!(is_user_object_key("ror/reference.bin.bak"));
+    }
+
+    /// The baseline rule is the last path segment, whole (`types::
+    /// is_reference_key`): a table over its shapes. A suffix test would take
+    /// `myreference.bin`, and a substring test `x/reference.bin/y`.
+    #[test]
+    fn user_object_key_takes_only_a_whole_reference_segment_as_a_baseline() {
+        let table: &[(&str, bool)] = &[
+            ("reference.bin", false),
+            ("a/reference.bin", false),
+            ("a/b/reference.bin", false),
+            ("myreference.bin", true),
+            ("a/myreference.bin", true),
+            ("a/api-reference.bin", true),
+            ("x/reference.bin/y", true),
+            ("reference.bin.delta", false), // a delta artifact, by its suffix
+            ("a/reference.bin.delta", false),
+            ("reference.bin.bak", true),
+        ];
+        for (key, want) in table {
+            assert_eq!(is_user_object_key(key), *want, "{key}");
+        }
     }
 
     // ── group_events_by_key ────────────────────────────────────────────────

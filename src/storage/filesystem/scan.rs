@@ -347,8 +347,8 @@ pub(super) fn collapse_key(key: &str, prefix: &str, delimiter: &str) -> Option<S
 
 /// Pure: does the flat walk keep this entry? A file is kept when its key
 /// starts with `prefix` and sorts after `token`; a directory when its
-/// subtree may hold such a key. A `.dg` directory is the proxy's own and
-/// never listed (F19).
+/// subtree may hold such a key. A `.dg` directory is an ordinary folder: its
+/// `reference.bin` is no key, a legacy key in it is (L1, #171).
 ///
 /// `skip`: the common prefix just listed. Every key that starts with it is
 /// collapsed already, so it is dropped while the directory is read; without
@@ -362,9 +362,6 @@ pub(super) fn flat_keep(
     entry: &WalkEntry,
 ) -> bool {
     if entry.is_dir {
-        if entry.name == ".dg" {
-            return false;
-        }
         let below = format!("{}/", join_key(dir_key, &entry.key_name));
         if skip.is_some_and(|s| below.starts_with(s)) {
             return false;
@@ -460,7 +457,7 @@ impl<'a> FlatWalk<'a> {
             if let Some(cp) = delimiter.and_then(|d| collapse_key(&below, prefix, d)) {
                 // Every key below collapses to `cp`: no need to read them,
                 // only to know that one is there.
-                if FilesystemBackend::dir_has_listed_key(&path).await? {
+                if FilesystemBackend::dir_has_visible_data_recursive(&path).await? {
                     self.skip = Some(cp.clone());
                     return Ok(Some(WalkStep::Collapsed(cp)));
                 }
