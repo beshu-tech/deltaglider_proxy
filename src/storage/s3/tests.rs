@@ -1778,6 +1778,23 @@ pub(crate) mod test_support {
         s3
     }
 
+    /// [`for_test_endpoint_as_node`] whose facts write queue holds `cap`
+    /// items.
+    pub(crate) fn for_test_endpoint_with_facts_queue(
+        endpoint: &str,
+        node: &str,
+        cap: usize,
+    ) -> S3Backend {
+        let mut s3 = for_test_endpoint_as_node(endpoint, node);
+        s3.facts_cleanup =
+            super::super::super::facts_cleanup::FactsCleanupQueue::start_with_capacity(
+                s3.client.clone(),
+                NativeEncryptionConfig::None.into(),
+                cap,
+            );
+        s3
+    }
+
     /// A backend that sends its requests with `client`.
     pub(crate) fn with_client(endpoint: &str, client: Client) -> S3Backend {
         S3Backend {
@@ -3068,6 +3085,293 @@ mod sealed_shape_tests {
                 assert!(fake.requests().is_empty(), "{:?}", fake.requests());
             }
         }
+    }
+
+    /// A delta as a PUT stores it: logical size 1000.
+    fn put_meta(name: &str) -> FileMetadata {
+        FileMetadata::new_delta(
+            name.into(),
+            "ab".repeat(32),
+            "cd".repeat(16),
+            1000,
+            "reference.bin".into(),
+            "ef".repeat(32),
+            10,
+            None,
+        )
+    }
+
+    /// How many of the entries of `v1/` another node lists with their
+    /// logical size (1000) and not their stored one.
+    async fn logical_sizes_seen_by(ep: &str, node: &str) -> usize {
+        let reader = test_support::for_test_endpoint_as_node(ep, node);
+        let mut objects = reader.bulk_list_objects("b", "v1/").await.unwrap();
+        // The caller heads the misses: no healer HEAD repairs one meanwhile.
+        reader
+            .resolve_listed_sizes(
+                "b",
+                &mut objects,
+                ResolveListed {
+                    trust_v1_facts: true,
+                    caller_heads_misses: true,
+                },
+            )
+            .await;
+        objects.iter().filter(|(_, m)| m.file_size == 1000).count()
+    }
+
+    /// Wait for `n` facts PUTs on the fake.
+    async fn wait_for_facts_puts(fake: &crate::storage::FakeS3, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let puts = fake
+                .requests()
+                .iter()
+                .filter(|r| r.starts_with("PUT /b/.dg/facts/v1/"))
+                .count();
+            if puts >= n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{puts} of {n} facts PUTs: {:?}",
+                fake.requests()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// L5 (#171), the PUT path: a PUT whose facts write the full queue
+    /// refused (`persist_listing_facts`) keeps it, and the next LIST of the
+    /// object writes it. Before that, another node lists the stored size.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_put_whose_facts_write_was_refused_gets_its_facts_at_the_next_list() {
+        let (ep, fake) = crate::storage::fake_s3::start().await;
+        let s3 = test_support::for_test_endpoint_with_facts_queue(&ep, "refused-put", 1);
+        fake.stall("PUT", ".dg/facts/");
+        let put = |i: usize| {
+            let s3 = &s3;
+            async move {
+                let name = format!("k{i}.zip");
+                s3.put_delta(
+                    "b",
+                    "v1",
+                    &name,
+                    crate::storage::PutBody::Bytes(bytes::Bytes::from(format!("body-{i}-xxxx"))),
+                    &put_meta(&name),
+                    crate::deltaglider::RefWriteProof::for_tests(),
+                )
+                .await
+                .unwrap();
+            }
+        };
+        // The first write takes the drain into a stalled request, the
+        // second fills the queue, the others are refused.
+        put(0).await;
+        assert!(
+            fake.wait_for(|r| r.starts_with("PUT /b/.dg/facts/v1/"))
+                .await
+        );
+        for i in 1..4 {
+            put(i).await;
+        }
+        fake.release_stalls();
+        wait_for_facts_puts(&fake, 2).await;
+        // The queued writes landed; the refused ones did not.
+        assert_eq!(logical_sizes_seen_by(&ep, "reader-before").await, 2);
+        // A LIST of the objects offers the refused writes again. The queue
+        // holds one item, so it takes one LIST for each refused write.
+        for _ in 0..6 {
+            if fake
+                .requests()
+                .iter()
+                .filter(|r| r.starts_with("PUT /b/.dg/facts/v1/"))
+                .count()
+                >= 4
+            {
+                break;
+            }
+            let mut objects = s3.bulk_list_objects("b", "v1/").await.unwrap();
+            s3.resolve_listed_sizes(
+                "b",
+                &mut objects,
+                ResolveListed {
+                    trust_v1_facts: true,
+                    caller_heads_misses: true,
+                },
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        wait_for_facts_puts(&fake, 4).await;
+        assert_eq!(logical_sizes_seen_by(&ep, "reader-after").await, 4);
+    }
+
+    /// L5 (#171), the backfill path: a HEAD that learned the facts of an
+    /// object a LIST found without them (`backfill_facts`) and whose write
+    /// the full queue refused is offered again by the next LIST.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_backfill_whose_facts_write_was_refused_gets_its_facts_at_the_next_list() {
+        let (ep, fake) = crate::storage::fake_s3::start().await;
+        let s3 = test_support::for_test_endpoint_with_facts_queue(&ep, "refused-backfill", 1);
+        let sha = "f".repeat(64);
+        // Two stored deltas without facts (an older release stored them).
+        for i in 0..2 {
+            let body = format!("backfill-body-{i}");
+            fake.insert_object(
+                &format!("b/v1/o{i}.zip.delta"),
+                body.as_bytes(),
+                &delta_meta(&sha, &[]),
+            );
+        }
+        fake.stall("PUT", ".dg/facts/");
+        // Fill the drain (stalled) and the queue (one item) with PUTs.
+        let put = |i: usize| {
+            let s3 = &s3;
+            async move {
+                let name = format!("k{i}.zip");
+                s3.put_delta(
+                    "b",
+                    "v1",
+                    &name,
+                    crate::storage::PutBody::Bytes(bytes::Bytes::from(format!("body-{i}-xxxx"))),
+                    &put_meta(&name),
+                    crate::deltaglider::RefWriteProof::for_tests(),
+                )
+                .await
+                .unwrap();
+            }
+        };
+        put(0).await;
+        assert!(
+            fake.wait_for(|r| r.starts_with("PUT /b/.dg/facts/v1/"))
+                .await
+        );
+        put(1).await;
+        // A HEAD learned the facts of each stored delta: the queue is full.
+        let listed = s3.bulk_list_objects("b", "v1/o").await.unwrap();
+        assert_eq!(listed.len(), 2);
+        for (key, meta) in &listed {
+            let id = StoredObjectId {
+                scope: &s3.list_cache_scope,
+                bucket: "b",
+                key: &format!("{key}.delta"),
+                etag: &meta.md5,
+                size: meta.stored_size(),
+            };
+            list_size_cache::mark_missing_facts(&id);
+            s3.backfill_listing_facts(
+                "b",
+                &format!("{key}.delta"),
+                &meta.md5,
+                meta.stored_size(),
+                &put_meta(key),
+            );
+        }
+        fake.release_stalls();
+        wait_for_facts_puts(&fake, 2).await;
+        let before = fake
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("PUT /b/.dg/facts/v1/o"))
+            .count();
+        assert_eq!(before, 0, "the backfill writes were refused");
+        // The queue holds one item: it takes one LIST for each refused write.
+        for _ in 0..6 {
+            if fake
+                .requests()
+                .iter()
+                .filter(|r| r.starts_with("PUT /b/.dg/facts/v1/o"))
+                .count()
+                >= 2
+            {
+                break;
+            }
+            let mut objects = s3.bulk_list_objects("b", "v1/o").await.unwrap();
+            s3.resolve_listed_sizes(
+                "b",
+                &mut objects,
+                ResolveListed {
+                    trust_v1_facts: true,
+                    caller_heads_misses: true,
+                },
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        let offered = fake
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("PUT /b/.dg/facts/v1/o"))
+            .count();
+        assert_eq!(
+            offered,
+            2,
+            "the refused backfills were never offered again: {:?}",
+            fake.requests()
+        );
+    }
+
+    /// L5 (#171): the registry of refused writes holds no entry for an object
+    /// that was deleted or written again, and a LIST that meets an entry of
+    /// another version drops it. A stale entry would keep every LIST on the
+    /// slow path for ever.
+    #[tokio::test]
+    async fn the_refused_writes_registry_forgets_a_deleted_or_rewritten_object() {
+        let (ep, _fake) = crate::storage::fake_s3::start().await;
+        let s3 = test_support::for_test_endpoint_as_node(&ep, "registry-forget");
+        let id = |key: &'static str, etag: &'static str| StoredObjectId {
+            scope: &s3.list_cache_scope,
+            bucket: "b",
+            key,
+            etag,
+            size: 5,
+        };
+        // Deleted: the delete path forgets the entry.
+        list_size_cache::mark_unwritten(&id("p/del.zip.delta", "e1"), "facts-del".into());
+        s3.enqueue_facts_cleanup("b", "p/del.zip.delta", None);
+        assert_eq!(
+            list_size_cache::take_unwritten(&id("p/del.zip.delta", "e1")),
+            None
+        );
+        // Written again with a write that was queued: the PUT path forgets
+        // the entry of the older version.
+        list_size_cache::mark_unwritten(&id("p/new.zip.delta", "e1"), "facts-old".into());
+        let meta = FileMetadata::new_delta(
+            "new.zip".into(),
+            "ab".repeat(32),
+            "cd".repeat(16),
+            1000,
+            "reference.bin".into(),
+            "ef".repeat(32),
+            5,
+            None,
+        );
+        s3.persist_listing_facts("b", "p/new.zip.delta", "e2", 5, &meta);
+        assert_eq!(
+            list_size_cache::take_unwritten(&id("p/new.zip.delta", "e1")),
+            None
+        );
+        // A LIST that meets an entry of another version drops it.
+        list_size_cache::mark_unwritten(&id("p/other.zip.delta", "e1"), "facts-other".into());
+        assert_eq!(
+            list_size_cache::take_unwritten(&id("p/other.zip.delta", "e2")),
+            None
+        );
+        assert_eq!(
+            list_size_cache::take_unwritten(&id("p/other.zip.delta", "e1")),
+            None
+        );
+        // The right version is taken once.
+        list_size_cache::mark_unwritten(&id("p/same.zip.delta", "\"e1\""), "facts-same".into());
+        assert_eq!(
+            list_size_cache::take_unwritten(&id("p/same.zip.delta", "e1")).as_deref(),
+            Some("facts-same")
+        );
+        assert_eq!(
+            list_size_cache::take_unwritten(&id("p/same.zip.delta", "e1")),
+            None
+        );
     }
 
     /// L5 (#171): a facts write that the full queue refused is offered again

@@ -107,8 +107,23 @@ pub fn is_internal_common_prefix(p: &str) -> bool {
 /// (see [`is_hidden_key`], [`shows_in_listing`]).
 pub const INTERNAL_DIR: &str = ".dg";
 
-/// A delta baseline, relative to its folder.
-const BASELINE_PATH: &str = ".dg/reference.bin";
+/// The file name of a delta baseline: `<folder>/reference.bin` (a release
+/// before 2.0 kept it at `<folder>/.dg/reference.bin`, which has the same
+/// file name). THE name: every place that tells a baseline from an object
+/// (the S3 classifier, the filesystem walk, the bucket-empty check) uses
+/// [`is_baseline_name`] / [`is_baseline_key`].
+pub const BASELINE_FILE: &str = "reference.bin";
+
+/// Is this file name a delta baseline?
+pub fn is_baseline_name(name: &str) -> bool {
+    name == BASELINE_FILE
+}
+
+/// Is this raw backend key a delta baseline (its last segment is
+/// [`BASELINE_FILE`])?
+pub fn is_baseline_key(key: &str) -> bool {
+    is_baseline_name(key.rsplit('/').next().unwrap_or(key))
+}
 
 /// Does a path (a key's directory part, a prefix, a common prefix) go
 /// through a `.dg` directory, at any depth?
@@ -116,30 +131,42 @@ pub fn has_internal_segment(path: &str) -> bool {
     path.split('/').any(|s| s == INTERNAL_DIR)
 }
 
-/// Is a listed key the proxy's own file, never an object? The listing facts.
-/// (A delta baseline is reported apart by the listing, see
-/// [`shows_in_listing`].)
+/// THE rule of what a LIST hides: the proxy's own files, which are the
+/// listing facts (under `.dg/facts/` at the root of the bucket) and the delta
+/// baselines (`<folder>/reference.bin`). Everything else, a legacy key below a
+/// `.dg` directory included, is an object. The S3 flat path and probe, the
+/// filesystem walk and the bucket-empty check all follow it (differential
+/// test `s3_and_the_filesystem_list_the_same_keys`).
+pub fn is_own_file(key: &str) -> bool {
+    is_facts_key(key) || is_baseline_key(key)
+}
+
+/// The listing facts alone (a baseline is reported apart by the S3
+/// classifier, so it needs its own answer).
 pub fn is_hidden_key(key: &str) -> bool {
     is_facts_key(key)
 }
 
-/// Does a raw backend key make an entry of a LIST? Not the listing facts, and
-/// not a delta baseline (`reference.bin`).
+/// Does a raw backend key make an entry of a LIST? Not one of the proxy's own
+/// files ([`is_own_file`]).
 pub fn shows_in_listing(key: &str) -> bool {
-    !is_hidden_key(key) && key.rsplit('/').next() != Some("reference.bin")
+    !is_own_file(key)
 }
 
 /// Pure: could every key under the CommonPrefix `p` be one of the proxy's own
-/// files? True when `p` is a leading part of the facts namespace or of a
-/// `<folder>/.dg/reference.bin`. With a delimiter other than `/` such a
-/// prefix also covers a legacy client key (`.` covers `.dg/facts/...` and
-/// `.dg/old.txt`), so the listing must look under it before it shows it.
-/// With `/` only a `.dg/` prefix qualifies.
+/// files? True when `p` is a leading part of the facts namespace
+/// (`.dg/facts/`) or ends in a leading part of a baseline name after a
+/// complete folder part (`a/refer` of `a/reference.bin`). With a delimiter
+/// other than `/` such a prefix may also cover a legacy client key (`.` covers
+/// `.dg/facts/...` and `.dg/old.txt`), so the listing looks under it before it
+/// shows it.
 ///
-/// The folder part must be complete: a prefix such as `a` (delimiter `a`) of
-/// `aa/.dg/reference.bin` also covers every other key that starts with `a`,
-/// and is not checked. The facts exist in every bucket, so they are the case
-/// that matters; a baseline without an object is a leftover.
+/// This is the whole of what the text of a prefix can prove. Two shapes need a
+/// request per prefix to prove, and are NOT checked (a LIST page would cost
+/// one request per folder): a folder `f/` that holds only a baseline (an
+/// orphan; DeleteBucket reclaims it), and a prefix with an incomplete folder
+/// part (`a` of `aa/reference.bin` with delimiter `a`). The filesystem backend
+/// knows them for free and hides them.
 pub fn may_hold_only_own_keys(p: &str) -> bool {
     // Own keys start at the root or after a `/`.
     std::iter::once(0)
@@ -147,7 +174,7 @@ pub fn may_hold_only_own_keys(p: &str) -> bool {
         .any(|start| {
             let tail = &p[start..];
             !tail.is_empty()
-                && (BASELINE_PATH.starts_with(tail) || (start == 0 && FACTS_ROOT.starts_with(tail)))
+                && (BASELINE_FILE.starts_with(tail) || (start == 0 && FACTS_ROOT.starts_with(tail)))
         })
 }
 
@@ -916,14 +943,46 @@ mod tests {
             assert!(!is_hidden_key(key), "{key}");
             assert!(shows_in_listing(key), "{key}");
         }
-        for key in [".dg/reference.bin", "a/.dg/reference.bin", "reference.bin"] {
+        for key in [
+            ".dg/reference.bin",
+            "a/.dg/reference.bin",
+            "reference.bin",
+            "a/reference.bin",
+            "a/b/reference.bin",
+        ] {
             assert!(!shows_in_listing(key), "{key}");
+            assert!(is_own_file(key) && is_baseline_key(key), "{key}");
+        }
+        for key in [
+            "a/reference.bin.delta",
+            "a/xreference.bin",
+            "reference.bin/x",
+        ] {
+            assert!(shows_in_listing(key), "{key}");
         }
         for path in [".dg", ".dg/", "a/.dg/", "a/.dg/b/"] {
             assert!(has_internal_segment(path), "{path}");
         }
         for path in ["", ".dgx/", "a/b", "dg/"] {
             assert!(!has_internal_segment(path), "{path}");
+        }
+    }
+
+    /// The S3 listing and facts code tells a baseline from an object only
+    /// through [`is_baseline_name`] / [`is_baseline_key`]: a literal compare
+    /// would be a second copy of the rule (the legacy `.dg/reference.bin`
+    /// copy was wrong for the baselines of today).
+    #[test]
+    fn s3_code_has_no_second_copy_of_the_baseline_rule() {
+        for file in ["src/storage/s3/listing.rs", "src/storage/s3/facts.rs"] {
+            let text = crate::source_scan::prod_text(&crate::source_scan::read(file));
+            for needle in [
+                "== \"reference.bin\"",
+                "Some(\"reference.bin\")",
+                ".dg/reference.bin",
+            ] {
+                assert!(!text.contains(needle), "{file} compares {needle}");
+            }
         }
     }
 
@@ -937,9 +996,11 @@ mod tests {
             ".",
             ".d",
             ".dg",
-            "a/.dg/",
-            "a/.",
-            "a/b/.d",
+            "r",
+            "ref",
+            "a/r",
+            "a/reference.",
+            "a/b/reference.b",
             "a/.dg/r",
             "a/.dg/reference",
         ] {
@@ -959,6 +1020,13 @@ mod tests {
             ".x",
             "a/.dgx",
             "dg/",
+            // Not provable from the text (see the function): a folder, and
+            // an incomplete folder part.
+            "a/.dg/",
+            "a/.",
+            "a/b/.d",
+            "x",
+            "a/x",
         ] {
             assert!(!may_hold_only_own_keys(p), "{p}");
         }
@@ -977,9 +1045,10 @@ mod tests {
                 cut in 1usize..30,
             ) {
                 // The folder part is complete: a prefix such as `a` of
-                // `aa/.dg/reference.bin` names no folder (see the function).
+                // `aa/reference.bin` names no folder (see the function).
                 for (own, folder) in [
-                    (format!("{dir}.dg/reference.bin"), dir.len()),
+                    (format!("{dir}reference.bin"), dir.len()),
+                    (format!("{dir}.dg/reference.bin"), dir.len() + ".dg/".len()),
                     (".dg/facts/x!!1.e.1.2.e".to_string(), 0),
                 ] {
                     let cut = (folder + cut).min(own.len() - 1);
@@ -990,9 +1059,9 @@ mod tests {
                     if is_internal_common_prefix(p) {
                         continue;
                     }
-                    // A prefix that ends with `/` and is not `.dg/` covers the
-                    // normal folder case and is not checked.
-                    if p.ends_with('/') && !p.ends_with(".dg/") {
+                    // A prefix that ends with `/` is a folder (not proven by
+                    // its text), except the root `.dg/` of the facts.
+                    if p.ends_with('/') && !FACTS_ROOT.starts_with(p) {
                         continue;
                     }
                     prop_assert!(may_hold_only_own_keys(p), "{p} of {own}");

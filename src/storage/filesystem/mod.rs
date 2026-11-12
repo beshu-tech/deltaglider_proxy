@@ -115,7 +115,7 @@ fn stored_name(name: &str) -> StoredName<'_> {
     use super::traits::ObjectVariant;
     if is_internal_temp_name(name) {
         StoredName::Internal
-    } else if name == "reference.bin" {
+    } else if crate::storage::listing_facts::is_baseline_name(name) {
         StoredName::Reference
     } else if let Some(stem) = name.strip_suffix(".delta") {
         StoredName::Object {
@@ -762,7 +762,9 @@ impl FilesystemBackend {
                         return Ok(true);
                     }
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !is_internal_temp_name(name) && name != "reference.bin" {
+                    if !is_internal_temp_name(name)
+                        && !crate::storage::listing_facts::is_baseline_name(name)
+                    {
                         return Ok(true);
                     }
                 }

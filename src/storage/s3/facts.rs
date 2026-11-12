@@ -71,7 +71,7 @@ impl S3Backend {
         stored_size: u64,
         meta: &FileMetadata,
     ) {
-        if key.rsplit('/').next() == Some("reference.bin") {
+        if listing_facts::is_baseline_key(key) {
             return;
         }
         // A sealed object has no facts in clear: its listing token, made by
@@ -97,7 +97,11 @@ impl S3Backend {
         else {
             return;
         };
-        if !self.facts_cleanup.write(bucket, key, facts_key.clone()) {
+        if self.facts_cleanup.write(bucket, key, facts_key.clone()) {
+            // Queued: the write of an older version that the queue refused
+            // is moot.
+            list_size_cache::forget_unwritten(&self.list_cache_scope, bucket, key);
+        } else {
             // The queue refused it: a LIST of the object offers it again.
             list_size_cache::mark_unwritten(
                 &StoredObjectId {
@@ -110,6 +114,13 @@ impl S3Backend {
                 facts_key,
             );
         }
+    }
+
+    /// The stored object `key` is gone: its facts are cleaned up in the
+    /// background, and a refused facts write of it (L5) is moot.
+    pub(super) fn enqueue_facts_cleanup(&self, bucket: &str, key: &str, deleted_at: Option<i64>) {
+        list_size_cache::forget_unwritten(&self.list_cache_scope, bucket, key);
+        self.facts_cleanup.enqueue(bucket, key, deleted_at);
     }
 
     /// A LIST page resolved from this process's cache: the entries whose
@@ -445,7 +456,7 @@ pub(super) fn listed_stored_key(user_key: &str, meta: &FileMetadata) -> Option<S
 /// object `id` (see [`S3Backend::remember_listed_facts`]). Baselines are
 /// never listed to clients, so they get no entry.
 pub(super) fn remember_facts(id: &StoredObjectId<'_>, meta: &FileMetadata) {
-    if id.key.rsplit('/').next() == Some("reference.bin") {
+    if listing_facts::is_baseline_key(id.key) {
         return;
     }
     if let Some(facts) = LogicalFacts::of(meta) {
@@ -473,7 +484,7 @@ pub(super) fn backfill_facts(
     if !list_size_cache::take_missing_facts(id) {
         return;
     }
-    if id.key.rsplit('/').next() == Some("reference.bin") {
+    if listing_facts::is_baseline_key(id.key) {
         return;
     }
     if let Some(facts_key) = listing_facts::asked_facts_key(id.key, id.etag, id.size, &facts) {

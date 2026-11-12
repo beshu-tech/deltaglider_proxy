@@ -370,7 +370,11 @@ impl FactsCleanupQueue {
     }
 
     /// [`Self::start`] with queues of `cap` items each.
-    fn start_with_capacity(client: Client, native: NativeEncryptionPolicy, cap: usize) -> Self {
+    pub(in crate::storage) fn start_with_capacity(
+        client: Client,
+        native: NativeEncryptionPolicy,
+        cap: usize,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(cap);
         let (deleted, deleted_rx) = mpsc::channel(cap);
         let rewritten: Rewritten = Default::default();

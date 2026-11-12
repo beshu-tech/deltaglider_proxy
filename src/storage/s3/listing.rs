@@ -138,7 +138,7 @@ impl S3Backend {
             }
 
             // Internal deltaspace file: never a user-visible object.
-            if filename == "reference.bin" {
+            if listing_facts::is_baseline_name(filename) {
                 baselines.push((obj.key.clone(), obj.size));
                 continue;
             }
@@ -384,7 +384,7 @@ impl S3Backend {
     pub(super) fn lite_metadata_from_listed(obj: &S3ListedObject) -> FileMetadata {
         let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
         let is_delta = filename.ends_with(".delta");
-        let is_reference = filename == "reference.bin";
+        let is_reference = listing_facts::is_baseline_name(filename);
         let original_name = filename.trim_end_matches(".delta").to_string();
         let storage_info = if is_delta {
             StorageInfo::delta_stub(obj.size)
@@ -504,7 +504,7 @@ pub(super) fn list_anchor<'a>(
     let mut candidates: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for key in raw_keys {
         let filename = key.rsplit('/').next().unwrap_or(key);
-        if filename == "reference.bin" {
+        if listing_facts::is_baseline_name(filename) {
             continue;
         }
         // Strip ALL trailing `.delta` (not just one) so this matches the
@@ -643,54 +643,146 @@ pub(super) fn truncated_without_token(bucket: &str) -> StorageError {
     ))
 }
 
+/// Keys per request of a probe.
+const PROBE_PAGE: i32 = 16;
+/// Requests one probe of a prefix may send, over both of its ranges.
+const PROBE_REQUESTS_MAX: u32 = 6;
+/// Prefixes one LIST page probes: the extra requests of a page are at most
+/// `PROBES_PER_PAGE x PROBE_REQUESTS_MAX` (the common case is 2 for the root
+/// `.dg/`, 0 once it is remembered).
+pub(super) const PROBES_PER_PAGE: u32 = 8;
+/// How long a prefix with no listed key is remembered. A key cannot be
+/// written below it through the proxy, so only a writer outside the proxy can
+/// make the answer stale, and it shows up in at most this long.
+const OWN_ONLY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Prefixes (`scope\0bucket\0prefix`) found to hold only the proxy's own
+/// files.
+static OWN_ONLY_PREFIXES: std::sync::LazyLock<moka::sync::Cache<String, ()>> =
+    std::sync::LazyLock::new(|| {
+        moka::sync::Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(OWN_ONLY_TTL)
+            .build()
+    });
+
+/// What a range of a probe found.
+enum ProbeVerdict {
+    /// A key that a LIST shows.
+    Listed,
+    /// No such key in the range.
+    Nothing,
+    /// The request cap was spent: the prefix is shown.
+    GaveUp,
+}
+
 impl S3Backend {
     /// Does a key that a LIST shows exist under `prefix`? Asked for a
-    /// CommonPrefix that may hold only the proxy's own files. Small pages;
-    /// a page that ends in the facts namespace jumps past it. `requests`
-    /// counts what this sends.
+    /// CommonPrefix that may hold only the proxy's own files
+    /// ([`listing_facts::may_hold_only_own_keys`]), and bounded:
+    ///
+    /// * `PROBE_REQUESTS_MAX` requests at most for one prefix, and the page
+    ///   grants `PROBES_PER_PAGE` prefixes at most (`budget`). Past either
+    ///   limit the prefix is shown: a stray prefix is better than an
+    ///   unbounded LIST, as an entry past the HEAD budget of a page keeps its
+    ///   stored size.
+    /// * A prefix that is a leading part of the facts namespace is read in
+    ///   two ranges, past the facts (`start_after = PAST_FACTS`, one request
+    ///   when nothing lies there) and up to the first facts key. The facts
+    ///   (hundreds, in a busy bucket) are never paged through.
+    /// * A prefix with no listed key is remembered for `OWN_ONLY_TTL`, so the
+    ///   next LIST of the level sends no probe.
+    ///
+    /// `requests` counts what this sends (the page's total).
     async fn holds_listed_key(
         &self,
         bucket: &str,
         prefix: &str,
         requests: &mut u32,
+        budget: &mut u32,
     ) -> Result<bool, StorageError> {
-        const PROBE_PAGE: i32 = 16;
-        let mut skip_to: Option<&'static str> = None;
+        let cache_key = format!("{}\0{bucket}\0{prefix}", self.list_cache_scope);
+        if OWN_ONLY_PREFIXES.contains_key(&cache_key) {
+            return Ok(false);
+        }
+        if *budget == 0 {
+            return Ok(true);
+        }
+        *budget -= 1;
+        let mut sent = 0u32;
+        let ranges: &[(Option<&str>, bool)] = if listing_facts::FACTS_ROOT.starts_with(prefix) {
+            // (start_after, stop at the first facts key)
+            &[(Some(listing_facts::PAST_FACTS), false), (None, true)]
+        } else {
+            &[(None, false)]
+        };
+        for (start_after, stop_at_facts) in ranges {
+            match self
+                .probe_range(bucket, prefix, *start_after, *stop_at_facts, &mut sent)
+                .await
+            {
+                Ok(ProbeVerdict::Listed) | Ok(ProbeVerdict::GaveUp) => {
+                    *requests += sent;
+                    return Ok(true);
+                }
+                Ok(ProbeVerdict::Nothing) => {}
+                Err(e) => {
+                    *requests += sent;
+                    return Err(e);
+                }
+            }
+        }
+        *requests += sent;
+        OWN_ONLY_PREFIXES.insert(cache_key, ());
+        Ok(false)
+    }
+
+    /// One range of [`Self::holds_listed_key`]: pages of `PROBE_PAGE` keys
+    /// from `start_after` (or the start of `prefix`), until a listed key, the
+    /// end, the first facts key (`stop_at_facts`) or the request cap.
+    async fn probe_range(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        stop_at_facts: bool,
+        sent: &mut u32,
+    ) -> Result<ProbeVerdict, StorageError> {
         let mut token: Option<String> = None;
+        let mut first = true;
         loop {
+            if *sent >= PROBE_REQUESTS_MAX {
+                return Ok(ProbeVerdict::GaveUp);
+            }
             let mut request = self
                 .client
                 .list_objects_v2()
                 .bucket(bucket)
                 .prefix(prefix)
                 .max_keys(PROBE_PAGE);
-            if let Some(past) = skip_to.take() {
-                request = request.start_after(past);
+            if first {
+                request = request.set_start_after(start_after.map(String::from));
+                first = false;
             } else if let Some(t) = token.take() {
                 request = request.continuation_token(t);
             }
-            *requests += 1;
+            *sent += 1;
             let response = request
                 .send()
                 .await
                 .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
-            let contents = response.contents();
-            if contents
-                .iter()
-                .filter_map(|o| o.key())
-                .any(listing_facts::shows_in_listing)
-            {
-                return Ok(true);
+            let keys: Vec<&str> = response.contents().iter().filter_map(|o| o.key()).collect();
+            if keys.iter().any(|k| listing_facts::shows_in_listing(k)) {
+                return Ok(ProbeVerdict::Listed);
+            }
+            if stop_at_facts && keys.iter().any(|k| listing_facts::is_facts_key(k)) {
+                return Ok(ProbeVerdict::Nothing);
             }
             if !response.is_truncated.unwrap_or(false) {
-                return Ok(false);
+                return Ok(ProbeVerdict::Nothing);
             }
             token = response.next_continuation_token.clone();
-            skip_to = contents
-                .last()
-                .and_then(|o| o.key())
-                .and_then(listing_facts::skip_past_facts);
-            if token.is_none() && skip_to.is_none() {
+            if token.is_none() {
                 return Err(truncated_without_token(bucket));
             }
         }
@@ -729,6 +821,8 @@ impl S3Backend {
         let mut skip_to: Option<&'static str> = None;
         // Every request this call sends: its pages and its probes.
         let mut upstream_requests = 0u32;
+        // The prefixes this call may still probe (see `holds_listed_key`).
+        let mut probe_budget = PROBES_PER_PAGE;
         let upstream_max_keys = max_keys
             .saturating_add(1 + UPSTREAM_SLACK)
             .min(UPSTREAM_MAX_KEYS);
@@ -777,7 +871,12 @@ impl S3Backend {
                         }
                         if listing_facts::may_hold_only_own_keys(&p)
                             && !self
-                                .holds_listed_key(bucket, &p, &mut upstream_requests)
+                                .holds_listed_key(
+                                    bucket,
+                                    &p,
+                                    &mut upstream_requests,
+                                    &mut probe_budget,
+                                )
                                 .await?
                         {
                             continue;
@@ -1014,7 +1113,7 @@ pub(super) fn short_page_anchor<'a>(
     }
     let mut entries: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for key in raw_keys {
-        if key.rsplit('/').next() == Some("reference.bin") {
+        if listing_facts::is_baseline_key(key) {
             continue;
         }
         entries.insert(key.trim_end_matches(".delta"));
@@ -1282,11 +1381,14 @@ mod delegated_cost_tests {
     async fn the_common_prefixes_of_any_delimiter_come_from_visible_keys_only() {
         // `.dg/facts/..` exists in every bucket; the rest are the shapes
         // that made phantoms.
-        let key_sets: [&[&str]; 4] = [
+        let key_sets: [&[&str]; 6] = [
             &[".dg/facts/x!!1.e.1.2.e", "top", "a/x"],
+            // The baselines of today (`<folder>/reference.bin`).
+            &[".dg/facts/x!!1.e.1.2.e", "a/x.txt", "a/reference.bin"],
+            &[".dg/facts/x!!1.e.1.2.e", "top", "reference.bin", "a/b/c"],
             &[
                 ".dg/facts/x!!1.e.1.2.e",
-                "a/.dg/reference.bin",
+                "a/reference.bin",
                 "a/b",
                 ".well-known/w",
             ],
@@ -1354,6 +1456,204 @@ mod delegated_cost_tests {
                 }
             }
         }
+    }
+
+    /// Every page of a delegated LIST: its objects (in order) and its
+    /// CommonPrefixes.
+    async fn walk_pages<B: crate::storage::StorageBackend>(
+        backend: &B,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..200 {
+            let page = backend
+                .list_objects_delegated("b", prefix, delimiter, max_keys, token.as_deref())
+                .await
+                .unwrap()
+                .unwrap();
+            objects.extend(page.objects.into_iter().map(|(k, _)| k));
+            prefixes.extend(page.common_prefixes);
+            if !page.is_truncated {
+                return (objects, prefixes);
+            }
+            token = page.next_continuation_token;
+        }
+        panic!("the listing does not end: {prefix:?} {delimiter:?} {max_keys}");
+    }
+
+    /// The guard of THE hiding rule (`listing_facts::is_own_file`): the same
+    /// keys give the same objects and the same CommonPrefixes on the S3
+    /// backend (fake) and on the filesystem backend, for every delimiter and
+    /// page size. The S3 side holds the listing facts too (the filesystem has
+    /// none); both hold the baselines of today (`<folder>/reference.bin`) and
+    /// of the legacy layout (`<folder>/.dg/reference.bin`), and legacy client
+    /// keys below `.dg`. A folder that holds ONLY a baseline is the one case
+    /// they differ in (`an_s3_listing_shows_a_folder_with_only_a_baseline`).
+    #[tokio::test]
+    async fn s3_and_the_filesystem_list_the_same_keys() {
+        let sets: &[&[&str]] = &[
+            &["a/x.txt", "a/reference.bin"],
+            &["top", "reference.bin", "a/b/c", "a/b/reference.bin"],
+            &["a/reference.bin", "a/b", ".well-known/w", "é/u"],
+            &[
+                ".dg/old.txt",
+                "a/.dg/bar",
+                "a/.dg/reference.bin",
+                ".dgx/k",
+                ".dg-x",
+                "a-b/y",
+                "a_b/z",
+            ],
+            &["x.zip", "d/y", "d/reference.bin"],
+        ];
+        for keys in sets {
+            // S3: the keys, plus the facts that every bucket has.
+            let mut s3_keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+            s3_keys.push(".dg/facts/x!!1.e.1.2.e".into());
+            s3_keys.push(".dg/facts/y!!1.e.1.2.e".into());
+            let (s3, _fake) = backend_with_keys(&s3_keys).await;
+            // The filesystem: raw files, listed from their stat.
+            let dir = tempfile::tempdir().unwrap();
+            let fs = crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap();
+            fs.create_bucket("b").await.unwrap();
+            let root = dir.path().join("b").join("deltaspaces");
+            for key in keys.iter() {
+                let path = root.join(key);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"x").unwrap();
+            }
+            for prefix in ["", "a/", "a/.", ".dg/", ".d", "d/", "a/b/", "r", "a/r"] {
+                for delimiter in [
+                    None,
+                    Some("/"),
+                    Some("."),
+                    Some("r"),
+                    Some("e"),
+                    Some("-"),
+                    Some("_"),
+                ] {
+                    for max_keys in [1u32, 1000] {
+                        let ctx = format!("{keys:?} {prefix:?} {delimiter:?} {max_keys}");
+                        let (s3_objects, s3_prefixes) =
+                            walk_pages(&s3, prefix, delimiter, max_keys).await;
+                        let (fs_objects, fs_prefixes) =
+                            walk_pages(&fs, prefix, delimiter, max_keys).await;
+                        assert_eq!(s3_objects, fs_objects, "objects: {ctx}");
+                        assert_eq!(s3_prefixes, fs_prefixes, "prefixes: {ctx}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The one case where the backends differ: a folder that holds ONLY a
+    /// baseline (an orphan that DeleteBucket reclaims). The filesystem knows
+    /// it for free; on S3 it takes a request per folder, which a LIST page
+    /// does not send. Pinned so that a change is a decision.
+    #[tokio::test]
+    async fn an_s3_listing_shows_a_folder_with_only_a_baseline() {
+        let keys = vec!["ba/reference.bin".to_string(), "top".to_string()];
+        let (s3, _fake) = backend_with_keys(&keys).await;
+        let (_, prefixes) = walk_pages(&s3, "", Some("/"), 1000).await;
+        assert_eq!(prefixes, ["ba/"]);
+        let dir = tempfile::tempdir().unwrap();
+        let fs = crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        fs.create_bucket("b").await.unwrap();
+        let ba = dir.path().join("b").join("deltaspaces").join("ba");
+        std::fs::create_dir_all(&ba).unwrap();
+        std::fs::write(ba.join("reference.bin"), b"x").unwrap();
+        let (_, prefixes) = walk_pages(&fs, "", Some("/"), 1000).await;
+        assert!(prefixes.is_empty(), "{prefixes:?}");
+    }
+
+    /// Request cost of the root `.dg/` CommonPrefix (the listing facts): the
+    /// probe jumps past the facts, so it costs two requests (past the facts,
+    /// and up to the first facts key) however many facts there are, and none
+    /// once the answer is remembered. A legacy key next to the facts is found.
+    #[tokio::test]
+    async fn a_root_delimiter_list_probes_past_the_facts() {
+        for facts in [3usize, 40, 400] {
+            let mut keys: Vec<String> = (0..facts)
+                .map(|i| format!(".dg/facts/k{i:04}!!1.e.1.2.e"))
+                .collect();
+            keys.extend(["top".to_string(), "a/x".to_string()]);
+            let (s3, fake) = backend_with_keys(&keys).await;
+            let page = s3
+                .list_objects_delegated("b", "", Some("/"), 1000, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(page.common_prefixes, ["a/"], "{facts} facts");
+            assert_eq!(lists(&fake), 3, "{facts} facts: {:?}", fake.requests());
+            assert_eq!(page.upstream_requests, 3, "{facts} facts");
+            // Remembered: the next LIST of the level is the one request.
+            fake.clear();
+            s3.list_objects_delegated("b", "", Some("/"), 1000, None)
+                .await
+                .unwrap();
+            assert_eq!(lists(&fake), 1, "{facts} facts, again");
+        }
+        // A legacy key after the facts (`.dg/z`) is found by the first range,
+        // one before them (`.dg/a`) by the second.
+        for legacy in [".dg/z", ".dg/a"] {
+            let keys = vec![
+                ".dg/facts/k0!!1.e.1.2.e".to_string(),
+                legacy.to_string(),
+                "top".to_string(),
+            ];
+            let (s3, fake) = backend_with_keys(&keys).await;
+            let page = s3
+                .list_objects_delegated("b", "", Some("/"), 1000, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(page.common_prefixes, [".dg/"], "{legacy}");
+            assert_eq!(
+                lists(&fake),
+                if legacy == ".dg/z" { 2 } else { 3 },
+                "{legacy}: {:?}",
+                fake.requests()
+            );
+        }
+    }
+
+    /// A page probes at most `PROBES_PER_PAGE` prefixes: 12 folders that each
+    /// hold a baseline (so the delimiter `r` makes a prefix `dN/r` of only a
+    /// baseline) send 8 probes; the other 4 prefixes are shown, unchecked.
+    #[tokio::test]
+    async fn a_page_probes_a_bounded_number_of_prefixes() {
+        let mut keys = Vec::new();
+        for i in 0..12 {
+            keys.push(format!("d{i:02}/reference.bin"));
+            keys.push(format!("d{i:02}/x"));
+        }
+        let (s3, fake) = backend_with_keys(&keys).await;
+        let page = s3
+            .list_objects_delegated("b", "", Some("r"), 1000, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.objects.len(), 12, "the x keys");
+        assert_eq!(
+            page.common_prefixes.len(),
+            12 - PROBES_PER_PAGE as usize,
+            "{:?}",
+            page.common_prefixes
+        );
+        assert_eq!(
+            lists(&fake),
+            1 + PROBES_PER_PAGE as usize,
+            "{:?}",
+            fake.requests()
+        );
     }
 
     /// A page reports the requests it sent (its pages and its probes), so

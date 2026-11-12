@@ -1179,3 +1179,162 @@ async fn test_copy_object_judges_the_destination_conditionals() {
         Some(404)
     );
 }
+
+/// A1 (#171), every write path of a CopyObject: the passthrough server copy
+/// (`.jpg` to `.jpg`: the backend copies the stored file), the delta fast
+/// path (a stored delta to a `.zip` key: the `.delta` ships), a metadata
+/// REPLACE self-copy, and the copy through the store (`.bin`, in the test
+/// above). On each: `If-None-Match: *` on an existing destination, a wrong
+/// ETag and a weak ETag give `412` and change nothing; the right ETag goes
+/// through; `If-Match` on a missing destination gives `404`; `*` on a missing
+/// one creates it.
+#[tokio::test]
+async fn test_copy_object_destination_conditionals_on_every_write_path() {
+    use aws_sdk_s3::types::MetadataDirective;
+    let server = TestServer::filesystem().await;
+    let client = server.s3_client().await;
+    let bucket = server.bucket().to_string();
+    // Poorly compressible bytes, and a second version that differs a little,
+    // so that the second PUT is stored as a delta.
+    let mut x: u32 = 0x9E37_79B9;
+    let base: Vec<u8> = (0..256 * 1024)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 8) as u8
+        })
+        .collect();
+    let mut v2 = base.clone();
+    v2[1000..1100].fill(7);
+    let put = |key: &str, body: Vec<u8>| {
+        let (client, bucket, key) = (client.clone(), bucket.clone(), key.to_string());
+        async move {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(body))
+                .send()
+                .await
+                .unwrap()
+                .e_tag()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let etag_of = |key: &str| {
+        let (client, bucket, key) = (client.clone(), bucket.clone(), key.to_string());
+        async move {
+            client
+                .head_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap()
+                .e_tag()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let status = |r: Result<_, aws_sdk_s3::error::SdkError<_>>| match r {
+        Ok(_) => 200u16,
+        Err(e) => e.raw_response().map(|r| r.status().as_u16()).unwrap_or(0),
+    };
+    let copy = |src: &str,
+                dst: &str,
+                replace: bool,
+                if_match: Option<String>,
+                none_match: Option<&str>| {
+        let mut req = client
+            .copy_object()
+            .bucket(&bucket)
+            .key(dst)
+            .copy_source(format!("{bucket}/{src}"));
+        if replace {
+            req = req
+                .metadata_directive(MetadataDirective::Replace)
+                .metadata("note", "replaced");
+        }
+        if let Some(v) = if_match {
+            req = req.if_match(v);
+        }
+        if let Some(v) = none_match {
+            req = req.if_none_match(v);
+        }
+        async move { status(req.send().await) }
+    };
+
+    put("src.jpg", b"JPEG-SOURCE".to_vec()).await;
+    put("v1.zip", base.clone()).await;
+    put("v2.zip", v2).await;
+    put("self.jpg", b"SELF".to_vec()).await;
+    // (name, source, existing destination, REPLACE self-copy)
+    let cases = [
+        ("passthrough server copy", "src.jpg", "dst.jpg", false),
+        ("delta fast path", "v2.zip", "dst.zip", false),
+        ("metadata REPLACE self-copy", "self.jpg", "self.jpg", true),
+    ];
+    for (name, src, dst, replace) in cases {
+        if src != dst {
+            put(dst, b"EXISTING-DEST".to_vec()).await;
+        }
+        let before = etag_of(dst).await;
+        assert_eq!(
+            copy(src, dst, replace, None, Some("*")).await,
+            412,
+            "{name}: *"
+        );
+        assert_eq!(
+            copy(
+                src,
+                dst,
+                replace,
+                Some("\"00000000000000000000000000000000\"".into()),
+                None
+            )
+            .await,
+            412,
+            "{name}: wrong ETag"
+        );
+        let weak = format!("W/{before}");
+        assert_eq!(
+            copy(src, dst, replace, Some(weak), None).await,
+            412,
+            "{name}: weak ETag"
+        );
+        assert_eq!(
+            etag_of(dst).await,
+            before,
+            "{name}: refused copies change nothing"
+        );
+        assert_eq!(
+            copy(src, dst, replace, Some(before.clone()), None).await,
+            200,
+            "{name}: right ETag"
+        );
+        // A missing destination: `*` creates it, `If-Match` is 404.
+        if src != dst {
+            let fresh = format!("fresh-{dst}");
+            assert_eq!(
+                copy(src, &fresh, false, None, Some("*")).await,
+                200,
+                "{name}: create"
+            );
+            let never = format!("never-{dst}");
+            assert_eq!(
+                copy(
+                    src,
+                    &never,
+                    false,
+                    Some("\"00000000000000000000000000000000\"".into()),
+                    None
+                )
+                .await,
+                404,
+                "{name}: If-Match on a missing destination"
+            );
+        }
+    }
+}

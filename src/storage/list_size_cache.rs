@@ -221,38 +221,80 @@ pub fn mark_sealed(id: &StoredObjectId<'_>) {
 /// never runs for it: the durable facts would stay unwritten, and every
 /// other node and every restart would list the stored size. A LIST of the
 /// object takes the entry and offers the write again
-/// ([`take_unwritten`]). Bounded; an entry of an object that was overwritten
-/// since is never taken, so a full registry first drops the entries older
-/// than [`UNWRITTEN_MAX_AGE`].
-static UNWRITTEN: LazyLock<std::sync::Mutex<std::collections::HashMap<String, Unwritten>>> =
-    LazyLock::new(Default::default);
+/// ([`take_unwritten`]).
+///
+/// The registry is a moka cache (capacity [`UNWRITTEN_CAP`], entries live
+/// [`UNWRITTEN_TTL`]), so its eviction costs O(1) amortised and takes no
+/// global lock on the request path. It is keyed by the stored OBJECT (scope,
+/// bucket, key), not by its ETag: the entry of an object that was deleted
+/// ([`forget_unwritten`], from the delete path) or written again with a write
+/// that was queued ([`forget_unwritten`], from the PUT path) is removed at
+/// once, and one for another version than the listed one is dropped when the
+/// LIST meets it. An entry that the cache evicts for room is counted
+/// (`deltaglider_listing_facts_queue_dropped_total{queue="unwritten"}`) and
+/// logged (the first, then every 10,000th).
+static UNWRITTEN: LazyLock<Cache<String, Unwritten>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(UNWRITTEN_CAP)
+        .time_to_live(UNWRITTEN_TTL)
+        .eviction_listener(|_key, _value, cause| {
+            LIVE_UNWRITTEN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if cause == moka::notification::RemovalCause::Size {
+                note_unwritten_dropped();
+            }
+        })
+        .build()
+});
 
+/// Entries of [`UNWRITTEN`], for the free question [`any_unwritten`] (the
+/// cache's own count is only eventually exact).
+static LIVE_UNWRITTEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Entries of [`UNWRITTEN`] dropped for room, for the log's rate limit.
+static UNWRITTEN_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone)]
 struct Unwritten {
+    etag: String,
+    size: u64,
     facts_key: String,
-    at: std::time::Instant,
 }
 
 /// Most entries of [`UNWRITTEN`].
-const UNWRITTEN_CAP: usize = 100_000;
-/// How long an entry of the refused-writes registry is kept when it is full.
-pub const UNWRITTEN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const UNWRITTEN_CAP: u64 = 100_000;
+/// How long an entry of [`UNWRITTEN`] lives.
+const UNWRITTEN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// The registry logs its first drop and every this many after it.
+const UNWRITTEN_LOG_EVERY: u64 = 10_000;
+
+fn note_unwritten_dropped() {
+    let n = UNWRITTEN_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    super::s3::LISTING_FACTS_QUEUE_DROPPED
+        .with_label_values(&["unwritten"])
+        .inc();
+    if n == 1 || n.is_multiple_of(UNWRITTEN_LOG_EVERY) {
+        tracing::warn!(
+            "the registry of refused listing-facts writes is full ({UNWRITTEN_CAP} entries): \
+             {n} entries dropped so far; those objects list their stored size on other nodes \
+             until a HEAD or the healer writes their facts"
+        );
+    }
+}
+
+/// The registry key of a stored object: the object, not one of its versions.
+fn object_key(scope: &str, bucket: &str, key: &str) -> String {
+    format!("{scope}\0{bucket}\0{key}")
+}
 
 /// Note that the write of `facts_key` for the stored object `id` was refused.
 pub fn mark_unwritten(id: &StoredObjectId<'_>, facts_key: String) {
-    let Ok(mut map) = UNWRITTEN.lock() else {
-        return;
-    };
-    if map.len() >= UNWRITTEN_CAP {
-        map.retain(|_, u| u.at.elapsed() < UNWRITTEN_MAX_AGE);
-        if map.len() >= UNWRITTEN_CAP {
-            return;
-        }
-    }
-    map.insert(
-        cache_key(id),
+    LIVE_UNWRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    UNWRITTEN.insert(
+        object_key(id.scope, id.bucket, id.key),
         Unwritten {
+            etag: bare_etag(id.etag).to_string(),
+            size: id.size,
             facts_key,
-            at: std::time::Instant::now(),
         },
     );
 }
@@ -260,17 +302,28 @@ pub fn mark_unwritten(id: &StoredObjectId<'_>, facts_key: String) {
 /// Are any facts writes refused and not offered again? A LIST asks first,
 /// so that it costs nothing when the answer is no.
 pub fn any_unwritten() -> bool {
-    UNWRITTEN.lock().map(|m| !m.is_empty()).unwrap_or(false)
+    if LIVE_UNWRITTEN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return false;
+    }
+    // Let expired and replaced entries settle, so the count is the truth.
+    UNWRITTEN.run_pending_tasks();
+    LIVE_UNWRITTEN.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
 /// The facts key of a refused write of the stored object `id`, removed: the
-/// caller offers it again (and marks it again if it is refused again).
+/// caller offers it again (and marks it again if it is refused again). An
+/// entry for another version of the object is dropped and gives `None`.
 pub fn take_unwritten(id: &StoredObjectId<'_>) -> Option<String> {
-    UNWRITTEN
-        .lock()
-        .ok()?
-        .remove(&cache_key(id))
-        .map(|u| u.facts_key)
+    let entry = UNWRITTEN.remove(&object_key(id.scope, id.bucket, id.key))?;
+    (entry.etag == bare_etag(id.etag) && entry.size == id.size).then_some(entry.facts_key)
+}
+
+/// The stored object was deleted, or written again with a write that went
+/// into the queue: its refused write (if any) is moot.
+pub fn forget_unwritten(scope: &str, bucket: &str, key: &str) {
+    if LIVE_UNWRITTEN.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        UNWRITTEN.invalidate(&object_key(scope, bucket, key));
+    }
 }
 
 /// The listing tokens that this process made for stored objects (issue

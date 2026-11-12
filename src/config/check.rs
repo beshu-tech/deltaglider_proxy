@@ -6,6 +6,9 @@
 
 use super::*;
 
+/// S3 stores at most 5 GiB with one PUT request.
+pub(super) const SINGLE_PUT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
 /// Why a config document is refused on its own, before any running config
 /// is involved. [`Config::validate_document`] returns it; each caller words
 /// it for its surface.
@@ -174,13 +177,32 @@ impl Config {
         // A PUT body is held in memory (its signature is checked over it),
         // then stored with ONE backend request, and S3 stores at most 5 GiB
         // in one request: a larger body is buffered only to be refused.
-        const SINGLE_PUT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+        // An object that large must arrive as a multipart upload, whose size
+        // the spool limits (`multipart::multipart_limit_warning`): ONE
+        // message says both, so that `config lint` never gives two pieces of
+        // advice that disagree (the advisory rule is silent above 5 GiB).
         if self.max_object_size > SINGLE_PUT_MAX_BYTES {
+            let multipart = match crate::multipart::multipart_limit_warning(
+                self.tuning.spool_max_bytes,
+                self.tuning.multipart_relay_upload_max,
+                self.tuning.multipart_total_max,
+                self.max_object_size,
+            ) {
+                Some(limit) => limit,
+                None => format!(
+                    "The multipart limit of the spool covers it ({} bytes).",
+                    crate::multipart::multipart_object_limit(
+                        self.tuning.spool_max_bytes,
+                        self.tuning.multipart_relay_upload_max,
+                        self.tuning.multipart_total_max,
+                    )
+                ),
+            };
             warnings.push(format!(
                 "max_object_size={} is above 5 GiB ({SINGLE_PUT_MAX_BYTES} bytes), the most \
-                 that an S3 backend stores with one PUT request: the proxy holds such a body \
-                 in memory and then the backend refuses it. Set it to 5 GiB or less; larger \
-                 objects arrive as multipart uploads",
+                 that an S3 backend stores with one PUT request: a PutObject request with such \
+                 a body is buffered by the proxy and then refused by the backend, so an object \
+                 that large must arrive as a multipart upload. {multipart}",
                 self.max_object_size
             ));
         }

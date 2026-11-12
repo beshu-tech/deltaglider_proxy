@@ -301,21 +301,37 @@ mod listing_model {
                 .build()
                 .unwrap();
             rt.block_on(async {
-                let (_tmp, engine) = engine_with_folder(0).await;
+                let (tmp, engine) = engine_with_folder(0).await;
                 let mut stored = BTreeSet::new();
                 for (dirs, file) in &files {
                     let mut parts: Vec<&str> = dirs.iter().map(|&d| SEGS[d]).collect();
                     parts.push(SEGS[*file]);
+                    // A key below a `.dg` directory: the write path refuses
+                    // it now; an older release stored it (L1, #171).
+                    let legacy = parts[..parts.len() - 1].contains(&".dg");
                     let key = parts.join("/");
-                    // A refused key (a reserved name) is not stored: it is
-                    // not in the model either.
                     if engine
                         .store("b", &key, b"x", None, Default::default())
                         .await
                         .is_ok()
                     {
                         stored.insert(key);
+                    } else if legacy {
+                        // Below the write path's validation, as an older
+                        // release left it. A path that clashes with another
+                        // key (a file where a folder goes) is skipped.
+                        let path = tmp.path().join("b").join("deltaspaces").join(&key);
+                        let made = path
+                            .parent()
+                            .is_some_and(|p| std::fs::create_dir_all(p).is_ok())
+                            && !path.exists()
+                            && std::fs::write(&path, b"x").is_ok();
+                        if made {
+                            stored.insert(key);
+                        }
                     }
+                    // Any other refused key (a reserved name) is not stored:
+                    // it is not in the model either.
                 }
                 let flat = engine
                     .list_objects("b", "", None, 1000, None, false)

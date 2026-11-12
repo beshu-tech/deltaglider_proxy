@@ -290,6 +290,13 @@ fn validate_plan(
 // Per-key authorization
 // ---------------------------------------------------------------------------
 
+/// The reason a delete job stops when the user who started it cannot be
+/// found by id: the user was deleted or disabled, or a backup restore or an
+/// IAM sync merge gave the user another id (the job cannot tell which).
+pub(crate) const USER_OF_JOB_GONE: &str = "AccessDenied: the user who started this job is \
+    disabled or gone (a backup restore or an IAM sync can also give a user a new id; start \
+    the job again as that user)";
+
 /// Who a bulk request acts as.
 pub(crate) enum BulkActor {
     /// Admin GUI or open mode: no per-key check.
@@ -345,15 +352,23 @@ impl BulkActor {
                 // By the user's id when the job has one: the keys may have
                 // rotated since it started (A2, #171). An id with no user
                 // is a user that is gone, never the access key id (another
-                // user may hold that key now).
+                // user may hold that key now). A backup restore and an IAM
+                // sync merge can give a user a new id: the job stops, and
+                // its message says why.
                 let access_key_id = match (user_id, iam) {
                     (Some(id), crate::iam::IamState::Iam(index)) => index
                         .get_by_id(*id)
                         .map(|u| u.access_key_id.as_str())
-                        .ok_or("AccessDenied: user disabled or gone")?,
+                        .ok_or(USER_OF_JOB_GONE)?,
                     _ => access_key_id.as_str(),
                 };
-                Self::for_user(iam, access_key_id, *client_ip)
+                Self::for_user(iam, access_key_id, *client_ip).map_err(|why| {
+                    if user_id.is_some() {
+                        USER_OF_JOB_GONE.to_string()
+                    } else {
+                        why
+                    }
+                })
             }
         }
     }
@@ -2050,6 +2065,81 @@ pub async fn list_all(
 
 #[cfg(test)]
 mod tests {
+    /// A2 (#171): a delete job acts as the user it names by id, with the
+    /// user's permissions of now, after a key rotation. A user who is gone
+    /// (or disabled) stops it with a message that names the cause, also when
+    /// another user holds the old access key id now.
+    #[test]
+    fn a_delete_job_acts_as_its_user_by_id() {
+        use super::{BulkActor, USER_OF_JOB_GONE};
+        use crate::iam::{EmptyIamOutcome, IamIndex, IamUser, Permission, S3Action};
+        use crate::maintenance::delete::Principal;
+        let user = |ak: &str, id: i64, enabled: bool, resource: &str| IamUser {
+            id,
+            name: format!("user-{id}"),
+            access_key_id: ak.into(),
+            secret_access_key: "s".into(),
+            enabled,
+            created_at: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["delete".into(), "list".into()],
+                resources: vec![resource.into()],
+                conditions: None,
+            }],
+            group_ids: vec![],
+            auth_source: "local".into(),
+            iam_policies: vec![],
+        };
+        let iam = |u: IamUser| IamIndex::build_iam_state(vec![u], vec![], EmptyIamOutcome::DenyAll);
+        let job = |user_id: Option<i64>| Principal::User {
+            access_key_id: "AKOLD".into(),
+            client_ip: None,
+            user_id,
+        };
+        let allowed = |actor: &BulkActor, bucket: &str| {
+            actor.check(S3Action::Delete, bucket, "a/1.txt").is_ok()
+        };
+        // Rotated: user 7 holds AKNEW now, and the job acts as user 7.
+        let actor =
+            BulkActor::for_principal(&iam(user("AKNEW", 7, true, "releases/*")), &job(Some(7)))
+                .expect("the owner after a rotation");
+        assert_eq!(actor.label(), "user-7");
+        assert!(allowed(&actor, "releases") && !allowed(&actor, "downloads"));
+        // Permissions reduced since the job started: the job follows them.
+        let actor =
+            BulkActor::for_principal(&iam(user("AKNEW", 7, true, "downloads/*")), &job(Some(7)))
+                .expect("the owner with other permissions");
+        assert!(!allowed(&actor, "releases"));
+        // Another user holds the old access key id now: the job is NOT
+        // theirs, and it says why it stops.
+        let why =
+            BulkActor::for_principal(&iam(user("AKOLD", 8, true, "releases/*")), &job(Some(7)))
+                .err()
+                .expect("a job of a user who is gone");
+        assert_eq!(why, USER_OF_JOB_GONE);
+        assert!(
+            why.contains("backup restore") && why.contains("IAM sync"),
+            "{why}"
+        );
+        // Disabled: the same message.
+        let why =
+            BulkActor::for_principal(&iam(user("AKNEW", 7, false, "releases/*")), &job(Some(7)))
+                .err()
+                .expect("a disabled owner");
+        assert_eq!(why, USER_OF_JOB_GONE);
+        // A job row of an older release has no id: judged by the access key.
+        assert!(
+            BulkActor::for_principal(&iam(user("AKOLD", 8, true, "releases/*")), &job(None))
+                .is_ok()
+        );
+        assert!(
+            BulkActor::for_principal(&iam(user("AKNEW", 7, true, "releases/*")), &job(None))
+                .is_err()
+        );
+    }
+
     fn names(items: &[(&str, &str)]) -> Vec<String> {
         let owned: Vec<(String, String)> = items
             .iter()
