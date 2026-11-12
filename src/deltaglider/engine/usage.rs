@@ -101,6 +101,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// the key held. Call it right after the storage write commits, before
     /// the next await (see the module doc).
     pub(super) fn record_commit(&self, bucket: &str, prior: &CounterPrior, added: &FileMetadata) {
+        crate::deltaglider::commit_signal::note();
         let Some(u) = &self.bucket_usage else { return };
         match prior.counted() {
             // `counted()` unwraps a ReadAhead: never one here.

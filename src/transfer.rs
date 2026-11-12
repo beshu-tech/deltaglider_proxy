@@ -2855,6 +2855,8 @@ mod multipart_abort_tests {
         src_meta: FileMetadata,
         fail_part: AtomicBool,
         slow_parts: AtomicBool,
+        slow_complete: AtomicBool,
+        completes_started: std::sync::atomic::AtomicUsize,
         fail_complete: AtomicBool,
         /// Part uploads that started (a stalled one counts).
         parts_started: std::sync::atomic::AtomicUsize,
@@ -2874,6 +2876,8 @@ mod multipart_abort_tests {
                 src_meta: meta,
                 fail_part: AtomicBool::new(false),
                 slow_parts: AtomicBool::new(false),
+                slow_complete: AtomicBool::new(false),
+                completes_started: Default::default(),
                 fail_complete: AtomicBool::new(false),
                 parts_started: Default::default(),
                 aborts: Mutex::new(Vec::new()),
@@ -2977,6 +2981,10 @@ mod multipart_abort_tests {
             _: &[Bytes],
             _: &FileMetadata,
         ) -> Result<String, StorageError> {
+            self.completes_started.fetch_add(1, Ordering::SeqCst);
+            if self.slow_complete.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
             if self.fail_complete.load(Ordering::Relaxed) {
                 return Err(StorageError::Other("injected complete failure".into()));
             }
@@ -3587,6 +3595,46 @@ mod multipart_abort_tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "guard-drop abort never reached the backend"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A cut DURING the Complete request leaves no parts: the guard stays
+    /// armed until Complete returned Ok, so the drop aborts the upload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_copy_cut_during_complete_aborts_the_multipart_upload() {
+        let spy = AbortSpy::new(vec![7u8; 64]);
+        spy.slow_complete.store(true, Ordering::Relaxed);
+        let (engine, spy) = spy_engine(spy);
+        let meta = spy.src_meta.clone();
+
+        let eng = engine.clone();
+        let task = tokio::spawn(async move {
+            let req = copy_request();
+            let lock = eng
+                .lock_object_write(req.destination_bucket, req.destination_key)
+                .await;
+            let _ = stream_copy_passthrough(&eng, &lock, req, &meta).await;
+        });
+        let started = std::time::Instant::now();
+        while spy.completes_started.load(Ordering::SeqCst) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the copy never reached its Complete request"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            spy.aborts.lock().unwrap().is_empty(),
+            "nothing aborts before the copy is cut"
+        );
+        task.abort();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while spy.aborts.lock().unwrap().len() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a cut during Complete left the upload on the backend"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

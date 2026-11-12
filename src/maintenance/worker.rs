@@ -1455,15 +1455,27 @@ pub(crate) async fn drain_inflight_writes_within(
     let deadline = std::time::Instant::now() + ceiling;
     while gate.inflight_writes(bucket) > 0 {
         if std::time::Instant::now() > deadline {
-            // Read the background count, then the total once more: a write
-            // that ended between the two reads is no reason to fail.
-            let background = gate.inflight_background_writes(bucket);
-            let unverified = gate.inflight_unverified_writes(bucket);
-            let total = gate.inflight_writes(bucket);
-            return match drain_timeout_stop(bucket, ceiling, total, background, unverified) {
-                Some(stop) => Err(stop),
-                None => Ok(()),
-            };
+            // Sample three times, 20 ms apart. A write that ends between
+            // the reads, or a background admission that the gate refuses a
+            // moment after it counted, shows up in one sample only: a
+            // drained sample (total 0) ends the wait, and background
+            // writes in ANY sample defer the job. Only request writes in
+            // every sample fail it (no open request outlives the request
+            // timeout).
+            let mut stop = None;
+            for sample in 0..3 {
+                let total = gate.inflight_writes(bucket);
+                let background = gate.inflight_background_writes(bucket);
+                match drain_timeout_stop(bucket, ceiling, total, background) {
+                    None => return Ok(()),
+                    Some(PhaseStop::Deferred(why)) => stop = Some(PhaseStop::Deferred(why)),
+                    Some(other) => stop = stop.or(Some(other)),
+                }
+                if sample < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+            return Err(stop.expect("three samples"));
         }
         tokio::time::sleep(std::time::Duration::from_millis(DRAIN_POLL_MS)).await;
     }
@@ -1471,8 +1483,8 @@ pub(crate) async fn drain_inflight_writes_within(
 }
 
 /// Pure: how a drain that timed out stops its job, from the in-flight
-/// counts read after the deadline (the background count first, then the
-/// total). Nothing in flight on the re-read: no stop (`None`). Background
+/// counts read after the deadline (one sample; the drain takes three). Nothing
+/// in flight on the re-read: no stop (`None`). Background
 /// or detached writes in flight: deferred (they end on their own, the job
 /// retries later). Request writes only: failed (no open request outlives
 /// the request timeout).
@@ -1481,14 +1493,10 @@ pub(crate) fn drain_timeout_stop(
     ceiling: std::time::Duration,
     total_inflight: i64,
     background_inflight: i64,
-    unverified_inflight: i64,
 ) -> Option<PhaseStop> {
     if total_inflight <= 0 {
         None
-    } else if background_inflight > 0 || unverified_inflight >= total_inflight {
-        // Unverified request writes are not yet admitted: the check
-        // refuses or admits them within milliseconds. Only these in
-        // flight is a retry, never a failure.
+    } else if background_inflight > 0 {
         Some(PhaseStop::Deferred(format!(
             "{background_inflight} background write(s) to '{bucket}' (replication, lifecycle, \
              detached DeleteObjects or CompleteMultipartUpload) still in flight after {}s",
@@ -1807,29 +1815,19 @@ mod tests {
     fn drain_timeout_stop_truth_table() {
         let c = std::time::Duration::from_secs(1);
         assert!(
-            drain_timeout_stop("b", c, 0, 0, 0).is_none(),
+            drain_timeout_stop("b", c, 0, 0).is_none(),
             "drained on the re-read"
         );
         assert!(
-            drain_timeout_stop("b", c, 0, 1, 0).is_none(),
+            drain_timeout_stop("b", c, 0, 1).is_none(),
             "drained on the re-read"
         );
         assert!(matches!(
-            drain_timeout_stop("b", c, 2, 1, 0),
+            drain_timeout_stop("b", c, 2, 1),
             Some(PhaseStop::Deferred(_))
         ));
         assert!(matches!(
-            drain_timeout_stop("b", c, 1, 0, 0),
-            Some(PhaseStop::Failed(_))
-        ));
-        // Only writes that the check has not yet admitted: retry.
-        assert!(matches!(
-            drain_timeout_stop("b", c, 2, 0, 2),
-            Some(PhaseStop::Deferred(_))
-        ));
-        // A verified request write beside them: still a failure.
-        assert!(matches!(
-            drain_timeout_stop("b", c, 2, 0, 1),
+            drain_timeout_stop("b", c, 1, 0),
             Some(PhaseStop::Failed(_))
         ));
     }

@@ -393,7 +393,12 @@ impl S3Backend {
     /// least `part_bytes` (production: 5 GiB and 512 MiB). For a test that
     /// runs the multipart copy on a few MiB without the process-wide
     /// `DGP_TEST_COPY_*` seams. S3's smallest part (5 MiB) still applies.
+    #[doc(hidden)]
     pub fn with_copy_limits(mut self, object_max: u64, part_bytes: u64) -> Self {
+        assert!(
+            object_max > 0,
+            "a copy limit of 0 sends every copy through parts"
+        );
         self.copy_limits = Some((object_max, part_bytes.max(5 * 1024 * 1024)));
         self
     }

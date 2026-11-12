@@ -743,14 +743,19 @@ impl CopyFault {
 /// multipart ETags), then an `ObjectCopied` outbox event. Returns the
 /// source's metadata as read before the copy.
 async fn copy_one(
-    // The caller's count of the write: a copy runs only inside one.
-    _write: &crate::maintenance::gate::WriteGuard,
+    // The caller's count of the write: a copy runs only inside one, and
+    // the count is of the destination bucket.
+    write: &crate::maintenance::gate::WriteGuard,
     s3: &Arc<AppState>,
     engine: &Arc<crate::deltaglider::DynEngine>,
     (src_bucket, src_key): (&str, &str),
     (dst_bucket, dst_key): (&str, &str),
     no_overwrite: bool,
 ) -> Result<crate::types::FileMetadata, CopyFault> {
+    debug_assert!(
+        write.covers(dst_bucket),
+        "a copy into '{dst_bucket}' outside the count of its write"
+    );
     let head = engine
         .head(src_bucket, src_key)
         .await

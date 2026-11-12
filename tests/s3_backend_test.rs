@@ -1541,81 +1541,103 @@ async fn a_dropped_multipart_copy_leaves_no_upload_behind() {
         .unwrap()
         .with_copy_limits(5 * MIB as u64, 5 * MIB as u64),
     );
-    let body = common::big_passthrough_body(100 * MIB);
-    let meta = FileMetadata::new_passthrough(
-        "src.dat".into(),
-        "0".repeat(64),
-        "0".repeat(32),
-        body.len() as u64,
-        None,
-    );
-    backend
-        .put_passthrough(&bucket, "p", "src.dat", body.into(), &meta)
-        .await
-        .unwrap();
-    let source = backend
-        .get_passthrough_metadata(&bucket, "p", "src.dat")
-        .await
-        .unwrap();
-    let mut target = source.clone();
-    target.original_name = "dst.dat".into();
-
-    let copy = tokio::spawn({
-        let (backend, bucket) = (backend.clone(), bucket.clone());
-        async move {
-            backend
-                .copy_within(
-                    ObjectVariant::Passthrough,
-                    ObjectAt {
-                        bucket: &bucket,
-                        prefix: "p",
-                        filename: "src.dat",
-                    },
-                    ObjectAt {
-                        bucket: &bucket,
-                        prefix: "p",
-                        filename: "dst.dat",
-                    },
-                    &source,
-                    &target,
-                )
-                .await
-        }
-    });
-    let in_progress = || async {
-        raw.list_multipart_uploads()
-            .bucket(&bucket)
-            .send()
+    // The copy runs on a local MinIO and can end before the test sees its
+    // upload: then it tries again with a larger source (more parts). Only a
+    // copy that was cut counts; if none is cut, the test fails.
+    let mut cut_seen = false;
+    for (attempt, size_mib) in [100usize, 400, 1000].into_iter().enumerate() {
+        let body = common::big_passthrough_body(size_mib * MIB);
+        let (src_name, dst_name) = (format!("src{attempt}.dat"), format!("dst{attempt}.dat"));
+        let meta = FileMetadata::new_passthrough(
+            src_name.clone(),
+            "0".repeat(64),
+            "0".repeat(32),
+            body.len() as u64,
+            None,
+        );
+        backend
+            .put_passthrough(&bucket, "p", &src_name, body.into(), &meta)
             .await
-            .unwrap()
-            .uploads()
-            .len()
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while in_progress().await == 0 {
-        assert!(
-            !copy.is_finished(),
-            "the copy ended before the test saw its upload"
-        );
-        assert!(std::time::Instant::now() < deadline, "no upload appeared");
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-    copy.abort();
-    assert!(copy.await.unwrap_err().is_cancelled(), "the copy was cut");
+            .unwrap();
+        let source = backend
+            .get_passthrough_metadata(&bucket, "p", &src_name)
+            .await
+            .unwrap();
+        let mut target = source.clone();
+        target.original_name = dst_name.clone();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while in_progress().await > 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the dropped copy left its multipart upload on the destination"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let copy = tokio::spawn({
+            let (backend, bucket, src_name, dst_name) = (
+                backend.clone(),
+                bucket.clone(),
+                src_name.clone(),
+                dst_name.clone(),
+            );
+            async move {
+                backend
+                    .copy_within(
+                        ObjectVariant::Passthrough,
+                        ObjectAt {
+                            bucket: &bucket,
+                            prefix: "p",
+                            filename: &src_name,
+                        },
+                        ObjectAt {
+                            bucket: &bucket,
+                            prefix: "p",
+                            filename: &dst_name,
+                        },
+                        &source,
+                        &target,
+                    )
+                    .await
+            }
+        });
+        let in_progress = || async {
+            raw.list_multipart_uploads()
+                .bucket(&bucket)
+                .send()
+                .await
+                .unwrap()
+                .uploads()
+                .len()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut seen = false;
+        while !copy.is_finished() && std::time::Instant::now() < deadline {
+            if in_progress().await > 0 {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        copy.abort();
+        let cut = copy.await.is_err_and(|e| e.is_cancelled());
+        if !(seen && cut) {
+            // The copy ended first: a larger source next time.
+            continue;
+        }
+        cut_seen = true;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while in_progress().await > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped copy left its multipart upload on the destination"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        break;
     }
-    let _ = raw
-        .delete_object()
-        .bucket(&bucket)
-        .key("p/src.dat")
-        .send()
-        .await;
+    assert!(cut_seen, "no copy was cut while its upload was open");
+    for attempt in 0..3 {
+        for name in ["src", "dst"] {
+            let _ = raw
+                .delete_object()
+                .bucket(&bucket)
+                .key(format!("p/{name}{attempt}.dat"))
+                .send()
+                .await;
+        }
+    }
     let _ = raw.delete_bucket().bucket(&bucket).send().await;
 }

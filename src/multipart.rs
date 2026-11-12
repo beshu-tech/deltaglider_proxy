@@ -246,15 +246,20 @@ impl Drop for StoreInProgressGuard {
     }
 }
 
-/// RAII: rolls an upload back from `Completing` to `Open` on drop unless
-/// [`Self::finish`]ed. The store of a Complete ends in `finish_upload`
-/// (success) or here: an error, a panic and a dropped future all leave the
-/// upload `Open`, so the client's retry does not wait for the
-/// `Completing` timeout.
+/// RAII for the store of a Complete, armed from the flip to `Completing`.
+/// A pre-commit exit (an error, a panic, a dropped future) rolls the upload
+/// back to `Open`, so the client's retry does not wait for the
+/// `Completing` timeout. Once the write COMMITTED (the engine told the
+/// `committed` flag), an exit is not a retry: the upload is completed, the
+/// registry keeps the success for retries, and joiners get it
+/// ([`CompletionPublisher`]'s drop). [`Self::finish`] ends the guard after
+/// `finish_upload`.
 #[must_use = "the rollback runs when the guard is dropped"]
 pub struct CompletingGuard {
     store: std::sync::Arc<MultipartStore>,
     upload_id: String,
+    etag: String,
+    committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     finished: bool,
 }
 
@@ -267,7 +272,12 @@ impl CompletingGuard {
 
 impl Drop for CompletingGuard {
     fn drop(&mut self) {
-        if !self.finished {
+        if self.finished {
+            return;
+        }
+        if self.committed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.store.commit_unwound(&self.upload_id, &self.etag);
+        } else {
             self.store.rollback_upload(&self.upload_id);
         }
     }
@@ -389,12 +399,35 @@ impl CompletionFailure {
     }
 }
 
-/// Pure: what the owner of a Complete publishes when its request ends
-/// WITHOUT running the store: `Err` is the owner's own answer (a quota
-/// 403, a precondition 412), shared as it is; no answer (the request was
-/// dropped) is [`CompletionFailure::owner_gone`].
-pub fn failure_before_store(answer: Option<&s3s::S3Error>) -> CompletionFailure {
-    answer.map_or_else(CompletionFailure::owner_gone, CompletionFailure::of)
+/// Pure: does a joined retry get this refusal of the owner as it is? Only
+/// a refusal that depends on the upload and its parts, never on the
+/// owner's headers or principal: the joiner matched the owner on bucket,
+/// key and part list only, so a precondition (`If-Match`, `If-None-Match`),
+/// a quota of the owner's principal or an access refusal says nothing
+/// about the joiner. Everything else is not shared: the joiner gets
+/// [`CompletionFailure::owner_gone`] (503), retries, becomes the owner and
+/// gets its own answer.
+pub fn shared_with_joiners(code: &s3s::S3ErrorCode) -> bool {
+    use s3s::S3ErrorCode as C;
+    matches!(
+        code,
+        C::InvalidPart
+            | C::InvalidPartOrder
+            | C::EntityTooSmall
+            | C::EntityTooLarge
+            | C::NoSuchUpload
+            | C::InternalError
+    )
+}
+
+/// Pure: what the owner of a Complete publishes to its joiners when it ends
+/// WITHOUT a success: its own answer when [`shared_with_joiners`], else (or
+/// when the request was dropped, `None`) [`CompletionFailure::owner_gone`].
+pub fn joiner_failure(answer: Option<&s3s::S3Error>) -> CompletionFailure {
+    match answer {
+        Some(err) if shared_with_joiners(err.code()) => CompletionFailure::of(err),
+        _ => CompletionFailure::owner_gone(),
+    }
 }
 
 const COMPLETION_TOMBSTONE_TTL_SECS: u64 = 900;
@@ -452,10 +485,18 @@ impl CompletionPublisher {
 
 impl Drop for CompletionPublisher {
     fn drop(&mut self) {
-        if !self.published {
-            self.store.clear_completion_slot(&self.upload_id);
-            let _ = self.tx.send(Some(Err(failure_before_store(None))));
+        if self.published {
+            return;
         }
+        // The store committed and its task then ended abnormally
+        // ([`CompletingGuard`]): the tombstone holds the success, and
+        // joiners get it. Otherwise the slot clears and they retry.
+        if let Some(etag) = self.store.unwound_commit(&self.upload_id, self.fingerprint) {
+            let _ = self.tx.send(Some(Ok(etag)));
+            return;
+        }
+        self.store.clear_completion_slot(&self.upload_id);
+        let _ = self.tx.send(Some(Err(joiner_failure(None))));
     }
 }
 
@@ -1067,13 +1108,61 @@ impl MultipartStore {
         }
     }
 
-    /// The rollback guard of an upload that `complete_parts` flipped to
-    /// `Completing` (see [`CompletingGuard`]).
-    pub fn completing_guard(self: &std::sync::Arc<Self>, upload_id: &str) -> CompletingGuard {
+    /// The guard of an upload that `complete_parts` flipped to `Completing`
+    /// (see [`CompletingGuard`]); `committed` is set when the write commits.
+    pub fn completing_guard(
+        self: &std::sync::Arc<Self>,
+        upload_id: &str,
+        etag: &str,
+        committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> CompletingGuard {
         CompletingGuard {
             store: std::sync::Arc::clone(self),
             upload_id: upload_id.to_string(),
+            etag: etag.to_string(),
+            committed,
             finished: false,
+        }
+    }
+
+    /// The write committed and its task ended before `finish_upload`:
+    /// complete the upload here and keep the success for retries and
+    /// joiners.
+    fn commit_unwound(&self, upload_id: &str, etag: &str) {
+        {
+            let mut slots = self.completions.lock();
+            if let Some(CompletionSlot::InFlight {
+                fingerprint,
+                bucket,
+                key,
+                ..
+            }) = slots.remove(upload_id)
+            {
+                slots.insert(
+                    upload_id.to_string(),
+                    CompletionSlot::Done {
+                        fingerprint,
+                        etag: etag.to_string(),
+                        bucket,
+                        key,
+                        at: std::time::Instant::now(),
+                    },
+                );
+            }
+        }
+        self.finish_upload(upload_id);
+    }
+
+    /// The success that [`Self::commit_unwound`] kept for the completion
+    /// with `fingerprint`, if any.
+    fn unwound_commit(&self, upload_id: &str, fingerprint: u64) -> Option<String> {
+        match self.completions.lock().get(upload_id) {
+            Some(CompletionSlot::Done {
+                fingerprint: f,
+                etag,
+                ..
+            }) if *f == fingerprint => Some(etag.clone()),
+            _ => None,
         }
     }
 

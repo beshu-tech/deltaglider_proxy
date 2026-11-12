@@ -19,14 +19,18 @@ type AbortFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// Aborts a multipart upload when dropped, unless [`Self::disarm`]ed.
 #[must_use = "a guard that is dropped at once aborts the upload at once"]
 pub struct MpuAbortGuard {
-    abort: Option<Box<dyn FnOnce() -> AbortFuture + Send>>,
+    /// Kept (not consumed) by [`Self::abort`] until its request ended, so
+    /// a cut during that request leaves the guard armed.
+    abort: Option<Box<dyn Fn() -> AbortFuture + Send + Sync>>,
 }
 
 impl MpuAbortGuard {
-    /// Arm a guard. `abort` makes the best-effort abort request.
+    /// Arm a guard. `abort` makes the best-effort abort request; it may run
+    /// twice (an explicit abort that is cut, then the drop), and an abort
+    /// of an upload that is gone is harmless.
     pub fn new<F, Fut>(abort: F) -> Self
     where
-        F: FnOnce() -> Fut + Send + 'static,
+        F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         Self {
@@ -39,11 +43,14 @@ impl MpuAbortGuard {
         self.abort = None;
     }
 
-    /// Abort now and wait for the request (the error path).
+    /// Abort now and wait for the request (the error path). The guard stays
+    /// armed until the request ended: a future that is cut here still
+    /// aborts the upload from the drop.
     pub async fn abort(mut self) {
-        if let Some(abort) = self.abort.take() {
+        if let Some(abort) = self.abort.as_ref() {
             abort().await;
         }
+        self.abort = None;
     }
 }
 
@@ -73,8 +80,11 @@ mod tests {
     fn counting() -> (Arc<AtomicUsize>, MpuAbortGuard) {
         let n = Arc::new(AtomicUsize::new(0));
         let n2 = n.clone();
-        let guard = MpuAbortGuard::new(move || async move {
-            n2.fetch_add(1, Ordering::SeqCst);
+        let guard = MpuAbortGuard::new(move || {
+            let n2 = n2.clone();
+            async move {
+                n2.fetch_add(1, Ordering::SeqCst);
+            }
         });
         (n, guard)
     }
@@ -101,6 +111,29 @@ mod tests {
         assert_eq!(n.load(Ordering::SeqCst), 0);
     }
 
+    /// A cut during the explicit abort request still aborts, from the drop.
+    #[tokio::test]
+    async fn an_abort_that_is_cut_leaves_the_guard_armed() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let (n2, started2) = (n.clone(), started.clone());
+        let guard = MpuAbortGuard::new(move || {
+            let (n2, started2) = (n2.clone(), started2.clone());
+            async move {
+                // The first request stalls (it is cut); the second finishes.
+                if started2.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::future::pending::<()>().await;
+                }
+                n2.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let cut = tokio::time::timeout(std::time::Duration::from_millis(50), guard.abort()).await;
+        assert!(cut.is_err(), "the abort was cut");
+        settle().await;
+        assert_eq!(started.load(Ordering::SeqCst), 2, "the drop aborted again");
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn explicit_abort_runs_once_and_drop_adds_nothing() {
         let (n, guard) = counting();
@@ -109,23 +142,70 @@ mod tests {
         assert_eq!(n.load(Ordering::SeqCst), 1);
     }
 
-    /// Functions that call `create_multipart_upload` without the guard: the
-    /// trait methods themselves (`create_multipart_upload` of the backends
-    /// and their wrappers: they forward or implement the request, the caller
-    /// above them holds the guard). Every other function that opens a
-    /// multipart upload on a backend arms an [`MpuAbortGuard`] in the same
-    /// function, so the upload cannot outlive a dropped future.
+    /// The backends' own `create_multipart_upload` methods, which implement
+    /// or forward the request: the caller above them holds the guard. An
+    /// exemption is a (file, function) pair, never a function name alone.
+    const TRAIT_METHODS: [(&str, &str); 4] = [
+        // The client's CreateMultipartUpload: an in-memory relay upload, no
+        // backend upload exists until the store at Complete.
+        ("src/s3_adapter_s3s/mod.rs", "create_multipart_upload"),
+        ("src/storage/s3/mod.rs", "create_multipart_upload"),
+        ("src/storage/routing.rs", "create_multipart_upload"),
+        ("src/storage/encrypting/mod.rs", "create_multipart_upload"),
+    ];
+
+    /// Openers that hand the guard to their caller (it is the caller that
+    /// disarms or aborts it); every caller of one is checked too.
+    const RETURNS_GUARD: [(&str, &str); 1] = [(
+        "src/deltaglider/engine/store.rs",
+        "begin_passthrough_multipart",
+    )];
+
+    /// Does the function `func` of `src` end a guard (`disarm` or `abort`)?
+    fn ends_guard(src: &crate::source_scan::ast::Source, func: usize) -> bool {
+        src.prod
+            .calls
+            .iter()
+            .any(|c| c.func == func && (c.named("disarm") || c.named("abort")))
+    }
+
+    /// Functions that open a multipart upload on a backend without a guard:
+    /// the guard is made in the same function, bound to a variable (an
+    /// unbound one would drop, and abort, at once), and ended there with
+    /// `disarm` or `abort` (or the function is in [`RETURNS_GUARD`], and
+    /// each of its callers ends the guard instead).
     fn unguarded(sources: &[crate::source_scan::ast::Source]) -> Vec<String> {
         let mut out = Vec::new();
         for src in sources {
             for call in src.prod.calls_named("create_multipart_upload") {
                 let name = src.fn_name(call.func);
-                let guarded =
-                    src.prod.calls.iter().any(|c| {
-                        c.func == call.func && c.segs.iter().any(|s| s == "MpuAbortGuard")
-                    });
-                if name != "create_multipart_upload" && !guarded {
-                    out.push(format!("{}:{} in {name}", src.rel, call.line));
+                if TRAIT_METHODS
+                    .iter()
+                    .any(|(rel, f)| *rel == src.rel && *f == name)
+                {
+                    continue;
+                }
+                let bound = src.prod.bindings.iter().any(|b| {
+                    b.func == call.func && b.init_idents.iter().any(|i| i == "MpuAbortGuard")
+                });
+                let returns = RETURNS_GUARD
+                    .iter()
+                    .any(|(rel, f)| *rel == src.rel && *f == name);
+                if !bound || !(returns || ends_guard(src, call.func)) {
+                    out.push(format!(
+                        "{}:{} in {name} (guard bound to a variable, then disarm or abort)",
+                        src.rel, call.line
+                    ));
+                }
+            }
+            for (_, opener) in RETURNS_GUARD {
+                for call in src.prod.calls_named(opener) {
+                    if src.fn_name(call.func) != opener && !ends_guard(src, call.func) {
+                        out.push(format!(
+                            "{}:{} calls {opener} and never ends its guard",
+                            src.rel, call.line
+                        ));
+                    }
                 }
             }
         }
@@ -137,7 +217,7 @@ mod tests {
         let sources = crate::source_scan::ast::src();
         let found = unguarded(sources);
         assert!(found.is_empty(), "an upload without a guard: {found:?}");
-        // The scan sees the two openers it is about.
+        // The scan sees the openers and the caller it is about.
         for (rel, name) in [
             ("src/storage/s3/copy.rs", "copy_parts"),
             (
@@ -153,13 +233,47 @@ mod tests {
                 "the scan missed {name} in {rel}"
             );
         }
-        let fixture = [crate::source_scan::ast::parse(
-            "src/x.rs",
-            "async fn bad(c: C) { c.create_multipart_upload().send().await; } \
-                 async fn good(c: C) { let _g = MpuAbortGuard::new(|| async {}); \
+        let transfer = sources.iter().find(|s| s.rel == "src/transfer.rs").unwrap();
+        assert!(
+            transfer
+                .prod
+                .calls_named("begin_passthrough_multipart")
+                .next()
+                .is_some(),
+            "the scan missed the caller of the opener"
+        );
+        let fixture = [
+            crate::source_scan::ast::parse(
+                "src/x.rs",
+                "async fn bad(c: C) { c.create_multipart_upload().send().await; } \
+                 async fn good(c: C) { let g = MpuAbortGuard::new(|| async {}); \
+                 c.create_multipart_upload().send().await; g.disarm(); } \
+                 async fn unbound(c: C) { MpuAbortGuard::new(|| async {}); \
                  c.create_multipart_upload().send().await; } \
-                 async fn create_multipart_upload(c: C) { c.create_multipart_upload(); }",
-        )];
-        assert_eq!(unguarded(&fixture), ["src/x.rs:1 in bad"]);
+                 async fn never_ended(c: C) { let g = MpuAbortGuard::new(|| async {}); \
+                 c.create_multipart_upload().send().await; } \
+                 async fn caller(e: E) { let (h, g) = e.begin_passthrough_multipart(l).await; }",
+            ),
+            // A trait method of that name in a file that is not listed.
+            crate::source_scan::ast::parse(
+                "src/y.rs",
+                "async fn create_multipart_upload(c: C) { c.create_multipart_upload(); }",
+            ),
+        ];
+        let found = unguarded(&fixture);
+        let names: Vec<&str> = found.iter().map(String::as_str).collect();
+        assert_eq!(found.len(), 5, "{names:?}");
+        for expected in [
+            "in bad",
+            "in unbound",
+            "in never_ended",
+            "src/y.rs",
+            "never ends",
+        ] {
+            assert!(
+                found.iter().any(|f| f.contains(expected)),
+                "{expected} not caught: {names:?}"
+            );
+        }
     }
 }

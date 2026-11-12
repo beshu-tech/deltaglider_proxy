@@ -2050,8 +2050,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let guard = {
             let engine = Arc::clone(self);
             let handle = Arc::clone(&handle);
-            MpuAbortGuard::new(move || async move {
-                engine.abort_passthrough_multipart_ref(&handle).await;
+            MpuAbortGuard::new(move || {
+                let (engine, handle) = (Arc::clone(&engine), Arc::clone(&handle));
+                async move {
+                    engine.abort_passthrough_multipart_ref(&handle).await;
+                }
             })
         };
         Ok((handle, guard))

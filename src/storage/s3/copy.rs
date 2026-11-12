@@ -272,14 +272,28 @@ impl S3Backend {
         let guard = {
             let client = self.bulk_client.clone();
             let (bucket, key, upload_id) = (bucket.to_string(), key.to_string(), upload_id.clone());
-            MpuAbortGuard::new(move || async move {
-                let _ = client
-                    .abort_multipart_upload()
-                    .bucket(bucket)
-                    .key(key)
-                    .upload_id(upload_id)
-                    .send()
-                    .await;
+            MpuAbortGuard::new(move || {
+                let (client, bucket, key, upload_id) = (
+                    client.clone(),
+                    bucket.clone(),
+                    key.clone(),
+                    upload_id.clone(),
+                );
+                async move {
+                    if let Err(e) = client
+                        .abort_multipart_upload()
+                        .bucket(&bucket)
+                        .key(&key)
+                        .upload_id(&upload_id)
+                        .send()
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to abort multipart copy {bucket}/{key} ({upload_id}): {}",
+                            aws_sdk_s3::error::DisplayErrorContext(&e)
+                        );
+                    }
+                }
             })
         };
         match self.copy_part_list(plan, &upload_id).await {

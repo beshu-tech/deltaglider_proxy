@@ -1699,62 +1699,149 @@ fn the_uploads_lock_is_never_held_for_file_io() {
     }
 }
 
-/// What the owner of a Complete publishes when its request ends without the
-/// store: its own refusal as it is (code and status), else a retryable 503.
+/// What the owner of a Complete publishes to its joiners when it ends without
+/// a success: only a refusal that depends on the upload and its parts, as it
+/// is; a refusal that depends on the owner's headers or principal (a
+/// precondition, a quota, an access refusal), or no answer at all, is a
+/// retryable 503, so the joiner becomes the owner and gets its own answer.
 #[test]
-fn failure_before_store_table() {
+fn joiner_failure_table() {
     use axum::http::StatusCode;
     use s3s::S3ErrorCode as C;
     let mut quota = s3s::S3Error::with_message(C::Custom("QuotaExceeded".into()), "full");
     quota.set_status_code(StatusCode::FORBIDDEN);
     let mut precondition = s3s::S3Error::with_message(C::PreconditionFailed, "etag");
     precondition.set_status_code(StatusCode::PRECONDITION_FAILED);
-    let slow = s3s::S3Error::with_message(C::SlowDown, "later");
-    let table: [(Option<&s3s::S3Error>, C, Option<StatusCode>); 4] = [
+    let denied = s3s::S3Error::with_message(C::AccessDenied, "no");
+    let table: [(Option<s3s::S3Error>, C, Option<StatusCode>); 8] = [
         (
-            Some(&quota),
-            C::Custom("QuotaExceeded".into()),
-            Some(StatusCode::FORBIDDEN),
+            Some(quota),
+            C::SlowDown,
+            Some(StatusCode::SERVICE_UNAVAILABLE),
         ),
         (
-            Some(&precondition),
-            C::PreconditionFailed,
-            Some(StatusCode::PRECONDITION_FAILED),
+            Some(precondition),
+            C::SlowDown,
+            Some(StatusCode::SERVICE_UNAVAILABLE),
         ),
-        (Some(&slow), C::SlowDown, slow.status_code()),
+        (
+            Some(denied),
+            C::SlowDown,
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+        ),
         (None, C::SlowDown, Some(StatusCode::SERVICE_UNAVAILABLE)),
+        (
+            Some(s3s::S3Error::with_message(C::EntityTooSmall, "tiny")),
+            C::EntityTooSmall,
+            None,
+        ),
+        (
+            Some(s3s::S3Error::with_message(C::InvalidPart, "etag")),
+            C::InvalidPart,
+            None,
+        ),
+        (
+            Some(s3s::S3Error::with_message(C::InvalidPartOrder, "order")),
+            C::InvalidPartOrder,
+            None,
+        ),
+        (
+            Some(s3s::S3Error::with_message(C::InternalError, "boom")),
+            C::InternalError,
+            None,
+        ),
     ];
     for (answer, code, status) in table {
-        let seen = failure_before_store(answer).to_s3s();
+        let seen = joiner_failure(answer.as_ref()).to_s3s();
         assert_eq!(seen.code(), &code);
-        assert_eq!(seen.status_code(), status, "{code:?}");
+        // A shared answer keeps the owner's status; the others are 503.
+        let expected = status.or_else(|| answer.as_ref().and_then(|a| a.status_code()));
+        assert_eq!(seen.status_code(), expected, "{code:?}");
     }
 }
 
-/// A Complete whose store panics (or whose task is dropped) leaves the
-/// upload `Open`, not `Completing` until the timeout.
-#[tokio::test]
-async fn a_completing_guard_rolls_back_on_unwind_and_not_after_finish() {
+fn guard_fixture() -> (
+    std::sync::Arc<MultipartStore>,
+    String,
+    CompletionPublisher,
+    tokio::sync::watch::Receiver<Option<CompletionResult>>,
+) {
     let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let parts = parts_fixture();
     let id = store.create("b", "k", None, Default::default()).unwrap();
-    let state_of = |store: &MultipartStore| store.uploads.read().get(&id).map(|u| u.state);
-    let flip = |store: &MultipartStore| {
-        store.uploads.write().get_mut(&id).unwrap().state = MultipartState::Completing;
+    let owner = match store.begin_complete(&id, "b", "k", &parts).unwrap() {
+        BeginComplete::Owner(p) => p,
+        _ => panic!("must be Owner"),
     };
+    let rx = match store.begin_complete(&id, "b", "k", &parts).unwrap() {
+        BeginComplete::Join(rx) => rx,
+        _ => panic!("must Join"),
+    };
+    store.uploads.write().get_mut(&id).unwrap().state = MultipartState::Completing;
+    (store, id, owner, rx)
+}
 
-    flip(&store);
+/// A Complete whose store panics BEFORE the write committed: the upload is
+/// open again, and joiners are told to retry.
+#[tokio::test]
+async fn a_panic_before_the_commit_rolls_the_upload_back() {
+    let (store, id, owner, rx) = guard_fixture();
+    let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let task = tokio::spawn({
-        let store = store.clone();
-        let id = id.clone();
+        let (store, id) = (store.clone(), id.clone());
         async move {
-            let _guard = store.completing_guard(&id);
+            let _owner = owner;
+            let _guard = store.completing_guard(&id, "\"etag\"", committed);
             panic!("the store panicked");
         }
     });
     assert!(task.await.unwrap_err().is_panic());
-    assert_eq!(state_of(&store), Some(MultipartState::Open));
+    assert_eq!(
+        store.uploads.read().get(&id).map(|u| u.state),
+        Some(MultipartState::Open)
+    );
+    let seen = rx.borrow().clone().unwrap().unwrap_err();
+    assert_eq!(seen.code, s3s::S3ErrorCode::SlowDown, "retry");
+}
 
-    flip(&store);
-    store.completing_guard(&id).finish();
-    assert_eq!(state_of(&store), Some(MultipartState::Completing));
+/// A panic AFTER the write committed is not a retry: the upload is
+/// completed, joiners and later retries get the success.
+#[tokio::test]
+async fn a_panic_after_the_commit_completes_the_upload() {
+    let (store, id, owner, rx) = guard_fixture();
+    let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn({
+        let (store, id, committed) = (store.clone(), id.clone(), committed.clone());
+        async move {
+            let _owner = owner;
+            let _guard = store.completing_guard(&id, "\"etag\"", committed.clone());
+            committed.store(true, std::sync::atomic::Ordering::SeqCst);
+            panic!("a step after the commit panicked");
+        }
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    assert!(
+        store.uploads.read().get(&id).is_none(),
+        "the upload is completed, not open"
+    );
+    assert_eq!(rx.borrow().clone().unwrap().unwrap(), "\"etag\"");
+    match store
+        .begin_complete(&id, "b", "k", &parts_fixture())
+        .unwrap()
+    {
+        BeginComplete::AlreadyDone { etag } => assert_eq!(etag, "\"etag\""),
+        _ => panic!("a retry gets the tombstone"),
+    }
+}
+
+/// A guard that is finished leaves the upload alone.
+#[tokio::test]
+async fn a_finished_completing_guard_changes_nothing() {
+    let (store, id, _owner, _rx) = guard_fixture();
+    let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    store.completing_guard(&id, "\"etag\"", committed).finish();
+    assert_eq!(
+        store.uploads.read().get(&id).map(|u| u.state),
+        Some(MultipartState::Completing)
+    );
 }

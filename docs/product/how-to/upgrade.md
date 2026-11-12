@@ -353,7 +353,7 @@ Where the admin session cookie is `Secure` (TLS at the proxy, a trusted `X-Forwa
 
 ## A stop waits for detached work (2.2.1)
 
-A `DeleteObjects` batch and the store of a `CompleteMultipartUpload` run on after their request ends, so that a client disconnect cannot cut an object in half. Before this release, a stop did not wait for them: SIGTERM could end the process in the middle of a batch or a store. Now the proxy waits for this work, up to 15 seconds, after it stopped accepting requests. It logs a warning with the number of tasks that it cut when the 15 seconds pass; the clients retry those requests. A stop now takes up to 55 seconds: 10 for the running requests, 15 for detached work, 10 for a maintenance job, 10 for the event outbox and `DGP_SHUTDOWN_TIMEOUT_SECS` (default 10) for blocking work. A `terminationGracePeriodSeconds` or `stop_grace_period` of 60 seconds, as the Helm chart, the operator and the compose example set, still holds. Keep it at 60 or more.
+A `DeleteObjects` batch and the store of a `CompleteMultipartUpload` run on after their request ends, so that a client disconnect cannot cut an object in half. When the proxy gets the stop signal, it stops accepting requests and then waits for this work, up to 15 seconds. When the 15 seconds pass, it logs a warning with the number of tasks that it cut, and the clients retry those requests. A stop takes up to 55 seconds: 10 for the running requests, 15 for detached work, 10 for a maintenance job, 10 for the event outbox and `DGP_SHUTDOWN_TIMEOUT_SECS` (default 10) for blocking work. A `terminationGracePeriodSeconds` or `stop_grace_period` of 60 seconds, as the Helm chart, the operator and the compose example set, still holds. Keep it at 60 or more.
 
 ## Common gotchas
 

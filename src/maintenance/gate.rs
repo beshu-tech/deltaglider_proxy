@@ -72,9 +72,6 @@ pub struct MaintenanceGate {
     /// replication copy has no request deadline, so a drain that waits for
     /// one past its ceiling defers instead of failing.
     inflight_background: DashMap<String, i64>,
-    /// Of the request writes, those the verified-request check has not
-    /// yet admitted or refused (see [`RequestWriteCount`]).
-    inflight_unverified: DashMap<String, i64>,
     /// The encryption witness of this node (multi-instance only): why it
     /// refuses writes to a bucket now. Set once at boot.
     write_refusal: std::sync::OnceLock<ProbeCell>,
@@ -98,7 +95,6 @@ impl Default for MaintenanceGate {
             unwinding: parking_lot::Mutex::new(HashSet::new()),
             inflight_writes: DashMap::new(),
             inflight_background: DashMap::new(),
-            inflight_unverified: DashMap::new(),
             write_refusal: std::sync::OnceLock::new(),
         }
     }
@@ -306,17 +302,6 @@ impl MaintenanceGate {
         self.begin_background_write(bucket)
     }
 
-    /// Of [`Self::inflight_writes`], the request writes that the
-    /// verified-request check has not yet admitted or refused. They end
-    /// within milliseconds (or a refusal drops them), so a drain that
-    /// finds only these defers its job; it does not fail it.
-    pub fn inflight_unverified_writes(&self, bucket: &str) -> i64 {
-        self.inflight_unverified
-            .get(&bucket.to_ascii_lowercase())
-            .map(|v| *v)
-            .unwrap_or(0)
-    }
-
     /// Of [`Self::inflight_writes`], the background writes.
     pub fn inflight_background_writes(&self, bucket: &str) -> i64 {
         self.inflight_background
@@ -413,6 +398,13 @@ pub struct WriteGuard {
     background: bool,
 }
 
+impl WriteGuard {
+    /// Does this count cover writes into `bucket`? (Case-insensitive.)
+    pub fn covers(&self, bucket: &str) -> bool {
+        self.bucket.eq_ignore_ascii_case(bucket)
+    }
+}
+
 impl Drop for WriteGuard {
     fn drop(&mut self) {
         // The total first, then the background count (see
@@ -424,59 +416,30 @@ impl Drop for WriteGuard {
     }
 }
 
-/// The count of one S3 write request, shared with the request's
-/// extensions. The middleware counts a write before s3s verifies it (see
-/// [`maintenance_gate_middleware`]); a request that the verified-request
-/// check then refuses (503, 403) ends its count at once
-/// ([`check_verified_request`]). A refused request writes nothing, so it
-/// must not hold up a maintenance drain: clients that retry a 503 at a high
-/// rate kept the in-flight count above 0 for the whole wait, and the drain
-/// timed out with no write in flight.
-#[derive(Clone)]
-pub struct RequestWriteCount(Arc<parking_lot::Mutex<RequestCountState>>);
-
-struct RequestCountState {
-    guard: Option<WriteGuard>,
-    /// Counted in `inflight_unverified` until the check passes or refuses.
-    unverified: Option<(Arc<MaintenanceGate>, String)>,
-}
-
-impl RequestCountState {
-    fn clear_unverified(&mut self) {
-        if let Some((gate, bucket)) = self.unverified.take() {
-            bump(&gate.inflight_unverified, &bucket, -1);
-        }
-    }
-}
-
-impl Drop for RequestCountState {
-    fn drop(&mut self) {
-        self.clear_unverified();
-    }
-}
+/// The in-flight count of one S3 write request, shared with the request's
+/// extensions. A request is counted only when it is VERIFIED and ADMITTED:
+/// [`check_verified_request`] counts it, then asks the gate (count first,
+/// so a job that arms at any moment either sees the count or refuses the
+/// request), and ends the count at once on a refusal. The middleware only
+/// puts the empty slot into the request. Nothing that is not yet verified
+/// is in flight: once a bucket is gated, every request that is not yet
+/// verified will be refused, so a drain ignores it, and a caller that
+/// trickles a request head cannot hold a drain.
+#[derive(Clone, Default)]
+pub struct RequestWriteCount(Arc<parking_lot::Mutex<Option<WriteGuard>>>);
 
 impl RequestWriteCount {
-    fn new(gate: &Arc<MaintenanceGate>, bucket: &str) -> Self {
-        let key = bucket.to_ascii_lowercase();
-        // Unverified first, total second; both end in the reverse order.
-        bump(&gate.inflight_unverified, &key, 1);
-        let guard = gate.begin_write(&key);
-        Self(Arc::new(parking_lot::Mutex::new(RequestCountState {
-            guard: Some(guard),
-            unverified: Some((Arc::clone(gate), key)),
-        })))
-    }
-
-    /// The check admitted the request: it is a verified write now.
-    pub fn verified(&self) {
-        self.0.lock().clear_unverified();
+    /// Count the write now (once).
+    fn admit(&self, gate: &Arc<MaintenanceGate>, bucket: &str) {
+        let mut slot = self.0.lock();
+        if slot.is_none() {
+            *slot = Some(gate.begin_write(bucket));
+        }
     }
 
     /// End the count (idempotent).
     pub fn release(&self) {
-        let mut state = self.0.lock();
-        state.clear_unverified();
-        state.guard.take();
+        self.0.lock().take();
     }
 }
 
@@ -506,26 +469,17 @@ fn is_write_method(method: &Method) -> bool {
     matches!(*method, Method::PUT | Method::POST | Method::DELETE)
 }
 
-/// Axum middleware on the S3 router: counts in-flight writes. It does NOT
-/// refuse anything: it runs before s3s verifies the signature, and the
-/// refusal names the background job, so an unverified caller would learn
-/// which buckets are busy. The refusal is [`check_verified_request`].
-///
-/// Registering here, before the busy check, keeps the acquire-then-recheck
-/// order (H37): a write that the drain did not see is caught by the later
-/// check. RAII releases the slot on a mid-body disconnect (H12).
+/// Axum middleware on the S3 router: gives each write request its empty
+/// [`RequestWriteCount`]. It counts and refuses NOTHING: it runs before s3s
+/// verifies the signature, and the refusal names the background job, so an
+/// unverified caller would learn which buckets are busy. The count and the
+/// refusal are [`check_verified_request`]. RAII ends the count when the
+/// request ends, also on a mid-body disconnect (H12).
 pub async fn maintenance_gate_middleware(request: Request<Body>, next: Next) -> Response {
-    let Some(gate) = request.extensions().get::<Arc<MaintenanceGate>>().cloned() else {
-        // Gate not wired (shouldn't happen in production) — never block.
-        return next.run(request).await;
-    };
     if !is_write_method(request.method()) {
         return next.run(request).await;
     }
-    let Some(bucket) = bucket_from_path(request.uri().path()) else {
-        return next.run(request).await;
-    };
-    let count = RequestWriteCount::new(&gate, &bucket);
+    let count = RequestWriteCount::default();
     let mut request = request;
     request.extensions_mut().insert(count.clone());
     let response = next.run(request).await;
@@ -560,12 +514,22 @@ pub fn check_verified_request(
     method: &Method,
     path: &str,
 ) -> Result<(), crate::api::errors::S3Error> {
+    // Count FIRST, then ask the gates (acquire-then-recheck, H37): a job
+    // that arms later either sees this count or refuses the request.
+    let count = extensions.get::<RequestWriteCount>();
+    if let (Some(count), Some(gate), true) = (
+        count,
+        extensions.get::<Arc<MaintenanceGate>>(),
+        is_write_method(method),
+    ) {
+        if let Some(bucket) = bucket_from_path(path) {
+            count.admit(gate, &bucket);
+        }
+    }
     let verdict = verified_request_refusal(extensions, method, path);
-    if let Some(count) = extensions.get::<RequestWriteCount>() {
-        if verdict.is_err() {
+    if verdict.is_err() {
+        if let Some(count) = count {
             count.release();
-        } else {
-            count.verified();
         }
     }
     verdict
@@ -708,6 +672,22 @@ mod tests {
             offenders.is_empty(),
             "use MaintenanceGate::write_blocked: {offenders:?}"
         );
+    }
+
+    /// Does the fn `name` of the source file `rel` take a `WriteGuard`
+    /// parameter? (Its signature text: the exemption holds only while the
+    /// type is there.)
+    fn takes_write_guard(rel: &str, name: &str) -> bool {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let Some(at) = text.find(&format!("fn {name}(")) else {
+            return false;
+        };
+        let signature = &text[at..];
+        let end = signature.find(") ->").unwrap_or(signature.len());
+        signature[..end].contains("WriteGuard")
     }
 
     /// Request-scoped writers that take their count as a `&WriteGuard`
@@ -866,7 +846,7 @@ mod tests {
                 let name = src.fn_name(call.func);
                 let proven = PROOF_PARAMETER
                     .iter()
-                    .any(|(rel, f, _)| *rel == src.rel && *f == name);
+                    .any(|(rel, f, _)| *rel == src.rel && *f == name && takes_write_guard(rel, f));
                 if !counted && !proven {
                     offenders.push(format!(
                         "{}:{} in {name} (needs one of {names:?} in the same function)",
@@ -1306,26 +1286,27 @@ mod tests {
         assert_eq!(g.inflight_writes("b"), 0);
     }
 
-    /// A write request that the verified-request check refuses (503 on a
-    /// busy bucket) is not in flight any more: it writes nothing, and SDK
-    /// retries of the 503 must not keep a maintenance drain waiting. An
-    /// admitted write stays counted until its handler ends.
-    #[tokio::test]
-    async fn a_refused_write_request_is_not_in_flight() {
-        use tower::ServiceExt;
-        let gate = Arc::new(MaintenanceGate::new());
-        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let unverified = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let app = axum::Router::new()
+    /// A router around the gate: the middleware, and a handler that does
+    /// what the s3s access hook does for every request. `entered` fires
+    /// before the hook, `release` lets the handler go on; `seen` records
+    /// `(admitted, in flight at the hook's verdict)`.
+    fn gated_app(
+        gate: Arc<MaintenanceGate>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        seen: Arc<parking_lot::Mutex<Vec<(bool, i64)>>>,
+    ) -> axum::Router {
+        axum::Router::new()
             .route(
                 "/:bucket/:key",
                 axum::routing::put({
-                    let (gate, seen, unverified) = (gate.clone(), seen.clone(), unverified.clone());
+                    let gate = gate.clone();
                     move |request: Request<Body>| {
-                        let (gate, seen, unverified) =
-                            (gate.clone(), seen.clone(), unverified.clone());
+                        let (gate, entered, release, seen) =
+                            (gate.clone(), entered.clone(), release.clone(), seen.clone());
                         async move {
-                            // What the s3s access hook does for every request.
+                            entered.notify_one();
+                            release.notified().await;
                             let verdict = check_verified_request(
                                 request.extensions(),
                                 request.method(),
@@ -1333,36 +1314,131 @@ mod tests {
                             );
                             seen.lock()
                                 .push((verdict.is_ok(), gate.inflight_writes("b")));
-                            unverified.lock().push(gate.inflight_unverified_writes("b"));
                             "done"
                         }
                     }
                 }),
             )
             .layer(axum::middleware::from_fn(maintenance_gate_middleware))
-            .layer(axum::Extension(gate.clone()));
-        let put = || {
-            Request::builder()
-                .method(Method::PUT)
-                .uri("/b/k")
-                .body(Body::empty())
-                .unwrap()
-        };
-        app.clone().oneshot(put()).await.unwrap();
+            .layer(axum::Extension(gate))
+    }
+
+    fn put_request() -> Request<Body> {
+        Request::builder()
+            .method(Method::PUT)
+            .uri("/b/k")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// A write request counts as in flight only when it is verified AND
+    /// admitted: a refused request (503 on a busy bucket) never counts, an
+    /// admitted one counts until its handler ends. A request that has not
+    /// reached the verified check yet counts as nothing.
+    #[tokio::test]
+    async fn a_write_request_counts_only_when_verified_and_admitted() {
+        use tower::ServiceExt;
+        let gate = Arc::new(MaintenanceGate::new());
+        let (entered, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let app = gated_app(gate.clone(), entered.clone(), release.clone(), seen.clone());
+
+        // Not yet verified: in flight as nothing.
+        let first = tokio::spawn(app.clone().oneshot(put_request()));
+        entered.notified().await;
+        assert_eq!(gate.inflight_writes("b"), 0, "unverified is not in flight");
+        release.notify_one();
+        first.await.unwrap().unwrap();
+
         gate.set_busy("b");
-        app.clone().oneshot(put()).await.unwrap();
+        let second = tokio::spawn(app.clone().oneshot(put_request()));
+        entered.notified().await;
+        release.notify_one();
+        second.await.unwrap().unwrap();
+
         assert_eq!(
             *seen.lock(),
             vec![(true, 1), (false, 0)],
             "(admitted, counted in flight) per request"
         );
-        assert_eq!(
-            *unverified.lock(),
-            vec![0, 0],
-            "the verdict ends the unverified count, either way"
-        );
         assert_eq!(gate.inflight_writes("b"), 0, "nothing leaks");
-        assert_eq!(gate.inflight_unverified_writes("b"), 0);
+    }
+
+    /// A caller that never finishes its request (a trickled head, a flood
+    /// of bad signatures) cannot hold a drain: the gate is busy, the
+    /// unverified request is in flight as nothing, and the drain completes.
+    #[tokio::test]
+    async fn an_unverified_request_does_not_hold_a_drain() {
+        use tower::ServiceExt;
+        let gate = Arc::new(MaintenanceGate::new());
+        let (entered, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let app = gated_app(gate.clone(), entered.clone(), release, seen.clone());
+        gate.set_busy("b");
+        let pending = tokio::spawn(app.oneshot(put_request()));
+        entered.notified().await;
+        crate::maintenance::worker::drain_inflight_writes_within(
+            &gate,
+            "b",
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect("the drain completes with a request still unverified");
+        pending.abort();
+    }
+
+    /// No instant exists where a verified write starts after the drain
+    /// read zero: the count and the check are one step in the right order
+    /// (count first). Writers loop on the real check while a job arms the
+    /// gate and drains; a write that is admitted after the drain read zero
+    /// is the failure.
+    #[test]
+    fn no_verified_write_starts_after_the_drain_read_zero() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        for _round in 0..300 {
+            let gate = Arc::new(MaintenanceGate::new());
+            let zero_seen = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let late = Arc::new(AtomicUsize::new(0));
+            let writers: Vec<_> = (0..3)
+                .map(|_| {
+                    let (gate, zero_seen, stop, late) =
+                        (gate.clone(), zero_seen.clone(), stop.clone(), late.clone());
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::SeqCst) {
+                            let mut ext = axum::http::Extensions::new();
+                            ext.insert(gate.clone());
+                            ext.insert(RequestWriteCount::default());
+                            let admitted =
+                                check_verified_request(&ext, &Method::PUT, "/b/k").is_ok();
+                            if admitted && zero_seen.load(Ordering::SeqCst) {
+                                late.fetch_add(1, Ordering::SeqCst);
+                            }
+                            // The write: held for a moment, then ends with ext.
+                            std::hint::spin_loop();
+                        }
+                    })
+                })
+                .collect();
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            gate.set_busy("b");
+            while gate.inflight_writes("b") > 0 {
+                std::hint::spin_loop();
+            }
+            zero_seen.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_micros(300));
+            stop.store(true, Ordering::SeqCst);
+            for w in writers {
+                w.join().unwrap();
+            }
+            assert_eq!(late.load(Ordering::SeqCst), 0, "a write started after zero");
+        }
     }
 
     #[test]
