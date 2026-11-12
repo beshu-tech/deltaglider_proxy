@@ -1855,9 +1855,14 @@ async fn an_error_after_the_commit_never_erases_the_success() {
     let (store, id, owner, rx) = guard_fixture();
     let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     drop(store.completing_guard(&id, "\"etag\"", committed));
-    owner.publish(Err(CompletionFailure::internal("a step after the commit failed")));
+    owner.publish(Err(CompletionFailure::internal(
+        "a step after the commit failed",
+    )));
     assert_eq!(rx.borrow().clone().unwrap().unwrap(), "\"etag\"");
-    match store.begin_complete(&id, "b", "k", &parts_fixture()).unwrap() {
+    match store
+        .begin_complete(&id, "b", "k", &parts_fixture())
+        .unwrap()
+    {
         BeginComplete::AlreadyDone { etag } => assert_eq!(etag, "\"etag\""),
         _ => panic!("a retry gets the tombstone"),
     }

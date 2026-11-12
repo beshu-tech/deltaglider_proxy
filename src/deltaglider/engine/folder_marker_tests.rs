@@ -237,7 +237,10 @@ async fn every_multipart_store_path_notes_its_commit() {
             .await;
             drop(lock);
             stored.unwrap();
-            assert!(flag.load(Ordering::SeqCst), "{key}: the commit was not noted");
+            assert!(
+                flag.load(Ordering::SeqCst),
+                "{key}: the commit was not noted"
+            );
         }
     }
 }

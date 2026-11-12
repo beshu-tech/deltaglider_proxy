@@ -222,7 +222,10 @@ mod tests {
 
     /// Is the guard of `func` leaked: `mem::forget(g)` or a `ManuallyDrop`?
     fn guard_is_leaked(src: &crate::source_scan::ast::Source, func: usize) -> bool {
-        src.prod.calls.iter().any(|c| c.func == func && c.named("forget"))
+        src.prod
+            .calls
+            .iter()
+            .any(|c| c.func == func && c.named("forget"))
             || src
                 .prod
                 .paths
@@ -302,7 +305,10 @@ mod tests {
         // The scan sees the openers and the caller it is about.
         for (rel, name) in [
             ("src/storage/s3/copy.rs", "copy_parts"),
-            ("src/deltaglider/engine/store.rs", "begin_passthrough_multipart"),
+            (
+                "src/deltaglider/engine/store.rs",
+                "begin_passthrough_multipart",
+            ),
         ] {
             let (src, _) = files.iter().find(|(s, _)| s.rel == rel).unwrap();
             assert!(
@@ -312,7 +318,10 @@ mod tests {
                 "the scan missed {name} in {rel}"
             );
         }
-        let (transfer, _) = files.iter().find(|(s, _)| s.rel == "src/transfer.rs").unwrap();
+        let (transfer, _) = files
+            .iter()
+            .find(|(s, _)| s.rel == "src/transfer.rs")
+            .unwrap();
         assert!(
             transfer
                 .prod
@@ -384,8 +393,14 @@ async fn caller(e: E) {
             "src/y.rs",
             "never ends its guard",
         ] {
-            assert!(report.contains(expected), "{expected} not caught:\n{report}");
+            assert!(
+                report.contains(expected),
+                "{expected} not caught:\n{report}"
+            );
         }
-        assert!(!report.contains("in good"), "the good opener passes:\n{report}");
+        assert!(
+            !report.contains("in good"),
+            "the good opener passes:\n{report}"
+        );
     }
 }

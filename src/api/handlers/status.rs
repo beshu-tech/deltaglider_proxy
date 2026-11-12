@@ -1088,6 +1088,13 @@ mod readiness_tests {
             "a multipart request met a cap or a full spool budget",
         ),
         (
+            "src/maintenance/gate.rs",
+            "return Err(crate::api::errors::S3Error::SlowDown(",
+            1,
+            Reach::PerRequest,
+            "a write request that has no in-flight count slot (never in production: the middleware gives each write one)",
+        ),
+        (
             "src/multipart.rs",
             "code: s3s::S3ErrorCode::SlowDown,",
             1,

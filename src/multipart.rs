@@ -480,7 +480,10 @@ impl CompletionPublisher {
             &result,
         );
         // A failure that follows a commit is the success for the joiners.
-        let result = match (&result, self.store.unwound_commit(&self.upload_id, self.fingerprint)) {
+        let result = match (
+            &result,
+            self.store.unwound_commit(&self.upload_id, self.fingerprint),
+        ) {
             (Err(_), Some(etag)) => Ok(etag),
             _ => result,
         };

@@ -865,9 +865,15 @@ mod multipart_cost_tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         drop(lock);
         owner.await.unwrap().expect("the owner completes");
-        let strict = strict.await.unwrap().expect_err("create-only finds the object");
+        let strict = strict
+            .await
+            .unwrap()
+            .expect_err("create-only finds the object");
         assert_eq!(*strict.code(), s3s::S3ErrorCode::PreconditionFailed);
-        plain.await.unwrap().expect("a joiner without a precondition succeeds");
+        plain
+            .await
+            .unwrap()
+            .expect("a joiner without a precondition succeeds");
     }
 
     /// A CompleteMultipartUpload whose request is gone (client disconnect,

@@ -1502,13 +1502,14 @@ fn destination_holds_it(
     source: &crate::types::FileMetadata,
     dest: &crate::types::FileMetadata,
 ) -> bool {
-    let client_metadata = |m: &crate::types::FileMetadata| -> std::collections::BTreeMap<String, String> {
-        m.user_metadata
-            .iter()
-            .filter(|(k, _)| !k.starts_with("dg-") && k.as_str() != LIFECYCLE_RULE_METADATA_KEY)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    };
+    let client_metadata =
+        |m: &crate::types::FileMetadata| -> std::collections::BTreeMap<String, String> {
+            m.user_metadata
+                .iter()
+                .filter(|(k, _)| !k.starts_with("dg-") && k.as_str() != LIFECYCLE_RULE_METADATA_KEY)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
     crate::transfer::content_verdict(source, Some(dest)) == crate::transfer::ContentVerdict::Same
         && source.content_type == dest.content_type
         && client_metadata(source) == client_metadata(dest)
@@ -2953,10 +2954,19 @@ mod tests {
         );
         assert!(super::destination_holds_it(&source, &ours));
         for (why, other) in [
-            ("bytes", meta_of("bb", Some("text/plain"), &[("owner", "dana")])),
-            ("content type", meta_of("aa", Some("image/png"), &[("owner", "dana")])),
+            (
+                "bytes",
+                meta_of("bb", Some("text/plain"), &[("owner", "dana")]),
+            ),
+            (
+                "content type",
+                meta_of("aa", Some("image/png"), &[("owner", "dana")]),
+            ),
             ("no content type", meta_of("aa", None, &[("owner", "dana")])),
-            ("user metadata", meta_of("aa", Some("text/plain"), &[("owner", "bob")])),
+            (
+                "user metadata",
+                meta_of("aa", Some("text/plain"), &[("owner", "bob")]),
+            ),
             ("missing metadata", meta_of("aa", Some("text/plain"), &[])),
         ] {
             assert!(!super::destination_holds_it(&source, &other), "{why}");
@@ -3001,6 +3011,30 @@ mod tests {
         let keys: Vec<&str> = kept.iter().map(|d| d.key.as_str()).collect();
         assert_eq!(keys, ["x/1.bin"]);
         assert_eq!(out.objects_skipped, 2);
+
+        // And the batch itself runs the re-check: its delete of an object
+        // whose destination is gone deletes nothing.
+        let mut out = super::LifecycleRunOutcome::default();
+        let windows = crate::maintenance::gate::admit_all(None, &["b"]).unwrap();
+        let stopped = super::delete_planned(
+            None,
+            &engine,
+            &windows,
+            &rule(),
+            vec![planned("x/3.bin")],
+            &|| true,
+            None,
+            &mut out,
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(!stopped);
+        assert!(
+            engine.head("b", "x/3.bin").await.is_ok(),
+            "the source stays while its destination is gone"
+        );
+        assert_eq!(out.objects_affected, 0);
     }
 
     /// The page's delete batch is admitted again before it runs: a job that
