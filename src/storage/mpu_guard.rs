@@ -161,22 +161,83 @@ mod tests {
         "begin_passthrough_multipart",
     )];
 
-    /// Does the function `func` of `src` end a guard (`disarm` or `abort`)?
-    fn ends_guard(src: &crate::source_scan::ast::Source, func: usize) -> bool {
+    type Files<'a> = [(&'a crate::source_scan::ast::Source, String)];
+
+    /// The guard of a call: the first binding after the create call, in the
+    /// same function, that IS `MpuAbortGuard::new(..)` (a wrapped guard,
+    /// `foo(MpuAbortGuard::new(..))`, is not one).
+    fn guard_after<'a>(
+        src: &'a crate::source_scan::ast::Source,
+        call: &crate::source_scan::ast::Call,
+    ) -> Option<&'a crate::source_scan::ast::Binding> {
         src.prod
-            .calls
+            .bindings
             .iter()
-            .any(|c| c.func == func && (c.named("disarm") || c.named("abort")))
+            .filter(|b| {
+                b.func == call.func
+                    && b.line >= call.line
+                    && b.init_idents.iter().any(|i| i == "MpuAbortGuard")
+                    && matches!(b.init_root.as_deref(), None | Some("new"))
+            })
+            .min_by_key(|b| b.line)
+    }
+
+    /// The upload id exists only after the create call returned, so the
+    /// guard comes after it: the guard binding follows the create with no
+    /// other `.await` between (the create's own is the only one), else a
+    /// cut between them would leave the upload unguarded.
+    fn awaits_between_create_and_guard(text: &str, create_line: usize, guard_line: usize) -> bool {
+        let region: String = text
+            .lines()
+            .skip(create_line - 1)
+            .take(guard_line.saturating_sub(create_line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        region.matches(".await").count() > 1
+    }
+
+    /// Is the guard ended in `func`: `disarm` or `abort` called ON that
+    /// binding, or (for an opener that hands it to its caller) returned in
+    /// a tuple?
+    fn guard_is_ended(
+        src: &crate::source_scan::ast::Source,
+        func: usize,
+        name: &str,
+        returned: bool,
+    ) -> bool {
+        let on_binding = src.prod.calls.iter().any(|c| {
+            c.func == func
+                && c.method
+                && (c.name == "disarm" || c.name == "abort")
+                && c.root_ident.as_deref() == Some(name)
+        });
+        on_binding
+            || (returned
+                && src
+                    .prod
+                    .tuples
+                    .iter()
+                    .any(|t| t.elems.iter().any(|e| e == name)))
+    }
+
+    /// Is the guard of `func` leaked: `mem::forget(g)` or a `ManuallyDrop`?
+    fn guard_is_leaked(src: &crate::source_scan::ast::Source, func: usize) -> bool {
+        src.prod.calls.iter().any(|c| c.func == func && c.named("forget"))
+            || src
+                .prod
+                .paths
+                .iter()
+                .any(|p| p.func == func && p.segs.iter().any(|s| s == "ManuallyDrop"))
     }
 
     /// Functions that open a multipart upload on a backend without a guard:
-    /// the guard is made in the same function, bound to a variable (an
-    /// unbound one would drop, and abort, at once), and ended there with
-    /// `disarm` or `abort` (or the function is in [`RETURNS_GUARD`], and
-    /// each of its callers ends the guard instead).
-    fn unguarded(sources: &[crate::source_scan::ast::Source]) -> Vec<String> {
+    /// the guard is made right after the create (no other await between),
+    /// bound as `MpuAbortGuard::new(..)`, ended by `disarm` or `abort` ON
+    /// that binding (or returned by the opener, whose callers end it), and
+    /// never leaked.
+    fn unguarded(files: &Files<'_>) -> Vec<String> {
         let mut out = Vec::new();
-        for src in sources {
+        for (src, text) in files {
             for call in src.prod.calls_named("create_multipart_upload") {
                 let name = src.fn_name(call.func);
                 if TRAIT_METHODS
@@ -185,24 +246,35 @@ mod tests {
                 {
                     continue;
                 }
-                let bound = src.prod.bindings.iter().any(|b| {
-                    b.func == call.func && b.init_idents.iter().any(|i| i == "MpuAbortGuard")
-                });
-                let returns = RETURNS_GUARD
+                let at = format!("{}:{} in {name}", src.rel, call.line);
+                let Some(guard) = guard_after(src, call) else {
+                    out.push(format!("{at}: no guard bound right after the create"));
+                    continue;
+                };
+                if awaits_between_create_and_guard(text, call.line, guard.line) {
+                    out.push(format!("{at}: an await between the create and the guard"));
+                }
+                let returned = RETURNS_GUARD
                     .iter()
                     .any(|(rel, f)| *rel == src.rel && *f == name);
-                if !bound || !(returns || ends_guard(src, call.func)) {
-                    out.push(format!(
-                        "{}:{} in {name} (guard bound to a variable, then disarm or abort)",
-                        src.rel, call.line
-                    ));
+                if !guard_is_ended(src, call.func, &guard.name, returned) {
+                    out.push(format!("{at}: the guard is never disarmed or aborted"));
+                }
+                if guard_is_leaked(src, call.func) {
+                    out.push(format!("{at}: the guard is leaked"));
                 }
             }
             for (_, opener) in RETURNS_GUARD {
                 for call in src.prod.calls_named(opener) {
-                    if src.fn_name(call.func) != opener && !ends_guard(src, call.func) {
+                    if src.fn_name(call.func) == opener {
+                        continue;
+                    }
+                    let ends = src.prod.calls.iter().any(|c| {
+                        c.func == call.func && c.method && (c.name == "disarm" || c.name == "abort")
+                    });
+                    if !ends || guard_is_leaked(src, call.func) {
                         out.push(format!(
-                            "{}:{} calls {opener} and never ends its guard",
+                            "{}:{} calls {opener} and never ends its guard (or leaks it)",
                             src.rel, call.line
                         ));
                     }
@@ -212,20 +284,27 @@ mod tests {
         out
     }
 
+    fn real_files() -> Vec<(&'static crate::source_scan::ast::Source, String)> {
+        crate::source_scan::ast::src()
+            .iter()
+            .map(|src| {
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&src.rel);
+                (src, std::fs::read_to_string(path).unwrap_or_default())
+            })
+            .collect()
+    }
+
     #[test]
     fn every_backend_multipart_upload_has_an_abort_guard() {
-        let sources = crate::source_scan::ast::src();
-        let found = unguarded(sources);
+        let files = real_files();
+        let found = unguarded(&files);
         assert!(found.is_empty(), "an upload without a guard: {found:?}");
         // The scan sees the openers and the caller it is about.
         for (rel, name) in [
             ("src/storage/s3/copy.rs", "copy_parts"),
-            (
-                "src/deltaglider/engine/store.rs",
-                "begin_passthrough_multipart",
-            ),
+            ("src/deltaglider/engine/store.rs", "begin_passthrough_multipart"),
         ] {
-            let src = sources.iter().find(|s| s.rel == rel).unwrap();
+            let (src, _) = files.iter().find(|(s, _)| s.rel == rel).unwrap();
             assert!(
                 src.prod
                     .calls_named("create_multipart_upload")
@@ -233,7 +312,7 @@ mod tests {
                 "the scan missed {name} in {rel}"
             );
         }
-        let transfer = sources.iter().find(|s| s.rel == "src/transfer.rs").unwrap();
+        let (transfer, _) = files.iter().find(|(s, _)| s.rel == "src/transfer.rs").unwrap();
         assert!(
             transfer
                 .prod
@@ -242,38 +321,71 @@ mod tests {
                 .is_some(),
             "the scan missed the caller of the opener"
         );
-        let fixture = [
-            crate::source_scan::ast::parse(
-                "src/x.rs",
-                "async fn bad(c: C) { c.create_multipart_upload().send().await; } \
-                 async fn good(c: C) { let g = MpuAbortGuard::new(|| async {}); \
-                 c.create_multipart_upload().send().await; g.disarm(); } \
-                 async fn unbound(c: C) { MpuAbortGuard::new(|| async {}); \
-                 c.create_multipart_upload().send().await; } \
-                 async fn never_ended(c: C) { let g = MpuAbortGuard::new(|| async {}); \
-                 c.create_multipart_upload().send().await; } \
-                 async fn caller(e: E) { let (h, g) = e.begin_passthrough_multipart(l).await; }",
-            ),
-            // A trait method of that name in a file that is not listed.
-            crate::source_scan::ast::parse(
-                "src/y.rs",
-                "async fn create_multipart_upload(c: C) { c.create_multipart_upload(); }",
-            ),
-        ];
-        let found = unguarded(&fixture);
-        let names: Vec<&str> = found.iter().map(String::as_str).collect();
-        assert_eq!(found.len(), 5, "{names:?}");
-        for expected in [
-            "in bad",
-            "in unbound",
-            "in never_ended",
+
+        // Fixtures: one good opener, and one bypass each.
+        let text = r#"
+async fn good(c: C) {
+    let up = c.create_multipart_upload().send().await;
+    let g = MpuAbortGuard::new(|| async {});
+    g.disarm();
+}
+async fn bad(c: C) {
+    c.create_multipart_upload().send().await;
+}
+async fn unbound(c: C) {
+    c.create_multipart_upload().send().await;
+    MpuAbortGuard::new(|| async {});
+}
+async fn never_ended(c: C) {
+    c.create_multipart_upload().send().await;
+    let g = MpuAbortGuard::new(|| async {});
+}
+async fn late(c: C) {
+    c.create_multipart_upload().send().await;
+    let x = c.other().await;
+    let g = MpuAbortGuard::new(|| async {});
+    g.disarm();
+}
+async fn forgotten(c: C) {
+    c.create_multipart_upload().send().await;
+    let g = MpuAbortGuard::new(|| async {});
+    std::mem::forget(g);
+}
+async fn wrapped(c: C) {
+    c.create_multipart_upload().send().await;
+    let g = keep(MpuAbortGuard::new(|| async {}));
+    g.disarm();
+}
+async fn wrong_receiver(c: C, other: O) {
+    c.create_multipart_upload().send().await;
+    let g = MpuAbortGuard::new(|| async {});
+    other.abort();
+}
+async fn caller(e: E) {
+    let (h, g) = e.begin_passthrough_multipart(l).await;
+}
+"#;
+        let fixture = crate::source_scan::ast::parse("src/x.rs", text);
+        let other = crate::source_scan::ast::parse(
             "src/y.rs",
-            "never ends",
+            "async fn create_multipart_upload(c: C) { c.create_multipart_upload(); }",
+        );
+        let files = [(&fixture, text.to_string()), (&other, String::new())];
+        let found = unguarded(&files);
+        let report = found.join("\n");
+        for expected in [
+            "in bad:",
+            "in unbound:",
+            "in never_ended:",
+            "in late: an await between",
+            "in forgotten: the guard is leaked",
+            "in wrapped:",
+            "in wrong_receiver: the guard is never",
+            "src/y.rs",
+            "never ends its guard",
         ] {
-            assert!(
-                found.iter().any(|f| f.contains(expected)),
-                "{expected} not caught: {names:?}"
-            );
+            assert!(report.contains(expected), "{expected} not caught:\n{report}");
         }
+        assert!(!report.contains("in good"), "the good opener passes:\n{report}");
     }
 }

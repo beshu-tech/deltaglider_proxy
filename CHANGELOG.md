@@ -13,7 +13,7 @@
 - A `DeleteObjects` batch or a `CompleteMultipartUpload` store that runs after its request counts its spool space against the same backend share as its request (`DGP_BACKEND_SHARE_PERCENT`).
 - A retried `CompleteMultipartUpload` that joins a running Complete gets the owner's answer when the answer depends only on the upload and its parts (`InvalidPart`, `EntityTooSmall`, `EntityTooLarge`, ...). When the owner was refused for a reason that depends on its own request (a precondition, a quota, an access refusal) or its request ended first, the retry gets `503 SlowDown` and becomes the owner on its next attempt.
 - An upload whose Complete store panics before the object is written goes back to open at once, not after `DGP_MULTIPART_COMPLETING_TIMEOUT_SECS`. After the object is written, the upload counts as completed and a retry gets the success.
-- A write request counts as in flight for a maintenance drain only when its signature is verified and the gate admitted it. A request that is refused, or that has not finished its verification, is not in flight. A drain that times out samples the counts three times before it fails a job.
+- A write request counts as in flight for a maintenance drain only when its signature is verified and the gate admitted it. A request that is refused does not stay in flight, and one that has not finished its verification is not in flight. A write request that has no count slot is refused with `503`. A drain that times out samples the counts three times before it fails a job.
 
 ## v2.2.0 — 2026-11-11
 

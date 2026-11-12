@@ -1262,6 +1262,7 @@ async fn run_or_preview_retain_newest(
             stored_size: stored_size_of(&metas, &c.key, c.size),
             action: "retain-newest",
             counted: true,
+            dest_check: None,
         })
         .collect();
     let lease_alive = ctx
@@ -1459,6 +1460,18 @@ struct PlannedDelete {
     /// Counted as an affected object. A transition's source delete is not:
     /// its copy was.
     counted: bool,
+    /// The copy of this move was skipped because its destination already
+    /// held the object: the destination is read again right before the
+    /// source delete, and the delete goes only while it still holds it.
+    dest_check: Option<DestCheck>,
+}
+
+/// What a skipped copy relied on (see `PlannedDelete::dest_check`).
+#[derive(Debug)]
+struct DestCheck {
+    bucket: String,
+    key: String,
+    source: crate::types::FileMetadata,
 }
 
 impl PlannedDelete {
@@ -1475,8 +1488,55 @@ impl PlannedDelete {
             stored_size: meta.stored_size(),
             action,
             counted,
+            dest_check: None,
         }
     }
+}
+
+/// Pure: does the destination object stand for the source, so that a move
+/// may skip its copy and delete its source? The content is the same
+/// (`content_verdict`), and so are the content type and the user metadata
+/// that a client set (the `dg-` keys and the rule's own provenance key
+/// are the proxy's, not the object's).
+fn destination_holds_it(
+    source: &crate::types::FileMetadata,
+    dest: &crate::types::FileMetadata,
+) -> bool {
+    let client_metadata = |m: &crate::types::FileMetadata| -> std::collections::BTreeMap<String, String> {
+        m.user_metadata
+            .iter()
+            .filter(|(k, _)| !k.starts_with("dg-") && k.as_str() != LIFECYCLE_RULE_METADATA_KEY)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    crate::transfer::content_verdict(source, Some(dest)) == crate::transfer::ContentVerdict::Same
+        && source.content_type == dest.content_type
+        && client_metadata(source) == client_metadata(dest)
+}
+
+/// The deletes that may go: a delete whose copy was skipped goes only
+/// while its destination still holds the object (read now, not at plan
+/// time). The others are dropped; the next run plans them again.
+async fn verified_deletes(
+    engine: &DynEngine,
+    deletes: Vec<PlannedDelete>,
+    out: &mut LifecycleRunOutcome,
+) -> Vec<PlannedDelete> {
+    let mut kept = Vec::with_capacity(deletes.len());
+    for delete in deletes {
+        if let Some(check) = &delete.dest_check {
+            let holds = match engine.head(&check.bucket, &check.key).await {
+                Ok(dest) => destination_holds_it(&check.source, &dest),
+                Err(_) => false,
+            };
+            if !holds {
+                out.objects_skipped += 1;
+                continue;
+            }
+        }
+        kept.push(delete);
+    }
+    kept
 }
 
 /// What a run does with one planned object before its page's deletes.
@@ -1519,16 +1579,16 @@ async fn plan_action(
             // the object: no second copy and no second event. A copy
             // skips it; a move goes on to delete its source.
             if let Ok(dest) = engine.head(destination_bucket, destination_key).await {
-                if crate::transfer::content_verdict(meta, Some(&dest))
-                    == crate::transfer::ContentVerdict::Same
-                {
+                if destination_holds_it(meta, &dest) {
                     return Ok(if *delete_source_after_success {
-                        Planned::Delete(PlannedDelete::of(
-                            key,
-                            meta,
-                            "transition-source-delete",
-                            false,
-                        ))
+                        let mut delete =
+                            PlannedDelete::of(key, meta, "transition-source-delete", false);
+                        delete.dest_check = Some(DestCheck {
+                            bucket: destination_bucket.clone(),
+                            key: destination_key.clone(),
+                            source: meta.clone(),
+                        });
+                        Planned::Delete(delete)
                     } else {
                         Planned::Skipped
                     });
@@ -1617,6 +1677,10 @@ async fn delete_planned(
     out: &mut LifecycleRunOutcome,
     response_cap: usize,
 ) -> Result<bool, String> {
+    let deletes = verified_deletes(engine, deletes, out).await;
+    if deletes.is_empty() {
+        return Ok(false);
+    }
     let events = Arc::new(DeleteEvents {
         db: db.cloned(),
         rule_name: rule.name.clone(),
@@ -2848,6 +2912,95 @@ mod tests {
         announced.sort();
         let expected: Vec<String> = keys.iter().map(|k| format!("cold/{k}")).collect();
         assert_eq!(announced, expected, "one transition event for each object");
+    }
+
+    fn meta_of(
+        sha: &str,
+        content_type: Option<&str>,
+        user: &[(&str, &str)],
+    ) -> crate::types::FileMetadata {
+        let mut m = crate::types::FileMetadata::fallback(
+            "k".into(),
+            7,
+            "md5".into(),
+            chrono::Utc::now(),
+            content_type.map(str::to_string),
+            crate::types::StorageInfo::Passthrough,
+        );
+        m.file_sha256 = sha.into();
+        m.user_metadata = user
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        m
+    }
+
+    /// A move skips its copy, and deletes its source, only for a
+    /// destination that is the same object: the same bytes, the same
+    /// content type and the same user metadata. The proxy's own keys (`dg-`
+    /// and the rule's provenance key) are not the object's.
+    #[test]
+    fn a_destination_stands_for_its_source_only_when_it_is_the_same_object() {
+        let source = meta_of("aa", Some("text/plain"), &[("owner", "dana")]);
+        let ours = meta_of(
+            "aa",
+            Some("text/plain"),
+            &[
+                ("owner", "dana"),
+                (crate::transfer::LIFECYCLE_RULE_METADATA_KEY, "r"),
+                ("dg-extra", "1"),
+            ],
+        );
+        assert!(super::destination_holds_it(&source, &ours));
+        for (why, other) in [
+            ("bytes", meta_of("bb", Some("text/plain"), &[("owner", "dana")])),
+            ("content type", meta_of("aa", Some("image/png"), &[("owner", "dana")])),
+            ("no content type", meta_of("aa", None, &[("owner", "dana")])),
+            ("user metadata", meta_of("aa", Some("text/plain"), &[("owner", "bob")])),
+            ("missing metadata", meta_of("aa", Some("text/plain"), &[])),
+        ] {
+            assert!(!super::destination_holds_it(&source, &other), "{why}");
+        }
+    }
+
+    /// A delete whose copy was skipped re-reads its destination right
+    /// before the source delete: a destination that is gone or changed
+    /// since the plan keeps the source (the next run copies again).
+    #[tokio::test]
+    async fn a_skipped_copy_deletes_its_source_only_while_the_destination_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        store_all(&engine, &["x/1.bin", "x/2.bin", "x/3.bin"]).await;
+        let source = engine.head("b", "x/1.bin").await.unwrap();
+        // 1: the destination holds it; 2: it was overwritten after the
+        // plan; 3: it is gone.
+        engine
+            .store("dst", "cold/x/1.bin", b"payload", None, Default::default())
+            .await
+            .unwrap();
+        engine
+            .store("dst", "cold/x/2.bin", b"changed!", None, Default::default())
+            .await
+            .unwrap();
+        let planned = |key: &str| {
+            let mut d = super::PlannedDelete::of(key, &source, "transition-source-delete", false);
+            d.dest_check = Some(super::DestCheck {
+                bucket: "dst".into(),
+                key: format!("cold/{key}"),
+                source: source.clone(),
+            });
+            d
+        };
+        let mut out = super::LifecycleRunOutcome::default();
+        let kept = super::verified_deletes(
+            &engine,
+            vec![planned("x/1.bin"), planned("x/2.bin"), planned("x/3.bin")],
+            &mut out,
+        )
+        .await;
+        let keys: Vec<&str> = kept.iter().map(|d| d.key.as_str()).collect();
+        assert_eq!(keys, ["x/1.bin"]);
+        assert_eq!(out.objects_skipped, 2);
     }
 
     /// The page's delete batch is admitted again before it runs: a job that

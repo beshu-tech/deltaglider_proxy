@@ -636,11 +636,13 @@ async fn run_copy_loop(
                         }),
                     Ok(()) => {
                         copy_one(
-                            write,
+                            write
+                                .proof_for(&req.dest_bucket)
+                                .expect("the loop counts its destination bucket"),
                             s3,
                             engine,
                             (&req.source_bucket, &it.source_key),
-                            (&req.dest_bucket, &dk),
+                            &dk,
                             req.no_overwrite,
                         )
                         .await
@@ -743,19 +745,16 @@ impl CopyFault {
 /// multipart ETags), then an `ObjectCopied` outbox event. Returns the
 /// source's metadata as read before the copy.
 async fn copy_one(
-    // The caller's count of the write: a copy runs only inside one, and
-    // the count is of the destination bucket.
-    write: &crate::maintenance::gate::WriteGuard,
+    // The proof of the caller's count of the destination bucket: a copy
+    // runs only inside one.
+    write: crate::maintenance::gate::DestWrite<'_>,
     s3: &Arc<AppState>,
     engine: &Arc<crate::deltaglider::DynEngine>,
     (src_bucket, src_key): (&str, &str),
-    (dst_bucket, dst_key): (&str, &str),
+    dst_key: &str,
     no_overwrite: bool,
 ) -> Result<crate::types::FileMetadata, CopyFault> {
-    debug_assert!(
-        write.covers(dst_bucket),
-        "a copy into '{dst_bucket}' outside the count of its write"
-    );
+    let dst_bucket = write.bucket();
     let head = engine
         .head(src_bucket, src_key)
         .await

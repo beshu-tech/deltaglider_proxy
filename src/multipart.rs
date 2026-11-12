@@ -404,7 +404,8 @@ impl CompletionFailure {
 /// owner's headers or principal: the joiner matched the owner on bucket,
 /// key and part list only, so a precondition (`If-Match`, `If-None-Match`),
 /// a quota of the owner's principal or an access refusal says nothing
-/// about the joiner. Everything else is not shared: the joiner gets
+/// about the joiner. An internal error is not shared either: it is the
+/// owner's, and a retry may well succeed. Everything else is not shared: the joiner gets
 /// [`CompletionFailure::owner_gone`] (503), retries, becomes the owner and
 /// gets its own answer.
 pub fn shared_with_joiners(code: &s3s::S3ErrorCode) -> bool {
@@ -416,7 +417,6 @@ pub fn shared_with_joiners(code: &s3s::S3ErrorCode) -> bool {
             | C::EntityTooSmall
             | C::EntityTooLarge
             | C::NoSuchUpload
-            | C::InternalError
     )
 }
 
@@ -479,6 +479,11 @@ impl CompletionPublisher {
             &self.key,
             &result,
         );
+        // A failure that follows a commit is the success for the joiners.
+        let result = match (&result, self.store.unwound_commit(&self.upload_id, self.fingerprint)) {
+            (Err(_), Some(etag)) => Ok(etag),
+            _ => result,
+        };
         let _ = self.tx.send(Some(result));
     }
 }
@@ -1071,9 +1076,13 @@ impl MultipartStore {
                 );
             }
             // Failure clears the slot: the upload rolled back to Open, so the
-            // next Complete attempt becomes a fresh Owner.
+            // next Complete attempt becomes a fresh Owner. A `Done` slot
+            // stays: the write committed (see [`CompletingGuard`]), and a
+            // failure after it never erases the success.
             Err(_) => {
-                slots.remove(upload_id);
+                if !matches!(slots.get(upload_id), Some(CompletionSlot::Done { .. })) {
+                    slots.remove(upload_id);
+                }
             }
         }
     }

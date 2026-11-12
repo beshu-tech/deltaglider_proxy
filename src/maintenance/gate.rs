@@ -235,6 +235,13 @@ impl MaintenanceGate {
 
     /// Number of S3 write requests currently in flight for `bucket`.
     pub fn inflight_writes(&self, bucket: &str) -> i64 {
+        // SeqCst fence: a drain arms the gate (`busy` store), then reads the
+        // counts; a request counts, then reads `busy`
+        // ([`check_verified_request`], with the same fence). Each side
+        // writes one location and reads the other, so without both fences
+        // each could miss the other's write. With them, one side sees the
+        // other: the drain sees the count, or the request sees the gate.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         self.inflight_writes
             .get(&bucket.to_ascii_lowercase())
             .map(|v| *v)
@@ -399,9 +406,25 @@ pub struct WriteGuard {
 }
 
 impl WriteGuard {
-    /// Does this count cover writes into `bucket`? (Case-insensitive.)
-    pub fn covers(&self, bucket: &str) -> bool {
-        self.bucket.eq_ignore_ascii_case(bucket)
+    /// The proof of a write into `bucket`, if this count covers it
+    /// (case-insensitive). A writer that takes a [`DestWrite`] cannot run
+    /// outside the count of its destination bucket.
+    pub fn proof_for<'a>(&'a self, bucket: &'a str) -> Option<DestWrite<'a>> {
+        self.bucket
+            .eq_ignore_ascii_case(bucket)
+            .then_some(DestWrite { bucket })
+    }
+}
+
+/// See [`WriteGuard::proof_for`].
+#[derive(Clone, Copy)]
+pub struct DestWrite<'a> {
+    bucket: &'a str,
+}
+
+impl DestWrite<'_> {
+    pub fn bucket(&self) -> &str {
+        self.bucket
     }
 }
 
@@ -517,13 +540,27 @@ pub fn check_verified_request(
     // Count FIRST, then ask the gates (acquire-then-recheck, H37): a job
     // that arms later either sees this count or refuses the request.
     let count = extensions.get::<RequestWriteCount>();
-    if let (Some(count), Some(gate), true) = (
-        count,
+    if let (Some(gate), true) = (
         extensions.get::<Arc<MaintenanceGate>>(),
         is_write_method(method),
     ) {
         if let Some(bucket) = bucket_from_path(path) {
-            count.admit(gate, &bucket);
+            match count {
+                Some(count) => count.admit(gate, &bucket),
+                // Fail closed: a write that has no slot to be counted in
+                // would be invisible to a drain.
+                None => {
+                    tracing::error!(
+                        "write request to '{bucket}' has no in-flight count slot; refused"
+                    );
+                    return Err(crate::api::errors::S3Error::SlowDown(
+                        "the request could not be counted; retry".to_string(),
+                    ));
+                }
+            }
+            // Pairs with the fence in `inflight_writes`: the count is
+            // visible before the gate is read.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         }
     }
     let verdict = verified_request_refusal(extensions, method, path);
@@ -674,7 +711,7 @@ mod tests {
         );
     }
 
-    /// Does the fn `name` of the source file `rel` take a `WriteGuard`
+    /// Does the fn `name` of the source file `rel` take a `DestWrite`
     /// parameter? (Its signature text: the exemption holds only while the
     /// type is there.)
     fn takes_write_guard(rel: &str, name: &str) -> bool {
@@ -687,15 +724,15 @@ mod tests {
         };
         let signature = &text[at..];
         let end = signature.find(") ->").unwrap_or(signature.len());
-        signature[..end].contains("WriteGuard")
+        signature[..end].contains("DestWrite")
     }
 
-    /// Request-scoped writers that take their count as a `&WriteGuard`
+    /// Request-scoped writers that take their count as a `DestWrite`
     /// parameter: the type proves it, the caller counts.
     const PROOF_PARAMETER: [(&str, &str, &str); 1] = [(
         "src/api/admin/objects.rs",
         "copy_one",
-        "takes the bulk loop's &WriteGuard",
+        "takes the bulk loop's DestWrite",
     )];
 
     /// Code exempt from [`background_writers_are_admitted`], with why.
@@ -831,7 +868,7 @@ mod tests {
             // check the gate per item after counting) counts in the module
             // or one inside it.
             // The count is in the SAME function as the write, or the function
-            // takes the caller's `&WriteGuard` (listed in `PROOF_PARAMETER`).
+            // takes the caller's `DestWrite` (listed in `PROOF_PARAMETER`).
             let names = [
                 "admit_background_write",
                 "admit_all",
@@ -1365,6 +1402,22 @@ mod tests {
             "(admitted, counted in flight) per request"
         );
         assert_eq!(gate.inflight_writes("b"), 0, "nothing leaks");
+    }
+
+    /// A write request that has no count slot (it did not pass the
+    /// middleware) fails closed: refused, never an uncounted write.
+    #[test]
+    fn a_write_without_a_count_slot_is_refused() {
+        let gate = Arc::new(MaintenanceGate::new());
+        let mut ext = axum::http::Extensions::new();
+        ext.insert(gate.clone());
+        assert!(check_verified_request(&ext, &Method::PUT, "/b/k").is_err());
+        assert_eq!(gate.inflight_writes("b"), 0);
+        // A read needs no slot; a write with a slot passes.
+        assert!(check_verified_request(&ext, &Method::GET, "/b/k").is_ok());
+        ext.insert(RequestWriteCount::default());
+        assert!(check_verified_request(&ext, &Method::PUT, "/b/k").is_ok());
+        assert_eq!(gate.inflight_writes("b"), 1);
     }
 
     /// A caller that never finishes its request (a trickled head, a flood

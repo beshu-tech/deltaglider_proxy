@@ -1745,10 +1745,11 @@ fn joiner_failure_table() {
             C::InvalidPartOrder,
             None,
         ),
+        // An internal error is retryable for a joiner: 503, never 500.
         (
             Some(s3s::S3Error::with_message(C::InternalError, "boom")),
-            C::InternalError,
-            None,
+            C::SlowDown,
+            Some(StatusCode::SERVICE_UNAVAILABLE),
         ),
     ];
     for (answer, code, status) in table {
@@ -1844,4 +1845,20 @@ async fn a_finished_completing_guard_changes_nothing() {
         store.uploads.read().get(&id).map(|u| u.state),
         Some(MultipartState::Completing)
     );
+}
+
+/// An `Err` published after a post-commit unwind wrote the success must
+/// not erase it: the slot stays `Done`, joiners get the success, and a
+/// retry gets the tombstone, not NoSuchUpload.
+#[tokio::test]
+async fn an_error_after_the_commit_never_erases_the_success() {
+    let (store, id, owner, rx) = guard_fixture();
+    let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    drop(store.completing_guard(&id, "\"etag\"", committed));
+    owner.publish(Err(CompletionFailure::internal("a step after the commit failed")));
+    assert_eq!(rx.borrow().clone().unwrap().unwrap(), "\"etag\"");
+    match store.begin_complete(&id, "b", "k", &parts_fixture()).unwrap() {
+        BeginComplete::AlreadyDone { etag } => assert_eq!(etag, "\"etag\""),
+        _ => panic!("a retry gets the tombstone"),
+    }
 }

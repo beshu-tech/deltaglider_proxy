@@ -185,3 +185,59 @@ async fn an_empty_delimiter_is_no_delimiter() {
         );
     }
 }
+
+/// The caller of a multipart Complete learns that the write committed from
+/// the engine (`commit_signal`): every store path of a Complete notes it,
+/// on a plain and on an encrypting backend. A path that lost the signal
+/// would let a panic after the commit roll back a stored object.
+#[tokio::test]
+async fn every_multipart_store_path_notes_its_commit() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for (_dir, engine) in engines().await {
+        for (key, via_delta_store) in [
+            ("img/a.jpg", false),
+            ("rel/b.zip", true),
+            ("rel/c.zip", false),
+        ] {
+            let relay = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(relay.path(), b"multipart body").unwrap();
+            let parts = [crate::deltaglider::RelayPart::of_file(relay.path())];
+            let flag = Arc::new(AtomicBool::new(false));
+            let lock = engine.lock_object_write("b", key).await;
+            let mpe = "\"0123456789abcdef0123456789abcdef-1\"".to_string();
+            let stored = crate::deltaglider::commit_signal::watching(flag.clone(), async {
+                if via_delta_store {
+                    engine
+                        .store_relayed_parts_delta_with_multipart_etag(
+                            &lock,
+                            "b",
+                            key,
+                            &parts,
+                            14,
+                            None,
+                            Default::default(),
+                            mpe.clone(),
+                        )
+                        .await
+                } else {
+                    engine
+                        .store_passthrough_relayed_parts_with_multipart_etag(
+                            &lock,
+                            "b",
+                            key,
+                            &parts,
+                            14,
+                            None,
+                            Default::default(),
+                            mpe.clone(),
+                        )
+                        .await
+                }
+            })
+            .await;
+            drop(lock);
+            stored.unwrap();
+            assert!(flag.load(Ordering::SeqCst), "{key}: the commit was not noted");
+        }
+    }
+}
