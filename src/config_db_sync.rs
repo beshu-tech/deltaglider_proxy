@@ -159,6 +159,8 @@ pub struct ConfigDbSync {
     /// strictly ordered; cross-node conflicts still use the reconcile path.
     upload_lock: tokio::sync::Mutex<()>,
     health: parking_lot::Mutex<SyncHealth>,
+    /// The process's coordination status ([`Self::with_status`]).
+    status: crate::coordination::CoordinationStatus,
     /// What the coordination-bucket validation proved ([`Self::use_profile`]),
     /// shared with the other coordination writers: the upload's
     /// compare-and-swap uses its `If-Match` form. While it is unknown, the
@@ -220,6 +222,7 @@ impl ConfigDbSync {
             needs_upload: AtomicBool::new(pending.is_some()),
             upload_lock: tokio::sync::Mutex::new(()),
             health: parking_lot::Mutex::new(SyncHealth::default()),
+            status: Default::default(),
             profile: Default::default(),
         })
         .inspect(|s: &Self| s.publish_health())
@@ -236,6 +239,22 @@ impl ConfigDbSync {
     pub fn with_profile_cell(mut self, cell: crate::coordination::if_match::ProfileCell) -> Self {
         self.profile = cell;
         self
+    }
+
+    /// Share the process's coordination status: a pull or an upload that
+    /// ends well confirms the local IAM database in it.
+    pub fn with_status(mut self, status: crate::coordination::CoordinationStatus) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// Did this process confirm the local IAM database against the bucket?
+    pub fn iam_confirmed(&self) -> bool {
+        !matches!(
+            self.status.iam_sync(),
+            crate::coordination::status::IamSync::Unconfirmed
+                | crate::coordination::status::IamSync::Overridden
+        )
     }
 
     /// The primary config DB key (the key of the local DB after boot).
@@ -284,6 +303,7 @@ impl ConfigDbSync {
             let mut h = self.health.lock();
             match outcome {
                 Ok(()) => {
+                    self.status.confirm_iam();
                     h.last_pull_ok_at = Some(now);
                     h.pull_error = None;
                 }
@@ -303,6 +323,7 @@ impl ConfigDbSync {
             let mut h = self.health.lock();
             match outcome {
                 Ok(()) => {
+                    self.status.confirm_iam();
                     h.last_push_ok_at = Some(now);
                     h.push_error = None;
                 }
@@ -830,40 +851,62 @@ pub async fn validate_coordination_bucket_with(
     validate_cas_bucket(client, bucket, COORDINATION_WITNESS_KEY).await
 }
 
-/// How many NonCas verdicts in a row the background re-probe takes as
-/// final. One could be a mixed answer of a bucket behind a flapping proxy;
+/// How many no-conditional-writes verdicts in a row the background re-probe
+/// takes as final. One could be a mixed answer of a bucket behind a flapping proxy;
 /// two in a row is a verdict.
-pub const REPROBE_NONCAS_LIMIT: u32 = 2;
+pub const REPROBE_DEFINITIVE_LIMIT: u32 = 2;
 
 /// What the background re-probe does with its latest verdict (pure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReprobeStep {
     /// The bucket is proven: enable the coordination writers and stop.
     Proven,
-    /// Not decided yet: wait, then probe again. `noncas_streak` is the
-    /// number of NonCas verdicts in a row, this one included.
-    Again { noncas_streak: u32 },
-    /// The bucket is not CAS, twice in a row: HA coordination is unsafe.
-    /// Shut down gracefully with a failure exit code.
+    /// Not decided yet: wait, then probe again. `definitive_streak` is the
+    /// number of definitive failures in a row, this one included.
+    Again { definitive_streak: u32 },
+    /// No conditional writes, twice in a row: HA coordination is unsafe.
+    /// Shut down gracefully with a failure exit code. (A refused write is
+    /// never a reason to stop a running node.)
     Shutdown,
 }
 
 /// THE re-probe rule for the coordination bucket (pure). `streak` is the
-/// number of NonCas verdicts in a row BEFORE this one. An `Indeterminate`
-/// verdict resets the streak: the probe could not run, so it says nothing.
+/// number of definitive failures in a row BEFORE this one. An
+/// `Indeterminate` verdict resets the streak: the probe could not run, so it
+/// says nothing.
 pub fn reprobe_step(
     verdict: &Result<CoordinationValidation, CasValidationFailure>,
     streak: u32,
 ) -> ReprobeStep {
     match verdict {
         Ok(_) => ReprobeStep::Proven,
-        Err(CasValidationFailure::Indeterminate(_)) => ReprobeStep::Again { noncas_streak: 0 },
-        Err(CasValidationFailure::NonCas) if streak + 1 >= REPROBE_NONCAS_LIMIT => {
+        Err(CasValidationFailure::Indeterminate(_)) => ReprobeStep::Again {
+            definitive_streak: 0,
+        },
+        // A refused write never stops a RUNNING node: only the boot exits on
+        // a definitive answer. The node stays not ready and the re-probe logs.
+        Err(CasValidationFailure::Misconfigured(_)) => ReprobeStep::Again {
+            definitive_streak: 0,
+        },
+        Err(CasValidationFailure::NonCas) if streak + 1 >= REPROBE_DEFINITIVE_LIMIT => {
             ReprobeStep::Shutdown
         }
         Err(CasValidationFailure::NonCas) => ReprobeStep::Again {
-            noncas_streak: streak + 1,
+            definitive_streak: streak + 1,
         },
+    }
+}
+
+/// One word for a verdict on the coordination bucket (pure): the re-probe
+/// logs a line each time the word changes.
+pub fn verdict_word(
+    verdict: &Result<CoordinationValidation, CasValidationFailure>,
+) -> &'static str {
+    match verdict {
+        Ok(_) => "proven",
+        Err(CasValidationFailure::NonCas) => "no_conditional_writes",
+        Err(CasValidationFailure::Misconfigured(_)) => "write_refused",
+        Err(CasValidationFailure::Indeterminate(_)) => "unreachable",
     }
 }
 
@@ -878,6 +921,11 @@ impl CasValidationFailure {
                  (>=2024-09), or Ceph/Hetzner; Backblaze B2 (501) and old MinIO/SeaweedFS \
                  (silent overwrite) are NOT supported."
             ),
+            CasValidationFailure::Misconfigured(e) => format!(
+                "Coordination bucket '{bucket}' (config_sync_bucket / DGP_CONFIG_SYNC_BUCKET) \
+                 refused the probe's write. Check that the bucket exists on the coordination \
+                 backend and that the backend's credentials may write to it: {e}"
+            ),
             CasValidationFailure::Indeterminate(e) => {
                 format!("Coordination bucket '{bucket}' could not be probed: {e}")
             }
@@ -885,15 +933,33 @@ impl CasValidationFailure {
     }
 }
 
-/// Why a CAS validation did not pass. `NonCas` is DEFINITIVE (the backend
-/// accepted an `If-None-Match:*` re-PUT it should have 412'd); `Indeterminate`
-/// means the probe could not run (network, missing bucket) — callers decide
-/// whether that is fatal (coordination: yes) or a loud warning (data-plane
-/// capability gate: yes-warn, no-crash).
+/// Why a CAS validation did not pass.
+///
+/// - `NonCas` is DEFINITIVE: the backend accepted an `If-None-Match:*`
+///   re-PUT it should have 412'd.
+/// - `Misconfigured` is DEFINITIVE too: the backend answered the probe's
+///   plain write with a refusal that no retry changes (missing bucket,
+///   wrong key, no right to write).
+///   [`crate::coordination::cas_probe::classify_write_refusal`] is the rule.
+/// - `Indeterminate`: the probe could not run (no answer, timeout, 5xx).
+///
+/// For the coordination bucket both definitive kinds end the boot; an
+/// indeterminate one boots not ready, with every coordination writer closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CasValidationFailure {
     NonCas,
+    Misconfigured(String),
     Indeterminate(String),
+}
+
+impl From<crate::coordination::cas_probe::ProbeError> for CasValidationFailure {
+    fn from(e: crate::coordination::cas_probe::ProbeError) -> Self {
+        use crate::coordination::cas_probe::ProbeErrorKind;
+        match e.kind {
+            ProbeErrorKind::Misconfigured => Self::Misconfigured(e.detail),
+            ProbeErrorKind::Indeterminate => Self::Indeterminate(e.detail),
+        }
+    }
 }
 
 /// Generalized boot-time CAS validation of an arbitrary (client, bucket):
@@ -963,7 +1029,7 @@ async fn validate_cas_bucket_as(
     {
         Ok(p) if p.cas => p.profile(),
         Ok(_) => return Err(CasValidationFailure::NonCas),
-        Err(e) => return Err(CasValidationFailure::Indeterminate(e)),
+        Err(e) => return Err(e.into()),
     };
 
     // ── 3. Witness write (create-if-absent; overwrite if refreshing stale) ──
@@ -1689,19 +1755,63 @@ mod tests {
     fn the_reprobe_step_table() {
         let unknown = || Err(CasValidationFailure::Indeterminate("timeout".into()));
         let noncas = || Err(CasValidationFailure::NonCas);
+        let refused = || Err(CasValidationFailure::Misconfigured("NoSuchBucket".into()));
+        let again = |definitive_streak| ReprobeStep::Again { definitive_streak };
         // (verdict, streak before, want)
         let cases = [
             (proven(), 0, ReprobeStep::Proven),
             (proven(), 1, ReprobeStep::Proven),
-            (unknown(), 0, ReprobeStep::Again { noncas_streak: 0 }),
-            // an unknown verdict between two NonCas verdicts breaks the streak
-            (unknown(), 1, ReprobeStep::Again { noncas_streak: 0 }),
-            (noncas(), 0, ReprobeStep::Again { noncas_streak: 1 }),
+            (unknown(), 0, again(0)),
+            // an unknown verdict between two definitive ones breaks the streak
+            (unknown(), 1, again(0)),
+            (noncas(), 0, again(1)),
             (noncas(), 1, ReprobeStep::Shutdown),
+            (refused(), 0, again(0)),
+            // a refused write never stops a running node
+            (refused(), 1, again(0)),
+            (refused(), 5, again(0)),
         ];
         for (verdict, streak, want) in cases {
             assert_eq!(reprobe_step(&verdict, streak), want, "{verdict:?} {streak}");
         }
+    }
+
+    #[test]
+    fn each_verdict_has_its_own_word() {
+        let words = [
+            verdict_word(&proven()),
+            verdict_word(&Err(CasValidationFailure::NonCas)),
+            verdict_word(&Err(CasValidationFailure::Misconfigured("x".into()))),
+            verdict_word(&Err(CasValidationFailure::Indeterminate("x".into()))),
+        ];
+        let distinct: std::collections::HashSet<_> = words.iter().collect();
+        assert_eq!(distinct.len(), words.len(), "{words:?}");
+    }
+
+    /// The probe's kinds map one to one: only a refused write names the
+    /// configuration.
+    #[test]
+    fn a_probe_error_keeps_its_kind() {
+        use crate::coordination::cas_probe::{ProbeError, ProbeErrorKind};
+        let of = |kind| {
+            CasValidationFailure::from(ProbeError {
+                kind,
+                detail: "d".into(),
+            })
+        };
+        assert_eq!(
+            of(ProbeErrorKind::Misconfigured),
+            CasValidationFailure::Misconfigured("d".into())
+        );
+        assert_eq!(
+            of(ProbeErrorKind::Indeterminate),
+            CasValidationFailure::Indeterminate("d".into())
+        );
+        let text = of(ProbeErrorKind::Misconfigured).describe_for_coordination("dgp-sync");
+        assert!(
+            text.contains("'dgp-sync'") && text.contains("config_sync_bucket"),
+            "{text}"
+        );
     }
 
     /// A writer with no proven profile refuses (retryable); a proven cell

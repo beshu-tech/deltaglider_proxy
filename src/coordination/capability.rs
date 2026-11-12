@@ -471,7 +471,9 @@ pub async fn establish_backend_verdict_within(
                 CapabilityVerdict::NonCas
             }
         }
-        Ok(Err(reason)) => CapabilityVerdict::Unknown { reason },
+        Ok(Err(reason)) => CapabilityVerdict::Unknown {
+            reason: reason.to_string(),
+        },
     }
 }
 

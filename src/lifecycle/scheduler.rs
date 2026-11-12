@@ -380,6 +380,7 @@ mod tests {
             backend_health: Default::default(),
             encryption_witness: None,
             config_db_key_mismatch: false,
+            coordination: Default::default(),
         });
         let db = Arc::new(Mutex::new(JobsDb::in_memory("test").unwrap()));
         Env {

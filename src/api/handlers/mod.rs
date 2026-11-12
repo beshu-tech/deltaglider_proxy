@@ -146,6 +146,7 @@ impl AppState {
             backend_health: Default::default(),
             encryption_witness: None,
             config_db_key_mismatch: false,
+            coordination: Default::default(),
         })
     }
 }
@@ -189,6 +190,9 @@ pub struct AppState {
     /// (503 "Config database locked", `ConfigDbMismatchGuard`). Fixed at boot;
     /// `/_/ready` reads it, so both surfaces share one fact.
     pub config_db_key_mismatch: bool,
+    /// What the process knows about its coordination bucket (`Default`:
+    /// none). The S3 authentication gate and `/_/ready` share it.
+    pub coordination: crate::coordination::CoordinationStatus,
 }
 
 // ---------------------------------------------------------------------------

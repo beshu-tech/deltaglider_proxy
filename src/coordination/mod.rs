@@ -34,6 +34,7 @@ pub mod reference_lock;
 mod rgw_dialect_tests;
 pub mod s3_lease;
 pub mod server_clock;
+pub mod status;
 
 pub use capability::{BackendCapabilityCache, CapabilityVerdict, VerifiedVia};
 pub use encryption_witness::{EncryptionWitness, WitnessStatus};
@@ -41,6 +42,7 @@ pub use health::{BackendHealthCache, HealthVerdict};
 pub use lease::{CoordinationLease, DynCoordinationLease, LeaseError, LeaseSubsystem, LocalLease};
 pub use reference_lock::{DynReferenceLock, ReferenceLock, S3ReferenceLock};
 pub use s3_lease::S3Lease;
+pub use status::CoordinationStatus;
 
 /// A durable-per-node identity for lease ownership provenance + self-reclaim.
 ///

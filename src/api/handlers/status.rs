@@ -198,6 +198,18 @@ pub struct ReadinessResponse {
     pub config_db: &'static str,
     /// Spool directory ("ready" | "unusable"): can a temp file be made.
     pub spool: &'static str,
+    /// The coordination bucket ("proven" | "unproven" = no probe proved its
+    /// conditional writes yet, the node is not ready | "absent" = none).
+    pub coordination: &'static str,
+    /// The IAM database against the coordination bucket ("confirmed" |
+    /// "unconfirmed" = no pull or upload ended well in this process yet, the
+    /// S3 API answers 503 to IAM users and the node is not ready |
+    /// "unconfirmed_override" = same, but `DGP_IAM_SERVE_UNCONFIRMED` serves
+    /// the local copy and the node is ready | "absent").
+    pub iam_sync: &'static str,
+    /// Present while `iam_sync` is "unconfirmed": the override that ends it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iam_sync_hint: Option<&'static str>,
     /// Jobs DB openability ("ready" | "locked" | "absent"): the node-local
     /// job state and event outbox.
     pub jobs_db: &'static str,
@@ -427,6 +439,12 @@ pub struct NodeConditions {
     pub jobs_db_wedged: bool,
     /// The spool directory takes a new file (after one re-create).
     pub spool_usable: bool,
+    /// A coordination bucket is configured and no probe proved it yet:
+    /// every coordination writer refuses.
+    pub coordination_unproven: bool,
+    /// The IAM database is not confirmed against the coordination bucket
+    /// yet. The S3 API answers 503 to every request of an IAM user.
+    pub iam_sync_unconfirmed: bool,
 }
 
 /// A row's name and the edit that makes it fail.
@@ -437,7 +455,7 @@ impl NodeConditions {
     /// Every row of the table, for the exhaustive unit test: each field
     /// as the one condition that fails.
     #[cfg(test)]
-    const FAILING_ROWS: [FailingRow; 5] = [
+    const FAILING_ROWS: [FailingRow; 7] = [
         ("backends", |c| c.backends_ready = false),
         ("config_db_key_mismatch", |c| {
             c.config_db_key_mismatch = true
@@ -445,6 +463,8 @@ impl NodeConditions {
         ("config_db_wedged", |c| c.config_db_wedged = true),
         ("jobs_db_wedged", |c| c.jobs_db_wedged = true),
         ("spool", |c| c.spool_usable = false),
+        ("coordination_unproven", |c| c.coordination_unproven = true),
+        ("iam_sync_unconfirmed", |c| c.iam_sync_unconfirmed = true),
     ];
 }
 
@@ -455,6 +475,8 @@ pub fn readiness_verdict(c: &NodeConditions) -> bool {
         && !c.config_db_wedged
         && !c.jobs_db_wedged
         && c.spool_usable
+        && !c.coordination_unproven
+        && !c.iam_sync_unconfirmed
 }
 
 /// The `config_db` word of the response. A key mismatch is named apart
@@ -542,12 +564,24 @@ pub async fn readiness_check(
             .spool_probe(move || engine.spool_usable(), SPOOL_READY_TIMEOUT)
             .await
     };
+    use crate::coordination::status::{readiness_word, IamSync};
+    let coordination = state.coordination.bucket_proven();
+    let iam_sync = match state.coordination.iam_sync() {
+        IamSync::NotConfigured => None,
+        IamSync::Confirmed => Some(true),
+        IamSync::Unconfirmed => Some(false),
+        // Served on the operator's word: ready, and the word says so.
+        IamSync::Overridden => None,
+    };
+    let iam_overridden = state.coordination.iam_sync() == IamSync::Overridden;
     let ready = readiness_verdict(&NodeConditions {
         backends_ready: backend_verdict_is_ready(backend),
         config_db_key_mismatch: state.config_db_key_mismatch,
         config_db_wedged: config_db_mutex == "locked",
         jobs_db_wedged: jobs_db == "locked",
         spool_usable,
+        coordination_unproven: coordination == Some(false),
+        iam_sync_unconfirmed: iam_sync == Some(false),
     });
     let code = if ready {
         StatusCode::OK
@@ -562,6 +596,15 @@ pub async fn readiness_check(
             config_db,
             jobs_db,
             spool: if spool_usable { "ready" } else { "unusable" },
+            coordination: readiness_word(coordination, "proven", "unproven"),
+            iam_sync: if iam_overridden {
+                "unconfirmed_override"
+            } else {
+                readiness_word(iam_sync, "confirmed", "unconfirmed")
+            },
+            iam_sync_hint: (iam_sync == Some(false)).then_some(
+                "set DGP_IAM_SERVE_UNCONFIRMED=true to serve IAM users from the local database before a sync confirms it",
+            ),
             backends,
             encryption_witness: state.encryption_witness.as_ref().map(|w| WitnessReadiness {
                 status: w.status().status,
@@ -613,6 +656,62 @@ mod readiness_tests {
             config_db_wedged: false,
             jobs_db_wedged: false,
             spool_usable: true,
+            coordination_unproven: false,
+            iam_sync_unconfirmed: false,
+        }
+    }
+
+    /// A coordination bucket that no probe proved, and an IAM database that
+    /// no sync confirmed, each make the node not ready with their own word.
+    #[tokio::test]
+    async fn an_unproven_coordination_bucket_is_not_ready() {
+        use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+        let (mut state, _fake, _backend) = s3_state().await;
+        let cell = ProfileCell::unknown();
+        let status = CoordinationStatus::with_bucket(cell.clone(), false);
+        Arc::get_mut(&mut state).unwrap().coordination = status.clone();
+        let words = |state: Arc<AppState>| async move {
+            let (code, Json(body)) = readiness_check(State(state)).await;
+            (code, body.coordination, body.iam_sync)
+        };
+        assert_eq!(
+            words(state.clone()).await,
+            (StatusCode::SERVICE_UNAVAILABLE, "unproven", "unconfirmed")
+        );
+        cell.prove(Default::default());
+        assert_eq!(
+            words(state.clone()).await,
+            (StatusCode::SERVICE_UNAVAILABLE, "proven", "unconfirmed")
+        );
+        status.confirm_iam();
+        assert_eq!(
+            words(state.clone()).await,
+            (StatusCode::OK, "proven", "confirmed")
+        );
+    }
+
+    /// The operator override serves the local IAM copy: the node is ready
+    /// and the word says why; an unconfirmed node without it names the
+    /// override in the hint.
+    #[tokio::test]
+    async fn the_iam_override_is_named_and_makes_the_node_ready() {
+        use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+        for (serve, code, word, hint) in [
+            (false, StatusCode::SERVICE_UNAVAILABLE, "unconfirmed", true),
+            (true, StatusCode::OK, "unconfirmed_override", false),
+        ] {
+            let (mut state, _fake, _backend) = s3_state().await;
+            let cell = ProfileCell::unknown();
+            cell.prove(Default::default());
+            Arc::get_mut(&mut state).unwrap().coordination =
+                CoordinationStatus::with_bucket(cell, serve);
+            let (got, Json(body)) = readiness_check(State(state)).await;
+            assert_eq!((got, body.iam_sync), (code, word));
+            assert_eq!(
+                body.iam_sync_hint
+                    .is_some_and(|h| h.contains("DGP_IAM_SERVE_UNCONFIRMED")),
+                hint
+            );
         }
     }
 
@@ -869,6 +968,14 @@ mod readiness_tests {
             1,
             Reach::Global("config_db_key_mismatch"),
             "no key opens the config database: every request refused",
+        ),
+        (
+            "src/api/auth.rs",
+            "=return Err(S3Error::ServiceUnavailable(",
+            1,
+            Reach::Global("iam_sync_unconfirmed"),
+            "the IAM database is not confirmed against the coordination bucket: every \
+             request of an IAM user refused",
         ),
         (
             "src/api/admin/external_auth.rs",
@@ -1266,7 +1373,17 @@ mod readiness_tests {
                 );
             }
         }
-        assert_eq!(globals, 1, "a new global refusal needs a readiness row");
+        assert_eq!(globals, 2, "a new global refusal needs a readiness row");
+        // The row and the S3 gate read ONE shared status.
+        assert!(
+            status_src.contains("state.coordination.iam_sync()"),
+            "readiness must read AppState::coordination"
+        );
+        assert!(
+            crate::source_scan::read("src/api/s3_router.rs")
+                .contains("axum::Extension(state.coordination.clone())"),
+            "the S3 router must hand AppState::coordination to the auth gate"
+        );
         // The row is fed by the SAME fact the S3 router locks on.
         assert!(
             status_src.contains("config_db_key_mismatch: state.config_db_key_mismatch"),

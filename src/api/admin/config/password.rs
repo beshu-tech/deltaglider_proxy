@@ -50,12 +50,22 @@ use crate::config::tuning::env_pinned_hash_var;
 /// Make `hash` the bootstrap hash: the state file first (the next boot
 /// reads it), then the in-memory login verifier and the config. Shared by
 /// the password change and the backup restore.
-pub(crate) async fn install_bootstrap_hash(state: &AdminState, hash: &str) -> std::io::Result<()> {
+///
+/// THE place where a hash is installed, so THE place where the sessions of
+/// the old password end: every bootstrap session except the one in
+/// `headers` (the caller that makes the change stays signed in). Returns
+/// how many sessions ended. A failed write ends nothing.
+pub(crate) async fn install_bootstrap_hash(
+    state: &AdminState,
+    hash: &str,
+    headers: &HeaderMap,
+) -> std::io::Result<usize> {
     let state_file = std::path::Path::new(".deltaglider_bootstrap_hash");
     crate::config::write_bootstrap_hash_file(state_file, hash)?;
     *state.password_hash.write() = hash.to_string();
     state.config.write().await.bootstrap_password_hash = Some(hash.to_string());
-    Ok(())
+    let keep = super::super::auth::extract_session_token(&state.sessions, headers);
+    Ok(state.sessions.revoke_bootstrap_except(keep.as_deref()))
 }
 
 /// PUT /api/admin/password — change bootstrap password.
@@ -134,20 +144,20 @@ pub async fn change_password(
         }
     };
 
-    if let Err(e) = install_bootstrap_hash(&state, &new_hash).await {
-        tracing::error!("Failed to persist new admin hash to disk: {}", e);
-        return password_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "Failed to persist hash file ({}). Password change aborted.",
-                e
-            ),
-        );
-    }
-
-    // A session minted under the old password ends; the caller's stays.
-    let keep = super::super::auth::extract_session_token(&state.sessions, &headers);
-    let ended = state.sessions.revoke_bootstrap_except(keep.as_deref());
+    // Installing the hash ends the other sessions; the caller's stays.
+    let ended = match install_bootstrap_hash(&state, &new_hash, &headers).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("Failed to persist new admin hash to disk: {}", e);
+            return password_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Failed to persist hash file ({}). Password change aborted.",
+                    e
+                ),
+            );
+        }
+    };
     audit_log(
         "change_password",
         "bootstrap",
@@ -434,6 +444,37 @@ mod tests {
             !handler.contains(concat!(".re", "key(")),
             "password.rs calls rekey"
         );
+    }
+
+    /// Only `install_bootstrap_hash` writes the live bootstrap hash (state
+    /// file and login verifier) in the admin API, so only it must end the
+    /// sessions of the old password. A second writer would skip that rule.
+    #[test]
+    fn only_install_bootstrap_hash_writes_the_live_hash() {
+        let mut hits = Vec::new();
+        for path in crate::source_scan::rust_files("src/api") {
+            let rel = crate::source_scan::rel(&path);
+            let text = crate::source_scan::prod_text(&crate::source_scan::read(&rel));
+            for needle in [
+                concat!("write_bootstrap_", "hash_file("),
+                concat!("password_hash", ".write()"),
+            ] {
+                if text.contains(needle) {
+                    hits.push(format!("{rel}: {needle}"));
+                }
+            }
+        }
+        let own = "src/api/admin/config/password.rs";
+        assert_eq!(
+            hits,
+            vec![
+                format!("{own}: {}", concat!("write_bootstrap_", "hash_file(")),
+                format!("{own}: {}", concat!("password_hash", ".write()")),
+            ],
+            "a second writer of the bootstrap hash must go through install_bootstrap_hash"
+        );
+        let body = crate::source_scan::prod_text(include_str!("password.rs"));
+        assert!(body.contains("revoke_bootstrap_except"));
     }
 
     #[test]

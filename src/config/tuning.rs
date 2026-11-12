@@ -82,6 +82,15 @@ pub struct RuntimeTuning {
     pub debug_headers: bool,
     /// `DGP_TRUST_PROXY_HEADERS`.
     pub trust_proxy_headers: bool,
+    /// `DGP_IAM_SERVE_UNCONFIRMED`: with a coordination bucket, serve IAM
+    /// users from the local database before one sync confirmed it. Off by
+    /// default: a peer may have removed a user since the last run.
+    pub iam_serve_unconfirmed: bool,
+    /// `DGP_OUTBOUND_USE_SYSTEM_PROXY`: the webhook, Slack and OIDC clients
+    /// send their requests through the system HTTP(S) proxy
+    /// (`HTTP(S)_PROXY`, `ALL_PROXY`). Off by default: with a proxy the
+    /// connect-time address check does not see the target.
+    pub outbound_via_system_proxy: bool,
     /// `DGP_SECURE_COOKIES`: a recognised value wins; `None` (unset or not
     /// a boolean) falls through to TLS / forwarded-proto detection.
     pub secure_cookies: Option<bool>,
@@ -162,6 +171,8 @@ impl RuntimeTuning {
             cors_permissive: lookup_bool(env, "DGP_CORS_PERMISSIVE", false),
             debug_headers: lookup_bool(env, "DGP_DEBUG_HEADERS", false),
             trust_proxy_headers: lookup_bool(env, "DGP_TRUST_PROXY_HEADERS", false),
+            iam_serve_unconfirmed: lookup_bool(env, "DGP_IAM_SERVE_UNCONFIRMED", false),
+            outbound_via_system_proxy: lookup_bool(env, "DGP_OUTBOUND_USE_SYSTEM_PROXY", false),
             secure_cookies: env("DGP_SECURE_COOKIES").and_then(|raw| parse_bool(&raw)),
             clock_skew_secs,
             // Twice the skew: s3s accepts a signature dated up to the skew
@@ -295,6 +306,15 @@ mod tests {
             Zero::Meaningful("the chip counts no reference"),
         ),
     ];
+
+    /// The system proxy for the webhook, Slack and OIDC clients is an
+    /// opt-in: off in an empty environment.
+    #[test]
+    fn the_outbound_system_proxy_is_opt_in() {
+        assert!(!from(&[]).outbound_via_system_proxy);
+        assert!(from(&[("DGP_OUTBOUND_USE_SYSTEM_PROXY", "true")]).outbound_via_system_proxy);
+        assert!(!from(&[("DGP_OUTBOUND_USE_SYSTEM_PROXY", "no")]).outbound_via_system_proxy);
+    }
 
     /// `0` reads as `1` on every `Floor1` setting: the whole tuning struct
     /// with the variable at `0` equals the one with it at `1` (zero is the

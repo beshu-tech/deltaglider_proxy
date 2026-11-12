@@ -351,6 +351,30 @@ The jobs database also commits without waiting for the disk, except for the comm
 
 Where the admin session cookie is `Secure` (TLS at the proxy, a trusted `X-Forwarded-Proto: https`, or `DGP_SECURE_COOKIES=true`), its name is now `__Host-dgp_session`. Where the cookie is not `Secure`, the name stays `dgp_session`. An explicit `DGP_SECURE_COOKIES` decides in both directions. Sessions live in memory, so every session ends at the restart of the upgrade anyway, and users sign in again. Only a tool that reads the cookie by its name, such as a script or a load balancer rule, needs the new name ([How to serve TLS](serve-tls.md)).
 
+## A coordination bucket that the backend refuses stops the boot (2.2.1)
+
+The boot probe of the coordination bucket (`config_sync_bucket`) now separates two kinds of failure. When the backend answers the probe's first write with a refusal that no retry changes (the bucket does not exist, the access key is unknown, the signature does not match, or the credentials may not write), the proxy exits with code 1. The message names the bucket and the setting `config_sync_bucket`. Fix the bucket name or the backend credentials, then start the proxy again. When the backend gives no answer (a timeout, a connection error, a `5xx` or a throttling answer), the proxy still starts, as in 2.2.0.
+
+A proxy that started without an answer is **not ready** until a background probe proves the bucket and one sync of the IAM database ends well. `GET /_/ready` answers `503` and names the reason in two fields: `coordination` is `unproven`, and `iam_sync` is `unconfirmed`. The background probe writes a log line each time its verdict changes. A running node never stops because of a later refusal: it stays not ready and logs the change. Only the start exits on a refusal.
+
+While `iam_sync` is `unconfirmed`, the S3 API answers `503 ServiceUnavailable` (retryable) to the requests of IAM users. The local IAM database is the copy of an earlier run, and a peer may have removed a user since. A request with the bootstrap key pair, and open access, do not depend on the shared database and are served. A proxy whose IAM mode is `declarative` takes its users from the config file, so it is confirmed from the start. A load balancer that checks `/_/ready` sends no traffic to such a node. The `503` message and the `iam_sync_hint` field of `/_/ready` name the override. Set `DGP_IAM_SERVE_UNCONFIRMED=true` to end the refusal on purpose: the node then serves IAM users from its local database, and `/_/ready` shows `iam_sync: "unconfirmed_override"` and answers `200`. Use it for a single instance that must restart while the sync bucket is down. The risk: a user that a peer removed since the last run can still sign in on this node until a sync ends well. A good sync ends the refusal without the override, and the override then has no effect.
+
+## An admin password restore ends the other admin sessions (2.2.1)
+
+Every change of the bootstrap hash now ends the admin sessions that were opened with the previous password. This includes a backup restore that brings back another admin password (mode `full`), and the roll-back of a failed restore. Before, only a password change did this. The session that makes the change stays signed in; every other session gets `401` and must sign in again with the current password.
+
+## A backend host that resolves to loopback is refused at start (2.2.1)
+
+The rule of 2.2.0 stays: an S3 endpoint whose name resolves only to loopback needs `allow_local: true` on its backend (or `DGP_BACKEND_ALLOW_LOCAL=true`), and a link-local or metadata address is refused also with `allow_local`. What changes is when you learn about it. At start, and at every config apply, the proxy now resolves the endpoint host of each S3 backend. When every address is refused, the proxy exits (or refuses the apply) with a message that names the backend, the host and the setting `allow_local`. A name that does not resolve, or does not resolve in 5 seconds, says nothing here: DNS can come up later. `allow_local` already opens loopback only; it never opens link-local addresses, so it needs no narrower form.
+
+## Webhook, Slack and OIDC requests can use the system proxy (2.2.1)
+
+The default of 2.2.0 stays: webhook, Slack and OIDC requests connect directly and ignore `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`. A deployment whose only way out is an egress proxy can now set `DGP_OUTBOUND_USE_SYSTEM_PROXY=true`. The trade-off: the egress proxy resolves the target name, so the proxy cannot check the address that the request reaches. Only the check of the URL text (no literal private, loopback or metadata address) still applies. Use the variable only when the egress proxy filters its own targets. The proxy reads the variable once at start; restart it after a change.
+
+## The spool directory is private also after a re-creation (2.2.1)
+
+When something removes the spool directory while the proxy runs, the proxy makes it again with mode `0700`, whatever the umask of the process. Before, it used the umask, so under `002` the directory was group-writable until the next start.
+
 ## Common gotchas
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.

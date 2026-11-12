@@ -2842,3 +2842,53 @@ async fn one_job_reads_by_id() {
         assert_eq!(code, StatusCode::NOT_FOUND, "{missing}");
     }
 }
+
+/// A backup restore that brings back another admin password ends the other
+/// sessions of the bootstrap password. The session that restores stays.
+#[tokio::test]
+async fn backup_restore_of_another_password_ends_the_other_sessions() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let zip = admin
+        .get(format!("{ep}/_/api/admin/backup"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    // Rotate to P2: the backup now holds the old hash.
+    let p2 = "a-new-strong-password-1";
+    let r = admin
+        .put(format!("{ep}/_/api/admin/password"))
+        .json(&json!({ "current_password": common::TEST_BOOTSTRAP_PASSWORD, "new_password": p2 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let second = admin_http_client_with_password(&ep, p2).await;
+    assert!(session_valid(&second, &ep).await);
+    let restore = admin
+        .post(format!("{ep}/_/api/admin/backup?mode=full"))
+        .header("content-type", "application/zip")
+        .body(zip)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        restore.status(),
+        StatusCode::OK,
+        "{:?}",
+        restore.text().await
+    );
+    let cfg = second
+        .get(format!("{ep}/_/api/admin/config"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(cfg, StatusCode::UNAUTHORIZED, "the other session must end");
+    // The acting session stays: it chose the restore.
+    assert!(session_valid(&admin, &ep).await);
+}

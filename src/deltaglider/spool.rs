@@ -715,11 +715,13 @@ fn backend_share_mib(max_mib: usize, percent: u8) -> usize {
 /// directory while the process runs (a tmp cleaner, an operator). The first
 /// `ENOENT` creates the directory again and tries once more, like the
 /// filesystem backend does for a folder that a DELETE pruned. Any other
-/// error, and a second `ENOENT`, go to the caller.
+/// error, and a second `ENOENT`, go to the caller. The directory is made by
+/// [`create_private_dir`], the one function that makes a spool directory
+/// (boot and re-creation): mode 0700 whatever the umask.
 pub(crate) fn temp_in(dir: &Path) -> std::io::Result<NamedTempFile> {
     match NamedTempFile::new_in(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(dir)?;
+            create_private_dir(dir)?;
             NamedTempFile::new_in(dir)
         }
         other => other,
@@ -1045,6 +1047,34 @@ mod tests {
     /// A new root is created 0700; an existing private root is kept as
     /// it is; one only its group can write to is made 0700; a root that
     /// other users can write to is refused with a message that names it.
+    #[cfg(unix)]
+    #[test]
+    fn a_spool_directory_made_again_is_private_under_a_wide_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("spool");
+        let spool = SpoolDir::new(root.clone(), 1 << 20).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        // SAFETY: umask has no preconditions; restored below.
+        let old = unsafe { libc::umask(0) };
+        let made = temp_in(&root);
+        unsafe { libc::umask(old) };
+        made.unwrap();
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700, "the re-created spool directory");
+        drop(spool);
+    }
+
+    #[test]
+    fn only_create_private_dir_makes_a_spool_directory() {
+        let text = crate::source_scan::prod_text(include_str!("spool.rs"));
+        assert_eq!(
+            text.matches(concat!("create_dir", "_all(")).count(),
+            1,
+            "the non-unix twin of create_private_dir is the only create_dir_all"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_spool_root_is_private() {

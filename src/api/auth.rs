@@ -95,14 +95,31 @@ enum AuthGateDecision<'a> {
     Bootstrap(&'a crate::iam::AuthConfig),
     /// Multi-user IAM mode.
     Iam(&'a crate::iam::IamIndex),
+    /// Multi-user IAM mode on a node that did not confirm its IAM database
+    /// against the coordination bucket yet — reject, retryable
+    /// ([`crate::coordination::status::stale_iam_service`]).
+    IamUnconfirmed,
 }
 
 /// Fold the config-DB lock flag + [`IamState`] into a single exhaustive auth
 /// decision. The lock overrides everything; otherwise the IamState variant
 /// selects the auth path.
-fn classify_auth_gate(locked: bool, iam_state: &IamState) -> AuthGateDecision<'_> {
+fn classify_auth_gate(
+    locked: bool,
+    iam_state: &IamState,
+    sync: crate::coordination::status::IamSync,
+) -> AuthGateDecision<'_> {
+    use crate::coordination::status::{stale_iam_service, CredentialSource, StaleIamService};
     if locked {
         return AuthGateDecision::Locked;
+    }
+    let source = match iam_state {
+        IamState::Disabled => CredentialSource::Open,
+        IamState::Legacy(_) => CredentialSource::Bootstrap,
+        IamState::Iam(_) => CredentialSource::IamDatabase,
+    };
+    if stale_iam_service(sync, source) == StaleIamService::Refuse {
+        return AuthGateDecision::IamUnconfirmed;
     }
     match iam_state {
         IamState::Disabled => AuthGateDecision::Open,
@@ -880,12 +897,28 @@ pub async fn sigv4_auth_middleware(
     let deny_all = IamState::deny_all();
     let iam_state = iam_snapshot.as_deref().unwrap_or(&deny_all);
 
-    let auth_config = match classify_auth_gate(config_db_key_mismatch, iam_state) {
+    // A router built without the coordination status has no coordination
+    // bucket: `NotConfigured`.
+    let iam_sync = request
+        .extensions()
+        .get::<crate::coordination::CoordinationStatus>()
+        .map_or(crate::coordination::status::IamSync::NotConfigured, |s| {
+            s.iam_sync()
+        });
+
+    let auth_config = match classify_auth_gate(config_db_key_mismatch, iam_state, iam_sync) {
         AuthGateDecision::Locked => {
             // Clear 503 with a recovery hint — NOT a misleading 500.
             // The proxy must not serve data without working authentication.
             return Err(crate::api::S3Error::ServiceUnavailable(
                 "Config database locked — recover via admin GUI (/_/).".into(),
+            )
+            .into_response());
+        }
+        AuthGateDecision::IamUnconfirmed => {
+            return Err(S3Error::ServiceUnavailable(
+                "The IAM database is not confirmed against the coordination bucket yet; retry later, or set DGP_IAM_SERVE_UNCONFIRMED=true to serve the local copy."
+                    .into(),
             )
             .into_response());
         }
@@ -1019,7 +1052,7 @@ pub async fn sigv4_auth_middleware(
     // its own, so the s3s access hook (`resolved_identity_is_verified`) refuses
     // the request unless s3s verified the SAME access key resolved here.
     let authenticated_user = match auth_config {
-        AuthGateDecision::Locked | AuthGateDecision::Open => {
+        AuthGateDecision::Locked | AuthGateDecision::IamUnconfirmed | AuthGateDecision::Open => {
             return Err(S3Error::AccessDenied.into_response());
         }
         AuthGateDecision::Bootstrap(auth) => {
@@ -1404,6 +1437,7 @@ mod tests {
             AuthGateDecision::Open => "open",
             AuthGateDecision::Bootstrap(_) => "bootstrap",
             AuthGateDecision::Iam(_) => "iam",
+            AuthGateDecision::IamUnconfirmed => "iam_unconfirmed",
         }
     }
 
@@ -1417,15 +1451,46 @@ mod tests {
         let iam = IamState::Iam(crate::iam::IamIndex::from_users(vec![]));
         let disabled = IamState::Disabled;
 
+        use crate::coordination::status::IamSync;
         // locked=true overrides EVERY IamState variant.
         for state in [&disabled, &legacy, &iam] {
-            assert_eq!(gate_kind(&classify_auth_gate(true, state)), "locked");
+            for sync in [
+                IamSync::NotConfigured,
+                IamSync::Confirmed,
+                IamSync::Unconfirmed,
+            ] {
+                assert_eq!(gate_kind(&classify_auth_gate(true, state, sync)), "locked");
+            }
         }
 
         // locked=false: the IamState variant decides the path.
-        assert_eq!(gate_kind(&classify_auth_gate(false, &disabled)), "open");
-        assert_eq!(gate_kind(&classify_auth_gate(false, &legacy)), "bootstrap");
-        assert_eq!(gate_kind(&classify_auth_gate(false, &iam)), "iam");
+        for sync in [IamSync::NotConfigured, IamSync::Confirmed] {
+            assert_eq!(
+                gate_kind(&classify_auth_gate(false, &disabled, sync)),
+                "open"
+            );
+            assert_eq!(
+                gate_kind(&classify_auth_gate(false, &legacy, sync)),
+                "bootstrap"
+            );
+            assert_eq!(gate_kind(&classify_auth_gate(false, &iam, sync)), "iam");
+        }
+
+        // An IAM database that is not confirmed against the coordination
+        // bucket refuses its users; the other sources do not come from it.
+        let stale = IamSync::Unconfirmed;
+        assert_eq!(
+            gate_kind(&classify_auth_gate(false, &disabled, stale)),
+            "open"
+        );
+        assert_eq!(
+            gate_kind(&classify_auth_gate(false, &legacy, stale)),
+            "bootstrap"
+        );
+        assert_eq!(
+            gate_kind(&classify_auth_gate(false, &iam, stale)),
+            "iam_unconfirmed"
+        );
     }
 
     #[test]

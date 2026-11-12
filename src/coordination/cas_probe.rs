@@ -158,6 +158,94 @@ impl ProbeResult {
     }
 }
 
+/// What a probe that gave no verdict says about the bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeErrorKind {
+    /// The backend ANSWERED the probe's plain write with a refusal that no
+    /// retry changes: the bucket does not exist, the credentials are wrong
+    /// or have no right to write. The configuration is wrong.
+    Misconfigured,
+    /// No answer, or an answer that a later attempt can change (timeout,
+    /// connection error, 5xx, throttling). The probe says nothing.
+    Indeterminate,
+}
+
+/// Why [`probe_cas`] gave no verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeError {
+    pub kind: ProbeErrorKind,
+    pub detail: String,
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+/// A conditional step that the probe could not read is never a verdict on
+/// the configuration: the plain write went through before it.
+impl From<String> for ProbeError {
+    fn from(detail: String) -> Self {
+        Self {
+            kind: ProbeErrorKind::Indeterminate,
+            detail,
+        }
+    }
+}
+
+/// S3 error codes of an answer that a later attempt can change, whatever
+/// the HTTP status they come with.
+const RETRYABLE_CODES: &[&str] = &[
+    "RequestTimeout",
+    "RequestTimeTooSkewed",
+    concat!("Slow", "Down"),
+    "Throttling",
+    "ThrottlingException",
+    "TooManyRequests",
+    "RequestLimitExceeded",
+    concat!("Service", "Unavailable"),
+    "InternalError",
+];
+
+/// Pure: what the answer to the probe's first, UNCONDITIONAL write says.
+/// `status` is the HTTP status (`None`: no HTTP answer), `code` the S3
+/// error code (empty when the answer has none).
+///
+/// A 3xx or 4xx answer is the backend's statement about the request: the
+/// bucket is missing (`NoSuchBucket`), the key is unknown
+/// (`InvalidAccessKeyId`), the signature or the region is wrong, the
+/// credentials may not write (`AccessDenied`), the bucket lives elsewhere
+/// (`PermanentRedirect`). The exceptions are the answers that depend on
+/// load or on time (408, 429, the codes in `RETRYABLE_CODES`). Everything
+/// else (no answer, 5xx) is indeterminate.
+pub fn classify_write_refusal(status: Option<u16>, code: &str) -> ProbeErrorKind {
+    let Some(status) = status else {
+        return ProbeErrorKind::Indeterminate;
+    };
+    if RETRYABLE_CODES.contains(&code) || matches!(status, 408 | 429) {
+        return ProbeErrorKind::Indeterminate;
+    }
+    match status {
+        300..=499 => ProbeErrorKind::Misconfigured,
+        _ => ProbeErrorKind::Indeterminate,
+    }
+}
+
+/// The HTTP status and the S3 error code of an SDK error (`None` status:
+/// the backend gave no HTTP answer).
+fn answer_of<E>(e: &aws_sdk_s3::error::SdkError<E>) -> (Option<u16>, String)
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    let status = match e {
+        aws_sdk_s3::error::SdkError::ServiceError(svc) => Some(svc.raw().status().as_u16()),
+        _ => None,
+    };
+    (status, e.code().unwrap_or_default().to_string())
+}
+
 fn outcome<T, E>(res: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> StepOutcome
 where
     E: std::error::Error + aws_sdk_s3::error::ProvideErrorMetadata + 'static,
@@ -258,7 +346,11 @@ async fn current_etag(client: &Client, bucket: &str, key: &str) -> Option<String
 /// of the key on a bucket that keeps versions). A backend that refuses the
 /// correct ETag quoted costs four more: the GET that tells a refusal from a
 /// lost response, two unquoted PUTs and a HEAD.
-pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<ProbeResult, String> {
+pub async fn probe_cas(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<ProbeResult, ProbeError> {
     let first = client
         .put_object()
         .bucket(bucket)
@@ -266,7 +358,13 @@ pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<Probe
         .body(ByteStream::from_static(b"1"))
         .send()
         .await
-        .map_err(|e| format!("probe could not write to '{bucket}': {e:?}"))?;
+        .map_err(|e| {
+            let (status, code) = answer_of(&e);
+            ProbeError {
+                kind: classify_write_refusal(status, &code),
+                detail: format!("probe could not write to '{bucket}': {e:?}"),
+            }
+        })?;
     let etag = first.e_tag().unwrap_or_default().to_string();
     let put = |body: &'static [u8]| {
         client
@@ -361,6 +459,59 @@ pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<Probe
         conditional_delete: classify_conditional_delete(&delete_wrong),
         if_match,
     })
+}
+
+#[cfg(test)]
+mod write_refusal_tests {
+    use super::ProbeErrorKind::{Indeterminate, Misconfigured};
+    use super::*;
+
+    /// The truth table over the answers a plain PUT gets from S3, MinIO,
+    /// Ceph and Backblaze B2.
+    #[test]
+    fn a_refusal_is_definitive_only_when_no_retry_changes_it() {
+        let table: &[(Option<u16>, &str, ProbeErrorKind)] = &[
+            // The backend answered: the configuration is wrong.
+            (Some(404), "NoSuchBucket", Misconfigured),
+            (Some(403), "AccessDenied", Misconfigured),
+            (Some(403), "InvalidAccessKeyId", Misconfigured),
+            (Some(403), "SignatureDoesNotMatch", Misconfigured),
+            (Some(403), "AllAccessDisabled", Misconfigured),
+            (Some(400), "AuthorizationHeaderMalformed", Misconfigured),
+            (Some(400), "InvalidBucketName", Misconfigured),
+            (Some(400), "ExpiredToken", Misconfigured),
+            (Some(301), "PermanentRedirect", Misconfigured),
+            (Some(405), "MethodNotAllowed", Misconfigured),
+            (Some(404), "", Misconfigured),
+            // A later attempt can get another answer.
+            (None, "", Indeterminate),
+            (None, "NoSuchBucket", Indeterminate),
+            (Some(500), "InternalError", Indeterminate),
+            (Some(502), "", Indeterminate),
+            (Some(503), "SlowDown", Indeterminate),
+            (Some(503), "ServiceUnavailable", Indeterminate),
+            (Some(504), "", Indeterminate),
+            (Some(408), "", Indeterminate),
+            (Some(429), "", Indeterminate),
+            (Some(400), "RequestTimeout", Indeterminate),
+            (Some(400), "Throttling", Indeterminate),
+            (Some(403), "RequestTimeTooSkewed", Indeterminate),
+            (Some(200), "", Indeterminate),
+        ];
+        for (status, code, want) in table {
+            assert_eq!(
+                classify_write_refusal(*status, code),
+                *want,
+                "status {status:?} code {code:?}"
+            );
+        }
+    }
+
+    /// A step after the first write never names the configuration.
+    #[test]
+    fn a_later_step_is_indeterminate() {
+        assert_eq!(ProbeError::from("x".to_string()).kind, Indeterminate);
+    }
 }
 
 #[cfg(test)]

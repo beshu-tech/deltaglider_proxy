@@ -2262,7 +2262,8 @@ impl StorageBackend for FilesystemBackend {
         }
         let token = continuation_token.unwrap_or("");
         let keep = |dir_key: &str, e: &WalkEntry| level_keep(name_filter, token, dir_key, e);
-        let Some(mut level) = SortedDir::open(&read_dir_path, dir_part.to_string(), &keep).await?
+        let Some(mut level) =
+            SortedDir::open(&read_dir_path, dir_part.to_string(), &keep, 0).await?
         else {
             return Ok(Some(no_keys()));
         };

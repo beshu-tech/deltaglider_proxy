@@ -517,6 +517,53 @@ impl Config {
         errors
     }
 
+    /// FATAL errors of the S3 backends whose endpoint HOST resolves only to
+    /// addresses that the connect-time guard refuses (a name that points at
+    /// this host's loopback without `allow_local`, or at a link-local or
+    /// metadata address). Every request to such a backend would fail, so
+    /// boot and apply refuse the config and name the backend and the
+    /// setting. A name that does not resolve, or not in time, says nothing:
+    /// DNS may come up later. Needs I/O, so it is apart from
+    /// [`Self::check_fatal`].
+    pub async fn backend_resolution_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (name, backend) in self.effective_backends() {
+            let BackendConfig::S3 {
+                endpoint: Some(ep),
+                allow_local,
+                ..
+            } = backend
+            else {
+                continue;
+            };
+            let Some(host) = reqwest::Url::parse(ep)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+            else {
+                continue;
+            };
+            let host = host.trim_matches(['[', ']']);
+            if host.parse::<std::net::IpAddr>().is_ok() {
+                continue; // a literal address: the text check judged it
+            }
+            let lookup = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::net::lookup_host((host, 0)),
+            )
+            .await;
+            let Ok(Ok(addrs)) = lookup else { continue };
+            let ips: Vec<std::net::IpAddr> = addrs.map(|sa| sa.ip()).collect();
+            let kind = crate::storage::s3_endpoint_kind(*allow_local);
+            if let Some(e) = crate::security::backend_resolution_error(host, &ips, kind) {
+                errors.push(format!(
+                    "backend '{name}': endpoint host '{host}' (backend setting \
+                     `allow_local`, env DGP_BACKEND_ALLOW_LOCAL): {e}"
+                ));
+            }
+        }
+        errors
+    }
+
     /// `advanced` count settings where 0 stops the proxy: `blocking_threads: 0`
     /// panics tokio at the next start (a crash loop after a good-looking
     /// apply), `codec_concurrency: 0` answers every delta PUT with 503, and
@@ -702,5 +749,50 @@ mod object_size_tests {
         assert!(warns(5 * GIB + 1));
         assert!(!warns(5 * GIB));
         assert!(!warns(Config::default().max_object_size));
+    }
+}
+
+#[cfg(test)]
+mod backend_resolution_tests {
+    use super::*;
+
+    fn s3(endpoint: &str, allow_local: bool) -> BackendConfig {
+        BackendConfig::S3 {
+            endpoint: Some(endpoint.into()),
+            region: "us-east-1".into(),
+            force_path_style: true,
+            access_key_id: None,
+            secret_access_key: None,
+            allow_local,
+            session_token: None,
+        }
+    }
+
+    /// `localhost` resolves to loopback: a backend on it is refused up
+    /// front, with the backend name and the setting, unless `allow_local`.
+    #[tokio::test]
+    async fn a_backend_host_that_resolves_to_loopback_is_refused_at_check_time() {
+        let mut cfg = Config {
+            backend: s3("https://localhost:9000", false),
+            ..Default::default()
+        };
+        let errors = cfg.backend_resolution_errors().await;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("backend 'default'")
+                && errors[0].contains("localhost")
+                && errors[0].contains("allow_local"),
+            "{}",
+            errors[0]
+        );
+        cfg.backend = s3("https://localhost:9000", true);
+        assert!(cfg.backend_resolution_errors().await.is_empty());
+        // A literal address is judged by the text check, not here.
+        cfg.backend = s3("https://127.0.0.1:9000", false);
+        assert!(cfg.backend_resolution_errors().await.is_empty());
+        cfg.backend = BackendConfig::Filesystem {
+            path: "/data".into(),
+        };
+        assert!(cfg.backend_resolution_errors().await.is_empty());
     }
 }

@@ -387,6 +387,18 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Security",
     },
     EnvVarEntry {
+        name: "DGP_IAM_SERVE_UNCONFIRMED",
+        description: "With a config_sync_bucket: serve IAM users from the local IAM database before one sync confirmed it. Default false: the S3 API answers 503 to IAM users until a pull or upload ends well, because a peer may have removed a user since the last run. Set true for a single instance that must restart during a sync-bucket outage",
+        example: "false",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_OUTBOUND_USE_SYSTEM_PROXY",
+        description: "Send webhook, Slack and OIDC requests through the system HTTP(S) proxy (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY). Default false: the proxy then resolves the target itself, so the proxy's own check of the target address does not run; only the URL text check applies. Use it only where the proxy is the sole way out",
+        example: "false",
+        category: "Security",
+    },
+    EnvVarEntry {
         name: "DGP_TRUSTED_PROXY_CIDRS",
         description: "Comma-separated CIDRs of trusted reverse proxies; XFF honored only from these peers. Required when DGP_TRUST_PROXY_HEADERS=true",
         example: "10.0.0.0/8,192.168.1.5",

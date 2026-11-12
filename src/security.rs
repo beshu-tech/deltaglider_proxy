@@ -489,21 +489,52 @@ impl SsrfGuardedResolver {
     }
 }
 
+/// Where the guarded outbound clients send their requests
+/// (`DGP_OUTBOUND_USE_SYSTEM_PROXY`, parsed into `RuntimeTuning`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutboundEgress {
+    /// Straight to the target: the connect-time address check sees it.
+    #[default]
+    Direct,
+    /// Through the system HTTP(S) proxy, for a deployment whose only way
+    /// out is that proxy. The proxy resolves the target, so the address
+    /// check cannot run; the URL text check still does.
+    SystemProxy,
+}
+
+static OUTBOUND_EGRESS: std::sync::OnceLock<OutboundEgress> = std::sync::OnceLock::new();
+
+/// Set the egress of every guarded client built after this call. Once, at
+/// boot, from the tuning snapshot; later calls change nothing.
+pub fn install_outbound_egress(via_system_proxy: bool) {
+    let _ = OUTBOUND_EGRESS.set(if via_system_proxy {
+        OutboundEgress::SystemProxy
+    } else {
+        OutboundEgress::Direct
+    });
+}
+
 /// THE builder of an outbound HTTP client that an operator-supplied URL can
-/// reach (webhook, Slack, OIDC discovery and token requests). Three guards:
-/// the [`SsrfGuardedResolver`] (a name that resolves to a refused address
-/// fails at connect time), no redirects (a redirect could bounce a request
-/// that passed [`validate_outbound_url`] onto a private or metadata address),
-/// and no system proxy (`HTTP(S)_PROXY`, `ALL_PROXY`): with a proxy, only the
-/// proxy host is resolved here, the proxy resolves the target, and the
-/// connect-time address check never runs. A source guard
+/// reach (webhook, Slack, OIDC discovery and token requests). By default
+/// three guards: the [`SsrfGuardedResolver`] (a name that resolves to a
+/// refused address fails at connect time), no redirects (a redirect could
+/// bounce a request that passed [`validate_outbound_url`] onto a private or
+/// metadata address), and no system proxy (`HTTP(S)_PROXY`, `ALL_PROXY`):
+/// with a proxy, only the proxy host is resolved here, the proxy resolves
+/// the target, and the connect-time address check never runs. The operator
+/// can opt in to the system proxy ([`OutboundEgress::SystemProxy`]); the
+/// resolver is then left out too, because it would judge the proxy's own
+/// address. A source guard
 /// (`outbound_http_clients_come_from_the_one_guarded_builder`) refuses any
 /// other client builder.
 pub fn guarded_reqwest_builder(kind: UrlKind) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver::new(kind)))
+    let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    match OUTBOUND_EGRESS.get().copied().unwrap_or_default() {
+        OutboundEgress::Direct => builder
+            .no_proxy()
+            .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver::new(kind))),
+        OutboundEgress::SystemProxy => builder,
+    }
 }
 
 /// [`guarded_reqwest_builder`], built. A build error is an error: there is no
@@ -584,6 +615,22 @@ fn ip_is_link_local(ip: IpAddr) -> bool {
                 || embedded_ipv4(v6).is_some_and(|m| m.is_link_local())
         }
     }
+}
+
+/// Pure: the error for a backend endpoint HOST whose resolved addresses `ips`
+/// are ALL refused for `kind` (every request to it would fail at connect
+/// time), else `None`. An empty list says nothing (no answer is not a
+/// refusal). Boot and apply run it so such a backend is refused up front;
+/// [`SdkSsrfGuardedResolver`] enforces the same rule per connection.
+pub(crate) fn backend_resolution_error(
+    host: &str,
+    ips: &[IpAddr],
+    kind: UrlKind,
+) -> Option<String> {
+    if ips.is_empty() || !ips.iter().all(|ip| resolved_backend_ip_refused(*ip, kind)) {
+        return None;
+    }
+    Some(refused_resolution_message(host, ips, kind))
 }
 
 fn refused_resolution_message(host: &str, refused: &[IpAddr], kind: UrlKind) -> String {
@@ -1069,6 +1116,34 @@ mod tests {
         // A public literal → at least one acceptable addr → Ok.
         let ok = resolve("8.8.8.8").await.expect("public addr accepted");
         assert!(ok.count() >= 1);
+    }
+
+    /// A host is refused up front only when EVERY address it resolves to is
+    /// refused; one usable address, or none at all, says nothing.
+    #[test]
+    fn a_host_is_refused_up_front_only_when_all_its_addresses_are() {
+        let ips = |v: &[&str]| -> Vec<IpAddr> { v.iter().map(|s| s.parse().unwrap()).collect() };
+        let refused = |v: &[&str], kind| backend_resolution_error("minio.corp", &ips(v), kind);
+        // (addresses, Backend refuses, BackendDev refuses)
+        for (a, backend, dev) in [
+            (&["127.0.0.1"][..], true, false),
+            (&["::1"], true, false),
+            (&["127.0.0.1", "::1"], true, false),
+            (&["169.254.169.254"], true, true),
+            (&["127.0.0.1", "169.254.169.254"], true, false),
+            (&["127.0.0.1", "10.0.0.5"], false, false),
+            (&["10.0.0.5"], false, false),
+            (&["203.0.113.7"], false, false),
+            (&[], false, false),
+        ] {
+            assert_eq!(refused(a, UrlKind::Backend).is_some(), backend, "{a:?}");
+            assert_eq!(refused(a, UrlKind::BackendDev).is_some(), dev, "{a:?}");
+        }
+        let text = refused(&["127.0.0.1"], UrlKind::Backend).unwrap();
+        assert!(
+            text.contains("minio.corp") && text.contains("allow_local"),
+            "{text}"
+        );
     }
 
     #[test]

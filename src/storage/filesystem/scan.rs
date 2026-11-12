@@ -19,6 +19,12 @@
 //! [`SCAN_CHUNK_MAX`]: the passes are O(log N) up to the cap, then
 //! N / `SCAN_CHUNK_MAX`. The memory bound stays explicit: at most
 //! `SCAN_CHUNK_MAX` entries per open directory.
+//!
+//! A walk holds one chunk per OPEN directory, and a key path can be deep. So
+//! the cap halves with each level ([`depth_cap`]): the deepest levels stay
+//! at [`SCAN_CHUNK`]. A request then holds at most
+//! `2 x SCAN_CHUNK_MAX + depth x SCAN_CHUNK` entries, however many directories
+//! are deep and big (`depth_cap_sums_to_a_per_request_bound`).
 
 use super::{
     fsio, io_to_storage_error, note_held, stored_name, FilesystemBackend, StorageError, StoredName,
@@ -53,6 +59,14 @@ pub(super) fn chunk_size() -> usize {
 /// The chunk after `current` (see the module doc): doubled, within `max`.
 pub(super) fn grown(current: usize, max: usize) -> usize {
     current.saturating_mul(2).min(max).max(current)
+}
+
+/// Pure: the most entries that a directory at `depth` (0 = the walk's root)
+/// may hold after growth: `max` halved once per level, never below
+/// [`SCAN_CHUNK`]. The sum over a path of open directories is below
+/// `2 x max + depth x SCAN_CHUNK`.
+pub(super) fn depth_cap(depth: usize, max: usize) -> usize {
+    (max >> depth.min(usize::BITS as usize - 1)).max(SCAN_CHUNK.min(max))
 }
 
 /// The cap on growth now. Tests set a small one to reach it.
@@ -184,6 +198,8 @@ pub(super) struct SortedDir {
     chunk: Vec<WalkEntry>,
     /// The size of the next chunk: doubles on each refill.
     chunk_limit: usize,
+    /// The cap of `chunk_limit` at this directory's depth ([`depth_cap`]).
+    max_chunk: usize,
     /// The next entry of the chunk.
     next: usize,
     /// Entries remain after the chunk.
@@ -197,6 +213,7 @@ impl SortedDir {
         path: &Path,
         key: String,
         keep: Keep<'_>,
+        depth: usize,
     ) -> Result<Option<Self>, StorageError> {
         let limit = chunk_size();
         let Some((chunk, more)) = read_chunk(path, &key, None, limit, keep).await? else {
@@ -206,7 +223,8 @@ impl SortedDir {
             path: path.to_path_buf(),
             key,
             chunk,
-            chunk_limit: grown(limit, chunk_max()),
+            chunk_limit: grown(limit, depth_cap(depth, chunk_max())),
+            max_chunk: depth_cap(depth, chunk_max()),
             next: 0,
             more,
         }))
@@ -225,7 +243,7 @@ impl SortedDir {
                 Some((chunk, more)) => {
                     self.chunk = chunk;
                     self.more = more;
-                    self.chunk_limit = grown(limit, chunk_max());
+                    self.chunk_limit = grown(limit, self.max_chunk);
                 }
                 // The directory went away between two chunks.
                 None => {
@@ -389,7 +407,7 @@ impl<'a> FlatWalk<'a> {
         delimiter: Option<&'a str>,
     ) -> Result<Option<Self>, StorageError> {
         let keep = |d: &str, e: &WalkEntry| flat_keep(prefix, token, None, d, e);
-        let Some(root) = SortedDir::open(root, root_key, &keep).await? else {
+        let Some(root) = SortedDir::open(root, root_key, &keep, 0).await? else {
             return Ok(None);
         };
         Ok(Some(Self {
@@ -441,7 +459,7 @@ impl<'a> FlatWalk<'a> {
                 }
                 continue;
             }
-            if let Some(sub) = SortedDir::open(&path, key, &keep).await? {
+            if let Some(sub) = SortedDir::open(&path, key, &keep, self.stack.len()).await? {
                 self.stack.push(sub);
                 note_held(self.stack.iter().map(SortedDir::held).sum());
             }
@@ -461,6 +479,18 @@ mod tests {
             is_dir,
             is_delta: name.ends_with(".delta"),
         }
+    }
+
+    /// The cap halves per level and the sum over any path is bounded: a
+    /// request cannot hold depth x 65,536 entries.
+    #[test]
+    fn depth_cap_sums_to_a_per_request_bound() {
+        assert_eq!(depth_cap(0, SCAN_CHUNK_MAX), SCAN_CHUNK_MAX);
+        assert_eq!(depth_cap(1, SCAN_CHUNK_MAX), SCAN_CHUNK_MAX / 2);
+        assert_eq!(depth_cap(500, SCAN_CHUNK_MAX), SCAN_CHUNK);
+        // 512 levels: the deepest path a 1,024-byte key can name.
+        let total: usize = (0..512).map(|d| depth_cap(d, SCAN_CHUNK_MAX)).sum();
+        assert!(total <= 2 * SCAN_CHUNK_MAX + 512 * SCAN_CHUNK, "{total}");
     }
 
     proptest! {

@@ -41,6 +41,48 @@ async fn an_unreachable_coordination_bucket_does_not_stop_the_boot() {
         .await
         .expect("health request");
     assert_eq!(health.status().as_u16(), 200);
+    // Not ready: no probe proved the bucket, and the IAM database is not
+    // confirmed against it. The words name the reason.
+    let ready = reqwest::get(format!("{}/_/ready", server.endpoint()))
+        .await
+        .expect("ready request");
+    assert_eq!(ready.status().as_u16(), 503);
+    let body: serde_json::Value = ready.json().await.expect("ready body");
+    assert_eq!(body["coordination"], "unproven", "{body}");
+    assert_eq!(body["iam_sync"], "unconfirmed", "{body}");
+}
+
+/// A coordination bucket that the backend refuses (here: it does not
+/// exist) ends the boot with a message that names the bucket and the
+/// setting. Without that, the node would boot, and every delta write would
+/// answer 503 for good.
+#[tokio::test]
+async fn a_missing_coordination_bucket_ends_the_boot() {
+    skip_unless_minio!();
+    let mut server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .build()
+        .await;
+    server.kill();
+    let bucket = "dgp-no-such-sync-bucket";
+    let (status, output) = server
+        .spawn_expect_exit(
+            &[
+                ("DGP_CONFIG_SYNC_BUCKET", bucket),
+                ("DGP_CONFIG_DB_KEY", "a-test-key-for-the-sync-bucket"),
+                ("DGP_STATE_LOCK_WAIT_SECS", "5"),
+            ],
+            60,
+        )
+        .await;
+    let status = status.expect("the proxy must exit");
+    assert!(!status.success(), "exit status {status:?}\n{output}");
+    assert!(
+        output.contains(bucket) && output.contains("config_sync_bucket"),
+        "the message must name the bucket and the setting:\n{output}"
+    );
 }
 
 /// Log lines that only a running boot after the listener step writes.

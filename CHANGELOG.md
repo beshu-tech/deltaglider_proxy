@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Upgrade steps for the next release
+
+- **A coordination bucket that the backend refuses stops the boot.** A missing bucket, an unknown access key, a wrong signature or credentials that may not write now end the boot with exit code 1 and a message that names the bucket and `config_sync_bucket`. A probe without an answer (timeout, connection error, `5xx`) still lets the proxy start (and a later refusal never stops a running node), but the node is not ready: `/_/ready` answers `503` with `coordination: "unproven"` and `iam_sync: "unconfirmed"`, and the S3 API answers `503` to IAM users until one sync of the IAM database ends well or `DGP_IAM_SERVE_UNCONFIRMED=true` is set. The bootstrap key pair and open access are served.
+- **A restore that changes the admin password ends the other admin sessions.** The session that restores stays.
+- **A backend host that resolves to loopback is refused at start and at apply**, with a message that names the backend and `allow_local`.
+- **`DGP_OUTBOUND_USE_SYSTEM_PROXY=true`** sends webhook, Slack and OIDC requests through the system proxy. The default (direct) is unchanged. With the proxy, the address check of the target cannot run.
+- **The spool directory is made with mode `0700`** also when the proxy makes it again after a removal.
+
+### Changed
+
+- A filesystem LIST now holds at most about `2 x 65,536 + depth x 1,024` directory entries for one request, because the chunk of a nested directory halves with each level.
+
 ## v2.2.0 — 2026-11-11
 
 ### Upgrade steps for the next release

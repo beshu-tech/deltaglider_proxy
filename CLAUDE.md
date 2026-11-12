@@ -444,6 +444,7 @@ roadmap (audit Tiers A→C) toward true round-robin HA. `/_/health` is liveness-
 verdicts while they are younger than 2 x its interval (else one single-flight
 live probe per 5 s) and probes the config DB and jobs DB locks live (503 when not ready) —
 point LB readiness checks at `/_/ready`.
+With a `config_sync_bucket`, `/_/ready` also answers 503 while `coordination` is `unproven` (no probe proved the bucket) or `iam_sync` is `unconfirmed` (no pull/upload ended well in this process); then (unless `DGP_IAM_SERVE_UNCONFIRMED`) the S3 gate (`coordination::status::stale_iam_service`) refuses IAM-database users with a retryable 503 and serves the bootstrap pair and open access. A boot probe whose first write gets a definitive refusal (`cas_probe::classify_write_refusal`) exits at BOOT only (a running node never exits on a later refusal); only no-answer/5xx/throttle is indeterminate. `DGP_OUTBOUND_USE_SYSTEM_PROXY` (`RuntimeTuning::outbound_via_system_proxy`, installed once by `security::install_outbound_egress`) is the only way the webhook/Slack/OIDC clients use the system proxy; then their SSRF resolver is left out.
 
 ## Frontend (demo/s3-browser/ui)
 
