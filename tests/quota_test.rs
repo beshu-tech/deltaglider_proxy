@@ -194,13 +194,32 @@ async fn test_quota_delete_frees_space() {
     // smaller fills are not reliable: once the usage cache knows the first,
     // the quota check rejects the second up front (403), which leaves the
     // bucket UNDER quota and the probe below is never blocked.
+    let http = reqwest::Client::new();
+    let endpoint = server.endpoint();
+    let before_put = common::get_usage_scan_version(&http, &endpoint).await;
     put_sized(&server, "fill1.bin", 12000)
         .await
         .expect("first PUT is allowed optimistically");
 
+    // The PUT's own quota check started a scan of the bucket, and that scan
+    // can overlap the PUT's writes: on a busy host it saw the object half
+    // stored, and its count (24,040 B for 12,040 B) was kept as the trusted
+    // counter, so the quota never opened again after the delete. Wait for
+    // that scan, then let the operator's Refresh set the counter from the
+    // stored objects (nothing writes now); the quota steps below start from
+    // the true size.
+    common::wait_for_usage_scan_refresh(&http, &endpoint, before_put).await;
+    let admin = common::admin_http_client(&endpoint).await;
+    let refreshed = admin
+        .post(format!(
+            "{endpoint}/_/api/admin/usage/refresh?bucket={BUCKET}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(refreshed.status().is_success(), "{:?}", refreshed.status());
+
     // Signal-driven poll for the scanner to catch up and enforce quota.
-    let http = reqwest::Client::new();
-    let endpoint = server.endpoint();
     let mut blocked = false;
     for _ in 0..20 {
         let baseline = common::get_usage_scan_version(&http, &endpoint).await;

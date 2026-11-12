@@ -2414,6 +2414,10 @@ async fn a_multipart_upload_past_the_derived_limit_is_refused_with_its_origin() 
         .env("DGP_TEST_DISK_FREE_BYTES", &(2 * GIB).to_string())
         // The total of all uploads must not be the limit that this test hits.
         .env("DGP_MAX_TOTAL_MULTIPART_BYTES", &(4 * GIB).to_string())
+        // Six parts of 100 MiB take minutes on a host under load; the
+        // default request limit (300 s) closed a connection in the middle
+        // of a part.
+        .env("DGP_REQUEST_TIMEOUT_SECS", "3600")
         // Past the per-upload limit on purpose (a warning at boot).
         .max_object_size(2 * GIB)
         .build()
@@ -2432,18 +2436,31 @@ async fn a_multipart_upload_past_the_derived_limit_is_refused_with_its_origin() 
         .and_then(|s| s.split("</UploadId>").next())
         .unwrap()
         .to_string();
-    let part = vec![7u8; (100 * MIB) as usize];
-    // Five parts of 100 MiB fit in 512 MiB; the sixth does not.
-    for n in 1..=6 {
+    // Five parts of 100 MiB and one of 12 MiB fill the 512 MiB. The last
+    // part is tiny on purpose: the proxy refuses it and may close the
+    // connection before a client has sent a large body to the end, and
+    // then the client sees a broken pipe, not the answer. A body that
+    // small always fits in the socket buffers, so the answer always arrives.
+    let sizes = [
+        100 * MIB,
+        100 * MIB,
+        100 * MIB,
+        100 * MIB,
+        100 * MIB,
+        12 * MIB,
+        1024,
+    ];
+    for (i, size) in sizes.into_iter().enumerate() {
+        let n = i + 1;
         let resp = http
             .put(format!("{url}?partNumber={n}&uploadId={id}"))
-            .body(part.clone())
+            .body(vec![7u8; size as usize])
             .send()
             .await
             .unwrap();
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap();
-        if n <= 5 {
+        if n <= 6 {
             assert_eq!(status, 200, "part {n}: {text}");
         } else {
             // AWS answers EntityTooLarge with HTTP 400.

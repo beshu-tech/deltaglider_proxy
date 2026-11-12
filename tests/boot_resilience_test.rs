@@ -459,6 +459,14 @@ async fn hanging_identity_providers_do_not_delay_the_boot() {
     });
 
     let mut server = TestServer::filesystem().await;
+    // A boot with no provider, on this host and at this load: the time that a
+    // boot needs at all. A fixed limit on the boot (8 s) failed on a busy
+    // host, where the boot alone takes that long; a boot that waits for
+    // discovery takes the 10 s discovery limit more than this one.
+    server.terminate();
+    let started = std::time::Instant::now();
+    server.respawn_with_env(&[]).await;
+    let plain_boot = started.elapsed();
     let ep = server.endpoint();
     let admin = common::admin_http_client(&ep).await;
     for name in ["idp-a", "idp-b", "idp-c"] {
@@ -500,8 +508,9 @@ async fn hanging_identity_providers_do_not_delay_the_boot() {
     server.respawn_with_env(&[]).await;
     let boot = started.elapsed();
     assert!(
-        boot < std::time::Duration::from_secs(8),
-        "the boot waited on identity-provider discovery: {boot:?}"
+        boot < plain_boot + std::time::Duration::from_secs(7),
+        "the boot waited on identity-provider discovery: {boot:?} with three hanging \
+         providers, {plain_boot:?} with none"
     );
 }
 

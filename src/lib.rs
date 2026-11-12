@@ -2103,7 +2103,7 @@ mod source_guards {
         let mut offenders = Vec::new();
         let bins = binary_path_names(files);
         for src in files {
-            for n in spawns_without_cwd(&src.test, &bins) {
+            for n in spawns_without_cwd(src, &src.test, &bins) {
                 offenders.push(format!("{}:{n}", src.rel));
             }
         }
@@ -2214,6 +2214,125 @@ mod source_guards {
         }
     }
 
+    /// The one function of `tests/common/` that builds a command for the
+    /// proxy binary (and sets the parent-death signal on it).
+    const PROXY_BINARY_HELPER: &str = "proxy_binary";
+
+    /// A `X::new(arg)` where `arg` holds `env!("CARGO_BIN_EXE_..")` or a
+    /// name of `bins`.
+    fn is_direct_proxy_spawn(
+        c: &crate::source_scan::ast::Call,
+        bins: &std::collections::HashSet<String>,
+    ) -> bool {
+        !c.method
+            && c.segs.len() >= 2
+            && c.segs.last().is_some_and(|s| s == "new")
+            && (names_bin_exe(&c.arg_macros) || c.arg_idents_all.iter().any(|i| bins.contains(i)))
+    }
+
+    /// Lines of the direct spawns of the proxy binary in `f` outside the
+    /// helper [`PROXY_BINARY_HELPER`]. Such a command has no parent-death
+    /// signal: when its `cargo test` is killed, the proxy runs on and holds
+    /// a build slot of the host.
+    fn spawns_outside_the_helper(
+        src: &crate::source_scan::ast::Source,
+        f: &crate::source_scan::ast::Facts,
+        bins: &std::collections::HashSet<String>,
+    ) -> Vec<usize> {
+        f.calls
+            .iter()
+            .filter(|c| {
+                is_direct_proxy_spawn(c, bins) && src.fn_name(c.func) != PROXY_BINARY_HELPER
+            })
+            .map(|c| c.line)
+            .collect()
+    }
+
+    /// Every integration-test run of the proxy binary goes through
+    /// `common::proxy_binary()`, which makes the child end with its parent
+    /// (`PR_SET_PDEATHSIG`). A proxy that survived its `cargo test` ran for
+    /// 31 hours and held a host build slot.
+    #[test]
+    fn integration_test_spawns_end_with_their_parent() {
+        let files = crate::source_scan::ast::tests();
+        assert!(files.len() > 50, "scan found tests/ ({})", files.len());
+        let bins = binary_path_names(files);
+        let mut offenders = Vec::new();
+        for src in files {
+            for n in spawns_outside_the_helper(src, &src.test, &bins) {
+                offenders.push(format!("{}:{n}", src.rel));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "build the command with common::proxy_binary(): {offenders:?}"
+        );
+        // The helper exists and is the one place that names the binary.
+        let helper = files
+            .iter()
+            .filter(|s| {
+                s.test.calls.iter().any(|c| {
+                    is_direct_proxy_spawn(c, &bins) && s.fn_name(c.func) == PROXY_BINARY_HELPER
+                })
+            })
+            .count();
+        assert_eq!(helper, 1, "exactly one file defines {PROXY_BINARY_HELPER}");
+    }
+
+    #[test]
+    fn the_parent_death_guard_sees_each_direct_spawn() {
+        use crate::source_scan::ast::parse;
+        let bin = ["CARGO_BIN", "_EXE_deltaglider_proxy"].concat();
+        let outside = |text: &str| {
+            let files = [parse("fixture.rs", text)];
+            let bins = binary_path_names(&files);
+            spawns_outside_the_helper(&files[0], &files[0].prod, &bins).len()
+        };
+        assert_eq!(
+            outside(&format!(
+                "fn proxy_binary() -> C {{ Command::new(env!(\"{bin}\")) }}"
+            )),
+            0,
+            "the helper"
+        );
+        assert_eq!(
+            outside(&format!(
+                "fn a() {{ Command::new(env!(\"{bin}\")).output(); }}"
+            )),
+            1
+        );
+        assert_eq!(
+            outside(&format!(
+                "use std::process::Command as C;\nfn a() {{ C::new(env!(\"{bin}\")); }}"
+            )),
+            1,
+            "alias"
+        );
+        assert_eq!(
+            outside(&format!(
+                "const BIN: &str = env!(\"{bin}\");\nfn a() {{ Command::new(BIN); }}"
+            )),
+            1,
+            "const"
+        );
+        assert_eq!(
+            outside("fn a() { common::proxy_binary().output(); }"),
+            0,
+            "the helper's callers"
+        );
+        // The cwd guard counts a call of the helper as a spawn.
+        let no_cwd = |text: &str| {
+            let files = [parse("fixture.rs", text)];
+            let bins = binary_path_names(&files);
+            spawns_without_cwd(&files[0], &files[0].prod, &bins).len()
+        };
+        assert_eq!(no_cwd("fn a() { common::proxy_binary().output(); }"), 1);
+        assert_eq!(
+            no_cwd("fn a() { common::proxy_binary().current_dir(d).output(); }"),
+            0
+        );
+    }
+
     /// 1-based lines of the proxy spawns in `src` whose builder never gets a
     /// `.current_dir(..)`. A spawn is a `X::new(arg)` where `arg` holds
     /// `env!("CARGO_BIN_EXE_..")` or a name of `bins` (a `const`, a `let`,
@@ -2223,15 +2342,15 @@ mod source_guards {
     /// the variable the chain was bound to (`let mut c = Command::new(B);
     /// c.current_dir(d)`) in the same fn.
     fn spawns_without_cwd(
+        src: &crate::source_scan::ast::Source,
         f: &crate::source_scan::ast::Facts,
         bins: &std::collections::HashSet<String>,
     ) -> Vec<usize> {
+        // The harness helper `proxy_binary()` is a spawn too; its own body
+        // (the one direct spawn that the guard below allows) is not.
         let is_spawn = |c: &crate::source_scan::ast::Call| {
-            !c.method
-                && c.segs.len() >= 2
-                && c.segs.last().is_some_and(|s| s == "new")
-                && (names_bin_exe(&c.arg_macros)
-                    || c.arg_idents_all.iter().any(|i| bins.contains(i)))
+            (is_direct_proxy_spawn(c, bins) && src.fn_name(c.func) != PROXY_BINARY_HELPER)
+                || (!c.method && c.segs.last().is_some_and(|s| s == PROXY_BINARY_HELPER))
         };
         let has_cwd = |spawn: &crate::source_scan::ast::Call| {
             let bound: Vec<&str> = f
@@ -2263,7 +2382,7 @@ mod source_guards {
             let bins = binary_path_names(&files);
             files
                 .iter()
-                .map(|s| spawns_without_cwd(&s.prod, &bins).len())
+                .map(|s| spawns_without_cwd(s, &s.prod, &bins).len())
                 .sum::<usize>()
         };
         let bad = |text: &str| bad_in(&[text]);
