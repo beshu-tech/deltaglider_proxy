@@ -398,6 +398,42 @@ When something removes the spool directory while the proxy runs, the proxy makes
 
 A `DeleteObjects` batch and the store of a `CompleteMultipartUpload` run on after their request ends, so that a client disconnect cannot cut an object in half. When the proxy gets the stop signal, it stops accepting requests and then waits for this work, up to 15 seconds. When the 15 seconds pass, it logs a warning with the number of tasks that it cut, and the clients retry those requests. A stop takes up to 55 seconds: 10 for the running requests, 15 for detached work, 10 for a maintenance job, 10 for the event outbox and `DGP_SHUTDOWN_TIMEOUT_SECS` (default 10) for blocking work. A `terminationGracePeriodSeconds` or `stop_grace_period` of 60 seconds, as the Helm chart, the operator and the compose example set, still holds. Keep it at 60 or more.
 
+## Every new reason for a boot to fail (2.2.0 and 2.2.1)
+
+A proxy that used to start with your configuration can now exit at start for the reasons below. Each row names the fix. The proxy prints the reason before it exits. `deltaglider_proxy config lint` finds the first row without a start; the others depend on the host, the network or the backend.
+
+| What the proxy finds | Since | What to do |
+|---|---|---|
+| A `0` in `advanced.blocking_threads`, `advanced.codec_concurrency` or `advanced.filtered_list_max_engine_pages` (or in `DGP_BLOCKING_THREADS`, `DGP_CODEC_CONCURRENCY`, `DGP_FILTERED_LIST_MAX_ENGINE_PAGES`). | 2.2.0 | Remove the `0`. Each of them already broke the proxy: a panic at start, a `503` for every delta write, or a failure of every filtered listing. |
+| An S3 backend whose endpoint name resolves only to addresses that the proxy refuses (loopback without `allow_local`, link-local, or a cloud metadata address). A backend that no bucket names counts too, because the proxy lists the buckets of every backend. | 2.2.1 | Set `allow_local: true` on that backend if it is a local or in-cluster endpoint, fix the DNS name, or remove the backend. |
+| A second process on the same state directory (the folder of `deltaglider_config.db`) after `DGP_STATE_LOCK_WAIT_SECS` (60 seconds by default). | 2.2.0 | Stop the old process before the new one starts, or raise the wait. Give each replica its own volume. |
+| A spool directory (`DGP_SPOOL_DIR`) that another user owns, that all users can write to (such as `/tmp` itself), or in which the proxy cannot make a file. | 2.2.0 | Give the spool a directory of its own, or run `chmod 700` on it. |
+| A proxy without a terminal that makes its bootstrap password and cannot write `.deltaglider_bootstrap_hash`. | 2.2.0 | Make the working directory writable, or set `DGP_BOOTSTRAP_PASSWORD_HASH`. |
+| A coordination bucket (`config_sync_bucket`) for which the backend gives an S3 error that no retry changes (a missing bucket, an unknown access key, a wrong signature, no right to write), after 30 seconds of retries. | 2.2.1 | Fix the bucket name or the credentials of the backend. Before 2.2.1 any failure of the probe stopped the boot; now only these errors do. |
+| A coordination bucket that two probes in a row prove to have no atomic conditional writes. A running proxy then drains and exits with code 1. | 2.2.0 | Use a bucket on a backend with conditional writes, or remove `config_sync_bucket` ([Backend capability validation](backend-capability-validation.md)). |
+
+Two of these stop a configuration that worked before, and the proxy still makes them fatal. A spool directory that is shared or owned by another user lets another user on the host change the files of an upload. A backend whose name resolves to a refused address cannot serve a request, and the proxy lists its buckets at start, so the failure would otherwise show up later and in another place. If you see no safe way to change one of them, start the previous version and report the case.
+
+## A key below a `.dg` directory (2.2.0, listed again in 2.2.1)
+
+Since 2.2.0, a request that writes a key with a directory named `.dg` at any depth, or a file named `.dg`, gets `400 InvalidArgument`: `PutObject`, `CopyObject` to that key, `CreateMultipartUpload` and a browser form upload. The proxy keeps its own files in directories with this name (the delta baselines and, on an S3 backend, the listing facts). A key such as `releases/.dg/notes.txt` that an older release stored stays in the bucket. Release 2.2.0 listed no such key, so a bucket that held only these keys looked empty, and `DeleteBucket` answered `409 BucketNotEmpty` for it. From release 2.2.1 on, a listing shows these keys like any other key, a client can read them and delete them, and `DeleteBucket` names the first one in its `409` message. The proxy never shows its own files. A migrate stops with a failure that names such a key, because the new place refuses to store it, and the job does not flip the bucket. Delete the key (or copy it to a key outside `.dg`) and start the migrate again. A replication or lifecycle rule records the same failure for such a key.
+
+## A name of 255 bytes on every backend (2.2.0)
+
+A file name (the last part of a key) of 250 bytes or more is stored as a whole object, never as a delta, on every backend. A delta is stored under the file name plus `.delta`, which must stay within the 255 bytes that a file system allows for a name, and the proxy uses one rule for all backends so that a bucket can move between a filesystem and an S3 backend. The object is stored and read as before, but it takes no savings. Before, the second upload of such a delta-eligible name failed with `400 KeyTooLongError`.
+
+## A multipart object larger than the spool allows (2.2.1)
+
+The proxy now checks, at start and in `config lint`, that the largest multipart object matches `max_object_size`. The largest multipart object is half of `DGP_SPOOL_MAX_BYTES` (the spool holds every part until `CompleteMultipartUpload`), unless `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` or `DGP_MAX_TOTAL_MULTIPART_BYTES` sets a lower value. When that limit is below `max_object_size`, the proxy logs a warning and `config lint` prints it. The warning names `DGP_SPOOL_MAX_BYTES` and the value that removes it: twice `max_object_size`. Without the warning, a client sent all the parts of a large object and then got `413 EntityTooLarge` at the end. With the default spool of 16 GiB the limit is 8 GiB, and the default `max_object_size` is 100 MiB, so a default configuration gets no warning. The Helm chart gives the spool three quarters of `tmp.sizeLimit` (1.5 GiB for the default `2Gi`, so the limit is 768 MiB), and the operator gives it 6 GiB (a limit of 3 GiB). Neither default warns. When you raise `max_object_size` on Kubernetes, raise `tmp.sizeLimit` to about eight thirds of the largest multipart object.
+
+## `CopyObject` judges `If-Match` and `If-None-Match` of the destination (2.2.1)
+
+A `CopyObject` request with `If-None-Match: *` now gets `412 PreconditionFailed` when the destination key exists, and one with an `If-Match` that does not match the destination gets `412` (or `404 NoSuchKey` when the destination is missing), as on S3. The destination stays as it was. Before, the proxy ignored both headers and the copy always went through. A client that sent them by habit, and relied on the copy going through, now sees the refusal.
+
+## A delete job can be cancelled after a key rotation (2.2.1)
+
+A delete job that a browser user started now records the user's id with the access key. After an admin rotates the keys of that user, the user cancels the job with the new keys, and the job goes on to act as the user. A job row from an older release has no id and is judged by the access key as before.
+
 ## Common gotchas
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.

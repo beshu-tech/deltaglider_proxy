@@ -83,6 +83,70 @@ pub fn max_total_multipart_bytes(spool_max_bytes: u64, configured: Option<u64>) 
     configured.unwrap_or(spool_max_bytes / 2)
 }
 
+/// Pure: the largest multipart object, in bytes. A part is a spool file, so
+/// the object is at most what one upload may hold ([`relay_upload_cap`]) and
+/// at most what all open uploads may hold together
+/// ([`max_total_multipart_bytes`]).
+pub fn multipart_object_limit(
+    spool_max_bytes: u64,
+    relay_configured: Option<u64>,
+    total_configured: Option<u64>,
+) -> u64 {
+    let total = max_total_multipart_bytes(spool_max_bytes, total_configured);
+    relay_upload_cap(spool_max_bytes, relay_configured).map_or(total, |relay| relay.min(total))
+}
+
+/// Pure: the config warning for a multipart limit below `max_object_size`
+/// (`None` when the limit is enough). A multipart object larger than the limit
+/// gets `413 EntityTooLarge` after its parts were sent, so the operator must
+/// hear of it at boot and in `config lint`. The message names the two
+/// settings and the `DGP_SPOOL_MAX_BYTES` that removes the warning: with the
+/// default caps the limit is half of the spool, so twice `max_object_size`.
+pub fn multipart_limit_warning(
+    spool_max_bytes: u64,
+    relay_configured: Option<u64>,
+    total_configured: Option<u64>,
+    max_object_size: u64,
+) -> Option<String> {
+    let limit = multipart_object_limit(spool_max_bytes, relay_configured, total_configured);
+    if max_object_size == 0 || limit >= max_object_size {
+        return None;
+    }
+    let needed = max_object_size.saturating_mul(2);
+    let mut message = format!(
+        "A multipart upload can hold at most {limit} bytes of spool space, which is below \
+         max_object_size={max_object_size}. A multipart object larger than {limit} bytes gets \
+         413 EntityTooLarge after the client sent its parts. Set DGP_SPOOL_MAX_BYTES to \
+         {needed} or more (now {spool_max_bytes}; the limit is half of it), or lower \
+         max_object_size"
+    );
+    // A cap that the operator set can hold the limit down at any spool size.
+    let still_capped = multipart_object_limit(needed, relay_configured, total_configured);
+    if still_capped < max_object_size {
+        let setters: Vec<String> = [
+            (RELAY_UPLOAD_MAX_ENV, relay_configured),
+            (MAX_TOTAL_MULTIPART_ENV, total_configured),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| {
+            value
+                .filter(|v| *v > 0 && *v < max_object_size)
+                .map(|v| format!("{name} (now {v})"))
+        })
+        .collect();
+        message.push_str(&format!(
+            ", and raise {} too",
+            if setters.is_empty() {
+                "the caps you set".to_string()
+            } else {
+                setters.join(" and ")
+            }
+        ));
+    }
+    message.push('.');
+    Some(message)
+}
+
 /// Pure: the spool budget, in bytes, that a part of `size` bytes holds.
 /// The spool reserves whole MiB, at least one per file, so the caps count
 /// this and not the part's bytes: counted in bytes, 10,000 parts of one

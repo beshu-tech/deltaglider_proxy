@@ -110,7 +110,10 @@ persistence:
 # reconstructions and multipart relay parts. The chart sets
 # DGP_SPOOL_MAX_BYTES to three quarters of sizeLimit (Mi or Gi), so the
 # spool never gets the pod evicted. Size it for your largest concurrent
-# uploads; the largest multipart object is half the spool budget.
+# uploads; the largest multipart object is half the spool budget (three
+# eighths of sizeLimit: 768 MiB for the default 2Gi). The proxy warns at
+# start when that is below max_object_size; to allow objects of N bytes,
+# set sizeLimit to about 8N/3.
 tmp:
   sizeLimit: 2Gi
 

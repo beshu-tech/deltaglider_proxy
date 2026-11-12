@@ -23,6 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
+/// The default of `DGP_SPOOL_MAX_BYTES`: 16 GiB.
+pub const DEFAULT_SPOOL_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 tokio::task_local! {
     /// The backend whose share of the budget a request's spool counts
     /// against (see [`scoped`]).
@@ -119,7 +122,7 @@ impl SpoolDir {
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("dgp-spool"));
         let max_bytes: u64 =
-            crate::config::env_parse_with_default("DGP_SPOOL_MAX_BYTES", 16 * 1024 * 1024 * 1024);
+            crate::config::env_parse_with_default("DGP_SPOOL_MAX_BYTES", DEFAULT_SPOOL_MAX_BYTES);
         let share: u8 = crate::config::env_parse_with_default(
             "DGP_BACKEND_SHARE_PERCENT",
             crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT,

@@ -92,17 +92,23 @@ pub fn skip_past_facts(last_key: &str) -> Option<&'static str> {
     is_facts_key(last_key).then_some(PAST_FACTS)
 }
 
-/// Is a CommonPrefix of a listing inside the facts namespace (or a partial
-/// path to it, like `.dg/fac` with delimiter `t`)? Never shown to a client.
+/// Is a CommonPrefix of a listing inside the facts namespace? Such a prefix
+/// holds only the proxy's own keys, whatever else the bucket holds: no client
+/// key lives there (the namespace is reserved for every request).
 pub fn is_internal_common_prefix(p: &str) -> bool {
-    p.starts_with(FACTS_ROOT) || (p.len() > ".dg/".len() && FACTS_ROOT.starts_with(p))
+    p.starts_with(FACTS_ROOT)
 }
 
-/// The proxy's own directory name. Older releases kept the delta baseline
-/// at `<prefix>/.dg/reference.bin`; this release keeps the listing facts
-/// under `.dg/facts/` (S3). A client key never lives in a `.dg` directory
-/// (F19, epic #142): it is refused at ingest and never listed.
+/// The proxy's own directory name. Since v2.2.0 a client key below a `.dg`
+/// directory is refused at ingest (F19, epic #142). A key that an older
+/// release stored there is a client object like any other: LIST shows it, a
+/// client can read it and delete it, and nothing can write it again. Only the
+/// proxy's own files are hidden: the listing facts and the delta baseline
+/// (see [`is_hidden_key`], [`shows_in_listing`]).
 pub const INTERNAL_DIR: &str = ".dg";
+
+/// A delta baseline, relative to its folder.
+const BASELINE_PATH: &str = ".dg/reference.bin";
 
 /// Does a path (a key's directory part, a prefix, a common prefix) go
 /// through a `.dg` directory, at any depth?
@@ -110,15 +116,39 @@ pub fn has_internal_segment(path: &str) -> bool {
     path.split('/').any(|s| s == INTERNAL_DIR)
 }
 
-/// Is a listed key invisible to clients? The listing facts, and any key
-/// below a `.dg` directory except a legacy baseline (`reference.bin`, which
-/// the listing reports apart).
+/// Is a listed key the proxy's own file, never an object? The listing facts.
+/// (A delta baseline is reported apart by the listing, see
+/// [`shows_in_listing`].)
 pub fn is_hidden_key(key: &str) -> bool {
-    if is_facts_key(key) {
-        return true;
-    }
-    let (dir, file) = key.rsplit_once('/').unwrap_or(("", key));
-    has_internal_segment(dir) && file != "reference.bin"
+    is_facts_key(key)
+}
+
+/// Does a raw backend key make an entry of a LIST? Not the listing facts, and
+/// not a delta baseline (`reference.bin`).
+pub fn shows_in_listing(key: &str) -> bool {
+    !is_hidden_key(key) && key.rsplit('/').next() != Some("reference.bin")
+}
+
+/// Pure: could every key under the CommonPrefix `p` be one of the proxy's own
+/// files? True when `p` is a leading part of the facts namespace or of a
+/// `<folder>/.dg/reference.bin`. With a delimiter other than `/` such a
+/// prefix also covers a legacy client key (`.` covers `.dg/facts/...` and
+/// `.dg/old.txt`), so the listing must look under it before it shows it.
+/// With `/` only a `.dg/` prefix qualifies.
+///
+/// The folder part must be complete: a prefix such as `a` (delimiter `a`) of
+/// `aa/.dg/reference.bin` also covers every other key that starts with `a`,
+/// and is not checked. The facts exist in every bucket, so they are the case
+/// that matters; a baseline without an object is a leftover.
+pub fn may_hold_only_own_keys(p: &str) -> bool {
+    // Own keys start at the root or after a `/`.
+    std::iter::once(0)
+        .chain(p.match_indices('/').map(|(i, _)| i + 1))
+        .any(|start| {
+            let tail = &p[start..];
+            !tail.is_empty()
+                && (BASELINE_PATH.starts_with(tail) || (start == 0 && FACTS_ROOT.starts_with(tail)))
+        })
 }
 
 /// Order-preserving, prefix-free encoding of a stored key (see module doc).
@@ -838,31 +868,44 @@ mod tests {
 
     #[test]
     fn facts_common_prefixes_are_internal() {
-        for p in [".dg/facts/", ".dg/facts/zz/", ".dg/fac", ".dg/facts"] {
+        for p in [".dg/facts/", ".dg/facts/zz/", ".dg/facts/x.d"] {
             assert!(is_internal_common_prefix(p), "{p}");
         }
-        for p in [".dg/", ".d", "", "a/.dg/facts/x/", ".well-known/", ".dgx/"] {
+        // A leading part of the namespace may also cover a client key.
+        for p in [
+            ".dg/",
+            ".dg/fac",
+            ".dg/facts",
+            ".d",
+            "",
+            "a/.dg/facts/x/",
+            ".well-known/",
+            ".dgx/",
+        ] {
             assert!(!is_internal_common_prefix(p), "{p}");
         }
     }
 
-    /// F19 (epic #142): the one rule of what a listing hides. A `.dg`
-    /// directory at any depth is the proxy's; a legacy baseline is reported
-    /// apart, not hidden here; `.dgx`, `.well-known` and the like are keys.
+    /// L1 (#171): the one rule of what a listing hides. Only the proxy's own
+    /// files are hidden: the facts, and the delta baselines (reported
+    /// apart). A key that an older release stored below a `.dg` directory is
+    /// an object like any other.
     #[test]
-    fn a_key_in_a_dg_directory_is_hidden_from_listings() {
+    fn only_the_proxys_own_files_are_hidden_from_listings() {
+        for key in [
+            ".dg/facts/x!!1.e.1.2.e",
+            KEY_CLAIM_KEY,
+            CONVERSION_MARKER_KEY,
+        ] {
+            assert!(is_hidden_key(key), "{key}");
+            assert!(!shows_in_listing(key), "{key}");
+        }
         for key in [
             ".dg/foo",
             "a/.dg/foo",
-            ".dg/facts/x!!1.e.1.2.e",
             "a/b/.dg/c/d.txt",
             ".dg/sub/x",
-        ] {
-            assert!(is_hidden_key(key), "{key}");
-        }
-        for key in [
-            ".dg/reference.bin",
-            "a/.dg/reference.bin",
+            "a/.dg/facts/x",
             ".dgx/a",
             ".dg",
             "a/.dg",
@@ -871,12 +914,90 @@ mod tests {
             "a.dg/b",
         ] {
             assert!(!is_hidden_key(key), "{key}");
+            assert!(shows_in_listing(key), "{key}");
+        }
+        for key in [".dg/reference.bin", "a/.dg/reference.bin", "reference.bin"] {
+            assert!(!shows_in_listing(key), "{key}");
         }
         for path in [".dg", ".dg/", "a/.dg/", "a/.dg/b/"] {
             assert!(has_internal_segment(path), "{path}");
         }
         for path in ["", ".dgx/", "a/b", "dg/"] {
             assert!(!has_internal_segment(path), "{path}");
+        }
+    }
+
+    /// L2 (#171): which CommonPrefixes need a look under them. Table.
+    #[test]
+    fn a_common_prefix_that_may_hold_only_own_files_is_checked() {
+        for p in [
+            ".dg/",
+            ".dg/f",
+            ".dg/facts",
+            ".",
+            ".d",
+            ".dg",
+            "a/.dg/",
+            "a/.",
+            "a/b/.d",
+            "a/.dg/r",
+            "a/.dg/reference",
+        ] {
+            assert!(may_hold_only_own_keys(p), "{p}");
+        }
+        for p in [
+            "",
+            "a/",
+            "a/b/",
+            ".dgx/",
+            ".well-known/",
+            "a.",
+            "a/b.",
+            "é/",
+            "a/.dg/x/",
+            "a/x.dg/",
+            ".x",
+            "a/.dgx",
+            "dg/",
+        ] {
+            assert!(!may_hold_only_own_keys(p), "{p}");
+        }
+    }
+
+    /// The class guard of the check above: whatever the delimiter, a prefix
+    /// of one of the proxy's own keys is checked, so no phantom prefix passes.
+    mod prefix_model {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn every_leading_part_of_an_own_key_is_checked(
+                dir in "(([a-z.]{1,3}|\\.dg)/){0,3}",
+                cut in 1usize..30,
+            ) {
+                // The folder part is complete: a prefix such as `a` of
+                // `aa/.dg/reference.bin` names no folder (see the function).
+                for (own, folder) in [
+                    (format!("{dir}.dg/reference.bin"), dir.len()),
+                    (".dg/facts/x!!1.e.1.2.e".to_string(), 0),
+                ] {
+                    let cut = (folder + cut).min(own.len() - 1);
+                    if !own.is_char_boundary(cut) {
+                        continue;
+                    }
+                    let p = &own[..cut];
+                    if is_internal_common_prefix(p) {
+                        continue;
+                    }
+                    // A prefix that ends with `/` and is not `.dg/` covers the
+                    // normal folder case and is not checked.
+                    if p.ends_with('/') && !p.ends_with(".dg/") {
+                        continue;
+                    }
+                    prop_assert!(may_hold_only_own_keys(p), "{p} of {own}");
+                }
+            }
         }
     }
 

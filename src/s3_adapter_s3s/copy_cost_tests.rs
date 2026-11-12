@@ -121,9 +121,18 @@ impl Fixture {
         let engine = self.state.engine.load();
         let head = engine.head(source.0, source.1).await.unwrap();
         let input = copy_input(source, dest, None);
-        copy::copy_through_store(&self.svc, &engine, source, &input, "COPY", &head)
-            .await
-            .unwrap();
+        let precondition = crate::deltaglider::Precondition::none();
+        copy::copy_through_store(
+            &self.svc,
+            &engine,
+            source,
+            &input,
+            "COPY",
+            &head,
+            &precondition,
+        )
+        .await
+        .unwrap();
     }
 }
 

@@ -26,9 +26,13 @@
 //! new item, counts it in `deltaglider_listing_facts_queue_dropped_total`
 //! (label `queue`: `write` or `cleanup`) and logs a warning (the first drop
 //! and every 10,000th). Both kinds of work are best effort already: a
-//! dropped write leaves the LIST reporting the stored size until a HEAD or
-//! the healer writes the facts, a dropped cleanup leaves entries that never
-//! match a later object and that the facts GC removes.
+//! dropped cleanup leaves entries that never match a later object and that
+//! the facts GC removes. A dropped write is repaired at once: its caller
+//! keeps the facts key (`list_size_cache::mark_unwritten`), and the next LIST
+//! of the object offers the write again, so the repair needs no healer HEAD
+//! (which the one-hour `tried` mark of the healer would hold back) and no
+//! free slot at the time of the drop. Until then another node, or this one
+//! after a restart, lists the stored size.
 
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -427,8 +431,9 @@ impl FactsCleanupQueue {
 
     /// `stored_key` was written again, with the facts object `facts_key`:
     /// write it in the background, and a queued delete cleanup of the key
-    /// keeps its newest entry.
-    pub(super) fn write(&self, bucket: &str, stored_key: &str, facts_key: String) {
+    /// keeps its newest entry. `false`: not queued, see [`FactsWriter::write`].
+    #[must_use = "a refused facts write must be kept: list_size_cache::mark_unwritten"]
+    pub(super) fn write(&self, bucket: &str, stored_key: &str, facts_key: String) -> bool {
         self.writer.write(bucket, stored_key, facts_key)
     }
 
@@ -496,7 +501,13 @@ impl FactsWriter {
     /// cleanup: when the cleanup lists the key before the new entry lands,
     /// it does not see that entry and leaves it; when after, the rewrite
     /// mark keeps the newest entry.
-    pub(super) fn write(&self, bucket: &str, stored_key: &str, facts_key: String) {
+    ///
+    /// `false` when the write was not queued (the queue is full or closed):
+    /// the caller keeps the facts key for a later offer
+    /// (`list_size_cache::mark_unwritten`), so the repair does not wait for
+    /// a LIST to find a miss.
+    #[must_use = "a refused facts write must be kept: list_size_cache::mark_unwritten"]
+    pub(super) fn write(&self, bucket: &str, stored_key: &str, facts_key: String) -> bool {
         if let Ok(mut st) = self.rewritten.lock() {
             let pair = (bucket.to_string(), stored_key.to_string());
             if st.pending.contains(&pair) {
@@ -512,7 +523,9 @@ impl FactsWriter {
         ) {
             self.outstanding.done(bucket, 1);
             debug!("facts write not queued; {bucket}/{stored_key} lists its stored size");
+            return false;
         }
+        true
     }
 }
 
@@ -872,10 +885,10 @@ mod tests {
         const N: usize = 32;
         let started = std::time::Instant::now();
         for i in 0..N {
-            queue.write("b", &format!("p/k{i}"), format!(".dg/facts/p/k{i}"));
+            let _ = queue.write("b", &format!("p/k{i}"), format!(".dg/facts/p/k{i}"));
         }
         // The same key twice in one batch is written once.
-        queue.write("b", "p/k0", ".dg/facts/p/k0".to_string());
+        let _ = queue.write("b", "p/k0", ".dg/facts/p/k0".to_string());
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let puts = || {
             fake.requests()
@@ -945,7 +958,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let queued = std::time::Instant::now();
-        queue.write("b", "p/x.zip.delta", ".dg/facts/p/x".to_string());
+        let _ = queue.write("b", "p/x.zip.delta", ".dg/facts/p/x".to_string());
         let written = || {
             fake.requests()
                 .iter()
@@ -981,7 +994,7 @@ mod tests {
         );
         // The first write and the first cleanup take their drain task into
         // a stalled request; the queues fill behind them.
-        queue.write("b", "p/first", ".dg/facts/p/first".to_string());
+        let _ = queue.write("b", "p/first", ".dg/facts/p/first".to_string());
         queue.enqueue("b", "d/first.html", None);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let busy = |fake: &crate::storage::fake_s3::FakeS3| {
@@ -998,10 +1011,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         const MORE: usize = 50;
+        let mut refused = 0;
         for i in 0..MORE {
-            queue.write("b", &format!("p/k{i}"), format!(".dg/facts/p/k{i}"));
+            // L5 (#171): the caller learns of a refused write.
+            if !queue.write("b", &format!("p/k{i}"), format!(".dg/facts/p/k{i}")) {
+                refused += 1;
+            }
             queue.enqueue("b", &format!("d/k{i}.html"), None);
         }
+        assert_eq!(refused, MORE - CAP, "write() reports exactly the refusals");
         let (writes, cleanups) = queue.dropped();
         assert_eq!(
             writes,
@@ -1095,7 +1113,7 @@ mod tests {
         }
         let queue = FactsCleanupQueue::start(client.clone(), native.into());
         let new = listing_facts::token_key("d/a.delta", "e1", 1, "new").unwrap();
-        queue.write("b", "d/a.delta", new.clone());
+        let _ = queue.write("b", "d/a.delta", new.clone());
         queue.settle("b").await;
         let mut keys: Vec<String> = client
             .list_objects_v2()

@@ -313,6 +313,7 @@ impl BulkActor {
             BulkSession::IamUser {
                 access_key_id,
                 client_ip,
+                ..
             } => (access_key_id, *client_ip),
         };
         let iam = state.iam_state.load();
@@ -339,7 +340,21 @@ impl BulkActor {
             Principal::User {
                 access_key_id,
                 client_ip,
-            } => Self::for_user(iam, access_key_id, *client_ip),
+                user_id,
+            } => {
+                // By the user's id when the job has one: the keys may have
+                // rotated since it started (A2, #171). An id with no user
+                // is a user that is gone, never the access key id (another
+                // user may hold that key now).
+                let access_key_id = match (user_id, iam) {
+                    (Some(id), crate::iam::IamState::Iam(index)) => index
+                        .get_by_id(*id)
+                        .map(|u| u.access_key_id.as_str())
+                        .ok_or("AccessDenied: user disabled or gone")?,
+                    _ => access_key_id.as_str(),
+                };
+                Self::for_user(iam, access_key_id, *client_ip)
+            }
         }
     }
 

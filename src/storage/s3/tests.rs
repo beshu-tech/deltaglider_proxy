@@ -3070,6 +3070,61 @@ mod sealed_shape_tests {
         }
     }
 
+    /// L5 (#171): a facts write that the full queue refused is offered again
+    /// by the next LIST of its object, with no miss and no healer HEAD. A
+    /// second refusal keeps it for the LIST after.
+    #[tokio::test]
+    async fn a_list_offers_a_refused_facts_write_again() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let s3 = test_support::for_test_endpoint_as_node(&endpoint, "refused-facts");
+        let sha = "f".repeat(64);
+        let body = [5u8; 333];
+        fake.insert_object("b/p/app.zip.delta", &body, &delta_meta(&sha, &[]));
+        let facts_key = listing_facts::facts_key(
+            "p/app.zip.delta",
+            &md5_hex(&body),
+            333,
+            &LogicalFacts {
+                size: 100_000,
+                etag: "0123456789abcdef0123456789abcdef".into(),
+            },
+        )
+        .unwrap();
+        let mut objects = s3.bulk_list_objects("b", "p/").await.unwrap();
+        let id = |objects: &[(String, FileMetadata)]| {
+            (objects[0].1.md5.clone(), objects[0].1.stored_size())
+        };
+        let (etag, size) = id(&objects);
+        let stored = StoredObjectId {
+            scope: &s3.list_cache_scope,
+            bucket: "b",
+            key: "p/app.zip.delta",
+            etag: &etag,
+            size,
+        };
+        list_size_cache::mark_unwritten(&stored, facts_key.clone());
+        assert!(list_size_cache::any_unwritten());
+        fake.clear();
+        let resolve = ResolveListed {
+            trust_v1_facts: true,
+            caller_heads_misses: true,
+        };
+        s3.resolve_listed_sizes("b", &mut objects, resolve).await;
+        // The request path escapes the `!!` of the key.
+        let put = "PUT /b/.dg/facts/p/app.zip.delta".to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !fake.requests().iter().any(|r| r.starts_with(&put)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refused write was never offered: {:?}",
+                fake.requests()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Taken: a second LIST sends no second write.
+        assert_eq!(list_size_cache::take_unwritten(&stored), None);
+    }
+
     /// A range read names the stored object's total size.
     #[tokio::test]
     async fn a_range_read_names_the_stored_total() {

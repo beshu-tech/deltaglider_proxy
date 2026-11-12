@@ -1054,3 +1054,128 @@ async fn test_copy_object_above_the_spool_threshold() {
         }
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// A1 (#171) — CopyObject judges the destination's If-Match / If-None-Match
+// ────────────────────────────────────────────────────────────────────────
+
+/// S3 answers a CopyObject whose `If-None-Match: *` meets an existing
+/// destination with 412, and `If-Match` with another ETag with 412; the
+/// destination stays as it was. s3s 0.14 drops these two headers, so the
+/// adapter reads them itself. Both write paths: a passthrough key (the
+/// backend copies) and a delta-eligible key (the store).
+#[tokio::test]
+async fn test_copy_object_judges_the_destination_conditionals() {
+    let server = TestServer::filesystem().await;
+    let client = server.s3_client().await;
+    let bucket = server.bucket();
+    let put = |key: &'static str, body: &'static [u8]| {
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        async move {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(body))
+                .send()
+                .await
+                .unwrap()
+                .e_tag()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let read = |key: &'static str| {
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        async move {
+            client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap()
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes()
+        }
+    };
+    put("src.bin", b"NEW-SOURCE").await;
+    for dest in ["dst.bin", "dst.zip"] {
+        let dest_etag = put(dest, b"EXISTING-DEST").await;
+        let copy = |if_match: Option<&str>, if_none_match: Option<&str>| {
+            let mut req = client
+                .copy_object()
+                .bucket(bucket)
+                .key(dest)
+                .copy_source(format!("{bucket}/src.bin"));
+            if let Some(v) = if_match {
+                req = req.if_match(v);
+            }
+            if let Some(v) = if_none_match {
+                req = req.if_none_match(v);
+            }
+            async move { req.send().await }
+        };
+        let code = |r: Result<_, aws_sdk_s3::error::SdkError<_>>| match r {
+            Ok(_) => "ok".to_string(),
+            Err(e) => e
+                .raw_response()
+                .map(|r| r.status().as_u16().to_string())
+                .unwrap_or_else(|| format!("{e:?}")),
+        };
+        assert_eq!(code(copy(None, Some("*")).await), "412", "{dest}: *");
+        assert_eq!(
+            code(copy(Some("\"00000000000000000000000000000000\""), None).await),
+            "412",
+            "{dest}: wrong ETag"
+        );
+        assert_eq!(
+            &read(if dest == "dst.bin" {
+                "dst.bin"
+            } else {
+                "dst.zip"
+            })
+            .await[..],
+            b"EXISTING-DEST",
+            "{dest}: refused copies change nothing"
+        );
+        // The right ETag, then the copy goes through.
+        assert_eq!(code(copy(Some(&dest_etag), None).await), "ok", "{dest}");
+        assert_eq!(
+            &read(if dest == "dst.bin" {
+                "dst.bin"
+            } else {
+                "dst.zip"
+            })
+            .await[..],
+            b"NEW-SOURCE"
+        );
+    }
+    // A missing destination: `If-None-Match: *` creates it, `If-Match` is 404.
+    let r = client
+        .copy_object()
+        .bucket(bucket)
+        .key("fresh.bin")
+        .copy_source(format!("{bucket}/src.bin"))
+        .if_none_match("*")
+        .send()
+        .await;
+    assert!(r.is_ok(), "{r:?}");
+    let r = client
+        .copy_object()
+        .bucket(bucket)
+        .key("never.bin")
+        .copy_source(format!("{bucket}/src.bin"))
+        .if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await;
+    assert_eq!(
+        r.unwrap_err().raw_response().map(|r| r.status().as_u16()),
+        Some(404)
+    );
+}

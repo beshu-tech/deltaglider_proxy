@@ -215,6 +215,64 @@ pub fn mark_sealed(id: &StoredObjectId<'_>) {
     SEALED.insert(key, ());
 }
 
+/// Facts writes that the full write queue refused (L5, #171), by stored
+/// object: the facts key to write. This process lists such an object right
+/// (its [`record`] entry), so no LIST of it finds a miss and the healer
+/// never runs for it: the durable facts would stay unwritten, and every
+/// other node and every restart would list the stored size. A LIST of the
+/// object takes the entry and offers the write again
+/// ([`take_unwritten`]). Bounded; an entry of an object that was overwritten
+/// since is never taken, so a full registry first drops the entries older
+/// than [`UNWRITTEN_MAX_AGE`].
+static UNWRITTEN: LazyLock<std::sync::Mutex<std::collections::HashMap<String, Unwritten>>> =
+    LazyLock::new(Default::default);
+
+struct Unwritten {
+    facts_key: String,
+    at: std::time::Instant,
+}
+
+/// Most entries of [`UNWRITTEN`].
+const UNWRITTEN_CAP: usize = 100_000;
+/// How long an entry of the refused-writes registry is kept when it is full.
+pub const UNWRITTEN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Note that the write of `facts_key` for the stored object `id` was refused.
+pub fn mark_unwritten(id: &StoredObjectId<'_>, facts_key: String) {
+    let Ok(mut map) = UNWRITTEN.lock() else {
+        return;
+    };
+    if map.len() >= UNWRITTEN_CAP {
+        map.retain(|_, u| u.at.elapsed() < UNWRITTEN_MAX_AGE);
+        if map.len() >= UNWRITTEN_CAP {
+            return;
+        }
+    }
+    map.insert(
+        cache_key(id),
+        Unwritten {
+            facts_key,
+            at: std::time::Instant::now(),
+        },
+    );
+}
+
+/// Are any facts writes refused and not offered again? A LIST asks first,
+/// so that it costs nothing when the answer is no.
+pub fn any_unwritten() -> bool {
+    UNWRITTEN.lock().map(|m| !m.is_empty()).unwrap_or(false)
+}
+
+/// The facts key of a refused write of the stored object `id`, removed: the
+/// caller offers it again (and marks it again if it is refused again).
+pub fn take_unwritten(id: &StoredObjectId<'_>) -> Option<String> {
+    UNWRITTEN
+        .lock()
+        .ok()?
+        .remove(&cache_key(id))
+        .map(|u| u.facts_key)
+}
+
 /// The listing tokens that this process made for stored objects (issue
 /// #120): a LIST right after a PUT finds the token here, before the
 /// background writer has stored its `!!2` marker. Exact per stored object;

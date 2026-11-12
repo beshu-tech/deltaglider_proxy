@@ -1578,6 +1578,89 @@ fn max_total_multipart_bytes_truth_table() {
     assert_eq!(store.max_total_multipart_bytes(), 16 << 20);
 }
 
+/// L4 / R1 (#171): the largest multipart object and the warning that
+/// guards it. The table covers the default caps, each cap alone, and the
+/// binary and chart defaults.
+#[test]
+fn the_multipart_limit_warns_only_below_max_object_size() {
+    const GIB: u64 = 1 << 30;
+    // (spool, relay cap, total cap, max_object_size) -> limit, warns
+    type Config = (u64, Option<u64>, Option<u64>, u64);
+    let table: &[(Config, (u64, bool))] = &[
+        // The binary default: 16 GiB spool, 100 MiB objects.
+        ((16 * GIB, None, None, 100 * MIB), (8 * GIB, false)),
+        // 10 GiB objects need 20 GiB of spool.
+        ((16 * GIB, None, None, 10 * GIB), (8 * GIB, true)),
+        ((20 * GIB, None, None, 10 * GIB), (10 * GIB, false)),
+        // The chart default (2Gi tmp -> 1.5 GiB spool) and the operator's
+        // (8Gi tmp -> 6 GiB) with the default object size.
+        ((3 * GIB / 2, None, None, 100 * MIB), (768 * MIB, false)),
+        ((6 * GIB, None, None, 100 * MIB), (3 * GIB, false)),
+        // Each cap lowers the limit alone; 0 on the relay cap lifts it.
+        ((16 * GIB, Some(GIB), None, 2 * GIB), (GIB, true)),
+        ((16 * GIB, None, Some(GIB), 2 * GIB), (GIB, true)),
+        ((16 * GIB, Some(0), None, 2 * GIB), (8 * GIB, false)),
+        // No object limit: nothing to guard.
+        ((16 * GIB, None, None, 0), (8 * GIB, false)),
+    ];
+    for ((spool, relay, total, max), (limit, warns)) in table {
+        assert_eq!(
+            multipart_object_limit(*spool, *relay, *total),
+            *limit,
+            "{spool} {relay:?} {total:?}"
+        );
+        let warning = multipart_limit_warning(*spool, *relay, *total, *max);
+        assert_eq!(
+            warning.is_some(),
+            *warns,
+            "{spool} {relay:?} {total:?} {max}"
+        );
+        if let Some(w) = warning {
+            for name in ["DGP_SPOOL_MAX_BYTES", "max_object_size"] {
+                assert!(w.contains(name), "{w}");
+            }
+        }
+    }
+    // A cap that the operator set is named when more spool does not help.
+    let w = multipart_limit_warning(16 * GIB, Some(GIB), None, 2 * GIB).unwrap();
+    assert!(
+        w.contains(RELAY_UPLOAD_MAX_ENV) && w.contains("raise"),
+        "{w}"
+    );
+    assert!(!w.contains(MAX_TOTAL_MULTIPART_ENV), "{w}");
+}
+
+mod multipart_limit_model {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Whatever the config, the `DGP_SPOOL_MAX_BYTES` that the warning
+        /// names removes it, unless a cap that the operator set holds the
+        /// limit down (then the message names that cap).
+        #[test]
+        fn the_named_spool_removes_the_warning(
+            spool in 1u64..(1 << 40),
+            max in 1u64..(1 << 38),
+            relay in proptest::option::of(0u64..(1 << 38)),
+            total in proptest::option::of(0u64..(1 << 38)),
+        ) {
+            let Some(w) = multipart_limit_warning(spool, relay, total, max) else {
+                prop_assert!(multipart_object_limit(spool, relay, total) >= max);
+                return Ok(());
+            };
+            let needed = max.saturating_mul(2);
+            prop_assert!(w.contains(&needed.to_string()), "{w}");
+            let after = multipart_object_limit(needed, relay, total);
+            if after < max {
+                prop_assert!(w.contains("raise"), "{w}");
+            } else {
+                prop_assert!(multipart_limit_warning(needed, relay, total, max).is_none());
+            }
+        }
+    }
+}
+
 /// The name of the function that `line` declares: the `fn <name>(` token
 /// after any `pub`, `pub(..)`, `async`, `const` or `unsafe` prefix.
 fn fn_name(line: &str) -> Option<String> {

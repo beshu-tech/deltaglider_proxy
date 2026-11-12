@@ -1745,6 +1745,8 @@ impl StorageBackend for S3Backend {
                 .map(|(key, meta)| Self::listed_size_without_facts(key, meta))
                 .collect();
         }
+        // Before the cache rewrites the entries: their stored facts name them.
+        self.offer_refused_facts(bucket, objects);
         let mut sizes: Vec<ListedSize> = objects
             .iter_mut()
             .map(|(key, meta)| Self::resolve_one_listed(&self.list_cache_scope, bucket, key, meta))

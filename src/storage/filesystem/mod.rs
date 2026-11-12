@@ -742,28 +742,12 @@ impl FilesystemBackend {
     /// Return true when a deltaspace subtree contains at least one user-visible
     /// data file. Empty physical directories are not S3 prefixes and must not
     /// leak into delimiter listings as undeletable "folders". Every file
-    /// counts, a `.dg` directory's too: this is the bucket delete's check,
-    /// which must never erase what it cannot name.
+    /// counts, a `.dg` directory's too (a legacy key is one that LIST shows);
+    /// a `reference.bin` and a temp file do not. This is the one check of the
+    /// listing's folders and of the bucket delete, which must never erase
+    /// what it cannot name.
     fn dir_has_visible_data_recursive<'a>(
         current_dir: &'a Path,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
-    {
-        Self::dir_holds_data(current_dir, false)
-    }
-
-    /// Does the folder hold a key that a LIST shows? As
-    /// [`Self::dir_has_visible_data_recursive`], but a `.dg` directory (the
-    /// proxy's own, never listed) does not count.
-    fn dir_has_listed_key<'a>(
-        current_dir: &'a Path,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
-    {
-        Self::dir_holds_data(current_dir, true)
-    }
-
-    fn dir_holds_data<'a>(
-        current_dir: &'a Path,
-        skip_internal: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -774,12 +758,7 @@ impl FilesystemBackend {
                 let path = entry.path();
                 let ft = entry.file_type().await?;
                 if ft.is_dir() {
-                    if skip_internal
-                        && entry.file_name() == crate::storage::listing_facts::INTERNAL_DIR
-                    {
-                        continue;
-                    }
-                    if Self::dir_holds_data(&path, skip_internal).await? {
+                    if Self::dir_has_visible_data_recursive(&path).await? {
                         return Ok(true);
                     }
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -1062,9 +1041,6 @@ impl FilesystemBackend {
         } else {
             deltaspaces_dir.join(dir_part)
         };
-        if crate::storage::listing_facts::has_internal_segment(dir_part) {
-            return Ok(empty);
-        }
         let token = continuation_token.unwrap_or("");
         let max = max_keys as usize;
         let Some(mut walk) =
@@ -2251,11 +2227,7 @@ impl StorageBackend for FilesystemBackend {
             forms: super::traits::ListedForms::Unreported,
             reference_prefixes: None,
         };
-        // The proxy's own directory lists nothing (F19). A directory that
-        // does not exist is an empty result, not an error.
-        if crate::storage::listing_facts::has_internal_segment(dir_part) {
-            return Ok(Some(no_keys()));
-        }
+        // A directory that does not exist is an empty result, not an error.
         // A stat error is an error, never "no keys" (review B11).
         if !fsio::exists(&read_dir_path).await? {
             return Ok(Some(no_keys()));
@@ -2313,7 +2285,7 @@ impl StorageBackend for FilesystemBackend {
             let Some(e) = entry else { break };
             // A folder (`dir/name/`).
             let cp = format!("{}/", join_key(dir_part, &e.key_name));
-            if Self::dir_has_listed_key(&level.path.join(&e.name)).await? {
+            if Self::dir_has_visible_data_recursive(&level.path.join(&e.name)).await? {
                 cp_entries.push(cp);
                 if obj_entries.len() + cp_entries.len() >= want {
                     break;
@@ -2361,13 +2333,10 @@ impl StorageBackend for FilesystemBackend {
 
 /// Pure: does the single-level listing (`delimiter = /`) keep this entry of
 /// the directory `dir_key`? A name must start with the filter and its entry
-/// (`dir/name` or `dir/name/`) sort after the token. The `.dg` directory is
-/// the proxy's own and never listed (F19). A marker file at the bucket root
-/// names no key.
+/// (`dir/name` or `dir/name/`) sort after the token. A `.dg` directory is an
+/// ordinary folder: its `reference.bin` is no key, and a legacy key in it is
+/// (L1, #171). A marker file at the bucket root names no key.
 fn level_keep(name_filter: &str, token: &str, dir_key: &str, e: &WalkEntry) -> bool {
-    if e.is_dir && e.name == crate::storage::listing_facts::INTERNAL_DIR {
-        return false;
-    }
     if !e.key_name.starts_with(name_filter) || (dir_key.is_empty() && e.key_name.is_empty()) {
         return false;
     }
@@ -2402,9 +2371,7 @@ impl FilesystemBackend {
         let want = max_keys as usize + 1;
         let mut objects: Vec<(String, FileMetadata)> = Vec::new();
         let mut prefixes: Vec<String> = Vec::new();
-        let walk = if crate::storage::listing_facts::has_internal_segment(dir_part)
-            || !fsio::exists(&walk_root).await?
-        {
+        let walk = if !fsio::exists(&walk_root).await? {
             None
         } else {
             FlatWalk::open(

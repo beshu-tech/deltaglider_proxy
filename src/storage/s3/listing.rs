@@ -644,6 +644,58 @@ pub(super) fn truncated_without_token(bucket: &str) -> StorageError {
 }
 
 impl S3Backend {
+    /// Does a key that a LIST shows exist under `prefix`? Asked for a
+    /// CommonPrefix that may hold only the proxy's own files. Small pages;
+    /// a page that ends in the facts namespace jumps past it. `requests`
+    /// counts what this sends.
+    async fn holds_listed_key(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        requests: &mut u32,
+    ) -> Result<bool, StorageError> {
+        const PROBE_PAGE: i32 = 16;
+        let mut skip_to: Option<&'static str> = None;
+        let mut token: Option<String> = None;
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix)
+                .max_keys(PROBE_PAGE);
+            if let Some(past) = skip_to.take() {
+                request = request.start_after(past);
+            } else if let Some(t) = token.take() {
+                request = request.continuation_token(t);
+            }
+            *requests += 1;
+            let response = request
+                .send()
+                .await
+                .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
+            let contents = response.contents();
+            if contents
+                .iter()
+                .filter_map(|o| o.key())
+                .any(listing_facts::shows_in_listing)
+            {
+                return Ok(true);
+            }
+            if !response.is_truncated.unwrap_or(false) {
+                return Ok(false);
+            }
+            token = response.next_continuation_token.clone();
+            skip_to = contents
+                .last()
+                .and_then(|o| o.key())
+                .and_then(listing_facts::skip_past_facts);
+            if token.is_none() && skip_to.is_none() {
+                return Err(truncated_without_token(bucket));
+            }
+        }
+    }
+
     /// The delegated listing (`StorageBackend::list_objects_delegated`):
     /// upstream S3 pages (and, with a delimiter, collapses) the listing, and
     /// the proxy reads only as far as the page needs.
@@ -711,15 +763,22 @@ impl S3Backend {
                 .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
             DELEGATED_LIST_UPSTREAM_PAGES.inc();
 
-            // Collect CommonPrefixes, skipping ONLY the `.dg/` internal deltaspace
-            // directory (never a user-visible key). Deliberately narrow: an
-            // earlier version skipped ANY dot-prefixed segment, which also hid
-            // legitimate folders like `.well-known/` from user-facing listings.
+            // Collect CommonPrefixes. One that holds only the proxy's own
+            // files is not shown: the facts namespace outright, and a prefix
+            // that may cover them (`.dg/`, or `.` with delimiter `.`) when a
+            // look under it finds no key that a LIST shows (L2, #171).
+            // Deliberately narrow: an earlier version skipped ANY dot-prefixed
+            // segment, which also hid legitimate folders like `.well-known/`.
             if let Some(cps) = response.common_prefixes {
                 for cp in cps {
                     if let Some(p) = cp.prefix {
-                        if listing_facts::has_internal_segment(&p)
-                            || listing_facts::is_internal_common_prefix(&p)
+                        if listing_facts::is_internal_common_prefix(&p) {
+                            continue;
+                        }
+                        if listing_facts::may_hold_only_own_keys(&p)
+                            && !self
+                                .holds_listed_key(bucket, &p, &mut upstream_requests)
+                                .await?
                         {
                             continue;
                         }
@@ -1130,14 +1189,15 @@ mod delegated_cost_tests {
         assert_eq!(page.reference_prefixes, None);
     }
 
-    /// F19 + the class guard of epic #142 (S3 backend): keys that an older
-    /// release stored under a `.dg` directory are listed nowhere, flat or
-    /// with a delimiter, and the recursive delimiter walk equals the flat
-    /// listing at every page size. Unicode and a dot-dir stay
-    /// ordinary keys.
+    /// L1 (#171, S3 backend): keys that an older release stored under a
+    /// `.dg` directory are ordinary keys, listed flat and with a delimiter,
+    /// and the recursive delimiter walk equals the flat listing at every
+    /// page size. The facts and the baselines are listed nowhere. Unicode and
+    /// a dot-dir stay ordinary keys.
     #[tokio::test]
-    async fn a_dg_directory_is_hidden_the_same_way_flat_and_with_a_delimiter() {
+    async fn a_legacy_dg_key_is_listed_the_same_way_flat_and_with_a_delimiter() {
         let keys: Vec<String> = [
+            ".dg/facts/x!!1.e.1.2.e",
             ".dg/foo",
             ".dg/reference.bin",
             "a/.dg/bar",
@@ -1154,9 +1214,11 @@ mod delegated_cost_tests {
         .to_vec();
         let (s3, _fake) = backend_with_keys(&keys).await;
         let want: Vec<String> = [
+            ".dg/foo",
             ".dgx/k",
             ".well-known/w",
             "a-b/y",
+            "a/.dg/bar",
             "a/x",
             "a_b/z",
             "top",
@@ -1201,13 +1263,97 @@ mod delegated_cost_tests {
             walked.sort();
             assert_eq!(walked, want, "walk, max_keys {max_keys}");
         }
-        // Asked for by name, the proxy's directory still lists nothing.
+        // Asked for by name, the proxy's directory lists the legacy key,
+        // never the facts or a baseline.
         let page = s3
             .list_objects_delegated("b", ".dg/", None, 1000, None)
             .await
             .unwrap()
             .unwrap();
-        assert!(page.objects.is_empty(), "{:?}", page.objects);
+        let names: Vec<_> = page.objects.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, [".dg/foo"]);
+    }
+
+    /// L2 (#171): a CommonPrefix is shown only when a key that LIST shows
+    /// lies under it, whatever the delimiter. The model builds the prefixes
+    /// from the visible keys; the proxy's own files (the facts, the
+    /// baselines) make none. Every page size.
+    #[tokio::test]
+    async fn the_common_prefixes_of_any_delimiter_come_from_visible_keys_only() {
+        // `.dg/facts/..` exists in every bucket; the rest are the shapes
+        // that made phantoms.
+        let key_sets: [&[&str]; 4] = [
+            &[".dg/facts/x!!1.e.1.2.e", "top", "a/x"],
+            &[
+                ".dg/facts/x!!1.e.1.2.e",
+                "a/.dg/reference.bin",
+                "a/b",
+                ".well-known/w",
+            ],
+            &[
+                ".dg/facts/x!!1.e.1.2.e",
+                ".dg/old.txt",
+                "a/.dg/bar",
+                "a/.dg/reference.bin",
+                ".dgx/k",
+                ".dg-x",
+            ],
+            &[".dg/facts/x!!1.e.1.2.e", ".dg/facts/y!!1.e.1.2.e"],
+        ];
+        for keys in key_sets {
+            let owned: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+            let (s3, _fake) = backend_with_keys(&owned).await;
+            let visible: Vec<&str> = keys
+                .iter()
+                .copied()
+                .filter(|k| listing_facts::shows_in_listing(k))
+                .collect();
+            for prefix in ["", "a/", ".dg/", ".d", "a/.", ".dg/f"] {
+                for delimiter in ["/", ".", "d", "g", "x", "-", "r", "f"] {
+                    let mut want_objects = Vec::new();
+                    let mut want_prefixes = std::collections::BTreeSet::new();
+                    for k in visible.iter().filter(|k| k.starts_with(prefix)) {
+                        let rest = &k[prefix.len()..];
+                        match rest.find(delimiter) {
+                            Some(i) => {
+                                want_prefixes.insert(format!("{prefix}{}{delimiter}", &rest[..i]));
+                            }
+                            None => want_objects.push(k.to_string()),
+                        }
+                    }
+                    want_objects.sort();
+                    for max_keys in [1u32, 1000] {
+                        let mut objects = Vec::new();
+                        let mut prefixes = std::collections::BTreeSet::new();
+                        let mut token: Option<String> = None;
+                        loop {
+                            let page = s3
+                                .list_objects_delegated(
+                                    "b",
+                                    prefix,
+                                    Some(delimiter),
+                                    max_keys,
+                                    token.as_deref(),
+                                )
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            objects.extend(page.objects.into_iter().map(|(k, _)| k));
+                            prefixes.extend(page.common_prefixes);
+                            if !page.is_truncated {
+                                break;
+                            }
+                            token = page.next_continuation_token;
+                        }
+                        let ctx = format!(
+                            "{keys:?} prefix {prefix:?} delimiter {delimiter:?} max {max_keys}"
+                        );
+                        assert_eq!(objects, want_objects, "objects: {ctx}");
+                        assert_eq!(prefixes, want_prefixes, "prefixes: {ctx}");
+                    }
+                }
+            }
+        }
     }
 
     /// A page reports the requests it sent (its pages and its probes), so

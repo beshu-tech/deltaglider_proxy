@@ -16,8 +16,16 @@
 
 - **A stop now waits for detached work, so it can take up to 55 seconds.** A `DeleteObjects` batch and the store of a `CompleteMultipartUpload` run on after their request ends. A stop now waits for them up to 15 seconds (after the 10 seconds for requests) and logs how many tasks it cut. Keep `terminationGracePeriodSeconds` and `stop_grace_period` at 60 seconds or more.
 
+- **A key below a `.dg` directory is listed again.** An object that an older release stored there is a key like any other: a listing shows it (the proxy's own files, the listing facts and the delta baselines, stay hidden), a client reads and deletes it, `DeleteBucket` names it in its `409`, and a migrate stops before the flip with a failure that names it, because the new place refuses to write a `.dg` key. Delete such a key or copy it to another name before a migrate. A write to a `.dg` key still gets `400`.
+- **`CopyObject` judges `If-Match` and `If-None-Match` of the destination.** `If-None-Match: *` on an existing destination and an `If-Match` with another ETag now get `412 PreconditionFailed`.
+- **A warning when the largest multipart object is below `max_object_size`.** It shows at start and in `config lint`, names `DGP_SPOOL_MAX_BYTES` and the value that removes it. The defaults of the binary, the Helm chart and the operator do not warn.
+- **`upgrade.md` lists every new reason for a boot to fail** of 2.2.0 and 2.2.1 with its fix, the `400` for a `.dg` key and the 255-byte name rule.
+
 ### Fixed
 
+- A listing with a delimiter shows a common prefix only when a key that the listing shows lies under it, also with a delimiter other than `/` (the listing facts and the delta baselines make none). The filesystem backend never repeats the common prefix of the continuation token on the next page.
+- A listing-facts write that the full queue refused is offered again by the next listing of its object, so the size of a delta in a listing is right on every node without a healer request.
+- The owner of a delete job can cancel it after the keys of that user were rotated, and the job goes on to act as the user.
 - A spool check that panicked kept `/_/ready` at `503` for ever. A panic now gives one failed verdict, and the next round replaces it.
 - A migrate job stops when its durable progress save fails, before the flip and before the source delete. The flip and the cleanup take a proof that only a successful durable save makes.
 - A failed write inside a page of the event-driven replication consumer now rolls the whole page back and returns the error.

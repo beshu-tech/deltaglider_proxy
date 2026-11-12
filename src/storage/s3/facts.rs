@@ -57,7 +57,9 @@ impl S3Backend {
         token: &str,
     ) {
         if let Some(marker) = listing_facts::token_key(key, stored_etag, stored_size, token) {
-            self.facts_cleanup.write(bucket, key, marker);
+            // Best effort: a refused token write leaves the object to the
+            // token healer (`encrypting::token_heal`), which has its own mark.
+            let _ = self.facts_cleanup.write(bucket, key, marker);
         }
     }
 
@@ -95,7 +97,48 @@ impl S3Backend {
         else {
             return;
         };
-        self.facts_cleanup.write(bucket, key, facts_key);
+        if !self.facts_cleanup.write(bucket, key, facts_key.clone()) {
+            // The queue refused it: a LIST of the object offers it again.
+            list_size_cache::mark_unwritten(
+                &StoredObjectId {
+                    scope: &self.list_cache_scope,
+                    bucket,
+                    key,
+                    etag: stored_etag,
+                    size: stored_size,
+                },
+                facts_key,
+            );
+        }
+    }
+
+    /// A LIST page resolved from this process's cache: the entries whose
+    /// facts write the queue refused offer it again (L5, #171). Free when no
+    /// write was refused.
+    pub(super) fn offer_refused_facts(&self, bucket: &str, objects: &[(String, FileMetadata)]) {
+        if !list_size_cache::any_unwritten() {
+            return;
+        }
+        for (user_key, meta) in objects {
+            let Some(stored_key) = listed_stored_key(user_key, meta) else {
+                continue;
+            };
+            let id = StoredObjectId {
+                scope: &self.list_cache_scope,
+                bucket,
+                key: &stored_key,
+                etag: &meta.md5,
+                size: meta.stored_size(),
+            };
+            if let Some(facts_key) = list_size_cache::take_unwritten(&id) {
+                if !self
+                    .facts_cleanup
+                    .write(bucket, &stored_key, facts_key.clone())
+                {
+                    list_size_cache::mark_unwritten(&id, facts_key);
+                }
+            }
+        }
     }
 
     /// Lazy backfill: a HEAD learned the facts of a stored object that a LIST
@@ -418,7 +461,7 @@ pub(super) fn remember_facts(id: &StoredObjectId<'_>, meta: &FileMetadata) {
 pub(super) fn backfill_facts(
     id: &StoredObjectId<'_>,
     meta: &FileMetadata,
-    write: impl FnOnce(String),
+    write: impl FnOnce(String) -> bool,
 ) {
     // Sealed: a HEAD can never learn its facts. Remember that (and take
     // the missing mark), so no LIST reads its `!!1` facts again and the
@@ -435,7 +478,11 @@ pub(super) fn backfill_facts(
     }
     if let Some(facts_key) = listing_facts::asked_facts_key(id.key, id.etag, id.size, &facts) {
         list_size_cache::record_asked(id, facts);
-        write(facts_key);
+        // A refused write is kept: the next LIST of the object offers it
+        // again (the healer's one-hour mark would hold its HEAD back).
+        if !write(facts_key.clone()) {
+            list_size_cache::mark_unwritten(id, facts_key);
+        }
     }
 }
 
