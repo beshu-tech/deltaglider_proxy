@@ -73,7 +73,7 @@ The proxy takes a lock on its state directory, which is the folder of `deltaglid
 Usually one of these happened:
 
 1. A rolling update started the new process while the old one still ran on the same volume. The error names the holder when it is known: the process id (the one inside the holder's own container, often 1), the host name (the container id in a container) and the start time. A deploy must stop the old process first. On Kubernetes, use `updateStrategy.type: Recreate` for a deployment with one shared volume (the Helm chart does), or give each replica its own volume (the operator does). With Docker Compose, run `docker compose down` before `up`, or let `up -d` recreate the container. On a platform that starts the new container before it removes the old one, the overlap must stay shorter than `DGP_STATE_LOCK_WAIT_SECS`: raise the wait, or make the platform stop the old container first.
-2. The old process takes longer to stop than the wait, for example because `DGP_SHUTDOWN_TIMEOUT_SECS` is raised, or because `DGP_STATE_LOCK_WAIT_SECS` is below about 40 seconds (a stop takes up to 40 seconds). Stop the old process first, or raise `DGP_STATE_LOCK_WAIT_SECS`.
+2. The old process takes longer to stop than the wait, for example because `DGP_SHUTDOWN_TIMEOUT_SECS` is raised, or because `DGP_STATE_LOCK_WAIT_SECS` is below about 55 seconds (a stop takes up to 55 seconds). Stop the old process first, or raise `DGP_STATE_LOCK_WAIT_SECS`.
 3. Two proxies point at the same directory by mistake. Give each one its own directory with `DGP_CONFIG`.
 
 ## Startup fails: the spool directory is not private

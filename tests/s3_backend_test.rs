@@ -1505,3 +1505,179 @@ async fn a_copy_above_the_copy_object_limit_is_a_multipart_server_copy() {
         "under the production limit the copy is one CopyObject"
     );
 }
+
+/// A multipart server-side copy whose future is dropped (the 30-minute cut
+/// of a copy, a killed run) leaves no multipart upload on the destination:
+/// the abort guard of `copy_parts` aborts it. The copy takes one
+/// UploadPartCopy request per 5 MiB; the test cuts it as soon as MinIO lists
+/// the upload. The copy runs on a local MinIO and can end before the test
+/// sees its upload: it then tries again with a source of more parts (up to
+/// 1 GiB). The source is built on MinIO by a multipart upload of one 5 MiB
+/// buffer repeated, so the test holds 5 MiB in memory, not the source.
+/// The bucket is removed also when the test fails.
+#[tokio::test]
+async fn a_dropped_multipart_copy_leaves_no_upload_behind() {
+    use deltaglider_proxy::storage::{
+        ObjectAt, ObjectVariant, S3Backend, StorageBackend, StorageBackendExt,
+    };
+    skip_unless_minio!();
+    const MIB: usize = 1024 * 1024;
+    let raw = minio_client().await;
+    let bucket = common::unique_bucket("copy-drop");
+    raw.create_bucket().bucket(&bucket).send().await.unwrap();
+
+    let outcome = async {
+        let cfg: deltaglider_proxy::config::BackendConfig = serde_yaml::from_str(&format!(
+            "type: s3\nendpoint: \"{}\"\nregion: us-east-1\nforce_path_style: true\n\
+             access_key_id: {}\nsecret_access_key: {}\nallow_local: true\n",
+            common::minio_endpoint_url(),
+            common::MINIO_ACCESS_KEY,
+            common::MINIO_SECRET_KEY
+        ))
+        .unwrap();
+        let backend = std::sync::Arc::new(
+            S3Backend::new(
+                &cfg,
+                deltaglider_proxy::storage::NativeEncryptionConfig::None,
+            )
+            .await
+            .unwrap()
+            .with_copy_limits(5 * MIB as u64, 5 * MIB as u64),
+        );
+        let part = bytes::Bytes::from(common::big_passthrough_body(5 * MIB));
+        let in_progress = || async {
+            raw.list_multipart_uploads()
+                .bucket(&bucket)
+                .send()
+                .await
+                .unwrap()
+                .uploads()
+                .len()
+        };
+        for (attempt, parts) in [20usize, 80, 200].into_iter().enumerate() {
+            // The source: `parts` x 5 MiB, uploaded part by part.
+            let src_key = format!("p/src{attempt}.dat");
+            let created = raw
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(&src_key)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let upload_id = created.upload_id().unwrap().to_string();
+            let mut done = Vec::new();
+            for n in 1..=parts as i32 {
+                let out = raw
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(&src_key)
+                    .upload_id(&upload_id)
+                    .part_number(n)
+                    .body(ByteStream::from(part.clone()))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                done.push(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(n)
+                        .set_e_tag(out.e_tag().map(str::to_string))
+                        .build(),
+                );
+            }
+            raw.complete_multipart_upload()
+                .bucket(&bucket)
+                .key(&src_key)
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                        .set_parts(Some(done))
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let src_name = format!("src{attempt}.dat");
+            let dst_name = format!("dst{attempt}.dat");
+            let source = backend
+                .get_passthrough_metadata(&bucket, "p", &src_name)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut target = source.clone();
+            target.original_name = dst_name.clone();
+            let copy = tokio::spawn({
+                let (backend, bucket) = (backend.clone(), bucket.clone());
+                async move {
+                    backend
+                        .copy_within(
+                            ObjectVariant::Passthrough,
+                            ObjectAt {
+                                bucket: &bucket,
+                                prefix: "p",
+                                filename: &src_name,
+                            },
+                            ObjectAt {
+                                bucket: &bucket,
+                                prefix: "p",
+                                filename: &dst_name,
+                            },
+                            &source,
+                            &target,
+                        )
+                        .await
+                }
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let mut seen = false;
+            while !copy.is_finished() && std::time::Instant::now() < deadline {
+                if in_progress().await > 0 {
+                    seen = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            copy.abort();
+            let cut = copy.await.is_err_and(|e| e.is_cancelled());
+            if !(seen && cut) {
+                continue; // The copy ended first: more parts next time.
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while in_progress().await > 0 {
+                if std::time::Instant::now() > deadline {
+                    return Err(
+                        "the dropped copy left its multipart upload on the destination".into(),
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            return Ok(());
+        }
+        Err::<(), String>("no copy was cut while its upload was open".into())
+    }
+    .await;
+
+    // Clean up whatever the test left, also after a failure.
+    if let Ok(list) = raw.list_multipart_uploads().bucket(&bucket).send().await {
+        for u in list.uploads() {
+            let _ = raw
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(u.key().unwrap_or_default())
+                .upload_id(u.upload_id().unwrap_or_default())
+                .send()
+                .await;
+        }
+    }
+    if let Ok(list) = raw.list_objects_v2().bucket(&bucket).send().await {
+        for o in list.contents() {
+            let _ = raw
+                .delete_object()
+                .bucket(&bucket)
+                .key(o.key().unwrap_or_default())
+                .send()
+                .await;
+        }
+    }
+    let _ = raw.delete_bucket().bucket(&bucket).send().await;
+    outcome.unwrap();
+}

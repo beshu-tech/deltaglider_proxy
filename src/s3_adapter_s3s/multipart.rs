@@ -204,9 +204,15 @@ pub(super) async fn complete_multipart_upload(
             Ok(resp)
         };
     match begin {
-        crate::multipart::BeginComplete::AlreadyDone { etag } => complete_response(&etag, None),
+        crate::multipart::BeginComplete::AlreadyDone { etag } => {
+            judge_joiner(svc, &input, &etag).await?;
+            complete_response(&etag, None)
+        }
         crate::multipart::BeginComplete::Join(rx) => match await_completion_outcome(rx).await {
-            Ok(etag) => complete_response(&etag, None),
+            Ok(etag) => {
+                judge_joiner(svc, &input, &etag).await?;
+                complete_response(&etag, None)
+            }
             Err(failure) => Err(failure.to_s3s()),
         },
         crate::multipart::BeginComplete::Owner(publisher) => {
@@ -227,8 +233,10 @@ pub(super) async fn complete_multipart_upload(
                 .sum();
             // The quota gate, then the same conditional write as PutObject
             // (If-None-Match: * is create-only), under the same per-key lock,
-            // held until the store ends. Only the owner checks: a retry that
-            // joins or hits the tombstone sees its OWN object and must not 412.
+            // held until the store ends. Only the owner admits: a retry that
+            // joins or hits the tombstone is not admitted again (see
+            // `judge_joiner`: it is the success while the key still holds this
+            // upload's object, else its own preconditions are judged).
             let write_lock = crate::api::handlers::object_helpers::store_client_multipart_admit(
                 &svc.state,
                 &input.bucket,
@@ -239,7 +247,18 @@ pub(super) async fn complete_multipart_upload(
                     if_none_match: input.if_none_match.clone(),
                 },
             )
-            .await?;
+            .await;
+            // A refusal before the store (quota, precondition) is the
+            // owner's answer: publish it, so a joined retry gets the same
+            // status, not an internal error from the dropped publisher.
+            let write_lock = match write_lock {
+                Ok(lock) => lock,
+                Err(refusal) => {
+                    let refusal = s3s::S3Error::from(refusal);
+                    publisher.publish(Err(crate::multipart::joiner_failure(Some(&refusal))));
+                    return Err(refusal);
+                }
+            };
             let user_metadata = svc
                 .state
                 .multipart
@@ -281,7 +300,7 @@ pub(super) async fn complete_multipart_upload(
                 .map_err(s3s::S3Error::from);
                 match &result {
                     Ok((etag, _)) => publisher.publish(Ok(etag.clone())),
-                    Err(e) => publisher.publish(Err(crate::multipart::CompletionFailure::of(e))),
+                    Err(e) => publisher.publish(Err(crate::multipart::joiner_failure(Some(e)))),
                 }
                 result
             });
@@ -296,6 +315,45 @@ pub(super) async fn complete_multipart_upload(
             }
         }
     }
+}
+
+/// A request that joins a completion, or hits its tombstone, is the same
+/// write as the owner's (the same upload id): a retry after a lost 200, or a
+/// request that arrived while the owner ran. While the key still holds the
+/// object this upload wrote (`upload_etag`), the answer is the success,
+/// whatever the request's preconditions: `If-None-Match: *` of a retry is
+/// satisfied by the very object that its first try created. When the key
+/// holds another object, or none, the request's own preconditions are
+/// judged against that (`retry_verdict`).
+async fn judge_joiner(
+    svc: &DeltaGliderS3Service,
+    input: &s3s::dto::CompleteMultipartUploadInput,
+    upload_etag: &str,
+) -> s3s::S3Result<()> {
+    let has_precondition = input.if_match.is_some() || input.if_none_match.is_some();
+    if !has_precondition {
+        return Ok(());
+    }
+    let engine = svc.state.engine.load();
+    let current = engine
+        .head(&input.bucket, &input.key)
+        .await
+        .ok()
+        .map(|meta| meta.etag());
+    if crate::multipart::retry_verdict(current.as_deref(), upload_etag, has_precondition)
+        == crate::multipart::RetryVerdict::Success
+    {
+        return Ok(());
+    }
+    let precondition = crate::deltaglider::Precondition {
+        if_match: input.if_match.clone(),
+        if_none_match: input.if_none_match.clone(),
+    };
+    let _checked = engine
+        .lock_and_check(&input.bucket, &input.key, &precondition)
+        .await
+        .map_err(s3s::S3Error::from)?;
+    Ok(())
 }
 
 /// Whether CompleteMultipartUpload stores the parts as they are, never
@@ -409,49 +467,83 @@ pub(super) async fn run_multipart_completion(
     // Protect the relay part files from the idle-TTL sweeper while the store
     // reads them (H18): a slow remote store can exceed completing_timeout.
     let store_guard = state.multipart.store_guard(&upload_id);
-    let stored = if stores_whole {
-        engine
-            .store_passthrough_relayed_parts_with_multipart_etag(
-                write_lock,
-                &bucket,
-                &key,
-                &completed.parts,
-                completed.total_size,
-                completed.content_type,
-                completed.user_metadata,
-                etag.clone(),
-            )
-            .await
-    } else {
-        // A delta candidate: the parts are joined into one spool file and
-        // delta-encoded as a stream, whatever the size of the upload.
-        engine
-            .store_relayed_parts_delta_with_multipart_etag(
-                write_lock,
-                &bucket,
-                &key,
-                &completed.parts,
-                completed.total_size,
-                completed.content_type,
-                completed.user_metadata,
-                etag.clone(),
-            )
-            .await
+    // Armed from here: a pre-commit error, panic or drop rolls the upload
+    // back; once the write committed, an exit completes it instead.
+    let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let completing = state
+        .multipart
+        .completing_guard(&upload_id, &etag, committed.clone());
+    let store = async {
+        if stores_whole {
+            engine
+                .store_passthrough_relayed_parts_with_multipart_etag(
+                    write_lock,
+                    &bucket,
+                    &key,
+                    &completed.parts,
+                    completed.total_size,
+                    completed.content_type,
+                    completed.user_metadata,
+                    etag.clone(),
+                )
+                .await
+        } else {
+            // A delta candidate: the parts are joined into one spool file and
+            // delta-encoded as a stream, whatever the size of the upload.
+            engine
+                .store_relayed_parts_delta_with_multipart_etag(
+                    write_lock,
+                    &bucket,
+                    &key,
+                    &completed.parts,
+                    completed.total_size,
+                    completed.content_type,
+                    completed.user_metadata,
+                    etag.clone(),
+                )
+                .await
+        }
     };
+    let committed_seen = committed.clone();
+    let stored = crate::deltaglider::commit_signal::watching(committed, store).await;
     drop(store_guard);
     let result = match stored {
         Ok(result) => result,
-        Err(e) => {
-            state.multipart.rollback_upload(&upload_id);
-            return Err(e.into());
-        }
+        Err(e) => return Err(e.into()),
     };
+    // A store that returned Ok has committed, so it noted its commit. If
+    // it did not, the signal is lost (a store that moved the commit to a
+    // task of its own): the guard would roll back a stored object.
+    if !committed_seen.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::error!(
+            "multipart completion of {bucket}/{key}: the store returned Ok without noting its commit"
+        );
+        debug_assert!(false, "the store of a Complete lost its commit signal");
+    }
+    #[cfg(test)]
+    if panic_after_store::armed(&upload_id) {
+        panic!("injected panic after the store of {upload_id}");
+    }
     state.multipart.finish_upload(&upload_id);
+    completing.finish();
     crate::api::handlers::object_helpers::store_client_multipart_commit(
         &state, &bucket, &key, &result,
     )
     .await;
     Ok((etag, result))
+}
+
+/// Test seam: panic in `run_multipart_completion` right after its store
+/// returned Ok, for the uploads that name themselves here.
+#[cfg(test)]
+pub(super) mod panic_after_store {
+    static ARMED: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+    pub(in crate::s3_adapter_s3s) fn arm(upload_id: &str) {
+        ARMED.lock().push(upload_id.to_string());
+    }
+    pub(super) fn armed(upload_id: &str) -> bool {
+        ARMED.lock().iter().any(|u| u == upload_id)
+    }
 }
 
 pub(super) fn completed_parts_to_request(
@@ -593,6 +685,281 @@ mod multipart_cost_tests {
             .filter(|r| *r == "HEAD /b/" || r.starts_with("HEAD /b/?"))
             .count();
         assert_eq!(head_buckets, 1, "{:?}", fake.requests());
+    }
+
+    /// The precondition of a Complete is the OWNER's: a retry that joined
+    /// it matched on bucket, key and parts only, so it must not get the
+    /// owner's 412. It gets a retryable 503, becomes the owner on its retry,
+    /// and gets its own answer: a Complete without the precondition
+    /// succeeds, one with the same precondition gets its own 412.
+    #[tokio::test]
+    async fn a_joined_complete_never_gets_the_preconditions_of_its_owner() {
+        let (engine, _fake) = crate::deltaglider::s3_engine().await;
+        engine
+            .store(
+                "b",
+                "a/photo.jpg",
+                b"already here",
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let state = AppState::for_tests(engine);
+        let svc = Arc::new(service(state.clone()));
+        let id = state
+            .multipart
+            .create("b", "a/photo.jpg", None, Default::default())
+            .unwrap();
+        let etag = upload_part(&svc, request(part(&id, 1)))
+            .await
+            .unwrap()
+            .output
+            .e_tag
+            .unwrap();
+        let input = |create_only: bool| {
+            s3s::dto::CompleteMultipartUploadInput::builder()
+                .bucket("b".into())
+                .key("a/photo.jpg".into())
+                .upload_id(id.clone())
+                .if_none_match(create_only.then_some(s3s::dto::ETagCondition::Any))
+                .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
+                    parts: Some(vec![s3s::dto::CompletedPart {
+                        part_number: Some(1),
+                        e_tag: Some(etag.clone()),
+                        ..Default::default()
+                    }]),
+                }))
+                .build()
+                .unwrap()
+        };
+        // The object's lock is held: the owner waits in its admission.
+        let lock = state
+            .engine
+            .load()
+            .lock_object_write("b", "a/photo.jpg")
+            .await;
+        let owner = tokio::spawn({
+            let (svc, input) = (svc.clone(), input(true));
+            async move { complete_multipart_upload(&svc, request(input)).await }
+        });
+        eventually("the owner's completion is in flight", || {
+            state.multipart.completion_joiners(&id).is_some()
+        })
+        .await;
+        let joiner = tokio::spawn({
+            let (svc, input) = (svc.clone(), input(false));
+            async move { complete_multipart_upload(&svc, request(input)).await }
+        });
+        eventually("the joiner joined", || {
+            state.multipart.completion_joiners(&id) == Some(1)
+        })
+        .await;
+        drop(lock);
+        let owner = owner.await.unwrap().expect_err("the precondition refuses");
+        assert_eq!(*owner.code(), s3s::S3ErrorCode::PreconditionFailed);
+        let joiner = joiner
+            .await
+            .unwrap()
+            .expect_err("the joiner is told to retry");
+        assert_eq!(*joiner.code(), s3s::S3ErrorCode::SlowDown, "{joiner:?}");
+        assert_eq!(
+            joiner.status_code(),
+            Some(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+        );
+
+        // Its retry is a fresh owner: with the same precondition it gets
+        // its own 412; without it, the Complete succeeds.
+        let again = complete_multipart_upload(&svc, request(input(true)))
+            .await
+            .expect_err("the same precondition refuses again");
+        assert_eq!(*again.code(), s3s::S3ErrorCode::PreconditionFailed);
+        complete_multipart_upload(&svc, request(input(false)))
+            .await
+            .expect("without the precondition the retry completes");
+    }
+
+    /// Poll `ready` (real state, not a guess at timing) for up to 10 s.
+    async fn eventually(what: &str, ready: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready() {
+            assert!(std::time::Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    fn complete_input(
+        id: &str,
+        etag: &s3s::dto::ETag,
+        create_only: bool,
+    ) -> s3s::dto::CompleteMultipartUploadInput {
+        s3s::dto::CompleteMultipartUploadInput::builder()
+            .bucket("b".into())
+            .key("a/photo.jpg".into())
+            .upload_id(id.into())
+            .if_none_match(create_only.then_some(s3s::dto::ETagCondition::Any))
+            .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
+                parts: Some(vec![s3s::dto::CompletedPart {
+                    part_number: Some(1),
+                    e_tag: Some(etag.clone()),
+                    ..Default::default()
+                }]),
+            }))
+            .build()
+            .unwrap()
+    }
+
+    /// A step after the object was written panics (injected right after the
+    /// store of the Complete): the upload is completed, not open; the
+    /// object was written once; a retry gets the success.
+    #[tokio::test]
+    async fn a_panic_after_the_commit_leaves_a_completed_upload() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let state = AppState::for_tests(engine);
+        let svc = service(state.clone());
+        let id = state
+            .multipart
+            .create("b", "a/photo.jpg", None, Default::default())
+            .unwrap();
+        let etag = upload_part(&svc, request(part(&id, 1)))
+            .await
+            .unwrap()
+            .output
+            .e_tag
+            .unwrap();
+        super::panic_after_store::arm(&id);
+        let owner = complete_multipart_upload(&svc, request(complete_input(&id, &etag, false)))
+            .await
+            .expect_err("the owner's task panicked");
+        assert_eq!(*owner.code(), s3s::S3ErrorCode::InternalError);
+
+        assert_eq!(state.multipart.count_uploads(), 0, "completed, not open");
+        let puts = fake
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("PUT /b/a/photo.jpg"))
+            .count();
+        assert_eq!(puts, 1, "{:?}", fake.requests());
+        assert!(state.engine.load().head("b", "a/photo.jpg").await.is_ok());
+
+        let retry = complete_multipart_upload(&svc, request(complete_input(&id, &etag, false)))
+            .await
+            .expect("a retry gets the success");
+        assert!(retry.output.e_tag.is_some());
+        let puts = fake
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("PUT /b/a/photo.jpg"))
+            .count();
+        assert_eq!(puts, 1, "the retry wrote nothing");
+    }
+
+    /// A request for the SAME upload that joins a successful Complete is the
+    /// same write: while the key holds the object this upload wrote, it gets
+    /// the success (the same ETag) whatever its preconditions.
+    #[tokio::test]
+    async fn a_joiner_of_the_same_upload_gets_the_success_whatever_its_precondition() {
+        let (engine, _fake) = crate::deltaglider::s3_engine().await;
+        let state = AppState::for_tests(engine);
+        let svc = Arc::new(service(state.clone()));
+        let id = state
+            .multipart
+            .create("b", "a/photo.jpg", None, Default::default())
+            .unwrap();
+        let etag = upload_part(&svc, request(part(&id, 1)))
+            .await
+            .unwrap()
+            .output
+            .e_tag
+            .unwrap();
+        let lock = state
+            .engine
+            .load()
+            .lock_object_write("b", "a/photo.jpg")
+            .await;
+        let owner = tokio::spawn({
+            let (svc, input) = (svc.clone(), complete_input(&id, &etag, false));
+            async move { complete_multipart_upload(&svc, request(input)).await }
+        });
+        eventually("the owner's completion is in flight", || {
+            state.multipart.completion_joiners(&id).is_some()
+        })
+        .await;
+        let strict = tokio::spawn({
+            let (svc, input) = (svc.clone(), complete_input(&id, &etag, true));
+            async move { complete_multipart_upload(&svc, request(input)).await }
+        });
+        let plain = tokio::spawn({
+            let (svc, input) = (svc.clone(), complete_input(&id, &etag, false));
+            async move { complete_multipart_upload(&svc, request(input)).await }
+        });
+        eventually("both joiners joined", || {
+            state.multipart.completion_joiners(&id) == Some(2)
+        })
+        .await;
+        drop(lock);
+        let owner = owner.await.unwrap().expect("the owner completes");
+        let strict = strict
+            .await
+            .unwrap()
+            .expect("create-only is satisfied by this upload's own object");
+        let plain = plain
+            .await
+            .unwrap()
+            .expect("a joiner without a precondition succeeds");
+        assert_eq!(strict.output.e_tag, owner.output.e_tag);
+        assert_eq!(plain.output.e_tag, owner.output.e_tag);
+    }
+
+    /// The 200 of a create-only Complete is lost; the SDK retries with the
+    /// same `If-None-Match: *`. The retry is the same write: the success with
+    /// the same ETag. When another client replaced the key meanwhile, the
+    /// retry's precondition is judged against that object: 412.
+    #[tokio::test]
+    async fn a_lost_200_retry_with_if_none_match_gets_the_success_until_the_key_changes() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let state = AppState::for_tests(engine);
+        let svc = service(state.clone());
+        let id = state
+            .multipart
+            .create("b", "a/photo.jpg", None, Default::default())
+            .unwrap();
+        let etag = upload_part(&svc, request(part(&id, 1)))
+            .await
+            .unwrap()
+            .output
+            .e_tag
+            .unwrap();
+        let first = complete_multipart_upload(&svc, request(complete_input(&id, &etag, true)))
+            .await
+            .expect("the create-only Complete succeeds");
+        let retry = complete_multipart_upload(&svc, request(complete_input(&id, &etag, true)))
+            .await
+            .expect("the retry of a lost 200 gets the success");
+        assert_eq!(retry.output.e_tag, first.output.e_tag);
+        let puts = fake
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("PUT /b/a/photo.jpg"))
+            .count();
+        assert_eq!(puts, 1, "the retry wrote nothing");
+
+        state
+            .engine
+            .load()
+            .store(
+                "b",
+                "a/photo.jpg",
+                b"another client",
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let late = complete_multipart_upload(&svc, request(complete_input(&id, &etag, true)))
+            .await
+            .expect_err("the key holds another object now");
+        assert_eq!(*late.code(), s3s::S3ErrorCode::PreconditionFailed);
     }
 
     /// A CompleteMultipartUpload whose request is gone (client disconnect,

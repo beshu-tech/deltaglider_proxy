@@ -647,7 +647,10 @@ async fn stream_copy_passthrough(
     // Hashes come from the COPY source (a copy doesn't recompute them) so the
     // streaming path never holds the whole object to hash it. They go in at
     // create: a native S3 complete stores no metadata.
-    let handle = engine
+    // The guard aborts the upload on EVERY exit but a Complete that
+    // returned Ok: an error, and a drop of this future (the `bounded` cut,
+    // a killed run) too, a drop during the Complete request included.
+    let (handle, abort_guard) = engine
         .begin_passthrough_multipart(
             lock,
             request.destination_bucket,
@@ -664,9 +667,6 @@ async fn stream_copy_passthrough(
         .await
         .map_err(|e| CopyError::engine("multipart create failed", e))?;
     let native = handle.native();
-    let handle = Arc::new(handle);
-    // Abort the upload if THIS future is dropped (killed) before complete/abort.
-    let mut abort_guard = MultipartAbortGuard::new(engine.clone(), handle.clone());
 
     info!(
         "{} streaming multipart copy src={}/{} dst={}/{} ({} bytes, {} parts, concurrency={})",
@@ -743,10 +743,7 @@ async fn stream_copy_passthrough(
     let collected = match results {
         Ok(v) => v,
         Err(e) => {
-            // Explicit abort on a part failure — by ref, so it works at any
-            // Arc strong count; disarm so the guard's Drop doesn't double-abort.
-            engine.abort_passthrough_multipart_ref(&handle).await;
-            drop(abort_guard.disarm());
+            abort_guard.abort().await;
             return Err(e);
         }
     };
@@ -762,24 +759,19 @@ async fn stream_copy_passthrough(
     retained.sort_by_key(|(n, _)| *n);
     let assembled: Vec<Bytes> = retained.into_iter().map(|(_, b)| b).collect();
 
-    // Reached complete: disarm the guard (it holds a clone) so the Arc is sole-owned.
-    drop(handle);
-    let handle = match Arc::try_unwrap(abort_guard.disarm()) {
-        Ok(h) => h,
-        Err(shared) => {
-            // Should be sole-owned here; if not, ABORT the upload before
-            // erroring — the guard is already disarmed, so nobody else will.
-            engine.abort_passthrough_multipart_ref(&shared).await;
-            return Err(CopyError::new(
-                CopyClass::Permanent,
-                "internal: multipart handle still shared at finish",
-            ));
+    let result = match engine
+        .finish_passthrough_multipart(lock, &handle, parts, assembled)
+        .await
+    {
+        Ok(result) => {
+            abort_guard.disarm();
+            result
+        }
+        Err(e) => {
+            abort_guard.abort().await;
+            return Err(CopyError::engine("multipart complete failed", e));
         }
     };
-    let result = engine
-        .finish_passthrough_multipart(lock, handle, parts, assembled)
-        .await
-        .map_err(|e| CopyError::engine("multipart complete failed", e))?;
 
     let bytes = result.metadata.file_size as usize;
     verify_destination(
@@ -797,43 +789,6 @@ async fn stream_copy_passthrough(
         source_file_size: source_head.file_size,
         bytes_egress_saved: 0,
     })
-}
-
-/// Aborts the multipart upload on drop UNLESS disarmed. Covers the
-/// cancellation path: when a kill drops the streaming-copy future mid-part,
-/// neither the Ok nor the Err arm runs, so without this the upload is left
-/// dangling on the destination (backends like B2 don't GC incomplete uploads).
-/// On an armed drop we spawn a detached best-effort abort (Drop is sync).
-struct MultipartAbortGuard {
-    engine: Arc<DynEngine>,
-    handle: Option<Arc<crate::deltaglider::PassthroughMultipartHandle>>,
-}
-
-impl MultipartAbortGuard {
-    fn new(
-        engine: Arc<DynEngine>,
-        handle: Arc<crate::deltaglider::PassthroughMultipartHandle>,
-    ) -> Self {
-        Self {
-            engine,
-            handle: Some(handle),
-        }
-    }
-    /// Hand the handle back; the normal complete/abort path now owns cleanup.
-    fn disarm(&mut self) -> Arc<crate::deltaglider::PassthroughMultipartHandle> {
-        self.handle.take().expect("disarm called twice")
-    }
-}
-
-impl Drop for MultipartAbortGuard {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            let engine = self.engine.clone();
-            // By-ref abort: correct even while the dropped future's other Arc
-            // clones are still being torn down.
-            tokio::spawn(async move { engine.abort_passthrough_multipart_ref(&handle).await });
-        }
-    }
 }
 
 /// Fetch one part via a native ranged GET; a body that broke off part-way
@@ -2900,7 +2855,11 @@ mod multipart_abort_tests {
         src_meta: FileMetadata,
         fail_part: AtomicBool,
         slow_parts: AtomicBool,
+        slow_complete: AtomicBool,
+        completes_started: std::sync::atomic::AtomicUsize,
         fail_complete: AtomicBool,
+        /// Part uploads that started (a stalled one counts).
+        parts_started: std::sync::atomic::AtomicUsize,
         aborts: Mutex<Vec<String>>,
     }
 
@@ -2917,7 +2876,10 @@ mod multipart_abort_tests {
                 src_meta: meta,
                 fail_part: AtomicBool::new(false),
                 slow_parts: AtomicBool::new(false),
+                slow_complete: AtomicBool::new(false),
+                completes_started: Default::default(),
                 fail_complete: AtomicBool::new(false),
+                parts_started: Default::default(),
                 aborts: Mutex::new(Vec::new()),
             }
         }
@@ -2998,6 +2960,7 @@ mod multipart_abort_tests {
             part_number: i32,
             _: Bytes,
         ) -> Result<UploadedPart, StorageError> {
+            self.parts_started.fetch_add(1, Ordering::SeqCst);
             if self.slow_parts.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
@@ -3018,6 +2981,10 @@ mod multipart_abort_tests {
             _: &[Bytes],
             _: &FileMetadata,
         ) -> Result<String, StorageError> {
+            self.completes_started.fetch_add(1, Ordering::SeqCst);
+            if self.slow_complete.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
             if self.fail_complete.load(Ordering::Relaxed) {
                 return Err(StorageError::Other("injected complete failure".into()));
             }
@@ -3147,10 +3114,22 @@ mod multipart_abort_tests {
             _: &str,
             _: &str,
             _: &str,
-            _: u64,
-            _: u64,
+            start: u64,
+            end: u64,
         ) -> Result<crate::storage::RangeRead, crate::storage::StorageError> {
-            Err(nope())
+            // The range of the source, so the streaming copy reaches its
+            // part uploads (a spy that cannot read fails the copy before
+            // them, and every abort the tests see is the error path's).
+            let len = end - start + 1;
+            let bytes = Bytes::from(vec![7u8; len as usize]);
+            Ok(crate::storage::RangeRead {
+                stream: Box::pin(futures::stream::once(async move {
+                    Ok::<Bytes, StorageError>(bytes)
+                })),
+                len,
+                metadata: self.src_meta.clone(),
+                stored_total: self.src_meta.file_size,
+            })
         }
         async fn listing_tokens(
             &self,
@@ -3594,7 +3573,18 @@ mod multipart_abort_tests {
         });
         // Let the copy reach the (stalled) upload_part, then kill it — the
         // abort guard's Drop must abort even while part-task Arcs unwind.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        while spy.parts_started.load(Ordering::SeqCst) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the copy never reached its part upload"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            spy.aborts.lock().unwrap().is_empty(),
+            "nothing aborts before the copy is cut"
+        );
         task.abort();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -3605,6 +3595,46 @@ mod multipart_abort_tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "guard-drop abort never reached the backend"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A cut DURING the Complete request leaves no parts: the guard stays
+    /// armed until Complete returned Ok, so the drop aborts the upload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_copy_cut_during_complete_aborts_the_multipart_upload() {
+        let spy = AbortSpy::new(vec![7u8; 64]);
+        spy.slow_complete.store(true, Ordering::Relaxed);
+        let (engine, spy) = spy_engine(spy);
+        let meta = spy.src_meta.clone();
+
+        let eng = engine.clone();
+        let task = tokio::spawn(async move {
+            let req = copy_request();
+            let lock = eng
+                .lock_object_write(req.destination_bucket, req.destination_key)
+                .await;
+            let _ = stream_copy_passthrough(&eng, &lock, req, &meta).await;
+        });
+        let started = std::time::Instant::now();
+        while spy.completes_started.load(Ordering::SeqCst) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the copy never reached its Complete request"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            spy.aborts.lock().unwrap().is_empty(),
+            "nothing aborts before the copy is cut"
+        );
+        task.abort();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while spy.aborts.lock().unwrap().len() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a cut during Complete left the upload on the backend"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

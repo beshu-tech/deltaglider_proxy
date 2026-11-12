@@ -151,8 +151,9 @@ pub const DB_KEY_SECRET_KEY: &str = "dbKey";
 pub const TMP_SIZE_LIMIT_MIB: u64 = 8192;
 
 /// The grace period of a proxy pod's stop, in seconds. A proxy stop takes
-/// up to 40 s (10 s each for requests, a maintenance job, the event outbox
-/// and `DGP_SHUTDOWN_TIMEOUT_SECS` of blocking work); the Kubernetes
+/// up to 55 s (10 s each for requests, a maintenance job, the event outbox
+/// and `DGP_SHUTDOWN_TIMEOUT_SECS` of blocking work, and 15 s for work that
+/// outlives its request); the Kubernetes
 /// default of 30 s would kill it first. The Helm chart uses the same value.
 pub const TERMINATION_GRACE_SECS: i64 = 60;
 
@@ -638,7 +639,7 @@ mod tests {
         assert_eq!(spool_max_bytes_for_tmp(4), 3 * 1024 * 1024);
     }
 
-    /// A proxy stop takes up to 40 s, so the pod's grace period is longer
+    /// A proxy stop takes up to 55 s, so the pod's grace period is longer
     /// than that (the Kubernetes default of 30 s would SIGKILL a drain).
     #[test]
     fn proxy_pods_get_a_grace_period_longer_than_a_stop() {
@@ -652,7 +653,7 @@ mod tests {
             .unwrap()
             .termination_grace_period_seconds;
         assert_eq!(grace, Some(TERMINATION_GRACE_SECS));
-        const { assert!(TERMINATION_GRACE_SECS > 40) };
+        const { assert!(TERMINATION_GRACE_SECS > 55) };
     }
 
     /// The readiness probe waits longer than `/_/ready` takes in the worst

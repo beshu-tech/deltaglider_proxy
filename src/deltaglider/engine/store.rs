@@ -7,6 +7,7 @@ use super::usage::CounterPrior;
 use super::*;
 use crate::deltaglider::ingest::BodyHashes;
 use crate::deltaglider::spool::SpoolBudget;
+use crate::storage::mpu_guard::MpuAbortGuard;
 use crate::storage::{MultipartUpload, ObjectVariant, StorageBackend, UploadedPart};
 use crate::types::PassthroughReason;
 use md5::{Digest, Md5};
@@ -1989,14 +1990,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// (`lock`) until it finishes or aborts; like every passthrough write,
     /// the upload takes no deltaspace lock. The caller drives parts via
     /// [`Self::upload_passthrough_part`] then finalizes with
-    /// [`Self::finish_passthrough_multipart`] (or aborts).
+    /// [`Self::finish_passthrough_multipart`].
+    ///
+    /// The upload comes with its [`MpuAbortGuard`]: armed until the caller
+    /// disarms it after Complete returned `Ok`. A future that is dropped
+    /// on the way (a timeout, a kill) aborts the upload through the guard.
     pub async fn begin_passthrough_multipart(
-        &self,
+        self: &Arc<Self>,
         lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
         facts: MultipartObjectFacts,
-    ) -> Result<PassthroughMultipartHandle, EngineError> {
+    ) -> Result<(Arc<PassthroughMultipartHandle>, MpuAbortGuard), EngineError>
+    where
+        S: 'static,
+    {
         let total_size = facts.total_size;
         self.ensure_within_passthrough_ceiling(total_size)?;
 
@@ -2030,7 +2038,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .create_multipart_upload(bucket, &deltaspace_id, &obj_key.filename, &metadata)
             .await?;
 
-        Ok(PassthroughMultipartHandle {
+        let handle = Arc::new(PassthroughMultipartHandle {
             bucket: bucket.to_string(),
             key: key.to_string(),
             deltaspace_id,
@@ -2038,7 +2046,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             total_size,
             metadata,
             upload,
-        })
+        });
+        let guard = {
+            let engine = Arc::clone(self);
+            let handle = Arc::clone(&handle);
+            MpuAbortGuard::new(move || {
+                let (engine, handle) = (Arc::clone(&engine), Arc::clone(&handle));
+                async move {
+                    engine.abort_passthrough_multipart_ref(&handle).await;
+                }
+            })
+        };
+        Ok((handle, guard))
     }
 
     /// Upload one part of an in-progress passthrough multipart upload.
@@ -2067,13 +2086,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Finalize a passthrough multipart upload: complete on the backend
     /// (a buffering backend writes the handle's metadata now), and clean the
-    /// old delta variant. Consumes the handle (releases the lock). `parts`
-    /// and `assembled` must be in part-number order; `assembled` is empty
-    /// for native backends.
+    /// old delta variant. `parts` and `assembled` must be in part-number
+    /// order; `assembled` is empty for native backends. A failed Complete
+    /// does not abort here: the caller's [`MpuAbortGuard`] does, and the
+    /// same guard covers a drop during the Complete request.
     pub async fn finish_passthrough_multipart(
         &self,
         lock: &ObjectWriteGuard,
-        handle: PassthroughMultipartHandle,
+        handle: &PassthroughMultipartHandle,
         mut parts: Vec<UploadedPart>,
         assembled: Vec<Bytes>,
     ) -> Result<StoreResult, EngineError> {
@@ -2099,9 +2119,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             )
             .await
         {
-            // Complete failed: abort so the fully-uploaded part set doesn't
-            // dangle on backends (B2) that never GC incomplete uploads.
-            self.abort_passthrough_multipart_ref(&handle).await;
             return Err(e.into());
         }
         // Committed: count it before the next await.

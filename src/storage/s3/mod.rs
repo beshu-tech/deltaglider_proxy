@@ -312,6 +312,10 @@ pub struct S3Backend {
     /// skips the attempt. One backend instance is one backend definition,
     /// so a redefined backend tries again.
     copy_unsupported: std::sync::atomic::AtomicBool,
+    /// `(object limit, part size)` of a server-side copy; `None`: the
+    /// production constants (or the debug test seams). Set by
+    /// [`S3Backend::with_copy_limits`].
+    copy_limits: Option<(u64, u64)>,
     /// A conditional-request profile fixed at construction
     /// ([`S3Backend::with_conditional_profile`]); `None` = the one that
     /// the capability probe found for this definition
@@ -362,6 +366,7 @@ impl S3Backend {
             healer: heal::FactsHealer::new(client.clone()),
             acl_support: Default::default(),
             copy_unsupported: Default::default(),
+            copy_limits: None,
             pinned_profile: None,
             client,
             bulk_client,
@@ -383,6 +388,20 @@ impl S3Backend {
             name.to_string(),
             crate::coordination::capability::fingerprint(config),
         ));
+        self
+    }
+
+    /// Copy with a multipart copy above `object_max` bytes, in parts of at
+    /// least `part_bytes` (production: 5 GiB and 512 MiB). For a test that
+    /// runs the multipart copy on a few MiB without the process-wide
+    /// `DGP_TEST_COPY_*` seams. S3's smallest part (5 MiB) still applies.
+    #[doc(hidden)]
+    pub fn with_copy_limits(mut self, object_max: u64, part_bytes: u64) -> Self {
+        assert!(
+            object_max > 0,
+            "a copy limit of 0 sends every copy through parts"
+        );
+        self.copy_limits = Some((object_max, part_bytes.max(5 * 1024 * 1024)));
         self
     }
 

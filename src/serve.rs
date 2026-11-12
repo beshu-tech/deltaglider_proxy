@@ -108,6 +108,15 @@ impl Default for ListenerLimits {
 /// (usage flush, event-outbox flush) until the orchestrator sends SIGKILL.
 pub const GRACEFUL_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a stop waits for the work that outlives its request (a
+/// DeleteObjects batch, the store of a CompleteMultipartUpload) after the
+/// listener closed. The steps of a stop are 10 s for requests
+/// ([`GRACEFUL_SHUTDOWN_DEADLINE`]), this wait, 10 s for a maintenance job,
+/// 10 s for the event outbox and `DGP_SHUTDOWN_TIMEOUT_SECS` (default 10)
+/// for blocking work: 55 s at most, inside the 60 s of
+/// `terminationGracePeriodSeconds` and of the compose `stop_grace_period`.
+pub const DETACHED_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Serve `app` over plain HTTP on `listener` until `shutdown` resolves,
 /// then wait for the requests in flight, up to [`GRACEFUL_SHUTDOWN_DEADLINE`].
 /// Middlewares see the peer address through `ConnectInfo<SocketAddr>`.
