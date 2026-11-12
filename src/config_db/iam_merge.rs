@@ -1335,20 +1335,19 @@ impl ConfigDb {
                 match copy_order(remote_gen, *base_gen) {
                     CopyOrder::Descendant => {}
                     CopyOrder::RolledBack => {
-                        return Err(ConfigDbError::Other(format!(
+                        return Err(ConfigDbError::RollbackRefused(format!(
                             "peer config DB is sync generation {remote_gen}, older than the \
-                             last synced copy ({base_gen}): refusing it as a rollback (a copy \
-                             put back into the sync bucket?)"
+                             last synced copy ({base_gen}) (a copy put back into the sync \
+                             bucket?)"
                         )));
                     }
                     // A peer or base from before v29: judge by row age.
                     CopyOrder::Unknown => {
                         let old = rollback_rows(b, &remote);
                         if !old.is_empty() {
-                            return Err(ConfigDbError::Other(format!(
+                            return Err(ConfigDbError::RollbackRefused(format!(
                                 "peer config DB holds rows older than the last synced copy \
-                                 ({}): refusing it as a rollback (a copy put back into the \
-                                 sync bucket?)",
+                                 ({}) (a copy put back into the sync bucket?)",
                                 old.join(", ")
                             )));
                         }

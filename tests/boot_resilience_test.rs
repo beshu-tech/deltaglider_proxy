@@ -41,13 +41,16 @@ async fn an_unreachable_coordination_bucket_does_not_stop_the_boot() {
         .await
         .expect("health request");
     assert_eq!(health.status().as_u16(), 200);
-    // Not ready: no probe proved the bucket, and the IAM database is not
-    // confirmed against it. The words name the reason.
+    // The endpoint is the data backend too, so the node is not ready
+    // because its BACKEND is unreachable (`backend`), not because of the
+    // coordination bucket: `coordination` is information. The node has no
+    // IAM users, so the unconfirmed IAM database refuses nobody.
     let ready = reqwest::get(format!("{}/_/ready", server.endpoint()))
         .await
         .expect("ready request");
     assert_eq!(ready.status().as_u16(), 503);
     let body: serde_json::Value = ready.json().await.expect("ready body");
+    assert_eq!(body["backend"], "unreachable", "{body}");
     assert_eq!(body["coordination"], "unproven", "{body}");
     assert_eq!(body["iam_sync"], "unconfirmed", "{body}");
 }
@@ -101,6 +104,11 @@ async fn a_restart_during_a_sync_outage_refuses_iam_logins_until_the_override() 
     let ready = reqwest::get(format!("{ep}/_/ready")).await.unwrap();
     assert_eq!(ready.status().as_u16(), 503);
     let body: serde_json::Value = ready.json().await.unwrap();
+    // The dropped endpoint is the data backend too: `backend` says so, and
+    // `iam_sync` names the refusal of the IAM users beside it. (The unit
+    // table `only_a_refusal_of_iam_users_makes_the_node_not_ready` holds the
+    // rows where only the IAM refusal makes the node not ready.)
+    assert_eq!(body["backend"], "unreachable", "{body}");
     assert_eq!(body["iam_sync"], "unconfirmed", "{body}");
     let fresh = || {
         reqwest::Client::builder()
@@ -148,6 +156,52 @@ async fn a_restart_during_a_sync_outage_refuses_iam_logins_until_the_override() 
         .await
         .unwrap();
     assert_eq!(ok.status().as_u16(), 200);
+}
+
+/// A `config_sync_bucket` on a backend that cannot hold one (here: the
+/// filesystem) builds no sync client; the error comes from the config, so a
+/// retry would repeat it. The sync is off, as when no bucket is set: the
+/// local IAM database is the only copy, so IAM users are served and the
+/// node is ready.
+#[tokio::test]
+async fn a_sync_bucket_on_a_filesystem_backend_leaves_the_node_serving_iam_users() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .config_sync_bucket("coordination")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = common::admin_http_client(&ep).await;
+    let user: serde_json::Value = admin
+        .post(format!("{ep}/_/api/admin/users"))
+        .json(&serde_json::json!({
+            "name": "dana",
+            "permissions": [{ "actions": ["*"], "resources": ["*"] }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ready = reqwest::get(format!("{ep}/_/ready")).await.unwrap();
+    let status = ready.status().as_u16();
+    let body: serde_json::Value = ready.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let login = reqwest::Client::builder()
+        .cookie_store(true)
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{ep}/_/api/admin/login-as"))
+        .json(&serde_json::json!({
+            "access_key_id": user["access_key_id"],
+            "secret_access_key": user["secret_access_key"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status().as_u16(), 200);
 }
 
 /// A coordination bucket that the backend refuses (here: it does not
@@ -422,14 +476,23 @@ async fn hanging_identity_providers_do_not_delay_the_boot() {
             .send()
             .await;
     }
-    let listed: serde_json::Value = admin
-        .get(format!("{ep}/_/api/admin/ext-auth/providers"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // Each client gave up after 500 ms while its save was still running on
+    // the server: wait (bounded) until the third provider is saved.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let listed = loop {
+        let listed: serde_json::Value = admin
+            .get(format!("{ep}/_/api/admin/ext-auth/providers"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if listed.as_array().map(Vec::len) == Some(3) || std::time::Instant::now() > deadline {
+            break listed;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     assert_eq!(listed.as_array().map(Vec::len), Some(3), "{listed}");
 
     server.terminate();

@@ -206,6 +206,11 @@ const RETRYABLE_CODES: &[&str] = &[
     "TemporaryRedirect",
     "OperationAborted",
     "ExpiredToken",
+    // A full store or an account over its quota is the store's state, not a
+    // wrong configuration.
+    "QuotaExceeded",
+    "StorageQuotaExceeded",
+    "storage_cap_exceeded",
     "RequestTimeTooSkewed",
     concat!("Slow", "Down"),
     "Throttling",
@@ -218,7 +223,14 @@ const RETRYABLE_CODES: &[&str] = &[
 
 /// Codes of a refusal that a new bucket or a new access key can still
 /// cause: they take a moment to reach every part of the store.
-const PROPAGATING_CODES: &[&str] = &["AccessDenied", "InvalidAccessKeyId", "NoSuchBucket"];
+const PROPAGATING_CODES: &[&str] = &[
+    "AccessDenied",
+    "InvalidAccessKeyId",
+    "NoSuchBucket",
+    // A key that was made a moment ago may not be known to every part of
+    // the store yet.
+    "SignatureDoesNotMatch",
+];
 
 /// Pure: can a bucket or a key that was made a moment ago explain `code`?
 pub fn code_may_propagate(code: &str) -> bool {
@@ -522,6 +534,10 @@ mod write_refusal_tests {
             // A token or a redirect that a retry changes.
             (Some(400), "ExpiredToken", Indeterminate),
             (Some(307), "TemporaryRedirect", Indeterminate),
+            // A full store is its state, not the configuration.
+            (Some(403), "QuotaExceeded", Indeterminate),
+            (Some(507), "", Indeterminate),
+            (Some(400), "storage_cap_exceeded", Indeterminate),
             (Some(409), "OperationAborted", Indeterminate),
         ];
         for (status, code, want) in table {
@@ -535,10 +551,15 @@ mod write_refusal_tests {
 
     #[test]
     fn only_three_codes_may_propagate() {
-        for code in ["AccessDenied", "InvalidAccessKeyId", "NoSuchBucket"] {
+        for code in [
+            "AccessDenied",
+            "InvalidAccessKeyId",
+            "NoSuchBucket",
+            "SignatureDoesNotMatch",
+        ] {
             assert!(code_may_propagate(code), "{code}");
         }
-        for code in ["SignatureDoesNotMatch", "PermanentRedirect", "", "SlowDown"] {
+        for code in ["PermanentRedirect", "InvalidBucketName", "", "SlowDown"] {
             assert!(!code_may_propagate(code), "{code}");
         }
     }

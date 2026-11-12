@@ -316,6 +316,11 @@ mod tests {
             ),
             (
                 "src/api/admin/auth.rs",
+                "login_s3_creds",
+                "its caller `login` passes the gated view",
+            ),
+            (
+                "src/api/admin/auth.rs",
                 "non_admin_bulk_session",
                 "its caller passes the gated view",
             ),
@@ -366,39 +371,137 @@ mod tests {
                 "the sync rebuilds the index, judges nobody",
             ),
         ];
+        const GATES: [&str; 2] = ["credential_view", "credential_view_or_closed"];
         let mut offenders = Vec::new();
         let mut gated = 0;
-        for (rel, text) in crate::source_scan::prod_sources("src") {
-            if rel.starts_with("src/iam/") || rel == "src/coordination/status.rs" {
+        for src in crate::source_scan::ast::src() {
+            if src.rel.starts_with("src/iam/") || src.rel == "src/coordination/status.rs" {
                 continue;
             }
-            let prod = crate::source_scan::prod_mask(&text);
-            for (at, line) in text.lines().enumerate() {
-                if !prod[at]
-                    || line.trim_start().starts_with("//")
-                    || !line.contains("IamState::Iam(")
-                {
-                    continue;
+            // The functions that read the users of the index: a path
+            // `IamState::Iam` (a pattern or a value), or a call of
+            // `accepts_credentials` (it looks a key pair up in the index).
+            let mut readers: std::collections::BTreeMap<usize, usize> = Default::default();
+            for p in &src.prod.paths {
+                if p.segs.windows(2).any(|w| w == ["IamState", "Iam"]) {
+                    readers.entry(p.func).or_insert(p.line);
                 }
-                let (name, body) = crate::source_scan::enclosing_fn(&text, at);
-                if body.contains("credential_view") {
+            }
+            for c in src.prod.calls_named("accepts_credentials") {
+                readers.entry(c.func).or_insert(c.line);
+            }
+            // The functions that CALL a gate (a call expression, so a
+            // comment or a string that names it counts for nothing).
+            let gate_fns: std::collections::BTreeSet<usize> = GATES
+                .iter()
+                .flat_map(|g| src.prod.calls_named(g))
+                .map(|c| c.func)
+                .collect();
+            for (func, line) in readers {
+                let name = src.fn_name(func);
+                if gate_fns.contains(&func) {
                     gated += 1;
-                    continue;
-                }
-                let exempt = EXEMPT
+                } else if !EXEMPT
                     .iter()
-                    .any(|(f, n, _)| *f == rel && (n.is_empty() || *n == name));
-                if !exempt {
-                    offenders.push(format!("{rel}:{} in fn {name}", at + 1));
+                    .any(|(f, n, _)| *f == src.rel && (n.is_empty() || *n == name))
+                {
+                    offenders.push(format!("{}:{line} in fn {name}", src.rel));
                 }
             }
         }
-        assert!(gated >= 5, "the scan found the gated reads ({gated})");
+        assert!(gated >= 6, "the scan found the gated reads ({gated})");
         assert!(
             offenders.is_empty(),
-            "these functions read the users of the IAM index without credential_view:\n{}",
+            "these functions read the users of the IAM index without calling the gate:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// Every place that judges a credential or a principal CALLS the gate (or
+    /// the function that does): remove a call and this fails, whatever the
+    /// function reads. The pure verdicts of the admin surface are unit tested
+    /// (`an_unconfirmed_iam_database_judges_no_admin_session_and_no_oauth_mint`).
+    #[test]
+    fn every_place_that_judges_a_principal_calls_the_gate() {
+        // (file, function, one of the calls it must make)
+        const SITES: &[(&str, &str, &str)] = &[
+            (
+                "src/api/auth.rs",
+                "sigv4_auth_middleware",
+                "credential_view_or_closed",
+            ),
+            ("src/api/s3s_hooks.rs", "get_secret_key", "credential_view"),
+            (
+                "src/api/handlers/form_post.rs",
+                "authenticate_form_post",
+                "credential_view",
+            ),
+            ("src/api/admin/auth.rs", "login", "credential_view"),
+            ("src/api/admin/auth.rs", "login_as", "credential_view"),
+            (
+                "src/api/admin/auth.rs",
+                "browser_session_connect",
+                "credential_view",
+            ),
+            (
+                "src/api/admin/auth.rs",
+                "resolve_iam_identity",
+                "credential_view",
+            ),
+            (
+                "src/api/admin/auth.rs",
+                "resolve_effective_iam_user",
+                "credential_view",
+            ),
+            (
+                "src/api/admin/auth.rs",
+                "require_bulk_session",
+                "credential_view",
+            ),
+            (
+                "src/api/admin/auth.rs",
+                "bucket_view_session",
+                "credential_view",
+            ),
+            (
+                "src/api/admin/auth.rs",
+                "session_admin_verdict",
+                "credential_view",
+            ),
+            (
+                "src/api/admin/auth.rs",
+                "oauth_mint_verdict",
+                "credential_view",
+            ),
+            (
+                "src/api/admin/auth.rs",
+                "admin_gui_session_ok",
+                "session_admin_verdict",
+            ),
+            (
+                "src/api/admin/external_auth.rs",
+                "oauth_callback",
+                "oauth_mint_verdict",
+            ),
+            ("src/api/admin/objects.rs", "for_session", "credential_view"),
+            (
+                "src/maintenance/delete.rs",
+                "execute_delete_phases",
+                "credential_view",
+            ),
+        ];
+        let srcs = crate::source_scan::ast::src();
+        for (file, func, callee) in SITES {
+            let src = srcs
+                .iter()
+                .find(|s| s.rel == *file)
+                .unwrap_or_else(|| panic!("{file} exists"));
+            let calls = src
+                .prod
+                .calls_named(callee)
+                .any(|c| src.fn_name(c.func) == *func);
+            assert!(calls, "{file}: fn {func} must call {callee}");
+        }
     }
 
     #[test]

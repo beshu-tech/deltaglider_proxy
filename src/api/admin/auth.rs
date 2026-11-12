@@ -675,13 +675,16 @@ pub async fn login(
     {
         let config = state.config.read().await;
         let iam = state.iam_state.load();
-        let creds = login_s3_creds(
-            config
-                .access_key_id
-                .clone()
-                .zip(config.secret_access_key.clone()),
-            &iam,
-        );
+        let pair = config
+            .access_key_id
+            .clone()
+            .zip(config.secret_access_key.clone());
+        // The pair is offered only if the S3 API would accept it, and that
+        // is judged against the IAM index only through the gate.
+        let creds = match state.credential_view(&iam) {
+            Ok(view) => login_s3_creds(pair, view),
+            Err(_) => LoginS3Creds::None,
+        };
         let region = match &config.backend {
             crate::config::BackendConfig::S3 { region, .. } => region.clone(),
             _ => "us-east-1".to_string(),
@@ -1363,14 +1366,42 @@ fn admin_gui_session_ok(state: &AdminState, token: &str, client_ip: Option<IpAdd
         .sessions
         .admin_gui_auth_method(token, client_ip)
         .is_some_and(|method| {
-            let iam = state.iam_state.load();
-            match state.credential_view(&iam) {
-                Ok(view) => session_principal_is_admin(&method, view, client_ip),
-                // An IAM user's rights are not known until the database is
-                // confirmed; the bootstrap password does not depend on it.
-                Err(_) => matches!(method, AuthMethod::Bootstrap),
-            }
+            session_admin_verdict(
+                &state.s3_state.coordination,
+                &state.iam_state.load(),
+                &method,
+                client_ip,
+            )
         })
+}
+
+/// Pure: is the principal of an admin session still an admin, judged against
+/// the IAM state only through the gate? While the IAM database is
+/// unconfirmed the rights of an IAM user are not known (not an admin); the
+/// bootstrap password does not depend on that database.
+pub(crate) fn session_admin_verdict(
+    status: &crate::coordination::CoordinationStatus,
+    iam: &IamState,
+    method: &AuthMethod,
+    client_ip: Option<IpAddr>,
+) -> bool {
+    match status.credential_view(iam) {
+        Ok(view) => session_principal_is_admin(method, view, client_ip),
+        Err(_) => matches!(method, AuthMethod::Bootstrap),
+    }
+}
+
+/// Pure: may an OAuth sign-in mint a session, and of which kind? `Ok(true)`
+/// is an admin session, `Ok(false)` a browser-only one. `Err` while the IAM
+/// database is unconfirmed: nobody is judged against it yet.
+pub(crate) fn oauth_mint_verdict(
+    status: &crate::coordination::CoordinationStatus,
+    iam: &IamState,
+    method: &AuthMethod,
+    client_ip: Option<IpAddr>,
+) -> Result<bool, crate::coordination::status::IamUnconfirmed> {
+    let view = status.credential_view(iam)?;
+    Ok(session_principal_is_admin(method, view, client_ip))
 }
 
 /// Middleware: valid **AdminGui** session only (rejects S3BrowserLift cookies),
@@ -1999,6 +2030,49 @@ mod tests {
             auth_source: "local".into(),
             iam_policies: vec![],
         }
+    }
+
+    /// An unconfirmed IAM database judges nobody: the admin re-check of an
+    /// IAM user's session fails, an OAuth sign-in is refused, and the
+    /// bootstrap password still stands. A confirmed one judges as before.
+    #[test]
+    fn an_unconfirmed_iam_database_judges_no_admin_session_and_no_oauth_mint() {
+        use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+        let iam = IamState::Iam(IamIndex::from_users_and_groups(
+            vec![admin_test_user(4, "AKADMIN", true, true, vec![])],
+            vec![],
+        ));
+        let ip = Some("198.51.100.1".parse().unwrap());
+        let login_as = AuthMethod::IamLoginAs {
+            access_key_id: "AKADMIN".into(),
+        };
+        let external = AuthMethod::External {
+            provider_name: "corp".into(),
+            user_id: 4,
+        };
+        let unconfirmed = CoordinationStatus::with_bucket(ProfileCell::unknown(), false);
+        // The re-check of an admin session.
+        assert!(!session_admin_verdict(&unconfirmed, &iam, &login_as, ip));
+        assert!(!session_admin_verdict(&unconfirmed, &iam, &external, ip));
+        assert!(session_admin_verdict(
+            &unconfirmed,
+            &iam,
+            &AuthMethod::Bootstrap,
+            ip
+        ));
+        // The OAuth mint.
+        assert!(oauth_mint_verdict(&unconfirmed, &iam, &external, ip).is_err());
+        // A node with no coordination bucket judges as before.
+        let none = CoordinationStatus::default();
+        assert!(session_admin_verdict(&none, &iam, &login_as, ip));
+        assert_eq!(oauth_mint_verdict(&none, &iam, &external, ip), Ok(true));
+        // So does one that a sync confirmed.
+        unconfirmed.confirm_iam();
+        assert!(session_admin_verdict(&unconfirmed, &iam, &login_as, ip));
+        assert_eq!(
+            oauth_mint_verdict(&unconfirmed, &iam, &external, ip),
+            Ok(true)
+        );
     }
 
     /// auth-5: a non-admin browser session reaches the bulk endpoints under

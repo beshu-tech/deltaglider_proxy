@@ -2010,6 +2010,43 @@ mod per_key_lockout_tests {
         req
     }
 
+    /// The SigV4 middleware is the first layer of the gate, and refuses on
+    /// its own (this router has no s3s behind it): an IAM key pair gets a
+    /// retryable 503 while the IAM database is unconfirmed, and also when the
+    /// router carries no coordination status at all (it fails closed).
+    #[tokio::test]
+    async fn the_middleware_alone_refuses_an_unconfirmed_iam_database() {
+        use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+        let peer: std::net::SocketAddr = "10.0.1.6:40000".parse().unwrap();
+        let send = |status: Option<CoordinationStatus>| {
+            let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Iam(
+                IamIndex::from_users(vec![user(1, "alice", ALICE)]),
+            )));
+            let limiter = RateLimiter::new(100, Duration::from_secs(300), Duration::from_secs(600));
+            let mut app = axum::Router::new()
+                .fallback(s3s_stand_in)
+                .layer(axum::middleware::from_fn(sigv4_auth_middleware))
+                .layer(axum::Extension(iam))
+                .layer(axum::Extension(limiter));
+            if let Some(s) = status {
+                app = app.layer(axum::Extension(s));
+            }
+            async move { app.oneshot(signed(ALICE, peer)).await.unwrap().status() }
+        };
+        let unconfirmed = CoordinationStatus::with_bucket(ProfileCell::unknown(), false);
+        assert_eq!(
+            send(Some(unconfirmed.clone())).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(send(None).await, StatusCode::SERVICE_UNAVAILABLE);
+        unconfirmed.confirm_iam();
+        assert_eq!(send(Some(unconfirmed)).await, StatusCode::OK);
+        assert_eq!(
+            send(Some(CoordinationStatus::default())).await,
+            StatusCode::OK
+        );
+    }
+
     /// Behind a reverse proxy every client has the proxy's address. One
     /// client with a rotated secret locked that address out, and every
     /// other client behind the proxy got 503 SlowDown for 10 minutes,

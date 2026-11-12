@@ -110,6 +110,56 @@ struct SyncHealth {
     pull_error: Option<String>,
     push_error: Option<String>,
     last_error_at: Option<i64>,
+    /// When a pull that the store answered but this node refuses was last
+    /// logged as an error ([`refusal_log_due`]).
+    last_refusal_log_at: Option<i64>,
+}
+
+/// Why a pull did not merge a copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullFailure {
+    /// The store did not answer, or its answer was no copy (a transport
+    /// error, a refusal of the request, a read that failed).
+    NoAnswer,
+    /// The copy in the store comes from a newer release (after a downgrade).
+    RemoteSchemaNewer,
+    /// The copy is older than the last one this node merged.
+    RefusedAsRollback,
+    /// The copy cannot be read or opened, or the merge failed.
+    Other,
+}
+
+/// Pure: does this pull outcome CONFIRM the local IAM database? Yes when the
+/// store answered and this release can do nothing better with its copy than
+/// keep the local database: a copy from a newer release, or one refused as a
+/// rollback. Then the local database is the best one this release has, and
+/// holding the node unready would keep the whole fleet out of service for a
+/// copy that no retry changes. No answer from the store, a copy that cannot
+/// be read, a wrong key and a failed merge all leave it unconfirmed.
+pub fn pull_failure_confirms_local_db(failure: PullFailure) -> bool {
+    matches!(
+        failure,
+        PullFailure::RemoteSchemaNewer | PullFailure::RefusedAsRollback
+    )
+}
+
+/// Pure: the kind of a merge error text (the text of the error that
+/// `reopen_and_rebuild_iam` returns).
+pub fn classify_merge_error(text: &str) -> PullFailure {
+    if text.starts_with(crate::config_db::ROLLBACK_REFUSED_PREFIX) {
+        PullFailure::RefusedAsRollback
+    } else {
+        PullFailure::Other
+    }
+}
+
+/// How often a refusal that confirms the local database is logged as an
+/// error (it repeats at every poll).
+const REFUSAL_LOG_EVERY_SECS: i64 = 10 * 60;
+
+/// Pure: is the next error log of a refused copy due?
+pub fn refusal_log_due(last: Option<i64>, now: i64) -> bool {
+    last.is_none_or(|t| now.saturating_sub(t) >= REFUSAL_LOG_EVERY_SECS)
 }
 
 /// The sync state an operator needs to see that multi-instance IAM diverges.
@@ -314,6 +364,34 @@ impl ConfigDbSync {
             }
         }
         self.publish_health();
+    }
+
+    /// Record a pull that did not merge a copy. A failure that
+    /// [`pull_failure_confirms_local_db`] confirms the local IAM database
+    /// in the process status, with a rate-limited error that names the
+    /// cause; any other failure only records its text.
+    pub fn record_pull_failure(&self, failure: PullFailure, cause: String) {
+        if pull_failure_confirms_local_db(failure) {
+            let now = crate::event_outbox::current_unix_seconds();
+            let due = {
+                let mut h = self.health.lock();
+                let due = refusal_log_due(h.last_refusal_log_at, now);
+                if due {
+                    h.last_refusal_log_at = Some(now);
+                }
+                due
+            };
+            if due {
+                tracing::error!(
+                    "Config DB S3 sync (bucket={}): the copy in the store is not merged ({cause}). \
+                     The store answered and this release cannot use the copy: the local IAM \
+                     database is served and the sync is not in step with the store",
+                    self.bucket
+                );
+            }
+            self.status.confirm_iam();
+        }
+        self.record_pull(Err(cause));
     }
 
     /// Record how an upload (with its retries) ended.
@@ -581,11 +659,14 @@ impl ConfigDbSync {
                      v{} (rolling upgrade in progress?) — NOT merging it",
                     crate::config_db::SCHEMA_VERSION
                 );
-                self.record_pull(Err(format!(
-                    "the synced copy has schema v{v}, newer than this binary's v{}: upgrade \
-                     this instance",
-                    crate::config_db::SCHEMA_VERSION
-                )));
+                self.record_pull_failure(
+                    PullFailure::RemoteSchemaNewer,
+                    format!(
+                        "the synced copy has schema v{v}, newer than this binary's v{}: upgrade \
+                         this instance",
+                        crate::config_db::SCHEMA_VERSION
+                    ),
+                );
                 return Ok(None);
             }
             Some(v) if v < crate::config_db::SCHEMA_VERSION => warn!(
@@ -622,9 +703,10 @@ impl ConfigDbSync {
                             "Config DB downloaded from S3 comes from a newer binary (rolling \
                              upgrade in progress?) — NOT merging into the local copy: {e}"
                         );
-                        self.record_pull(Err(format!(
-                            "the synced copy comes from a newer binary: {e}"
-                        )));
+                        self.record_pull_failure(
+                            PullFailure::RemoteSchemaNewer,
+                            format!("the synced copy comes from a newer binary: {e}"),
+                        );
                         Ok(None)
                     }
                     _ => {
@@ -958,6 +1040,17 @@ pub fn reprobe_step(
     }
 }
 
+/// After this many probes without a log line, a bucket that stays unproven
+/// is logged again (about 10 minutes at the longest wait).
+pub const REPROBE_RELOG_EVERY: u32 = 10;
+
+/// Pure: does the re-probe log its failed verdict now? At each change of
+/// the verdict word, and at a low rate while it stays the same, so a node
+/// that stays unproven keeps saying so.
+pub fn reprobe_log_due(word_changed: bool, probes_since_log: u32) -> bool {
+    word_changed || probes_since_log >= REPROBE_RELOG_EVERY
+}
+
 /// One word for a verdict on the coordination bucket (pure): the re-probe
 /// logs a line each time the word changes.
 pub fn verdict_word(
@@ -988,7 +1081,9 @@ impl CasValidationFailure {
                  backend and that the backend's credentials may write to it: {e}"
             ),
             CasValidationFailure::Indeterminate(e) => {
-                format!("Coordination bucket '{bucket}' could not be probed: {e}")
+                format!(
+                    "Coordination bucket '{bucket}' (config_sync_bucket) could not be probed: {e}"
+                )
             }
         }
     }
@@ -1608,7 +1703,10 @@ pub async fn poll_round(
     {
         Ok(Some(_)) => {}
         Ok(None) => tracing::debug!("Config DB S3 sync poll: no changes"),
-        Err(e) => warn!("Config DB S3 sync poll failed: {}", e),
+        Err(e) => warn!(
+            "Config DB S3 sync poll failed (bucket '{}', config_sync_bucket): {}",
+            sync.bucket, e
+        ),
     }
     if sync.take_needs_upload() {
         if let Err(e) = upload_with_reconcile(
@@ -1639,6 +1737,9 @@ pub async fn run_poll_loop(
     sessions: Arc<crate::session::SessionStore>,
 ) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+    // A slow round delays the next tick; it does not start a burst of
+    // catch-up rounds.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick is immediate: the startup sync already ran.
     tick.tick().await;
     let mut rounds: u32 = 0;
@@ -1695,7 +1796,13 @@ async fn pull_locked(
     )
     .await;
     let applied = merged.is_ok();
-    sync.record_pull(merged.map_err(|e| format!("the IAM merge failed: {e}")));
+    match &merged {
+        Ok(()) => sync.record_pull(Ok(())),
+        Err(e) => sync.record_pull_failure(
+            classify_merge_error(e),
+            format!("the IAM merge failed: {e}"),
+        ),
+    }
     // Commit the ETag only on a successful merge so a failure retries.
     if applied {
         sync.commit_downloaded_etag(dl.etag).await;
@@ -2015,6 +2122,87 @@ mod tests {
         assert!(!status.refuses_iam_users());
         assert!(status.credential_view(&iam.load()).is_ok());
         assert_eq!(poll_wait(sync.iam_confirmed(), 0), PollWait::Tick);
+    }
+
+    /// Which pull outcomes confirm the local IAM database: the ones where
+    /// the store answered and this release cannot use its copy.
+    #[test]
+    fn a_copy_this_release_cannot_use_confirms_the_local_database() {
+        use PullFailure::*;
+        // (failure, confirms)
+        for (failure, confirms) in [
+            (NoAnswer, false),
+            (RemoteSchemaNewer, true),
+            (RefusedAsRollback, true),
+            (Other, false),
+        ] {
+            assert_eq!(
+                pull_failure_confirms_local_db(failure),
+                confirms,
+                "{failure:?}"
+            );
+        }
+        // The typed refusal of the merge is told from any other merge error.
+        let rollback = crate::config_db::ConfigDbError::RollbackRefused("old".into());
+        assert_eq!(
+            classify_merge_error(&rollback.to_string()),
+            RefusedAsRollback
+        );
+        let other = crate::config_db::ConfigDbError::Other("disk full".into());
+        assert_eq!(classify_merge_error(&other.to_string()), Other);
+    }
+
+    /// A refused copy confirms the database at its first pull, and its error
+    /// log is rate limited.
+    #[tokio::test]
+    async fn a_refused_copy_confirms_once_and_logs_rarely() {
+        use crate::coordination::status::IamSync;
+        use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+        assert!(refusal_log_due(None, 1_000));
+        assert!(!refusal_log_due(Some(1_000), 1_000 + 599));
+        assert!(refusal_log_due(Some(1_000), 1_000 + 600));
+
+        let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let status = CoordinationStatus::with_bucket(ProfileCell::unknown(), false);
+        let dir = tempfile::tempdir().unwrap();
+        let sync = ConfigDbSync::new(
+            &BackendConfig::S3 {
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("k".into()),
+                secret_access_key: Some("s".into()),
+                allow_local: true,
+                session_token: None,
+            },
+            "b".into(),
+            "k.db".into(),
+            dir.path().join("deltaglider_config.db"),
+            crate::config_db::ConfigDbKeys::primary_only(&"k".repeat(40)),
+            false,
+        )
+        .await
+        .unwrap()
+        .with_status(status.clone());
+        // No answer, and a copy that cannot be opened: still unconfirmed.
+        sync.record_pull_failure(PullFailure::NoAnswer, "timeout".into());
+        sync.record_pull_failure(PullFailure::Other, "cannot be opened".into());
+        assert_eq!(status.iam_sync(), IamSync::Unconfirmed);
+        // The store answered with a copy from a newer release: confirmed.
+        sync.record_pull_failure(PullFailure::RemoteSchemaNewer, "schema v99".into());
+        assert_eq!(status.iam_sync(), IamSync::Confirmed);
+        assert!(
+            sync.health.lock().pull_error.is_some(),
+            "the cause stays visible"
+        );
+    }
+
+    #[test]
+    fn the_reprobe_logs_at_a_change_and_then_at_a_low_rate() {
+        assert!(reprobe_log_due(true, 0));
+        assert!(!reprobe_log_due(false, 0));
+        assert!(!reprobe_log_due(false, REPROBE_RELOG_EVERY - 1));
+        assert!(reprobe_log_due(false, REPROBE_RELOG_EVERY));
     }
 
     #[test]

@@ -1259,10 +1259,7 @@ async fn async_main(
     coordination_check.status.attach_iam(iam_state.clone());
     // The IAM database of a node with a coordination bucket is judged only
     // once a sync confirmed it. Say so at boot, with the way out.
-    if matches!(
-        coordination_check.status.iam_sync(),
-        deltaglider_proxy::coordination::status::IamSync::Unconfirmed
-    ) {
+    if coordination_check.status.refuses_iam_users() {
         tracing::warn!(
             "IAM database not confirmed against the coordination bucket: the S3 API answers \
              503 to IAM users and /_/ready answers 503 until a sync ends well. Set {}=true \

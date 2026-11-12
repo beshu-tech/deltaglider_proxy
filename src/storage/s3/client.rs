@@ -8,7 +8,19 @@ use super::*;
 /// The URL kind of a backend: `allow_local` (or `DGP_BACKEND_ALLOW_LOCAL`)
 /// opens loopback and plain `http://`; nothing opens link-local or metadata.
 pub(crate) fn s3_endpoint_kind(allow_local: bool) -> crate::security::UrlKind {
-    if allow_local || crate::config::env_bool("DGP_BACKEND_ALLOW_LOCAL", false) {
+    s3_endpoint_kind_with(
+        allow_local,
+        crate::config::env_bool("DGP_BACKEND_ALLOW_LOCAL", false),
+    )
+}
+
+/// [`s3_endpoint_kind`] with the value of `DGP_BACKEND_ALLOW_LOCAL` given by
+/// the caller (a unit test reads no process env).
+pub(crate) fn s3_endpoint_kind_with(
+    allow_local: bool,
+    env_allow: bool,
+) -> crate::security::UrlKind {
+    if allow_local || env_allow {
         crate::security::UrlKind::BackendDev
     } else {
         crate::security::UrlKind::Backend

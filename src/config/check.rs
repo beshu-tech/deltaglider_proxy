@@ -523,6 +523,7 @@ impl Config {
     pub(crate) fn resolution_targets(
         &self,
         previous: Option<&Config>,
+        env_allow_local: bool,
     ) -> Vec<(String, String, crate::security::UrlKind)> {
         let mut out = Vec::new();
         for (name, backend) in self.effective_backends() {
@@ -550,7 +551,7 @@ impl Config {
             out.push((
                 name.to_string(),
                 host,
-                crate::storage::s3_endpoint_kind(*allow_local),
+                crate::storage::s3_endpoint_kind_with(*allow_local, env_allow_local),
             ));
         }
         out
@@ -567,24 +568,38 @@ impl Config {
     /// apply judges only the backends it adds or changes. Needs I/O, so it is
     /// apart from [`Self::check_fatal`].
     pub async fn backend_resolution_errors(&self, previous: Option<&Config>) -> Vec<String> {
-        let lookups =
-            self.resolution_targets(previous)
-                .into_iter()
-                .map(|(name, host, kind)| async move {
-                    let found = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        tokio::net::lookup_host((host.as_str(), 0)),
-                    )
-                    .await;
-                    let Ok(Ok(addrs)) = found else { return None };
-                    let ips: Vec<std::net::IpAddr> = addrs.map(|sa| sa.ip()).collect();
-                    crate::security::backend_resolution_error(&host, &ips, kind).map(|e| {
-                        format!(
-                            "backend '{name}': endpoint host '{host}' (backend setting \
+        self.backend_resolution_errors_with(
+            previous,
+            crate::config::env_bool("DGP_BACKEND_ALLOW_LOCAL", false),
+        )
+        .await
+    }
+
+    /// [`Self::backend_resolution_errors`] with the value of
+    /// `DGP_BACKEND_ALLOW_LOCAL` given by the caller.
+    pub(crate) async fn backend_resolution_errors_with(
+        &self,
+        previous: Option<&Config>,
+        env_allow_local: bool,
+    ) -> Vec<String> {
+        let lookups = self
+            .resolution_targets(previous, env_allow_local)
+            .into_iter()
+            .map(|(name, host, kind)| async move {
+                let found = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    tokio::net::lookup_host((host.as_str(), 0)),
+                )
+                .await;
+                let Ok(Ok(addrs)) = found else { return None };
+                let ips: Vec<std::net::IpAddr> = addrs.map(|sa| sa.ip()).collect();
+                crate::security::backend_resolution_error(&host, &ips, kind).map(|e| {
+                    format!(
+                        "backend '{name}': endpoint host '{host}' (backend setting \
                          `allow_local`, env DGP_BACKEND_ALLOW_LOCAL): {e}"
-                        )
-                    })
-                });
+                    )
+                })
+            });
         futures::future::join_all(lookups)
             .await
             .into_iter()
@@ -804,7 +819,7 @@ mod backend_resolution_tests {
             backend: s3("https://localhost:9000", false),
             ..Default::default()
         };
-        let errors = cfg.backend_resolution_errors(None).await;
+        let errors = cfg.backend_resolution_errors_with(None, false).await;
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(
             errors[0].contains("backend 'default'")
@@ -814,14 +829,23 @@ mod backend_resolution_tests {
             errors[0]
         );
         cfg.backend = s3("https://localhost:9000", true);
-        assert!(cfg.backend_resolution_errors(None).await.is_empty());
+        assert!(cfg
+            .backend_resolution_errors_with(None, false)
+            .await
+            .is_empty());
         // A literal address is judged by the text check, not here.
         cfg.backend = s3("https://127.0.0.1:9000", false);
-        assert!(cfg.backend_resolution_errors(None).await.is_empty());
+        assert!(cfg
+            .backend_resolution_errors_with(None, false)
+            .await
+            .is_empty());
         cfg.backend = BackendConfig::Filesystem {
             path: "/data".into(),
         };
-        assert!(cfg.backend_resolution_errors(None).await.is_empty());
+        assert!(cfg
+            .backend_resolution_errors_with(None, false)
+            .await
+            .is_empty());
     }
 
     /// An apply judges only the backends it adds or changes; the boot judges
@@ -838,7 +862,7 @@ mod backend_resolution_tests {
             ..Default::default()
         };
         let same = old.clone();
-        assert!(same.resolution_targets(Some(&old)).is_empty());
+        assert!(same.resolution_targets(Some(&old), false).is_empty());
         let added = Config {
             backends: vec![
                 named("hetzner-fsn1", "https://s3.example.org"),
@@ -846,11 +870,11 @@ mod backend_resolution_tests {
             ],
             ..Default::default()
         };
-        let targets = added.resolution_targets(Some(&old));
+        let targets = added.resolution_targets(Some(&old), false);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].0, "aws-dr");
         // The boot has no previous config: every backend with a host name.
-        assert_eq!(added.resolution_targets(None).len(), 2);
+        assert_eq!(added.resolution_targets(None, false).len(), 2);
     }
 
     /// The two call sites are the rule: remove the boot call or the apply

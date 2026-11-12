@@ -271,6 +271,17 @@ async fn harness() -> Harness {
 }
 
 async fn harness_with(coordination: crate::coordination::CoordinationStatus) -> Harness {
+    harness_layers(coordination.clone(), coordination).await
+}
+
+/// The harness with the status of the SigV4 middleware (`middleware`) and
+/// the status of the s3s secret lookup (`hook`) apart, to test each layer of
+/// the gate alone.
+async fn harness_layers(
+    middleware: crate::coordination::CoordinationStatus,
+    hook: crate::coordination::CoordinationStatus,
+) -> Harness {
+    let coordination = middleware;
     use s3s::service::S3ServiceBuilder;
 
     let iam: crate::iam::SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Iam(
@@ -316,7 +327,7 @@ async fn harness_with(coordination: crate::coordination::CoordinationStatus) -> 
         backend_health: Default::default(),
         encryption_witness: None,
         config_db_key_mismatch: false,
-        coordination: coordination.clone(),
+        coordination,
     });
     let rate_limiter = crate::rate_limiter::RateLimiter::new(
         100,
@@ -345,7 +356,7 @@ async fn harness_with(coordination: crate::coordination::CoordinationStatus) -> 
     let mut builder = S3ServiceBuilder::new(NopS3);
     builder.set_auth(DeltaGliderS3sAuth {
         iam_state: iam,
-        coordination,
+        coordination: hook,
     });
     builder.set_access(RecordingAccess);
     builder.set_config(crate::api::s3s_hooks::s3s_config(
@@ -1277,14 +1288,6 @@ enum BodyCheck {
     NotReached,
 }
 
-/// P2.4: the adapter stores the signed `x-amz-content-sha256` as the
-/// body's SHA-256, without hashing the body, exactly when
-/// `s3s_verified_payload_sha256` says s3s verified it. One row per body
-/// shape s3s 0.14 distinguishes (`ops/signature.rs`): the row states what
-/// s3s does with a right and a wrong body, and whether the adapter trusts
-/// the digest. The invariant in `violations` (a trusted digest always
-/// matches the delivered body) runs on every row and on the generated
-/// requests.
 /// A node whose IAM database no sync confirmed refuses the requests that
 /// are judged against it (a key pair, signed or presigned, and a form
 /// POST) with a retryable 503, and serves the ones that read no IAM
@@ -1347,6 +1350,39 @@ async fn an_unconfirmed_iam_database_refuses_only_what_it_judges() {
     );
 }
 
+/// The second layer of the gate, the s3s secret lookup, refuses an
+/// unconfirmed database on its own (the `bare` router is s3s with that
+/// lookup and no middleware). The first layer, the SigV4 middleware, is
+/// tested alone in `api::auth` (`the_middleware_alone_refuses_...`).
+#[tokio::test]
+async fn the_s3s_secret_lookup_refuses_an_unconfirmed_database_alone() {
+    use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+    let key = format!("/{PUBLIC_BUCKET}/other/k");
+    let h = harness_layers(
+        Default::default(),
+        CoordinationStatus::with_bucket(ProfileCell::unknown(), false),
+    )
+    .await;
+    let (status, _) = send(&h.bare, &get(&key, v4(ALICE)))
+        .await
+        .expect("a request");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // A confirmed database: the lookup finds the key and s3s serves it.
+    let h = harness_layers(Default::default(), Default::default()).await;
+    let (status, _) = send(&h.bare, &get(&key, v4(ALICE)))
+        .await
+        .expect("a request");
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+}
+
+/// P2.4: the adapter stores the signed `x-amz-content-sha256` as the
+/// body's SHA-256, without hashing the body, exactly when
+/// `s3s_verified_payload_sha256` says s3s verified it. One row per body
+/// shape s3s 0.14 distinguishes (`ops/signature.rs`): the row states what
+/// s3s does with a right and a wrong body, and whether the adapter trusts
+/// the digest. The invariant in `violations` (a trusted digest always
+/// matches the delivered body) runs on every row and on the generated
+/// requests.
 #[tokio::test]
 async fn s3s_verifies_the_payload_hash_we_trust() {
     use BodyCheck::*;
