@@ -223,14 +223,15 @@ pub fn mark_sealed(id: &StoredObjectId<'_>) {
 /// object takes the entry and offers the write again
 /// ([`take_unwritten`]).
 ///
-/// The registry is a moka cache (capacity [`UNWRITTEN_CAP`], entries live
-/// [`UNWRITTEN_TTL`]), so its eviction costs O(1) amortised and takes no
-/// global lock on the request path. It is keyed by the stored OBJECT (scope,
-/// bucket, key), not by its ETag: the entry of an object that was deleted
-/// ([`forget_unwritten`], from the delete path) or written again with a write
-/// that was queued ([`forget_unwritten`], from the PUT path) is removed at
-/// once, and one for another version than the listed one is dropped when the
-/// LIST meets it. An entry that the cache evicts for room is counted
+/// The registry holds at most [`UNWRITTEN_CAP`] entries for [`UNWRITTEN_TTL`]
+/// each, in a map under one mutex with an exact entry count in an atomic
+/// ([`Registry`]); its eviction is O(1) amortised. It is keyed by the stored
+/// OBJECT (scope, bucket, key), not by its ETag: the entry of an object that
+/// was deleted ([`forget_unwritten`], from the delete path) or written again
+/// with a write that was queued ([`forget_unwritten`], from the PUT path) is
+/// removed at once, and one for another version than the listed one is
+/// dropped when the LIST meets it. An entry that the registry evicts for room
+/// is counted
 /// (`deltaglider_listing_facts_queue_dropped_total{queue="unwritten"}`) and
 /// logged (the first, then every 10,000th).
 static UNWRITTEN: LazyLock<Registry> =
@@ -250,77 +251,127 @@ const UNWRITTEN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3
 /// The registry logs its first drop and every this many after it.
 const UNWRITTEN_LOG_EVERY: u64 = 10_000;
 
-/// The refused-writes cache with an exact count of its entries.
+/// The refused-writes registry: a map and the keys in insertion order under
+/// ONE mutex, and the number of entries in an atomic.
 ///
-/// The count (`live`) answers [`any_unwritten`] with one atomic load, so a LIST
-/// page pays nothing when no write was refused, and no housekeeping call
-/// runs on the request path. It is exact because each entry leaves it once:
-/// a fresh insert counts one, an explicit removal (`take`, `forget`) takes
-/// one, and the eviction listener takes one for expiry and for room (an
-/// explicit removal and a replacement are the caller's, not the listener's).
+/// The count (`live`) is stored under the mutex after every change, so it IS
+/// the number of entries: it cannot say "empty" while an entry is there (a
+/// lost repair), and it cannot stay "not empty" after the last entry left.
+/// [`any_unwritten`] reads it with one atomic load, so a LIST page pays
+/// nothing, and takes no lock, when no write was refused. (A moka cache gave a
+/// count that drifted under `insert` and `remove` racing on one key, in both
+/// directions.) Eviction is O(1) amortised: the oldest key leaves when the
+/// registry is full, and an expired key leaves when the registry is touched;
+/// the queue of keys drops the stale ones (re-marked or removed) as it meets
+/// them and is compacted when stale keys outnumber the cap.
 struct Registry {
-    cache: Cache<String, Unwritten>,
-    live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Entries dropped for room, for the log's rate limit (the listener owns
-    /// a clone; the tests read this one).
-    #[cfg_attr(not(test), allow(dead_code))]
-    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    inner: parking_lot::Mutex<RegistryInner>,
+    live: std::sync::atomic::AtomicUsize,
+    /// Entries dropped for room, for the log's rate limit.
+    dropped: std::sync::atomic::AtomicU64,
+    cap: usize,
+    ttl: std::time::Duration,
+}
+
+#[derive(Default)]
+struct RegistryInner {
+    map: std::collections::HashMap<String, RegistrySlot>,
+    /// Keys in insertion order, each with the `seq` of the insert it stands
+    /// for. A key whose slot has another `seq` (or none) is stale.
+    order: std::collections::VecDeque<(String, u64)>,
+    seq: u64,
+}
+
+struct RegistrySlot {
+    value: Unwritten,
+    at: std::time::Instant,
+    seq: u64,
+}
+
+impl RegistryInner {
+    /// Drop the keys at the head of the queue that are stale or expired.
+    fn expire(&mut self, now: std::time::Instant, ttl: std::time::Duration) {
+        while let Some((key, seq)) = self.order.front() {
+            match self.map.get(key) {
+                Some(slot) if slot.seq == *seq => {
+                    if now.duration_since(slot.at) < ttl {
+                        break;
+                    }
+                    let key = key.clone();
+                    self.map.remove(&key);
+                }
+                _ => {}
+            }
+            self.order.pop_front();
+        }
+    }
 }
 
 impl Registry {
     fn new(cap: u64, ttl: std::time::Duration) -> Self {
-        use std::sync::atomic::Ordering::Relaxed;
-        let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (listener_live, listener_dropped) = (live.clone(), dropped.clone());
-        let cache = Cache::builder()
-            .max_capacity(cap)
-            .time_to_live(ttl)
-            .eviction_listener(move |_key, _value, cause| {
-                use moka::notification::RemovalCause::{Expired, Size};
-                match cause {
-                    Expired => {
-                        listener_live.fetch_sub(1, Relaxed);
-                    }
-                    Size => {
-                        listener_live.fetch_sub(1, Relaxed);
-                        let n = listener_dropped.fetch_add(1, Relaxed) + 1;
-                        super::s3::LISTING_FACTS_QUEUE_DROPPED
-                            .with_label_values(&["unwritten"])
-                            .inc();
-                        if n == 1 || n.is_multiple_of(UNWRITTEN_LOG_EVERY) {
-                            tracing::warn!(
-                                "the registry of refused listing-facts writes is full ({cap} \
-                                 entries): {n} entries dropped so far; those objects list their \
-                                 stored size on other nodes until a HEAD or the healer writes \
-                                 their facts"
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            })
-            .build();
         Registry {
-            cache,
-            live,
-            dropped,
+            inner: Default::default(),
+            live: std::sync::atomic::AtomicUsize::new(0),
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            cap: usize::try_from(cap).unwrap_or(usize::MAX),
+            ttl,
         }
     }
 
     fn mark(&self, key: String, value: Unwritten) {
         use std::sync::atomic::Ordering::Relaxed;
-        // `is_fresh` is true for exactly one of the threads that race to
-        // insert the same key.
-        if self
-            .cache
-            .entry(key.clone())
-            .or_insert(value.clone())
-            .is_fresh()
+        let now = std::time::Instant::now();
+        let mut evicted = 0u64;
         {
-            self.live.fetch_add(1, Relaxed);
-        } else {
-            self.cache.insert(key, value);
+            let mut guard = self.inner.lock();
+            let inner = &mut *guard;
+            inner.expire(now, self.ttl);
+            inner.seq += 1;
+            let seq = inner.seq;
+            inner.map.insert(
+                key.clone(),
+                RegistrySlot {
+                    value,
+                    at: now,
+                    seq,
+                },
+            );
+            inner.order.push_back((key, seq));
+            while inner.map.len() > self.cap {
+                let Some((old, old_seq)) = inner.order.pop_front() else {
+                    break;
+                };
+                if inner.map.get(&old).is_some_and(|slot| slot.seq == old_seq) {
+                    inner.map.remove(&old);
+                    evicted += 1;
+                }
+            }
+            if inner.order.len() > self.cap.saturating_mul(2).saturating_add(16) {
+                let RegistryInner { map, order, .. } = inner;
+                order.retain(|(key, seq)| map.get(key).is_some_and(|slot| slot.seq == *seq));
+            }
+            self.live.store(inner.map.len(), Relaxed);
+        }
+        for _ in 0..evicted {
+            self.note_dropped();
+        }
+    }
+
+    fn note_dropped(&self) {
+        let n = self
+            .dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        super::s3::LISTING_FACTS_QUEUE_DROPPED
+            .with_label_values(&["unwritten"])
+            .inc();
+        if n == 1 || n.is_multiple_of(UNWRITTEN_LOG_EVERY) {
+            tracing::warn!(
+                "the registry of refused listing-facts writes is full ({} entries): {n} entries \
+                 dropped so far; those objects list their stored size on other nodes until a \
+                 HEAD or the healer writes their facts",
+                self.cap
+            );
         }
     }
 
@@ -328,10 +379,16 @@ impl Registry {
         self.live.load(std::sync::atomic::Ordering::Relaxed) > 0
     }
 
+    /// Remove an entry (one that expired is gone, and gives `None`).
     fn remove(&self, key: &str) -> Option<Unwritten> {
-        let entry = self.cache.remove(key)?;
-        self.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        Some(entry)
+        let now = std::time::Instant::now();
+        let mut guard = self.inner.lock();
+        guard.expire(now, self.ttl);
+        let slot = guard.map.remove(key);
+        self.live
+            .store(guard.map.len(), std::sync::atomic::Ordering::Relaxed);
+        slot.filter(|slot| now.duration_since(slot.at) < self.ttl)
+            .map(|slot| slot.value)
     }
 }
 
@@ -408,29 +465,39 @@ mod unwritten_registry_tests {
             let (key, value) = entry(n);
             registry.mark(key, value);
         }
-        registry.cache.run_pending_tasks();
-        let dropped = registry.dropped.load(std::sync::atomic::Ordering::Relaxed);
-        let live = registry.live.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(dropped >= (N as u64 - CAP), "{dropped} dropped of {N}");
+        let kept_n = live(&registry);
+        let dropped = metric() - before;
+        assert_eq!(kept_n as u64, CAP, "the registry holds its cap");
         assert_eq!(
-            live as u64 + dropped,
-            N as u64,
-            "every entry is live or dropped"
+            dropped,
+            N as u64 - CAP,
+            "the metric counts every entry dropped for room"
         );
-        assert_eq!(live as u64, registry.cache.entry_count());
-        assert!(metric() - before >= dropped, "the metric counts the drops");
-        assert!(registry.any() == (live > 0));
-        // An explicit removal takes exactly one from the count.
-        let kept = (0..N)
-            .map(entry)
-            .find(|(key, _)| registry.cache.contains_key(key))
-            .expect("a kept entry");
-        assert!(registry.remove(&kept.0).is_some());
-        assert!(registry.remove(&kept.0).is_none());
-        assert_eq!(
-            registry.live.load(std::sync::atomic::Ordering::Relaxed),
-            live - 1
-        );
+        assert_eq!(kept_n, entries(&registry));
+        assert!(registry.any());
+        // The oldest left, the newest stayed (FIFO).
+        assert!(registry.remove(&entry(0).0).is_none());
+        let newest = entry(N - 1).0;
+        assert!(registry.remove(&newest).is_some());
+        assert!(registry.remove(&newest).is_none());
+        assert_eq!(live(&registry), kept_n - 1);
+        assert_eq!(live(&registry), entries(&registry));
+    }
+
+    /// The queue of keys stays bounded when the same keys are marked and
+    /// removed over and over (stale keys are compacted).
+    #[test]
+    fn the_queue_of_keys_stays_bounded() {
+        let registry = Registry::new(8, UNWRITTEN_TTL);
+        for round in 0..10_000 {
+            let (key, value) = entry(round % 3);
+            registry.mark(key.clone(), value);
+            if round % 2 == 0 {
+                let _ = registry.remove(&key);
+            }
+        }
+        assert!(registry.inner.lock().order.len() <= 8 * 2 + 16 + 1);
+        assert_eq!(live(&registry), entries(&registry));
     }
 
     /// Marking an object again (a newer version refused) replaces its entry
@@ -446,12 +513,107 @@ mod unwritten_registry_tests {
             facts_key: "facts-new".into(),
         };
         registry.mark(key.clone(), newer);
-        assert_eq!(registry.live.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(live(&registry), 1);
         assert_eq!(
             registry.remove(&key).map(|u| u.facts_key).as_deref(),
             Some("facts-new")
         );
         assert!(!registry.any());
+        assert_eq!(live(&registry), 0);
+    }
+
+    /// An entry that expired and was not touched since: `remove` finds it
+    /// gone, and the count is zero (a hand-kept count went to `usize::MAX`
+    /// when `remove` and the expiry both subtracted). A registry that is only
+    /// touched by a `remove` of ANOTHER key drops it too, so a stale entry
+    /// does not keep every LIST on the slow path for ever.
+    #[test]
+    fn an_expired_entry_is_counted_out_once() {
+        let registry = Registry::new(100, std::time::Duration::from_millis(40));
+        let (key, value) = entry(1);
+        registry.mark(key.clone(), value);
+        let (other, other_value) = entry(2);
+        registry.mark(other.clone(), other_value);
+        assert!(registry.any());
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert!(registry.remove(&key).is_none(), "expired: gone");
+        assert_eq!(live(&registry), 0, "the other expired entry left too");
+        assert!(!registry.any());
+        assert_eq!(entries(&registry), 0);
+    }
+
+    /// The repair is never lost: with one entry counted, marking the same
+    /// object again and then removing it must leave the count at what is
+    /// there (the old `mark` left 0 with a live entry, so `any()` was false
+    /// and the facts write was never offered).
+    #[test]
+    fn marking_again_then_removing_keeps_the_count_true() {
+        let registry = Registry::new(100, UNWRITTEN_TTL);
+        let (key, value) = entry(1);
+        let (other, other_value) = entry(2);
+        registry.mark(key.clone(), value.clone());
+        registry.mark(other.clone(), other_value);
+        registry.mark(key.clone(), value);
+        assert!(registry.remove(&key).is_some());
+        assert_eq!(live(&registry), 1, "`{other}` is still there");
+        assert!(registry.any());
+        assert!(registry.remove(&other).is_some());
+        assert!(!registry.any());
+    }
+
+    /// Real threads mark and remove the same keys. At every end of a round:
+    /// a live entry means `any()`; once pending work has run the count is
+    /// the number of entries; and once everything is removed `any()` is
+    /// false. (The old count was off in both directions in 200 of 200 rounds.)
+    #[test]
+    fn the_count_survives_marks_racing_removes() {
+        for round in 0..40u64 {
+            let registry = std::sync::Arc::new(Registry::new(1_000, UNWRITTEN_TTL));
+            let handles: Vec<_> = (0..4u64)
+                .map(|t| {
+                    let registry = registry.clone();
+                    std::thread::spawn(move || {
+                        let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (round << 8) ^ t;
+                        for _ in 0..2_000 {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            let (key, value) = entry((x % 2) as usize);
+                            if x & 0x100 == 0 {
+                                registry.mark(key, value);
+                            } else {
+                                let _ = registry.remove(&key);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            assert_eq!(
+                live(&registry),
+                entries(&registry),
+                "round {round}: the count is the entries"
+            );
+            if entries(&registry) > 0 {
+                assert!(registry.any(), "round {round}: a live entry, any() false");
+            }
+            for n in 0..2 {
+                let _ = registry.remove(&entry(n).0);
+            }
+            assert!(!registry.any(), "round {round}: everything removed");
+            assert_eq!(live(&registry), 0, "round {round}");
+        }
+    }
+
+    fn live(registry: &Registry) -> usize {
+        registry.live.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The entries that are really in the map.
+    fn entries(registry: &Registry) -> usize {
+        registry.inner.lock().map.len()
     }
 }
 

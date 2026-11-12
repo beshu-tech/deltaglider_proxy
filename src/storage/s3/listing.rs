@@ -674,6 +674,9 @@ enum ProbeVerdict {
     Nothing,
     /// The request cap was spent: the prefix is shown.
     GaveUp,
+    /// The backend refuses the prefix as a name
+    /// ([`super::errors::refuses_prefix_as_a_name`]).
+    Refused,
 }
 
 impl S3Backend {
@@ -695,9 +698,13 @@ impl S3Backend {
     ///   no client write adds a key), so the next LIST of the level sends no
     ///   probe and the answer cannot go stale. Any other prefix (`a/r`, `.`)
     ///   is probed each time: a client can write a key under it at any moment.
-    /// * A probe that fails (the backend refuses the prefix: MinIO answers
-    ///   `XMinioInvalidResourceName` for `prefix=.`) never fails the LIST: the
-    ///   prefix is shown, as past the budget.
+    /// * A probe that fails because the backend refuses the PREFIX as a name
+    ///   (MinIO answers `XMinioInvalidResourceName` for `prefix=.`) shows the
+    ///   prefix, unchecked, unless it is an [`UnwritablePrefix`], the proxy's
+    ///   own namespace, which is then hidden. Every other error (a `503`, a
+    ///   timeout, an auth error) is the error of the page, as a failed page
+    ///   request is: a retryable error stays retryable, and a dying backend
+    ///   costs one request timeout, not eight.
     ///
     /// `requests` counts what this sends (the page's total).
     async fn holds_listed_key(
@@ -706,17 +713,18 @@ impl S3Backend {
         prefix: &str,
         requests: &mut u32,
         budget: &mut u32,
-    ) -> bool {
-        let remembered = listing_facts::UnwritablePrefix::of(prefix)
-            .map(|u| format!("{}\0{bucket}\0{}", self.list_cache_scope, u.as_str()));
+    ) -> Result<bool, StorageError> {
+        let unwritable = listing_facts::UnwritablePrefix::of(prefix);
+        let remembered =
+            unwritable.map(|u| format!("{}\0{bucket}\0{}", self.list_cache_scope, u.as_str()));
         if remembered
             .as_ref()
             .is_some_and(|key| OWN_ONLY_PREFIXES.contains_key(key))
         {
-            return false;
+            return Ok(false);
         }
         if *budget == 0 {
-            return true;
+            return Ok(true);
         }
         *budget -= 1;
         let mut sent = 0u32;
@@ -733,13 +741,18 @@ impl S3Backend {
             {
                 Ok(ProbeVerdict::Listed) | Ok(ProbeVerdict::GaveUp) => {
                     *requests += sent;
-                    return true;
+                    return Ok(true);
+                }
+                Ok(ProbeVerdict::Refused) => {
+                    *requests += sent;
+                    debug!("the backend refuses the prefix {prefix:?} of {bucket} as a name");
+                    // The proxy's own namespace is never shown.
+                    return Ok(unwritable.is_none());
                 }
                 Ok(ProbeVerdict::Nothing) => {}
                 Err(e) => {
                     *requests += sent;
-                    debug!("probe of prefix {prefix:?} in {bucket} failed, showing it: {e}");
-                    return true;
+                    return Err(e);
                 }
             }
         }
@@ -747,7 +760,7 @@ impl S3Backend {
         if let Some(key) = remembered {
             OWN_ONLY_PREFIXES.insert(key, ());
         }
-        false
+        Ok(false)
     }
 
     /// One range of [`Self::holds_listed_key`]: pages of `PROBE_PAGE` keys
@@ -780,10 +793,13 @@ impl S3Backend {
                 request = request.continuation_token(t);
             }
             *sent += 1;
-            let response = request
-                .send()
-                .await
-                .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(e) if super::errors::sdk_refuses_prefix_as_a_name(&e) => {
+                    return Ok(ProbeVerdict::Refused);
+                }
+                Err(e) => return Err(self.classify(bucket, &e, S3Op::ListObjects)),
+            };
             let keys: Vec<&str> = response.contents().iter().filter_map(|o| o.key()).collect();
             if keys.iter().any(|k| listing_facts::shows_in_listing(k)) {
                 return Ok(ProbeVerdict::Listed);
@@ -890,7 +906,7 @@ impl S3Backend {
                                     &mut upstream_requests,
                                     &mut probe_budget,
                                 )
-                                .await
+                                .await?
                         {
                             continue;
                         }
@@ -1848,16 +1864,20 @@ mod delegated_cost_tests {
         }
     }
 
-    /// A probe that fails never fails the LIST: the prefix is shown. MinIO
-    /// answers `XMinioInvalidResourceName` for a probe of `prefix=.`.
-    #[tokio::test]
-    async fn a_failed_probe_shows_the_prefix_and_not_an_error() {
-        let keys = vec![
+    fn probe_keys() -> Vec<String> {
+        vec![
             ".dg/facts/x!!1.e.1.2.e".to_string(),
             "a/reference.bin".to_string(),
             "a/x".to_string(),
-        ];
-        let (s3, fake) = backend_with_keys(&keys).await;
+        ]
+    }
+
+    /// A probe that the backend refuses AS A NAME (MinIO answers
+    /// `XMinioInvalidResourceName` for `prefix=.`) shows the prefix, and
+    /// hides the proxy's own namespace (`.dg/`), which is never shown.
+    #[tokio::test]
+    async fn a_prefix_the_backend_refuses_as_a_name_is_shown_but_not_the_proxys_own() {
+        let (s3, fake) = backend_with_keys(&probe_keys()).await;
         // The probes ask for 16 keys; the page itself for more.
         fake.fail(
             "LIST",
@@ -1871,11 +1891,44 @@ mod delegated_cost_tests {
         assert_eq!(prefixes, ["a/r"], "shown: the probe could not tell");
         let (_, prefixes) = walk_pages(&s3, "", Some("."), 1000).await;
         assert_eq!(prefixes, [".", "a/reference."], "{prefixes:?}");
+        let (_, prefixes) = walk_pages(&s3, "", Some("/"), 1000).await;
+        assert_eq!(prefixes, ["a/"], "`.dg/` is never shown: {prefixes:?}");
         assert!(
             fake.faulted("LIST", "max-keys=16") > 0,
             "the probes ran: {:?}",
             fake.requests()
         );
+    }
+
+    /// Any other probe error is the error of the page: a retryable `503`
+    /// stays retryable, no answer lists `.dg/`, and the page stops at the
+    /// first failed probe (one request timeout, not eight).
+    #[tokio::test]
+    async fn a_failed_probe_fails_the_page_with_its_own_error() {
+        for (status, code) in [
+            (503u16, "SlowDown"),
+            (403, "AccessDenied"),
+            (500, "InternalError"),
+        ] {
+            let (s3, fake) = backend_with_keys(&probe_keys()).await;
+            fake.fail("LIST", "max-keys=16", status, code, u32::MAX);
+            for (prefix, delimiter) in [("", "/"), ("", "r"), ("", ".")] {
+                let page = s3
+                    .list_objects_delegated("b", prefix, Some(delimiter), 1000, None)
+                    .await;
+                let err = page.err().unwrap_or_else(|| {
+                    panic!("{status} {code}: the LIST must fail ({prefix:?} {delimiter:?})")
+                });
+                if status == 503 {
+                    assert!(
+                        matches!(err, StorageError::Throttled(_)),
+                        "a 503 stays retryable: {err:?}"
+                    );
+                }
+            }
+            // Each LIST stopped at its first probe.
+            assert_eq!(fake.faulted("LIST", "max-keys=16"), 3, "{status} {code}");
+        }
     }
 
     /// A page reports the requests it sent (its pages and its probes), so
