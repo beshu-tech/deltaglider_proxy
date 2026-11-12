@@ -225,20 +225,58 @@ pub struct ExplicitLimits {
     /// added a filesystem backend after the boot measured). The budget does
     /// not change; the operator gets a warning (item `ShareChangesAtRestart`).
     pub shares_device_now: bool,
+    /// A configured S3 backend hosts a proxy-encrypted bucket: the stored
+    /// ciphertext is larger than the plaintext, so the 5 GiB of one backend
+    /// PUT holds less plaintext ([`largest_plaintext_in_one_put`]).
+    pub s3_proxy_encrypted: bool,
 }
 
 /// The most that an S3 backend stores with one PUT request.
 pub const S3_SINGLE_PUT_MAX_BYTES: u64 = 5 * GIB;
 
+/// Spool files of a delta encode, each up to the object's size: the body,
+/// the reference and the delta output.
+pub const DELTA_FILES_PLAIN: u64 = 3;
+
+/// The same, when the store holds a second copy of the body beside the
+/// other three: the ciphertext file of a proxy-encrypted bucket
+/// (`file_put_spool_bytes`), or the joined file of a multipart upload
+/// (`join_parts_into`) that the relay parts feed.
+pub const DELTA_FILES_WITH_BODY_COPY: u64 = 4;
+
 /// Pure: the largest object that the delta encode can take with a reference
-/// of about the same size. The streaming encode holds three files in the
-/// spool at once, the body, the reference and the delta output, each up to
-/// the object's size, so an object above a third of the budget is stored
-/// whole with the reason `delta-unavailable`. (A reference file that an
-/// earlier request already cached still counts: it holds spool space.) The
-/// test `delta_ceiling_tests` in `engine/store.rs` measures this.
+/// of about the same size, in a plain bucket: the spool holds
+/// [`DELTA_FILES_PLAIN`] files of the object's size, so an object above that
+/// share of the budget is stored whole with the reason `delta-unavailable`.
+/// (A reference file that an earlier request already cached still counts: it
+/// holds spool space.) The test `delta_ceiling_tests` in `engine/store.rs`
+/// measures both ceilings on the real store path.
 pub fn delta_ceiling(spool_budget: u64) -> u64 {
-    spool_budget / 3
+    spool_budget / DELTA_FILES_PLAIN
+}
+
+/// Pure: the same for a proxy-encrypted bucket and for the delta of a
+/// multipart upload: [`DELTA_FILES_WITH_BODY_COPY`] files.
+pub fn delta_ceiling_with_body_copy(spool_budget: u64) -> u64 {
+    spool_budget / DELTA_FILES_WITH_BODY_COPY
+}
+
+/// Pure: the largest plaintext whose encrypted form
+/// (`storage::encrypting::v2::stored_len`: header + a 16-byte tag per 64 KiB
+/// frame) fits in one 5 GiB backend PUT.
+pub fn largest_plaintext_in_one_put() -> u64 {
+    use crate::storage::encrypting::v2::stored_len;
+    let (mut lo, mut hi) = (0u64, S3_SINGLE_PUT_MAX_BYTES);
+    // `stored_len` is strictly increasing: find the last plaintext that fits.
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if stored_len(mid).is_some_and(|s| s <= S3_SINGLE_PUT_MAX_BYTES) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
 }
 
 /// Where a value comes from.
@@ -285,6 +323,9 @@ pub struct EffectiveLimits {
     /// Objects above this are stored whole, not as a delta: see
     /// [`delta_ceiling`].
     pub delta_ceiling: u64,
+    /// The same for a proxy-encrypted bucket and for a multipart upload
+    /// ([`delta_ceiling_with_body_copy`]).
+    pub delta_ceiling_with_body_copy: u64,
 }
 
 /// What bounds the largest object.
@@ -298,6 +339,11 @@ pub enum ObjectSizeBound {
     TotalMultipart,
     /// An S3 backend stores a client object with one PUT: 5 GiB.
     S3SinglePut,
+    /// The same with a proxy-encrypted bucket on an S3 backend: the largest
+    /// plaintext whose ciphertext fits in 5 GiB.
+    S3SinglePutEncrypted,
+    /// The spool budget itself: nothing larger can be held.
+    SpoolBudget,
 }
 
 impl ObjectSizeBound {
@@ -309,8 +355,19 @@ impl ObjectSizeBound {
             Self::S3SinglePut => {
                 "auto: 5 GiB, the most that an S3 backend stores with one PUT request"
             }
+            Self::S3SinglePutEncrypted => {
+                "auto: the largest object whose encrypted form fits the 5 GiB of one S3 PUT request"
+            }
+            Self::SpoolBudget => "auto: the spool budget",
         }
     }
+}
+
+/// Which multipart limit a warning names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultipartLimit {
+    PerUpload,
+    Total,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,10 +390,25 @@ pub enum LimitWarning {
         limit: u64,
         bound: ObjectSizeBound,
     },
+    /// An explicit per-upload limit or multipart total is above the whole
+    /// spool budget: an upload of that size can never fit.
+    MultipartLimitAboveBudget {
+        which: MultipartLimit,
+        value: u64,
+        budget: u64,
+    },
     /// A config apply put a filesystem backend (or data) on the device of
     /// the spool after the boot measured. The budget stays; the smaller
     /// share for a shared device applies at the next start.
     ShareChangesAtRestart,
+}
+
+/// Records whether the condition holds now and says whether it just began:
+/// the warning for a condition that holds over several applies is logged
+/// once, and again only after the condition went away and came back.
+pub fn share_change_is_new(held_before: &std::sync::atomic::AtomicBool, now: bool) -> bool {
+    let before = held_before.swap(now, std::sync::atomic::Ordering::AcqRel);
+    now && !before
 }
 
 /// Round down to whole MiB.
@@ -459,13 +531,44 @@ pub fn derive_limits(
             BytesOrAuto::Auto => {
                 let (mut v, mut bound) = multipart_bound
                     .unwrap_or((default_per_upload(spool_budget), ObjectSizeBound::PerUpload));
-                if explicit.s3_backend && S3_SINGLE_PUT_MAX_BYTES < v {
-                    v = S3_SINGLE_PUT_MAX_BYTES;
-                    bound = ObjectSizeBound::S3SinglePut;
+                // Nothing larger than the budget can ever be held.
+                if v > spool_budget {
+                    v = spool_budget;
+                    bound = ObjectSizeBound::SpoolBudget;
+                }
+                if explicit.s3_backend {
+                    let (cap, cap_bound) = if explicit.s3_proxy_encrypted {
+                        (
+                            largest_plaintext_in_one_put(),
+                            ObjectSizeBound::S3SinglePutEncrypted,
+                        )
+                    } else {
+                        (S3_SINGLE_PUT_MAX_BYTES, ObjectSizeBound::S3SinglePut)
+                    };
+                    if cap < v {
+                        v = cap;
+                        bound = cap_bound;
+                    }
                 }
                 (v, Source::Auto, bound)
             }
         };
+    for (which, source, value) in [
+        (MultipartLimit::PerUpload, per_upload_source, per_upload),
+        (
+            MultipartLimit::Total,
+            total_multipart_source,
+            total_multipart,
+        ),
+    ] {
+        if source == Source::Explicit && value > spool_budget {
+            warnings.push(LimitWarning::MultipartLimitAboveBudget {
+                which,
+                value,
+                budget: spool_budget,
+            });
+        }
+    }
     if let (Source::Explicit, Some((limit, bound))) = (max_object_size_source, multipart_bound) {
         if max_object_size > limit {
             warnings.push(LimitWarning::ObjectSizeAboveMultipartLimit {
@@ -495,6 +598,7 @@ pub fn derive_limits(
             max_object_size_source,
             max_object_size_bound,
             delta_ceiling: delta_ceiling(spool_budget),
+            delta_ceiling_with_body_copy: delta_ceiling_with_body_copy(spool_budget),
         },
         warnings,
     )
@@ -592,6 +696,23 @@ impl LimitWarning {
                     human_bytes(limit),
                 )
             }
+            Self::MultipartLimitAboveBudget {
+                which,
+                value,
+                budget,
+            } => {
+                let name = match which {
+                    MultipartLimit::PerUpload => "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
+                    MultipartLimit::Total => "DGP_MAX_TOTAL_MULTIPART_BYTES",
+                };
+                format!(
+                    "{name} is {} ({value} bytes), above the whole spool budget of {} \
+                     ({budget} bytes) in {dir}. An upload of that size can never fit. Lower \
+                     {name}, or raise DGP_SPOOL_MAX_BYTES.",
+                    human_bytes(value),
+                    human_bytes(budget),
+                )
+            }
             Self::ShareChangesAtRestart => format!(
                 "A filesystem backend or the data directory is now on the same device as the \
                  spool directory {dir}. The spool budget stays as measured at boot; the smaller \
@@ -642,11 +763,13 @@ impl EffectiveLimits {
         };
         format!(
             "spool budget {} = {}; {per_upload}; total multipart limit {}; {mos}; delta ceiling \
-             {} (an object above it is stored whole, reason delta-unavailable)",
+             {} ({} in a proxy-encrypted bucket or for a multipart upload); an object above \
+             its ceiling is stored whole, reason delta-unavailable",
             human_bytes(self.spool_budget),
             self.spool_note(dir),
             human_bytes(self.total_multipart),
             human_bytes(self.delta_ceiling),
+            human_bytes(self.delta_ceiling_with_body_copy),
         )
     }
 }
@@ -767,10 +890,27 @@ impl ResolvedLimits {
             delta_ceiling: value(
                 e.delta_ceiling,
                 "auto",
-                "a third of the spool budget: the delta encode holds the body, the reference and \
-                 the delta output at once; an object above it is stored whole with the reason \
-                 delta-unavailable"
-                    .to_string(),
+                format!(
+                    "the spool budget divided by {DELTA_FILES_PLAIN}: the delta encode holds the \
+                     body, the reference and the delta output at once; an object above it is \
+                     stored whole with the reason delta-unavailable"
+                ),
+            ),
+            delta_ceiling_encrypted: value(
+                e.delta_ceiling_with_body_copy,
+                "auto",
+                format!(
+                    "the spool budget divided by {DELTA_FILES_WITH_BODY_COPY}: a proxy-encrypted \
+                     bucket also holds the ciphertext file"
+                ),
+            ),
+            delta_ceiling_multipart: value(
+                e.delta_ceiling_with_body_copy,
+                "auto",
+                format!(
+                    "the spool budget divided by {DELTA_FILES_WITH_BODY_COPY}: a multipart \
+                     upload also holds its relay parts beside the joined file"
+                ),
             ),
             warnings: self.warning_messages(),
         }
@@ -804,6 +944,10 @@ pub struct LimitsReport {
     pub max_object_size: LimitValue,
     /// The largest object that can be stored as a delta ([`delta_ceiling`]).
     pub delta_ceiling: LimitValue,
+    /// The same in a proxy-encrypted bucket ([`delta_ceiling_with_body_copy`]).
+    pub delta_ceiling_encrypted: LimitValue,
+    /// The same for the delta of a multipart upload.
+    pub delta_ceiling_multipart: LimitValue,
     pub warnings: Vec<String>,
 }
 
@@ -1267,6 +1411,128 @@ mod tests {
         );
     }
 
+    /// An explicit per-upload limit or multipart total above the whole
+    /// budget warns, and an auto `max_object_size` never exceeds the budget.
+    #[test]
+    fn a_multipart_limit_above_the_budget_warns_and_clamps_the_auto_object_size() {
+        let dir = Path::new("/var/spool/dgp");
+        let ex = ExplicitLimits {
+            spool: SpoolSetting::Bytes(10 * GIB),
+            per_upload: Some(40 * GIB),
+            total_multipart: Some(50 * GIB),
+            ..auto()
+        };
+        let (l, w) = derive_limits(facts(500 * GIB), ex);
+        assert_eq!(l.max_object_size, 10 * GIB);
+        assert_eq!(l.max_object_size_bound, ObjectSizeBound::SpoolBudget);
+        assert_eq!(w.len(), 2, "{w:?}");
+        let text: Vec<_> = w.iter().map(|w| w.message(dir)).collect();
+        assert!(text[0].contains("DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES") && text[0].contains("40 GiB"));
+        assert!(text[1].contains("DGP_MAX_TOTAL_MULTIPART_BYTES") && text[1].contains("50 GiB"));
+        // At the budget it is fine; zero (no cap) is no limit.
+        let ex = ExplicitLimits {
+            spool: SpoolSetting::Bytes(10 * GIB),
+            per_upload: Some(10 * GIB),
+            total_multipart: Some(0),
+            ..auto()
+        };
+        assert!(derive_limits(facts(500 * GIB), ex).1.is_empty());
+        // A derived value never warns.
+        assert!(derive_limits(facts(60 * GIB), auto()).1.is_empty());
+    }
+
+    /// With a proxy-encrypted bucket on an S3 backend, the ciphertext of an
+    /// object (header + 16 bytes per 64 KiB frame) must fit in 5 GiB.
+    #[test]
+    fn auto_object_size_leaves_room_for_the_ciphertext_on_s3() {
+        use crate::storage::encrypting::v2::stored_len;
+        let max = largest_plaintext_in_one_put();
+        assert!(max < S3_SINGLE_PUT_MAX_BYTES);
+        assert!(stored_len(max).unwrap() <= S3_SINGLE_PUT_MAX_BYTES);
+        assert!(stored_len(max + 1).unwrap() > S3_SINGLE_PUT_MAX_BYTES);
+        let ex = ExplicitLimits {
+            s3_backend: true,
+            s3_proxy_encrypted: true,
+            ..auto()
+        };
+        let (l, _) = derive_limits(facts(60 * GIB), ex);
+        assert_eq!(l.max_object_size, max);
+        assert_eq!(
+            l.max_object_size_bound,
+            ObjectSizeBound::S3SinglePutEncrypted
+        );
+        // Without S3, or without encryption, the plain bound applies.
+        let ex = ExplicitLimits {
+            s3_proxy_encrypted: true,
+            ..auto()
+        };
+        assert_eq!(
+            derive_limits(facts(60 * GIB), ex).0.max_object_size,
+            15 * GIB
+        );
+        let ex = ExplicitLimits {
+            s3_backend: true,
+            ..auto()
+        };
+        assert_eq!(
+            derive_limits(facts(60 * GIB), ex).0.max_object_size,
+            5 * GIB
+        );
+        // An explicit value is unchanged.
+        let ex = ExplicitLimits {
+            s3_backend: true,
+            s3_proxy_encrypted: true,
+            max_object_size: BytesOrAuto::Bytes(5 * GIB),
+            ..auto()
+        };
+        assert_eq!(
+            derive_limits(facts(60 * GIB), ex).0.max_object_size,
+            5 * GIB
+        );
+    }
+
+    #[test]
+    fn the_delta_ceilings_come_from_the_file_counts() {
+        let (l, _) = derive_limits(facts(60 * GIB), auto());
+        assert_eq!(l.delta_ceiling, 30 * GIB / DELTA_FILES_PLAIN);
+        assert_eq!(
+            l.delta_ceiling_with_body_copy,
+            30 * GIB / DELTA_FILES_WITH_BODY_COPY
+        );
+        let r = ResolvedLimits {
+            effective: l,
+            warnings: vec![],
+            dir: "/spool".into(),
+            facts: facts(60 * GIB),
+            env_set: vec![],
+            spool_invalid: None,
+        };
+        let rep = r.report();
+        assert_eq!(rep.delta_ceiling.bytes, 10 * GIB);
+        assert_eq!(rep.delta_ceiling_encrypted.bytes, 30 * GIB / 4);
+        assert_eq!(rep.delta_ceiling_multipart.bytes, 30 * GIB / 4);
+        let line = l.boot_line(Path::new("/spool"));
+        assert!(
+            line.contains("delta ceiling 10 GiB (7.5 GiB in a proxy-encrypted"),
+            "{line}"
+        );
+    }
+
+    /// The share warning is logged once per change.
+    #[test]
+    fn the_share_warning_is_logged_once_per_change() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(!share_change_is_new(&flag, false));
+        assert!(share_change_is_new(&flag, true));
+        assert!(
+            !share_change_is_new(&flag, true),
+            "not again while it holds"
+        );
+        assert!(!share_change_is_new(&flag, true));
+        assert!(!share_change_is_new(&flag, false));
+        assert!(share_change_is_new(&flag, true), "again after it went away");
+    }
+
     #[test]
     fn an_invalid_spool_setting_is_auto_and_says_so() {
         assert_eq!(parse_spool_setting(None), (SpoolSetting::Auto, None));
@@ -1546,6 +1812,7 @@ mod tests {
                         total_multipart,
                         max_object_size,
                         s3_backend,
+                        s3_proxy_encrypted: false,
                         shares_device_now: false,
                     }
                 },
@@ -1622,7 +1889,9 @@ mod tests {
             if ex.s3_backend {
                 prop_assert!(l.max_object_size <= S3_SINGLE_PUT_MAX_BYTES);
             }
+            prop_assert!(l.max_object_size <= l.spool_budget);
             prop_assert_eq!(l.delta_ceiling, l.spool_budget / 3);
+            prop_assert_eq!(l.delta_ceiling_with_body_copy, l.spool_budget / 4);
         }
     }
 }

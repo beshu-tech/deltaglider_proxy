@@ -1600,7 +1600,18 @@ impl Config {
             .filter(|v| env(v).is_some())
             .collect();
         let s3_backend = self.has_s3_backend();
-        let roots = self.filesystem_roots();
+        let s3_proxy_encrypted = self.s3_proxy_encrypted();
+        // The roots of the boot: the filesystem backends and the state
+        // directory.
+        let mut roots = self.filesystem_roots();
+        if let Some(state_dir) = crate::config_db::config_db_path().parent() {
+            let dir = if state_dir.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                state_dir
+            };
+            roots.push(dir.to_path_buf());
+        }
         self.tuning.limits = boot.map(|boot| {
             // The disk facts are those of the boot. Only this is asked
             // again: did a filesystem backend come onto the spool's device?
@@ -1614,10 +1625,16 @@ impl Config {
                     total_multipart: self.tuning.multipart_total_max,
                     max_object_size: self.max_object_size,
                     s3_backend,
+                    s3_proxy_encrypted,
                     shares_device_now,
                 },
             );
-            if warnings.contains(&limits::LimitWarning::ShareChangesAtRestart) {
+            // Log once per change: not again on each later apply while the
+            // condition holds.
+            static SHARE_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let now = warnings.contains(&limits::LimitWarning::ShareChangesAtRestart);
+            if limits::share_change_is_new(&SHARE_WARNED, now) {
                 tracing::warn!(
                     "[limits] {}",
                     limits::LimitWarning::ShareChangesAtRestart.message(&boot.dir)
@@ -2353,6 +2370,22 @@ impl Config {
                 .map(|b| (b.name.as_str(), &b.backend))
                 .collect()
         }
+    }
+
+    /// Does an S3 backend host a bucket that the proxy encrypts
+    /// (`aes256-gcm-proxy`)? Its ciphertext is larger than the plaintext, so
+    /// one 5 GiB backend PUT holds less plaintext.
+    pub fn s3_proxy_encrypted(&self) -> bool {
+        let pes = self.proxy_encrypted_storage();
+        let hosts: std::collections::BTreeSet<&str> = pes
+            .sites
+            .iter()
+            .map(String::as_str)
+            .chain(pes.buckets.values().map(String::as_str))
+            .collect();
+        self.effective_backends()
+            .iter()
+            .any(|(name, b)| matches!(b, BackendConfig::S3 { .. }) && hosts.contains(name))
     }
 
     /// Does any configured backend (see [`Self::effective_backends`]) use S3?

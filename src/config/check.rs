@@ -845,6 +845,43 @@ mod object_size_tests {
         assert!(!c.check().iter().any(|w| w.contains("5 GiB")));
     }
 
+    /// `s3_proxy_encrypted` is true only for an S3 backend whose own site
+    /// encrypts with the proxy.
+    #[test]
+    fn s3_proxy_encrypted_needs_an_s3_backend_that_encrypts() {
+        let s3 = |name: &str, encrypted: bool| NamedBackendConfig {
+            name: name.into(),
+            backend: BackendConfig::S3 {
+                endpoint: Some("https://s3.example".into()),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                allow_local: false,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
+            },
+            encryption: if encrypted {
+                BackendEncryptionConfig::Aes256GcmProxy {
+                    key: Some("ab".repeat(32)),
+                    key_id: Some("k1".into()),
+                    legacy_key: None,
+                    legacy_key_id: None,
+                }
+            } else {
+                BackendEncryptionConfig::default()
+            },
+        };
+        let with = |backends: Vec<NamedBackendConfig>| Config {
+            default_backend: backends.first().map(|b| b.name.clone()),
+            backends,
+            ..Config::default()
+        };
+        assert!(with(vec![s3("aws", true)]).s3_proxy_encrypted());
+        assert!(!with(vec![s3("aws", false)]).s3_proxy_encrypted());
+        assert!(with(vec![s3("plain", false), s3("aws", true)]).s3_proxy_encrypted());
+        assert!(!Config::default().s3_proxy_encrypted());
+    }
+
     /// The warnings of the derivation reach `Config::check` (boot, lint,
     /// apply): a rule that nothing lists warns nobody.
     #[test]

@@ -404,24 +404,27 @@ Before this release, `DGP_SPOOL_MAX_BYTES` was 16 GiB and `max_object_size` was 
 
 **A deployment with an explicit spool and the default `max_object_size` changes too.** Its `max_object_size` was 100 MiB and is now the derived limit. For example, with the Helm chart default (`tmp.sizeLimit: 2Gi`, so `DGP_SPOOL_MAX_BYTES` is 1.5 GiB), the per-upload limit and `max_object_size` go from 100 MiB to 768 MiB. To keep 100 MiB, set `max_object_size: 104857600` (or `DGP_MAX_OBJECT_SIZE=104857600`).
 
-For example, take a host with 60 GiB of free space in the spool directory:
+For example, take a host with 60 GiB of free space in the spool directory. Only `max_object_size` differs for a deployment with an S3 backend, which the table shows in its own column (with a bucket that the proxy encrypts on S3, it is a little below 5 GiB, so that the ciphertext fits in one backend PUT):
 
-| Limit | Before | Now |
-|---|---|---|
-| `DGP_SPOOL_MAX_BYTES` | 16 GiB | 30 GiB |
-| `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` (largest multipart object) | 8 GiB | 15 GiB |
-| `DGP_MAX_TOTAL_MULTIPART_BYTES` | 8 GiB | 15 GiB |
-| `max_object_size` | 100 MB | 15 GiB (5 GiB if any backend is S3) |
-| Delta ceiling (objects above it are stored whole) | not a limit before | 10 GiB |
+| Limit | Before | Now, filesystem backends only | Now, with an S3 backend |
+|---|---|---|---|
+| `DGP_SPOOL_MAX_BYTES` | 16 GiB | 30 GiB | 30 GiB |
+| `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` (largest multipart object) | 8 GiB | 15 GiB | 15 GiB |
+| `DGP_MAX_TOTAL_MULTIPART_BYTES` | 8 GiB | 15 GiB | 15 GiB |
+| `max_object_size` | 100 MB | 15 GiB | 5 GiB (the most that one backend PUT stores) |
+| Delta ceiling, plain bucket (objects above it are stored whole) | not a limit before | 10 GiB | 10 GiB |
+| Delta ceiling, encrypted bucket or multipart upload | not a limit before | 7.5 GiB | 7.5 GiB |
+
+With an S3 backend, `max_object_size` (5 GiB) is below the delta ceiling (10 GiB), so the ceilings matter there only when you set a higher `max_object_size` or when the budget is smaller.
 
 What to check:
 
 1. **Look at the start-up log.** One line starts with `[limits]` and shows the values and where they come from. `GET /_/api/admin/config` shows the same in the field `limits`.
 2. **A larger `max_object_size` changes what a client can send.** A single PutObject request with a body of up to the new limit is now accepted, and the proxy reads such a body into the spool directory. Make sure that the disk has room for it, or set `max_object_size` to a number. A request over the limit gets HTTP 400 `EntityTooLarge`.
-3. **Check the delta ceiling.** The delta encode holds the body, the reference and the delta output in the spool at once, so an object above a third of the spool budget (the delta ceiling, 10 GiB in the example) is accepted but stored whole, not as a delta, with `dg-passthrough-reason: delta-unavailable`. The boot log line and `limits.delta_ceiling` show it. If you store delta-eligible objects near the ceiling, raise `DGP_SPOOL_MAX_BYTES`.
+3. **Check the delta ceiling.** The delta encode holds the body, the reference and the delta output in the spool at once, so an object above a third of the spool budget (the delta ceiling, 10 GiB in the example) is accepted but stored whole, not as a delta, with `dg-passthrough-reason: delta-unavailable`. In a bucket that the proxy encrypts, and for the delta of a multipart upload, the encode also holds a second copy of the body, so the ceiling there is a quarter of the budget (7.5 GiB). The boot log line and `limits.delta_ceiling`, `limits.delta_ceiling_encrypted` and `limits.delta_ceiling_multipart` show them. If you store delta-eligible objects near the ceiling, raise `DGP_SPOOL_MAX_BYTES`.
 4. **A tmpfs or a Kubernetes pod without a value gets 1 GiB and a warning.** The free space there does not show the real limit. Set `DGP_SPOOL_MAX_BYTES` to the space that the directory really has. The Helm chart and the operator already set it, so they are not affected.
 5. **Pin the old values if you need them.** Set `DGP_SPOOL_MAX_BYTES=17179869184` and `max_object_size: 104857600` (or `DGP_MAX_OBJECT_SIZE=104857600`). An explicit value always wins. A value that you set is never changed, but the proxy logs a warning when the spool budget is above 90% of the free space, or when `max_object_size` is above the lowest of the per-upload limit and the multipart total.
-6. **The limits do not change while the proxy runs, and every start measures again.** The proxy measures the disk once, at start. A fuller disk at a restart gives smaller limits; reads of objects that are already stored do not depend on these limits. A config apply that adds or removes an S3 backend changes `max_object_size` (the 5 GiB bound) at once, and one that puts a filesystem backend on the device of the spool logs a warning that the 25% share applies at the next start. A `DGP_SPOOL_MAX_BYTES` that does not parse (for example `16GB`) is not fatal: the proxy logs a warning and uses `auto`.
+6. **The limits do not change while the proxy runs, and every start measures again.** The proxy measures the disk once, at start, and the spool budget never changes while the proxy runs. `max_object_size` follows each config apply, and an open multipart upload uses the new value from its next part. A fuller disk at a restart gives smaller limits; reads of objects that are already stored do not depend on these limits. A config apply that adds or removes an S3 backend changes `max_object_size` (the 5 GiB bound) at once, and one that puts a filesystem backend on the device of the spool logs a warning that the 25% share applies at the next start. A `DGP_SPOOL_MAX_BYTES` that does not parse (for example `16GB`) is not fatal: the proxy logs a warning and uses `auto`.
 
 ## Common gotchas
 

@@ -51,7 +51,8 @@ test('auto is the default: an empty field shows the effective value and its sour
   const input = await screen.findByRole('textbox', { name: 'Maximum object size (MiB)' });
   await waitFor(() => expect(input).toHaveAttribute('placeholder', 'auto (15360 MiB)'));
   expect(input).toHaveValue('');
-  expect(await screen.findByText(/Now 15360 MiB \(auto: auto: the per-upload limit\)/)).toBeInTheDocument();
+  expect(await screen.findByText(/Now 15360 MiB \(auto: the per-upload limit\)/)).toBeInTheDocument();
+  expect(screen.queryByText(/auto: auto:/)).not.toBeInTheDocument();
 });
 
 test('a literal "auto" in the section is an empty field, never NaN', async () => {

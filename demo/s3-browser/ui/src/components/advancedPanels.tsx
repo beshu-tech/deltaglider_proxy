@@ -502,7 +502,10 @@ export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
           yamlPath="advanced.max_object_size"
           helpText={
             effective
-              ? `Applies to every bucket. Leave the field empty for auto. Now ${Math.round(effective.bytes / MIB)} MiB (${effective.source}: ${effective.detail}). The YAML value is in bytes, or the word auto.`
+              ? `Applies to every bucket. Leave the field empty for auto. Now ${Math.round(effective.bytes / MIB)} MiB (${
+                  // The detail of an auto value already starts with "auto:".
+                  effective.source === 'auto' ? effective.detail : `${effective.source}: ${effective.detail}`
+                }). The YAML value is in bytes, or the word auto.`
               : 'Applies to every bucket. Leave the field empty for auto. The YAML value is in bytes, or the word auto.'
           }
           defaultPlaceholder="auto"

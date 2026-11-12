@@ -2891,6 +2891,84 @@ mod delta_ceiling_tests {
         assert!(!delta, "an object above the ceiling is stored whole");
         assert_eq!(reason.as_deref(), Some("delta-unavailable"));
     }
+
+    /// The same two PUTs into a bucket that the proxy encrypts, through the
+    /// ingest (which reserves the body AND its ciphertext file) and the
+    /// conditional store, as a client PUT goes.
+    async fn second_put_encrypted(budget: u64, size: u64) -> (bool, Option<String>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().join("data"))
+            .await
+            .unwrap();
+        backend.create_bucket("b").await.unwrap();
+        let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            crate::storage::EncryptionConfig {
+                key: Some(crate::storage::EncryptionKey::from_hex(&"ab".repeat(32)).unwrap()),
+                key_id: Some("kid".into()),
+                ..Default::default()
+            },
+        )));
+        let wrapper = crate::storage::EncryptingBackend::new(backend, cfg);
+        let mut engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(wrapper), &Config::default(), None)
+                .with_memory_budget(crate::deltaglider::memory_budget::MemoryBudget::new(0));
+        engine.spool = Arc::new(
+            crate::deltaglider::spool::SpoolDir::new(tmp.path().join("spool"), budget).unwrap(),
+        );
+        let v1: Vec<u8> = (0..size as u32)
+            .map(|n| (n.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let mut v2 = v1.clone();
+        v2[size as usize / 2..size as usize / 2 + 100].fill(0xAB);
+        for (key, data) in [("rel/a.zip", &v1), ("rel/b.zip", &v2)] {
+            let body = crate::deltaglider::ingest::ingest_bytes(
+                &engine,
+                "b",
+                Bytes::from(data.clone()),
+                u64::MAX,
+                None,
+            )
+            .await
+            .unwrap();
+            engine
+                .store_conditional(
+                    "b",
+                    key,
+                    body,
+                    None,
+                    HashMap::new(),
+                    &crate::deltaglider::Precondition::none(),
+                )
+                .await
+                .unwrap();
+        }
+        let meta = engine.head("b", "rel/b.zip").await.unwrap();
+        (
+            matches!(meta.storage_info, crate::types::StorageInfo::Delta { .. }),
+            meta.passthrough_reason,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_delta_ceiling_of_an_encrypted_bucket_is_a_quarter_of_the_budget() {
+        let budget = 32 * MIB;
+        let ceiling = crate::config::limits::delta_ceiling_with_body_copy(budget);
+        assert_eq!(ceiling, 8 * MIB);
+        let (delta, _) = second_put_encrypted(budget, ceiling - MIB).await;
+        assert!(delta, "an object below the quarter is a delta");
+        // Above a quarter but below a third: a plain bucket takes a delta,
+        // an encrypted one does not.
+        let between = ceiling + MIB;
+        assert!(between < crate::config::limits::delta_ceiling(budget));
+        let (delta, reason) = second_put_encrypted(budget, between).await;
+        assert!(
+            !delta,
+            "an encrypted object above the quarter is stored whole"
+        );
+        assert_eq!(reason.as_deref(), Some("delta-unavailable"));
+        let (delta, _) = second_put(budget, between).await;
+        assert!(delta, "the same size is a delta in a plain bucket");
+    }
 }
 
 /// Tier 4: a GET served from the metadata cache must not re-insert the entry
