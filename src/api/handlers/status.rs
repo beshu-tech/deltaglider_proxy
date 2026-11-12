@@ -1589,9 +1589,15 @@ mod readiness_tests {
             .count();
         // The wrapper itself, and the wait of the backend probe.
         assert!(waits >= 2, "READY_DEADLINE used {waits} times");
-        assert!(
-            me.prod.calls_named("ready_probe").count() >= 1,
-            "the backend check goes through the detached single flight"
+        // The backend check waits exactly `READY_DEADLINE`: any other bound
+        // on the detached single flight fails here.
+        let probes: Vec<_> = me.prod.calls_named("ready_probe").collect();
+        assert_eq!(probes.len(), 1, "one detached single flight");
+        assert_eq!(probes[0].argc, 2);
+        assert_eq!(
+            probes[0].arg_idents.get(1).cloned().flatten().as_deref(),
+            Some("READY_DEADLINE"),
+            "the wait of the backend probe is READY_DEADLINE"
         );
     }
 

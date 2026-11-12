@@ -251,9 +251,23 @@ struct ReadyProbeState {
     running: bool,
 }
 
+/// THE rule for how long a backend verdict may serve `/_/ready`: twice the
+/// interval at which verdicts are renewed. The health loop's verdicts use it
+/// with the loop interval ([`BackendHealthCache::loop_verdicts`]); the live
+/// probe's last verdict uses it with the default loop interval
+/// ([`READY_STALE_VERDICT_MAX`]). So a node answers ready for at most this
+/// long after its backend stops.
+pub const fn max_verdict_age(interval: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(interval.as_secs().saturating_mul(2))
+}
+
+/// The default of `DGP_BACKEND_HEALTH_INTERVAL_SECS`.
+pub const DEFAULT_HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How old the last live verdict may be when `/_/ready` still answers from
-/// it while a newer probe runs.
-pub const READY_STALE_VERDICT_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+/// it while a newer probe runs: [`max_verdict_age`] of the default loop
+/// interval (60 s).
+pub const READY_STALE_VERDICT_MAX: std::time::Duration = max_verdict_age(DEFAULT_HEALTH_INTERVAL);
 
 /// Pure: what `/_/ready` answers for the backend when the live probe still
 /// runs after the wait: the last verdict while it is younger than
@@ -491,7 +505,7 @@ impl BackendHealthCache {
             let view = self.health_loop.lock();
             (view.every?, view.targets.clone()?)
         };
-        let max_age = every.saturating_mul(2);
+        let max_age = max_verdict_age(every);
         let entries = self.entries.read();
         targets
             .iter()
@@ -725,7 +739,10 @@ pub fn health_probe_interval() -> Option<std::time::Duration> {
     if boot_probe_mode() == BootProbeMode::Off {
         return None;
     }
-    match crate::config::env_parse_with_default("DGP_BACKEND_HEALTH_INTERVAL_SECS", 30u64) {
+    match crate::config::env_parse_with_default(
+        "DGP_BACKEND_HEALTH_INTERVAL_SECS",
+        DEFAULT_HEALTH_INTERVAL.as_secs(),
+    ) {
         0 => None,
         secs => Some(std::time::Duration::from_secs(secs)),
     }
@@ -2014,6 +2031,18 @@ mod ready_probe_tests {
                 .await,
             "ready"
         );
+    }
+
+    /// The two verdict-age bounds are one rule.
+    #[test]
+    fn the_live_bound_is_the_loop_rule_at_the_default_interval() {
+        let s = Duration::from_secs;
+        assert_eq!(max_verdict_age(s(30)), s(60));
+        assert_eq!(
+            READY_STALE_VERDICT_MAX,
+            max_verdict_age(DEFAULT_HEALTH_INTERVAL)
+        );
+        assert_eq!(max_verdict_age(s(7)), s(14));
     }
 
     #[test]

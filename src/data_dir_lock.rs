@@ -111,7 +111,7 @@ pub fn acquire(
     loop {
         match classify(file.try_lock()) {
             Attempt::Held => {
-                write_holder(&file);
+                write_holder(dir);
                 return Ok(DataDirLock {
                     _file: file,
                     path,
@@ -145,14 +145,19 @@ pub fn acquire(
     }
 }
 
-/// Record who holds the lock, in the lock file: one write of one line. The
+/// The file that names the holder, next to the lock file. It is a file of
+/// its own and is replaced by a rename, so a reader never sees it empty or
+/// half written. (The lock file cannot be replaced: the lock belongs to its
+/// inode, and a new inode would be a second, free lock.)
+pub const HOLDER_FILE_NAME: &str = ".deltaglider.holder";
+
+/// Record who holds the lock, in the holder file: one line, written to a
+/// temp file and renamed over it. The
 /// process id is the one in the holder's own namespace (in a container it
 /// is often 1), so the line also has the host name (the container id in a
 /// container) and the start time. Best effort: the lock does not depend on
 /// it, it only makes the refusal of a second process plainer.
-fn write_holder(file: &std::fs::File) {
-    use std::io::Write;
-    let mut file = file;
+fn write_holder(dir: &Path) {
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
         .unwrap_or_default();
@@ -160,8 +165,12 @@ fn write_holder(file: &std::fs::File) {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let line = holder_text(std::process::id(), host.trim(), started);
-    let _ = file.set_len(0);
-    let _ = file.write_all(line.as_bytes());
+    let tmp = dir.join(format!("{HOLDER_FILE_NAME}.{}.tmp", std::process::id()));
+    let written = std::fs::write(&tmp, line.as_bytes())
+        .and_then(|()| std::fs::rename(&tmp, dir.join(HOLDER_FILE_NAME)));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Pure: the holder line of the lock file.
@@ -174,9 +183,9 @@ fn holder_text(pid: u32, host: &str, started_unix: u64) -> String {
     format!("pid {pid} on host {host}, started at unix time {started_unix}\n")
 }
 
-/// The holder text of the lock file, when it has one.
-fn read_holder(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// The holder text of the directory, when it has one.
+fn read_holder(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(HOLDER_FILE_NAME)).ok()?;
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_string())
 }
@@ -185,7 +194,7 @@ fn read_holder(path: &Path) -> Option<String> {
 /// the directory, the holder (when known), what happened, and the fix: a
 /// deploy must stop the old process before it starts the new one.
 fn busy_message(dir: &Path, path: &Path, wait: Duration) -> String {
-    let holder = read_holder(path)
+    let holder = read_holder(dir)
         .map(|h| format!("; held by {h}; the pid is the one in the holder's own container or host"))
         .unwrap_or_default();
     let waited = if wait.is_zero() {
@@ -250,6 +259,22 @@ mod tests {
         assert!(lock.is_held());
         assert!(lock.covers(&a.path().join("deltaglider_config.db")));
         assert!(!lock.covers(&b.path().join("deltaglider_config.db")));
+    }
+
+    #[test]
+    fn the_holder_file_is_whole_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = acquire(dir.path(), NO_WAIT, || {}).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(HOLDER_FILE_NAME)).unwrap();
+        assert!(
+            text.starts_with(&format!("pid {} on host", std::process::id())),
+            "{text}"
+        );
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
     }
 
     #[test]

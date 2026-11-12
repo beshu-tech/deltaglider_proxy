@@ -593,6 +593,8 @@ fn note_transient_stop(row: &MaintenanceJob) -> u32 {
 
 fn forget_transient_stops(row: &MaintenanceJob) {
     transient_stops().remove(&identity(row));
+    // The count of stops after a flip ends with the job as well.
+    post_flip_save_stops().lock().remove(&row.id);
 }
 
 /// Record `n` transient stops of `row` without progress (tests).
@@ -1898,6 +1900,23 @@ mod tests {
             );
             assert_eq!(matches!(stop, PhaseStop::FailedTransient(_)), !post_flip);
         }
+    }
+
+    /// The count of stops after the flip ends with the job.
+    #[test]
+    fn the_post_flip_stop_count_ends_with_the_job() {
+        let db = JobsDb::in_memory("post-flip-count-test-key-0123456789abcdef").unwrap();
+        let id = db
+            .maintenance_create_job("migrate", "m", "cleanup", Some("{}"), "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("w", current_unix_seconds(), 60)
+            .unwrap()
+            .unwrap();
+        let job = db.maintenance_job_by_id(id).unwrap().unwrap();
+        post_flip_save_stops().lock().insert(job.id, 3);
+        forget_transient_stops(&job);
+        assert!(!post_flip_save_stops().lock().contains_key(&job.id));
     }
 
     #[test]
