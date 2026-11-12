@@ -307,7 +307,7 @@ A field other than the file can be at most 64 KiB, else the form gets `400 Inval
 Before this release, the proxy read the whole body of a `PutObject` request into memory. It now reads a body larger than `DGP_SPOOL_THRESHOLD_BYTES` (16 MiB by default) into a file in the spool directory (`DGP_SPOOL_DIR`), and it reads a smaller body into memory while the upload memory budget (`DGP_INGEST_MEMORY_MAX_BYTES`, 1 GiB by default) has room for it. Every multipart part now goes into a relay file in the spool too, also for an upload that can become a delta. So concurrent large uploads now use disk instead of memory. Check these points before you upgrade:
 
 1. **Put `DGP_SPOOL_DIR` on a real disk.** Each large upload holds about its own size in the spool until it is stored, and twice that in a bucket that the proxy encrypts, because the encrypted copy is written to the spool too. Do not use a tmpfs or a Kubernetes `emptyDir` without a size limit, because those use memory or can fill the disk of the node.
-2. **Set `DGP_SPOOL_MAX_BYTES` (default 16 GiB) for the large uploads that arrive at the same time.** An upload whose declared size is larger than this budget gets `413 EntityTooLarge` before its body is read, and the message names `DGP_SPOOL_MAX_BYTES`. In a bucket that the proxy encrypts, the body and its encrypted copy must fit together, so the largest upload there is about half of the budget. A copy of a large delta object holds the spool file of its source while it writes the destination, so it needs about twice its size.
+2. **Set `DGP_SPOOL_MAX_BYTES` (default 16 GiB in 2.2.0; `auto` since 2.2.1, see [the spool and upload limits follow the disk](#the-spool-and-upload-limits-follow-the-disk-221)) for the large uploads that arrive at the same time.** An upload whose declared size is larger than this budget gets `413 EntityTooLarge` before its body is read, and the message names `DGP_SPOOL_MAX_BYTES`. In a bucket that the proxy encrypts, the body and its encrypted copy must fit together, so the largest upload there is about half of the budget. A copy of a large delta object holds the spool file of its source while it writes the destination, so it needs about twice its size.
 3. **Check your largest multipart object.** One multipart upload can hold at most `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` of spool space, which is half of `DGP_SPOOL_MAX_BYTES` by default (8 GiB with the default budget). A larger multipart object gets `413 EntityTooLarge`, with a message that names the variable. Raise `DGP_SPOOL_MAX_BYTES`, or set `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`, if you upload larger objects. A single part larger than 5 GiB (the S3 limit) or larger than `max_object_size` now gets `413 EntityTooLarge` before the proxy reads it.
 4. **Check the total of open multipart uploads.** The default of `DGP_MAX_TOTAL_MULTIPART_BYTES`, the spool space that all open uploads may hold together, is now half of `DGP_SPOOL_MAX_BYTES` instead of `max_object_size × DGP_MAX_MULTIPART_UPLOADS / 4`. With the default spool of 16 GiB, the total drops to 8 GiB (it was 2,500 GiB with a `max_object_size` of 10 GiB). So two concurrent uploads of 5 GiB each can get `503 SlowDown` on their later parts, and an upload that a client abandons holds its share until the idle sweep removes it, which can take up to about 65 minutes. Size the spool for the uploads that are open at the same time, or set `DGP_MAX_TOTAL_MULTIPART_BYTES`.
 5. **Give the spool a directory of its own.** The proxy creates `DGP_SPOOL_DIR` with mode `0700`. At startup, it sets an existing directory that only its group can write to (one made under umask `002`) to `0700`. A directory that another user owns, or that all users can write to (such as `/tmp` itself), now stops the proxy at startup with an error that names it.
@@ -397,6 +397,27 @@ When something removes the spool directory while the proxy runs, the proxy makes
 ## A stop waits for detached work (2.2.1)
 
 A `DeleteObjects` batch and the store of a `CompleteMultipartUpload` run on after their request ends, so that a client disconnect cannot cut an object in half. When the proxy gets the stop signal, it stops accepting requests and then waits for this work, up to 15 seconds. When the 15 seconds pass, it logs a warning with the number of tasks that it cut, and the clients retry those requests. A stop takes up to 55 seconds: 10 for the running requests, 15 for detached work, 10 for a maintenance job, 10 for the event outbox and `DGP_SHUTDOWN_TIMEOUT_SECS` (default 10) for blocking work. A `terminationGracePeriodSeconds` or `stop_grace_period` of 60 seconds, as the Helm chart, the operator and the compose example set, still holds. Keep it at 60 or more.
+
+## The spool and upload limits follow the disk (2.2.1)
+
+Before this release, `DGP_SPOOL_MAX_BYTES` was 16 GiB and `max_object_size` was 100 MB when you set nothing. Now both default to `auto`, and the proxy derives all the upload limits once, at start, from the free space of the disk that holds the spool directory (`DGP_SPOOL_DIR`). The rule is in [Auto-sized limits](../reference/configuration.md#auto-sized-limits). In short, the spool budget is 50% of the free space (25% when the spool shares its device with a filesystem backend or the data directory, and at least 1 GiB). The largest multipart object and the total of all open multipart uploads are each half of the budget, and `max_object_size` is the largest multipart object.
+
+For example, take a host with 60 GiB of free space in the spool directory:
+
+| Limit | Before | Now |
+|---|---|---|
+| `DGP_SPOOL_MAX_BYTES` | 16 GiB | 30 GiB |
+| `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` (largest multipart object) | 8 GiB | 15 GiB |
+| `DGP_MAX_TOTAL_MULTIPART_BYTES` | 8 GiB | 15 GiB |
+| `max_object_size` | 100 MB | 15 GiB |
+
+What to check:
+
+1. **Look at the start-up log.** One line starts with `[limits]` and shows the values and where they come from. `GET /_/api/admin/config` shows the same in the field `limits`.
+2. **A larger `max_object_size` changes what a client can send.** A single PutObject request with a body of up to the new limit is now accepted, and the proxy reads such a body into the spool directory. Make sure that the disk has room for it, or set `max_object_size` to a number.
+3. **A tmpfs or a Kubernetes pod without a value gets 1 GiB and a warning.** The free space there does not show the real limit. Set `DGP_SPOOL_MAX_BYTES` to the space that the directory really has. The Helm chart and the operator already set it, so they are not affected.
+4. **Pin the old values if you need them.** Set `DGP_SPOOL_MAX_BYTES=17179869184` and `max_object_size: 104857600` (or `DGP_MAX_OBJECT_SIZE=104857600`). An explicit value always wins. A value that you set is never changed, but the proxy logs a warning when it is above 90% of the free space, or when `max_object_size` or `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` is above half of the spool budget.
+5. **The limits do not change while the proxy runs.** The proxy measures the disk once, at start. If you free or fill the disk a lot, restart the proxy to measure it again.
 
 ## Common gotchas
 

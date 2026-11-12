@@ -647,7 +647,7 @@ mod large_copy_tests {
             .await
             .unwrap();
         let small = crate::config::Config {
-            max_object_size: 64 * 1024,
+            max_object_size: (64 * 1024).into(),
             ..Default::default()
         };
         let state = AppState::for_tests(engine_with(small).await);

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bc60c255c1a486eeb946ce11ba4d5299565a4d7a80a6719afdce05a614f18041 # shrinks to f = DiskFacts { free: 0, total: 0, own_spool_bytes: 0, is_tmpfs: false, shares_device_with_data: false, in_kubernetes: false }, ex = ExplicitLimits { spool: Auto, per_upload: Some(0), total_multipart: None, max_object_size: Auto }
+cc 068441d715436a399c5fc62a5099dba7cb66db090ad05a37f64bc36916c4babb # shrinks to f = DiskFacts { free: 0, total: 0, own_spool_bytes: 0, is_tmpfs: false, shares_device_with_data: false, in_kubernetes: false }, p = 1

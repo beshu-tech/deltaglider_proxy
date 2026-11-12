@@ -62,7 +62,7 @@ impl IngestRig {
         };
         let mut config = crate::config::Config::default();
         if let Some(max) = cfg.max_object_size {
-            config.max_object_size = max;
+            config.max_object_size = max.into();
         }
         config.tuning.spool_threshold_bytes = Some(cfg.threshold);
         config.tuning.spool_acquire_timeout_secs = 1;

@@ -1543,7 +1543,7 @@ pub struct AdvancedSection {
     pub max_delta_ratio: Option<f32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_object_size: Option<u64>,
+    pub max_object_size: Option<crate::config::limits::BytesOrAuto>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_passthrough_object_size: Option<u64>,

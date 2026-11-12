@@ -2270,3 +2270,232 @@ async fn validate_runs_the_apply_gates() {
     );
     assert!(body.contains("DGP_CONFIG_DB_KEY"), "{body}");
 }
+
+// ═══════════════════════════════════════════════════
+// Auto-sized limits (#171, R7)
+// ═══════════════════════════════════════════════════
+
+const GIB: u64 = 1024 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
+
+async fn get_limits(server: &TestServer) -> serde_json::Value {
+    let admin = admin_http_client(&server.endpoint()).await;
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    cfg
+}
+
+/// The `[limits]` lines of the proxy log (WARN and INFO), as one text, read
+/// from the log ring of the running proxy.
+async fn limit_log_lines(server: &TestServer) -> String {
+    let admin = admin_http_client(&server.endpoint()).await;
+    let logs: serde_json::Value = admin
+        .get(format!(
+            "{}/_/api/admin/logs?q=%5Blimits%5D&limit=500",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    logs["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            format!(
+                "{} {}",
+                e["level"].as_str().unwrap_or(""),
+                e["message"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// With nothing set, every limit follows the free space of the spool
+/// directory at boot, `GET /config` shows each value and its source, and the
+/// boot log names the inputs. The free space is faked, so the numbers hold on
+/// every host (the worked example of the upgrade notes, doubled).
+#[tokio::test]
+async fn auto_limits_follow_the_free_space_and_show_their_source() {
+    let spool = tempfile::TempDir::new().unwrap();
+    let server = TestServer::builder()
+        .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
+        .env("DGP_TEST_DISK_FREE_BYTES", &(80 * GIB).to_string())
+        // The harness logs warnings only; the boot line is INFO.
+        .env("RUST_LOG", "deltaglider_proxy=info")
+        .build()
+        .await;
+    let cfg = get_limits(&server).await;
+    let l = &cfg["limits"];
+    assert_eq!(l["spool_budget"]["bytes"], 40 * GIB, "{l}");
+    assert_eq!(l["per_upload"]["bytes"], 20 * GIB, "{l}");
+    assert_eq!(l["total_multipart"]["bytes"], 20 * GIB, "{l}");
+    assert_eq!(l["max_object_size"]["bytes"], 20 * GIB, "{l}");
+    for name in [
+        "spool_budget",
+        "per_upload",
+        "total_multipart",
+        "max_object_size",
+    ] {
+        assert_eq!(l[name]["source"], "auto", "{name}: {l}");
+    }
+    assert_eq!(l["free_bytes"], 80 * GIB);
+    assert_eq!(l["warnings"], json!([]), "{l}");
+    assert_eq!(cfg["max_object_size"], 20 * GIB, "the effective value");
+    let out = limit_log_lines(&server).await;
+    for needle in [
+        "spool budget 40 GiB",
+        "50% of 80 GiB free on",
+        "per-upload limit 20 GiB",
+        "max_object_size auto = 20 GiB",
+    ] {
+        assert!(out.contains(needle), "{needle} not in the boot log:\n{out}");
+    }
+}
+
+/// An explicit value always wins, `GET /config` says where it came from, and
+/// the boot logs a warning (never fatal) that names the directory, the
+/// numbers and the setting to change.
+#[tokio::test]
+async fn explicit_limits_win_and_warn_at_boot() {
+    let spool = tempfile::TempDir::new().unwrap();
+    let server = TestServer::builder()
+        .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
+        .env("DGP_TEST_DISK_FREE_BYTES", &(100 * GIB).to_string())
+        .env("DGP_SPOOL_MAX_BYTES", &(99 * GIB).to_string())
+        .max_object_size(60 * GIB)
+        .build()
+        .await;
+    let cfg = get_limits(&server).await;
+    let l = &cfg["limits"];
+    assert_eq!(l["spool_budget"]["bytes"], 99 * GIB, "{l}");
+    assert_eq!(l["spool_budget"]["source"], "env", "{l}");
+    assert_eq!(l["max_object_size"]["bytes"], 60 * GIB, "{l}");
+    assert_eq!(l["max_object_size"]["source"], "explicit", "{l}");
+    assert_eq!(l["per_upload"]["source"], "auto", "{l}");
+    assert_eq!(l["per_upload"]["bytes"], 99 * GIB / 2, "{l}");
+    let warnings = l["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 2, "{l}");
+    let dir = spool.path().display().to_string();
+    let out = limit_log_lines(&server).await;
+    for needle in [
+        "DGP_SPOOL_MAX_BYTES is 99 GiB",
+        "100 GiB",
+        "max_object_size is 60 GiB",
+        dir.as_str(),
+    ] {
+        assert!(out.contains(needle), "{needle} not in the boot log:\n{out}");
+    }
+    assert!(
+        warnings.iter().all(|w| w.as_str().unwrap().contains(&dir)),
+        "each warning names the directory: {warnings:?}"
+    );
+}
+
+/// A multipart upload past the DERIVED per-upload limit gets 413, and the
+/// message says that the limit is auto-derived and from what. The free space
+/// is 2 GiB, so the budget is the 1 GiB floor and one upload may hold
+/// 512 MiB.
+#[tokio::test]
+async fn a_multipart_upload_past_the_derived_limit_gets_413_with_its_origin() {
+    let spool = tempfile::TempDir::new().unwrap();
+    let server = TestServer::builder()
+        .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
+        .env("DGP_TEST_DISK_FREE_BYTES", &(2 * GIB).to_string())
+        // The total of all uploads must not be the limit that this test hits.
+        .env("DGP_MAX_TOTAL_MULTIPART_BYTES", &(4 * GIB).to_string())
+        // Past the per-upload limit on purpose (a warning at boot).
+        .max_object_size(2 * GIB)
+        .build()
+        .await;
+    let l = get_limits(&server).await["limits"].clone();
+    assert_eq!(l["per_upload"]["bytes"], 512 * MIB, "{l}");
+    assert_eq!(l["per_upload"]["source"], "auto", "{l}");
+
+    let http = server.http();
+    let url = format!("{}/{}/big.bin", server.endpoint(), server.bucket());
+    let resp = http.post(format!("{url}?uploads")).send().await.unwrap();
+    let body = resp.text().await.unwrap();
+    let id = body
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .unwrap()
+        .to_string();
+    let part = vec![7u8; (100 * MIB) as usize];
+    // Five parts of 100 MiB fit in 512 MiB; the sixth does not.
+    for n in 1..=6 {
+        let resp = http
+            .put(format!("{url}?partNumber={n}&uploadId={id}"))
+            .body(part.clone())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap();
+        if n <= 5 {
+            assert_eq!(status, 200, "part {n}: {text}");
+        } else {
+            // S3 answers EntityTooLarge with 400; accept 413 too.
+            assert!(matches!(status, 400 | 413), "part {n}: {status} {text}");
+            for needle in [
+                "EntityTooLarge",
+                "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
+                "auto: half of the spool budget",
+                "auto: 50% of 2 GiB free on",
+            ] {
+                assert!(text.contains(needle), "{needle} not in: {text}");
+            }
+        }
+    }
+    let _ = http.delete(format!("{url}?uploadId={id}")).send().await;
+}
+
+/// A config apply derives the limits again from the boot's measure: the
+/// limits stay, a new `max_object_size` wins at once, and the spool budget
+/// does not move.
+#[tokio::test]
+async fn a_config_apply_keeps_the_limits_and_takes_a_new_max_object_size() {
+    let spool = tempfile::TempDir::new().unwrap();
+    let server = TestServer::builder()
+        .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
+        .env("DGP_TEST_DISK_FREE_BYTES", &(80 * GIB).to_string())
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let put = |body: serde_json::Value| {
+        let admin = admin.clone();
+        let url = format!("{}/_/api/admin/config", server.endpoint());
+        async move {
+            let r = admin.put(url).json(&body).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{:?}", r.text().await);
+        }
+    };
+
+    // An apply that does not touch the limits.
+    put(json!({ "max_delta_ratio": 0.5 })).await;
+    let l = get_limits(&server).await["limits"].clone();
+    assert_eq!(l["spool_budget"]["bytes"], 40 * GIB, "{l}");
+    assert_eq!(l["max_object_size"]["bytes"], 20 * GIB, "{l}");
+    assert_eq!(l["max_object_size"]["source"], "auto", "{l}");
+
+    // An apply that sets `max_object_size`: explicit wins, the budget stays.
+    put(json!({ "max_object_size": GIB })).await;
+    let cfg = get_limits(&server).await;
+    let l = &cfg["limits"];
+    assert_eq!(cfg["max_object_size"], GIB, "{cfg}");
+    assert_eq!(l["max_object_size"]["bytes"], GIB, "{l}");
+    assert_eq!(l["max_object_size"]["source"], "explicit", "{l}");
+    assert_eq!(l["spool_budget"]["bytes"], 40 * GIB, "{l}");
+    assert_eq!(l["per_upload"]["bytes"], 20 * GIB, "{l}");
+}

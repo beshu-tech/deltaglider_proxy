@@ -138,7 +138,7 @@ async fn build_engine(opts: CliEngineOpts) -> Result<DynEngine, BuildError> {
         ..Config::default()
     };
     if let Some(size) = opts.max_object_size {
-        cfg.max_object_size = size;
+        cfg.max_object_size = crate::config::limits::BytesOrAuto::Bytes(size);
     }
 
     let engine = DynEngine::new(&cfg, None).await?;

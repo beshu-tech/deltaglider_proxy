@@ -752,7 +752,7 @@ mod tests {
                 .unwrap(),
         );
         let config = crate::config::Config {
-            max_object_size: 1024 * 1024,
+            max_object_size: (1024 * 1024).into(),
             ..Default::default()
         };
         let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(

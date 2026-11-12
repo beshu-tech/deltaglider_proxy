@@ -21,6 +21,7 @@ pub mod env_overrides;
 pub mod env_shadow;
 mod expansion;
 pub(crate) mod lenient;
+pub mod limits;
 
 pub use env::*;
 pub use expansion::*;
@@ -142,9 +143,12 @@ pub struct Config {
     #[serde(default = "default_max_delta_ratio")]
     pub max_delta_ratio: f32,
 
-    /// Maximum object size in bytes (xdelta3 memory constraint)
-    #[serde(default = "default_max_object_size")]
-    pub max_object_size: u64,
+    /// Maximum object size in bytes (xdelta3 memory constraint), or `auto`
+    /// (default): the effective per-upload limit of the spool
+    /// ([`limits::derive_limits`]). Read the effective value with
+    /// [`Config::max_object_size_bytes`].
+    #[serde(default)]
+    pub max_object_size: limits::BytesOrAuto,
 
     /// Maximum passthrough object size for the streaming multipart paths
     /// (Phase B). Decoupled from `max_object_size` (which gates the
@@ -1043,10 +1047,6 @@ pub(crate) fn default_max_delta_ratio() -> f32 {
     0.75
 }
 
-pub(crate) fn default_max_object_size() -> u64 {
-    100 * 1024 * 1024 // 100MB
-}
-
 pub(crate) fn default_max_passthrough_object_size() -> u64 {
     64 * 1024 * 1024 * 1024 // 64 GiB
 }
@@ -1117,7 +1117,7 @@ impl Default for Config {
             listen_addr: default_listen_addr(),
             backend: BackendConfig::default(),
             max_delta_ratio: default_max_delta_ratio(),
-            max_object_size: default_max_object_size(),
+            max_object_size: limits::BytesOrAuto::Auto,
             max_passthrough_object_size: default_max_passthrough_object_size(),
             range_spool_ttl_secs: default_range_spool_ttl_secs(),
             cache_size_mb: default_cache_size_mb(),
@@ -1568,6 +1568,71 @@ impl Config {
                 )
             }
         };
+        self.resolve_limits_with(env);
+    }
+
+    /// Derive the effective limits of this snapshot from what the spool
+    /// measured at boot (see [`limits::derive_limits`]) and store them in
+    /// [`RuntimeTuning::limits`]. Runs on every load and apply, so a changed
+    /// `max_object_size` takes effect; the budget does not change, because
+    /// the disk facts are those of the boot. Before the boot claimed the
+    /// spool it leaves `None`.
+    pub fn resolve_limits(&mut self) {
+        self.resolve_limits_with(&process_env);
+    }
+
+    /// [`Self::resolve_limits`] over an injected lookup (which variables are
+    /// set decides the source label of each value).
+    pub(crate) fn resolve_limits_with(&mut self, env: EnvLookup) {
+        self.resolve_limits_from(crate::deltaglider::spool::boot_limits(), env);
+    }
+
+    /// The rule of [`Self::resolve_limits`] over given boot facts (`None`:
+    /// not measured yet).
+    pub(crate) fn resolve_limits_from(
+        &mut self,
+        boot: Option<crate::deltaglider::spool::BootLimits>,
+        env: EnvLookup,
+    ) {
+        let env_set: Vec<&'static str> = limits::LIMIT_ENV_VARS
+            .iter()
+            .copied()
+            .filter(|v| env(v).is_some())
+            .collect();
+        self.tuning.limits = boot.map(|boot| {
+            let (effective, warnings) = limits::derive_limits(
+                boot.facts,
+                limits::ExplicitLimits {
+                    spool: self.tuning.spool_max,
+                    per_upload: self.tuning.multipart_relay_upload_max,
+                    total_multipart: self.tuning.multipart_total_max,
+                    max_object_size: self.max_object_size,
+                },
+            );
+            limits::ResolvedLimits {
+                effective,
+                warnings,
+                dir: boot.dir,
+                facts: boot.facts,
+                env_set,
+            }
+        });
+    }
+
+    /// The effective `max_object_size` in bytes: the number the operator
+    /// set, or, for `auto`, the per-upload limit of the spool (the
+    /// default of earlier releases, 100 MiB, before the boot measured it).
+    pub fn max_object_size_bytes(&self) -> u64 {
+        match self.max_object_size {
+            limits::BytesOrAuto::Bytes(n) => n,
+            limits::BytesOrAuto::Auto => self
+                .tuning
+                .limits
+                .as_ref()
+                .map_or(limits::UNMEASURED_MAX_OBJECT_SIZE, |l| {
+                    l.effective.max_object_size
+                }),
+        }
     }
 
     /// Re-apply the env overrides to an edited config that is about to

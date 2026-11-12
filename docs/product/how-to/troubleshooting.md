@@ -109,8 +109,8 @@ The proxy reserves memory or spool space for an upload body before it reads the 
 
 The message of the error names the limit and how to raise it:
 
-- **`DGP_SPOOL_MAX_BYTES`.** The declared size of the upload is larger than the whole spool budget, so the proxy could never hold the body in a spool file. In a bucket that the proxy encrypts, the body and its encrypted copy must fit together, so the largest upload there is about half of the budget, and the message names the encryption. Raise `DGP_SPOOL_MAX_BYTES`, and make sure that `DGP_SPOOL_DIR` has that much free space.
-- **`DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`.** A multipart upload went past the spool space that one upload may hold, which is half of `DGP_SPOOL_MAX_BYTES` by default. Raise `DGP_SPOOL_MAX_BYTES`, or set `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`.
+- **`DGP_SPOOL_MAX_BYTES`.** The declared size of the upload is larger than the whole spool budget, so the proxy could never hold the body in a spool file. In a bucket that the proxy encrypts, the body and its encrypted copy must fit together, so the largest upload there is about half of the budget, and the message names the encryption. The message says whether the budget is auto-derived and from what (for example `auto: 50% of 46 GiB free on /var/spool/dgp at boot`). Raise `DGP_SPOOL_MAX_BYTES`, and make sure that `DGP_SPOOL_DIR` has that much free space. With `auto`, free disk space and restart the proxy, or move `DGP_SPOOL_DIR` to a larger disk.
+- **`DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`.** A multipart upload went past the spool space that one upload may hold, which is half of the effective spool budget by default. The message says whether the limit is auto-derived. Raise `DGP_SPOOL_MAX_BYTES`, or set `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`.
 
 A `413 EntityTooLarge` without such a name comes from `max_object_size`, or from the S3 part limit of 5 GiB for one multipart part.
 

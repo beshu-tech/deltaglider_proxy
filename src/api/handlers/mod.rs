@@ -164,7 +164,8 @@ impl AppState {
         Arc::new(Self {
             engine: arc_swap::ArcSwap::from_pointee(engine),
             multipart: Arc::new(
-                crate::multipart::MultipartStore::new(config.max_object_size).with_spool(spool),
+                crate::multipart::MultipartStore::new(config.max_object_size_bytes())
+                    .with_spool(spool),
             ),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             usage_scanner: Arc::new(crate::usage_scanner::UsageScanner::new()),

@@ -30,6 +30,8 @@ pub enum EnvValueKind {
     /// Applies only when not blank (`DGP_CONFIG_SYNC_KEY`).
     NonBlankText,
     Unsigned,
+    /// A number of bytes or the word `auto` (`limits::BytesOrAuto`).
+    BytesOrAuto,
     Float,
     SocketAddr,
     /// A boolean; an unrecognised value falls back to the default.
@@ -137,7 +139,7 @@ pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
     bind!(
         "DGP_MAX_OBJECT_SIZE",
         "advanced.max_object_size",
-        Unsigned,
+        BytesOrAuto,
         max_object_size
     ),
     bind!(
@@ -383,6 +385,10 @@ fn applied_value(kind: EnvValueKind, raw: &str) -> Option<String> {
         EnvValueKind::Text => Some(raw.to_string()),
         EnvValueKind::NonBlankText => (!raw.trim().is_empty()).then(|| raw.to_string()),
         EnvValueKind::Unsigned => raw.parse::<u64>().ok().map(|v| v.to_string()),
+        EnvValueKind::BytesOrAuto => raw
+            .parse::<super::limits::BytesOrAuto>()
+            .ok()
+            .map(|v| v.to_string()),
         EnvValueKind::Float => raw.parse::<f32>().ok().map(|v| v.to_string()),
         EnvValueKind::SocketAddr => raw
             .parse::<std::net::SocketAddr>()
@@ -852,7 +858,7 @@ storage:
             let raw = match b.kind {
                 EnvValueKind::SocketAddr => "127.0.0.1:1",
                 EnvValueKind::Float => "0.3",
-                EnvValueKind::Unsigned => "7",
+                EnvValueKind::Unsigned | EnvValueKind::BytesOrAuto => "7",
                 _ => "x-test",
             };
             let mut cfg = Config::default();

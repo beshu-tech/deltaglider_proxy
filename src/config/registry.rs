@@ -81,8 +81,8 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MAX_OBJECT_SIZE",
-        description: "Max object size in bytes for delta processing",
-        example: "104857600",
+        description: "Max object size in bytes, or `auto` (default): the effective per-upload limit of the spool (half of the effective spool budget)",
+        example: "auto",
         category: "Delta Engine",
     },
     EnvVarEntry {
@@ -448,8 +448,8 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MAX_TOTAL_MULTIPART_BYTES",
-        description: "Cap on the spool space that the parts of all open multipart uploads hold together (whole MiB per part, at least 1 MiB); a part past it gets 503 SlowDown (default: half of DGP_SPOOL_MAX_BYTES)",
-        example: "1073741824",
+        description: "Cap on the spool space that the parts of all open multipart uploads hold together (whole MiB per part, at least 1 MiB); a part past it gets 503 SlowDown (default: half of the effective spool budget)",
+        example:"1073741824",
         category: "Server",
     },
     EnvVarEntry {
@@ -562,8 +562,8 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_SPOOL_MAX_BYTES",
-        description: "Byte budget for all spool files; a request that holds none waits, a holder gets 503 SlowDown (default: 16 GiB)",
-        example: "17179869184",
+        description: "Byte budget for all spool files; a request that holds none waits, a holder gets 503 SlowDown. `auto` (default) = 50% of the free space of DGP_SPOOL_DIR at boot (25% when it shares a device with backend data; at least 1 GiB; on a tmpfs or under Kubernetes set it yourself). A percent such as `40%` = that share of the free space at boot. A number = bytes, as given. Measured once at boot, never while the proxy runs",
+        example: "auto",
         category: "Delta Engine",
     },
     EnvVarEntry {
@@ -580,7 +580,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
-        description: "Max spool bytes one multipart upload may hold, which is also the largest multipart object; a part past it gets 413 EntityTooLarge (default: half of DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)",
+        description: "Max spool bytes one multipart upload may hold, which is also the largest multipart object; a part past it gets 413 EntityTooLarge (default: half of the effective spool budget; 0 = no per-upload cap)",
         example: "8589934592",
         category: "Delta Engine",
     },

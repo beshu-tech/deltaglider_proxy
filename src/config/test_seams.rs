@@ -86,6 +86,11 @@ pub struct TestSeams {
     /// largest): the part size of a multipart server-side copy (production:
     /// 512 MiB).
     pub copy_part_bytes: Option<u64>,
+    /// `DGP_TEST_DISK_FREE_BYTES`: the free space of the spool directory at
+    /// boot, so a test sees one auto-sized limit on every host. It also
+    /// turns off the tmpfs, Kubernetes and shared-device facts
+    /// (`limits::measure_disk_facts`).
+    pub disk_free_bytes: Option<u64>,
 }
 
 /// S3's smallest part: the floor of the two copy seams, so a seam never
@@ -190,6 +195,7 @@ impl TestSeams {
                 "DGP_TEST_COPY_OBJECT_MAX_BYTES",
             )),
             copy_part_bytes: copy_seam_bytes(lookup_parse(env, "DGP_TEST_COPY_PART_BYTES")),
+            disk_free_bytes: lookup_parse(env, "DGP_TEST_DISK_FREE_BYTES"),
         }
     }
 }
@@ -219,6 +225,7 @@ pub const SEAM_ENV_VARS: &[&str] = &[
     "DGP_TEST_ATOMICITY_PROBE_DELAY_MS",
     "DGP_TEST_COPY_OBJECT_MAX_BYTES",
     "DGP_TEST_COPY_PART_BYTES",
+    "DGP_TEST_DISK_FREE_BYTES",
 ];
 
 /// The seams of this process: parsed from the environment on first use in a

@@ -72,7 +72,7 @@ All three scopes route through the same `apply_config_transition` path, so hot-r
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/_/api/admin/config` | Runtime config as flat JSON. It also carries `env_overrides`, `config_file_path` (the file that an apply writes) and `config_file_writable` (`false` when the proxy cannot write that file, for example a read-only mount) |
+| `GET` | `/_/api/admin/config` | Runtime config as flat JSON. `max_object_size` is the effective number of bytes, and `limits` shows the effective upload limits (`spool_budget`, `per_upload`, `total_multipart`, `max_object_size`, each as `{bytes, source, detail}` with `source` one of `auto`, `explicit` or `env`), the disk facts they come from (`spool_dir`, `free_bytes`, `total_bytes`, `own_spool_bytes`, `on_tmpfs`, `shares_device_with_data`, `in_kubernetes`) and the `warnings` of the derivation; `limits` is `null` until the proxy has measured the disk at start (see [Auto-sized limits](configuration.md#auto-sized-limits)). It also carries `env_overrides`, `config_file_path` (the file that an apply writes) and `config_file_writable` (`false` when the proxy cannot write that file, for example a read-only mount) |
 | `PUT` | `/_/api/admin/config` | Partial JSON update |
 | `DELETE` | `/_/api/admin/config/bootstrap-credentials` | Remove the bootstrap SigV4 pair from the config: `{removed, warnings}` |
 
@@ -439,9 +439,9 @@ For a migration, the gate ends at the moment the bucket flips to the new backend
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DGP_MAX_OBJECT_SIZE` | `100 MiB` | Largest single object (and, per upload, largest multipart upload). |
+| `DGP_MAX_OBJECT_SIZE` | `auto` | Largest single object (and, per upload, largest multipart upload): a number of bytes, or `auto` for half of the effective spool budget. |
 | `DGP_MAX_MULTIPART_UPLOADS` | `1000` | Maximum concurrent multipart uploads across the proxy. |
-| `DGP_MAX_TOTAL_MULTIPART_BYTES` | half of `DGP_SPOOL_MAX_BYTES` | Global in-flight byte cap across all multipart uploads, whose parts are spool files. The cap protects against the C3 DoS pattern, in which many uploads accumulate without completing. The proxy rejects a request with `SlowDown` when the cap is exceeded. |
+| `DGP_MAX_TOTAL_MULTIPART_BYTES` | half of the effective spool budget | Global in-flight byte cap across all multipart uploads, whose parts are spool files. The cap protects against the C3 DoS pattern, in which many uploads accumulate without completing. The proxy rejects a request with `SlowDown` when the cap is exceeded. |
 | `DGP_MULTIPART_IDLE_TTL_HOURS` | `24` | Idle-TTL for incomplete multipart uploads. The periodic sweeper drops uploads with no UploadPart activity for this long (excluding uploads currently being completed). |
 | `DGP_AUDIT_RING_SIZE` | `500` | In-memory audit ring capacity. |
 | `DGP_LOG_RING_SIZE` | `2000` | In-memory operational-log ring capacity (backs the admin Logs viewer). |
