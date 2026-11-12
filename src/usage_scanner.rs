@@ -510,7 +510,7 @@ impl UsageScanner {
             .bucket_usage
             .as_deref()
             .filter(|_| prefix.is_empty());
-        let ticket = usage.map(|u| u.begin_scan(bucket));
+        let ticket = usage.map(|u| u.begin_scan_watching(bucket, &s3_state.maintenance_gate));
         // One key past the cap tells whether the prefix goes on.
         let listing = engine
             .storage()
@@ -1124,7 +1124,13 @@ mod stamp_tests {
     use crate::storage::FakeS3;
 
     async fn state(n: usize) -> (Arc<AppState>, Arc<BucketUsage>, Arc<FakeS3>) {
-        let (engine, fake, _) = test_support::fake_s3_engine().await;
+        let (st, usage, fake, _endpoint) = state_at(n).await;
+        (st, usage, fake)
+    }
+
+    /// [`state`], and the fake's endpoint (for a write past the proxy).
+    async fn state_at(n: usize) -> (Arc<AppState>, Arc<BucketUsage>, Arc<FakeS3>, String) {
+        let (engine, fake, endpoint) = test_support::fake_s3_engine().await;
         let usage = Arc::new(BucketUsage::in_memory().unwrap());
         let engine = engine.with_bucket_usage(Some(usage.clone()));
         for i in 0..n {
@@ -1141,7 +1147,49 @@ mod stamp_tests {
         }
         let mut st = Arc::try_unwrap(AppState::for_tests(engine)).ok().unwrap();
         st.bucket_usage = Some(usage.clone());
-        (Arc::new(st), usage, fake)
+        (Arc::new(st), usage, fake, endpoint)
+    }
+
+    /// A write stores its object first and records its counter change a
+    /// moment later. A scan that lists in that moment sees the object, and
+    /// the journal has no change yet. Stamped, the scan's count and the
+    /// writer's change would add up to a double count that no later scan
+    /// repairs (the quota stays closed after a delete). The write is in
+    /// flight, so the scan is not stamped; the write counts once; the next
+    /// scan, with no write in flight, stamps.
+    #[tokio::test]
+    async fn a_scan_between_a_writes_commit_and_its_record_is_not_stamped() {
+        let (st, usage, _fake, endpoint) = state_at(0).await;
+
+        // The writer: counted as in flight, object stored, change not recorded.
+        let writer = st.maintenance_gate.begin_write("b");
+        test_support::put_raw(&endpoint, "d/first.txt", &[7u8; 12_000]).await;
+
+        // The scan runs right then.
+        let entry = UsageScanner::do_scan(&st, "b", "").await.unwrap();
+        assert_eq!(entry.stored_size, 12_000, "the scan listed the object");
+        assert_eq!(
+            usage.read("b").unwrap().and_then(|r| r.last_scan_at),
+            None,
+            "a scan that ended with a write in flight was stamped"
+        );
+
+        // The writer records its change and ends.
+        let meta = st.engine.load().head("b", "d/first.txt").await.unwrap();
+        usage.apply_net("b", None, Some(&meta), 0);
+        drop(writer);
+        let row = usage.read("b").unwrap().unwrap();
+        assert_eq!(
+            (row.object_count, row.stored_bytes),
+            (1, 12_000),
+            "the object was counted twice: {row:?}"
+        );
+
+        // With no write in flight, the next scan stamps the true count.
+        UsageScanner::do_scan(&st, "b", "").await.unwrap();
+        let row = usage.read("b").unwrap().unwrap();
+        assert!(row.last_scan_at.is_some(), "{row:?}");
+        assert_eq!((row.object_count, row.stored_bytes), (1, 12_000), "{row:?}");
     }
 
     #[tokio::test]

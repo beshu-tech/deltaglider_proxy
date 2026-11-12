@@ -826,20 +826,42 @@ mod backend_share_tests {
         // above the share is refused at once: the share's worth of HEADs is
         // held at the backend. (A count of the HEADs that arrived would also
         // count a retry of one request.)
-        let share = (config.tuning.max_concurrent_requests
-            * usize::from(config.tuning.backend_share_percent)
-            / 100)
-            .max(1);
-        assert!(share < 4, "the test needs a slot that the share leaves");
+        // The share is a fixed number here, not a value computed as the
+        // product does: 75% of 4 slots is 3. A share of 2 or 4 fails below.
+        const SHARE: usize = 3;
+        assert_eq!(
+            (
+                config.tuning.max_concurrent_requests,
+                config.tuning.backend_share_percent
+            ),
+            (4, crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT)
+        );
+        assert_eq!(crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT, 75);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        while fake.peak_in_flight("HEAD") < share {
+        // The request above the share is refused at once, and the share's
+        // worth of HEADs is held.
+        // A HEAD of an object asks the backend for the key and for its delta
+        // form at once: two HEADs for each held request.
+        const HEADS_PER_REQUEST: usize = 2;
+        while fake.peak_in_flight("HEAD") < SHARE * HEADS_PER_REQUEST || ended.lock().is_empty() {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the slow requests never reached the backend: {:?}",
-                fake.requests()
+                "the slow requests never reached the backend: {:?} / {:?}",
+                fake.requests(),
+                ended.lock()
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        assert_eq!(
+            fake.peak_in_flight("HEAD"),
+            SHARE * HEADS_PER_REQUEST,
+            "more or fewer requests than the share were held"
+        );
+        assert_eq!(
+            *ended.lock(),
+            vec!["Ok(503)".to_string()],
+            "exactly the request above the share is refused"
+        );
 
         // The local-disk GET is answered while every slow request is still
         // held. Behind a full cap it would never be answered: the long
@@ -853,7 +875,7 @@ mod backend_share_tests {
         .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert!(
-            slow.iter().filter(|h| !h.is_finished()).count() >= share,
+            slow.iter().filter(|h| !h.is_finished()).count() == SHARE,
             "a held request ended before the GET: the test proved nothing; ended: {:?}",
             ended.lock()
         );

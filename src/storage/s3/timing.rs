@@ -620,6 +620,48 @@ mod tests {
         assert_eq!(End::Cancelled.outcome(), "cancelled");
     }
 
+    /// The size of the body reaches the slow check of the LOG: the same
+    /// 6 s is slow for a request with no body (5 s threshold) and not slow
+    /// for one with a body of 10 MiB (15 s). With a fixed time and no
+    /// network, nothing here depends on the load of the host.
+    #[test]
+    fn the_body_of_a_request_raises_the_threshold_of_its_logged_line() {
+        let logged = |body_bytes: u64, total: Duration| -> String {
+            let captured = Captured::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                Report {
+                    backend: "timing-wiring",
+                    operation: "PutObject",
+                    bucket: "releases",
+                    uri: "/releases/v1/app.zip",
+                    body_bytes,
+                    total,
+                    before_first_send: Some(Duration::ZERO),
+                    statuses: &[Some(200)],
+                    end: End::Ok,
+                }
+                .record(Some(Duration::from_secs(5)));
+            });
+            let bytes = captured.0.lock().clone();
+            String::from_utf8(bytes).unwrap()
+        };
+        let mib10 = 10u64 << 20;
+        let six = Duration::from_secs(6);
+        let no_body = logged(0, six);
+        assert!(no_body.contains("slow backend request"), "{no_body}");
+        assert!(no_body.contains("body_bytes=0"), "{no_body}");
+        let big = logged(mib10, six);
+        assert!(!big.contains("slow backend request"), "{big}");
+        let past = logged(mib10, Duration::from_secs(15));
+        assert!(past.contains("slow backend request"), "{past}");
+        assert!(past.contains(&format!("body_bytes={mib10}")), "{past}");
+    }
+
     #[test]
     fn slow_means_at_or_above_the_threshold_plus_a_second_per_mib_of_body() {
         let ms = Duration::from_millis;

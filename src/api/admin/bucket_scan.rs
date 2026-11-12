@@ -558,7 +558,9 @@ async fn run_scan(
     // The ticket marks the scan start: a write that lands while the scan
     // runs is kept on top of the scan result (H14b).
     let usage = s3_state.bucket_usage.clone();
-    let ticket = usage.as_deref().map(|u| u.begin_scan(bucket));
+    let ticket = usage
+        .as_deref()
+        .map(|u| u.begin_scan_watching(bucket, &s3_state.maintenance_gate));
     // No cap: the dashboard scan is the "real number" path the operator
     // triggered explicitly (the chip endpoint caps it instead). HEADs go
     // only to the objects whose size the listing cannot tell. Progress goes

@@ -155,7 +155,7 @@ struct Journal {
     recount: bool,
 }
 
-/// A Refresh scan in flight, from [`BucketUsage::begin_scan`]. Consumed by
+/// A Refresh scan in flight, from [`BucketUsage::begin_scan_watching`]. Consumed by
 /// [`BucketUsage::overwrite_from_scan`]; a dropped ticket (failed scan)
 /// removes its journal.
 pub struct ScanTicket<'a> {
@@ -163,6 +163,31 @@ pub struct ScanTicket<'a> {
     bucket: String,
     id: u64,
     consumed: bool,
+    /// The gate whose in-flight write count the scan reads when it ends
+    /// ([`scan_is_quiet`]). `None` only for a unit test of the counter.
+    gate: Option<&'a crate::maintenance::gate::MaintenanceGate>,
+}
+
+/// THE rule for a scan result to be stamped as the trusted counter
+/// (`last_scan_at`): the bucket did not change while the scan ran (the
+/// journal is empty), AND no write was in flight when the scan ended.
+///
+/// The journal sees a write only when its counter change lands. A write
+/// stores its object first and records its change a moment later. A scan
+/// that lists in between sees the object, finds an empty journal, and is
+/// stamped; the writer's change then lands on top of it and the object is
+/// counted twice, with no later scan to repair it. A write counts as in
+/// flight from before its storage write until after its record
+/// (`MaintenanceGate::begin_write` and its siblings), so a scan that ends
+/// with a write in flight cannot be trusted.
+///
+/// The count is read at the END only. A scan that the quota check starts
+/// runs inside the write request that asked for it, so a count at the start
+/// would never be zero. A write that is in flight at the start and ends
+/// before the scan ends records its change during the scan, and the journal
+/// has it.
+pub(crate) fn scan_is_quiet(journal_is_empty: bool, writes_in_flight_at_end: i64) -> bool {
+    journal_is_empty && writes_in_flight_at_end <= 0
 }
 
 impl Drop for ScanTicket<'_> {
@@ -424,7 +449,29 @@ impl BucketUsage {
     /// bucket is also journaled for this scan, so
     /// [`Self::overwrite_from_scan`] can keep the writes that land while
     /// the scan runs.
+    ///
+    /// The ticket reads the gate's in-flight write count when the scan ends
+    /// (`scan_is_quiet`); the only way to start a scan in production code
+    /// (the unwatched `begin_scan` exists for unit tests).
+    pub fn begin_scan_watching<'a>(
+        &'a self,
+        bucket: &str,
+        gate: &'a crate::maintenance::gate::MaintenanceGate,
+    ) -> ScanTicket<'a> {
+        self.begin_scan_with(bucket, Some(gate))
+    }
+
+    /// A scan that no write can overlap (a unit test of the counter).
+    #[cfg(test)]
     pub fn begin_scan(&self, bucket: &str) -> ScanTicket<'_> {
+        self.begin_scan_with(bucket, None)
+    }
+
+    fn begin_scan_with<'a>(
+        &'a self,
+        bucket: &str,
+        gate: Option<&'a crate::maintenance::gate::MaintenanceGate>,
+    ) -> ScanTicket<'a> {
         let id = self.next_scan.fetch_add(1, Ordering::Relaxed);
         self.pending
             .entry(bucket.to_string())
@@ -436,6 +483,7 @@ impl BucketUsage {
             bucket: bucket.to_string(),
             id,
             consumed: false,
+            gate,
         }
     }
 
@@ -576,9 +624,16 @@ impl BucketUsage {
         let bucket = std::mem::take(&mut ticket.bucket);
         let journal = self.end_scan(&bucket, ticket.id).unwrap_or_default();
         ticket.consumed = true;
-        // Quiet: the bucket did not change while the scan ran. Only a quiet
-        // scan stamps `last_scan_at`, the mark that the quota gate trusts.
-        let quiet = journal.delta == (0, 0, 0) && !journal.recount;
+        // Quiet: the bucket did not change while the scan ran, and no write
+        // is in flight now ([`scan_is_quiet`]). Only a quiet scan stamps
+        // `last_scan_at`, the mark that the quota gate trusts. The count is
+        // read AFTER the journal is taken: a write whose change lands after
+        // that is still in flight here.
+        let writes_in_flight = ticket.gate.map_or(0, |g| g.inflight_writes(&bucket));
+        let quiet = scan_is_quiet(
+            journal.delta == (0, 0, 0) && !journal.recount,
+            writes_in_flight,
+        );
         if quiet_only && !quiet {
             return Ok(false);
         }
@@ -788,6 +843,25 @@ mod tests {
         let row = db.read("b").unwrap().unwrap();
         assert_eq!(row.object_count, 0, "clamped at 0, not negative");
         assert_eq!(row.logical_bytes, 0);
+    }
+
+    /// The whole truth table of the stamp rule: a scan is trusted only when
+    /// the journal is empty AND no write is in flight at its end.
+    #[test]
+    fn a_scan_is_quiet_only_without_journal_and_without_writes_in_flight() {
+        for (journal_is_empty, writes, quiet) in [
+            (true, 0, true),
+            (true, 1, false),
+            (true, 7, false),
+            (false, 0, false),
+            (false, 1, false),
+        ] {
+            assert_eq!(
+                scan_is_quiet(journal_is_empty, writes),
+                quiet,
+                "journal empty: {journal_is_empty}, writes in flight: {writes}"
+            );
+        }
     }
 
     #[test]
