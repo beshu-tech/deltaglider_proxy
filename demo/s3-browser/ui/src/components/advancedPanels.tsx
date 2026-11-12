@@ -104,7 +104,8 @@ interface AdvancedSectionBody {
   blocking_threads?: number;
   log_level?: string;
   config_sync_bucket?: string;
-  max_object_size?: number;
+  /** Bytes, or the word `auto` (the server omits `auto` on GET). */
+  max_object_size?: number | 'auto';
   tls?: {
     enabled?: boolean;
     cert_path?: string | null;
@@ -467,9 +468,19 @@ export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
   const subset = useAdvancedSubset(SIZE_LIMIT_INITIAL, onSessionExpired, 'storage/buckets/limits');
   const { value, setValue } = subset;
   const form = useFieldValidation();
+  const { data: config } = useAdminConfig({ onSessionExpired });
   const gate = loadGate(subset);
   if (gate) return gate;
-  const mb = value.max_object_size != null ? Math.round(value.max_object_size / MIB) : undefined;
+  // A number is the operator's value. An empty field, or the word `auto`,
+  // is auto: the effective value comes from `GET /config` `limits`.
+  const mb =
+    typeof value.max_object_size === 'number'
+      ? Math.round(value.max_object_size / MIB)
+      : undefined;
+  const effective = config?.limits?.max_object_size;
+  const autoPlaceholder = effective
+    ? `auto (${Math.round(effective.bytes / MIB)} MiB)`
+    : 'auto';
   // Up to 5 TiB, the largest S3 object.
   const sizeField = form.number(
     'max_object_size',
@@ -489,8 +500,12 @@ export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
         <FormField
           label="Maximum object size (MiB)"
           yamlPath="advanced.max_object_size"
-          helpText="Applies to every bucket. The YAML value is in bytes."
-          defaultPlaceholder="100"
+          helpText={
+            effective
+              ? `Applies to every bucket. Leave the field empty for auto. Now ${Math.round(effective.bytes / MIB)} MiB (${effective.source}: ${effective.detail}). The YAML value is in bytes, or the word auto.`
+              : 'Applies to every bucket. Leave the field empty for auto. The YAML value is in bytes, or the word auto.'
+          }
+          defaultPlaceholder="auto"
           examples={[100, 1024, 5120]}
           onExampleClick={(x) => setValue({ ...value, max_object_size: Number(x) * MIB })}
           error={sizeField.error}
@@ -498,7 +513,7 @@ export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
           <Input
             aria-label="Maximum object size (MiB)"
             {...sizeField.inputProps}
-            placeholder="100"
+            placeholder={autoPlaceholder}
             style={{ width: 180, ...inputRadius }}
             suffix="MiB"
           />

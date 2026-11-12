@@ -580,7 +580,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
-        description: "Max spool bytes one multipart upload may hold, which is also the largest multipart object; a part past it gets 413 EntityTooLarge (default: half of the effective spool budget; 0 = no per-upload cap)",
+        description: "Max spool bytes one multipart upload may hold, which is also the largest multipart object; a part past it gets 400 EntityTooLarge (default: half of the effective spool budget; 0 = no per-upload cap)",
         example: "8589934592",
         category: "Delta Engine",
     },

@@ -2402,12 +2402,12 @@ async fn explicit_limits_win_and_warn_at_boot() {
     );
 }
 
-/// A multipart upload past the DERIVED per-upload limit gets 413, and the
+/// A multipart upload past the DERIVED per-upload limit gets 400 EntityTooLarge, and the
 /// message says that the limit is auto-derived and from what. The free space
 /// is 2 GiB, so the budget is the 1 GiB floor and one upload may hold
 /// 512 MiB.
 #[tokio::test]
-async fn a_multipart_upload_past_the_derived_limit_gets_413_with_its_origin() {
+async fn a_multipart_upload_past_the_derived_limit_is_refused_with_its_origin() {
     let spool = tempfile::TempDir::new().unwrap();
     let server = TestServer::builder()
         .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
@@ -2446,8 +2446,8 @@ async fn a_multipart_upload_past_the_derived_limit_gets_413_with_its_origin() {
         if n <= 5 {
             assert_eq!(status, 200, "part {n}: {text}");
         } else {
-            // S3 answers EntityTooLarge with 400; accept 413 too.
-            assert!(matches!(status, 400 | 413), "part {n}: {status} {text}");
+            // AWS answers EntityTooLarge with HTTP 400.
+            assert_eq!(status, 400, "part {n}: {text}");
             for needle in [
                 "EntityTooLarge",
                 "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",

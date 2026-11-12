@@ -217,6 +217,28 @@ pub struct ExplicitLimits {
     /// `DGP_MAX_TOTAL_MULTIPART_BYTES`.
     pub total_multipart: Option<u64>,
     pub max_object_size: BytesOrAuto,
+    /// A configured backend is an S3 backend. It stores a client object
+    /// with ONE PUT request, which takes at most 5 GiB
+    /// ([`S3_SINGLE_PUT_MAX_BYTES`]).
+    pub s3_backend: bool,
+    /// The spool directory shares its device with data NOW (a config apply
+    /// added a filesystem backend after the boot measured). The budget does
+    /// not change; the operator gets a warning (item `ShareChangesAtRestart`).
+    pub shares_device_now: bool,
+}
+
+/// The most that an S3 backend stores with one PUT request.
+pub const S3_SINGLE_PUT_MAX_BYTES: u64 = 5 * GIB;
+
+/// Pure: the largest object that the delta encode can take with a reference
+/// of about the same size. The streaming encode holds three files in the
+/// spool at once, the body, the reference and the delta output, each up to
+/// the object's size, so an object above a third of the budget is stored
+/// whole with the reason `delta-unavailable`. (A reference file that an
+/// earlier request already cached still counts: it holds spool space.) The
+/// test `delta_ceiling_tests` in `engine/store.rs` measures this.
+pub fn delta_ceiling(spool_budget: u64) -> u64 {
+    spool_budget / 3
 }
 
 /// Where a value comes from.
@@ -258,13 +280,37 @@ pub struct EffectiveLimits {
     pub total_multipart_source: Source,
     pub max_object_size: u64,
     pub max_object_size_source: Source,
+    /// What set `max_object_size` (the lowest of the bounds, for `auto`).
+    pub max_object_size_bound: ObjectSizeBound,
+    /// Objects above this are stored whole, not as a delta: see
+    /// [`delta_ceiling`].
+    pub delta_ceiling: u64,
 }
 
-/// The setting that a warning asks the operator to change.
+/// What bounds the largest object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UploadLimit {
+pub enum ObjectSizeBound {
+    /// The operator set `max_object_size`.
+    Explicit,
+    /// The per-upload limit of the spool.
     PerUpload,
-    MaxObjectSize,
+    /// The total of all open multipart uploads.
+    TotalMultipart,
+    /// An S3 backend stores a client object with one PUT: 5 GiB.
+    S3SinglePut,
+}
+
+impl ObjectSizeBound {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Explicit => "set by max_object_size",
+            Self::PerUpload => "auto: the per-upload limit",
+            Self::TotalMultipart => "auto: the total multipart limit",
+            Self::S3SinglePut => {
+                "auto: 5 GiB, the most that an S3 backend stores with one PUT request"
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,14 +325,18 @@ pub enum LimitWarning {
         available: u64,
         shared_device: bool,
     },
-    /// An explicit upload limit is above half of the budget: an upload of
-    /// that size cannot fit.
-    UploadAboveHalfBudget {
-        which: UploadLimit,
+    /// An explicit `max_object_size` is above the most that a multipart
+    /// upload can hold (the lower of the per-upload limit and the total):
+    /// a multipart object of that size is refused after its parts arrived.
+    ObjectSizeAboveMultipartLimit {
         value: u64,
         limit: u64,
-        budget: u64,
+        bound: ObjectSizeBound,
     },
+    /// A config apply put a filesystem backend (or data) on the device of
+    /// the spool after the boot measured. The budget stays; the smaller
+    /// share for a shared device applies at the next start.
+    ShareChangesAtRestart,
 }
 
 /// Round down to whole MiB.
@@ -391,27 +441,46 @@ pub fn derive_limits(
         Some(n) => (n, Source::Explicit),
         None => (default_total_multipart(spool_budget), Source::Auto),
     };
-    let (max_object_size, max_object_size_source) = match explicit.max_object_size {
-        BytesOrAuto::Bytes(n) => (n, Source::Explicit),
-        BytesOrAuto::Auto if per_upload == 0 => (default_per_upload(spool_budget), Source::Auto),
-        BytesOrAuto::Auto => (per_upload, Source::Auto),
+    // What a multipart upload can hold: the lower of the per-upload limit
+    // (0 = no cap) and the total (0 = no part is admitted, which does not
+    // limit a PutObject). `None`: no multipart bound.
+    let multipart_bound = {
+        let per = (per_upload != 0).then_some((per_upload, ObjectSizeBound::PerUpload));
+        let total =
+            (total_multipart != 0).then_some((total_multipart, ObjectSizeBound::TotalMultipart));
+        match (per, total) {
+            (Some(p), Some(t)) => Some(if t.0 < p.0 { t } else { p }),
+            (p, t) => p.or(t),
+        }
     };
-    let half = spool_budget / 2;
-    if per_upload_source == Source::Explicit && per_upload > half {
-        warnings.push(LimitWarning::UploadAboveHalfBudget {
-            which: UploadLimit::PerUpload,
-            value: per_upload,
-            limit: half,
-            budget: spool_budget,
-        });
+    let (max_object_size, max_object_size_source, max_object_size_bound) =
+        match explicit.max_object_size {
+            BytesOrAuto::Bytes(n) => (n, Source::Explicit, ObjectSizeBound::Explicit),
+            BytesOrAuto::Auto => {
+                let (mut v, mut bound) = multipart_bound
+                    .unwrap_or((default_per_upload(spool_budget), ObjectSizeBound::PerUpload));
+                if explicit.s3_backend && S3_SINGLE_PUT_MAX_BYTES < v {
+                    v = S3_SINGLE_PUT_MAX_BYTES;
+                    bound = ObjectSizeBound::S3SinglePut;
+                }
+                (v, Source::Auto, bound)
+            }
+        };
+    if let (Source::Explicit, Some((limit, bound))) = (max_object_size_source, multipart_bound) {
+        if max_object_size > limit {
+            warnings.push(LimitWarning::ObjectSizeAboveMultipartLimit {
+                value: max_object_size,
+                limit,
+                bound,
+            });
+        }
     }
-    if max_object_size_source == Source::Explicit && max_object_size > half {
-        warnings.push(LimitWarning::UploadAboveHalfBudget {
-            which: UploadLimit::MaxObjectSize,
-            value: max_object_size,
-            limit: half,
-            budget: spool_budget,
-        });
+    if explicit.shares_device_now
+        && !facts.shares_device_with_data
+        && spool_source == Source::Auto
+        && matches!(spool_basis, SpoolBasis::Share { .. })
+    {
+        warnings.push(LimitWarning::ShareChangesAtRestart);
     }
     (
         EffectiveLimits {
@@ -424,6 +493,8 @@ pub fn derive_limits(
             total_multipart_source,
             max_object_size,
             max_object_size_source,
+            max_object_size_bound,
+            delta_ceiling: delta_ceiling(spool_budget),
         },
         warnings,
     )
@@ -497,36 +568,42 @@ impl LimitWarning {
                     human_bytes(budget)
                 )
             }
-            Self::UploadAboveHalfBudget {
-                which,
+            Self::ObjectSizeAboveMultipartLimit {
                 value,
                 limit,
-                budget,
+                bound,
             } => {
-                let (name, fix) = match which {
-                    UploadLimit::PerUpload => (
-                        "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
-                        "Lower it, or raise DGP_SPOOL_MAX_BYTES",
+                let (setting, fix) = match bound {
+                    ObjectSizeBound::TotalMultipart => (
+                        "DGP_MAX_TOTAL_MULTIPART_BYTES",
+                        "Raise DGP_MAX_TOTAL_MULTIPART_BYTES (or DGP_SPOOL_MAX_BYTES)",
                     ),
-                    UploadLimit::MaxObjectSize => (
-                        "max_object_size",
-                        "Lower it (or set it to auto), or raise DGP_SPOOL_MAX_BYTES",
+                    _ => (
+                        "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
+                        "Raise DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES (or DGP_SPOOL_MAX_BYTES)",
                     ),
                 };
                 format!(
-                    "{name} is {} ({value} bytes), above half of the spool budget \
-                     ({} of {}, spool directory {dir}). An upload of that size cannot fit. {fix}.",
+                    "max_object_size is {} ({value} bytes), above the {} ({setting}) that a \
+                     multipart upload can hold in the spool directory {dir}. A multipart object \
+                     larger than that is refused with EntityTooLarge after its parts arrived. \
+                     {fix}, lower max_object_size, or set it to auto.",
                     human_bytes(value),
                     human_bytes(limit),
-                    human_bytes(budget)
                 )
             }
+            Self::ShareChangesAtRestart => format!(
+                "A filesystem backend or the data directory is now on the same device as the \
+                 spool directory {dir}. The spool budget stays as measured at boot; the smaller \
+                 {AUTO_SHARED_DEVICE_PERCENT}% share for a shared device applies at the next \
+                 start. A change of DGP_SPOOL_MAX_BYTES also needs a restart."
+            ),
         }
     }
 }
 
 impl EffectiveLimits {
-    /// How the spool budget was found, for a log line and a 413 message.
+    /// How the spool budget was found, for a log line and an EntityTooLarge message.
     pub fn spool_note(&self, dir: &Path) -> String {
         match (self.spool_source, self.spool_basis) {
             (_, SpoolBasis::Share { percent, available }) => {
@@ -557,16 +634,19 @@ impl EffectiveLimits {
         };
         let mos = match self.max_object_size_source {
             Source::Auto => format!(
-                "max_object_size auto = {}",
-                human_bytes(self.max_object_size)
+                "max_object_size auto = {} ({})",
+                human_bytes(self.max_object_size),
+                self.max_object_size_bound.describe()
             ),
             Source::Explicit => format!("max_object_size {}", human_bytes(self.max_object_size)),
         };
         format!(
-            "spool budget {} = {}; {per_upload}; total multipart limit {}; {mos}",
+            "spool budget {} = {}; {per_upload}; total multipart limit {}; {mos}; delta ceiling \
+             {} (an object above it is stored whole, reason delta-unavailable)",
             human_bytes(self.spool_budget),
             self.spool_note(dir),
             human_bytes(self.total_multipart),
+            human_bytes(self.delta_ceiling),
         )
     }
 }
@@ -582,6 +662,30 @@ pub struct ResolvedLimits {
     /// The variables of [`LIMIT_ENV_VARS`] that were set when the limits
     /// were derived (the source of their value is `env`, not the file).
     pub env_set: Vec<&'static str>,
+    /// The text of `DGP_SPOOL_MAX_BYTES` when it did not parse (the spool
+    /// then used `auto`).
+    pub spool_invalid: Option<String>,
+}
+
+/// Pure: the spool setting of a `DGP_SPOOL_MAX_BYTES` text. A text that
+/// does not parse is `auto`, and the second value is that text (the caller
+/// logs it and `limits` shows it).
+pub fn parse_spool_setting(raw: Option<&str>) -> (SpoolSetting, Option<String>) {
+    match raw {
+        None => (SpoolSetting::Auto, None),
+        Some(raw) => match raw.parse() {
+            Ok(setting) => (setting, None),
+            Err(_) => (SpoolSetting::Auto, Some(raw.to_string())),
+        },
+    }
+}
+
+/// The warning for a `DGP_SPOOL_MAX_BYTES` that did not parse.
+pub fn invalid_spool_message(raw: &str) -> String {
+    format!(
+        "DGP_SPOOL_MAX_BYTES=\"{raw}\" is not a valid value, so the spool budget is auto. Use \
+         'auto', a percent such as '40%', or a number of bytes (for example 17179869184)."
+    )
 }
 
 /// The variables that set a limit.
@@ -594,7 +698,11 @@ pub const LIMIT_ENV_VARS: &[&str] = &[
 
 impl ResolvedLimits {
     pub fn warning_messages(&self) -> Vec<String> {
-        self.warnings.iter().map(|w| w.message(&self.dir)).collect()
+        self.spool_invalid
+            .iter()
+            .map(|raw| invalid_spool_message(raw))
+            .chain(self.warnings.iter().map(|w| w.message(&self.dir)))
+            .collect()
     }
 
     /// The `limits` object of `GET /_/api/admin/config`.
@@ -627,7 +735,12 @@ impl ResolvedLimits {
             in_kubernetes: self.facts.in_kubernetes,
             spool_budget: value(
                 e.spool_budget,
-                label(e.spool_source, "DGP_SPOOL_MAX_BYTES"),
+                if self.spool_invalid.is_some() {
+                    // The variable is set but not valid: the value is auto.
+                    "invalid-auto"
+                } else {
+                    label(e.spool_source, "DGP_SPOOL_MAX_BYTES")
+                },
                 e.spool_note(&self.dir),
             ),
             per_upload: value(
@@ -649,10 +762,15 @@ impl ResolvedLimits {
             max_object_size: value(
                 e.max_object_size,
                 label(e.max_object_size_source, "DGP_MAX_OBJECT_SIZE"),
-                match e.max_object_size_source {
-                    Source::Auto => "auto: the per-upload limit".to_string(),
-                    Source::Explicit => "set by max_object_size".to_string(),
-                },
+                e.max_object_size_bound.describe().to_string(),
+            ),
+            delta_ceiling: value(
+                e.delta_ceiling,
+                "auto",
+                "a third of the spool budget: the delta encode holds the body, the reference and \
+                 the delta output at once; an object above it is stored whole with the reason \
+                 delta-unavailable"
+                    .to_string(),
             ),
             warnings: self.warning_messages(),
         }
@@ -684,6 +802,8 @@ pub struct LimitsReport {
     pub per_upload: LimitValue,
     pub total_multipart: LimitValue,
     pub max_object_size: LimitValue,
+    /// The largest object that can be stored as a delta ([`delta_ceiling`]).
+    pub delta_ceiling: LimitValue,
     pub warnings: Vec<String>,
 }
 
@@ -728,6 +848,24 @@ pub fn measure_disk_facts(dir: &Path, data_roots: &[PathBuf], env: EnvLookup) ->
             shares_device_with_data: false,
             in_kubernetes,
         }
+    }
+}
+
+/// Does `dir` lie on the same device as any of `roots` (a root that does
+/// not exist yet counts by its nearest existing parent)?
+pub fn shares_device(dir: &Path, roots: &[PathBuf]) -> bool {
+    // The disk seam fakes the whole disk, the shared device included.
+    if super::test_seams::test_seams().disk_free_bytes.is_some() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        unix::shares_device(dir, roots)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, roots);
+        false
     }
 }
 
@@ -784,8 +922,13 @@ mod unix {
         }
         #[allow(clippy::unnecessary_cast)]
         {
-            fs.f_type as i64 == TMPFS_MAGIC
+            is_tmpfs_type(fs.f_type as i64)
         }
+    }
+
+    /// Pure: is this the `f_type` of a tmpfs?
+    pub(super) fn is_tmpfs_type(f_type: i64) -> bool {
+        f_type == TMPFS_MAGIC
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -944,6 +1087,7 @@ mod tests {
             per_upload: Some(3 * GIB),
             total_multipart: Some(4 * GIB),
             max_object_size: BytesOrAuto::Bytes(2 * GIB),
+            ..auto()
         };
         let (l, w) = derive_limits(facts(100 * GIB), ex);
         assert_eq!(
@@ -1003,7 +1147,9 @@ mod tests {
         f.total = 0;
         assert!(derive_limits(f, ex(500 * GIB)).1.is_empty());
 
-        // An upload limit above half of the budget.
+        // An explicit max_object_size above the multipart limit. The total
+        // is derived (5 GiB), the per-upload limit explicit (6 GiB): the
+        // lower one is named.
         let ex = ExplicitLimits {
             spool: SpoolSetting::Bytes(10 * GIB),
             per_upload: Some(6 * GIB),
@@ -1011,17 +1157,249 @@ mod tests {
             ..auto()
         };
         let w = derive_limits(facts(100 * GIB), ex).1;
-        assert_eq!(w.len(), 2, "{w:?}");
-        let text: Vec<_> = w.iter().map(|w| w.message(dir)).collect();
-        assert!(text[0].contains("DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES") && text[0].contains("6 GiB"));
-        assert!(text[1].contains("max_object_size") && text[1].contains("5 GiB"));
-        // Exactly half is fine.
+        assert_eq!(w.len(), 1, "{w:?}");
+        let m = w[0].message(dir);
+        assert!(
+            m.contains("DGP_MAX_TOTAL_MULTIPART_BYTES") && m.contains("5 GiB"),
+            "{m}"
+        );
+        // Explicit against explicit: the per-upload limit is the lower one.
+        let ex = ExplicitLimits {
+            spool: SpoolSetting::Bytes(100 * GIB),
+            per_upload: Some(6 * GIB),
+            total_multipart: Some(9 * GIB),
+            max_object_size: BytesOrAuto::Bytes(8 * GIB),
+            ..auto()
+        };
+        let w = derive_limits(facts(500 * GIB), ex).1;
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0]
+            .message(dir)
+            .contains("DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES"));
+        // Exactly the limit is fine, and a zero (no cap) is no limit.
         let ex = ExplicitLimits {
             spool: SpoolSetting::Bytes(10 * GIB),
             max_object_size: BytesOrAuto::Bytes(5 * GIB),
             ..auto()
         };
         assert!(derive_limits(facts(100 * GIB), ex).1.is_empty());
+        let ex = ExplicitLimits {
+            spool: SpoolSetting::Bytes(10 * GIB),
+            per_upload: Some(0),
+            total_multipart: Some(0),
+            max_object_size: BytesOrAuto::Bytes(50 * GIB),
+            ..auto()
+        };
+        assert!(derive_limits(facts(100 * GIB), ex).1.is_empty());
+
+        // A filesystem backend that came onto the spool's device after the
+        // boot: a warning, and the budget does not move.
+        let ex = ExplicitLimits {
+            shares_device_now: true,
+            ..auto()
+        };
+        let (l, w) = derive_limits(facts(60 * GIB), ex);
+        assert_eq!(l.spool_budget, 30 * GIB);
+        assert_eq!(w, vec![LimitWarning::ShareChangesAtRestart]);
+        let m = w[0].message(dir);
+        assert!(
+            m.contains("next start") && m.contains("/var/spool/dgp"),
+            "{m}"
+        );
+        // Not when the boot already saw the shared device, or when the
+        // budget is not auto.
+        let mut shared = facts(60 * GIB);
+        shared.shares_device_with_data = true;
+        assert!(derive_limits(shared, ex).1.is_empty());
+        let fixed = ExplicitLimits {
+            spool: SpoolSetting::Bytes(10 * GIB),
+            ..ex
+        };
+        assert!(derive_limits(facts(60 * GIB), fixed).1.is_empty());
+    }
+
+    /// An auto `max_object_size` is the lowest bound: with an S3 backend it
+    /// is at most 5 GiB (one backend PUT), explicit multipart limits count,
+    /// and a filesystem-only deployment has no 5 GiB cap.
+    #[test]
+    fn auto_max_object_size_is_the_lowest_bound() {
+        let s3 = ExplicitLimits {
+            s3_backend: true,
+            ..auto()
+        };
+        let (l, _) = derive_limits(facts(60 * GIB), s3);
+        assert_eq!(l.max_object_size, 5 * GIB);
+        assert_eq!(l.max_object_size_bound, ObjectSizeBound::S3SinglePut);
+        let (l, _) = derive_limits(facts(60 * GIB), auto());
+        assert_eq!(l.max_object_size, 15 * GIB);
+        assert_eq!(l.max_object_size_bound, ObjectSizeBound::PerUpload);
+        // Below 5 GiB the budget decides, S3 or not.
+        let (l, _) = derive_limits(facts(4 * GIB), s3);
+        assert_eq!(l.max_object_size, GIB);
+        // An explicit total below the per-upload limit.
+        let ex = ExplicitLimits {
+            total_multipart: Some(2 * GIB),
+            ..auto()
+        };
+        let (l, _) = derive_limits(facts(60 * GIB), ex);
+        assert_eq!(l.max_object_size, 2 * GIB);
+        assert_eq!(l.max_object_size_bound, ObjectSizeBound::TotalMultipart);
+        // An explicit per-upload limit below the total.
+        let ex = ExplicitLimits {
+            per_upload: Some(GIB),
+            ..auto()
+        };
+        let (l, _) = derive_limits(facts(60 * GIB), ex);
+        assert_eq!(l.max_object_size, GIB);
+        // A total of 0 admits no multipart part; it does not limit a PUT.
+        let ex = ExplicitLimits {
+            total_multipart: Some(0),
+            ..auto()
+        };
+        assert_eq!(
+            derive_limits(facts(60 * GIB), ex).0.max_object_size,
+            15 * GIB
+        );
+        // The delta ceiling is a third of the budget.
+        assert_eq!(
+            derive_limits(facts(60 * GIB), auto()).0.delta_ceiling,
+            10 * GIB
+        );
+    }
+
+    #[test]
+    fn an_invalid_spool_setting_is_auto_and_says_so() {
+        assert_eq!(parse_spool_setting(None), (SpoolSetting::Auto, None));
+        assert_eq!(
+            parse_spool_setting(Some("40%")),
+            (SpoolSetting::Percent(40), None)
+        );
+        let (s, bad) = parse_spool_setting(Some("16GB"));
+        assert_eq!((s, bad.as_deref()), (SpoolSetting::Auto, Some("16GB")));
+        let m = invalid_spool_message("16GB");
+        for needle in ["16GB", "auto", "40%", "bytes"] {
+            assert!(m.contains(needle), "{needle} in {m}");
+        }
+        // `limits` shows the source, and the warning leads the list.
+        let (effective, warnings) = derive_limits(facts(60 * GIB), auto());
+        let r = ResolvedLimits {
+            effective,
+            warnings,
+            dir: "/spool".into(),
+            facts: facts(60 * GIB),
+            env_set: vec![],
+            spool_invalid: Some("16GB".into()),
+        };
+        assert_eq!(r.report().spool_budget.source, "invalid-auto");
+        assert!(r.warning_messages()[0].contains("16GB"));
+        let ok = ResolvedLimits {
+            spool_invalid: None,
+            ..r
+        };
+        assert_eq!(ok.report().spool_budget.source, "auto");
+    }
+
+    // ── The I/O half, on a temp dir and an injected environment ──
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn kubernetes_is_read_from_the_injected_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let k8s = |n: &str| (n == "KUBERNETES_SERVICE_HOST").then(|| "10.0.0.1".to_string());
+        assert!(measure_disk_facts(dir.path(), &[], &k8s).in_kubernetes);
+        assert!(!measure_disk_facts(dir.path(), &[], &no_env).in_kubernetes);
+        let empty = |n: &str| (n == "KUBERNETES_SERVICE_HOST").then(String::new);
+        assert!(!measure_disk_facts(dir.path(), &[], &empty).in_kubernetes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tmpfs_is_known_by_its_f_type() {
+        assert!(unix::is_tmpfs_type(0x0102_1994));
+        assert!(!unix::is_tmpfs_type(0));
+        assert!(!unix::is_tmpfs_type(0xEF53)); // ext4
+                                               // The real call: /dev/shm is a tmpfs on Linux, the temp dir of a
+                                               // test is whatever the host has.
+        #[cfg(target_os = "linux")]
+        if let Some(shm) = Path::new("/dev/shm")
+            .exists()
+            .then(|| PathBuf::from("/dev/shm"))
+        {
+            let (_, _, tmpfs) = unix::statvfs_facts(&shm).unwrap();
+            assert!(tmpfs, "/dev/shm is a tmpfs");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_on_the_same_device_shares_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        std::fs::create_dir(&spool).unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        assert!(shares_device(&spool, std::slice::from_ref(&data)));
+        // A root that does not exist yet counts by its nearest parent.
+        assert!(shares_device(&spool, &[data.join("a/b/not-yet")]));
+        assert!(!shares_device(&spool, &[]));
+        let facts = measure_disk_facts(&spool, &[data], &no_env);
+        assert!(facts.shares_device_with_data);
+        assert!(!measure_disk_facts(&spool, &[], &no_env).shares_device_with_data);
+        // A different device: /dev/shm against the (usually not tmpfs)
+        // temp dir, when both exist and differ.
+        use std::os::unix::fs::MetadataExt as _;
+        let shm = PathBuf::from("/dev/shm");
+        if shm.exists()
+            && std::fs::metadata(&shm).unwrap().dev() != std::fs::metadata(&spool).unwrap().dev()
+        {
+            assert!(!shares_device(&spool, &[shm]));
+        }
+    }
+
+    #[test]
+    fn the_measure_counts_the_spool_files_that_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), vec![0u8; 3 * MIB as usize]).unwrap();
+        std::fs::write(dir.path().join("b"), vec![0u8; MIB as usize]).unwrap();
+        let facts = measure_disk_facts(dir.path(), &[], &no_env);
+        assert_eq!(facts.own_spool_bytes, 4 * MIB);
+        assert!(facts.measured());
+        assert!(facts.free > 0 && facts.total >= facts.free);
+    }
+
+    /// The spool sweeps its directory BEFORE it measures: a stale file does
+    /// not count as the proxy's own space (it is gone), a fresh one does.
+    #[cfg(unix)]
+    #[test]
+    fn the_spool_measures_after_its_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("spool");
+        std::fs::create_dir(&root).unwrap();
+        let stale = root.join("stale");
+        std::fs::write(&stale, vec![0u8; 4 * MIB as usize]).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::write(root.join("fresh"), vec![0u8; 2 * MIB as usize]).unwrap();
+        let pool = crate::deltaglider::spool::SpoolDir::build(
+            root.clone(),
+            SpoolSetting::Auto,
+            None,
+            75,
+            &[],
+            &no_env,
+        )
+        .unwrap();
+        assert!(!stale.exists(), "the stale file was swept");
+        let boot = pool.boot().expect("a measured spool");
+        assert_eq!(boot.facts.own_spool_bytes, 2 * MIB);
     }
 
     /// The Helm chart and the operator set `DGP_SPOOL_MAX_BYTES` to three
@@ -1055,6 +1433,7 @@ mod tests {
             dir: "/spool".into(),
             facts: facts(60 * GIB),
             budget_note: String::new(),
+            spool_invalid: None,
         };
         let env = |_: &str| None;
         let mut c = Config::default();
@@ -1157,15 +1536,20 @@ mod tests {
                 Just(BytesOrAuto::Auto),
                 (0u64..(1u64 << 45)).prop_map(BytesOrAuto::Bytes)
             ],
+            proptest::bool::ANY,
         )
-            .prop_map(|(spool, per_upload, total_multipart, max_object_size)| {
-                ExplicitLimits {
-                    spool,
-                    per_upload,
-                    total_multipart,
-                    max_object_size,
-                }
-            })
+            .prop_map(
+                |(spool, per_upload, total_multipart, max_object_size, s3_backend)| {
+                    ExplicitLimits {
+                        spool,
+                        per_upload,
+                        total_multipart,
+                        max_object_size,
+                        s3_backend,
+                        shares_device_now: false,
+                    }
+                },
+            )
     }
 
     proptest! {
@@ -1209,17 +1593,36 @@ mod tests {
             prop_assert!(l.spool_budget <= f.available().max(SPOOL_FLOOR_BYTES));
         }
 
-        /// A warning is never missing for an explicit per-upload or object
-        /// limit above half of the budget, and never present for one at or
-        /// below it.
+        /// The warning for an explicit `max_object_size` above what a
+        /// multipart upload can hold is exact: present when the value is
+        /// above the lowest non-zero of the per-upload limit and the total
+        /// (explicit or derived), absent otherwise.
         #[test]
-        fn the_half_budget_warning_is_exact(f in arb_facts(), ex in arb_explicit()) {
+        fn the_multipart_limit_warning_is_exact(f in arb_facts(), ex in arb_explicit()) {
             let (l, w) = derive_limits(f, ex);
-            let has = |which| w.iter().any(|x| matches!(x, LimitWarning::UploadAboveHalfBudget { which: k, .. } if *k == which));
-            prop_assert_eq!(has(UploadLimit::PerUpload),
-                ex.per_upload.is_some() && l.per_upload > l.spool_budget / 2);
-            prop_assert_eq!(has(UploadLimit::MaxObjectSize),
-                matches!(ex.max_object_size, BytesOrAuto::Bytes(_)) && l.max_object_size > l.spool_budget / 2);
+            let has = w.iter().any(|x| matches!(x, LimitWarning::ObjectSizeAboveMultipartLimit { .. }));
+            let lowest = [l.per_upload, l.total_multipart].into_iter().filter(|n| *n != 0).min();
+            let expect = matches!(ex.max_object_size, BytesOrAuto::Bytes(_))
+                && lowest.is_some_and(|m| l.max_object_size > m);
+            prop_assert_eq!(has, expect);
+        }
+
+        /// An auto `max_object_size` is at most every non-zero multipart
+        /// limit, explicit or derived, and at most 5 GiB when an S3 backend
+        /// exists.
+        #[test]
+        fn auto_max_object_size_respects_every_bound(f in arb_facts(), ex in arb_explicit()) {
+            let ex = ExplicitLimits { max_object_size: BytesOrAuto::Auto, ..ex };
+            let (l, _) = derive_limits(f, ex);
+            for bound in [l.per_upload, l.total_multipart] {
+                if bound != 0 {
+                    prop_assert!(l.max_object_size <= bound);
+                }
+            }
+            if ex.s3_backend {
+                prop_assert!(l.max_object_size <= S3_SINGLE_PUT_MAX_BYTES);
+            }
+            prop_assert_eq!(l.delta_ceiling, l.spool_budget / 3);
         }
     }
 }

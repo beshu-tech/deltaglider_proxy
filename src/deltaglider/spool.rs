@@ -30,8 +30,10 @@ use tempfile::NamedTempFile;
 pub struct BootLimits {
     pub dir: PathBuf,
     pub facts: crate::config::limits::DiskFacts,
-    /// How the budget was found (for a log line and a 413 message).
+    /// How the budget was found (for a log line and an EntityTooLarge message).
     pub budget_note: String,
+    /// The text of `DGP_SPOOL_MAX_BYTES` when it did not parse.
+    pub spool_invalid: Option<String>,
 }
 
 static SHARED: std::sync::OnceLock<SpoolDir> = std::sync::OnceLock::new();
@@ -43,7 +45,7 @@ static SHARED: std::sync::OnceLock<SpoolDir> = std::sync::OnceLock::new();
 static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// How the budget of the process-wide spool was found (`auto: 50% of 46 GiB
-/// free on /tmp/dgp-spool at boot`, `set explicitly`), for a 413 message. Does
+/// free on /tmp/dgp-spool at boot`, `set explicitly`), for an EntityTooLarge message. Does
 /// not create the spool.
 pub fn shared_budget_note() -> String {
     SHARED
@@ -164,12 +166,37 @@ impl SpoolDir {
         let dir = crate::config::process_env_os("DGP_SPOOL_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("dgp-spool"));
-        let setting: crate::config::limits::SpoolSetting =
-            crate::config::env_parse("DGP_SPOOL_MAX_BYTES").unwrap_or_default();
+        let (setting, invalid) = crate::config::limits::parse_spool_setting(
+            crate::config::process_env("DGP_SPOOL_MAX_BYTES").as_deref(),
+        );
+        if let Some(raw) = &invalid {
+            tracing::warn!("{}", crate::config::limits::invalid_spool_message(raw));
+        }
         let share: u8 = crate::config::env_parse_with_default(
             "DGP_BACKEND_SHARE_PERCENT",
             crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT,
         );
+        Self::build(
+            dir,
+            setting,
+            invalid,
+            share,
+            data_roots,
+            &crate::config::process_env,
+        )
+    }
+
+    /// [`Self::from_env`] with its inputs given: create and sweep the
+    /// directory, THEN measure its disk (the files that stay count as free),
+    /// derive the budget, and build the pool.
+    pub(crate) fn build(
+        dir: PathBuf,
+        setting: crate::config::limits::SpoolSetting,
+        invalid: Option<String>,
+        share: u8,
+        data_roots: &[PathBuf],
+        env: crate::config::EnvLookup,
+    ) -> std::io::Result<Self> {
         let unusable = |e: std::io::Error| {
             std::io::Error::new(
                 e.kind(),
@@ -182,11 +209,7 @@ impl SpoolDir {
         };
         // Create and sweep first: the budget counts what stays.
         Self::new(dir.clone(), 0).map_err(unusable)?.sweep_orphans();
-        let facts = crate::config::limits::measure_disk_facts(
-            &dir,
-            data_roots,
-            &crate::config::process_env,
-        );
+        let facts = crate::config::limits::measure_disk_facts(&dir, data_roots, env);
         let (effective, _warnings) = crate::config::limits::derive_limits(
             facts,
             crate::config::limits::ExplicitLimits {
@@ -201,6 +224,7 @@ impl SpoolDir {
             budget_note: effective.spool_note(&dir),
             dir,
             facts,
+            spool_invalid: invalid,
         }));
         Ok(pool)
     }

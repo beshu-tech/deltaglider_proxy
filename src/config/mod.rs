@@ -1599,7 +1599,13 @@ impl Config {
             .copied()
             .filter(|v| env(v).is_some())
             .collect();
+        let s3_backend = self.has_s3_backend();
+        let roots = self.filesystem_roots();
         self.tuning.limits = boot.map(|boot| {
+            // The disk facts are those of the boot. Only this is asked
+            // again: did a filesystem backend come onto the spool's device?
+            let shares_device_now =
+                !boot.facts.shares_device_with_data && limits::shares_device(&boot.dir, &roots);
             let (effective, warnings) = limits::derive_limits(
                 boot.facts,
                 limits::ExplicitLimits {
@@ -1607,14 +1613,23 @@ impl Config {
                     per_upload: self.tuning.multipart_relay_upload_max,
                     total_multipart: self.tuning.multipart_total_max,
                     max_object_size: self.max_object_size,
+                    s3_backend,
+                    shares_device_now,
                 },
             );
+            if warnings.contains(&limits::LimitWarning::ShareChangesAtRestart) {
+                tracing::warn!(
+                    "[limits] {}",
+                    limits::LimitWarning::ShareChangesAtRestart.message(&boot.dir)
+                );
+            }
             limits::ResolvedLimits {
                 effective,
                 warnings,
                 dir: boot.dir,
                 facts: boot.facts,
                 env_set,
+                spool_invalid: boot.spool_invalid,
             }
         });
     }
@@ -2338,6 +2353,15 @@ impl Config {
                 .map(|b| (b.name.as_str(), &b.backend))
                 .collect()
         }
+    }
+
+    /// Does any configured backend (see [`Self::effective_backends`]) use S3?
+    /// An S3 backend stores a client object with ONE PUT request, which takes
+    /// at most 5 GiB.
+    pub fn has_s3_backend(&self) -> bool {
+        self.effective_backends()
+            .iter()
+            .any(|(_, b)| matches!(b, BackendConfig::S3 { .. }))
     }
 
     /// The root folder of every filesystem backend that runs (see

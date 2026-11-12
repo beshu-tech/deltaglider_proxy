@@ -105,14 +105,14 @@ Mitigation without operator access: the embedded uploader uploads one file at a 
 
 The proxy reserves memory or spool space for an upload body before it reads the body, so the request must declare the length of its body. A `PutObject` request declares it in `Content-Length`, or in `x-amz-decoded-content-length` for an aws-chunked body. A request that sends its body with plain `Transfer-Encoding: chunked` declares neither, so it gets `411 MissingContentLength`, as on S3. A browser form upload must send `Content-Length` too. The AWS SDKs and the usual S3 tools always send the length, so check the client that sends the request, for example a script that streams from a pipe without a known size.
 
-## Uploads fail with 413 EntityTooLarge that names a spool setting
+## Uploads fail with 400 EntityTooLarge that names a spool setting
 
 The message of the error names the limit and how to raise it:
 
 - **`DGP_SPOOL_MAX_BYTES`.** The declared size of the upload is larger than the whole spool budget, so the proxy could never hold the body in a spool file. In a bucket that the proxy encrypts, the body and its encrypted copy must fit together, so the largest upload there is about half of the budget, and the message names the encryption. The message says whether the budget is auto-derived and from what (for example `auto: 50% of 46 GiB free on /var/spool/dgp at boot`). Raise `DGP_SPOOL_MAX_BYTES`, and make sure that `DGP_SPOOL_DIR` has that much free space. With `auto`, free disk space and restart the proxy, or move `DGP_SPOOL_DIR` to a larger disk.
 - **`DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`.** A multipart upload went past the spool space that one upload may hold, which is half of the effective spool budget by default. The message says whether the limit is auto-derived. Raise `DGP_SPOOL_MAX_BYTES`, or set `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`.
 
-A `413 EntityTooLarge` without such a name comes from `max_object_size`, or from the S3 part limit of 5 GiB for one multipart part.
+A `400 EntityTooLarge` without such a name comes from `max_object_size`, or from the S3 part limit of 5 GiB for one multipart part.
 
 ## 503 SlowDown on PUT
 

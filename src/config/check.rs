@@ -175,16 +175,18 @@ impl Config {
             if max_object_size == 0 {
                 warnings.push("max_object_size=0 will reject all uploads".to_string());
             }
-            // A PUT body is held in memory (its signature is checked over it),
-            // then stored with ONE backend request, and S3 stores at most 5 GiB
-            // in one request: a larger body is buffered only to be refused.
-            const SINGLE_PUT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-            if max_object_size > SINGLE_PUT_MAX_BYTES {
+            // The proxy stores a client object, also a multipart object,
+            // with ONE backend request, and S3 stores at most 5 GiB in one
+            // request. A larger body goes to a spool file and is then
+            // refused by the backend.
+            const SINGLE_PUT_MAX_BYTES: u64 = limits::S3_SINGLE_PUT_MAX_BYTES;
+            if max_object_size > SINGLE_PUT_MAX_BYTES && self.has_s3_backend() {
                 warnings.push(format!(
                     "max_object_size={max_object_size} is above 5 GiB ({SINGLE_PUT_MAX_BYTES} bytes), the most \
-                     that an S3 backend stores with one PUT request: the proxy holds such a body \
-                     in memory and then the backend refuses it. Set it to 5 GiB or less; larger \
-                     objects arrive as multipart uploads"
+                     that an S3 backend stores with one PUT request. The proxy stores a multipart \
+                     object with one backend PUT too, so a multipart object is limited to 5 GiB as \
+                     well. A larger body is read into a spool file (and fills the spool) and then \
+                     the backend refuses it. Set max_object_size to 5 GiB or less, or to auto"
                 ));
             }
         }
@@ -790,6 +792,15 @@ mod object_size_tests {
         let warns = |size: u64| {
             let mut c = Config {
                 max_object_size: limits::BytesOrAuto::Bytes(size),
+                backend: BackendConfig::S3 {
+                    endpoint: Some("https://s3.example".into()),
+                    region: "us-east-1".into(),
+                    force_path_style: true,
+                    allow_local: false,
+                    access_key_id: None,
+                    secret_access_key: None,
+                    session_token: None,
+                },
                 ..Config::default()
             };
             c.check()
@@ -799,6 +810,13 @@ mod object_size_tests {
         assert!(warns(5 * GIB + 1));
         assert!(!warns(5 * GIB));
         assert!(!warns(Config::default().max_object_size_bytes()));
+        // A filesystem-only deployment has no 5 GiB limit.
+        let mut fs = Config {
+            max_object_size: limits::BytesOrAuto::Bytes(50 * GIB),
+            ..Config::default()
+        };
+        assert!(!fs.has_s3_backend());
+        assert!(!fs.check().iter().any(|w| w.contains("5 GiB")));
     }
 
     /// An `auto` value is never an operator's choice: no 5 GiB warning,
@@ -821,6 +839,7 @@ mod object_size_tests {
             dir: "/spool".into(),
             facts,
             env_set: vec![],
+            spool_invalid: None,
         });
         assert!(c.max_object_size_bytes() > 5 * limits::GIB);
         assert!(!c.check().iter().any(|w| w.contains("5 GiB")));
@@ -853,6 +872,7 @@ mod object_size_tests {
             dir: "/spool".into(),
             facts,
             env_set: vec![],
+            spool_invalid: None,
         });
         assert!(c
             .check()

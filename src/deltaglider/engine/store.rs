@@ -2823,6 +2823,76 @@ mod spool_budget_tests {
     }
 }
 
+/// The delta ceiling of a spool budget (`config::limits::delta_ceiling`):
+/// the streaming encode holds the body, the reference and the delta output
+/// in the spool at once, so an object above a third of the budget is stored
+/// whole with the reason `delta-unavailable`. The formula in the limits
+/// module comes from this measure.
+#[cfg(test)]
+mod delta_ceiling_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::storage::FilesystemBackend;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Store a baseline and then a near copy of `size` bytes; the second
+    /// object's storage form and passthrough reason.
+    async fn second_put(budget: u64, size: u64) -> (bool, Option<String>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().join("data"))
+            .await
+            .unwrap();
+        backend.create_bucket("b").await.unwrap();
+        let mut engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        engine.spool = Arc::new(
+            crate::deltaglider::spool::SpoolDir::new(tmp.path().join("spool"), budget).unwrap(),
+        );
+        let v1: Vec<u8> = (0..size as u32)
+            .map(|n| (n.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let mut v2 = v1.clone();
+        v2[size as usize / 2..size as usize / 2 + 100].fill(0xAB);
+        for (key, data) in [("rel/a.zip", &v1), ("rel/b.zip", &v2)] {
+            let body = engine.spool_acquire(data.len() as u64).await.unwrap();
+            tokio::fs::write(body.path(), data).await.unwrap();
+            let lock = engine.lock_object_write("b", key).await;
+            engine
+                .store_spooled_delta(
+                    &lock,
+                    "b",
+                    key,
+                    &body,
+                    data.len() as u64,
+                    None,
+                    HashMap::new(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let meta = engine.head("b", "rel/b.zip").await.unwrap();
+        (
+            matches!(meta.storage_info, crate::types::StorageInfo::Delta { .. }),
+            meta.passthrough_reason,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_delta_ceiling_is_a_third_of_the_budget() {
+        let budget = 30 * MIB;
+        let ceiling = crate::config::limits::delta_ceiling(budget);
+        assert_eq!(ceiling, 10 * MIB);
+        let (delta, _) = second_put(budget, ceiling - MIB).await;
+        assert!(delta, "an object below the ceiling is a delta");
+        let (delta, reason) = second_put(budget, ceiling + 2 * MIB).await;
+        assert!(!delta, "an object above the ceiling is stored whole");
+        assert_eq!(reason.as_deref(), Some("delta-unavailable"));
+    }
+}
+
 /// Tier 4: a GET served from the metadata cache must not re-insert the entry
 /// (each insert restarts moka's TTL, so a hot key never expired).
 #[cfg(test)]

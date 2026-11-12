@@ -104,7 +104,7 @@ You can set all settings through environment variables:
 | `DGP_CONFIG_SYNC_BUCKET` | *(unset)* | S3 bucket for encrypted-DB multi-instance sync. Needs `DGP_CONFIG_DB_KEY` |
 | `DGP_TLS_ENABLED` | `false` | Enable HTTPS |
 | `DGP_SPOOL_DIR` | `/tmp/dgp-spool` | Scratch directory for upload bodies larger than 16 MiB, multipart parts and large delta files. Put it on a volume with room for your concurrent large uploads |
-| `DGP_SPOOL_MAX_BYTES` | `auto` | Byte budget of the spool: `auto` (50% of the free space of the spool directory at start), a percent such as `40%`, or bytes. A larger upload gets `413`, and one multipart object can hold at most half of it |
+| `DGP_SPOOL_MAX_BYTES` | `auto` | Byte budget of the spool: `auto` (50% of the free space of the spool directory at start), a percent such as `40%`, or bytes. A larger upload gets `400 EntityTooLarge`, and one multipart object can hold at most half of it |
 
 Or mount a YAML config file:
 

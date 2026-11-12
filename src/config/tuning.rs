@@ -200,7 +200,7 @@ impl RuntimeTuning {
             },
             spool_threshold_bytes: lookup_parse(env, "DGP_SPOOL_THRESHOLD_BYTES"),
             spool_acquire_timeout_secs: parse_or("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", 120).max(1),
-            spool_max: lookup_parse(env, "DGP_SPOOL_MAX_BYTES").unwrap_or_default(),
+            spool_max: super::limits::parse_spool_setting(env("DGP_SPOOL_MAX_BYTES").as_deref()).0,
             multipart_relay_upload_max: lookup_parse(env, "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES"),
             multipart_total_max: lookup_parse(env, "DGP_MAX_TOTAL_MULTIPART_BYTES"),
             limits: None,
@@ -301,10 +301,6 @@ mod tests {
             Zero::Meaningful("every body takes the spool path"),
         ),
         ("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", Zero::Floor1),
-        (
-            "DGP_SPOOL_MAX_BYTES",
-            Zero::Meaningful("the spool admits no body"),
-        ),
         (
             "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
             Zero::Meaningful("no cap for one multipart upload"),
