@@ -163,7 +163,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
       declarative.rs         Declarative-mode reconciler (diff_iam → apply_iam_reconcile)
       external_auth/         OAuth/OIDC providers (Google, generic OIDC)
   → config_db/              Encrypted SQLCipher DB (users.rs, groups.rs, auth_providers.rs, declarative.rs; `classify_sqlite_error` pure fn in mod.rs)
-  → config_db_sync.rs       Multi-instance IAM sync via S3 (DGP_CONFIG_SYNC_BUCKET). Hosts `reopen_and_rebuild_iam` (shared by startup, periodic poller, and `POST /api/admin/config/sync-now`)
+  → config_db_sync.rs       Multi-instance IAM sync via S3 (DGP_CONFIG_SYNC_BUCKET). Hosts `reopen_and_rebuild_iam` (shared by startup, periodic poller, and `POST /api/admin/config/sync-now`); `open_live_db` takes the `DataDirLock` (a re-encrypt replaces the DB file, so it runs only under the state lock; `--set-bootstrap-password` refuses while a server runs; guard `rekey_has_no_caller_outside_a_lock_holder`)
   → event_outbox.rs         Durable object-event outbox: handlers append facts after successful mutations (never block S3 path)
   → event_delivery.rs       Background dispatcher: claims due outbox rows, delivers as webhook JSON or Slack message; disabled unless advanced.event_delivery.enabled + a target; `drain_outbox` claims batches per tick while they come back full (budget = one tick; stops on a mostly-failed batch), raw posts ≤8 at once (one object's posts in order), Slack 1 at a time
   → slack_format.rs         PURE Slack Block Kit formatter + notification filter for event_delivery format=slack
@@ -191,7 +191,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             (SIGTERM → `shutdown::begin()`) = ShuttingDown: record_failure refuses, `after_run` never
                             settles/unwinds any Err while shutting down, row released to `queued` for an instant resume), paged.rs (`paged_phase`: THE paged loop — pager, poison restart,
                             persist, heartbeat, cancel, shutdown — used by reencrypt, backfill, migrate copy/verify/prune; migrate can
-                            persist only with a `Flushed` proof from `flush_copies`), migrate.rs (kind=migrate: stage→copy→verify→
+                            persist only with a `Flushed` proof from `flush_copies`, and its flip and cleanup need the `Durable` proof that only a successful FULL save makes; a failed save stops the phase with `Deferred`), migrate.rs (kind=migrate: stage→copy→verify→
                             flip→cleanup, transient __dgmigrate_* routes — gated from creation, filtered out of all bucket listings, cleared at
                             flip; pre-flip cancel unwind; cleanup re-checks routed_to_target PER SWEEP; cancel-in-cleanup settles completed with
                             a note), backfill.rs (kind=backfill-metadata: stamp canonical DG metadata onto foreign/pre-proxy passthrough objects

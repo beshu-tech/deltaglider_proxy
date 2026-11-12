@@ -3921,6 +3921,60 @@ mod source_guards {
         );
     }
 
+    /// A re-encrypt replaces the DB file, so it runs only in a process that
+    /// holds the state directory lock (a running server keeps its handle on
+    /// the old file and would lose every later write). The type carries the
+    /// rule where it can: `open_live_db` takes the `DataDirLock`. This guard
+    /// names the files that may call each way into a re-encrypt, so a new
+    /// caller (a CLI path) has to be added here on purpose, with its lock.
+    #[test]
+    fn rekey_has_no_caller_outside_a_lock_holder() {
+        // (call, files that may contain it outside tests)
+        const CALLERS: &[(&str, &[&str])] = &[
+            // The re-encrypt itself and the opens that reach it.
+            ("rekey_file(", &["src/config_db/mod.rs"]),
+            ("rekey_file_hooked(", &["src/config_db/mod.rs"]),
+            (
+                "open_keyed(",
+                &["src/config_db/mod.rs", "src/config_db/jobs_db.rs"],
+            ),
+            // The config DB opens: the sync download (a running server, which
+            // holds the lock) and `open_live_db`.
+            (
+                "open_with_keys(",
+                &["src/config_db/mod.rs", "src/config_db_sync.rs"],
+            ),
+            // Boot, the recovery promotion and `--set-bootstrap-password`,
+            // each with the lock as an argument (the compiler checks that).
+            (
+                "open_live_db(",
+                &["src/config_db_sync.rs", "src/startup.rs"],
+            ),
+        ];
+        for (call, allowed) in CALLERS {
+            let name = call.trim_end_matches('(');
+            let mut found = 0;
+            for src in crate::source_scan::ast::src() {
+                let calls = src.prod.calls_named(name).count();
+                if calls == 0 {
+                    continue;
+                }
+                found += calls;
+                assert!(
+                    allowed.contains(&src.rel.as_str()),
+                    "{}: `{call}` outside the files that hold the state directory lock \
+                     ({allowed:?}). A re-encrypt must run under the lock, and refuse while \
+                     a server runs.",
+                    src.rel
+                );
+            }
+            assert!(
+                found > 0,
+                "`{call}` has no caller left: drop it from CALLERS"
+            );
+        }
+    }
+
     #[test]
     fn request_path_reads_no_env() {
         // A file of the request path that reads the environment on purpose

@@ -1625,6 +1625,29 @@ pub(crate) async fn persist(
     }
 }
 
+/// Proof that the job's row is durable at the phase that the holder of the
+/// proof is about to run. Only a successful [`persist_flushed`] makes one,
+/// or [`Durable::of_stored_row`] for a row that was read back from the
+/// database (what a restart reads is, by definition, what is stored). The
+/// flip of a migrate and its source cleanup take one: a save that failed
+/// leaves no proof, so a failed save stops the job before the flip or the
+/// delete and never after it.
+#[derive(Debug)]
+pub(crate) struct Durable(());
+
+impl Durable {
+    /// The row `job` was read from the database: its phase is stored.
+    pub(crate) fn of_stored_row(_job: &MaintenanceJob) -> Self {
+        Durable(())
+    }
+
+    /// A proof for a test that has no row.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Durable(())
+    }
+}
+
 /// [`persist`] for a phase that writes without the per-object fsync: only
 /// a [`super::migrate::Flushed`] (made by a successful flush) opens it, so
 /// a saved cursor never points past a copy that a crash can lose.
@@ -1634,6 +1657,11 @@ pub(crate) async fn persist(
 /// earlier phase, with the YAML already flipped, would let a cancel or a
 /// failure of the resumed job unwind (delete) the live data on the target.
 /// One fsync per page or phase costs nothing next to the page's copies.
+///
+/// A save that fails (the disk is full, the file is read-only) stops the
+/// phase with [`PhaseStop::Deferred`]: the row stays in its last stored
+/// phase and the job runs again later. It is not `Failed`: after the flip a
+/// failed job unwinds, which would delete the live data on the target.
 pub(crate) async fn persist_flushed(
     _proof: super::migrate::Flushed,
     db: &Arc<Mutex<JobsDb>>,
@@ -1641,16 +1669,21 @@ pub(crate) async fn persist_flushed(
     phase: &str,
     c: &Counters,
     token: Option<&str>,
-) {
+) -> Result<Durable, PhaseStop> {
     let db = db.lock().await;
-    if let Err(e) = db.maintenance_update_progress_durable(
+    db.maintenance_update_progress_durable(
         job.id, phase, c.total, c.done, c.skipped, c.failed, c.bytes, token,
-    ) {
+    )
+    .map_err(|e| {
         warn!(
             "maintenance: durable progress persist failed for job #{}: {}",
             job.id, e
         );
-    }
+        PhaseStop::Deferred(format!(
+            "the job's progress could not be saved durably (phase '{phase}'): {e}"
+        ))
+    })?;
+    Ok(Durable(()))
 }
 
 /// The job's lease keeper. The per-page `heartbeat` is not enough on its

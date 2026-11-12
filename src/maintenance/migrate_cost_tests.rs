@@ -153,7 +153,7 @@ async fn verify_retries_a_transient_target_head_error() {
     e.fake.fail("HEAD", "t/run/k-037", 503, "SlowDown", 1);
     let c = Counters::default();
     let result = e.run().verify(&c).await;
-    assert_eq!(result, Ok(()), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     assert!(
         e.fake
             .requests()
@@ -330,7 +330,12 @@ async fn the_flip_marks_the_usage_row_for_a_recount() {
         params: &params,
         provenance: provenance_value(&params, job.id),
     };
-    m.flip(&Counters::default()).await.unwrap();
+    m.flip(
+        &Counters::default(),
+        crate::maintenance::worker::Durable::for_tests(),
+    )
+    .await
+    .unwrap();
     usage.flush_pending();
     let row = usage.read("b").unwrap().unwrap();
     assert_eq!(row.last_scan_at, None, "the row still reads as scanned");

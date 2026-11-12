@@ -65,6 +65,14 @@ impl ReplaySlot {
 /// Shared replay cache type: signature string -> its slot.
 pub type ReplayCache = Arc<DashMap<String, ReplaySlot>>;
 
+/// The text of the 503 that a locked node (no config DB key opens the config
+/// DB) answers to every S3 request. `/_/ready` answers 503 too, so a
+/// Kubernetes Service sends no traffic here: the text names the way to the
+/// recovery wizard that does not go through the Service.
+pub const CONFIG_DB_LOCKED_MESSAGE: &str = "Config database locked: no config DB key opens it. \
+Recover in the admin GUI at /_/ on this node. On Kubernetes this node is out of the Service, so \
+use `kubectl port-forward pod/<name> 9000:9000` and open http://localhost:9000/_/admin.";
+
 /// Drop every slot outside the replay window (the periodic sweep and the
 /// first pass of the inline prune).
 pub fn expire_replay_cache(cache: &ReplayCache, window: Duration, now: Instant) {
@@ -884,10 +892,10 @@ pub async fn sigv4_auth_middleware(
         AuthGateDecision::Locked => {
             // Clear 503 with a recovery hint — NOT a misleading 500.
             // The proxy must not serve data without working authentication.
-            return Err(crate::api::S3Error::ServiceUnavailable(
-                "Config database locked — recover via admin GUI (/_/).".into(),
-            )
-            .into_response());
+            return Err(
+                crate::api::S3Error::ServiceUnavailable(CONFIG_DB_LOCKED_MESSAGE.into())
+                    .into_response(),
+            );
         }
         // Open access (no auth configured / no IAM extension): pass through.
         AuthGateDecision::Open => {
@@ -1243,6 +1251,15 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuthHeader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 503 of a locked node says how to reach the wizard when the
+    /// Service sends no traffic to the node.
+    #[test]
+    fn the_locked_message_names_the_way_to_the_recovery_wizard() {
+        for part in ["Config database locked", "/_/", "kubectl port-forward"] {
+            assert!(CONFIG_DB_LOCKED_MESSAGE.contains(part), "{part}");
+        }
+    }
 
     /// A sealed slot first seen at `at` (a mutation that succeeded).
     fn sealed_at(at: Instant) -> ReplaySlot {

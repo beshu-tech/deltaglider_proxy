@@ -527,11 +527,12 @@ impl BackendHealthCache {
         let usable = if self.spool_check_running.swap(true, SeqCst) {
             false
         } else {
-            let running = Arc::clone(&self.spool_check_running);
+            // The guard clears the flag when the check ends, also when it
+            // panics: a flag that stays set would refuse every later probe.
+            let running = RunningFlag(Arc::clone(&self.spool_check_running));
             let task = tokio::task::spawn_blocking(move || {
-                let usable = check();
-                running.store(false, SeqCst);
-                usable
+                let _running = running;
+                check()
             });
             matches!(tokio::time::timeout(limit, task).await, Ok(Ok(true)))
         };
@@ -542,6 +543,16 @@ impl BackendHealthCache {
     /// Drop entries for backends no longer in the config (post-apply hygiene).
     pub fn retain_backends(&self, names: &std::collections::BTreeSet<String>) {
         self.entries.write().retain(|k, _| names.contains(k));
+    }
+}
+
+/// Clears the "spool check running" flag when dropped (see
+/// [`BackendHealthCache::spool_probe`]).
+struct RunningFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for RunningFlag {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1809,5 +1820,19 @@ mod spool_probe_tests {
         assert!(!usable);
         assert_eq!(runs.load(SeqCst), 1, "no second blocking call");
         drop(release);
+    }
+
+    /// A check that panics gives a failed verdict. The next round (after
+    /// the TTL) runs the check again and replaces it.
+    #[tokio::test]
+    async fn a_panicked_spool_check_fails_once_and_the_next_round_recovers() {
+        let cache = BackendHealthCache::default();
+        let usable = cache
+            .spool_probe(|| -> bool { panic!("probe bug") }, Duration::from_secs(5))
+            .await;
+        assert!(!usable, "a panic is a failed verdict");
+        *cache.spool_probe.lock().await = None;
+        let usable = cache.spool_probe(|| true, Duration::from_secs(5)).await;
+        assert!(usable, "the flag of the dead check does not stay set");
     }
 }

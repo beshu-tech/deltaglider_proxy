@@ -9,7 +9,8 @@
 //! folder and keeps it until it exits; the kernel drops it on a crash, so a
 //! stale file never blocks a restart. A second process waits a bounded time
 //! (`DGP_STATE_LOCK_WAIT_SECS`) for the first one to stop, then refuses to
-//! start.
+//! start. The holder writes its process id into the lock file, so the
+//! refusal can name it.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -86,7 +87,10 @@ pub fn acquire(
     let mut announced = false;
     loop {
         match classify(file.try_lock()) {
-            Attempt::Held => return Ok(DataDirLock { _file: file, path }),
+            Attempt::Held => {
+                write_holder(&file);
+                return Ok(DataDirLock { _file: file, path });
+            }
             Attempt::Unsupported => {
                 tracing::warn!(
                     "the file system of '{}' does not support file locks; this process cannot \
@@ -97,18 +101,7 @@ pub fn acquire(
             }
             Attempt::Failed(e) => return Err(format!("cannot lock '{}': {e}", path.display())),
             Attempt::Busy if Instant::now() >= deadline => {
-                return Err(format!(
-                    "another DeltaGlider Proxy process already uses the state directory '{}' \
-                     (lock file '{}'){}. Stop it first, or give this process its own directory \
-                     with DGP_CONFIG",
-                    dir.display(),
-                    path.display(),
-                    if wait.is_zero() {
-                        String::new()
-                    } else {
-                        format!(" and did not stop within {} s", wait.as_secs().max(1))
-                    }
-                ));
+                return Err(busy_message(dir, &path, wait));
             }
             Attempt::Busy => {
                 if !announced {
@@ -119,6 +112,47 @@ pub fn acquire(
             }
         }
     }
+}
+
+/// Record this process id in the lock file. Best effort: the lock does not
+/// depend on it, it only makes the refusal of a second process plainer.
+fn write_holder(file: &std::fs::File) {
+    use std::io::Write;
+    let mut file = file;
+    let _ = file.set_len(0);
+    let _ = writeln!(file, "pid {}", std::process::id());
+}
+
+/// The holder text of the lock file, when it has one.
+fn read_holder(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// The refusal text. Pure over its inputs and the lock file text. It names
+/// the directory, the holder (when known), what happened, and the fix: a
+/// deploy must stop the old process before it starts the new one.
+fn busy_message(dir: &Path, path: &Path, wait: Duration) -> String {
+    let holder = read_holder(path)
+        .map(|h| format!("; held by {h}"))
+        .unwrap_or_default();
+    let waited = if wait.is_zero() {
+        String::new()
+    } else {
+        format!(" and did not stop within {} s", wait.as_secs().max(1))
+    };
+    format!(
+        "another DeltaGlider Proxy process already uses the state directory '{}' \
+         (lock file '{}'{holder}){waited}. Two processes on one state directory are not allowed. \
+         Stop the old process before the new one starts: with Docker Compose run \
+         `docker compose down` first, and on Kubernetes set the Deployment `strategy` to \
+         `Recreate`. A rolling update works only when the old process stops within \
+         DGP_STATE_LOCK_WAIT_SECS: raise it, or stop the old process first. To run a second process, give it its own directory with \
+         DGP_CONFIG",
+        dir.display(),
+        path.display(),
+    )
 }
 
 #[cfg(all(test, unix))]
@@ -136,6 +170,24 @@ mod tests {
         assert!(err.contains(&dir.path().display().to_string()), "{err}");
         drop(first);
         acquire(dir.path(), NO_WAIT, || {}).expect("the lock is free after the holder drops");
+    }
+
+    #[test]
+    fn the_refusal_names_the_holder_and_the_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let _first = acquire(dir.path(), NO_WAIT, || {}).expect("first lock");
+        let err = acquire(dir.path(), NO_WAIT, || {}).expect_err("second lock must fail");
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "the holder is named: {err}"
+        );
+        for fix in [
+            "Stop the old process",
+            "Recreate",
+            "DGP_STATE_LOCK_WAIT_SECS",
+        ] {
+            assert!(err.contains(fix), "{fix}: {err}");
+        }
     }
 
     #[test]

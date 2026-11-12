@@ -1286,10 +1286,15 @@ pub fn park_upload(local_path: &std::path::Path) -> std::io::Result<()> {
 /// old key, so one upload is parked for the sync start, while the old key is
 /// still a fallback on the other nodes. `sync_enabled = false` parks nothing
 /// (no sync bucket).
+///
+/// The open can re-encrypt the file, and a running server keeps its own
+/// handle on the old file. So the caller must hold the state directory lock
+/// (`_state_lock` is that proof): no second process can swap the file.
 pub fn open_live_db(
     path: &std::path::Path,
     keys: &crate::config_db::ConfigDbKeys,
     sync_enabled: bool,
+    _state_lock: &crate::data_dir_lock::DataDirLock,
 ) -> Result<(ConfigDb, crate::config_db::OpenedWith), crate::config_db::ConfigDbError> {
     let (db, opened) = ConfigDb::open_with_keys(path, keys)?;
     if sync_enabled && matches!(opened, crate::config_db::OpenedWith::Migrated(_)) {
@@ -2084,14 +2089,16 @@ mod tests {
             .with_fallback(crate::config_db::FallbackKind::LegacyBootstrapHash, HASH);
         drop(ConfigDb::open_or_create(&db_path, HASH).unwrap());
         let marker = pending_marker_path(&db_path);
-        drop(open_live_db(&db_path, &keys, true).unwrap());
+        let lock = crate::data_dir_lock::acquire(dir.path(), std::time::Duration::ZERO, || {})
+            .expect("state lock");
+        drop(open_live_db(&db_path, &keys, true, &lock).unwrap());
         assert!(marker.exists(), "the migrated DB must be queued for upload");
         std::fs::remove_file(&marker).unwrap();
-        drop(open_live_db(&db_path, &keys, true).unwrap());
+        drop(open_live_db(&db_path, &keys, true, &lock).unwrap());
         assert!(!marker.exists(), "a DB already on the key queues nothing");
         let other = dir.path().join("single.db");
         drop(ConfigDb::open_or_create(&other, HASH).unwrap());
-        drop(open_live_db(&other, &keys, false).unwrap());
+        drop(open_live_db(&other, &keys, false, &lock).unwrap());
         assert!(
             !pending_marker_path(&other).exists(),
             "no sync bucket, no park"

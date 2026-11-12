@@ -1157,14 +1157,6 @@ async fn drain_rule_rows(
             });
         }
     }
-    // A held key keeps its events: the rule's cursor stops before its id.
-    let hold = |failed_ids: &mut BTreeMap<String, std::collections::BTreeSet<i64>>,
-                w: &KeyWork<'_>| {
-        failed_ids
-            .entry(w.rule.name.clone())
-            .or_default()
-            .insert(w.max_id);
-    };
     let mut window = DrainWindow::default();
     let mut deletes: Vec<&KeyWork<'_>> = Vec::new();
     // Why the destination refused this drain's keys (not a maintenance job).
@@ -1260,10 +1252,8 @@ async fn drain_rule_rows(
         if let Err(e) = dbg.atomic(|dbg| {
             // Mid-drain heartbeat: a long drain (up to 500 engine copies) must
             // keep pinning the background pruner's staleness floor.
-            let _ =
-                dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
-            settle_key(dbg, replication, w, outcome, now, &mut window, failed_ids);
-            Ok(())
+            dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds())?;
+            settle_key(dbg, replication, w, outcome, now, &mut window, failed_ids)
         }) {
             warn!("event consumer: the outcome of a key was not saved (rolled back): {e}");
         }
@@ -1323,15 +1313,43 @@ async fn drain_rule_rows(
         None => Vec::new(),
     };
     let dbg = db.lock().await;
-    // The whole delete batch settles in ONE commit (E6/F20): the cursor, and
-    // every key's failure row or cleared ledger row.
-    if let Err(e) = dbg.atomic(|dbg| {
-        let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
+    // The whole delete batch settles in ONE commit (see `settle_delete_batch`).
+    if let Err(e) = settle_delete_batch(
+        &dbg,
+        replication,
+        global,
+        now,
+        unmappable,
+        batched.into_iter().zip(outcomes),
+        &mut window,
+        failed_ids,
+    ) {
+        warn!("event consumer: the outcome of a delete batch was not saved (rolled back): {e}");
+    }
+    std::ops::ControlFlow::Continue(window)
+}
+
+/// The whole delete batch settles in ONE commit (E6/F20): the cursor, and
+/// every key's failure row or cleared ledger row. Any write error rolls the
+/// batch back and is returned.
+#[allow(clippy::too_many_arguments)]
+fn settle_delete_batch<'a, 'k: 'a>(
+    dbg: &JobsDb,
+    replication: &crate::config_sections::ReplicationConfig,
+    global: i64,
+    now: i64,
+    unmappable: Vec<(&'a KeyWork<'k>, String)>,
+    outcomes: impl IntoIterator<Item = (&'a KeyWork<'k>, super::mirror_delete::MirrorOutcome)>,
+    window: &mut DrainWindow,
+    failed_ids: &mut BTreeMap<String, std::collections::BTreeSet<i64>>,
+) -> Result<(), crate::config_db::ConfigDbError> {
+    dbg.atomic(|dbg| {
+        dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds())?;
         for (w, msg) in unmappable {
             let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
-            settle_key(dbg, replication, w, Err(err), now, &mut window, failed_ids);
+            settle_key(dbg, replication, w, Err(err), now, window, failed_ids)?;
         }
-        for (w, outcome) in batched.into_iter().zip(outcomes) {
+        for (w, outcome) in outcomes {
             use super::mirror_delete::MirrorOutcome;
             let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = match outcome {
                 // The gate refused the batch once it was counted: the key's
@@ -1355,17 +1373,27 @@ async fn drain_rule_rows(
                     f.class, f.message,
                 ))),
             };
-            settle_key(dbg, replication, w, result, now, &mut window, failed_ids);
+            settle_key(dbg, replication, w, result, now, window, failed_ids)?;
         }
         Ok(())
-    }) {
-        warn!("event consumer: the outcome of a delete batch was not saved (rolled back): {e}");
-    }
-    std::ops::ControlFlow::Continue(window)
+    })
+}
+
+/// A held key keeps its events: the rule's cursor stops before its id.
+fn hold(failed_ids: &mut BTreeMap<String, std::collections::BTreeSet<i64>>, w: &KeyWork<'_>) {
+    failed_ids
+        .entry(w.rule.name.clone())
+        .or_default()
+        .insert(w.max_id);
 }
 
 /// Record one key's outcome: clear or record its failure, and hold its
 /// events unless the failure is about the key and its attempts are used up.
+///
+/// It runs inside a page transaction ([`JobsDb::atomic`]). Every write
+/// error is returned: the caller's `?` then rolls the whole page back. An
+/// error that stayed inside would let the rest of the page commit without
+/// the write that failed.
 fn settle_key(
     dbg: &JobsDb,
     replication: &crate::config_sections::ReplicationConfig,
@@ -1374,7 +1402,7 @@ fn settle_key(
     now: i64,
     window: &mut DrainWindow,
     failed_ids: &mut BTreeMap<String, std::collections::BTreeSet<i64>>,
-) {
+) -> Result<(), crate::config_db::ConfigDbError> {
     let (rule, bucket, key) = (w.rule, w.bucket, w.key);
     let err = match outcome {
         Ok(()) => {
@@ -1383,8 +1411,8 @@ fn settle_key(
             if w.action == KeyAction::Delete && rule.replicate_deletes {
                 note_event_activity(&rule.name, w.action, true, current_unix_seconds());
             }
-            let _ = dbg.replication_clear_object_failure(&rule.name, key);
-            return;
+            dbg.replication_clear_object_failure(&rule.name, key)?;
+            return Ok(());
         }
         Err(err) => err,
     };
@@ -1397,26 +1425,25 @@ fn settle_key(
     );
     // The failure ring has a foreign key to the state row; a rule the
     // scheduler never ran has none yet.
-    let _ = dbg.replication_ensure_state(&rule.name, now);
+    dbg.replication_ensure_state(&rule.name, now)?;
     // One row per key: the consumer retries a held key on every drain, and a
     // row per attempt pushed every other failure out of the ring.
     let dest_key = rewrite_key(&rule.source.prefix, &rule.destination.prefix, key)
         .unwrap_or_else(|_| key.to_string());
     let record = |msg: &str| {
-        let _ = dbg.replication_record_event_failure(
+        dbg.replication_record_event_failure(
             &rule.name,
             now,
             key,
             &dest_key,
             &format!("event-driven {}: {msg}", event_action_word(w.action)),
             replication.max_failures_retained,
-        );
+        )
     };
     // A permanent key error is recorded and counts as handled: holding it
     // would stall the rule, forever.
     if err.downcast_ref::<PermanentKeyError>().is_some() {
-        record(&err.to_string());
-        return;
+        return record(&err.to_string());
     }
     let mut hold = || {
         failed_ids
@@ -1429,13 +1456,11 @@ fn settle_key(
     // giving up, or a short outage gave up on every key and dropped its
     // events.
     if !failure_counts_toward_give_up(class) {
-        record(&err.to_string());
+        record(&err.to_string())?;
         hold();
-        return;
+        return Ok(());
     }
-    let attempts = dbg
-        .replication_record_object_failure(&rule.name, key, &err.to_string(), now)
-        .unwrap_or(0);
+    let attempts = dbg.replication_record_object_failure(&rule.name, key, &err.to_string(), now)?;
     if key_attempts_exhausted(attempts) {
         warn!(
             "event consumer: rule '{}' gives up on {}/{} after {} failed \
@@ -1445,11 +1470,12 @@ fn settle_key(
         record(&format!(
             "{err} (gave up after {attempts} attempts; the next reconcile run \
              retries the object)"
-        ));
+        ))?;
     } else {
-        record(&err.to_string());
+        record(&err.to_string())?;
         hold();
     }
+    Ok(())
 }
 
 /// The verb of an event action in a failure message.
@@ -1735,6 +1761,109 @@ mod tests {
             include_globs: Vec::new(),
             exclude_globs: Vec::new(),
         }
+    }
+
+    /// A write error inside a page transaction aborts the page: the cursor
+    /// advance and the keys that came before do not commit. (The closures
+    /// used to drop the inner error, and the page committed its other
+    /// writes.) A table that is missing makes the failure write fail.
+    #[test]
+    fn a_failed_write_inside_a_page_aborts_the_page() {
+        let db = JobsDb::in_memory("event-consumer-page-test-key-0123456789ab").unwrap();
+        db.conn
+            .execute_batch("DROP TABLE replication_failures")
+            .unwrap();
+        let replication = crate::config_sections::ReplicationConfig::default();
+        let rule = rule("r", "src", "", true);
+        let work = KeyWork {
+            bucket: "src",
+            key: "a/b",
+            rule: &rule,
+            action: KeyAction::Copy,
+            max_id: 7,
+        };
+        let mut window = DrainWindow::default();
+        let mut failed_ids = BTreeMap::new();
+        let outcome: Result<(), Box<dyn std::error::Error + Send + Sync>> =
+            Err(Box::new(PermanentKeyError("bad key".into())));
+        let page = db.atomic(|dbg| {
+            dbg.listener_cursor_advance(REPLICATION_LISTENER, 7, 100)?;
+            settle_key(
+                dbg,
+                &replication,
+                &work,
+                outcome,
+                100,
+                &mut window,
+                &mut failed_ids,
+            )
+        });
+        assert!(page.is_err(), "the failed write must fail the page");
+        assert_eq!(
+            db.listener_cursor_load(REPLICATION_LISTENER).unwrap(),
+            0,
+            "the cursor advance must roll back with the page"
+        );
+    }
+
+    /// The delete batch of the real drain loop (`settle_delete_batch`)
+    /// settles a page of failures in ONE commit, however many keys it has:
+    /// the cursor, the ledger rows and the failure rows together. And a
+    /// failed write inside it aborts the whole batch.
+    #[test]
+    fn a_batch_of_failed_deletes_settles_in_one_commit() {
+        let db = JobsDb::in_memory("event-consumer-batch-test-key-0123456789a").unwrap();
+        let replication = crate::config_sections::ReplicationConfig::default();
+        let rule = rule("r", "src", "", true);
+        let keys: Vec<String> = (0..50).map(|i| format!("k{i}")).collect();
+        let work: Vec<KeyWork<'_>> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| KeyWork {
+                bucket: "src",
+                key,
+                rule: &rule,
+                action: KeyAction::Delete,
+                max_id: i as i64,
+            })
+            .collect();
+        let unmappable = || work.iter().map(|w| (w, "no".to_string())).collect();
+        let (mut window, mut failed_ids) = (DrainWindow::default(), BTreeMap::new());
+        let commits = db.count_commits();
+        settle_delete_batch(
+            &db,
+            &replication,
+            50,
+            100,
+            unmappable(),
+            Vec::new(),
+            &mut window,
+            &mut failed_ids,
+        )
+        .unwrap();
+        assert_eq!(commits.get(), 1, "50 failed keys, one commit");
+        assert_eq!(db.listener_cursor_load(REPLICATION_LISTENER).unwrap(), 50);
+
+        // A write that fails inside the batch rolls everything back.
+        db.conn
+            .execute_batch("DROP TABLE replication_failures")
+            .unwrap();
+        let err = settle_delete_batch(
+            &db,
+            &replication,
+            99,
+            100,
+            unmappable(),
+            Vec::new(),
+            &mut window,
+            &mut failed_ids,
+        );
+        assert!(err.is_err());
+        assert_eq!(
+            db.listener_cursor_load(REPLICATION_LISTENER).unwrap(),
+            50,
+            "the cursor advance rolled back with the batch"
+        );
     }
 
     // ── compact_key_events ──────────────────────────────────────────────────
