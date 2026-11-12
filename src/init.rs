@@ -312,7 +312,7 @@ pub fn run_init_inner(
         listen_addr,
         backend,
         max_delta_ratio,
-        max_object_size: max_object_size_mb * 1024 * 1024,
+        max_object_size: (max_object_size_mb * 1024 * 1024).into(),
         cache_size_mb,
         authentication,
         access_key_id,

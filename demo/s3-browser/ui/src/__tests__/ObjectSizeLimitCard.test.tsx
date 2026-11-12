@@ -33,3 +33,46 @@ test('edits max_object_size in MB and PUTs bytes', async () => {
   await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
   expect(http.callsTo('PUT', SECTION)[0].body).toEqual({ max_object_size: 250 * 1024 * 1024 });
 });
+
+const LIMITS = {
+  limits: {
+    max_object_size: {
+      bytes: 15 * 1024 * 1024 * 1024,
+      source: 'auto',
+      detail: 'auto: the per-upload limit',
+    },
+  },
+};
+
+test('auto is the default: an empty field shows the effective value and its source', async () => {
+  http.on('GET', SECTION, json({}));
+  http.on('GET', '/_/api/admin/config', json(LIMITS));
+  renderWithQuery(<ObjectSizeLimitCard />);
+  const input = await screen.findByRole('textbox', { name: 'Maximum object size (MiB)' });
+  await waitFor(() => expect(input).toHaveAttribute('placeholder', 'auto (15360 MiB)'));
+  expect(input).toHaveValue('');
+  expect(await screen.findByText(/Now 15360 MiB \(auto: the per-upload limit\)/)).toBeInTheDocument();
+  expect(screen.queryByText(/auto: auto:/)).not.toBeInTheDocument();
+});
+
+test('a literal "auto" in the section is an empty field, never NaN', async () => {
+  http.on('GET', SECTION, json({ max_object_size: 'auto' }));
+  http.on('GET', '/_/api/admin/config', json(LIMITS));
+  renderWithQuery(<ObjectSizeLimitCard />);
+  const input = await screen.findByRole('textbox', { name: 'Maximum object size (MiB)' });
+  await waitFor(() => expect(input).toHaveAttribute('placeholder', 'auto (15360 MiB)'));
+  expect(input).toHaveValue('');
+  expect((input as HTMLInputElement).value).not.toMatch(/NaN/);
+});
+
+test('clearing an explicit value sends null, which is auto', async () => {
+  const user = userEvent.setup();
+  renderWithQuery(<ObjectSizeLimitCard />);
+  const input = await screen.findByRole('textbox', { name: 'Maximum object size (MiB)' });
+  await waitFor(() => expect(input).toHaveValue('100'));
+  await user.clear(input);
+  await user.click(screen.getByRole('button', { name: /Review & apply/ }));
+  await user.click(await screen.findByRole('button', { name: 'Apply and persist changes' }));
+  await waitFor(() => expect(http.callsTo('PUT', SECTION)).toHaveLength(1));
+  expect(http.callsTo('PUT', SECTION)[0].body).toEqual({ max_object_size: null });
+});

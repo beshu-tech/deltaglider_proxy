@@ -95,7 +95,6 @@ pub fn advisories(cfg: &Config, env: &EnvView) -> Vec<Advisory> {
         rule_shared_rate_limit_bucket(cfg, env),
         rule_frozen_bucket_quota(cfg, env),
         rule_public_prefix_redundant_with_open_auth(cfg, env),
-        rule_multipart_limit_below_max_object_size(cfg, env),
     ]
     .into_iter()
     .flatten()
@@ -164,112 +163,9 @@ fn rule_public_prefix_redundant_with_open_auth(cfg: &Config, _env: &EnvView) -> 
     })
 }
 
-/// The spool decides the largest multipart object (half of it by default),
-/// and `max_object_size` is what the config allows: when the first is lower,
-/// a large multipart upload fails with 413 only after its parts were sent.
-/// The decision is the pure `multipart::multipart_limit_warning`.
-fn rule_multipart_limit_below_max_object_size(cfg: &Config, _env: &EnvView) -> Option<Advisory> {
-    // Above 5 GiB the 5 GiB warning of `Config::check` says this too, in one
-    // message with its own advice.
-    if cfg.max_object_size > super::check::SINGLE_PUT_MAX_BYTES {
-        return None;
-    }
-    crate::multipart::multipart_limit_warning(
-        cfg.tuning.spool_max_bytes,
-        cfg.tuning.multipart_relay_upload_max,
-        cfg.tuning.multipart_total_max,
-        cfg.max_object_size,
-    )
-    .map(Advisory::warn)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// L4 / R1 (#171): the rule reads the config's env snapshot and
-    /// `max_object_size`. The table of the decision is in `multipart`.
-    #[test]
-    fn a_multipart_limit_below_max_object_size_warns_and_names_the_fix() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        let mut c = base_cfg();
-        assert!(
-            rule_multipart_limit_below_max_object_size(&c, &env(true, true)).is_none(),
-            "the defaults (16 GiB spool, 100 MiB objects) are fine"
-        );
-        c.max_object_size = 4 * GIB;
-        c.tuning.spool_max_bytes = 6 * GIB;
-        let a = rule_multipart_limit_below_max_object_size(&c, &env(true, true))
-            .expect("3 GiB < 4 GiB fires");
-        assert_eq!(a.severity, Severity::Warn);
-        assert!(a.message.contains("DGP_SPOOL_MAX_BYTES"), "{}", a.message);
-        assert!(a.message.contains("max_object_size"), "{}", a.message);
-        assert!(a.message.contains(&(8 * GIB).to_string()), "{}", a.message);
-        // The fix the message names removes the warning.
-        c.tuning.spool_max_bytes = 8 * GIB;
-        assert!(rule_multipart_limit_below_max_object_size(&c, &env(true, true)).is_none());
-    }
-
-    /// Above 5 GiB, `config lint` says it in ONE message: the single PUT
-    /// limit and the multipart limit of the spool together, so that the
-    /// advice never disagrees with itself. The advisory rule stays silent.
-    #[test]
-    fn above_5_gib_the_two_limits_make_one_message() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        let mut c = base_cfg();
-        c.max_object_size = 10 * GIB;
-        c.tuning.spool_max_bytes = 16 * GIB;
-        assert!(rule_multipart_limit_below_max_object_size(&c, &env(true, true)).is_none());
-        let warnings = c.check();
-        let about: Vec<&String> = warnings
-            .iter()
-            .filter(|w| w.contains("max_object_size"))
-            .collect();
-        assert_eq!(about.len(), 1, "{warnings:?}");
-        assert!(about[0].contains("5 GiB"), "{}", about[0]);
-        assert!(about[0].contains("multipart"), "{}", about[0]);
-        assert!(about[0].contains("DGP_SPOOL_MAX_BYTES"), "{}", about[0]);
-        assert!(about[0].contains(&(20 * GIB).to_string()), "{}", about[0]);
-        // No advice to set it to 5 GiB: that would not carry a 10 GiB object.
-        assert!(!about[0].contains("or less"), "{}", about[0]);
-        // With a spool that carries it, one message still: no multipart advice.
-        c.tuning.spool_max_bytes = 20 * GIB;
-        let warnings = c.check();
-        let about: Vec<&String> = warnings
-            .iter()
-            .filter(|w| w.contains("max_object_size"))
-            .collect();
-        assert_eq!(about.len(), 1, "{warnings:?}");
-        assert!(
-            !about[0].contains("Set DGP_SPOOL_MAX_BYTES"),
-            "{}",
-            about[0]
-        );
-    }
-
-    /// The rule is on the list that `Config::check` (boot, `config lint`,
-    /// apply) runs: a rule that exists but is not listed warns nobody.
-    #[test]
-    fn config_check_carries_the_multipart_warning() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        let mut c = base_cfg();
-        c.max_object_size = 4 * GIB;
-        c.tuning.spool_max_bytes = 2 * GIB;
-        let warnings = c.check();
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("DGP_SPOOL_MAX_BYTES") && w.contains("multipart")),
-            "{warnings:?}"
-        );
-        c.tuning.spool_max_bytes = 8 * GIB;
-        assert!(
-            !c.check()
-                .iter()
-                .any(|w| w.contains("multipart upload can hold")),
-            "the fix removes the warning"
-        );
-    }
 
     fn base_cfg() -> Config {
         Config::default()

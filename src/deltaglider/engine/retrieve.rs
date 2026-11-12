@@ -1894,7 +1894,7 @@ mod reference_download_tests {
         // The spool threshold is capped at max_object_size: 64 KiB deltas
         // take the spool path.
         let config = Config {
-            max_object_size: 32 * 1024,
+            max_object_size: (32 * 1024).into(),
             ..Config::default()
         };
         let metrics = Arc::new(crate::metrics::Metrics::new());
@@ -1938,7 +1938,7 @@ mod reference_download_tests {
     #[tokio::test]
     async fn cold_gets_of_a_large_delta_read_its_body_only_in_the_fill() {
         let config = Config {
-            max_object_size: 32 * 1024,
+            max_object_size: (32 * 1024).into(),
             ..Config::default()
         };
         let metrics = Arc::new(crate::metrics::Metrics::new());
@@ -2075,9 +2075,9 @@ mod range_spool_tests {
             b"this is not valid JSON {{{",
         )
         .unwrap();
-        for max_object_size in [Config::default().max_object_size, 64 * 1024] {
+        for max_object_size in [Config::default().max_object_size_bytes(), 64 * 1024] {
             let config = Config {
-                max_object_size,
+                max_object_size: max_object_size.into(),
                 ..Config::default()
             };
             for fresh in [true, false] {
@@ -2124,7 +2124,7 @@ mod range_spool_tests {
         // Objects above the spool threshold (here max_object_size, which
         // caps it) take the spooled range path.
         let config = Config {
-            max_object_size: 64 * 1024,
+            max_object_size: (64 * 1024).into(),
             ..Config::default()
         };
         let metrics = Arc::new(crate::metrics::Metrics::new());

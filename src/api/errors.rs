@@ -239,8 +239,10 @@ impl S3Error {
             S3Error::NoSuchBucket(_) => StatusCode::NOT_FOUND,
             S3Error::BucketNotEmpty(_) => StatusCode::CONFLICT,
             S3Error::BucketAlreadyExists(_) => StatusCode::CONFLICT,
+            // AWS answers EntityTooLarge with 400, also for a POST above the
+            // policy's content-length range. Every path of the proxy agrees.
             S3Error::EntityTooLarge { .. } | S3Error::EntityTooLargeReason(_) => {
-                StatusCode::PAYLOAD_TOO_LARGE
+                StatusCode::BAD_REQUEST
             }
             S3Error::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             S3Error::InvalidArgument(_) => StatusCode::BAD_REQUEST,
@@ -735,7 +737,7 @@ mod tests {
             (
                 "StorageError::TooLarge",
                 s(StorageError::TooLarge { size: 2, max: 1 }),
-                413,
+                400,
                 "EntityTooLarge",
             ),
             (
@@ -877,7 +879,7 @@ mod tests {
             (
                 "CodecError::TooLarge",
                 c(CodecError::TooLarge { size: 2, max: 1 }),
-                413,
+                400,
                 "EntityTooLarge",
             ),
             (
@@ -938,7 +940,7 @@ mod tests {
             (
                 "EngineError::TooLarge",
                 en(EngineError::TooLarge { size: 2, max: 1 }),
-                413,
+                400,
                 "EntityTooLarge",
             ),
             (
@@ -1229,16 +1231,18 @@ mod tests {
         assert!(form.to_string().contains("3000 bytes"));
     }
 
-    /// Regression: EntityTooLarge must return 413, not 400.
-    /// S3 clients rely on the status code to distinguish size errors from bad requests.
+    /// EntityTooLarge is HTTP 400, as on AWS, on every path (the s3s adapter
+    /// and the form POST handler answer the same).
     #[test]
-    fn entity_too_large_returns_413() {
+    fn entity_too_large_returns_400() {
         let err = S3Error::EntityTooLarge {
             size: 200,
             max: 100,
         };
-        assert_eq!(err.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(err.status_code().as_u16(), 413);
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.status_code().as_u16(), 400);
+        let reason = S3Error::EntityTooLargeReason("r".into());
+        assert_eq!(reason.status_code().as_u16(), 400);
     }
 
     /// Verify all S3 error status codes match S3 API specification.

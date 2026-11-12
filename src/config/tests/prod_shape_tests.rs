@@ -124,7 +124,7 @@ fn storage_shape_is_intact() {
     assert!(!cfg.lifecycle.enabled);
     assert_eq!(cfg.lifecycle.rules.len(), 1);
 
-    assert_eq!(cfg.max_object_size, 536_870_912);
+    assert_eq!(cfg.max_object_size_bytes(), 536_870_912);
 }
 
 #[test]

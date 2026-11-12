@@ -165,7 +165,13 @@ export interface AdminConfig {
   backend_has_credentials: boolean;
   // Compression
   max_delta_ratio: number;
+  /** The effective `max_object_size` in bytes (for `auto`, the derived one). */
   max_object_size: number;
+  /** The effective upload limits and where each comes from; null before the
+   *  proxy measured its spool disk at start. */
+  limits?: {
+    max_object_size: { bytes: number; source: string; detail: string };
+  } | null;
   cache_size_mb: number;
   metadata_cache_mb: number;
   codec_concurrency: number;

@@ -406,7 +406,7 @@ mod spool_threshold_tests {
                 .unwrap(),
         );
         let mut config = Config {
-            max_object_size: 8 * 1024 * 1024,
+            max_object_size: (8 * 1024 * 1024).into(),
             ..Config::default()
         };
         let plain = DeltaGliderEngine::new_with_backend(backend.clone(), &config, None);

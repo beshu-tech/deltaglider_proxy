@@ -427,7 +427,7 @@ async fn a_fast_copy_above_the_delta_limit_is_stored_whole() {
     writer.create_bucket("b").await.unwrap();
     let keys = crate::deltaglider::store_deltas(&writer, "run", 2).await;
     let config = crate::config::Config {
-        max_object_size: 32 * 1024,
+        max_object_size: (32 * 1024).into(),
         ..Default::default()
     };
     let small = engine_on(on_fake().await, &config, &metrics);

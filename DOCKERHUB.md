@@ -88,7 +88,7 @@ You can set all settings through environment variables:
 |----------|---------|-------------|
 | `DGP_LISTEN_ADDR` | `0.0.0.0:9000` | S3 API listen address |
 | `DGP_MAX_DELTA_RATIO` | `0.75` | Max delta/original ratio (lower = more aggressive) |
-| `DGP_MAX_OBJECT_SIZE` | `104857600` | Max size of an uploaded object (100 MB), for every object and not only for deltas |
+| `DGP_MAX_OBJECT_SIZE` | `auto` | Max size of an uploaded object, for every object and not only for deltas: bytes, or `auto` (half of the spool budget) |
 | `DGP_CACHE_MB` | `100` | Reference cache size in MB (recommend ≥1024 for production) |
 | `DGP_ACCESS_KEY_ID` | *(unset)* | Proxy SigV4 access key (**required**: the proxy refuses to start without credentials unless `DGP_AUTHENTICATION=none`) |
 | `DGP_SECRET_ACCESS_KEY` | *(unset)* | Proxy SigV4 secret key |
@@ -104,7 +104,7 @@ You can set all settings through environment variables:
 | `DGP_CONFIG_SYNC_BUCKET` | *(unset)* | S3 bucket for encrypted-DB multi-instance sync. Needs `DGP_CONFIG_DB_KEY` |
 | `DGP_TLS_ENABLED` | `false` | Enable HTTPS |
 | `DGP_SPOOL_DIR` | `/tmp/dgp-spool` | Scratch directory for upload bodies larger than 16 MiB, multipart parts and large delta files. Put it on a volume with room for your concurrent large uploads |
-| `DGP_SPOOL_MAX_BYTES` | `17179869184` | Byte budget of the spool (16 GiB). A larger upload gets `413`, and one multipart object can hold at most half of it |
+| `DGP_SPOOL_MAX_BYTES` | `auto` | Byte budget of the spool: `auto` (50% of the free space of the spool directory at start), a percent such as `40%`, or bytes. A larger upload gets `400 EntityTooLarge`, and one multipart object can hold at most half of it |
 
 Or mount a YAML config file:
 

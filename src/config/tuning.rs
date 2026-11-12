@@ -108,15 +108,19 @@ pub struct RuntimeTuning {
     pub spool_threshold_bytes: Option<u64>,
     /// `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS`.
     pub spool_acquire_timeout_secs: u64,
-    /// `DGP_SPOOL_MAX_BYTES`: the spool budget. The spool and the config
-    /// check read the same variable.
-    pub spool_max_bytes: u64,
+    /// `DGP_SPOOL_MAX_BYTES`: `auto` (default), a percent of the free space,
+    /// or bytes. The spool itself reads the same variable once at boot.
+    pub spool_max: super::limits::SpoolSetting,
     /// `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`: what one multipart upload may hold
-    /// in the spool (`Some(0)` = no cap; `None` = half of the spool).
+    /// in the spool (`Some(0)` = no cap; `None` = half of the budget).
     pub multipart_relay_upload_max: Option<u64>,
     /// `DGP_MAX_TOTAL_MULTIPART_BYTES`: what all open multipart uploads may
-    /// hold together (`None` = half of the spool).
+    /// hold together (`None` = half of the budget).
     pub multipart_total_max: Option<u64>,
+    /// The effective limits of this snapshot ([`super::Config::resolve_limits`]).
+    /// `None` until the spool measured its disk at boot (a unit test, `config
+    /// lint`): `auto` then reads as the defaults of earlier releases.
+    pub limits: Option<super::limits::ResolvedLimits>,
     /// `DGP_SHUTDOWN_TIMEOUT_SECS` (at least 1): after the drain steps, the
     /// time that the exit waits for tasks on the blocking pool (an xdelta3
     /// run can take 2 hours). Read before the runtime exists.
@@ -196,14 +200,10 @@ impl RuntimeTuning {
             },
             spool_threshold_bytes: lookup_parse(env, "DGP_SPOOL_THRESHOLD_BYTES"),
             spool_acquire_timeout_secs: parse_or("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", 120).max(1),
-            spool_max_bytes: parse_or(
-                "DGP_SPOOL_MAX_BYTES",
-                crate::deltaglider::spool::DEFAULT_SPOOL_MAX_BYTES,
-            ),
-            // The names are `multipart::RELAY_UPLOAD_MAX_ENV` and
-            // `MAX_TOTAL_MULTIPART_ENV` (a test checks it).
+            spool_max: super::limits::parse_spool_setting(env("DGP_SPOOL_MAX_BYTES").as_deref()).0,
             multipart_relay_upload_max: lookup_parse(env, "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES"),
             multipart_total_max: lookup_parse(env, "DGP_MAX_TOTAL_MULTIPART_BYTES"),
+            limits: None,
             // 0 would abandon the blocking tasks at once.
             shutdown_timeout_secs: parse_or(
                 "DGP_SHUTDOWN_TIMEOUT_SECS",
@@ -301,10 +301,6 @@ mod tests {
             Zero::Meaningful("every body takes the spool path"),
         ),
         ("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", Zero::Floor1),
-        (
-            "DGP_SPOOL_MAX_BYTES",
-            Zero::Meaningful("the spool admits no body"),
-        ),
         (
             "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
             Zero::Meaningful("no cap for one multipart upload"),
