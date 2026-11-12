@@ -1252,15 +1252,6 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuthHeader> {
 mod tests {
     use super::*;
 
-    /// The 503 of a locked node says how to reach the wizard when the
-    /// Service sends no traffic to the node.
-    #[test]
-    fn the_locked_message_names_the_way_to_the_recovery_wizard() {
-        for part in ["Config database locked", "/_/", "kubectl port-forward"] {
-            assert!(CONFIG_DB_LOCKED_MESSAGE.contains(part), "{part}");
-        }
-    }
-
     /// A sealed slot first seen at `at` (a mutation that succeeded).
     fn sealed_at(at: Instant) -> ReplaySlot {
         ReplaySlot {

@@ -23,12 +23,35 @@ pub const LOCK_FILE_NAME: &str = ".deltaglider.lock";
 pub struct DataDirLock {
     _file: std::fs::File,
     path: PathBuf,
+    /// False when the file system offers no lock (`Attempt::Unsupported`,
+    /// some network file systems): the guard then protects nothing.
+    held: bool,
 }
 
 impl DataDirLock {
     /// The lock file this guard holds.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Does the file system really hold the lock? `false` on a file system
+    /// without locks, where this process cannot tell whether another one
+    /// uses the directory.
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// Is this the lock of the directory that holds `file`? The comparison
+    /// is on the real paths, so `./` and an absolute path agree.
+    pub fn covers(&self, file: &Path) -> bool {
+        let dir_of = |p: &Path| {
+            let parent = p
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf())
+        };
+        dir_of(&self.path) == dir_of(file)
     }
 }
 
@@ -89,7 +112,11 @@ pub fn acquire(
         match classify(file.try_lock()) {
             Attempt::Held => {
                 write_holder(&file);
-                return Ok(DataDirLock { _file: file, path });
+                return Ok(DataDirLock {
+                    _file: file,
+                    path,
+                    held: true,
+                });
             }
             Attempt::Unsupported => {
                 tracing::warn!(
@@ -97,7 +124,11 @@ pub fn acquire(
                      tell whether another process uses the state directory",
                     dir.display()
                 );
-                return Ok(DataDirLock { _file: file, path });
+                return Ok(DataDirLock {
+                    _file: file,
+                    path,
+                    held: false,
+                });
             }
             Attempt::Failed(e) => return Err(format!("cannot lock '{}': {e}", path.display())),
             Attempt::Busy if Instant::now() >= deadline => {
@@ -114,13 +145,33 @@ pub fn acquire(
     }
 }
 
-/// Record this process id in the lock file. Best effort: the lock does not
-/// depend on it, it only makes the refusal of a second process plainer.
+/// Record who holds the lock, in the lock file: one write of one line. The
+/// process id is the one in the holder's own namespace (in a container it
+/// is often 1), so the line also has the host name (the container id in a
+/// container) and the start time. Best effort: the lock does not depend on
+/// it, it only makes the refusal of a second process plainer.
 fn write_holder(file: &std::fs::File) {
     use std::io::Write;
     let mut file = file;
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .unwrap_or_default();
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let line = holder_text(std::process::id(), host.trim(), started);
     let _ = file.set_len(0);
-    let _ = writeln!(file, "pid {}", std::process::id());
+    let _ = file.write_all(line.as_bytes());
+}
+
+/// Pure: the holder line of the lock file.
+fn holder_text(pid: u32, host: &str, started_unix: u64) -> String {
+    let host = if host.is_empty() {
+        "unknown host"
+    } else {
+        host
+    };
+    format!("pid {pid} on host {host}, started at unix time {started_unix}\n")
 }
 
 /// The holder text of the lock file, when it has one.
@@ -135,7 +186,7 @@ fn read_holder(path: &Path) -> Option<String> {
 /// deploy must stop the old process before it starts the new one.
 fn busy_message(dir: &Path, path: &Path, wait: Duration) -> String {
     let holder = read_holder(path)
-        .map(|h| format!("; held by {h}"))
+        .map(|h| format!("; held by {h}; the pid is the one in the holder's own container or host"))
         .unwrap_or_default();
     let waited = if wait.is_zero() {
         String::new()
@@ -178,9 +229,10 @@ mod tests {
         let _first = acquire(dir.path(), NO_WAIT, || {}).expect("first lock");
         let err = acquire(dir.path(), NO_WAIT, || {}).expect_err("second lock must fail");
         assert!(
-            err.contains(&format!("pid {}", std::process::id())),
+            err.contains(&format!("pid {} on host", std::process::id())),
             "the holder is named: {err}"
         );
+        assert!(err.contains("own container"), "{err}");
         for fix in [
             "Stop the old process",
             "Recreate",
@@ -188,6 +240,25 @@ mod tests {
         ] {
             assert!(err.contains(fix), "{fix}: {err}");
         }
+    }
+
+    #[test]
+    fn a_lock_covers_only_its_own_directory() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let lock = acquire(a.path(), NO_WAIT, || {}).unwrap();
+        assert!(lock.is_held());
+        assert!(lock.covers(&a.path().join("deltaglider_config.db")));
+        assert!(!lock.covers(&b.path().join("deltaglider_config.db")));
+    }
+
+    #[test]
+    fn the_holder_line_has_pid_host_and_start() {
+        assert_eq!(
+            holder_text(1, "3f2a9c", 1_700_000_000),
+            "pid 1 on host 3f2a9c, started at unix time 1700000000\n"
+        );
+        assert!(holder_text(7, "", 5).contains("unknown host"));
     }
 
     #[test]

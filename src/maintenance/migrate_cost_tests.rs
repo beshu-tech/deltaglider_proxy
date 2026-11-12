@@ -339,6 +339,31 @@ async fn the_flip_marks_the_usage_row_for_a_recount() {
     usage.flush_pending();
     let row = usage.read("b").unwrap().unwrap();
     assert_eq!(row.last_scan_at, None, "the row still reads as scanned");
+
+    // A resumed flip (the save after it failed) finds the config flipped.
+    // It must not write the config again: here the config file cannot be
+    // written, as on a full disk, and the flip still succeeds.
+    let broken = ConfigMutator {
+        config: mutator.config.clone(),
+        app: state.clone(),
+        persist_path: "/nonexistent-dgp-dir/c.yaml".to_string(),
+    };
+    let resumed = MigrateRun {
+        mutator: &broken,
+        db: &db,
+        state: &state,
+        holder: Holder::test("inst"),
+        job: &job,
+        params: &params,
+        provenance: provenance_value(&params, job.id),
+    };
+    resumed
+        .flip(
+            &Counters::default(),
+            crate::maintenance::worker::Durable::for_tests(),
+        )
+        .await
+        .expect("a flip that already happened writes nothing");
 }
 
 /// P6.1: the verify of one object HEADed both forms on the source and on
@@ -393,4 +418,32 @@ async fn migrate_copy_reuses_the_skip_check_as_the_prior() {
         assert_eq!(dst.get("COPY"), Some(&1), "{key}: target {dst:?}");
         assert_eq!(dst.get("DELETE"), None, "{key}: target {dst:?}");
     }
+}
+
+/// A durable save that fails before the flip stops the job there: the flip
+/// does not run (the config never routes the bucket to the target) and the
+/// copies stay on the target (a transient stop deletes nothing). The failure
+/// is injected with an open transaction on the jobs DB, where the
+/// `synchronous = FULL` commit refuses.
+#[tokio::test]
+async fn no_flip_runs_after_a_failed_durable_save() {
+    let e = env("verify", 3).await;
+    e.db.lock().await.conn.execute_batch("BEGIN").unwrap();
+    let result = e.phases().await;
+    assert!(
+        matches!(result, Err(PhaseStop::FailedTransient(_))),
+        "{result:?}"
+    );
+    let cfg = e.mutator.read().await;
+    assert!(
+        !routed_to_target(&cfg, "b", "dst"),
+        "the bucket was flipped after a failed save"
+    );
+    drop(cfg);
+    e.state
+        .engine
+        .load()
+        .head("t", "run/k-000.txt")
+        .await
+        .expect("the copies stay on the target");
 }

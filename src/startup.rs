@@ -2370,15 +2370,19 @@ mod tests {
     use super::*;
     use deltaglider_proxy::config::Config;
 
-    /// A state directory lock of its own, for a test that opens a DB.
-    fn test_lock() -> (
-        tempfile::TempDir,
-        deltaglider_proxy::data_dir_lock::DataDirLock,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let lock =
-            deltaglider_proxy::data_dir_lock::acquire(dir.path(), Duration::ZERO, || {}).unwrap();
-        (dir, lock)
+    /// The state directory lock of the directory that holds `db_file`.
+    /// Leaked on purpose: a test lives for its tempdir only.
+    fn lock_of(
+        db_file: &std::path::Path,
+    ) -> &'static deltaglider_proxy::data_dir_lock::DataDirLock {
+        Box::leak(Box::new(
+            deltaglider_proxy::data_dir_lock::acquire(
+                db_file.parent().unwrap(),
+                Duration::ZERO,
+                || {},
+            )
+            .unwrap(),
+        ))
     }
 
     /// On a backend without atomic writes the boot advice is a migrate job,
@@ -2489,7 +2493,7 @@ mod tests {
         );
         let keys = deltaglider_proxy::config_db::ConfigDbKeys::primary_only("$2b$04$good");
         drop(
-            promote_backup_db(&db_file, &bak, &keys, false, &test_lock().1)
+            promote_backup_db(&db_file, &bak, &keys, false, lock_of(&db_file))
                 .expect("promote must succeed"),
         );
         assert!(db_file.exists(), "live DB must exist after promote");
@@ -2539,7 +2543,7 @@ mod tests {
         let keys = ConfigDbKeys::primary_only(primary)
             .with_fallback(FallbackKind::LegacyBootstrapHash, "$2b$04$legacy");
         assert_eq!(probe_bak_users(&bak, &keys), Some(1));
-        drop(promote_backup_db(&db_file, &bak, &keys, false, &test_lock().1).unwrap());
+        drop(promote_backup_db(&db_file, &bak, &keys, false, lock_of(&db_file)).unwrap());
         assert!(probe_key(&db_file, primary).unwrap());
     }
 
@@ -2589,7 +2593,7 @@ mod tests {
         drop(ConfigDb::open_or_create(&db_file, primary).unwrap());
         let keys = ConfigDbKeys::primary_only(primary)
             .with_fallback(FallbackKind::LegacyBootstrapHash, "$2b$04$legacy");
-        drop(promote_backup_db(&db_file, &bak, &keys, true, &test_lock().1).unwrap());
+        drop(promote_backup_db(&db_file, &bak, &keys, true, lock_of(&db_file)).unwrap());
         assert!(
             db_file.with_extension("db.sync-pending").exists(),
             "the re-encrypted DB is not queued for upload"

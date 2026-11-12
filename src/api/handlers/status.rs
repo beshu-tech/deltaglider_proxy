@@ -336,7 +336,7 @@ fn readiness_from_health_loop(verdicts: &[crate::coordination::HealthVerdict]) -
 /// The live backend probe of `/_/ready`: ListBuckets with retries, then
 /// the cheap HEAD and the last-known-good window (#78). Bounded by short
 /// timeouts so a hung backend yields a fast "not ready".
-async fn live_backend_readiness(engine: &crate::deltaglider::DynEngine) -> &'static str {
+async fn live_backend_readiness(engine: Arc<crate::deltaglider::DynEngine>) -> &'static str {
     use std::time::Duration;
     // Cheapest real backend op: list buckets, capped so a dead/slow backend
     // fails the probe fast rather than hanging the LB health check.
@@ -525,10 +525,14 @@ pub async fn readiness_check(
         match state.backend_health.loop_verdicts() {
             Some(verdicts) => readiness_from_health_loop(&verdicts),
             None => {
+                // Detached: the probe runs to its end and stores its verdict
+                // (its retries and timeouts are tunable and can take longer
+                // than the deadline); this request waits at most the
+                // deadline and else answers from the last verdict.
                 let engine = state.engine.load_full();
                 state
                     .backend_health
-                    .ready_probe(live_backend_readiness(&engine))
+                    .ready_probe(live_backend_readiness(engine), READY_DEADLINE)
                     .await
             }
         }
@@ -553,7 +557,7 @@ pub async fn readiness_check(
             .await
     };
     let (backend, config_db_mutex, jobs_db, spool_usable) = tokio::join!(
-        within_ready_deadline(backend_check, "timeout"),
+        backend_check,
         within_ready_deadline(config_db_check, "locked"),
         within_ready_deadline(jobs_db_check, "locked"),
         within_ready_deadline(spool_check, false),
@@ -1494,8 +1498,9 @@ mod readiness_tests {
     }
 
     /// Both DBs wedged: the checks wait at the same time, so the probe takes
-    /// about one wait (1 s), not the sum (2 s). It answers 503.
-    #[tokio::test]
+    /// one wait, not the sum of two. The clock is paused (virtual time), so
+    /// the measure is exact and no wall clock decides. It answers 503.
+    #[tokio::test(start_paused = true)]
     async fn readiness_checks_run_at_the_same_time() {
         let dir = tempfile::tempdir().unwrap();
         let backend: Box<crate::storage::DynStorageBackend<'static>> =
@@ -1521,15 +1526,30 @@ mod readiness_tests {
             s.config_db = Some(config_db.clone());
             s.jobs_db = Some(jobs_db.clone());
         }
+        // The backend answers from a health-loop verdict and the spool check
+        // from its cache: no other check waits in this test.
+        let default_backend = crate::config::Config::default().backend;
+        state
+            .backend_health
+            .set_loop_interval(Duration::from_secs(30));
+        state.backend_health.set_for_test(
+            &[("default", &default_backend)],
+            HealthVerdict::Healthy,
+            std::time::Instant::now(),
+        );
+        state
+            .backend_health
+            .spool_probe(|| true, std::time::Duration::from_secs(1))
+            .await;
         let _held_config = config_db.lock().await;
         let _held_jobs = jobs_db.lock().await;
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let (code, Json(body)) = readiness_check(State(state)).await;
         let took = started.elapsed();
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!((body.config_db, body.jobs_db), ("locked", "locked"));
         assert!(
-            took < CONFIG_DB_READY_WAIT * 2,
+            took < CONFIG_DB_READY_WAIT * 3 / 2,
             "the two waits ran one after the other: {took:?}"
         );
     }
@@ -1542,6 +1562,37 @@ mod readiness_tests {
         assert!(!within_ready_deadline(hung, false).await);
         assert!(started.elapsed() < READY_DEADLINE * 2);
         assert!(within_ready_deadline(async { true }, false).await);
+    }
+
+    /// Each check of `/_/ready` has a bound: the two DB locks and the spool
+    /// check run under `within_ready_deadline`, and the live backend probe
+    /// waits `READY_DEADLINE` (it runs detached, see
+    /// `BackendHealthCache::ready_probe`). Removing a bound makes the probe
+    /// as slow as its slowest check again.
+    #[test]
+    fn every_readiness_check_has_the_deadline() {
+        let sources = crate::source_scan::ast::src();
+        let me = sources
+            .iter()
+            .find(|s| s.rel == "src/api/handlers/status.rs")
+            .expect("status.rs is scanned");
+        let wrapped = me.prod.calls_named("within_ready_deadline").count();
+        assert!(
+            wrapped >= 3,
+            "config DB, jobs DB and spool check: {wrapped}"
+        );
+        let waits = me
+            .prod
+            .paths
+            .iter()
+            .filter(|p| p.segs.last().is_some_and(|s| s == "READY_DEADLINE"))
+            .count();
+        // The wrapper itself, and the wait of the backend probe.
+        assert!(waits >= 2, "READY_DEADLINE used {waits} times");
+        assert!(
+            me.prod.calls_named("ready_probe").count() >= 1,
+            "the backend check goes through the detached single flight"
+        );
     }
 
     /// The kubelet default (1 s) would fail a healthy pod. The operator and

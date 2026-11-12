@@ -4,9 +4,9 @@
 
 ### Upgrade steps for the next release
 
-- **A deploy must stop the old process before it starts the new one.** A second process on one state directory exits after `DGP_STATE_LOCK_WAIT_SECS`. Its error now names the holder process and the fix. A rolling update on a shared volume (Coolify) works while the overlap stays shorter than `DGP_STATE_LOCK_WAIT_SECS`. Kubernetes with a shared PVC needs `strategy: Recreate`. The Helm chart already uses `Recreate`; the operator gives every pod its own volume.
+- **A deploy must stop the old process before it starts the new one.** A second process on one state directory exits after `DGP_STATE_LOCK_WAIT_SECS`. Its error now names the holder process and the fix. A rolling update on a shared volume works while the overlap stays shorter than `DGP_STATE_LOCK_WAIT_SECS`. Kubernetes with a shared PVC needs `strategy: Recreate`. The Helm chart already uses `Recreate`; the operator gives every pod its own volume.
 - **`--set-bootstrap-password` refuses while a server runs when it must re-encrypt the config DB.** Stop the server first.
-- **Readiness probes need `timeoutSeconds` of 5 or more.** `/_/ready` runs its checks at the same time and answers within 3 seconds. The Helm chart and the operator now set 5.
+- **Set the readiness probe `timeoutSeconds` to 5 or more.** `/_/ready` runs its checks at the same time and answers within 3 seconds. The Helm chart and the operator now set 5. The live backend probe runs to its end in the background, and `/_/ready` answers from its last verdict while it runs.
 
 ### Fixed
 

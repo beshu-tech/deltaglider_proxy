@@ -64,7 +64,7 @@ pub(crate) use users::first_free_user_name;
 pub use jobs_db::{jobs_db_path, JobsDb};
 pub use key::{ConfigDbKeys, DbKeySource, DbSecret, FallbackKind};
 
-/// How [`ConfigDb::open_with_keys`] opened the DB.
+/// How `ConfigDb::open_with_keys` opened the DB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenedWith {
     /// The file did not exist; it is new, keyed with the primary key.
@@ -358,7 +358,7 @@ impl ConfigDb {
     /// fallback key (the legacy bootstrap hash, or a key file that an env key
     /// replaces) is re-encrypted with the primary key first, see
     /// [`rekey_file`]. A DB that opens with no key is `WrongPassphrase`.
-    pub fn open_with_keys(
+    pub(crate) fn open_with_keys(
         local_path: &Path,
         keys: &ConfigDbKeys,
     ) -> Result<(Self, OpenedWith), ConfigDbError> {

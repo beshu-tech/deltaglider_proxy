@@ -299,7 +299,22 @@ async fn a_node_locked_by_a_wrong_db_key_is_not_ready() {
     server
         .respawn_with_env(&[("DGP_CONFIG_DB_KEY", KEY_WRONG)])
         .await;
-    assert_eq!(raw_put_status(&endpoint, server.bucket()).await, 503);
+    // The real answer of an S3 request names the way to the recovery wizard
+    // that a Kubernetes Service cannot reach.
+    let put = reqwest::Client::new()
+        .put(format!("{endpoint}/{}/mismatch-probe.bin", server.bucket()))
+        .body(b"probe".to_vec())
+        .send()
+        .await
+        .expect("raw PUT");
+    assert_eq!(put.status().as_u16(), 503);
+    let text = put.text().await.unwrap();
+    for part in ["Config database locked", "kubectl port-forward", "/_/admin"] {
+        assert!(
+            text.contains(part),
+            "{part} missing in the 503 body: {text}"
+        );
+    }
     let (code, body) = ready(endpoint.clone()).await;
     assert_eq!(
         code, 503,

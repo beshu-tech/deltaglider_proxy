@@ -203,6 +203,24 @@ pub fn unwinds_on_failure(phase: &str) -> bool {
     phase != "cleanup"
 }
 
+/// Does the live config route `bucket` to `target`? Once it does, the flip
+/// has happened and the target holds the LIVE bucket.
+pub fn routed_to_target(cfg: &crate::config::Config, bucket: &str, target: &str) -> bool {
+    cfg.buckets
+        .get(bucket)
+        .and_then(|p| p.backend.as_deref().map(|b| b == target))
+        .unwrap_or(false)
+}
+
+/// THE rule for an unwind (delete the staged copies and the staging route):
+/// the phase must be one that unwinds AND the live config must not route the
+/// bucket to the target. The row can name a phase before the flip while the
+/// config is already flipped (a save after the flip failed, or a power loss
+/// reverted the row), and the unwind would then delete live data.
+pub fn unwind_allowed(phase: &str, routed_to_target: bool) -> bool {
+    unwinds_on_failure(phase) && !routed_to_target
+}
+
 /// First free `__dgmigrate_<bucket>_<n>` name.
 pub fn pick_transient_key(bucket_key: &str, taken: &dyn Fn(&str) -> bool) -> String {
     let mut n = 0u32;
@@ -909,7 +927,8 @@ pub(crate) async fn execute_migrate_phases(
             .flatten()
             .map(|j| j.phase)
             .unwrap_or_else(|| job.phase.clone());
-        let unwinds = unwinds_on_failure(&phase);
+        let routed = routed_to_target(&*mutator.read().await, &job.bucket, &params.target_backend);
+        let unwinds = unwind_allowed(&phase, routed);
         if unwinds {
             // Source stays authoritative: clients may write to it again
             // now, not after the staged-copy cleanup below.
@@ -1216,16 +1235,27 @@ impl MigrateRun<'_> {
         let bucket_key = bucket.clone();
         let target = params.target_backend.clone();
         let transient = params.transient_key.clone();
-        self.mutator
-            // STRICT: the flip's file-persist must succeed or the whole flip
-            // rolls back (engine swapped back to source). A file that lags
-            // the flip is the data-loss crash window: boot would route
-            // clients to the source while the resumed cleanup deletes it.
-            .mutate_and_apply_strict(
-                &format!("Bucket '{bucket_key}' migrated to backend '{target}'"),
-                move |cfg| apply_flip(cfg, &bucket_key, &target, Some(&transient)),
-            )
-            .await?;
+        // Idempotent: a resumed flip (the save after it failed, or the row
+        // went back to `flip`) finds the config flipped already. It must not
+        // write the config again: that write can fail (a full disk), and a
+        // failed job would then be judged against a flipped config.
+        let flipped = routed_to_target(
+            &*self.mutator.read().await,
+            &bucket_key,
+            &params.target_backend,
+        );
+        if !flipped {
+            self.mutator
+                // STRICT: the flip's file-persist must succeed or the whole flip
+                // rolls back (engine swapped back to source). A file that lags
+                // the flip is the data-loss crash window: boot would route
+                // clients to the source while the resumed cleanup deletes it.
+                .mutate_and_apply_strict(
+                    &format!("Bucket '{bucket_key}' migrated to backend '{target}'"),
+                    move |cfg| apply_flip(cfg, &bucket_key, &target, Some(&transient)),
+                )
+                .await?;
+        }
         info!(
             "migrate: bucket '{}' flipped to backend '{}'",
             bucket, params.target_backend
@@ -1301,13 +1331,8 @@ impl MigrateRun<'_> {
             // stick — or an admin apply mid-cleanup that re-routes the
             // bucket back — must stop the sweep instantly instead of
             // deleting data clients are actively writing to.
-            let routed_to_target = {
-                let cfg = mutator.read().await;
-                cfg.buckets
-                    .get(bucket)
-                    .and_then(|p| p.backend.as_deref().map(|b| b == params.target_backend))
-                    .unwrap_or(false)
-            };
+            let routed_to_target =
+                routed_to_target(&*mutator.read().await, bucket, &params.target_backend);
             if !routed_to_target {
                 stopped = Some(format!(
                     "cleanup refused: bucket '{}' is not routed to '{}' in the live \
@@ -1959,12 +1984,44 @@ mod tests {
         .await;
         assert!(
             matches!(outcome, Err(PhaseStop::Deferred(_))),
-            "a failed save must stop the phase: {outcome:?}"
+            "a failed save after the flip waits: {outcome:?}"
+        );
+        let before_flip = save_after_flush(async { Ok(Flushed(())) }, |flushed| {
+            persist_flushed(flushed, &db, &job, "flip", &c, None)
+        })
+        .await;
+        assert!(
+            matches!(before_flip, Err(PhaseStop::FailedTransient(_))),
+            "a failed save before the flip is a bounded transient failure: {before_flip:?}"
         );
         let guard = db.lock().await;
         guard.conn.execute_batch("ROLLBACK").unwrap();
         let row = guard.maintenance_job_by_id(id).unwrap().unwrap();
         assert_eq!(row.phase, "flip", "the stored phase did not move");
+    }
+
+    /// THE unwind rule: a phase that unwinds, and a bucket the live config
+    /// does not route to the target. Never an unwind over a flipped config.
+    #[test]
+    fn unwind_allowed_truth_table() {
+        for (phase, routed, want) in [
+            ("stage", false, true),
+            ("copy", false, true),
+            ("verify", false, true),
+            ("flip", false, true),
+            ("cleanup", false, false),
+            // The row names an earlier phase, the config is flipped.
+            ("copy", true, false),
+            ("verify", true, false),
+            ("flip", true, false),
+            ("cleanup", true, false),
+        ] {
+            assert_eq!(
+                unwind_allowed(phase, routed),
+                want,
+                "{phase} routed={routed}"
+            );
+        }
     }
 
     use super::*;

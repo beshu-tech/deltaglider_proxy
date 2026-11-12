@@ -31,7 +31,7 @@ pub const STALE_TEMP_MAX_AGE: Duration = Duration::from_secs(3600);
 /// rename mostly does not. So such a file goes only when it is old AND
 /// carries no metadata (`carries_metadata` is asked only then; "cannot
 /// tell" must answer `true`). A dead write that already had its metadata
-/// stays: it costs disk space, never an object.
+/// stays: it costs disk space. A foreign file without metadata that has such a name and is old is still removed.
 pub(crate) fn is_stale_temp(
     name: &str,
     age: Duration,
