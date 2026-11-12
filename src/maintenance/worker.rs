@@ -33,7 +33,7 @@ use crate::storage::StorageBackend;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::api::handlers::AppState;
 use crate::background::LeaseKeeper;
@@ -593,6 +593,8 @@ fn note_transient_stop(row: &MaintenanceJob) -> u32 {
 
 fn forget_transient_stops(row: &MaintenanceJob) {
     transient_stops().remove(&identity(row));
+    // The count of stops after a flip ends with the job as well.
+    post_flip_save_stops().lock().remove(&row.id);
 }
 
 /// Record `n` transient stops of `row` without progress (tests).
@@ -1638,6 +1640,29 @@ pub(crate) async fn persist(
     }
 }
 
+/// Proof that the job's row is durable at the phase that the holder of the
+/// proof is about to run. Only a successful [`persist_flushed`] makes one,
+/// or [`Durable::of_stored_row`] for a row that was read back from the
+/// database (what a restart reads is, by definition, what is stored). The
+/// flip of a migrate and its source cleanup take one: a save that failed
+/// leaves no proof, so a failed save stops the job before the flip or the
+/// delete and never after it.
+#[derive(Debug)]
+pub(crate) struct Durable(());
+
+impl Durable {
+    /// The row `job` was read from the database: its phase is stored.
+    pub(crate) fn of_stored_row(_job: &MaintenanceJob) -> Self {
+        Durable(())
+    }
+
+    /// A proof for a test that has no row.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Durable(())
+    }
+}
+
 /// [`persist`] for a phase that writes without the per-object fsync: only
 /// a [`super::migrate::Flushed`] (made by a successful flush) opens it, so
 /// a saved cursor never points past a copy that a crash can lose.
@@ -1647,6 +1672,10 @@ pub(crate) async fn persist(
 /// earlier phase, with the YAML already flipped, would let a cancel or a
 /// failure of the resumed job unwind (delete) the live data on the target.
 /// One fsync per page or phase costs nothing next to the page's copies.
+///
+/// A save that fails (the disk is full, the file is read-only) stops the
+/// phase and gives no proof. How it stops depends on where the job is
+/// ([`save_failure_stop`]).
 pub(crate) async fn persist_flushed(
     _proof: super::migrate::Flushed,
     db: &Arc<Mutex<JobsDb>>,
@@ -1654,16 +1683,76 @@ pub(crate) async fn persist_flushed(
     phase: &str,
     c: &Counters,
     token: Option<&str>,
-) {
+) -> Result<Durable, PhaseStop> {
     let db = db.lock().await;
-    if let Err(e) = db.maintenance_update_progress_durable(
+    let saved = db.maintenance_update_progress_durable(
         job.id, phase, c.total, c.done, c.skipped, c.failed, c.bytes, token,
-    ) {
-        warn!(
-            "maintenance: durable progress persist failed for job #{}: {}",
-            job.id, e
-        );
+    );
+    match saved {
+        Ok(()) => {
+            post_flip_save_stops().lock().remove(&job.id);
+            Ok(Durable(()))
+        }
+        Err(e) => {
+            let detail =
+                format!("the job's progress could not be saved durably (phase '{phase}'): {e}");
+            if save_failure_is_post_flip(phase) {
+                let n = {
+                    let mut stops = post_flip_save_stops().lock();
+                    let n = stops.entry(job.id).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                if post_flip_stop_is_error(n) {
+                    error!(
+                        "maintenance: job #{} cannot save its progress after the flip (stop {n}); \
+                         the bucket stays write-gated until the jobs database recovers: {detail}",
+                        job.id
+                    );
+                } else {
+                    warn!("maintenance: job #{} (stop {n}): {detail}", job.id);
+                }
+            } else {
+                warn!("maintenance: job #{}: {detail}", job.id);
+            }
+            Err(save_failure_stop(phase, detail))
+        }
     }
+}
+
+/// Is the save of `phase` one that follows the flip? Only the save of
+/// `cleanup` does: the flip is on disk, and the job can only go on.
+fn save_failure_is_post_flip(phase: &str) -> bool {
+    phase == "cleanup"
+}
+
+/// Pure: how a failed durable save of `phase` stops the job.
+///
+/// Before the flip the stop is a transient failure: the worker retries a
+/// bounded number of times, then settles `failed`, which unwinds and opens
+/// the write gate again. After the flip the stop is `Deferred` with no
+/// bound: the job must finish, and a failed job there would be judged
+/// against a flipped config. The bucket stays write-gated while it waits
+/// (the log says so, and escalates, see [`post_flip_stop_is_error`]).
+pub(crate) fn save_failure_stop(phase: &str, detail: String) -> PhaseStop {
+    if save_failure_is_post_flip(phase) {
+        PhaseStop::Deferred(detail)
+    } else {
+        PhaseStop::FailedTransient(detail)
+    }
+}
+
+/// Pure: is the `n`th stop in a row (counting from 1) after the flip logged
+/// as an error? The first stops are warnings; every 10th is an error.
+pub(crate) fn post_flip_stop_is_error(n: u32) -> bool {
+    n >= 10 && n.is_multiple_of(10)
+}
+
+/// Consecutive post-flip save failures of each job (this process).
+fn post_flip_save_stops() -> &'static parking_lot::Mutex<std::collections::HashMap<i64, u32>> {
+    static STOPS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<i64, u32>>> =
+        std::sync::OnceLock::new();
+    STOPS.get_or_init(Default::default)
 }
 
 /// The job's lease keeper. The per-page `heartbeat` is not enough on its
@@ -1806,6 +1895,49 @@ pub(crate) mod cost_tests;
 
 #[cfg(test)]
 mod tests {
+    /// A failed durable save stops a job before the flip with a bounded
+    /// transient failure, and after the flip with `Deferred`.
+    #[test]
+    fn save_failure_stop_table() {
+        for (phase, post_flip) in [
+            ("copy", false),
+            ("verify", false),
+            ("flip", false),
+            ("cleanup", true),
+        ] {
+            let stop = save_failure_stop(phase, "disk full".into());
+            assert_eq!(
+                matches!(stop, PhaseStop::Deferred(_)),
+                post_flip,
+                "{phase}: {stop:?}"
+            );
+            assert_eq!(matches!(stop, PhaseStop::FailedTransient(_)), !post_flip);
+        }
+    }
+
+    /// The count of stops after the flip ends with the job.
+    #[test]
+    fn the_post_flip_stop_count_ends_with_the_job() {
+        let db = JobsDb::in_memory("post-flip-count-test-key-0123456789abcdef").unwrap();
+        let id = db
+            .maintenance_create_job("migrate", "m", "cleanup", Some("{}"), "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("w", current_unix_seconds(), 60)
+            .unwrap()
+            .unwrap();
+        let job = db.maintenance_job_by_id(id).unwrap().unwrap();
+        post_flip_save_stops().lock().insert(job.id, 3);
+        forget_transient_stops(&job);
+        assert!(!post_flip_save_stops().lock().contains_key(&job.id));
+    }
+
+    #[test]
+    fn post_flip_stops_escalate_every_tenth() {
+        let errors: Vec<u32> = (1..=30).filter(|n| post_flip_stop_is_error(*n)).collect();
+        assert_eq!(errors, [10, 20, 30]);
+    }
+
     use super::*;
 
     /// The drain's stop after its deadline, from the counts re-read then

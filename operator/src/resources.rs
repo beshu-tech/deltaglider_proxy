@@ -157,6 +157,12 @@ pub const TMP_SIZE_LIMIT_MIB: u64 = 8192;
 /// default of 30 s would kill it first. The Helm chart uses the same value.
 pub const TERMINATION_GRACE_SECS: i64 = 60;
 
+/// The `timeoutSeconds` of a proxy pod's readiness probe. `/_/ready` runs its
+/// checks at the same time and answers within 3 s at the latest (the proxy's
+/// `READY_DEADLINE`); the Kubernetes default of 1 s would fail a healthy pod
+/// whose checks take longer. The Helm chart uses the same value.
+pub const READINESS_TIMEOUT_SECS: i64 = 5;
+
 /// Pure: the `DGP_SPOOL_MAX_BYTES` for a `/tmp` of `limit_mib`: three
 /// quarters of it, so the spool never reaches the limit (the rest is for
 /// the other files in `/tmp`).
@@ -367,6 +373,7 @@ pub fn proxy_statefulset(cr: &DeltaGliderProxy, replicas: i32) -> Value {
                         "readinessProbe": {
                             "httpGet": { "path": "/_/ready", "port": PROXY_PORT },
                             "initialDelaySeconds": 5, "periodSeconds": 10,
+                            "timeoutSeconds": READINESS_TIMEOUT_SECS,
                         },
                         "volumeMounts": volume_mounts,
                     }],
@@ -647,6 +654,24 @@ mod tests {
             .termination_grace_period_seconds;
         assert_eq!(grace, Some(TERMINATION_GRACE_SECS));
         const { assert!(TERMINATION_GRACE_SECS > 55) };
+    }
+
+    /// The readiness probe waits longer than `/_/ready` takes in the worst
+    /// case (3 s), not the 1 s default.
+    #[test]
+    fn proxy_pods_get_a_readiness_timeout_that_fits_the_worst_case() {
+        let cr = cr(1);
+        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr, 1)).unwrap();
+        let probe = sts.spec.unwrap().template.spec.unwrap().containers[0]
+            .readiness_probe
+            .clone()
+            .unwrap();
+        assert_eq!(
+            probe.timeout_seconds,
+            Some(READINESS_TIMEOUT_SECS as i32),
+            "the probe must set timeoutSeconds"
+        );
+        const { assert!(READINESS_TIMEOUT_SECS > 3) };
     }
 
     #[test]

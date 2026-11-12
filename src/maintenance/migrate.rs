@@ -72,7 +72,7 @@ use super::paged::{
 use super::store::MaintenanceJob;
 use super::worker::{
     after_run, check_cancel, current_row, drain_inflight_writes, heartbeat, persist_flushed,
-    record_failure, resumable_in, AfterRun, Counters, Holder, PhaseStop,
+    record_failure, resumable_in, AfterRun, Counters, Durable, Holder, PhaseStop,
 };
 
 pub const TRANSIENT_PREFIX: &str = "__dgmigrate_";
@@ -203,6 +203,24 @@ pub fn unwinds_on_failure(phase: &str) -> bool {
     phase != "cleanup"
 }
 
+/// Does the live config route `bucket` to `target`? Once it does, the flip
+/// has happened and the target holds the LIVE bucket.
+pub fn routed_to_target(cfg: &crate::config::Config, bucket: &str, target: &str) -> bool {
+    cfg.buckets
+        .get(bucket)
+        .and_then(|p| p.backend.as_deref().map(|b| b == target))
+        .unwrap_or(false)
+}
+
+/// THE rule for an unwind (delete the staged copies and the staging route):
+/// the phase must be one that unwinds AND the live config must not route the
+/// bucket to the target. The row can name a phase before the flip while the
+/// config is already flipped (a save after the flip failed, or a power loss
+/// reverted the row), and the unwind would then delete live data.
+pub fn unwind_allowed(phase: &str, routed_to_target: bool) -> bool {
+    unwinds_on_failure(phase) && !routed_to_target
+}
+
 /// First free `__dgmigrate_<bucket>_<n>` name.
 pub fn pick_transient_key(bucket_key: &str, taken: &dyn Fn(&str) -> bool) -> String {
     let mut n = 0u32;
@@ -293,25 +311,26 @@ pub fn alias_refusal(bucket: &str, aliases: &[String]) -> Option<String> {
 
 /// Proof that the deferred copy writes are durable. Only [`flush_copies`]
 /// makes one, and [`persist_flushed`] (the only save this file can reach)
-/// takes one, so every migrate save waits for a successful flush.
+/// takes one, so every migrate save waits for a successful flush. That save
+/// gives back a [`Durable`], which the flip and the cleanup take.
 pub(crate) struct Flushed(());
 
 /// Save progress only after the copies made so far are durable. The copy
 /// phase writes without the per-object fsync (`storage::with_deferred_fsync`),
 /// so a cursor saved first could point past a copy that a crash loses. A
 /// failed flush saves nothing and fails the phase (the source stays
-/// authoritative).
-async fn save_after_flush<F, S, Fut>(flush: F, save: S) -> Result<(), PhaseStop>
+/// authoritative). A failed save stops the phase too (see
+/// [`persist_flushed`]); only a successful one gives the [`Durable`] proof.
+async fn save_after_flush<F, S, Fut>(flush: F, save: S) -> Result<Durable, PhaseStop>
 where
     F: std::future::Future<Output = Result<Flushed, crate::deltaglider::EngineError>>,
     S: FnOnce(Flushed) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = Result<Durable, PhaseStop>>,
 {
     let flushed = flush
         .await
         .map_err(|e| format!("could not make the copied objects durable: {e}"))?;
-    save(flushed).await;
-    Ok(())
+    save(flushed).await
 }
 
 /// Flush the deferred copy writes of the live engine (every backend).
@@ -908,7 +927,8 @@ pub(crate) async fn execute_migrate_phases(
             .flatten()
             .map(|j| j.phase)
             .unwrap_or_else(|| job.phase.clone());
-        let unwinds = unwinds_on_failure(&phase);
+        let routed = routed_to_target(&*mutator.read().await, &job.bucket, &params.target_backend);
+        let unwinds = unwind_allowed(&phase, routed);
         if unwinds {
             // Source stays authoritative: clients may write to it again
             // now, not after the staged-copy cleanup below.
@@ -964,24 +984,28 @@ async fn run_phases(
     // exact once the copy ended (every object copied or skipped).
     let mut c = Counters::of(job);
     let mut phase = job.phase.as_str();
+    // Each phase ends with a durable save of the next phase and gives the
+    // proof of it. The flip and the cleanup take the proof, so neither can
+    // run after a save that failed. A resumed row is the stored state.
+    let mut saved = Durable::of_stored_row(job);
     if phase == "stage" {
-        m.stage(&c).await?;
+        saved = m.stage(&c).await?;
         phase = "copy";
     }
     if phase == "copy" {
-        m.copy(&mut c).await?;
+        saved = m.copy(&mut c).await?;
         phase = "verify";
     }
     if phase == "verify" {
-        m.verify(&c).await?;
+        saved = m.verify(&c).await?;
         phase = "flip";
     }
     if phase == "flip" {
-        m.flip(&c).await?;
+        saved = m.flip(&c, saved).await?;
         phase = "cleanup";
     }
     if phase == "cleanup" && params.delete_source {
-        m.cleanup().await?;
+        m.cleanup(&saved).await?;
     }
     Ok(())
 }
@@ -1013,7 +1037,7 @@ impl MigrateRun<'_> {
         phase: &str,
         c: &Counters,
         token: Option<&str>,
-    ) -> Result<(), PhaseStop> {
+    ) -> Result<Durable, PhaseStop> {
         save_after_flush(flush_copies(self.state), |flushed| {
             persist_flushed(flushed, self.db, self.job, phase, c, token)
         })
@@ -1055,7 +1079,7 @@ impl MigrateRun<'_> {
     }
 
     /// ── Phase: stage ──
-    async fn stage(&self, c: &Counters) -> Result<(), PhaseStop> {
+    async fn stage(&self, c: &Counters) -> Result<Durable, PhaseStop> {
         let (bucket, params) = (&self.job.bucket, self.params);
         check_cancel(self.db, self.job.id).await?;
         self.ensure_staging_route(&format!(
@@ -1092,7 +1116,7 @@ impl MigrateRun<'_> {
     }
 
     /// ── Phase: copy (resumable; ANY copy failure aborts pre-flip) ──
-    async fn copy(&self, c: &mut Counters) -> Result<(), PhaseStop> {
+    async fn copy(&self, c: &mut Counters) -> Result<Durable, PhaseStop> {
         let count = c.total.is_none().then(|| {
             BackgroundCount::spawn(self.state.engine.load().clone(), self.job.bucket.clone())
         });
@@ -1138,7 +1162,7 @@ impl MigrateRun<'_> {
     }
 
     /// ── Phase: verify ──
-    async fn verify(&self, c: &Counters) -> Result<(), PhaseStop> {
+    async fn verify(&self, c: &Counters) -> Result<Durable, PhaseStop> {
         let mut step = VerifyStep {
             m: self,
             c,
@@ -1202,21 +1226,36 @@ impl MigrateRun<'_> {
     }
 
     /// ── Phase: flip (idempotent; NOT interruptible) ──
-    async fn flip(&self, c: &Counters) -> Result<(), PhaseStop> {
+    ///
+    /// `_saved`: the row is durable at `flip`. The flip changes the config,
+    /// and a row that a power loss reverts to an earlier phase would let the
+    /// resumed job unwind over the flipped config.
+    async fn flip(&self, c: &Counters, _saved: Durable) -> Result<Durable, PhaseStop> {
         let (bucket, params) = (&self.job.bucket, self.params);
         let bucket_key = bucket.clone();
         let target = params.target_backend.clone();
         let transient = params.transient_key.clone();
-        self.mutator
-            // STRICT: the flip's file-persist must succeed or the whole flip
-            // rolls back (engine swapped back to source). A file that lags
-            // the flip is the data-loss crash window: boot would route
-            // clients to the source while the resumed cleanup deletes it.
-            .mutate_and_apply_strict(
-                &format!("Bucket '{bucket_key}' migrated to backend '{target}'"),
-                move |cfg| apply_flip(cfg, &bucket_key, &target, Some(&transient)),
-            )
-            .await?;
+        // Idempotent: a resumed flip (the save after it failed, or the row
+        // went back to `flip`) finds the config flipped already. It must not
+        // write the config again: that write can fail (a full disk), and a
+        // failed job would then be judged against a flipped config.
+        let flipped = routed_to_target(
+            &*self.mutator.read().await,
+            &bucket_key,
+            &params.target_backend,
+        );
+        if !flipped {
+            self.mutator
+                // STRICT: the flip's file-persist must succeed or the whole flip
+                // rolls back (engine swapped back to source). A file that lags
+                // the flip is the data-loss crash window: boot would route
+                // clients to the source while the resumed cleanup deletes it.
+                .mutate_and_apply_strict(
+                    &format!("Bucket '{bucket_key}' migrated to backend '{target}'"),
+                    move |cfg| apply_flip(cfg, &bucket_key, &target, Some(&transient)),
+                )
+                .await?;
+        }
         info!(
             "migrate: bucket '{}' flipped to backend '{}'",
             bucket, params.target_backend
@@ -1227,14 +1266,17 @@ impl MigrateRun<'_> {
         if let Some(usage) = &self.state.bucket_usage {
             usage.mark_for_recount(bucket);
         }
-        self.checkpoint("cleanup", c, None).await?;
+        // A save that fails stops the job here: the cleanup (the source
+        // delete) never runs without the proof that the row is durable at
+        // `cleanup`. The flip is idempotent, so the resumed job repeats it.
+        let saved = self.checkpoint("cleanup", c, None).await?;
         // Destination is authoritative — client writes resume NOW, not at
         // job settle: the row is in `cleanup`, which gates neither the
         // bucket nor the (just removed) staging route.
         self.state
             .maintenance_gate
             .sync_from(&*self.db.lock().await);
-        Ok(())
+        Ok(saved)
     }
 
     /// ── Phase: cleanup (optional delete-source; never fails the job) ──
@@ -1242,7 +1284,7 @@ impl MigrateRun<'_> {
     /// Not a [`paged_phase`]: it has no cursor (deletes shift the key
     /// tokens, so a sweep that deleted restarts from the top), and a cancel
     /// here is a note on a finished migration, not a stop.
-    async fn cleanup(&self) -> Result<(), PhaseStop> {
+    async fn cleanup(&self, _saved: &Durable) -> Result<(), PhaseStop> {
         let (mutator, db, state, holder, job, params) = (
             self.mutator,
             self.db,
@@ -1289,13 +1331,8 @@ impl MigrateRun<'_> {
             // stick — or an admin apply mid-cleanup that re-routes the
             // bucket back — must stop the sweep instantly instead of
             // deleting data clients are actively writing to.
-            let routed_to_target = {
-                let cfg = mutator.read().await;
-                cfg.buckets
-                    .get(bucket)
-                    .and_then(|p| p.backend.as_deref().map(|b| b == params.target_backend))
-                    .unwrap_or(false)
-            };
+            let routed_to_target =
+                routed_to_target(&*mutator.read().await, bucket, &params.target_backend);
             if !routed_to_target {
                 stopped = Some(format!(
                     "cleanup refused: bucket '{}' is not routed to '{}' in the live \
@@ -1483,14 +1520,17 @@ impl PageStep for CopyStep<'_, '_> {
 
     async fn save(&mut self, token: Option<&str>) -> Result<(), PhaseStop> {
         self.take_count();
-        self.m.checkpoint("copy", self.c, token).await
+        self.m.checkpoint("copy", self.c, token).await.map(drop)
     }
 
     /// Resume token = this page's: the verdict skip makes the redo of its
     /// first part idempotent.
     async fn mid_page(&mut self, page_token: Option<&str>) -> Result<(), PhaseStop> {
         self.take_count();
-        self.m.checkpoint("copy", self.c, page_token).await
+        self.m
+            .checkpoint("copy", self.c, page_token)
+            .await
+            .map(drop)
     }
 
     async fn object(&self, key: &str) -> CopyDone {
@@ -1642,7 +1682,7 @@ impl PageStep for VerifyStep<'_, '_> {
     }
 
     async fn save(&mut self, token: Option<&str>) -> Result<(), PhaseStop> {
-        self.m.checkpoint("verify", self.c, token).await
+        self.m.checkpoint("verify", self.c, token).await.map(drop)
     }
 
     async fn object(&self, key: &str) -> Result<(), PhaseStop> {
@@ -1874,6 +1914,7 @@ mod tests {
         };
         let save = |_: Flushed| async {
             log.lock().unwrap().push("save");
+            Ok(Durable::for_tests())
         };
         save_after_flush(flush(true), save).await.unwrap();
         assert_eq!(*log.lock().unwrap(), ["flush", "save"]);
@@ -1906,11 +1947,81 @@ mod tests {
         let before = runs(&db);
         let db = std::sync::Arc::new(tokio::sync::Mutex::new(db));
         let c = Counters::of(&job);
-        persist_flushed(Flushed(()), &db, &job, "cleanup", &c, None).await;
+        persist_flushed(Flushed(()), &db, &job, "cleanup", &c, None)
+            .await
+            .expect("the save commits");
         let guard = db.lock().await;
         assert_eq!(runs(&guard) - before, 1, "one FULL commit");
         let saved = guard.maintenance_job_by_id(id).unwrap().unwrap();
         assert_eq!(saved.phase, "cleanup");
+    }
+
+    /// A durable save that fails stops the phase and gives no proof, so the
+    /// flip and the cleanup (which take the proof) cannot run. The failure
+    /// is injected with an open transaction: `synchronous = FULL` cannot be
+    /// set inside one, so the commit refuses (a full disk fails the same
+    /// way, at the commit). The stop is `Deferred`, never `Failed`: a failed
+    /// job unwinds, and after the flip that deletes the live data.
+    #[tokio::test]
+    async fn a_failed_durable_save_stops_the_phase_with_no_proof() {
+        use super::{persist_flushed, save_after_flush, Flushed};
+        use crate::maintenance::worker::Counters;
+        let db = JobsDb::in_memory("migrate-failed-save-key-0123456789abcdef").unwrap();
+        let id = db
+            .maintenance_create_job("migrate", "m", "flip", Some("{}"), "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("w", crate::event_outbox::current_unix_seconds(), 60)
+            .unwrap()
+            .unwrap();
+        let job = db.maintenance_job_by_id(id).unwrap().unwrap();
+        db.conn.execute_batch("BEGIN").unwrap();
+        let db = std::sync::Arc::new(tokio::sync::Mutex::new(db));
+        let c = Counters::of(&job);
+        let outcome = save_after_flush(async { Ok(Flushed(())) }, |flushed| {
+            persist_flushed(flushed, &db, &job, "cleanup", &c, None)
+        })
+        .await;
+        assert!(
+            matches!(outcome, Err(PhaseStop::Deferred(_))),
+            "a failed save after the flip waits: {outcome:?}"
+        );
+        let before_flip = save_after_flush(async { Ok(Flushed(())) }, |flushed| {
+            persist_flushed(flushed, &db, &job, "flip", &c, None)
+        })
+        .await;
+        assert!(
+            matches!(before_flip, Err(PhaseStop::FailedTransient(_))),
+            "a failed save before the flip is a bounded transient failure: {before_flip:?}"
+        );
+        let guard = db.lock().await;
+        guard.conn.execute_batch("ROLLBACK").unwrap();
+        let row = guard.maintenance_job_by_id(id).unwrap().unwrap();
+        assert_eq!(row.phase, "flip", "the stored phase did not move");
+    }
+
+    /// THE unwind rule: a phase that unwinds, and a bucket the live config
+    /// does not route to the target. Never an unwind over a flipped config.
+    #[test]
+    fn unwind_allowed_truth_table() {
+        for (phase, routed, want) in [
+            ("stage", false, true),
+            ("copy", false, true),
+            ("verify", false, true),
+            ("flip", false, true),
+            ("cleanup", false, false),
+            // The row names an earlier phase, the config is flipped.
+            ("copy", true, false),
+            ("verify", true, false),
+            ("flip", true, false),
+            ("cleanup", true, false),
+        ] {
+            assert_eq!(
+                unwind_allowed(phase, routed),
+                want,
+                "{phase} routed={routed}"
+            );
+        }
     }
 
     use super::*;

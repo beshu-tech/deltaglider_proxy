@@ -496,6 +496,7 @@ fn promote_backup_db(
     bak_path: &std::path::Path,
     keys: &deltaglider_proxy::config_db::ConfigDbKeys,
     has_sync: bool,
+    lock: &deltaglider_proxy::data_dir_lock::DataDirLock,
 ) -> Result<deltaglider_proxy::config_db::ConfigDb, String> {
     let discarded = db_file.with_extension("db.discarded");
     std::fs::rename(db_file, &discarded).map_err(|e| {
@@ -514,7 +515,7 @@ fn promote_backup_db(
             db_file.display()
         ));
     }
-    let (db, _) = deltaglider_proxy::config_db_sync::open_live_db(db_file, keys, has_sync)
+    let (db, _) = deltaglider_proxy::config_db_sync::open_live_db(db_file, keys, has_sync, lock)
         .map_err(|e| format!("reopen promoted {}: {e}", db_file.display()))?;
     info!(
         "config-db mismatch incident resolved: promoted backup {} over the live DB \
@@ -530,7 +531,7 @@ fn promote_backup_db(
 /// config DB key now. Without this, the new hash would leave no key that
 /// opens the DB. No DB, or a DB already on the config DB key: no-op.
 pub fn migrate_legacy_config_db_key() -> Result<(), String> {
-    use deltaglider_proxy::config_db::{key, OpenedWith};
+    use deltaglider_proxy::config_db::key;
     let db_path = config_db_path();
     if !db_path.exists() {
         return Ok(());
@@ -551,9 +552,37 @@ pub fn migrate_legacy_config_db_key() -> Result<(), String> {
         current_hash.as_deref(),
         deltaglider_proxy::config::process_env,
     )?;
+    rekey_under_state_lock(&db_path, &keys)
+}
+
+/// Re-encrypt the DB at `db_path` to `keys.primary` when it does not open
+/// with it yet. A re-encrypt replaces the DB file, and a running server keeps
+/// its handle on the old file and would lose every later write. So this takes
+/// the state directory lock, as a server does, and refuses while a server
+/// runs. A DB that already opens with the primary key needs no lock.
+fn rekey_under_state_lock(
+    db_path: &std::path::Path,
+    keys: &deltaglider_proxy::config_db::ConfigDbKeys,
+) -> Result<(), String> {
+    use deltaglider_proxy::config_db::{probe_key, OpenedWith};
+    if probe_key(db_path, keys.primary.expose()).unwrap_or(false) {
+        return Ok(());
+    }
+    let dir = db_path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let lock =
+        deltaglider_proxy::data_dir_lock::acquire(dir, Duration::ZERO, || {}).map_err(|e| {
+            format!(
+                "the config DB must be re-encrypted before the password changes, and that \
+                 needs the state directory lock: {e}. Stop the server, run this command \
+                 again, then start the server"
+            )
+        })?;
     // The CLI does not know whether the config has a sync bucket, so it
     // always parks the upload: without a sync bucket the marker is inert.
-    match deltaglider_proxy::config_db_sync::open_live_db(&db_path, &keys, true) {
+    match deltaglider_proxy::config_db_sync::open_live_db(db_path, keys, true, &lock) {
         Ok((_, OpenedWith::Migrated(kind))) => {
             eprintln!(
                 "Config DB {} re-encrypted: it opened with {}, now with {}.",
@@ -614,11 +643,12 @@ pub fn init_config_db(
     keys: &deltaglider_proxy::config_db::ConfigDbKeys,
     iam_state: &SharedIamState,
     config: &Config,
+    lock: &deltaglider_proxy::data_dir_lock::DataDirLock,
 ) -> (
     Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
     bool,
 ) {
-    init_config_db_attempt(keys, iam_state, config, true)
+    init_config_db_attempt(keys, iam_state, config, true, lock)
 }
 
 /// One boot attempt. `allow_promote` bounds the recover-then-retry to a
@@ -629,6 +659,7 @@ fn init_config_db_attempt(
     iam_state: &SharedIamState,
     config: &Config,
     allow_promote: bool,
+    lock: &deltaglider_proxy::data_dir_lock::DataDirLock,
 ) -> (
     Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
     bool,
@@ -640,7 +671,7 @@ fn init_config_db_attempt(
         .config_sync_bucket
         .as_deref()
         .is_some_and(|b| !b.trim().is_empty());
-    match deltaglider_proxy::config_db_sync::open_live_db(&db_file, keys, has_sync) {
+    match deltaglider_proxy::config_db_sync::open_live_db(&db_file, keys, has_sync, lock) {
         Ok((db, _opened)) => {
             // Classify a lingering .db.bak BEFORE any boot-time mutation: a
             // node with an unresolved mismatch incident must stay locked.
@@ -664,10 +695,10 @@ fn init_config_db_attempt(
                 // as `.db.discarded`.
                 BakDisposition::Promote if allow_promote => {
                     drop(db);
-                    return match promote_backup_db(&db_file, &bak_path, keys, has_sync) {
+                    return match promote_backup_db(&db_file, &bak_path, keys, has_sync, lock) {
                         Ok(db) => {
                             drop(db);
-                            init_config_db_attempt(keys, iam_state, config, false)
+                            init_config_db_attempt(keys, iam_state, config, false, lock)
                         }
                         Err(err) => {
                             error!(
@@ -866,10 +897,10 @@ fn init_config_db_attempt(
                 && bak_path.exists()
                 && probe_bak_users(&bak_path, keys).is_some_and(|n| n > 0)
             {
-                match promote_backup_db(&db_file, &bak_path, keys, has_sync) {
+                match promote_backup_db(&db_file, &bak_path, keys, has_sync, lock) {
                     Ok(db) => {
                         drop(db);
-                        return init_config_db_attempt(keys, iam_state, config, false);
+                        return init_config_db_attempt(keys, iam_state, config, false, lock);
                     }
                     Err(err) => {
                         error!(
@@ -2306,8 +2337,53 @@ mod tests {
         }
     }
 
+    /// `--set-bootstrap-password` must not re-encrypt the config DB while a
+    /// server holds the state directory lock: the server would keep writing
+    /// to the replaced file. The CLI refuses and leaves the DB alone; with
+    /// no server it re-encrypts.
+    #[test]
+    fn a_rekey_refuses_while_a_server_holds_the_state_lock() {
+        use deltaglider_proxy::config_db::{ConfigDb, ConfigDbKeys, FallbackKind};
+        const HASH: &str = "$2b$04$legacyhashlegacyhashlegacyhashlegacyhash";
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("deltaglider_config.db");
+        drop(ConfigDb::open_or_create(&db_path, HASH).unwrap());
+        let keys = ConfigDbKeys::primary_only(&"k".repeat(40))
+            .with_fallback(FallbackKind::LegacyBootstrapHash, HASH);
+        let server =
+            deltaglider_proxy::data_dir_lock::acquire(dir.path(), Duration::ZERO, || {}).unwrap();
+        let err = rekey_under_state_lock(&db_path, &keys).expect_err("a server runs");
+        assert!(err.contains("Stop the server"), "{err}");
+        assert!(
+            deltaglider_proxy::config_db::probe_key(&db_path, HASH).unwrap(),
+            "the DB is still on the old key"
+        );
+        drop(server);
+        rekey_under_state_lock(&db_path, &keys).expect("no server: it re-encrypts");
+        assert!(deltaglider_proxy::config_db::probe_key(&db_path, keys.primary.expose()).unwrap());
+        // On the primary key already: no lock needed, also while a server runs.
+        let _server =
+            deltaglider_proxy::data_dir_lock::acquire(dir.path(), Duration::ZERO, || {}).unwrap();
+        rekey_under_state_lock(&db_path, &keys).expect("nothing to re-encrypt");
+    }
+
     use super::*;
     use deltaglider_proxy::config::Config;
+
+    /// The state directory lock of the directory that holds `db_file`.
+    /// Leaked on purpose: a test lives for its tempdir only.
+    fn lock_of(
+        db_file: &std::path::Path,
+    ) -> &'static deltaglider_proxy::data_dir_lock::DataDirLock {
+        Box::leak(Box::new(
+            deltaglider_proxy::data_dir_lock::acquire(
+                db_file.parent().unwrap(),
+                Duration::ZERO,
+                || {},
+            )
+            .unwrap(),
+        ))
+    }
 
     /// On a backend without atomic writes the boot advice is a migrate job,
     /// never the re-encrypt job that the backend refuses.
@@ -2416,7 +2492,10 @@ mod tests {
                 .unwrap(),
         );
         let keys = deltaglider_proxy::config_db::ConfigDbKeys::primary_only("$2b$04$good");
-        drop(promote_backup_db(&db_file, &bak, &keys, false).expect("promote must succeed"));
+        drop(
+            promote_backup_db(&db_file, &bak, &keys, false, lock_of(&db_file))
+                .expect("promote must succeed"),
+        );
         assert!(db_file.exists(), "live DB must exist after promote");
         assert!(!bak.exists(), ".db.bak must be consumed by promote");
         assert!(
@@ -2464,7 +2543,7 @@ mod tests {
         let keys = ConfigDbKeys::primary_only(primary)
             .with_fallback(FallbackKind::LegacyBootstrapHash, "$2b$04$legacy");
         assert_eq!(probe_bak_users(&bak, &keys), Some(1));
-        drop(promote_backup_db(&db_file, &bak, &keys, false).unwrap());
+        drop(promote_backup_db(&db_file, &bak, &keys, false, lock_of(&db_file)).unwrap());
         assert!(probe_key(&db_file, primary).unwrap());
     }
 
@@ -2514,7 +2593,7 @@ mod tests {
         drop(ConfigDb::open_or_create(&db_file, primary).unwrap());
         let keys = ConfigDbKeys::primary_only(primary)
             .with_fallback(FallbackKind::LegacyBootstrapHash, "$2b$04$legacy");
-        drop(promote_backup_db(&db_file, &bak, &keys, true).unwrap());
+        drop(promote_backup_db(&db_file, &bak, &keys, true, lock_of(&db_file)).unwrap());
         assert!(
             db_file.with_extension("db.sync-pending").exists(),
             "the re-encrypted DB is not queued for upload"
