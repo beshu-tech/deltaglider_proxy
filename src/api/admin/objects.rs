@@ -634,19 +634,24 @@ async fn run_copy_loop(
                                 req.source_bucket, it.source_key, e
                             ))
                         }),
-                    Ok(()) => {
-                        copy_one(
-                            write
-                                .proof_for(&req.dest_bucket)
-                                .expect("the loop counts its destination bucket"),
-                            s3,
-                            engine,
-                            (&req.source_bucket, &it.source_key),
-                            &dk,
-                            req.no_overwrite,
-                        )
-                        .await
-                    }
+                    Ok(()) => match write.proof_for(&req.dest_bucket) {
+                        Some(proof) => {
+                            copy_one(
+                                proof,
+                                s3,
+                                engine,
+                                (&req.source_bucket, &it.source_key),
+                                &dk,
+                                req.no_overwrite,
+                            )
+                            .await
+                        }
+                        // Never: the loop counts its destination bucket.
+                        None => Err(CopyFault::failed(format!(
+                            "the write count of this loop does not cover '{}'",
+                            req.dest_bucket
+                        ))),
+                    },
                     Err(denied) => Err(CopyFault::Failed(denied)),
                 };
                 out.push((

@@ -1847,6 +1847,37 @@ async fn a_finished_completing_guard_changes_nothing() {
     );
 }
 
+/// How a retry or joiner of a successful Complete is answered: the success
+/// while the key still holds this upload's object (also with a
+/// precondition), the success without a precondition, and a judgment of its
+/// own preconditions only when the key holds another object or none.
+#[test]
+fn retry_verdict_table() {
+    use RetryVerdict::{Judge, Success};
+    let mine = "\"abc-3\"";
+    let table: [(Option<&str>, bool, RetryVerdict); 8] = [
+        // Same object: the success, whatever the precondition.
+        (Some(mine), true, Success),
+        (Some(mine), false, Success),
+        // The ETag compares without quotes or the weak mark.
+        (Some("abc-3"), true, Success),
+        (Some("W/\"abc-3\""), true, Success),
+        // Another object, or none: the preconditions count.
+        (Some("\"other-1\""), true, Judge),
+        (None, true, Judge),
+        // No precondition: nothing to judge.
+        (Some("\"other-1\""), false, Success),
+        (None, false, Success),
+    ];
+    for (current, has_precondition, expected) in table {
+        assert_eq!(
+            retry_verdict(current, mine, has_precondition),
+            expected,
+            "{current:?} precondition={has_precondition}"
+        );
+    }
+}
+
 /// An `Err` published after a post-commit unwind wrote the success must
 /// not erase it: the slot stays `Done`, joiners get the success, and a
 /// retry gets the tombstone, not NoSuchUpload.

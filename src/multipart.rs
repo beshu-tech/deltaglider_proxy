@@ -430,6 +430,41 @@ pub fn joiner_failure(answer: Option<&s3s::S3Error>) -> CompletionFailure {
     }
 }
 
+/// How a retry or a joiner of a successful Complete is answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryVerdict {
+    /// The success of the upload, whatever the request's preconditions.
+    Success,
+    /// The key no longer holds this upload's object: the request's own
+    /// preconditions are judged against what it holds now.
+    Judge,
+}
+
+/// Pure: how a request for an upload that is already complete is answered.
+/// A retry of the SAME upload (a lost 200, a joiner) is the same write: when
+/// the key still holds the object that this upload wrote (`current_etag`
+/// equals `upload_etag`), the answer is the success, also for
+/// `If-None-Match: *` (the object exists because of this very upload). A
+/// request without preconditions is the success too. Only a key that now
+/// holds another object, or none, makes the request's preconditions count.
+pub fn retry_verdict(
+    current_etag: Option<&str>,
+    upload_etag: &str,
+    has_precondition: bool,
+) -> RetryVerdict {
+    let bare = |e: &str| {
+        e.trim()
+            .trim_start_matches("W/")
+            .trim_matches('"')
+            .to_string()
+    };
+    if !has_precondition || current_etag.is_some_and(|c| bare(c) == bare(upload_etag)) {
+        RetryVerdict::Success
+    } else {
+        RetryVerdict::Judge
+    }
+}
+
 const COMPLETION_TOMBSTONE_TTL_SECS: u64 = 900;
 
 enum CompletionSlot {
@@ -439,6 +474,8 @@ enum CompletionSlot {
         key: String,
         rx: tokio::sync::watch::Receiver<Option<CompletionResult>>,
         started_at: std::time::Instant,
+        /// Requests that joined this completion (tests wait on it).
+        joiners: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     },
     Done {
         fingerprint: u64,
@@ -1013,8 +1050,14 @@ impl MultipartStore {
                 bucket: b, key: k, ..
             }) if b != bucket || k != key => Err(S3Error::NoSuchUpload(upload_id.to_string())),
             Some(CompletionSlot::InFlight {
-                fingerprint: f, rx, ..
-            }) if *f == fingerprint => Ok(BeginComplete::Join(rx.clone())),
+                fingerprint: f,
+                rx,
+                joiners,
+                ..
+            }) if *f == fingerprint => {
+                joiners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BeginComplete::Join(rx.clone()))
+            }
             Some(CompletionSlot::InFlight { .. }) => Err(S3Error::InvalidRequest(
                 "another CompleteMultipartUpload with a different part list is in flight"
                     .to_string(),
@@ -1041,6 +1084,7 @@ impl MultipartStore {
                         key: key.to_string(),
                         rx,
                         started_at: std::time::Instant::now(),
+                        joiners: Default::default(),
                     },
                 );
                 Ok(BeginComplete::Owner(CompletionPublisher {
@@ -1053,6 +1097,18 @@ impl MultipartStore {
                     published: false,
                 }))
             }
+        }
+    }
+
+    /// Tests: the requests that joined the completion of `upload_id` that is
+    /// in flight now (`None`: none is in flight).
+    #[cfg(test)]
+    pub(crate) fn completion_joiners(&self, upload_id: &str) -> Option<usize> {
+        match self.completions.lock().get(upload_id) {
+            Some(CompletionSlot::InFlight { joiners, .. }) => {
+                Some(joiners.load(std::sync::atomic::Ordering::SeqCst))
+            }
+            _ => None,
         }
     }
 

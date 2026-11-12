@@ -1506,7 +1506,10 @@ fn destination_holds_it(
         |m: &crate::types::FileMetadata| -> std::collections::BTreeMap<String, String> {
             m.user_metadata
                 .iter()
-                .filter(|(k, _)| !k.starts_with("dg-") && k.as_str() != LIFECYCLE_RULE_METADATA_KEY)
+                .filter(|(k, _)| {
+                    !k.to_ascii_lowercase().starts_with("dg-")
+                        && !k.eq_ignore_ascii_case(LIFECYCLE_RULE_METADATA_KEY)
+                })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         };
@@ -2950,6 +2953,7 @@ mod tests {
                 ("owner", "dana"),
                 (crate::transfer::LIFECYCLE_RULE_METADATA_KEY, "r"),
                 ("dg-extra", "1"),
+                ("DG-Upper", "2"),
             ],
         );
         assert!(super::destination_holds_it(&source, &ours));
