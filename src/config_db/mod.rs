@@ -1584,6 +1584,22 @@ pub enum ConfigDbError {
     /// The write would leave the DB in a state the caller refuses (HTTP
     /// 409): nothing was committed.
     Refused(String),
+    /// A synced copy that is older than the last one this node merged: not
+    /// merged. `by` says how the age was judged.
+    RollbackRefused {
+        by: RollbackBy,
+        detail: String,
+    },
+}
+
+/// How a synced copy was found to be older than the last merged one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackBy {
+    /// By sync generation (v29 and later): exact.
+    Generation,
+    /// By the age of its rows (a copy from before v29, no generation): a
+    /// guess with a 5-minute tolerance.
+    RowAge,
 }
 
 impl std::fmt::Display for ConfigDbError {
@@ -1599,6 +1615,9 @@ impl std::fmt::Display for ConfigDbError {
             Self::NotFound(what) => write!(f, "Not found: {}", what),
             Self::Io(e) => write!(f, "I/O error: {}", e),
             Self::Other(msg) | Self::Refused(msg) => write!(f, "{}", msg),
+            Self::RollbackRefused { detail, .. } => {
+                write!(f, "{detail}: refusing it as a rollback")
+            }
         }
     }
 }

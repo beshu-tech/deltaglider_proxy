@@ -50,12 +50,22 @@ use crate::config::tuning::env_pinned_hash_var;
 /// Make `hash` the bootstrap hash: the state file first (the next boot
 /// reads it), then the in-memory login verifier and the config. Shared by
 /// the password change and the backup restore.
-pub(crate) async fn install_bootstrap_hash(state: &AdminState, hash: &str) -> std::io::Result<()> {
+///
+/// THE place where a hash is installed, so THE place where the sessions of
+/// the old password end: every bootstrap session except the one in
+/// `headers` (the caller that makes the change stays signed in). Returns
+/// how many sessions ended. A failed write ends nothing.
+pub(crate) async fn install_bootstrap_hash(
+    state: &AdminState,
+    hash: &str,
+    headers: &HeaderMap,
+) -> std::io::Result<usize> {
     let state_file = std::path::Path::new(".deltaglider_bootstrap_hash");
     crate::config::write_bootstrap_hash_file(state_file, hash)?;
     *state.password_hash.write() = hash.to_string();
     state.config.write().await.bootstrap_password_hash = Some(hash.to_string());
-    Ok(())
+    let keep = super::super::auth::extract_session_token(&state.sessions, headers);
+    Ok(state.sessions.revoke_bootstrap_except(keep.as_deref()))
 }
 
 /// PUT /api/admin/password — change bootstrap password.
@@ -134,20 +144,20 @@ pub async fn change_password(
         }
     };
 
-    if let Err(e) = install_bootstrap_hash(&state, &new_hash).await {
-        tracing::error!("Failed to persist new admin hash to disk: {}", e);
-        return password_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "Failed to persist hash file ({}). Password change aborted.",
-                e
-            ),
-        );
-    }
-
-    // A session minted under the old password ends; the caller's stays.
-    let keep = super::super::auth::extract_session_token(&state.sessions, &headers);
-    let ended = state.sessions.revoke_bootstrap_except(keep.as_deref());
+    // Installing the hash ends the other sessions; the caller's stays.
+    let ended = match install_bootstrap_hash(&state, &new_hash, &headers).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("Failed to persist new admin hash to disk: {}", e);
+            return password_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Failed to persist hash file ({}). Password change aborted.",
+                    e
+                ),
+            );
+        }
+    };
     audit_log(
         "change_password",
         "bootstrap",
@@ -433,6 +443,51 @@ mod tests {
         assert!(
             !handler.contains(concat!(".re", "key(")),
             "password.rs calls rekey"
+        );
+    }
+
+    /// Only `install_bootstrap_hash` writes the live bootstrap hash (state
+    /// file and login verifier) while the server runs, so only it must end
+    /// the sessions of the old password, and it does so inside its own body.
+    /// The two other writers run before any session exists: the boot's first
+    /// hash and the offline `--set-bootstrap-password` command. A new writer
+    /// anywhere in `src/` fails here.
+    #[test]
+    fn only_install_bootstrap_hash_writes_the_live_hash() {
+        const BOOT: [(&str, &str); 2] = [
+            ("src/config/mod.rs", "ensure_bootstrap_password_hash"),
+            ("src/main.rs", "main"),
+        ];
+        let mut writers = Vec::new();
+        for (rel, text) in crate::source_scan::prod_sources("src") {
+            let prod = crate::source_scan::prod_mask(&text);
+            for (at, line) in text.lines().enumerate() {
+                if !prod[at] || line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let writes = line.contains(concat!("write_bootstrap_", "hash_file("))
+                    && !line.contains("pub fn ")
+                    || line.contains(concat!("password_hash", ".write()"));
+                if writes {
+                    writers.push((rel.clone(), crate::source_scan::enclosing_fn(&text, at).0));
+                }
+            }
+        }
+        writers.retain(|(f, func)| !BOOT.iter().any(|(bf, bfn)| bf == f && bfn == func));
+        let own = "src/api/admin/config/password.rs".to_string();
+        assert_eq!(
+            writers,
+            vec![
+                (own.clone(), "install_bootstrap_hash".to_string()),
+                (own, "install_bootstrap_hash".to_string()),
+            ],
+            "a writer of the bootstrap hash outside install_bootstrap_hash skips the session rule"
+        );
+        let body =
+            crate::source_scan::fn_body(include_str!("password.rs"), "install_bootstrap_hash");
+        assert!(
+            body.contains("revoke_bootstrap_except"),
+            "install_bootstrap_hash must end the other bootstrap sessions itself"
         );
     }
 

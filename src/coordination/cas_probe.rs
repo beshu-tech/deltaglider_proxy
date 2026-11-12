@@ -158,6 +158,126 @@ impl ProbeResult {
     }
 }
 
+/// What a probe that gave no verdict says about the bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeErrorKind {
+    /// The backend ANSWERED the probe's plain write with a refusal that no
+    /// retry changes: the bucket does not exist, the credentials are wrong
+    /// or have no right to write. The configuration is wrong.
+    Misconfigured,
+    /// No answer, or an answer that a later attempt can change (timeout,
+    /// connection error, 5xx, throttling). The probe says nothing.
+    Indeterminate,
+}
+
+/// Why [`probe_cas`] gave no verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeError {
+    pub kind: ProbeErrorKind,
+    pub detail: String,
+    /// A refusal that a new bucket or a new access key can still cause
+    /// ([`code_may_propagate`]): the boot waits a short time before it
+    /// takes the refusal as final.
+    pub propagates: bool,
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+/// A conditional step that the probe could not read is never a verdict on
+/// the configuration: the plain write went through before it.
+impl From<String> for ProbeError {
+    fn from(detail: String) -> Self {
+        Self {
+            kind: ProbeErrorKind::Indeterminate,
+            detail,
+            propagates: false,
+        }
+    }
+}
+
+/// S3 error codes of an answer that a later attempt can change, whatever
+/// the HTTP status they come with.
+const RETRYABLE_CODES: &[&str] = &[
+    "RequestTimeout",
+    "TemporaryRedirect",
+    "OperationAborted",
+    "ExpiredToken",
+    // A full store or an account over its quota is the store's state, not a
+    // wrong configuration.
+    "QuotaExceeded",
+    // MinIO: a full bucket quota (`400`).
+    "XMinioAdminBucketQuotaExceeded",
+    "StorageQuotaExceeded",
+    "storage_cap_exceeded",
+    "RequestTimeTooSkewed",
+    concat!("Slow", "Down"),
+    "Throttling",
+    "ThrottlingException",
+    "TooManyRequests",
+    "RequestLimitExceeded",
+    concat!("Service", "Unavailable"),
+    "InternalError",
+];
+
+/// Codes of a refusal that a new bucket or a new access key can still
+/// cause: they take a moment to reach every part of the store.
+const PROPAGATING_CODES: &[&str] = &[
+    "AccessDenied",
+    "InvalidAccessKeyId",
+    "NoSuchBucket",
+    // A key that was made a moment ago may not be known to every part of
+    // the store yet.
+    "SignatureDoesNotMatch",
+];
+
+/// Pure: can a bucket or a key that was made a moment ago explain `code`?
+pub fn code_may_propagate(code: &str) -> bool {
+    PROPAGATING_CODES.contains(&code)
+}
+
+/// Pure: what the answer to the probe's first, UNCONDITIONAL write says.
+/// `status` is the HTTP status (`None`: no HTTP answer), `code` the S3
+/// error code that the answer's XML body carries (empty when it has none:
+/// an ingress, a WAF or a proxy answered, not the store).
+///
+/// Definitive ONLY for a parsed S3 error code that no retry changes, on a
+/// 3xx or 4xx status: the bucket is missing (`NoSuchBucket`), the key is
+/// unknown (`InvalidAccessKeyId`), the signature or the region is wrong,
+/// the credentials may not write (`AccessDenied`), the bucket lives
+/// elsewhere (`PermanentRedirect`). Everything else is indeterminate: no
+/// answer, 5xx, no S3 code, 408, 429 and the codes in `RETRYABLE_CODES`
+/// (answers that depend on load, on time or on a token).
+pub fn classify_write_refusal(status: Option<u16>, code: &str) -> ProbeErrorKind {
+    let Some(status) = status else {
+        return ProbeErrorKind::Indeterminate;
+    };
+    if code.is_empty() || RETRYABLE_CODES.contains(&code) || matches!(status, 408 | 429) {
+        return ProbeErrorKind::Indeterminate;
+    }
+    match status {
+        300..=499 => ProbeErrorKind::Misconfigured,
+        _ => ProbeErrorKind::Indeterminate,
+    }
+}
+
+/// The HTTP status and the S3 error code of an SDK error (`None` status:
+/// the backend gave no HTTP answer).
+fn answer_of<E>(e: &aws_sdk_s3::error::SdkError<E>) -> (Option<u16>, String)
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    let status = match e {
+        aws_sdk_s3::error::SdkError::ServiceError(svc) => Some(svc.raw().status().as_u16()),
+        _ => None,
+    };
+    (status, e.code().unwrap_or_default().to_string())
+}
+
 fn outcome<T, E>(res: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> StepOutcome
 where
     E: std::error::Error + aws_sdk_s3::error::ProvideErrorMetadata + 'static,
@@ -258,7 +378,11 @@ async fn current_etag(client: &Client, bucket: &str, key: &str) -> Option<String
 /// of the key on a bucket that keeps versions). A backend that refuses the
 /// correct ETag quoted costs four more: the GET that tells a refusal from a
 /// lost response, two unquoted PUTs and a HEAD.
-pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<ProbeResult, String> {
+pub async fn probe_cas(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<ProbeResult, ProbeError> {
     let first = client
         .put_object()
         .bucket(bucket)
@@ -266,7 +390,15 @@ pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<Probe
         .body(ByteStream::from_static(b"1"))
         .send()
         .await
-        .map_err(|e| format!("probe could not write to '{bucket}': {e:?}"))?;
+        .map_err(|e| {
+            let (status, code) = answer_of(&e);
+            let kind = classify_write_refusal(status, &code);
+            ProbeError {
+                kind,
+                detail: format!("probe could not write to '{bucket}': {e:?}"),
+                propagates: kind == ProbeErrorKind::Misconfigured && code_may_propagate(&code),
+            }
+        })?;
     let etag = first.e_tag().unwrap_or_default().to_string();
     let put = |body: &'static [u8]| {
         client
@@ -361,6 +493,86 @@ pub async fn probe_cas(client: &Client, bucket: &str, key: &str) -> Result<Probe
         conditional_delete: classify_conditional_delete(&delete_wrong),
         if_match,
     })
+}
+
+#[cfg(test)]
+mod write_refusal_tests {
+    use super::ProbeErrorKind::{Indeterminate, Misconfigured};
+    use super::*;
+
+    /// The truth table over the answers a plain PUT gets from S3, MinIO,
+    /// Ceph and Backblaze B2.
+    #[test]
+    fn a_refusal_is_definitive_only_when_no_retry_changes_it() {
+        let table: &[(Option<u16>, &str, ProbeErrorKind)] = &[
+            // The backend answered: the configuration is wrong.
+            (Some(404), "NoSuchBucket", Misconfigured),
+            (Some(403), "AccessDenied", Misconfigured),
+            (Some(403), "InvalidAccessKeyId", Misconfigured),
+            (Some(403), "SignatureDoesNotMatch", Misconfigured),
+            (Some(403), "AllAccessDisabled", Misconfigured),
+            (Some(400), "AuthorizationHeaderMalformed", Misconfigured),
+            (Some(400), "InvalidBucketName", Misconfigured),
+            (Some(301), "PermanentRedirect", Misconfigured),
+            (Some(405), "MethodNotAllowed", Misconfigured),
+            // A later attempt can get another answer.
+            (None, "", Indeterminate),
+            (None, "NoSuchBucket", Indeterminate),
+            (Some(500), "InternalError", Indeterminate),
+            (Some(502), "", Indeterminate),
+            (Some(503), "SlowDown", Indeterminate),
+            (Some(503), "ServiceUnavailable", Indeterminate),
+            (Some(504), "", Indeterminate),
+            (Some(408), "", Indeterminate),
+            (Some(429), "", Indeterminate),
+            (Some(400), "RequestTimeout", Indeterminate),
+            (Some(400), "Throttling", Indeterminate),
+            (Some(403), "RequestTimeTooSkewed", Indeterminate),
+            (Some(200), "", Indeterminate),
+            // No S3 error code: an ingress or a WAF answered, not the store.
+            (Some(404), "", Indeterminate),
+            (Some(403), "", Indeterminate),
+            (Some(301), "", Indeterminate),
+            // A token or a redirect that a retry changes.
+            (Some(400), "ExpiredToken", Indeterminate),
+            (Some(307), "TemporaryRedirect", Indeterminate),
+            // A full store is its state, not the configuration.
+            (Some(403), "QuotaExceeded", Indeterminate),
+            // MinIO answers a full bucket quota with this code (measured).
+            (Some(400), "XMinioAdminBucketQuotaExceeded", Indeterminate),
+            (Some(507), "", Indeterminate),
+            (Some(400), "storage_cap_exceeded", Indeterminate),
+            (Some(409), "OperationAborted", Indeterminate),
+        ];
+        for (status, code, want) in table {
+            assert_eq!(
+                classify_write_refusal(*status, code),
+                *want,
+                "status {status:?} code {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_four_codes_may_propagate() {
+        for code in [
+            "AccessDenied",
+            "InvalidAccessKeyId",
+            "NoSuchBucket",
+            "SignatureDoesNotMatch",
+        ] {
+            assert!(code_may_propagate(code), "{code}");
+        }
+        for code in ["PermanentRedirect", "InvalidBucketName", "", "SlowDown"] {
+            assert!(!code_may_propagate(code), "{code}");
+        }
+    }
+
+    /// A step after the first write never names the configuration.
+    #[test]
+    fn a_later_step_is_indeterminate() {
+        assert_eq!(ProbeError::from("x".to_string()).kind, Indeterminate);
+    }
 }
 
 #[cfg(test)]

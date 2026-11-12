@@ -60,7 +60,7 @@ In the admin UI:
    - **Everything except the admin password**: the config, the backends, the bucket policies, the users, the groups, the OIDC providers and the secrets. This instance keeps its own admin password.
    - **Config only**: the config, the backends and the bucket policies. The users, the groups, the OIDC providers and the admin password stay as they are.
    - **Users and groups only**: the users, the groups and the OIDC providers. The storage settings stay as they are.
-   - **Everything, including the admin password**: everything in the backup. This instance takes the admin password of the backup, unless `DGP_BOOTSTRAP_PASSWORD_HASH` sets it.
+   - **Everything, including the admin password**: everything in the backup. This instance takes the admin password of the backup, unless `DGP_BOOTSTRAP_PASSWORD_HASH` sets it. When the password of the backup differs from the current one, the restore ends every other admin session, so each of them must sign in again. The session that restores stays signed in.
 3. When the choice includes users and groups, select what happens to the users, groups and OIDC providers that exist now:
    - **Replace (point in time)**: after the restore, the instance holds exactly the entries of the backup. Entries that the backup does not hold are deleted.
    - **Merge (keep existing)**: entries that the backup does not hold are kept, and entries that exist now are not overwritten. Only the missing entries are added.

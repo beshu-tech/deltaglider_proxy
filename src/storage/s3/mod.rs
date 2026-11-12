@@ -39,7 +39,9 @@ mod versions;
 pub(crate) use tests::test_support;
 
 pub use body::BACKEND_GET_BODY_RESUMES;
-pub(crate) use client::{backend_request_timeout, check_s3_endpoint, guard_s3_endpoint};
+pub(crate) use client::{
+    backend_request_timeout, check_s3_endpoint, guard_s3_endpoint, s3_endpoint_kind_with,
+};
 use errors::*;
 pub(in crate::storage) use facts::put_facts_object;
 #[cfg(test)]

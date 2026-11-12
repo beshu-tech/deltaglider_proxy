@@ -675,13 +675,16 @@ pub async fn login(
     {
         let config = state.config.read().await;
         let iam = state.iam_state.load();
-        let creds = login_s3_creds(
-            config
-                .access_key_id
-                .clone()
-                .zip(config.secret_access_key.clone()),
-            &iam,
-        );
+        let pair = config
+            .access_key_id
+            .clone()
+            .zip(config.secret_access_key.clone());
+        // The pair is offered only if the S3 API would accept it, and that
+        // is judged against the IAM index only through the gate.
+        let creds = match state.credential_view(&iam) {
+            Ok(view) => login_s3_creds(pair, view),
+            Err(_) => LoginS3Creds::None,
+        };
         let region = match &config.backend {
             crate::config::BackendConfig::S3 { region, .. } => region.clone(),
             _ => "us-east-1".to_string(),
@@ -861,7 +864,10 @@ pub async fn resolve_iam_identity(
     .await?;
 
     let iam_state = state.iam_state.load();
-    let Some(user) = (match &**iam_state {
+    let Ok(iam_view) = state.credential_view(&iam_state) else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+    };
+    let Some(user) = (match iam_view {
         IamState::Iam(index) => index.get(&body.access_key_id).cloned(),
         _ => None,
     }) else {
@@ -968,7 +974,8 @@ async fn session_user_info(
 
 async fn resolve_effective_iam_user(state: &AdminState, access_key_id: &str) -> Option<IamUser> {
     let iam_state = state.iam_state.load();
-    if let IamState::Iam(index) = &**iam_state {
+    let iam_view = state.credential_view(&iam_state).ok()?;
+    if let IamState::Iam(index) = iam_view {
         if let Some(user) = index.get(access_key_id) {
             return Some(user.clone());
         }
@@ -1002,8 +1009,11 @@ pub async fn login_as(
     // access_key_id without any rate limit. The account dimension is
     // the AKID being attempted.
     let iam_state = state.iam_state.load();
+    let Ok(iam_view) = state.credential_view(&iam_state) else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+    };
     let known =
-        matches!(&**iam_state, IamState::Iam(index) if index.get(&body.access_key_id).is_some());
+        matches!(iam_view, IamState::Iam(index) if index.get(&body.access_key_id).is_some());
     let guard = crate::rate_limiter::RateLimitGuard::enter_with_account(
         &state.rate_limiter,
         &req_headers,
@@ -1014,7 +1024,7 @@ pub async fn login_as(
     )
     .await?;
 
-    let user = match &**iam_state {
+    let user = match iam_view {
         IamState::Iam(index) => index.get(&body.access_key_id),
         _ => None,
     };
@@ -1051,7 +1061,7 @@ pub async fn login_as(
         access_key_id: body.access_key_id.clone(),
     };
     let client_ip = request_client_ip(&req_headers, connect_info.as_ref());
-    if !session_principal_is_admin(&auth_method, &iam_state, client_ip) {
+    if !session_principal_is_admin(&auth_method, iam_view, client_ip) {
         return Err(StatusCode::FORBIDDEN.into());
     }
 
@@ -1116,9 +1126,12 @@ pub async fn browser_session_connect(
     let iam_state = state.iam_state.load();
     let access_key_id = body.access_key_id.trim();
     let secret_access_key = body.secret_access_key.as_str();
+    let Ok(iam_view) = state.credential_view(&iam_state) else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+    };
 
     // IAM multi-user only: legacy/bootstrap use the password connect path; open mode is separate.
-    let IamState::Iam(index) = &**iam_state else {
+    let IamState::Iam(index) = iam_view else {
         guard.record_failure();
         audit_log(
             "browser_session_connect_denied",
@@ -1353,8 +1366,42 @@ fn admin_gui_session_ok(state: &AdminState, token: &str, client_ip: Option<IpAdd
         .sessions
         .admin_gui_auth_method(token, client_ip)
         .is_some_and(|method| {
-            session_principal_is_admin(&method, &state.iam_state.load(), client_ip)
+            session_admin_verdict(
+                &state.s3_state.coordination,
+                &state.iam_state.load(),
+                &method,
+                client_ip,
+            )
         })
+}
+
+/// Pure: is the principal of an admin session still an admin, judged against
+/// the IAM state only through the gate? While the IAM database is
+/// unconfirmed the rights of an IAM user are not known (not an admin); the
+/// bootstrap password does not depend on that database.
+pub(crate) fn session_admin_verdict(
+    status: &crate::coordination::CoordinationStatus,
+    iam: &IamState,
+    method: &AuthMethod,
+    client_ip: Option<IpAddr>,
+) -> bool {
+    match status.credential_view(iam) {
+        Ok(view) => session_principal_is_admin(method, view, client_ip),
+        Err(_) => matches!(method, AuthMethod::Bootstrap),
+    }
+}
+
+/// Pure: may an OAuth sign-in mint a session, and of which kind? `Ok(true)`
+/// is an admin session, `Ok(false)` a browser-only one. `Err` while the IAM
+/// database is unconfirmed: nobody is judged against it yet.
+pub(crate) fn oauth_mint_verdict(
+    status: &crate::coordination::CoordinationStatus,
+    iam: &IamState,
+    method: &AuthMethod,
+    client_ip: Option<IpAddr>,
+) -> Result<bool, crate::coordination::status::IamUnconfirmed> {
+    let view = status.credential_view(iam)?;
+    Ok(session_principal_is_admin(method, view, client_ip))
 }
 
 /// Middleware: valid **AdminGui** session only (rejects S3BrowserLift cookies),
@@ -1445,11 +1492,13 @@ pub async fn require_bulk_session(
             .unwrap_or_else(|| "admin".to_string());
         (BulkSession::AdminGui, actor)
     } else {
-        match non_admin_bulk_session(
-            state.sessions.auth_method(&token, client_ip),
-            &iam,
-            client_ip,
-        ) {
+        match state.credential_view(&iam).ok().and_then(|view| {
+            non_admin_bulk_session(
+                state.sessions.auth_method(&token, client_ip),
+                view,
+                client_ip,
+            )
+        }) {
             Some(pair) => pair,
             None => return Err(admin_session_required()),
         }
@@ -1534,14 +1583,12 @@ pub(crate) fn bucket_view_session(
         return Some(BulkSession::AdminGui);
     }
     let iam = state.iam_state.load();
-    let (session, _) = non_admin_bulk_session(
-        state.sessions.auth_method(token, client_ip),
-        &iam,
-        client_ip,
-    )?;
+    let iam = state.credential_view(&iam).ok()?;
+    let (session, _) =
+        non_admin_bulk_session(state.sessions.auth_method(token, client_ip), iam, client_ip)?;
     let may = match &session {
         BulkSession::Open | BulkSession::AdminGui => true,
-        BulkSession::IamUser { access_key_id, .. } => match iam.as_ref() {
+        BulkSession::IamUser { access_key_id, .. } => match iam {
             IamState::Iam(index) => index
                 .principal(access_key_id)
                 .is_some_and(|u| u.can_see_bucket(bucket)),
@@ -1983,6 +2030,49 @@ mod tests {
             auth_source: "local".into(),
             iam_policies: vec![],
         }
+    }
+
+    /// An unconfirmed IAM database judges nobody: the admin re-check of an
+    /// IAM user's session fails, an OAuth sign-in is refused, and the
+    /// bootstrap password still stands. A confirmed one judges as before.
+    #[test]
+    fn an_unconfirmed_iam_database_judges_no_admin_session_and_no_oauth_mint() {
+        use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+        let iam = IamState::Iam(IamIndex::from_users_and_groups(
+            vec![admin_test_user(4, "AKADMIN", true, true, vec![])],
+            vec![],
+        ));
+        let ip = Some("198.51.100.1".parse().unwrap());
+        let login_as = AuthMethod::IamLoginAs {
+            access_key_id: "AKADMIN".into(),
+        };
+        let external = AuthMethod::External {
+            provider_name: "corp".into(),
+            user_id: 4,
+        };
+        let unconfirmed = CoordinationStatus::with_bucket(ProfileCell::unknown(), false);
+        // The re-check of an admin session.
+        assert!(!session_admin_verdict(&unconfirmed, &iam, &login_as, ip));
+        assert!(!session_admin_verdict(&unconfirmed, &iam, &external, ip));
+        assert!(session_admin_verdict(
+            &unconfirmed,
+            &iam,
+            &AuthMethod::Bootstrap,
+            ip
+        ));
+        // The OAuth mint.
+        assert!(oauth_mint_verdict(&unconfirmed, &iam, &external, ip).is_err());
+        // A node with no coordination bucket judges as before.
+        let none = CoordinationStatus::default();
+        assert!(session_admin_verdict(&none, &iam, &login_as, ip));
+        assert_eq!(oauth_mint_verdict(&none, &iam, &external, ip), Ok(true));
+        // So does one that a sync confirmed.
+        unconfirmed.confirm_iam();
+        assert!(session_admin_verdict(&unconfirmed, &iam, &login_as, ip));
+        assert_eq!(
+            oauth_mint_verdict(&unconfirmed, &iam, &external, ip),
+            Ok(true)
+        );
     }
 
     /// auth-5: a non-admin browser session reaches the bulk endpoints under

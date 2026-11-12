@@ -151,6 +151,50 @@ pub(crate) mod source_scan {
         out
     }
 
+    /// `(name, text)` of the function that holds line `at` (0-based) of
+    /// `text`: the nearest `fn` header above it, to the closing brace at the
+    /// header's indentation. Text-based, for rustfmt-formatted sources.
+    pub(crate) fn enclosing_fn(text: &str, at: usize) -> (String, String) {
+        let lines: Vec<&str> = text.lines().collect();
+        let header = |l: &str| -> Option<String> {
+            let l = l.trim_start();
+            let l = l
+                .strip_prefix("pub(crate) ")
+                .or(l.strip_prefix("pub(super) "))
+                .or(l.strip_prefix("pub "))
+                .unwrap_or(l);
+            let l = l.strip_prefix("async ").unwrap_or(l);
+            let rest = l.strip_prefix("fn ")?;
+            Some(rest.split(['(', '<']).next()?.to_string())
+        };
+        let Some(start) = (0..=at.min(lines.len().saturating_sub(1)))
+            .rev()
+            .find(|i| header(lines[*i]).is_some())
+        else {
+            return (String::new(), String::new());
+        };
+        let indent = lines[start].len() - lines[start].trim_start().len();
+        // (No bare brace in a literal: the production-line mask counts them.)
+        let close = format!("{}{}", " ".repeat(indent), '\u{7d}');
+        let end = lines[start..]
+            .iter()
+            .position(|l| l.starts_with(&close))
+            .map_or(lines.len() - 1, |p| start + p);
+        (
+            header(lines[start]).unwrap_or_default(),
+            lines[start..=end].join("\n"),
+        )
+    }
+
+    /// The text of `fn name` in `text` (see [`enclosing_fn`]).
+    pub(crate) fn fn_body(text: &str, name: &str) -> String {
+        let at = text
+            .lines()
+            .position(|l| l.contains(&format!("fn {name}(")))
+            .unwrap_or_else(|| panic!("fn {name} exists"));
+        enclosing_fn(text, at).1
+    }
+
     /// `mask[i]` is true when line `i` (0-based) of `text` is production
     /// code: outside every `#[cfg(test)] mod` body. A test-only item
     /// (`#[cfg(test)] fn`) counts as production: the scan stays strict.

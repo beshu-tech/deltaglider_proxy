@@ -579,6 +579,7 @@ async fn async_main(
     // Parsed once here (warnings too); no request reads these env vars.
     // Trust in X-Forwarded-For needs the list of proxies that may send it.
     let proxy_trust = deltaglider_proxy::rate_limiter::install_proxy_trust_from_env();
+    deltaglider_proxy::security::install_outbound_egress(config.tuning.outbound_via_system_proxy);
     if let Some(msg) = deltaglider_proxy::rate_limiter::proxy_trust_config_error(
         proxy_trust.trust,
         &proxy_trust.cidrs,
@@ -630,6 +631,16 @@ async fn async_main(
     let listener = claimed.listener;
     let rustls_config = claimed.rustls_config;
     let admin_password_hash = claimed.admin_password_hash;
+
+    // A backend host that resolves only to refused addresses fails every
+    // request: refuse it here, naming the backend and the setting.
+    let unreachable = config.backend_resolution_errors(None).await;
+    if !unreachable.is_empty() {
+        for e in &unreachable {
+            eprintln!("FATAL config error: {e}");
+        }
+        std::process::exit(1);
+    }
 
     // --- Metrics ---
     let metrics = init_metrics(&config);
@@ -943,6 +954,7 @@ async fn async_main(
         backend_health: backend_health.clone(),
         encryption_witness: encryption_witness.clone(),
         config_db_key_mismatch: config_db_mismatch,
+        coordination: coordination_check.status.clone(),
     });
     // The background writers (replication, lifecycle) ask the encryption
     // witness and the key sentinel through the maintenance gate: a refused
@@ -1246,6 +1258,18 @@ async fn async_main(
         &coordination_check,
     )
     .await;
+
+    coordination_check.status.attach_iam(iam_state.clone());
+    // The IAM database of a node with a coordination bucket is judged only
+    // once a sync confirmed it. Say so at boot, with the way out.
+    if coordination_check.status.refuses_iam_users() {
+        tracing::warn!(
+            "IAM database not confirmed against the coordination bucket: the S3 API answers \
+             503 to IAM users and /_/ready answers 503 until a sync ends well. Set {}=true \
+             to serve the local IAM database meanwhile",
+            deltaglider_proxy::coordination::status::SERVE_UNCONFIRMED_ENV
+        );
+    }
 
     // Start periodic config DB S3 poll (every 5 minutes)
     if let Some(ref sync) = config_sync {

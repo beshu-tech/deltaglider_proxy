@@ -199,6 +199,16 @@ pub struct JobPlane {
 }
 
 impl AdminState {
+    /// The gate on the IAM index for the admin surface
+    /// ([`crate::coordination::CoordinationStatus::credential_view`]): a
+    /// credential, a login or a principal is judged only against the view.
+    pub(crate) fn credential_view<'a>(
+        &self,
+        iam: &'a crate::iam::IamState,
+    ) -> Result<&'a crate::iam::IamState, crate::coordination::status::IamUnconfirmed> {
+        self.s3_state.coordination.credential_view(iam)
+    }
+
     /// The job plane, or 503 when this instance has no jobs DB.
     pub(crate) fn job_plane(&self) -> Result<&JobPlane, AdminError> {
         self.job_plane.as_ref().ok_or_else(AdminError::no_jobs_db)

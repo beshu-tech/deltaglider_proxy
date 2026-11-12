@@ -1364,7 +1364,8 @@ impl RestoreSnapshot {
         }
         if *state.password_hash.read() != self.password_hash {
             if let Err(e) =
-                super::config::password::install_bootstrap_hash(state, &self.password_hash).await
+                super::config::password::install_bootstrap_hash(state, &self.password_hash, headers)
+                    .await
             {
                 first_err.get_or_insert(format!("admin password not restored: {e}"));
             }
@@ -1920,7 +1921,8 @@ async fn apply_secrets(
     }
 
     if let BootstrapRestore::Adopt(hash) = &hash_plan {
-        if let Err(e) = super::config::password::install_bootstrap_hash(state, hash).await {
+        if let Err(e) = super::config::password::install_bootstrap_hash(state, hash, headers).await
+        {
             tracing::error!("Full-backup import: bootstrap hash not restored: {e}");
             return Err(BackupSecretApplyError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,

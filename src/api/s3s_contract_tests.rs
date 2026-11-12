@@ -267,6 +267,21 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with(Default::default()).await
+}
+
+async fn harness_with(coordination: crate::coordination::CoordinationStatus) -> Harness {
+    harness_layers(coordination.clone(), coordination).await
+}
+
+/// The harness with the status of the SigV4 middleware (`middleware`) and
+/// the status of the s3s secret lookup (`hook`) apart, to test each layer of
+/// the gate alone.
+async fn harness_layers(
+    middleware: crate::coordination::CoordinationStatus,
+    hook: crate::coordination::CoordinationStatus,
+) -> Harness {
+    let coordination = middleware;
     use s3s::service::S3ServiceBuilder;
 
     let iam: crate::iam::SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Iam(
@@ -312,6 +327,7 @@ async fn harness() -> Harness {
         backend_health: Default::default(),
         encryption_witness: None,
         config_db_key_mismatch: false,
+        coordination,
     });
     let rate_limiter = crate::rate_limiter::RateLimiter::new(
         100,
@@ -341,7 +357,10 @@ async fn harness() -> Harness {
     );
 
     let mut builder = S3ServiceBuilder::new(NopS3);
-    builder.set_auth(DeltaGliderS3sAuth { iam_state: iam });
+    builder.set_auth(DeltaGliderS3sAuth {
+        iam_state: iam,
+        coordination: hook,
+    });
     builder.set_access(RecordingAccess);
     builder.set_config(crate::api::s3s_hooks::s3s_config(
         crate::config::RuntimeTuning::default().clock_skew_secs,
@@ -1270,6 +1289,93 @@ enum BodyCheck {
     Refused,
     /// s3s refused the request before the handler.
     NotReached,
+}
+
+/// A node whose IAM database no sync confirmed refuses the requests that
+/// are judged against it (a key pair, signed or presigned, and a form
+/// POST) with a retryable 503, and serves the ones that read no IAM
+/// database: public prefix, CORS preflight, the `HEAD /` probe. One
+/// confirmation (or the operator override) opens the users again.
+#[tokio::test]
+async fn an_unconfirmed_iam_database_refuses_only_what_it_judges() {
+    use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+    let status = CoordinationStatus::with_bucket(ProfileCell::unknown(), false);
+    let h = harness_with(status.clone()).await;
+    let code = |raw: RawRequest| {
+        let h = &h;
+        async move { run(h, &raw).await.expect("a request").status }
+    };
+    let key = format!("/{PUBLIC_BUCKET}/other/k");
+    let public = format!("/{PUBLIC_BUCKET}/{PUBLIC_PREFIX}k");
+
+    assert_eq!(
+        code(get(&key, v4(ALICE))).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        code(get(&key, Auth::V4Presigned(ALICE))).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let mut form = form_post(&format!("/{PUBLIC_BUCKET}"));
+    form.headers
+        .push(("content-length".into(), form.body.len().to_string()));
+    assert_eq!(code(form).await, StatusCode::SERVICE_UNAVAILABLE);
+    // No IAM database is read: these are served.
+    // `NopS3` answers 501 to what reaches it: 501 = served.
+    assert_eq!(
+        code(get(&public, Auth::None)).await,
+        StatusCode::NOT_IMPLEMENTED
+    );
+    assert_ne!(
+        code(req(Method::OPTIONS, &key, &[], Auth::None)).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_ne!(
+        code(req(Method::HEAD, "/", &[], Auth::None)).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    // A sync confirms the database: the users are judged again.
+    status.confirm_iam();
+    assert_eq!(
+        code(get(&key, v4(ALICE))).await,
+        StatusCode::NOT_IMPLEMENTED
+    );
+
+    // The operator override serves the local copy.
+    let over = CoordinationStatus::with_bucket(ProfileCell::unknown(), true);
+    let h = harness_with(over).await;
+    assert_eq!(
+        run(&h, &get(&key, v4(ALICE)))
+            .await
+            .expect("a request")
+            .status,
+        StatusCode::NOT_IMPLEMENTED
+    );
+}
+
+/// The second layer of the gate, the s3s secret lookup, refuses an
+/// unconfirmed database on its own (the `bare` router is s3s with that
+/// lookup and no middleware). The first layer, the SigV4 middleware, is
+/// tested alone in `api::auth` (`the_middleware_alone_refuses_...`).
+#[tokio::test]
+async fn the_s3s_secret_lookup_refuses_an_unconfirmed_database_alone() {
+    use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+    let key = format!("/{PUBLIC_BUCKET}/other/k");
+    let h = harness_layers(
+        Default::default(),
+        CoordinationStatus::with_bucket(ProfileCell::unknown(), false),
+    )
+    .await;
+    let (status, _) = send(&h.bare, &get(&key, v4(ALICE)))
+        .await
+        .expect("a request");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // A confirmed database: the lookup finds the key and s3s serves it.
+    let h = harness_layers(Default::default(), Default::default()).await;
+    let (status, _) = send(&h.bare, &get(&key, v4(ALICE)))
+        .await
+        .expect("a request");
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
 }
 
 /// P2.4: the adapter stores the signed `x-amz-content-sha256` as the

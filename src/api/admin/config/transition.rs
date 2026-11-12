@@ -623,6 +623,14 @@ async fn transition_gates(
     };
     let inputs = GateInputs::gather(app, old_cfg, new_cfg, headers, forward).await;
     static_transition_gates(old_cfg, new_cfg, &inputs)?;
+    // A backend host that resolves only to refused addresses would fail
+    // every request: refuse the apply that makes one.
+    if forward {
+        let unreachable = new_cfg.backend_resolution_errors(Some(old_cfg)).await;
+        if !unreachable.is_empty() {
+            return Err(format!("config refused: {}", unreachable.join("; ")).into());
+        }
+    }
 
     // Backend write-capability gate (guard B, hot-apply half): refuse routing
     // a client-writable bucket onto a non-CAS backend under multi-instance.

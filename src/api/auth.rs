@@ -105,6 +105,14 @@ enum AuthGateDecision<'a> {
     Iam(&'a crate::iam::IamIndex),
 }
 
+/// The answer to a request that would be judged against an IAM database
+/// that no sync confirmed: `503`, retryable. The body is neutral; the
+/// override that ends the state is in the log and the documentation.
+pub(crate) fn iam_unconfirmed_response() -> axum::response::Response {
+    S3Error::ServiceUnavailable("The credential store is not ready yet; retry later.".into())
+        .into_response()
+}
+
 /// Fold the config-DB lock flag + [`IamState`] into a single exhaustive auth
 /// decision. The lock overrides everything; otherwise the IamState variant
 /// selects the auth path.
@@ -888,6 +896,13 @@ pub async fn sigv4_auth_middleware(
     let deny_all = IamState::deny_all();
     let iam_state = iam_snapshot.as_deref().unwrap_or(&deny_all);
 
+    // The coordination status of the process. A router built without it
+    // fails CLOSED for IAM users (`credential_view_or_closed`).
+    let coordination = request
+        .extensions()
+        .get::<crate::coordination::CoordinationStatus>()
+        .cloned();
+
     let auth_config = match classify_auth_gate(config_db_key_mismatch, iam_state) {
         AuthGateDecision::Locked => {
             // Clear 503 with a recovery hint — NOT a misleading 500.
@@ -1052,6 +1067,17 @@ pub async fn sigv4_auth_middleware(
             Some(AuthenticatedUser::bootstrap_shared(&auth.access_key_id))
         }
         AuthGateDecision::Iam(index) => {
+            // The users of the IAM database are judged only once the
+            // database is confirmed (or the operator accepted the local
+            // copy): `CoordinationStatus::credential_view`.
+            if crate::coordination::status::credential_view_or_closed(
+                coordination.as_ref(),
+                iam_state,
+            )
+            .is_err()
+            {
+                return Err(iam_unconfirmed_response());
+            }
             let user = match index.get(&params.access_key) {
                 Some(u) => u,
                 None => {
@@ -1984,6 +2010,43 @@ mod per_key_lockout_tests {
         req
     }
 
+    /// The SigV4 middleware is the first layer of the gate, and refuses on
+    /// its own (this router has no s3s behind it): an IAM key pair gets a
+    /// retryable 503 while the IAM database is unconfirmed, and also when the
+    /// router carries no coordination status at all (it fails closed).
+    #[tokio::test]
+    async fn the_middleware_alone_refuses_an_unconfirmed_iam_database() {
+        use crate::coordination::{if_match::ProfileCell, CoordinationStatus};
+        let peer: std::net::SocketAddr = "10.0.1.6:40000".parse().unwrap();
+        let send = |status: Option<CoordinationStatus>| {
+            let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Iam(
+                IamIndex::from_users(vec![user(1, "alice", ALICE)]),
+            )));
+            let limiter = RateLimiter::new(100, Duration::from_secs(300), Duration::from_secs(600));
+            let mut app = axum::Router::new()
+                .fallback(s3s_stand_in)
+                .layer(axum::middleware::from_fn(sigv4_auth_middleware))
+                .layer(axum::Extension(iam))
+                .layer(axum::Extension(limiter));
+            if let Some(s) = status {
+                app = app.layer(axum::Extension(s));
+            }
+            async move { app.oneshot(signed(ALICE, peer)).await.unwrap().status() }
+        };
+        let unconfirmed = CoordinationStatus::with_bucket(ProfileCell::unknown(), false);
+        assert_eq!(
+            send(Some(unconfirmed.clone())).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(send(None).await, StatusCode::SERVICE_UNAVAILABLE);
+        unconfirmed.confirm_iam();
+        assert_eq!(send(Some(unconfirmed)).await, StatusCode::OK);
+        assert_eq!(
+            send(Some(CoordinationStatus::default())).await,
+            StatusCode::OK
+        );
+    }
+
     /// Behind a reverse proxy every client has the proxy's address. One
     /// client with a rotated secret locked that address out, and every
     /// other client behind the proxy got 503 SlowDown for 10 minutes,
@@ -1998,6 +2061,9 @@ mod per_key_lockout_tests {
             .fallback(s3s_stand_in)
             .layer(axum::middleware::from_fn(sigv4_auth_middleware))
             .layer(axum::Extension(iam))
+            .layer(axum::Extension(
+                crate::coordination::CoordinationStatus::default(),
+            ))
             .layer(axum::Extension(limiter));
         let proxy: std::net::SocketAddr = "10.0.1.5:40000".parse().unwrap();
         let status = |req: Request<Body>| {

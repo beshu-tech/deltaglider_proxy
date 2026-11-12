@@ -946,6 +946,7 @@ async fn ingest_form_file(
 /// resolved key. Without authentication (open access) nothing is checked
 /// and the file has no policy range.
 fn authenticate_form_post(
+    coordination: &crate::coordination::CoordinationStatus,
     iam_state: Option<&SharedIamState>,
     bucket: &str,
     parsed: &FormHead,
@@ -961,6 +962,12 @@ fn authenticate_form_post(
     let snapshot = iam_state.load_full();
     if matches!(snapshot.as_ref(), IamState::Disabled) {
         return Ok(open);
+    }
+    // The users of an IAM database that no sync confirmed are not judged.
+    if coordination.credential_view(&snapshot).is_err() {
+        return Err(S3Error::ServiceUnavailable(
+            "The credential store is not ready yet; retry later.".into(),
+        ));
     }
 
     ensure_supported_form_fields(&parsed.fields_ci)?;
@@ -1146,22 +1153,23 @@ where
     // delay the health gate's fast 503 behind a backend timeout. And before
     // the file: an unauthenticated form costs its small fields only.
     let (head, file) = read_form_head(&mut multipart).await?;
-    let auth = match authenticate_form_post(iam_state, bucket, &head, client_ip) {
-        Ok(auth) => auth,
-        Err(e) => {
-            // Mirror the IAM middleware's PUT-denial audit so operators can see
-            // form-POST 403s in the admin audit ring (not just stdout warns) —
-            // the surface that produced the original hard-to-diagnose prod 403.
-            audit_log_s3(
-                "s3_post_denied",
-                "$form_post",
-                headers,
-                bucket,
-                &head.resolved_key,
-            );
-            return Err(e);
-        }
-    };
+    let auth =
+        match authenticate_form_post(&state.coordination, iam_state, bucket, &head, client_ip) {
+            Ok(auth) => auth,
+            Err(e) => {
+                // Mirror the IAM middleware's PUT-denial audit so operators can see
+                // form-POST 403s in the admin audit ring (not just stdout warns) —
+                // the surface that produced the original hard-to-diagnose prod 403.
+                audit_log_s3(
+                    "s3_post_denied",
+                    "$form_post",
+                    headers,
+                    bucket,
+                    &head.resolved_key,
+                );
+                return Err(e);
+            }
+        };
     // The client-write gate (a replication_target_only bucket, a read-only
     // encrypted bucket), after the signature check: its 403 names the
     // bucket's configuration and backend, which an unverified caller must

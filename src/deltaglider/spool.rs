@@ -730,11 +730,13 @@ fn backend_share_mib(max_mib: usize, percent: u8) -> usize {
 /// directory while the process runs (a tmp cleaner, an operator). The first
 /// `ENOENT` creates the directory again and tries once more, like the
 /// filesystem backend does for a folder that a DELETE pruned. Any other
-/// error, and a second `ENOENT`, go to the caller.
+/// error, and a second `ENOENT`, go to the caller. The directory is made by
+/// [`create_private_dir`], the one function that makes a spool directory
+/// (boot and re-creation): mode 0700 whatever the umask.
 pub(crate) fn temp_in(dir: &Path) -> std::io::Result<NamedTempFile> {
     match NamedTempFile::new_in(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(dir)?;
+            create_private_dir(dir)?;
             NamedTempFile::new_in(dir)
         }
         other => other,
@@ -1055,6 +1057,64 @@ mod tests {
         // A sticky dir is a shared temp root, even when ours (root's /tmp).
         assert!(refused(private_dir_verdict(0, 0, 0o41777)));
         assert!(refused(private_dir_verdict(1000, 1000, 0o41700)));
+    }
+
+    /// The check itself: it sets the umask of its PROCESS, so it never runs
+    /// with the other tests. It is `#[ignore]`d and runs only in the child
+    /// process that the next test starts.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual: cargo test --lib -- --ignored --exact deltaglider::spool::tests::child_a_spool_directory_made_again_is_private_under_a_wide_umask (the parent test runs it in a child process)"]
+    fn child_a_spool_directory_made_again_is_private_under_a_wide_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("spool");
+        let spool = SpoolDir::new(root.clone(), 1 << 20).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        // SAFETY: umask has no preconditions; this process runs this test only.
+        unsafe { libc::umask(0) };
+        let made = temp_in(&root);
+        made.unwrap();
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700, "the re-created spool directory");
+        drop(spool);
+    }
+
+    /// A spool directory that the proxy makes again after a removal is 0700
+    /// under a wide umask. The umask is process-wide, so the check runs in a
+    /// child process (this test binary, one test), and no parallel test sees it.
+    #[cfg(unix)]
+    #[test]
+    fn a_spool_directory_made_again_is_private_under_a_wide_umask() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+                "deltaglider::spool::tests::child_a_spool_directory_made_again_is_private_under_a_wide_umask",
+            ])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            text.contains("1 passed"),
+            "the child test did not run: {text}"
+        );
+    }
+
+    #[test]
+    fn only_create_private_dir_makes_a_spool_directory() {
+        let text = crate::source_scan::prod_text(include_str!("spool.rs"));
+        assert_eq!(
+            text.matches(concat!("create_dir", "_all(")).count(),
+            1,
+            "the non-unix twin of create_private_dir is the only create_dir_all"
+        );
     }
 
     /// A new root is created 0700; an existing private root is kept as

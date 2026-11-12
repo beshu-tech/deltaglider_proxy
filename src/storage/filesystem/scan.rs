@@ -19,6 +19,14 @@
 //! [`SCAN_CHUNK_MAX`]: the passes are O(log N) up to the cap, then
 //! N / `SCAN_CHUNK_MAX`. The memory bound stays explicit: at most
 //! `SCAN_CHUNK_MAX` entries per open directory.
+//!
+//! A walk holds one chunk per OPEN directory, and a key path can be deep.
+//! So the cap is ONE budget for the whole request ([`level_cap`]): a
+//! directory may grow its chunk to the budget minus what its ancestors
+//! hold, never below [`SCAN_CHUNK`]. The deepest directory, usually the
+//! only wide one, keeps almost the whole budget; a request holds at most
+//! `SCAN_CHUNK_MAX + depth x SCAN_CHUNK` entries, however deep and wide
+//! the tree is (`a_nested_wide_tree_holds_one_budget_and_lists_in_order`).
 
 use super::{
     fsio, io_to_storage_error, note_held, stored_name, FilesystemBackend, StorageError, StoredName,
@@ -53,6 +61,18 @@ pub(super) fn chunk_size() -> usize {
 /// The chunk after `current` (see the module doc): doubled, within `max`.
 pub(super) fn grown(current: usize, max: usize) -> usize {
     current.saturating_mul(2).min(max).max(current)
+}
+
+/// Pure: the most entries that a directory may hold after growth, when its
+/// ancestors hold `held_by_ancestors` entries of the request's `budget`
+/// (the walk keeps only the open directories, an ancestor's chunk stays
+/// while its children are read). Never below `floor` (one scan chunk), so a
+/// walk always makes progress; the sum over a path of open directories is
+/// at most `budget + depth x floor`.
+pub(super) fn level_cap(budget: usize, held_by_ancestors: usize, floor: usize) -> usize {
+    budget
+        .saturating_sub(held_by_ancestors)
+        .max(floor.min(budget))
 }
 
 /// The cap on growth now. Tests set a small one to reach it.
@@ -184,6 +204,8 @@ pub(super) struct SortedDir {
     chunk: Vec<WalkEntry>,
     /// The size of the next chunk: doubles on each refill.
     chunk_limit: usize,
+    /// The cap of `chunk_limit` for this directory ([`level_cap`]).
+    max_chunk: usize,
     /// The next entry of the chunk.
     next: usize,
     /// Entries remain after the chunk.
@@ -197,8 +219,10 @@ impl SortedDir {
         path: &Path,
         key: String,
         keep: Keep<'_>,
+        held_by_ancestors: usize,
     ) -> Result<Option<Self>, StorageError> {
         let limit = chunk_size();
+        let max_chunk = level_cap(chunk_max(), held_by_ancestors, limit);
         let Some((chunk, more)) = read_chunk(path, &key, None, limit, keep).await? else {
             return Ok(None);
         };
@@ -206,7 +230,8 @@ impl SortedDir {
             path: path.to_path_buf(),
             key,
             chunk,
-            chunk_limit: grown(limit, chunk_max()),
+            chunk_limit: grown(limit, max_chunk),
+            max_chunk,
             next: 0,
             more,
         }))
@@ -225,7 +250,7 @@ impl SortedDir {
                 Some((chunk, more)) => {
                     self.chunk = chunk;
                     self.more = more;
-                    self.chunk_limit = grown(limit, chunk_max());
+                    self.chunk_limit = grown(limit, self.max_chunk);
                 }
                 // The directory went away between two chunks.
                 None => {
@@ -389,7 +414,7 @@ impl<'a> FlatWalk<'a> {
         delimiter: Option<&'a str>,
     ) -> Result<Option<Self>, StorageError> {
         let keep = |d: &str, e: &WalkEntry| flat_keep(prefix, token, None, d, e);
-        let Some(root) = SortedDir::open(root, root_key, &keep).await? else {
+        let Some(root) = SortedDir::open(root, root_key, &keep, 0).await? else {
             return Ok(None);
         };
         Ok(Some(Self {
@@ -441,7 +466,10 @@ impl<'a> FlatWalk<'a> {
                 }
                 continue;
             }
-            if let Some(sub) = SortedDir::open(&path, key, &keep).await? {
+            // What the open directories hold now: the child's share of the
+            // request's budget is what is left.
+            let held: usize = self.stack.iter().map(SortedDir::held).sum();
+            if let Some(sub) = SortedDir::open(&path, key, &keep, held).await? {
                 self.stack.push(sub);
                 note_held(self.stack.iter().map(SortedDir::held).sum());
             }
@@ -460,6 +488,36 @@ mod tests {
             key_name: name.trim_end_matches(".delta").to_string(),
             is_dir,
             is_delta: name.ends_with(".delta"),
+        }
+    }
+
+    /// The cap of a level is the budget minus what its ancestors hold, with a
+    /// floor of one chunk; the sum over a path is bounded by the budget plus
+    /// one floor per level.
+    #[test]
+    fn level_cap_is_the_budget_left_by_the_ancestors() {
+        let (budget, floor) = (SCAN_CHUNK_MAX, SCAN_CHUNK);
+        // (held by the ancestors, cap)
+        for (held, cap) in [
+            (0, budget),
+            (floor, budget - floor),
+            (budget / 2, budget / 2),
+            (budget - floor, floor),
+            (budget, floor),
+            (budget * 3, floor),
+        ] {
+            assert_eq!(level_cap(budget, held, floor), cap, "held {held}");
+        }
+        // A budget below the floor is the budget.
+        assert_eq!(level_cap(8, 0, 1024), 8);
+        // Every level at its cap: the path holds budget + depth x floor.
+        let mut held = 0;
+        for depth in 0..512 {
+            held += level_cap(budget, held, floor);
+            assert!(
+                held <= budget + (depth + 1) * floor,
+                "depth {depth}: {held}"
+            );
         }
     }
 

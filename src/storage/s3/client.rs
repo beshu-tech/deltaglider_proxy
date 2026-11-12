@@ -5,6 +5,28 @@
 
 use super::*;
 
+/// The URL kind of a backend: `allow_local` (or `DGP_BACKEND_ALLOW_LOCAL`)
+/// opens loopback and plain `http://`; nothing opens link-local or metadata.
+pub(crate) fn s3_endpoint_kind(allow_local: bool) -> crate::security::UrlKind {
+    s3_endpoint_kind_with(
+        allow_local,
+        crate::config::env_bool("DGP_BACKEND_ALLOW_LOCAL", false),
+    )
+}
+
+/// [`s3_endpoint_kind`] with the value of `DGP_BACKEND_ALLOW_LOCAL` given by
+/// the caller (a unit test reads no process env).
+pub(crate) fn s3_endpoint_kind_with(
+    allow_local: bool,
+    env_allow: bool,
+) -> crate::security::UrlKind {
+    if allow_local || env_allow {
+        crate::security::UrlKind::BackendDev
+    } else {
+        crate::security::UrlKind::Backend
+    }
+}
+
 /// The outbound-URL check of [`guard_s3_endpoint`], without a client: the
 /// admin API runs it on a new backend so a refused endpoint is a 400, not a
 /// failed engine rebuild (500). Returns the URL kind the resolver enforces.
@@ -12,12 +34,7 @@ pub(crate) fn check_s3_endpoint(
     ep: &str,
     allow_local: bool,
 ) -> Result<crate::security::UrlKind, String> {
-    let env_allow = crate::config::env_bool("DGP_BACKEND_ALLOW_LOCAL", false);
-    let kind = if allow_local || env_allow {
-        crate::security::UrlKind::BackendDev
-    } else {
-        crate::security::UrlKind::Backend
-    };
+    let kind = s3_endpoint_kind(allow_local);
     crate::security::validate_outbound_url(ep, kind).map_err(|e| {
         format!(
             "Refusing to use S3 endpoint {ep:?}: {e}. \

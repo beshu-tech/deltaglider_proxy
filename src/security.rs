@@ -489,21 +489,61 @@ impl SsrfGuardedResolver {
     }
 }
 
+/// Where the guarded outbound clients send their requests
+/// (`DGP_OUTBOUND_USE_SYSTEM_PROXY`, parsed into `RuntimeTuning`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutboundEgress {
+    /// Straight to the target: the connect-time address check sees it.
+    #[default]
+    Direct,
+    /// Through the system HTTP(S) proxy, for a deployment whose only way
+    /// out is that proxy. The proxy resolves the target, so the address
+    /// check cannot run; the URL text check still does.
+    SystemProxy,
+}
+
+static OUTBOUND_EGRESS: std::sync::OnceLock<OutboundEgress> = std::sync::OnceLock::new();
+
+/// Set the egress of every guarded client built after this call. Once, at
+/// boot, from the tuning snapshot; later calls change nothing.
+pub fn install_outbound_egress(via_system_proxy: bool) {
+    let _ = OUTBOUND_EGRESS.set(if via_system_proxy {
+        OutboundEgress::SystemProxy
+    } else {
+        OutboundEgress::Direct
+    });
+}
+
 /// THE builder of an outbound HTTP client that an operator-supplied URL can
-/// reach (webhook, Slack, OIDC discovery and token requests). Three guards:
-/// the [`SsrfGuardedResolver`] (a name that resolves to a refused address
-/// fails at connect time), no redirects (a redirect could bounce a request
-/// that passed [`validate_outbound_url`] onto a private or metadata address),
-/// and no system proxy (`HTTP(S)_PROXY`, `ALL_PROXY`): with a proxy, only the
-/// proxy host is resolved here, the proxy resolves the target, and the
-/// connect-time address check never runs. A source guard
+/// reach (webhook, Slack, OIDC discovery and token requests). By default
+/// three guards: the [`SsrfGuardedResolver`] (a name that resolves to a
+/// refused address fails at connect time), no redirects (a redirect could
+/// bounce a request that passed [`validate_outbound_url`] onto a private or
+/// metadata address), and no system proxy (`HTTP(S)_PROXY`, `ALL_PROXY`):
+/// with a proxy, only the proxy host is resolved here, the proxy resolves
+/// the target, and the connect-time address check never runs. The operator
+/// can opt in to the system proxy ([`OutboundEgress::SystemProxy`]); the
+/// resolver is then left out too, because it would judge the proxy's own
+/// address. A source guard
 /// (`outbound_http_clients_come_from_the_one_guarded_builder`) refuses any
 /// other client builder.
 pub fn guarded_reqwest_builder(kind: UrlKind) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver::new(kind)))
+    guarded_reqwest_builder_for(kind, OUTBOUND_EGRESS.get().copied().unwrap_or_default())
+}
+
+/// [`guarded_reqwest_builder`] for an egress given by the caller (the
+/// process-wide one is the wrapper's business).
+pub fn guarded_reqwest_builder_for(
+    kind: UrlKind,
+    egress: OutboundEgress,
+) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    match egress {
+        OutboundEgress::Direct => builder
+            .no_proxy()
+            .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver::new(kind))),
+        OutboundEgress::SystemProxy => builder,
+    }
 }
 
 /// [`guarded_reqwest_builder`], built. A build error is an error: there is no
@@ -584,6 +624,22 @@ fn ip_is_link_local(ip: IpAddr) -> bool {
                 || embedded_ipv4(v6).is_some_and(|m| m.is_link_local())
         }
     }
+}
+
+/// Pure: the error for a backend endpoint HOST whose resolved addresses `ips`
+/// are ALL refused for `kind` (every request to it would fail at connect
+/// time), else `None`. An empty list says nothing (no answer is not a
+/// refusal). Boot and apply run it so such a backend is refused up front;
+/// [`SdkSsrfGuardedResolver`] enforces the same rule per connection.
+pub(crate) fn backend_resolution_error(
+    host: &str,
+    ips: &[IpAddr],
+    kind: UrlKind,
+) -> Option<String> {
+    if ips.is_empty() || !ips.iter().all(|ip| resolved_backend_ip_refused(*ip, kind)) {
+        return None;
+    }
+    Some(refused_resolution_message(host, ips, kind))
 }
 
 fn refused_resolution_message(host: &str, refused: &[IpAddr], kind: UrlKind) -> String {
@@ -1069,6 +1125,73 @@ mod tests {
         // A public literal → at least one acceptable addr → Ok.
         let ok = resolve("8.8.8.8").await.expect("public addr accepted");
         assert!(ok.count() >= 1);
+    }
+
+    /// Both arms of the egress. Direct: the resolver guard is on, so a name
+    /// that resolves to loopback fails at connect time. System proxy: no
+    /// resolver guard (it would judge the proxy's own address), so with no
+    /// proxy in the environment the same request goes through.
+    #[tokio::test]
+    async fn the_egress_decides_whether_the_resolver_guard_is_on() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+            }
+        });
+        let url = format!("http://localhost:{port}/");
+        let direct = guarded_reqwest_builder_for(UrlKind::Webhook, OutboundEgress::Direct)
+            .build()
+            .unwrap();
+        let err = direct
+            .get(&url)
+            .send()
+            .await
+            .expect_err("the guard refuses");
+        assert!(format!("{err:?}").contains("SSRF guard"), "{err:?}");
+        let proxied = guarded_reqwest_builder_for(UrlKind::Webhook, OutboundEgress::SystemProxy)
+            .build()
+            .unwrap();
+        // Redirects stay off in both arms.
+        match proxied.get(&url).send().await {
+            Ok(r) => assert_eq!(r.status(), 200),
+            // A proxy in this host's environment may answer instead; the
+            // resolver guard is never what refuses.
+            Err(e) => assert!(!format!("{e:?}").contains("SSRF guard"), "{e:?}"),
+        }
+        assert_eq!(OutboundEgress::default(), OutboundEgress::Direct);
+    }
+
+    /// A host is refused up front only when EVERY address it resolves to is
+    /// refused; one usable address, or none at all, says nothing.
+    #[test]
+    fn a_host_is_refused_up_front_only_when_all_its_addresses_are() {
+        let ips = |v: &[&str]| -> Vec<IpAddr> { v.iter().map(|s| s.parse().unwrap()).collect() };
+        let refused = |v: &[&str], kind| backend_resolution_error("minio.corp", &ips(v), kind);
+        // (addresses, Backend refuses, BackendDev refuses)
+        for (a, backend, dev) in [
+            (&["127.0.0.1"][..], true, false),
+            (&["::1"], true, false),
+            (&["127.0.0.1", "::1"], true, false),
+            (&["169.254.169.254"], true, true),
+            (&["127.0.0.1", "169.254.169.254"], true, false),
+            (&["127.0.0.1", "10.0.0.5"], false, false),
+            (&["10.0.0.5"], false, false),
+            (&["203.0.113.7"], false, false),
+            (&[], false, false),
+        ] {
+            assert_eq!(refused(a, UrlKind::Backend).is_some(), backend, "{a:?}");
+            assert_eq!(refused(a, UrlKind::BackendDev).is_some(), dev, "{a:?}");
+        }
+        let text = refused(&["127.0.0.1"], UrlKind::Backend).unwrap();
+        assert!(
+            text.contains("minio.corp") && text.contains("allow_local"),
+            "{text}"
+        );
     }
 
     #[test]
