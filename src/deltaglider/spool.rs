@@ -1049,7 +1049,7 @@ mod tests {
     /// process that the next test starts.
     #[cfg(unix)]
     #[test]
-    #[ignore = "runs in a child process: it changes the umask of its process"]
+    #[ignore = "manual: cargo test --lib -- --ignored --exact deltaglider::spool::tests::child_a_spool_directory_made_again_is_private_under_a_wide_umask (the parent test runs it in a child process)"]
     fn child_a_spool_directory_made_again_is_private_under_a_wide_umask() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
