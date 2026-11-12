@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Upgrade steps for the next release
+
+- **A deploy must stop the old process before it starts the new one.** A second process on one state directory exits after `DGP_STATE_LOCK_WAIT_SECS`. Its error now names the holder process and the fix. A rolling update on a shared volume works while the overlap stays shorter than `DGP_STATE_LOCK_WAIT_SECS`. Kubernetes with a shared PVC needs `strategy: Recreate`. The Helm chart already uses `Recreate`; the operator gives every pod its own volume.
+- **`--set-bootstrap-password` refuses while a server runs when it must re-encrypt the config DB.** Stop the server first.
+- **Set the readiness probe `timeoutSeconds` to 5 or more.** `/_/ready` runs its checks at the same time and answers within 3 seconds. The Helm chart and the operator now set 5. The live backend probe runs to its end in the background, and `/_/ready` answers from its last verdict while it runs.
+
+### Fixed
+
+- A spool check that panicked kept `/_/ready` at `503` for ever. A panic now gives one failed verdict, and the next round replaces it.
+- A migrate job stops when its durable progress save fails, before the flip and before the source delete. The flip and the cleanup take a proof that only a successful durable save makes.
+- A failed write inside a page of the event-driven replication consumer now rolls the whole page back and returns the error.
+- The start-up sweep keeps a file named `.tmpXXXXXX` that carries proxy metadata (an object that a release before 2.0 stored under that key).
+- The S3 `503` of a node whose config DB no key opens, and the Kubernetes guides, now name `kubectl port-forward` as the way to the recovery wizard.
+
 ## v2.2.0 — 2026-11-11
 
 ### Upgrade steps for the next release

@@ -206,6 +206,17 @@ parallel `UploadPart` requests, and the final `CompleteMultipartUpload`) through
 hash-pinned path. If you see a `NoSuchUpload` error here, some client is reaching the
 proxy pods without going through the router.
 
+## When a pod is not ready
+
+The readiness probe of a proxy pod is `GET /_/ready` with `timeoutSeconds: 5`. A pod answers `503` there when its storage backends are down, when a database lock is stuck, when its spool directory is unusable, and when no key opens its config DB (`config_db: "key_mismatch"`). The router sends no traffic to such a pod, and that includes the admin UI. To reach the recovery wizard of a pod whose config DB no key opens, forward the port of that pod and open the admin UI there:
+
+```bash
+kubectl -n dgp port-forward pod/dgp-0 9000:9000
+# open http://localhost:9000/_/admin
+```
+
+Each proxy pod has its own volume (a StatefulSet), and Kubernetes stops a pod before it starts the pod with the same name, so two processes never use one state directory.
+
 ## Know the trade-offs
 
 Consistent hashing pins traffic to pods; it does not share any state between them.
