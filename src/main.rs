@@ -876,7 +876,14 @@ async fn async_main(
     // LIST continuation tokens that carry a scan position are sealed with a
     // key derived from the DB key, so every node that shares it opens them.
     deltaglider_proxy::s3_adapter_s3s::install_list_token_keys(&db_keys);
-    let (config_db, config_db_mismatch) = init_config_db(&db_keys, &iam_state, &config);
+    let (config_db, config_db_mismatch) = init_config_db(
+        &db_keys,
+        &iam_state,
+        &config,
+        state_lock_slot
+            .as_ref()
+            .expect("the state lock is claimed before the config DB opens"),
+    );
     // The node-local job state, in its own unsynced file next to the config DB.
     let jobs_db = init_jobs_db(&db_keys, &config_db, config_db_mismatch, &config);
     // After the DB: its IAM users (declarative ones are reconciled into it

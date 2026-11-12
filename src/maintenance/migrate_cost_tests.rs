@@ -153,7 +153,7 @@ async fn verify_retries_a_transient_target_head_error() {
     e.fake.fail("HEAD", "t/run/k-037", 503, "SlowDown", 1);
     let c = Counters::default();
     let result = e.run().verify(&c).await;
-    assert_eq!(result, Ok(()), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
     assert!(
         e.fake
             .requests()
@@ -330,7 +330,12 @@ async fn the_flip_marks_the_usage_row_for_a_recount() {
         params: &params,
         provenance: provenance_value(&params, job.id),
     };
-    m.flip(&Counters::default()).await.unwrap();
+    m.flip(
+        &Counters::default(),
+        crate::maintenance::worker::Durable::for_tests(),
+    )
+    .await
+    .unwrap();
     usage.flush_pending();
     let row = usage.read("b").unwrap().unwrap();
     assert_eq!(row.last_scan_at, None, "the row still reads as scanned");
@@ -388,4 +393,150 @@ async fn migrate_copy_reuses_the_skip_check_as_the_prior() {
         assert_eq!(dst.get("COPY"), Some(&1), "{key}: target {dst:?}");
         assert_eq!(dst.get("DELETE"), None, "{key}: target {dst:?}");
     }
+}
+
+/// A durable save that fails before the flip stops the job there: the flip
+/// does not run (the config never routes the bucket to the target) and the
+/// copies stay on the target (a transient stop deletes nothing). The failure
+/// is injected with an open transaction on the jobs DB, where the
+/// `synchronous = FULL` commit refuses.
+#[tokio::test]
+async fn no_flip_runs_after_a_failed_durable_save() {
+    let e = env("verify", 3).await;
+    e.db.lock().await.conn.execute_batch("BEGIN").unwrap();
+    let result = e.phases().await;
+    assert!(
+        matches!(result, Err(PhaseStop::FailedTransient(_))),
+        "{result:?}"
+    );
+    let cfg = e.mutator.read().await;
+    assert!(
+        !routed_to_target(&cfg, "b", "dst"),
+        "the bucket was flipped after a failed save"
+    );
+    drop(cfg);
+    e.state
+        .engine
+        .load()
+        .head("t", "run/k-000.txt")
+        .await
+        .expect("the copies stay on the target");
+}
+
+/// A resumed flip (the save after it failed) finds the config flipped. It
+/// must not write the config again: here the config file cannot be written,
+/// as on a full disk, and the flip still succeeds.
+#[tokio::test]
+async fn a_resumed_flip_writes_nothing_when_the_config_is_flipped() {
+    let e = env("flip", 1).await;
+    let durable = || crate::maintenance::worker::Durable::for_tests();
+    // The flip happened (the save after it failed): the config routes the
+    // bucket to the target.
+    e.mutator.config.write().await.buckets.insert(
+        "b".into(),
+        crate::bucket_policy::BucketPolicyConfig {
+            backend: Some("dst".into()),
+            ..Default::default()
+        },
+    );
+    assert!(routed_to_target(&*e.mutator.read().await, "b", "dst"));
+    let broken = ConfigMutator {
+        config: e.mutator.config.clone(),
+        app: e.state.clone(),
+        persist_path: "/nonexistent-dgp-dir/c.yaml".to_string(),
+    };
+    let resumed = MigrateRun {
+        mutator: &broken,
+        db: &e.db,
+        state: &e.state,
+        holder: Holder::test("inst"),
+        job: &e.job,
+        params: &e.params,
+        provenance: provenance_value(&e.params, e.job.id),
+    };
+    resumed
+        .flip(&Counters::default(), durable())
+        .await
+        .expect("a flip that already happened writes nothing");
+}
+
+/// The config routes the bucket to the target already (the flip happened),
+/// and the row names an earlier phase. A failure or a cancel of the resumed
+/// job must not unwind: the staged copies ARE the live bucket, their route
+/// stays, and the write gate is not released by an unwind.
+async fn flipped_env(phase: &str) -> Env {
+    let e = env(phase, 3).await;
+    e.mutator.config.write().await.buckets.insert(
+        "b".into(),
+        crate::bucket_policy::BucketPolicyConfig {
+            backend: Some("dst".into()),
+            ..Default::default()
+        },
+    );
+    e.state.maintenance_gate.sync_from(&*e.db.lock().await);
+    assert!(
+        e.state.maintenance_gate.is_busy("b"),
+        "the job gates its bucket"
+    );
+    e
+}
+
+async fn assert_nothing_unwound(e: &Env, ctx: &str) {
+    let engine = e.state.engine.load().clone();
+    for key in ["run/k-000.txt", "run/k-002.txt"] {
+        engine
+            .head("t", key)
+            .await
+            .unwrap_or_else(|err| panic!("{ctx}: the target copy {key} is gone: {err}"));
+    }
+    assert!(
+        e.mutator.read().await.buckets.contains_key("t"),
+        "{ctx}: the route to the target was removed"
+    );
+    assert!(
+        e.state.maintenance_gate.is_busy("b"),
+        "{ctx}: the gate was released by an unwind"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_over_a_flipped_config_unwinds_nothing() {
+    let e = flipped_env("verify").await;
+    // One copy is missing: verify fails for good (not a transient error).
+    e.state
+        .engine
+        .load()
+        .delete("t", "run/k-001.txt")
+        .await
+        .unwrap();
+    let result = e.phases().await;
+    assert!(
+        matches!(result, Err(PhaseStop::Failed(_))),
+        "the verify must fail: {result:?}"
+    );
+    assert_nothing_unwound(&e, "failure at verify").await;
+}
+
+#[tokio::test]
+async fn a_cancel_over_a_flipped_config_unwinds_nothing() {
+    let e = flipped_env("verify").await;
+    e.db.lock()
+        .await
+        .maintenance_request_cancel(e.job.id)
+        .unwrap();
+    let result = e.phases().await;
+    assert_eq!(result, Err(PhaseStop::Cancelled), "{result:?}");
+    assert_nothing_unwound(&e, "cancel at verify").await;
+}
+
+#[tokio::test]
+async fn a_save_failure_at_the_flip_over_a_flipped_config_unwinds_nothing() {
+    let e = flipped_env("flip").await;
+    e.db.lock().await.conn.execute_batch("BEGIN").unwrap();
+    let result = e.phases().await;
+    assert!(
+        matches!(result, Err(PhaseStop::Deferred(_))),
+        "a failed save after the flip waits: {result:?}"
+    );
+    assert_nothing_unwound(&e, "save failure at flip").await;
 }

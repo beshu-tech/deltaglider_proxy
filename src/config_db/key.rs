@@ -14,7 +14,7 @@
 //! `DGP_CONFIG_DB_KEY_PREVIOUS` (rotation) and a key file that an env key
 //! replaces stay as FALLBACK keys: a DB that
 //! opens only with a fallback is re-encrypted with the primary key on boot
-//! (see [`super::ConfigDb::open_with_keys`]).
+//! (see `super::ConfigDb::open_with_keys`).
 
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;

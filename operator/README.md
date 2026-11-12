@@ -170,6 +170,16 @@ becomes `Degraded` and `status.message` lists the exact problems. Fix the spec a
 operator scales up on the next reconcile. A spec that breaks the contract therefore never scales into data
 corruption.
 
+## A pod that is not ready
+
+A proxy pod answers `503` on `GET /_/ready` (the readiness probe, `timeoutSeconds: 5`)
+when its backends, its databases or its spool are unusable, and when no key opens its
+config DB. The router sends no traffic to it, the admin UI included. For a config DB
+that no key opens, forward the pod's port (`kubectl port-forward pod/<name> 9000:9000`)
+and open `http://localhost:9000/_/admin` for the recovery wizard. Each pod has its own
+volume and a StatefulSet stops a pod before it starts the pod with the same name, so
+two processes never use one state directory.
+
 ## Spec reference
 
 ```yaml

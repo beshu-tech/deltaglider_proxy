@@ -225,9 +225,11 @@ pub struct BackendHealthCache {
     suspects: parking_lot::Mutex<HashMap<String, Suspicion>>,
     /// What the health loop probes, for `/_/ready` (see [`Self::loop_verdicts`]).
     health_loop: parking_lot::Mutex<HealthLoopView>,
-    /// The last live `/_/ready` backend probe and when it ended. Behind an
-    /// async mutex: concurrent probes wait for the one that runs.
-    ready_probe: tokio::sync::Mutex<Option<(std::time::Instant, &'static str)>>,
+    /// The last live `/_/ready` backend probe, and whether one runs now.
+    ready_probe: parking_lot::Mutex<ReadyProbeState>,
+    /// Wakes the `/_/ready` requests that wait for the live probe when it
+    /// ends (with a verdict or without).
+    ready_probe_done: tokio::sync::Notify,
     /// The last `/_/ready` spool check and when it ended (same single flight
     /// as `ready_probe`).
     spool_probe: tokio::sync::Mutex<Option<(std::time::Instant, bool)>>,
@@ -238,6 +240,55 @@ pub struct BackendHealthCache {
     /// atomicity watch probes a backend that it could not verify again at
     /// once (`coordination::atomicity::spawn_watch`).
     pub(crate) recovered: tokio::sync::Notify,
+}
+
+/// The live `/_/ready` backend probe: its last verdict, a counter of the
+/// verdicts stored (a waiter looks for a newer one), and whether a probe runs.
+#[derive(Debug, Default)]
+struct ReadyProbeState {
+    last: Option<(std::time::Instant, &'static str)>,
+    stored: u64,
+    running: bool,
+}
+
+/// THE rule for how long a backend verdict may serve `/_/ready`: twice the
+/// interval at which verdicts are renewed. The health loop's verdicts use it
+/// with the loop interval ([`BackendHealthCache::loop_verdicts`]); the live
+/// probe's last verdict uses it with the default loop interval
+/// ([`READY_STALE_VERDICT_MAX`]). So a node answers ready for at most this
+/// long after its backend stops.
+pub const fn max_verdict_age(interval: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(interval.as_secs().saturating_mul(2))
+}
+
+/// The default of `DGP_BACKEND_HEALTH_INTERVAL_SECS`.
+pub const DEFAULT_HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How old the last live verdict may be when `/_/ready` still answers from
+/// it while a newer probe runs: [`max_verdict_age`] of the default loop
+/// interval (60 s).
+pub const READY_STALE_VERDICT_MAX: std::time::Duration = max_verdict_age(DEFAULT_HEALTH_INTERVAL);
+
+/// Pure: what `/_/ready` answers for the backend when the live probe still
+/// runs after the wait: the last verdict while it is younger than
+/// [`READY_STALE_VERDICT_MAX`], else `"timeout"`. A probe that is slower than
+/// the wait (a few slow attempts) so keeps the answer of the last one.
+pub fn answer_while_probing(last: Option<(std::time::Duration, &'static str)>) -> &'static str {
+    match last {
+        Some((age, verdict)) if age < READY_STALE_VERDICT_MAX => verdict,
+        _ => "timeout",
+    }
+}
+
+/// Clears the "probe running" flag and wakes the waiters when the probe task
+/// ends, also when it panics.
+struct ReadyProbeRun(Arc<BackendHealthCache>);
+
+impl Drop for ReadyProbeRun {
+    fn drop(&mut self) {
+        self.0.ready_probe.lock().running = false;
+        self.0.ready_probe_done.notify_waiters();
+    }
 }
 
 /// The health loop's interval (set when the loop starts) and the backends
@@ -454,7 +505,7 @@ impl BackendHealthCache {
             let view = self.health_loop.lock();
             (view.every?, view.targets.clone()?)
         };
-        let max_age = every.saturating_mul(2);
+        let max_age = max_verdict_age(every);
         let entries = self.entries.read();
         targets
             .iter()
@@ -487,22 +538,69 @@ impl BackendHealthCache {
         );
     }
 
-    /// Single-flight live readiness probe: answers from the last result for
-    /// [`READY_PROBE_TTL`]; else runs `probe`, while concurrent callers
-    /// wait for its answer instead of probing too.
-    pub async fn ready_probe<F>(&self, probe: F) -> &'static str
+    /// Single-flight live readiness probe. It answers from the last result
+    /// for [`READY_PROBE_TTL`]. Otherwise it starts `probe` (unless one runs)
+    /// as a DETACHED task: the probe runs to its end and stores its verdict,
+    /// whatever the callers do. A caller waits at most `wait` for a verdict
+    /// newer than the one it found, and else answers
+    /// [`answer_while_probing`]. So a probe that is slower than the wait
+    /// (its retries and timeouts are tunable) is not cut off and not
+    /// repeated by every request: the next request finds its verdict.
+    pub async fn ready_probe<F>(
+        self: &Arc<Self>,
+        probe: F,
+        wait: std::time::Duration,
+    ) -> &'static str
     where
-        F: std::future::Future<Output = &'static str>,
+        F: std::future::Future<Output = &'static str> + Send + 'static,
     {
-        let mut last = self.ready_probe.lock().await;
-        if let Some((at, verdict)) = *last {
-            if at.elapsed() < READY_PROBE_TTL {
-                return verdict;
+        let entry_count = {
+            let st = self.ready_probe.lock();
+            if let Some((at, verdict)) = st.last {
+                if at.elapsed() < READY_PROBE_TTL {
+                    return verdict;
+                }
+            }
+            st.stored
+        };
+        let start = {
+            let mut st = self.ready_probe.lock();
+            !std::mem::replace(&mut st.running, true)
+        };
+        if start {
+            let run = ReadyProbeRun(Arc::clone(self));
+            let this = Arc::clone(self);
+            tokio::spawn(async move {
+                let _run = run;
+                let verdict = probe.await;
+                let mut st = this.ready_probe.lock();
+                st.last = Some((std::time::Instant::now(), verdict));
+                st.stored += 1;
+            });
+        }
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let notified = self.ready_probe_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let st = self.ready_probe.lock();
+                if st.stored > entry_count {
+                    if let Some((_, verdict)) = st.last {
+                        return verdict;
+                    }
+                }
+                if !st.running {
+                    // The probe ended without a verdict (it panicked).
+                    break;
+                }
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                break;
             }
         }
-        let verdict = probe.await;
-        *last = Some((std::time::Instant::now(), verdict));
-        verdict
+        let st = self.ready_probe.lock();
+        answer_while_probing(st.last.map(|(at, v)| (at.elapsed(), v)))
     }
 
     /// The `/_/ready` spool check. The check does disk I/O (a temp file in
@@ -527,11 +625,12 @@ impl BackendHealthCache {
         let usable = if self.spool_check_running.swap(true, SeqCst) {
             false
         } else {
-            let running = Arc::clone(&self.spool_check_running);
+            // The guard clears the flag when the check ends, also when it
+            // panics: a flag that stays set would refuse every later probe.
+            let running = RunningFlag(Arc::clone(&self.spool_check_running));
             let task = tokio::task::spawn_blocking(move || {
-                let usable = check();
-                running.store(false, SeqCst);
-                usable
+                let _running = running;
+                check()
             });
             matches!(tokio::time::timeout(limit, task).await, Ok(Ok(true)))
         };
@@ -542,6 +641,16 @@ impl BackendHealthCache {
     /// Drop entries for backends no longer in the config (post-apply hygiene).
     pub fn retain_backends(&self, names: &std::collections::BTreeSet<String>) {
         self.entries.write().retain(|k, _| names.contains(k));
+    }
+}
+
+/// Clears the "spool check running" flag when dropped (see
+/// [`BackendHealthCache::spool_probe`]).
+struct RunningFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for RunningFlag {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -630,7 +739,10 @@ pub fn health_probe_interval() -> Option<std::time::Duration> {
     if boot_probe_mode() == BootProbeMode::Off {
         return None;
     }
-    match crate::config::env_parse_with_default("DGP_BACKEND_HEALTH_INTERVAL_SECS", 30u64) {
+    match crate::config::env_parse_with_default(
+        "DGP_BACKEND_HEALTH_INTERVAL_SECS",
+        DEFAULT_HEALTH_INTERVAL.as_secs(),
+    ) {
         0 => None,
         secs => Some(std::time::Duration::from_secs(secs)),
     }
@@ -1809,5 +1921,142 @@ mod spool_probe_tests {
         assert!(!usable);
         assert_eq!(runs.load(SeqCst), 1, "no second blocking call");
         drop(release);
+    }
+
+    /// A check that panics gives a failed verdict. The next round (after
+    /// the TTL) runs the check again and replaces it.
+    #[tokio::test]
+    async fn a_panicked_spool_check_fails_once_and_the_next_round_recovers() {
+        let cache = BackendHealthCache::default();
+        let usable = cache
+            .spool_probe(|| -> bool { panic!("probe bug") }, Duration::from_secs(5))
+            .await;
+        assert!(!usable, "a panic is a failed verdict");
+        *cache.spool_probe.lock().await = None;
+        let usable = cache.spool_probe(|| true, Duration::from_secs(5)).await;
+        assert!(usable, "the flag of the dead check does not stay set");
+    }
+}
+
+#[cfg(test)]
+mod ready_probe_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
+
+    /// A probe slower than the wait is not cut off: it runs to its end and
+    /// stores its verdict. The caller that gave up answers `timeout` (no
+    /// older verdict), and the next caller finds the stored verdict without
+    /// a second probe.
+    #[tokio::test]
+    async fn a_slow_probe_runs_to_its_end_and_the_next_request_finds_its_verdict() {
+        let cache = Arc::new(BackendHealthCache::default());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counter = runs.clone();
+        let first = cache
+            .ready_probe(
+                async move {
+                    counter.fetch_add(1, SeqCst);
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    "ready"
+                },
+                Duration::from_millis(50),
+            )
+            .await;
+        assert_eq!(first, "timeout", "no older verdict: the wait ends");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let counter = runs.clone();
+        let second = cache
+            .ready_probe(
+                async move {
+                    counter.fetch_add(1, SeqCst);
+                    "unreachable"
+                },
+                Duration::from_millis(50),
+            )
+            .await;
+        assert_eq!(second, "ready", "the stored verdict of the slow probe");
+        assert_eq!(runs.load(SeqCst), 1, "one probe");
+    }
+
+    /// While a newer probe runs, a request answers from the last verdict.
+    #[tokio::test]
+    async fn a_request_answers_from_the_last_verdict_while_a_probe_runs() {
+        let cache = Arc::new(BackendHealthCache::default());
+        assert_eq!(
+            cache
+                .ready_probe(async { "ready" }, Duration::from_secs(2))
+                .await,
+            "ready"
+        );
+        // Past the TTL: the next probe is slow.
+        cache.ready_probe.lock().last = Some((
+            std::time::Instant::now() - READY_PROBE_TTL - Duration::from_secs(1),
+            "ready",
+        ));
+        let answer = cache
+            .ready_probe(
+                async {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    "unreachable"
+                },
+                Duration::from_millis(50),
+            )
+            .await;
+        assert_eq!(answer, "ready", "the last verdict, not a 503");
+    }
+
+    /// A probe that panics gives no verdict, ends the wait at once, and the
+    /// next request starts a new probe.
+    #[tokio::test]
+    async fn a_panicked_probe_does_not_wedge_the_flight() {
+        let cache = Arc::new(BackendHealthCache::default());
+        let started = std::time::Instant::now();
+        let answer = cache
+            .ready_probe(
+                async {
+                    if true {
+                        panic!("probe bug");
+                    }
+                    "ready"
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(answer, "timeout");
+        assert!(started.elapsed() < Duration::from_secs(2), "no full wait");
+        assert_eq!(
+            cache
+                .ready_probe(async { "ready" }, Duration::from_secs(2))
+                .await,
+            "ready"
+        );
+    }
+
+    /// The two verdict-age bounds are one rule.
+    #[test]
+    fn the_live_bound_is_the_loop_rule_at_the_default_interval() {
+        let s = Duration::from_secs;
+        assert_eq!(max_verdict_age(s(30)), s(60));
+        assert_eq!(
+            READY_STALE_VERDICT_MAX,
+            max_verdict_age(DEFAULT_HEALTH_INTERVAL)
+        );
+        assert_eq!(max_verdict_age(s(7)), s(14));
+    }
+
+    #[test]
+    fn answer_while_probing_table() {
+        let s = Duration::from_secs;
+        assert_eq!(answer_while_probing(None), "timeout");
+        assert_eq!(answer_while_probing(Some((s(1), "ready"))), "ready");
+        assert_eq!(
+            answer_while_probing(Some((s(1), "unreachable"))),
+            "unreachable"
+        );
+        assert_eq!(
+            answer_while_probing(Some((READY_STALE_VERDICT_MAX, "ready"))),
+            "timeout"
+        );
     }
 }
