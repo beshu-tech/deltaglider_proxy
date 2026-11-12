@@ -133,6 +133,8 @@ impl Side {
 
 /// A `let x = init;`, `const X: T = init;` or `static`.
 pub(crate) struct Binding {
+    /// 1-based line of the initialiser.
+    pub line: usize,
     pub func: usize,
     pub name: String,
     /// A `const` or `static` item (visible crate-wide), not a `let`.
@@ -837,6 +839,7 @@ impl Collector {
             init_strings.push(init_strings.concat());
         }
         self.cur().bindings.push(Binding {
+            line: pos(init.span()).0,
             func,
             name,
             item,

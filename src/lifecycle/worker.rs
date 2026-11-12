@@ -667,27 +667,6 @@ async fn run_or_preview(
             stopped_by = Some(stop);
             break 'pages;
         }
-        // Admit the page's writes through the gate (counted, then the gate
-        // asked: acquire-then-recheck, H22/F9) so a concurrently-arming
-        // maintenance drain either waits for this page's writes or we defer
-        // with the guards dropped. Mid-run maintenance defer: if a write
-        // bucket (source or transition dest) becomes gated mid-run, stop —
-        // cursor preserved, resumes when the maintenance job clears. Mirrors
-        // the replication RunControl fix (#12); preview never writes, so it's
-        // execute-only.
-        let windows = if execute {
-            match admit_write_windows(rule, maintenance_gate.as_ref()) {
-                Ok(windows) => windows,
-                Err(why) => {
-                    info!("lifecycle rule '{}' deferring mid-run — {why}", rule.name);
-                    deferred = true;
-                    break 'pages;
-                }
-            }
-        } else {
-            // A preview writes nothing: an admission of no bucket.
-            crate::maintenance::gate::admit_all(None, &[]).map_err(|e| e.into_reason())?
-        };
         if execute
             && !renew_run_lease(&db, rule, ctx.as_ref(), &mut out.failures, response_cap).await?
         {
@@ -795,6 +774,19 @@ async fn run_or_preview(
                         });
                     }
                     if execute {
+                        // ONE admission per object (counted, then the gate
+                        // asked): a maintenance job that arms during the page
+                        // waits for at most this object's copy, and the next
+                        // object defers the run. The cursor stays before the
+                        // page, so the resume plans it again.
+                        let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
+                            Ok(windows) => windows,
+                            Err(why) => {
+                                info!("lifecycle rule '{}' deferring mid-page: {why}", rule.name);
+                                deferred = true;
+                                break;
+                            }
+                        };
                         match plan_action(db.as_ref(), engine, &windows, rule, &key, &meta, &action)
                             .await
                         {
@@ -851,12 +843,26 @@ async fn run_or_preview(
         if let Some(ctx) = ctx.as_ref() {
             ctx.publish(&out);
         }
-        if stopped_by.is_some() {
+        if stopped_by.is_some() || deferred {
             // Copies already made stay; the page's deletes do not run.
             break 'pages;
         }
 
         if !deletes.is_empty() {
+            // The admission of the page's delete batch: `proceed` asks the
+            // gate again before each key, so a job that arms meanwhile waits
+            // for one key's delete.
+            let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
+                Ok(windows) => windows,
+                Err(why) => {
+                    info!(
+                        "lifecycle rule '{}' deferring before its deletes: {why}",
+                        rule.name
+                    );
+                    deferred = true;
+                    break 'pages;
+                }
+            };
             let stopped = delete_planned(
                 db.as_ref(),
                 engine,
@@ -1256,6 +1262,7 @@ async fn run_or_preview_retain_newest(
             stored_size: stored_size_of(&metas, &c.key, c.size),
             action: "retain-newest",
             counted: true,
+            dest_check: None,
         })
         .collect();
     let lease_alive = ctx
@@ -1453,6 +1460,18 @@ struct PlannedDelete {
     /// Counted as an affected object. A transition's source delete is not:
     /// its copy was.
     counted: bool,
+    /// The copy of this move was skipped because its destination already
+    /// held the object: the destination is read again right before the
+    /// source delete, and the delete goes only while it still holds it.
+    dest_check: Option<DestCheck>,
+}
+
+/// What a skipped copy relied on (see `PlannedDelete::dest_check`).
+#[derive(Debug)]
+struct DestCheck {
+    bucket: String,
+    key: String,
+    source: crate::types::FileMetadata,
 }
 
 impl PlannedDelete {
@@ -1469,8 +1488,59 @@ impl PlannedDelete {
             stored_size: meta.stored_size(),
             action,
             counted,
+            dest_check: None,
         }
     }
+}
+
+/// Pure: does the destination object stand for the source, so that a move
+/// may skip its copy and delete its source? The content is the same
+/// (`content_verdict`), and so are the content type and the user metadata
+/// that a client set (the `dg-` keys and the rule's own provenance key
+/// are the proxy's, not the object's).
+fn destination_holds_it(
+    source: &crate::types::FileMetadata,
+    dest: &crate::types::FileMetadata,
+) -> bool {
+    let client_metadata =
+        |m: &crate::types::FileMetadata| -> std::collections::BTreeMap<String, String> {
+            m.user_metadata
+                .iter()
+                .filter(|(k, _)| {
+                    !k.to_ascii_lowercase().starts_with("dg-")
+                        && !k.eq_ignore_ascii_case(LIFECYCLE_RULE_METADATA_KEY)
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+    crate::transfer::content_verdict(source, Some(dest)) == crate::transfer::ContentVerdict::Same
+        && source.content_type == dest.content_type
+        && client_metadata(source) == client_metadata(dest)
+}
+
+/// The deletes that may go: a delete whose copy was skipped goes only
+/// while its destination still holds the object (read now, not at plan
+/// time). The others are dropped; the next run plans them again.
+async fn verified_deletes(
+    engine: &DynEngine,
+    deletes: Vec<PlannedDelete>,
+    out: &mut LifecycleRunOutcome,
+) -> Vec<PlannedDelete> {
+    let mut kept = Vec::with_capacity(deletes.len());
+    for delete in deletes {
+        if let Some(check) = &delete.dest_check {
+            let holds = match engine.head(&check.bucket, &check.key).await {
+                Ok(dest) => destination_holds_it(&check.source, &dest),
+                Err(_) => false,
+            };
+            if !holds {
+                out.objects_skipped += 1;
+                continue;
+            }
+        }
+        kept.push(delete);
+    }
+    kept
 }
 
 /// What a run does with one planned object before its page's deletes.
@@ -1507,15 +1577,25 @@ async fn plan_action(
             destination_key,
             delete_source_after_success,
         } => {
-            // A copy-mode transition meets the same expired objects on every
-            // run: skip one the destination already holds.
-            if !*delete_source_after_success {
-                if let Ok(dest) = engine.head(destination_bucket, destination_key).await {
-                    if crate::transfer::content_verdict(meta, Some(&dest))
-                        == crate::transfer::ContentVerdict::Same
-                    {
-                        return Ok(Planned::Skipped);
-                    }
+            // A transition meets the same expired objects again: a copy-mode
+            // run on every run, a move-mode run after a deferral that kept
+            // the page's source deletes back. The destination already holds
+            // the object: no second copy and no second event. A copy
+            // skips it; a move goes on to delete its source.
+            if let Ok(dest) = engine.head(destination_bucket, destination_key).await {
+                if destination_holds_it(meta, &dest) {
+                    return Ok(if *delete_source_after_success {
+                        let mut delete =
+                            PlannedDelete::of(key, meta, "transition-source-delete", false);
+                        delete.dest_check = Some(DestCheck {
+                            bucket: destination_bucket.clone(),
+                            key: destination_key.clone(),
+                            source: meta.clone(),
+                        });
+                        Planned::Delete(delete)
+                    } else {
+                        Planned::Skipped
+                    });
                 }
             }
             // The encryption witness refuses this node's writes to the
@@ -1601,6 +1681,10 @@ async fn delete_planned(
     out: &mut LifecycleRunOutcome,
     response_cap: usize,
 ) -> Result<bool, String> {
+    let deletes = verified_deletes(engine, deletes, out).await;
+    if deletes.is_empty() {
+        return Ok(false);
+    }
     let events = Arc::new(DeleteEvents {
         db: db.cloned(),
         rule_name: rule.name.clone(),
@@ -2659,6 +2743,351 @@ mod tests {
             state.next_due_at <= before + 120,
             "due again soon, not one delay later: {}",
             state.next_due_at - before
+        );
+    }
+
+    /// A maintenance job that arms while a page is copied waits for ONE
+    /// object's copy: every object has its own admission, so the object
+    /// after the arm defers the run. The gate here refuses from the
+    /// third object on (a job armed in the middle of the page).
+    #[tokio::test]
+    async fn a_gate_armed_mid_page_stops_the_run_at_the_next_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        let keys = ["x/1.bin", "x/2.bin", "x/3.bin", "x/4.bin", "x/5.bin"];
+        store_all(&engine, &keys).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rule = LifecycleRule {
+            name: "mid-page".into(),
+            expire_after: Some("1ms".into()),
+            action: crate::config_sections::LifecycleAction::Transition(
+                crate::config_sections::LifecycleTransitionAction {
+                    destination: crate::config_sections::LifecycleDestination {
+                        bucket: "dst".into(),
+                        prefix: "cold/".into(),
+                    },
+                    delete_source_after_success: false,
+                },
+            ),
+            ..rule()
+        };
+        let copied = |engine: Arc<DynEngine>| async move {
+            let mut n = 0;
+            for key in keys {
+                n += usize::from(engine.head("dst", &format!("cold/{key}")).await.is_ok());
+            }
+            n
+        };
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        // Each object asks the gate once for "dst" (its admission): the
+        // third ask is the one after the job armed.
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        gate.set_write_refusal_probe(Arc::new(move |bucket: &str| {
+            (bucket == "dst" && asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= 3)
+                .then(|| "a job armed mid-page".to_string())
+        }));
+        let db = jobs_db();
+        db.lock()
+            .await
+            .lifecycle_ensure_state(&rule.name, 0)
+            .unwrap();
+        let out = super::run_rule(
+            Some(db.clone()),
+            &engine,
+            &rule,
+            10,
+            "scheduler",
+            3600,
+            None,
+            Some(gate.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.status, "deferred", "{out:?}");
+        assert_eq!(
+            copied(engine.clone()).await,
+            2,
+            "no object is copied after the gate armed: {out:?}"
+        );
+        assert_eq!((out.objects_copied, out.errors), (2, 0), "{out:?}");
+        assert_eq!(
+            gate.inflight_writes("dst"),
+            0,
+            "no admission outlives the run"
+        );
+    }
+
+    fn transition_rule(name: &str, delete_source: bool) -> LifecycleRule {
+        LifecycleRule {
+            name: name.into(),
+            expire_after: Some("1ms".into()),
+            action: crate::config_sections::LifecycleAction::Transition(
+                crate::config_sections::LifecycleTransitionAction {
+                    destination: crate::config_sections::LifecycleDestination {
+                        bucket: "dst".into(),
+                        prefix: "cold/".into(),
+                    },
+                    delete_source_after_success: delete_source,
+                },
+            ),
+            ..rule()
+        }
+    }
+
+    /// A move-mode run that a mid-page deferral stopped keeps the page's
+    /// source deletes back while its copies stand. The next run meets the
+    /// same objects: the destination already holds them, so it makes no
+    /// second copy and sends no second event, and it deletes the source.
+    #[tokio::test]
+    async fn a_move_run_after_a_mid_page_deferral_copies_and_announces_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        let keys = ["x/1.bin", "x/2.bin", "x/3.bin", "x/4.bin", "x/5.bin"];
+        store_all(&engine, &keys).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rule = transition_rule("move", true);
+        let db = jobs_db();
+        let mut config = Config::default();
+        config.event_delivery.enabled = true;
+        config.event_delivery.webhook_url = Some("https://hook.example/x".into());
+        crate::event_outbox::set_config_readers(&db, &config);
+        db.lock()
+            .await
+            .lifecycle_ensure_state(&rule.name, 0)
+            .unwrap();
+
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        gate.set_write_refusal_probe(Arc::new(move |bucket: &str| {
+            (bucket == "dst" && asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= 3)
+                .then(|| "a job armed mid-page".to_string())
+        }));
+        let first = super::run_rule(
+            Some(db.clone()),
+            &engine,
+            &rule,
+            10,
+            "scheduler",
+            3600,
+            None,
+            Some(gate),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status, "deferred", "{first:?}");
+        assert_eq!(first.objects_scanned, 3, "{first:?}");
+        for key in keys {
+            assert!(
+                engine.head("b", key).await.is_ok(),
+                "{key}: the page's deletes wait for the resume"
+            );
+        }
+
+        let second = super::run_rule(
+            Some(db.clone()),
+            &engine,
+            &rule,
+            10,
+            "scheduler",
+            3600,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.errors, 0, "{second:?}");
+        crate::event_outbox::flush_appends(&db).await;
+        for key in keys {
+            assert!(
+                engine.head("b", key).await.is_err(),
+                "{key}: source deleted"
+            );
+            assert!(
+                engine.head("dst", &format!("cold/{key}")).await.is_ok(),
+                "{key}: destination holds it"
+            );
+        }
+        let rows = db.lock().await.event_outbox_since(0, 100).unwrap();
+        let mut announced: Vec<String> = rows
+            .iter()
+            .filter(|r| r.kind == "LifecycleTransitioned")
+            .map(|r| r.key.clone())
+            .collect();
+        announced.sort();
+        let expected: Vec<String> = keys.iter().map(|k| format!("cold/{k}")).collect();
+        assert_eq!(announced, expected, "one transition event for each object");
+    }
+
+    fn meta_of(
+        sha: &str,
+        content_type: Option<&str>,
+        user: &[(&str, &str)],
+    ) -> crate::types::FileMetadata {
+        let mut m = crate::types::FileMetadata::fallback(
+            "k".into(),
+            7,
+            "md5".into(),
+            chrono::Utc::now(),
+            content_type.map(str::to_string),
+            crate::types::StorageInfo::Passthrough,
+        );
+        m.file_sha256 = sha.into();
+        m.user_metadata = user
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        m
+    }
+
+    /// A move skips its copy, and deletes its source, only for a
+    /// destination that is the same object: the same bytes, the same
+    /// content type and the same user metadata. The proxy's own keys (`dg-`
+    /// and the rule's provenance key) are not the object's.
+    #[test]
+    fn a_destination_stands_for_its_source_only_when_it_is_the_same_object() {
+        let source = meta_of("aa", Some("text/plain"), &[("owner", "dana")]);
+        let ours = meta_of(
+            "aa",
+            Some("text/plain"),
+            &[
+                ("owner", "dana"),
+                (crate::transfer::LIFECYCLE_RULE_METADATA_KEY, "r"),
+                ("dg-extra", "1"),
+                ("DG-Upper", "2"),
+            ],
+        );
+        assert!(super::destination_holds_it(&source, &ours));
+        for (why, other) in [
+            (
+                "bytes",
+                meta_of("bb", Some("text/plain"), &[("owner", "dana")]),
+            ),
+            (
+                "content type",
+                meta_of("aa", Some("image/png"), &[("owner", "dana")]),
+            ),
+            ("no content type", meta_of("aa", None, &[("owner", "dana")])),
+            (
+                "user metadata",
+                meta_of("aa", Some("text/plain"), &[("owner", "bob")]),
+            ),
+            ("missing metadata", meta_of("aa", Some("text/plain"), &[])),
+        ] {
+            assert!(!super::destination_holds_it(&source, &other), "{why}");
+        }
+    }
+
+    /// A delete whose copy was skipped re-reads its destination right
+    /// before the source delete: a destination that is gone or changed
+    /// since the plan keeps the source (the next run copies again).
+    #[tokio::test]
+    async fn a_skipped_copy_deletes_its_source_only_while_the_destination_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        store_all(&engine, &["x/1.bin", "x/2.bin", "x/3.bin"]).await;
+        let source = engine.head("b", "x/1.bin").await.unwrap();
+        // 1: the destination holds it; 2: it was overwritten after the
+        // plan; 3: it is gone.
+        engine
+            .store("dst", "cold/x/1.bin", b"payload", None, Default::default())
+            .await
+            .unwrap();
+        engine
+            .store("dst", "cold/x/2.bin", b"changed!", None, Default::default())
+            .await
+            .unwrap();
+        let planned = |key: &str| {
+            let mut d = super::PlannedDelete::of(key, &source, "transition-source-delete", false);
+            d.dest_check = Some(super::DestCheck {
+                bucket: "dst".into(),
+                key: format!("cold/{key}"),
+                source: source.clone(),
+            });
+            d
+        };
+        let mut out = super::LifecycleRunOutcome::default();
+        let kept = super::verified_deletes(
+            &engine,
+            vec![planned("x/1.bin"), planned("x/2.bin"), planned("x/3.bin")],
+            &mut out,
+        )
+        .await;
+        let keys: Vec<&str> = kept.iter().map(|d| d.key.as_str()).collect();
+        assert_eq!(keys, ["x/1.bin"]);
+        assert_eq!(out.objects_skipped, 2);
+
+        // And the batch itself runs the re-check: its delete of an object
+        // whose destination is gone deletes nothing.
+        let mut out = super::LifecycleRunOutcome::default();
+        let windows = crate::maintenance::gate::admit_all(None, &["b"]).unwrap();
+        let stopped = super::delete_planned(
+            None,
+            &engine,
+            &windows,
+            &rule(),
+            vec![planned("x/3.bin")],
+            &|| true,
+            None,
+            &mut out,
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(!stopped);
+        assert!(
+            engine.head("b", "x/3.bin").await.is_ok(),
+            "the source stays while its destination is gone"
+        );
+        assert_eq!(out.objects_affected, 0);
+    }
+
+    /// The page's delete batch is admitted again before it runs: a job that
+    /// armed after the page's objects were planned stops it. The gate here
+    /// refuses the fourth ask, which is the batch's (three objects ask once
+    /// each).
+    #[tokio::test]
+    async fn the_delete_batch_of_a_page_is_admitted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        let keys = ["x/1.bin", "x/2.bin", "x/3.bin"];
+        store_all(&engine, &keys).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rule = LifecycleRule {
+            name: "batch".into(),
+            expire_after: Some("1ms".into()),
+            ..rule()
+        };
+        let db = jobs_db();
+        db.lock()
+            .await
+            .lifecycle_ensure_state(&rule.name, 0)
+            .unwrap();
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        gate.set_write_refusal_probe(Arc::new(move |bucket: &str| {
+            (bucket == "b" && asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= 4)
+                .then(|| "a job armed before the batch".to_string())
+        }));
+        let out = super::run_rule(
+            Some(db),
+            &engine,
+            &rule,
+            10,
+            "scheduler",
+            3600,
+            None,
+            Some(gate.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.status, "deferred", "{out:?}");
+        for key in keys {
+            assert!(engine.head("b", key).await.is_ok(), "{key}: not deleted");
+        }
+        assert_eq!(
+            gate.inflight_writes("b"),
+            0,
+            "no admission outlives the run"
         );
     }
 

@@ -11,6 +11,7 @@ pub(crate) use fake_s3::{backend as fake_s3_backend, FakeS3};
 mod filesystem;
 pub mod list_size_cache;
 pub mod listing_facts;
+pub mod mpu_guard;
 pub(crate) mod routing;
 mod s3;
 

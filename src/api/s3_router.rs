@@ -233,6 +233,10 @@ pub struct RouterDeps<'a> {
     pub admission_chain: &'a crate::admission::SharedAdmissionChain,
     /// The live, hot-reloaded config.
     pub shared_config: &'a crate::config::SharedConfig,
+    /// The slots of work that outlives its request (see
+    /// [`crate::api::handlers::DetachedWork`]). The caller keeps a clone to
+    /// wait for the work at shutdown.
+    pub detached: &'a crate::api::handlers::DetachedWork,
 }
 
 /// [`build_s3_router`] with the `S3` impl and the s3s access hook given
@@ -252,6 +256,7 @@ where
         public_prefix_snapshot,
         admission_chain,
         shared_config,
+        detached,
     } = deps;
     use crate::api::s3s_hooks::DeltaGliderS3sAuth;
     use axum::error_handling::HandleError;
@@ -531,9 +536,7 @@ where
     }
 
     router
-        .layer(axum::Extension(crate::api::handlers::DetachedWork::new(
-            config.tuning.max_concurrent_requests,
-        )))
+        .layer(axum::Extension(detached.clone()))
         .layer(axum::Extension(replay_cache.clone()))
         .layer(axum::Extension(crate::api::auth::ReplayWindow(
             config.tuning.replay_window(),
@@ -576,6 +579,11 @@ mod backend_share_tests {
 
     /// The production S3 router over `config` (open access).
     async fn router(config: &Config) -> Router {
+        router_and_state(config).await.0
+    }
+
+    /// [`router`], with the app state (the gate) it was built around.
+    async fn router_and_state(config: &Config) -> (Router, Arc<AppState>) {
         let engine = crate::deltaglider::DynEngine::new(config, None)
             .await
             .unwrap();
@@ -601,7 +609,7 @@ mod backend_share_tests {
         );
         let replay_cache: crate::api::auth::ReplayCache = Default::default();
         let shared_config = config.clone().into_shared();
-        build_s3_router(RouterDeps {
+        let app = build_s3_router(RouterDeps {
             state: &state,
             iam_state: &iam,
             metrics: &metrics,
@@ -611,7 +619,64 @@ mod backend_share_tests {
             public_prefix_snapshot: &snapshot,
             admission_chain: &chain,
             shared_config: &shared_config,
-        })
+            detached: &crate::api::handlers::DetachedWork::new(
+                config.tuning.max_concurrent_requests,
+            ),
+        });
+        (app, state)
+    }
+
+    /// The write count reaches the s3s access hook through the real router:
+    /// a PUT whose body stalls is counted in flight from its verification
+    /// (and not before), a PUT to a busy bucket is refused and never
+    /// counted, and the count ends with the request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_write_count_reaches_the_hook_through_the_router() {
+        let config = Config::default();
+        let (app, state) = router_and_state(&config).await;
+        let gate = state.maintenance_gate.clone();
+
+        // A busy bucket: 503, and not in flight at any point after it.
+        gate.set_busy("downloads");
+        let refused = app
+            .clone()
+            .oneshot(with_body("PUT", "/downloads/new.txt", b"x".to_vec(), &[]))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 503);
+        assert_eq!(gate.inflight_writes("downloads"), 0);
+        gate.clear("downloads");
+
+        // An admitted PUT whose body stalls is in flight while it waits.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+        let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx));
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/downloads/slow.txt")
+            .header("host", "localhost:9000")
+            .header("content-length", "1000000")
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap();
+        let put = tokio::spawn(app.clone().oneshot(req));
+        tx.send(Ok(bytes::Bytes::from_static(b"head")))
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while gate.inflight_writes("downloads") == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the verified write never counted in flight"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(gate.inflight_writes("downloads"), 1);
+        drop(tx);
+        let _ = put.await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while gate.inflight_writes("downloads") != 0 {
+            assert!(std::time::Instant::now() < deadline, "the count leaked");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     fn request(method: &str, path: &str) -> axum::http::Request<axum::body::Body> {

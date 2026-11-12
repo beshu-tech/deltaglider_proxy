@@ -1088,6 +1088,27 @@ mod readiness_tests {
             "a multipart request met a cap or a full spool budget",
         ),
         (
+            "src/maintenance/gate.rs",
+            "return Err(crate::api::errors::S3Error::SlowDown(",
+            1,
+            Reach::PerRequest,
+            "a write request that has no in-flight count slot (never in production: the middleware gives each write one)",
+        ),
+        (
+            "src/multipart.rs",
+            "code: s3s::S3ErrorCode::SlowDown,",
+            1,
+            Reach::PerRequest,
+            "a joined Complete whose owner's request ended before it finished",
+        ),
+        (
+            "src/multipart.rs",
+            "status: Some(axum::http::StatusCode::SERVICE_UNAVAILABLE),",
+            1,
+            Reach::PerRequest,
+            "the status of that same answer",
+        ),
+        (
             "src/api/errors.rs",
             "S3Error::SlowDown(\"the copy source changed during the copy; retry the request\".to_string())",
             1,

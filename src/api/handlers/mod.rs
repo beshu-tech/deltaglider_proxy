@@ -79,28 +79,59 @@ pub(crate) use status::get_peak_rss_bytes;
 /// slot until their deadline (the request slots have per-backend shares,
 /// the detached slots do not).
 #[derive(Clone)]
-pub struct DetachedWork(Arc<tokio::sync::Semaphore>);
+pub struct DetachedWork {
+    slots: Arc<tokio::sync::Semaphore>,
+    total: usize,
+}
 
 /// A reserved slot of [`DetachedWork`] (empty without a router: unit tests
 /// call handlers directly).
 #[must_use = "a reserved slot does nothing until it spawns its task"]
 pub struct DetachedSlot {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// The backend share of the spool budget the request ran in, captured
+    /// at reserve time: `tokio::spawn` drops a task-local, and the detached
+    /// store must count against the same share as its request.
+    spool_scope: Option<Arc<str>>,
 }
 
 impl DetachedWork {
     pub fn new(slots: usize) -> Self {
-        Self(Arc::new(tokio::sync::Semaphore::new(slots.max(1))))
+        let total = slots.max(1);
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(total)),
+            total,
+        }
+    }
+
+    /// Slots held now: the detached tasks that run (or wait to start).
+    pub fn in_flight(&self) -> usize {
+        self.total.saturating_sub(self.slots.available_permits())
+    }
+
+    /// Wait until no detached task runs, at most `bound`. Returns the
+    /// tasks still running at the end (0: all finished). Used at shutdown,
+    /// after the listener stopped: no new task can start meanwhile.
+    pub async fn drain(&self, bound: std::time::Duration) -> usize {
+        let all = u32::try_from(self.total).unwrap_or(u32::MAX);
+        match tokio::time::timeout(bound, self.slots.acquire_many(all)).await {
+            Ok(_) => 0,
+            Err(_) => self.in_flight(),
+        }
     }
 
     /// Wait for a slot for one detached task of the request with
     /// `extensions`. Call it before taking any object write lock.
     pub(crate) async fn reserve(extensions: &axum::http::Extensions) -> DetachedSlot {
         let Some(work) = extensions.get::<DetachedWork>() else {
-            return DetachedSlot { _permit: None };
+            return DetachedSlot {
+                _permit: None,
+                spool_scope: crate::deltaglider::spool::current_scope(),
+            };
         };
         DetachedSlot {
-            _permit: work.0.clone().acquire_owned().await.ok(),
+            _permit: work.slots.clone().acquire_owned().await.ok(),
+            spool_scope: crate::deltaglider::spool::current_scope(),
         }
     }
 }
@@ -113,10 +144,11 @@ impl DetachedSlot {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        tokio::spawn(async move {
+        let scope = self.spool_scope.clone();
+        tokio::spawn(crate::deltaglider::spool::scoped_in(scope, async move {
             let _slot = self;
             task.await
-        })
+        }))
     }
 }
 
@@ -541,5 +573,55 @@ mod detached_work_tests {
             .map(|o| o.rsplit(" in ").next().unwrap())
             .collect();
         assert_eq!(fns, ["a", "b", "c", "d", "e"], "{caught:?}");
+    }
+
+    /// The spool scope of the request reaches the detached task: a store
+    /// that outlives its request counts against the same backend share.
+    #[tokio::test]
+    async fn a_detached_task_keeps_the_spool_scope_of_its_request() {
+        let extensions = axum::http::Extensions::new();
+        let slot = crate::deltaglider::spool::scoped("hetzner-fsn1", async {
+            super::DetachedWork::reserve(&extensions).await
+        })
+        .await;
+        let seen = slot
+            .spawn_detached(async { crate::deltaglider::spool::current_scope() })
+            .await
+            .unwrap();
+        assert_eq!(seen.as_deref(), Some("hetzner-fsn1"));
+
+        let slot = super::DetachedWork::reserve(&extensions).await;
+        let seen = slot
+            .spawn_detached(async { crate::deltaglider::spool::current_scope() })
+            .await
+            .unwrap();
+        assert_eq!(seen, None, "no scope at reserve time, none in the task");
+    }
+
+    /// The shutdown wait: idle work drains at once, a running task is
+    /// waited for, and a task past the bound is counted, not waited for.
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_drain_waits_for_detached_tasks_within_its_bound() {
+        use std::time::Duration;
+        let work = super::DetachedWork::new(4);
+        assert_eq!(work.drain(Duration::from_secs(1)).await, 0, "idle");
+
+        let mut extensions = axum::http::Extensions::new();
+        extensions.insert(work.clone());
+        let slot = super::DetachedWork::reserve(&extensions).await;
+        let task = slot.spawn_detached(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        assert_eq!(work.in_flight(), 1);
+        assert_eq!(work.drain(Duration::from_secs(60)).await, 0, "waited");
+        task.await.unwrap();
+
+        let slot = super::DetachedWork::reserve(&extensions).await;
+        let _stuck = slot.spawn_detached(std::future::pending::<()>());
+        assert_eq!(
+            work.drain(Duration::from_secs(2)).await,
+            1,
+            "cut at the bound"
+        );
     }
 }
