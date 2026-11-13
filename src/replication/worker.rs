@@ -2365,24 +2365,37 @@ mod request_count_tests {
             .store("src", "a/new.txt", b"new", None, Default::default())
             .await
             .unwrap();
-        engine
-            .store("dst", "b/stale.txt", b"old", None, Default::default())
-            .await
-            .unwrap();
+        // Many stale keys in `b/` and a small page: the walk of `b/` takes
+        // several listing round trips, so a run that STOPS at the deferred
+        // copy would never reach its deletes.
+        for i in 0..7 {
+            engine
+                .store(
+                    "dst",
+                    &format!("b/stale{i}.txt"),
+                    b"old",
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
         let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
         let gate = full_dst_gate();
-        let outcome = run_with_gate(&db, &engine, &rule(true), &gate).await;
+        let mut small_pages = rule(true);
+        small_pages.batch_size = 2;
+        let outcome = run_with_gate(&db, &engine, &small_pages, &gate).await;
         assert_eq!(outcome.status, DEFERRED_STOP_STATUS, "{outcome:?}");
         assert_eq!(outcome.totals.objects_copied, 0, "the copy waited");
         assert_eq!(
-            outcome.totals.objects_deleted, 1,
-            "the delete ran: {outcome:?}"
+            outcome.totals.objects_deleted, 7,
+            "every delete ran: {outcome:?}"
         );
         assert_eq!(
             outcome.totals.errors, 0,
             "a deferral is no failure: {outcome:?}"
         );
-        assert!(engine.head("dst", "b/stale.txt").await.is_err(), "deleted");
+        assert!(engine.head("dst", "b/stale3.txt").await.is_err(), "deleted");
         assert!(engine.head("dst", "a/new.txt").await.is_err(), "not copied");
         assert_eq!(gate.inflight_writes("dst"), 0);
         // Space again: the item is done.

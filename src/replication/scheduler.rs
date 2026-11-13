@@ -442,7 +442,7 @@ storage:
 
     /// One scheduler pass over a rule whose destination disk is full (level
     /// critical): the requests that it sent to `dst`.
-    async fn requests_to_a_full_dst(replicate_deletes: bool) -> Vec<String> {
+    async fn requests_to_a_full_dst(replicate_deletes: bool) -> (Vec<String>, usize) {
         let (s3, fake) = crate::storage::fake_s3_backend().await;
         let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
         let engine =
@@ -477,10 +477,18 @@ storage:
         let lease = DynCoordinationLease::from_arc(Arc::new(FreeLease));
         fake.clear();
         run_due_rules(&replication, &config, &db, &state, "i", &lease).await;
-        fake.requests()
+        let runs = db
+            .lock()
+            .await
+            .replication_recent_runs("r", 10)
+            .unwrap()
+            .len();
+        let to_dst = fake
+            .requests()
             .into_iter()
             .filter(|r| r.contains(" /dst"))
-            .collect()
+            .collect();
+        (to_dst, runs)
     }
 
     /// At level critical on the destination disk the scheduler does not start
@@ -488,9 +496,11 @@ storage:
     /// that replicates deletes: its deletes free space.
     #[tokio::test]
     async fn the_scheduler_runs_a_deleting_rule_at_a_full_disk_and_defers_a_copying_one() {
-        let copy_only = requests_to_a_full_dst(false).await;
+        let (copy_only, runs) = requests_to_a_full_dst(false).await;
         assert!(copy_only.is_empty(), "a copy-only rule ran: {copy_only:?}");
-        let deleting = requests_to_a_full_dst(true).await;
+        assert_eq!(runs, 0, "the scheduler does not even start the run");
+        let (deleting, runs) = requests_to_a_full_dst(true).await;
+        assert_eq!(runs, 1, "the deleting rule runs");
         assert!(
             deleting.iter().any(|r| r.starts_with("DELETE")),
             "a rule that replicates deletes must delete at a full disk: {deleting:?}"
