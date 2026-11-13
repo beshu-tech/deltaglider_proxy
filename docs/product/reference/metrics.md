@@ -237,7 +237,7 @@ A background monitor measures the free space of the spool directory, of the root
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `deltaglider_spool_budget_bytes` | Gauge | — | The spool byte budget, which is the effective value of `DGP_SPOOL_MAX_BYTES` |
-| `deltaglider_spool_used_bytes` | Gauge | — | The spool bytes that running requests have reserved now, rounded up to whole MiB. It never goes above the budget |
+| `deltaglider_spool_used_bytes` | Gauge | — | The spool bytes that running requests have reserved now, counted in whole MiB and cut at the budget in bytes. It never goes above the budget, also when `DGP_SPOOL_MAX_BYTES` is not a whole number of MiB |
 | `deltaglider_spool_dir_free_bytes` | Gauge | — | The bytes that a new file can use on the disk of the spool directory |
 | `deltaglider_spool_dir_total_bytes` | Gauge | — | The size of the disk of the spool directory |
 | `deltaglider_disk_free_bytes` | Gauge | `path_role` | The bytes that a new file can use on the disk of a filesystem backend or of the data directory |

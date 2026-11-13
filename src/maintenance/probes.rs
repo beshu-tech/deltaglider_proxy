@@ -46,11 +46,26 @@ pub fn disk_refusal(state: &AppState, watch: &DiskWatch, bucket: &str) -> Option
 /// critical. A job that stores nothing (a backfill stamps metadata in place,
 /// a prune deletes) never asks.
 pub fn store_refusal(state: &AppState, bucket: &str) -> Option<String> {
-    store_refusal_with(
-        state,
-        crate::disk_watch::installed().map(|w| w.as_ref()),
-        bucket,
-    )
+    let watch = crate::disk_watch::installed();
+    store_refusal_with(state, watch.as_deref(), bucket)
+}
+
+/// The BACKEND half of [`store_refusal`]: only the disk of the filesystem
+/// backend that holds `bucket`. A job whose objects need no spool file (a
+/// re-encrypt of small objects, or of an S3 bucket) asks this alone; the
+/// objects that need a spool file meet the spool gate on their own.
+pub fn backend_store_refusal(state: &AppState, bucket: &str) -> Option<String> {
+    let watch = crate::disk_watch::installed();
+    backend_store_refusal_with(state, watch.as_deref(), bucket)
+}
+
+/// [`backend_store_refusal`] with the monitor given.
+pub fn backend_store_refusal_with(
+    state: &AppState,
+    watch: Option<&DiskWatch>,
+    bucket: &str,
+) -> Option<String> {
+    watch.and_then(|w| crate::disk_watch::bucket_write_refusal_now(w, &state.engine.load(), bucket))
 }
 
 /// [`store_refusal`] with the monitor given.
@@ -59,10 +74,13 @@ pub fn store_refusal_with(
     watch: Option<&DiskWatch>,
     bucket: &str,
 ) -> Option<String> {
-    let engine = state.engine.load();
-    engine.spool_dir().gate().refusal().or_else(|| {
-        watch.and_then(|w| crate::disk_watch::bucket_write_refusal_now(w, &engine, bucket))
-    })
+    state
+        .engine
+        .load()
+        .spool_dir()
+        .gate()
+        .refusal()
+        .or_else(|| backend_store_refusal_with(state, watch, bucket))
 }
 
 /// Install both probes on `gate` (boot). `watch` is `None` when the disk
@@ -179,6 +197,35 @@ mod tests {
         let (_d2, state2) = self::state().await;
         install(&state2.maintenance_gate, Arc::downgrade(&state2), None);
         assert_eq!(state2.maintenance_gate.store_blocked("b"), None);
+    }
+
+    /// THE gate of the client's storing verbs, by behavior: at level critical
+    /// of the backend that holds the bucket it answers `503 SlowDown` that
+    /// names the backend, the plain write gate of a delete does not, and the
+    /// answer follows the level.
+    #[tokio::test]
+    async fn the_client_store_gate_refuses_at_a_critical_disk_and_the_delete_gate_does_not() {
+        use crate::api::errors::S3Error;
+        use crate::api::handlers::object_helpers::{
+            check_client_store_allowed, check_client_write_allowed,
+        };
+        let (_dir, state) = state().await;
+        let watch = Arc::new(DiskWatch::new(
+            state.engine.load().spool_dir().gate().clone(),
+        ));
+        crate::disk_watch::install_for_this_test(watch.clone());
+        tick(&watch, 50);
+        check_client_store_allowed(&state, "b").await.unwrap();
+        tick(&watch, 3);
+        match check_client_store_allowed(&state, "b").await {
+            Err(S3Error::SlowDown(m)) => assert!(m.contains("backend 'default'"), "{m}"),
+            other => panic!("a store at level critical: {other:?}"),
+        }
+        check_client_write_allowed(&state, "b")
+            .await
+            .expect("a delete asks the write gate, which has no disk");
+        tick(&watch, 50);
+        check_client_store_allowed(&state, "b").await.unwrap();
     }
 
     /// A maintenance job that stores (re-encrypt, the copy of a migration)

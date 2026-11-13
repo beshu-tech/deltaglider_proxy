@@ -1193,8 +1193,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         ref_meta: &FileMetadata,
         max_ratio: f32,
     ) -> Result<(EncodeOutcome, EncodedDelta), EngineError> {
-        // A body above the threshold goes to a spool file: a new write.
-        self.admit_new_spool_write(0)?;
+        // A body above the threshold goes to a spool file: a new write. The
+        // disk gate says no like a full budget does: this PUT keeps no delta
+        // (`NoSpool`: the body is stored whole as `delta-unavailable`, which
+        // needs no spool). The write itself goes on.
+        if self.admit_new_spool_write(0).is_err() {
+            debug!(
+                "PUT {}/{}: the spool disk is nearly full; no delta for the large-reference encode",
+                put.bucket, put.key
+            );
+            return Ok((EncodeOutcome::NoSpool, EncodedDelta::None));
+        }
         let body = match self.spool.try_acquire(put.size) {
             Ok(body) => body,
             Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => {

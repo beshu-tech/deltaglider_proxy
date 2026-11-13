@@ -315,6 +315,18 @@ fn job_store_refusal(state: &AppState, job: &MaintenanceJob) -> Option<String> {
     super::probes::store_refusal(state, &bucket)
 }
 
+/// Why a job that waited for disk space must still wait when its wait ends.
+/// A migrate copies every object to the target (its large ones through the
+/// spool): the whole refusal. A re-encrypt rewrites many objects that need no
+/// spool file: only the disk of its bucket's backend; an object that does
+/// need a spool file defers the job again on its own turn.
+fn job_still_blocked(state: &AppState, job: &MaintenanceJob) -> Option<String> {
+    match job.kind.as_str() {
+        "reencrypt" => super::probes::backend_store_refusal(state, &job.bucket),
+        _ => job_store_refusal(state, job),
+    }
+}
+
 /// May deletes into the bucket of `job` pass while the job waits for disk
 /// space? Yes for a re-encrypt (every visit reads the object as it is when its
 /// turn comes, so a delete before it is skipped and one after it stays) and for a
@@ -405,7 +417,7 @@ async fn run_job(
     // the gate admitted meanwhile are drained, so no phase races one.
     let resumed_from_disk_wait = state.maintenance_gate.is_disk_deferred(job.id);
     let disk_still_full = if resumed_from_disk_wait {
-        job_store_refusal(state, &job)
+        job_still_blocked(state, &job)
     } else {
         None
     };
@@ -1110,7 +1122,10 @@ impl ObjectVisitor for Reencrypt<'_> {
                 Ok(Rewritten::Changed) if i == 0 => changed = true,
                 // A stale other form that a client write replaced.
                 Ok(Rewritten::Changed) => {}
-                Err(e) => return failed(&e),
+                Err(e) => {
+                    let refusal = engine.spool_dir().gate().refusal();
+                    return rewrite_error_visit(&e, refusal, || failed(&e));
+                }
             }
         }
         if changed {
@@ -1154,6 +1169,24 @@ pub(crate) enum Visit {
     Changed,
     /// Recorded in the failure ring and counted; the phase goes on.
     Failed(String),
+    /// Not rewritten: the object needs a spool file and the spool disk is at
+    /// level high or critical. No failure: the job waits and does the object
+    /// again (a rewrite is idempotent).
+    Deferred(String),
+}
+
+/// Pure: what a failed rewrite means for the visit. A retryable refusal of
+/// the spool disk gate (`disk_refusal`: the gate says no NOW) defers the job;
+/// any other error is the object's failure.
+pub(crate) fn rewrite_error_visit(
+    error: &crate::deltaglider::EngineError,
+    disk_refusal: Option<String>,
+    failed: impl FnOnce() -> Visit,
+) -> Visit {
+    match (error, disk_refusal) {
+        (crate::deltaglider::EngineError::Overloaded(_), Some(why)) => Visit::Deferred(why),
+        _ => failed(),
+    }
 }
 
 /// The per-object work of a count-then-walk job kind (reencrypt,
@@ -1371,7 +1404,13 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
         if !V::WRITES_BYTES {
             return None;
         }
-        super::probes::store_refusal(self.state, &self.job.bucket)
+        // The disk of the backend only: the objects that need a spool file
+        // meet the spool gate in their own rewrite ([`Visit::Deferred`]).
+        super::probes::backend_store_refusal(self.state, &self.job.bucket)
+    }
+
+    fn stops(done: &Visit) -> bool {
+        matches!(done, Visit::Deferred(_))
     }
 
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
@@ -1441,6 +1480,9 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
                 record_failure(self.db, self.job.id, key, &reason).await?;
                 self.c.failed += 1;
             }
+            // The job waits for the spool disk: the objects before this one
+            // are settled, the page is not saved, the job does this one again.
+            Visit::Deferred(why) => return Err(PhaseStop::Deferred(why)),
         }
         Ok(())
     }

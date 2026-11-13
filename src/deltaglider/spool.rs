@@ -326,10 +326,15 @@ impl SpoolDir {
         }
     }
 
-    /// Spool bytes reserved now (the budget in use), for the gauge.
+    /// Spool bytes reserved now (the budget in use), for the gauge. The
+    /// reservations count whole MiB, and the budget rounds up to whole MiB, so
+    /// the count is cut at the budget in bytes: it never shows more than
+    /// [`Self::max_bytes`].
     pub fn used_bytes(&self) -> u64 {
         const MIB: u64 = 1024 * 1024;
-        (self.budget.max.saturating_sub(self.budget.free()) as u64).saturating_mul(MIB)
+        (self.budget.max.saturating_sub(self.budget.free()) as u64)
+            .saturating_mul(MIB)
+            .min(self.max_bytes)
     }
 
     /// Let the reservations made in one backend's scope ([`scoped`]) hold
@@ -1163,6 +1168,23 @@ pub(crate) fn for_each_chunk_blocking(
 
 #[cfg(test)]
 mod tests {
+    /// The gauge of the reserved bytes never shows more than the budget: the
+    /// reservations count whole MiB and the budget rounds up, so a budget that
+    /// is not a whole number of MiB would show up to 1 MiB too much.
+    #[test]
+    fn used_bytes_never_exceeds_a_budget_that_is_not_whole_mib() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        for max in [3 * MIB + 1, 10_000_000_000, 7 * MIB, MIB / 2 + 5] {
+            let spool = SpoolDir::new(dir.path().join(format!("s{max}")), max).unwrap();
+            assert_eq!(spool.used_bytes(), 0);
+            let held = spool.try_acquire(max).unwrap();
+            assert_eq!(spool.used_bytes(), max, "budget {max} held in full");
+            drop(held);
+            assert_eq!(spool.used_bytes(), 0);
+        }
+    }
+
     use super::*;
 
     #[test]

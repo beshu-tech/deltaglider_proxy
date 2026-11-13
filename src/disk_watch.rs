@@ -100,7 +100,7 @@ pub struct Facts {
 /// * the floor (bytes taken from the spool limits) keeps a small disk from
 ///   running out under one upload;
 /// * the ceiling (bytes) keeps a huge disk from refusing writes while it
-///   still has plenty of room: 5% of a 10 TiB volume is 500 GiB.
+///   still has plenty of room: 5% of a 10 TiB volume is 512 GiB.
 ///
 /// A ceiling of `0` turns the level off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +110,7 @@ pub struct Thresholds {
     pub critical_percent: u8,
     /// A level ends when the free space is this many percentage points of
     /// the disk above its entry threshold (never more than a fifth of the
-    /// ceiling of the level).
+    /// OWN ceiling of the level that ends).
     pub recover_points: u8,
     /// Twice the largest reservation that the spool allows for one upload.
     pub low_floor: u64,
@@ -224,7 +224,7 @@ impl Thresholds {
     }
 
     /// The bytes above the entry threshold at which `level` ends: the
-    /// percent points of the disk, and at most a fifth of its ceiling (so
+    /// percent points of the disk, and at most a fifth of the level's own ceiling (so
     /// a huge disk does not wait for hundreds of GiB to recover).
     pub fn recover_margin(&self, level: Level, total: u64) -> u64 {
         percent_of(total, self.recover_points).min(self.ceiling(level) / 5)
@@ -590,6 +590,9 @@ struct State {
     /// the refusal, not the series).
     last: HashMap<String, RoleReport>,
     gauge_labels: HashSet<String>,
+    /// Whether the spool was judged by its use at the last tick that knew:
+    /// a measure that fails or times out changes nothing.
+    by_use: Option<bool>,
 }
 
 #[derive(Default)]
@@ -611,9 +614,30 @@ pub struct DiskWatch {
 
 static INSTALLED: OnceLock<Arc<DiskWatch>> = OnceLock::new();
 
-/// The monitor of this process, once the boot installed it.
-pub fn installed() -> Option<&'static Arc<DiskWatch>> {
-    INSTALLED.get()
+/// The monitor of this process, once the boot installed it. A test installs
+/// its own for its thread ([`install_for_this_test`]).
+pub fn installed() -> Option<Arc<DiskWatch>> {
+    #[cfg(test)]
+    {
+        if let Some(w) = TEST_WATCH.with(|w| w.borrow().clone()) {
+            return Some(w);
+        }
+    }
+    INSTALLED.get().cloned()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_WATCH: std::cell::RefCell<Option<Arc<DiskWatch>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A monitor for the tests of this thread only (a `current_thread` test
+/// runtime runs its tasks on the test thread): the process-wide monitor, and
+/// the other tests, never feel a test's full disk.
+#[cfg(test)]
+pub(crate) fn install_for_this_test(watch: Arc<DiskWatch>) {
+    TEST_WATCH.with(|w| *w.borrow_mut() = Some(watch));
 }
 
 fn human(n: u64) -> String {
@@ -797,8 +821,17 @@ impl DiskWatch {
         let spool_facts = probe.measure(&targets.spool_dir);
         roles.push(("spool".into(), targets.spool_dir.clone(), spool_facts));
         // The spool is judged by its use too where the free space may hide
-        // the real limit, and where it cannot be measured at all.
-        let by_use = targets.spool_by_use || spool_facts.is_none();
+        // the real limit, and where it was never measured. A measure that
+        // fails or times out (a hung mount) changes nothing: the last
+        // decision stands, as the last level does.
+        let by_use = {
+            let state = self.state.lock();
+            match (spool_facts, state.by_use) {
+                (Some(_), _) => targets.spool_by_use,
+                (None, Some(last)) => last,
+                (None, None) => true,
+            }
+        };
         if by_use {
             // The use of the budget as a measure: free = what is not reserved.
             roles.push((
@@ -900,6 +933,7 @@ impl DiskWatch {
             );
         }
         self.spool_gate.set_by_use(by_use.then_some(th_use));
+        state.by_use = Some(by_use);
         {
             let mut refusals = self.refusals.write();
             refusals.default_backend = targets.default_backend.clone();
@@ -968,7 +1002,8 @@ pub async fn bucket_write_refusal(
     engine: &crate::deltaglider::DynEngine,
     bucket: &str,
 ) -> Option<String> {
-    bucket_write_refusal_with(installed()?, engine, bucket).await
+    let watch = installed()?;
+    bucket_write_refusal_with(&watch, engine, bucket).await
 }
 
 /// [`bucket_write_refusal`] with the monitor given.
@@ -1134,6 +1169,18 @@ impl TimedProbe {
     }
 }
 
+/// Removes a path from the hung set when the measure thread ends, however.
+struct Unhung {
+    hung: Arc<Mutex<HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl Drop for Unhung {
+    fn drop(&mut self) {
+        self.hung.lock().remove(&self.path);
+    }
+}
+
 impl DiskProbe for TimedProbe {
     fn measure(&self, path: &Path) -> Option<PathFacts> {
         if !self.hung.lock().insert(path.to_path_buf()) {
@@ -1145,8 +1192,13 @@ impl DiskProbe for TimedProbe {
         let spawned = std::thread::Builder::new()
             .name("disk-measure".into())
             .spawn(move || {
+                // Ends the hang on every exit of the thread, a panic of the
+                // probe included: the path must never stay hung for good.
+                let _unhung = Unhung {
+                    hung,
+                    path: owned.clone(),
+                };
                 let facts = inner.measure(&owned);
-                hung.lock().remove(&owned);
                 let _ = tx.send(facts);
             });
         if spawned.is_err() {
@@ -1160,7 +1212,7 @@ impl DiskProbe for TimedProbe {
                 }
                 facts
             }
-            Err(_) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if self.warned.lock().insert(path.to_path_buf()) {
                     tracing::warn!(
                         "[disk] the free space of {} did not answer within {} s (a hung network \
@@ -1168,6 +1220,17 @@ impl DiskProbe for TimedProbe {
                          DGP_DISK_MEASURE_TIMEOUT_SECS to wait longer",
                         path.display(),
                         self.timeout.as_secs()
+                    );
+                }
+                None
+            }
+            // The probe panicked: no answer, and the path is free again.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if self.warned.lock().insert(path.to_path_buf()) {
+                    tracing::warn!(
+                        "[disk] the free space of {} could not be measured (the measure \
+                         panicked); its role keeps its last level",
+                        path.display()
                     );
                 }
                 None

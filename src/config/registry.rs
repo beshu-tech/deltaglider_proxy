@@ -628,7 +628,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_DISK_LOW_MAX_BYTES",
-        description: "The most free space, in bytes, at which disk level low starts, whatever DGP_DISK_LOW_PERCENT says: 5% of a 10 TiB volume is 500 GiB, which is no reason to warn. 0 turns level low off (default: 53687091200, 50 GiB)",
+        description: "The most free space, in bytes, at which disk level low starts, whatever DGP_DISK_LOW_PERCENT says: 5% of a 10 TiB volume is 512 GiB, which is no reason to warn. 0 turns level low off (default: 53687091200, 50 GiB)",
         example: "53687091200",
         category: "Server",
     },

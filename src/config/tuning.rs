@@ -72,6 +72,128 @@ pub struct DiskMonitorTuning {
     pub measure_timeout_secs: u64,
 }
 
+impl DiskMonitorTuning {
+    /// Parse the disk monitor settings from `env`, with one note for every
+    /// input that is not taken as written: a value that is not a number, a
+    /// percent outside 1 to 50, a ceiling or a percent that a lower level
+    /// overrides. The notes are config warnings (`Config::check`,
+    /// `config lint`), never silent.
+    pub fn from_env(env: EnvLookup) -> (Self, Vec<String>) {
+        let mut notes = Vec::new();
+        let lookup_parse_number = |var: &str, notes: &mut Vec<String>| -> Option<u64> {
+            let raw = env(var)?;
+            match raw.trim().parse::<u64>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    notes.push(format!(
+                        "{var}=\"{raw}\" is not a whole number; the default applies. Write a \
+                         plain number (bytes, seconds or percent), not a size with a unit"
+                    ));
+                    None
+                }
+            }
+        };
+        let lookup_parse_percent = |var: &str, default: u8, notes: &mut Vec<String>| -> u8 {
+            match lookup_parse_number(var, notes) {
+                None => default,
+                Some(n) if (1..=50).contains(&n) => n as u8,
+                Some(n) => {
+                    let used = n.clamp(1, 50);
+                    notes.push(format!(
+                        "{var}={n} is outside 1 to 50; {used} applies (0 would never start the \
+                         level, above 50 it would cover a half-empty disk). To turn a level \
+                         off set its DGP_DISK_*_MAX_BYTES to 0"
+                    ));
+                    used as u8
+                }
+            }
+        };
+        let low_percent = lookup_parse_percent("DGP_DISK_LOW_PERCENT", 15, &mut notes);
+        let high_percent = lookup_parse_percent("DGP_DISK_HIGH_PERCENT", 10, &mut notes);
+        let critical_percent = lookup_parse_percent("DGP_DISK_CRITICAL_PERCENT", 5, &mut notes);
+        let recover_points = lookup_parse_percent("DGP_DISK_RECOVER_POINTS", 2, &mut notes);
+        let lookup_parse_at_least_one = |var: &str, default: u64, notes: &mut Vec<String>| -> u64 {
+            match lookup_parse_number(var, notes) {
+                None => default,
+                Some(0) => {
+                    notes.push(format!("{var}=0 is not allowed; 1 applies"));
+                    1
+                }
+                Some(n) => n,
+            }
+        };
+        let interval_secs =
+            lookup_parse_at_least_one("DGP_DISK_MONITOR_INTERVAL_SECS", 30, &mut notes);
+        let measure_timeout_secs =
+            lookup_parse_at_least_one("DGP_DISK_MEASURE_TIMEOUT_SECS", 5, &mut notes);
+        let lookup_parse_bytes = |var: &str, default: u64, notes: &mut Vec<String>| -> u64 {
+            lookup_parse_number(var, notes).unwrap_or(default)
+        };
+        let tuning = Self {
+            interval_secs,
+            low_percent,
+            high_percent,
+            critical_percent,
+            recover_points,
+            low_max_bytes: lookup_parse_bytes(
+                "DGP_DISK_LOW_MAX_BYTES",
+                DISK_LOW_MAX_DEFAULT,
+                &mut notes,
+            ),
+            high_max_bytes: lookup_parse_bytes(
+                "DGP_DISK_HIGH_MAX_BYTES",
+                DISK_HIGH_MAX_DEFAULT,
+                &mut notes,
+            ),
+            critical_max_bytes: lookup_parse_bytes(
+                "DGP_DISK_CRITICAL_MAX_BYTES",
+                DISK_CRITICAL_MAX_DEFAULT,
+                &mut notes,
+            ),
+            measure_timeout_secs,
+        };
+        notes.extend(tuning.ordering_notes());
+        (tuning, notes)
+    }
+
+    /// Pure: the settings that a level above overrides. A lower level never
+    /// starts at a smaller free space than a higher one, so a ceiling or a
+    /// percent below the one of a higher level is raised to it
+    /// (`disk_watch::Thresholds`). A level that is off is skipped.
+    pub fn ordering_notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        // (name, ceiling, percent), most severe first.
+        let levels = [
+            ("critical", self.critical_max_bytes, self.critical_percent),
+            ("high", self.high_max_bytes, self.high_percent),
+            ("low", self.low_max_bytes, self.low_percent),
+        ];
+        let on: Vec<_> = levels.iter().filter(|(_, max, _)| *max != 0).collect();
+        for pair in on.windows(2) {
+            let ((above, above_max, above_pct), (below, below_max, below_pct)) = (pair[0], pair[1]);
+            if below_max < above_max {
+                notes.push(format!(
+                    "DGP_DISK_{}_MAX_BYTES ({below_max}) is below DGP_DISK_{}_MAX_BYTES \
+                     ({above_max}): level {below} starts at {above_max} bytes free, so it does \
+                     not start before level {above}",
+                    below.to_uppercase(),
+                    above.to_uppercase()
+                ));
+            }
+            if below_pct < above_pct {
+                notes.push(format!(
+                    "DGP_DISK_{}_PERCENT ({below_pct}) is below DGP_DISK_{}_PERCENT \
+                     ({above_pct}): level {below} starts at {above_pct}% free, so it does not \
+                     start before level {above}",
+                    below.to_uppercase(),
+                    above.to_uppercase()
+                ));
+            }
+        }
+        notes
+    }
+}
+
 /// The defaults of the disk ceilings: 50 GiB for low, 25 GiB for high, 10 GiB
 /// for critical. Critical leaves room for two uploads of the 5 GiB that one
 /// backend PUT takes, high for five, low for ten.
@@ -176,6 +298,9 @@ pub struct RuntimeTuning {
     pub upload_concurrency: usize,
     pub ready: ReadyProbe,
     pub disk_monitor: DiskMonitorTuning,
+    /// What [`DiskMonitorTuning::from_env`] did not take as written (config
+    /// warnings).
+    pub disk_monitor_notes: Vec<String>,
     /// `DGP_REFERENCE_SCAN_LIMIT`: the most references one savings chip
     /// counts. It finds them on its listing pages, with no HEAD.
     pub reference_scan_limit: usize,
@@ -202,6 +327,7 @@ impl RuntimeTuning {
             .unwrap_or(900)
             .max(1);
         let codec = CodecTimeouts::default();
+        let (disk_monitor, disk_monitor_notes) = DiskMonitorTuning::from_env(env);
         Self {
             // 0 would time every request out at once.
             request_timeout_secs: parse_or("DGP_REQUEST_TIMEOUT_SECS", 300).max(1),
@@ -270,20 +396,8 @@ impl RuntimeTuning {
                     .unwrap_or(0)
                     .max(0),
             },
-            disk_monitor: DiskMonitorTuning {
-                interval_secs: parse_or("DGP_DISK_MONITOR_INTERVAL_SECS", 30).max(1),
-                low_percent: clamp_percent(lookup_parse(env, "DGP_DISK_LOW_PERCENT"), 15),
-                high_percent: clamp_percent(lookup_parse(env, "DGP_DISK_HIGH_PERCENT"), 10),
-                critical_percent: clamp_percent(lookup_parse(env, "DGP_DISK_CRITICAL_PERCENT"), 5),
-                recover_points: clamp_percent(lookup_parse(env, "DGP_DISK_RECOVER_POINTS"), 2),
-                low_max_bytes: lookup_parse(env, "DGP_DISK_LOW_MAX_BYTES")
-                    .unwrap_or(DISK_LOW_MAX_DEFAULT),
-                high_max_bytes: lookup_parse(env, "DGP_DISK_HIGH_MAX_BYTES")
-                    .unwrap_or(DISK_HIGH_MAX_DEFAULT),
-                critical_max_bytes: lookup_parse(env, "DGP_DISK_CRITICAL_MAX_BYTES")
-                    .unwrap_or(DISK_CRITICAL_MAX_DEFAULT),
-                measure_timeout_secs: parse_or("DGP_DISK_MEASURE_TIMEOUT_SECS", 5).max(1),
-            },
+            disk_monitor,
+            disk_monitor_notes,
             reference_scan_limit: lookup_parse(env, "DGP_REFERENCE_SCAN_LIMIT")
                 .unwrap_or(crate::deltaglider::REFERENCE_SCAN_LIMIT),
             bootstrap_hash_env: env_pinned_hash_var(env),
@@ -297,12 +411,6 @@ impl RuntimeTuning {
     pub fn replay_window(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.replay_window_secs)
     }
-}
-
-/// A disk monitor percent: the value, else `default`, kept in 1 to 50 (0
-/// would never fire; above 50 the levels would cover a half-empty disk).
-fn clamp_percent(value: Option<u8>, default: u8) -> u8 {
-    value.unwrap_or(default).clamp(1, 50)
 }
 
 /// D15: the env var that pins the bootstrap hash, if one is set. That hash
@@ -426,11 +534,11 @@ mod tests {
             match rule {
                 Zero::Floor1 => {
                     floors += 1;
-                    assert_eq!(
-                        from(&[(var, "0")]),
-                        from(&[(var, "1")]),
-                        "{var}=0 must read as 1"
-                    );
+                    // The settings are equal; the note that says so is not.
+                    let (mut zero, mut one) = (from(&[(var, "0")]), from(&[(var, "1")]));
+                    zero.disk_monitor_notes.clear();
+                    one.disk_monitor_notes.clear();
+                    assert_eq!(zero, one, "{var}=0 must read as 1");
                 }
                 Zero::Meaningful(why) => {
                     assert!(!why.is_empty(), "{var} documents what 0 means");
@@ -488,6 +596,86 @@ mod tests {
             t.replay_window_secs,
             t.clock_skew_secs
         );
+    }
+
+    /// Every disk monitor input that is not taken as written has a note
+    /// that names the variable and the value (never silent), and the
+    /// effective value is the documented fallback.
+    #[test]
+    fn the_disk_monitor_notes_name_every_input_that_is_not_taken_as_written() {
+        let parse = |pairs: &[(&str, &str)]| {
+            let env: std::collections::HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            DiskMonitorTuning::from_env(&|k| env.get(k).cloned())
+        };
+        let has = |notes: &[String], needle: &str| notes.iter().any(|n| n.contains(needle));
+        let (t, notes) = parse(&[("DGP_DISK_CRITICAL_MAX_BYTES", "10GiB")]);
+        assert_eq!(
+            t.critical_max_bytes, DISK_CRITICAL_MAX_DEFAULT,
+            "default applies"
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            has(&notes, "DGP_DISK_CRITICAL_MAX_BYTES=\"10GiB\""),
+            "{notes:?}"
+        );
+        let (t, notes) = parse(&[
+            ("DGP_DISK_LOW_PERCENT", "0"),
+            ("DGP_DISK_HIGH_PERCENT", "99"),
+        ]);
+        assert_eq!((t.low_percent, t.high_percent), (1, 50));
+        assert!(
+            has(
+                &notes,
+                "DGP_DISK_LOW_PERCENT=0 is outside 1 to 50; 1 applies"
+            ),
+            "{notes:?}"
+        );
+        assert!(
+            has(
+                &notes,
+                "DGP_DISK_HIGH_PERCENT=99 is outside 1 to 50; 50 applies"
+            ),
+            "{notes:?}"
+        );
+        let (t, notes) = parse(&[
+            ("DGP_DISK_MONITOR_INTERVAL_SECS", "0"),
+            ("DGP_DISK_MEASURE_TIMEOUT_SECS", "abc"),
+        ]);
+        assert_eq!((t.interval_secs, t.measure_timeout_secs), (1, 5));
+        assert!(has(&notes, "DGP_DISK_MONITOR_INTERVAL_SECS=0"), "{notes:?}");
+        assert!(
+            has(&notes, "DGP_DISK_MEASURE_TIMEOUT_SECS=\"abc\""),
+            "{notes:?}"
+        );
+        // A ceiling or a percent below the one of a higher level.
+        let (_, notes) = parse(&[
+            ("DGP_DISK_HIGH_MAX_BYTES", "1"),
+            ("DGP_DISK_LOW_PERCENT", "3"),
+        ]);
+        assert!(
+            has(
+                &notes,
+                "DGP_DISK_HIGH_MAX_BYTES (1) is below DGP_DISK_CRITICAL_MAX_BYTES"
+            ),
+            "{notes:?}"
+        );
+        assert!(
+            has(
+                &notes,
+                "DGP_DISK_LOW_PERCENT (3) is below DGP_DISK_HIGH_PERCENT (10)"
+            ),
+            "{notes:?}"
+        );
+        // A level that is off is skipped: no note about the order around it.
+        let (_, notes) = parse(&[("DGP_DISK_HIGH_MAX_BYTES", "0")]);
+        assert!(notes.is_empty(), "{notes:?}");
+        // The defaults: nothing to say.
+        let (t, notes) = parse(&[]);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(t.low_max_bytes, DISK_LOW_MAX_DEFAULT);
     }
 
     #[test]

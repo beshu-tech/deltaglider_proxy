@@ -824,6 +824,56 @@ async fn env_own_spool(objects: usize) -> Env {
     }
 }
 
+/// Every path is one 100 GiB disk with `free` GiB free.
+struct OneDisk(u64);
+
+impl crate::disk_watch::DiskProbe for OneDisk {
+    fn measure(&self, _path: &std::path::Path) -> Option<crate::disk_watch::PathFacts> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        Some(crate::disk_watch::PathFacts {
+            free: self.0 * GIB,
+            total: 100 * GIB,
+            device: 1,
+        })
+    }
+}
+
+/// A monitor of this test's thread: the backend `default` (where a bucket
+/// with no route lives) has `free` GiB of 100 free, and the spool is its own.
+fn watch_with(state: &AppState, free: u64) -> Arc<crate::disk_watch::DiskWatch> {
+    let gate = state.engine.load().spool_dir().gate().clone();
+    let watch = Arc::new(crate::disk_watch::DiskWatch::new(gate));
+    set_free(&watch, free);
+    crate::disk_watch::install_for_this_test(watch.clone());
+    watch
+}
+
+fn set_free(watch: &crate::disk_watch::DiskWatch, free: u64) {
+    use crate::disk_watch::{Sizing, Targets};
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let tuning = crate::config::tuning::RuntimeTuning::default().disk_monitor;
+    let targets = Targets {
+        spool_dir: "/spool".into(),
+        backends: vec![("default".into(), "/data".into())],
+        data_dir: "/state".into(),
+        default_backend: "default".into(),
+        spool_by_use: false,
+    };
+    let sizing = Sizing {
+        budget: 8 * GIB,
+        used: 0,
+        largest_reservation: GIB,
+    };
+    watch.tick(
+        &OneDisk(free),
+        &targets,
+        &tuning,
+        sizing,
+        std::time::Instant::now(),
+        None,
+    );
+}
+
 /// A re-encrypt (legacy rows have no conditional writes: they gate their
 /// bucket) that finds the spool disk full waits, with its mark on the gate:
 /// a delete into the bucket passes meanwhile and a store does not; the wait
@@ -834,8 +884,12 @@ async fn a_reencrypt_that_waits_for_disk_lets_deletes_pass_until_it_runs_again()
     use crate::disk_watch::Level;
     use crate::maintenance::gate::WriteKind;
     let e = env_own_spool(4).await;
+    // The disk of the bucket's backend is full (level critical). The spool
+    // disk is the same fake disk: open its gate, so that the wait is the
+    // backend's.
+    let watch = watch_with(&e.state, 3);
     let spool_gate = e.state.engine.load().spool_dir().gate().clone();
-    spool_gate.set(Level::High, "the spool disk is full".into());
+    spool_gate.set(Level::Ok, String::new());
     let gate = e.state.maintenance_gate.clone();
 
     let job = e.claim().await.unwrap();
@@ -853,7 +907,7 @@ async fn a_reencrypt_that_waits_for_disk_lets_deletes_pass_until_it_runs_again()
         row.last_error
             .as_deref()
             .unwrap_or("")
-            .contains("the spool disk is full"),
+            .contains("backend 'default'"),
         "{row:?}"
     );
     assert_eq!(
@@ -894,6 +948,7 @@ async fn a_reencrypt_that_waits_for_disk_lets_deletes_pass_until_it_runs_again()
     );
 
     // Space again: the mark ends, the job runs to its end.
+    set_free(&watch, 50);
     spool_gate.set(Level::Ok, String::new());
     let job =
         e.db.lock()
@@ -944,4 +999,102 @@ async fn a_job_that_runs_again_closes_the_gate_before_it_drains_the_deletes() {
         .unwrap();
     assert!(!gate.is_disk_deferred(5));
     let _ = WriteKind::Store;
+}
+
+/// A re-encrypt does not wait for the SPOOL disk as a whole: its objects need
+/// a spool file only above the spool threshold (and an S3 bucket's never do).
+/// With the spool disk full and the disk of its bucket fine, a job whose
+/// objects need no spool runs to its end.
+#[tokio::test]
+async fn a_reencrypt_whose_objects_need_no_spool_runs_at_a_full_spool_disk() {
+    use crate::disk_watch::Level;
+    let e = env_own_spool(4).await;
+    let _watch = watch_with(&e.state, 50);
+    e.state
+        .engine
+        .load()
+        .spool_dir()
+        .gate()
+        .set(Level::High, "the spool disk is full".into());
+    let job = e.claim().await.unwrap();
+    let id = job.id;
+    e.run(job).await;
+    let row =
+        e.db.lock()
+            .await
+            .maintenance_job_by_id(id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.objects_failed, 0, "{row:?}");
+    assert!(!e.state.maintenance_gate.is_disk_deferred(id));
+}
+
+/// An object that DOES need a spool file meets the spool gate in its own
+/// rewrite: that is not its failure. The job waits and does it again; the
+/// objects before it are settled and no failure is recorded.
+#[tokio::test]
+async fn an_object_that_needs_spool_at_a_full_spool_disk_defers_the_job() {
+    struct DefersAt(&'static str);
+    impl ObjectVisitor for DefersAt {
+        async fn visit(
+            &self,
+            _engine: &Arc<crate::deltaglider::DynEngine>,
+            key: &str,
+            _listed: Option<crate::storage::ObjectVariant>,
+        ) -> Visit {
+            if key == self.0 {
+                Visit::Deferred("the spool disk is full".into())
+            } else {
+                Visit::Done { bytes: 1 }
+            }
+        }
+    }
+    let e = env_own_spool(4).await;
+    let job = e.claim().await.unwrap();
+    let id = job.id;
+    let stop = run_count_then_walk(
+        &e.db,
+        &e.state,
+        Holder::test("inst"),
+        &job,
+        "test job",
+        &mut DefersAt("k-002.txt"),
+    )
+    .await
+    .err()
+    .expect("the job waits");
+    assert_eq!(stop, PhaseStop::Deferred("the spool disk is full".into()));
+    let row =
+        e.db.lock()
+            .await
+            .maintenance_job_by_id(id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(row.objects_failed, 0, "no failure is recorded: {row:?}");
+}
+
+/// A failed rewrite is the object's failure, except a retryable refusal of
+/// the spool disk gate that is in force now: that defers the job.
+#[test]
+fn a_rewrite_error_defers_only_for_the_spool_gate() {
+    use crate::deltaglider::EngineError;
+    let failed = || Visit::Failed("rewrite failed".into());
+    let overloaded = EngineError::Overloaded("busy".into());
+    let other = EngineError::NotFound("k".into());
+    let why = || Some("the spool disk is full".to_string());
+    assert!(matches!(
+        rewrite_error_visit(&overloaded, why(), failed),
+        Visit::Deferred(m) if m == "the spool disk is full"
+    ));
+    // Overloaded with the gate open: a full budget, an object's failure.
+    assert!(matches!(
+        rewrite_error_visit(&overloaded, None, failed),
+        Visit::Failed(_)
+    ));
+    // Another error, even with the gate shut: the object's failure.
+    assert!(matches!(
+        rewrite_error_visit(&other, why(), failed),
+        Visit::Failed(_)
+    ));
 }

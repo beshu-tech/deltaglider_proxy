@@ -156,6 +156,7 @@ const SPOOL_SITES: &[(&str, &str, Spool)] = &[
         "codec_source_spool_large_now",
         Spool::Gated,
     ),
+    // Asks the gate, and degrades to a whole store (`NoSpool`) instead of failing.
     (
         "src/deltaglider/engine/store.rs",
         "encode_memory_body_spooled",
@@ -275,6 +276,7 @@ fn every_storing_verb_asks_the_store_gate_and_no_delete_does() {
         ("src/s3_adapter_s3s/copy.rs", "copy_object"),
         ("src/s3_adapter_s3s/copy.rs", "upload_part_copy"),
         ("src/s3_adapter_s3s/multipart.rs", "create_multipart_upload"),
+        ("src/s3_adapter_s3s/multipart.rs", "upload_part"),
         (
             "src/s3_adapter_s3s/multipart.rs",
             "complete_multipart_upload",
@@ -306,4 +308,55 @@ fn every_storing_verb_asks_the_store_gate_and_no_delete_does() {
     }
     let form = crate::source_scan::read("src/api/handlers/form_post.rs");
     assert!(form.contains("check_client_store_allowed(state, bucket)"));
+}
+
+/// A rewrite of a passthrough object ABOVE the spool threshold takes a spool
+/// file (the re-encrypt job): a new write, refused with a retryable 503 at
+/// the spool gate. A small object rewrites in memory and is not asked.
+#[tokio::test]
+async fn a_large_rewrite_is_refused_at_a_full_spool_disk_and_a_small_one_is_not() {
+    let (raw, _fake) = s3_engine().await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = raw.with_spool_dir(
+        crate::deltaglider::spool::SpoolDir::new(dir.path().join("spool"), 128 * MIB).unwrap(),
+    );
+    let large = vec![1u8; (engine.spool_threshold() + MIB) as usize];
+    engine
+        .store("b", "large.jpg", &large, None, HashMap::new())
+        .await
+        .unwrap();
+    engine
+        .store("b", "small.jpg", &[2u8; 1024], None, HashMap::new())
+        .await
+        .unwrap();
+    let rewrite = |key: &'static str| {
+        let engine = &engine;
+        async move {
+            let read = engine.head("b", key).await.unwrap();
+            engine
+                .rewrite_object_if_unchanged(
+                    "b",
+                    key,
+                    crate::storage::ObjectVariant::Passthrough,
+                    &read,
+                    crate::deltaglider::Unconditional::Allowed,
+                )
+                .await
+        }
+    };
+    set_level(&engine, Level::High);
+    let m = refused(rewrite("large.jpg").await);
+    assert!(m.contains("level high"), "{m}");
+    assert!(
+        matches!(
+            rewrite("small.jpg").await,
+            Ok(crate::deltaglider::Rewritten::Done { .. })
+        ),
+        "a small rewrite needs no spool"
+    );
+    set_level(&engine, Level::Ok);
+    assert!(matches!(
+        rewrite("large.jpg").await,
+        Ok(crate::deltaglider::Rewritten::Done { .. })
+    ));
 }

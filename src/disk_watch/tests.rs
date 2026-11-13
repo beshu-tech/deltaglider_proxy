@@ -1483,3 +1483,89 @@ fn the_monitor_uses_the_timed_probe() {
         "the monitor measures through the timed probe"
     );
 }
+
+// ---- review round 2 ----
+
+/// A probe that panics on its first call and answers after.
+struct PanicOnce(std::sync::atomic::AtomicBool);
+
+impl DiskProbe for PanicOnce {
+    fn measure(&self, _path: &Path) -> Option<PathFacts> {
+        if !self.0.swap(true, Ordering::SeqCst) {
+            panic!("a probe that panics");
+        }
+        Some(PathFacts {
+            free: GIB,
+            total: TOTAL,
+            device: 4,
+        })
+    }
+}
+
+/// A measure that panics must not leave its path hung for good: the guard
+/// of the measure thread frees it on every exit. The next measure works.
+#[test]
+fn a_panicking_measure_frees_its_path() {
+    let probe = TimedProbe::new(
+        Arc::new(PanicOnce(std::sync::atomic::AtomicBool::new(false))),
+        Duration::from_secs(5),
+    );
+    let path = Path::new("/panics");
+    let t = Instant::now();
+    assert_eq!(probe.measure(path), None, "a panic is no answer");
+    assert!(
+        t.elapsed() < Duration::from_secs(4),
+        "no wait for the timeout"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe.hung_paths() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(probe.hung_paths(), 0, "the path stays hung after a panic");
+    assert_eq!(probe.measure(path).map(|f| f.free), Some(GIB));
+}
+
+/// A spool measure that fails or times out changes nothing, like the other
+/// roles: it must not turn the judgement by use on for that tick. Only a
+/// spool that was NEVER measured is judged by its use.
+#[test]
+fn a_failed_spool_measure_does_not_turn_the_use_judgement_on() {
+    let (_dir, spool, watch) = watch_and_spool();
+    let probe = FakeProbe::new();
+    probe.set("/spool", 1, 50);
+    probe.set("/data", 1, 50);
+    let tick = |t: &Targets| watch.tick(&probe, t, &tuning(), SIZING, Instant::now(), None);
+    // Measured, a plain disk: no judgement by use.
+    tick(&targets(false));
+    assert!(spool.gate().by_use().is_none());
+    // The measure now fails (a hung mount): still none, and no such role.
+    probe.0.lock().remove(Path::new("/spool"));
+    let roles = tick(&targets(false));
+    assert!(
+        spool.gate().by_use().is_none(),
+        "a failed measure changed it"
+    );
+    assert!(roles.iter().all(|r| r.label != SPOOL_BUDGET_ROLE));
+    // It answers again, then fails again with the judgement ON (a hidden
+    // limit): the judgement stays on.
+    probe.set("/spool", 1, 50);
+    tick(&targets_by_use());
+    assert!(spool.gate().by_use().is_some());
+    probe.0.lock().remove(Path::new("/spool"));
+    tick(&targets(false));
+    assert!(spool.gate().by_use().is_some(), "the last decision stands");
+
+    // A spool that was never measured has only its use to go by.
+    let (_d2, spool2, watch2) = watch_and_spool();
+    let probe2 = FakeProbe::new();
+    probe2.set("/data", 1, 50);
+    watch2.tick(
+        &probe2,
+        &targets(false),
+        &tuning(),
+        SIZING,
+        Instant::now(),
+        None,
+    );
+    assert!(spool2.gate().by_use().is_some());
+}
