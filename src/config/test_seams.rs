@@ -113,6 +113,18 @@ pub struct TestSeams {
     /// turns off the tmpfs, Kubernetes and shared-device facts
     /// (`limits::measure_disk_facts`).
     pub disk_free_bytes: Option<u64>,
+    /// `DGP_TEST_DISK_MONITOR_FREE_PERCENT` (0 to 100): the disk monitor
+    /// (`disk_watch`) sees every path as one 100 GiB device with this
+    /// percent free, so a test reaches the low, high and critical levels
+    /// on any host.
+    pub disk_monitor_free_percent: Option<u8>,
+    /// `DGP_TEST_DISK_MONITOR_FREE_FILE`: a file that holds the percent of
+    /// `DGP_TEST_DISK_MONITOR_FREE_PERCENT`, read at EVERY measure, so a test
+    /// moves the disk through its levels without a restart.
+    pub disk_monitor_free_file: Option<std::path::PathBuf>,
+    /// `DGP_TEST_MAINTENANCE_DEFER_SECS`: how long a maintenance job waits
+    /// after a deferral (production: 30 s), so a test sees the resume.
+    pub maintenance_defer_secs: Option<i64>,
 }
 
 /// S3's smallest part: the floor of the two copy seams, so a seam never
@@ -227,6 +239,16 @@ impl TestSeams {
             put_drop_complete_answer: lookup_parse(env, "DGP_TEST_PUT_DROP_COMPLETE_ANSWER")
                 .unwrap_or(false),
             disk_free_bytes: lookup_parse(env, "DGP_TEST_DISK_FREE_BYTES"),
+            disk_monitor_free_percent: lookup_parse::<u8>(
+                env,
+                "DGP_TEST_DISK_MONITOR_FREE_PERCENT",
+            )
+            .filter(|p| *p <= 100),
+            disk_monitor_free_file: env("DGP_TEST_DISK_MONITOR_FREE_FILE")
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from),
+            maintenance_defer_secs: lookup_parse::<i64>(env, "DGP_TEST_MAINTENANCE_DEFER_SECS")
+                .filter(|s| *s >= 1),
         }
     }
 }
@@ -262,6 +284,9 @@ pub const SEAM_ENV_VARS: &[&str] = &[
     "DGP_TEST_PUT_FAIL_PART",
     "DGP_TEST_PUT_DROP_COMPLETE_ANSWER",
     "DGP_TEST_DISK_FREE_BYTES",
+    "DGP_TEST_DISK_MONITOR_FREE_PERCENT",
+    "DGP_TEST_DISK_MONITOR_FREE_FILE",
+    "DGP_TEST_MAINTENANCE_DEFER_SECS",
 ];
 
 /// The wait of `DGP_TEST_PUT_FAIL_PART`: the parts before the failing one
@@ -355,9 +380,15 @@ mod tests {
             ("DGP_TEST_PUT_PART_BYTES", "7340032"),
             ("DGP_TEST_PUT_FAIL_PART", "3"),
             ("DGP_TEST_PUT_DROP_COMPLETE_ANSWER", "true"),
+            ("DGP_TEST_DISK_MONITOR_FREE_PERCENT", "8"),
+            ("DGP_TEST_DISK_MONITOR_FREE_FILE", "/tmp/free"),
+            ("DGP_TEST_MAINTENANCE_DEFER_SECS", "2"),
         ]);
         assert_eq!(t.put_fail_part, Some(3));
         assert!(t.put_drop_complete_answer);
+        assert_eq!(t.disk_monitor_free_percent, Some(8));
+        assert_eq!(t.disk_monitor_free_file, Some("/tmp/free".into()));
+        assert_eq!(t.maintenance_defer_secs, Some(2));
         assert_eq!(t.copy_object_max_bytes, Some(5 * 1024 * 1024));
         assert_eq!(t.copy_part_bytes, Some(6 * 1024 * 1024));
         assert_eq!(t.put_single_max_bytes, Some(5 * 1024 * 1024));

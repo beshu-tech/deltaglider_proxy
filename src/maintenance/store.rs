@@ -776,6 +776,20 @@ impl JobsDb {
         Ok(n > 0)
     }
 
+    /// Record that a job waited for DISK space while deletes into its bucket
+    /// passed: `params.disk_wait = true`. A migrate reads it at the verify and
+    /// prunes the destination of the keys that the source no longer holds.
+    /// Durable before the gate opens for deletes.
+    pub fn maintenance_note_disk_wait(&self, job_id: i64) -> Result<bool, ConfigDbError> {
+        let n = self.conn.execute(
+            "UPDATE maintenance_jobs
+                SET params = json_set(COALESCE(params, '{}'), '$.disk_wait', json('true'))
+              WHERE id = ?",
+            params![job_id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// The earliest time (unix seconds) at which a row comes due by time
     /// alone: a deferred or backed-off row's `not_before`, or a lease that
     /// lapses (its row then re-queues). The idle worker wakes then. The

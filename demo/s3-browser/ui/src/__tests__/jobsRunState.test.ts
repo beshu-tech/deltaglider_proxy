@@ -259,6 +259,10 @@ test('runEndedMessage says how a run the operator started ended', () => {
   });
   assert.equal(runEndedMessage({ ...lc, status: 'failed', last_error: 'bucket gone' }).text, 'Lifecycle "expire": the run failed — bucket gone');
   assert.equal(runEndedMessage({ ...lc, status: 'completed_with_errors' }).type, 'warning');
+  // A deferred run names no time: a full destination disk waits at least 5 minutes, a job gate about one.
+  const deferred = runEndedMessage({ ...lc, status: 'deferred' }).text;
+  assert.match(deferred, /at the rule's next run/);
+  assert.doesNotMatch(deferred, /minute/);
   assert.equal(
     runEndedMessage(
       { ...lc, status: 'succeeded', progress: { processed: 3, skipped: 0, failed: 0, bytes: 0 } },

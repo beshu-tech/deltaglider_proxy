@@ -348,6 +348,60 @@ pub fn spawn_cache_monitor(state: &Arc<AppState>, metrics: &Arc<Metrics>) {
     });
 }
 
+/// Make the disk monitor of this process (`disk_watch`), before the app
+/// state exists: the maintenance gate asks it. `None` when the spool is
+/// unusable (the monitor is off then, and no disk refusal exists).
+pub fn install_disk_watch() -> Option<Arc<deltaglider_proxy::disk_watch::DiskWatch>> {
+    match deltaglider_proxy::deltaglider::spool::SpoolDir::shared() {
+        Ok(spool) => Some(deltaglider_proxy::disk_watch::DiskWatch::install(
+            spool.gate().clone(),
+        )),
+        Err(e) => {
+            tracing::warn!("[disk] the monitor is off: the spool is unusable: {e}");
+            None
+        }
+    }
+}
+
+/// Spawn the disk monitor (`disk_watch`): every
+/// `DGP_DISK_MONITOR_INTERVAL_SECS` (30 s) it measures the free space of the
+/// spool directory, the filesystem backend roots and the data directory,
+/// sets the gauges, and moves the disk levels. Each measure has a deadline
+/// (`DGP_DISK_MEASURE_TIMEOUT_SECS`, [`TimedProbe`]): a hung network mount
+/// keeps the last verdict of its role and cannot freeze the monitor.
+pub async fn spawn_disk_monitor(
+    state: &Arc<AppState>,
+    config: &deltaglider_proxy::config::SharedConfig,
+    watch: Option<Arc<deltaglider_proxy::disk_watch::DiskWatch>>,
+) {
+    use deltaglider_proxy::disk_watch::{SystemProbe, TimedProbe};
+    let Some(watch) = watch else { return };
+    let Ok(spool) = deltaglider_proxy::deltaglider::spool::SpoolDir::shared() else {
+        return;
+    };
+    let (interval, probe) = {
+        let config = config.read().await;
+        let t = &config.tuning.disk_monitor;
+        let probe = Arc::new(TimedProbe::new(
+            Arc::new(SystemProbe),
+            Duration::from_secs(t.measure_timeout_secs),
+        ));
+        if let Some(message) =
+            deltaglider_proxy::disk_watch::boot_check_now(probe.as_ref(), &config, &spool)
+        {
+            warn!("[disk] {message}");
+        }
+        (t.interval_secs, probe)
+    };
+    let (state, config) = (state.clone(), config.clone());
+    spawn_periodic_blocking("disk-monitor", Duration::from_secs(interval), move || {
+        // An apply holds the write lock for a moment: skip that tick.
+        if let Ok(config) = config.try_read() {
+            deltaglider_proxy::disk_watch::tick_app(&watch, probe.as_ref(), &state, &config);
+        }
+    });
+}
+
 /// Build IAM state from config ([`Config::empty_iam_outcome`]): the IAM
 /// users load into it later. "No pair" alone never means open access.
 pub fn init_iam_state(config: &Config) -> SharedIamState {

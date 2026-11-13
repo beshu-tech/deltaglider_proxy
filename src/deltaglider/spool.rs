@@ -111,6 +111,9 @@ pub struct SpoolDir {
     /// Holders of optional spool files (the range-read reconstruction
     /// cache) that give budget back when an acquire finds it short.
     evictors: Arc<parking_lot::Mutex<Vec<std::sync::Weak<dyn SpoolEvictor>>>>,
+    /// The disk level (`disk_watch`): at high or critical a new write is
+    /// refused ([`SpoolDir::admit_new_write`]).
+    gate: Arc<crate::disk_watch::SpoolGate>,
 }
 
 /// A holder of spool files that are optional (a cache): it drops one when
@@ -294,7 +297,51 @@ impl SpoolDir {
             ),
             shares: Default::default(),
             evictors: Default::default(),
+            gate: Default::default(),
         })
+    }
+
+    /// The disk level that the monitor (`disk_watch`) sets and this spool
+    /// reads. Clones of the spool share it.
+    pub fn gate(&self) -> &Arc<crate::disk_watch::SpoolGate> {
+        &self.gate
+    }
+
+    /// Admit a NEW write: an op that holds no spool yet. It is refused with
+    /// [`CONTENDED`] (the engine answers a retryable `503 SlowDown`, with the
+    /// message) while the disk of the spool is at level high or critical
+    /// (the monitor's verdict), or, where the free space hides the real
+    /// limit, while the reserved bytes leave less than the high threshold of
+    /// the budget (judged now, from `used / budget`: no `statvfs`, one lock
+    /// read). An op that holds a spool, a read and a delete never ask: they
+    /// run to the end.
+    pub fn admit_new_write(&self) -> std::io::Result<()> {
+        match self.write_refusal() {
+            Some(message) => Err(std::io::Error::new(CONTENDED, message)),
+            None => Ok(()),
+        }
+    }
+
+    /// THE answer to "would a new spool write be refused now": the disk level
+    /// of the spool, else (where the free space hides the limit) the use of
+    /// the budget. [`Self::admit_new_write`] and every job that decides on a
+    /// refusal ask this one function, so none misses a refusal by use.
+    pub fn write_refusal(&self) -> Option<String> {
+        self.gate.refusal().or_else(|| {
+            let th = self.gate.by_use()?;
+            crate::disk_watch::use_refusal(&th, self.max_bytes(), self.used_bytes(), self.dir())
+        })
+    }
+
+    /// Spool bytes reserved now (the budget in use), for the gauge. The
+    /// reservations count whole MiB, and the budget rounds up to whole MiB, so
+    /// the count is cut at the budget in bytes: it never shows more than
+    /// [`Self::max_bytes`].
+    pub fn used_bytes(&self) -> u64 {
+        const MIB: u64 = 1024 * 1024;
+        (self.budget.max.saturating_sub(self.budget.free()) as u64)
+            .saturating_mul(MIB)
+            .min(self.max_bytes)
     }
 
     /// Let the reservations made in one backend's scope ([`scoped`]) hold
@@ -1128,6 +1175,56 @@ pub(crate) fn for_each_chunk_blocking(
 
 #[cfg(test)]
 mod tests {
+    /// The gauge of the reserved bytes never shows more than the budget: the
+    /// reservations count whole MiB and the budget rounds up, so a budget that
+    /// is not a whole number of MiB would show up to 1 MiB too much.
+    #[test]
+    fn used_bytes_never_exceeds_a_budget_that_is_not_whole_mib() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        for max in [3 * MIB + 1, 10_000_000_000, 7 * MIB, MIB / 2 + 5] {
+            let spool = SpoolDir::new(dir.path().join(format!("s{max}")), max).unwrap();
+            assert_eq!(spool.used_bytes(), 0);
+            let held = spool.try_acquire(max).unwrap();
+            assert_eq!(spool.used_bytes(), max, "budget {max} held in full");
+            drop(held);
+            assert_eq!(spool.used_bytes(), 0);
+        }
+    }
+
+    /// One answer to "is a new write refused now": the disk level OR the use of
+    /// the budget, and `admit_new_write` agrees with it.
+    #[test]
+    fn write_refusal_is_the_level_or_the_use_and_admission_agrees() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let spool = SpoolDir::new(dir.path().join("s"), 64 * MIB).unwrap();
+        assert_eq!(spool.write_refusal(), None);
+        assert!(spool.admit_new_write().is_ok());
+        // By level.
+        spool
+            .gate()
+            .set(crate::disk_watch::Level::High, "the disk is full".into());
+        assert_eq!(spool.write_refusal().as_deref(), Some("the disk is full"));
+        assert!(spool.admit_new_write().is_err());
+        spool
+            .gate()
+            .set(crate::disk_watch::Level::Ok, String::new());
+        // By use: the budget is nearly all reserved.
+        let mut th = crate::disk_watch::Thresholds::new(
+            &crate::config::tuning::RuntimeTuning::default().disk_monitor,
+            MIB,
+        );
+        th.low_floor = 0;
+        th.high_floor = 32 * MIB;
+        th.critical_floor = 0;
+        spool.gate().set_by_use(Some(th));
+        assert_eq!(spool.write_refusal(), None, "the budget is free");
+        let _held = spool.try_acquire(40 * MIB).unwrap();
+        assert!(spool.write_refusal().is_some(), "the budget is in use");
+        assert!(spool.admit_new_write().is_err());
+    }
+
     use super::*;
 
     #[test]

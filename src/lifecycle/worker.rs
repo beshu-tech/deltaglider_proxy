@@ -779,14 +779,18 @@ async fn run_or_preview(
                         // waits for at most this object's copy, and the next
                         // object defers the run. The cursor stays before the
                         // page, so the resume plans it again.
-                        let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
-                            Ok(windows) => windows,
-                            Err(why) => {
-                                info!("lifecycle rule '{}' deferring mid-page: {why}", rule.name);
-                                deferred = true;
-                                break;
-                            }
-                        };
+                        let windows =
+                            match admit_write_windows(rule, maintenance_gate.as_ref(), true) {
+                                Ok(windows) => windows,
+                                Err(why) => {
+                                    info!(
+                                        "lifecycle rule '{}' deferring mid-page: {why}",
+                                        rule.name
+                                    );
+                                    deferred = true;
+                                    break;
+                                }
+                            };
                         match plan_action(db.as_ref(), engine, &windows, rule, &key, &meta, &action)
                             .await
                         {
@@ -852,7 +856,7 @@ async fn run_or_preview(
             // The admission of the page's delete batch: `proceed` asks the
             // gate again before each key, so a job that arms meanwhile waits
             // for one key's delete.
-            let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
+            let windows = match admit_write_windows(rule, maintenance_gate.as_ref(), false) {
                 Ok(windows) => windows,
                 Err(why) => {
                     info!(
@@ -1229,7 +1233,7 @@ async fn run_or_preview_retain_newest(
     // reencrypt/migrate drain waits for it instead of racing our deletes
     // (H22). If a job armed between collect and here, defer the entire act
     // phase rather than delete into a bucket being rewritten.
-    let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
+    let windows = match admit_write_windows(rule, maintenance_gate.as_ref(), false) {
         Ok(windows) => windows,
         Err(why) => {
             info!(
@@ -2009,9 +2013,9 @@ fn maintenance_write_bucket_busy(
     let Some(gate) = gate else {
         return false;
     };
-    super::planner::rule_write_buckets(rule)
+    super::planner::rule_write_targets(rule)
         .into_iter()
-        .any(|b| gate.write_blocked(b).is_some())
+        .any(|(b, kind)| gate.blocked(b, kind).is_some())
 }
 
 /// Admit this rule's write buckets through the maintenance gate for the
@@ -2023,9 +2027,16 @@ fn maintenance_write_bucket_busy(
 fn admit_write_windows(
     rule: &LifecycleRule,
     gate: Option<&Arc<crate::maintenance::gate::MaintenanceGate>>,
+    storing: bool,
 ) -> Result<crate::maintenance::gate::Admitted, String> {
-    crate::maintenance::gate::admit_all(gate, &super::planner::rule_write_buckets(rule))
-        .map_err(|refusal| refusal.into_reason())
+    // `storing`: the window of copies (a transition stores into its
+    // destination). A window of deletes asks no disk refusal: they free space.
+    let result = if storing {
+        crate::maintenance::gate::admit_buckets(gate, &super::planner::rule_write_targets(rule))
+    } else {
+        crate::maintenance::gate::admit_all(gate, &super::planner::rule_write_buckets(rule))
+    };
+    result.map_err(|refusal| refusal.into_reason())
 }
 
 async fn renew_run_lease(
@@ -2834,6 +2845,96 @@ mod tests {
         }
     }
 
+    /// Every bucket's disk is at level critical (the disk probe of the
+    /// maintenance gate refuses a store anywhere).
+    fn full_disk_gate() -> Arc<crate::maintenance::gate::MaintenanceGate> {
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        gate.set_disk_refusal_probe(Arc::new(|b: &str| {
+            Some(format!("the disk of '{b}' is full"))
+        }));
+        gate
+    }
+
+    /// Lifecycle expiry works at level critical: a delete frees space, so the
+    /// run is neither deferred nor refused.
+    #[tokio::test]
+    async fn an_expiry_run_deletes_at_a_full_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        store_all(&engine, &["x/1.bin", "x/2.bin"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rule = LifecycleRule {
+            expire_after: Some("1ms".into()),
+            ..rule()
+        };
+        let db = jobs_db();
+        db.lock()
+            .await
+            .lifecycle_ensure_state(&rule.name, 0)
+            .unwrap();
+        let gate = full_disk_gate();
+        let out = super::run_rule(
+            Some(db),
+            &engine,
+            &rule,
+            10,
+            "scheduler",
+            3600,
+            None,
+            Some(gate.clone()),
+        )
+        .await
+        .unwrap();
+        assert_ne!(out.status, "deferred", "{out:?}");
+        assert_eq!(out.errors, 0, "{out:?}");
+        for key in ["x/1.bin", "x/2.bin"] {
+            assert!(engine.head("b", key).await.is_err(), "{key} expired");
+        }
+        assert_eq!(gate.inflight_writes("b"), 0);
+    }
+
+    /// A transition STORES into its destination: at level critical its run is
+    /// deferred, nothing is copied and the source stays; the same rule with
+    /// space moves its objects.
+    #[tokio::test]
+    async fn a_transition_run_waits_at_a_full_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        store_all(&engine, &["x/1.bin", "x/2.bin"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rule = transition_rule("move", true);
+        let db = jobs_db();
+        db.lock()
+            .await
+            .lifecycle_ensure_state(&rule.name, 0)
+            .unwrap();
+        let run = |gate: Arc<crate::maintenance::gate::MaintenanceGate>| {
+            super::run_rule(
+                Some(db.clone()),
+                &engine,
+                &rule,
+                10,
+                "scheduler",
+                3600,
+                None,
+                Some(gate),
+            )
+        };
+        let out = run(full_disk_gate()).await.unwrap();
+        assert_eq!(out.status, "deferred", "{out:?}");
+        assert_eq!((out.objects_copied, out.objects_moved), (0, 0), "{out:?}");
+        assert!(engine.head("dst", "cold/x/1.bin").await.is_err());
+        assert!(
+            engine.head("b", "x/1.bin").await.is_ok(),
+            "the source stays"
+        );
+        let out = run(Arc::new(crate::maintenance::gate::MaintenanceGate::new()))
+            .await
+            .unwrap();
+        assert_eq!(out.objects_moved, 2, "{out:?}");
+        assert!(engine.head("dst", "cold/x/1.bin").await.is_ok());
+    }
+
     /// A move-mode run that a mid-page deferral stopped keeps the page's
     /// source deletes back while its copies stand. The next run meets the
     /// same objects: the destination already holds them, so it makes no
@@ -3134,7 +3235,7 @@ mod tests {
     fn a_bucket_name_with_spaces_is_covered_by_its_admission() {
         let mut r = rule();
         r.bucket = " b ".into();
-        let windows = super::admit_write_windows(&r, None).unwrap();
+        let windows = super::admit_write_windows(&r, None, false).unwrap();
         assert!(windows.covers(&r.bucket), "{windows:?}");
         assert!(windows.covers("B"));
         assert!(!windows.covers("other"));

@@ -189,9 +189,9 @@ pub async fn run_now(
 
     // Same deferral the scheduler applies: run-now must not write into a
     // bucket a maintenance job (re-encrypt / migrate) is rewriting.
-    if let Some(why) = lifecycle::planner::rule_write_buckets(&rule)
+    if let Some(why) = lifecycle::planner::rule_write_targets(&rule)
         .into_iter()
-        .find_map(|b| state.s3_state.maintenance_gate.write_blocked(b))
+        .find_map(|(b, kind)| state.s3_state.maintenance_gate.blocked(b, kind))
     {
         return Err(AdminError::conflict(format!(
             "the rule cannot write now: {why}. Run the rule again when that ends"

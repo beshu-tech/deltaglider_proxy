@@ -999,6 +999,22 @@ pub fn measure_disk_facts(dir: &Path, data_roots: &[PathBuf], env: EnvLookup) ->
     }
 }
 
+/// What the disk monitor needs of one path: the free and total bytes of
+/// its filesystem and the device id (to count a device once). `None`: the
+/// measure failed (or this is not a Unix host). The same `statvfs` call as
+/// the boot measure ([`measure_disk_facts`]).
+pub fn measure_path(path: &Path) -> Option<(u64, u64, u64)> {
+    #[cfg(unix)]
+    {
+        unix::path_facts(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Does `dir` lie on the same device as any of `roots` (a root that does
 /// not exist yet counts by its nearest existing parent)?
 pub fn shares_device(dir: &Path, roots: &[PathBuf]) -> bool {
@@ -1095,6 +1111,19 @@ mod unix {
                 return None;
             }
         }
+    }
+
+    /// (free, total, device) of the filesystem that holds `path`, or of its
+    /// nearest existing parent.
+    pub(super) fn path_facts(path: &Path) -> Option<(u64, u64, u64)> {
+        let mut p: PathBuf = path.to_path_buf();
+        while !p.exists() {
+            if !p.pop() {
+                return None;
+            }
+        }
+        let (free, total, _) = statvfs_facts(&p)?;
+        Some((free, total, device_of(&p)?))
     }
 
     pub(super) fn shares_device(dir: &Path, roots: &[PathBuf]) -> bool {

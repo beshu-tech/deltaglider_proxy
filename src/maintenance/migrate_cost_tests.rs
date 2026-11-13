@@ -30,11 +30,20 @@ async fn env(phase: &str, objects: usize) -> Env {
 /// usage counter is on, as in production.
 async fn env_with(phase: &str, objects: usize, in_target: bool) -> Env {
     let (engine, fake) = s3_engine().await;
-    let engine = engine.with_bucket_usage(Some(Arc::new(
-        crate::bucket_usage::BucketUsage::in_memory().unwrap(),
-    )));
+    let dir = tempfile::tempdir().unwrap();
+    // A spool of its own: the process-wide spool (and its disk gate) must not
+    // feel a test's full disk.
+    let engine = engine
+        .with_spool_dir(
+            crate::deltaglider::spool::SpoolDir::new(dir.path().join("spool"), 64 * 1024 * 1024)
+                .unwrap(),
+        )
+        .with_bucket_usage(Some(Arc::new(
+            crate::bucket_usage::BucketUsage::in_memory().unwrap(),
+        )));
     engine.create_bucket("t").await.unwrap();
     let params = MigrateParams {
+        disk_wait: false,
         target_backend: "dst".into(),
         delete_source: false,
         transient_key: "t".into(),
@@ -78,7 +87,6 @@ async fn env_with(phase: &str, objects: usize, in_target: bool) -> Env {
     // engine's metadata cache).
     engine.metadata_cache().invalidate_prefix("b", "");
     engine.metadata_cache().invalidate_prefix("t", "");
-    let dir = tempfile::tempdir().unwrap();
     let mut cfg = crate::config::Config {
         backend: crate::config::BackendConfig::Filesystem {
             path: dir.path().join("data"),
@@ -274,6 +282,7 @@ async fn the_flip_marks_the_usage_row_for_a_recount() {
     );
     let mut cfg = crate::config::Config::from_yaml_str(&yaml).unwrap();
     let params = MigrateParams {
+        disk_wait: false,
         target_backend: "dst".into(),
         delete_source: false,
         transient_key: "__dgmigrate_b_0".into(),
@@ -539,4 +548,143 @@ async fn a_save_failure_at_the_flip_over_a_flipped_config_unwinds_nothing() {
         "a failed save after the flip waits: {result:?}"
     );
     assert_nothing_unwound(&e, "save failure at flip").await;
+}
+
+/// The copy of a migrate asks the DISK OF ITS TARGET BACKEND, not the spool
+/// disk as a whole: with the spool disk at level high and the target's disk
+/// fine, objects that need no spool file are copied (a 19 GiB host sits at
+/// level high of the real thresholds, and the copy used to wait at once).
+#[tokio::test]
+async fn a_migrate_copy_ignores_a_full_spool_disk_when_no_object_needs_a_spool() {
+    use super::super::worker::cost_tests::watch_with;
+    let e = env_with("stage", 5, false).await;
+    let _watch = watch_with(&e.state, 50);
+    e.state.engine.load().spool_dir().gate().set(
+        crate::disk_watch::Level::High,
+        "the spool disk is full".into(),
+    );
+    let mut c = Counters::default();
+    e.run().copy(&mut c).await.unwrap();
+    assert_eq!(c.done, 5, "{c:?}");
+}
+
+/// A critical disk of the target backend defers the copy before its next
+/// object: no copy, no failure recorded, no byte on the target.
+#[tokio::test]
+async fn a_migrate_copy_waits_for_the_disk_of_its_target_backend() {
+    use super::super::worker::cost_tests::watch_with;
+    let e = env_with("stage", 5, false).await;
+    let _watch = watch_with(&e.state, 3);
+    e.state
+        .engine
+        .load()
+        .spool_dir()
+        .gate()
+        .set(crate::disk_watch::Level::Ok, String::new());
+    let mut c = Counters::default();
+    let Err(stop) = e.run().copy(&mut c).await else {
+        panic!("the copy waits");
+    };
+    assert!(
+        matches!(&stop, PhaseStop::Deferred(m) if m.contains("backend 'default'")),
+        "{stop:?}"
+    );
+    assert_eq!((c.done, c.failed), (0, 0), "{c:?}");
+    assert_eq!(e.count("PUT") + e.count("COPY"), 0, "nothing was written");
+}
+
+/// The copy waits out a write that the gate admitted before it, every time
+/// it starts (a resume after a disk wait included): one that deletes a source
+/// key after the verify read it would bring the key back at the flip.
+#[tokio::test]
+async fn a_migrate_copy_starts_only_after_the_admitted_writes_end() {
+    let e = env_with("stage", 5, false).await;
+    let write = e.state.maintenance_gate.begin_detached_write("b");
+    let run = e.run();
+    let mut c = Counters::default();
+    {
+        let copy = run.copy(&mut c);
+        tokio::pin!(copy);
+        tokio::select! {
+            done = &mut copy => panic!("the copy started with a write in flight: {done:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(600)) => {}
+        }
+        drop(write);
+        copy.await.unwrap();
+    }
+    assert_eq!(c.done, 5, "{c:?}");
+}
+
+/// A cancel does not wait for the disk. A migrate that waits for a full
+/// target disk (its mark is set) and is cancelled runs its cancel at the next
+/// claim: the staged copies and the staging route go, the row ends
+/// `cancelled`, the mark ends. It used to be deferred again and again while
+/// the disk stayed full.
+#[tokio::test]
+async fn a_cancelled_migrate_unwinds_while_the_target_disk_is_still_full() {
+    use super::super::worker::cost_tests::watch_with;
+    let e = env_with("copy", 5, true).await;
+    let _watch = watch_with(&e.state, 3);
+    e.state
+        .engine
+        .load()
+        .spool_dir()
+        .gate()
+        .set(crate::disk_watch::Level::Ok, String::new());
+    let gate = e.state.maintenance_gate.clone();
+    gate.sync_from(&*e.db.lock().await);
+    gate.mark_disk_deferred(e.job.id, super::super::store::current_unix_seconds() - 1);
+    assert!(
+        e.db.lock()
+            .await
+            .maintenance_request_cancel(e.job.id)
+            .unwrap()
+            == super::super::store::CancelOutcome::CancelRequested
+    );
+    let config = e.mutator.config.clone();
+    super::super::worker::run_job(
+        &e.mutator,
+        &config,
+        &e.db,
+        &e.state,
+        Holder::test("inst"),
+        e.job.clone(),
+    )
+    .await;
+    let row =
+        e.db.lock()
+            .await
+            .maintenance_job_by_id(e.job.id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(row.status, "cancelled", "{row:?}");
+    let engine = e.state.engine.load().clone();
+    assert!(
+        engine.head("t", "run/k-000.txt").await.is_err(),
+        "the staged copies are removed"
+    );
+    assert!(!e.mutator.read().await.buckets.contains_key("t"));
+    assert!(!gate.has_disk_mark(e.job.id), "the mark ends with the run");
+}
+
+/// A copy that needs a spool file and meets the spool gate defers the job; a
+/// busy proxy with the gate open, and every other error, is the object's.
+#[test]
+fn a_copy_error_defers_the_job_only_for_the_spool_gate() {
+    let why = || Some("the spool disk is full".to_string());
+    let failed = |d: CopyDone| {
+        matches!(
+            d,
+            CopyDone::Failed {
+                transient: true,
+                ..
+            }
+        )
+    };
+    assert!(matches!(
+        copy_error_done(true, why(), true, "busy".into()),
+        CopyDone::Deferred(m) if m == "the spool disk is full"
+    ));
+    assert!(failed(copy_error_done(true, None, true, "busy".into())));
+    assert!(failed(copy_error_done(false, why(), true, "x".into())));
 }

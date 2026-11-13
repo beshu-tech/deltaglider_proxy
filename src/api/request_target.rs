@@ -90,6 +90,18 @@ impl RequestTarget {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Is this `DeleteObjects`: `POST /{bucket}?delete`? s3s ignores `delete`
+    /// on an OBJECT path, where the POST is a write (`CompleteMultipartUpload`
+    /// with `?uploadId=X&delete` is one, `CreateMultipartUpload`). THE one
+    /// test of every decision that treats a batch delete as a delete (IAM,
+    /// the maintenance gate).
+    pub fn is_batch_delete(&self, method: &axum::http::Method) -> bool {
+        *method == axum::http::Method::POST
+            && self.has_query("delete")
+            && self.bucket().is_some()
+            && self.bucket_and_key().1.is_empty()
+    }
+
     pub fn has_query(&self, name: &str) -> bool {
         self.query.iter().any(|(k, _)| k == name)
     }

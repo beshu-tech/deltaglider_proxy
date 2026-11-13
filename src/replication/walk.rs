@@ -360,6 +360,16 @@ pub enum Event {
         item_id: u64,
         ok: bool,
     },
+    /// The copy was REFUSED for now (the disk of the destination is at level
+    /// critical): not a failure, not settled. The item stays open, so the
+    /// watermark (and the persisted cursor) never passes it and the next run
+    /// does it again. Its directory counts it as unfinished work: the
+    /// directory's deletes are held like after a copy error (the source key
+    /// is not on the destination yet). The walk goes on, so the deletes of
+    /// the other directories still run.
+    CopyDeferred {
+        item_id: u64,
+    },
     DeleteSettled {
         item_id: u64,
         ok: bool,
@@ -399,6 +409,8 @@ pub struct WalkStats {
     pub dest_entries: u64,
     /// Delete candidates kept because [`deletes_held`] said so.
     pub deletes_held: u64,
+    /// Copies that were refused for now ([`Event::CopyDeferred`]).
+    pub copies_deferred: u64,
 }
 
 /// Pure: hold every mirror delete of the run. True when the source listed
@@ -741,6 +753,18 @@ impl WalkMachine {
                     if !ok {
                         task.copy_errors += 1;
                     }
+                }
+                self.maybe_complete_dir(&dir);
+            }
+            Event::CopyDeferred { item_id } => {
+                let Some(CmdRoute::CopyItem { dir, .. }) = self.routes.remove(&item_id) else {
+                    return;
+                };
+                // NOT `tracker.settle`: the item pins the watermark.
+                self.stats.copies_deferred += 1;
+                if let Some(task) = self.active.get_mut(&dir) {
+                    task.outstanding -= 1;
+                    task.copy_errors += 1;
                 }
                 self.maybe_complete_dir(&dir);
             }
@@ -2232,6 +2256,8 @@ mod machine_tests {
         last_cursor: Option<String>,
         /// Keys HEADed so far.
         head_keys: usize,
+        /// Keys whose copy is refused for now (`Event::CopyDeferred`).
+        defer: BTreeSet<String>,
     }
 
     impl Sim {
@@ -2279,6 +2305,10 @@ mod machine_tests {
                 Cmd::Copy {
                     item_id, rel_key, ..
                 } => {
+                    if self.defer.contains(&rel_key) {
+                        self.queue.push(Event::CopyDeferred { item_id });
+                        return;
+                    }
                     let src = self
                         .world
                         .src
@@ -2454,6 +2484,7 @@ mod machine_tests {
             queue: Vec::new(),
             last_cursor: None,
             head_keys: 0,
+            defer: BTreeSet::new(),
         };
         drive(&mut machine, &mut sim, &[0], None);
         assert!(machine.is_done(), "expected clean completion");
@@ -2503,6 +2534,7 @@ mod machine_tests {
             queue: Vec::new(),
             last_cursor: None,
             head_keys: 0,
+            defer: BTreeSet::new(),
         };
         drive(&mut machine, &mut sim, &[0], None);
         assert!(
@@ -2549,10 +2581,104 @@ mod machine_tests {
             queue: Vec::new(),
             last_cursor: None,
             head_keys: 0,
+            defer: BTreeSet::new(),
         };
         drive(&mut machine, &mut sim, &[0, 3, 1], None);
         assert!(machine.is_done(), "expected clean completion");
         sim.trace
+    }
+
+    /// A copy refused for a full destination disk (`Event::CopyDeferred`) is
+    /// deferred as ONE item: the walk goes on, the deletes of the clean
+    /// directories still run (they free space), the directory with the
+    /// deferred copy holds its own deletes (its source key is not on the
+    /// destination yet), the cursor never passes the deferred item, and the
+    /// next run does the copy and the held deletes.
+    #[test]
+    fn a_deferred_copy_pins_the_cursor_and_the_other_deletes_still_run() {
+        let mut world = simple_world(AUTH);
+        let mk = |sha: &str| world_obj(mk_meta(10, sha, "etag", 1_000, false), true);
+        // a/: one new key (copy deferred) and a stale dest-only key.
+        world.src.insert("a/new.txt".into(), mk("n"));
+        world
+            .dest
+            .insert("a/stale.txt".into(), copied_from(&mk("s"), true));
+        // b/: in sync, plus a stale dest-only key (a clean directory).
+        world.src.insert("b/same.txt".into(), mk("x"));
+        world
+            .dest
+            .insert("b/same.txt".into(), copied_from(&mk("x"), true));
+        world
+            .dest
+            .insert("b/stale.txt".into(), copied_from(&mk("t"), true));
+        let machine_for = |world: &FakeWorld, resume: Option<CursorV1>| {
+            mk_machine(
+                world,
+                ConflictPolicy::NewerWins,
+                false,
+                true,
+                3,
+                10_000,
+                2,
+                2,
+                usize::MAX,
+                resume,
+            )
+        };
+        let sim_for = |world: &FakeWorld, defer: &[&str]| Sim {
+            world: world.clone(),
+            page_size: 3,
+            trace: Trace::default(),
+            queue: Vec::new(),
+            last_cursor: None,
+            head_keys: 0,
+            defer: defer.iter().map(|k| k.to_string()).collect(),
+        };
+
+        // Run 1: the copy of a/new.txt is deferred.
+        let mut machine = machine_for(&world, None);
+        let mut sim = sim_for(&world, &["a/new.txt"]);
+        drive(&mut machine, &mut sim, &[0], None);
+        assert!(machine.is_done(), "the walk went on to its end");
+        assert_eq!(machine.stats().copies_deferred, 1);
+        assert!(sim.trace.copies.is_empty(), "the copy waited");
+        assert!(
+            sim.trace.deletes.contains("b/stale.txt"),
+            "a clean directory still deletes: {:?}",
+            sim.trace.deletes
+        );
+        assert!(
+            !sim.trace.deletes.contains("a/stale.txt"),
+            "the directory with the deferred copy holds its deletes"
+        );
+        // The cursor stops before the deferred item (or is not set): a
+        // resume starts at or before it.
+        let cursor = machine.cursor();
+        if let Some(c) = &cursor {
+            assert!(c.pos.as_str() < "a/new.txt", "cursor passed it: {}", c.pos);
+        }
+
+        // Run 2 (space again): the resumed walk copies it and deletes the
+        // held key.
+        let mut world2 = world.clone();
+        for k in &sim.trace.deletes {
+            world2.dest.remove(k);
+        }
+        let mut machine = machine_for(&world2, cursor);
+        let mut sim = sim_for(&world2, &[]);
+        drive(&mut machine, &mut sim, &[0], None);
+        assert!(machine.is_done());
+        assert_eq!(machine.stats().copies_deferred, 0);
+        assert!(
+            sim.trace.copies.contains("a/new.txt"),
+            "{:?}",
+            sim.trace.copies
+        );
+        assert!(
+            sim.trace.deletes.contains("a/stale.txt"),
+            "{:?}",
+            sim.trace.deletes
+        );
     }
 
     /// NEW-11: a source that lists empty (a wrong route, another node's
@@ -2585,6 +2711,7 @@ mod machine_tests {
             queue: Vec::new(),
             last_cursor: None,
             head_keys: 0,
+            defer: BTreeSet::new(),
         };
         drive(&mut machine, &mut sim, &[0, 2, 1], None);
         assert!(machine.is_done(), "the run completes");
@@ -2816,6 +2943,7 @@ mod machine_tests {
             queue: Vec::new(),
             last_cursor: None,
             head_keys: 0,
+            defer: BTreeSet::new(),
         };
         drive(&mut machine, &mut sim, &[0], None);
         assert!(machine.is_done());
@@ -2933,6 +3061,7 @@ mod machine_tests {
             queue: Vec::new(),
             last_cursor: None,
             head_keys: 0,
+            defer: BTreeSet::new(),
         };
         drive(&mut machine, &mut sim, &[0], None);
         assert!(machine.truncated_by_budget());
@@ -2979,6 +3108,7 @@ mod machine_tests {
             queue: Vec::new(),
             last_cursor: None,
             head_keys: 0,
+            defer: BTreeSet::new(),
         };
         drive(&mut machine, &mut sim, &[0], None);
         let (ref_copies, _) = reference_diff(&w, ConflictPolicy::SkipIfDestExists, false, false);
@@ -3045,6 +3175,7 @@ mod machine_tests {
                 queue: Vec::new(),
                 last_cursor: None,
                 head_keys: 0,
+                defer: BTreeSet::new(),
             };
             drive(&mut machine, &mut sim, &[0], None);
             world_now = sim.world;
@@ -3191,6 +3322,7 @@ mod machine_tests {
                 queue: Vec::new(),
                 last_cursor: None,
                 head_keys: 0,
+            defer: BTreeSet::new(),
             };
             drive(&mut machine, &mut sim, &seed, None);
             prop_assert!(machine.is_done(), "walk must complete");
@@ -3221,6 +3353,7 @@ mod machine_tests {
                     queue: Vec::new(),
                     last_cursor: None,
                     head_keys: 0,
+            defer: BTreeSet::new(),
                 };
                 drive(&mut machine, &mut sim, &[0], None);
                 results.push((sim.trace.copies, sim.trace.deletes));
@@ -3249,6 +3382,7 @@ mod machine_tests {
                 queue: Vec::new(),
                 last_cursor: None,
                 head_keys: 0,
+            defer: BTreeSet::new(),
             };
             drive(&mut machine, &mut sim, &seed, Some(cut));
             let cursor = machine.cursor();
@@ -3262,6 +3396,7 @@ mod machine_tests {
                 queue: Vec::new(),
                 last_cursor: None,
                 head_keys: 0,
+            defer: BTreeSet::new(),
             };
             drive(&mut resumed, &mut sim2, &seed, None);
             prop_assert!(resumed.is_done(), "resumed walk must complete");
@@ -3281,6 +3416,7 @@ mod machine_tests {
                     queue: Vec::new(),
                     last_cursor: None,
                     head_keys: 0,
+            defer: BTreeSet::new(),
                 };
                 drive(&mut fresh, &mut sim3, &seed, None);
                 prop_assert!(fresh.is_done(), "the fresh pass must complete");
@@ -3322,6 +3458,7 @@ mod machine_tests {
                     queue: Vec::new(),
                     last_cursor: None,
                     head_keys: 0,
+            defer: BTreeSet::new(),
                 };
                 drive(&mut machine, &mut sim, &[0], None);
                 world_now = sim.world;
@@ -3362,6 +3499,7 @@ mod machine_tests {
                 queue: Vec::new(),
                 last_cursor: None,
                 head_keys: 0,
+            defer: BTreeSet::new(),
             };
             drive(&mut machine, &mut sim, &[3, 1, 4], Some(cut));
             let cursor = machine.cursor();
@@ -3374,6 +3512,7 @@ mod machine_tests {
                 queue: Vec::new(),
                 last_cursor: None,
                 head_keys: 0,
+            defer: BTreeSet::new(),
             };
             drive(&mut resumed, &mut sim2, &[2, 5], None);
             prop_assert!(resumed.is_done());

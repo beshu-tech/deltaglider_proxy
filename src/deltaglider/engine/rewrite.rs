@@ -175,6 +175,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Large: the body goes through a spool file (bounded memory).
         // Taken before the GET, so no response waits for budget.
         let spool = if size > self.spool_threshold() {
+            // A rewrite stores bytes: a new write for the disk gate.
+            self.admit_new_spool_write(0)?;
             Some(self.spool_acquire(size).await?)
         } else {
             None

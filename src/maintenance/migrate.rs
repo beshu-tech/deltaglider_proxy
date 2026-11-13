@@ -113,6 +113,12 @@ pub struct MigrateParams {
     /// Absent in rows written before the option existed → `Empty`.
     #[serde(default)]
     pub target: MigrateTarget,
+    /// The copy waited for disk space while the gate let deletes into the
+    /// source pass (`worker::disk_wait_is_safe`). A client delete of a key
+    /// that was copied already leaves it on the destination, so the verify
+    /// prunes the destination of every key that the source lacks.
+    #[serde(default)]
+    pub disk_wait: bool,
 }
 
 /// Pages the stage phase lists to count the destination (the count in the
@@ -1117,6 +1123,12 @@ impl MigrateRun<'_> {
 
     /// ── Phase: copy (resumable; ANY copy failure aborts pre-flip) ──
     async fn copy(&self, c: &mut Counters) -> Result<Durable, PhaseStop> {
+        // The deletes that the gate admitted while this job waited for disk
+        // space (`MaintenanceGate::mark_disk_deferred`) must be over before the
+        // copy goes on: one that deletes a source key after the verify read it
+        // would bring the key back at the flip. Cheap when nothing is in flight;
+        // the stage drains the first time, this one every time the copy starts.
+        drain_inflight_writes(self.state, self.job.id, &self.job.bucket).await?;
         let count = c.total.is_none().then(|| {
             BackgroundCount::spawn(self.state.engine.load().clone(), self.job.bucket.clone())
         });
@@ -1187,7 +1199,7 @@ impl MigrateRun<'_> {
         .await;
         super::live::clear(self.job);
         verified?;
-        if self.params.target == MigrateTarget::Mirror {
+        if self.params.target == MigrateTarget::Mirror || self.params.disk_wait {
             self.prune_destination_extras().await?;
         }
         self.checkpoint("flip", c, None).await
@@ -1488,10 +1500,36 @@ enum CopyDone {
         transient: bool,
         message: String,
     },
+    /// The object needs a spool file and the spool disk is at level high or
+    /// critical: not the object's failure. The job waits and does it again.
+    Deferred(String),
+}
+
+/// Pure: what a failed copy ends in. A copy that the proxy found busy while
+/// the spool disk gate says no now (`spool_refusal`) defers the job; every
+/// other error is the object's failure.
+fn copy_error_done(
+    busy: bool,
+    spool_refusal: Option<String>,
+    transient: bool,
+    message: String,
+) -> CopyDone {
+    match (busy, spool_refusal) {
+        (true, Some(why)) => CopyDone::Deferred(why),
+        _ => CopyDone::Failed { transient, message },
+    }
 }
 
 impl PageStep for CopyStep<'_, '_> {
     type Done = CopyDone;
+
+    /// The copy stores into the target: it waits while the disk of the
+    /// target backend is at level critical. It does NOT ask the spool disk as
+    /// a whole: most objects need no spool file, and one that does meets the
+    /// spool gate in its own copy ([`CopyDone::Deferred`]).
+    fn refused(&self) -> Option<String> {
+        super::probes::backend_store_refusal(self.m.state, &self.m.params.transient_key)
+    }
 
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         self.m
@@ -1597,15 +1635,17 @@ impl PageStep for CopyStep<'_, '_> {
                 bytes: outcome.bytes_copied as i64,
                 adopted,
             },
-            Err(e) => CopyDone::Failed {
-                transient: e.class.retryable(),
-                message: e.to_string(),
-            },
+            Err(e) => copy_error_done(
+                e.class == crate::transfer::CopyClass::Busy,
+                engine.spool_dir().write_refusal(),
+                e.class.retryable(),
+                e.to_string(),
+            ),
         }
     }
 
     fn stops(done: &CopyDone) -> bool {
-        matches!(done, CopyDone::Failed { .. })
+        matches!(done, CopyDone::Failed { .. } | CopyDone::Deferred(_))
     }
 
     async fn settle(&mut self, key: &str, done: CopyDone) -> Result<(), PhaseStop> {
@@ -1626,6 +1666,9 @@ impl PageStep for CopyStep<'_, '_> {
                     .await?;
                 }
             }
+            // The job waits for the spool disk; nothing is recorded, and the
+            // page is not saved (the copies of it are idempotent).
+            CopyDone::Deferred(why) => return Err(PhaseStop::Deferred(why)),
             CopyDone::Failed { transient, message } => {
                 record_failure(m.db, m.job.id, key, &message).await?;
                 self.c.failed += 1;
@@ -2119,6 +2162,7 @@ storage:
     #[test]
     fn params_round_trip() {
         let p = MigrateParams {
+            disk_wait: false,
             target_backend: "hz".into(),
             delete_source: true,
             transient_key: "__dgmigrate_b_0".into(),
@@ -2172,6 +2216,7 @@ storage:
     #[test]
     fn provenance_is_job_unique() {
         let p = MigrateParams {
+            disk_wait: false,
             target_backend: "hz".into(),
             delete_source: false,
             transient_key: "t".into(),

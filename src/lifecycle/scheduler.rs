@@ -205,9 +205,9 @@ async fn run_due_rules(
 
         // Source AND transition destination: a transition PUT landing on
         // a gated bucket is the racing write the gate exists to stop.
-        if let Some(why) = super::planner::rule_write_buckets(rule)
+        if let Some(why) = super::planner::rule_write_targets(rule)
             .into_iter()
-            .find_map(|b| state.maintenance_gate.write_blocked(b))
+            .find_map(|(b, kind)| state.maintenance_gate.blocked(b, kind))
         {
             // Shown on the rule's Jobs row; logged once, not every check.
             if super::live::set_deferred(&rule.name, Some(maintenance_deferral(&why))) {

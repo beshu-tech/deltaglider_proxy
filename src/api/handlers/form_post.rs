@@ -42,7 +42,7 @@
 //! `content-length-range`, `expiration` — are re-validated on EVERY request
 //! (`validate_form_post_policy`) and are the real bound on a leaked signature.
 
-use super::object_helpers::{check_client_write_allowed, store_client_write, ClientWrite};
+use super::object_helpers::{check_client_store_allowed, store_client_write, ClientWrite};
 use super::{audit_log_s3, ensure_bucket_exists, AppState};
 use crate::api::errors::S3Error;
 use crate::deltaglider::ingest::{Destination, IngestError, IngestPlan, IngestedBody, Sha256Need};
@@ -1175,7 +1175,7 @@ where
     // bucket's configuration and backend, which an unverified caller must
     // not learn (S23). Still before any backend I/O (403-before-404 parity
     // with the PUT path, commit b1b2249).
-    check_client_write_allowed(state, bucket).await?;
+    check_client_store_allowed(state, bucket).await?;
     // Only now, with the policy signature verified: the gates' 503 names a
     // busy bucket or a backend's state.
     crate::maintenance::gate::check_verified_request(

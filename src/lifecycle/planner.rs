@@ -184,6 +184,26 @@ pub fn rule_write_buckets(rule: &LifecycleRule) -> Vec<&str> {
     buckets
 }
 
+/// [`rule_write_buckets`] with what the rule does to each: a transition
+/// STORES into its destination and only deletes from its source, so only the
+/// destination asks the disk refusal (a delete frees space).
+pub fn rule_write_targets(
+    rule: &LifecycleRule,
+) -> Vec<(&str, crate::maintenance::gate::WriteKind)> {
+    use crate::maintenance::gate::WriteKind;
+    let source = rule.bucket.trim();
+    let mut targets = vec![(source, WriteKind::FreesSpace)];
+    if let LifecycleAction::Transition(t) = &rule.action {
+        let dest = t.destination.bucket.trim();
+        if dest == source {
+            targets[0].1 = WriteKind::Store;
+        } else if !dest.is_empty() {
+            targets.push((dest, WriteKind::Store));
+        }
+    }
+    targets
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Apply { action: PlannedLifecycleAction },
@@ -832,6 +852,41 @@ mod tests {
             delete_source_after_success: false,
         });
         assert_eq!(rule_write_buckets(&same), vec!["b"]);
+    }
+
+    /// A transition STORES into its destination and only deletes from its
+    /// source: only the destination asks the disk refusal. A rule that only
+    /// expires stores nothing.
+    #[test]
+    fn rule_write_targets_store_only_into_a_transition_destination() {
+        use crate::config_sections::{LifecycleDestination, LifecycleTransitionAction};
+        use crate::maintenance::gate::WriteKind::{FreesSpace, Store};
+        let mut r = rule(&[], &[]);
+        r.bucket = " b ".to_string();
+        assert_eq!(rule_write_targets(&r), vec![("b", FreesSpace)], "expire");
+        let transition = |dest: &str| {
+            LifecycleAction::Transition(LifecycleTransitionAction {
+                destination: LifecycleDestination {
+                    bucket: dest.to_string(),
+                    prefix: String::new(),
+                },
+                delete_source_after_success: true,
+            })
+        };
+        r.action = transition(" archive");
+        assert_eq!(
+            rule_write_targets(&r),
+            vec![("b", FreesSpace), ("archive", Store)]
+        );
+        // Within one bucket the transition stores there.
+        r.action = transition("b");
+        assert_eq!(rule_write_targets(&r), vec![("b", Store)]);
+        // The same buckets as `rule_write_buckets`, always.
+        for dest in ["archive", " b ", ""] {
+            r.action = transition(dest);
+            let names: Vec<&str> = rule_write_targets(&r).into_iter().map(|(b, _)| b).collect();
+            assert_eq!(names, rule_write_buckets(&r));
+        }
     }
 
     #[test]

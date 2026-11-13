@@ -47,6 +47,7 @@ pub mod gate;
 pub mod live;
 pub mod migrate;
 mod paged;
+pub mod probes;
 pub mod store;
 pub mod worker;
 

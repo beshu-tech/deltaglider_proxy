@@ -191,6 +191,8 @@ impl Config {
         if let Some(resolved) = &self.tuning.limits {
             warnings.extend(resolved.warning_messages());
         }
+        // The disk monitor settings that were not taken as written.
+        warnings.extend(self.tuning.disk_monitor_notes.iter().cloned());
         // Duplicate backend names and routes to undefined backends are FATAL,
         // not warnings: see `check_fatal`, which `check_all` runs first.
 
@@ -915,6 +917,44 @@ mod object_size_tests {
             .check()
             .iter()
             .any(|w| w.contains("DGP_SPOOL_MAX_BYTES") && w.contains("/spool")));
+    }
+
+    /// An input of the disk monitor that is not taken as written is a named
+    /// warning of `Config::check` (boot, `config lint`, apply), never silent.
+    #[test]
+    fn check_carries_the_disk_monitor_notes() {
+        let env = |name: &str| -> Option<String> {
+            match name {
+                "DGP_DISK_CRITICAL_MAX_BYTES" => Some("10GiB".into()),
+                "DGP_DISK_HIGH_PERCENT" => Some("90".into()),
+                "DGP_DISK_LOW_MAX_BYTES" => Some("1".into()),
+                _ => None,
+            }
+        };
+        let mut c = Config {
+            tuning: super::super::RuntimeTuning::from_env(&env),
+            ..Default::default()
+        };
+        let warnings = c.check();
+        for needle in [
+            "DGP_DISK_CRITICAL_MAX_BYTES=\"10GiB\" is not a whole number",
+            "DGP_DISK_HIGH_PERCENT=90 is outside 1 to 50",
+            "DGP_DISK_LOW_MAX_BYTES (1) is below DGP_DISK_HIGH_MAX_BYTES",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w.contains(needle)),
+                "`{needle}` is not in {warnings:?}"
+            );
+        }
+        // The defaults warn about nothing.
+        let mut c = Config {
+            tuning: super::super::RuntimeTuning::from_env(&|_| None),
+            ..Default::default()
+        };
+        assert!(
+            !c.check().iter().any(|w| w.contains("_DISK_")),
+            "a default environment must not warn"
+        );
     }
 }
 

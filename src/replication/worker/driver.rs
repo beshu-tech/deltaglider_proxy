@@ -50,6 +50,10 @@ pub(super) struct RunFlags {
     /// or its backend failed a health check. The cursor is kept; the run
     /// settles "deferred" and is due again shortly.
     pub stopped_deferred: bool,
+    /// A copy was deferred for a full destination DISK (level critical):
+    /// the walk went on with what frees space, and the rule is due again at
+    /// its own cadence, not every minute (a walk lists both sides).
+    pub disk_deferred: bool,
     /// Operator KILL: the run flipped to 'cancelling' mid-flight.
     pub killed: bool,
     /// The poison-cursor guard cleared a stale resume cursor: the settle
@@ -340,17 +344,22 @@ impl<'a> WalkDriver<'a> {
                 // this +1 and drains it, or the copy sees the job and stays
                 // unsettled while the run stops as deferred. The RAII guard
                 // rides in the copy future — a kill dropping it releases it.
-                let admitted = match crate::maintenance::gate::admit_all(
+                let admitted = match crate::maintenance::gate::admit_stores(
                     s.ctrl.maintenance_gate.as_ref(),
                     &[&s.ctrl.dest_bucket],
                 ) {
                     Err(refusal) => {
+                        // A full disk refuses THIS copy only (`disk_full`):
+                        // the walk goes on, so the deletes that free space
+                        // still run. Any other refusal stops the run.
+                        let disk_full = refusal.is_disk();
                         self.inflight.push(Box::pin(async move {
                             DriverDone::Copy {
                                 item_id,
                                 rel_key,
                                 res: Box::new(PerObjectResult {
                                     gated: true,
+                                    disk_full,
                                     error_message: Some(refusal.into_reason()),
                                     ..Default::default()
                                 }),
@@ -502,7 +511,15 @@ impl<'a> WalkDriver<'a> {
                             r.error_message.as_deref().unwrap_or_default()
                         );
                         flags.stopped_deferred = true;
-                        machine.drain(walk::DrainReason::Paused);
+                        // The disk: only this copy waits, and the walk goes
+                        // on with what frees space. Else the run stops.
+                        if !r.disk_full {
+                            machine.drain(walk::DrainReason::Paused);
+                        }
+                    }
+                    if r.disk_full {
+                        flags.disk_deferred = true;
+                        machine.on_event(walk::Event::CopyDeferred { item_id });
                     }
                     return;
                 }

@@ -858,7 +858,7 @@ fn the_file_is_ingested_only_after_the_signature_and_the_policy() {
         "form_body_len(",
         "read_form_head(",
         "authenticate_form_post(",
-        "check_client_write_allowed(",
+        "check_client_store_allowed(",
         "check_verified_request(",
         "ensure_bucket_exists(",
         "check_quota_for_write(",
