@@ -1369,6 +1369,18 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         }
     }
 
+    /// May a LIST of `bucket` trust the unauthenticated `!!1` listing facts?
+    /// Only where the read rule ([`seal::read_verdict`]) serves every
+    /// unsealed object to a client: the bucket writes plaintext
+    /// ([`seal::PlaintextRule::Serves`]). The bytes of such an object are as
+    /// unauthenticated as its facts, so the facts add no trust. A bucket that
+    /// encrypts refuses unsealed objects outside a conversion window
+    /// (`PlaintextRule::Encrypts`); there a forged marker would choose the
+    /// size of a sealed object, so it keeps the `!!2` tokens only.
+    fn v1_facts_trusted(&self, bucket: &str) -> bool {
+        self.writes_plaintext(bucket)
+    }
+
     /// The plaintext rule of `bucket` with the conversion `window`.
     fn plaintext_rule<'w>(
         &self,
@@ -2735,10 +2747,14 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
         page.objects = self.present_listed(b, std::mem::take(&mut page.objects));
         Ok(Some(page))
     }
-    /// With a key, the inner listing may hold ciphertext: its own facts are
-    /// not trusted (a backend writer can forge `!!1` markers), a listed
-    /// size is the stored size, and the logical facts come from listing
-    /// tokens that open under a key of this backend.
+    /// With a key, the inner listing may hold ciphertext. In a bucket that
+    /// encrypts (or converts), its own facts are not trusted (a backend
+    /// writer can forge `!!1` markers), a listed size is the stored size,
+    /// and the logical facts come from listing tokens that open under a key
+    /// of this backend. In a bucket that writes plaintext the read rule
+    /// serves every unsealed object ([`seal::PlaintextRule::Serves`]), so
+    /// the `!!1` facts of its objects are trusted as in a backend without a
+    /// key ([`Self::v1_facts_trusted`]).
     async fn resolve_listed_sizes(
         &self,
         b: &str,
@@ -2754,7 +2770,7 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
                 b,
                 objects,
                 ResolveListed {
-                    trust_v1_facts: false,
+                    trust_v1_facts: self.v1_facts_trusted(b),
                     ..how
                 },
             )

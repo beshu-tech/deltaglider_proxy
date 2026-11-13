@@ -620,6 +620,43 @@ mod tests {
             .expect("the background heal finished the page");
     }
 
+    /// The production shape: bucket `b` writes plaintext, bucket `enc` has
+    /// its own key, one backend. The wrapper holds a key, yet a delta in `b`
+    /// is plaintext by the read rule, so a LIST shows its original size: from
+    /// its `!!1` facts when it has them, from one HEAD when it has none.
+    #[tokio::test]
+    async fn a_plain_delta_on_a_backend_with_a_keyed_bucket_lists_its_original_size() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let writer = engine_on(test_support::for_test_endpoint(&endpoint));
+        writer.create_bucket("b").await.unwrap();
+        crate::deltaglider::store_deltas(&writer, "rel", 3).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fake.stored_count("b/.dg/facts/") < 3 {
+            assert!(tokio::time::Instant::now() < deadline, "facts written");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // With its facts (node 1), and after the facts are gone (node 2).
+        let with_facts = bucket_keyed_reader(&endpoint, "keyed-node-1");
+        let page = list(&with_facts, "rel/").await;
+        assert_eq!(page.objects.len(), 3);
+        let sizes = |p: &crate::deltaglider::ListObjectsPage| -> Vec<u64> {
+            p.objects.iter().map(|(_, m)| m.file_size).collect()
+        };
+        assert_eq!(sizes(&page), [65_536; 3], "from the facts");
+        assert_eq!(fake.remove_prefix("b/.dg/facts/"), 3);
+        let without = bucket_keyed_reader(&endpoint, "keyed-node-2");
+        fake.clear();
+        let page = list(&without, "rel/").await;
+        assert_eq!(sizes(&page), [65_536; 3], "from one HEAD each");
+        assert!(page.facts_missing_keys.is_empty(), "{page:?}");
+        assert!(wait_stored(&fake, 3, "b/.dg/facts/").await, "facts kept");
+        let other = bucket_keyed_reader(&endpoint, "keyed-node-3");
+        fake.clear();
+        let page = list(&other, "rel/").await;
+        assert_eq!(sizes(&page), [65_536; 3]);
+        assert_eq!(fake.requests().iter().filter(|r| delta_heads(r)).count(), 0);
+    }
+
     /// A backend that throttles the HEADs of a LIST does not fail the LIST:
     /// the entries list their stored size, the healer pauses, and a later
     /// LIST is right.
@@ -872,6 +909,34 @@ mod tests {
             .await
             .unwrap();
         page
+    }
+
+    /// An engine whose backend holds a key for bucket `enc` only: bucket `b`
+    /// (and any other) writes plaintext. Its own listing-cache scope.
+    fn bucket_keyed_reader(endpoint: &str, node: &str) -> DynEngine {
+        use crate::storage::{BucketKeys, EncryptingBackend, EncryptionConfig, EncryptionKey};
+        let mut s3 = test_support::for_test_endpoint(endpoint);
+        s3.list_cache_scope = test_support::test_scope(endpoint, node);
+        let key = EncryptionKey::from_hex(&"cd".repeat(32)).unwrap();
+        let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(EncryptionConfig {
+            buckets: std::collections::HashMap::from([(
+                "enc".to_string(),
+                BucketKeys {
+                    key: Some(key.clone()),
+                    key_id: Some("enc-id".into()),
+                    ..Default::default()
+                },
+            )]),
+            keyring: std::collections::HashMap::from([("enc-id".to_string(), key)]),
+            ..Default::default()
+        })));
+        let backend: Box<DynStorageBackend<'static>> =
+            DynStorageBackend::new_box(EncryptingBackend::new(s3, cfg));
+        DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &crate::config::Config::default(),
+            None,
+        )
     }
 
     /// An engine with a proxy-encryption key on the fake, with its own
