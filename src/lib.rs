@@ -60,6 +60,9 @@ pub mod zip_stream;
 #[cfg(test)]
 mod test_root;
 
+#[cfg(test)]
+mod test_log_capture;
+
 /// THE source scanner that every source guard uses: one file walker and one
 /// definition of "production lines". A guard that cut a file at its first
 /// `#[cfg(test)]` stopped at the first test-only ITEM (a `#[cfg(test)] fn`)
@@ -3061,6 +3064,44 @@ mod source_guards {
                 "{f} ({why}) no longer reads env: drop it from ALLOWED"
             );
         }
+    }
+
+    /// A test that reads log output gets its subscriber from
+    /// `test_log_capture` (T7 of #171). `tracing` caches per callsite
+    /// whether anyone wants it, for every thread; a hand-made
+    /// `set_default` / `with_default` can find a callsite cached as "never"
+    /// (a sibling test reached it first) and capture nothing, so a "this is
+    /// not logged" check passes blind. The helper keeps every callsite open,
+    /// and `require_target` names each layer the test claims to watch.
+    #[test]
+    fn log_capture_goes_through_the_one_helper() {
+        let mut offenders = Vec::new();
+        let mut helper_sites = 0;
+        for src in crate::source_scan::ast::src() {
+            for p in &src.test.paths {
+                let n = p.segs.len();
+                let last = p.segs.last().map(String::as_str).unwrap_or("");
+                let own_subscriber = n >= 2
+                    && matches!(p.segs[n - 2].as_str(), "subscriber" | "dispatcher")
+                    && matches!(last, "set_default" | "with_default" | "set_global_default");
+                let rebuild = last == "rebuild_interest_cache";
+                if src.rel == "src/test_log_capture.rs" {
+                    helper_sites += usize::from(own_subscriber || rebuild);
+                } else if own_subscriber || rebuild {
+                    offenders.push(format!("{}:{}: {}", src.rel, p.line, p.segs.join("::")));
+                }
+            }
+        }
+        assert!(
+            helper_sites >= 2,
+            "the guard saw the helper's own calls ({helper_sites})"
+        );
+        assert!(
+            offenders.is_empty(),
+            "capture logs with `crate::test_log_capture::{{capture, capture_with, install}}`, \
+             not a hand-made subscriber:\n{}",
+            offenders.join("\n")
+        );
     }
 
     /// `(line, what)` of every read of the process environment in `f`: a
