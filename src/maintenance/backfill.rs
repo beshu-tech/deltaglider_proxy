@@ -194,7 +194,7 @@ pub(crate) async fn execute_backfill_phases(
 
 /// The backfill per-object step: hash the content once, stamp the
 /// canonical metadata in place.
-struct Backfill<'a> {
+pub(crate) struct Backfill<'a> {
     bucket: &'a str,
     refresh_last_modified: bool,
 }

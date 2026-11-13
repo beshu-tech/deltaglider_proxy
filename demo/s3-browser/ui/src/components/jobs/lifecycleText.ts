@@ -113,7 +113,7 @@ export function lifecycleRunResultText(
   if (run.status === 'deferred')
     return {
       type: 'warning',
-      text: `Lifecycle rule "${rule}" deferred by a maintenance job: ${did}${failed}. It goes on in about a minute.`,
+      text: `Lifecycle rule "${rule}" deferred (a maintenance job or a full destination disk holds the bucket): ${did}${failed}. It goes on at the rule's next run.`,
     };
   if (run.status === 'cancelled') return { type: 'warning', text: `Lifecycle rule "${rule}" killed: ${did}${failed}.` };
   if (run.status === 'failed') return { type: 'error', text: `Lifecycle rule "${rule}" failed: ${did}${failed}.` };

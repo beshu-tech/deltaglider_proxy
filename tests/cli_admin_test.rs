@@ -446,3 +446,55 @@ async fn test_s3_verbs_refuse_a_deltaglider_proxy_endpoint() {
         assert!(stderr.contains("storage backend"), "{args:?}: {stderr}");
     }
 }
+
+/// A disk monitor setting that is not taken as written is a named warning
+/// of `config lint` (the exit code stays 0: the file is valid): a size with a
+/// unit, a percent out of range and a ceiling below the one of a higher level.
+/// A clean environment prints no such warning.
+#[tokio::test]
+async fn test_config_lint_warns_for_disk_monitor_settings_it_does_not_take_as_written() {
+    let yaml_path = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        yaml_path.path(),
+        "storage:\n  filesystem: /tmp/dgp-cli-disk-lint\n",
+    )
+    .unwrap();
+    let path = yaml_path.path().to_str().unwrap();
+    let lint = |env: &[(&str, &str)]| {
+        let mut cmd = common::proxy_binary();
+        cmd.current_dir(std::env::temp_dir())
+            .args(["config", "lint", path])
+            .env("DGP_BOOTSTRAP_PASSWORD", TEST_PASSWORD);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().unwrap();
+        (
+            output.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    };
+    let (code, all) = lint(&[
+        ("DGP_DISK_CRITICAL_MAX_BYTES", "10GiB"),
+        ("DGP_DISK_HIGH_PERCENT", "90"),
+        ("DGP_DISK_LOW_MAX_BYTES", "1"),
+    ]);
+    assert_eq!(code, Some(0), "{all}");
+    for needle in [
+        "DGP_DISK_CRITICAL_MAX_BYTES=\"10GiB\" is not a whole number",
+        "DGP_DISK_HIGH_PERCENT=90 is outside 1 to 50",
+        "DGP_DISK_LOW_MAX_BYTES (1) is below DGP_DISK_HIGH_MAX_BYTES",
+    ] {
+        assert!(all.contains(needle), "`{needle}` missing from: {all}");
+    }
+    let (code, all) = lint(&[]);
+    assert_eq!(code, Some(0), "{all}");
+    assert!(
+        !all.contains("DGP_DISK_"),
+        "a clean environment warns: {all}"
+    );
+}

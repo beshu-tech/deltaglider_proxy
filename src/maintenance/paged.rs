@@ -244,6 +244,13 @@ pub(crate) trait PageStep {
     async fn end_page(&mut self) -> Result<(), PhaseStop> {
         Ok(())
     }
+    /// Why no further object may start now (a phase that STORES bytes while
+    /// the disk it writes to is at level critical): the phase defers, and
+    /// the objects in flight end. Asked before EACH object. A phase that
+    /// stores nothing keeps the default.
+    fn refused(&self) -> Option<String> {
+        None
+    }
 }
 
 /// How one paged phase runs.
@@ -366,6 +373,7 @@ async fn run_objects<S: PageStep>(
     concurrency: usize,
 ) -> Result<(), PhaseStop> {
     let mut outcomes: Vec<S::Done> = Vec::with_capacity(keys.len());
+    let mut refused: Option<String> = None;
     {
         let step: &S = step;
         let mut next = keys.iter();
@@ -376,6 +384,14 @@ async fn run_objects<S: PageStep>(
                 && in_flight.len() < concurrency.max(1)
                 && !crate::shutdown::is_shutting_down()
             {
+                // The disk gate of a phase that stores bytes, per object.
+                if next.len() > 0 {
+                    if let Some(why) = step.refused() {
+                        refused = Some(why);
+                        stopped = true;
+                        break;
+                    }
+                }
                 let Some(key) = next.next() else { break };
                 in_flight.push_back(async move {
                     object_stall().await;
@@ -395,6 +411,9 @@ async fn run_objects<S: PageStep>(
     }
     if started < keys.len() {
         stop_if_shutting_down()?;
+        if let Some(why) = refused {
+            return Err(PhaseStop::Deferred(why));
+        }
         return Err(PhaseStop::Failed(format!(
             "the phase stopped before '{}'",
             keys[started]
@@ -421,6 +440,11 @@ mod tests {
         object_ms: u64,
         /// The object whose outcome stops the phase.
         stop_at: Option<&'static str>,
+        /// A phase that stores bytes: no object starts once this many ran
+        /// (the disk of its bucket turned critical); `None`: never.
+        refuse_after: Option<usize>,
+        /// Set by the object that makes the disk critical.
+        disk_critical: std::sync::atomic::AtomicBool,
         in_flight: AtomicUsize,
         peak: AtomicUsize,
     }
@@ -485,6 +509,11 @@ mod tests {
             self.push(format!("mid {token:?}"));
             Ok(())
         }
+        fn refused(&self) -> Option<String> {
+            self.disk_critical
+                .load(Ordering::SeqCst)
+                .then(|| "the disk is critical".to_string())
+        }
         async fn object(&self, key: &str) -> bool {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
@@ -493,6 +522,10 @@ mod tests {
             }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             self.push(format!("ran {key}"));
+            let ran = self.log().iter().filter(|l| l.starts_with("ran ")).count();
+            if self.refuse_after.is_some_and(|n| ran >= n) {
+                self.disk_critical.store(true, Ordering::SeqCst);
+            }
             self.stop_at != Some(key)
         }
         fn stops(done: &bool) -> bool {
@@ -567,6 +600,50 @@ mod tests {
                 job: &self.job,
             }
         }
+    }
+
+    /// A phase that stores bytes defers while its disk is critical: no object
+    /// starts after the refusal (asked before EACH object), the objects that
+    /// ran are settled, and the page is NOT saved (they are done again on
+    /// resume). A phase that stores nothing keeps its default and finishes.
+    #[tokio::test]
+    async fn a_phase_that_stores_defers_before_the_next_object_and_saves_no_cursor() {
+        let d = db();
+        let mut f = two_pages();
+        f.refuse_after = Some(1);
+        let one_at_a_time = PhaseSpec {
+            concurrency: 1,
+            ..spec(None, None)
+        };
+        let err = paged_phase(d.ctx(), one_at_a_time, &mut f)
+            .await
+            .unwrap_err();
+        assert_eq!(err, PhaseStop::Deferred("the disk is critical".into()));
+        let log = settled(&f);
+        assert!(log.contains(&"obj a".to_string()), "{log:?}");
+        assert!(
+            !log.contains(&"obj b".to_string()),
+            "b never started: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("save ")),
+            "the page is not saved: {log:?}"
+        );
+        // Several in flight: the ones started finish, none starts after (the
+        // next page asks again before its first object).
+        let mut f = two_pages();
+        f.object_ms = 20;
+        f.refuse_after = Some(2);
+        let err = paged_phase(d.ctx(), spec(None, None), &mut f)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PhaseStop::Deferred(_)), "{err:?}");
+        assert!(!f.log().contains(&"ran c".to_string()));
+        // No refusal: the phase runs to its end.
+        let mut f = two_pages();
+        paged_phase(d.ctx(), spec(None, None), &mut f)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -86,11 +86,17 @@ impl S3Access for VerifiedIdentityS3sAccess {
             // verified the signature: their 503 names a busy bucket or a
             // backend's state, which a forged signature must not learn.
             let (method, path) = (cx.method().clone(), cx.uri().path().to_owned());
+            let query = cx.uri().query().map(str::to_owned);
             // Through the one error bridge, like the form-POST path: the
             // client gets the gate's own message, and the response layer
             // adds the 503's `Retry-After`.
-            crate::maintenance::gate::check_verified_request(cx.extensions_mut(), &method, &path)
-                .map_err(s3s::S3Error::from)
+            crate::maintenance::gate::check_verified_request_q(
+                cx.extensions_mut(),
+                &method,
+                &path,
+                query.as_deref(),
+            )
+            .map_err(s3s::S3Error::from)
         } else {
             tracing::warn!(
                 "SECURITY | event=identity_mismatch | resolved={} | verified={}",

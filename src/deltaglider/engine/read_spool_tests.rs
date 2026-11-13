@@ -318,6 +318,48 @@ async fn a_small_put_against_a_large_reference_without_spool_is_stored_whole() {
     assert_eq!(engine.retrieve("b", "rel/s.zip").await.unwrap().0, small);
 }
 
+/// The disk gate (`disk_watch`) says no like a full budget: a 2 KiB PUT
+/// against a reference above the threshold used to degrade to a whole store
+/// when the budget was full, and still does when the spool DISK is at level
+/// high. It is not refused: its body is in memory and the write needs no
+/// spool.
+#[tokio::test]
+async fn a_small_put_against_a_large_reference_at_a_full_spool_disk_is_stored_whole() {
+    use crate::disk_watch::Level;
+    let (_dir, engine, _) = engine(64 * 1024).await;
+    let base = noise(11, 200 * 1024);
+    engine
+        .store("b", "rel/a.zip", &base, None, HashMap::new())
+        .await
+        .unwrap();
+    engine
+        .spool
+        .gate()
+        .set(Level::High, "the spool disk is full".into());
+    let mut small = base[..2048].to_vec();
+    small[100] ^= 1;
+    let r = engine
+        .store("b", "rel/s.zip", &small, None, HashMap::new())
+        .await
+        .expect("a full spool disk does not refuse a write that needs no spool");
+    assert_eq!(r.metadata.storage_info.label(), "passthrough");
+    assert_eq!(
+        r.metadata.passthrough_reason.as_deref(),
+        Some("delta-unavailable")
+    );
+    assert_eq!(engine.retrieve("b", "rel/s.zip").await.unwrap().0, small);
+    // With room again the same PUT is a delta.
+    engine.spool.gate().set(Level::Ok, String::new());
+    let mut again = base[..2048].to_vec();
+    again[200] ^= 1;
+    let r = engine
+        .store("b", "rel/t.zip", &again, None, HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(r.metadata.storage_info.label(), "delta");
+    budget_is_free(&engine);
+}
+
 /// The legacy-reference migration of a reference above the spool
 /// threshold encodes it against itself from a spool file: the reference
 /// cache refuses a reference this large, so the migration must not go

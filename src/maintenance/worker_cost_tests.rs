@@ -771,3 +771,656 @@ async fn the_background_count_gives_the_total() {
     }
     assert_eq!(count.get(), Some(5));
 }
+
+// ---- a job that waits for disk space ----
+
+/// [`env`] with a spool of its own: the disk gate of the process-wide spool
+/// must not feel a test's full disk.
+async fn env_own_spool(objects: usize) -> Env {
+    let (engine, fake) = s3_engine().await;
+    for i in 0..objects {
+        engine
+            .store(
+                "b",
+                &format!("k-{i:03}.txt"),
+                b"x",
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine.with_spool_dir(
+        crate::deltaglider::spool::SpoolDir::new(dir.path().join("spool"), 8 * 1024 * 1024)
+            .unwrap(),
+    );
+    let config: SharedConfig = crate::config::Config::default().into_shared();
+    let state = AppState::for_tests(engine);
+    let mutator = ConfigMutator {
+        config: config.clone(),
+        app: state.clone(),
+        persist_path: dir.path().join("c.yaml").display().to_string(),
+    };
+    let db = JobsDb::in_memory("k").unwrap();
+    db.maintenance_create_job(
+        "reencrypt",
+        "b",
+        "counting",
+        None,
+        "admin",
+        unique_created_at(),
+    )
+    .unwrap()
+    .unwrap();
+    fake.clear();
+    Env {
+        state,
+        fake,
+        db: Arc::new(Mutex::new(db)),
+        config,
+        mutator,
+        _dir: dir,
+    }
+}
+
+/// Every path is one 100 GiB disk with `free` GiB free.
+struct OneDisk(u64);
+
+impl crate::disk_watch::DiskProbe for OneDisk {
+    fn measure(&self, _path: &std::path::Path) -> Option<crate::disk_watch::PathFacts> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        Some(crate::disk_watch::PathFacts {
+            free: self.0 * GIB,
+            total: 100 * GIB,
+            device: 1,
+        })
+    }
+}
+
+/// A monitor of this test's thread: the backend `default` (where a bucket
+/// with no route lives) has `free` GiB of 100 free, and the spool is its own.
+pub(crate) fn watch_with(state: &AppState, free: u64) -> Arc<crate::disk_watch::DiskWatch> {
+    let gate = state.engine.load().spool_dir().gate().clone();
+    let watch = Arc::new(crate::disk_watch::DiskWatch::new(gate));
+    set_free(&watch, free);
+    crate::disk_watch::install_for_this_test(watch.clone());
+    watch
+}
+
+pub(crate) fn set_free(watch: &crate::disk_watch::DiskWatch, free: u64) {
+    use crate::disk_watch::{Sizing, Targets};
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let tuning = crate::config::tuning::RuntimeTuning::default().disk_monitor;
+    let targets = Targets {
+        spool_dir: "/spool".into(),
+        backends: vec![("default".into(), "/data".into())],
+        data_dir: "/state".into(),
+        default_backend: "default".into(),
+        spool_by_use: false,
+    };
+    let sizing = Sizing {
+        budget: 8 * GIB,
+        used: 0,
+        largest_reservation: GIB,
+    };
+    watch.tick(
+        &OneDisk(free),
+        &targets,
+        &tuning,
+        sizing,
+        std::time::Instant::now(),
+        None,
+    );
+}
+
+impl Env {
+    /// [`Env::run`] with a wait of `defer_secs` after a deferral.
+    async fn run_waiting(&self, job: MaintenanceJob, defer_secs: i64) {
+        run_job(
+            &self.mutator,
+            &self.config,
+            &self.db,
+            &self.state,
+            Holder {
+                defer_secs: Some(defer_secs),
+                ..Holder::test("inst")
+            },
+            job,
+        )
+        .await;
+    }
+}
+
+/// Keep the write gate on the re-encrypt of bucket `b`: its backend has no
+/// proven conditional writes, so the job holds the bucket and its wait for disk
+/// space has deletes to let pass. (A job whose rewrites are conditional holds
+/// nothing; see `a_reencrypt_without_the_write_gate_sets_no_mark_and_never_drains`.)
+async fn keep_the_write_gate(e: &Env) {
+    // A backend that no probe reaches has no proven conditional writes
+    // (`rewrites_are_conditional`), so the job keeps the gate.
+    e.config.write().await.backend = crate::config::BackendConfig::S3 {
+        endpoint: Some("http://127.0.0.1:9".into()),
+        region: "us-east-1".into(),
+        force_path_style: true,
+        access_key_id: None,
+        secret_access_key: None,
+        allow_local: true,
+        session_token: None,
+    };
+}
+
+/// A re-encrypt (legacy rows have no conditional writes: they gate their
+/// bucket) that finds the disk of its bucket full waits, with its mark on the
+/// gate: a delete into the bucket passes meanwhile; the wait goes on while the
+/// disk stays full; and when it ends, ON THE REAL CLOCK (the row is claimed
+/// after its wait has passed, so the mark has expired by then), a delete that
+/// the wait admitted and that is still running holds the job: the job does not
+/// run before it ends. No restart, no faked `now`.
+#[tokio::test]
+async fn a_reencrypt_that_waits_for_disk_resumes_on_the_real_clock_and_drains_the_deletes() {
+    let e = env_own_spool(4).await;
+    keep_the_write_gate(&e).await;
+    let watch = watch_with(&e.state, 3);
+    e.state
+        .engine
+        .load()
+        .spool_dir()
+        .gate()
+        .set(crate::disk_watch::Level::Ok, String::new());
+    let gate = e.state.maintenance_gate.clone();
+    let row = |id| {
+        let db = e.db.clone();
+        async move { db.lock().await.maintenance_job_by_id(id).unwrap().unwrap() }
+    };
+
+    let job = e.claim().await.unwrap();
+    let id = job.id;
+    gate.sync_from(&*e.db.lock().await);
+    e.run_waiting(job, 1).await;
+    let r = row(id).await;
+    assert_eq!(r.status, "queued", "{r:?}");
+    assert!(
+        r.last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("backend 'default'"),
+        "{r:?}"
+    );
+    assert_eq!(
+        r.objects_skipped + r.objects_done,
+        0,
+        "nothing was rewritten: {r:?}"
+    );
+    assert!(gate.is_disk_deferred(id), "the wait is on the gate");
+    assert_eq!(
+        gate.busy_kind_for("b", crate::maintenance::gate::WriteKind::FreesSpace),
+        None,
+        "deletes pass"
+    );
+    assert_eq!(gate.write_blocked("b"), None, "a delete job passes");
+
+    // The wait ends on the real clock: the claim finds the row only now, and
+    // the mark has expired. Still critical: the job waits on, the mark is
+    // renewed.
+    assert!(e.claim().await.is_none(), "claimed before its wait ended");
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    assert!(!gate.is_disk_deferred(id), "the mark expired with the wait");
+    assert!(gate.has_disk_mark(id), "but the job's mark is still there");
+    let job = e.claim().await.expect("claimable once its wait is over");
+    gate.sync_from(&*e.db.lock().await);
+    e.run_waiting(job, 1).await;
+    assert_eq!(row(id).await.status, "queued");
+    assert!(
+        gate.is_disk_deferred(id),
+        "the mark is renewed while the disk is full"
+    );
+
+    // Space again. A delete that the wait admitted is STILL RUNNING when the
+    // wait ends: the job must not run before it is over.
+    set_free(&watch, 50);
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    let in_flight_delete = gate.begin_write("b");
+    let job = e.claim().await.expect("claimable");
+    gate.sync_from(&*e.db.lock().await);
+    let finished = std::sync::atomic::AtomicBool::new(false);
+    let run = async {
+        e.run_waiting(job, 1).await;
+        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+    };
+    let release = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the job ran while a delete of the wait was still in flight"
+        );
+        assert!(
+            !gate.is_disk_deferred(id),
+            "a delete is refused from now on"
+        );
+        drop(in_flight_delete);
+    };
+    tokio::join!(run, release);
+    let r = row(id).await;
+    assert_eq!(r.status, "completed", "{r:?}");
+    assert!(!gate.has_disk_mark(id), "the mark ends with the drain");
+}
+
+/// A re-encrypt whose rewrites are conditional holds no write gate: client
+/// writes go on, deletes need no pass, and a resume has nothing to drain. A
+/// client write that is in flight at its resume must not hold it (the drain
+/// would wait up to the request timeout and then fail the job).
+#[tokio::test]
+async fn a_reencrypt_without_the_write_gate_sets_no_mark_and_never_drains() {
+    let e = env_own_spool(4).await;
+    let watch = watch_with(&e.state, 3);
+    e.state
+        .engine
+        .load()
+        .spool_dir()
+        .gate()
+        .set(crate::disk_watch::Level::Ok, String::new());
+    let gate = e.state.maintenance_gate.clone();
+    let row = |id| {
+        let db = e.db.clone();
+        async move { db.lock().await.maintenance_job_by_id(id).unwrap().unwrap() }
+    };
+    let job = e.claim().await.unwrap();
+    let id = job.id;
+    {
+        let db = e.db.lock().await;
+        db.maintenance_set_params(id, Some("{\"conditional_writes\":true}"))
+            .unwrap();
+        gate.sync_from(&db);
+    }
+    assert!(!gate.arms_job(id), "a conditional job holds no bucket");
+    e.run_waiting(job, 1).await;
+    let r = row(id).await;
+    assert_eq!(r.status, "queued");
+    assert!(
+        !r.params.as_deref().unwrap_or("").contains("disk_wait"),
+        "an ungated job records no wait: {r:?}"
+    );
+    assert!(!gate.arms_job(id), "the run kept the job conditional");
+    assert!(!gate.has_disk_mark(id), "no gate, so no wait to mark");
+
+    // Space again, and a client write in flight at the resume.
+    set_free(&watch, 50);
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    let client_write = gate.begin_write("b");
+    let job = e.claim().await.expect("claimable");
+    gate.sync_from(&*e.db.lock().await);
+    tokio::time::timeout(std::time::Duration::from_secs(5), e.run_waiting(job, 1))
+        .await
+        .expect("the resume waited for a client write that the job does not gate");
+    drop(client_write);
+    assert_eq!(row(id).await.status, "completed");
+}
+
+/// The resume order: the gate is whole FIRST (a delete is refused from that
+/// moment), THEN the deletes that were admitted meanwhile are drained. A
+/// delete still in flight holds the job: it waits for it and gives up after
+/// its ceiling (the request timeout, so no request outlives it).
+#[tokio::test]
+async fn a_job_that_runs_again_closes_the_gate_before_it_drains_the_deletes() {
+    use crate::maintenance::gate::{MaintenanceGate, WriteKind};
+    let gate = Arc::new(MaintenanceGate::new());
+    gate.set_busy("b");
+    gate.mark_disk_deferred(5, current_unix_seconds() + 600);
+    let _in_flight_delete = gate.begin_write("b");
+    // `set_busy` has no job id: the closing is the mark's.
+    let stop = resume_after_disk_wait(&gate, 5, "b", std::time::Duration::from_millis(60))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(stop, PhaseStop::Failed(_) | PhaseStop::Deferred(_)),
+        "{stop:?}"
+    );
+    assert!(
+        !gate.is_disk_deferred(5),
+        "the wait is closed before the drain: a delete is refused"
+    );
+    assert!(
+        gate.has_disk_mark(5),
+        "a drain that gave up keeps the mark: the next claim drains again"
+    );
+    // Without the in-flight delete it drains at once, and only then is the
+    // mark gone.
+    drop(_in_flight_delete);
+    gate.mark_disk_deferred(5, current_unix_seconds() + 600);
+    resume_after_disk_wait(&gate, 5, "b", std::time::Duration::from_millis(60))
+        .await
+        .unwrap();
+    assert!(!gate.is_disk_deferred(5));
+    assert!(!gate.has_disk_mark(5), "the mark ends after the drain");
+    let _ = WriteKind::Store;
+}
+
+/// A re-encrypt does not wait for the SPOOL disk as a whole: its objects need
+/// a spool file only above the spool threshold (and an S3 bucket's never do).
+/// With the spool disk full and the disk of its bucket fine, a job whose
+/// objects need no spool runs to its end.
+#[tokio::test]
+async fn a_reencrypt_whose_objects_need_no_spool_runs_at_a_full_spool_disk() {
+    use crate::disk_watch::Level;
+    let e = env_own_spool(4).await;
+    let _watch = watch_with(&e.state, 50);
+    e.state
+        .engine
+        .load()
+        .spool_dir()
+        .gate()
+        .set(Level::High, "the spool disk is full".into());
+    let job = e.claim().await.unwrap();
+    let id = job.id;
+    e.run(job).await;
+    let row =
+        e.db.lock()
+            .await
+            .maintenance_job_by_id(id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.objects_failed, 0, "{row:?}");
+    assert!(!e.state.maintenance_gate.is_disk_deferred(id));
+}
+
+/// An object that DOES need a spool file meets the spool gate in its own
+/// rewrite: that is not its failure. The job waits and does it again; the
+/// objects before it are settled and no failure is recorded.
+#[tokio::test]
+async fn an_object_that_needs_spool_at_a_full_spool_disk_defers_the_job() {
+    struct DefersAt(&'static str);
+    impl ObjectVisitor for DefersAt {
+        async fn visit(
+            &self,
+            _engine: &Arc<crate::deltaglider::DynEngine>,
+            key: &str,
+            _listed: Option<crate::storage::ObjectVariant>,
+        ) -> Visit {
+            if key == self.0 {
+                Visit::Deferred("the spool disk is full".into())
+            } else {
+                Visit::Done { bytes: 1 }
+            }
+        }
+    }
+    let e = env_own_spool(4).await;
+    let job = e.claim().await.unwrap();
+    let id = job.id;
+    let stop = run_count_then_walk(
+        &e.db,
+        &e.state,
+        Holder::test("inst"),
+        &job,
+        "test job",
+        &mut DefersAt("k-002.txt"),
+    )
+    .await
+    .err()
+    .expect("the job waits");
+    assert_eq!(stop, PhaseStop::Deferred("the spool disk is full".into()));
+    let row =
+        e.db.lock()
+            .await
+            .maintenance_job_by_id(id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(row.objects_failed, 0, "no failure is recorded: {row:?}");
+}
+
+/// A failed rewrite is the object's failure, except a retryable refusal of
+/// the spool disk gate that is in force now: that defers the job.
+#[test]
+fn a_rewrite_error_defers_only_for_the_spool_gate() {
+    use crate::deltaglider::EngineError;
+    let failed = || Visit::Failed("rewrite failed".into());
+    let overloaded = EngineError::Overloaded("busy".into());
+    let other = EngineError::NotFound("k".into());
+    let why = || Some("the spool disk is full".to_string());
+    assert!(matches!(
+        rewrite_error_visit(&overloaded, why(), failed),
+        Visit::Deferred(m) if m == "the spool disk is full"
+    ));
+    // Overloaded with the gate open: a full budget, an object's failure.
+    assert!(matches!(
+        rewrite_error_visit(&overloaded, None, failed),
+        Visit::Failed(_)
+    ));
+    // Another error, even with the gate shut: the object's failure.
+    assert!(matches!(
+        rewrite_error_visit(&other, why(), failed),
+        Visit::Failed(_)
+    ));
+}
+
+/// A wait for disk space opens the gate to deletes only where that is safe:
+/// a re-encrypt, and a migrate in its COPY phase. A migrate deferred in the
+/// stage, the verify, the flip or the cleanup while the disk is critical (a
+/// backend that does not answer defers it too) is NOT marked: its verify would
+/// not see a delete.
+#[tokio::test]
+async fn a_disk_wait_marks_the_gate_only_in_the_phases_where_it_is_safe() {
+    use crate::coordination::health::HealthVerdict;
+    for (kind, phase, marked) in [
+        ("migrate", "stage", false),
+        ("migrate", "copy", true),
+        ("migrate", "verify", false),
+        ("migrate", "flip", false),
+        ("migrate", "cleanup", false),
+        ("reencrypt", "objects", true),
+    ] {
+        let mut e = env_own_spool(0).await;
+        let _watch = watch_with(&e.state, 3);
+        e.state
+            .engine
+            .load()
+            .spool_dir()
+            .gate()
+            .set(crate::disk_watch::Level::Ok, String::new());
+        let params = (kind == "migrate").then(|| {
+            serde_json::to_string(&super::super::migrate::MigrateParams {
+                disk_wait: false,
+                target_backend: "default".into(),
+                delete_source: false,
+                transient_key: "__dgmigrate_b_0".into(),
+                from_backend: "default".into(),
+                target: super::super::migrate::MigrateTarget::Empty,
+            })
+            .unwrap()
+        });
+        let db = JobsDb::in_memory("k").unwrap();
+        db.maintenance_create_job(
+            kind,
+            "b",
+            phase,
+            params.as_deref(),
+            "admin",
+            unique_created_at(),
+        )
+        .unwrap()
+        .unwrap();
+        e.db = Arc::new(Mutex::new(db));
+        // The backend does not answer: the job defers before any phase, with
+        // the disk of its bucket critical as well.
+        {
+            let cfg = e.config.read().await;
+            let (name, def) = cfg.effective_backend_for_bucket("b").unwrap();
+            e.state.backend_health.set(
+                &name,
+                def,
+                HealthVerdict::Unreachable {
+                    detail: "connection refused".into(),
+                },
+            );
+        }
+        let job = e.claim().await.unwrap();
+        let id = job.id;
+        e.state.maintenance_gate.sync_from(&*e.db.lock().await);
+        e.run(job).await;
+        let row =
+            e.db.lock()
+                .await
+                .maintenance_job_by_id(id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(row.status, "queued", "{kind} {phase}: {row:?}");
+        assert_eq!(
+            e.state.maintenance_gate.has_disk_mark(id),
+            marked,
+            "{kind} in phase {phase}"
+        );
+    }
+}
+
+/// A re-encrypt visit of an object ABOVE the spool threshold at a full spool
+/// disk meets the spool gate in its rewrite: the job waits. The visit is not
+/// the object's failure (nothing is recorded), and the object stays as it was.
+#[tokio::test]
+async fn a_large_reencrypt_visit_at_a_full_spool_disk_defers_and_leaves_the_object() {
+    use crate::disk_watch::Level;
+    let e = env_own_spool(0).await;
+    let engine = e.state.engine.load_full();
+    let large = vec![9u8; (engine.spool_threshold() + 1024 * 1024) as usize];
+    engine
+        .store("b", "large.jpg", &large, None, Default::default())
+        .await
+        .unwrap();
+    engine
+        .spool_dir()
+        .gate()
+        .set(Level::High, "the spool disk is full".into());
+    let marker = crate::maintenance::conversion::begin(&engine, "b", None)
+        .await
+        .unwrap();
+    let adoptions = crate::maintenance::conversion::Adoptions::default();
+    let visitor = Reencrypt {
+        config: &e.config,
+        bucket: "b",
+        desired: Some(DesiredEncryption::Proxy {
+            key_id: "k1".into(),
+        }),
+        writes_plaintext: false,
+        marker: &marker,
+        adoptions: &adoptions,
+        unconditional: crate::deltaglider::Unconditional::Allowed,
+    };
+    let visit = visitor.visit(&engine, "large.jpg", None).await;
+    assert!(
+        matches!(&visit, Visit::Deferred(m) if m == "the spool disk is full"),
+        "a refusal of the spool gate defers the job: {}",
+        match &visit {
+            Visit::Failed(m) => format!("Failed({m})"),
+            _ => "another outcome".into(),
+        }
+    );
+    // The object is whole and unchanged (no marker was stamped).
+    let meta = engine.head("b", "large.jpg").await.unwrap();
+    assert!(
+        needs_rewrite(
+            &meta.user_metadata,
+            &DesiredEncryption::Proxy {
+                key_id: "k1".into()
+            }
+        ),
+        "the object was not rewritten"
+    );
+    assert_eq!(engine.retrieve("b", "large.jpg").await.unwrap().0, large);
+    // With room again the same visit rewrites it.
+    engine.spool_dir().gate().set(Level::Ok, String::new());
+    assert!(matches!(
+        visitor.visit(&engine, "large.jpg", None).await,
+        Visit::Done { .. } | Visit::Adopted { .. }
+    ));
+}
+
+/// The same large re-encrypt visit at a spool that refuses by the USE of its
+/// budget (the disk level is fine): it defers too, and the object stays as it
+/// was. It used to fail, land in the failure ring and end the job
+/// `completed_with_errors`.
+#[tokio::test]
+async fn a_large_reencrypt_visit_at_a_spool_refusing_by_use_defers() {
+    let e = env_own_spool(0).await;
+    let engine = e.state.engine.load_full();
+    let large = vec![9u8; (engine.spool_threshold() + 1024 * 1024) as usize];
+    engine
+        .store("b", "large.jpg", &large, None, Default::default())
+        .await
+        .unwrap();
+    let mut th = crate::disk_watch::Thresholds::new(
+        &crate::config::tuning::RuntimeTuning::default().disk_monitor,
+        9 * 1024 * 1024,
+    );
+    th.high_floor = 9 * 1024 * 1024 * 1024;
+    engine.spool_dir().gate().set_by_use(Some(th));
+    assert!(engine.spool_dir().write_refusal().is_some());
+    let marker = crate::maintenance::conversion::begin(&engine, "b", None)
+        .await
+        .unwrap();
+    let adoptions = crate::maintenance::conversion::Adoptions::default();
+    let visitor = Reencrypt {
+        config: &e.config,
+        bucket: "b",
+        desired: Some(DesiredEncryption::Proxy {
+            key_id: "k1".into(),
+        }),
+        writes_plaintext: false,
+        marker: &marker,
+        adoptions: &adoptions,
+        unconditional: crate::deltaglider::Unconditional::Allowed,
+    };
+    let visit = visitor.visit(&engine, "large.jpg", None).await;
+    assert!(
+        matches!(&visit, Visit::Deferred(_)),
+        "a refusal by use defers the job: {}",
+        match &visit {
+            Visit::Failed(m) => format!("Failed({m})"),
+            _ => "another outcome".into(),
+        }
+    );
+    assert_eq!(engine.retrieve("b", "large.jpg").await.unwrap().0, large);
+}
+
+/// A visit that defers the job stops the page: no later object STARTS (the
+/// phase's `stops`), so a job that waits for the disk does not go on rewriting.
+#[tokio::test]
+async fn a_deferral_stops_the_objects_after_it() {
+    use std::sync::Mutex as StdMutex;
+    struct Recorder(StdMutex<Vec<String>>);
+    impl ObjectVisitor for Recorder {
+        const CONCURRENCY: usize = 1;
+        async fn visit(
+            &self,
+            _engine: &Arc<crate::deltaglider::DynEngine>,
+            key: &str,
+            _listed: Option<crate::storage::ObjectVariant>,
+        ) -> Visit {
+            self.0.lock().unwrap().push(key.to_string());
+            if key == "k-001.txt" {
+                Visit::Deferred("the spool disk is full".into())
+            } else {
+                Visit::Done { bytes: 1 }
+            }
+        }
+    }
+    let e = env_own_spool(4).await;
+    let job = e.claim().await.unwrap();
+    let mut visitor = Recorder(StdMutex::new(Vec::new()));
+    let stop = run_count_then_walk(
+        &e.db,
+        &e.state,
+        Holder::test("inst"),
+        &job,
+        "test job",
+        &mut visitor,
+    )
+    .await
+    .err()
+    .expect("the job waits");
+    assert!(matches!(stop, PhaseStop::Deferred(_)), "{stop:?}");
+    assert_eq!(
+        *visitor.0.lock().unwrap(),
+        ["k-000.txt", "k-001.txt"],
+        "nothing starts after the deferred object"
+    );
+}
