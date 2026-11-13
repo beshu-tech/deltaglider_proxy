@@ -467,7 +467,7 @@ The proxy now measures the free space of the spool directory, of the root of eve
 
 Two behaviors are new:
 
-1. **At level high or critical on the disk of the spool, the proxy refuses new uploads that need spool space.** A request that holds no spool space yet gets `503 SlowDown`, and the message names the level, the directory and the settings to change. S3 clients retry that status. A request that already holds spool space runs to its end. Reads, deletes and uploads that the proxy holds in memory (bodies of at most `DGP_SPOOL_THRESHOLD_BYTES`) are not affected.
+1. **At level high or critical on the disk of the spool, the proxy refuses new uploads that need spool space.** A request that holds no spool space yet gets `503 SlowDown`, and the message names the level, the directory and the settings to change. S3 clients retry that status. A request that already holds spool space runs to its end. Reads, deletes and uploads that need no spool file are not affected: a body of at most `DGP_SPOOL_THRESHOLD_BYTES` of a file type that the proxy stores whole (an image, a video) stays in memory. A small file of a delta-eligible type (such as `.zip`) is refused too, because the delta encode needs a spool file for its source.
 2. **At level critical on the disk of a filesystem backend, the proxy refuses writes to the buckets of that backend** with `503 SlowDown`. Deletes still work, because they free space. Replication and lifecycle runs wait for the disk in the same way.
 
 `GET /_/ready` does not change. A node with a full disk still serves reads, so it stays ready.

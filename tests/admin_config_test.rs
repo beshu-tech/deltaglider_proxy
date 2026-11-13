@@ -2552,6 +2552,7 @@ async fn put_status(server: &TestServer, key: &str, len: usize) -> (u16, String)
 /// at 50% free the same upload succeeds.
 #[tokio::test]
 async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
+    common::expect_server_errors("the disk level high refuses a new upload that needs spool space");
     let (_spool, ok) = disk_server(50).await;
     let (status, body) = put_status(&ok, "large.bin", 4 * MIB as usize).await;
     assert_eq!(status, 200, "a disk with room admits the upload: {body}");
@@ -2568,10 +2569,14 @@ async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
         metrics.contains("deltaglider_disk_level{path_role=\"spool\"} 2"),
         "{metrics}"
     );
-    assert!(
-        metrics.contains("deltaglider_spool_budget_bytes"),
-        "{metrics}"
-    );
+    for name in [
+        "deltaglider_spool_budget_bytes",
+        "deltaglider_spool_dir_free_bytes",
+        "deltaglider_spool_dir_total_bytes",
+        "deltaglider_disk_free_bytes{path_role=\"data\"}",
+    ] {
+        assert!(metrics.contains(name), "{name} not in: {metrics}");
+    }
 
     let (status, body) = put_status(&server, "large.bin", 4 * MIB as usize).await;
     assert_eq!(status, 503, "{body}");
@@ -2579,13 +2584,18 @@ async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
         assert!(body.contains(needle), "{needle} not in: {body}");
     }
 
-    // A small body needs no spool: the upload and the read work.
+    // A delta encode needs a spool file for its source, so a small
+    // delta-eligible file is refused too.
     let (status, body) = put_status(&server, "small.bin", 1024).await;
+    assert_eq!(status, 503, "{body}");
+    // A small body of a passthrough type needs no spool: the upload and the
+    // read work.
+    let (status, body) = put_status(&server, "small.jpg", 1024).await;
     assert_eq!(status, 200, "{body}");
     let got = server
         .http()
         .get(format!(
-            "{}/{}/small.bin",
+            "{}/{}/small.jpg",
             server.endpoint(),
             server.bucket()
         ))
@@ -2606,8 +2616,10 @@ async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
 /// 503 SlowDown that names the backend; a delete still works.
 #[tokio::test]
 async fn at_disk_level_critical_writes_to_the_backend_are_refused_and_deletes_work() {
+    common::expect_server_errors("the disk level critical refuses writes to the backend");
     let (_spool, server) = disk_server(3).await;
-    let (status, body) = put_status(&server, "small.bin", 1024).await;
+    // A passthrough body needs no spool, so only the backend gate refuses it.
+    let (status, body) = put_status(&server, "small.jpg", 1024).await;
     assert_eq!(status, 503, "{body}");
     for needle in ["SlowDown", "critical", "Reads and deletes still work"] {
         assert!(body.contains(needle), "{needle} not in: {body}");
@@ -2615,14 +2627,18 @@ async fn at_disk_level_critical_writes_to_the_backend_are_refused_and_deletes_wo
     let del = server
         .http()
         .delete(format!(
-            "{}/{}/small.bin",
+            "{}/{}/small.jpg",
             server.endpoint(),
             server.bucket()
         ))
         .send()
         .await
         .unwrap();
-    assert_eq!(del.status().as_u16(), 204, "a delete frees space");
+    assert_eq!(
+        del.status().as_u16(),
+        204,
+        "a delete is not refused: it frees space"
+    );
     let ready = reqwest::get(format!("{}/_/ready", server.endpoint()))
         .await
         .unwrap();

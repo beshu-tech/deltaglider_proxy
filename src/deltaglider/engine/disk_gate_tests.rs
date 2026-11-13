@@ -132,3 +132,47 @@ fn every_write_reservation_asks_the_disk_gate() {
         "one place asks the spool gate"
     );
 }
+
+/// CLASS GUARD: every client verb that STORES bytes asks the store gate (it
+/// adds the critical-disk refusal of a filesystem backend to the write
+/// gate); a verb that only deletes asks the plain write gate. The admin bulk
+/// copy and move ask the disk refusal for their destination.
+#[test]
+fn every_storing_verb_asks_the_store_gate_and_no_delete_does() {
+    for (file, f) in [
+        ("src/s3_adapter_s3s/object.rs", "put_object"),
+        ("src/s3_adapter_s3s/copy.rs", "copy_object"),
+        ("src/s3_adapter_s3s/copy.rs", "upload_part_copy"),
+        ("src/s3_adapter_s3s/multipart.rs", "create_multipart_upload"),
+        (
+            "src/s3_adapter_s3s/multipart.rs",
+            "complete_multipart_upload",
+        ),
+    ] {
+        let body = crate::source_scan::prod_fn_text(file, f);
+        assert!(
+            body.contains("check_client_store_allowed("),
+            "{file} {f} stores bytes and must ask check_client_store_allowed"
+        );
+    }
+    for (file, f) in [
+        ("src/s3_adapter_s3s/object.rs", "delete_object"),
+        ("src/s3_adapter_s3s/object.rs", "delete_objects"),
+        ("src/s3_adapter_s3s/bucket.rs", "delete_bucket"),
+    ] {
+        let body = crate::source_scan::prod_fn_text(file, f);
+        assert!(
+            !body.contains("check_client_store_allowed("),
+            "{file} {f} frees space and must not ask the store gate"
+        );
+    }
+    for f in ["copy_objects", "move_objects"] {
+        let body = crate::source_scan::prod_fn_text("src/api/admin/objects.rs", f);
+        assert!(
+            body.contains("reject_if_disk_critical(&state, &req.dest_bucket)"),
+            "{f} stores into its destination and must ask reject_if_disk_critical"
+        );
+    }
+    let form = crate::source_scan::read("src/api/handlers/form_post.rs");
+    assert!(form.contains("check_client_store_allowed(state, bucket)"));
+}
