@@ -2742,6 +2742,36 @@ mod tests {
             }
         }
 
+        /// A maintenance job armed on the source bucket stops the source
+        /// deletes of a move: the copies are made, the sources stay (the
+        /// per-item check of the delete batch, [`WriteKind::FreesSpace`]).
+        #[tokio::test]
+        async fn a_move_leaves_its_sources_when_a_job_holds_the_bucket() {
+            let (engine, _fake) = s3_engine().await;
+            let keys = store_deltas(&engine, "e2e/run-1", 4).await;
+            let mut copied = Vec::new();
+            for key in &keys {
+                copied.push(Some(engine.head("b", key).await.unwrap()));
+            }
+            let items: Vec<CopyItem> = paths(&keys)
+                .into_iter()
+                .map(|p| CopyItem {
+                    source_key: p.clone(),
+                    relative: p,
+                })
+                .collect();
+            let state = AppState::for_tests(engine);
+            state.maintenance_gate.set_busy("b");
+
+            let (deleted, _) = delete_moved_sources(&state, "b", &items, &copied, |_| false).await;
+
+            assert_eq!(deleted, 0, "a held bucket deletes no source");
+            let engine = state.engine.load();
+            for key in &keys {
+                assert!(engine.head("b", key).await.is_ok(), "{key} is still there");
+            }
+        }
+
         /// A move deleted each source with a plain conditional delete, which
         /// lists the folder again after every source. Now the source folder
         /// is listed once, after its last source.
