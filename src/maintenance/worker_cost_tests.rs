@@ -1309,6 +1309,53 @@ async fn a_large_reencrypt_visit_at_a_full_spool_disk_defers_and_leaves_the_obje
     ));
 }
 
+/// The same large re-encrypt visit at a spool that refuses by the USE of its
+/// budget (the disk level is fine): it defers too, and the object stays as it
+/// was. It used to fail, land in the failure ring and end the job
+/// `completed_with_errors`.
+#[tokio::test]
+async fn a_large_reencrypt_visit_at_a_spool_refusing_by_use_defers() {
+    let e = env_own_spool(0).await;
+    let engine = e.state.engine.load_full();
+    let large = vec![9u8; (engine.spool_threshold() + 1024 * 1024) as usize];
+    engine
+        .store("b", "large.jpg", &large, None, Default::default())
+        .await
+        .unwrap();
+    let mut th = crate::disk_watch::Thresholds::new(
+        &crate::config::tuning::RuntimeTuning::default().disk_monitor,
+        9 * 1024 * 1024,
+    );
+    th.high_floor = 9 * 1024 * 1024 * 1024;
+    engine.spool_dir().gate().set_by_use(Some(th));
+    assert!(engine.spool_dir().write_refusal().is_some());
+    let marker = crate::maintenance::conversion::begin(&engine, "b", None)
+        .await
+        .unwrap();
+    let adoptions = crate::maintenance::conversion::Adoptions::default();
+    let visitor = Reencrypt {
+        config: &e.config,
+        bucket: "b",
+        desired: Some(DesiredEncryption::Proxy {
+            key_id: "k1".into(),
+        }),
+        writes_plaintext: false,
+        marker: &marker,
+        adoptions: &adoptions,
+        unconditional: crate::deltaglider::Unconditional::Allowed,
+    };
+    let visit = visitor.visit(&engine, "large.jpg", None).await;
+    assert!(
+        matches!(&visit, Visit::Deferred(_)),
+        "a refusal by use defers the job: {}",
+        match &visit {
+            Visit::Failed(m) => format!("Failed({m})"),
+            _ => "another outcome".into(),
+        }
+    );
+    assert_eq!(engine.retrieve("b", "large.jpg").await.unwrap().0, large);
+}
+
 /// A visit that defers the job stops the page: no later object STARTS (the
 /// phase's `stops`), so a job that waits for the disk does not go on rewriting.
 #[tokio::test]

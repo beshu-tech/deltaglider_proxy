@@ -1719,6 +1719,114 @@ async fn test_a_migrate_that_waits_for_disk_lets_deletes_pass_and_the_flip_keeps
     }
 }
 
+/// A migrate whose copies need a SPOOL file (objects above the spool
+/// threshold, across two backends) waits while the spool disk refuses new
+/// writes (level high), whatever the disk of the target says. The object that
+/// met the refusal is not a failure; the wait lets deletes pass and the job
+/// records it, so the verify prunes the key that a client deleted after its
+/// copy; with space again the job copies the rest and flips.
+#[tokio::test]
+async fn test_a_migrate_whose_copies_need_a_spool_waits_at_a_refusing_spool() {
+    common::expect_server_errors("the spool disk refuses the writes that need spool space");
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let free = tempfile::TempDir::new().unwrap();
+    let free_file = free.path().join("free-percent");
+    let set_free = |percent: u8| std::fs::write(&free_file, percent.to_string()).unwrap();
+    set_free(50);
+    let bucket = "migspool";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "1024")
+        .env("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "100")
+        .env(
+            "DGP_TEST_DISK_MONITOR_FREE_FILE",
+            &free_file.display().to_string(),
+        )
+        .env("DGP_TEST_MAINTENANCE_DEFER_SECS", "2")
+        .env("DGP_DISK_MONITOR_INTERVAL_SECS", "1")
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    let body = |i: usize| {
+        let mut b = [MARKER, format!(" object {i}").as_bytes()].concat();
+        b.resize(8 * 1024, b'.');
+        b
+    };
+    for i in 0..150 {
+        put_object(
+            &http,
+            &endpoint,
+            bucket,
+            &format!("obj-{i:03}.json"),
+            body(i),
+            "application/json",
+        )
+        .await;
+    }
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    for _ in 0..1000 {
+        let job = newest_job(&admin, &endpoint).await;
+        if job["phase"] == "copy" && job["progress"]["processed"].as_i64().unwrap_or(0) >= 10 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Level high of the spool disk (8% free): no backend write is refused.
+    set_free(8);
+    let mut deleted = false;
+    for _ in 0..300 {
+        let resp = http
+            .delete(format!("{endpoint}/{bucket}/obj-000.json"))
+            .send()
+            .await
+            .unwrap();
+        if resp.status().as_u16() == 204 {
+            deleted = true;
+            break;
+        }
+        assert_eq!(resp.status().as_u16(), 503, "armed until the wait starts");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(deleted, "a delete never passed while the job waited");
+    let job = newest_migrate_job(&admin, &endpoint).await;
+    assert_ne!(job["status"], "failed", "a refused copy is a wait: {job}");
+    assert!(
+        job["progress"]["failed"].as_i64().unwrap_or(0) == 0,
+        "no failure recorded: {job}"
+    );
+
+    set_free(50);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_migrate_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+    let gone = http
+        .head(format!("{endpoint}/{bucket}/obj-000.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        gone.status().as_u16(),
+        404,
+        "obj-000 came back after the flip"
+    );
+    for n in [1usize, 75, 149] {
+        assert_eq!(
+            get_bytes(&http, &endpoint, bucket, &format!("obj-{n:03}.json")).await,
+            body(n),
+            "obj-{n:03}"
+        );
+    }
+}
+
 /// The newest MIGRATE row of the jobs list (a delete job is newer).
 async fn newest_migrate_job(admin: &reqwest::Client, endpoint: &str) -> serde_json::Value {
     let v: serde_json::Value = admin

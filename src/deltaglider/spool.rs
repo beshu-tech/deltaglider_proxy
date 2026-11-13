@@ -316,14 +316,21 @@ impl SpoolDir {
     /// read). An op that holds a spool, a read and a delete never ask: they
     /// run to the end.
     pub fn admit_new_write(&self) -> std::io::Result<()> {
-        let refusal = self.gate.refusal().or_else(|| {
-            let th = self.gate.by_use()?;
-            crate::disk_watch::use_refusal(&th, self.max_bytes(), self.used_bytes(), self.dir())
-        });
-        match refusal {
+        match self.write_refusal() {
             Some(message) => Err(std::io::Error::new(CONTENDED, message)),
             None => Ok(()),
         }
+    }
+
+    /// THE answer to "would a new spool write be refused now": the disk level
+    /// of the spool, else (where the free space hides the limit) the use of
+    /// the budget. [`Self::admit_new_write`] and every job that decides on a
+    /// refusal ask this one function, so none misses a refusal by use.
+    pub fn write_refusal(&self) -> Option<String> {
+        self.gate.refusal().or_else(|| {
+            let th = self.gate.by_use()?;
+            crate::disk_watch::use_refusal(&th, self.max_bytes(), self.used_bytes(), self.dir())
+        })
     }
 
     /// Spool bytes reserved now (the budget in use), for the gauge. The
@@ -1183,6 +1190,39 @@ mod tests {
             drop(held);
             assert_eq!(spool.used_bytes(), 0);
         }
+    }
+
+    /// One answer to "is a new write refused now": the disk level OR the use of
+    /// the budget, and `admit_new_write` agrees with it.
+    #[test]
+    fn write_refusal_is_the_level_or_the_use_and_admission_agrees() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let spool = SpoolDir::new(dir.path().join("s"), 64 * MIB).unwrap();
+        assert_eq!(spool.write_refusal(), None);
+        assert!(spool.admit_new_write().is_ok());
+        // By level.
+        spool
+            .gate()
+            .set(crate::disk_watch::Level::High, "the disk is full".into());
+        assert_eq!(spool.write_refusal().as_deref(), Some("the disk is full"));
+        assert!(spool.admit_new_write().is_err());
+        spool
+            .gate()
+            .set(crate::disk_watch::Level::Ok, String::new());
+        // By use: the budget is nearly all reserved.
+        let mut th = crate::disk_watch::Thresholds::new(
+            &crate::config::tuning::RuntimeTuning::default().disk_monitor,
+            MIB,
+        );
+        th.low_floor = 0;
+        th.high_floor = 32 * MIB;
+        th.critical_floor = 0;
+        spool.gate().set_by_use(Some(th));
+        assert_eq!(spool.write_refusal(), None, "the budget is free");
+        let _held = spool.try_acquire(40 * MIB).unwrap();
+        assert!(spool.write_refusal().is_some(), "the budget is in use");
+        assert!(spool.admit_new_write().is_err());
     }
 
     use super::*;

@@ -356,10 +356,13 @@ fn deferral_waits_for_disk(
     if job_backend_refusal(state, job).is_some() {
         return true;
     }
-    let Err(PhaseStop::Deferred(why)) = stop else {
+    if !matches!(stop, Err(PhaseStop::Deferred(_))) {
         return false;
-    };
-    state.engine.load().spool_dir().gate().refusal().as_deref() == Some(why.as_str())
+    }
+    // The spool refuses a new write now (level or use): the job's deferral
+    // is the spool's. The message of a refusal by use moves with the bytes in
+    // use, so the test is the refusal itself, not its text.
+    state.engine.load().spool_dir().write_refusal().is_some()
 }
 
 /// May deletes into the bucket of `job` pass while the job waits for disk
@@ -1166,7 +1169,7 @@ impl ObjectVisitor for Reencrypt<'_> {
                 // A stale other form that a client write replaced.
                 Ok(Rewritten::Changed) => {}
                 Err(e) => {
-                    let refusal = engine.spool_dir().gate().refusal();
+                    let refusal = engine.spool_dir().write_refusal();
                     return rewrite_error_visit(&e, refusal, || failed(&e));
                 }
             }
@@ -2491,6 +2494,28 @@ mod tests {
         );
         // The prune and the verify store nothing: they keep the default.
         assert_eq!(migrate.matches("fn refused(").count(), 1);
+    }
+
+    /// THE question "would a new spool write be refused now" has one answer,
+    /// `SpoolDir::write_refusal` (disk level AND use of the budget). A caller
+    /// that reads the disk level alone (`gate().refusal()`) misses a refusal by
+    /// use, so a refused object would be failed instead of deferred.
+    #[test]
+    fn nothing_but_the_spool_reads_the_disk_level_alone() {
+        for file in crate::source_scan::rust_files("src") {
+            let rel = crate::source_scan::rel(&file);
+            if rel == "src/disk_watch.rs"
+                || rel.starts_with("src/disk_watch/")
+                || rel == "src/deltaglider/spool.rs"
+            {
+                continue;
+            }
+            let text = crate::source_scan::prod_text(&crate::source_scan::read(&rel));
+            assert!(
+                !text.contains(".gate().refusal()"),
+                "{rel} reads the spool's disk level alone: ask `spool_dir().write_refusal()`"
+            );
+        }
     }
 
     /// The phases in which a job may wait for disk space with deletes passing:

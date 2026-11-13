@@ -1637,7 +1637,7 @@ impl PageStep for CopyStep<'_, '_> {
             },
             Err(e) => copy_error_done(
                 e.class == crate::transfer::CopyClass::Busy,
-                engine.spool_dir().gate().refusal(),
+                engine.spool_dir().write_refusal(),
                 e.class.retryable(),
                 e.to_string(),
             ),
