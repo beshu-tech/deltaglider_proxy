@@ -319,6 +319,10 @@ mod ingest_tests;
 #[cfg(test)]
 mod read_spool_tests;
 
+/// The disk-level gate of new spool reservations.
+#[cfg(test)]
+mod disk_gate_tests;
+
 /// `delete_batch`: request costs and the per-key contract.
 #[cfg(test)]
 mod delete_batch_tests;

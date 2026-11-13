@@ -412,6 +412,102 @@ async fn test_migrate_cancel_preflip_restores_source() {
     .await;
 }
 
+/// A cancel does not wait for the disk. A migrate that waits for a full target
+/// disk and is cancelled unwinds at its next claim, while the disk is STILL
+/// full: its staged copies (which free space) and its staging route go, and the
+/// source stays authoritative. It used to stay `cancelling` for as long as the
+/// disk was full, each claim deferring it again.
+#[tokio::test]
+async fn test_a_migrate_that_waits_for_disk_can_be_cancelled() {
+    common::expect_server_errors("level critical refuses the write that this test tries");
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let free = tempfile::TempDir::new().unwrap();
+    let free_file = free.path().join("free-percent");
+    let set_free = |percent: u8| std::fs::write(&free_file, percent.to_string()).unwrap();
+    set_free(50);
+    let bucket = "migdiskcan";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .env("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "100")
+        .env(
+            "DGP_TEST_DISK_MONITOR_FREE_FILE",
+            &free_file.display().to_string(),
+        )
+        .env("DGP_TEST_MAINTENANCE_DEFER_SECS", "2")
+        .env("DGP_DISK_MONITOR_INTERVAL_SECS", "1")
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    seed(&http, &endpoint, bucket, 300).await;
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    let job_id = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+        .as_i64()
+        .unwrap();
+    for _ in 0..1000 {
+        let job = newest_job(&admin, &endpoint).await;
+        if job["phase"] == "copy" && job["progress"]["processed"].as_i64().unwrap_or(0) >= 20 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    set_free(3);
+    // The job waits once a delete passes.
+    let mut waiting = false;
+    for _ in 0..300 {
+        let resp = http
+            .delete(format!("{endpoint}/{bucket}/obj-299.json"))
+            .send()
+            .await
+            .unwrap();
+        if resp.status().as_u16() == 204 {
+            waiting = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(waiting, "the job never waited for disk");
+    assert!(
+        walkdir_files(&dir_b.path().join(bucket))
+            .iter()
+            .any(|p| p.contains("obj-")),
+        "the wait landed mid-copy"
+    );
+
+    let cancel = admin
+        .post(format!(
+            "{endpoint}/_/api/admin/jobs/maintenance:{job_id}/cancel"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancel.status().is_success(), "cancel: {}", cancel.status());
+
+    // The disk stays full: the cancel still ends the job.
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_migrate_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "cancelled", "{job}");
+    assert!(
+        !walkdir_files(&dir_b.path().join(bucket))
+            .iter()
+            .any(|p| p.contains("obj-")),
+        "the staged copies are removed"
+    );
+    assert!(transient_keys(&admin, &endpoint).await.is_empty());
+    assert_ne!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst"),
+        "the source stays authoritative"
+    );
+    assert!(get_bytes(&http, &endpoint, bucket, "obj-000.json")
+        .await
+        .starts_with(MARKER));
+}
+
 /// D9: a bucket whose policy has an `alias` lives under the ALIAS name on
 /// its backend. The migrate must copy from, flip to and clean up under the
 /// real name — not the virtual one. Before the fix the flip routed the bucket
@@ -1368,4 +1464,384 @@ async fn test_migrate_meets_a_legacy_dg_key_and_stops_before_the_flip() {
     wait_job_done(&admin, &endpoint, bucket).await;
     let job = newest_job(&admin, &endpoint).await;
     assert_eq!(job["status"], "succeeded", "job: {job}");
+}
+
+/// A migrate whose copy waits for DISK space does not keep the bucket from
+/// deleting. The job holds the write gate for its whole life, so a delete of
+/// the source that the gate refused would wait for the job, and the job for
+/// the disk. The whole path runs WITHOUT a restart and on the real clock: the
+/// disk goes critical while the copy runs (the file seam, read at every
+/// measure), the job waits (2 s, seam), deletes pass, a delete JOB deletes
+/// (not Skipped, no failure), the disk recovers, and the job resumes on its
+/// own.
+///
+/// Correctness: the stop lands in the COPY (some keys are on the destination).
+/// A key that was copied and then deleted at the source must not come back at
+/// the destination after the flip: the job recorded its wait in its params,
+/// so its verify prunes the destination of every key that the source lacks.
+/// A write is refused all along. The free space is the seam's, never the
+/// host's.
+#[tokio::test]
+async fn test_a_migrate_that_waits_for_disk_lets_deletes_pass_and_the_flip_keeps_them() {
+    common::expect_server_errors("level critical refuses the write that this test tries");
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let free = tempfile::TempDir::new().unwrap();
+    let free_file = free.path().join("free-percent");
+    let set_free = |percent: u8| std::fs::write(&free_file, percent.to_string()).unwrap();
+    set_free(50);
+    let bucket = "migdisk";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .env("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "100")
+        .env(
+            "DGP_TEST_DISK_MONITOR_FREE_FILE",
+            &free_file.display().to_string(),
+        )
+        .env("DGP_TEST_MAINTENANCE_DEFER_SECS", "2")
+        .env("DGP_DISK_MONITOR_INTERVAL_SECS", "1")
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    seed(&http, &endpoint, bucket, 300).await;
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    for _ in 0..1000 {
+        let job = newest_job(&admin, &endpoint).await;
+        if job["phase"] == "copy" && job["progress"]["processed"].as_i64().unwrap_or(0) >= 20 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The disk of the target fills up mid-copy.
+    set_free(3);
+    let mut deleted = false;
+    for _ in 0..300 {
+        let resp = http
+            .delete(format!("{endpoint}/{bucket}/obj-000.json"))
+            .send()
+            .await
+            .unwrap();
+        if resp.status().as_u16() == 204 {
+            deleted = true;
+            break;
+        }
+        assert_eq!(resp.status().as_u16(), 503, "armed until the wait starts");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        deleted,
+        "a delete never passed while the job waited for disk"
+    );
+    let staged: Vec<String> = walkdir_files(&dir_b.path().join(bucket))
+        .into_iter()
+        .filter(|p| p.contains("obj-"))
+        .collect();
+    assert!(
+        staged.len() >= 20 && staged.len() < 300,
+        "the wait landed mid-copy: {}",
+        staged.len()
+    );
+    assert!(
+        staged.iter().any(|p| p.contains("obj-000.json")),
+        "obj-000 was copied before the wait"
+    );
+    // DeleteObjects passes as well.
+    server
+        .s3_client()
+        .await
+        .delete_objects()
+        .bucket(bucket)
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .objects(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key("obj-299.json")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("DeleteObjects passes while the job waits for disk");
+    // The admin bulk delete passes too (it frees space); an admin copy and a
+    // move into the held bucket do not (they store bytes).
+    let resp = admin
+        .post(format!("{endpoint}/_/api/admin/objects/delete"))
+        .json(&serde_json::json!({ "bucket": bucket, "keys": ["obj-200.json"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "bulk delete during a disk wait"
+    );
+    let answer: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(answer["deleted"].as_u64(), Some(1), "{answer}");
+    let gone = http
+        .head(format!("{endpoint}/{bucket}/obj-200.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status().as_u16(), 404, "obj-200 is deleted");
+    for op in ["copy", "move"] {
+        let resp = admin
+            .post(format!("{endpoint}/_/api/admin/objects/{op}"))
+            .json(&serde_json::json!({
+                "source_bucket": bucket, "dest_bucket": bucket, "dest_prefix": "into/",
+                "items": [{ "source_key": "obj-001.json", "relative": "obj-001.json" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            409,
+            "an admin {op} into the held bucket stores bytes"
+        );
+    }
+    // A write is still refused; a read works.
+    let w = http
+        .put(format!("{endpoint}/{bucket}/new.json"))
+        .body(b"x".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(w.status().as_u16(), 503, "a write stays refused");
+    assert_eq!(
+        get_bytes(&http, &endpoint, bucket, "obj-001.json").await,
+        [MARKER, b" object 1"].concat()
+    );
+    // A delete JOB deletes while the job waits: not skipped, not failed.
+    let resp = admin
+        .post(format!("{endpoint}/_/api/admin/objects/delete-jobs"))
+        .json(&serde_json::json!({
+            "bucket": bucket, "prefixes": [], "keys": ["obj-100.json"], "expected": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+    let delete_job = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+        .as_i64()
+        .unwrap();
+    let mut settled = serde_json::Value::Null;
+    for _ in 0..300 {
+        let all: serde_json::Value = admin
+            .get(format!("{endpoint}/_/api/admin/jobs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        settled = all["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == format!("maintenance:{delete_job}"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if settled["status"] == "succeeded" || settled["status"] == "failed" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(settled["status"], "succeeded", "{settled}");
+    let failures: serde_json::Value = admin
+        .get(format!(
+            "{endpoint}/_/api/admin/jobs/maintenance:{delete_job}/failures"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        failures["failures"].as_array().map(Vec::len),
+        Some(0),
+        "the delete job skipped keys during the wait: {failures}"
+    );
+    for key in ["obj-000.json", "obj-100.json", "obj-299.json"] {
+        let gone = http
+            .head(format!("{endpoint}/{bucket}/{key}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            gone.status().as_u16(),
+            404,
+            "{key} is deleted at the source"
+        );
+    }
+
+    // Space again, NO restart: the job resumes on its own, copies the rest,
+    // verifies, prunes the destination and flips.
+    set_free(50);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_migrate_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+    // The bucket is served by the destination now: the keys that clients
+    // deleted during the wait are gone there too, the rest is whole.
+    for key in ["obj-000.json", "obj-100.json", "obj-299.json"] {
+        let head = http
+            .head(format!("{endpoint}/{bucket}/{key}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            head.status().as_u16(),
+            404,
+            "{key} came back after the flip"
+        );
+    }
+    for (key, n) in [
+        ("obj-001.json", 1),
+        ("obj-150.json", 150),
+        ("obj-298.json", 298),
+    ] {
+        assert_eq!(
+            get_bytes(&http, &endpoint, bucket, key).await,
+            [MARKER, format!(" object {n}").as_bytes()].concat(),
+            "{key}"
+        );
+    }
+}
+
+/// A migrate whose copies need a SPOOL file (objects above the spool
+/// threshold, across two backends) waits while the spool disk refuses new
+/// writes (level high), whatever the disk of the target says. The object that
+/// met the refusal is not a failure; the wait lets deletes pass and the job
+/// records it, so the verify prunes the key that a client deleted after its
+/// copy; with space again the job copies the rest and flips.
+#[tokio::test]
+async fn test_a_migrate_whose_copies_need_a_spool_waits_at_a_refusing_spool() {
+    common::expect_server_errors("the spool disk refuses the writes that need spool space");
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let free = tempfile::TempDir::new().unwrap();
+    let free_file = free.path().join("free-percent");
+    let set_free = |percent: u8| std::fs::write(&free_file, percent.to_string()).unwrap();
+    set_free(50);
+    let bucket = "migspool";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "1024")
+        .env("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "100")
+        .env(
+            "DGP_TEST_DISK_MONITOR_FREE_FILE",
+            &free_file.display().to_string(),
+        )
+        .env("DGP_TEST_MAINTENANCE_DEFER_SECS", "2")
+        .env("DGP_DISK_MONITOR_INTERVAL_SECS", "1")
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    let body = |i: usize| {
+        let mut b = [MARKER, format!(" object {i}").as_bytes()].concat();
+        b.resize(8 * 1024, b'.');
+        b
+    };
+    for i in 0..150 {
+        put_object(
+            &http,
+            &endpoint,
+            bucket,
+            &format!("obj-{i:03}.json"),
+            body(i),
+            "application/json",
+        )
+        .await;
+    }
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    for _ in 0..1000 {
+        let job = newest_job(&admin, &endpoint).await;
+        if job["phase"] == "copy" && job["progress"]["processed"].as_i64().unwrap_or(0) >= 10 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Level high of the spool disk (8% free): no backend write is refused.
+    set_free(8);
+    let mut deleted = false;
+    for _ in 0..300 {
+        let resp = http
+            .delete(format!("{endpoint}/{bucket}/obj-000.json"))
+            .send()
+            .await
+            .unwrap();
+        if resp.status().as_u16() == 204 {
+            deleted = true;
+            break;
+        }
+        assert_eq!(resp.status().as_u16(), 503, "armed until the wait starts");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(deleted, "a delete never passed while the job waited");
+    let job = newest_migrate_job(&admin, &endpoint).await;
+    assert_ne!(job["status"], "failed", "a refused copy is a wait: {job}");
+    assert!(
+        job["progress"]["failed"].as_i64().unwrap_or(0) == 0,
+        "no failure recorded: {job}"
+    );
+
+    set_free(50);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_migrate_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+    let gone = http
+        .head(format!("{endpoint}/{bucket}/obj-000.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        gone.status().as_u16(),
+        404,
+        "obj-000 came back after the flip"
+    );
+    for n in [1usize, 75, 149] {
+        assert_eq!(
+            get_bytes(&http, &endpoint, bucket, &format!("obj-{n:03}.json")).await,
+            body(n),
+            "obj-{n:03}"
+        );
+    }
+}
+
+/// The newest MIGRATE row of the jobs list (a delete job is newer).
+async fn newest_migrate_job(admin: &reqwest::Client, endpoint: &str) -> serde_json::Value {
+    let v: serde_json::Value = admin
+        .get(format!("{endpoint}/_/api/admin/jobs"))
+        .send()
+        .await
+        .expect("jobs GET failed")
+        .json()
+        .await
+        .expect("jobs not JSON");
+    v["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["kind"] == "migrate")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
 }

@@ -75,8 +75,7 @@ pub fn authz_target<'a>(
     // POST /{bucket}?delete is a batch DELETE, not a write. Only on a bucket
     // path: s3s ignores `delete` on an object path, where the POST is a
     // write (CompleteMultipartUpload, CreateMultipartUpload).
-    let batch_delete =
-        *method == axum::http::Method::POST && target.has_query("delete") && key.is_empty();
+    let batch_delete = target.is_batch_delete(method);
     if batch_delete {
         action = S3Action::Delete;
     }

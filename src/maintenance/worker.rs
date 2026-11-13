@@ -107,6 +107,9 @@ pub(crate) struct Holder<'a> {
     pub backend: Option<&'a super::gate::BackendCheck>,
     /// What a delete job needs (`None` in tests that run no delete).
     pub deletes: Option<&'a super::delete::DeleteDeps>,
+    /// Seconds that a deferred job waits (`None`: [`BACKEND_DEFER_SECS`], or
+    /// the test seam `DGP_TEST_MAINTENANCE_DEFER_SECS`).
+    pub defer_secs: Option<i64>,
 }
 
 impl Holder<'_> {
@@ -128,6 +131,7 @@ impl<'a> Holder<'a> {
             lease: LeaseTiming::MAINTENANCE,
             backend: None,
             deletes: None,
+            defer_secs: None,
         }
     }
 }
@@ -263,6 +267,7 @@ async fn run_lane(
                                 lease,
                                 backend: None,
                                 deletes: Some(&deletes),
+                                defer_secs: None,
                             };
                             run_job(&mutator, &config, &db, &state, holder, job).await;
                             drop(slot);
@@ -285,6 +290,96 @@ async fn run_lane(
     }
 }
 
+/// A job that waited for disk space may run again. FIRST the gate is whole
+/// (a delete is refused from this moment), THEN the deletes that it admitted
+/// meanwhile are drained, so no phase races one. A drain that times out
+/// defers the job again.
+pub(crate) async fn resume_after_disk_wait(
+    gate: &crate::maintenance::gate::MaintenanceGate,
+    job_id: i64,
+    bucket: &str,
+    ceiling: std::time::Duration,
+) -> Result<(), PhaseStop> {
+    gate.close_disk_deferred(job_id);
+    drain_inflight_writes_within(gate, bucket, ceiling).await?;
+    // The mark ends only now. A drain that gave up leaves it (closed): the
+    // next claim drains again.
+    gate.clear_disk_deferred(job_id);
+    Ok(())
+}
+
+/// Why a job that STORES bytes waits for disk space now: the spool disk, or
+/// the disk of the bucket that it writes into (the migrate's staging bucket on
+/// the target backend; the re-encrypt's own bucket). `None`: it does not.
+/// Seconds that a deferred job waits: [`BACKEND_DEFER_SECS`], or the debug
+/// seam `DGP_TEST_MAINTENANCE_DEFER_SECS` (a test sees the resume).
+fn defer_secs() -> i64 {
+    crate::config::test_seams::test_seams()
+        .maintenance_defer_secs
+        .unwrap_or(BACKEND_DEFER_SECS)
+}
+
+/// The bucket that a job STORES into: the migrate's staging bucket on the
+/// target backend, the re-encrypt's own bucket. `None`: the job stores
+/// nothing.
+fn job_store_bucket(job: &MaintenanceJob) -> Option<String> {
+    match job.kind.as_str() {
+        "migrate" => Some(
+            super::migrate::parse_params(job.params.as_deref()?)
+                .ok()?
+                .transient_key,
+        ),
+        "reencrypt" => Some(job.bucket.clone()),
+        _ => None,
+    }
+}
+
+/// Why a job that STORES bytes waits for the disk of its backend now:
+/// `Some` only while that disk is at level critical. THE refusal of both
+/// kinds, at every check: before each object, at the end of a wait, and when
+/// a deferral is marked. Neither kind asks the spool disk as a whole: most of
+/// their objects need no spool file, and an object that does meets the spool
+/// gate in its own turn ([`Visit::Deferred`], the migrate's `CopyDone::Deferred`).
+fn job_backend_refusal(state: &AppState, job: &MaintenanceJob) -> Option<String> {
+    super::probes::backend_store_refusal(state, &job_store_bucket(job)?)
+}
+
+/// Is this stop a wait for DISK space, so that deletes may pass? The disk of
+/// the job's backend is critical, or an object that needs a spool file met
+/// the spool gate (the stop carries the gate's own message). Any other
+/// deferral (a backend that does not answer) is not.
+fn deferral_waits_for_disk(
+    state: &AppState,
+    job: &MaintenanceJob,
+    stop: &Result<(), PhaseStop>,
+) -> bool {
+    if job_backend_refusal(state, job).is_some() {
+        return true;
+    }
+    if !matches!(stop, Err(PhaseStop::Deferred(_))) {
+        return false;
+    }
+    // The spool refuses a new write now (level or use): the job's deferral
+    // is the spool's. The message of a refusal by use moves with the bytes in
+    // use, so the test is the refusal itself, not its text.
+    state.engine.load().spool_dir().write_refusal().is_some()
+}
+
+/// May deletes into the bucket of `job` pass while the job waits for disk
+/// space? Yes for a re-encrypt (every visit reads the object as it is when its
+/// turn comes, so a delete before it is skipped and one after it stays) and for a
+/// migrate in its COPY phase (a key that a client deleted after its copy is
+/// removed from the destination by the verify phase: the job records the wait
+/// and the verify prunes, `MigrateParams::disk_wait`). Not for a migrate in any
+/// other phase: verify and the flip would not see the delete.
+pub(crate) fn disk_wait_is_safe(job: &MaintenanceJob) -> bool {
+    match job.kind.as_str() {
+        "reencrypt" => true,
+        "migrate" => job.phase == "copy",
+        _ => false,
+    }
+}
+
 /// Pure: how long the idle worker waits before it looks at the queue
 /// again without a notify. Half a lease TTL at most (an abandoned row of a
 /// peer becomes claimable within one TTL; a synced row that no notify
@@ -303,7 +398,7 @@ pub(crate) fn idle_wait_secs(lease_ttl_secs: i64, next_due: Option<i64>, now: i6
 
 /// Execute one claimed job to a terminal state. Never panics the loop:
 /// every failure path settles the row and releases the gate.
-async fn run_job(
+pub(crate) async fn run_job(
     mutator: &ConfigMutator,
     config: &SharedConfig,
     db: &Arc<Mutex<JobsDb>>,
@@ -354,9 +449,34 @@ async fn run_job(
         .err();
     // A gated backend: wait before any phase sends a request.
     let gated = holder.check_backend();
+    // A job that waited for DISK space: while the disk is still full it waits
+    // on (its mark stays, deletes keep passing). Once it may run, the mark is
+    // cleared FIRST (a delete is refused from then on) and the deletes that
+    // the gate admitted meanwhile are drained, so no phase races one.
+    let resumed_from_disk_wait = state.maintenance_gate.has_disk_mark(job.id);
+    // An operator's cancel or kill does not wait for the disk: the unwind of
+    // a migrate deletes its staged copies, which frees space. The mark still
+    // ends in order (close, drain, clear) before the phases run.
+    let cancel_asked = check_cancel(db, job.id).await.is_err();
+    let disk_still_full = if resumed_from_disk_wait && !cancel_asked {
+        job_backend_refusal(state, &job)
+    } else {
+        None
+    };
+    let drained = if resumed_from_disk_wait && disk_still_full.is_none() {
+        let ceiling =
+            std::time::Duration::from_secs(state.engine.load().tuning().request_timeout_secs);
+        resume_after_disk_wait(&state.maintenance_gate, job.id, &bucket, ceiling).await
+    } else {
+        Ok(())
+    };
     let outcome = match job.kind.as_str() {
         _ if reserved.is_some() => Err(reserved.unwrap_or_default().into()),
         _ if gated.is_err() => gated,
+        _ if disk_still_full.is_some() => {
+            Err(PhaseStop::Deferred(disk_still_full.unwrap_or_default()))
+        }
+        _ if drained.is_err() => drained,
         // The conversion job reads every unsealed object of its bucket
         // (`storage/encrypting/conversion.rs`): only here.
         "reencrypt" => {
@@ -413,7 +533,7 @@ async fn run_job(
                 )
             }
             other => (
-                BACKEND_DEFER_SECS,
+                holder.defer_secs.unwrap_or_else(defer_secs),
                 other
                     .as_ref()
                     .err()
@@ -421,14 +541,30 @@ async fn run_job(
                     .unwrap_or_default(),
             ),
         };
+        // A wait for DISK space lets deletes into the bucket pass (see
+        // `disk_wait_is_safe`); the mark ends with the wait.
+        // `row` is the row NOW (the phase moved since the claim).
+        // Only a job that holds its bucket has a wait to open for deletes: one
+        // that does not (conditional rewrites) has nothing to drain either.
+        let waits_for_disk = disk_wait_is_safe(&row)
+            && state.maintenance_gate.arms_job(job.id)
+            && deferral_waits_for_disk(state, &row, &outcome);
+        let until = current_unix_seconds().saturating_add(wait);
         let deferred = {
             let db = db.lock().await;
-            let deferred = db.maintenance_defer(
-                job.id,
-                holder.id,
-                current_unix_seconds().saturating_add(wait),
-                &why,
-            );
+            if waits_for_disk {
+                // Durable BEFORE the gate opens for deletes: a migrate that
+                // saw one prunes its destination at the verify.
+                if let Err(e) = db.maintenance_note_disk_wait(job.id) {
+                    warn!(
+                        "maintenance: job #{} could not record its disk wait: {e}",
+                        job.id
+                    );
+                } else {
+                    state.maintenance_gate.mark_disk_deferred(job.id, until);
+                }
+            }
+            let deferred = db.maintenance_defer(job.id, holder.id, until, &why);
             state.maintenance_gate.sync_from(&db);
             deferred
         };
@@ -958,6 +1094,7 @@ struct Reencrypt<'a> {
 
 impl ObjectVisitor for Reencrypt<'_> {
     const CONCURRENCY: usize = REENCRYPT_CONCURRENCY;
+    const WRITES_BYTES: bool = true;
 
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         // Re-resolve the desired state every page: a config apply mid-run
@@ -1031,7 +1168,10 @@ impl ObjectVisitor for Reencrypt<'_> {
                 Ok(Rewritten::Changed) if i == 0 => changed = true,
                 // A stale other form that a client write replaced.
                 Ok(Rewritten::Changed) => {}
-                Err(e) => return failed(&e),
+                Err(e) => {
+                    let refusal = engine.spool_dir().write_refusal();
+                    return rewrite_error_visit(&e, refusal, || failed(&e));
+                }
             }
         }
         if changed {
@@ -1075,6 +1215,24 @@ pub(crate) enum Visit {
     Changed,
     /// Recorded in the failure ring and counted; the phase goes on.
     Failed(String),
+    /// Not rewritten: the object needs a spool file and the spool disk is at
+    /// level high or critical. No failure: the job waits and does the object
+    /// again (a rewrite is idempotent).
+    Deferred(String),
+}
+
+/// Pure: what a failed rewrite means for the visit. A retryable refusal of
+/// the spool disk gate (`disk_refusal`: the gate says no NOW) defers the job;
+/// any other error is the object's failure.
+pub(crate) fn rewrite_error_visit(
+    error: &crate::deltaglider::EngineError,
+    disk_refusal: Option<String>,
+    failed: impl FnOnce() -> Visit,
+) -> Visit {
+    match (error, disk_refusal) {
+        (crate::deltaglider::EngineError::Overloaded(_), Some(why)) => Visit::Deferred(why),
+        _ => failed(),
+    }
 }
 
 /// The per-object work of a count-then-walk job kind (reencrypt,
@@ -1082,6 +1240,11 @@ pub(crate) enum Visit {
 pub(crate) trait ObjectVisitor {
     /// Objects of a page in flight at once.
     const CONCURRENCY: usize = PAGE_CONCURRENCY;
+    /// Does a visit STORE bytes into the bucket (a re-encrypt rewrite)? Then
+    /// the walk defers while the disk it writes to is at level critical
+    /// ([`crate::maintenance::probes::backend_store_refusal`]). A backfill stamps
+    /// metadata in place and writes no object bytes: `false`.
+    const WRITES_BYTES: bool = false;
     /// Runs before each listing page.
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         Ok(())
@@ -1283,6 +1446,19 @@ impl<V: ObjectVisitor> ObjectsStep<'_, V> {
 impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
     type Done = Visit;
 
+    fn refused(&self) -> Option<String> {
+        if !V::WRITES_BYTES {
+            return None;
+        }
+        // The disk of the backend only: the objects that need a spool file
+        // meet the spool gate in their own rewrite ([`Visit::Deferred`]).
+        super::probes::backend_store_refusal(self.state, &self.job.bucket)
+    }
+
+    fn stops(done: &Visit) -> bool {
+        matches!(done, Visit::Deferred(_))
+    }
+
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         self.visitor.begin_page().await?;
         self.engine = Some(self.state.engine.load().clone());
@@ -1350,6 +1526,9 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
                 record_failure(self.db, self.job.id, key, &reason).await?;
                 self.c.failed += 1;
             }
+            // The job waits for the spool disk: the objects before this one
+            // are settled, the page is not saved, the job does this one again.
+            Visit::Deferred(why) => return Err(PhaseStop::Deferred(why)),
         }
         Ok(())
     }
@@ -2288,6 +2467,97 @@ mod tests {
             "{:?}",
             row.last_error
         );
+    }
+
+    /// Which job kinds store bytes (and so defer on a critical disk): the
+    /// re-encrypt rewrite does; a backfill stamps metadata in place and
+    /// writes no object bytes. Each paged step that stores asks
+    /// `probes::backend_store_refusal`.
+    #[test]
+    fn only_the_job_steps_that_store_bytes_ask_the_disk() {
+        const { assert!(<Reencrypt<'static> as ObjectVisitor>::WRITES_BYTES) };
+        const { assert!(!<super::super::backfill::Backfill<'static> as ObjectVisitor>::WRITES_BYTES) };
+        let worker =
+            crate::source_scan::prod_text(&crate::source_scan::read("src/maintenance/worker.rs"));
+        let migrate =
+            crate::source_scan::prod_text(&crate::source_scan::read("src/maintenance/migrate.rs"));
+        let objects_refused =
+            crate::source_scan::prod_fn_text("src/maintenance/worker.rs", "refused");
+        assert!(objects_refused.contains("V::WRITES_BYTES"));
+        assert!(objects_refused.contains("probes::backend_store_refusal("));
+        assert!(worker.contains("const WRITES_BYTES: bool = true;"));
+        let copy = crate::source_scan::prod_fn_text("src/maintenance/migrate.rs", "refused");
+        assert!(copy.contains("probes::backend_store_refusal("), "{copy}");
+        assert!(
+            copy.contains("transient_key"),
+            "the copy stores into the target"
+        );
+        // The prune and the verify store nothing: they keep the default.
+        assert_eq!(migrate.matches("fn refused(").count(), 1);
+    }
+
+    /// THE question "would a new spool write be refused now" has one answer,
+    /// `SpoolDir::write_refusal` (disk level AND use of the budget). A caller
+    /// that reads the disk level alone (`gate().refusal()`) misses a refusal by
+    /// use, so a refused object would be failed instead of deferred.
+    #[test]
+    fn nothing_but_the_spool_reads_the_disk_level_alone() {
+        for file in crate::source_scan::rust_files("src") {
+            let rel = crate::source_scan::rel(&file);
+            if rel == "src/disk_watch.rs"
+                || rel.starts_with("src/disk_watch/")
+                || rel == "src/deltaglider/spool.rs"
+            {
+                continue;
+            }
+            let text = crate::source_scan::prod_text(&crate::source_scan::read(&rel));
+            assert!(
+                !text.contains(".gate().refusal()"),
+                "{rel} reads the spool's disk level alone: ask `spool_dir().write_refusal()`"
+            );
+        }
+    }
+
+    /// The phases in which a job may wait for disk space with deletes passing:
+    /// a re-encrypt always, a migrate in its copy phase only (the verify and
+    /// the flip would not see a delete), no other kind.
+    #[test]
+    fn a_job_may_wait_for_disk_with_deletes_passing_only_where_it_is_safe() {
+        let row = |kind: &str, phase: &str| MaintenanceJob {
+            id: 1,
+            kind: kind.into(),
+            bucket: "b".into(),
+            status: "queued".into(),
+            phase: phase.into(),
+            objects_total: None,
+            objects_done: 0,
+            objects_skipped: 0,
+            objects_failed: 0,
+            bytes_done: 0,
+            continuation_token: None,
+            last_error: None,
+            triggered_by: None,
+            params: None,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            updated_at: 0,
+            objects_adopted: 0,
+            objects_changed: 0,
+        };
+        for (kind, phase, want) in [
+            ("reencrypt", "counting", true),
+            ("reencrypt", "objects", true),
+            ("migrate", "copy", true),
+            ("migrate", "stage", false),
+            ("migrate", "verify", false),
+            ("migrate", "flip", false),
+            ("migrate", "cleanup", false),
+            ("backfill-metadata", "objects", false),
+            ("delete", "objects", false),
+        ] {
+            assert_eq!(disk_wait_is_safe(&row(kind, phase)), want, "{kind} {phase}");
+        }
     }
 
     #[test]

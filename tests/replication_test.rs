@@ -3517,3 +3517,104 @@ async fn test_filter_preview_counts_past_the_first_thousand_keys() {
         "500 keys per verdict at most"
     );
 }
+
+const FULL_DISK_RULES_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"1h\"
+  rules:
+    - name: fd-deleting
+      enabled: true
+      source:
+        bucket: fd-src
+        prefix: \"\"
+      destination:
+        bucket: fd-dst1
+        prefix: \"\"
+      interval: \"24h\"
+      batch_size: 100
+      replicate_deletes: true
+    - name: fd-copying
+      enabled: true
+      source:
+        bucket: fd-src
+        prefix: \"\"
+      destination:
+        bucket: fd-dst2
+        prefix: \"\"
+      interval: \"24h\"
+      batch_size: 100
+";
+
+/// At level critical of the destination disk (the test seam), a run-now of a
+/// rule that replicates deletes is accepted and its walk deletes the stale
+/// key while the copy that needs space waits (the run ends `deferred`); a
+/// run-now of a rule that only copies is refused with 409 before any request.
+/// Reads and the delete stay possible so the disk can be emptied.
+#[tokio::test]
+async fn test_run_now_at_a_full_destination_disk_deletes_and_defers_the_copy() {
+    common::expect_server_errors("level critical refuses the writes that this test tries");
+    let mut server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(FULL_DISK_RULES_YAML)
+        .build()
+        .await;
+    {
+        let client = server.s3_client().await;
+        for b in ["fd-src", "fd-dst1", "fd-dst2"] {
+            client.create_bucket().bucket(b).send().await.ok();
+        }
+        for (bucket, key) in [("fd-src", "n/new.txt"), ("fd-dst1", "stale/x.txt")] {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(b"x".to_vec()))
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+    server
+        .respawn_with_env(&[
+            (
+                "DGP_BOOTSTRAP_PASSWORD_HASH",
+                common::TEST_BOOTSTRAP_PASSWORD_HASH,
+            ),
+            ("DGP_TEST_DISK_MONITOR_FREE_PERCENT", "3"),
+        ])
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+
+    // A rule that only copies has nothing to do: refused up front.
+    let resp = admin
+        .post(format!(
+            "{endpoint}/_/api/admin/jobs/replication:fd-copying/run-now"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 409);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("cannot write into its destination"), "{text}");
+
+    // A rule that replicates deletes runs: its delete frees space.
+    let run = fire_run_now(&admin, &endpoint, "fd-deleting").await;
+    assert_eq!(run["status"], "deferred", "{run}");
+    let client = server.s3_client().await;
+    let stale = client
+        .head_object()
+        .bucket("fd-dst1")
+        .key("stale/x.txt")
+        .send()
+        .await;
+    assert!(stale.is_err(), "the mirror delete ran at a full disk");
+    let copied = client
+        .head_object()
+        .bucket("fd-dst1")
+        .key("n/new.txt")
+        .send()
+        .await;
+    assert!(copied.is_err(), "the copy waited for space");
+}

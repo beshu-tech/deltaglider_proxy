@@ -230,6 +230,23 @@ The proxy reads each upload body once before it stores the object. A body that i
 
 A rising count of `reason="memory_budget"` means that many small uploads arrive at the same time and the memory budget is full. Those bodies still succeed, but each one costs a disk write. Raise `DGP_INGEST_MEMORY_MAX_BYTES` if the host has free memory.
 
+## Disk space
+
+A background monitor measures the free space of the spool directory, of the root of every filesystem backend and of the data directory every `DGP_DISK_MONITOR_INTERVAL_SECS` seconds (30 by default). Directories on one device are measured once and share one level. The spool directory has its own gauges. For the other directories the label `path_role` names the role: `backend:<name>` (the name of the backend, for example `backend:hetzner-fsn1`) or `data`. The level gauge has a series for every role, and a fifth role, `spool-budget`, when the free space of the spool directory is not a reliable limit (see below). An S3 backend has no series. The [capacity planning reference](capacity-planning.md#disk-watermarks) explains the levels, and [the monitoring guide](../how-to/monitor-with-prometheus.md#disk-space-rules) gives the alert rules.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_spool_budget_bytes` | Gauge | — | The spool byte budget, which is the effective value of `DGP_SPOOL_MAX_BYTES` |
+| `deltaglider_spool_used_bytes` | Gauge | — | The spool bytes that running requests have reserved now, counted in whole MiB and cut at the budget in bytes. It never goes above the budget, also when `DGP_SPOOL_MAX_BYTES` is not a whole number of MiB |
+| `deltaglider_spool_dir_free_bytes` | Gauge | — | The bytes that a new file can use on the disk of the spool directory |
+| `deltaglider_spool_dir_total_bytes` | Gauge | — | The size of the disk of the spool directory |
+| `deltaglider_disk_free_bytes` | Gauge | `path_role` | The bytes that a new file can use on the disk of a filesystem backend or of the data directory |
+| `deltaglider_disk_total_bytes` | Gauge | `path_role` | The size of the disk of the role |
+| `deltaglider_disk_level` | Gauge | `path_role` | The level of the disk of the role (`spool`, `spool-budget`, `backend:<name>` or `data`): 0 ok, 1 low, 2 high, 3 critical |
+
+The role `spool-budget` exists where `statvfs` cannot show the real limit of the spool directory: on a tmpfs, under Kubernetes (an `emptyDir` with a `sizeLimit`, or a container quota) and when the free space cannot be measured. Its level follows the share of the spool budget that running requests have reserved, with the same percents as a disk (low at 85% reserved, high at 90%, critical at 95%) and no floor or ceiling in bytes. The series is measured every `DGP_DISK_MONITOR_INTERVAL_SECS` and moves with the hysteresis of a disk. The refusal of a new upload is judged live at every request from the bytes reserved at that moment, so it can start and end between two measures. The level of `spool` and the live judgement are the two reasons for a refusal.
+The series of a role disappears when the role disappears, for example when a config apply removes a filesystem backend.
+
 ## Re-encrypt rewrites
 
 The re-encrypt job rewrites each stored object in place. It reads the object, seals it and writes it back under a condition on the version that it read. These requests carry no upload body, so they have their own metric.
@@ -302,6 +319,7 @@ All label sets are bounded:
 | `result` | 2 (success or failure) |
 | `reason` | 7 (see the Auth table); 4 on `deltaglider_ingest_bodies_total` |
 | `medium` | 2 (`memory` or `spool`) |
+| `path_role` | One for the spool, one for each filesystem backend and one for the data directory |
 
 No label contains a bucket name or an object key, so no label has unbounded cardinality.
 

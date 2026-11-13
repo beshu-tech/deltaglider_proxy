@@ -85,7 +85,7 @@ test('status helpers', () => {
   assert.notEqual(jobStatusTone(row({ status: 'queued' })), 'processing');
   // A run that the proxy stopped is not "cancelled" and not an operator pause.
   assert.equal(isActiveJobStatus('deferred'), false);
-  assert.equal(jobStatusLabel(row({ status: 'deferred' })), 'deferred · continues shortly');
+  assert.equal(jobStatusLabel(row({ status: 'deferred' })), 'deferred · continues at the next run');
   assert.equal(jobStatusTone(row({ status: 'deferred' })), 'warning');
 
   assert.equal(kindLabel('reencrypt'), 'Re-encrypt');

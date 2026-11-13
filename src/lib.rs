@@ -25,6 +25,7 @@ pub mod coordination;
 pub mod cors;
 pub mod data_dir_lock;
 pub mod deltaglider;
+pub mod disk_watch;
 pub mod event_delivery;
 pub mod event_outbox;
 #[doc(hidden)]

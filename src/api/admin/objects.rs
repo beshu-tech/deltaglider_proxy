@@ -447,13 +447,16 @@ impl BulkActor {
     }
 }
 
-/// 409 when the bucket is under maintenance (re-encryption rewrites the
-/// bucket in place; admin writes bypass the S3 gate, so check explicitly).
+/// 409 when the bucket is under maintenance for a write of `kind` (re-encryption
+/// rewrites the bucket in place; admin writes bypass the S3 gate, so check
+/// explicitly). A job that waits for disk space holds back a write that stores
+/// bytes and lets one that frees space pass, as the S3 gate does.
 fn reject_if_under_maintenance(
     state: &std::sync::Arc<crate::api::admin::AdminState>,
     bucket: &str,
+    write: crate::maintenance::gate::WriteKind,
 ) -> Result<(), AdminError> {
-    if let Some(kind) = state.s3_state.maintenance_gate.busy_kind(bucket) {
+    if let Some(kind) = state.s3_state.maintenance_gate.busy_kind_for(bucket, write) {
         return Err(AdminError::conflict(
             crate::maintenance::gate::refusal_message(bucket, &kind),
         ));
@@ -513,6 +516,20 @@ async fn reject_if_replication_target_only(
         .map_err(|e| AdminError::forbidden(e.to_string()))
 }
 
+/// 503 while the disk of the filesystem backend that holds `bucket` is at
+/// level critical (`disk_watch`): a bulk copy or move STORES into it. A
+/// delete never asks: it frees space.
+async fn reject_if_disk_critical(
+    state: &std::sync::Arc<crate::api::admin::AdminState>,
+    bucket: &str,
+) -> Result<(), AdminError> {
+    let engine = state.s3_state.engine.load_full();
+    match crate::disk_watch::bucket_write_refusal(&engine, bucket).await {
+        Some(message) => Err(AdminError::unavailable(message)),
+        None => Ok(()),
+    }
+}
+
 pub async fn copy_objects(
     Extension(session): Extension<BulkSession>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
@@ -527,8 +544,13 @@ pub async fn copy_objects(
         req.items,
         req.no_overwrite,
     )?;
-    reject_if_under_maintenance(&state, &req.dest_bucket)?;
+    reject_if_under_maintenance(
+        &state,
+        &req.dest_bucket,
+        crate::maintenance::gate::WriteKind::Store,
+    )?;
     reject_if_replication_target_only(&state, &req.dest_bucket).await?;
+    reject_if_disk_critical(&state, &req.dest_bucket).await?;
     if req.items.is_empty() {
         return Err(AdminError::invalid("no items to copy"));
     }
@@ -637,7 +659,7 @@ async fn run_copy_loop(
         .map(|indexes| async move {
             let mut out = Vec::with_capacity(indexes.len());
             for idx in indexes {
-                if gate.is_busy(&req.dest_bucket) {
+                if gate.is_busy_for(&req.dest_bucket, crate::maintenance::gate::WriteKind::Store) {
                     out.push((idx, CopyOutcome::Skipped));
                     continue;
                 }
@@ -894,10 +916,20 @@ pub async fn move_objects(
         req.items,
         req.no_overwrite,
     )?;
-    reject_if_under_maintenance(&state, &req.dest_bucket)?;
-    reject_if_under_maintenance(&state, &req.source_bucket)?;
+    reject_if_under_maintenance(
+        &state,
+        &req.dest_bucket,
+        crate::maintenance::gate::WriteKind::Store,
+    )?;
+    // The source delete of a move frees space.
+    reject_if_under_maintenance(
+        &state,
+        &req.source_bucket,
+        crate::maintenance::gate::WriteKind::FreesSpace,
+    )?;
     // Move = store into dest + delete from source: both are client writes.
     reject_if_replication_target_only(&state, &req.dest_bucket).await?;
+    reject_if_disk_critical(&state, &req.dest_bucket).await?;
     reject_if_replication_target_only(&state, &req.source_bucket).await?;
     if req.items.is_empty() {
         return Err(AdminError::invalid("no items to move"));
@@ -1031,7 +1063,14 @@ async fn delete_moved_sources(
     }
     // A maintenance job armed mid-move stops the deletes; the copies
     // succeeded, so leftovers are benign (as a failed source delete).
-    let proceed = || !gate.is_busy(source_bucket);
+    // The source delete of a move frees space: it passes a bucket whose job waits
+    // for disk space, as a client delete does.
+    let proceed = || {
+        !gate.is_busy_for(
+            source_bucket,
+            crate::maintenance::gate::WriteKind::FreesSpace,
+        )
+    };
     let emit = deleted_event_emitter(s3, source_bucket);
     let outcomes = engine
         .delete_batch(
@@ -1122,7 +1161,11 @@ pub async fn bulk_delete(
         keys: req.keys,
         savings: state.savings_cache.clone(),
     };
-    reject_if_under_maintenance(&state, &req.bucket)?;
+    reject_if_under_maintenance(
+        &state,
+        &req.bucket,
+        crate::maintenance::gate::WriteKind::FreesSpace,
+    )?;
     reject_if_replication_target_only(&state, &req.bucket).await?;
     if req.keys.is_empty() {
         return Err(AdminError::invalid("no keys to delete"));
@@ -1503,7 +1546,9 @@ pub(crate) async fn run_bulk_delete(
             }
         }
     }
-    let proceed = || !gate.is_busy(bucket);
+    // One rule with the page check of a delete job and the request gate: a delete
+    // passes a bucket whose job waits for disk space (it frees space).
+    let proceed = || !gate.is_busy_for(bucket, crate::maintenance::gate::WriteKind::FreesSpace);
     let emit_event = deleted_event_emitter(s3, bucket);
     let emit = |key: &str, outcome: &DeleteOutcome| {
         tally(counts_as_deleted(outcome));
@@ -2711,6 +2756,156 @@ mod tests {
                 "{}",
                 res.failures[0].error
             );
+            let engine = state.engine.load();
+            for key in &keys {
+                assert!(engine.head("b", key).await.is_ok(), "{key} is still there");
+            }
+        }
+
+        /// The kind of every admin entry check, by source: a copy or move
+        /// DESTINATION stores bytes; a move's source and a bulk delete free
+        /// space (so a job's disk wait lets them in). A blind `Store` there is
+        /// the 409 that the docs deny; a blind `FreesSpace` on a destination
+        /// lets copies into a held bucket.
+        #[test]
+        fn the_admin_entry_checks_name_the_kind_of_their_write() {
+            let text = crate::source_scan::prod_text(&crate::source_scan::read(
+                "src/api/admin/objects.rs",
+            ));
+            let flat: String = text.split_whitespace().collect();
+            let call = |bucket: &str, kind: &str| {
+                format!(
+                    "reject_if_under_maintenance(&state,&req.{bucket},crate::maintenance::gate::WriteKind::{kind},)?;"
+                )
+            };
+            assert_eq!(
+                flat.matches(&call("dest_bucket", "Store")).count(),
+                2,
+                "copy and move"
+            );
+            assert_eq!(
+                flat.matches(&call("source_bucket", "FreesSpace")).count(),
+                1,
+                "move source"
+            );
+            assert_eq!(
+                flat.matches(&call("bucket", "FreesSpace")).count(),
+                1,
+                "bulk delete"
+            );
+            assert_eq!(
+                flat.matches("reject_if_under_maintenance(&state,").count(),
+                4,
+                "no entry check without a named kind"
+            );
+        }
+
+        /// A job that WAITS FOR DISK SPACE holds bucket `b` (a re-encrypt row,
+        /// gate armed) with its wait on the gate: a write that frees space
+        /// passes, a write that stores bytes does not.
+        fn hold_for_disk(state: &std::sync::Arc<AppState>) {
+            let db = crate::config_db::JobsDb::in_memory("t").unwrap();
+            let id = db
+                .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
+                .unwrap()
+                .unwrap();
+            state.maintenance_gate.sync_from(&db);
+            state
+                .maintenance_gate
+                .mark_disk_deferred(id, crate::maintenance::store::current_unix_seconds() + 600);
+            assert!(state.maintenance_gate.is_busy("b"));
+        }
+
+        /// The per-item check of a bulk delete lets a delete pass a job's disk
+        /// wait: every key goes.
+        #[tokio::test]
+        async fn a_bulk_delete_passes_a_job_that_waits_for_disk() {
+            let (engine, _fake) = s3_engine().await;
+            let keys = store_deltas(&engine, "e2e/run-1", 4).await;
+            let state = AppState::for_tests(engine);
+            hold_for_disk(&state);
+
+            let res = run_bulk_delete(
+                &state,
+                "b",
+                &paths(&keys),
+                &BulkActor::Unrestricted,
+                &|_| {},
+            )
+            .await;
+
+            assert_eq!((res.deleted, res.failed), (4, 0), "{res:?}");
+            let engine = state.engine.load();
+            for key in &keys {
+                assert!(engine.head("b", key).await.is_err(), "{key} is deleted");
+            }
+        }
+
+        /// The per-item check of a bulk COPY refuses a job's disk wait: a copy
+        /// stores bytes. Every item is skipped.
+        #[tokio::test]
+        async fn a_bulk_copy_into_a_bucket_that_waits_for_disk_is_skipped() {
+            let (engine, _fake) = s3_engine().await;
+            let keys = sources(&engine).await;
+            let plan = copy_plan(&engine, &keys);
+            let state = AppState::for_tests(engine);
+            hold_for_disk(&state);
+
+            let (res, copied) = run_copy_loop(&state, &plan, &BulkActor::Unrestricted, false).await;
+
+            assert_eq!((res.succeeded, res.failed), (0, keys.len()), "{res:?}");
+            assert!(copied.iter().all(Option::is_none));
+        }
+
+        /// The source delete of a move passes a job's disk wait (it frees
+        /// space): the sources of the copies that were made are deleted.
+        #[tokio::test]
+        async fn a_move_deletes_its_sources_while_a_job_waits_for_disk() {
+            let (engine, _fake) = s3_engine().await;
+            let keys = store_deltas(&engine, "e2e/run-1", 4).await;
+            let mut copied = Vec::new();
+            for key in &keys {
+                copied.push(Some(engine.head("b", key).await.unwrap()));
+            }
+            let items: Vec<CopyItem> = paths(&keys)
+                .into_iter()
+                .map(|p| CopyItem {
+                    source_key: p.clone(),
+                    relative: p,
+                })
+                .collect();
+            let state = AppState::for_tests(engine);
+            hold_for_disk(&state);
+
+            let (deleted, _) = delete_moved_sources(&state, "b", &items, &copied, |_| false).await;
+
+            assert_eq!(deleted, keys.len(), "a delete passes the wait");
+        }
+
+        /// A maintenance job armed on the source bucket stops the source
+        /// deletes of a move: the copies are made, the sources stay (the
+        /// per-item check of the delete batch, [`WriteKind::FreesSpace`]).
+        #[tokio::test]
+        async fn a_move_leaves_its_sources_when_a_job_holds_the_bucket() {
+            let (engine, _fake) = s3_engine().await;
+            let keys = store_deltas(&engine, "e2e/run-1", 4).await;
+            let mut copied = Vec::new();
+            for key in &keys {
+                copied.push(Some(engine.head("b", key).await.unwrap()));
+            }
+            let items: Vec<CopyItem> = paths(&keys)
+                .into_iter()
+                .map(|p| CopyItem {
+                    source_key: p.clone(),
+                    relative: p,
+                })
+                .collect();
+            let state = AppState::for_tests(engine);
+            state.maintenance_gate.set_busy("b");
+
+            let (deleted, _) = delete_moved_sources(&state, "b", &items, &copied, |_| false).await;
+
+            assert_eq!(deleted, 0, "a held bucket deletes no source");
             let engine = state.engine.load();
             for key in &keys {
                 assert!(engine.head("b", key).await.is_ok(), "{key} is still there");
