@@ -627,6 +627,12 @@ pub enum WriteIf {
     /// Not stored: the backend has no conditional writes (S3 501). The
     /// caller decides whether an unconditional write is safe.
     Unsupported,
+    /// Not stored: the object is above the single-PUT limit, the write needs
+    /// a multipart upload, and the backend is not proven to enforce a
+    /// condition on CompleteMultipartUpload (nothing was sent). Like
+    /// [`Self::Unsupported`], the caller decides whether an unconditional
+    /// write is safe; it has another reason to give when it is not.
+    UnprovenMultipart,
 }
 
 /// The body of a [`StorageBackend::put_object`].

@@ -998,15 +998,27 @@ impl StorageBackend for S3Backend {
         let fence = RefFence::ETag(version.to_string());
         let put = match body.files() {
             Some(files) => {
-                self.put_object_file_with_metadata_fenced_with(
-                    bucket,
-                    &key,
-                    &files,
-                    metadata,
-                    &fence,
-                    OnUnsupported::Report,
-                )
-                .await?
+                match self
+                    .put_object_file_with_metadata_fenced_with(
+                        bucket,
+                        &key,
+                        &files,
+                        metadata,
+                        &fence,
+                        OnUnsupported::Report,
+                    )
+                    .await
+                {
+                    Ok(put) => put,
+                    // Nothing was sent. The caller (the re-encrypt job)
+                    // writes without the condition when it holds the write
+                    // gate, and says why it cannot otherwise.
+                    Err(StorageError::ConditionalMultipartRefused(why)) => {
+                        debug!("S3 conditional rewrite {bucket}/{key}: {why}");
+                        return Ok(WriteIf::UnprovenMultipart);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             None => {
                 let data = body.into_small_bytes()?;

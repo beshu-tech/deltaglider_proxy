@@ -294,6 +294,9 @@ pub async fn probe_conditional_complete(
     key: &str,
     dialect: IfMatchDialect,
 ) -> Option<bool> {
+    // Armed from before the first write: a cut future leaves the key, and
+    // the guard removes it (see [`SweepOnDrop`]).
+    let sweep = SweepOnDrop::new(client, bucket, key);
     let seed = client
         .put_object()
         .bucket(bucket)
@@ -301,32 +304,46 @@ pub async fn probe_conditional_complete(
         .body(ByteStream::from_static(b"old"))
         .send()
         .await
-        .ok()?;
-    let etag = seed.e_tag().unwrap_or_default().to_string();
-    let verdict = async {
-        let create = complete_with(client, bucket, key, |r| r.if_none_match("*")).await;
-        // The old object must be intact after each refusal.
-        if create == StepOutcome::PreconditionFailed
-            && !key_holds(client, bucket, key, b"old").await
-        {
-            return Some(false);
+        .ok();
+    let verdict = match seed {
+        None => None,
+        Some(seed) => {
+            let etag = seed.e_tag().unwrap_or_default().to_string();
+            async {
+                let create = complete_with(client, bucket, key, |r| r.if_none_match("*")).await;
+                // The old object must be intact after each refusal: a
+                // refusal that went with a changed (or an unreadable) key
+                // proves nothing.
+                if create == StepOutcome::PreconditionFailed {
+                    match key_holds_checked(client, bucket, key, b"old").await {
+                        Some(true) => {}
+                        Some(false) => return Some(false),
+                        None => return None,
+                    }
+                }
+                let wrong = complete_with(client, bucket, key, |r| {
+                    r.if_match_etag(WRONG_ETAG, dialect)
+                })
+                .await;
+                if wrong == StepOutcome::PreconditionFailed {
+                    match key_holds_checked(client, bucket, key, b"old").await {
+                        Some(true) => {}
+                        Some(false) => return Some(false),
+                        None => return None,
+                    }
+                }
+                if etag.is_empty() {
+                    return None;
+                }
+                let right =
+                    complete_with(client, bucket, key, |r| r.if_match_etag(&etag, dialect)).await;
+                classify_conditional_complete(&create, &wrong, &right)
+            }
+            .await
         }
-        let wrong = complete_with(client, bucket, key, |r| {
-            r.if_match_etag(WRONG_ETAG, dialect)
-        })
-        .await;
-        if wrong == StepOutcome::PreconditionFailed && !key_holds(client, bucket, key, b"old").await
-        {
-            return Some(false);
-        }
-        if etag.is_empty() {
-            return None;
-        }
-        let right = complete_with(client, bucket, key, |r| r.if_match_etag(&etag, dialect)).await;
-        classify_conditional_complete(&create, &wrong, &right)
-    }
-    .await;
+    };
     remove_all_versions(client, bucket, key).await;
+    sweep.disarm();
     verdict
 }
 
@@ -474,15 +491,65 @@ where
     }
 }
 
-/// Does `bucket/key` hold exactly `body`? `false` when it cannot be read.
-async fn key_holds(client: &Client, bucket: &str, key: &str, body: &[u8]) -> bool {
+/// Does `bucket/key` hold exactly `body`? `Some(false)`: another body, or
+/// no key (the backend answered `NoSuchKey`). `None`: the backend could not
+/// be asked (a transport error, another error answer, a broken body): that
+/// proves nothing either way.
+async fn key_holds_checked(client: &Client, bucket: &str, key: &str, body: &[u8]) -> Option<bool> {
     match client.get_object().bucket(bucket).key(key).send().await {
         Ok(out) => out
             .body
             .collect()
             .await
-            .is_ok_and(|b| b.into_bytes().as_ref() == body),
-        Err(_) => false,
+            .ok()
+            .map(|b| b.into_bytes().as_ref() == body),
+        Err(e) if e.as_service_error().is_some_and(|s| s.is_no_such_key()) => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// [`key_holds_checked`] for a caller that takes "cannot tell" as "no".
+async fn key_holds(client: &Client, bucket: &str, key: &str, body: &[u8]) -> bool {
+    key_holds_checked(client, bucket, key, body).await == Some(true)
+}
+
+/// Removes a probe key with every version when it is dropped, unless it was
+/// disarmed: a probe future that is cut (its deadline, a caller that gives
+/// up) stops between its writes and its cleanup, and the key would stay in a
+/// data bucket where a client lists it. The sweep runs on a task of its own.
+struct SweepOnDrop {
+    client: Client,
+    bucket: String,
+    key: String,
+    armed: bool,
+}
+
+impl SweepOnDrop {
+    fn new(client: &Client, bucket: &str, key: &str) -> Self {
+        Self {
+            client: client.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            armed: true,
+        }
+    }
+
+    /// The probe removed its key itself.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SweepOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (client, bucket, key) = (self.client.clone(), self.bucket.clone(), self.key.clone());
+        runtime.spawn(async move { remove_all_versions(&client, &bucket, &key).await });
     }
 }
 
@@ -555,6 +622,8 @@ pub async fn probe_cas(
     bucket: &str,
     key: &str,
 ) -> Result<ProbeResult, ProbeError> {
+    // Armed from before the first write (see [`SweepOnDrop`]).
+    let sweep = SweepOnDrop::new(client, bucket, key);
     let first = client
         .put_object()
         .bucket(bucket)
@@ -659,12 +728,121 @@ pub async fn probe_cas(
             .await,
     );
     remove_all_versions(client, bucket, key).await;
+    sweep.disarm();
     let (cas, if_match) = verdict?;
     Ok(ProbeResult {
         cas,
         conditional_delete: classify_conditional_delete(&delete_wrong),
         if_match,
     })
+}
+
+#[cfg(test)]
+mod drop_and_unknown_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn client_for(endpoint: &str) -> Client {
+        Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "a", "b", None, None, "t",
+                ))
+                .force_path_style(true)
+                .endpoint_url(endpoint)
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+                .build(),
+        )
+    }
+
+    /// Wait until `fake` holds no object under `prefix`, at most 5 s.
+    async fn gone(fake: &crate::storage::fake_s3::FakeS3, prefix: &str) -> bool {
+        for _ in 0..100 {
+            if fake.stored_count(prefix) == 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// A probe future that is cut (its deadline) between its writes and its
+    /// cleanup leaves no key in the data bucket: the drop guard removes it.
+    /// Stage 1 is cut inside its DELETE with the key written.
+    #[tokio::test]
+    async fn a_cut_conditional_put_probe_leaves_no_key() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let client = client_for(&endpoint);
+        fake.set_delay_ms("DELETE", 5_000);
+        let cut = tokio::time::timeout(
+            Duration::from_millis(1_500),
+            probe_cas(&client, "b", "probe/stage1"),
+        )
+        .await;
+        assert!(cut.is_err(), "the probe was cut by its deadline");
+        assert_eq!(fake.stored_count("b/probe/stage1"), 1, "the key is there");
+        fake.set_delay_ms("DELETE", 0);
+        assert!(
+            gone(&fake, "b/probe/stage1").await,
+            "the drop guard removed the key"
+        );
+    }
+
+    /// The same for the conditional Complete probe: the seed object of a cut
+    /// stage 2 (cut inside its CreateMultipartUpload) is removed.
+    #[tokio::test]
+    async fn a_cut_conditional_complete_probe_leaves_no_seed() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let client = client_for(&endpoint);
+        fake.set_delay_ms("POST", 5_000);
+        let cut = tokio::time::timeout(
+            Duration::from_secs(1),
+            probe_conditional_complete(&client, "b", "probe/stage2-mpu", IfMatchDialect::Quoted),
+        )
+        .await;
+        assert!(cut.is_err(), "the probe was cut by its deadline");
+        assert_eq!(
+            fake.stored_count("b/probe/stage2-mpu"),
+            1,
+            "the seed is there"
+        );
+        fake.set_delay_ms("POST", 0);
+        assert!(
+            gone(&fake, "b/probe/stage2-mpu").await,
+            "the drop guard removed the seed"
+        );
+    }
+
+    /// `key_holds_checked`: the key's body, another body, no key, and a
+    /// backend that cannot be asked (a 500): only the last is "cannot tell".
+    #[tokio::test]
+    async fn a_failed_read_is_unknown_not_false() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let client = client_for(&endpoint);
+        fake.insert_object("b/k", b"old", &[]);
+        assert_eq!(
+            key_holds_checked(&client, "b", "k", b"old").await,
+            Some(true)
+        );
+        assert_eq!(
+            key_holds_checked(&client, "b", "k", b"new").await,
+            Some(false)
+        );
+        assert_eq!(
+            key_holds_checked(&client, "b", "missing", b"old").await,
+            Some(false),
+            "no key: it does not hold the body"
+        );
+        fake.fail("GET", "b/k", 500, "InternalError", u32::MAX);
+        assert_eq!(
+            key_holds_checked(&client, "b", "k", b"old").await,
+            None,
+            "a read error says nothing"
+        );
+        assert!(!key_holds(&client, "b", "k", b"old").await);
+    }
 }
 
 #[cfg(test)]

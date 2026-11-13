@@ -958,6 +958,32 @@ mod tests {
             .expect("the part waits for the backend: no deadline of the whole operation");
     }
 
+    /// `put_if_unchanged` (the re-encrypt job's rewrite) of an object above
+    /// the limit on a backend with no proof of a conditional Complete sends
+    /// nothing and answers `UnprovenMultipart`: a job that holds the write
+    /// gate then writes without the condition. It was an error, so such an
+    /// object failed although an unconditional write was safe.
+    #[tokio::test]
+    async fn a_rewrite_above_the_limit_without_proof_is_unproven_multipart() {
+        use crate::deltaglider::spool::{SpoolBudget, SpoolDir};
+        use crate::storage::{PutBody, RewriteTarget, StorageBackend, WriteIf};
+        let (endpoint, mut heads) = head_recorder(std::time::Duration::ZERO).await;
+        let s3 = production_backend(&endpoint)
+            .await
+            .with_put_limits(MIN_PART_BYTES, MIN_PART_BYTES);
+        let (dir, path, meta) = file_and_meta(MIN_PART_BYTES as usize + 1);
+        let sd = SpoolDir::new(dir.path().join("spool"), 8 << 20).unwrap();
+        let spool = SpoolBudget::new(&sd, None, None);
+        let target = RewriteTarget::Passthrough { name: "o" };
+        let body = PutBody::File { path: &path, spool };
+        let out = s3
+            .put_if_unchanged("b", "p", target, body, &meta, "\"abc\"")
+            .await
+            .expect("not an error");
+        assert_eq!(out, WriteIf::UnprovenMultipart);
+        assert!(heads.try_recv().is_err(), "no request was sent");
+    }
+
     /// A write with a condition above the single-PUT limit, on a backend
     /// whose conditional Complete is not proven, sends no request and gets a
     /// true error (`ConditionalMultipartRefused`, naming the 5 GiB and the
