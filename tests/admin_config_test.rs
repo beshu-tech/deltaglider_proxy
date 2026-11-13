@@ -2518,13 +2518,14 @@ async fn a_config_apply_keeps_the_limits_and_takes_a_new_max_object_size() {
 }
 
 /// A server whose disk monitor sees `free_percent` of a 100 GiB disk free
-/// (the seam), with a spool threshold of 1 MiB so that a 4 MiB body needs a
-/// spool reservation.
+/// (the seam), with a spool threshold of 1 KiB so that an 8 KiB body needs a
+/// spool reservation. The bodies stay below the socket buffers: a proxy that
+/// answers 503 before it reads the body must not break the client's write.
 async fn disk_server(free_percent: u8) -> (tempfile::TempDir, TestServer) {
     let spool = tempfile::TempDir::new().unwrap();
     let server = TestServer::builder()
         .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
-        .env("DGP_SPOOL_THRESHOLD_BYTES", &MIB.to_string())
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "1024")
         .env(
             "DGP_TEST_DISK_MONITOR_FREE_PERCENT",
             &free_percent.to_string(),
@@ -2554,7 +2555,7 @@ async fn put_status(server: &TestServer, key: &str, len: usize) -> (u16, String)
 async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
     common::expect_server_errors("the disk level high refuses a new upload that needs spool space");
     let (_spool, ok) = disk_server(50).await;
-    let (status, body) = put_status(&ok, "large.bin", 4 * MIB as usize).await;
+    let (status, body) = put_status(&ok, "large.bin", 8 * 1024).await;
     assert_eq!(status, 200, "a disk with room admits the upload: {body}");
 
     let (_spool, server) = disk_server(8).await;
@@ -2578,7 +2579,7 @@ async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
         assert!(metrics.contains(name), "{name} not in: {metrics}");
     }
 
-    let (status, body) = put_status(&server, "large.bin", 4 * MIB as usize).await;
+    let (status, body) = put_status(&server, "large.bin", 8 * 1024).await;
     assert_eq!(status, 503, "{body}");
     for needle in ["SlowDown", "level high", "DGP_SPOOL_MAX_BYTES"] {
         assert!(body.contains(needle), "{needle} not in: {body}");
@@ -2586,11 +2587,11 @@ async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
 
     // A delta encode needs a spool file for its source, so a small
     // delta-eligible file is refused too.
-    let (status, body) = put_status(&server, "small.bin", 1024).await;
+    let (status, body) = put_status(&server, "small.bin", 512).await;
     assert_eq!(status, 503, "{body}");
     // A small body of a passthrough type needs no spool: the upload and the
     // read work.
-    let (status, body) = put_status(&server, "small.jpg", 1024).await;
+    let (status, body) = put_status(&server, "small.jpg", 512).await;
     assert_eq!(status, 200, "{body}");
     let got = server
         .http()
@@ -2603,7 +2604,7 @@ async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
         .await
         .unwrap();
     assert_eq!(got.status().as_u16(), 200);
-    assert_eq!(got.bytes().await.unwrap().len(), 1024);
+    assert_eq!(got.bytes().await.unwrap().len(), 512);
 
     // A full disk still serves reads, so the node stays ready.
     let ready = reqwest::get(format!("{}/_/ready", server.endpoint()))
