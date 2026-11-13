@@ -1203,11 +1203,14 @@ impl DiskProbe for TimedProbe {
             .spawn(move || {
                 // Ends the hang on every exit of the thread, a panic of the
                 // probe included: the path must never stay hung for good.
-                let _unhung = Unhung {
+                let unhung = Unhung {
                     hung,
                     path: owned.clone(),
                 };
                 let facts = inner.measure(&owned);
+                // Free the path BEFORE the answer: the next measure of it
+                // (another role on the same path) follows the answer at once.
+                drop(unhung);
                 let _ = tx.send(facts);
             });
         if spawned.is_err() {

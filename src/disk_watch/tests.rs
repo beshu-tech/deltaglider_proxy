@@ -1525,6 +1525,37 @@ fn a_panicking_measure_frees_its_path() {
     assert_eq!(probe.measure(path).map(|f| f.free), Some(GIB));
 }
 
+/// Two roles can share one path (a filesystem backend at the data
+/// directory). The second measure of the path follows the first at once, so
+/// the first thread must be free of the path BEFORE it answers: else the
+/// second measure meets the hang flag and answers nothing, and its role has
+/// no series in that tick.
+#[test]
+fn a_path_is_free_again_when_its_measure_answers() {
+    struct Instant_;
+    impl DiskProbe for Instant_ {
+        fn measure(&self, _: &Path) -> Option<PathFacts> {
+            Some(PathFacts {
+                free: GIB,
+                total: 2 * GIB,
+                device: 1,
+            })
+        }
+    }
+    let probe = TimedProbe::new(Arc::new(Instant_), Duration::from_secs(5));
+    let path = Path::new("/shared");
+    for round in 0..2000 {
+        assert!(
+            probe.measure(path).is_some(),
+            "first measure, round {round}"
+        );
+        assert!(
+            probe.measure(path).is_some(),
+            "the second measure of the same path met the hang flag, round {round}"
+        );
+    }
+}
+
 /// A spool measure that fails or times out changes nothing, like the other
 /// roles: it must not turn the judgement by use on for that tick. Only a
 /// spool that was NEVER measured is judged by its use.
