@@ -438,7 +438,7 @@ impl UsageScanner {
                 return; // the semaphore is never closed
             };
 
-            let result = Self::do_scan(&s3_state, &bucket, &prefix).await;
+            let result = Self::do_scan_until_stamped(&s3_state, &bucket, &prefix).await;
             match result {
                 Ok(entry) => {
                     debug!(
@@ -487,6 +487,7 @@ impl UsageScanner {
     /// Logical sizes come from the listing (filesystem: exact, from the
     /// xattrs it reads anyway) or from the listing-size cache (S3); an object
     /// neither knows counts its stored size and marks the result estimated.
+    #[cfg(test)]
     async fn do_scan(
         s3_state: &AppState,
         bucket: &str,
@@ -496,12 +497,55 @@ impl UsageScanner {
     }
 
     /// [`Self::do_scan`] with the object cap as a parameter (tests lower it).
+    #[cfg(test)]
     async fn do_scan_capped(
         s3_state: &AppState,
         bucket: &str,
         prefix: &str,
         max_objects: usize,
     ) -> Result<UsageEntry, String> {
+        Ok(
+            Self::do_scan_stamping(s3_state, bucket, prefix, max_objects)
+                .await?
+                .0,
+        )
+    }
+
+    /// The scan of the quota check. The scan starts inside the write
+    /// request that asked for it, so it often ends while that write is
+    /// between its storage write and the record of its change, and such a
+    /// scan is not trusted ([`crate::bucket_usage::scan_is_quiet`]). The scan
+    /// is then repeated, after the writes in their window ended, so that a
+    /// bucket with one writer after the other gets a trusted counter. At
+    /// most [`STAMP_REPEATS`] repeats: a bucket that always has a write in
+    /// its window keeps the last snapshot, as before.
+    async fn do_scan_until_stamped(
+        s3_state: &AppState,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<UsageEntry, String> {
+        let mut repeats = 0;
+        loop {
+            let (entry, stamp) =
+                Self::do_scan_stamping(s3_state, bucket, prefix, MAX_SCAN_OBJECTS).await?;
+            let Some(usage) = s3_state.bucket_usage.as_deref() else {
+                return Ok(entry);
+            };
+            if stamp != Stamp::Declined || repeats >= STAMP_REPEATS {
+                return Ok(entry);
+            }
+            repeats += 1;
+            usage.wait_windows_closed(bucket, STAMP_REPEAT_WAIT).await;
+        }
+    }
+
+    /// [`Self::do_scan_capped`], and whether the scan stamped the counter.
+    async fn do_scan_stamping(
+        s3_state: &AppState,
+        bucket: &str,
+        prefix: &str,
+        max_objects: usize,
+    ) -> Result<(UsageEntry, Stamp), String> {
         let engine = s3_state.engine.load();
         // A scan of the whole bucket can stamp the usage counter (below).
         // The ticket marks the scan start: a write that lands while the
@@ -510,7 +554,7 @@ impl UsageScanner {
             .bucket_usage
             .as_deref()
             .filter(|_| prefix.is_empty());
-        let ticket = usage.map(|u| u.begin_scan_watching(bucket, &s3_state.maintenance_gate));
+        let ticket = usage.map(|u| u.begin_scan(bucket));
         // One key past the cap tells whether the prefix goes on.
         let listing = engine
             .storage()
@@ -538,6 +582,7 @@ impl UsageScanner {
             .await;
 
         let totals = aggregate_usage(prefix, &objects, &stored, &sizes, &listing.baselines);
+        let mut stamp = Stamp::NotApplicable;
         if let (Some(usage), Some(ticket)) = (usage, ticket) {
             // Only a complete, exact scan replaces the counter, as a
             // Refresh does: the quota check then trusts the counter (O(1))
@@ -545,12 +590,13 @@ impl UsageScanner {
             if !truncated && !totals.sizes_estimated {
                 let now = crate::replication::current_unix_seconds();
                 let savings = savings_totals(&objects, &listing.baselines);
-                // Only a quiet scan: nobody repeats this scan, so a write
-                // that it may count twice must not stamp the counter.
+                // Only a quiet scan: a write that it may count twice must
+                // not stamp the counter.
                 match usage.overwrite_from_quiet_scan(ticket, &savings, now) {
-                    Ok(true) => {}
+                    Ok(true) => stamp = Stamp::Stamped,
                     Ok(false) => {
-                        debug!(bucket = %bucket, "usage counter not stamped: the bucket changed during the scan")
+                        stamp = Stamp::Declined;
+                        debug!(bucket = %bucket, "usage counter not stamped: a write changed the bucket or sat between its storage write and its record")
                     }
                     Err(e) => {
                         warn!(bucket = %bucket, error = %e, "usage counter not stamped by the scan")
@@ -558,7 +604,7 @@ impl UsageScanner {
                 }
             }
         }
-        Ok(UsageEntry {
+        let entry = UsageEntry {
             prefix: prefix.to_string(),
             bucket: bucket.to_string(),
             total_size: totals.total_size,
@@ -570,9 +616,28 @@ impl UsageScanner {
             stale_seconds: 0,
             truncated,
             sizes_estimated: totals.sizes_estimated,
-        })
+        };
+        Ok((entry, stamp))
     }
 }
+
+/// What a whole-bucket scan did to the usage counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stamp {
+    /// The counter now holds the scan's numbers as the trusted count.
+    Stamped,
+    /// The scan was complete and exact, but not quiet (a write changed the
+    /// bucket, or sat between its storage write and its record).
+    Declined,
+    /// Not a whole-bucket scan, a partial one, or no counter.
+    NotApplicable,
+}
+
+/// How often the scan of the quota check is repeated when it ended inside a
+/// write ([`UsageScanner::do_scan_until_stamped`]), and how long each repeat
+/// waits for the writes in their window to end.
+const STAMP_REPEATS: u32 = 2;
+const STAMP_REPEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Request-count fixtures for the admin scans: an engine on a fake S3, and
 /// raw objects written straight into the fake (no proxy metadata, no
@@ -1154,15 +1219,17 @@ mod stamp_tests {
     /// moment later. A scan that lists in that moment sees the object, and
     /// the journal has no change yet. Stamped, the scan's count and the
     /// writer's change would add up to a double count that no later scan
-    /// repairs (the quota stays closed after a delete). The write is in
-    /// flight, so the scan is not stamped; the write counts once; the next
-    /// scan, with no write in flight, stamps.
+    /// repairs (the quota stays closed after a delete). The write sits in
+    /// its window (the engine's object write lock), so the scan is not
+    /// stamped; the write counts once; the next scan, with no write in its
+    /// window, stamps.
     #[tokio::test]
     async fn a_scan_between_a_writes_commit_and_its_record_is_not_stamped() {
         let (st, usage, _fake, endpoint) = state_at(0).await;
 
-        // The writer: counted as in flight, object stored, change not recorded.
-        let writer = st.maintenance_gate.begin_write("b");
+        // The writer: holds the engine's object write lock (its window),
+        // object stored, change not recorded.
+        let writer = st.engine.load().lock_object_write("b", "d/first.txt").await;
         test_support::put_raw(&endpoint, "d/first.txt", &[7u8; 12_000]).await;
 
         // The scan runs right then.
@@ -1171,7 +1238,7 @@ mod stamp_tests {
         assert_eq!(
             usage.read("b").unwrap().and_then(|r| r.last_scan_at),
             None,
-            "a scan that ended with a write in flight was stamped"
+            "a scan that ended inside a write's window was stamped"
         );
 
         // The writer records its change and ends.
@@ -1185,11 +1252,126 @@ mod stamp_tests {
             "the object was counted twice: {row:?}"
         );
 
-        // With no write in flight, the next scan stamps the true count.
+        // With no write in its window, the next scan stamps the true count.
         UsageScanner::do_scan(&st, "b", "").await.unwrap();
         let row = usage.read("b").unwrap().unwrap();
         assert!(row.last_scan_at.is_some(), "{row:?}");
         assert_eq!((row.object_count, row.stored_bytes), (1, 12_000), "{row:?}");
+    }
+
+    /// The scan of the quota check starts inside the write that asked for
+    /// it, so it often ends inside that write's window: it is repeated
+    /// after the write, and the repeat stamps the exact count, whichever way
+    /// the write and the first listing interleave.
+    #[tokio::test]
+    async fn a_scan_that_ends_inside_a_write_is_repeated_until_it_stamps() {
+        let (st, usage, fake, endpoint) = state_at(0).await;
+        let engine = st.engine.load_full();
+        let writer = engine.lock_object_write("b", "d/first.txt").await;
+        test_support::put_raw(&endpoint, "d/first.txt", &[7u8; 12_000]).await;
+        let scan = {
+            let st = st.clone();
+            tokio::spawn(async move { UsageScanner::do_scan_until_stamped(&st, "b", "").await })
+        };
+        // The first listing is on its way; the write records and ends.
+        fake.wait_for(|r| r.contains("list-type=2")).await;
+        let meta = engine.head("b", "d/first.txt").await.unwrap();
+        usage.apply_net("b", None, Some(&meta), 0);
+        drop(writer);
+        scan.await.unwrap().unwrap();
+        let row = usage.read("b").unwrap().unwrap();
+        assert!(row.last_scan_at.is_some(), "{row:?}");
+        assert_eq!((row.object_count, row.stored_bytes), (1, 12_000), "{row:?}");
+    }
+
+    /// A bucket that always has a write in its window is not scanned
+    /// again and again: the scan is repeated [`STAMP_REPEATS`] times, then
+    /// it keeps the snapshot and the counter stays untrusted.
+    #[tokio::test]
+    async fn the_repeats_of_a_scan_are_bounded() {
+        let (st, usage, fake, _endpoint) = state_at(1).await;
+        let engine = st.engine.load_full();
+        let _held = engine.lock_object_write("b", "d/never-ends.txt").await;
+        let before = test_support::scope_lists(&fake).len();
+        UsageScanner::do_scan_until_stamped(&st, "b", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            test_support::scope_lists(&fake).len() - before,
+            1 + STAMP_REPEATS as usize,
+            "the scan and its repeats"
+        );
+        assert_eq!(usage.read("b").unwrap().and_then(|r| r.last_scan_at), None);
+    }
+
+    /// One writer after the other (the quota check of each PUT starts a
+    /// scan): every scan ends between two writes, so every scan is stamped
+    /// and the count is exact, also with a baseline (a delta-eligible
+    /// file: reference.bin + delta, written under the deltaspace lock).
+    #[tokio::test]
+    async fn a_serial_writer_gets_a_stamped_exact_counter() {
+        let (st, usage, _fake) = state(0).await;
+        let engine = st.engine.load_full();
+        let mut stored = 0u64;
+        for i in 0..3 {
+            engine
+                .store(
+                    "b",
+                    &format!("run/build-{i}.zip"),
+                    &vec![i as u8; 12_000],
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+            UsageScanner::do_scan(&st, "b", "").await.unwrap();
+            let row = usage.read("b").unwrap().unwrap();
+            assert!(
+                row.last_scan_at.is_some(),
+                "write {i} was not stamped: {row:?}"
+            );
+            assert_eq!(row.object_count, i + 1, "{row:?}");
+            let truth = engine.storage().total_size(Some("b")).await.unwrap();
+            stored = row.stored_bytes;
+            assert_eq!(stored, truth, "{row:?}");
+        }
+        assert!(stored > 0);
+    }
+
+    /// A write that is still uploading its body has stored nothing: it is
+    /// in flight (the gate counts it) but not in its window, so it never
+    /// blocks a stamp, however long it takes. Its later commit and record
+    /// land on top of the stamped row.
+    #[tokio::test]
+    async fn a_write_that_is_uploading_does_not_block_the_stamp() {
+        let (st, usage, _fake, endpoint) = state_at(1).await;
+        let uploading = st.maintenance_gate.begin_write("b");
+        for i in 0..3 {
+            UsageScanner::do_scan(&st, "b", "").await.unwrap();
+            let row = usage.read("b").unwrap().unwrap();
+            assert!(
+                row.last_scan_at.is_some(),
+                "scan {i} was not stamped: {row:?}"
+            );
+            assert_eq!(row.object_count, 1, "{row:?}");
+        }
+        // The upload ends: the commit and the record land on the stamped row.
+        let lock = st.engine.load().lock_object_write("b", "d/late.txt").await;
+        test_support::put_raw(&endpoint, "d/late.txt", b"0123456789").await;
+        let meta = st.engine.load().head("b", "d/late.txt").await.unwrap();
+        usage.apply_net("b", None, Some(&meta), 0);
+        drop(lock);
+        drop(uploading);
+        let row = usage.read("b").unwrap().unwrap();
+        assert_eq!(row.object_count, 2, "{row:?}");
+        assert!(row.last_scan_at.is_some(), "{row:?}");
+        // And the next scan agrees with the counter.
+        UsageScanner::do_scan(&st, "b", "").await.unwrap();
+        let again = usage.read("b").unwrap().unwrap();
+        assert_eq!(
+            (again.object_count, again.stored_bytes),
+            (row.object_count, row.stored_bytes)
+        );
     }
 
     #[tokio::test]

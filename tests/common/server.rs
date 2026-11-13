@@ -169,7 +169,9 @@ fn end_with_parent(cmd: &mut Command) {
                 return Err(std::io::Error::last_os_error());
             }
             // The parent can end between fork and prctl: the signal is then
-            // never sent, so the child checks it here.
+            // never sent, so the child checks it here. The check covers the
+            // parent process (its id), not the spawning thread: a thread that
+            // ends in this gap, in a process that goes on, is not seen.
             if libc::getppid() != parent {
                 libc::raise(signal);
             }

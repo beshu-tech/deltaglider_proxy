@@ -111,6 +111,10 @@ impl From<ConditionalError> for crate::api::S3Error {
 /// the lock makes one.
 pub struct ObjectWriteGuard {
     _guard: tokio::sync::OwnedMutexGuard<()>,
+    /// The write is between its first storage write and the record of its
+    /// change until this guard drops ([`crate::bucket_usage::WriteWindow`]):
+    /// a usage scan that ends in that time is not trusted.
+    _window: Option<crate::bucket_usage::WriteWindow>,
     /// The lock entry, for the write counter that `Drop` bumps.
     lock: Arc<ObjectWriteLock>,
     /// The object this guard locks, as the engine parses its key.
@@ -248,6 +252,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         ObjectWriteGuard {
             _guard: guard,
+            _window: self.open_write_window(bucket),
             lock: mutex,
             object,
             checked: None,
