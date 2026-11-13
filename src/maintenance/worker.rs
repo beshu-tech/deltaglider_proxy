@@ -107,6 +107,9 @@ pub(crate) struct Holder<'a> {
     pub backend: Option<&'a super::gate::BackendCheck>,
     /// What a delete job needs (`None` in tests that run no delete).
     pub deletes: Option<&'a super::delete::DeleteDeps>,
+    /// Seconds that a deferred job waits (`None`: [`BACKEND_DEFER_SECS`], or
+    /// the test seam `DGP_TEST_MAINTENANCE_DEFER_SECS`).
+    pub defer_secs: Option<i64>,
 }
 
 impl Holder<'_> {
@@ -128,6 +131,7 @@ impl<'a> Holder<'a> {
             lease: LeaseTiming::MAINTENANCE,
             backend: None,
             deletes: None,
+            defer_secs: None,
         }
     }
 }
@@ -263,6 +267,7 @@ async fn run_lane(
                                 lease,
                                 backend: None,
                                 deletes: Some(&deletes),
+                                defer_secs: None,
                             };
                             run_job(&mutator, &config, &db, &state, holder, job).await;
                             drop(slot);
@@ -295,36 +300,66 @@ pub(crate) async fn resume_after_disk_wait(
     bucket: &str,
     ceiling: std::time::Duration,
 ) -> Result<(), PhaseStop> {
+    gate.close_disk_deferred(job_id);
+    drain_inflight_writes_within(gate, bucket, ceiling).await?;
+    // The mark ends only now. A drain that gave up leaves it (closed): the
+    // next claim drains again.
     gate.clear_disk_deferred(job_id);
-    drain_inflight_writes_within(gate, bucket, ceiling).await
+    Ok(())
 }
 
 /// Why a job that STORES bytes waits for disk space now: the spool disk, or
 /// the disk of the bucket that it writes into (the migrate's staging bucket on
 /// the target backend; the re-encrypt's own bucket). `None`: it does not.
-fn job_store_refusal(state: &AppState, job: &MaintenanceJob) -> Option<String> {
-    let bucket = match job.kind.as_str() {
-        "migrate" => {
-            super::migrate::parse_params(job.params.as_deref()?)
-                .ok()?
-                .transient_key
-        }
-        "reencrypt" => job.bucket.clone(),
-        _ => return None,
-    };
-    super::probes::store_refusal(state, &bucket)
+/// Seconds that a deferred job waits: [`BACKEND_DEFER_SECS`], or the debug
+/// seam `DGP_TEST_MAINTENANCE_DEFER_SECS` (a test sees the resume).
+fn defer_secs() -> i64 {
+    crate::config::test_seams::test_seams()
+        .maintenance_defer_secs
+        .unwrap_or(BACKEND_DEFER_SECS)
 }
 
-/// Why a job that waited for disk space must still wait when its wait ends.
-/// A migrate copies every object to the target (its large ones through the
-/// spool): the whole refusal. A re-encrypt rewrites many objects that need no
-/// spool file: only the disk of its bucket's backend; an object that does
-/// need a spool file defers the job again on its own turn.
-fn job_still_blocked(state: &AppState, job: &MaintenanceJob) -> Option<String> {
+/// The bucket that a job STORES into: the migrate's staging bucket on the
+/// target backend, the re-encrypt's own bucket. `None`: the job stores
+/// nothing.
+fn job_store_bucket(job: &MaintenanceJob) -> Option<String> {
     match job.kind.as_str() {
-        "reencrypt" => super::probes::backend_store_refusal(state, &job.bucket),
-        _ => job_store_refusal(state, job),
+        "migrate" => Some(
+            super::migrate::parse_params(job.params.as_deref()?)
+                .ok()?
+                .transient_key,
+        ),
+        "reencrypt" => Some(job.bucket.clone()),
+        _ => None,
     }
+}
+
+/// Why a job that STORES bytes waits for the disk of its backend now:
+/// `Some` only while that disk is at level critical. THE refusal of both
+/// kinds, at every check: before each object, at the end of a wait, and when
+/// a deferral is marked. Neither kind asks the spool disk as a whole: most of
+/// their objects need no spool file, and an object that does meets the spool
+/// gate in its own turn ([`Visit::Deferred`], the migrate's `CopyDone::Deferred`).
+fn job_backend_refusal(state: &AppState, job: &MaintenanceJob) -> Option<String> {
+    super::probes::backend_store_refusal(state, &job_store_bucket(job)?)
+}
+
+/// Is this stop a wait for DISK space, so that deletes may pass? The disk of
+/// the job's backend is critical, or an object that needs a spool file met
+/// the spool gate (the stop carries the gate's own message). Any other
+/// deferral (a backend that does not answer) is not.
+fn deferral_waits_for_disk(
+    state: &AppState,
+    job: &MaintenanceJob,
+    stop: &Result<(), PhaseStop>,
+) -> bool {
+    if job_backend_refusal(state, job).is_some() {
+        return true;
+    }
+    let Err(PhaseStop::Deferred(why)) = stop else {
+        return false;
+    };
+    state.engine.load().spool_dir().gate().refusal().as_deref() == Some(why.as_str())
 }
 
 /// May deletes into the bucket of `job` pass while the job waits for disk
@@ -415,9 +450,9 @@ async fn run_job(
     // on (its mark stays, deletes keep passing). Once it may run, the mark is
     // cleared FIRST (a delete is refused from then on) and the deletes that
     // the gate admitted meanwhile are drained, so no phase races one.
-    let resumed_from_disk_wait = state.maintenance_gate.is_disk_deferred(job.id);
+    let resumed_from_disk_wait = state.maintenance_gate.has_disk_mark(job.id);
     let disk_still_full = if resumed_from_disk_wait {
-        job_still_blocked(state, &job)
+        job_backend_refusal(state, &job)
     } else {
         None
     };
@@ -491,7 +526,7 @@ async fn run_job(
                 )
             }
             other => (
-                BACKEND_DEFER_SECS,
+                holder.defer_secs.unwrap_or_else(defer_secs),
                 other
                     .as_ref()
                     .err()
@@ -502,7 +537,8 @@ async fn run_job(
         // A wait for DISK space lets deletes into the bucket pass (see
         // `disk_wait_is_safe`); the mark ends with the wait.
         // `row` is the row NOW (the phase moved since the claim).
-        let waits_for_disk = disk_wait_is_safe(&row) && job_store_refusal(state, &row).is_some();
+        let waits_for_disk =
+            disk_wait_is_safe(&row) && deferral_waits_for_disk(state, &row, &outcome);
         let until = current_unix_seconds().saturating_add(wait);
         let deferred = {
             let db = db.lock().await;

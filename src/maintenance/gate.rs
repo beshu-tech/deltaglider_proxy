@@ -158,12 +158,12 @@ pub(crate) fn busy_jobs(arms: &[GateArm], unwinding: &HashSet<i64>) -> HashMap<S
 /// Pure: is this request one that frees space (a delete)? `DeleteObject`,
 /// `DeleteBucket` and `AbortMultipartUpload` are `DELETE`; `DeleteObjects` is
 /// `POST ?delete`. The rest of a write method stores bytes.
-pub fn request_frees_space(method: &Method, query: Option<&str>) -> bool {
+pub fn request_frees_space(method: &Method, path: &str, query: Option<&str>) -> bool {
     match *method {
         Method::DELETE => true,
-        // The query as s3s decodes it (`RequestTarget`), not by hand.
-        Method::POST => crate::api::request_target::RequestTarget::parse("/b", query)
-            .is_ok_and(|target| target.has_query("delete")),
+        // As s3s routes it (`RequestTarget`): `?delete` on a BUCKET path only.
+        Method::POST => crate::api::request_target::RequestTarget::parse(path, query)
+            .is_ok_and(|target| target.is_batch_delete(method)),
         _ => false,
     }
 }
@@ -191,10 +191,21 @@ impl MaintenanceGate {
         Self::default()
     }
 
-    /// Is this bucket currently gated? (Bucket names compare lowercased —
-    /// the same normalization the routing layer uses.)
+    /// Is this bucket currently gated against a STORE? (Bucket names compare
+    /// lowercased — the same normalization the routing layer uses.) A write
+    /// that frees space asks [`Self::is_busy_for`]: a job that waits for disk
+    /// space lets it pass.
     pub fn is_busy(&self, bucket: &str) -> bool {
         self.busy.load().contains_key(&bucket.to_ascii_lowercase())
+    }
+
+    /// [`Self::is_busy`] for a write of `kind`: THE per-item question of the
+    /// bulk loops, one rule with the page check of a delete job
+    /// ([`Self::write_blocked`]) and the request gate
+    /// ([`write_gate_refusal_q`]): a write that frees space passes a bucket
+    /// whose job waits for disk space.
+    pub fn is_busy_for(&self, bucket: &str, kind: WriteKind) -> bool {
+        self.busy_kind_for(bucket, kind).is_some()
     }
 
     /// Install the write-refusal probe: the encryption witness and the key
@@ -318,6 +329,22 @@ impl MaintenanceGate {
     /// The job runs again (or is gone): the gate is whole.
     pub fn clear_disk_deferred(&self, job_id: i64) {
         self.disk_deferred.remove(&job_id);
+    }
+
+    /// Did the job wait for disk space, whatever the time now? A job is
+    /// claimed only AFTER its wait ended (`until` is past), so this ignores
+    /// the time: the deletes that the wait admitted may still be running.
+    pub fn has_disk_mark(&self, job_id: i64) -> bool {
+        self.disk_deferred.contains_key(&job_id)
+    }
+
+    /// Close the wait NOW (a delete is refused from this moment) but keep the
+    /// mark: it ends only after the deletes that the wait admitted were
+    /// drained ([`Self::clear_disk_deferred`]).
+    pub fn close_disk_deferred(&self, job_id: i64) {
+        if let Some(mut until) = self.disk_deferred.get_mut(&job_id) {
+            *until = 0;
+        }
     }
 
     /// Does the job wait for disk space now?
@@ -714,7 +741,7 @@ pub fn write_gate_refusal_q(
         return None;
     }
     let bucket = bucket_from_path(path)?;
-    let kind = if request_frees_space(method, query) {
+    let kind = if request_frees_space(method, path, query) {
         WriteKind::FreesSpace
     } else {
         WriteKind::Store
@@ -1003,20 +1030,32 @@ mod tests {
 
     #[test]
     fn the_frees_space_requests_by_table() {
+        // (method, path, query, frees space): every shape of a POST and DELETE.
         let t = [
-            (Method::DELETE, None, true),
-            (Method::DELETE, Some("uploadId=x"), true),
-            (Method::POST, Some("delete"), true),
-            (Method::POST, Some("delete="), true),
-            (Method::POST, Some("x=1&delete"), true),
-            (Method::POST, Some("deleted"), false),
-            (Method::POST, Some("uploads"), false),
-            (Method::POST, None, false),
-            (Method::PUT, Some("delete"), false),
-            (Method::GET, Some("delete"), false),
+            (Method::DELETE, "/b/k", None, true),
+            (Method::DELETE, "/b/k", Some("uploadId=x"), true),
+            (Method::DELETE, "/b", None, true),
+            // DeleteObjects: `?delete` on a bucket path.
+            (Method::POST, "/b", Some("delete"), true),
+            (Method::POST, "/b/", Some("delete"), true),
+            (Method::POST, "/b", Some("delete="), true),
+            (Method::POST, "/b", Some("x=1&delete"), true),
+            // s3s reads these as writes: a part, a Complete, a Create.
+            (Method::POST, "/b/k", Some("delete"), false),
+            (Method::POST, "/b/k", Some("uploadId=X&delete"), false),
+            (Method::POST, "/b/k", Some("uploadId=X"), false),
+            (Method::POST, "/b/k", Some("uploads"), false),
+            (Method::POST, "/b/k", Some("uploads&delete"), false),
+            (Method::POST, "/b", Some("deleted"), false),
+            (Method::POST, "/b", Some("uploads"), false),
+            (Method::POST, "/b", None, false),
+            (Method::POST, "/", Some("delete"), false),
+            (Method::PUT, "/b", Some("delete"), false),
+            (Method::PUT, "/b/k", Some("partNumber=1&uploadId=x"), false),
+            (Method::GET, "/b", Some("delete"), false),
         ];
-        for (m, q, want) in t {
-            assert_eq!(request_frees_space(&m, q), want, "{m} {q:?}");
+        for (m, path, q, want) in t {
+            assert_eq!(request_frees_space(&m, path, q), want, "{m} {path} {q:?}");
         }
     }
 

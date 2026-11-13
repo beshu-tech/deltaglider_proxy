@@ -1284,6 +1284,10 @@ fn overlap_refusal(rule: &ReplicationRule) -> String {
     )
 }
 
+/// The soonest that a rule whose copy waited for a full destination disk runs
+/// again (5 minutes), however short its interval.
+const DISK_RETRY_FLOOR_SECS: i64 = 300;
+
 /// Pure: when the rule is next due after this run.
 fn next_due_after(
     flags: &driver::RunFlags,
@@ -1291,7 +1295,12 @@ fn next_due_after(
     rule: &ReplicationRule,
     finished_at: i64,
 ) -> i64 {
-    if flags.dest_unusable || flags.backend_throttled {
+    if flags.disk_deferred {
+        // A full destination disk does not recover in a minute, and each run
+        // lists both sides from the first deferred key: the rule's own cadence,
+        // and never faster than DISK_RETRY_FLOOR_SECS.
+        compute_next_due(rule, finished_at).max(finished_at + DISK_RETRY_FLOOR_SECS)
+    } else if flags.dest_unusable || flags.backend_throttled {
         // Dead dest won't recover in a minute, and a throttling backend
         // needs breathing room — back off to the rule's normal cadence
         // (but never faster than 60s) instead of hammering every minute.
@@ -1955,6 +1964,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(next_due_after(&deferred, false, &rule, at), at + 60);
+        // A full destination disk: the rule's own cadence, floor 5 minutes.
+        let full_disk = driver::RunFlags {
+            stopped_deferred: true,
+            disk_deferred: true,
+            ..Default::default()
+        };
+        assert_eq!(next_due_after(&full_disk, false, &rule, at), at + 3600);
+        let mut quick = mk_rule();
+        quick.interval = "1m".into();
+        assert_eq!(next_due_after(&full_disk, false, &quick, at), at + 300);
+        quick.interval = "1d".into();
+        assert_eq!(next_due_after(&full_disk, false, &quick, at), at + 86_400);
     }
 
     #[test]
@@ -2225,13 +2246,19 @@ mod request_count_tests {
     /// A filesystem engine (singleton backend `default`, so its encrypting
     /// wrapper consults the witness gate) with buckets `src` and `dst`.
     async fn witnessed_engine() -> (Arc<DynEngine>, tempfile::TempDir) {
+        witnessed_engine_with(None).await
+    }
+
+    async fn witnessed_engine_with(
+        metrics: Option<Arc<crate::metrics::Metrics>>,
+    ) -> (Arc<DynEngine>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg = crate::config::Config::from_yaml_str(&format!(
             "storage:\n  filesystem: {}\n",
             dir.path().display()
         ))
         .unwrap();
-        let engine = Arc::new(DynEngine::new(&cfg, None).await.unwrap());
+        let engine = Arc::new(DynEngine::new(&cfg, metrics).await.unwrap());
         for b in ["src", "dst"] {
             engine.create_bucket(b).await.unwrap();
         }
@@ -2360,7 +2387,8 @@ mod request_count_tests {
     /// directory is deleted. The next run, with space, copies the item.
     #[tokio::test]
     async fn at_a_full_destination_disk_the_walk_still_deletes_and_defers_the_copy() {
-        let (engine, _dir) = witnessed_engine().await;
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let (engine, _dir) = witnessed_engine_with(Some(metrics.clone())).await;
         engine
             .store("src", "a/new.txt", b"new", None, Default::default())
             .await
@@ -2390,6 +2418,28 @@ mod request_count_tests {
         assert_eq!(
             outcome.totals.objects_deleted, 7,
             "every delete ran: {outcome:?}"
+        );
+        // The directory with the deferred copy is COMPLETED by the walk (the
+        // driver sends `Event::CopyDeferred`): the root, `a/` and `b/`. A run
+        // that never settled the item would leave `a/` open forever.
+        assert_eq!(
+            metrics.replication_dirs_completed_total.get(),
+            3,
+            "every directory completed: {outcome:?}"
+        );
+        // And the rule is due again at its own cadence (1 h here), not in a
+        // minute: a walk lists both sides. The real clock, no faked `now`.
+        let due = db
+            .lock()
+            .await
+            .replication_load_state("r")
+            .unwrap()
+            .unwrap()
+            .next_due_at;
+        let now = current_unix_seconds();
+        assert!(
+            due >= now + 3500,
+            "a full destination disk reschedules at the rule's cadence: due {due}, now {now}"
         );
         assert_eq!(
             outcome.totals.errors, 0,

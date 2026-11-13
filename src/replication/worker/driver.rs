@@ -50,6 +50,10 @@ pub(super) struct RunFlags {
     /// or its backend failed a health check. The cursor is kept; the run
     /// settles "deferred" and is due again shortly.
     pub stopped_deferred: bool,
+    /// A copy was deferred for a full destination DISK (level critical):
+    /// the walk went on with what frees space, and the rule is due again at
+    /// its own cadence, not every minute (a walk lists both sides).
+    pub disk_deferred: bool,
     /// Operator KILL: the run flipped to 'cancelling' mid-flight.
     pub killed: bool,
     /// The poison-cursor guard cleared a stale resume cursor: the settle
@@ -514,6 +518,7 @@ impl<'a> WalkDriver<'a> {
                         }
                     }
                     if r.disk_full {
+                        flags.disk_deferred = true;
                         machine.on_event(walk::Event::CopyDeferred { item_id });
                     }
                     return;

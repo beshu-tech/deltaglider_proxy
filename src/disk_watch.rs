@@ -392,7 +392,16 @@ pub struct SystemProbe;
 
 impl DiskProbe for SystemProbe {
     fn measure(&self, path: &Path) -> Option<PathFacts> {
-        if let Some(percent) = crate::config::test_seams::test_seams().disk_monitor_free_percent {
+        let seams = crate::config::test_seams::test_seams();
+        // The file seam is read at every measure: a test changes the level
+        // of the disk while the proxy runs.
+        let from_file = seams
+            .disk_monitor_free_file
+            .as_ref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|t| t.trim().parse::<u8>().ok())
+            .filter(|p| *p <= 100);
+        if let Some(percent) = from_file.or(seams.disk_monitor_free_percent) {
             let total = 100 * 1024 * 1024 * 1024u64;
             return Some(PathFacts {
                 free: percent_of(total, percent),

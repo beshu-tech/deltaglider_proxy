@@ -30,9 +30,17 @@ async fn env(phase: &str, objects: usize) -> Env {
 /// usage counter is on, as in production.
 async fn env_with(phase: &str, objects: usize, in_target: bool) -> Env {
     let (engine, fake) = s3_engine().await;
-    let engine = engine.with_bucket_usage(Some(Arc::new(
-        crate::bucket_usage::BucketUsage::in_memory().unwrap(),
-    )));
+    let dir = tempfile::tempdir().unwrap();
+    // A spool of its own: the process-wide spool (and its disk gate) must not
+    // feel a test's full disk.
+    let engine = engine
+        .with_spool_dir(
+            crate::deltaglider::spool::SpoolDir::new(dir.path().join("spool"), 64 * 1024 * 1024)
+                .unwrap(),
+        )
+        .with_bucket_usage(Some(Arc::new(
+            crate::bucket_usage::BucketUsage::in_memory().unwrap(),
+        )));
     engine.create_bucket("t").await.unwrap();
     let params = MigrateParams {
         disk_wait: false,
@@ -79,7 +87,6 @@ async fn env_with(phase: &str, objects: usize, in_target: bool) -> Env {
     // engine's metadata cache).
     engine.metadata_cache().invalidate_prefix("b", "");
     engine.metadata_cache().invalidate_prefix("t", "");
-    let dir = tempfile::tempdir().unwrap();
     let mut cfg = crate::config::Config {
         backend: crate::config::BackendConfig::Filesystem {
             path: dir.path().join("data"),
@@ -541,4 +548,67 @@ async fn a_save_failure_at_the_flip_over_a_flipped_config_unwinds_nothing() {
         "a failed save after the flip waits: {result:?}"
     );
     assert_nothing_unwound(&e, "save failure at flip").await;
+}
+
+/// The copy of a migrate asks the DISK OF ITS TARGET BACKEND, not the spool
+/// disk as a whole: with the spool disk at level high and the target's disk
+/// fine, objects that need no spool file are copied (a 19 GiB host sits at
+/// level high of the real thresholds, and the copy used to wait at once).
+#[tokio::test]
+async fn a_migrate_copy_ignores_a_full_spool_disk_when_no_object_needs_a_spool() {
+    use super::super::worker::cost_tests::watch_with;
+    let e = env_with("stage", 5, false).await;
+    let _watch = watch_with(&e.state, 50);
+    e.state.engine.load().spool_dir().gate().set(
+        crate::disk_watch::Level::High,
+        "the spool disk is full".into(),
+    );
+    let mut c = Counters::default();
+    e.run().copy(&mut c).await.unwrap();
+    assert_eq!(c.done, 5, "{c:?}");
+}
+
+/// A critical disk of the target backend defers the copy before its next
+/// object: no copy, no failure recorded, no byte on the target.
+#[tokio::test]
+async fn a_migrate_copy_waits_for_the_disk_of_its_target_backend() {
+    use super::super::worker::cost_tests::watch_with;
+    let e = env_with("stage", 5, false).await;
+    let _watch = watch_with(&e.state, 3);
+    e.state
+        .engine
+        .load()
+        .spool_dir()
+        .gate()
+        .set(crate::disk_watch::Level::Ok, String::new());
+    let mut c = Counters::default();
+    let stop = e.run().copy(&mut c).await.err().expect("the copy waits");
+    assert!(
+        matches!(&stop, PhaseStop::Deferred(m) if m.contains("backend 'default'")),
+        "{stop:?}"
+    );
+    assert_eq!((c.done, c.failed), (0, 0), "{c:?}");
+    assert_eq!(e.count("PUT") + e.count("COPY"), 0, "nothing was written");
+}
+
+/// A copy that needs a spool file and meets the spool gate defers the job; a
+/// busy proxy with the gate open, and every other error, is the object's.
+#[test]
+fn a_copy_error_defers_the_job_only_for_the_spool_gate() {
+    let why = || Some("the spool disk is full".to_string());
+    let failed = |d: CopyDone| {
+        matches!(
+            d,
+            CopyDone::Failed {
+                transient: true,
+                ..
+            }
+        )
+    };
+    assert!(matches!(
+        copy_error_done(true, why(), true, "busy".into()),
+        CopyDone::Deferred(m) if m == "the spool disk is full"
+    ));
+    assert!(failed(copy_error_done(true, None, true, "busy".into())));
+    assert!(failed(copy_error_done(false, why(), true, "x".into())));
 }

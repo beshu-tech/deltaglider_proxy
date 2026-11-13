@@ -2815,3 +2815,26 @@ async fn at_disk_level_critical_bulk_copy_move_and_multipart_are_refused() {
         assert!(text.contains("SlowDown"), "{what}: {text}");
     }
 }
+
+/// The harness pins the disk monitor (a healthy 50% of a 100 GiB disk), so
+/// no test depends on the free space of the machine that runs it: a host
+/// with 19 GiB free sits at level high of the real thresholds, and every
+/// large upload of every test would be refused.
+#[tokio::test]
+async fn a_test_server_sees_a_healthy_disk_whatever_the_host_has() {
+    let server = TestServer::builder().build().await;
+    let metrics = reqwest::get(format!("{}/_/metrics", server.endpoint()))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains(&format!("deltaglider_spool_dir_free_bytes {}", 50 * GIB)),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("deltaglider_disk_level{path_role=\"spool\"} 0"),
+        "{metrics}"
+    );
+}

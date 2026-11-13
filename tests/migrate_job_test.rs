@@ -1371,26 +1371,40 @@ async fn test_migrate_meets_a_legacy_dg_key_and_stops_before_the_flip() {
 }
 
 /// A migrate whose copy waits for DISK space does not keep the bucket from
-/// deleting. The source disk can only be freed by deleting, and the job
-/// holds the write gate for its whole life, so a delete of the source that
-/// the gate refused would wait for the job, and the job for the disk.
+/// deleting. The job holds the write gate for its whole life, so a delete of
+/// the source that the gate refused would wait for the job, and the job for
+/// the disk. The whole path runs WITHOUT a restart and on the real clock: the
+/// disk goes critical while the copy runs (the file seam, read at every
+/// measure), the job waits (2 s, seam), deletes pass, a delete JOB deletes
+/// (not Skipped, no failure), the disk recovers, and the job resumes on its
+/// own.
 ///
-/// Correctness, by phase: the stop lands in the COPY (some keys are on the
-/// destination already). The job waits (disk critical), the gate lets
-/// deletes pass and nothing else. A key that was copied and then deleted at
-/// the source must not come back at the destination after the flip: the job
-/// recorded its wait in its params, so its verify prunes the destination of
-/// every key that the source lacks. A write is refused all along.
+/// Correctness: the stop lands in the COPY (some keys are on the destination).
+/// A key that was copied and then deleted at the source must not come back at
+/// the destination after the flip: the job recorded its wait in its params,
+/// so its verify prunes the destination of every key that the source lacks.
+/// A write is refused all along. The free space is the seam's, never the
+/// host's.
 #[tokio::test]
 async fn test_a_migrate_that_waits_for_disk_lets_deletes_pass_and_the_flip_keeps_them() {
     common::expect_server_errors("level critical refuses the write that this test tries");
     let dir_a = tempfile::TempDir::new().unwrap();
     let dir_b = tempfile::TempDir::new().unwrap();
+    let free = tempfile::TempDir::new().unwrap();
+    let free_file = free.path().join("free-percent");
+    let set_free = |percent: u8| std::fs::write(&free_file, percent.to_string()).unwrap();
+    set_free(50);
     let bucket = "migdisk";
-    let mut server = TestServer::builder()
+    let server = TestServer::builder()
         .bucket(bucket)
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
-        .env("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "20")
+        .env("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "100")
+        .env(
+            "DGP_TEST_DISK_MONITOR_FREE_FILE",
+            &free_file.display().to_string(),
+        )
+        .env("DGP_TEST_MAINTENANCE_DEFER_SECS", "2")
+        .env("DGP_DISK_MONITOR_INTERVAL_SECS", "1")
         .build()
         .await;
     let http = server.http();
@@ -1406,37 +1420,10 @@ async fn test_a_migrate_that_waits_for_disk_lets_deletes_pass_and_the_flip_keeps
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    server.terminate();
-    let staged: Vec<String> = walkdir_files(&dir_b.path().join(bucket))
-        .into_iter()
-        .filter(|p| p.contains("obj-"))
-        .collect();
-    assert!(
-        staged.len() >= 20 && staged.len() < 300,
-        "mid-copy: {}",
-        staged.len()
-    );
-    assert!(
-        staged.iter().any(|p| p.contains("obj-000.json")),
-        "obj-000 was copied before the stop"
-    );
-
-    // Resume at level critical: the copy is refused, the job waits.
-    server
-        .respawn_with_env(&[
-            (
-                "DGP_BOOTSTRAP_PASSWORD_HASH",
-                common::TEST_BOOTSTRAP_PASSWORD_HASH,
-            ),
-            ("DGP_TEST_DISK_MONITOR_FREE_PERCENT", "3"),
-        ])
-        .await;
-    let endpoint = server.endpoint();
-    let http = server.http();
-    let admin = admin_http_client(&endpoint).await;
-    // The gate opens for a delete once the job records its wait.
+    // The disk of the target fills up mid-copy.
+    set_free(3);
     let mut deleted = false;
-    for _ in 0..600 {
+    for _ in 0..300 {
         let resp = http
             .delete(format!("{endpoint}/{bucket}/obj-000.json"))
             .send()
@@ -1452,6 +1439,19 @@ async fn test_a_migrate_that_waits_for_disk_lets_deletes_pass_and_the_flip_keeps
     assert!(
         deleted,
         "a delete never passed while the job waited for disk"
+    );
+    let staged: Vec<String> = walkdir_files(&dir_b.path().join(bucket))
+        .into_iter()
+        .filter(|p| p.contains("obj-"))
+        .collect();
+    assert!(
+        staged.len() >= 20 && staged.len() < 300,
+        "the wait landed mid-copy: {}",
+        staged.len()
+    );
+    assert!(
+        staged.iter().any(|p| p.contains("obj-000.json")),
+        "obj-000 was copied before the wait"
     );
     // DeleteObjects passes as well.
     server
@@ -1473,7 +1473,7 @@ async fn test_a_migrate_that_waits_for_disk_lets_deletes_pass_and_the_flip_keeps
         .send()
         .await
         .expect("DeleteObjects passes while the job waits for disk");
-    // A write and a part are still refused; a read works.
+    // A write is still refused; a read works.
     let w = http
         .put(format!("{endpoint}/{bucket}/new.json"))
         .body(b"x".to_vec())
@@ -1485,35 +1485,83 @@ async fn test_a_migrate_that_waits_for_disk_lets_deletes_pass_and_the_flip_keeps
         get_bytes(&http, &endpoint, bucket, "obj-001.json").await,
         [MARKER, b" object 1"].concat()
     );
-    let gone = http
-        .head(format!("{endpoint}/{bucket}/obj-000.json"))
+    // A delete JOB deletes while the job waits: not skipped, not failed.
+    let resp = admin
+        .post(format!("{endpoint}/_/api/admin/objects/delete-jobs"))
+        .json(&serde_json::json!({
+            "bucket": bucket, "prefixes": [], "keys": ["obj-100.json"], "expected": 1
+        }))
         .send()
         .await
         .unwrap();
-    assert_eq!(gone.status().as_u16(), 404);
+    assert_eq!(resp.status().as_u16(), 202);
+    let delete_job = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+        .as_i64()
+        .unwrap();
+    let mut settled = serde_json::Value::Null;
+    for _ in 0..300 {
+        let all: serde_json::Value = admin
+            .get(format!("{endpoint}/_/api/admin/jobs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        settled = all["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == format!("maintenance:{delete_job}"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if settled["status"] == "succeeded" || settled["status"] == "failed" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(settled["status"], "succeeded", "{settled}");
+    let failures: serde_json::Value = admin
+        .get(format!(
+            "{endpoint}/_/api/admin/jobs/maintenance:{delete_job}/failures"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        failures["failures"].as_array().map(Vec::len),
+        Some(0),
+        "the delete job skipped keys during the wait: {failures}"
+    );
+    for key in ["obj-000.json", "obj-100.json", "obj-299.json"] {
+        let gone = http
+            .head(format!("{endpoint}/{bucket}/{key}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            gone.status().as_u16(),
+            404,
+            "{key} is deleted at the source"
+        );
+    }
 
-    // Space again: the job resumes, copies the rest, verifies, prunes the
-    // destination and flips.
-    server
-        .respawn_with_env(&[(
-            "DGP_BOOTSTRAP_PASSWORD_HASH",
-            common::TEST_BOOTSTRAP_PASSWORD_HASH,
-        )])
-        .await;
-    let endpoint = server.endpoint();
-    let http = server.http();
-    let admin2 = admin_http_client(&endpoint).await;
-    let _ = admin;
-    wait_job_done(&admin2, &endpoint, bucket).await;
-    let job = newest_job(&admin2, &endpoint).await;
+    // Space again, NO restart: the job resumes on its own, copies the rest,
+    // verifies, prunes the destination and flips.
+    set_free(50);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_migrate_job(&admin, &endpoint).await;
     assert_eq!(job["status"], "succeeded", "job: {job}");
     assert_eq!(
-        bucket_backend(&admin2, &endpoint, bucket).await.as_deref(),
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
         Some("dst")
     );
     // The bucket is served by the destination now: the keys that clients
     // deleted during the wait are gone there too, the rest is whole.
-    for key in ["obj-000.json", "obj-299.json"] {
+    for key in ["obj-000.json", "obj-100.json", "obj-299.json"] {
         let head = http
             .head(format!("{endpoint}/{bucket}/{key}"))
             .send()
@@ -1536,4 +1584,23 @@ async fn test_a_migrate_that_waits_for_disk_lets_deletes_pass_and_the_flip_keeps
             "{key}"
         );
     }
+}
+
+/// The newest MIGRATE row of the jobs list (a delete job is newer).
+async fn newest_migrate_job(admin: &reqwest::Client, endpoint: &str) -> serde_json::Value {
+    let v: serde_json::Value = admin
+        .get(format!("{endpoint}/_/api/admin/jobs"))
+        .send()
+        .await
+        .expect("jobs GET failed")
+        .json()
+        .await
+        .expect("jobs not JSON");
+    v["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["kind"] == "migrate")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
 }

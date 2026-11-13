@@ -1205,7 +1205,11 @@ async fn drain_rule_rows(
             match gate.admit_background(&w.rule.destination.bucket, action_write_kind(w.action)) {
                 Ok(write) => write,
                 Err(refusal) => {
-                    if refusal.is_maintenance() {
+                    // A maintenance job ends on its own; a full disk ends when
+                    // the operator frees space, and a catch-up walk meanwhile
+                    // would list both sides every minute to defer the same copies.
+                    // The events wait in both cases (the cursor does not pass them).
+                    if refusal.is_maintenance() || refusal.is_disk() {
                         debug!(
                             "event consumer: rule '{}' deferred — {}",
                             w.rule.name,
@@ -3202,12 +3206,34 @@ storage:
             )
             .await;
         f.event(EventKind::ObjectDeleted, "k.bin").await;
-        f.put("n.bin").await;
+        let copy_event = f.put("n.bin").await;
+        // The state row of the rule, as the scheduler keeps it.
+        let due_before = {
+            let db = f.db.lock().await;
+            db.replication_ensure_state("r", crate::replication::current_unix_seconds())
+                .unwrap();
+            db.replication_load_state("r").unwrap().unwrap().next_due_at
+        };
         let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
         gate.set_disk_refusal_probe(Arc::new(|b: &str| {
             (b == "dst").then(|| "the disk of 'dst' is full".to_string())
         }));
         f.drain_gated(None, &gate).await;
+        // The copy event WAITS (the cursor does not pass it) and does not
+        // re-arm a catch-up walk: a walk every minute would list both sides to
+        // defer the same copy.
+        assert!(
+            f.cursor().await < copy_event,
+            "the copy event is held, not skipped"
+        );
+        let due_after = {
+            let db = f.db.lock().await;
+            db.replication_load_state("r").unwrap().unwrap().next_due_at
+        };
+        assert_eq!(
+            due_after, due_before,
+            "a full disk must not make the rule due"
+        );
         assert!(
             f.engine.head("dst", "k.bin").await.is_err(),
             "the mirror delete ran"

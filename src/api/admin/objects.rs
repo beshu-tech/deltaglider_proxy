@@ -652,7 +652,7 @@ async fn run_copy_loop(
         .map(|indexes| async move {
             let mut out = Vec::with_capacity(indexes.len());
             for idx in indexes {
-                if gate.is_busy(&req.dest_bucket) {
+                if gate.is_busy_for(&req.dest_bucket, crate::maintenance::gate::WriteKind::Store) {
                     out.push((idx, CopyOutcome::Skipped));
                     continue;
                 }
@@ -1047,7 +1047,14 @@ async fn delete_moved_sources(
     }
     // A maintenance job armed mid-move stops the deletes; the copies
     // succeeded, so leftovers are benign (as a failed source delete).
-    let proceed = || !gate.is_busy(source_bucket);
+    // The source delete of a move frees space: it passes a bucket whose job waits
+    // for disk space, as a client delete does.
+    let proceed = || {
+        !gate.is_busy_for(
+            source_bucket,
+            crate::maintenance::gate::WriteKind::FreesSpace,
+        )
+    };
     let emit = deleted_event_emitter(s3, source_bucket);
     let outcomes = engine
         .delete_batch(
@@ -1519,7 +1526,9 @@ pub(crate) async fn run_bulk_delete(
             }
         }
     }
-    let proceed = || !gate.is_busy(bucket);
+    // One rule with the page check of a delete job and the request gate: a delete
+    // passes a bucket whose job waits for disk space (it frees space).
+    let proceed = || !gate.is_busy_for(bucket, crate::maintenance::gate::WriteKind::FreesSpace);
     let emit_event = deleted_event_emitter(s3, bucket);
     let emit = |key: &str, outcome: &DeleteOutcome| {
         tally(counts_as_deleted(outcome));
