@@ -16,13 +16,16 @@ use md5::Digest;
 const MIB: usize = 1024 * 1024;
 
 /// The proxy with an S3 backend (MinIO) whose single-PUT limit is 5 MiB and
-/// whose backend parts are 5 MiB.
+/// whose backend parts are 6 MiB. The client's parts are 5 MiB, so the
+/// parts of the backend upload are not the parts of the client's: a
+/// multipart ETag that the proxy took from the backend would differ from
+/// the client's.
 fn seamed(bucket: &str) -> common::TestServerBuilder {
     TestServer::builder()
         .s3_endpoint(&common::minio_endpoint_url())
         .bucket(bucket)
         .env("DGP_TEST_PUT_SINGLE_MAX_BYTES", "5242880")
-        .env("DGP_TEST_PUT_PART_BYTES", "5242880")
+        .env("DGP_TEST_PUT_PART_BYTES", "6291456")
 }
 
 /// The ETag S3 gives a multipart object of these parts: the MD5 of the
@@ -221,6 +224,16 @@ async fn a_large_multipart_object_in_a_proxy_encrypted_bucket_is_a_backend_multi
         "the ciphertext went to the backend in parts"
     );
     assert_eq!(get(&client, &bucket, key).await, parts.concat());
+    // A LIST shows the plaintext size, not the size of the ciphertext.
+    let listed = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(key)
+        .send()
+        .await
+        .unwrap();
+    let sizes: Vec<_> = listed.contents().iter().map(|o| o.size()).collect();
+    assert_eq!(sizes, vec![Some(13 * MIB as i64)], "LIST size");
     // The backend holds ciphertext, never the plaintext.
     let raw = common::minio_client()
         .await
@@ -274,6 +287,35 @@ async fn a_failed_backend_part_leaves_no_backend_multipart_upload() {
         .send()
         .await;
     assert!(missing.is_err(), "no object was stored");
+}
+
+/// The backend completes the upload and its answer is lost (a dropped
+/// connection, a timeout; the debug seam drops it). The proxy finds its own
+/// object by its ETag (the MD5 of the parts' MD5s) and answers the client
+/// with the success: it does not report a failure and does not send the
+/// parts again.
+#[tokio::test]
+async fn a_lost_backend_complete_answer_is_a_success_not_a_second_upload() {
+    skip_unless_minio!();
+    let server = seamed(common::MINIO_BUCKET)
+        .env("DGP_TEST_PUT_DROP_COMPLETE_ANSWER", "true")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    let key = format!("{}/lost.dat", common::unique_bucket("mpu-lost"));
+    let parts = thirteen_mib();
+    let etag = client_multipart(&client, server.bucket(), &key, &parts)
+        .await
+        .unwrap_or_else(|e| panic!("the Complete must succeed: {e:?}"));
+    assert_eq!(etag, multipart_etag(&parts));
+    let ops = |op: &'static str| {
+        let endpoint = server.endpoint();
+        async move { backend_operations(&endpoint, op).await }
+    };
+    assert_eq!(ops("CompleteMultipartUpload").await, 1, "one Complete");
+    assert_eq!(ops("UploadPart").await, 3, "the parts were sent once");
+    assert_eq!(get(&client, server.bucket(), &key).await, parts.concat());
+    assert!(open_backend_uploads(server.bucket(), &key).await.is_empty());
 }
 
 /// A client with a short read timeout (the AWS CLI waits 60 s) completes an

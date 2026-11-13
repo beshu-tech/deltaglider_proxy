@@ -14,10 +14,25 @@
 //! The parts stream from file ranges ([`FileBody::slice`]); no part is held
 //! in memory. The upload is aborted on every error and when the future is
 //! dropped ([`MpuAbortGuard`]).
+//!
+//! Time limits. The client's read timeout (`DGP_S3_READ_TIMEOUT_SECS`,
+//! 60 s) is a deadline for the whole request, body included: a part of
+//! 64 MiB that needs longer to leave never gets an answer, and each retry
+//! sends it again (measured against Hetzner Object Storage, where all 20
+//! UploadPart requests of a 5.5 GiB upload ended with no status). So a part
+//! and the Complete carry [`upload_timeouts`] without a deadline for the
+//! operation: an attempt and its read timeout may last
+//! [`super::client::LONG_TIMEOUT`], and the stalled-stream protection
+//! (`DGP_S3_STALL_GRACE_SECS`) ends a part that does not move. The
+//! Complete answers after the backend joined the parts, which takes
+//! minutes for an object of many GiB.
+//!
+//! A write with a condition (`If-None-Match`, `If-Match`) is not stored
+//! with a multipart upload: see [`fence_is_conditional`].
 
+use super::client::upload_timeouts;
 use super::file_body::FileBody;
 use super::*;
-use crate::coordination::if_match::IfMatchRequest;
 use crate::storage::mpu_guard::MpuAbortGuard;
 use futures::{StreamExt, TryStreamExt};
 
@@ -38,6 +53,43 @@ pub(super) const MAX_PARTS: u64 = 10_000;
 
 /// Parts of one upload that are in flight together.
 pub(super) const PARALLEL_PARTS: usize = 4;
+
+/// Pure: does a write carry a condition? A conditional write is not stored
+/// with a multipart upload. The proxy knows that a backend enforces a
+/// condition on PutObject (the CAS probe, `coordination/cas_probe.rs`),
+/// but it has no proof for CompleteMultipartUpload, and a backend that
+/// ignores the header there would store a baseline over a peer's. So an
+/// object above the single-PUT limit is written with a condition on no
+/// backend: a caller that asks for `Report` gets "no conditional writes",
+/// and any other caller gets `EntityTooLarge`.
+pub(super) fn fence_is_conditional(fence: &RefFence) -> bool {
+    match fence {
+        RefFence::Unfenced => false,
+        RefFence::Absent => true,
+        RefFence::ETag(e) => !e.is_empty(),
+    }
+}
+
+/// Pure: the ETag that S3 gives a multipart object of parts with these
+/// ETags: the MD5 of their MD5s, a dash and the part count. `None` when a
+/// part ETag is not an MD5 (an object that SSE-KMS or SSE-C encrypts has
+/// ETags that are not): then the ETag of the object proves nothing.
+pub(super) fn multipart_etag(part_etags: &[String]) -> Option<String> {
+    use md5::Digest;
+    let mut digests = Vec::with_capacity(part_etags.len() * 16);
+    for etag in part_etags {
+        let bare = etag.trim().trim_matches('"');
+        if bare.len() != 32 {
+            return None;
+        }
+        digests.extend_from_slice(&hex::decode(bare).ok()?);
+    }
+    Some(format!(
+        "{}-{}",
+        hex::encode(md5::Md5::digest(&digests)),
+        part_etags.len()
+    ))
+}
 
 /// The size above which a file body is a multipart upload:
 /// [`SINGLE_PUT_MAX_BYTES`], or the debug test seam
@@ -120,22 +172,6 @@ where
     }
 }
 
-/// `CompleteMultipartUpload` with the write condition of a PUT: the same
-/// two headers (`If-None-Match: *` for [`RefFence::Absent`], `If-Match` in
-/// the backend's dialect for an ETag).
-fn apply_complete_fence(
-    req: aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
-    fence: &RefFence,
-    dialect: crate::coordination::if_match::IfMatchDialect,
-) -> aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder
-{
-    match fence {
-        RefFence::Absent => req.if_none_match("*"),
-        RefFence::ETag(e) if !e.is_empty() => req.if_match_etag(e, dialect),
-        _ => req,
-    }
-}
-
 /// What a multipart store of a file body is given.
 pub(super) struct MultipartPut<'a> {
     pub bucket: &'a str,
@@ -209,6 +245,20 @@ impl S3Backend {
             ..
         } = *put;
         let total = files.len();
+        if fence_is_conditional(put.fence) {
+            warn!(
+                "S3 PUT {bucket}/{key}: {total} bytes need a multipart upload, which is stored \
+                 without a condition on no backend; refusing the conditional write"
+            );
+            return match put.on_unsupported {
+                OnUnsupported::Report => Ok(FencedPut::Unsupported),
+                OnUnsupported::Unfenced => Err(StorageError::EntityTooLarge(format!(
+                    "{bucket}/{key}: an object of {total} bytes needs a multipart upload on the \
+                     storage backend, and a write with a condition (a delta baseline, a rewrite \
+                     of a stored version) cannot use one"
+                ))),
+            };
+        }
         let preferred = self.put_limits().1;
         let Some(ranges) = plan_parts(total, preferred) else {
             return Err(StorageError::TooLarge {
@@ -217,20 +267,22 @@ impl S3Backend {
             });
         };
         let native = self.native_encryption.for_bucket(bucket);
-        let mut create = self
-            .bulk_client
-            .create_multipart_upload()
-            .bucket(bucket)
-            .key(key)
-            .content_type("application/octet-stream");
-        for (k, v) in headers {
-            create = create.metadata(k.clone(), v.clone());
-        }
-        create = apply_native_encryption(create, &native);
-        let created = create
-            .send()
-            .await
-            .map_err(|e| self.classify(bucket, &e, S3Op::CreateMpu))?;
+        let created = retry_unidentified_400(
+            || {
+                let mut create = self
+                    .bulk_client
+                    .create_multipart_upload()
+                    .bucket(bucket)
+                    .key(key)
+                    .content_type("application/octet-stream");
+                for (k, v) in headers {
+                    create = create.metadata(k.clone(), v.clone());
+                }
+                apply_native_encryption(create, &native).send()
+            },
+            |e| self.classify(bucket, &e, S3Op::CreateMpu),
+        )
+        .await?;
         let Some(upload_id) = created.upload_id().map(str::to_string) else {
             return Err(StorageError::Other(
                 "CreateMultipartUpload returned no upload id".into(),
@@ -270,6 +322,9 @@ impl S3Backend {
     ) -> Result<aws_sdk_s3::types::CompletedPart, StorageError> {
         let (bucket, key) = (put.bucket, put.key);
         if crate::config::test_seams::test_seams().put_fail_part == Some(number) {
+            // The earlier parts are on the backend by now: the abort has
+            // something to remove.
+            crate::config::test_seams::let_earlier_parts_finish().await;
             return Err(StorageError::Transient(format!(
                 "injected failure of part {number} (DGP_TEST_PUT_FAIL_PART)"
             )));
@@ -285,10 +340,12 @@ impl S3Backend {
                     .upload_id(upload_id)
                     .part_number(number)
                     .body(part.byte_stream());
-                match self.upload_config(len) {
-                    Some(c) => request.customize().config_override(c).send().await,
-                    None => request.send().await,
-                }
+                // No deadline of the whole operation: see the module docs.
+                request
+                    .customize()
+                    .config_override(Self::long_upload_config())
+                    .send()
+                    .await
             },
             |e| self.classify(bucket, &e, S3Op::UploadPart),
         )
@@ -311,7 +368,6 @@ impl S3Backend {
             key,
             files,
             metadata,
-            on_unsupported,
             ..
         } = *put;
         let completed: Vec<CompletedPart> = futures::stream::iter(
@@ -329,9 +385,15 @@ impl S3Backend {
         .await?;
 
         let stored_size = files.len();
-        let mut fence = put.fence.clone();
-        loop {
-            let request = self
+        let part_etags: Vec<String> = completed
+            .iter()
+            .filter_map(|p| p.e_tag().map(str::to_string))
+            .collect();
+        let expected = multipart_etag(&part_etags);
+        let drop_first_answer = crate::config::test_seams::test_seams().put_drop_complete_answer;
+        let mut backoff = UNIDENTIFIED_400_BACKOFF_MS.iter();
+        for attempt in 0.. {
+            let sent = self
                 .bulk_client
                 .complete_multipart_upload()
                 .bucket(bucket)
@@ -341,45 +403,85 @@ impl S3Backend {
                     CompletedMultipartUpload::builder()
                         .set_parts(Some(completed.clone()))
                         .build(),
-                );
-            let request = apply_complete_fence(request, &fence, self.if_match_dialect());
-            match request.send().await {
-                Ok(resp) => {
+                )
+                .customize()
+                .config_override(Self::long_upload_config())
+                .send()
+                .await;
+            // A debug seam: the backend completed the upload, and its
+            // answer is lost (a dropped connection, a timeout).
+            let failure = match sent {
+                Ok(resp) if !(drop_first_answer && attempt == 0) => {
                     let etag = resp.e_tag().unwrap_or_default();
                     self.remember_listed_facts(bucket, key, etag, stored_size, metadata);
                     self.persist_listing_facts(bucket, key, etag, stored_size, metadata);
                     return Ok(FencedPut::Stored(resp.e_tag().map(str::to_string)));
                 }
-                Err(e) => {
-                    let signal = crate::coordination::cas::sdk_error_signal(&e);
-                    match fenced_write_verdict(&fence, &signal) {
-                        // The ETag of a multipart object is no MD5 of its
-                        // body, so a refused condition cannot be proven to
-                        // be our own landed write (as a single PUT does):
-                        // it reads as lost.
-                        FencedWriteVerdict::Lost => return Ok(FencedPut::Lost),
-                        FencedWriteVerdict::Unsupported
-                            if on_unsupported == OnUnsupported::Report =>
-                        {
-                            return Ok(FencedPut::Unsupported);
-                        }
-                        FencedWriteVerdict::Unsupported => {
-                            warn!("S3 PUT {bucket}/{key}: the backend has no conditional writes (501); completing without the fence");
-                            fence = RefFence::Unfenced;
-                            continue;
-                        }
-                        FencedWriteVerdict::Other
-                            if on_unsupported == OnUnsupported::Report
-                                && conditional_target_gone(&fence, &signal) =>
-                        {
-                            return Ok(FencedPut::Lost);
-                        }
-                        FencedWriteVerdict::Other => {}
-                    }
-                    return Err(self.classify(bucket, &e, S3Op::CompleteMpu));
-                }
+                Ok(_) => None,
+                Err(e) => Some(e),
+            };
+            // The Complete may have landed although it failed here: a
+            // retry of it answers `NoSuchUpload`, a late answer is a
+            // timeout. The object of this upload is the one at the key, so
+            // that is a success, and the client does not upload every part
+            // again.
+            if let Some(etag) = self
+                .landed_multipart(bucket, key, expected.as_deref())
+                .await
+            {
+                self.remember_listed_facts(bucket, key, &etag, stored_size, metadata);
+                self.persist_listing_facts(bucket, key, &etag, stored_size, metadata);
+                return Ok(FencedPut::Stored(Some(etag)));
             }
+            let Some(e) = failure else {
+                return Err(StorageError::Transient(
+                    "injected: the answer of CompleteMultipartUpload was lost \
+                     (DGP_TEST_PUT_DROP_COMPLETE_ANSWER)"
+                        .into(),
+                ));
+            };
+            // A 400 without a request id (Hetzner): sent again, now that
+            // the object is known not to be there.
+            if let Some(ms) = is_unidentified_400(&e).then(|| backoff.next()).flatten() {
+                warn!("S3 CompleteMultipartUpload {bucket}/{key}: a 400 without a request id, retrying in {ms}ms: {e:?}");
+                tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+                continue;
+            }
+            return Err(self.classify(bucket, &e, S3Op::CompleteMpu));
         }
+        unreachable!("the loop returns on every path")
+    }
+
+    /// The config of a part and of a CompleteMultipartUpload: no deadline
+    /// for the operation, a long attempt and read timeout
+    /// ([`upload_timeouts`]); the connect timeout stays.
+    fn long_upload_config() -> aws_sdk_s3::config::Builder {
+        aws_sdk_s3::config::Builder::new().timeout_config(upload_timeouts(None))
+    }
+
+    /// The ETag of the object at `key` when it is the object that a
+    /// Complete of parts with the ETag `expected` makes (the ETag of the
+    /// object is [`multipart_etag`] of its parts); `None` for no object, for
+    /// another ETag, for an ETag that proves nothing (`expected` is `None`)
+    /// and for a failed HEAD.
+    async fn landed_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected: Option<&str>,
+    ) -> Option<String> {
+        let expected = expected?;
+        BACKEND_HEAD_REQUESTS.inc();
+        let head = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .ok()?;
+        let etag = head.e_tag()?;
+        (etag.trim().trim_matches('"') == expected).then(|| etag.to_string())
     }
 }
 
@@ -391,6 +493,445 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
     const TIB: u64 = 1024 * GIB;
+
+    /// A listener that answers every request with an empty `200` (and an
+    /// ETag) `delay` after it read the request head, and sends each head
+    /// (the request line and headers, lower-cased) to the channel.
+    async fn head_recorder(
+        delay: std::time::Duration,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                    let head = String::from_utf8_lossy(&buf[..end])
+                        .to_lowercase()
+                        .replace('\r', "");
+                    let _ = tx.send(head);
+                    tokio::time::sleep(delay).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\netag: \"abc\"\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        (endpoint, rx)
+    }
+
+    /// The backend as production builds it (`S3Backend::new`), on `endpoint`.
+    async fn production_backend(endpoint: &str) -> S3Backend {
+        let cfg = crate::config::BackendConfig::S3 {
+            session_token: None,
+            endpoint: Some(endpoint.to_string()),
+            region: "us-east-1".to_string(),
+            force_path_style: true,
+            access_key_id: Some("AKIA".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            allow_local: true,
+        };
+        S3Backend::new(&cfg, NativeEncryptionConfig::None)
+            .await
+            .unwrap()
+    }
+
+    /// A listener that answers its n-th request with `responses[n]` (a whole
+    /// HTTP response; an empty `200` after the last) and sends each request
+    /// line to the channel.
+    async fn scripted_server(
+        responses: Vec<String>,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let responses = std::sync::Arc::new(responses);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let (tx, next, responses) = (tx.clone(), next.clone(), responses.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&buf)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    let n = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = tx.send(line);
+                    let reply = responses.get(n).cloned().unwrap_or_else(|| {
+                        "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".to_string()
+                    });
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (endpoint, rx)
+    }
+
+    /// A Hetzner 400 without a request id is sent again by the
+    /// CreateMultipartUpload (as by the PutObject and the UploadPart): the
+    /// next request is a second Create, and the upload goes on to its parts.
+    #[tokio::test]
+    async fn a_400_without_a_request_id_is_retried_by_the_create() {
+        let no_id = "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n".to_string();
+        let xml = "<?xml version=\"1.0\"?><InitiateMultipartUploadResult><Bucket>b</Bucket>\
+                   <Key>k</Key><UploadId>uid1</UploadId></InitiateMultipartUploadResult>";
+        let created = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\n\r\n{xml}",
+            xml.len()
+        );
+        // The part is refused for good (a request id): the upload ends.
+        let refused =
+            "HTTP/1.1 400 Bad Request\r\nx-amz-request-id: r1\r\ncontent-length: 0\r\n\r\n"
+                .to_string();
+        let (endpoint, mut lines) = scripted_server(vec![no_id, created, refused]).await;
+        let s3 = production_backend(&endpoint)
+            .await
+            .with_put_limits(MIN_PART_BYTES, MIN_PART_BYTES);
+        let (_dir, path, meta) = file_and_meta(MIN_PART_BYTES as usize + 1);
+        let _ = s3
+            .put_object_file_with_metadata("b", "k", &[path.as_path()], &meta)
+            .await;
+        let mut seen = Vec::new();
+        while let Ok(Some(l)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), lines.recv()).await
+        {
+            seen.push(l);
+        }
+        assert!(seen[0].starts_with("post /b/k?uploads"), "{seen:?}");
+        assert!(seen[1].starts_with("post /b/k?uploads"), "{seen:?}");
+        assert!(seen[2].starts_with("put /b/k?x-id=uploadpart"), "{seen:?}");
+    }
+
+    /// A listener that takes a request body at about 100 KB/s (a read of at
+    /// most 4 KiB every 40 ms) and answers `200` when it has it all.
+    async fn slow_upload_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    let mut got = buf.len() - end;
+                    while got < len {
+                        // 100 KB/s
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => got += n,
+                        }
+                    }
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\netag: \"abc\"\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        endpoint
+    }
+
+    /// The backend as production builds it, with a read timeout of 1 s on
+    /// the upload client (production: 60 s) and a request deadline of 10 s
+    /// on the other (production: 30 s, which sizes the deadline of an
+    /// upload).
+    async fn backend_with_short_read_timeout(endpoint: &str) -> S3Backend {
+        let mut s3 = production_backend(endpoint).await;
+        let cfg = crate::config::BackendConfig::S3 {
+            session_token: None,
+            endpoint: Some(endpoint.to_string()),
+            region: "us-east-1".to_string(),
+            force_path_style: true,
+            access_key_id: Some("AKIA".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            allow_local: true,
+        };
+        s3.client = S3Backend::build_client_with(&cfg, Some(std::time::Duration::from_secs(10)))
+            .await
+            .unwrap();
+        let conf = s3
+            .bulk_client
+            .config()
+            .to_builder()
+            .timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .read_timeout(std::time::Duration::from_secs(1))
+                    .build(),
+            )
+            .build();
+        s3.bulk_client = aws_sdk_s3::Client::from_conf(conf);
+        s3
+    }
+
+    /// A part whose body takes longer than the read timeout to leave (about
+    /// 3 s against 1 s) still gets its answer. The read timeout of the client
+    /// is a deadline for the whole request, body included: with it, a part
+    /// of 64 MiB over a link that moves less than 1 MiB/s per connection
+    /// never completed, and every retry sent it again (Hetzner, 20 of 20
+    /// parts).
+    #[tokio::test]
+    async fn a_part_that_outlasts_the_read_timeout_completes() {
+        let endpoint = slow_upload_server().await;
+        let s3 = backend_with_short_read_timeout(&endpoint).await;
+        let (_dir, path, meta) = file_and_meta(300_000);
+        upload_part_with(&s3, &path, &meta, 300_000, 300_000)
+            .await
+            .expect("the slow body is not cut by the read timeout");
+    }
+
+    /// The same for the PutObject of a file, and of bytes in memory: one
+    /// rule (`upload_config`) for every upload.
+    #[tokio::test]
+    async fn a_put_that_outlasts_the_read_timeout_completes() {
+        let endpoint = slow_upload_server().await;
+        let s3 = backend_with_short_read_timeout(&endpoint).await;
+        let (_dir, path, meta) = file_and_meta(300_000);
+        s3.put_object_file_with_metadata("b", "k", &[path.as_path()], &meta)
+            .await
+            .expect("a PUT of a file");
+        s3.put_object_with_metadata("b", "k2", bytes::Bytes::from(vec![1u8; 300_000]), &meta)
+            .await
+            .expect("a PUT of bytes");
+    }
+
+    /// A file of `len` bytes and the metadata of a passthrough object.
+    fn file_and_meta(len: usize) -> (tempfile::TempDir, std::path::PathBuf, FileMetadata) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, vec![7u8; len]).unwrap();
+        let meta = FileMetadata::new_passthrough(
+            "o".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            len as u64,
+            None,
+        );
+        (dir, path, meta)
+    }
+
+    /// The request head of one UploadPart of `part_len` bytes of a file of
+    /// `len` bytes, sent by `s3` to the recorder.
+    async fn upload_part_with(
+        s3: &S3Backend,
+        path: &std::path::Path,
+        meta: &FileMetadata,
+        len: u64,
+        part_len: u64,
+    ) -> Result<aws_sdk_s3::types::CompletedPart, StorageError> {
+        let files = FileBody::open(&[path]).await.unwrap();
+        let headers = HashMap::new();
+        let put = MultipartPut {
+            bucket: "b",
+            key: "k",
+            files: &files,
+            headers: &headers,
+            metadata: meta,
+            fence: &RefFence::Unfenced,
+            on_unsupported: OnUnsupported::Unfenced,
+        };
+        assert!(part_len <= len);
+        s3.upload_one_part(&put, "uid", 1, 0, part_len).await
+    }
+
+    /// An UploadPart is sent like the PutObject of the same bytes: a
+    /// `Content-Length` of the exact body, an unsigned payload, and no
+    /// `aws-chunked` encoding, trailing checksum, checksum header or
+    /// `Expect`. A body that the SDK wraps in `aws-chunked` with a trailing
+    /// checksum is one that a backend may not take, and its length is not
+    /// the length of the file range. The client is built as production
+    /// builds it (`S3Backend::new`: request checksums only when required).
+    #[tokio::test]
+    async fn an_upload_part_is_sent_like_a_put_object() {
+        let (endpoint, mut heads) = head_recorder(std::time::Duration::ZERO).await;
+        let s3 = production_backend(&endpoint).await;
+        let (_dir, path, meta) = file_and_meta(100_000);
+        s3.put_object_file_with_metadata("b", "k", &[path.as_path()], &meta)
+            .await
+            .unwrap();
+        let put = heads.recv().await.unwrap();
+        upload_part_with(&s3, &path, &meta, 100_000, 100_000)
+            .await
+            .unwrap();
+        let part = heads.recv().await.unwrap();
+        assert!(part.starts_with("put /b/k?x-id=uploadpart&partnumber=1&uploadid=uid "));
+        for (what, head) in [("PutObject", &put), ("UploadPart", &part)] {
+            assert!(
+                head.contains("\ncontent-length: 100000\n"),
+                "{what}: {head}"
+            );
+            assert!(
+                head.contains("\nx-amz-content-sha256: unsigned-payload\n"),
+                "{what}: {head}"
+            );
+            for absent in [
+                "aws-chunked",
+                "x-amz-trailer",
+                "x-amz-checksum",
+                "x-amz-sdk-checksum-algorithm",
+                "x-amz-decoded-content-length",
+                "transfer-encoding",
+                "content-encoding",
+                "expect:",
+            ] {
+                assert!(!head.contains(absent), "{what} sends {absent}: {head}");
+            }
+        }
+    }
+
+    /// A part has no deadline for the whole operation. The deadline of a
+    /// single PUT (`DGP_BACKEND_REQUEST_TIMEOUT_SECS` plus one second per
+    /// MiB, retries included) was the only limit of a part that moves:
+    /// 94 s for a part of 64 MiB, and every retry spent a share of it. The
+    /// client here has an operation deadline of 0.3 s (the production
+    /// client has 30 s), and the backend answers after 1.5 s.
+    #[tokio::test]
+    async fn a_part_has_no_deadline_for_the_whole_operation() {
+        let (endpoint, _heads) = head_recorder(std::time::Duration::from_millis(1500)).await;
+        let mut s3 = production_backend(&endpoint).await;
+        let cfg = crate::config::BackendConfig::S3 {
+            session_token: None,
+            endpoint: Some(endpoint.clone()),
+            region: "us-east-1".to_string(),
+            force_path_style: true,
+            access_key_id: Some("AKIA".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            allow_local: true,
+        };
+        s3.client = S3Backend::build_client_with(&cfg, Some(std::time::Duration::from_millis(300)))
+            .await
+            .unwrap();
+        let (_dir, path, meta) = file_and_meta(10);
+        upload_part_with(&s3, &path, &meta, 10, 10)
+            .await
+            .expect("the part waits for the backend: no deadline of the whole operation");
+    }
+
+    /// A write with a condition above the single-PUT limit sends no
+    /// request: `Report` callers read "no conditional writes", the others
+    /// get `EntityTooLarge`. An unconditional write of the same body is
+    /// stored with a multipart upload (its first request is the Create).
+    #[tokio::test]
+    async fn a_conditional_write_above_the_limit_is_refused_before_any_request() {
+        let (endpoint, mut heads) = head_recorder(std::time::Duration::ZERO).await;
+        let s3 = production_backend(&endpoint)
+            .await
+            .with_put_limits(MIN_PART_BYTES, MIN_PART_BYTES);
+        let (_dir, path, meta) = file_and_meta(MIN_PART_BYTES as usize + 1);
+        let files = [path.as_path()];
+        for fence in [RefFence::Absent, RefFence::ETag("\"abc\"".into())] {
+            let reported = s3
+                .put_object_file_with_metadata_fenced_with(
+                    "b",
+                    "k",
+                    &files,
+                    &meta,
+                    &fence,
+                    OnUnsupported::Report,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reported, FencedPut::Unsupported, "{fence:?}");
+            let err = s3
+                .put_object_file_with_metadata_fenced_with(
+                    "b",
+                    "k",
+                    &files,
+                    &meta,
+                    &fence,
+                    OnUnsupported::Unfenced,
+                )
+                .await
+                .expect_err("a conditional multipart write is refused");
+            assert!(matches!(err, StorageError::EntityTooLarge(_)), "{err:?}");
+        }
+        assert!(heads.try_recv().is_err(), "no request was sent");
+        // An empty ETag is no condition (a backend that does not fence).
+        assert!(!fence_is_conditional(&RefFence::ETag(String::new())));
+        assert!(!fence_is_conditional(&RefFence::Unfenced));
+        // Without a condition the write goes to the backend as a multipart
+        // upload: its first request is CreateMultipartUpload.
+        let _ = s3
+            .put_object_file_with_metadata_fenced_with(
+                "b",
+                "k",
+                &files,
+                &meta,
+                &RefFence::Unfenced,
+                OnUnsupported::Unfenced,
+            )
+            .await;
+        let first = heads.recv().await.unwrap();
+        assert!(first.starts_with("post /b/k?uploads"), "{first}");
+    }
+
+    /// The ETag of a multipart object: the MD5 of the parts' MD5s and the
+    /// part count (a known vector), and nothing for an ETag that is no MD5.
+    #[test]
+    fn the_etag_of_a_multipart_object_is_the_md5_of_the_part_md5s() {
+        // md5(md5("a") ++ md5("b")) with the quotes that S3 puts around a
+        // part ETag.
+        let a = format!(
+            "\"{}\"",
+            hex::encode(<md5::Md5 as md5::Digest>::digest(b"a"))
+        );
+        let b = hex::encode(<md5::Md5 as md5::Digest>::digest(b"b"));
+        let mut both = Vec::new();
+        both.extend_from_slice(&<md5::Md5 as md5::Digest>::digest(b"a"));
+        both.extend_from_slice(&<md5::Md5 as md5::Digest>::digest(b"b"));
+        let want = format!(
+            "{}-2",
+            hex::encode(<md5::Md5 as md5::Digest>::digest(&both))
+        );
+        assert_eq!(multipart_etag(&[a.clone(), b]), Some(want));
+        assert_eq!(multipart_etag(&[a, "\"not-an-md5\"".into()]), None);
+        assert_eq!(multipart_etag(&["zz".repeat(16)]), None);
+        assert!(multipart_etag(&[]).is_some());
+    }
 
     #[test]
     fn part_plans_of_known_sizes() {

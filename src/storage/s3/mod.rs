@@ -288,7 +288,9 @@ pub struct S3Backend {
     /// CopyObject, CompleteMultipartUpload): their duration grows with the
     /// object size, so the client has only the per-attempt and read
     /// timeouts. A PutObject or UploadPart gets a deadline sized for its
-    /// body per request ([`S3Backend::upload_config`]).
+    /// body per request, and attempt and read timeouts to match
+    /// ([`S3Backend::upload_config`]): the read timeout of the client
+    /// (60 s) would end a body that needs longer.
     bulk_client: Client,
     /// `(backend name, definition fingerprint)` for the passive health signal
     /// (`coordination::health::note_unavailable`). `None` for a backend that
@@ -1284,10 +1286,11 @@ impl StorageBackend for S3Backend {
                 .upload_id(&upload.upload_id)
                 .part_number(part_number)
                 .body(ByteStream::from(data.clone()));
-            let result = match self.upload_config(data.len() as u64) {
-                Some(c) => request.customize().config_override(c).send().await,
-                None => request.send().await,
-            };
+            let result = request
+                .customize()
+                .config_override(self.upload_config(data.len() as u64))
+                .send()
+                .await;
             match result {
                 Ok(resp) => {
                     let etag = resp.e_tag().unwrap_or_default().to_string();

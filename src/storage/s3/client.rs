@@ -134,6 +134,34 @@ pub(super) fn upload_deadline(
     })
 }
 
+/// The attempt and read timeout of an upload that has no deadline of its
+/// own (the request deadline is off, or the upload is one part of a larger
+/// one), and of the wait for a CompleteMultipartUpload.
+pub(super) const LONG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Pure: the timeouts of an upload whose whole-operation deadline is
+/// `operation` (`None`: it has none). The client's read timeout
+/// (`DGP_S3_READ_TIMEOUT_SECS`, 60 s) is a deadline for the whole request,
+/// from the first byte of the body to the response headers: a body that
+/// needs longer than that to leave (a part of 64 MiB over a slow link) never
+/// gets an answer, and every retry sends it again from its start. So an
+/// upload carries its own limits: the attempt timeout and the read timeout
+/// equal its deadline (or [`LONG_TIMEOUT`]). A body that does not move is
+/// ended by the stalled-stream protection (`DGP_S3_STALL_GRACE_SECS`), not
+/// by these. The connect timeout stays.
+pub(super) fn upload_timeouts(
+    operation: Option<std::time::Duration>,
+) -> aws_sdk_s3::config::timeout::TimeoutConfig {
+    let limit = operation.unwrap_or(LONG_TIMEOUT);
+    let mut timeouts = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+        .operation_attempt_timeout(limit)
+        .read_timeout(limit);
+    if let Some(operation) = operation {
+        timeouts = timeouts.operation_timeout(operation);
+    }
+    timeouts.build()
+}
+
 /// A retry partition of its own for one backend definition. The SDK's
 /// default partition is process-wide per region (`s3-<region>`): its retry
 /// token bucket and its adaptive rate limiter were shared by every backend
@@ -296,5 +324,27 @@ impl S3Backend {
         }
 
         Ok(timer.client(s3_config_builder))
+    }
+}
+
+#[cfg(test)]
+mod upload_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// An upload's attempt and read timeout are its deadline (or the long
+    /// timeout when it has none), so the 60 s read timeout of the client
+    /// never ends a body that is still moving.
+    #[test]
+    fn an_upload_carries_its_own_attempt_and_read_timeout() {
+        let t = upload_timeouts(Some(Duration::from_secs(94)));
+        assert_eq!(t.operation_timeout(), Some(Duration::from_secs(94)));
+        assert_eq!(t.operation_attempt_timeout(), Some(Duration::from_secs(94)));
+        assert_eq!(t.read_timeout(), Some(Duration::from_secs(94)));
+        assert_eq!(t.connect_timeout(), None, "the connect timeout stays");
+        let none = upload_timeouts(None);
+        assert_eq!(none.operation_timeout(), None);
+        assert_eq!(none.operation_attempt_timeout(), Some(LONG_TIMEOUT));
+        assert_eq!(none.read_timeout(), Some(LONG_TIMEOUT));
     }
 }

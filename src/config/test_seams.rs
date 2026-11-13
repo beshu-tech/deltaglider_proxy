@@ -103,6 +103,11 @@ pub struct TestSeams {
     /// multipart upload that fails with a transient error, so a test sees
     /// the upload aborted after earlier parts were stored.
     pub put_fail_part: Option<i32>,
+    /// `DGP_TEST_PUT_DROP_COMPLETE_ANSWER=true`: the first
+    /// CompleteMultipartUpload of a backend multipart upload completes, and
+    /// the proxy treats its answer as lost, so a test sees that the proxy
+    /// finds its own object and does not upload the parts again.
+    pub put_drop_complete_answer: bool,
     /// `DGP_TEST_DISK_FREE_BYTES`: the free space of the spool directory at
     /// boot, so a test sees one auto-sized limit on every host. It also
     /// turns off the tmpfs, Kubernetes and shared-device facts
@@ -219,6 +224,8 @@ impl TestSeams {
             )),
             put_part_bytes: copy_seam_bytes(lookup_parse(env, "DGP_TEST_PUT_PART_BYTES")),
             put_fail_part: lookup_parse::<i32>(env, "DGP_TEST_PUT_FAIL_PART").filter(|n| *n >= 1),
+            put_drop_complete_answer: lookup_parse(env, "DGP_TEST_PUT_DROP_COMPLETE_ANSWER")
+                .unwrap_or(false),
             disk_free_bytes: lookup_parse(env, "DGP_TEST_DISK_FREE_BYTES"),
         }
     }
@@ -253,8 +260,15 @@ pub const SEAM_ENV_VARS: &[&str] = &[
     "DGP_TEST_PUT_SINGLE_MAX_BYTES",
     "DGP_TEST_PUT_PART_BYTES",
     "DGP_TEST_PUT_FAIL_PART",
+    "DGP_TEST_PUT_DROP_COMPLETE_ANSWER",
     "DGP_TEST_DISK_FREE_BYTES",
 ];
+
+/// The wait of `DGP_TEST_PUT_FAIL_PART`: the parts before the failing one
+/// are on the backend by the time it fails.
+pub async fn let_earlier_parts_finish() {
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+}
 
 /// The seams of this process: parsed from the environment on first use in a
 /// debug build, all off in a release build.
@@ -340,8 +354,10 @@ mod tests {
             ("DGP_TEST_PUT_SINGLE_MAX_BYTES", "5242880"),
             ("DGP_TEST_PUT_PART_BYTES", "7340032"),
             ("DGP_TEST_PUT_FAIL_PART", "3"),
+            ("DGP_TEST_PUT_DROP_COMPLETE_ANSWER", "true"),
         ]);
         assert_eq!(t.put_fail_part, Some(3));
+        assert!(t.put_drop_complete_answer);
         assert_eq!(t.copy_object_max_bytes, Some(5 * 1024 * 1024));
         assert_eq!(t.copy_part_bytes, Some(6 * 1024 * 1024));
         assert_eq!(t.put_single_max_bytes, Some(5 * 1024 * 1024));

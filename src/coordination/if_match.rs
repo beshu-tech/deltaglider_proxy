@@ -146,10 +146,6 @@ if_match_on!(
     if_match
 );
 if_match_on!(
-    aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
-    if_match
-);
-if_match_on!(
     aws_sdk_s3::operation::delete_object::builders::DeleteObjectFluentBuilder,
     if_match
 );

@@ -85,22 +85,20 @@ pub(super) fn is_unidentified_400<E>(e: &SdkError<E>) -> bool {
 impl S3Backend {
     /// The per-request config of an upload of `bytes`: an operation
     /// deadline sized for the body ([`upload_deadline`] over the request
-    /// deadline of `client`). The upload client has no deadline of its own,
-    /// so a stalled backend held a PUT for minutes. `None` when the request
-    /// deadline is off.
-    pub(super) fn upload_config(&self, bytes: u64) -> Option<aws_sdk_s3::config::Builder> {
+    /// deadline of `client`; none when that is off), and the attempt and
+    /// read timeout that go with it ([`upload_timeouts`]). The upload
+    /// client has no deadline of its own, so a stalled backend held a PUT
+    /// for minutes; and its read timeout (60 s) would end a body that needs
+    /// longer, in every attempt.
+    pub(super) fn upload_config(&self, bytes: u64) -> aws_sdk_s3::config::Builder {
         let base = self
             .client
             .config()
             .timeout_config()
             .and_then(|t| t.operation_timeout());
-        super::client::upload_deadline(base, bytes).map(|t| {
-            aws_sdk_s3::config::Builder::new().timeout_config(
-                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-                    .operation_timeout(t)
-                    .build(),
-            )
-        })
+        aws_sdk_s3::config::Builder::new().timeout_config(super::client::upload_timeouts(
+            super::client::upload_deadline(base, bytes),
+        ))
     }
 
     /// Rewrite an object's metadata WITHOUT moving its bytes: a server-side
@@ -396,10 +394,11 @@ impl S3Backend {
             }
             request = apply_native_encryption(request, &native);
             request = apply_put_fence(request, &fence, self.if_match_dialect());
-            let sent = match self.upload_config(data.len() as u64) {
-                Some(c) => request.customize().config_override(c).send().await,
-                None => request.send().await,
-            };
+            let sent = request
+                .customize()
+                .config_override(self.upload_config(data.len() as u64))
+                .send()
+                .await;
 
             match sent {
                 Ok(resp) => {
@@ -613,10 +612,11 @@ impl S3Backend {
             }
             request = apply_native_encryption(request, &native);
             request = apply_put_fence(request, &fence, self.if_match_dialect());
-            let sent = match self.upload_config(stored_size) {
-                Some(c) => request.customize().config_override(c).send().await,
-                None => request.send().await,
-            };
+            let sent = request
+                .customize()
+                .config_override(self.upload_config(stored_size))
+                .send()
+                .await;
 
             match sent {
                 Ok(resp) => {
