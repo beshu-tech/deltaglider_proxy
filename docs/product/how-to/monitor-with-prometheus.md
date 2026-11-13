@@ -239,14 +239,35 @@ groups:
         for: 10m
         labels: { severity: warning }
         annotations:
-          summary: "Disk {{ $labels.path_role }} is low on free space: free space or lower DGP_SPOOL_MAX_BYTES"
+          summary: "Disk {{ $labels.path_role }} is low on free space; nothing is refused yet"
 
-      - alert: DeltaGliderDiskHigh
-        expr: deltaglider_disk_level >= 2
+      - alert: DeltaGliderSpoolRefusingUploads
+        expr: deltaglider_disk_level{path_role=~"spool|spool-budget"} >= 2
         for: 2m
         labels: { severity: critical }
         annotations:
-          summary: "Disk {{ $labels.path_role }} is at level high or critical: the proxy refuses new uploads that need spool space"
+          summary: "The proxy refuses new uploads that need spool space ({{ $labels.path_role }}): free disk space, lower DGP_SPOOL_MAX_BYTES or move DGP_SPOOL_DIR"
+
+      - alert: DeltaGliderBackendDiskCritical
+        expr: deltaglider_disk_level{path_role=~"backend:.*"} == 3
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Disk of {{ $labels.path_role }} is full: its buckets refuse writes, reads and deletes still work. Delete objects or add disk space"
+
+      - alert: DeltaGliderBackendDiskHigh
+        expr: deltaglider_disk_level{path_role=~"backend:.*"} == 2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Disk of {{ $labels.path_role }} is nearly full: at level critical its buckets refuse writes"
+
+      - alert: DeltaGliderDataDiskHigh
+        expr: deltaglider_disk_level{path_role="data"} >= 2
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "The data directory is nearly full: the config database and the job state live there. Free disk space"
 
       - alert: DeltaGliderSpoolBudgetNearlyUsed
         expr: >
@@ -268,9 +289,9 @@ groups:
 
 The proxy measures the free space of three kinds of directory every 30 seconds: the spool directory (`spool`, with the gauges `deltaglider_spool_dir_free_bytes` and `deltaglider_spool_dir_total_bytes`), the root of every filesystem backend (`backend:<name>`, for example `backend:hetzner-fsn1`) and the data directory that holds the config database and the job state (`data`). Roles that share one disk share one level. The gauge `deltaglider_disk_level` is 0 (ok), 1 (low), 2 (high) or 3 (critical); the [capacity planning reference](../reference/capacity-planning.md#disk-watermarks) gives the thresholds and what the proxy does at each level.
 
-The rules above page you at level high, which is the point where the proxy starts to refuse new uploads that need spool space. `DeltaGliderDiskLow` is only a warning: nothing is refused yet.
+Each rule names what the proxy does for its role. At level high on the spool, and at level critical on a filesystem backend, the proxy starts to refuse writes, so those rules page you. The data directory refuses nothing itself, but the config database and the job state live there, so a full one is an emergency of its own. `DeltaGliderDiskLow` is only a warning: nothing is refused yet.
 
-Free space does not show the real limit of a Kubernetes `emptyDir` volume with a `sizeLimit`, or of a container with a disk quota, because `statvfs` reports the whole host disk. Under Kubernetes, on a tmpfs, and when the free space cannot be measured, the proxy therefore also judges the spool by its use: the series `deltaglider_disk_level{path_role="spool-budget"}` follows the share of the spool budget that running requests have reserved, and the two level rules above cover it. The rule `DeltaGliderSpoolBudgetNearlyUsed` watches the same ratio on every host.
+Free space does not show the real limit of a Kubernetes `emptyDir` volume with a `sizeLimit`, or of a container with a disk quota, because `statvfs` reports the whole host disk. Under Kubernetes, on a tmpfs, and when the free space cannot be measured, the proxy therefore also judges the spool by its use: the series `deltaglider_disk_level{path_role="spool-budget"}` follows the share of the spool budget that running requests have reserved, and `DeltaGliderSpoolRefusingUploads` covers it. The refusal itself is judged live at every new request, so the series can lag it by one measure. The rule `DeltaGliderSpoolBudgetNearlyUsed` watches the same ratio on every host.
 
 To chart the free space as a percent for one role:
 

@@ -627,6 +627,30 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_DISK_LOW_MAX_BYTES",
+        description: "The most free space, in bytes, at which disk level low starts, whatever DGP_DISK_LOW_PERCENT says: 5% of a 10 TiB volume is 500 GiB, which is no reason to warn. 0 turns level low off (default: 53687091200, 50 GiB)",
+        example: "53687091200",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_DISK_HIGH_MAX_BYTES",
+        description: "The most free space, in bytes, at which disk level high starts. 0 turns level high off, and then the free space of the disk never makes the spool refuse a new upload (default: 26843545600, 25 GiB)",
+        example: "26843545600",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_DISK_CRITICAL_MAX_BYTES",
+        description: "The most free space, in bytes, at which disk level critical starts. 0 turns level critical off, and then no write to a filesystem backend is refused on a full disk (default: 10737418240, 10 GiB)",
+        example: "10737418240",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_DISK_MEASURE_TIMEOUT_SECS",
+        description: "Seconds that the disk monitor waits for the free space of one directory (a hung network mount can block it). After that the role keeps its last verdict and the proxy logs a warning once (default: 5, minimum 1)",
+        example: "5",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_SHUTDOWN_TIMEOUT_SECS",
         description: "Seconds that the exit waits for running blocking tasks (an xdelta3 run) after the drain steps; then the process exits (default: 10, minimum 1)",
         example: "10",

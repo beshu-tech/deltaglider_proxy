@@ -84,10 +84,6 @@ impl Level {
             Level::Critical => "critical",
         }
     }
-
-    fn one_lower(self) -> Level {
-        Level::from_u8(self.as_u8().saturating_sub(1))
-    }
 }
 
 /// The free and the total bytes of a filesystem.
@@ -97,22 +93,33 @@ pub struct Facts {
     pub total: u64,
 }
 
-/// The thresholds of the levels: a percent of the disk, and a floor in
-/// bytes taken from the spool limits. A level starts when the free space is
-/// below the larger of the two.
+/// The thresholds of the levels. A level starts when the free space is
+/// below `min(max(percent of the disk, floor), ceiling)`:
+/// * the percent follows the size of the disk;
+/// * the floor (bytes taken from the spool limits) keeps a small disk from
+///   running out under one upload;
+/// * the ceiling (bytes) keeps a huge disk from refusing writes while it
+///   still has plenty of room: 5% of a 10 TiB volume is 500 GiB.
+///
+/// A ceiling of `0` turns the level off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Thresholds {
     pub low_percent: u8,
     pub high_percent: u8,
     pub critical_percent: u8,
     /// A level ends when the free space is this many percentage points of
-    /// the disk above its entry threshold.
+    /// the disk above its entry threshold (never more than a fifth of the
+    /// ceiling of the level).
     pub recover_points: u8,
     /// Twice the largest reservation that the spool allows for one upload.
     pub low_floor: u64,
     /// The largest reservation that the spool allows for one upload.
     pub high_floor: u64,
     pub critical_floor: u64,
+    /// The most free space at which level low starts (`0`: no level low).
+    pub low_max: u64,
+    pub high_max: u64,
+    pub critical_max: u64,
 }
 
 fn percent_of(total: u64, percent: u8) -> u64 {
@@ -131,43 +138,107 @@ impl Thresholds {
             low_floor: largest_reservation.saturating_mul(2),
             high_floor: largest_reservation,
             critical_floor: CRITICAL_FLOOR_BYTES,
+            low_max: tuning.low_max_bytes,
+            high_max: tuning.high_max_bytes,
+            critical_max: tuning.critical_max_bytes,
         }
+        .monotone()
     }
 
     /// The thresholds for a measure that is no disk: the use of the spool
     /// against its budget. The budget already bounds every reservation, so
-    /// no floor in bytes applies, only the percents.
+    /// neither a floor nor a ceiling in bytes applies, only the percents. A
+    /// level that the tuning turns off stays off.
     pub fn percent_only(tuning: &DiskMonitorTuning) -> Self {
+        let on = |max: u64| if max == 0 { 0 } else { u64::MAX };
         Self {
             low_floor: 0,
             high_floor: 0,
             critical_floor: 0,
+            low_max: on(tuning.low_max_bytes),
+            high_max: on(tuning.high_max_bytes),
+            critical_max: on(tuning.critical_max_bytes),
             ..Self::new(tuning, 0)
         }
     }
 
-    /// The free space below which `level` starts. Never smaller for a lower
-    /// level, whatever the settings: a settings mistake (high above low)
-    /// cannot make the levels overlap. `Ok` has none (0).
-    pub fn enter(&self, level: Level, total: u64) -> u64 {
-        let critical = percent_of(total, self.critical_percent).max(self.critical_floor);
-        let high = percent_of(total, self.high_percent)
-            .max(self.high_floor)
-            .max(critical);
-        let low = percent_of(total, self.low_percent)
-            .max(self.low_floor)
-            .max(high);
+    /// Ceilings that never fall for a lower level: a settings mistake (a
+    /// higher level with the larger ceiling) cannot make the levels
+    /// overlap. An off level (`0`) is skipped.
+    pub fn monotone(mut self) -> Self {
+        if self.critical_max != 0 && self.high_max != 0 {
+            self.high_max = self.high_max.max(self.critical_max);
+        }
+        let above = if self.high_max != 0 {
+            self.high_max
+        } else {
+            self.critical_max
+        };
+        if self.low_max != 0 && above != 0 {
+            self.low_max = self.low_max.max(above);
+        }
+        self
+    }
+
+    fn ceiling(&self, level: Level) -> u64 {
         match level {
             Level::Ok => 0,
-            Level::Low => low,
-            Level::High => high,
-            Level::Critical => critical,
+            Level::Low => self.low_max,
+            Level::High => self.high_max,
+            Level::Critical => self.critical_max,
         }
     }
 
-    /// The bytes above the entry threshold at which a level ends.
-    pub fn recover_margin(&self, total: u64) -> u64 {
-        percent_of(total, self.recover_points)
+    /// Does this level exist (`Ok` always does)?
+    pub fn enabled(&self, level: Level) -> bool {
+        level == Level::Ok || self.ceiling(level) != 0
+    }
+
+    /// The free space below which `level` starts: the larger of the
+    /// thresholds of every level above it, so the levels never overlap.
+    /// `Ok` and a level that is off have none (0).
+    pub fn enter(&self, level: Level, total: u64) -> u64 {
+        let own = |l: Level| {
+            let (percent, floor) = match l {
+                Level::Ok => return 0,
+                Level::Low => (self.low_percent, self.low_floor),
+                Level::High => (self.high_percent, self.high_floor),
+                Level::Critical => (self.critical_percent, self.critical_floor),
+            };
+            if !self.enabled(l) {
+                return 0;
+            }
+            percent_of(total, percent).max(floor).min(self.ceiling(l))
+        };
+        if !self.enabled(level) {
+            return 0;
+        }
+        let mut value = own(level);
+        for above in [Level::High, Level::Critical] {
+            if above > level {
+                value = value.max(own(above));
+            }
+        }
+        value
+    }
+
+    /// The bytes above the entry threshold at which `level` ends: the
+    /// percent points of the disk, and at most a fifth of its ceiling (so
+    /// a huge disk does not wait for hundreds of GiB to recover).
+    pub fn recover_margin(&self, level: Level, total: u64) -> u64 {
+        percent_of(total, self.recover_points).min(self.ceiling(level) / 5)
+    }
+
+    /// The level below `level` that exists (`Ok` at the end).
+    pub fn lower(&self, level: Level) -> Level {
+        let mut l = level;
+        while l > Level::Ok {
+            l = Level::from_u8(l.as_u8() - 1);
+            if self.enabled(l) {
+                return l;
+            }
+        }
+        Level::Ok
     }
 }
 
@@ -176,7 +247,7 @@ pub fn raw_level(facts: Facts, th: &Thresholds) -> Level {
     Level::ALL
         .into_iter()
         .rev()
-        .find(|l| *l != Level::Ok && facts.free < th.enter(*l, facts.total))
+        .find(|l| *l != Level::Ok && th.enabled(*l) && facts.free < th.enter(*l, facts.total))
         .unwrap_or(Level::Ok)
 }
 
@@ -206,9 +277,9 @@ pub fn next_level(prev: Level, facts: Facts, th: &Thresholds) -> Level {
     }
     let leave_at = th
         .enter(prev, facts.total)
-        .saturating_add(th.recover_margin(facts.total));
+        .saturating_add(th.recover_margin(prev, facts.total));
     if facts.free >= leave_at {
-        prev.one_lower()
+        th.lower(prev)
     } else {
         prev
     }
@@ -243,12 +314,20 @@ pub fn log_action(
     }
 }
 
-/// The spool's view of the disk level: the monitor writes it, the spool
-/// reads it before it admits a new reservation.
+/// The spool's view of the disk: the monitor writes it, the spool reads it
+/// before it admits a new reservation.
+///
+/// Two things refuse a NEW write. The level of the spool DISK is the
+/// monitor's last verdict ([`SpoolGate::set`]). The USE of the budget, where
+/// the free space may hide the real limit ([`SpoolView`]), is judged live
+/// at every reservation from `used / budget` ([`use_refusal`]): it moves in
+/// an instant, and a verdict that is 30 s old would keep refusing after a
+/// spike ended.
 #[derive(Debug, Default)]
 pub struct SpoolGate {
     level: AtomicU8,
     message: Mutex<String>,
+    by_use: Mutex<Option<Thresholds>>,
 }
 
 impl SpoolGate {
@@ -262,10 +341,34 @@ impl SpoolGate {
         self.level.store(level.as_u8(), Ordering::Release);
     }
 
-    /// `Some(message)` while the spool refuses new reservations.
+    /// `Some(message)` while the disk of the spool is at level high or
+    /// critical.
     pub fn refusal(&self) -> Option<String> {
         (self.level() >= Level::High).then(|| self.message.lock().clone())
     }
+
+    /// Turn the live judgement of the use of the budget on (with its
+    /// thresholds) or off. Set by the monitor.
+    pub fn set_by_use(&self, thresholds: Option<Thresholds>) {
+        *self.by_use.lock() = thresholds;
+    }
+
+    /// The thresholds of the live judgement, when it is on.
+    pub fn by_use(&self) -> Option<Thresholds> {
+        *self.by_use.lock()
+    }
+}
+
+/// Pure: the refusal of a new spool reservation by the use of the budget:
+/// `Some(message)` when the reserved bytes (`used`) leave less than the high
+/// threshold of the budget.
+pub fn use_refusal(th: &Thresholds, budget: u64, used: u64, dir: &Path) -> Option<String> {
+    let facts = Facts {
+        free: budget.saturating_sub(used),
+        total: budget,
+    };
+    let level = raw_level(facts, th);
+    (level >= Level::High).then(|| spool_refusal_message(level, SPOOL_BUDGET_ROLE, dir, facts))
 }
 
 /// One measured path.
@@ -445,11 +548,17 @@ pub fn boot_check(
     view: SpoolView,
     free: Option<u64>,
     budget: u64,
+    explicit: bool,
     dir: &Path,
     limit_warnings: &[crate::config::limits::LimitWarning],
 ) -> Option<String> {
     use crate::config::limits::LimitWarning as W;
     let verdict = boot_space_verdict(view, free, budget);
+    // An explicit budget on a directory whose free space is no proof is the
+    // right setup there: the warning is about a budget that nobody set.
+    if explicit && matches!(verdict, BootSpaceVerdict::NotVisible(_)) {
+        return None;
+    }
     let said_already = limit_warnings.iter().any(|w| match verdict {
         BootSpaceVerdict::Fits => false,
         BootSpaceVerdict::BudgetAboveFree { .. } => {
@@ -475,9 +584,10 @@ struct DeviceState {
 #[derive(Default)]
 struct State {
     devices: HashMap<u64, DeviceState>,
-    /// The last report of the spool DISK. A tick that cannot measure the
-    /// disk judges the spool by it again (a failed measure changes nothing).
-    spool_disk_last: Option<RoleReport>,
+    /// The last report of every configured role. A role whose measure
+    /// fails keeps it: a failed measure changes nothing (not the level, not
+    /// the refusal, not the series).
+    last: HashMap<String, RoleReport>,
     gauge_labels: HashSet<String>,
 }
 
@@ -493,6 +603,9 @@ pub struct DiskWatch {
     spool_gate: Arc<SpoolGate>,
     state: Mutex<State>,
     refusals: RwLock<Refusals>,
+    /// The lines that the monitor logged (tests read them).
+    #[cfg(test)]
+    emitted: Mutex<Vec<(Level, String)>>,
 }
 
 static INSTALLED: OnceLock<Arc<DiskWatch>> = OnceLock::new();
@@ -545,6 +658,42 @@ pub fn backend_refusal_message(backend: &str, path: &Path, facts: Facts) -> Stri
     )
 }
 
+/// Pure: what to do about a level on a role. The text follows the role: the
+/// spool refuses new uploads, a backend refuses writes only at critical, the
+/// data directory refuses nothing.
+pub fn advice(level: Level, label: &str) -> String {
+    let spool = label == "spool" || label == SPOOL_BUDGET_ROLE;
+    match (level, spool, label.strip_prefix("backend:")) {
+        (Level::Ok, _, _) => "the disk has recovered".to_string(),
+        (Level::Low, true, _) => {
+            "free disk space, lower DGP_SPOOL_MAX_BYTES or point DGP_SPOOL_DIR to a larger disk"
+                .to_string()
+        }
+        (Level::Low | Level::High, false, Some(name)) => format!(
+            "no write is refused yet; at level critical the buckets of backend '{name}' refuse \
+             writes. Delete objects or add disk space"
+        ),
+        (Level::Low | Level::High, false, None) => {
+            "no write is refused. The config database and the job state live here: free disk space"
+                .to_string()
+        }
+        (Level::High | Level::Critical, true, _) => {
+            "the spool refuses new uploads that need spool space with a retryable 503 until the \
+             disk recovers: free disk space or lower DGP_SPOOL_MAX_BYTES"
+                .to_string()
+        }
+        (Level::Critical, false, Some(name)) => format!(
+            "writes to the buckets of backend '{name}' get a retryable 503; reads and deletes \
+             still work. Delete objects or add disk space now"
+        ),
+        (Level::Critical, false, None) => {
+            "the config database and the job state live here and can fail to write: free disk \
+             space now"
+                .to_string()
+        }
+    }
+}
+
 /// Pure: the log line of a level change or a reminder.
 pub fn log_line(level: Level, roles: &[&RoleReport], reminder: bool) -> String {
     let places = roles
@@ -560,25 +709,36 @@ pub fn log_line(level: Level, roles: &[&RoleReport], reminder: bool) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let advice = match level {
-        Level::Ok => "the disk has recovered",
-        Level::Low => {
-            "free disk space, or lower DGP_SPOOL_MAX_BYTES or point DGP_SPOOL_DIR to a larger disk"
+    let mut seen: Vec<String> = Vec::new();
+    for r in roles {
+        let text = format!("{}: {}", r.label, advice(level, &r.label));
+        if !seen.contains(&text) {
+            seen.push(text);
         }
-        Level::High => {
-            "the spool refuses new reservations with a retryable 503 until the disk recovers; \
-             free disk space or lower DGP_SPOOL_MAX_BYTES"
-        }
-        Level::Critical => {
-            "the spool refuses new reservations, and writes to the buckets of a filesystem backend \
-             on this disk get a retryable 503; free disk space now, or lower DGP_SPOOL_MAX_BYTES"
-        }
-    };
+    }
     format!(
-        "[disk] level {}{}: {places}; {advice}",
+        "[disk] level {}{}: {places}; {}",
         level.name(),
-        if reminder { " (still)" } else { "" }
+        if reminder { " (still)" } else { "" },
+        seen.join("; ")
     )
+}
+
+/// Pure: the refusal of a write into a bucket whose home is `home`, given
+/// the backends at level critical. A bucket whose home the router cannot
+/// tell is NOT judged by the default backend (that would be a guess): the
+/// write meets its backend's own error.
+pub fn refusal_for_home(
+    critical: &BTreeMap<String, String>,
+    default_backend: &str,
+    home: &crate::storage::BucketHome,
+) -> Option<String> {
+    use crate::storage::BucketHome;
+    match home {
+        BucketHome::Backend(name) => critical.get(name).cloned(),
+        BucketHome::Default => critical.get(default_backend).cloned(),
+        BucketHome::Undetermined => None,
+    }
 }
 
 impl DiskWatch {
@@ -587,6 +747,8 @@ impl DiskWatch {
             spool_gate,
             state: Mutex::new(State::default()),
             refusals: RwLock::new(Refusals::default()),
+            #[cfg(test)]
+            emitted: Mutex::new(Vec::new()),
         }
     }
 
@@ -602,15 +764,13 @@ impl DiskWatch {
         self.spool_gate.level()
     }
 
-    /// The refusal of a client write to a bucket on `backend` (`None`: the
-    /// bucket has no route, so it goes to the default backend).
-    pub fn write_refusal(&self, backend: Option<&str>) -> Option<String> {
+    /// The refusal of a client write to a bucket whose home is `home`.
+    pub fn write_refusal_for(&self, home: &crate::storage::BucketHome) -> Option<String> {
         let refusals = self.refusals.read();
         if refusals.critical.is_empty() {
             return None;
         }
-        let name = backend.unwrap_or(refusals.default_backend.as_str());
-        refusals.critical.get(name).cloned()
+        refusal_for_home(&refusals.critical, &refusals.default_backend, home)
     }
 
     /// Is any filesystem backend at level critical?
@@ -619,7 +779,8 @@ impl DiskWatch {
     }
 
     /// Measure every role, move the level of every device, apply the
-    /// effects, set the gauges and log. Returns the roles for a test.
+    /// effects, set the gauges and log. Returns the roles that were
+    /// measured, for a test.
     pub fn tick(
         &self,
         probe: &dyn DiskProbe,
@@ -634,7 +795,10 @@ impl DiskWatch {
         let mut roles: Vec<(String, PathBuf, Option<PathFacts>)> = Vec::new();
         let spool_facts = probe.measure(&targets.spool_dir);
         roles.push(("spool".into(), targets.spool_dir.clone(), spool_facts));
-        if targets.spool_by_use || spool_facts.is_none() {
+        // The spool is judged by its use too where the free space may hide
+        // the real limit, and where it cannot be measured at all.
+        let by_use = targets.spool_by_use || spool_facts.is_none();
+        if by_use {
             // The use of the budget as a measure: free = what is not reserved.
             roles.push((
                 SPOOL_BUDGET_ROLE.into(),
@@ -692,6 +856,16 @@ impl DiskWatch {
                 device: pf.device,
             });
         }
+        // Every configured role has a verdict: this tick's, else the last.
+        let configured: HashSet<String> = roles.iter().map(|(l, _, _)| l.clone()).collect();
+        let mut effective = reports.clone();
+        for label in &configured {
+            if !reports.iter().any(|r| &r.label == label) {
+                if let Some(last) = state.last.get(label) {
+                    effective.push(last.clone());
+                }
+            }
+        }
 
         // Log: once per device on a change, a reminder while high or worse.
         for (device, (prev, next, _)) in &device_levels {
@@ -705,6 +879,8 @@ impl DiskWatch {
             let on_device: Vec<&RoleReport> =
                 reports.iter().filter(|r| r.device == *device).collect();
             let line = log_line(*next, &on_device, action == LogAction::Reminder);
+            #[cfg(test)]
+            self.emitted.lock().push((*next, line.clone()));
             match *next {
                 Level::Ok => tracing::info!("{line}"),
                 Level::Low | Level::High => tracing::warn!("{line}"),
@@ -712,29 +888,22 @@ impl DiskWatch {
             }
         }
 
-        // Effects.
-        // The spool level is the worse of its disk and its use. A disk that
-        // could not be measured now keeps its last verdict.
-        if let Some(disk) = reports.iter().find(|r| r.label == "spool") {
-            state.spool_disk_last = Some(disk.clone());
-        }
-        let spool_disk = state.spool_disk_last.clone();
-        if let Some(spool) = reports
-            .iter()
-            .filter(|r| r.label == SPOOL_BUDGET_ROLE)
-            .chain(spool_disk.as_ref())
-            .max_by_key(|r| r.level)
-        {
+        // Effects. The spool gate follows the spool DISK; the use of the
+        // budget is judged live, at every new reservation, from the same
+        // thresholds ([`SpoolGate::set_by_use`]): a spike of use must not
+        // keep refusing until the next tick.
+        if let Some(disk) = effective.iter().find(|r| r.label == "spool") {
             self.spool_gate.set(
-                spool.level,
-                spool_refusal_message(spool.level, &spool.label, &spool.path, spool.facts),
+                disk.level,
+                spool_refusal_message(disk.level, &disk.label, &disk.path, disk.facts),
             );
         }
+        self.spool_gate.set_by_use(by_use.then_some(th_use));
         {
             let mut refusals = self.refusals.write();
             refusals.default_backend = targets.default_backend.clone();
             refusals.critical.clear();
-            for r in &reports {
+            for r in &effective {
                 if let Some(name) = r.label.strip_prefix("backend:") {
                     if r.level == Level::Critical {
                         refusals.critical.insert(
@@ -749,8 +918,8 @@ impl DiskWatch {
         if let Some(m) = metrics {
             m.spool_budget_bytes.set(clamp_i64(sizing.budget));
             m.spool_used_bytes.set(clamp_i64(sizing.used));
-            let now_labels: HashSet<String> = reports.iter().map(|r| r.label.clone()).collect();
-            for gone in state.gauge_labels.difference(&now_labels) {
+            // A series goes only with its role, not with one failed measure.
+            for gone in state.gauge_labels.difference(&configured) {
                 let _ = m.disk_free_bytes.remove_label_values(&[gone]);
                 let _ = m.disk_total_bytes.remove_label_values(&[gone]);
                 let _ = m.disk_level.remove_label_values(&[gone]);
@@ -776,28 +945,59 @@ impl DiskWatch {
                     .with_label_values(&[&r.label])
                     .set(i64::from(r.level.as_u8()));
             }
-            state.gauge_labels = now_labels;
+            state.gauge_labels = configured.clone();
         }
+        state.last = effective
+            .into_iter()
+            .filter(|r| configured.contains(&r.label))
+            .map(|r| (r.label.clone(), r))
+            .collect();
         reports
     }
 }
 
-/// THE disk refusal of a write to `bucket`: `Some(message)` while the disk
-/// of the filesystem backend that holds the bucket is at level critical.
-/// The client-store gate (`check_client_store_allowed`) turns it into
-/// `503 SlowDown`; the background writers (replication, lifecycle) defer on
-/// it through the maintenance gate. Costs one lock read while no backend
-/// is critical.
-pub fn bucket_write_refusal(
+/// THE disk refusal of a write that STORES bytes into `bucket`:
+/// `Some(message)` while the disk of the filesystem backend that holds the
+/// bucket is at level critical. The router says where the bucket lives
+/// (`bucket_home`: a route, a cached resolution, or the one HeadBucket round
+/// that the write itself sends); a bucket whose home it cannot tell is not
+/// refused (see [`refusal_for_home`]). Costs one lock read while no backend is
+/// critical. A delete never asks: it frees space.
+pub async fn bucket_write_refusal(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+) -> Option<String> {
+    bucket_write_refusal_with(installed()?, engine, bucket).await
+}
+
+/// [`bucket_write_refusal`] with the monitor given.
+pub async fn bucket_write_refusal_with(
+    watch: &DiskWatch,
     engine: &crate::deltaglider::DynEngine,
     bucket: &str,
 ) -> Option<String> {
     use crate::storage::StorageBackend as _;
-    let watch = installed()?;
     if !watch.any_backend_critical() {
         return None;
     }
-    watch.write_refusal(engine.storage().resolved_backend_name(bucket).as_deref())
+    let home = engine.storage().bucket_home(bucket).await;
+    watch.write_refusal_for(&home)
+}
+
+/// [`bucket_write_refusal`] from memory only, for the synchronous gates of
+/// the background writers: a bucket whose home the router does not know
+/// without a request is not refused now (the router resolves it in the
+/// background, so the next check knows).
+pub fn bucket_write_refusal_now(
+    watch: &DiskWatch,
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+) -> Option<String> {
+    use crate::storage::StorageBackend as _;
+    if !watch.any_backend_critical() {
+        return None;
+    }
+    watch.write_refusal_for(&engine.storage().bucket_home_now(bucket))
 }
 
 fn clamp_i64(n: u64) -> i64 {
@@ -813,6 +1013,7 @@ pub fn spool_view_of(config: &crate::config::Config) -> SpoolView {
 
 /// The boot check of the running process: measures the spool directory now.
 pub fn boot_check_now(
+    probe: &dyn DiskProbe,
     config: &crate::config::Config,
     spool: &crate::deltaglider::spool::SpoolDir,
 ) -> Option<String> {
@@ -821,7 +1022,7 @@ pub fn boot_check_now(
         .limits
         .as_ref()
         .map_or(0, |l| l.facts.own_spool_bytes);
-    let free = SystemProbe
+    let free = probe
         .measure(spool.dir())
         .map(|f| f.free.saturating_add(own));
     let warnings = config
@@ -829,10 +1030,16 @@ pub fn boot_check_now(
         .limits
         .as_ref()
         .map_or(&[][..], |l| l.warnings.as_slice());
+    let explicit = config
+        .tuning
+        .limits
+        .as_ref()
+        .is_some_and(|l| l.effective.spool_source == crate::config::limits::Source::Explicit);
     boot_check(
         spool_view_of(config),
         free,
         spool.max_bytes(),
+        explicit,
         spool.dir(),
         warnings,
     )
@@ -842,6 +1049,7 @@ pub fn boot_check_now(
 /// engine and the config of now.
 pub fn tick_app(
     watch: &DiskWatch,
+    probe: &dyn DiskProbe,
     state: &crate::api::handlers::AppState,
     config: &crate::config::Config,
 ) {
@@ -880,7 +1088,7 @@ pub fn tick_app(
         per_upload.min(budget)
     };
     watch.tick(
-        &SystemProbe,
+        probe,
         &targets,
         &config.tuning.disk_monitor,
         Sizing {
@@ -891,6 +1099,80 @@ pub fn tick_app(
         Instant::now(),
         Some(&state.metrics),
     );
+}
+
+/// A probe with a deadline per measure. `statvfs` on a hung network mount
+/// does not return; the thread that waits for it cannot be stopped. So each
+/// measure runs on a thread of its own and the monitor waits `timeout` for
+/// it. On a timeout the measure is `None` (the role keeps its last verdict,
+/// [`DiskWatch::tick`]), and a path whose measure still hangs gets no second
+/// thread until the first one returns. The timeout is logged once for a
+/// path, until a measure of it succeeds again.
+pub struct TimedProbe {
+    inner: Arc<dyn DiskProbe>,
+    timeout: Duration,
+    /// Paths whose measure thread has not returned.
+    hung: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Paths whose timeout is already logged.
+    warned: Mutex<HashSet<PathBuf>>,
+}
+
+impl TimedProbe {
+    pub fn new(inner: Arc<dyn DiskProbe>, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            hung: Arc::default(),
+            warned: Mutex::default(),
+        }
+    }
+
+    /// How many paths have a measure thread that has not returned.
+    pub fn hung_paths(&self) -> usize {
+        self.hung.lock().len()
+    }
+}
+
+impl DiskProbe for TimedProbe {
+    fn measure(&self, path: &Path) -> Option<PathFacts> {
+        if !self.hung.lock().insert(path.to_path_buf()) {
+            // The thread of an earlier measure of this path still waits.
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (inner, hung, owned) = (self.inner.clone(), self.hung.clone(), path.to_path_buf());
+        let spawned = std::thread::Builder::new()
+            .name("disk-measure".into())
+            .spawn(move || {
+                let facts = inner.measure(&owned);
+                hung.lock().remove(&owned);
+                let _ = tx.send(facts);
+            });
+        if spawned.is_err() {
+            self.hung.lock().remove(path);
+            return None;
+        }
+        match rx.recv_timeout(self.timeout) {
+            Ok(facts) => {
+                if facts.is_some() {
+                    self.warned.lock().remove(path);
+                }
+                facts
+            }
+            Err(_) => {
+                if self.warned.lock().insert(path.to_path_buf()) {
+                    tracing::warn!(
+                        "[disk] the free space of {} did not answer within {} s (a hung network \
+                         mount?); its role keeps its last level until it answers. Set \
+                         DGP_DISK_MEASURE_TIMEOUT_SECS to wait longer",
+                        path.display(),
+                        self.timeout.as_secs()
+                    );
+                }
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -340,7 +340,7 @@ impl<'a> WalkDriver<'a> {
                 // this +1 and drains it, or the copy sees the job and stays
                 // unsettled while the run stops as deferred. The RAII guard
                 // rides in the copy future — a kill dropping it releases it.
-                let admitted = match crate::maintenance::gate::admit_all(
+                let admitted = match crate::maintenance::gate::admit_stores(
                     s.ctrl.maintenance_gate.as_ref(),
                     &[&s.ctrl.dest_bucket],
                 ) {

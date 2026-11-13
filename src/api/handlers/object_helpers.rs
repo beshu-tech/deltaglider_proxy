@@ -331,7 +331,8 @@ pub(crate) async fn check_client_store_allowed(
     bucket: &str,
 ) -> Result<(), S3Error> {
     check_client_write_allowed(state, bucket).await?;
-    if let Some(message) = crate::disk_watch::bucket_write_refusal(&state.engine.load(), bucket) {
+    let engine = state.engine.load_full();
+    if let Some(message) = crate::disk_watch::bucket_write_refusal(&engine, bucket).await {
         return Err(S3Error::SlowDown(message));
     }
     Ok(())

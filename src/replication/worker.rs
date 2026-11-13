@@ -1139,7 +1139,7 @@ impl RunControl {
         let maint_busy = match self
             .maintenance_gate
             .as_ref()
-            .and_then(|g| g.write_blocked(&self.dest_bucket))
+            .and_then(|g| g.store_blocked(&self.dest_bucket))
         {
             Some(why) => {
                 info!("replication rule '{}' defers: {why}", self.rule_name);

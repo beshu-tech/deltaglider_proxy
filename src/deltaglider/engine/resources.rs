@@ -214,8 +214,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// The spool file for the buffered codec's source, taken WITHOUT waiting:
     /// the buffered PUT encodes under the deltaspace lock. A full budget is a
-    /// retryable SlowDown.
+    /// retryable SlowDown. The buffered codec works on a reference of at most
+    /// the spool threshold (16 MiB by default), so this file is small and the
+    /// disk level does not gate it: the rule of the disk gate is "a body, a
+    /// ciphertext or a reference LARGER than the threshold goes to a spool
+    /// file" ([`Self::codec_source_spool_large_now`]).
     pub(crate) fn codec_source_spool_now(
+        &self,
+        bytes: usize,
+    ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
+        self.spool.try_acquire(bytes as u64).map_err(spool_error)
+    }
+
+    /// [`Self::codec_source_spool_now`] for a source above the spool
+    /// threshold (a large reference that the streaming codec reads from a
+    /// file): a new write that the disk gate refuses at level high.
+    pub(crate) fn codec_source_spool_large_now(
         &self,
         bytes: usize,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
@@ -224,11 +238,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// THE disk-level gate of a write that wants spool space: at disk level
-    /// high or critical (`disk_watch`) an op that holds no spool yet
-    /// (`held_mib` = 0) is refused with a retryable `Overloaded` that names
-    /// the level. An op that holds a spool already runs to its end, and
-    /// reads and deletes never ask. Every write reservation passes here
-    /// (source guard `every_write_reservation_asks_the_disk_gate`).
+    /// high or critical (`disk_watch`), or with the budget nearly all
+    /// reserved where the free space is no proof, an op that holds no spool
+    /// yet (`held_mib` = 0) is refused with a retryable `Overloaded` that
+    /// names the level. An op that holds a spool already runs to its end,
+    /// and reads and deletes never ask. Every spool acquisition in `src/`
+    /// is a gated write, a small codec source, or a read (source guard
+    /// `every_spool_acquisition_is_classified`).
     pub(crate) fn admit_new_spool_write(&self, held_mib: usize) -> Result<(), EngineError> {
         if held_mib > 0 {
             return Ok(());

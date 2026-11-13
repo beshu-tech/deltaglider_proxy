@@ -56,6 +56,10 @@ pub(super) async fn upload_part(
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
     let body_ctx = crate::api::body_ingest::BodyContext::of(&req);
     let input = req.input;
+    // A part is bytes for a bucket: refuse at a critical disk of its backend
+    // before the client sends more parts that Complete would then refuse.
+    crate::api::handlers::object_helpers::check_client_store_allowed(&svc.state, &input.bucket)
+        .await?;
     // Cached briefly per bucket: one HeadBucket per upload, not per part.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let max_object_size = svc.state.engine.load().max_object_size();
@@ -166,8 +170,11 @@ pub(super) async fn complete_multipart_upload(
     let extensions = req.extensions;
     let input = req.input;
     // Defense-in-depth: the marker can be hot-applied mid-upload, so
-    // Complete (the moment bytes reach the backend) re-checks. A client
-    // that gets the 503 of a critical disk retries Complete; its parts stay.
+    // Complete (the moment bytes reach the backend) re-checks. Create and
+    // UploadPart refuse a critical disk first, so only a disk that turned
+    // critical DURING the upload gets here: Complete writes the assembled
+    // object onto that disk, so it is refused with a retryable 503 and the
+    // parts stay for the retry. It needs no new spool for the parts it holds.
     crate::api::handlers::object_helpers::check_client_store_allowed(&svc.state, &input.bucket)
         .await?;
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;

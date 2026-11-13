@@ -244,7 +244,7 @@ A background monitor measures the free space of the spool directory, of the root
 | `deltaglider_disk_total_bytes` | Gauge | `path_role` | The size of the disk of the role |
 | `deltaglider_disk_level` | Gauge | `path_role` | The level of the disk of the role (`spool`, `spool-budget`, `backend:<name>` or `data`): 0 ok, 1 low, 2 high, 3 critical |
 
-The role `spool-budget` exists where `statvfs` cannot show the real limit of the spool directory: on a tmpfs, under Kubernetes (an `emptyDir` with a `sizeLimit`, or a container quota) and when the free space cannot be measured. Its level follows the share of the spool budget that running requests have reserved, with the same percents as a disk (low at 85% reserved, high at 90%, critical at 95%) and no floor in bytes. The level of the spool is the higher of the level of `spool` and the level of `spool-budget`.
+The role `spool-budget` exists where `statvfs` cannot show the real limit of the spool directory: on a tmpfs, under Kubernetes (an `emptyDir` with a `sizeLimit`, or a container quota) and when the free space cannot be measured. Its level follows the share of the spool budget that running requests have reserved, with the same percents as a disk (low at 85% reserved, high at 90%, critical at 95%) and no floor or ceiling in bytes. The series is measured every `DGP_DISK_MONITOR_INTERVAL_SECS` and moves with the hysteresis of a disk. The refusal of a new upload is judged live at every request from the bytes reserved at that moment, so it can start and end between two measures. The level of `spool` and the live judgement are the two reasons for a refusal.
 The series of a role disappears when the role disappears, for example when a config apply removes a filesystem backend.
 
 ## Re-encrypt rewrites

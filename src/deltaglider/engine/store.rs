@@ -1193,6 +1193,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         ref_meta: &FileMetadata,
         max_ratio: f32,
     ) -> Result<(EncodeOutcome, EncodedDelta), EngineError> {
+        // A body above the threshold goes to a spool file: a new write.
+        self.admit_new_spool_write(0)?;
         let body = match self.spool.try_acquire(put.size) {
             Ok(body) => body,
             Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => {
@@ -2368,7 +2370,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         deltaspace_id: &str,
         ref_meta: &FileMetadata,
     ) -> Result<Vec<u8>, EngineError> {
-        let file = self.codec_source_spool_now(ref_meta.file_size as usize)?;
+        let file = self.codec_source_spool_large_now(ref_meta.file_size as usize)?;
         self.storage
             .get_reference_to_file(bucket, deltaspace_id, file.path())
             .await?;

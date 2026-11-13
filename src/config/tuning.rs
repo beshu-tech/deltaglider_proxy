@@ -59,7 +59,25 @@ pub struct DiskMonitorTuning {
     /// `DGP_DISK_RECOVER_POINTS`: a level ends when the free space is this
     /// many percentage points above its entry threshold (1 to 50).
     pub recover_points: u8,
+    /// `DGP_DISK_LOW_MAX_BYTES`: the most free space at which level low
+    /// starts, whatever the percent says (`0`: no level low).
+    pub low_max_bytes: u64,
+    /// `DGP_DISK_HIGH_MAX_BYTES` (`0`: no level high).
+    pub high_max_bytes: u64,
+    /// `DGP_DISK_CRITICAL_MAX_BYTES` (`0`: no level critical).
+    pub critical_max_bytes: u64,
+    /// `DGP_DISK_MEASURE_TIMEOUT_SECS` (at least 1): a measure of one
+    /// directory that takes longer (a hung network mount) keeps the last
+    /// verdict of its role and logs a warning once.
+    pub measure_timeout_secs: u64,
 }
+
+/// The defaults of the disk ceilings: 50 GiB for low, 25 GiB for high, 10 GiB
+/// for critical. Critical leaves room for two uploads of the 5 GiB that one
+/// backend PUT takes, high for five, low for ten.
+pub const DISK_LOW_MAX_DEFAULT: u64 = 50 * 1024 * 1024 * 1024;
+pub const DISK_HIGH_MAX_DEFAULT: u64 = 25 * 1024 * 1024 * 1024;
+pub const DISK_CRITICAL_MAX_DEFAULT: u64 = 10 * 1024 * 1024 * 1024;
 
 /// The default of `DGP_SHUTDOWN_TIMEOUT_SECS`. The drain steps before this
 /// wait take up to 10 s each, and the detached-work wait up to 15 s, so the
@@ -258,6 +276,13 @@ impl RuntimeTuning {
                 high_percent: clamp_percent(lookup_parse(env, "DGP_DISK_HIGH_PERCENT"), 10),
                 critical_percent: clamp_percent(lookup_parse(env, "DGP_DISK_CRITICAL_PERCENT"), 5),
                 recover_points: clamp_percent(lookup_parse(env, "DGP_DISK_RECOVER_POINTS"), 2),
+                low_max_bytes: lookup_parse(env, "DGP_DISK_LOW_MAX_BYTES")
+                    .unwrap_or(DISK_LOW_MAX_DEFAULT),
+                high_max_bytes: lookup_parse(env, "DGP_DISK_HIGH_MAX_BYTES")
+                    .unwrap_or(DISK_HIGH_MAX_DEFAULT),
+                critical_max_bytes: lookup_parse(env, "DGP_DISK_CRITICAL_MAX_BYTES")
+                    .unwrap_or(DISK_CRITICAL_MAX_DEFAULT),
+                measure_timeout_secs: parse_or("DGP_DISK_MEASURE_TIMEOUT_SECS", 5).max(1),
             },
             reference_scan_limit: lookup_parse(env, "DGP_REFERENCE_SCAN_LIMIT")
                 .unwrap_or(crate::deltaglider::REFERENCE_SCAN_LIMIT),
@@ -346,6 +371,19 @@ mod tests {
         ("DGP_DISK_HIGH_PERCENT", Zero::Floor1),
         ("DGP_DISK_CRITICAL_PERCENT", Zero::Floor1),
         ("DGP_DISK_RECOVER_POINTS", Zero::Floor1),
+        ("DGP_DISK_MEASURE_TIMEOUT_SECS", Zero::Floor1),
+        (
+            "DGP_DISK_LOW_MAX_BYTES",
+            Zero::Meaningful("no level low: the disk never warns"),
+        ),
+        (
+            "DGP_DISK_HIGH_MAX_BYTES",
+            Zero::Meaningful("no level high: the spool never refuses on the free space"),
+        ),
+        (
+            "DGP_DISK_CRITICAL_MAX_BYTES",
+            Zero::Meaningful("no level critical: no write is refused on a full backend disk"),
+        ),
         (
             "DGP_STATE_LOCK_WAIT_SECS",
             Zero::Meaningful("the boot does not wait for the state directory lock"),
@@ -478,7 +516,11 @@ mod tests {
                 low_percent: 15,
                 high_percent: 10,
                 critical_percent: 5,
-                recover_points: 2
+                recover_points: 2,
+                low_max_bytes: 50 * 1024 * 1024 * 1024,
+                high_max_bytes: 25 * 1024 * 1024 * 1024,
+                critical_max_bytes: 10 * 1024 * 1024 * 1024,
+                measure_timeout_secs: 5,
             }
         );
         assert_eq!(t.shutdown_timeout_secs, DEFAULT_SHUTDOWN_TIMEOUT_SECS);
@@ -532,6 +574,10 @@ mod tests {
             ("DGP_DISK_HIGH_PERCENT", "99"),
             ("DGP_DISK_CRITICAL_PERCENT", "6"),
             ("DGP_DISK_RECOVER_POINTS", "3"),
+            ("DGP_DISK_LOW_MAX_BYTES", "100"),
+            ("DGP_DISK_HIGH_MAX_BYTES", "0"),
+            ("DGP_DISK_CRITICAL_MAX_BYTES", "7"),
+            ("DGP_DISK_MEASURE_TIMEOUT_SECS", "9"),
             ("DGP_SHUTDOWN_TIMEOUT_SECS", "17"),
             ("DGP_STATE_LOCK_WAIT_SECS", "19"),
             ("DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES", "14"),
@@ -566,7 +612,11 @@ mod tests {
                 low_percent: 20,
                 high_percent: 50,
                 critical_percent: 6,
-                recover_points: 3
+                recover_points: 3,
+                low_max_bytes: 100,
+                high_max_bytes: 0,
+                critical_max_bytes: 7,
+                measure_timeout_secs: 9,
             }
         );
         assert_eq!(t.shutdown_timeout_secs, 17);

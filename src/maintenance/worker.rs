@@ -958,6 +958,7 @@ struct Reencrypt<'a> {
 
 impl ObjectVisitor for Reencrypt<'_> {
     const CONCURRENCY: usize = REENCRYPT_CONCURRENCY;
+    const WRITES_BYTES: bool = true;
 
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         // Re-resolve the desired state every page: a config apply mid-run
@@ -1082,6 +1083,11 @@ pub(crate) enum Visit {
 pub(crate) trait ObjectVisitor {
     /// Objects of a page in flight at once.
     const CONCURRENCY: usize = PAGE_CONCURRENCY;
+    /// Does a visit STORE bytes into the bucket (a re-encrypt rewrite)? Then
+    /// the walk defers while the disk it writes to is at level critical
+    /// ([`crate::maintenance::probes::store_refusal`]). A backfill stamps
+    /// metadata in place and writes no object bytes: `false`.
+    const WRITES_BYTES: bool = false;
     /// Runs before each listing page.
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         Ok(())
@@ -1282,6 +1288,13 @@ impl<V: ObjectVisitor> ObjectsStep<'_, V> {
 
 impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
     type Done = Visit;
+
+    fn refused(&self) -> Option<String> {
+        if !V::WRITES_BYTES {
+            return None;
+        }
+        super::probes::store_refusal(self.state, &self.job.bucket)
+    }
 
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         self.visitor.begin_page().await?;
@@ -2288,6 +2301,33 @@ mod tests {
             "{:?}",
             row.last_error
         );
+    }
+
+    /// Which job kinds store bytes (and so defer on a critical disk): the
+    /// re-encrypt rewrite does; a backfill stamps metadata in place and
+    /// writes no object bytes. Each paged step that stores asks
+    /// `probes::store_refusal`.
+    #[test]
+    fn only_the_job_steps_that_store_bytes_ask_the_disk() {
+        assert!(<Reencrypt<'static> as ObjectVisitor>::WRITES_BYTES);
+        assert!(!<super::super::backfill::Backfill<'static> as ObjectVisitor>::WRITES_BYTES);
+        let worker =
+            crate::source_scan::prod_text(&crate::source_scan::read("src/maintenance/worker.rs"));
+        let migrate =
+            crate::source_scan::prod_text(&crate::source_scan::read("src/maintenance/migrate.rs"));
+        let objects_refused =
+            crate::source_scan::prod_fn_text("src/maintenance/worker.rs", "refused");
+        assert!(objects_refused.contains("V::WRITES_BYTES"));
+        assert!(objects_refused.contains("probes::store_refusal("));
+        assert!(worker.contains("const WRITES_BYTES: bool = true;"));
+        let copy = crate::source_scan::prod_fn_text("src/maintenance/migrate.rs", "refused");
+        assert!(copy.contains("probes::store_refusal("), "{copy}");
+        assert!(
+            copy.contains("transient_key"),
+            "the copy stores into the target"
+        );
+        // The prune and the verify store nothing: they keep the default.
+        assert_eq!(migrate.matches("fn refused(").count(), 1);
     }
 
     #[test]

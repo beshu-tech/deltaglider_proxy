@@ -516,11 +516,12 @@ async fn reject_if_replication_target_only(
 /// 503 while the disk of the filesystem backend that holds `bucket` is at
 /// level critical (`disk_watch`): a bulk copy or move STORES into it. A
 /// delete never asks: it frees space.
-fn reject_if_disk_critical(
+async fn reject_if_disk_critical(
     state: &std::sync::Arc<crate::api::admin::AdminState>,
     bucket: &str,
 ) -> Result<(), AdminError> {
-    match crate::disk_watch::bucket_write_refusal(&state.s3_state.engine.load(), bucket) {
+    let engine = state.s3_state.engine.load_full();
+    match crate::disk_watch::bucket_write_refusal(&engine, bucket).await {
         Some(message) => Err(AdminError::unavailable(message)),
         None => Ok(()),
     }
@@ -542,7 +543,7 @@ pub async fn copy_objects(
     )?;
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_replication_target_only(&state, &req.dest_bucket).await?;
-    reject_if_disk_critical(&state, &req.dest_bucket)?;
+    reject_if_disk_critical(&state, &req.dest_bucket).await?;
     if req.items.is_empty() {
         return Err(AdminError::invalid("no items to copy"));
     }
@@ -912,7 +913,7 @@ pub async fn move_objects(
     reject_if_under_maintenance(&state, &req.source_bucket)?;
     // Move = store into dest + delete from source: both are client writes.
     reject_if_replication_target_only(&state, &req.dest_bucket).await?;
-    reject_if_disk_critical(&state, &req.dest_bucket)?;
+    reject_if_disk_critical(&state, &req.dest_bucket).await?;
     reject_if_replication_target_only(&state, &req.source_bucket).await?;
     if req.items.is_empty() {
         return Err(AdminError::invalid("no items to move"));

@@ -2585,10 +2585,11 @@ async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
         assert!(body.contains(needle), "{needle} not in: {body}");
     }
 
-    // A delta encode needs a spool file for its source, so a small
-    // delta-eligible file is refused too.
+    // The rule is "a body above the spool threshold goes to a spool file":
+    // a small file of a delta-eligible type is admitted like a small image
+    // (its codec source is at most the threshold).
     let (status, body) = put_status(&server, "small.bin", 512).await;
-    assert_eq!(status, 503, "{body}");
+    assert_eq!(status, 200, "{body}");
     // A small body of a passthrough type needs no spool: the upload and the
     // read work.
     let (status, body) = put_status(&server, "small.jpg", 512).await;
@@ -2644,4 +2645,173 @@ async fn at_disk_level_critical_writes_to_the_backend_are_refused_and_deletes_wo
         .await
         .unwrap();
     assert_eq!(ready.status(), StatusCode::OK);
+}
+
+/// Seed a server at a healthy disk, then restart it with the disk at 3% free
+/// (level critical): the data stays, the writes stop.
+async fn critical_server() -> (tempfile::TempDir, TestServer) {
+    let spool = tempfile::TempDir::new().unwrap();
+    let mut server = TestServer::builder()
+        .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
+        .build()
+        .await;
+    let http = server.http();
+    let (ep, bucket) = (server.endpoint(), server.bucket().to_string());
+    for key in ["a.txt", "b.txt", "big/f1.txt", "big/f2.txt"] {
+        let r = http
+            .put(format!("{ep}/{bucket}/{key}"))
+            .body(b"data".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "{key}");
+    }
+    server
+        .respawn_with_env(&[("DGP_TEST_DISK_MONITOR_FREE_PERCENT", "3")])
+        .await;
+    (spool, server)
+}
+
+/// Reads and deletes must work at level critical, in every form: a client
+/// read, a client delete, and a bulk delete JOB (a job is a writer that frees
+/// space: it must not stay queued behind the disk).
+#[tokio::test]
+async fn at_disk_level_critical_reads_deletes_and_the_delete_job_work() {
+    common::expect_server_errors("level critical refuses the writes that this test tries");
+    let (_spool, server) = critical_server().await;
+    let http = server.http();
+    let (ep, bucket) = (server.endpoint(), server.bucket().to_string());
+
+    // The disk is critical: a write is refused ...
+    let (status, body) = put_status(&server, "new.jpg", 100).await;
+    assert_eq!(status, 503, "{body}");
+    // ... a read is not ...
+    let got = http
+        .get(format!("{ep}/{bucket}/a.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status().as_u16(), 200);
+    assert_eq!(got.bytes().await.unwrap().as_ref(), b"data");
+    // ... a client delete really deletes ...
+    let del = http
+        .delete(format!("{ep}/{bucket}/b.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status().as_u16(), 204);
+    let head = http
+        .head(format!("{ep}/{bucket}/b.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status().as_u16(), 404, "the delete took effect");
+
+    // ... and a delete job runs to its end and removes the keys.
+    let admin = admin_http_client(&ep).await;
+    let resp = admin
+        .post(format!("{ep}/_/api/admin/objects/delete-jobs"))
+        .json(&json!({ "bucket": bucket, "prefixes": ["big/"], "keys": [], "expected": 2 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+    let started: serde_json::Value = resp.json().await.unwrap();
+    let id = started["job_id"].as_i64().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let all: serde_json::Value = admin
+            .get(format!("{ep}/_/api/admin/jobs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let row = all["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == format!("maintenance:{id}"))
+            .cloned();
+        if let Some(row) = row {
+            if row["status"] == "succeeded" {
+                break;
+            }
+            assert_ne!(row["status"], "failed", "{row}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the delete job stayed queued at disk level critical: {all}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    for key in ["big/f1.txt", "big/f2.txt"] {
+        let head = http
+            .head(format!("{ep}/{bucket}/{key}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status().as_u16(), 404, "{key} is gone");
+    }
+    // The bulk delete of the file browser (a request, not a job) works too.
+    let resp = admin
+        .post(format!("{ep}/_/api/admin/objects/delete"))
+        .json(&json!({ "bucket": bucket, "keys": ["a.txt"] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+}
+
+/// At level critical a bulk copy and a bulk move into the bucket are refused
+/// with 503 (they store bytes), and so is every verb of a multipart upload
+/// (the parts would be refused at Complete: refuse them at the start).
+#[tokio::test]
+async fn at_disk_level_critical_bulk_copy_move_and_multipart_are_refused() {
+    common::expect_server_errors("level critical refuses the writes that this test tries");
+    let (_spool, server) = critical_server().await;
+    let (ep, bucket) = (server.endpoint(), server.bucket().to_string());
+    let admin = admin_http_client(&ep).await;
+    let body = json!({
+        "source_bucket": bucket,
+        "dest_bucket": bucket,
+        "dest_prefix": "copy-of/",
+        "items": [{ "source_key": "a.txt", "relative": "a.txt" }]
+    });
+    for route in ["copy", "move"] {
+        let resp = admin
+            .post(format!("{ep}/_/api/admin/objects/{route}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 503, "bulk {route}");
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("critical"), "{route}: {text}");
+    }
+    let http = server.http();
+    for (what, req) in [
+        (
+            "CreateMultipartUpload",
+            http.post(format!("{ep}/{bucket}/mp.bin?uploads")),
+        ),
+        (
+            "UploadPart",
+            http.put(format!("{ep}/{bucket}/mp.bin?partNumber=1&uploadId=x"))
+                .body(vec![1u8; 16]),
+        ),
+        (
+            "CompleteMultipartUpload",
+            http.post(format!("{ep}/{bucket}/mp.bin?uploadId=x")).body(
+                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+                 <ETag>\"x\"</ETag></Part></CompleteMultipartUpload>",
+            ),
+        ),
+    ] {
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 503, "{what}");
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("SlowDown"), "{what}: {text}");
+    }
 }

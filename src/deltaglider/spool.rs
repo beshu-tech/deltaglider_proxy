@@ -307,12 +307,20 @@ impl SpoolDir {
         &self.gate
     }
 
-    /// Admit a NEW write: an op that holds no spool yet. At disk level high
-    /// or critical it is refused with [`CONTENDED`] (the engine answers a
-    /// retryable `503 SlowDown`, with the message). An op that holds a
-    /// spool, a read and a delete never ask: they run to the end.
+    /// Admit a NEW write: an op that holds no spool yet. It is refused with
+    /// [`CONTENDED`] (the engine answers a retryable `503 SlowDown`, with the
+    /// message) while the disk of the spool is at level high or critical
+    /// (the monitor's verdict), or, where the free space hides the real
+    /// limit, while the reserved bytes leave less than the high threshold of
+    /// the budget (judged now, from `used / budget`: no `statvfs`, one lock
+    /// read). An op that holds a spool, a read and a delete never ask: they
+    /// run to the end.
     pub fn admit_new_write(&self) -> std::io::Result<()> {
-        match self.gate.refusal() {
+        let refusal = self.gate.refusal().or_else(|| {
+            let th = self.gate.by_use()?;
+            crate::disk_watch::use_refusal(&th, self.max_bytes(), self.used_bytes(), self.dir())
+        });
+        match refusal {
             Some(message) => Err(std::io::Error::new(CONTENDED, message)),
             None => Ok(()),
         }

@@ -75,6 +75,22 @@ pub struct MaintenanceGate {
     /// The encryption witness of this node (multi-instance only): why it
     /// refuses writes to a bucket now. Set once at boot.
     write_refusal: std::sync::OnceLock<ProbeCell>,
+    /// The disk monitor's verdict (`disk_watch`): why a STORING write into
+    /// a bucket is refused now (the disk of its filesystem backend is at
+    /// level critical). A write that frees space never asks it
+    /// ([`WriteKind::FreesSpace`]). Set once at boot.
+    disk_refusal: std::sync::OnceLock<ProbeCell>,
+}
+
+/// What a background write does to the disk of its bucket. The disk
+/// refusal ([`MaintenanceGate::set_disk_refusal_probe`]) applies to
+/// [`WriteKind::Store`] only: reads and deletes must work at level critical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKind {
+    /// Puts bytes on the disk: a copy, a transition, a rewrite.
+    Store,
+    /// Frees space or moves no bytes: a delete.
+    FreesSpace,
 }
 
 /// Why this node refuses writes to a bucket (memory only).
@@ -96,6 +112,7 @@ impl Default for MaintenanceGate {
             inflight_writes: DashMap::new(),
             inflight_background: DashMap::new(),
             write_refusal: std::sync::OnceLock::new(),
+            disk_refusal: std::sync::OnceLock::new(),
         }
     }
 }
@@ -145,31 +162,55 @@ impl MaintenanceGate {
         let _ = self.write_refusal.set(ProbeCell(probe));
     }
 
-    /// THE check of a background writer before it writes into `bucket`:
-    /// why it must stop as deferred (a maintenance job rewrites the bucket,
-    /// or the encryption witness refuses this node's writes to it), or
-    /// `None`. Memory only. Every replication / lifecycle gate check goes
-    /// through here (source guard `background_writers_ask_write_blocked`).
-    pub fn write_blocked(&self, bucket: &str) -> Option<String> {
-        self.refusal_of(bucket).map(WriteRefusal::into_reason)
+    /// Install the disk refusal probe (boot): see [`Self::store_blocked`].
+    pub fn set_disk_refusal_probe(&self, probe: WriteRefusalProbe) {
+        let _ = self.disk_refusal.set(ProbeCell(probe));
     }
 
-    /// [`Self::write_blocked`], with the cause kept apart.
-    fn refusal_of(&self, bucket: &str) -> Option<WriteRefusal> {
-        if let Some(kind) = self.busy_kind(bucket) {
+    /// THE check of a background writer that FREES space or stores no
+    /// bytes (a delete) before it writes into `bucket`: why it must stop as
+    /// deferred (a maintenance job rewrites the bucket, or the encryption
+    /// witness refuses this node's writes to it), or `None`. Memory only.
+    /// It never reports a full disk. A writer that stores bytes asks
+    /// [`Self::store_blocked`] (source guard
+    /// `background_writers_ask_write_blocked`).
+    pub fn write_blocked(&self, bucket: &str) -> Option<String> {
+        self.blocked(bucket, WriteKind::FreesSpace)
+    }
+
+    /// [`Self::write_blocked`] for a writer that stores bytes (a copy, a
+    /// transition): it also stops while the disk of the bucket's filesystem
+    /// backend is at level critical.
+    pub fn store_blocked(&self, bucket: &str) -> Option<String> {
+        self.blocked(bucket, WriteKind::Store)
+    }
+
+    /// [`Self::write_blocked`] or [`Self::store_blocked`] by `kind`.
+    pub fn blocked(&self, bucket: &str, kind: WriteKind) -> Option<String> {
+        self.refusal_of(bucket, kind).map(WriteRefusal::into_reason)
+    }
+
+    /// [`Self::blocked`], with the cause kept apart.
+    fn refusal_of(&self, bucket: &str, kind: WriteKind) -> Option<WriteRefusal> {
+        if let Some(job) = self.busy_kind(bucket) {
             return Some(WriteRefusal::Maintenance(format!(
-                "bucket '{bucket}' has an active maintenance job ({kind})"
+                "bucket '{bucket}' has an active maintenance job ({job})"
             )));
         }
-        self.write_refusal
-            .get()
-            .and_then(|probe| (probe.0)(bucket))
-            .map(WriteRefusal::Refused)
+        let ask = |cell: &std::sync::OnceLock<ProbeCell>| {
+            cell.get()
+                .and_then(|probe| (probe.0)(bucket))
+                .map(WriteRefusal::Refused)
+        };
+        ask(&self.write_refusal).or_else(|| match kind {
+            WriteKind::Store => ask(&self.disk_refusal),
+            WriteKind::FreesSpace => None,
+        })
     }
 
-    /// THE admission of one background write (replication copy, mirror
-    /// delete, lifecycle act) into `bucket`: count it as in flight FIRST,
-    /// then ask [`Self::write_blocked`]. A maintenance job that arms at any
+    /// THE admission of one background write that STORES bytes (a
+    /// replication copy) into `bucket`: count it as in flight FIRST, then
+    /// ask [`Self::store_blocked`]. A maintenance job that arms at any
     /// moment either sees the count (its drain waits for the write) or the
     /// write sees the job (the guard drops, the caller defers). Checking
     /// first and counting after left a window where the drain saw 0 and
@@ -179,7 +220,7 @@ impl MaintenanceGate {
         self: &Arc<Self>,
         bucket: &str,
     ) -> Result<Admitted, WriteRefusal> {
-        admit_all(Some(self), &[bucket])
+        admit_stores(Some(self), &[bucket])
     }
 
     /// The kind of the job that gates this bucket, if one does.
@@ -348,21 +389,52 @@ impl Admitted {
 /// the count or is seen (all counts drop, `Err`). Without a gate (`None`:
 /// tests, a node with no maintenance plane) the writes are admitted
 /// uncounted.
+///
+/// `admit_all` is for writes that free space or store no bytes (deletes):
+/// it never reports a full disk. [`admit_stores`] is for writes that store
+/// bytes; [`admit_buckets`] takes the kind per bucket.
 pub fn admit_all(
     gate: Option<&Arc<MaintenanceGate>>,
     buckets: &[&str],
 ) -> Result<Admitted, WriteRefusal> {
+    let kinds: Vec<(&str, WriteKind)> = buckets
+        .iter()
+        .map(|b| (*b, WriteKind::FreesSpace))
+        .collect();
+    admit_buckets(gate, &kinds)
+}
+
+/// [`admit_all`] for writes that STORE bytes into `buckets`: the gate also
+/// refuses while the disk of a bucket's filesystem backend is at level
+/// critical.
+pub fn admit_stores(
+    gate: Option<&Arc<MaintenanceGate>>,
+    buckets: &[&str],
+) -> Result<Admitted, WriteRefusal> {
+    let kinds: Vec<(&str, WriteKind)> = buckets.iter().map(|b| (*b, WriteKind::Store)).collect();
+    admit_buckets(gate, &kinds)
+}
+
+/// THE admission, with the kind of write per bucket (a lifecycle transition
+/// stores into its destination and only deletes from its source).
+pub fn admit_buckets(
+    gate: Option<&Arc<MaintenanceGate>>,
+    buckets: &[(&str, WriteKind)],
+) -> Result<Admitted, WriteRefusal> {
     let mut guards = Vec::with_capacity(buckets.len());
-    for bucket in buckets {
+    for (bucket, _) in buckets {
         guards.push(gate.map(|g| g.begin_background_write(bucket)));
     }
     if let Some(gate) = gate {
-        if let Some(refusal) = buckets.iter().find_map(|b| gate.refusal_of(b)) {
+        if let Some(refusal) = buckets
+            .iter()
+            .find_map(|(b, kind)| gate.refusal_of(b, *kind))
+        {
             return Err(refusal); // `guards` drop: no longer counted.
         }
     }
     Ok(Admitted {
-        buckets: buckets.iter().map(|b| b.to_string()).collect(),
+        buckets: buckets.iter().map(|(b, _)| b.to_string()).collect(),
         _guards: guards,
     })
 }
@@ -691,6 +763,65 @@ impl BackendCheck {
 mod tests {
     use super::*;
 
+    /// Reads and deletes must work at level critical: the disk refusal
+    /// stops a write that STORES bytes, and no other.
+    #[test]
+    fn the_disk_refusal_stops_stores_and_never_a_delete() {
+        let g = Arc::new(MaintenanceGate::new());
+        g.set_disk_refusal_probe(Arc::new(|b: &str| {
+            (b == "full").then(|| "the disk is full".into())
+        }));
+        // A delete asks no disk: every way of asking for a delete passes.
+        assert_eq!(g.write_blocked("full"), None);
+        assert_eq!(g.blocked("full", WriteKind::FreesSpace), None);
+        assert!(admit_all(Some(&g), &["full"]).is_ok());
+        assert!(admit_buckets(Some(&g), &[("full", WriteKind::FreesSpace)]).is_ok());
+        // A store asks it.
+        assert_eq!(g.store_blocked("full").as_deref(), Some("the disk is full"));
+        assert_eq!(
+            g.blocked("full", WriteKind::Store).as_deref(),
+            Some("the disk is full")
+        );
+        assert_eq!(g.store_blocked("roomy"), None);
+        assert!(matches!(
+            admit_stores(Some(&g), &["roomy", "full"]),
+            Err(WriteRefusal::Refused(m)) if m == "the disk is full"
+        ));
+        assert!(admit_stores(Some(&g), &["roomy"]).is_ok());
+        assert!(
+            g.admit_background_write("full").is_err(),
+            "a copy is a store"
+        );
+        // A transition: it deletes from `full` and stores into `roomy`.
+        assert!(admit_buckets(
+            Some(&g),
+            &[("full", WriteKind::FreesSpace), ("roomy", WriteKind::Store)]
+        )
+        .is_ok());
+        // ... and the other way round stops.
+        assert!(admit_buckets(
+            Some(&g),
+            &[("roomy", WriteKind::FreesSpace), ("full", WriteKind::Store)]
+        )
+        .is_err());
+        // A refused admission counts nothing (the guards dropped).
+        assert_eq!(g.inflight_background_writes("full"), 0);
+        // A maintenance job wins for both kinds.
+        let arm = GateArm {
+            job_id: 1,
+            key: "roomy".into(),
+            kind: "reencrypt".into(),
+            migrate_source: false,
+        };
+        g.busy.store(Arc::new(busy_set(&[arm], &HashSet::new())));
+        for kind in [WriteKind::Store, WriteKind::FreesSpace] {
+            assert!(matches!(
+                g.refusal_of("roomy", kind),
+                Some(WriteRefusal::Maintenance(_))
+            ));
+        }
+    }
+
     /// Source guard: replication and lifecycle ask `write_blocked` (the
     /// maintenance job AND the encryption witness), never `is_busy` alone.
     #[test]
@@ -791,7 +922,10 @@ mod tests {
         src.prod
             .calls
             .iter()
-            .filter(|c| !c.method && c.named("admit_all"))
+            .filter(|c| {
+                !c.method
+                    && (c.named("admit_all") || c.named("admit_stores") || c.named("admit_buckets"))
+            })
             .filter(|c| c.arg_idents.first() == Some(&Some("None".to_string())))
             .filter(|c| {
                 c.arg_idents_all.len() > 1 || !c.arg_strings.is_empty() || !c.arg_calls.is_empty()
@@ -872,6 +1006,8 @@ mod tests {
             let names = [
                 "admit_background_write",
                 "admit_all",
+                "admit_stores",
+                "admit_buckets",
                 "begin_write",
                 "begin_detached_write",
             ];

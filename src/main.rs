@@ -939,6 +939,7 @@ async fn async_main(
         engine.encryption_policies().witness_gate(),
     )
     .await;
+    let disk_watch = startup::install_disk_watch();
     let state = Arc::new(AppState {
         engine: ArcSwap::from_pointee(engine),
         multipart,
@@ -958,31 +959,14 @@ async fn async_main(
     });
     // The background writers (replication, lifecycle) ask the encryption
     // witness and the key sentinel through the maintenance gate: a refused
-    // destination defers them instead of failing object after object.
-    {
-        let weak = Arc::downgrade(&state);
-        maintenance_gate.set_write_refusal_probe(Arc::new(move |bucket: &str| {
-            weak.upgrade().and_then(|s| {
-                s.engine
-                    .load()
-                    .write_refusal(bucket)
-                    // An encrypted bucket on a backend without atomic
-                    // writes is read-only (N2): background writers wait.
-                    .or_else(|| {
-                        s.atomic_write_block_now(bucket)
-                            .map(|b| b.admin_message(bucket))
-                    })
-                    // A critical disk of the bucket's filesystem backend:
-                    // they wait for space too.
-                    .or_else(|| {
-                        deltaglider_proxy::disk_watch::bucket_write_refusal(
-                            &s.engine.load(),
-                            bucket,
-                        )
-                    })
-            })
-        }));
-    }
+    // destination defers them instead of failing object after object. A
+    // writer that stores bytes also waits for a critical disk; a delete
+    // never does (`maintenance::probes`).
+    deltaglider_proxy::maintenance::probes::install(
+        &maintenance_gate,
+        Arc::downgrade(&state),
+        disk_watch.clone(),
+    );
     // The storage wrappers skip their own writes (listing tokens, key
     // claims) into encrypted buckets on a backend without proven atomic
     // writes.
@@ -1033,7 +1017,7 @@ async fn async_main(
 
     // --- Background monitors ---
     spawn_cache_monitor(&state, &metrics);
-    startup::spawn_disk_monitor(&state, &shared_config).await;
+    startup::spawn_disk_monitor(&state, &shared_config, disk_watch).await;
     // #87: Tokio runtime sampler — a no-op call unless built with
     // `--cfg tokio_unstable` (see src/metrics.rs for the gating rationale).
     deltaglider_proxy::metrics::spawn_tokio_runtime_metrics_sampler(&metrics);

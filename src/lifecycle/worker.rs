@@ -779,14 +779,18 @@ async fn run_or_preview(
                         // waits for at most this object's copy, and the next
                         // object defers the run. The cursor stays before the
                         // page, so the resume plans it again.
-                        let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
-                            Ok(windows) => windows,
-                            Err(why) => {
-                                info!("lifecycle rule '{}' deferring mid-page: {why}", rule.name);
-                                deferred = true;
-                                break;
-                            }
-                        };
+                        let windows =
+                            match admit_write_windows(rule, maintenance_gate.as_ref(), true) {
+                                Ok(windows) => windows,
+                                Err(why) => {
+                                    info!(
+                                        "lifecycle rule '{}' deferring mid-page: {why}",
+                                        rule.name
+                                    );
+                                    deferred = true;
+                                    break;
+                                }
+                            };
                         match plan_action(db.as_ref(), engine, &windows, rule, &key, &meta, &action)
                             .await
                         {
@@ -852,7 +856,7 @@ async fn run_or_preview(
             // The admission of the page's delete batch: `proceed` asks the
             // gate again before each key, so a job that arms meanwhile waits
             // for one key's delete.
-            let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
+            let windows = match admit_write_windows(rule, maintenance_gate.as_ref(), false) {
                 Ok(windows) => windows,
                 Err(why) => {
                     info!(
@@ -1229,7 +1233,7 @@ async fn run_or_preview_retain_newest(
     // reencrypt/migrate drain waits for it instead of racing our deletes
     // (H22). If a job armed between collect and here, defer the entire act
     // phase rather than delete into a bucket being rewritten.
-    let windows = match admit_write_windows(rule, maintenance_gate.as_ref()) {
+    let windows = match admit_write_windows(rule, maintenance_gate.as_ref(), false) {
         Ok(windows) => windows,
         Err(why) => {
             info!(
@@ -2009,9 +2013,9 @@ fn maintenance_write_bucket_busy(
     let Some(gate) = gate else {
         return false;
     };
-    super::planner::rule_write_buckets(rule)
+    super::planner::rule_write_targets(rule)
         .into_iter()
-        .any(|b| gate.write_blocked(b).is_some())
+        .any(|(b, kind)| gate.blocked(b, kind).is_some())
 }
 
 /// Admit this rule's write buckets through the maintenance gate for the
@@ -2023,9 +2027,16 @@ fn maintenance_write_bucket_busy(
 fn admit_write_windows(
     rule: &LifecycleRule,
     gate: Option<&Arc<crate::maintenance::gate::MaintenanceGate>>,
+    storing: bool,
 ) -> Result<crate::maintenance::gate::Admitted, String> {
-    crate::maintenance::gate::admit_all(gate, &super::planner::rule_write_buckets(rule))
-        .map_err(|refusal| refusal.into_reason())
+    // `storing`: the window of copies (a transition stores into its
+    // destination). A window of deletes asks no disk refusal: they free space.
+    let result = if storing {
+        crate::maintenance::gate::admit_buckets(gate, &super::planner::rule_write_targets(rule))
+    } else {
+        crate::maintenance::gate::admit_all(gate, &super::planner::rule_write_buckets(rule))
+    };
+    result.map_err(|refusal| refusal.into_reason())
 }
 
 async fn renew_run_lease(
@@ -3134,7 +3145,7 @@ mod tests {
     fn a_bucket_name_with_spaces_is_covered_by_its_admission() {
         let mut r = rule();
         r.bucket = " b ".into();
-        let windows = super::admit_write_windows(&r, None).unwrap();
+        let windows = super::admit_write_windows(&r, None, false).unwrap();
         assert!(windows.covers(&r.bucket), "{windows:?}");
         assert!(windows.covers("B"));
         assert!(!windows.covers("other"));

@@ -53,6 +53,7 @@ async fn a_new_write_reservation_is_refused_at_high_and_critical() {
             .await
             .unwrap();
         engine.codec_source_spool_now(1024).unwrap();
+        engine.codec_source_spool_large_now(1024).unwrap();
     }
     for level in [Level::High, Level::Critical] {
         set_level(&engine, level);
@@ -60,8 +61,11 @@ async fn a_new_write_reservation_is_refused_at_high_and_critical() {
             let m = refused(engine.reserve_ingest_spool(MIB, 0, wait).await);
             assert!(m.contains(level.name()), "{m}");
         }
-        let m = refused(engine.codec_source_spool_now(1024));
+        let m = refused(engine.codec_source_spool_large_now(1024));
         assert!(m.contains(level.name()), "{m}");
+        // A small codec source (a reference of at most the threshold) is no
+        // new body: the rule is "larger than the threshold".
+        engine.codec_source_spool_now(1024).unwrap();
     }
 }
 
@@ -103,35 +107,158 @@ async fn reads_and_deletes_go_on_at_critical() {
     engine.delete("b", "k.txt").await.unwrap();
 }
 
-/// CLASS GUARD: every function of `resources.rs` that reserves spool for a
-/// WRITE asks the disk gate; a read helper never does.
-#[test]
-fn every_write_reservation_asks_the_disk_gate() {
-    let src = crate::source_scan::read("src/deltaglider/engine/resources.rs");
-    for f in [
-        "reserve_ingest_spool",
+/// How a spool acquisition of `src/` relates to the disk gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spool {
+    /// A new write: the fn asks `admit_new_spool_write` (or is the gate).
+    Gated,
+    /// A reference or body that the buffered codec holds, at most the spool
+    /// threshold: no gate (the rule is "LARGER than the threshold").
+    SmallCodec,
+    /// A read (a GET, a range read): reads and deletes work at level critical.
+    Read,
+    /// The primitive that the gated, small and read callers share.
+    Primitive,
+    /// A write of the CLI (`cp`): the CLI process runs no disk monitor, so
+    /// its spool gate never leaves level ok.
+    NoMonitor,
+}
+
+/// Every fn of `src/` (outside `spool.rs`) that acquires spool space, by
+/// file and name. A new acquisition fails the guard until it is classified:
+/// a write that forgot the gate is a disk that fills under a refusing proxy.
+const SPOOL_SITES: &[(&str, &str, Spool)] = &[
+    (
+        "src/deltaglider/engine/resources.rs",
+        "spool_acquire",
+        Spool::Primitive,
+    ),
+    (
+        "src/deltaglider/engine/resources.rs",
+        "spool_acquire_group",
+        Spool::Primitive,
+    ),
+    (
+        "src/deltaglider/engine/resources.rs",
         "reserve_storage_spool",
+        Spool::Gated,
+    ),
+    (
+        "src/deltaglider/engine/resources.rs",
+        "reserve_ingest_spool",
+        Spool::Gated,
+    ),
+    (
+        "src/deltaglider/engine/resources.rs",
         "codec_source_spool_now",
-    ] {
-        let body = crate::source_scan::prod_fn_text("src/deltaglider/engine/resources.rs", f);
-        assert!(
-            body.contains("admit_new_spool_write("),
-            "{f} reserves spool for a write and must ask admit_new_spool_write"
-        );
+        Spool::SmallCodec,
+    ),
+    (
+        "src/deltaglider/engine/resources.rs",
+        "codec_source_spool_large_now",
+        Spool::Gated,
+    ),
+    (
+        "src/deltaglider/engine/store.rs",
+        "encode_memory_body_spooled",
+        Spool::Gated,
+    ),
+    (
+        "src/deltaglider/engine/rewrite.rs",
+        "rewrite_passthrough",
+        Spool::Gated,
+    ),
+    ("src/cli/transfer_io.rs", "upload_file", Spool::NoMonitor),
+];
+
+/// CLASS GUARD: every acquisition of spool space in `src/` is classified in
+/// [`SPOOL_SITES`]; each gated fn asks the gate, no other fn does, and the
+/// table has no row that no code matches.
+#[test]
+fn every_spool_acquisition_is_classified() {
+    const ACQUIRING: &[&str] = &[
+        "spool_acquire",
+        "spool_acquire_group",
+        "reserve_beside",
+        "try_reserve",
+        "try_acquire",
+        "acquire",
+        "acquire_pair",
+        "acquire_group",
+    ];
+    // A call on a spool (`self.spool.try_acquire(..)`, `spool().acquire(..)`)
+    // or one of the engine's own wrappers. The names also mean semaphores
+    // and the memory budget, so the receiver decides.
+    let on_spool = regex_lite::Regex::new(
+        r"spool\w*(?:\(\))?\s*\.\s*(?:try_acquire|acquire|acquire_pair|acquire_group|reserve_beside|try_reserve)\s*\(|\bspool_acquire(?:_group)?\s*\(",
+    )
+    .unwrap();
+    let mut found: Vec<(String, String)> = Vec::new();
+    for src in crate::source_scan::ast::src() {
+        if matches!(
+            src.rel.as_str(),
+            "src/deltaglider/spool.rs" | "src/deltaglider/memory_budget.rs"
+        ) {
+            continue;
+        }
+        for call in &src.prod.calls {
+            if !ACQUIRING.iter().any(|n| call.named(n)) {
+                continue;
+            }
+            let name = src.fn_name(call.func).to_string();
+            let text = crate::source_scan::prod_fn_text(&src.rel, &name);
+            if !on_spool.is_match(&text) {
+                continue;
+            }
+            let row = (src.rel.clone(), name);
+            if !found.contains(&row) {
+                found.push(row);
+            }
+        }
     }
-    for f in ["spool_acquire_group", "spool_acquire"] {
-        let body = crate::source_scan::prod_fn_text("src/deltaglider/engine/resources.rs", f);
-        assert!(
-            !body.contains("admit_new_spool_write("),
-            "{f} serves reads and must not ask the write gate"
-        );
+    let mut problems = Vec::new();
+    for (file, name) in &found {
+        if !SPOOL_SITES.iter().any(|(f, n, _)| f == file && n == name) {
+            // A read helper that is classed by its file below.
+            if READ_FILES.contains(&file.as_str()) {
+                continue;
+            }
+            problems.push(format!("{file}::{name} acquires spool space: classify it"));
+        }
     }
+    for (file, name, class) in SPOOL_SITES {
+        if !found.iter().any(|(f, n)| f == file && n == name) {
+            problems.push(format!(
+                "{file}::{name} is in SPOOL_SITES but acquires nothing"
+            ));
+            continue;
+        }
+        let body = crate::source_scan::prod_fn_text(file, name);
+        let asks = body.contains("admit_new_spool_write(");
+        match class {
+            Spool::Gated if !asks => {
+                problems.push(format!("{file}::{name} is a write and must ask the gate"))
+            }
+            Spool::SmallCodec | Spool::Read | Spool::Primitive | Spool::NoMonitor if asks => {
+                problems.push(format!(
+                    "{file}::{name} is {class:?} and must not ask the gate"
+                ))
+            }
+            _ => {}
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
     assert_eq!(
-        src.matches("self.spool.admit_new_write()").count(),
+        crate::source_scan::read("src/deltaglider/engine/resources.rs")
+            .matches("self.spool.admit_new_write()")
+            .count(),
         1,
         "one place asks the spool gate"
     );
 }
+
+/// Files whose spool acquisitions are all reads (a GET and a range read).
+const READ_FILES: &[&str] = &["src/deltaglider/engine/retrieve.rs"];
 
 /// CLASS GUARD: every client verb that STORES bytes asks the store gate (it
 /// adds the critical-disk refusal of a filesystem backend to the write

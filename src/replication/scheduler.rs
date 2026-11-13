@@ -152,7 +152,7 @@ async fn run_due_rules(
 
         if let Some(why) = state
             .maintenance_gate
-            .write_blocked(&rule.destination.bucket)
+            .store_blocked(&rule.destination.bucket)
         {
             // Shown on the rule's Jobs row; one WARN per change.
             super::deferral::destination_blocked(&rule.name, &why);
