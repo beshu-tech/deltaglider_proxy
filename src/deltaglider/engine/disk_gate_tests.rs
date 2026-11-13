@@ -35,10 +35,11 @@ fn set_level(engine: &DynEngine, level: Level) {
         .set(level, format!("at level {}", level.name()));
 }
 
-fn refused(r: Result<impl std::fmt::Debug, EngineError>) -> String {
+fn refused<T>(r: Result<T, EngineError>) -> String {
     match r {
         Err(EngineError::Overloaded(m)) => m,
-        other => panic!("want Overloaded, got {other:?}"),
+        Err(e) => panic!("want Overloaded, got {e}"),
+        Ok(_) => panic!("want Overloaded, the reservation was admitted"),
     }
 }
 

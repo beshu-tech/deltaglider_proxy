@@ -365,7 +365,13 @@ pub async fn spawn_disk_monitor(
         }
     };
     let watch = deltaglider_proxy::disk_watch::DiskWatch::install(spool.gate().clone());
-    let interval = config.read().await.tuning.disk_monitor.interval_secs;
+    let interval = {
+        let config = config.read().await;
+        if let Some(message) = deltaglider_proxy::disk_watch::boot_check_now(&config, &spool) {
+            warn!("[disk] {message}");
+        }
+        config.tuning.disk_monitor.interval_secs
+    };
     let (state, config) = (state.clone(), config.clone());
     spawn_periodic_blocking("disk-monitor", Duration::from_secs(interval), move || {
         // An apply holds the write lock for a moment: skip that tick.

@@ -476,7 +476,8 @@ What to do:
 
 - **Add the alert rules** of [the monitoring guide](monitor-with-prometheus.md#disk-space-rules) so that you learn of level low before a client sees a `503`.
 - **Check the thresholds.** Level low starts below 15% free, level high below 10% and level critical below 5% (or 1 GiB). Each level also has a floor from the spool limits. Change them with `DGP_DISK_LOW_PERCENT`, `DGP_DISK_HIGH_PERCENT` and `DGP_DISK_CRITICAL_PERCENT`.
-- **On a Kubernetes `emptyDir` with a `sizeLimit`, the free space is the free space of the host.** The levels then show the host disk. Set `DGP_SPOOL_MAX_BYTES` to the real size of the volume and watch the ratio of `deltaglider_spool_used_bytes` to `deltaglider_spool_budget_bytes`.
+- **On a Kubernetes `emptyDir` with a `sizeLimit`, the free space is the free space of the host.** The proxy then also judges the spool by the share of `DGP_SPOOL_MAX_BYTES` that running requests have reserved (the role `spool-budget`): at 90% reserved, a new upload gets `503 SlowDown` where it used to wait for budget. Set `DGP_SPOOL_MAX_BYTES` to the real size of the volume.
+- **Read the new warning at start.** When the spool directory has less free space than the spool budget, the proxy logs a line that starts with `[disk]`. Lower `DGP_SPOOL_MAX_BYTES` or move `DGP_SPOOL_DIR` to a larger disk.
 
 ## Common gotchas
 

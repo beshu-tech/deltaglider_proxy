@@ -2525,7 +2525,10 @@ async fn disk_server(free_percent: u8) -> (tempfile::TempDir, TestServer) {
     let server = TestServer::builder()
         .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
         .env("DGP_SPOOL_THRESHOLD_BYTES", &MIB.to_string())
-        .env("DGP_TEST_DISK_MONITOR_FREE_PERCENT", &free_percent.to_string())
+        .env(
+            "DGP_TEST_DISK_MONITOR_FREE_PERCENT",
+            &free_percent.to_string(),
+        )
         .build()
         .await;
     (spool, server)
@@ -2565,7 +2568,10 @@ async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
         metrics.contains("deltaglider_disk_level{path_role=\"spool\"} 2"),
         "{metrics}"
     );
-    assert!(metrics.contains("deltaglider_spool_budget_bytes"), "{metrics}");
+    assert!(
+        metrics.contains("deltaglider_spool_budget_bytes"),
+        "{metrics}"
+    );
 
     let (status, body) = put_status(&server, "large.bin", 4 * MIB as usize).await;
     assert_eq!(status, 503, "{body}");
@@ -2578,7 +2584,11 @@ async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
     assert_eq!(status, 200, "{body}");
     let got = server
         .http()
-        .get(format!("{}/{}/small.bin", server.endpoint(), server.bucket()))
+        .get(format!(
+            "{}/{}/small.bin",
+            server.endpoint(),
+            server.bucket()
+        ))
         .send()
         .await
         .unwrap();
@@ -2604,7 +2614,11 @@ async fn at_disk_level_critical_writes_to_the_backend_are_refused_and_deletes_wo
     }
     let del = server
         .http()
-        .delete(format!("{}/{}/small.bin", server.endpoint(), server.bucket()))
+        .delete(format!(
+            "{}/{}/small.bin",
+            server.endpoint(),
+            server.bucket()
+        ))
         .send()
         .await
         .unwrap();

@@ -81,11 +81,16 @@ pub struct Metrics {
     pub spool_budget_bytes: IntGauge,
     /// Spool bytes reserved now.
     pub spool_used_bytes: IntGauge,
-    /// Free bytes of the disk of a role (`spool`, `backend:<name>`, `data`).
+    /// Free bytes of the disk of the spool directory.
+    pub spool_dir_free_bytes: IntGauge,
+    /// Total bytes of the disk of the spool directory.
+    pub spool_dir_total_bytes: IntGauge,
+    /// Free bytes of the disk of a role (`backend:<name>`, `data`).
     pub disk_free_bytes: IntGaugeVec,
     /// Total bytes of the disk of a role.
     pub disk_total_bytes: IntGaugeVec,
-    /// Disk level of a role: 0 ok, 1 low, 2 high, 3 critical.
+    /// Disk level of a role (`spool`, `spool-budget`, `backend:<name>`,
+    /// `data`): 0 ok, 1 low, 2 high, 3 critical.
     pub disk_level: IntGaugeVec,
     /// Passthrough objects that an in-place rewrite (the re-encrypt job)
     /// read in full, by medium (`memory`/`spool`). A rewrite that finds the
@@ -514,12 +519,28 @@ impl Metrics {
             )
             .unwrap()
         );
+        let spool_dir_free_bytes = register!(
+            registry,
+            IntGauge::new(
+                "deltaglider_spool_dir_free_bytes",
+                "Free bytes of the disk of the spool directory",
+            )
+            .unwrap()
+        );
+        let spool_dir_total_bytes = register!(
+            registry,
+            IntGauge::new(
+                "deltaglider_spool_dir_total_bytes",
+                "Total bytes of the disk of the spool directory",
+            )
+            .unwrap()
+        );
         let disk_free_bytes = register!(
             registry,
             IntGaugeVec::new(
                 Opts::new(
                     "deltaglider_disk_free_bytes",
-                    "Free bytes of the disk of a role: spool, backend:<name> or data",
+                    "Free bytes of the disk of a filesystem backend (backend:<name>) or the data directory (data)",
                 ),
                 &["path_role"],
             )
@@ -530,7 +551,7 @@ impl Metrics {
             IntGaugeVec::new(
                 Opts::new(
                     "deltaglider_disk_total_bytes",
-                    "Total bytes of the disk of a role: spool, backend:<name> or data",
+                    "Total bytes of the disk of a filesystem backend (backend:<name>) or the data directory (data)",
                 ),
                 &["path_role"],
             )
@@ -541,7 +562,7 @@ impl Metrics {
             IntGaugeVec::new(
                 Opts::new(
                     "deltaglider_disk_level",
-                    "Disk level of a role: 0 ok, 1 low, 2 high, 3 critical",
+                    "Disk level of a role (spool, spool-budget, backend:<name>, data): 0 ok, 1 low, 2 high, 3 critical",
                 ),
                 &["path_role"],
             )
@@ -782,6 +803,8 @@ impl Metrics {
             ingest_bodies_total,
             spool_budget_bytes,
             spool_used_bytes,
+            spool_dir_free_bytes,
+            spool_dir_total_bytes,
             disk_free_bytes,
             disk_total_bytes,
             disk_level,

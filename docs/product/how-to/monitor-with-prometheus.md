@@ -266,16 +266,16 @@ groups:
 
 ### Disk space rules
 
-The proxy measures the free space of three kinds of directory every 30 seconds: the spool directory (`spool`), the root of every filesystem backend (`backend:<name>`, for example `backend:hetzner-fsn1`) and the data directory that holds the config database and the job state (`data`). Roles that share one disk share one level. The gauge `deltaglider_disk_level` is 0 (ok), 1 (low), 2 (high) or 3 (critical); the [capacity planning reference](../reference/capacity-planning.md#disk-watermarks) gives the thresholds and what the proxy does at each level.
+The proxy measures the free space of three kinds of directory every 30 seconds: the spool directory (`spool`, with the gauges `deltaglider_spool_dir_free_bytes` and `deltaglider_spool_dir_total_bytes`), the root of every filesystem backend (`backend:<name>`, for example `backend:hetzner-fsn1`) and the data directory that holds the config database and the job state (`data`). Roles that share one disk share one level. The gauge `deltaglider_disk_level` is 0 (ok), 1 (low), 2 (high) or 3 (critical); the [capacity planning reference](../reference/capacity-planning.md#disk-watermarks) gives the thresholds and what the proxy does at each level.
 
 The rules above page you at level high, which is the point where the proxy starts to refuse new uploads that need spool space. `DeltaGliderDiskLow` is only a warning: nothing is refused yet.
 
-Free space does not show the real limit of a Kubernetes `emptyDir` volume with a `sizeLimit`, or of a container with a disk quota, because `statvfs` reports the whole host disk. Where `DGP_SPOOL_MAX_BYTES` is set and is smaller than the free space, the ratio of `deltaglider_spool_used_bytes` to `deltaglider_spool_budget_bytes` is the signal to watch, and the rule `DeltaGliderSpoolBudgetNearlyUsed` uses it.
+Free space does not show the real limit of a Kubernetes `emptyDir` volume with a `sizeLimit`, or of a container with a disk quota, because `statvfs` reports the whole host disk. Under Kubernetes, on a tmpfs, and when the free space cannot be measured, the proxy therefore also judges the spool by its use: the series `deltaglider_disk_level{path_role="spool-budget"}` follows the share of the spool budget that running requests have reserved, and the two level rules above cover it. The rule `DeltaGliderSpoolBudgetNearlyUsed` watches the same ratio on every host.
 
 To chart the free space as a percent for one role:
 
 ```promql
-100 * deltaglider_disk_free_bytes{path_role="spool"} / deltaglider_disk_total_bytes{path_role="spool"}
+100 * deltaglider_spool_dir_free_bytes / deltaglider_spool_dir_total_bytes
 ```
 
 ## The built-in admin dashboard

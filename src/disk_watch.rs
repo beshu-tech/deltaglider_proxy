@@ -18,10 +18,18 @@
 //!   ([`DiskWatch::write_refusal`], asked by the client-write gate).
 //! * `/_/ready` does not change: a full disk still serves reads.
 //!
-//! The monitor also sets the gauges `deltaglider_spool_budget_bytes`,
-//! `deltaglider_spool_used_bytes` and, per role (`spool`, `backend:<name>`,
-//! `data`), `deltaglider_disk_free_bytes`, `deltaglider_disk_total_bytes`
-//! and `deltaglider_disk_level`.
+//! `statvfs` does not show every real limit: a Kubernetes `emptyDir` with a
+//! `sizeLimit` and a container quota both hide it, and a tmpfs is memory.
+//! Where that can be so ([`SpoolView`]), the monitor also judges the spool
+//! by its own use: the bytes reserved against the budget
+//! (`DGP_SPOOL_MAX_BYTES`), as one more role named `spool-budget`. The spool
+//! level is the worse of the two.
+//!
+//! The monitor sets the gauges `deltaglider_spool_budget_bytes`,
+//! `deltaglider_spool_used_bytes`, `deltaglider_spool_dir_free_bytes` and
+//! `deltaglider_spool_dir_total_bytes`; per other role (`backend:<name>`,
+//! `data`) `deltaglider_disk_free_bytes` and `deltaglider_disk_total_bytes`;
+//! and for every role `deltaglider_disk_level`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -123,6 +131,18 @@ impl Thresholds {
             low_floor: largest_reservation.saturating_mul(2),
             high_floor: largest_reservation,
             critical_floor: CRITICAL_FLOOR_BYTES,
+        }
+    }
+
+    /// The thresholds for a measure that is no disk: the use of the spool
+    /// against its budget. The budget already bounds every reservation, so
+    /// no floor in bytes applies, only the percents.
+    pub fn percent_only(tuning: &DiskMonitorTuning) -> Self {
+        Self {
+            low_floor: 0,
+            high_floor: 0,
+            critical_floor: 0,
+            ..Self::new(tuning, 0)
         }
     }
 
@@ -292,6 +312,8 @@ pub struct Targets {
     pub data_dir: PathBuf,
     /// Where a bucket with no route goes.
     pub default_backend: String,
+    /// Also judge the spool by its use against its budget ([`SpoolView`]).
+    pub spool_by_use: bool,
 }
 
 /// What the spool is sized to, for the thresholds and the gauges.
@@ -314,6 +336,135 @@ pub struct RoleReport {
     pub device: u64,
 }
 
+/// The role of the spool judged by its use, and its stand-in device id (a
+/// real device id never has every bit set).
+pub const SPOOL_BUDGET_ROLE: &str = "spool-budget";
+const USE_DEVICE: u64 = u64::MAX;
+
+/// How to judge the spool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpoolView {
+    /// The free space of the disk says it all.
+    Disk,
+    /// The free space may hide the real limit: judge the use too.
+    DiskAndUse(UseReason),
+}
+
+/// Why the free space of the spool directory is not the whole truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UseReason {
+    /// On a tmpfs the free space is memory.
+    Tmpfs,
+    /// Under Kubernetes an `emptyDir` `sizeLimit` is not in the free space.
+    Kubernetes,
+    /// The free space could not be measured.
+    Unmeasured,
+}
+
+impl UseReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            UseReason::Tmpfs => "the directory is on a tmpfs, so its free space is memory",
+            UseReason::Kubernetes => {
+                "the proxy runs under Kubernetes, where the free space does not show an \
+                 emptyDir sizeLimit or a quota"
+            }
+            UseReason::Unmeasured => "the free space could not be measured",
+        }
+    }
+}
+
+/// Pure: how the monitor judges the spool, from what the boot found.
+pub fn spool_view(is_tmpfs: bool, in_kubernetes: bool, measured: bool) -> SpoolView {
+    if !measured {
+        SpoolView::DiskAndUse(UseReason::Unmeasured)
+    } else if is_tmpfs {
+        SpoolView::DiskAndUse(UseReason::Tmpfs)
+    } else if in_kubernetes {
+        SpoolView::DiskAndUse(UseReason::Kubernetes)
+    } else {
+        SpoolView::Disk
+    }
+}
+
+/// The verdict of the boot check of the spool directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootSpaceVerdict {
+    /// The directory has at least a budget of free space.
+    Fits,
+    /// The budget is above the free space: uploads can fill the disk
+    /// before the budget is full.
+    BudgetAboveFree { budget: u64, free: u64 },
+    /// The free space is no proof either way ([`SpoolView`]).
+    NotVisible(UseReason),
+}
+
+/// Pure boot check: is there room for a full spool budget? `free` is the
+/// free space of the directory plus the spool files the proxy can reuse
+/// (`None`: not measured).
+pub fn boot_space_verdict(view: SpoolView, free: Option<u64>, budget: u64) -> BootSpaceVerdict {
+    match (view, free) {
+        (SpoolView::DiskAndUse(reason), _) => BootSpaceVerdict::NotVisible(reason),
+        (SpoolView::Disk, None) => BootSpaceVerdict::NotVisible(UseReason::Unmeasured),
+        (SpoolView::Disk, Some(free)) if free < budget => {
+            BootSpaceVerdict::BudgetAboveFree { budget, free }
+        }
+        (SpoolView::Disk, Some(_)) => BootSpaceVerdict::Fits,
+    }
+}
+
+/// The boot warning of a verdict, or `None`. `dir` is the spool directory.
+pub fn boot_space_message(verdict: BootSpaceVerdict, dir: &Path) -> Option<String> {
+    match verdict {
+        BootSpaceVerdict::Fits => None,
+        BootSpaceVerdict::BudgetAboveFree { budget, free } => Some(format!(
+            "the spool directory {} has {} free, below the spool budget DGP_SPOOL_MAX_BYTES of \
+             {}. Uploads can fill the disk before the budget is full, and then a running write \
+             fails with ENOSPC. Lower DGP_SPOOL_MAX_BYTES, free disk space, or move DGP_SPOOL_DIR \
+             to a larger disk.",
+            dir.display(),
+            human(free),
+            human(budget)
+        )),
+        BootSpaceVerdict::NotVisible(reason) => Some(format!(
+            "the disk monitor cannot trust the free space of the spool directory {}: {}. It \
+             judges the spool by its use against DGP_SPOOL_MAX_BYTES instead; set that value to \
+             the space that the directory really has.",
+            dir.display(),
+            reason.describe()
+        )),
+    }
+}
+
+/// Pure: the boot warning, or `None` when the boot has nothing to say or the
+/// derivation of the limits already warned about the same thing (it warns
+/// about an explicit budget near the free space, about a floor above it and
+/// about a free space that is no size).
+pub fn boot_check(
+    view: SpoolView,
+    free: Option<u64>,
+    budget: u64,
+    dir: &Path,
+    limit_warnings: &[crate::config::limits::LimitWarning],
+) -> Option<String> {
+    use crate::config::limits::LimitWarning as W;
+    let verdict = boot_space_verdict(view, free, budget);
+    let said_already = limit_warnings.iter().any(|w| match verdict {
+        BootSpaceVerdict::Fits => false,
+        BootSpaceVerdict::BudgetAboveFree { .. } => {
+            matches!(
+                w,
+                W::SpoolAboveFreeSpace { .. } | W::FloorAboveAvailable { .. }
+            )
+        }
+        BootSpaceVerdict::NotVisible(_) => matches!(w, W::FreeSpaceUnreliable { .. }),
+    });
+    if said_already {
+        return None;
+    }
+    boot_space_message(verdict, dir)
+}
+
 #[derive(Default)]
 struct DeviceState {
     level: Option<Level>,
@@ -323,6 +474,9 @@ struct DeviceState {
 #[derive(Default)]
 struct State {
     devices: HashMap<u64, DeviceState>,
+    /// The last report of the spool DISK. A tick that cannot measure the
+    /// disk judges the spool by it again (a failed measure changes nothing).
+    spool_disk_last: Option<RoleReport>,
     gauge_labels: HashSet<String>,
 }
 
@@ -352,16 +506,29 @@ fn human(n: u64) -> String {
 }
 
 /// Pure: the message of a refused new spool reservation.
-pub fn spool_refusal_message(level: Level, path: &Path, facts: Facts) -> String {
+pub fn spool_refusal_message(level: Level, label: &str, path: &Path, facts: Facts) -> String {
+    let what = if label == SPOOL_BUDGET_ROLE {
+        format!(
+            "the spool budget (DGP_SPOOL_MAX_BYTES) of the directory {} is nearly all reserved, \
+             at level {} ({} of {} left)",
+            path.display(),
+            level.name(),
+            human(facts.free),
+            human(facts.total)
+        )
+    } else {
+        format!(
+            "the disk of the spool directory {} is at level {} ({} free of {})",
+            path.display(),
+            level.name(),
+            human(facts.free),
+            human(facts.total)
+        )
+    };
     format!(
-        "the disk of the spool directory {} is at level {} ({} free of {}); the proxy refuses new \
-         uploads that need spool space until the disk has more free space. Running requests, reads \
-         and deletes are not affected. Free disk space, lower DGP_SPOOL_MAX_BYTES, or move \
-         DGP_SPOOL_DIR to a larger disk; retry later",
-        path.display(),
-        level.name(),
-        human(facts.free),
-        human(facts.total)
+        "{what}; the proxy refuses new uploads that need spool space until there is more. \
+         Running requests, reads and deletes are not affected. Free disk space, lower \
+         DGP_SPOOL_MAX_BYTES, or move DGP_SPOOL_DIR to a larger disk; retry later"
     )
 }
 
@@ -398,12 +565,12 @@ pub fn log_line(level: Level, roles: &[&RoleReport], reminder: bool) -> String {
             "free disk space, or lower DGP_SPOOL_MAX_BYTES or point DGP_SPOOL_DIR to a larger disk"
         }
         Level::High => {
-            "the spool refuses new reservations with 503 SlowDown until the disk recovers; free \
-             disk space"
+            "the spool refuses new reservations with a retryable 503 until the disk recovers; \
+             free disk space or lower DGP_SPOOL_MAX_BYTES"
         }
         Level::Critical => {
             "the spool refuses new reservations, and writes to the buckets of a filesystem backend \
-             on this disk get 503 SlowDown; free disk space now"
+             on this disk get a retryable 503; free disk space now, or lower DGP_SPOOL_MAX_BYTES"
         }
     };
     format!(
@@ -462,12 +629,22 @@ impl DiskWatch {
         metrics: Option<&Metrics>,
     ) -> Vec<RoleReport> {
         let th = Thresholds::new(tuning, sizing.largest_reservation);
+        let th_use = Thresholds::percent_only(tuning);
         let mut roles: Vec<(String, PathBuf, Option<PathFacts>)> = Vec::new();
-        roles.push((
-            "spool".into(),
-            targets.spool_dir.clone(),
-            probe.measure(&targets.spool_dir),
-        ));
+        let spool_facts = probe.measure(&targets.spool_dir);
+        roles.push(("spool".into(), targets.spool_dir.clone(), spool_facts));
+        if targets.spool_by_use || spool_facts.is_none() {
+            // The use of the budget as a measure: free = what is not reserved.
+            roles.push((
+                SPOOL_BUDGET_ROLE.into(),
+                targets.spool_dir.clone(),
+                Some(PathFacts {
+                    free: sizing.budget.saturating_sub(sizing.used),
+                    total: sizing.budget,
+                    device: USE_DEVICE,
+                }),
+            ));
+        }
         for (name, path) in &targets.backends {
             roles.push((format!("backend:{name}"), path.clone(), probe.measure(path)));
         }
@@ -494,7 +671,12 @@ impl DiskWatch {
                 .get(&pf.device)
                 .and_then(|d| d.level)
                 .unwrap_or(Level::Ok);
-            device_levels.insert(pf.device, (prev, next_level(prev, f, &th), f));
+            let rule = if pf.device == USE_DEVICE {
+                &th_use
+            } else {
+                &th
+            };
+            device_levels.insert(pf.device, (prev, next_level(prev, f, rule), f));
         }
 
         let mut reports = Vec::new();
@@ -530,10 +712,21 @@ impl DiskWatch {
         }
 
         // Effects.
-        if let Some(spool) = reports.iter().find(|r| r.label == "spool") {
+        // The spool level is the worse of its disk and its use. A disk that
+        // could not be measured now keeps its last verdict.
+        if let Some(disk) = reports.iter().find(|r| r.label == "spool") {
+            state.spool_disk_last = Some(disk.clone());
+        }
+        let spool_disk = state.spool_disk_last.clone();
+        if let Some(spool) = reports
+            .iter()
+            .filter(|r| r.label == SPOOL_BUDGET_ROLE)
+            .chain(spool_disk.as_ref())
+            .max_by_key(|r| r.level)
+        {
             self.spool_gate.set(
                 spool.level,
-                spool_refusal_message(spool.level, &spool.path, spool.facts),
+                spool_refusal_message(spool.level, &spool.label, &spool.path, spool.facts),
             );
         }
         {
@@ -562,12 +755,22 @@ impl DiskWatch {
                 let _ = m.disk_level.remove_label_values(&[gone]);
             }
             for r in &reports {
-                m.disk_free_bytes
-                    .with_label_values(&[&r.label])
-                    .set(clamp_i64(r.facts.free));
-                m.disk_total_bytes
-                    .with_label_values(&[&r.label])
-                    .set(clamp_i64(r.facts.total));
+                match r.label.as_str() {
+                    "spool" => {
+                        m.spool_dir_free_bytes.set(clamp_i64(r.facts.free));
+                        m.spool_dir_total_bytes.set(clamp_i64(r.facts.total));
+                    }
+                    // The use of the budget has its own gauges above.
+                    SPOOL_BUDGET_ROLE => {}
+                    _ => {
+                        m.disk_free_bytes
+                            .with_label_values(&[&r.label])
+                            .set(clamp_i64(r.facts.free));
+                        m.disk_total_bytes
+                            .with_label_values(&[&r.label])
+                            .set(clamp_i64(r.facts.total));
+                    }
+                }
                 m.disk_level
                     .with_label_values(&[&r.label])
                     .set(i64::from(r.level.as_u8()));
@@ -585,9 +788,10 @@ impl DiskWatch {
 /// it through the maintenance gate. Costs one lock read while no backend
 /// is critical.
 pub fn bucket_write_refusal(
-    engine: &crate::deltaglider::engine::DynEngine,
+    engine: &crate::deltaglider::DynEngine,
     bucket: &str,
 ) -> Option<String> {
+    use crate::storage::StorageBackend as _;
     let watch = installed()?;
     if !watch.any_backend_critical() {
         return None;
@@ -597,6 +801,40 @@ pub fn bucket_write_refusal(
 
 fn clamp_i64(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// How the spool is judged under this config (the boot facts).
+pub fn spool_view_of(config: &crate::config::Config) -> SpoolView {
+    config.tuning.limits.as_ref().map_or(SpoolView::Disk, |l| {
+        spool_view(l.facts.is_tmpfs, l.facts.in_kubernetes, l.facts.measured())
+    })
+}
+
+/// The boot check of the running process: measures the spool directory now.
+pub fn boot_check_now(
+    config: &crate::config::Config,
+    spool: &crate::deltaglider::spool::SpoolDir,
+) -> Option<String> {
+    let own = config
+        .tuning
+        .limits
+        .as_ref()
+        .map_or(0, |l| l.facts.own_spool_bytes);
+    let free = SystemProbe
+        .measure(spool.dir())
+        .map(|f| f.free.saturating_add(own));
+    let warnings = config
+        .tuning
+        .limits
+        .as_ref()
+        .map_or(&[][..], |l| l.warnings.as_slice());
+    boot_check(
+        spool_view_of(config),
+        free,
+        spool.max_bytes(),
+        spool.dir(),
+        warnings,
+    )
 }
 
 /// One tick for the running process: the paths and the sizes come from the
@@ -627,6 +865,7 @@ pub fn tick_app(
         backends,
         data_dir,
         default_backend: config.default_backend_name(),
+        spool_by_use: spool_view_of(config) != SpoolView::Disk,
     };
     let budget = spool.max_bytes();
     let per_upload = config

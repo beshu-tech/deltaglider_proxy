@@ -261,6 +261,7 @@ impl DiskProbe for FakeProbe {
 
 fn targets(with_backend: bool) -> Targets {
     Targets {
+        spool_by_use: false,
         spool_dir: "/spool".into(),
         backends: if with_backend {
             vec![("hetzner-fsn1".to_string(), PathBuf::from("/backend"))]
@@ -269,6 +270,13 @@ fn targets(with_backend: bool) -> Targets {
         },
         data_dir: "/data".into(),
         default_backend: "hetzner-fsn1".into(),
+    }
+}
+
+fn targets_by_use() -> Targets {
+    Targets {
+        spool_by_use: true,
+        ..targets(false)
     }
 }
 
@@ -295,7 +303,7 @@ fn the_monitor_goes_low_high_critical_and_recovers_one_step_at_a_time() {
     probe.set("/data", 1, 50);
     probe.set("/backend", 2, 50);
     let t0 = Instant::now();
-    let mut tick = |n: u64| {
+    let tick = |n: u64| {
         watch.tick(
             &probe,
             &targets(true),
@@ -313,8 +321,10 @@ fn the_monitor_goes_low_high_critical_and_recovers_one_step_at_a_time() {
     // ok: the gauges carry the numbers, every role has its series.
     let roles = tick(0);
     assert_eq!(roles.len(), 3);
+    assert_eq!(metrics.spool_dir_free_bytes.get(), (50 * GIB) as i64);
+    assert_eq!(metrics.spool_dir_total_bytes.get(), TOTAL as i64);
     assert_eq!(
-        metrics.disk_free_bytes.with_label_values(&["spool"]).get(),
+        metrics.disk_free_bytes.with_label_values(&["data"]).get(),
         (50 * GIB) as i64
     );
     assert_eq!(
@@ -460,7 +470,11 @@ fn a_failed_measure_changes_nothing() {
         Instant::now(),
         None,
     );
-    assert!(roles.is_empty());
+    // Only the use of the budget is measured now; the disk keeps its verdict.
+    assert!(
+        roles.iter().all(|r| r.label == SPOOL_BUDGET_ROLE),
+        "{roles:?}"
+    );
     assert_eq!(watch.spool_level(), Level::High, "the verdict stays");
 }
 
@@ -470,13 +484,27 @@ fn the_messages_name_the_path_the_numbers_and_the_setting() {
         free: GIB,
         total: TOTAL,
     };
-    let m = spool_refusal_message(Level::High, Path::new("/var/dgp-spool"), f);
+    let m = spool_refusal_message(Level::High, "spool", Path::new("/var/dgp-spool"), f);
     for needle in [
         "/var/dgp-spool",
         "level high",
-        "1.0 GiB free of 100.0 GiB",
+        "1 GiB free of 100 GiB",
         "DGP_SPOOL_MAX_BYTES",
         "DGP_SPOOL_DIR",
+    ] {
+        assert!(m.contains(needle), "{needle} in {m}");
+    }
+    let m = spool_refusal_message(
+        Level::High,
+        SPOOL_BUDGET_ROLE,
+        Path::new("/var/dgp-spool"),
+        f,
+    );
+    for needle in [
+        "/var/dgp-spool",
+        "level high",
+        "nearly all reserved",
+        "DGP_SPOOL_MAX_BYTES",
     ] {
         assert!(m.contains(needle), "{needle} in {m}");
     }
@@ -509,6 +537,8 @@ fn the_reference_page_lists_every_disk_gauge() {
     for name in [
         "deltaglider_spool_budget_bytes",
         "deltaglider_spool_used_bytes",
+        "deltaglider_spool_dir_free_bytes",
+        "deltaglider_spool_dir_total_bytes",
         "deltaglider_disk_free_bytes",
         "deltaglider_disk_total_bytes",
         "deltaglider_disk_level",
@@ -534,4 +564,236 @@ fn readiness_does_not_read_the_disk_level() {
     );
     let health = crate::source_scan::read("src/coordination/health.rs");
     assert!(!health.contains("disk_watch"));
+}
+
+// ---- the spool judged by its use (statvfs hides the real limit) ----
+
+/// Under Kubernetes the free space of an `emptyDir` with a `sizeLimit` is the
+/// node's, so the spool level also follows the bytes reserved against the
+/// budget: percent thresholds only, no floor in bytes.
+#[test]
+fn the_spool_is_judged_by_its_use_where_the_free_space_hides_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool =
+        crate::deltaglider::spool::SpoolDir::new(dir.path().join("s"), 8 * 1024 * 1024).unwrap();
+    let watch = DiskWatch::new(spool.gate().clone());
+    let metrics = Metrics::new();
+    let probe = FakeProbe::new();
+    // The node disk is nearly empty: the free space says ok.
+    probe.set("/spool", 1, 90);
+    probe.set("/data", 1, 90);
+    let t0 = Instant::now();
+    let mut n = 0;
+    let mut tick = |used: u64| {
+        n += 1;
+        let sizing = Sizing {
+            budget: 10 * GIB,
+            used,
+            largest_reservation: 5 * GIB,
+        };
+        watch.tick(
+            &probe,
+            &targets_by_use(),
+            &tuning(),
+            sizing,
+            t0 + Duration::from_secs(30 * n),
+            Some(&metrics),
+        );
+        (
+            watch.spool_level(),
+            level_gauge(&metrics, SPOOL_BUDGET_ROLE),
+            level_gauge(&metrics, "spool"),
+        )
+    };
+    // Half the budget reserved by ONE upload (the per-upload limit): no
+    // level, whatever the byte floors say.
+    assert_eq!(tick(5 * GIB), (Level::Ok, 0, 0));
+    // 14% of the budget left: low (15%), no refusal.
+    assert_eq!(tick(86 * GIB / 10), (Level::Low, 1, 0));
+    assert!(spool.admit_new_write().is_ok());
+    // 9% left: high. New reservations get the budget message.
+    assert_eq!(tick(91 * GIB / 10), (Level::High, 2, 0));
+    let e = spool.admit_new_write().unwrap_err();
+    assert!(e.to_string().contains("nearly all reserved"), "{e}");
+    // The use falls back: the same one-step recovery as a disk.
+    assert_eq!(tick(0).0, Level::Low);
+    assert_eq!(tick(0).0, Level::Ok);
+    assert!(spool.admit_new_write().is_ok());
+    // The use of the budget has no free/total series of its own.
+    let text = prometheus::TextEncoder::new()
+        .encode_to_string(&metrics.registry.gather())
+        .unwrap();
+    assert!(!text.contains("deltaglider_disk_free_bytes{path_role=\"spool-budget\""));
+}
+
+/// The spool level is the worse of its disk and its use; a spool whose disk
+/// cannot be measured is judged by its use alone.
+#[test]
+fn the_spool_level_is_the_worse_of_its_disk_and_its_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool =
+        crate::deltaglider::spool::SpoolDir::new(dir.path().join("s"), 8 * 1024 * 1024).unwrap();
+    let watch = DiskWatch::new(spool.gate().clone());
+    let probe = FakeProbe::new();
+    probe.set("/data", 1, 90);
+    let sizing = Sizing {
+        budget: 10 * GIB,
+        used: 0,
+        largest_reservation: GIB,
+    };
+    // No measure of /spool at all: the use (0) says ok and the role exists.
+    let roles = watch.tick(
+        &probe,
+        &targets(false),
+        &tuning(),
+        sizing,
+        Instant::now(),
+        None,
+    );
+    assert!(roles.iter().any(|r| r.label == SPOOL_BUDGET_ROLE));
+    assert_eq!(watch.spool_level(), Level::Ok);
+    // The disk is critical, the use is fine: critical wins.
+    probe.set("/spool", 2, 3);
+    watch.tick(
+        &probe,
+        &targets_by_use(),
+        &tuning(),
+        sizing,
+        Instant::now(),
+        None,
+    );
+    assert_eq!(watch.spool_level(), Level::Critical);
+}
+
+#[test]
+fn the_use_thresholds_have_no_floor_in_bytes() {
+    let th = Thresholds::percent_only(&tuning());
+    let budget = 2 * GIB;
+    assert_eq!(th.enter(Level::Critical, budget), percent_of(budget, 5));
+    assert_eq!(th.enter(Level::High, budget), percent_of(budget, 10));
+    assert_eq!(th.enter(Level::Low, budget), percent_of(budget, 15));
+}
+
+#[test]
+fn the_view_of_the_spool_by_what_the_boot_found() {
+    use SpoolView::*;
+    use UseReason::*;
+    // (tmpfs, kubernetes, measured) -> view
+    let table = [
+        (false, false, true, Disk),
+        (true, false, true, DiskAndUse(Tmpfs)),
+        (false, true, true, DiskAndUse(Kubernetes)),
+        (true, true, true, DiskAndUse(Tmpfs)),
+        (false, false, false, DiskAndUse(Unmeasured)),
+        (true, true, false, DiskAndUse(Unmeasured)),
+    ];
+    for (tmpfs, k8s, measured, want) in table {
+        assert_eq!(
+            spool_view(tmpfs, k8s, measured),
+            want,
+            "{tmpfs} {k8s} {measured}"
+        );
+    }
+}
+
+#[test]
+fn the_boot_check_table() {
+    use crate::config::limits::{FloorReason, LimitWarning as W};
+    use BootSpaceVerdict::*;
+    let dir = Path::new("/var/dgp-spool");
+    let budget = 20 * GIB;
+    // (view, free, verdict)
+    let table = [
+        (SpoolView::Disk, Some(20 * GIB), Fits),
+        (
+            SpoolView::Disk,
+            Some(20 * GIB - 1),
+            BudgetAboveFree {
+                budget,
+                free: 20 * GIB - 1,
+            },
+        ),
+        (
+            SpoolView::Disk,
+            Some(0),
+            BudgetAboveFree { budget, free: 0 },
+        ),
+        (SpoolView::Disk, Some(500 * GIB), Fits),
+        (SpoolView::Disk, None, NotVisible(UseReason::Unmeasured)),
+        (
+            SpoolView::DiskAndUse(UseReason::Tmpfs),
+            Some(500 * GIB),
+            NotVisible(UseReason::Tmpfs),
+        ),
+        (
+            SpoolView::DiskAndUse(UseReason::Kubernetes),
+            Some(0),
+            NotVisible(UseReason::Kubernetes),
+        ),
+    ];
+    for (view, free, want) in table {
+        assert_eq!(
+            boot_space_verdict(view, free, budget),
+            want,
+            "{view:?} {free:?}"
+        );
+    }
+    // The warning names the directory, both sizes and the setting.
+    let m = boot_check(SpoolView::Disk, Some(5 * GIB), budget, dir, &[]).unwrap();
+    for needle in [
+        "/var/dgp-spool",
+        "5 GiB free",
+        "20 GiB",
+        "DGP_SPOOL_MAX_BYTES",
+        "ENOSPC",
+    ] {
+        assert!(m.contains(needle), "{needle} in {m}");
+    }
+    assert!(boot_check(SpoolView::Disk, Some(budget), budget, dir, &[]).is_none());
+    let m = boot_check(
+        SpoolView::DiskAndUse(UseReason::Kubernetes),
+        None,
+        budget,
+        dir,
+        &[],
+    )
+    .unwrap();
+    assert!(
+        m.contains("Kubernetes") && m.contains("DGP_SPOOL_MAX_BYTES"),
+        "{m}"
+    );
+    // The derivation of the limits warned already: no second line.
+    let above = W::SpoolAboveFreeSpace {
+        budget,
+        available: 5 * GIB,
+        shared_device: false,
+    };
+    let floor = W::FloorAboveAvailable { available: 5 * GIB };
+    for w in [above, floor] {
+        assert!(boot_check(SpoolView::Disk, Some(5 * GIB), budget, dir, &[w]).is_none());
+    }
+    let unreliable = W::FreeSpaceUnreliable {
+        reason: FloorReason::Kubernetes,
+    };
+    assert!(boot_check(
+        SpoolView::DiskAndUse(UseReason::Kubernetes),
+        None,
+        budget,
+        dir,
+        &[unreliable]
+    )
+    .is_none());
+    // A warning of another kind does not hide it.
+    assert!(boot_check(SpoolView::Disk, Some(5 * GIB), budget, dir, &[unreliable]).is_some());
+}
+
+proptest! {
+    /// The boot verdict is Fits exactly when a measured disk holds the budget.
+    #[test]
+    fn the_boot_verdict_is_fits_exactly_when_the_disk_holds_the_budget(
+        free in 0u64..(1000 * GIB), budget in 0u64..(1000 * GIB)
+    ) {
+        let v = boot_space_verdict(SpoolView::Disk, Some(free), budget);
+        prop_assert_eq!(v == BootSpaceVerdict::Fits, free >= budget);
+    }
 }

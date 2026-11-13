@@ -704,8 +704,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self
     }
 
-    /// The engine's spool (tests).
-    #[cfg(test)]
+    /// The engine's spool (the disk monitor reads its directory, budget and use).
     pub(crate) fn spool_dir(&self) -> &crate::deltaglider::spool::SpoolDir {
         &self.spool
     }
