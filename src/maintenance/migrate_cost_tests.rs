@@ -35,6 +35,7 @@ async fn env_with(phase: &str, objects: usize, in_target: bool) -> Env {
     )));
     engine.create_bucket("t").await.unwrap();
     let params = MigrateParams {
+        disk_wait: false,
         target_backend: "dst".into(),
         delete_source: false,
         transient_key: "t".into(),
@@ -274,6 +275,7 @@ async fn the_flip_marks_the_usage_row_for_a_recount() {
     );
     let mut cfg = crate::config::Config::from_yaml_str(&yaml).unwrap();
     let params = MigrateParams {
+        disk_wait: false,
         target_backend: "dst".into(),
         delete_source: false,
         transient_key: "__dgmigrate_b_0".into(),

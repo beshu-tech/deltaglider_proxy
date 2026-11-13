@@ -514,6 +514,7 @@ pub async fn start_migrate(
             return Err(AdminError::invalid(downgrades.join("; ")));
         }
         MigrateParams {
+            disk_wait: false,
             target_backend,
             delete_source: body.delete_source,
             transient_key: pick_transient_key(&bucket_key, &|k| cfg.buckets.contains_key(k)),

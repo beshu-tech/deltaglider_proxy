@@ -113,6 +113,12 @@ pub struct MigrateParams {
     /// Absent in rows written before the option existed → `Empty`.
     #[serde(default)]
     pub target: MigrateTarget,
+    /// The copy waited for disk space while the gate let deletes into the
+    /// source pass (`worker::disk_wait_is_safe`). A client delete of a key
+    /// that was copied already leaves it on the destination, so the verify
+    /// prunes the destination of every key that the source lacks.
+    #[serde(default)]
+    pub disk_wait: bool,
 }
 
 /// Pages the stage phase lists to count the destination (the count in the
@@ -1187,7 +1193,7 @@ impl MigrateRun<'_> {
         .await;
         super::live::clear(self.job);
         verified?;
-        if self.params.target == MigrateTarget::Mirror {
+        if self.params.target == MigrateTarget::Mirror || self.params.disk_wait {
             self.prune_destination_extras().await?;
         }
         self.checkpoint("flip", c, None).await
@@ -2125,6 +2131,7 @@ storage:
     #[test]
     fn params_round_trip() {
         let p = MigrateParams {
+            disk_wait: false,
             target_backend: "hz".into(),
             delete_source: true,
             transient_key: "__dgmigrate_b_0".into(),
@@ -2178,6 +2185,7 @@ storage:
     #[test]
     fn provenance_is_job_unique() {
         let p = MigrateParams {
+            disk_wait: false,
             target_backend: "hz".into(),
             delete_source: false,
             transient_key: "t".into(),

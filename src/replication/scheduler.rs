@@ -152,7 +152,7 @@ async fn run_due_rules(
 
         if let Some(why) = state
             .maintenance_gate
-            .store_blocked(&rule.destination.bucket)
+            .run_blocked(&rule.destination.bucket, rule.replicate_deletes)
         {
             // Shown on the rule's Jobs row; one WARN per change.
             super::deferral::destination_blocked(&rule.name, &why);
@@ -438,5 +438,62 @@ storage:
             .filter(|r| r.contains(" /dst"))
             .collect();
         assert!(to_dst.is_empty(), "requests to a gated backend: {to_dst:?}");
+    }
+
+    /// One scheduler pass over a rule whose destination disk is full (level
+    /// critical): the requests that it sent to `dst`.
+    async fn requests_to_a_full_dst(replicate_deletes: bool) -> Vec<String> {
+        let (s3, fake) = crate::storage::fake_s3_backend().await;
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        for b in ["src", "dst"] {
+            engine.create_bucket(b).await.unwrap();
+        }
+        engine
+            .store("src", "a/new.txt", b"data", None, Default::default())
+            .await
+            .unwrap();
+        engine
+            .store("dst", "b/stale.txt", b"old", None, Default::default())
+            .await
+            .unwrap();
+        let state = AppState::for_tests(engine);
+        state
+            .maintenance_gate
+            .set_disk_refusal_probe(Arc::new(|b: &str| {
+                (b == "dst").then(|| "the disk of 'dst' is full".to_string())
+            }));
+        let mut cfg = Config::default();
+        cfg.replication.enabled = true;
+        cfg.replication.rules = vec![serde_yaml::from_str(&format!(
+            "name: r\nenabled: true\nreplicate_deletes: {replicate_deletes}\n\
+             source: {{bucket: src}}\ndestination: {{bucket: dst}}\n"
+        ))
+        .unwrap()];
+        let replication = cfg.replication.clone();
+        let config: SharedConfig = Arc::new(tokio::sync::RwLock::new(cfg));
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("pw").unwrap()));
+        let lease = DynCoordinationLease::from_arc(Arc::new(FreeLease));
+        fake.clear();
+        run_due_rules(&replication, &config, &db, &state, "i", &lease).await;
+        fake.requests()
+            .into_iter()
+            .filter(|r| r.contains(" /dst"))
+            .collect()
+    }
+
+    /// At level critical on the destination disk the scheduler does not start
+    /// a rule that only copies (no request goes to `dst`), and starts a rule
+    /// that replicates deletes: its deletes free space.
+    #[tokio::test]
+    async fn the_scheduler_runs_a_deleting_rule_at_a_full_disk_and_defers_a_copying_one() {
+        let copy_only = requests_to_a_full_dst(false).await;
+        assert!(copy_only.is_empty(), "a copy-only rule ran: {copy_only:?}");
+        let deleting = requests_to_a_full_dst(true).await;
+        assert!(
+            deleting.iter().any(|r| r.starts_with("DELETE")),
+            "a rule that replicates deletes must delete at a full disk: {deleting:?}"
+        );
     }
 }

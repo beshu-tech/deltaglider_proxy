@@ -478,6 +478,7 @@ pub async fn run_rule_gated(
         ),
         max_failures_retained,
         dest_bucket: rule.destination.bucket.clone(),
+        replicate_deletes: rule.replicate_deletes,
         maintenance_gate,
         health: health.map(|gate| (gate, engine.clone(), rule.clone())),
     };
@@ -741,6 +742,9 @@ struct PerObjectResult {
     // This node refuses writes to the destination (the encryption witness):
     // the driver stops the run as deferred, cursor kept.
     gated: bool,
+    // Of `gated`: the refusal is a full destination disk (level critical).
+    // Only this copy waits; the walk goes on and its deletes still run.
+    disk_full: bool,
     // Error text for the driver to persist (failure ring + poison ledger).
     // In-flight futures are DB-FREE by contract — the driver owns all DB
     // effects (see the walk-driver notes on the fair-mutex deadlock).
@@ -1097,6 +1101,9 @@ struct RunControl {
     /// rewriting the dest MID-RUN, defer (stop, cursor preserved) instead of
     /// writing into a bucket being migrated/re-encrypted (finding #12).
     dest_bucket: String,
+    /// Does the rule delete on the destination? Then a full destination disk
+    /// does not defer the run: its deletes free space ([`MaintenanceGate::run_blocked`]).
+    replicate_deletes: bool,
     maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
     /// The backend health gate, with the engine and rule it judges: a
     /// gated source or destination backend defers the run like the
@@ -1139,7 +1146,7 @@ impl RunControl {
         let maint_busy = match self
             .maintenance_gate
             .as_ref()
-            .and_then(|g| g.store_blocked(&self.dest_bucket))
+            .and_then(|g| g.run_blocked(&self.dest_bucket, self.replicate_deletes))
         {
             Some(why) => {
                 info!("replication rule '{}' defers: {why}", self.rule_name);
@@ -2310,6 +2317,97 @@ mod request_count_tests {
         assert_eq!(outcome.status, DEFERRED_STOP_STATUS, "{outcome:?}");
         assert_eq!(outcome.totals.errors, 0, "{outcome:?}");
         assert_eq!(outcome.totals.objects_copied, 0, "{outcome:?}");
+    }
+
+    /// A gate whose disk probe says that the disk of `dst` is full (level
+    /// critical): what the monitor installs at level critical.
+    fn full_dst_gate() -> Arc<crate::maintenance::gate::MaintenanceGate> {
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        gate.set_disk_refusal_probe(Arc::new(|b: &str| {
+            (b == "dst").then(|| "the disk of 'dst' is full".to_string())
+        }));
+        gate
+    }
+
+    async fn run_with_gate(
+        db: &Arc<Mutex<JobsDb>>,
+        engine: &Arc<DynEngine>,
+        rule: &ReplicationRule,
+        gate: &Arc<crate::maintenance::gate::MaintenanceGate>,
+    ) -> RunOutcome {
+        run_rule(
+            db.clone(),
+            engine,
+            rule,
+            10,
+            None,
+            0,
+            "scheduler",
+            None,
+            RunConcurrency::default(),
+            Some(gate.clone()),
+            DynCoordinationLease::from_arc(Arc::new(FreeLease)),
+        )
+        .await
+        .unwrap()
+        .1
+    }
+
+    /// Mirror deletes work at level critical. A rule that replicates deletes
+    /// is NOT deferred as a whole for a full destination disk: its walk goes
+    /// on, the copy that needs space waits as one item (the run ends
+    /// `deferred`, the cursor stays before it), and the stale key of a clean
+    /// directory is deleted. The next run, with space, copies the item.
+    #[tokio::test]
+    async fn at_a_full_destination_disk_the_walk_still_deletes_and_defers_the_copy() {
+        let (engine, _dir) = witnessed_engine().await;
+        engine
+            .store("src", "a/new.txt", b"new", None, Default::default())
+            .await
+            .unwrap();
+        engine
+            .store("dst", "b/stale.txt", b"old", None, Default::default())
+            .await
+            .unwrap();
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
+        let gate = full_dst_gate();
+        let outcome = run_with_gate(&db, &engine, &rule(true), &gate).await;
+        assert_eq!(outcome.status, DEFERRED_STOP_STATUS, "{outcome:?}");
+        assert_eq!(outcome.totals.objects_copied, 0, "the copy waited");
+        assert_eq!(
+            outcome.totals.objects_deleted, 1,
+            "the delete ran: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.totals.errors, 0,
+            "a deferral is no failure: {outcome:?}"
+        );
+        assert!(engine.head("dst", "b/stale.txt").await.is_err(), "deleted");
+        assert!(engine.head("dst", "a/new.txt").await.is_err(), "not copied");
+        assert_eq!(gate.inflight_writes("dst"), 0);
+        // Space again: the item is done.
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let outcome = run_with_gate(&db, &engine, &rule(true), &gate).await;
+        assert_eq!(outcome.totals.objects_copied, 1, "{outcome:?}");
+        assert!(engine.head("dst", "a/new.txt").await.is_ok());
+    }
+
+    /// A rule that only copies has nothing to do at a full destination disk:
+    /// its run is deferred before any request, like for a busy bucket.
+    #[tokio::test]
+    async fn at_a_full_destination_disk_a_rule_without_deletes_defers_the_run() {
+        let (engine, _dir) = witnessed_engine().await;
+        engine
+            .store("src", "a/new.txt", b"new", None, Default::default())
+            .await
+            .unwrap();
+        let db = Arc::new(Mutex::new(JobsDb::in_memory("t").unwrap()));
+        let gate = full_dst_gate();
+        let outcome = run_with_gate(&db, &engine, &rule(false), &gate).await;
+        assert_eq!(outcome.status, DEFERRED_STOP_STATUS, "{outcome:?}");
+        assert_eq!(outcome.totals.objects_copied, 0);
+        assert_eq!(outcome.totals.errors, 0, "{outcome:?}");
+        assert!(engine.head("dst", "a/new.txt").await.is_err());
     }
 
     fn count(fake: &FakeS3, pred: impl Fn(&str) -> bool) -> usize {

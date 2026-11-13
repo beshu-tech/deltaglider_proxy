@@ -2845,6 +2845,96 @@ mod tests {
         }
     }
 
+    /// Every bucket's disk is at level critical (the disk probe of the
+    /// maintenance gate refuses a store anywhere).
+    fn full_disk_gate() -> Arc<crate::maintenance::gate::MaintenanceGate> {
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        gate.set_disk_refusal_probe(Arc::new(|b: &str| {
+            Some(format!("the disk of '{b}' is full"))
+        }));
+        gate
+    }
+
+    /// Lifecycle expiry works at level critical: a delete frees space, so the
+    /// run is neither deferred nor refused.
+    #[tokio::test]
+    async fn an_expiry_run_deletes_at_a_full_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        store_all(&engine, &["x/1.bin", "x/2.bin"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rule = LifecycleRule {
+            expire_after: Some("1ms".into()),
+            ..rule()
+        };
+        let db = jobs_db();
+        db.lock()
+            .await
+            .lifecycle_ensure_state(&rule.name, 0)
+            .unwrap();
+        let gate = full_disk_gate();
+        let out = super::run_rule(
+            Some(db),
+            &engine,
+            &rule,
+            10,
+            "scheduler",
+            3600,
+            None,
+            Some(gate.clone()),
+        )
+        .await
+        .unwrap();
+        assert_ne!(out.status, "deferred", "{out:?}");
+        assert_eq!(out.errors, 0, "{out:?}");
+        for key in ["x/1.bin", "x/2.bin"] {
+            assert!(engine.head("b", key).await.is_err(), "{key} expired");
+        }
+        assert_eq!(gate.inflight_writes("b"), 0);
+    }
+
+    /// A transition STORES into its destination: at level critical its run is
+    /// deferred, nothing is copied and the source stays; the same rule with
+    /// space moves its objects.
+    #[tokio::test]
+    async fn a_transition_run_waits_at_a_full_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        store_all(&engine, &["x/1.bin", "x/2.bin"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let rule = transition_rule("move", true);
+        let db = jobs_db();
+        db.lock()
+            .await
+            .lifecycle_ensure_state(&rule.name, 0)
+            .unwrap();
+        let run = |gate: Arc<crate::maintenance::gate::MaintenanceGate>| {
+            super::run_rule(
+                Some(db.clone()),
+                &engine,
+                &rule,
+                10,
+                "scheduler",
+                3600,
+                None,
+                Some(gate),
+            )
+        };
+        let out = run(full_disk_gate()).await.unwrap();
+        assert_eq!(out.status, "deferred", "{out:?}");
+        assert_eq!((out.objects_copied, out.objects_moved), (0, 0), "{out:?}");
+        assert!(engine.head("dst", "cold/x/1.bin").await.is_err());
+        assert!(
+            engine.head("b", "x/1.bin").await.is_ok(),
+            "the source stays"
+        );
+        let out = run(Arc::new(crate::maintenance::gate::MaintenanceGate::new()))
+            .await
+            .unwrap();
+        assert_eq!(out.objects_moved, 2, "{out:?}");
+        assert!(engine.head("dst", "cold/x/1.bin").await.is_ok());
+    }
+
     /// A move-mode run that a mid-page deferral stopped keeps the page's
     /// source deletes back while its copies stand. The next run meets the
     /// same objects: the destination already holds them, so it makes no

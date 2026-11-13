@@ -345,12 +345,17 @@ impl<'a> WalkDriver<'a> {
                     &[&s.ctrl.dest_bucket],
                 ) {
                     Err(refusal) => {
+                        // A full disk refuses THIS copy only (`disk_full`):
+                        // the walk goes on, so the deletes that free space
+                        // still run. Any other refusal stops the run.
+                        let disk_full = refusal.is_disk();
                         self.inflight.push(Box::pin(async move {
                             DriverDone::Copy {
                                 item_id,
                                 rel_key,
                                 res: Box::new(PerObjectResult {
                                     gated: true,
+                                    disk_full,
                                     error_message: Some(refusal.into_reason()),
                                     ..Default::default()
                                 }),
@@ -502,7 +507,14 @@ impl<'a> WalkDriver<'a> {
                             r.error_message.as_deref().unwrap_or_default()
                         );
                         flags.stopped_deferred = true;
-                        machine.drain(walk::DrainReason::Paused);
+                        // The disk: only this copy waits, and the walk goes
+                        // on with what frees space. Else the run stops.
+                        if !r.disk_full {
+                            machine.drain(walk::DrainReason::Paused);
+                        }
+                    }
+                    if r.disk_full {
+                        machine.on_event(walk::Event::CopyDeferred { item_id });
                     }
                     return;
                 }

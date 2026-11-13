@@ -80,6 +80,24 @@ pub struct MaintenanceGate {
     /// level critical). A write that frees space never asks it
     /// ([`WriteKind::FreesSpace`]). Set once at boot.
     disk_refusal: std::sync::OnceLock<ProbeCell>,
+    /// The job that arms each busy key (same keys as `busy`).
+    busy_job: ArcSwap<HashMap<String, i64>>,
+    /// Jobs that wait for DISK space, with the unix second at which the wait
+    /// ends: while a job waits, a delete into its bucket is not refused (the
+    /// only way to free space on that disk besides a cancel). Memory only: a
+    /// restart arms everything again. The worker sets it
+    /// ([`MaintenanceGate::mark_disk_deferred`]) and clears it before the job
+    /// runs again ([`MaintenanceGate::clear_disk_deferred`]).
+    disk_deferred: DashMap<i64, i64>,
+}
+
+/// Pure: the run-level verdict of one refusal ([`MaintenanceGate::run_blocked`]).
+pub fn run_verdict(refusal: Option<WriteRefusal>, replicate_deletes: bool) -> Option<String> {
+    match refusal {
+        None => None,
+        Some(WriteRefusal::Disk(_)) if replicate_deletes => None,
+        Some(other) => Some(other.into_reason()),
+    }
 }
 
 /// What a background write does to the disk of its bucket. The disk
@@ -113,6 +131,8 @@ impl Default for MaintenanceGate {
             inflight_background: DashMap::new(),
             write_refusal: std::sync::OnceLock::new(),
             disk_refusal: std::sync::OnceLock::new(),
+            busy_job: ArcSwap::from_pointee(HashMap::new()),
+            disk_deferred: DashMap::new(),
         }
     }
 }
@@ -125,6 +145,28 @@ pub(crate) fn busy_set(arms: &[GateArm], unwinding: &HashSet<i64>) -> HashMap<St
         .filter(|a| !(a.migrate_source && unwinding.contains(&a.job_id)))
         .map(|a| (a.key.to_ascii_lowercase(), a.kind.clone()))
         .collect()
+}
+
+/// Pure: the job that arms each key of [`busy_set`].
+pub(crate) fn busy_jobs(arms: &[GateArm], unwinding: &HashSet<i64>) -> HashMap<String, i64> {
+    arms.iter()
+        .filter(|a| !(a.migrate_source && unwinding.contains(&a.job_id)))
+        .map(|a| (a.key.to_ascii_lowercase(), a.job_id))
+        .collect()
+}
+
+/// Pure: is this request one that frees space (a delete)? `DeleteObject`,
+/// `DeleteBucket` and `AbortMultipartUpload` are `DELETE`; `DeleteObjects` is
+/// `POST ?delete`. The rest of a write method stores bytes.
+pub fn request_frees_space(method: &Method, query: Option<&str>) -> bool {
+    match *method {
+        Method::DELETE => true,
+        Method::POST => query
+            .unwrap_or("")
+            .split('&')
+            .any(|kv| kv == "delete" || kv.starts_with("delete=")),
+        _ => false,
+    }
 }
 
 /// Pure: the words for a job kind in the gate's 503 text.
@@ -190,22 +232,32 @@ impl MaintenanceGate {
         self.refusal_of(bucket, kind).map(WriteRefusal::into_reason)
     }
 
+    /// Why a replication RUN into `bucket` must not start (or must stop) as
+    /// deferred, or `None`. A maintenance job or the encryption witness
+    /// defers the whole run. A full disk (level critical) defers it only when
+    /// the rule has nothing but copies to do: a rule that replicates deletes
+    /// still has work that frees space, so its run goes on, and each COPY
+    /// is refused on its own ([`admit_stores`], the walk's
+    /// `Event::CopyDeferred`).
+    pub fn run_blocked(&self, bucket: &str, replicate_deletes: bool) -> Option<String> {
+        run_verdict(self.refusal_of(bucket, WriteKind::Store), replicate_deletes)
+    }
+
     /// [`Self::blocked`], with the cause kept apart.
     fn refusal_of(&self, bucket: &str, kind: WriteKind) -> Option<WriteRefusal> {
-        if let Some(job) = self.busy_kind(bucket) {
+        if let Some(job) = self.busy_kind_for(bucket, kind) {
             return Some(WriteRefusal::Maintenance(format!(
                 "bucket '{bucket}' has an active maintenance job ({job})"
             )));
         }
-        let ask = |cell: &std::sync::OnceLock<ProbeCell>| {
-            cell.get()
-                .and_then(|probe| (probe.0)(bucket))
-                .map(WriteRefusal::Refused)
-        };
-        ask(&self.write_refusal).or_else(|| match kind {
-            WriteKind::Store => ask(&self.disk_refusal),
-            WriteKind::FreesSpace => None,
-        })
+        let ask =
+            |cell: &std::sync::OnceLock<ProbeCell>| cell.get().and_then(|probe| (probe.0)(bucket));
+        ask(&self.write_refusal)
+            .map(WriteRefusal::Refused)
+            .or_else(|| match kind {
+                WriteKind::Store => ask(&self.disk_refusal).map(WriteRefusal::Disk),
+                WriteKind::FreesSpace => None,
+            })
     }
 
     /// THE admission of one background write that STORES bytes (a
@@ -221,6 +273,17 @@ impl MaintenanceGate {
         bucket: &str,
     ) -> Result<Admitted, WriteRefusal> {
         admit_stores(Some(self), &[bucket])
+    }
+
+    /// [`Self::admit_background_write`] for an action of a known kind: the
+    /// event consumer asks it per action, so a delete (it frees space) is
+    /// never refused for a full disk.
+    pub fn admit_background(
+        self: &Arc<Self>,
+        bucket: &str,
+        kind: WriteKind,
+    ) -> Result<Admitted, WriteRefusal> {
+        admit_buckets(Some(self), &[(bucket, kind)])
     }
 
     /// The kind of the job that gates this bucket, if one does.
@@ -244,6 +307,43 @@ impl MaintenanceGate {
         // A settled job leaves no unwind release behind.
         unwinding.retain(|id| arms.iter().any(|a| a.job_id == *id));
         self.busy.store(Arc::new(busy_set(&arms, &unwinding)));
+        self.busy_job.store(Arc::new(busy_jobs(&arms, &unwinding)));
+    }
+
+    /// The job `job_id` waits for disk space until `until` (unix seconds):
+    /// deletes into its bucket pass meanwhile. See `disk_deferred`.
+    pub fn mark_disk_deferred(&self, job_id: i64, until: i64) {
+        self.disk_deferred.insert(job_id, until);
+    }
+
+    /// The job runs again (or is gone): the gate is whole.
+    pub fn clear_disk_deferred(&self, job_id: i64) {
+        self.disk_deferred.remove(&job_id);
+    }
+
+    /// Does the job wait for disk space now?
+    pub fn is_disk_deferred(&self, job_id: i64) -> bool {
+        self.disk_deferred
+            .get(&job_id)
+            .is_some_and(|until| *until > crate::maintenance::store::current_unix_seconds())
+    }
+
+    /// [`Self::busy_kind`] for a write of `kind`: a job that waits for disk
+    /// space does not hold back a write that frees space.
+    pub fn busy_kind_for(&self, bucket: &str, kind: WriteKind) -> Option<String> {
+        let key = bucket.to_ascii_lowercase();
+        let busy = self.busy.load().get(&key).cloned()?;
+        if kind == WriteKind::FreesSpace {
+            let waiting = self
+                .busy_job
+                .load()
+                .get(&key)
+                .is_some_and(|id| self.is_disk_deferred(*id));
+            if waiting {
+                return None;
+            }
+        }
+        Some(busy)
     }
 
     /// A migrate that stops before its flip (cancel or failure) makes the
@@ -448,23 +548,32 @@ pub enum WriteRefusal {
     /// This node refuses writes to the bucket (the encryption witness): it
     /// may last.
     Refused(String),
+    /// The disk of the bucket's filesystem backend is at level critical: a
+    /// copy waits, a delete does not (it frees space), so the writer defers
+    /// the ITEM and goes on with what frees space.
+    Disk(String),
 }
 
 impl WriteRefusal {
     pub fn reason(&self) -> &str {
         match self {
-            WriteRefusal::Maintenance(r) | WriteRefusal::Refused(r) => r,
+            WriteRefusal::Maintenance(r) | WriteRefusal::Refused(r) | WriteRefusal::Disk(r) => r,
         }
     }
 
     pub fn into_reason(self) -> String {
         match self {
-            WriteRefusal::Maintenance(r) | WriteRefusal::Refused(r) => r,
+            WriteRefusal::Maintenance(r) | WriteRefusal::Refused(r) | WriteRefusal::Disk(r) => r,
         }
     }
 
     pub fn is_maintenance(&self) -> bool {
         matches!(self, WriteRefusal::Maintenance(_))
+    }
+
+    /// A full disk and nothing else: the refusal of a copy only.
+    pub fn is_disk(&self) -> bool {
+        matches!(self, WriteRefusal::Disk(_))
     }
 }
 
@@ -590,12 +699,29 @@ pub fn write_gate_refusal(
     method: &Method,
     path: &str,
 ) -> Option<crate::api::errors::S3Error> {
+    write_gate_refusal_q(gate, method, path, None)
+}
+
+/// [`write_gate_refusal`] with the query, which tells `DeleteObjects` (`POST
+/// ?delete`) from a write: a delete into a bucket whose job waits for disk
+/// space is not refused ([`MaintenanceGate::busy_kind_for`]).
+pub fn write_gate_refusal_q(
+    gate: &MaintenanceGate,
+    method: &Method,
+    path: &str,
+    query: Option<&str>,
+) -> Option<crate::api::errors::S3Error> {
     if !is_write_method(method) {
         return None;
     }
     let bucket = bucket_from_path(path)?;
-    gate.busy_kind(&bucket)
-        .map(|kind| crate::api::errors::S3Error::SlowDown(refusal_message(&bucket, &kind)))
+    let kind = if request_frees_space(method, query) {
+        WriteKind::FreesSpace
+    } else {
+        WriteKind::Store
+    };
+    gate.busy_kind_for(&bucket, kind)
+        .map(|job| crate::api::errors::S3Error::SlowDown(refusal_message(&bucket, &job)))
 }
 
 /// The request gates whose refusal reveals internal state (a busy bucket,
@@ -608,6 +734,17 @@ pub fn check_verified_request(
     extensions: &axum::http::Extensions,
     method: &Method,
     path: &str,
+) -> Result<(), crate::api::errors::S3Error> {
+    check_verified_request_q(extensions, method, path, None)
+}
+
+/// [`check_verified_request`] with the query of the request (see
+/// [`write_gate_refusal_q`]). A caller that has none gets the strict answer.
+pub fn check_verified_request_q(
+    extensions: &axum::http::Extensions,
+    method: &Method,
+    path: &str,
+    query: Option<&str>,
 ) -> Result<(), crate::api::errors::S3Error> {
     // Count FIRST, then ask the gates (acquire-then-recheck, H37): a job
     // that arms later either sees this count or refuses the request.
@@ -635,7 +772,7 @@ pub fn check_verified_request(
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         }
     }
-    let verdict = verified_request_refusal(extensions, method, path);
+    let verdict = verified_request_refusal(extensions, method, path, query);
     if verdict.is_err() {
         if let Some(count) = count {
             count.release();
@@ -648,6 +785,7 @@ fn verified_request_refusal(
     extensions: &axum::http::Extensions,
     method: &Method,
     path: &str,
+    query: Option<&str>,
 ) -> Result<(), crate::api::errors::S3Error> {
     if let Some(gate) = extensions.get::<crate::coordination::health::BackendHealthGate>() {
         if let Some(refusal) = crate::coordination::health::reserved_bucket_refusal(gate, path) {
@@ -655,7 +793,7 @@ fn verified_request_refusal(
         }
     }
     if let Some(gate) = extensions.get::<Arc<MaintenanceGate>>() {
-        if let Some(refusal) = write_gate_refusal(gate, method, path) {
+        if let Some(refusal) = write_gate_refusal_q(gate, method, path, query) {
             return Err(refusal);
         }
     }
@@ -762,6 +900,126 @@ impl BackendCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The run-level verdict: a full disk defers a run that only copies, and
+    /// never a run that also deletes; every other refusal defers either.
+    #[test]
+    fn a_full_disk_defers_only_a_run_that_has_nothing_to_delete() {
+        let disk = || Some(WriteRefusal::Disk("full".into()));
+        let witness = || Some(WriteRefusal::Refused("witness".into()));
+        let job = || Some(WriteRefusal::Maintenance("job".into()));
+        assert_eq!(run_verdict(None, false), None);
+        assert_eq!(run_verdict(None, true), None);
+        assert_eq!(run_verdict(disk(), false).as_deref(), Some("full"));
+        assert_eq!(run_verdict(disk(), true), None, "its deletes free space");
+        for deletes in [false, true] {
+            assert_eq!(run_verdict(witness(), deletes).as_deref(), Some("witness"));
+            assert_eq!(run_verdict(job(), deletes).as_deref(), Some("job"));
+        }
+        // Through the gate.
+        let g = MaintenanceGate::new();
+        g.set_disk_refusal_probe(Arc::new(|b: &str| (b == "full").then(|| "full".into())));
+        assert_eq!(g.run_blocked("full", false).as_deref(), Some("full"));
+        assert_eq!(g.run_blocked("full", true), None);
+        assert_eq!(g.run_blocked("roomy", false), None);
+        // The refusal of a copy is a disk refusal, apart from the others.
+        assert!(matches!(
+            admit_stores(Some(&Arc::new(g)), &["full"]),
+            Err(r) if r.is_disk()
+        ));
+    }
+
+    fn arm(job_id: i64, key: &str, kind: &str) -> GateArm {
+        GateArm {
+            job_id,
+            key: key.into(),
+            kind: kind.into(),
+            migrate_source: false,
+        }
+    }
+
+    fn gate_with(arms: &[GateArm]) -> MaintenanceGate {
+        let g = MaintenanceGate::new();
+        g.busy.store(Arc::new(busy_set(arms, &HashSet::new())));
+        g.busy_job.store(Arc::new(busy_jobs(arms, &HashSet::new())));
+        g
+    }
+
+    /// Which requests a job that waits for DISK space lets through: the
+    /// ones that free space (`DELETE`, `POST ?delete`), and only while the
+    /// wait lasts and only into the bucket of that job. A write, a part, a
+    /// `CompleteMultipartUpload` (a `POST` without `?delete`) stay refused.
+    #[test]
+    fn a_job_that_waits_for_disk_lets_deletes_pass_and_nothing_else() {
+        let now = crate::maintenance::store::current_unix_seconds();
+        let g = gate_with(&[arm(7, "b", "reencrypt"), arm(8, "other", "migrate")]);
+        let refused = |m: &Method, path: &str, q: Option<&str>| {
+            write_gate_refusal_q(&g, m, path, q).is_some()
+        };
+        let all = |expect_delete_refused: bool, label: &str| {
+            assert_eq!(
+                refused(&Method::DELETE, "/b/k", None),
+                expect_delete_refused,
+                "{label}: DeleteObject"
+            );
+            assert_eq!(
+                refused(&Method::POST, "/b", Some("delete")),
+                expect_delete_refused,
+                "{label}: DeleteObjects"
+            );
+            assert!(refused(&Method::PUT, "/b/k", None), "{label}: PutObject");
+            assert!(
+                refused(&Method::PUT, "/b/k", Some("partNumber=1&uploadId=x")),
+                "{label}: UploadPart"
+            );
+            assert!(
+                refused(&Method::POST, "/b/k", Some("uploadId=x")),
+                "{label}: Complete"
+            );
+            assert!(
+                refused(&Method::POST, "/b/k", Some("uploads")),
+                "{label}: Create"
+            );
+            assert!(!refused(&Method::GET, "/b/k", None), "{label}: a read");
+        };
+        // Not waiting: everything is refused.
+        all(true, "armed");
+        // Waiting for disk: deletes into `b` pass, nothing else does.
+        g.mark_disk_deferred(7, now + 60);
+        all(false, "waiting");
+        assert!(g.write_blocked("b").is_none(), "a background delete passes");
+        assert!(g.store_blocked("b").is_some(), "a background copy does not");
+        assert!(
+            refused(&Method::DELETE, "/other/k", None),
+            "another job's bucket is still armed"
+        );
+        // The wait ends (its time passes): the gate is whole again.
+        g.mark_disk_deferred(7, now - 1);
+        all(true, "expired");
+        // The job runs again: cleared.
+        g.mark_disk_deferred(7, now + 60);
+        g.clear_disk_deferred(7);
+        all(true, "cleared");
+    }
+
+    #[test]
+    fn the_frees_space_requests_by_table() {
+        let t = [
+            (Method::DELETE, None, true),
+            (Method::DELETE, Some("uploadId=x"), true),
+            (Method::POST, Some("delete"), true),
+            (Method::POST, Some("delete="), true),
+            (Method::POST, Some("x=1&delete"), true),
+            (Method::POST, Some("deleted"), false),
+            (Method::POST, Some("uploads"), false),
+            (Method::POST, None, false),
+            (Method::PUT, Some("delete"), false),
+            (Method::GET, Some("delete"), false),
+        ];
+        for (m, q, want) in t {
+            assert_eq!(request_frees_space(&m, q), want, "{m} {q:?}");
+        }
+    }
 
     /// Reads and deletes must work at level critical: the disk refusal
     /// stops a write that STORES bytes, and no other.

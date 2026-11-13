@@ -78,6 +78,17 @@ pub enum KeyAction {
     Noop,
 }
 
+/// What an action does to the disk of the destination: a copy stores bytes, a
+/// delete frees space (and a no-op writes nothing). The disk gate refuses the
+/// first kind only: a full destination must still delete.
+pub fn action_write_kind(action: KeyAction) -> crate::maintenance::gate::WriteKind {
+    use crate::maintenance::gate::WriteKind;
+    match action {
+        KeyAction::Copy => WriteKind::Store,
+        KeyAction::Delete | KeyAction::Noop => WriteKind::FreesSpace,
+    }
+}
+
 /// The source-side liveness a known event kind produces. `Copy` ⇒ object ends
 /// up PRESENT, `Delete` ⇒ ABSENT. `None` ⇒ the kind carries no liveness signal
 /// (not an object-state transition).
@@ -1190,22 +1201,23 @@ async fn drain_rule_rows(
         // Admitted = counted as an in-flight write of the destination until
         // the copy ends (F9), so a job's drain waits for it. A delete is
         // admitted again by its batch (`mirror_delete`).
-        let write = match gate.admit_background_write(&w.rule.destination.bucket) {
-            Ok(write) => write,
-            Err(refusal) => {
-                if refusal.is_maintenance() {
-                    debug!(
-                        "event consumer: rule '{}' deferred — {}",
-                        w.rule.name,
-                        refusal.reason()
-                    );
-                    hold(failed_ids, w);
-                } else {
-                    refused.get_or_insert(refusal.into_reason());
+        let write =
+            match gate.admit_background(&w.rule.destination.bucket, action_write_kind(w.action)) {
+                Ok(write) => write,
+                Err(refusal) => {
+                    if refusal.is_maintenance() {
+                        debug!(
+                            "event consumer: rule '{}' deferred — {}",
+                            w.rule.name,
+                            refusal.reason()
+                        );
+                        hold(failed_ids, w);
+                    } else {
+                        refused.get_or_insert(refusal.into_reason());
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
         super::deferral::writes_again(&w.rule.name);
         match claim_key(
             config,
@@ -3170,6 +3182,63 @@ storage:
         );
         assert_eq!(f.cursor().await, 0, "the event is held for a retry");
         f.fake.release_stalls();
+    }
+
+    /// Mirror deletes work at level critical: an event DELETE is admitted as
+    /// a write that frees space and goes through, while an event COPY of the
+    /// same drain is refused for the full disk (its events are skipped, the
+    /// rule is made due for a catch-up walk) and nothing fails.
+    #[tokio::test]
+    async fn at_a_full_destination_disk_an_event_delete_goes_on_and_an_event_copy_waits() {
+        let mut f = fixture(true).await;
+        f.put("k.bin").await;
+        f.drain(None).await;
+        assert!(f.engine.head("dst", "k.bin").await.is_ok(), "mirrored");
+        f.engine
+            .delete_batch(
+                "src",
+                vec![crate::deltaglider::DeleteItem::new("k.bin")],
+                Default::default(),
+            )
+            .await;
+        f.event(EventKind::ObjectDeleted, "k.bin").await;
+        f.put("n.bin").await;
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
+        gate.set_disk_refusal_probe(Arc::new(|b: &str| {
+            (b == "dst").then(|| "the disk of 'dst' is full".to_string())
+        }));
+        f.drain_gated(None, &gate).await;
+        assert!(
+            f.engine.head("dst", "k.bin").await.is_err(),
+            "the mirror delete ran"
+        );
+        assert!(
+            f.engine.head("dst", "n.bin").await.is_err(),
+            "the copy waited for space"
+        );
+        let failures =
+            f.db.lock()
+                .await
+                .replication_recent_failures("r", 10)
+                .unwrap();
+        assert!(
+            failures.is_empty(),
+            "a deferral is no failure: {failures:?}"
+        );
+        assert_eq!(gate.inflight_writes("dst"), 0);
+    }
+
+    /// The decision "this action stores bytes or frees space", by table.
+    #[test]
+    fn an_action_stores_only_when_it_copies() {
+        use crate::maintenance::gate::WriteKind::{FreesSpace, Store};
+        for (action, want) in [
+            (KeyAction::Copy, Store),
+            (KeyAction::Delete, FreesSpace),
+            (KeyAction::Noop, FreesSpace),
+        ] {
+            assert_eq!(action_write_kind(action), want, "{action:?}");
+        }
     }
 
     /// Owner decision (F9): a write that the gate refuses once it is

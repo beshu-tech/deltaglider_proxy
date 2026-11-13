@@ -213,39 +213,25 @@ mod tests {
         let _ = SPOOL_BUDGET_ROLE;
     }
 
-    /// Source guards of the wiring: the boot installs the probes through
-    /// [`install`] (not by hand), and the writers that free space or store
-    /// nothing never ask the store gate.
+    /// Source guard of the wiring: the boot installs the probes through
+    /// [`install`] (not by hand), and the copy of a replication run asks the
+    /// STORE admission. That a delete never asks the disk is proved by
+    /// behavior, not by text: the delete job (`admin_config_test`), the mirror
+    /// delete of a walk and of an event drain, the lifecycle expiry and the
+    /// probes above each run a delete at level critical.
     #[test]
-    fn the_boot_installs_the_probes_and_the_delete_paths_never_ask_the_store_gate() {
+    fn the_boot_installs_the_probes_through_one_function() {
         let main = crate::source_scan::read("src/main.rs");
         assert!(main.contains("maintenance::probes::install("));
         assert!(!main.contains("set_write_refusal_probe("));
         assert!(!main.contains("set_disk_refusal_probe("));
-        for file in [
-            "src/maintenance/delete.rs",
-            "src/replication/mirror_delete.rs",
-        ] {
-            let text = crate::source_scan::prod_text(&crate::source_scan::read(file));
-            for forbidden in ["store_blocked(", "admit_stores(", "WriteKind::Store"] {
-                assert!(
-                    !text.contains(forbidden),
-                    "{file} frees space and must not ask `{forbidden}`"
-                );
-            }
-        }
-        // The storing paths do ask it.
-        for (file, needle) in [
-            ("src/replication/worker/driver.rs", "admit_stores("),
-            ("src/replication/worker.rs", "store_blocked("),
-            ("src/replication/scheduler.rs", "store_blocked("),
-            ("src/api/admin/replication.rs", "store_blocked("),
-        ] {
-            assert!(
-                crate::source_scan::prod_text(&crate::source_scan::read(file)).contains(needle),
-                "{file} stores bytes and must ask `{needle}`"
-            );
-        }
+        assert!(
+            crate::source_scan::prod_text(&crate::source_scan::read(
+                "src/replication/worker/driver.rs"
+            ))
+            .contains("admit_stores("),
+            "a replication copy stores bytes and asks the store admission"
+        );
     }
 
     /// The lifecycle windows: the copies of a transition store, the delete

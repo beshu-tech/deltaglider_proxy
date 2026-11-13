@@ -67,7 +67,7 @@ pub async fn run_now(
     if let Some(why) = state
         .s3_state
         .maintenance_gate
-        .store_blocked(&rule.destination.bucket)
+        .run_blocked(&rule.destination.bucket, rule.replicate_deletes)
     {
         return Err(AdminError::conflict(format!(
             "the rule cannot write into its destination now: {why}. Run the rule again \

@@ -1369,3 +1369,171 @@ async fn test_migrate_meets_a_legacy_dg_key_and_stops_before_the_flip() {
     let job = newest_job(&admin, &endpoint).await;
     assert_eq!(job["status"], "succeeded", "job: {job}");
 }
+
+/// A migrate whose copy waits for DISK space does not keep the bucket from
+/// deleting. The source disk can only be freed by deleting, and the job
+/// holds the write gate for its whole life, so a delete of the source that
+/// the gate refused would wait for the job, and the job for the disk.
+///
+/// Correctness, by phase: the stop lands in the COPY (some keys are on the
+/// destination already). The job waits (disk critical), the gate lets
+/// deletes pass and nothing else. A key that was copied and then deleted at
+/// the source must not come back at the destination after the flip: the job
+/// recorded its wait in its params, so its verify prunes the destination of
+/// every key that the source lacks. A write is refused all along.
+#[tokio::test]
+async fn test_a_migrate_that_waits_for_disk_lets_deletes_pass_and_the_flip_keeps_them() {
+    common::expect_server_errors("level critical refuses the write that this test tries");
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migdisk";
+    let mut server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .env("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "20")
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    seed(&http, &endpoint, bucket, 300).await;
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    for _ in 0..1000 {
+        let job = newest_job(&admin, &endpoint).await;
+        if job["phase"] == "copy" && job["progress"]["processed"].as_i64().unwrap_or(0) >= 20 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    server.terminate();
+    let staged: Vec<String> = walkdir_files(&dir_b.path().join(bucket))
+        .into_iter()
+        .filter(|p| p.contains("obj-"))
+        .collect();
+    assert!(
+        staged.len() >= 20 && staged.len() < 300,
+        "mid-copy: {}",
+        staged.len()
+    );
+    assert!(
+        staged.iter().any(|p| p.contains("obj-000.json")),
+        "obj-000 was copied before the stop"
+    );
+
+    // Resume at level critical: the copy is refused, the job waits.
+    server
+        .respawn_with_env(&[
+            (
+                "DGP_BOOTSTRAP_PASSWORD_HASH",
+                common::TEST_BOOTSTRAP_PASSWORD_HASH,
+            ),
+            ("DGP_TEST_DISK_MONITOR_FREE_PERCENT", "3"),
+        ])
+        .await;
+    let endpoint = server.endpoint();
+    let http = server.http();
+    let admin = admin_http_client(&endpoint).await;
+    // The gate opens for a delete once the job records its wait.
+    let mut deleted = false;
+    for _ in 0..600 {
+        let resp = http
+            .delete(format!("{endpoint}/{bucket}/obj-000.json"))
+            .send()
+            .await
+            .unwrap();
+        if resp.status().as_u16() == 204 {
+            deleted = true;
+            break;
+        }
+        assert_eq!(resp.status().as_u16(), 503, "armed until the wait starts");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        deleted,
+        "a delete never passed while the job waited for disk"
+    );
+    // DeleteObjects passes as well.
+    server
+        .s3_client()
+        .await
+        .delete_objects()
+        .bucket(bucket)
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .objects(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key("obj-299.json")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("DeleteObjects passes while the job waits for disk");
+    // A write and a part are still refused; a read works.
+    let w = http
+        .put(format!("{endpoint}/{bucket}/new.json"))
+        .body(b"x".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(w.status().as_u16(), 503, "a write stays refused");
+    assert_eq!(
+        get_bytes(&http, &endpoint, bucket, "obj-001.json").await,
+        [MARKER, b" object 1"].concat()
+    );
+    let gone = http
+        .head(format!("{endpoint}/{bucket}/obj-000.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status().as_u16(), 404);
+
+    // Space again: the job resumes, copies the rest, verifies, prunes the
+    // destination and flips.
+    server
+        .respawn_with_env(&[(
+            "DGP_BOOTSTRAP_PASSWORD_HASH",
+            common::TEST_BOOTSTRAP_PASSWORD_HASH,
+        )])
+        .await;
+    let endpoint = server.endpoint();
+    let http = server.http();
+    let admin2 = admin_http_client(&endpoint).await;
+    let _ = admin;
+    wait_job_done(&admin2, &endpoint, bucket).await;
+    let job = newest_job(&admin2, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(
+        bucket_backend(&admin2, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+    // The bucket is served by the destination now: the keys that clients
+    // deleted during the wait are gone there too, the rest is whole.
+    for key in ["obj-000.json", "obj-299.json"] {
+        let head = http
+            .head(format!("{endpoint}/{bucket}/{key}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            head.status().as_u16(),
+            404,
+            "{key} came back after the flip"
+        );
+    }
+    for (key, n) in [
+        ("obj-001.json", 1),
+        ("obj-150.json", 150),
+        ("obj-298.json", 298),
+    ] {
+        assert_eq!(
+            get_bytes(&http, &endpoint, bucket, key).await,
+            [MARKER, format!(" object {n}").as_bytes()].concat(),
+            "{key}"
+        );
+    }
+}
