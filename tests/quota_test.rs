@@ -570,7 +570,6 @@ async fn a_serial_writer_gets_a_trusted_exact_counter() {
         .env("DGP_USAGE_CACHE_TTL_SECS", "1")
         .build()
         .await;
-    let http = reqwest::Client::new();
     let endpoint = server.endpoint();
     let admin = common::admin_http_client(&endpoint).await;
     let usage_url = format!("{endpoint}/_/api/admin/usage/bucket/{}", server.bucket());
@@ -586,12 +585,18 @@ async fn a_serial_writer_gets_a_trusted_exact_counter() {
         body
     };
 
-    // The first PUT starts the scan; wait for it to end (the scan repeats
-    // inside the same task, so the version moves once).
-    let before = common::get_usage_scan_version(&http, &endpoint).await;
+    // The first PUT starts the scan. The scan publishes its snapshot at
+    // once and, when it ended inside the PUT, repeats after the PUT: wait
+    // (bounded) until the counter is trusted.
     put_sized(&server, "serial-0.dat", 3000).await.expect("PUT");
-    common::wait_for_usage_scan_refresh(&http, &endpoint, before).await;
-    let body = counter().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let body = loop {
+        let body = counter().await;
+        if body["never_scanned"] == false || std::time::Instant::now() > deadline {
+            break body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert_eq!(
         body["never_scanned"], false,
         "the scan of a serial writer was not trusted: {body}"

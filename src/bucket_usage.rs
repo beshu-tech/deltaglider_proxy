@@ -191,9 +191,12 @@ pub struct ScanTicket<'a> {
 /// no longer lists the object, and it is counted too few), with no later
 /// scan to repair it.
 ///
-/// Only that window matters. A write that is still uploading its body has
-/// stored nothing, and a write that has recorded its change is in the
-/// pending delta or the journal; neither blocks a stamp. A write that
+/// Only that window matters. The window is the whole hold of the object
+/// write lock or the deltaspace lock (a copy holds the lock of its
+/// destination while it reads its source). A client write that is still
+/// receiving its body holds no lock and has stored nothing, and a write
+/// that has recorded its change is in the pending delta or the journal;
+/// neither blocks a stamp. A write that
 /// entered and left the window during the scan recorded its change during
 /// the scan, so the journal has it. The count is read in the same critical
 /// section that cuts the journal ([`BucketUsage::cut_scan`]), so a write
@@ -207,6 +210,9 @@ pub(crate) fn scan_is_quiet(journal_is_empty: bool, writes_in_window: u32) -> bo
 /// object is visible to a listing from the write on), and dropped after the
 /// record. The engine holds one inside every object write lock and every
 /// deltaspace lock, which is where every storage write and its record sit.
+/// It spans the whole hold of the lock, so it is wider than the span from
+/// the storage write to the record: a copy holds its destination lock while
+/// it reads its source, and counts for that time too.
 #[must_use = "the window ends when the guard drops"]
 pub struct WriteWindow {
     /// `None`: a bucket the counter skips.
@@ -1011,6 +1017,89 @@ mod tests {
             totals.accumulate(m);
         }
         totals
+    }
+
+    /// Stress: three writers store (S) and record (R) inside a window while
+    /// a scanner lists and asks for a quiet stamp, over and over. After
+    /// every stamp, with the writers parked, the row must equal what was
+    /// stored: a stamp never loses a write and never counts one twice.
+    /// Red when the cut reads the window count in a second step.
+    #[test]
+    fn a_stamp_is_exact_under_concurrent_writers() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
+        const WRITERS: usize = 3;
+        let db = Arc::new(BucketUsage::in_memory().unwrap());
+        // Objects stored so far (what a listing sees).
+        let visible = Arc::new(AtomicU64::new(0));
+        let pause = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let parked = Arc::new(AtomicUsize::new(0));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let (db, visible, pause, stop, parked) = (
+                    db.clone(),
+                    visible.clone(),
+                    pause.clone(),
+                    stop.clone(),
+                    parked.clone(),
+                );
+                std::thread::spawn(move || {
+                    let meta = meta_passthrough(10);
+                    while !stop.load(SeqCst) {
+                        if pause.load(SeqCst) {
+                            parked.fetch_add(1, SeqCst);
+                            while pause.load(SeqCst) && !stop.load(SeqCst) {
+                                std::thread::yield_now();
+                            }
+                            parked.fetch_sub(1, SeqCst);
+                            continue;
+                        }
+                        let window = db.open_write_window("b");
+                        visible.fetch_add(1, SeqCst); // the storage write
+                        db.apply_object("b", &meta, 1); // its record
+                        drop(window);
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let (mut tries, mut stamps, mut wrong) = (0u32, 0u32, 0u32);
+        while start.elapsed() < std::time::Duration::from_secs(2) && wrong == 0 {
+            tries += 1;
+            let ticket = db.begin_scan("b");
+            let listed = visible.load(SeqCst);
+            let totals = SavingsTotals {
+                original_bytes: 10 * listed,
+                stored_bytes: 10 * listed,
+                passthrough_bytes: 10 * listed,
+                passthrough_count: listed,
+                ..Default::default()
+            };
+            if db.overwrite_from_quiet_scan(ticket, &totals, 5).unwrap() {
+                stamps += 1;
+                pause.store(true, SeqCst);
+                while parked.load(SeqCst) < WRITERS {
+                    std::thread::yield_now();
+                }
+                let row = db.read("b").unwrap().unwrap();
+                if row.object_count != visible.load(SeqCst) {
+                    wrong += 1;
+                    eprintln!(
+                        "stamped row {} != stored {}",
+                        row.object_count,
+                        visible.load(SeqCst)
+                    );
+                }
+                pause.store(false, SeqCst);
+            }
+        }
+        stop.store(true, SeqCst);
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert_eq!(wrong, 0, "a stamped scan disagrees with what was stored");
+        assert!(stamps > 0, "no scan was stamped in {tries} tries");
     }
 
     /// A window is a count in the bucket's entry: it blocks the stamp while

@@ -433,14 +433,55 @@ impl UsageScanner {
                 scanner: scanner.clone(),
                 key: key.clone(),
             };
+            Self::scan_and_publish(
+                &scanner,
+                &s3_state,
+                &key,
+                &bucket,
+                &prefix,
+                STAMP_REPEAT_WAIT,
+            )
+            .await;
+            // _scan_guard drops here, removing the dedup key. Same
+            // semantics as the pre-fix explicit `remove` call but
+            // panic-safe.
+        });
+
+        true
+    }
+
+    /// The body of a scan task: scan, publish the snapshot at once, and
+    /// when the scan was complete but not trusted (it ended inside a write,
+    /// see [`crate::bucket_usage::scan_is_quiet`]) scan again after the
+    /// writes in their window ended, publishing each result. The scan
+    /// starts inside the write request that asked for it, so such a scan is
+    /// common; the repeat gives a bucket with one writer after the other a
+    /// trusted counter. A repeat is a full listing: at most
+    /// [`STAMP_REPEATS`] extra listings per scan that a quota check
+    /// triggers. A bucket that always has a write in its window keeps the
+    /// first snapshot, as before.
+    ///
+    /// The scan slot is held for one listing only, never across the wait for
+    /// the writes: other buckets' scans are not blocked by it. The caller
+    /// holds the dedup key for the whole task.
+    async fn scan_and_publish(
+        scanner: &Arc<Self>,
+        s3_state: &AppState,
+        key: &str,
+        bucket: &str,
+        prefix: &str,
+        repeat_wait: std::time::Duration,
+    ) {
+        let mut repeats = 0;
+        loop {
             // Queued scans stay "scanning" (deduplicated) while they wait.
-            let Ok(_slot) = scanner.scan_slots.clone().acquire_owned().await else {
+            let Ok(slot) = scanner.scan_slots.clone().acquire_owned().await else {
                 return; // the semaphore is never closed
             };
-
-            let result = Self::do_scan_until_stamped(&s3_state, &bucket, &prefix).await;
+            let result = Self::do_scan_stamping(s3_state, bucket, prefix, MAX_SCAN_OBJECTS).await;
+            drop(slot);
             match result {
-                Ok(entry) => {
+                Ok((entry, stamp)) => {
                     debug!(
                         bucket = %bucket,
                         prefix = %prefix,
@@ -450,11 +491,19 @@ impl UsageScanner {
                         truncated = entry.truncated,
                         "Usage scan complete"
                     );
-                    Self::insert_with_eviction(&scanner, key.clone(), entry);
+                    Self::insert_with_eviction(scanner, key.to_string(), entry);
                     // Publish: a scan settled (success OR truncated) — bump the
                     // refresh counter so test barriers (and future operators)
                     // can detect it deterministically instead of blind-sleeping.
                     crate::usage_scanner::bump_usage_scan_version();
+                    let Some(usage) = s3_state.bucket_usage.as_deref() else {
+                        return;
+                    };
+                    if stamp != Stamp::Declined || repeats >= STAMP_REPEATS {
+                        return;
+                    }
+                    repeats += 1;
+                    usage.wait_windows_closed(bucket, repeat_wait).await;
                 }
                 Err(e) => {
                     warn!(
@@ -465,16 +514,12 @@ impl UsageScanner {
                     );
                     // Recorded BEFORE the guard clears the dedup key, so a
                     // poll never sees "not scanning" without the failure.
-                    scanner.failures.record(&key, e);
+                    scanner.failures.record(key, e);
                     crate::usage_scanner::bump_usage_scan_version();
+                    return;
                 }
             }
-            // _scan_guard drops here, removing the dedup key. Same
-            // semantics as the pre-fix explicit `remove` call but
-            // panic-safe.
-        });
-
-        true
+        }
     }
 
     /// Perform the actual scan: list the objects under the prefix and group by
@@ -509,34 +554,6 @@ impl UsageScanner {
                 .await?
                 .0,
         )
-    }
-
-    /// The scan of the quota check. The scan starts inside the write
-    /// request that asked for it, so it often ends while that write is
-    /// between its storage write and the record of its change, and such a
-    /// scan is not trusted ([`crate::bucket_usage::scan_is_quiet`]). The scan
-    /// is then repeated, after the writes in their window ended, so that a
-    /// bucket with one writer after the other gets a trusted counter. At
-    /// most [`STAMP_REPEATS`] repeats: a bucket that always has a write in
-    /// its window keeps the last snapshot, as before.
-    async fn do_scan_until_stamped(
-        s3_state: &AppState,
-        bucket: &str,
-        prefix: &str,
-    ) -> Result<UsageEntry, String> {
-        let mut repeats = 0;
-        loop {
-            let (entry, stamp) =
-                Self::do_scan_stamping(s3_state, bucket, prefix, MAX_SCAN_OBJECTS).await?;
-            let Some(usage) = s3_state.bucket_usage.as_deref() else {
-                return Ok(entry);
-            };
-            if stamp != Stamp::Declined || repeats >= STAMP_REPEATS {
-                return Ok(entry);
-            }
-            repeats += 1;
-            usage.wait_windows_closed(bucket, STAMP_REPEAT_WAIT).await;
-        }
     }
 
     /// [`Self::do_scan_capped`], and whether the scan stamped the counter.
@@ -634,7 +651,7 @@ enum Stamp {
 }
 
 /// How often the scan of the quota check is repeated when it ended inside a
-/// write ([`UsageScanner::do_scan_until_stamped`]), and how long each repeat
+/// write ([`UsageScanner::scan_and_publish`]), and how long each repeat
 /// waits for the writes in their window to end.
 const STAMP_REPEATS: u32 = 2;
 const STAMP_REPEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1271,14 +1288,24 @@ mod stamp_tests {
         test_support::put_raw(&endpoint, "d/first.txt", &[7u8; 12_000]).await;
         let scan = {
             let st = st.clone();
-            tokio::spawn(async move { UsageScanner::do_scan_until_stamped(&st, "b", "").await })
+            tokio::spawn(async move {
+                UsageScanner::scan_and_publish(
+                    &st.usage_scanner,
+                    &st,
+                    "b/",
+                    "b",
+                    "",
+                    STAMP_REPEAT_WAIT,
+                )
+                .await
+            })
         };
         // The first listing is on its way; the write records and ends.
         fake.wait_for(|r| r.contains("list-type=2")).await;
         let meta = engine.head("b", "d/first.txt").await.unwrap();
         usage.apply_net("b", None, Some(&meta), 0);
         drop(writer);
-        scan.await.unwrap().unwrap();
+        scan.await.unwrap();
         let row = usage.read("b").unwrap().unwrap();
         assert!(row.last_scan_at.is_some(), "{row:?}");
         assert_eq!((row.object_count, row.stored_bytes), (1, 12_000), "{row:?}");
@@ -1293,15 +1320,69 @@ mod stamp_tests {
         let engine = st.engine.load_full();
         let _held = engine.lock_object_write("b", "d/never-ends.txt").await;
         let before = test_support::scope_lists(&fake).len();
-        UsageScanner::do_scan_until_stamped(&st, "b", "")
-            .await
-            .unwrap();
+        UsageScanner::scan_and_publish(
+            &st.usage_scanner,
+            &st,
+            "b/",
+            "b",
+            "",
+            std::time::Duration::from_millis(20),
+        )
+        .await;
         assert_eq!(
             test_support::scope_lists(&fake).len() - before,
             1 + STAMP_REPEATS as usize,
             "the scan and its repeats"
         );
         assert_eq!(usage.read("b").unwrap().and_then(|r| r.last_scan_at), None);
+    }
+
+    /// A bucket that is never stamped (a write is always in its window)
+    /// publishes its snapshot after ONE scan, as the single scan did, and
+    /// the scan slot is free while the task waits for the writes: the
+    /// quota check, and the scans of other buckets, do not wait for the
+    /// repeats.
+    #[tokio::test]
+    async fn the_first_snapshot_is_published_after_one_scan_and_the_slot_is_free() {
+        let (st, _usage, fake, _endpoint) = state_at(1).await;
+        let engine = st.engine.load_full();
+        let _held = engine.lock_object_write("b", "d/never-ends.txt").await;
+        let task = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                UsageScanner::scan_and_publish(
+                    &st.usage_scanner,
+                    &st,
+                    "b/",
+                    "b",
+                    "",
+                    // Far longer than the test: the task is waiting.
+                    std::time::Duration::from_secs(600),
+                )
+                .await
+            })
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while st.usage_scanner.get("b", "").is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no snapshot after the first scan"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            test_support::scope_lists(&fake).len(),
+            1,
+            "the snapshot came after more than one listing"
+        );
+        // The task waits for the writes, with no scan slot in its hand.
+        // (The permit goes back right after the listing; poll for it.)
+        while st.usage_scanner.scan_slots.available_permits() < MAX_CONCURRENT_SCANS {
+            assert!(tokio::time::Instant::now() < deadline, "the slot is held");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!task.is_finished(), "the task is waiting for the writes");
+        task.abort();
     }
 
     /// One writer after the other (the quota check of each PUT starts a
