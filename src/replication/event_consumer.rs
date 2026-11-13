@@ -742,6 +742,17 @@ fn rule_watermark(
     contiguous_watermark(&rows[start..], failed_ids.unwrap_or(&empty), cursor)
 }
 
+/// Pure: when the catch-up walk of a rule whose destination refused events is
+/// due: at once, or, for a full disk only, not before the disk retry floor
+/// (`replication_make_due` keeps an earlier due time).
+fn catch_up_due(now: i64, disk_only: bool) -> i64 {
+    if disk_only {
+        now.saturating_add(super::worker::DISK_RETRY_FLOOR_SECS)
+    } else {
+        now
+    }
+}
+
 /// Pure: the global `replication` cursor = the slowest rule's cursor (it is
 /// the read floor and the lag the jobs API shows). No enabled rule: every
 /// row is handled.
@@ -1169,6 +1180,8 @@ async fn drain_rule_rows(
     let mut deletes: Vec<&KeyWork<'_>> = Vec::new();
     // Why the destination refused this drain's keys (not a maintenance job).
     let mut refused: Option<String> = None;
+    // Every refusal of this drain was a full disk.
+    let mut refused_for_disk_only = true;
     for (i, w) in work.iter().enumerate() {
         if drain_must_stop(&window) {
             // The destination is dead or throttling: hold the rest of the
@@ -1195,9 +1208,12 @@ async fn drain_rule_rows(
         // place: that ends on its own, so this key's events wait (the cursor
         // does not advance past them) and replay after the job. Anything
         // else (a read-only encrypted bucket, the atomic-write check, the
-        // encryption witness) may last: the events are skipped, so they do
-        // not pin the outbox, and the rule is made due for a catch-up walk
-        // that the scheduler runs once the destination accepts writes.
+        // encryption witness, a full disk) may last: the events are skipped,
+        // so they never pin the cursor or the outbox (a held copy would
+        // starve every later event, and the drain would read the same rows
+        // again and again), and the rule is made due for a catch-up walk.
+        // The walk defers each copy that needs space and keeps the deletes
+        // of its directory, so it repairs what the events skipped.
         // Admitted = counted as an in-flight write of the destination until
         // the copy ends (F9), so a job's drain waits for it. A delete is
         // admitted again by its batch (`mirror_delete`).
@@ -1205,11 +1221,7 @@ async fn drain_rule_rows(
             match gate.admit_background(&w.rule.destination.bucket, action_write_kind(w.action)) {
                 Ok(write) => write,
                 Err(refusal) => {
-                    // A maintenance job ends on its own; a full disk ends when
-                    // the operator frees space, and a catch-up walk meanwhile
-                    // would list both sides every minute to defer the same copies.
-                    // The events wait in both cases (the cursor does not pass them).
-                    if refusal.is_maintenance() || refusal.is_disk() {
+                    if refusal.is_maintenance() {
                         debug!(
                             "event consumer: rule '{}' deferred — {}",
                             w.rule.name,
@@ -1217,6 +1229,10 @@ async fn drain_rule_rows(
                         );
                         hold(failed_ids, w);
                     } else {
+                        // A full disk ends when the operator frees space: its
+                        // catch-up walk waits for the floor, so no walk lists
+                        // both sides every minute to defer the same copies.
+                        refused_for_disk_only &= refusal.is_disk();
                         refused.get_or_insert(refusal.into_reason());
                     }
                     continue;
@@ -1286,7 +1302,8 @@ async fn drain_rule_rows(
     if let Some(why) = refused {
         super::deferral::destination_blocked(rule_name, &why);
         let dbg = db.lock().await;
-        if let Err(e) = dbg.replication_make_due(rule_name, now) {
+        let due = catch_up_due(now, refused_for_disk_only);
+        if let Err(e) = dbg.replication_make_due(rule_name, due) {
             warn!("event consumer: rule '{rule_name}' not made due for its catch-up: {e}");
         }
     }
@@ -3057,8 +3074,20 @@ storage:
             health: Option<&crate::coordination::BackendHealthCache>,
             gate: &Arc<crate::maintenance::gate::MaintenanceGate>,
         ) {
+            self.drain_gated_at(health, gate, 100).await;
+        }
+
+        /// [`Self::drain_gated`] at `now` (the clock of the rule's due time).
+        async fn drain_gated_at(
+            &mut self,
+            health: Option<&crate::coordination::BackendHealthCache>,
+            gate: &Arc<crate::maintenance::gate::MaintenanceGate>,
+            now: i64,
+        ) {
             let replication = self.config.read().await.replication.clone();
-            drain_once(
+            // Boxed: the drain future is large, and a debug test thread has a
+            // small stack.
+            Box::pin(drain_once(
                 &self.config,
                 &self.db,
                 &self.engine,
@@ -3068,8 +3097,8 @@ storage:
                 &replication,
                 &FreeLease,
                 "c",
-                100,
-            )
+                now,
+            ))
             .await;
         }
 
@@ -3190,8 +3219,11 @@ storage:
 
     /// Mirror deletes work at level critical: an event DELETE is admitted as
     /// a write that frees space and goes through, while an event COPY of the
-    /// same drain is refused for the full disk (its events are skipped, the
-    /// rule is made due for a catch-up walk) and nothing fails.
+    /// same drain is refused for the full disk. The copy event is SKIPPED, not
+    /// held (a held copy would pin the cursor and starve every later event),
+    /// nothing fails, and the rule is due for a catch-up walk after the disk
+    /// retry floor, not at once (a walk lists both sides to defer the same
+    /// copy). The clock is the real one.
     #[tokio::test]
     async fn at_a_full_destination_disk_an_event_delete_goes_on_and_an_event_copy_waits() {
         let mut f = fixture(true).await;
@@ -3207,32 +3239,36 @@ storage:
             .await;
         f.event(EventKind::ObjectDeleted, "k.bin").await;
         let copy_event = f.put("n.bin").await;
-        // The state row of the rule, as the scheduler keeps it.
-        let due_before = {
+        // The state row of the rule, far from due, as the scheduler keeps it.
+        let now = crate::replication::current_unix_seconds();
+        {
             let db = f.db.lock().await;
-            db.replication_ensure_state("r", crate::replication::current_unix_seconds())
+            db.replication_ensure_state("r", now).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE replication_state SET next_due_at = ?1 WHERE rule_name = 'r'",
+                    [now + 86_400],
+                )
                 .unwrap();
-            db.replication_load_state("r").unwrap().unwrap().next_due_at
-        };
+        }
         let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
         gate.set_disk_refusal_probe(Arc::new(|b: &str| {
             (b == "dst").then(|| "the disk of 'dst' is full".to_string())
         }));
-        f.drain_gated(None, &gate).await;
-        // The copy event WAITS (the cursor does not pass it) and does not
-        // re-arm a catch-up walk: a walk every minute would list both sides to
-        // defer the same copy.
+        f.drain_gated_at(None, &gate, now).await;
         assert!(
-            f.cursor().await < copy_event,
-            "the copy event is held, not skipped"
+            f.cursor().await >= copy_event,
+            "the copy event is skipped: the cursor passes it"
         );
         let due_after = {
             let db = f.db.lock().await;
             db.replication_load_state("r").unwrap().unwrap().next_due_at
         };
+        let floor = crate::replication::worker::DISK_RETRY_FLOOR_SECS;
         assert_eq!(
-            due_after, due_before,
-            "a full disk must not make the rule due"
+            due_after,
+            now + floor,
+            "a full disk makes the rule due after the floor, not at once"
         );
         assert!(
             f.engine.head("dst", "k.bin").await.is_err(),
@@ -3252,6 +3288,90 @@ storage:
             "a deferral is no failure: {failures:?}"
         );
         assert_eq!(gate.inflight_writes("dst"), 0);
+    }
+
+    /// A refused copy does not starve the events behind it. 509 copy events
+    /// (more than one drain reads) and a mirror delete behind them, with the
+    /// destination disk full: the copies are skipped, the cursor moves past
+    /// them, the delete runs within two drains, a third drain sends nothing,
+    /// and the walk of the rule, with space again, repairs every copy.
+    #[tokio::test]
+    async fn a_full_disk_does_not_starve_the_deletes_behind_the_copies() {
+        let mut f = fixture(true).await;
+        f.put("gone.bin").await;
+        f.drain(None).await;
+        assert!(f.engine.head("dst", "gone.bin").await.is_ok(), "mirrored");
+        let mut last = 0;
+        for i in 0..509 {
+            last = f.put(&format!("n{i:03}.bin")).await;
+        }
+        f.engine
+            .delete_batch(
+                "src",
+                vec![crate::deltaglider::DeleteItem::new("gone.bin")],
+                Default::default(),
+            )
+            .await;
+        last = last.max(f.event(EventKind::ObjectDeleted, "gone.bin").await);
+        assert!(
+            last > i64::from(DRAIN_BATCH),
+            "the delete is past one drain"
+        );
+        let now = crate::replication::current_unix_seconds();
+        f.db.lock()
+            .await
+            .replication_ensure_state("r", now)
+            .unwrap();
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
+        gate.set_disk_refusal_probe(Arc::new(|b: &str| {
+            (b == "dst").then(|| "the disk of 'dst' is full".to_string())
+        }));
+
+        f.drain_gated_at(None, &gate, now).await;
+        assert!(
+            f.cursor().await >= i64::from(DRAIN_BATCH),
+            "the first drain passed its copies: {}",
+            f.cursor().await
+        );
+        f.drain_gated_at(None, &gate, now).await;
+        assert!(
+            f.engine.head("dst", "gone.bin").await.is_err(),
+            "the delete behind the copies ran"
+        );
+        assert_eq!(f.cursor().await, last, "the cursor reached the end");
+        let before = f.fake.requests().len();
+        f.drain_gated_at(None, &gate, now).await;
+        assert_eq!(
+            f.fake.requests().len(),
+            before,
+            "a third drain re-sends nothing: {:?}",
+            &f.fake.requests()[before..]
+        );
+        assert!(
+            f.engine.head("dst", "n000.bin").await.is_err(),
+            "not copied"
+        );
+
+        // Space again: the walk repairs every skipped copy.
+        let rule = f.config.read().await.replication.rules[0].clone();
+        let space = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let (_, outcome) = crate::replication::worker::run_rule(
+            f.db.clone(),
+            &f.engine,
+            &rule,
+            10,
+            None,
+            0,
+            "scheduler",
+            None,
+            crate::replication::worker::RunConcurrency::default(),
+            Some(space),
+            crate::coordination::DynCoordinationLease::from_arc(Arc::new(FreeLease)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.totals.objects_copied, 509, "{outcome:?}");
+        assert!(f.engine.head("dst", "n508.bin").await.is_ok());
     }
 
     /// The decision "this action stores bytes or frees space", by table.

@@ -1286,7 +1286,7 @@ fn overlap_refusal(rule: &ReplicationRule) -> String {
 
 /// The soonest that a rule whose copy waited for a full destination disk runs
 /// again (5 minutes), however short its interval.
-const DISK_RETRY_FLOOR_SECS: i64 = 300;
+pub(crate) const DISK_RETRY_FLOOR_SECS: i64 = 300;
 
 /// Pure: when the rule is next due after this run.
 fn next_due_after(
