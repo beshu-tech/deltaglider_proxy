@@ -987,6 +987,52 @@ async fn a_reencrypt_that_waits_for_disk_resumes_on_the_real_clock_and_drains_th
     assert!(!gate.has_disk_mark(id), "the mark ends with the drain");
 }
 
+/// A re-encrypt whose rewrites are conditional holds no write gate: client
+/// writes go on, deletes need no pass, and a resume has nothing to drain. A
+/// client write that is in flight at its resume must not hold it (the drain
+/// would wait up to the request timeout and then fail the job).
+#[tokio::test]
+async fn a_reencrypt_without_the_write_gate_sets_no_mark_and_never_drains() {
+    let e = env_own_spool(4).await;
+    let watch = watch_with(&e.state, 3);
+    e.state
+        .engine
+        .load()
+        .spool_dir()
+        .gate()
+        .set(crate::disk_watch::Level::Ok, String::new());
+    let gate = e.state.maintenance_gate.clone();
+    let row = |id| {
+        let db = e.db.clone();
+        async move { db.lock().await.maintenance_job_by_id(id).unwrap().unwrap() }
+    };
+    let job = e.claim().await.unwrap();
+    let id = job.id;
+    {
+        let db = e.db.lock().await;
+        db.maintenance_set_params(id, Some("{\"conditional_writes\":true}"))
+            .unwrap();
+        gate.sync_from(&db);
+    }
+    assert!(!gate.arms_job(id), "a conditional job holds no bucket");
+    e.run_waiting(job, 1).await;
+    assert_eq!(row(id).await.status, "queued");
+    assert!(!gate.arms_job(id), "the run kept the job conditional");
+    assert!(!gate.has_disk_mark(id), "no gate, so no wait to mark");
+
+    // Space again, and a client write in flight at the resume.
+    set_free(&watch, 50);
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    let client_write = gate.begin_write("b");
+    let job = e.claim().await.expect("claimable");
+    gate.sync_from(&*e.db.lock().await);
+    tokio::time::timeout(std::time::Duration::from_secs(5), e.run_waiting(job, 1))
+        .await
+        .expect("the resume waited for a client write that the job does not gate");
+    drop(client_write);
+    assert_eq!(row(id).await.status, "completed");
+}
+
 /// The resume order: the gate is whole FIRST (a delete is refused from that
 /// moment), THEN the deletes that were admitted meanwhile are drained. A
 /// delete still in flight holds the job: it waits for it and gives up after

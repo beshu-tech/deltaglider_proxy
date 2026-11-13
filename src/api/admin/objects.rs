@@ -447,13 +447,16 @@ impl BulkActor {
     }
 }
 
-/// 409 when the bucket is under maintenance (re-encryption rewrites the
-/// bucket in place; admin writes bypass the S3 gate, so check explicitly).
+/// 409 when the bucket is under maintenance for a write of `kind` (re-encryption
+/// rewrites the bucket in place; admin writes bypass the S3 gate, so check
+/// explicitly). A job that waits for disk space holds back a write that stores
+/// bytes and lets one that frees space pass, as the S3 gate does.
 fn reject_if_under_maintenance(
     state: &std::sync::Arc<crate::api::admin::AdminState>,
     bucket: &str,
+    write: crate::maintenance::gate::WriteKind,
 ) -> Result<(), AdminError> {
-    if let Some(kind) = state.s3_state.maintenance_gate.busy_kind(bucket) {
+    if let Some(kind) = state.s3_state.maintenance_gate.busy_kind_for(bucket, write) {
         return Err(AdminError::conflict(
             crate::maintenance::gate::refusal_message(bucket, &kind),
         ));
@@ -541,7 +544,11 @@ pub async fn copy_objects(
         req.items,
         req.no_overwrite,
     )?;
-    reject_if_under_maintenance(&state, &req.dest_bucket)?;
+    reject_if_under_maintenance(
+        &state,
+        &req.dest_bucket,
+        crate::maintenance::gate::WriteKind::Store,
+    )?;
     reject_if_replication_target_only(&state, &req.dest_bucket).await?;
     reject_if_disk_critical(&state, &req.dest_bucket).await?;
     if req.items.is_empty() {
@@ -909,8 +916,17 @@ pub async fn move_objects(
         req.items,
         req.no_overwrite,
     )?;
-    reject_if_under_maintenance(&state, &req.dest_bucket)?;
-    reject_if_under_maintenance(&state, &req.source_bucket)?;
+    reject_if_under_maintenance(
+        &state,
+        &req.dest_bucket,
+        crate::maintenance::gate::WriteKind::Store,
+    )?;
+    // The source delete of a move frees space.
+    reject_if_under_maintenance(
+        &state,
+        &req.source_bucket,
+        crate::maintenance::gate::WriteKind::FreesSpace,
+    )?;
     // Move = store into dest + delete from source: both are client writes.
     reject_if_replication_target_only(&state, &req.dest_bucket).await?;
     reject_if_disk_critical(&state, &req.dest_bucket).await?;
@@ -1145,7 +1161,11 @@ pub async fn bulk_delete(
         keys: req.keys,
         savings: state.savings_cache.clone(),
     };
-    reject_if_under_maintenance(&state, &req.bucket)?;
+    reject_if_under_maintenance(
+        &state,
+        &req.bucket,
+        crate::maintenance::gate::WriteKind::FreesSpace,
+    )?;
     reject_if_replication_target_only(&state, &req.bucket).await?;
     if req.keys.is_empty() {
         return Err(AdminError::invalid("no keys to delete"));

@@ -615,6 +615,58 @@ async fn a_migrate_copy_starts_only_after_the_admitted_writes_end() {
     assert_eq!(c.done, 5, "{c:?}");
 }
 
+/// A cancel does not wait for the disk. A migrate that waits for a full
+/// target disk (its mark is set) and is cancelled runs its cancel at the next
+/// claim: the staged copies and the staging route go, the row ends
+/// `cancelled`, the mark ends. It used to be deferred again and again while
+/// the disk stayed full.
+#[tokio::test]
+async fn a_cancelled_migrate_unwinds_while_the_target_disk_is_still_full() {
+    use super::super::worker::cost_tests::watch_with;
+    let e = env_with("copy", 5, true).await;
+    let _watch = watch_with(&e.state, 3);
+    e.state
+        .engine
+        .load()
+        .spool_dir()
+        .gate()
+        .set(crate::disk_watch::Level::Ok, String::new());
+    let gate = e.state.maintenance_gate.clone();
+    gate.sync_from(&*e.db.lock().await);
+    gate.mark_disk_deferred(e.job.id, super::super::store::current_unix_seconds() - 1);
+    assert!(
+        e.db.lock()
+            .await
+            .maintenance_request_cancel(e.job.id)
+            .unwrap()
+            == super::super::store::CancelOutcome::CancelRequested
+    );
+    let config = e.mutator.config.clone();
+    super::super::worker::run_job(
+        &e.mutator,
+        &config,
+        &e.db,
+        &e.state,
+        Holder::test("inst"),
+        e.job.clone(),
+    )
+    .await;
+    let row =
+        e.db.lock()
+            .await
+            .maintenance_job_by_id(e.job.id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(row.status, "cancelled", "{row:?}");
+    let engine = e.state.engine.load().clone();
+    assert!(
+        engine.head("t", "run/k-000.txt").await.is_err(),
+        "the staged copies are removed"
+    );
+    assert!(!e.mutator.read().await.buckets.contains_key("t"));
+    assert!(!gate.has_disk_mark(e.job.id), "the mark ends with the run");
+}
+
 /// A copy that needs a spool file and meets the spool gate defers the job; a
 /// busy proxy with the gate open, and every other error, is the object's.
 #[test]

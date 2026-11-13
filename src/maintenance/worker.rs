@@ -395,7 +395,7 @@ pub(crate) fn idle_wait_secs(lease_ttl_secs: i64, next_due: Option<i64>, now: i6
 
 /// Execute one claimed job to a terminal state. Never panics the loop:
 /// every failure path settles the row and releases the gate.
-async fn run_job(
+pub(crate) async fn run_job(
     mutator: &ConfigMutator,
     config: &SharedConfig,
     db: &Arc<Mutex<JobsDb>>,
@@ -451,7 +451,11 @@ async fn run_job(
     // cleared FIRST (a delete is refused from then on) and the deletes that
     // the gate admitted meanwhile are drained, so no phase races one.
     let resumed_from_disk_wait = state.maintenance_gate.has_disk_mark(job.id);
-    let disk_still_full = if resumed_from_disk_wait {
+    // An operator's cancel or kill does not wait for the disk: the unwind of
+    // a migrate deletes its staged copies, which frees space. The mark still
+    // ends in order (close, drain, clear) before the phases run.
+    let cancel_asked = check_cancel(db, job.id).await.is_err();
+    let disk_still_full = if resumed_from_disk_wait && !cancel_asked {
         job_backend_refusal(state, &job)
     } else {
         None
@@ -537,8 +541,11 @@ async fn run_job(
         // A wait for DISK space lets deletes into the bucket pass (see
         // `disk_wait_is_safe`); the mark ends with the wait.
         // `row` is the row NOW (the phase moved since the claim).
-        let waits_for_disk =
-            disk_wait_is_safe(&row) && deferral_waits_for_disk(state, &row, &outcome);
+        // Only a job that holds its bucket has a wait to open for deletes: one
+        // that does not (conditional rewrites) has nothing to drain either.
+        let waits_for_disk = disk_wait_is_safe(&row)
+            && state.maintenance_gate.arms_job(job.id)
+            && deferral_waits_for_disk(state, &row, &outcome);
         let until = current_unix_seconds().saturating_add(wait);
         let deferred = {
             let db = db.lock().await;

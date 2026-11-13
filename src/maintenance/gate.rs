@@ -316,8 +316,18 @@ impl MaintenanceGate {
         let mut unwinding = self.unwinding.lock();
         // A settled job leaves no unwind release behind.
         unwinding.retain(|id| arms.iter().any(|a| a.job_id == *id));
+        // A job that settled (or was cancelled while it waited) leaves no wait.
+        self.disk_deferred
+            .retain(|id, _| arms.iter().any(|a| a.job_id == *id));
         self.busy.store(Arc::new(busy_set(&arms, &unwinding)));
         self.busy_job.store(Arc::new(busy_jobs(&arms, &unwinding)));
+    }
+
+    /// Does the gate hold a bucket for this job now? A re-encrypt whose
+    /// rewrites are conditional holds none: client writes go on, so it has no
+    /// wait to open for deletes and nothing to drain.
+    pub fn arms_job(&self, job_id: i64) -> bool {
+        self.busy_job.load().values().any(|id| *id == job_id)
     }
 
     /// The job `job_id` waits for disk space until `until` (unix seconds):
@@ -1525,6 +1535,26 @@ mod tests {
     /// R8: the busy set is the active rows, whatever the gate held before —
     /// a key armed by hand (or left over) goes, a key of an active row stays
     /// until its row settles or its phase stops gating it.
+    /// A job that waited for disk space and was cancelled (a queued
+    /// re-encrypt cancels at once) leaves no mark behind.
+    #[test]
+    fn a_cancelled_job_leaves_no_disk_mark() {
+        let db = JobsDb::in_memory("testpass").unwrap();
+        let g = MaintenanceGate::new();
+        let id = db
+            .maintenance_create_job("reencrypt", "Enc", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        g.sync_from(&db);
+        assert!(g.arms_job(id));
+        g.mark_disk_deferred(id, current_unix_seconds() + 60);
+        assert!(g.has_disk_mark(id));
+        db.maintenance_request_cancel(id).unwrap();
+        g.sync_from(&db);
+        assert!(!g.arms_job(id));
+        assert!(!g.has_disk_mark(id), "the cancelled job's mark is gone");
+    }
+
     #[test]
     fn sync_from_derives_the_busy_set_from_active_rows() {
         let db = JobsDb::in_memory("testpass").unwrap();
