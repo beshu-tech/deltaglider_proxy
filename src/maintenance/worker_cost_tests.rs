@@ -892,6 +892,24 @@ impl Env {
     }
 }
 
+/// Keep the write gate on the re-encrypt of bucket `b`: its backend has no
+/// proven conditional writes, so the job holds the bucket and its wait for disk
+/// space has deletes to let pass. (A job whose rewrites are conditional holds
+/// nothing; see `a_reencrypt_without_the_write_gate_sets_no_mark_and_never_drains`.)
+async fn keep_the_write_gate(e: &Env) {
+    // A backend that no probe reaches has no proven conditional writes
+    // (`rewrites_are_conditional`), so the job keeps the gate.
+    e.config.write().await.backend = crate::config::BackendConfig::S3 {
+        endpoint: Some("http://127.0.0.1:9".into()),
+        region: "us-east-1".into(),
+        force_path_style: true,
+        access_key_id: None,
+        secret_access_key: None,
+        allow_local: true,
+        session_token: None,
+    };
+}
+
 /// A re-encrypt (legacy rows have no conditional writes: they gate their
 /// bucket) that finds the disk of its bucket full waits, with its mark on the
 /// gate: a delete into the bucket passes meanwhile; the wait goes on while the
@@ -902,6 +920,7 @@ impl Env {
 #[tokio::test]
 async fn a_reencrypt_that_waits_for_disk_resumes_on_the_real_clock_and_drains_the_deletes() {
     let e = env_own_spool(4).await;
+    keep_the_write_gate(&e).await;
     let watch = watch_with(&e.state, 3);
     e.state
         .engine
@@ -1237,6 +1256,7 @@ async fn a_disk_wait_marks_the_gate_only_in_the_phases_where_it_is_safe() {
         }
         let job = e.claim().await.unwrap();
         let id = job.id;
+        e.state.maintenance_gate.sync_from(&*e.db.lock().await);
         e.run(job).await;
         let row =
             e.db.lock()
