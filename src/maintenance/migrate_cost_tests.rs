@@ -582,7 +582,9 @@ async fn a_migrate_copy_waits_for_the_disk_of_its_target_backend() {
         .gate()
         .set(crate::disk_watch::Level::Ok, String::new());
     let mut c = Counters::default();
-    let stop = e.run().copy(&mut c).await.err().expect("the copy waits");
+    let Err(stop) = e.run().copy(&mut c).await else {
+        panic!("the copy waits");
+    };
     assert!(
         matches!(&stop, PhaseStop::Deferred(m) if m.contains("backend 'default'")),
         "{stop:?}"

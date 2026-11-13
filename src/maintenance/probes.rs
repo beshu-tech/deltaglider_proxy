@@ -40,20 +40,12 @@ pub fn disk_refusal(state: &AppState, watch: &DiskWatch, bucket: &str) -> Option
 }
 
 /// Why a maintenance job that STORES bytes into `bucket` (a re-encrypt
-/// rewrite, the copy of a migration) waits now: the disk of the spool is at
-/// level high or critical (each object would fail for want of spool space),
-/// or the disk of the filesystem backend that holds `bucket` is at level
-/// critical. A job that stores nothing (a backfill stamps metadata in place,
-/// a prune deletes) never asks.
-pub fn store_refusal(state: &AppState, bucket: &str) -> Option<String> {
-    let watch = crate::disk_watch::installed();
-    store_refusal_with(state, watch.as_deref(), bucket)
-}
-
-/// The BACKEND half of [`store_refusal`]: only the disk of the filesystem
-/// backend that holds `bucket`. A job whose objects need no spool file (a
-/// re-encrypt of small objects, or of an S3 bucket) asks this alone; the
-/// objects that need a spool file meet the spool gate on their own.
+/// rewrite, the copy of a migration) waits now: the disk of the filesystem
+/// backend that holds `bucket` is at level critical. THE refusal of both
+/// kinds. They do not ask the spool disk as a whole: most objects need no
+/// spool file, and an object that does meets the spool gate in its own turn
+/// (`Visit::Deferred`, `CopyDone::Deferred`). A job that stores nothing (a
+/// backfill stamps metadata in place, a prune deletes) never asks.
 pub fn backend_store_refusal(state: &AppState, bucket: &str) -> Option<String> {
     let watch = crate::disk_watch::installed();
     backend_store_refusal_with(state, watch.as_deref(), bucket)
@@ -66,21 +58,6 @@ pub fn backend_store_refusal_with(
     bucket: &str,
 ) -> Option<String> {
     watch.and_then(|w| crate::disk_watch::bucket_write_refusal_now(w, &state.engine.load(), bucket))
-}
-
-/// [`store_refusal`] with the monitor given.
-pub fn store_refusal_with(
-    state: &AppState,
-    watch: Option<&DiskWatch>,
-    bucket: &str,
-) -> Option<String> {
-    state
-        .engine
-        .load()
-        .spool_dir()
-        .gate()
-        .refusal()
-        .or_else(|| backend_store_refusal_with(state, watch, bucket))
 }
 
 /// Install both probes on `gate` (boot). `watch` is `None` when the disk
@@ -102,9 +79,7 @@ pub fn install(gate: &MaintenanceGate, state: Weak<AppState>, watch: Option<Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk_watch::{
-        DiskProbe, DiskWatch, Level, PathFacts, Sizing, Targets, SPOOL_BUDGET_ROLE,
-    };
+    use crate::disk_watch::{DiskProbe, DiskWatch, PathFacts, Sizing, Targets};
     use crate::maintenance::gate::{admit_all, admit_stores, WriteKind};
     use std::time::Instant;
 
@@ -226,38 +201,6 @@ mod tests {
             .expect("a delete asks the write gate, which has no disk");
         tick(&watch, 50);
         check_client_store_allowed(&state, "b").await.unwrap();
-    }
-
-    /// A maintenance job that stores (re-encrypt, the copy of a migration)
-    /// waits for the spool disk and for the disk of its bucket's backend.
-    #[tokio::test]
-    async fn a_storing_job_waits_for_the_spool_disk_and_the_backend_disk() {
-        let (_dir, state) = state().await;
-        let gate = state.engine.load().spool_dir().gate().clone();
-        let watch = DiskWatch::new(gate.clone());
-        assert_eq!(store_refusal_with(&state, Some(&watch), "b"), None);
-
-        // The spool disk at level high: each object would fail for want of
-        // spool space.
-        gate.set(Level::High, "the spool disk is high".into());
-        assert_eq!(
-            store_refusal_with(&state, Some(&watch), "b").as_deref(),
-            Some("the spool disk is high")
-        );
-        gate.set(Level::Ok, String::new());
-        // The backend disk at level critical (one fake disk: the spool is
-        // critical too, so open its gate to see the backend's own refusal).
-        tick(&watch, 3);
-        assert_eq!(gate.level(), Level::Critical);
-        gate.set(Level::Ok, String::new());
-        assert!(store_refusal_with(&state, Some(&watch), "b")
-            .unwrap()
-            .contains("backend 'default'"));
-        // No monitor: the spool gate only.
-        assert_eq!(store_refusal_with(&state, None, "b"), None);
-        // The use of the budget is not a reason to defer a job (its own
-        // reservations count): only the disk is.
-        let _ = SPOOL_BUDGET_ROLE;
     }
 
     /// Source guard of the wiring: the boot installs the probes through

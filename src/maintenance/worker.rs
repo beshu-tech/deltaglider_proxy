@@ -1232,7 +1232,7 @@ pub(crate) trait ObjectVisitor {
     const CONCURRENCY: usize = PAGE_CONCURRENCY;
     /// Does a visit STORE bytes into the bucket (a re-encrypt rewrite)? Then
     /// the walk defers while the disk it writes to is at level critical
-    /// ([`crate::maintenance::probes::store_refusal`]). A backfill stamps
+    /// ([`crate::maintenance::probes::backend_store_refusal`]). A backfill stamps
     /// metadata in place and writes no object bytes: `false`.
     const WRITES_BYTES: bool = false;
     /// Runs before each listing page.
@@ -2462,7 +2462,7 @@ mod tests {
     /// Which job kinds store bytes (and so defer on a critical disk): the
     /// re-encrypt rewrite does; a backfill stamps metadata in place and
     /// writes no object bytes. Each paged step that stores asks
-    /// `probes::store_refusal`.
+    /// `probes::backend_store_refusal`.
     #[test]
     fn only_the_job_steps_that_store_bytes_ask_the_disk() {
         const { assert!(<Reencrypt<'static> as ObjectVisitor>::WRITES_BYTES) };
@@ -2477,7 +2477,7 @@ mod tests {
         assert!(objects_refused.contains("probes::backend_store_refusal("));
         assert!(worker.contains("const WRITES_BYTES: bool = true;"));
         let copy = crate::source_scan::prod_fn_text("src/maintenance/migrate.rs", "refused");
-        assert!(copy.contains("probes::store_refusal("), "{copy}");
+        assert!(copy.contains("probes::backend_store_refusal("), "{copy}");
         assert!(
             copy.contains("transient_key"),
             "the copy stores into the target"
