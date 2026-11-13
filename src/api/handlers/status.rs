@@ -1162,6 +1162,13 @@ mod readiness_tests {
             "the disk of the filesystem backend of one bucket is at level critical",
         ),
         (
+            "src/maintenance/worker.rs",
+            "(crate::deltaglider::EngineError::Overloaded(_), Some(why)) => Visit::Deferred(why),",
+            1,
+            Reach::PerRequest,
+            "a re-encrypt visit meets the spool gate: the JOB waits, no client request is refused",
+        ),
+        (
             "src/api/handlers/object_helpers.rs",
             "EngineError::Storage(StorageError::PreconditionFailed(_))",
             1,

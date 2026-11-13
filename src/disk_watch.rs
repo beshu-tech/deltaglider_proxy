@@ -615,7 +615,7 @@ pub struct DiskWatch {
 static INSTALLED: OnceLock<Arc<DiskWatch>> = OnceLock::new();
 
 /// The monitor of this process, once the boot installed it. A test installs
-/// its own for its thread ([`install_for_this_test`]).
+/// its own for its thread (`install_for_this_test`).
 pub fn installed() -> Option<Arc<DiskWatch>> {
     #[cfg(test)]
     {

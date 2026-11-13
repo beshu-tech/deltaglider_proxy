@@ -2438,7 +2438,7 @@ mod tests {
         let objects_refused =
             crate::source_scan::prod_fn_text("src/maintenance/worker.rs", "refused");
         assert!(objects_refused.contains("V::WRITES_BYTES"));
-        assert!(objects_refused.contains("probes::store_refusal("));
+        assert!(objects_refused.contains("probes::backend_store_refusal("));
         assert!(worker.contains("const WRITES_BYTES: bool = true;"));
         let copy = crate::source_scan::prod_fn_text("src/maintenance/migrate.rs", "refused");
         assert!(copy.contains("probes::store_refusal("), "{copy}");

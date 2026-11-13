@@ -162,31 +162,47 @@ impl DiskMonitorTuning {
     /// (`disk_watch::Thresholds`). A level that is off is skipped.
     pub fn ordering_notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
-        // (name, ceiling, percent), most severe first.
+        // (level, ceiling variable, percent variable, ceiling, percent), most
+        // severe first.
         let levels = [
-            ("critical", self.critical_max_bytes, self.critical_percent),
-            ("high", self.high_max_bytes, self.high_percent),
-            ("low", self.low_max_bytes, self.low_percent),
+            (
+                "critical",
+                "DGP_DISK_CRITICAL_MAX_BYTES",
+                "DGP_DISK_CRITICAL_PERCENT",
+                self.critical_max_bytes,
+                self.critical_percent,
+            ),
+            (
+                "high",
+                "DGP_DISK_HIGH_MAX_BYTES",
+                "DGP_DISK_HIGH_PERCENT",
+                self.high_max_bytes,
+                self.high_percent,
+            ),
+            (
+                "low",
+                "DGP_DISK_LOW_MAX_BYTES",
+                "DGP_DISK_LOW_PERCENT",
+                self.low_max_bytes,
+                self.low_percent,
+            ),
         ];
-        let on: Vec<_> = levels.iter().filter(|(_, max, _)| *max != 0).collect();
+        let on: Vec<_> = levels.iter().filter(|l| l.3 != 0).collect();
         for pair in on.windows(2) {
-            let ((above, above_max, above_pct), (below, below_max, below_pct)) = (pair[0], pair[1]);
+            let (above, above_max_var, above_pct_var, above_max, above_pct) = *pair[0];
+            let (below, below_max_var, below_pct_var, below_max, below_pct) = *pair[1];
             if below_max < above_max {
                 notes.push(format!(
-                    "DGP_DISK_{}_MAX_BYTES ({below_max}) is below DGP_DISK_{}_MAX_BYTES \
-                     ({above_max}): level {below} starts at {above_max} bytes free, so it does \
-                     not start before level {above}",
-                    below.to_uppercase(),
-                    above.to_uppercase()
+                    "{below_max_var} ({below_max}) is below {above_max_var} ({above_max}): level \
+                     {below} starts at {above_max} bytes free, so it does not start before \
+                     level {above}"
                 ));
             }
             if below_pct < above_pct {
                 notes.push(format!(
-                    "DGP_DISK_{}_PERCENT ({below_pct}) is below DGP_DISK_{}_PERCENT \
-                     ({above_pct}): level {below} starts at {above_pct}% free, so it does not \
-                     start before level {above}",
-                    below.to_uppercase(),
-                    above.to_uppercase()
+                    "{below_pct_var} ({below_pct}) is below {above_pct_var} ({above_pct}): level \
+                     {below} starts at {above_pct}% free, so it does not start before level \
+                     {above}"
                 ));
             }
         }

@@ -161,10 +161,9 @@ pub(crate) fn busy_jobs(arms: &[GateArm], unwinding: &HashSet<i64>) -> HashMap<S
 pub fn request_frees_space(method: &Method, query: Option<&str>) -> bool {
     match *method {
         Method::DELETE => true,
-        Method::POST => query
-            .unwrap_or("")
-            .split('&')
-            .any(|kv| kv == "delete" || kv.starts_with("delete=")),
+        // The query as s3s decodes it (`RequestTarget`), not by hand.
+        Method::POST => crate::api::request_target::RequestTarget::parse("/b", query)
+            .is_ok_and(|target| target.has_query("delete")),
         _ => false,
     }
 }
@@ -1043,7 +1042,7 @@ mod tests {
         assert_eq!(g.store_blocked("roomy"), None);
         assert!(matches!(
             admit_stores(Some(&g), &["roomy", "full"]),
-            Err(WriteRefusal::Refused(m)) if m == "the disk is full"
+            Err(WriteRefusal::Disk(m)) if m == "the disk is full"
         ));
         assert!(admit_stores(Some(&g), &["roomy"]).is_ok());
         assert!(

@@ -952,7 +952,7 @@ mod object_size_tests {
             ..Default::default()
         };
         assert!(
-            !c.check().iter().any(|w| w.contains("DGP_DISK_")),
+            !c.check().iter().any(|w| w.contains("_DISK_")),
             "a default environment must not warn"
         );
     }
