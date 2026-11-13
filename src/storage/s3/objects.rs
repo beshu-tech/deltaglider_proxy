@@ -228,7 +228,15 @@ impl S3Backend {
             request = request.if_match_etag(e, self.if_match_dialect());
         }
 
-        let resp = match request.send().await {
+        // The backend copies the object before it answers.
+        let copied = head.content_length().and_then(|l| u64::try_from(l).ok());
+        let copied = copied.unwrap_or(0);
+        let sent = request
+            .customize()
+            .config_override(self.upload_config(copied))
+            .send()
+            .await;
+        let resp = match sent {
             Ok(resp) => resp,
             Err(e)
                 if expect_etag.is_some()

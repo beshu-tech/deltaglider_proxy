@@ -452,10 +452,10 @@ impl S3Backend {
         unreachable!("the loop returns on every path")
     }
 
-    /// The config of a part and of a CompleteMultipartUpload: no deadline
-    /// for the operation, a long attempt and read timeout
+    /// The config of a part and of a CompleteMultipartUpload (also of a
+    /// copy): no deadline for the operation, a long attempt and read timeout
     /// ([`upload_timeouts`]); the connect timeout stays.
-    fn long_upload_config() -> aws_sdk_s3::config::Builder {
+    pub(super) fn long_upload_config() -> aws_sdk_s3::config::Builder {
         aws_sdk_s3::config::Builder::new().timeout_config(upload_timeouts(None))
     }
 
@@ -487,6 +487,7 @@ impl S3Backend {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{backend_with_short_read_timeout, production_backend};
     use super::*;
     use proptest::prelude::*;
 
@@ -532,22 +533,6 @@ mod tests {
             }
         });
         (endpoint, rx)
-    }
-
-    /// The backend as production builds it (`S3Backend::new`), on `endpoint`.
-    async fn production_backend(endpoint: &str) -> S3Backend {
-        let cfg = crate::config::BackendConfig::S3 {
-            session_token: None,
-            endpoint: Some(endpoint.to_string()),
-            region: "us-east-1".to_string(),
-            force_path_style: true,
-            access_key_id: Some("AKIA".to_string()),
-            secret_access_key: Some("secret".to_string()),
-            allow_local: true,
-        };
-        S3Backend::new(&cfg, NativeEncryptionConfig::None)
-            .await
-            .unwrap()
     }
 
     /// A listener that answers its n-th request with `responses[n]` (a whole
@@ -674,38 +659,6 @@ mod tests {
             }
         });
         endpoint
-    }
-
-    /// The backend as production builds it, with a read timeout of 1 s on
-    /// the upload client (production: 60 s) and a request deadline of 10 s
-    /// on the other (production: 30 s, which sizes the deadline of an
-    /// upload).
-    async fn backend_with_short_read_timeout(endpoint: &str) -> S3Backend {
-        let mut s3 = production_backend(endpoint).await;
-        let cfg = crate::config::BackendConfig::S3 {
-            session_token: None,
-            endpoint: Some(endpoint.to_string()),
-            region: "us-east-1".to_string(),
-            force_path_style: true,
-            access_key_id: Some("AKIA".to_string()),
-            secret_access_key: Some("secret".to_string()),
-            allow_local: true,
-        };
-        s3.client = S3Backend::build_client_with(&cfg, Some(std::time::Duration::from_secs(10)))
-            .await
-            .unwrap();
-        let conf = s3
-            .bulk_client
-            .config()
-            .to_builder()
-            .timeout_config(
-                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-                    .read_timeout(std::time::Duration::from_secs(1))
-                    .build(),
-            )
-            .build();
-        s3.bulk_client = aws_sdk_s3::Client::from_conf(conf);
-        s3
     }
 
     /// A part whose body takes longer than the read timeout to leave (about

@@ -1342,6 +1342,8 @@ impl StorageBackend for S3Backend {
             .key(&key)
             .upload_id(&upload.upload_id)
             .multipart_upload(completed)
+            .customize()
+            .config_override(Self::long_upload_config())
             .send()
             .await
             .map_err(|e| self.classify(&upload.bucket, &e, S3Op::CompleteMpu))?;

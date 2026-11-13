@@ -4053,6 +4053,68 @@ mod source_guards {
         );
     }
 
+    /// A request on the upload client (`bulk_client`) whose body or whose
+    /// server-side work grows with the object (PutObject, UploadPart,
+    /// CopyObject, UploadPartCopy, CompleteMultipartUpload) carries its own
+    /// timeouts through `.customize().config_override(..)`
+    /// (`upload_config`, `long_upload_config`): the client's read timeout
+    /// (60 s) is a deadline for the whole request, so without them a part,
+    /// a copy or a Complete that needs longer never gets its answer. The
+    /// scan reads every `bulk_client` use of `src/storage/s3`.
+    #[test]
+    fn size_dependent_requests_carry_their_own_timeouts() {
+        const GROWING: [&str; 5] = [
+            "put_object()",
+            "upload_part()",
+            "copy_object()",
+            "upload_part_copy()",
+            "complete_multipart_upload()",
+        ];
+        let mut offenders = Vec::new();
+        let mut checked = 0;
+        for (rel, text) in crate::source_scan::prod_sources("src/storage/s3") {
+            let lines = crate::source_scan::prod_lines(&text);
+            for (i, (n, line)) in lines.iter().enumerate() {
+                if !line.contains("bulk_client") {
+                    continue;
+                }
+                let near = lines[i..lines.len().min(i + 6)]
+                    .iter()
+                    .map(|(_, l)| *l)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !GROWING.iter().any(|op| near.contains(op)) {
+                    continue;
+                }
+                checked += 1;
+                // Up to the next use of the client: the statement or the
+                // `request.customize()` that sends what it built.
+                let end = lines[i + 1..]
+                    .iter()
+                    .position(|(_, l)| l.contains("bulk_client"))
+                    .map_or(lines.len(), |p| i + 1 + p)
+                    .min(i + 45);
+                let window = lines[i..end]
+                    .iter()
+                    .map(|(_, l)| *l)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !window.contains("config_override(") {
+                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            checked >= 8,
+            "the scan saw only {checked} size-dependent requests: it is blind"
+        );
+        assert!(
+            offenders.is_empty(),
+            "a size-dependent request without `.customize().config_override(upload_config(..))`:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     #[test]
     fn no_content_responses_carry_no_body() {
         let mut offenders = Vec::new();
