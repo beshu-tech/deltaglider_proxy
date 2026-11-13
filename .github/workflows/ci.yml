@@ -346,6 +346,7 @@ jobs:
               admin_config_test::
               admin_handlers_test::
               admin_section_test::
+              backend_multipart_test::
               bootstrap_password_hash_invariant_test::
               bucket_keyring_test::
               cli_admin_test::

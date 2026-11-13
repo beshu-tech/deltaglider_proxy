@@ -455,6 +455,7 @@ impl From<crate::storage::StorageError> for S3Error {
                 S3Error::InvalidRequest(key_not_held_message(&key, write))
             }
             crate::storage::StorageError::MetadataTooLarge(msg) => S3Error::MetadataTooLarge(msg),
+            crate::storage::StorageError::EntityTooLarge(msg) => S3Error::EntityTooLargeReason(msg),
             crate::storage::StorageError::InvalidRange(_) => S3Error::InvalidRange,
             crate::storage::StorageError::BucketNotFound(b) => S3Error::NoSuchBucket(b),
             crate::storage::StorageError::BucketNotEmpty(b) => S3Error::BucketNotEmpty(b),
@@ -809,6 +810,12 @@ mod tests {
                 s(StorageError::MetadataTooLarge("x".into())),
                 400,
                 "MetadataTooLarge",
+            ),
+            (
+                "StorageError::EntityTooLarge",
+                s(StorageError::EntityTooLarge("x".into())),
+                400,
+                "EntityTooLarge",
             ),
             (
                 "StorageError::Unavailable",

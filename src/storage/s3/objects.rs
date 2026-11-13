@@ -584,6 +584,21 @@ impl S3Backend {
         // deadline use their total.
         let body = FileBody::open(files).await?;
         let stored_size = body.len();
+        // One PutObject takes at most 5 GiB: a larger body is a backend
+        // multipart upload, with the same condition on its Complete.
+        if stored_size > self.put_limits().0 {
+            return self
+                .put_file_multipart(&super::mpu_put::MultipartPut {
+                    bucket,
+                    key,
+                    files: &body,
+                    headers: &headers,
+                    metadata,
+                    fence: &fence,
+                    on_unsupported,
+                })
+                .await;
+        }
         let mut backoff = UNIDENTIFIED_400_BACKOFF_MS.iter();
         loop {
             let mut request = self

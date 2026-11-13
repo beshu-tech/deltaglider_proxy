@@ -26,6 +26,92 @@ fn is_acl_request(uri: &axum::http::Uri) -> bool {
     crate::api::request_target::RequestTarget::from_uri(uri).is_ok_and(|t| t.has_query("acl"))
 }
 
+/// Whether the request is a `CompleteMultipartUpload` (`POST` with an
+/// `uploadId`), decoded as s3s decodes the query.
+fn is_complete_request(method: &axum::http::Method, uri: &axum::http::Uri) -> bool {
+    method == axum::http::Method::POST
+        && crate::api::request_target::RequestTarget::from_uri(uri)
+            .is_ok_and(|t| t.has_query("uploadId"))
+}
+
+/// Pure: a body frame without a second XML declaration. s3s sends the
+/// declaration of a slow `CompleteMultipartUpload` first (then spaces),
+/// and writes an error that follows with a declaration of its own
+/// (s3s 0.14.0 `ops/multipart.rs`: `serialize_error(err, false)`, where the
+/// success body is written without one). Two declarations are no XML
+/// document: the AWS SDKs read the `200` as a broken response, and the AWS
+/// CLI retries it as a `500`. `seen`: a declaration went out already.
+fn without_repeated_declaration(seen: &mut bool, data: bytes::Bytes) -> bytes::Bytes {
+    if !data.starts_with(b"<?xml") {
+        return data;
+    }
+    if !*seen {
+        *seen = true;
+        return data;
+    }
+    match data.windows(2).position(|w| w == b"?>") {
+        Some(end) => data.slice(end + 2..),
+        None => data,
+    }
+}
+
+/// A body whose data frames carry at most one XML declaration
+/// ([`without_repeated_declaration`]).
+struct OneDeclaration {
+    inner: axum::body::Body,
+    seen: bool,
+}
+
+impl http_body::Body for OneDeclaration {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let seen = &mut self.seen;
+                Poll::Ready(Some(Ok(
+                    frame.map_data(|data| without_repeated_declaration(seen, data))
+                )))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// The answer of a slow `CompleteMultipartUpload` (`200`, chunked: s3s
+/// sends the headers first and the result later) with at most one XML
+/// declaration. Any other response is returned as it is.
+fn with_one_declaration(
+    is_complete: bool,
+    response: axum::response::Response,
+) -> axum::response::Response {
+    let keepalive = response.status() == axum::http::StatusCode::OK
+        && response
+            .headers()
+            .contains_key(axum::http::header::TRANSFER_ENCODING);
+    if !(is_complete && keepalive) {
+        return response;
+    }
+    let (parts, inner) = response.into_parts();
+    axum::http::Response::from_parts(
+        parts,
+        axum::body::Body::new(OneDeclaration { inner, seen: false }),
+    )
+}
+
 /// Whether a response is a HEAD answer for a byte range. s3s applies
 /// `S3Response.status` only to custom routes, so HeadObject with `Range`
 /// left the adapter as 200 with a `Content-Range`; S3 answers 206
@@ -275,8 +361,10 @@ where
         next: axum::middleware::Next,
     ) -> axum::response::Response {
         let is_acl_request = is_acl_request(request.uri());
+        let is_complete = is_complete_request(request.method(), request.uri());
         let method = request.method().clone();
         let mut response = strip_forbidden_body(next.run(request).await);
+        response = with_one_declaration(is_complete, response);
         if head_range_is_partial(&method, response.status(), response.headers()) {
             *response.status_mut() = axum::http::StatusCode::PARTIAL_CONTENT;
         }
@@ -979,5 +1067,87 @@ mod tests {
         assert!(acl("versionId=v&acl"));
         assert!(!acl("aclx"));
         assert!(!acl("x=acl"));
+    }
+}
+
+#[cfg(test)]
+mod one_declaration_tests {
+    use super::*;
+    use axum::http::{Method, StatusCode};
+
+    const DECL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
+
+    /// A body of the given data frames, read to its end.
+    async fn read(frames: &[&str]) -> String {
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = frames
+            .iter()
+            .map(|f| Ok(bytes::Bytes::from(f.to_string())))
+            .collect();
+        let inner = axum::body::Body::from_stream(futures::stream::iter(chunks));
+        let body = axum::body::Body::new(OneDeclaration { inner, seen: false });
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// The body of a slow Complete that fails: the declaration, spaces, then
+    /// the error document with a declaration of its own. The second one goes.
+    #[tokio::test]
+    async fn an_error_after_the_keepalive_has_one_declaration() {
+        let error = format!("{DECL}<Error><Code>InvalidPart</Code></Error>");
+        let got = read(&[DECL, " ", " ", &error]).await;
+        assert_eq!(
+            got,
+            format!("{DECL}  <Error><Code>InvalidPart</Code></Error>")
+        );
+        assert_eq!(got.matches("<?xml").count(), 1);
+    }
+
+    /// The success has no declaration of its own, and a body without a
+    /// declaration is not changed.
+    #[tokio::test]
+    async fn other_bodies_are_not_changed() {
+        let ok = "<CompleteMultipartUploadResult><ETag>x</ETag></CompleteMultipartUploadResult>";
+        assert_eq!(read(&[DECL, " ", ok]).await, format!("{DECL} {ok}"));
+        assert_eq!(read(&[ok]).await, ok);
+        assert_eq!(read(&[]).await, "");
+    }
+
+    #[tokio::test]
+    async fn the_fix_applies_only_to_a_slow_complete() {
+        let complete =
+            |method: &Method, uri: &str| is_complete_request(method, &uri.parse().unwrap());
+        assert!(complete(&Method::POST, "/b/k?uploadId=u"));
+        assert!(complete(&Method::POST, "/b/k?uploadId=u&x=1"));
+        assert!(!complete(&Method::POST, "/b/k?uploads"));
+        assert!(!complete(&Method::GET, "/b/k?uploadId=u"));
+        // Two declarations in two frames, as a slow Complete that fails
+        // sends them.
+        let response = |status: StatusCode, chunked: bool| {
+            let mut r = axum::http::Response::builder().status(status);
+            if chunked {
+                r = r.header(axum::http::header::TRANSFER_ENCODING, "chunked");
+            }
+            let frames: Vec<Result<bytes::Bytes, std::io::Error>> =
+                vec![Ok(DECL.into()), Ok(format!("{DECL}<Error/>").into())];
+            r.body(axum::body::Body::from_stream(futures::stream::iter(frames)))
+                .unwrap()
+        };
+        for (is_complete, status, chunked, fixed) in [
+            (true, StatusCode::OK, true, true),
+            (true, StatusCode::OK, false, false),
+            (true, StatusCode::BAD_REQUEST, true, false),
+            (false, StatusCode::OK, true, false),
+        ] {
+            let out = with_one_declaration(is_complete, response(status, chunked));
+            let body = axum::body::to_bytes(out.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let declarations = String::from_utf8_lossy(&body).matches("<?xml").count();
+            assert_eq!(
+                declarations,
+                if fixed { 1 } else { 2 },
+                "{is_complete} {status} {chunked}"
+            );
+        }
     }
 }

@@ -30,6 +30,7 @@ mod file_body;
 pub(in crate::storage) mod heal;
 mod listing;
 mod metadata;
+mod mpu_put;
 mod objects;
 #[cfg(test)]
 mod tests;
@@ -317,6 +318,10 @@ pub struct S3Backend {
     /// production constants (or the debug test seams). Set by
     /// [`S3Backend::with_copy_limits`].
     copy_limits: Option<(u64, u64)>,
+    /// `(single-PUT limit, part size)` of a file body that is sent as a
+    /// multipart upload; `None`: the production constants (or the debug
+    /// test seams). Set by [`S3Backend::with_put_limits`].
+    put_limits: Option<(u64, u64)>,
     /// A conditional-request profile fixed at construction
     /// ([`S3Backend::with_conditional_profile`]); `None` = the one that
     /// the capability probe found for this definition
@@ -368,6 +373,7 @@ impl S3Backend {
             acl_support: Default::default(),
             copy_unsupported: Default::default(),
             copy_limits: None,
+            put_limits: None,
             pinned_profile: None,
             client,
             bulk_client,
@@ -403,6 +409,20 @@ impl S3Backend {
             "a copy limit of 0 sends every copy through parts"
         );
         self.copy_limits = Some((object_max, part_bytes.max(5 * 1024 * 1024)));
+        self
+    }
+
+    /// Send a file body above `single_max` bytes as a multipart upload, in
+    /// parts of at least `part_bytes` (production: 5 GiB and 64 MiB). For a
+    /// test that runs the path on a few MiB without the process-wide
+    /// `DGP_TEST_PUT_*` seams. S3's smallest part (5 MiB) still applies.
+    #[doc(hidden)]
+    pub fn with_put_limits(mut self, single_max: u64, part_bytes: u64) -> Self {
+        assert!(
+            single_max > 0,
+            "a limit of 0 sends every file body through parts"
+        );
+        self.put_limits = Some((single_max, part_bytes.max(5 * 1024 * 1024)));
         self
     }
 

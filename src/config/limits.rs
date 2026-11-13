@@ -217,22 +217,28 @@ pub struct ExplicitLimits {
     /// `DGP_MAX_TOTAL_MULTIPART_BYTES`.
     pub total_multipart: Option<u64>,
     pub max_object_size: BytesOrAuto,
-    /// A configured backend is an S3 backend. It stores a client object
-    /// with ONE PUT request, which takes at most 5 GiB
-    /// ([`S3_SINGLE_PUT_MAX_BYTES`]).
+    /// A configured backend is an S3 backend. An object above one PUT
+    /// request (5 GiB, [`S3_SINGLE_PUT_MAX_BYTES`]) is stored as a backend
+    /// multipart upload, so the object maximum of S3 (5 TiB,
+    /// [`S3_OBJECT_MAX_BYTES`]) is the most it holds.
     pub s3_backend: bool,
     /// The spool directory shares its device with data NOW (a config apply
     /// added a filesystem backend after the boot measured). The budget does
     /// not change; the operator gets a warning (item `ShareChangesAtRestart`).
     pub shares_device_now: bool,
     /// A configured S3 backend hosts a proxy-encrypted bucket: the stored
-    /// ciphertext is larger than the plaintext, so the 5 GiB of one backend
-    /// PUT holds less plaintext ([`largest_plaintext_in_one_put`]).
+    /// ciphertext is larger than the plaintext, so the 5 TiB of one S3
+    /// object holds less plaintext ([`largest_plaintext_in_one_object`]).
     pub s3_proxy_encrypted: bool,
 }
 
-/// The most that an S3 backend stores with one PUT request.
+/// The most that an S3 backend stores with one PUT request. A larger file
+/// body is a backend multipart upload (`storage/s3/mpu_put.rs`).
 pub const S3_SINGLE_PUT_MAX_BYTES: u64 = 5 * GIB;
+
+/// The largest object that S3 stores (a multipart upload of up to 10 000
+/// parts).
+pub const S3_OBJECT_MAX_BYTES: u64 = 5 * 1024 * GIB;
 
 /// Spool files of a delta encode, each up to the object's size: the body,
 /// the reference and the delta output.
@@ -263,14 +269,14 @@ pub fn delta_ceiling_with_body_copy(spool_budget: u64) -> u64 {
 
 /// Pure: the largest plaintext whose encrypted form
 /// (`storage::encrypting::v2::stored_len`: header + a 16-byte tag per 64 KiB
-/// frame) fits in one 5 GiB backend PUT.
-pub fn largest_plaintext_in_one_put() -> u64 {
+/// frame) fits in one S3 object ([`S3_OBJECT_MAX_BYTES`]).
+pub fn largest_plaintext_in_one_object() -> u64 {
     use crate::storage::encrypting::v2::stored_len;
-    let (mut lo, mut hi) = (0u64, S3_SINGLE_PUT_MAX_BYTES);
+    let (mut lo, mut hi) = (0u64, S3_OBJECT_MAX_BYTES);
     // `stored_len` is strictly increasing: find the last plaintext that fits.
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
-        if stored_len(mid).is_some_and(|s| s <= S3_SINGLE_PUT_MAX_BYTES) {
+        if stored_len(mid).is_some_and(|s| s <= S3_OBJECT_MAX_BYTES) {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -337,11 +343,11 @@ pub enum ObjectSizeBound {
     PerUpload,
     /// The total of all open multipart uploads.
     TotalMultipart,
-    /// An S3 backend stores a client object with one PUT: 5 GiB.
-    S3SinglePut,
+    /// The largest object of S3: 5 TiB.
+    S3ObjectMax,
     /// The same with a proxy-encrypted bucket on an S3 backend: the largest
-    /// plaintext whose ciphertext fits in 5 GiB.
-    S3SinglePutEncrypted,
+    /// plaintext whose ciphertext fits in 5 TiB.
+    S3ObjectMaxEncrypted,
     /// The spool budget itself: nothing larger can be held.
     SpoolBudget,
 }
@@ -352,11 +358,9 @@ impl ObjectSizeBound {
             Self::Explicit => "set by max_object_size",
             Self::PerUpload => "auto: the per-upload limit",
             Self::TotalMultipart => "auto: the total multipart limit",
-            Self::S3SinglePut => {
-                "auto: 5 GiB, the most that an S3 backend stores with one PUT request"
-            }
-            Self::S3SinglePutEncrypted => {
-                "auto: the largest object whose encrypted form fits the 5 GiB of one S3 PUT request"
+            Self::S3ObjectMax => "auto: 5 TiB, the largest object that S3 stores",
+            Self::S3ObjectMaxEncrypted => {
+                "auto: the largest object whose encrypted form fits the 5 TiB of one S3 object"
             }
             Self::SpoolBudget => "auto: the spool budget",
         }
@@ -539,11 +543,11 @@ pub fn derive_limits(
                 if explicit.s3_backend {
                     let (cap, cap_bound) = if explicit.s3_proxy_encrypted {
                         (
-                            largest_plaintext_in_one_put(),
-                            ObjectSizeBound::S3SinglePutEncrypted,
+                            largest_plaintext_in_one_object(),
+                            ObjectSizeBound::S3ObjectMaxEncrypted,
                         )
                     } else {
-                        (S3_SINGLE_PUT_MAX_BYTES, ObjectSizeBound::S3SinglePut)
+                        (S3_OBJECT_MAX_BYTES, ObjectSizeBound::S3ObjectMax)
                     };
                     if cap < v {
                         v = cap;
@@ -1363,17 +1367,25 @@ mod tests {
     }
 
     /// An auto `max_object_size` is the lowest bound: with an S3 backend it
-    /// is at most 5 GiB (one backend PUT), explicit multipart limits count,
-    /// and a filesystem-only deployment has no 5 GiB cap.
+    /// is at most 5 TiB (the largest S3 object; an object above 5 GiB is a
+    /// backend multipart upload), explicit multipart limits count, and a
+    /// filesystem-only deployment has no S3 cap.
     #[test]
     fn auto_max_object_size_is_the_lowest_bound() {
         let s3 = ExplicitLimits {
             s3_backend: true,
             ..auto()
         };
+        // 5 GiB is no cap: the spool decides.
         let (l, _) = derive_limits(facts(60 * GIB), s3);
-        assert_eq!(l.max_object_size, 5 * GIB);
-        assert_eq!(l.max_object_size_bound, ObjectSizeBound::S3SinglePut);
+        assert_eq!(l.max_object_size, 15 * GIB);
+        assert_eq!(l.max_object_size_bound, ObjectSizeBound::PerUpload);
+        // A spool above S3's object maximum is capped at it.
+        let (l, _) = derive_limits(facts(40 * S3_OBJECT_MAX_BYTES), s3);
+        assert_eq!(l.max_object_size, S3_OBJECT_MAX_BYTES);
+        assert_eq!(l.max_object_size_bound, ObjectSizeBound::S3ObjectMax);
+        let (l, _) = derive_limits(facts(40 * S3_OBJECT_MAX_BYTES), auto());
+        assert_eq!(l.max_object_size, 10 * S3_OBJECT_MAX_BYTES);
         let (l, _) = derive_limits(facts(60 * GIB), auto());
         assert_eq!(l.max_object_size, 15 * GIB);
         assert_eq!(l.max_object_size_bound, ObjectSizeBound::PerUpload);
@@ -1442,25 +1454,28 @@ mod tests {
     }
 
     /// With a proxy-encrypted bucket on an S3 backend, the ciphertext of an
-    /// object (header + 16 bytes per 64 KiB frame) must fit in 5 GiB.
+    /// object (header + 16 bytes per 64 KiB frame) must fit in 5 TiB.
     #[test]
     fn auto_object_size_leaves_room_for_the_ciphertext_on_s3() {
         use crate::storage::encrypting::v2::stored_len;
-        let max = largest_plaintext_in_one_put();
-        assert!(max < S3_SINGLE_PUT_MAX_BYTES);
-        assert!(stored_len(max).unwrap() <= S3_SINGLE_PUT_MAX_BYTES);
-        assert!(stored_len(max + 1).unwrap() > S3_SINGLE_PUT_MAX_BYTES);
+        let max = largest_plaintext_in_one_object();
+        assert!(max < S3_OBJECT_MAX_BYTES);
+        assert!(stored_len(max).unwrap() <= S3_OBJECT_MAX_BYTES);
+        assert!(stored_len(max + 1).unwrap() > S3_OBJECT_MAX_BYTES);
         let ex = ExplicitLimits {
             s3_backend: true,
             s3_proxy_encrypted: true,
             ..auto()
         };
-        let (l, _) = derive_limits(facts(60 * GIB), ex);
+        let (l, _) = derive_limits(facts(40 * S3_OBJECT_MAX_BYTES), ex);
         assert_eq!(l.max_object_size, max);
         assert_eq!(
             l.max_object_size_bound,
-            ObjectSizeBound::S3SinglePutEncrypted
+            ObjectSizeBound::S3ObjectMaxEncrypted
         );
+        // A spool below it decides, as for a plain bucket.
+        let (l, _) = derive_limits(facts(60 * GIB), ex);
+        assert_eq!(l.max_object_size, 15 * GIB);
         // Without S3, or without encryption, the plain bound applies.
         let ex = ExplicitLimits {
             s3_proxy_encrypted: true,
@@ -1476,7 +1491,7 @@ mod tests {
         };
         assert_eq!(
             derive_limits(facts(60 * GIB), ex).0.max_object_size,
-            5 * GIB
+            15 * GIB
         );
         // An explicit value is unchanged.
         let ex = ExplicitLimits {
@@ -1875,7 +1890,7 @@ mod tests {
         }
 
         /// An auto `max_object_size` is at most every non-zero multipart
-        /// limit, explicit or derived, and at most 5 GiB when an S3 backend
+        /// limit, explicit or derived, and at most 5 TiB when an S3 backend
         /// exists.
         #[test]
         fn auto_max_object_size_respects_every_bound(f in arb_facts(), ex in arb_explicit()) {
@@ -1887,7 +1902,7 @@ mod tests {
                 }
             }
             if ex.s3_backend {
-                prop_assert!(l.max_object_size <= S3_SINGLE_PUT_MAX_BYTES);
+                prop_assert!(l.max_object_size <= S3_OBJECT_MAX_BYTES);
             }
             prop_assert!(l.max_object_size <= l.spool_budget);
             prop_assert_eq!(l.delta_ceiling, l.spool_budget / 3);

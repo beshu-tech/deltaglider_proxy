@@ -57,6 +57,22 @@ mod classify_tests {
             ),
             (object_op, Some(400), "InvalidObjectName", "InvalidKey"),
             (object_op, Some(400), "KeyTooLongError", "KeyTooLong"),
+            // The backend refuses the object as too large: a client error
+            // on every operation that writes bytes, whatever the status.
+            (object_op, Some(400), "EntityTooLarge", "EntityTooLarge"),
+            (
+                S3Op::UploadPart,
+                Some(400),
+                "EntityTooLarge",
+                "EntityTooLarge",
+            ),
+            (
+                S3Op::CompleteMpu,
+                Some(400),
+                "EntityTooLarge",
+                "EntityTooLarge",
+            ),
+            (object_op, Some(413), "EntityTooLarge", "EntityTooLarge"),
             // A bare 400 is not the key's fault (wrong region, expired token).
             (S3Op::HeadObject, Some(400), "", "S3"),
             // F16: a backend that gives up on the request, a retry can clear.
@@ -103,6 +119,7 @@ mod classify_tests {
                 E::NoSuchUpload(_) => "NoSuchUpload",
                 E::InvalidKey(_) => "InvalidKey",
                 E::KeyTooLong(_) => "KeyTooLong",
+                E::EntityTooLarge(_) => "EntityTooLarge",
                 E::Transient(_) => "Transient",
                 E::Throttled(_) => "Throttled",
                 E::QuotaExceeded(_) => "QuotaExceeded",
@@ -1806,6 +1823,7 @@ pub(crate) mod test_support {
             acl_support: Default::default(),
             copy_unsupported: Default::default(),
             copy_limits: Default::default(),
+            put_limits: Default::default(),
             pinned_profile: None,
             bulk_client: client.clone(),
             health_key: None,
@@ -2075,6 +2093,7 @@ mod lost_response_tests {
             acl_support: Default::default(),
             copy_unsupported: Default::default(),
             copy_limits: Default::default(),
+            put_limits: Default::default(),
             pinned_profile: None,
             bulk_client: client.clone(),
             health_key: None,
@@ -2335,6 +2354,7 @@ mod conditional_delete_tests {
             acl_support: Default::default(),
             copy_unsupported: Default::default(),
             copy_limits: Default::default(),
+            put_limits: Default::default(),
             pinned_profile: None,
             bulk_client: client.clone(),
             health_key: None,

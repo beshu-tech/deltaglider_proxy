@@ -184,37 +184,44 @@ pub(super) async fn complete_multipart_upload(
         &input.key,
         &requested_parts,
     )?;
-    let complete_response =
-        |etag: &str,
-         stored: Option<&crate::types::StoreResult>|
-         -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
-            let location = format!("/{}/{}", input.bucket, input.key);
-            let mut resp = s3s::S3Response::new(s3s::dto::CompleteMultipartUploadOutput {
-                bucket: Some(input.bucket.clone()),
-                key: Some(input.key.clone()),
-                e_tag: Some(parse_s3s_etag(etag)?),
-                location: Some(location),
-                ..Default::default()
-            });
-            // The storage facts are known only to the request that ran the
-            // store; a joined retry or a tombstone hit answers without them.
-            if let Some(stored) = stored {
-                add_write_fact_headers(&mut resp.headers, stored, writer);
-            }
-            Ok(resp)
-        };
+    let complete_response = |etag: &str,
+                             stored: Option<&crate::types::StoreResult>|
+     -> s3s::S3Result<
+        s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>,
+    > {
+        let mut resp = s3s::S3Response::new(completion_output(&input.bucket, &input.key, etag)?);
+        // The storage facts are known only to the request that ran the
+        // store; a joined retry or a tombstone hit answers without them.
+        if let Some(stored) = stored {
+            add_write_fact_headers(&mut resp.headers, stored, writer);
+        }
+        Ok(resp)
+    };
+    let after = keepalive_after();
     match begin {
         crate::multipart::BeginComplete::AlreadyDone { etag } => {
-            judge_joiner(svc, &input, &etag).await?;
+            judge_joiner(&svc.state, &input, &etag).await?;
             complete_response(&etag, None)
         }
-        crate::multipart::BeginComplete::Join(rx) => match await_completion_outcome(rx).await {
-            Ok(etag) => {
-                judge_joiner(svc, &input, &etag).await?;
-                complete_response(&etag, None)
-            }
-            Err(failure) => Err(failure.to_s3s()),
-        },
+        crate::multipart::BeginComplete::Join(rx) => {
+            // A retry that joins a long store waits as long as the owner
+            // does, so it answers with the keepalive too.
+            let (state, joined) = (svc.state.clone(), input.clone());
+            let work = async move {
+                let etag = await_completion_outcome(rx)
+                    .await
+                    .map_err(|failure| failure.to_s3s())?;
+                judge_joiner(&state, &joined, &etag).await?;
+                Ok((etag, None))
+            };
+            answer_in_time(
+                after,
+                work,
+                (input.bucket.clone(), input.key.clone()),
+                |etag, stored| complete_response(&etag, stored.as_ref()),
+            )
+            .await
+        }
         crate::multipart::BeginComplete::Owner(publisher) => {
             // The slot of the detached store (F56) BEFORE the object lock:
             // a detached DeleteObjects batch holds a slot while it takes
@@ -298,21 +305,116 @@ pub(super) async fn complete_multipart_upload(
                 )
                 .await
                 .map_err(s3s::S3Error::from);
+                // The store ran: its failure is the upload's, whoever asks
+                // (the refusals that depend on the owner's headers or
+                // principal were judged before it, above). A joiner gets the
+                // real answer, not "ended before it finished" (`owner_gone`
+                // is for a store that did not run to its end).
                 match &result {
                     Ok((etag, _)) => publisher.publish(Ok(etag.clone())),
-                    Err(e) => publisher.publish(Err(crate::multipart::joiner_failure(Some(e)))),
+                    Err(e) => publisher.publish(Err(crate::multipart::CompletionFailure::of(e))),
                 }
                 result
             });
-            match handle.await {
-                Ok(Ok((etag, stored))) => complete_response(&etag, Some(&stored)),
-                Ok(Err(e)) => Err(e),
-                Err(join_err) => Err(s3s::S3Error::from(
-                    crate::api::errors::S3Error::InternalError(format!(
-                        "completion task failed: {join_err}"
+            let work = async move {
+                match handle.await {
+                    Ok(Ok((etag, stored))) => Ok((etag, Some(stored))),
+                    Ok(Err(e)) => Err(e),
+                    Err(join_err) => Err(s3s::S3Error::from(
+                        crate::api::errors::S3Error::InternalError(format!(
+                            "completion task failed: {join_err}"
+                        )),
                     )),
-                )),
-            }
+                }
+            };
+            answer_in_time(
+                after,
+                work,
+                (input.bucket.clone(), input.key.clone()),
+                |etag, stored| complete_response(&etag, stored.as_ref()),
+            )
+            .await
+        }
+    }
+}
+
+/// How long a CompleteMultipartUpload runs before it answers `200` and
+/// keeps the connection alive.
+const COMPLETE_KEEPALIVE_AFTER_MS: u64 = 5_000;
+
+fn keepalive_after() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        crate::config::test_seams::test_seams()
+            .complete_keepalive_after_ms
+            .unwrap_or(COMPLETE_KEEPALIVE_AFTER_MS),
+    )
+}
+
+/// The `200` body of a completed upload.
+fn completion_output(
+    bucket: &str,
+    key: &str,
+    etag: &str,
+) -> s3s::S3Result<s3s::dto::CompleteMultipartUploadOutput> {
+    Ok(s3s::dto::CompleteMultipartUploadOutput {
+        bucket: Some(bucket.to_string()),
+        key: Some(key.to_string()),
+        e_tag: Some(parse_s3s_etag(etag)?),
+        location: Some(format!("/{bucket}/{key}")),
+        ..Default::default()
+    })
+}
+
+/// What the store of a Complete ends in: the upload's ETag, and the
+/// storage facts when this request ran the store.
+type Completed = s3s::S3Result<(String, Option<crate::types::StoreResult>)>;
+
+/// Answer a Complete the way AWS does. A store that ends within `after`
+/// answers as any request does (`on_time`: the status of its own error,
+/// the storage facts in the headers). A longer store answers `200` at
+/// once, and s3s sends one space every 100 ms until the store ends, then
+/// the result document: the success, or the error as an error document in
+/// the `200` body. A client then never reaches its read timeout (the AWS CLI
+/// waits 60 s) while a store of many GiB runs, and the 300 s request
+/// deadline of the router no longer ends the request (it covers the
+/// response headers only). The storage facts are headers, and headers are
+/// out by then: a long Complete carries none.
+///
+/// `work` must not read a task-local (it is polled by the response body, not
+/// by the request task).
+async fn answer_in_time<F>(
+    after: std::time::Duration,
+    work: F,
+    (bucket, key): (String, String),
+    on_time: impl FnOnce(
+        String,
+        Option<crate::types::StoreResult>,
+    ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>>,
+) -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>>
+where
+    F: std::future::Future<Output = Completed> + Send + 'static,
+{
+    let mut work = Box::pin(work);
+    match tokio::time::timeout(after, work.as_mut()).await {
+        Ok(done) => {
+            let (etag, stored) = done?;
+            on_time(etag, stored)
+        }
+        Err(_) => {
+            let late = async move {
+                let (etag, _) = work.await.inspect_err(|e| {
+                    tracing::warn!(
+                        "CompleteMultipartUpload of {bucket}/{key} failed after its 200 was sent: {e}"
+                    );
+                })?;
+                completion_output(&bucket, &key, &etag)
+            };
+            Ok(s3s::S3Response::new(
+                s3s::dto::CompleteMultipartUploadOutput {
+                    future: Some(Box::pin(late)),
+                    ..Default::default()
+                },
+            ))
         }
     }
 }
@@ -326,7 +428,7 @@ pub(super) async fn complete_multipart_upload(
 /// holds another object, or none, the request's own preconditions are
 /// judged against that (`retry_verdict`).
 async fn judge_joiner(
-    svc: &DeltaGliderS3Service,
+    state: &AppState,
     input: &s3s::dto::CompleteMultipartUploadInput,
     upload_etag: &str,
 ) -> s3s::S3Result<()> {
@@ -334,7 +436,7 @@ async fn judge_joiner(
     if !has_precondition {
         return Ok(());
     }
-    let engine = svc.state.engine.load();
+    let engine = state.engine.load();
     let current = engine
         .head(&input.bucket, &input.key)
         .await
@@ -852,6 +954,91 @@ mod multipart_cost_tests {
             .filter(|r| r.starts_with("PUT /b/a/photo.jpg"))
             .count();
         assert_eq!(puts, 1, "the retry wrote nothing");
+    }
+
+    /// A Complete whose store the backend refuses with `code` (status 400),
+    /// with one request that joined it: the owner's and the joiner's errors.
+    async fn failed_store_and_joiner(code: &str) -> (s3s::S3Error, s3s::S3Error) {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let state = AppState::for_tests(engine);
+        let svc = Arc::new(service(state.clone()));
+        let id = state
+            .multipart
+            .create("b", "a/photo.jpg", None, Default::default())
+            .unwrap();
+        let etag = upload_part(&svc, request(part(&id, 1)))
+            .await
+            .unwrap()
+            .output
+            .e_tag
+            .unwrap();
+        fake.fail("PUT", "a/photo.jpg", 400, code, u32::MAX);
+        // The object's lock is held: the owner waits before its store, so
+        // the joiner joins a store that has not run yet.
+        let lock = state
+            .engine
+            .load()
+            .lock_object_write("b", "a/photo.jpg")
+            .await;
+        let owner = tokio::spawn({
+            let (svc, input) = (svc.clone(), complete_input(&id, &etag, false));
+            async move { complete_multipart_upload(&svc, request(input)).await }
+        });
+        eventually("the owner's completion is in flight", || {
+            state.multipart.completion_joiners(&id).is_some()
+        })
+        .await;
+        let joiner = tokio::spawn({
+            let (svc, input) = (svc.clone(), complete_input(&id, &etag, false));
+            async move { complete_multipart_upload(&svc, request(input)).await }
+        });
+        eventually("the joiner joined", || {
+            state.multipart.completion_joiners(&id) == Some(1)
+        })
+        .await;
+        drop(lock);
+        let owner = owner.await.unwrap().expect_err("the backend refuses");
+        let joiner = joiner.await.unwrap().expect_err("the joiner is told");
+        (owner, joiner)
+    }
+
+    /// A backend that refuses the object as too large (`EntityTooLarge`) is
+    /// a 400 `EntityTooLarge` for the owner and for a request that joined
+    /// its store: never the sanitised 500, never "ended before it finished".
+    #[tokio::test]
+    async fn a_backend_entity_too_large_is_a_400_for_the_owner_and_a_joiner() {
+        let (owner, joiner) = failed_store_and_joiner("EntityTooLarge").await;
+        for (who, err) in [("owner", &owner), ("joiner", &joiner)] {
+            assert_eq!(
+                *err.code(),
+                s3s::S3ErrorCode::EntityTooLarge,
+                "{who}: {err:?}"
+            );
+            assert_eq!(
+                err.status_code()
+                    .unwrap_or(axum::http::StatusCode::BAD_REQUEST),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{who}"
+            );
+        }
+    }
+
+    /// The store ran and failed: a joiner gets the owner's real failure, not
+    /// the retryable "ended before it finished" of a request that never ran
+    /// its store (`owner_gone`).
+    #[tokio::test]
+    async fn a_joiner_of_a_failed_store_gets_the_owners_failure() {
+        let (owner, joiner) = failed_store_and_joiner("InvalidRequest").await;
+        assert_eq!(*owner.code(), s3s::S3ErrorCode::InternalError, "{owner:?}");
+        assert_eq!(joiner.code(), owner.code(), "{joiner:?}");
+        assert_eq!(joiner.status_code(), owner.status_code());
+        assert!(
+            !joiner
+                .message()
+                .unwrap_or_default()
+                .contains("ended before it finished"),
+            "{joiner:?}"
+        );
     }
 
     /// A request for the SAME upload that joins a successful Complete is the

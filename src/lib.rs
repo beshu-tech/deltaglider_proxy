@@ -4021,6 +4021,38 @@ mod source_guards {
         );
     }
 
+    /// A file body goes to an S3 backend through ONE method
+    /// (`put_object_file_with_metadata_fenced_with`), which sends a body
+    /// above 5 GiB as a backend multipart upload. Another PUT of a file
+    /// body stream would fail above 5 GiB with `EntityTooLarge`: so
+    /// `.byte_stream()` is called once in `objects.rs` (the single PUT
+    /// behind the switch), once in `mpu_put.rs` (the parts) and nowhere
+    /// else in `storage/s3`.
+    #[test]
+    fn file_bodies_go_through_the_multipart_switch() {
+        let mut seen = std::collections::BTreeMap::<String, usize>::new();
+        for src in crate::source_scan::ast::src() {
+            let n = src
+                .prod
+                .calls_named("byte_stream")
+                .filter(|c| c.method)
+                .count();
+            if n > 0 {
+                seen.insert(src.rel.to_string(), n);
+            }
+        }
+        let expected: std::collections::BTreeMap<String, usize> = [
+            ("src/storage/s3/mpu_put.rs".to_string(), 1),
+            ("src/storage/s3/objects.rs".to_string(), 1),
+        ]
+        .into();
+        assert_eq!(
+            seen, expected,
+            "a file body is sent by the single PUT behind the multipart switch (objects.rs) \
+             and by the parts of an upload (mpu_put.rs) only"
+        );
+    }
+
     #[test]
     fn no_content_responses_carry_no_body() {
         let mut offenders = Vec::new();

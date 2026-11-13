@@ -803,6 +803,12 @@ pub enum StorageError {
     #[error("MetadataTooLarge: {0}")]
     MetadataTooLarge(String),
 
+    /// The backend refused the object as too large (`EntityTooLarge`, 400):
+    /// a retry gets the same answer. Maps to 400 EntityTooLarge, never 500
+    /// or 503.
+    #[error("EntityTooLarge: {0}")]
+    EntityTooLarge(String),
+
     /// The backend did not answer: the request timed out, or the
     /// connection failed. Maps to 503 ServiceUnavailable.
     #[error("Backend unavailable (timed out or unreachable): {0}")]
@@ -883,6 +889,7 @@ impl StorageError {
             E::InvalidKey(s) => E::InvalidKey(s.clone()),
             E::KeyTooLong(s) => E::KeyTooLong(s.clone()),
             E::MetadataTooLarge(s) => E::MetadataTooLarge(s.clone()),
+            E::EntityTooLarge(s) => E::EntityTooLarge(s.clone()),
             E::Unavailable(s) => E::Unavailable(s.clone()),
             E::Transient(s) => E::Transient(s.clone()),
             E::Contended(s) => E::Contended(s.clone()),

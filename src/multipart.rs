@@ -420,9 +420,11 @@ pub fn shared_with_joiners(code: &s3s::S3ErrorCode) -> bool {
     )
 }
 
-/// Pure: what the owner of a Complete publishes to its joiners when it ends
-/// WITHOUT a success: its own answer when [`shared_with_joiners`], else (or
-/// when the request was dropped, `None`) [`CompletionFailure::owner_gone`].
+/// Pure: what the owner of a Complete publishes to its joiners when it is
+/// refused BEFORE its store runs (the quota and precondition gate): its own
+/// answer when [`shared_with_joiners`], else (or when the request was
+/// dropped, `None`) [`CompletionFailure::owner_gone`]. A failure of the
+/// store itself is published as it is (`CompletionFailure::of`).
 pub fn joiner_failure(answer: Option<&s3s::S3Error>) -> CompletionFailure {
     match answer {
         Some(err) if shared_with_joiners(err.code()) => CompletionFailure::of(err),
