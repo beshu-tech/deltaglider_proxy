@@ -27,7 +27,7 @@ pub(super) async fn copy_object(
     )?;
     // Gate on the DESTINATION bucket first — copy-into is a client write,
     // refused regardless of backend reachability (403-before-404).
-    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
+    crate::api::handlers::object_helpers::check_client_store_allowed(&svc.state, &input.bucket)
         .await?;
     let directive = input
         .metadata_directive
@@ -313,7 +313,7 @@ pub(super) async fn upload_part_copy(
     )?;
     // Gate on the DESTINATION bucket — part-copy feeds a client write
     // (403-before-404, no backend I/O for a doomed request).
-    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
+    crate::api::handlers::object_helpers::check_client_store_allowed(&svc.state, &input.bucket)
         .await?;
     // A part of the destination upload: the write paths' brief bucket cache.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;

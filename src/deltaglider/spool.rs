@@ -111,6 +111,9 @@ pub struct SpoolDir {
     /// Holders of optional spool files (the range-read reconstruction
     /// cache) that give budget back when an acquire finds it short.
     evictors: Arc<parking_lot::Mutex<Vec<std::sync::Weak<dyn SpoolEvictor>>>>,
+    /// The disk level (`disk_watch`): at high or critical a new write is
+    /// refused ([`SpoolDir::admit_new_write`]).
+    gate: Arc<crate::disk_watch::SpoolGate>,
 }
 
 /// A holder of spool files that are optional (a cache): it drops one when
@@ -294,7 +297,31 @@ impl SpoolDir {
             ),
             shares: Default::default(),
             evictors: Default::default(),
+            gate: Default::default(),
         })
+    }
+
+    /// The disk level that the monitor (`disk_watch`) sets and this spool
+    /// reads. Clones of the spool share it.
+    pub fn gate(&self) -> &Arc<crate::disk_watch::SpoolGate> {
+        &self.gate
+    }
+
+    /// Admit a NEW write: an op that holds no spool yet. At disk level high
+    /// or critical it is refused with [`CONTENDED`] (the engine answers a
+    /// retryable `503 SlowDown`, with the message). An op that holds a
+    /// spool, a read and a delete never ask: they run to the end.
+    pub fn admit_new_write(&self) -> std::io::Result<()> {
+        match self.gate.refusal() {
+            Some(message) => Err(std::io::Error::new(CONTENDED, message)),
+            None => Ok(()),
+        }
+    }
+
+    /// Spool bytes reserved now (the budget in use), for the gauge.
+    pub fn used_bytes(&self) -> u64 {
+        const MIB: u64 = 1024 * 1024;
+        (self.budget.max.saturating_sub(self.budget.free()) as u64).saturating_mul(MIB)
     }
 
     /// Let the reservations made in one backend's scope ([`scoped`]) hold

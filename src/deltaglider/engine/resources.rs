@@ -155,6 +155,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         if need == 0 {
             return Ok(None);
         }
+        self.admit_new_spool_write(held_mib)?;
         self.with_spool_timeout(self.spool.reserve_beside(held_mib, need))
             .await
             .map(Some)
@@ -174,6 +175,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         held_mib: usize,
         wait: SpoolWait,
     ) -> Result<crate::deltaglider::spool::SpoolReservation, EngineError> {
+        self.admit_new_spool_write(held_mib)?;
         match wait {
             SpoolWait::Queue => {
                 self.with_spool_timeout(self.spool.reserve_beside(held_mib, bytes))
@@ -217,7 +219,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         bytes: usize,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
+        self.admit_new_spool_write(0)?;
         self.spool.try_acquire(bytes as u64).map_err(spool_error)
+    }
+
+    /// THE disk-level gate of a write that wants spool space: at disk level
+    /// high or critical (`disk_watch`) an op that holds no spool yet
+    /// (`held_mib` = 0) is refused with a retryable `Overloaded` that names
+    /// the level. An op that holds a spool already runs to its end, and
+    /// reads and deletes never ask. Every write reservation passes here
+    /// (source guard `every_write_reservation_asks_the_disk_gate`).
+    pub(crate) fn admit_new_spool_write(&self, held_mib: usize) -> Result<(), EngineError> {
+        if held_mib > 0 {
+            return Ok(());
+        }
+        self.spool.admit_new_write().map_err(spool_error)
     }
 
     /// `spool_acquire` for an op that holds `held_mib` of the budget already

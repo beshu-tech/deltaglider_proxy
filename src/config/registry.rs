@@ -597,6 +597,36 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Delta Engine",
     },
     EnvVarEntry {
+        name: "DGP_DISK_MONITOR_INTERVAL_SECS",
+        description: "Seconds between two measures of the free disk space of the spool directory, the filesystem backend roots and the data directory (default: 30, minimum 1)",
+        example: "30",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_DISK_LOW_PERCENT",
+        description: "Disk level low: free space below this percent of the disk, or below twice the largest spool reservation of one upload, whichever is more (default: 15, range 1 to 50)",
+        example: "15",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_DISK_HIGH_PERCENT",
+        description: "Disk level high: free space below this percent of the disk, or below the largest spool reservation of one upload, whichever is more. The proxy then refuses new spool reservations with 503 SlowDown (default: 10, range 1 to 50)",
+        example: "10",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_DISK_CRITICAL_PERCENT",
+        description: "Disk level critical: free space below this percent of the disk, or below 1 GiB, whichever is more. The proxy also refuses writes to the buckets of a filesystem backend on that disk (default: 5, range 1 to 50)",
+        example: "5",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_DISK_RECOVER_POINTS",
+        description: "A disk level ends when the free space is this many percentage points of the disk above the entry threshold of the level (default: 2, range 1 to 50)",
+        example: "2",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_SHUTDOWN_TIMEOUT_SECS",
         description: "Seconds that the exit waits for running blocking tasks (an xdelta3 run) after the drain steps; then the process exits (default: 10, minimum 1)",
         example: "10",

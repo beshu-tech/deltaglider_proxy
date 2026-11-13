@@ -2499,3 +2499,101 @@ async fn a_config_apply_keeps_the_limits_and_takes_a_new_max_object_size() {
     assert_eq!(l["spool_budget"]["bytes"], 40 * GIB, "{l}");
     assert_eq!(l["per_upload"]["bytes"], 20 * GIB, "{l}");
 }
+
+/// A server whose disk monitor sees `free_percent` of a 100 GiB disk free
+/// (the seam), with a spool threshold of 1 MiB so that a 4 MiB body needs a
+/// spool reservation.
+async fn disk_server(free_percent: u8) -> (tempfile::TempDir, TestServer) {
+    let spool = tempfile::TempDir::new().unwrap();
+    let server = TestServer::builder()
+        .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
+        .env("DGP_SPOOL_THRESHOLD_BYTES", &MIB.to_string())
+        .env("DGP_TEST_DISK_MONITOR_FREE_PERCENT", &free_percent.to_string())
+        .build()
+        .await;
+    (spool, server)
+}
+
+async fn put_status(server: &TestServer, key: &str, len: usize) -> (u16, String) {
+    let url = format!("{}/{}/{key}", server.endpoint(), server.bucket());
+    let resp = server
+        .http()
+        .put(url)
+        .body(vec![7u8; len])
+        .send()
+        .await
+        .unwrap();
+    (resp.status().as_u16(), resp.text().await.unwrap())
+}
+
+/// At disk level high a NEW upload that needs spool space gets 503 SlowDown
+/// with the level in the message. A small upload (held in memory), a read
+/// and `/_/ready` are not affected, and the gauge says high. With the disk
+/// at 50% free the same upload succeeds.
+#[tokio::test]
+async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
+    let (_spool, ok) = disk_server(50).await;
+    let (status, body) = put_status(&ok, "large.bin", 4 * MIB as usize).await;
+    assert_eq!(status, 200, "a disk with room admits the upload: {body}");
+
+    let (_spool, server) = disk_server(8).await;
+    // The monitor measures at its first tick, which runs at the boot.
+    let metrics = reqwest::get(format!("{}/_/metrics", server.endpoint()))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("deltaglider_disk_level{path_role=\"spool\"} 2"),
+        "{metrics}"
+    );
+    assert!(metrics.contains("deltaglider_spool_budget_bytes"), "{metrics}");
+
+    let (status, body) = put_status(&server, "large.bin", 4 * MIB as usize).await;
+    assert_eq!(status, 503, "{body}");
+    for needle in ["SlowDown", "level high", "DGP_SPOOL_MAX_BYTES"] {
+        assert!(body.contains(needle), "{needle} not in: {body}");
+    }
+
+    // A small body needs no spool: the upload and the read work.
+    let (status, body) = put_status(&server, "small.bin", 1024).await;
+    assert_eq!(status, 200, "{body}");
+    let got = server
+        .http()
+        .get(format!("{}/{}/small.bin", server.endpoint(), server.bucket()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status().as_u16(), 200);
+    assert_eq!(got.bytes().await.unwrap().len(), 1024);
+
+    // A full disk still serves reads, so the node stays ready.
+    let ready = reqwest::get(format!("{}/_/ready", server.endpoint()))
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+}
+
+/// At disk level critical a write to a bucket of the filesystem backend gets
+/// 503 SlowDown that names the backend; a delete still works.
+#[tokio::test]
+async fn at_disk_level_critical_writes_to_the_backend_are_refused_and_deletes_work() {
+    let (_spool, server) = disk_server(3).await;
+    let (status, body) = put_status(&server, "small.bin", 1024).await;
+    assert_eq!(status, 503, "{body}");
+    for needle in ["SlowDown", "critical", "Reads and deletes still work"] {
+        assert!(body.contains(needle), "{needle} not in: {body}");
+    }
+    let del = server
+        .http()
+        .delete(format!("{}/{}/small.bin", server.endpoint(), server.bucket()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status().as_u16(), 204, "a delete frees space");
+    let ready = reqwest::get(format!("{}/_/ready", server.endpoint()))
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+}

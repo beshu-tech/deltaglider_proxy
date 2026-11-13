@@ -230,6 +230,20 @@ The proxy reads each upload body once before it stores the object. A body that i
 
 A rising count of `reason="memory_budget"` means that many small uploads arrive at the same time and the memory budget is full. Those bodies still succeed, but each one costs a disk write. Raise `DGP_INGEST_MEMORY_MAX_BYTES` if the host has free memory.
 
+## Disk space
+
+A background monitor measures the free space of the spool directory, of the root of every filesystem backend and of the data directory every `DGP_DISK_MONITOR_INTERVAL_SECS` seconds (30 by default). Directories on one device are measured once and share one level. The label `path_role` names the role of the directory: `spool`, `backend:<name>` (the name of the backend, for example `backend:hetzner-fsn1`) or `data`. An S3 backend has no series. The [capacity planning reference](capacity-planning.md#disk-watermarks) explains the levels, and [the monitoring guide](../how-to/monitor-with-prometheus.md#disk-space-rules) gives the alert rules.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_spool_budget_bytes` | Gauge | — | The spool byte budget, which is the effective value of `DGP_SPOOL_MAX_BYTES` |
+| `deltaglider_spool_used_bytes` | Gauge | — | The spool bytes that running requests have reserved now, rounded up to whole MiB. It never goes above the budget |
+| `deltaglider_disk_free_bytes` | Gauge | `path_role` | The bytes that a new file can use on the disk of the role |
+| `deltaglider_disk_total_bytes` | Gauge | `path_role` | The size of the disk of the role |
+| `deltaglider_disk_level` | Gauge | `path_role` | The level of the disk: 0 ok, 1 low, 2 high, 3 critical |
+
+The series of a role disappears when the role disappears, for example when a config apply removes a filesystem backend.
+
 ## Re-encrypt rewrites
 
 The re-encrypt job rewrites each stored object in place. It reads the object, seals it and writes it back under a condition on the version that it read. These requests carry no upload body, so they have their own metric.
@@ -302,6 +316,7 @@ All label sets are bounded:
 | `result` | 2 (success or failure) |
 | `reason` | 7 (see the Auth table); 4 on `deltaglider_ingest_bodies_total` |
 | `medium` | 2 (`memory` or `spool`) |
+| `path_role` | One for the spool, one for each filesystem backend and one for the data directory |
 
 No label contains a bucket name or an object key, so no label has unbounded cardinality.
 

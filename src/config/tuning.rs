@@ -44,6 +44,23 @@ pub struct ReadyProbe {
     pub cache_ttl_secs: i64,
 }
 
+/// The disk monitor settings (`disk_watch`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskMonitorTuning {
+    /// `DGP_DISK_MONITOR_INTERVAL_SECS` (at least 1).
+    pub interval_secs: u64,
+    /// `DGP_DISK_LOW_PERCENT`: free space below this percent of the disk
+    /// is level low (1 to 50).
+    pub low_percent: u8,
+    /// `DGP_DISK_HIGH_PERCENT` (1 to 50).
+    pub high_percent: u8,
+    /// `DGP_DISK_CRITICAL_PERCENT` (1 to 50).
+    pub critical_percent: u8,
+    /// `DGP_DISK_RECOVER_POINTS`: a level ends when the free space is this
+    /// many percentage points above its entry threshold (1 to 50).
+    pub recover_points: u8,
+}
+
 /// The default of `DGP_SHUTDOWN_TIMEOUT_SECS`. The drain steps before this
 /// wait take up to 10 s each, and the detached-work wait up to 15 s, so the
 /// longest stop is 10 + 15 + 10 + 10 + 10 = 55 s.
@@ -140,6 +157,7 @@ pub struct RuntimeTuning {
     /// sets no value of its own (at least 1).
     pub upload_concurrency: usize,
     pub ready: ReadyProbe,
+    pub disk_monitor: DiskMonitorTuning,
     /// `DGP_REFERENCE_SCAN_LIMIT`: the most references one savings chip
     /// counts. It finds them on its listing pages, with no HEAD.
     pub reference_scan_limit: usize,
@@ -234,6 +252,13 @@ impl RuntimeTuning {
                     .unwrap_or(0)
                     .max(0),
             },
+            disk_monitor: DiskMonitorTuning {
+                interval_secs: parse_or("DGP_DISK_MONITOR_INTERVAL_SECS", 30).max(1),
+                low_percent: clamp_percent(lookup_parse(env, "DGP_DISK_LOW_PERCENT"), 15),
+                high_percent: clamp_percent(lookup_parse(env, "DGP_DISK_HIGH_PERCENT"), 10),
+                critical_percent: clamp_percent(lookup_parse(env, "DGP_DISK_CRITICAL_PERCENT"), 5),
+                recover_points: clamp_percent(lookup_parse(env, "DGP_DISK_RECOVER_POINTS"), 2),
+            },
             reference_scan_limit: lookup_parse(env, "DGP_REFERENCE_SCAN_LIMIT")
                 .unwrap_or(crate::deltaglider::REFERENCE_SCAN_LIMIT),
             bootstrap_hash_env: env_pinned_hash_var(env),
@@ -247,6 +272,12 @@ impl RuntimeTuning {
     pub fn replay_window(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.replay_window_secs)
     }
+}
+
+/// A disk monitor percent: the value, else `default`, kept in 1 to 50 (0
+/// would never fire; above 50 the levels would cover a half-empty disk).
+fn clamp_percent(value: Option<u8>, default: u8) -> u8 {
+    value.unwrap_or(default).clamp(1, 50)
 }
 
 /// D15: the env var that pins the bootstrap hash, if one is set. That hash
@@ -310,6 +341,11 @@ mod tests {
             Zero::Meaningful("no multipart part is admitted"),
         ),
         ("DGP_SHUTDOWN_TIMEOUT_SECS", Zero::Floor1),
+        ("DGP_DISK_MONITOR_INTERVAL_SECS", Zero::Floor1),
+        ("DGP_DISK_LOW_PERCENT", Zero::Floor1),
+        ("DGP_DISK_HIGH_PERCENT", Zero::Floor1),
+        ("DGP_DISK_CRITICAL_PERCENT", Zero::Floor1),
+        ("DGP_DISK_RECOVER_POINTS", Zero::Floor1),
         (
             "DGP_STATE_LOCK_WAIT_SECS",
             Zero::Meaningful("the boot does not wait for the state directory lock"),
@@ -435,6 +471,16 @@ mod tests {
         );
         assert_eq!(t.spool_threshold_bytes, None);
         assert_eq!(t.spool_acquire_timeout_secs, 120);
+        assert_eq!(
+            t.disk_monitor,
+            DiskMonitorTuning {
+                interval_secs: 30,
+                low_percent: 15,
+                high_percent: 10,
+                critical_percent: 5,
+                recover_points: 2
+            }
+        );
         assert_eq!(t.shutdown_timeout_secs, DEFAULT_SHUTDOWN_TIMEOUT_SECS);
         assert_eq!(t.state_lock_wait_secs, DEFAULT_STATE_LOCK_WAIT_SECS);
         assert_eq!(t.mpu_delta_reconstruct_max_bytes, 64 * 1024 * 1024);
@@ -481,6 +527,11 @@ mod tests {
             ("DGP_CODEC_ABSOLUTE_SECS", "11"),
             ("DGP_SPOOL_THRESHOLD_BYTES", "12"),
             ("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", "13"),
+            ("DGP_DISK_MONITOR_INTERVAL_SECS", "4"),
+            ("DGP_DISK_LOW_PERCENT", "20"),
+            ("DGP_DISK_HIGH_PERCENT", "99"),
+            ("DGP_DISK_CRITICAL_PERCENT", "6"),
+            ("DGP_DISK_RECOVER_POINTS", "3"),
             ("DGP_SHUTDOWN_TIMEOUT_SECS", "17"),
             ("DGP_STATE_LOCK_WAIT_SECS", "19"),
             ("DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES", "14"),
@@ -507,6 +558,17 @@ mod tests {
         );
         assert_eq!(t.spool_threshold_bytes, Some(12));
         assert_eq!(t.spool_acquire_timeout_secs, 13);
+        // A percent is kept in 1 to 50.
+        assert_eq!(
+            t.disk_monitor,
+            DiskMonitorTuning {
+                interval_secs: 4,
+                low_percent: 20,
+                high_percent: 50,
+                critical_percent: 6,
+                recover_points: 3
+            }
+        );
         assert_eq!(t.shutdown_timeout_secs, 17);
         assert_eq!(t.state_lock_wait_secs, 19);
         assert_eq!(t.mpu_delta_reconstruct_max_bytes, 14);

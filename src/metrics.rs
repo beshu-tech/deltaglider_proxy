@@ -12,7 +12,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
-    IntGauge, Opts, Registry, TextEncoder, TEXT_FORMAT,
+    IntGauge, IntGaugeVec, Opts, Registry, TextEncoder, TEXT_FORMAT,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -77,6 +77,16 @@ pub struct Metrics {
     pub ingest_memory_peak_bytes: IntGauge,
     /// Request bodies read, by medium (`memory`/`spool`) and reason.
     pub ingest_bodies_total: IntCounterVec,
+    /// The spool byte budget (`DGP_SPOOL_MAX_BYTES`, effective value).
+    pub spool_budget_bytes: IntGauge,
+    /// Spool bytes reserved now.
+    pub spool_used_bytes: IntGauge,
+    /// Free bytes of the disk of a role (`spool`, `backend:<name>`, `data`).
+    pub disk_free_bytes: IntGaugeVec,
+    /// Total bytes of the disk of a role.
+    pub disk_total_bytes: IntGaugeVec,
+    /// Disk level of a role: 0 ok, 1 low, 2 high, 3 critical.
+    pub disk_level: IntGaugeVec,
     /// Passthrough objects that an in-place rewrite (the re-encrypt job)
     /// read in full, by medium (`memory`/`spool`). A rewrite that finds the
     /// object changed or gone counts none; delta and reference rewrites
@@ -487,6 +497,57 @@ impl Metrics {
             .unwrap()
         );
 
+        // -- Disk watermarks (`disk_watch`) --
+        let spool_budget_bytes = register!(
+            registry,
+            IntGauge::new(
+                "deltaglider_spool_budget_bytes",
+                "The spool byte budget (DGP_SPOOL_MAX_BYTES, the effective value)",
+            )
+            .unwrap()
+        );
+        let spool_used_bytes = register!(
+            registry,
+            IntGauge::new(
+                "deltaglider_spool_used_bytes",
+                "Spool bytes reserved now (the budget in use)",
+            )
+            .unwrap()
+        );
+        let disk_free_bytes = register!(
+            registry,
+            IntGaugeVec::new(
+                Opts::new(
+                    "deltaglider_disk_free_bytes",
+                    "Free bytes of the disk of a role: spool, backend:<name> or data",
+                ),
+                &["path_role"],
+            )
+            .unwrap()
+        );
+        let disk_total_bytes = register!(
+            registry,
+            IntGaugeVec::new(
+                Opts::new(
+                    "deltaglider_disk_total_bytes",
+                    "Total bytes of the disk of a role: spool, backend:<name> or data",
+                ),
+                &["path_role"],
+            )
+            .unwrap()
+        );
+        let disk_level = register!(
+            registry,
+            IntGaugeVec::new(
+                Opts::new(
+                    "deltaglider_disk_level",
+                    "Disk level of a role: 0 ok, 1 low, 2 high, 3 critical",
+                ),
+                &["path_role"],
+            )
+            .unwrap()
+        );
+
         let rewrite_bodies_total = register!(
             registry,
             IntCounterVec::new(
@@ -719,6 +780,11 @@ impl Metrics {
             ingest_memory_bytes,
             ingest_memory_peak_bytes,
             ingest_bodies_total,
+            spool_budget_bytes,
+            spool_used_bytes,
+            disk_free_bytes,
+            disk_total_bytes,
+            disk_level,
             rewrite_bodies_total,
             replication_part_bytes_resident,
             replication_part_bytes_resident_peak,

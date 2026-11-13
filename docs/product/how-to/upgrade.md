@@ -426,6 +426,23 @@ What to check:
 5. **Pin the old values if you need them.** Set `DGP_SPOOL_MAX_BYTES=17179869184` and `max_object_size: 104857600` (or `DGP_MAX_OBJECT_SIZE=104857600`). An explicit value always wins. A value that you set is never changed, but the proxy logs a warning when the spool budget is above 90% of the free space, or when `max_object_size` is above the lowest of the per-upload limit and the multipart total.
 6. **The limits do not change while the proxy runs, and every start measures again.** The proxy measures the disk once, at start, and the spool budget never changes while the proxy runs. `max_object_size` follows each config apply, and an open multipart upload uses the new value from its next part. A fuller disk at a restart gives smaller limits; reads of objects that are already stored do not depend on these limits. A config apply that adds or removes an S3 backend changes `max_object_size` (the 5 GiB bound) at once, and one that puts a filesystem backend on the device of the spool logs a warning that the 25% share applies at the next start. A `DGP_SPOOL_MAX_BYTES` that does not parse (for example `16GB`) is not fatal: the proxy logs a warning and uses `auto`.
 
+## New uploads are refused when the disk is nearly full (2.2.1)
+
+The proxy now measures the free space of the spool directory, of the root of every filesystem backend and of the data directory every 30 seconds. It gives each disk a level: ok, low, high or critical (see [Disk watermarks](../reference/capacity-planning.md#disk-watermarks)). Before this release the proxy did not look at the free space, and a full disk showed only as a write error in the middle of a request.
+
+Two behaviors are new:
+
+1. **At level high or critical on the disk of the spool, the proxy refuses new uploads that need spool space.** A request that holds no spool space yet gets `503 SlowDown`, and the message names the level, the directory and the settings to change. S3 clients retry that status. A request that already holds spool space runs to its end. Reads, deletes and uploads that the proxy holds in memory (bodies of at most `DGP_SPOOL_THRESHOLD_BYTES`) are not affected.
+2. **At level critical on the disk of a filesystem backend, the proxy refuses writes to the buckets of that backend** with `503 SlowDown`. Deletes still work, because they free space. Replication and lifecycle runs wait for the disk in the same way.
+
+`GET /_/ready` does not change. A node with a full disk still serves reads, so it stays ready.
+
+What to do:
+
+- **Add the alert rules** of [the monitoring guide](monitor-with-prometheus.md#disk-space-rules) so that you learn of level low before a client sees a `503`.
+- **Check the thresholds.** Level low starts below 15% free, level high below 10% and level critical below 5% (or 1 GiB). Each level also has a floor from the spool limits. Change them with `DGP_DISK_LOW_PERCENT`, `DGP_DISK_HIGH_PERCENT` and `DGP_DISK_CRITICAL_PERCENT`.
+- **On a Kubernetes `emptyDir` with a `sizeLimit`, the free space is the free space of the host.** The levels then show the host disk. Set `DGP_SPOOL_MAX_BYTES` to the real size of the volume and watch the ratio of `deltaglider_spool_used_bytes` to `deltaglider_spool_budget_bytes`.
+
 ## Common gotchas
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.

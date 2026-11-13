@@ -91,6 +91,11 @@ pub struct TestSeams {
     /// turns off the tmpfs, Kubernetes and shared-device facts
     /// (`limits::measure_disk_facts`).
     pub disk_free_bytes: Option<u64>,
+    /// `DGP_TEST_DISK_MONITOR_FREE_PERCENT` (0 to 100): the disk monitor
+    /// (`disk_watch`) sees every path as one 100 GiB device with this
+    /// percent free, so a test reaches the low, high and critical levels
+    /// on any host.
+    pub disk_monitor_free_percent: Option<u8>,
 }
 
 /// S3's smallest part: the floor of the two copy seams, so a seam never
@@ -196,6 +201,11 @@ impl TestSeams {
             )),
             copy_part_bytes: copy_seam_bytes(lookup_parse(env, "DGP_TEST_COPY_PART_BYTES")),
             disk_free_bytes: lookup_parse(env, "DGP_TEST_DISK_FREE_BYTES"),
+            disk_monitor_free_percent: lookup_parse::<u8>(
+                env,
+                "DGP_TEST_DISK_MONITOR_FREE_PERCENT",
+            )
+            .filter(|p| *p <= 100),
         }
     }
 }
@@ -226,6 +236,7 @@ pub const SEAM_ENV_VARS: &[&str] = &[
     "DGP_TEST_COPY_OBJECT_MAX_BYTES",
     "DGP_TEST_COPY_PART_BYTES",
     "DGP_TEST_DISK_FREE_BYTES",
+    "DGP_TEST_DISK_MONITOR_FREE_PERCENT",
 ];
 
 /// The seams of this process: parsed from the environment on first use in a
@@ -308,7 +319,9 @@ mod tests {
             ("DGP_TEST_REWRITE_STALL", "before-lock:3000"),
             ("DGP_TEST_COPY_OBJECT_MAX_BYTES", "5242880"),
             ("DGP_TEST_COPY_PART_BYTES", "6291456"),
+            ("DGP_TEST_DISK_MONITOR_FREE_PERCENT", "8"),
         ]);
+        assert_eq!(t.disk_monitor_free_percent, Some(8));
         assert_eq!(t.copy_object_max_bytes, Some(5 * 1024 * 1024));
         assert_eq!(t.copy_part_bytes, Some(6 * 1024 * 1024));
         assert_eq!(

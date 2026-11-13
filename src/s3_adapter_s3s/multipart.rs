@@ -12,7 +12,7 @@ pub(super) async fn create_multipart_upload(
     let input = req.input;
     // Earliest reject: refusing at create saves the client uploading the
     // parts at all (403-before-404).
-    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
+    crate::api::handlers::object_helpers::check_client_store_allowed(&svc.state, &input.bucket)
         .await?;
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
     // The key rule of PutObject, at create: a refused key (`.dg` segment, `//`,
@@ -166,8 +166,9 @@ pub(super) async fn complete_multipart_upload(
     let extensions = req.extensions;
     let input = req.input;
     // Defense-in-depth: the marker can be hot-applied mid-upload, so
-    // Complete (the moment bytes reach the backend) re-checks.
-    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
+    // Complete (the moment bytes reach the backend) re-checks. A client
+    // that gets the 503 of a critical disk retries Complete; its parts stay.
+    crate::api::handlers::object_helpers::check_client_store_allowed(&svc.state, &input.bucket)
         .await?;
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     let requested_parts = completed_parts_to_request(input.multipart_upload.as_ref())?;

@@ -562,7 +562,7 @@ pub(super) async fn put_object(
     // Gate BEFORE the bucket check: a marked bucket refuses client bytes
     // regardless of backend reachability (403-before-404, no backend I/O
     // for a doomed request).
-    crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
+    crate::api::handlers::object_helpers::check_client_store_allowed(&svc.state, &input.bucket)
         .await?;
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
     // One HeadBucket per bucket per 5 seconds, not one per PUT.

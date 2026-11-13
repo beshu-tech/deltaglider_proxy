@@ -348,6 +348,33 @@ pub fn spawn_cache_monitor(state: &Arc<AppState>, metrics: &Arc<Metrics>) {
     });
 }
 
+/// Spawn the disk monitor (`disk_watch`): every
+/// `DGP_DISK_MONITOR_INTERVAL_SECS` (30 s) it measures the free space of the
+/// spool directory, the filesystem backend roots and the data directory,
+/// sets the gauges, and moves the disk levels. It runs on the blocking pool
+/// (`statvfs` on a hung network mount must not hold a worker).
+pub async fn spawn_disk_monitor(
+    state: &Arc<AppState>,
+    config: &deltaglider_proxy::config::SharedConfig,
+) {
+    let spool = match deltaglider_proxy::deltaglider::spool::SpoolDir::shared() {
+        Ok(spool) => spool,
+        Err(e) => {
+            tracing::warn!("[disk] the monitor is off: the spool is unusable: {e}");
+            return;
+        }
+    };
+    let watch = deltaglider_proxy::disk_watch::DiskWatch::install(spool.gate().clone());
+    let interval = config.read().await.tuning.disk_monitor.interval_secs;
+    let (state, config) = (state.clone(), config.clone());
+    spawn_periodic_blocking("disk-monitor", Duration::from_secs(interval), move || {
+        // An apply holds the write lock for a moment: skip that tick.
+        if let Ok(config) = config.try_read() {
+            deltaglider_proxy::disk_watch::tick_app(&watch, &state, &config);
+        }
+    });
+}
+
 /// Build IAM state from config ([`Config::empty_iam_outcome`]): the IAM
 /// users load into it later. "No pair" alone never means open access.
 pub fn init_iam_state(config: &Config) -> SharedIamState {

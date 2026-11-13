@@ -972,6 +972,14 @@ async fn async_main(
                         s.atomic_write_block_now(bucket)
                             .map(|b| b.admin_message(bucket))
                     })
+                    // A critical disk of the bucket's filesystem backend:
+                    // they wait for space too.
+                    .or_else(|| {
+                        deltaglider_proxy::disk_watch::bucket_write_refusal(
+                            &s.engine.load(),
+                            bucket,
+                        )
+                    })
             })
         }));
     }
@@ -1025,6 +1033,7 @@ async fn async_main(
 
     // --- Background monitors ---
     spawn_cache_monitor(&state, &metrics);
+    startup::spawn_disk_monitor(&state, &shared_config).await;
     // #87: Tokio runtime sampler — a no-op call unless built with
     // `--cfg tokio_unstable` (see src/metrics.rs for the gating rationale).
     deltaglider_proxy::metrics::spawn_tokio_runtime_metrics_sampler(&metrics);

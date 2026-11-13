@@ -320,6 +320,23 @@ pub(crate) async fn check_client_write_allowed(
     Ok(())
 }
 
+/// [`check_client_write_allowed`] for a request that STORES bytes (PutObject,
+/// CopyObject, UploadPartCopy, CreateMultipartUpload, CompleteMultipartUpload,
+/// form POST): it also
+/// refuses while the disk of the filesystem backend that holds the bucket
+/// is at level critical (`disk_watch`), with a retryable `503 SlowDown`
+/// that names the disk. A delete never asks this gate: it frees space.
+pub(crate) async fn check_client_store_allowed(
+    state: &Arc<AppState>,
+    bucket: &str,
+) -> Result<(), S3Error> {
+    check_client_write_allowed(state, bucket).await?;
+    if let Some(message) = crate::disk_watch::bucket_write_refusal(&state.engine.load(), bucket) {
+        return Err(S3Error::SlowDown(message));
+    }
+    Ok(())
+}
+
 /// What the quota gate saw when it let a write through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QuotaVerdict {
