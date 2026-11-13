@@ -154,8 +154,197 @@ impl ProbeResult {
         super::if_match::ConditionalProfile {
             if_match: self.if_match,
             conditional_delete: self.conditional_delete,
+            // Not part of this probe: see [`probe_conditional_complete`].
+            conditional_complete: None,
         }
     }
+}
+
+/// Pure: does CompleteMultipartUpload enforce a condition? `create` is the
+/// answer to a Complete with `If-None-Match: *` over an existing key,
+/// `wrong` the one with an `If-Match` of another ETag (both must be 412 and
+/// leave the old object), `right` the one with the current ETag (it must
+/// write: a backend that refuses every condition proves nothing, and a
+/// dialect that does not fit the backend shows here). `Some(true)`: proven.
+/// `Some(false)`: a condition is ignored or refused. `None`: the probe
+/// could not tell (no answer, an unclear one): never a proof, so the write
+/// with a condition of a large object stays refused.
+pub fn classify_conditional_complete(
+    create: &StepOutcome,
+    wrong: &StepOutcome,
+    right: &StepOutcome,
+) -> Option<bool> {
+    use StepOutcome::*;
+    for outcome in [create, wrong] {
+        match outcome {
+            PreconditionFailed => {}
+            Written | NotImplemented => return Some(false),
+            Dropped(_) | Other(_) => return None,
+        }
+    }
+    match right {
+        Written => Some(true),
+        PreconditionFailed | NotImplemented => Some(false),
+        Dropped(_) | Other(_) => None,
+    }
+}
+
+/// One tiny upload (one part of 3 bytes) of `key`, completed with the
+/// condition that `condition` sets. The upload is aborted when the Complete
+/// did not write it, so the backend keeps no open upload.
+async fn complete_with<F>(client: &Client, bucket: &str, key: &str, condition: F) -> StepOutcome
+where
+    F: FnOnce(
+        aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
+    ) -> aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
+{
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+    let created = match client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return StepOutcome::Other(format!("CreateMultipartUpload: {e:?}")),
+    };
+    let Some(upload_id) = created.upload_id().map(str::to_string) else {
+        return StepOutcome::Other("CreateMultipartUpload returned no upload id".into());
+    };
+    // Armed until the Complete wrote the object: every other way out, a
+    // cut included, aborts the upload (no open upload stays on the backend).
+    let guard = {
+        let (client, bucket, key, upload_id) = (
+            client.clone(),
+            bucket.to_string(),
+            key.to_string(),
+            upload_id.clone(),
+        );
+        crate::storage::mpu_guard::MpuAbortGuard::new(move || {
+            let (client, bucket, key, upload_id) = (
+                client.clone(),
+                bucket.clone(),
+                key.clone(),
+                upload_id.clone(),
+            );
+            async move {
+                let _ = client
+                    .abort_multipart_upload()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await;
+            }
+        })
+    };
+    let part = match client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"new"))
+        .send()
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            guard.abort().await;
+            return StepOutcome::Other(format!("UploadPart: {e:?}"));
+        }
+    };
+    let request = client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .set_e_tag(part.e_tag().map(str::to_string))
+                        .build(),
+                )
+                .build(),
+        );
+    let result = condition(request).send().await;
+    let step = outcome(&result);
+    if step == StepOutcome::Written {
+        guard.disarm();
+    } else {
+        guard.abort().await;
+    }
+    step
+}
+
+/// Probe whether CompleteMultipartUpload enforces `If-None-Match` and
+/// `If-Match` on `bucket/key` (a key of its own: the probe writes it and
+/// removes it with every version). Three tiny uploads, each of one part:
+/// a Complete with `If-None-Match: *` over the existing key and one with a
+/// wrong `If-Match` (both must get 412 and leave the old object, and no
+/// upload stays open), then one with the current ETag (must write). Run it
+/// after [`probe_cas`] proved the conditional PUT, with its `dialect`.
+/// The verdict is [`classify_conditional_complete`].
+pub async fn probe_conditional_complete(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    dialect: IfMatchDialect,
+) -> Option<bool> {
+    // Armed from before the first write: a cut future leaves the key, and
+    // the guard removes it (see [`SweepOnDrop`]).
+    let sweep = SweepOnDrop::new(client, bucket, key);
+    let seed = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"old"))
+        .send()
+        .await
+        .ok();
+    let verdict = match seed {
+        None => None,
+        Some(seed) => {
+            let etag = seed.e_tag().unwrap_or_default().to_string();
+            async {
+                let create = complete_with(client, bucket, key, |r| r.if_none_match("*")).await;
+                // The old object must be intact after each refusal: a
+                // refusal that went with a changed (or an unreadable) key
+                // proves nothing.
+                if create == StepOutcome::PreconditionFailed {
+                    match key_holds_checked(client, bucket, key, b"old").await {
+                        Some(true) => {}
+                        Some(false) => return Some(false),
+                        None => return None,
+                    }
+                }
+                let wrong = complete_with(client, bucket, key, |r| {
+                    r.if_match_etag(WRONG_ETAG, dialect)
+                })
+                .await;
+                if wrong == StepOutcome::PreconditionFailed {
+                    match key_holds_checked(client, bucket, key, b"old").await {
+                        Some(true) => {}
+                        Some(false) => return Some(false),
+                        None => return None,
+                    }
+                }
+                if etag.is_empty() {
+                    return None;
+                }
+                let right =
+                    complete_with(client, bucket, key, |r| r.if_match_etag(&etag, dialect)).await;
+                classify_conditional_complete(&create, &wrong, &right)
+            }
+            .await
+        }
+    };
+    remove_all_versions(client, bucket, key).await;
+    sweep.disarm();
+    verdict
 }
 
 /// What a probe that gave no verdict says about the bucket.
@@ -302,15 +491,65 @@ where
     }
 }
 
-/// Does `bucket/key` hold exactly `body`? `false` when it cannot be read.
-async fn key_holds(client: &Client, bucket: &str, key: &str, body: &[u8]) -> bool {
+/// Does `bucket/key` hold exactly `body`? `Some(false)`: another body, or
+/// no key (the backend answered `NoSuchKey`). `None`: the backend could not
+/// be asked (a transport error, another error answer, a broken body): that
+/// proves nothing either way.
+async fn key_holds_checked(client: &Client, bucket: &str, key: &str, body: &[u8]) -> Option<bool> {
     match client.get_object().bucket(bucket).key(key).send().await {
         Ok(out) => out
             .body
             .collect()
             .await
-            .is_ok_and(|b| b.into_bytes().as_ref() == body),
-        Err(_) => false,
+            .ok()
+            .map(|b| b.into_bytes().as_ref() == body),
+        Err(e) if e.as_service_error().is_some_and(|s| s.is_no_such_key()) => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// [`key_holds_checked`] for a caller that takes "cannot tell" as "no".
+async fn key_holds(client: &Client, bucket: &str, key: &str, body: &[u8]) -> bool {
+    key_holds_checked(client, bucket, key, body).await == Some(true)
+}
+
+/// Removes a probe key with every version when it is dropped, unless it was
+/// disarmed: a probe future that is cut (its deadline, a caller that gives
+/// up) stops between its writes and its cleanup, and the key would stay in a
+/// data bucket where a client lists it. The sweep runs on a task of its own.
+struct SweepOnDrop {
+    client: Client,
+    bucket: String,
+    key: String,
+    armed: bool,
+}
+
+impl SweepOnDrop {
+    fn new(client: &Client, bucket: &str, key: &str) -> Self {
+        Self {
+            client: client.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            armed: true,
+        }
+    }
+
+    /// The probe removed its key itself.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SweepOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (client, bucket, key) = (self.client.clone(), self.bucket.clone(), self.key.clone());
+        runtime.spawn(async move { remove_all_versions(&client, &bucket, &key).await });
     }
 }
 
@@ -383,6 +622,8 @@ pub async fn probe_cas(
     bucket: &str,
     key: &str,
 ) -> Result<ProbeResult, ProbeError> {
+    // Armed from before the first write (see [`SweepOnDrop`]).
+    let sweep = SweepOnDrop::new(client, bucket, key);
     let first = client
         .put_object()
         .bucket(bucket)
@@ -487,12 +728,170 @@ pub async fn probe_cas(
             .await,
     );
     remove_all_versions(client, bucket, key).await;
+    sweep.disarm();
     let (cas, if_match) = verdict?;
     Ok(ProbeResult {
         cas,
         conditional_delete: classify_conditional_delete(&delete_wrong),
         if_match,
     })
+}
+
+#[cfg(test)]
+mod drop_and_unknown_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn client_for(endpoint: &str) -> Client {
+        Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "a", "b", None, None, "t",
+                ))
+                .force_path_style(true)
+                .endpoint_url(endpoint)
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+                .build(),
+        )
+    }
+
+    /// Wait until `fake` holds no object under `prefix`, at most 5 s.
+    async fn gone(fake: &crate::storage::fake_s3::FakeS3, prefix: &str) -> bool {
+        for _ in 0..100 {
+            if fake.stored_count(prefix) == 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// A probe future that is cut (its deadline) between its writes and its
+    /// cleanup leaves no key in the data bucket: the drop guard removes it.
+    /// Stage 1 is cut inside its DELETE with the key written.
+    #[tokio::test]
+    async fn a_cut_conditional_put_probe_leaves_no_key() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let client = client_for(&endpoint);
+        fake.set_delay_ms("DELETE", 5_000);
+        let cut = tokio::time::timeout(
+            Duration::from_millis(1_500),
+            probe_cas(&client, "b", "probe/stage1"),
+        )
+        .await;
+        assert!(cut.is_err(), "the probe was cut by its deadline");
+        assert_eq!(fake.stored_count("b/probe/stage1"), 1, "the key is there");
+        fake.set_delay_ms("DELETE", 0);
+        assert!(
+            gone(&fake, "b/probe/stage1").await,
+            "the drop guard removed the key"
+        );
+    }
+
+    /// The same for the conditional Complete probe: the seed object of a cut
+    /// stage 2 (cut inside its CreateMultipartUpload) is removed.
+    #[tokio::test]
+    async fn a_cut_conditional_complete_probe_leaves_no_seed() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let client = client_for(&endpoint);
+        fake.set_delay_ms("POST", 5_000);
+        let cut = tokio::time::timeout(
+            Duration::from_secs(1),
+            probe_conditional_complete(&client, "b", "probe/stage2-mpu", IfMatchDialect::Quoted),
+        )
+        .await;
+        assert!(cut.is_err(), "the probe was cut by its deadline");
+        assert_eq!(
+            fake.stored_count("b/probe/stage2-mpu"),
+            1,
+            "the seed is there"
+        );
+        fake.set_delay_ms("POST", 0);
+        assert!(
+            gone(&fake, "b/probe/stage2-mpu").await,
+            "the drop guard removed the seed"
+        );
+    }
+
+    /// `key_holds_checked`: the key's body, another body, no key, and a
+    /// backend that cannot be asked (a 500): only the last is "cannot tell".
+    #[tokio::test]
+    async fn a_failed_read_is_unknown_not_false() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let client = client_for(&endpoint);
+        fake.insert_object("b/k", b"old", &[]);
+        assert_eq!(
+            key_holds_checked(&client, "b", "k", b"old").await,
+            Some(true)
+        );
+        assert_eq!(
+            key_holds_checked(&client, "b", "k", b"new").await,
+            Some(false)
+        );
+        assert_eq!(
+            key_holds_checked(&client, "b", "missing", b"old").await,
+            Some(false),
+            "no key: it does not hold the body"
+        );
+        fake.fail("GET", "b/k", 500, "InternalError", u32::MAX);
+        assert_eq!(
+            key_holds_checked(&client, "b", "k", b"old").await,
+            None,
+            "a read error says nothing"
+        );
+        assert!(!key_holds(&client, "b", "k", b"old").await);
+    }
+}
+
+#[cfg(test)]
+mod conditional_complete_tests {
+    use super::StepOutcome::*;
+    use super::*;
+
+    /// The verdict over the three Completes of the probe: proven only when
+    /// both conditions are refused (412) AND the right one writes. A
+    /// condition that is ignored or refused is a definite `false`; an
+    /// answer that is unclear is no verdict (`None`), never a proof.
+    #[test]
+    fn the_conditional_complete_verdict_truth_table() {
+        let d = || Dropped("reset".into());
+        let o = || Other("500".into());
+        let table: &[(StepOutcome, StepOutcome, StepOutcome, Option<bool>)] = &[
+            (PreconditionFailed, PreconditionFailed, Written, Some(true)),
+            // A condition that the backend ignores.
+            (Written, PreconditionFailed, Written, Some(false)),
+            (PreconditionFailed, Written, Written, Some(false)),
+            (NotImplemented, PreconditionFailed, Written, Some(false)),
+            (PreconditionFailed, NotImplemented, Written, Some(false)),
+            // Refuses the correct condition too (or a wrong dialect).
+            (
+                PreconditionFailed,
+                PreconditionFailed,
+                PreconditionFailed,
+                Some(false),
+            ),
+            (
+                PreconditionFailed,
+                PreconditionFailed,
+                NotImplemented,
+                Some(false),
+            ),
+            // No clear answer.
+            (d(), PreconditionFailed, Written, None),
+            (PreconditionFailed, o(), Written, None),
+            (PreconditionFailed, PreconditionFailed, d(), None),
+            (PreconditionFailed, PreconditionFailed, o(), None),
+        ];
+        for (create, wrong, right, want) in table {
+            assert_eq!(
+                classify_conditional_complete(create, wrong, right),
+                *want,
+                "{create:?} {wrong:?} {right:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1200,9 +1200,14 @@ pub async fn validate_backend_write_capability(
         cache.set(&name, &group.backend, verdict.clone());
         match verdict {
             CapabilityVerdict::CasVerified { via, if_match } => info!(
-                "backend capability: '{name}' conditional writes verified ({via:?}, If-Match {}) — \
-                 client-writable bucket(s) {:?} are safe under multi-instance",
+                "backend capability: '{name}' conditional writes verified ({via:?}, If-Match {}, \
+                 conditional CompleteMultipartUpload {}) — client-writable bucket(s) {:?} are \
+                 safe under multi-instance",
                 if_match.label(),
+                deltaglider_proxy::coordination::if_match::complete_words(
+                    deltaglider_proxy::coordination::if_match::lookup_for(&group.backend)
+                        .and_then(|p| p.conditional_complete)
+                ),
                 group.buckets
             ),
             CapabilityVerdict::NonCas => {

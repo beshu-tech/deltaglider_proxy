@@ -221,6 +221,8 @@ impl Intercept for RequestTimer {
         if let Some(clock) = cfg.get_mut_from_interceptor_state::<RequestClock>() {
             clock.first_send.get_or_insert_with(Instant::now);
             clock.statuses.push(None);
+            clock.attempt_starts.push(Instant::now());
+            clock.attempt_ends.push(None);
             clock.in_attempt = true;
         }
         Ok(())
@@ -235,10 +237,16 @@ impl Intercept for RequestTimer {
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         let status = context.response().map(|r| r.status().as_u16());
+        let end = context
+            .output_or_error()
+            .map(|result| end_of(result, status));
         if let Some(clock) = cfg.get_mut_from_interceptor_state::<RequestClock>() {
             if std::mem::take(&mut clock.in_attempt) {
                 if let Some(last) = clock.statuses.last_mut() {
                     *last = status;
+                }
+                if let Some(last) = clock.attempt_ends.last_mut() {
+                    *last = end;
                 }
             }
         }
@@ -393,6 +401,30 @@ fn attempt_statuses(statuses: &[Option<u16>]) -> String {
         .join(",")
 }
 
+/// Each attempt's length and how it ended, as text: `47.1s connection
+/// failure, 46.8s ?` (`?`: the SDK cut the attempt, with no result). An
+/// attempt lasts until the next one starts, or until the operation ends
+/// (`end`): the backoff between two attempts counts to the first one.
+fn attempt_details(starts: &[Instant], ends: &[Option<End>], end: Instant) -> String {
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, start)| {
+            let stop = starts.get(i + 1).copied().unwrap_or(end);
+            let how = ends
+                .get(i)
+                .copied()
+                .flatten()
+                .map_or_else(|| "?".to_string(), |e| e.to_string());
+            format!(
+                "{:.1}s {how}",
+                stop.saturating_duration_since(*start).as_secs_f64()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Seconds, rounded to the millisecond.
 fn secs(d: Duration) -> f64 {
     (d.as_secs_f64() * 1000.0).round() / 1000.0
@@ -414,6 +446,10 @@ struct RequestClock {
     first_send: Option<Instant>,
     /// The response status of each attempt sent; `None`: no response.
     statuses: Vec<Option<u16>>,
+    /// When each attempt was sent, and how it ended (`None`: the SDK cut
+    /// it without a result).
+    attempt_starts: Vec<Instant>,
+    attempt_ends: Vec<Option<End>>,
     /// An attempt was sent and its `read_after_attempt` did not run yet.
     in_attempt: bool,
     /// When and how the SDK finished the operation.
@@ -438,6 +474,8 @@ impl RequestClock {
             deadline: None,
             first_send: None,
             statuses: Vec::new(),
+            attempt_starts: Vec::new(),
+            attempt_ends: Vec::new(),
             in_attempt: false,
             finished: None,
             record: true,
@@ -463,6 +501,7 @@ impl Drop for RequestClock {
             total: at.saturating_duration_since(self.start),
             before_first_send: self.first_send.map(|t| t - self.start),
             statuses: &self.statuses,
+            attempt_details: attempt_details(&self.attempt_starts, &self.attempt_ends, at),
             end,
         };
         report.record(self.timer.slow);
@@ -479,6 +518,8 @@ struct Report<'a> {
     total: Duration,
     before_first_send: Option<Duration>,
     statuses: &'a [Option<u16>],
+    /// [`attempt_details`].
+    attempt_details: String,
     end: End,
 }
 
@@ -521,6 +562,7 @@ impl Report<'_> {
             before_first_attempt_secs = %before_first_attempt,
             status = %status,
             attempt_statuses = %attempt_statuses(self.statuses),
+            attempt_details = %self.attempt_details,
             result = %self.end,
             "slow backend request"
         );
@@ -637,6 +679,7 @@ mod tests {
                 total,
                 before_first_send: Some(Duration::ZERO),
                 statuses: &[Some(200)],
+                attempt_details: "6.0s ok".to_string(),
                 end: End::Ok,
             }
             .record(Some(Duration::from_secs(5)));

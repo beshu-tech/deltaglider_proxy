@@ -961,7 +961,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
             None => {
                 debug!("No reference in deltaspace, creating baseline");
-                self.write_baseline(&put, &xnode).await?
+                match self.write_baseline(&put, &xnode).await {
+                    Ok(meta) => meta,
+                    // A first baseline above the single-PUT limit, written
+                    // under the cross-instance lock (a condition), on a
+                    // backend not proven to enforce a condition on its
+                    // multipart Complete. Nothing was sent: the object is
+                    // stored whole, as when no delta is possible.
+                    Err(EngineError::Storage(StorageError::ConditionalMultipartRefused(why))) => {
+                        warn!(
+                            "{bucket}/{} is stored whole, without a delta baseline: {why}",
+                            put.key
+                        );
+                        // Boxed: the future of this rare branch stays out of the
+                        // frame of every delta-eligible PUT.
+                        return Box::pin(self.store_whole_without_baseline(put)).await;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         };
 
@@ -995,6 +1012,32 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 Err(e)
             }
         }
+    }
+
+    /// Store the PUT's body as a passthrough object because no baseline
+    /// could be written for it (`delta-unavailable`), under the locks that
+    /// the caller holds. The same write as the passthrough branch of
+    /// [`Self::encode_and_commit`], without a baseline to remove.
+    async fn store_whole_without_baseline(
+        &self,
+        put: PutObject<'_>,
+    ) -> Result<StoreResult, EngineError> {
+        let reserved = match put.body {
+            PutBody::Spooled(body) => {
+                self.storage_spool(put.storage, put.bucket, put.size, body.reserved_mib())
+                    .await?
+            }
+            PutBody::Buffered(_) => StorageSpool::Own(None),
+        };
+        let prior = put.prior;
+        let result = self
+            .write_passthrough_locked(
+                put.passthrough_write(PassthroughReason::DeltaUnavailable),
+                reserved.get(),
+            )
+            .await?;
+        self.count_decision("passthrough");
+        Ok(result.with_accounting(prior.replaced(), 0))
     }
 
     /// Encode against the reference, decide, commit. Returns the result and

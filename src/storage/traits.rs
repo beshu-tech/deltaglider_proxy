@@ -627,6 +627,12 @@ pub enum WriteIf {
     /// Not stored: the backend has no conditional writes (S3 501). The
     /// caller decides whether an unconditional write is safe.
     Unsupported,
+    /// Not stored: the object is above the single-PUT limit, the write needs
+    /// a multipart upload, and the backend is not proven to enforce a
+    /// condition on CompleteMultipartUpload (nothing was sent). Like
+    /// [`Self::Unsupported`], the caller decides whether an unconditional
+    /// write is safe; it has another reason to give when it is not.
+    UnprovenMultipart,
 }
 
 /// The body of a [`StorageBackend::put_object`].
@@ -803,6 +809,23 @@ pub enum StorageError {
     #[error("MetadataTooLarge: {0}")]
     MetadataTooLarge(String),
 
+    /// The backend refused the object as too large (`EntityTooLarge`, 400):
+    /// a retry gets the same answer. Maps to 400 EntityTooLarge, never 500
+    /// or 503.
+    #[error("EntityTooLarge: {0}")]
+    EntityTooLarge(String),
+
+    /// A write with a condition (`If-None-Match`, `If-Match`) of an object
+    /// above the single-PUT limit of the backend needs a multipart upload,
+    /// and the backend is not proven to enforce a condition on
+    /// CompleteMultipartUpload (`ConditionalProfile::conditional_complete`).
+    /// Nothing was sent. A caller that can store the object without the
+    /// condition does (a first delta baseline is stored whole); the
+    /// re-encrypt job fails the object with this text. Maps to 400
+    /// EntityTooLarge for a client.
+    #[error("{0}")]
+    ConditionalMultipartRefused(String),
+
     /// The backend did not answer: the request timed out, or the
     /// connection failed. Maps to 503 ServiceUnavailable.
     #[error("Backend unavailable (timed out or unreachable): {0}")]
@@ -883,6 +906,8 @@ impl StorageError {
             E::InvalidKey(s) => E::InvalidKey(s.clone()),
             E::KeyTooLong(s) => E::KeyTooLong(s.clone()),
             E::MetadataTooLarge(s) => E::MetadataTooLarge(s.clone()),
+            E::EntityTooLarge(s) => E::EntityTooLarge(s.clone()),
+            E::ConditionalMultipartRefused(s) => E::ConditionalMultipartRefused(s.clone()),
             E::Unavailable(s) => E::Unavailable(s.clone()),
             E::Transient(s) => E::Transient(s.clone()),
             E::Contended(s) => E::Contended(s.clone()),

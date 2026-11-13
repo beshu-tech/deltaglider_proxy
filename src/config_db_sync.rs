@@ -1203,6 +1203,7 @@ async fn validate_cas_bucket_as(
                 profile: crate::coordination::if_match::ConditionalProfile {
                     if_match,
                     conditional_delete,
+                    ..Default::default()
                 },
             });
         }
@@ -3089,6 +3090,7 @@ mod tests {
                 profile: crate::coordination::if_match::ConditionalProfile {
                     if_match: crate::coordination::if_match::IfMatchDialect::Quoted,
                     conditional_delete: false,
+                    ..Default::default()
                 }
             })
         );

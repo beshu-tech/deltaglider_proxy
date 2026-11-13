@@ -4063,6 +4063,144 @@ mod source_guards {
         );
     }
 
+    /// A file body goes to an S3 backend through ONE method
+    /// (`put_object_file_with_metadata_fenced_with`), which sends a body
+    /// above 5 GiB as a backend multipart upload. Another PUT of a file
+    /// body stream would fail above 5 GiB with `EntityTooLarge`: so
+    /// `.byte_stream()` is called once in `objects.rs` (the single PUT
+    /// behind the switch), once in `mpu_put.rs` (the parts) and nowhere
+    /// else in `storage/s3`.
+    #[test]
+    fn file_bodies_go_through_the_multipart_switch() {
+        let mut seen = std::collections::BTreeMap::<String, usize>::new();
+        for src in crate::source_scan::ast::src() {
+            let n = src
+                .prod
+                .calls_named("byte_stream")
+                .filter(|c| c.method)
+                .count();
+            if n > 0 {
+                seen.insert(src.rel.to_string(), n);
+            }
+        }
+        let expected: std::collections::BTreeMap<String, usize> = [
+            ("src/storage/s3/mpu_put.rs".to_string(), 1),
+            ("src/storage/s3/objects.rs".to_string(), 1),
+        ]
+        .into();
+        assert_eq!(
+            seen, expected,
+            "a file body is sent by the single PUT behind the multipart switch (objects.rs) \
+             and by the parts of an upload (mpu_put.rs) only"
+        );
+    }
+
+    /// The S3 requests whose body or whose server-side work grows with the
+    /// object (PutObject, UploadPart, CopyObject, UploadPartCopy,
+    /// CompleteMultipartUpload), on ANY client in `src/storage/s3`, carry
+    /// their own timeouts: the `config_override(..)` that follows the
+    /// request in its function names `upload_config`, `part_config` or
+    /// `complete_config`. The client's read timeout (60 s) is a deadline for
+    /// the whole request, so without them a part, a copy or a Complete that
+    /// needs longer never gets its answer. A request that is deliberately
+    /// without them is listed in `EXEMPT` with its reason.
+    #[test]
+    fn size_dependent_requests_carry_their_own_timeouts() {
+        const OPS: [&str; 5] = [
+            "put_object",
+            "upload_part",
+            "copy_object",
+            "upload_part_copy",
+            "complete_multipart_upload",
+        ];
+        const HELPERS: [&str; 3] = ["upload_config", "part_config", "complete_config"];
+        // (file, function, reason): empty or tiny bodies on the plain
+        // client, whose 30 s request deadline is the right limit. An empty
+        // function name exempts the whole file.
+        const EXEMPT: [(&str, &str, &str); 3] = [
+            (
+                "src/storage/s3/facts.rs",
+                "put_facts_object",
+                "a listing-facts object: a few bytes",
+            ),
+            (
+                "src/storage/s3/claim.rs",
+                "",
+                "the claim object of a bucket: a few bytes",
+            ),
+            (
+                "src/storage/s3/mod.rs",
+                "put_directory_marker",
+                "a directory marker: an empty object",
+            ),
+        ];
+        let mut offenders = Vec::new();
+        let mut checked = 0;
+        let mut exempted = std::collections::BTreeSet::new();
+        for src in crate::source_scan::ast::src() {
+            if !src.rel.starts_with("src/storage/s3/") {
+                continue;
+            }
+            let calls = &src.prod.calls;
+            for op in calls
+                .iter()
+                .filter(|c| c.method && OPS.contains(&c.name.as_str()))
+            {
+                let func = src.fn_name(op.func);
+                if let Some((file, f, _)) = EXEMPT
+                    .iter()
+                    .find(|(file, f, _)| *file == src.rel && (f.is_empty() || *f == func))
+                {
+                    exempted.insert((*file, *f));
+                    continue;
+                }
+                checked += 1;
+                // The next request of the function: the override of this
+                // one comes before it.
+                let next_op = calls
+                    .iter()
+                    .filter(|c| {
+                        c.method
+                            && c.func == op.func
+                            && OPS.contains(&c.name.as_str())
+                            && c.line > op.line
+                    })
+                    .map(|c| c.line)
+                    .min()
+                    .unwrap_or(usize::MAX);
+                let named = calls.iter().any(|o| {
+                    o.method
+                        && o.name == "config_override"
+                        && o.func == op.func
+                        && o.line >= op.line
+                        && o.line < next_op
+                        && o.arg_idents_all
+                            .iter()
+                            .any(|a| HELPERS.contains(&a.as_str()))
+                });
+                if !named {
+                    offenders.push(format!("{}:{}: .{}() in {func}", src.rel, op.line, op.name));
+                }
+            }
+        }
+        assert!(
+            checked >= 10,
+            "the scan saw only {checked} size-dependent requests: it is blind"
+        );
+        for (file, f, why) in EXEMPT {
+            assert!(
+                exempted.contains(&(file, f)),
+                "the exemption of {file} `{f}` ({why}) matches no request: remove it"
+            );
+        }
+        assert!(
+            offenders.is_empty(),
+            "a size-dependent request without `.customize().config_override(<upload_config | \
+             part_config | complete_config>)`:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     #[test]
     fn no_content_responses_carry_no_body() {
         let mut offenders = Vec::new();

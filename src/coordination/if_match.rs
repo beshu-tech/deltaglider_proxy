@@ -75,6 +75,25 @@ pub struct ConditionalProfile {
     /// DELETE enforces `If-Match` (a wrong ETag gets 412). When false, a
     /// delete that must not remove a newer object reads it first.
     pub conditional_delete: bool,
+    /// CompleteMultipartUpload enforces `If-None-Match` and `If-Match`
+    /// (the probe, [`super::cas_probe::probe_conditional_complete`]). `None`:
+    /// not probed (or the probe could not tell): a write with a condition of
+    /// an object above 5 GiB is then not stored with a multipart upload.
+    pub conditional_complete: Option<bool>,
+}
+
+/// Pure: the verdict on a conditional CompleteMultipartUpload in words, for
+/// the boot log and the admin API. Without the proof, a write with a
+/// condition of an object above 5 GiB is refused (see
+/// [`ConditionalProfile::conditional_complete`]).
+pub fn complete_words(verdict: Option<bool>) -> &'static str {
+    match verdict {
+        Some(true) => "enforced (objects above 5 GiB can be written with a condition)",
+        Some(false) => {
+            "NOT enforced (a write with a condition of an object above 5 GiB is refused)"
+        }
+        None => "not proven (a write with a condition of an object above 5 GiB is refused)",
+    }
 }
 
 /// What the process knows about the coordination bucket's conditional
@@ -146,6 +165,10 @@ if_match_on!(
     if_match
 );
 if_match_on!(
+    aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
+    if_match
+);
+if_match_on!(
     aws_sdk_s3::operation::delete_object::builders::DeleteObjectFluentBuilder,
     if_match
 );
@@ -175,13 +198,26 @@ static PROFILES: std::sync::LazyLock<parking_lot::RwLock<HashMap<String, Conditi
     std::sync::LazyLock::new(Default::default);
 
 /// Store the profile that a probe of the definition `fingerprint` found.
-pub fn record(fingerprint: &str, profile: ConditionalProfile) {
-    PROFILES.write().insert(fingerprint.to_string(), profile);
+pub fn record(fingerprint: &str, mut profile: ConditionalProfile) {
+    let mut profiles = PROFILES.write();
+    // A probe that did not test CompleteMultipartUpload (the coordination
+    // probe, which shares the definition) leaves an earlier verdict as it is.
+    if profile.conditional_complete.is_none() {
+        profile.conditional_complete = profiles
+            .get(fingerprint)
+            .and_then(|p| p.conditional_complete);
+    }
+    profiles.insert(fingerprint.to_string(), profile);
 }
 
 /// Store the profile that a probe of the backend definition `def` found.
 pub fn record_for(def: &crate::config::BackendConfig, profile: ConditionalProfile) {
     record(&super::capability::fingerprint(def), profile);
+}
+
+/// The profile that a probe found for the backend definition `def`.
+pub fn lookup_for(def: &crate::config::BackendConfig) -> Option<ConditionalProfile> {
+    lookup(&super::capability::fingerprint(def))
 }
 
 /// The profile of the definition `fingerprint`, when a probe found one.
@@ -231,6 +267,7 @@ mod tests {
         let p = ConditionalProfile {
             if_match: IfMatchDialect::Unquoted,
             conditional_delete: false,
+            conditional_complete: None,
         };
         record(&fp, p);
         assert_eq!(lookup(&fp), Some(p));

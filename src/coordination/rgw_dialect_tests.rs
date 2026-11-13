@@ -181,6 +181,7 @@ async fn a_pinned_delete_reads_first_and_keeps_a_changed_object() {
         .with_conditional_profile(ConditionalProfile {
             if_match: IfMatchDialect::Unquoted,
             conditional_delete: false,
+            ..Default::default()
         });
     let old = put(&client, "p/a.txt", b"v1").await;
     fake.replace_body("b/p/a.txt", b"v2");

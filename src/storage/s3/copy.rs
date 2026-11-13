@@ -156,7 +156,7 @@ impl S3Backend {
             .copy_limits
             .unwrap_or_else(|| (copy_object_max_bytes(), copy_part_bytes()));
         let copied = if size <= object_max {
-            self.copy_single(dst.bucket, &dst_key, &copy_source, etag, &headers)
+            self.copy_single(dst.bucket, &dst_key, &copy_source, etag, &headers, size)
                 .await
         } else {
             let plan = PartsCopy {
@@ -209,6 +209,7 @@ impl S3Backend {
         copy_source: &str,
         source_etag: &str,
         headers: &HashMap<String, String>,
+        size: u64,
     ) -> Result<String, (CopyFailure, StorageError)> {
         let mut request = self
             .bulk_client
@@ -223,7 +224,14 @@ impl S3Backend {
             request = request.metadata(k.clone(), v.clone());
         }
         request = apply_native_encryption(request, &self.native_encryption.for_bucket(bucket));
-        match request.send().await {
+        // The backend copies `size` bytes before it answers: the deadline
+        // and the read timeout of an upload of that size.
+        let sent = request
+            .customize()
+            .config_override(self.upload_config(size))
+            .send()
+            .await;
+        match sent {
             Ok(resp) => Ok(resp
                 .copy_object_result()
                 .and_then(|r| r.e_tag())
@@ -269,33 +277,7 @@ impl S3Backend {
         };
         // Armed until Complete returned Ok: an error and a dropped future
         // (the `bounded` cut, a killed run) both abort the upload.
-        let guard = {
-            let client = self.bulk_client.clone();
-            let (bucket, key, upload_id) = (bucket.to_string(), key.to_string(), upload_id.clone());
-            MpuAbortGuard::new(move || {
-                let (client, bucket, key, upload_id) = (
-                    client.clone(),
-                    bucket.clone(),
-                    key.clone(),
-                    upload_id.clone(),
-                );
-                async move {
-                    if let Err(e) = client
-                        .abort_multipart_upload()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .upload_id(&upload_id)
-                        .send()
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to abort multipart copy {bucket}/{key} ({upload_id}): {}",
-                            aws_sdk_s3::error::DisplayErrorContext(&e)
-                        );
-                    }
-                }
-            })
-        };
+        let guard = MpuAbortGuard::new(self.mpu_abort_request(bucket, key, &upload_id));
         match self.copy_part_list(plan, &upload_id).await {
             Ok(etag) => {
                 guard.disarm();
@@ -338,6 +320,8 @@ impl S3Backend {
                 .copy_source(copy_source)
                 .if_match_etag(source_etag, self.if_match_dialect())
                 .copy_source_range(format!("bytes={start}-{end}"))
+                .customize()
+                .config_override(self.upload_config(end - start + 1))
                 .send()
                 .await
                 .map_err(|e| {
@@ -368,6 +352,8 @@ impl S3Backend {
                     .set_parts(Some(parts))
                     .build(),
             )
+            .customize()
+            .config_override(self.complete_config())
             .send()
             .await
             .map_err(|e| {
@@ -382,7 +368,37 @@ impl S3Backend {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{backend_with_short_read_timeout, slow_answer_server};
     use super::*;
+
+    /// A server-side copy is work of the backend, and the backend answers
+    /// when it is done: the CopyObject, each UploadPartCopy and the Complete
+    /// of a large copy take as long as the object needs, and the client's
+    /// read timeout (60 s) is a deadline for the whole request. Each of them
+    /// carries its own timeouts (the backend works 2.5 s here, the read
+    /// timeout is 1 s).
+    #[tokio::test]
+    async fn a_server_side_copy_that_outlasts_the_read_timeout_completes() {
+        let endpoint = slow_answer_server(std::time::Duration::from_millis(2500)).await;
+        let s3 = backend_with_short_read_timeout(&endpoint).await;
+        let headers = HashMap::new();
+        s3.copy_single("b", "k", "b/src", "\"abc\"", &headers, 1)
+            .await
+            .map_err(|(_, e)| e)
+            .expect("CopyObject");
+        let plan = PartsCopy {
+            bucket: "b",
+            key: "k",
+            copy_source: "b/src",
+            source_etag: "\"abc\"",
+            size: 1,
+            part_bytes: 1,
+        };
+        s3.copy_part_list(&plan, "uid")
+            .await
+            .map_err(|(_, e)| e)
+            .expect("UploadPartCopy and Complete");
+    }
 
     #[test]
     fn copy_parts_cover_the_object_exactly() {

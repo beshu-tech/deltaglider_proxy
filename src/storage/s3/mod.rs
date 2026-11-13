@@ -30,6 +30,7 @@ mod file_body;
 pub(in crate::storage) mod heal;
 mod listing;
 mod metadata;
+mod mpu_put;
 mod objects;
 #[cfg(test)]
 mod tests;
@@ -287,7 +288,9 @@ pub struct S3Backend {
     /// CopyObject, CompleteMultipartUpload): their duration grows with the
     /// object size, so the client has only the per-attempt and read
     /// timeouts. A PutObject or UploadPart gets a deadline sized for its
-    /// body per request ([`S3Backend::upload_config`]).
+    /// body per request, and attempt and read timeouts to match
+    /// ([`S3Backend::upload_config`]): the read timeout of the client
+    /// (60 s) would end a body that needs longer.
     bulk_client: Client,
     /// `(backend name, definition fingerprint)` for the passive health signal
     /// (`coordination::health::note_unavailable`). `None` for a backend that
@@ -317,6 +320,13 @@ pub struct S3Backend {
     /// production constants (or the debug test seams). Set by
     /// [`S3Backend::with_copy_limits`].
     copy_limits: Option<(u64, u64)>,
+    /// `(single-PUT limit, part size)` of a file body that is sent as a
+    /// multipart upload; `None`: the production constants (or the debug
+    /// test seams). Set by [`S3Backend::with_put_limits`].
+    put_limits: Option<(u64, u64)>,
+    /// How long one attempt of a CompleteMultipartUpload waits for its
+    /// answer (`DGP_S3_COMPLETE_TIMEOUT_SECS`).
+    complete_timeout: std::time::Duration,
     /// A conditional-request profile fixed at construction
     /// ([`S3Backend::with_conditional_profile`]); `None` = the one that
     /// the capability probe found for this definition
@@ -368,6 +378,8 @@ impl S3Backend {
             acl_support: Default::default(),
             copy_unsupported: Default::default(),
             copy_limits: None,
+            put_limits: None,
+            complete_timeout: client::complete_timeout(),
             pinned_profile: None,
             client,
             bulk_client,
@@ -406,6 +418,20 @@ impl S3Backend {
         self
     }
 
+    /// Send a file body above `single_max` bytes as a multipart upload, in
+    /// parts of at least `part_bytes` (production: 5 GiB and 64 MiB). For a
+    /// test that runs the path on a few MiB without the process-wide
+    /// `DGP_TEST_PUT_*` seams. S3's smallest part (5 MiB) still applies.
+    #[doc(hidden)]
+    pub fn with_put_limits(mut self, single_max: u64, part_bytes: u64) -> Self {
+        assert!(
+            single_max > 0,
+            "a limit of 0 sends every file body through parts"
+        );
+        self.put_limits = Some((single_max, part_bytes.max(5 * 1024 * 1024)));
+        self
+    }
+
     /// Use `profile` for every conditional request, whatever a probe
     /// finds (tests, and a caller that probed the backend itself).
     pub fn with_conditional_profile(
@@ -439,6 +465,15 @@ impl S3Backend {
     pub(crate) fn conditional_delete_proven(&self) -> bool {
         self.conditional_profile()
             .is_some_and(|p| p.conditional_delete)
+    }
+
+    /// Does CompleteMultipartUpload enforce `If-None-Match` and `If-Match`
+    /// here? Only the probe proves it (`probe_conditional_complete`); until
+    /// then a write with a condition of an object above 5 GiB is not stored
+    /// with a multipart upload.
+    pub(crate) fn conditional_complete_proven(&self) -> bool {
+        self.conditional_profile()
+            .is_some_and(|p| p.conditional_complete == Some(true))
     }
 
     // === Key generation helpers ===
@@ -963,15 +998,27 @@ impl StorageBackend for S3Backend {
         let fence = RefFence::ETag(version.to_string());
         let put = match body.files() {
             Some(files) => {
-                self.put_object_file_with_metadata_fenced_with(
-                    bucket,
-                    &key,
-                    &files,
-                    metadata,
-                    &fence,
-                    OnUnsupported::Report,
-                )
-                .await?
+                match self
+                    .put_object_file_with_metadata_fenced_with(
+                        bucket,
+                        &key,
+                        &files,
+                        metadata,
+                        &fence,
+                        OnUnsupported::Report,
+                    )
+                    .await
+                {
+                    Ok(put) => put,
+                    // Nothing was sent. The caller (the re-encrypt job)
+                    // writes without the condition when it holds the write
+                    // gate, and says why it cannot otherwise.
+                    Err(StorageError::ConditionalMultipartRefused(why)) => {
+                        debug!("S3 conditional rewrite {bucket}/{key}: {why}");
+                        return Ok(WriteIf::UnprovenMultipart);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             None => {
                 let data = body.into_small_bytes()?;
@@ -1264,10 +1311,11 @@ impl StorageBackend for S3Backend {
                 .upload_id(&upload.upload_id)
                 .part_number(part_number)
                 .body(ByteStream::from(data.clone()));
-            let result = match self.upload_config(data.len() as u64) {
-                Some(c) => request.customize().config_override(c).send().await,
-                None => request.send().await,
-            };
+            let result = request
+                .customize()
+                .config_override(self.upload_config(data.len() as u64))
+                .send()
+                .await;
             match result {
                 Ok(resp) => {
                     let etag = resp.e_tag().unwrap_or_default().to_string();
@@ -1319,6 +1367,8 @@ impl StorageBackend for S3Backend {
             .key(&key)
             .upload_id(&upload.upload_id)
             .multipart_upload(completed)
+            .customize()
+            .config_override(self.complete_config())
             .send()
             .await
             .map_err(|e| self.classify(&upload.bucket, &e, S3Op::CompleteMpu))?;
