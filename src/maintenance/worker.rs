@@ -2309,8 +2309,8 @@ mod tests {
     /// `probes::store_refusal`.
     #[test]
     fn only_the_job_steps_that_store_bytes_ask_the_disk() {
-        assert!(<Reencrypt<'static> as ObjectVisitor>::WRITES_BYTES);
-        assert!(!<super::super::backfill::Backfill<'static> as ObjectVisitor>::WRITES_BYTES);
+        const { assert!(<Reencrypt<'static> as ObjectVisitor>::WRITES_BYTES) };
+        const { assert!(!<super::super::backfill::Backfill<'static> as ObjectVisitor>::WRITES_BYTES) };
         let worker =
             crate::source_scan::prod_text(&crate::source_scan::read("src/maintenance/worker.rs"));
         let migrate =

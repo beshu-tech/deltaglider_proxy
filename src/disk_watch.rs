@@ -13,9 +13,10 @@
 //!   reservations (a write that holds no spool yet) with the retryable
 //!   `503 SlowDown`. A running reservation, a read and a delete are never
 //!   affected ([`SpoolGate`]).
-//! * critical on the device of a filesystem backend: client writes to the
-//!   buckets of that backend get `503 SlowDown`
-//!   ([`DiskWatch::write_refusal`], asked by the client-write gate).
+//! * critical on the device of a filesystem backend: the writes that STORE
+//!   bytes into the buckets of that backend get `503 SlowDown`
+//!   ([`DiskWatch::write_refusal_for`], asked by the client-store gate and
+//!   by the maintenance gate for a copy). A delete and a read never ask.
 //! * `/_/ready` does not change: a full disk still serves reads.
 //!
 //! `statvfs` does not show every real limit: a Kubernetes `emptyDir` with a

@@ -1496,7 +1496,7 @@ impl PageStep for CopyStep<'_, '_> {
     /// The copy stores into the target: it waits while the disk of the
     /// target backend is at level critical.
     fn refused(&self) -> Option<String> {
-        super::probes::store_refusal(&self.m.state, &self.m.params.transient_key)
+        super::probes::store_refusal(self.m.state, &self.m.params.transient_key)
     }
 
     async fn begin_page(&mut self) -> Result<(), PhaseStop> {

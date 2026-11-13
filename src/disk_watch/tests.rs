@@ -1023,7 +1023,7 @@ fn an_explicit_budget_on_a_hidden_limit_does_not_warn() {
             "{reason:?} with an explicit budget"
         );
         assert!(
-            boot_check(view, Some(500 * GIB), budget, true, dir, &[]).is_some() == false,
+            boot_check(view, Some(500 * GIB), budget, true, dir, &[]).is_none(),
             "{reason:?} with an explicit budget and a measured disk"
         );
         // The same view with an auto budget (and no earlier warning) speaks.

@@ -115,8 +115,6 @@ enum Spool {
     /// A reference or body that the buffered codec holds, at most the spool
     /// threshold: no gate (the rule is "LARGER than the threshold").
     SmallCodec,
-    /// A read (a GET, a range read): reads and deletes work at level critical.
-    Read,
     /// The primitive that the gated, small and read callers share.
     Primitive,
     /// A write of the CLI (`cp`): the CLI process runs no disk monitor, so
@@ -239,13 +237,18 @@ fn every_spool_acquisition_is_classified() {
             Spool::Gated if !asks => {
                 problems.push(format!("{file}::{name} is a write and must ask the gate"))
             }
-            Spool::SmallCodec | Spool::Read | Spool::Primitive | Spool::NoMonitor if asks => {
-                problems.push(format!(
-                    "{file}::{name} is {class:?} and must not ask the gate"
-                ))
-            }
+            Spool::SmallCodec | Spool::Primitive | Spool::NoMonitor if asks => problems.push(
+                format!("{file}::{name} is {class:?} and must not ask the gate"),
+            ),
             _ => {}
         }
+    }
+    for file in READ_FILES {
+        assert!(
+            !crate::source_scan::prod_text(&crate::source_scan::read(file))
+                .contains("admit_new_spool_write("),
+            "{file} serves reads and must not ask the write gate"
+        );
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
     assert_eq!(
@@ -257,7 +260,8 @@ fn every_spool_acquisition_is_classified() {
     );
 }
 
-/// Files whose spool acquisitions are all reads (a GET and a range read).
+/// Files whose spool acquisitions are all reads (a GET and a range read):
+/// reads and deletes work at level critical, so they never ask the gate.
 const READ_FILES: &[&str] = &["src/deltaglider/engine/retrieve.rs"];
 
 /// CLASS GUARD: every client verb that STORES bytes asks the store gate (it
