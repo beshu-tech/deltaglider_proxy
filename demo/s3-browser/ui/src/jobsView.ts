@@ -153,7 +153,7 @@ export function runEndedMessage(row: JobRow, verb?: LifecycleVerb): { type: 'suc
     return { type: 'warning', text: `${what}: the run finished with errors — ${label}` };
   if (row.status === 'cancelled' || row.status === 'paused') return { type: 'warning', text: `${what}: the run stopped — ${label}` };
   if (row.status === 'deferred')
-    return { type: 'warning', text: `${what}: the proxy stopped the run; it goes on from there in about a minute — ${label}` };
+    return { type: 'warning', text: `${what}: the proxy stopped the run; it goes on from there at the rule's next run — ${label}` };
   return { type: 'success', text: `${what}: the run finished — ${label}` };
 }
 
@@ -328,9 +328,11 @@ export function jobStatusLabel(row: Pick<JobRow, 'status' | 'paused' | 'enabled'
   // "cancelled": the next run goes on from there.
   if (row.status === 'paused') return 'stopped · resumes where it left off';
   // A run that the proxy stopped (a maintenance job or an unhealthy backend
-  // gates its bucket, or a page budget): nobody paused it, and the next run,
-  // about a minute later, goes on from where it stopped.
-  if (row.status === 'deferred') return 'deferred · continues shortly';
+  // gates its bucket, a full destination disk, or a page budget): nobody paused
+  // it, and the next run goes on from where it stopped. The wait differs by
+  // reason (a minute, or the rule's interval and at least 5 minutes for a full
+  // disk), so no time is named.
+  if (row.status === 'deferred') return 'deferred · continues at the next run';
   // Shorten the verbose backend status for the chip; the run's error count is
   // shown separately in the Runs table.
   if (row.status === 'completed_with_errors') return 'completed · errors';

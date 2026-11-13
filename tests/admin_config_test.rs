@@ -2363,6 +2363,24 @@ async fn auto_limits_follow_the_free_space_and_show_their_source() {
     }
 }
 
+/// A test server sizes its spool from the HARNESS (80 GiB free), never from the
+/// disk of the host: its limits are the same on a 1 GiB host and on a 10 TiB
+/// host. This test sets no seam itself, and holds on every host (it is run with
+/// the outer variable at 1 GiB and at 10 TiB: the child never sees it).
+#[tokio::test]
+async fn a_test_server_sizes_its_limits_from_the_harness_not_the_host() {
+    let spool = tempfile::TempDir::new().unwrap();
+    let server = TestServer::builder()
+        .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
+        .build()
+        .await;
+    let cfg = get_limits(&server).await;
+    let l = &cfg["limits"];
+    assert_eq!(l["free_bytes"], 80 * GIB, "{l}");
+    assert_eq!(l["spool_budget"]["bytes"], 40 * GIB, "{l}");
+    assert_eq!(l["max_object_size"]["bytes"], 20 * GIB, "{l}");
+}
+
 /// An explicit value always wins, `GET /config` says where it came from, and
 /// the boot logs a warning (never fatal) that names the directory, the
 /// numbers and the setting to change.

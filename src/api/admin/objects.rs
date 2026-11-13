@@ -2762,6 +2762,126 @@ mod tests {
             }
         }
 
+        /// The kind of every admin entry check, by source: a copy or move
+        /// DESTINATION stores bytes; a move's source and a bulk delete free
+        /// space (so a job's disk wait lets them in). A blind `Store` there is
+        /// the 409 that the docs deny; a blind `FreesSpace` on a destination
+        /// lets copies into a held bucket.
+        #[test]
+        fn the_admin_entry_checks_name_the_kind_of_their_write() {
+            let text = crate::source_scan::prod_text(&crate::source_scan::read(
+                "src/api/admin/objects.rs",
+            ));
+            let flat: String = text.split_whitespace().collect();
+            let call = |bucket: &str, kind: &str| {
+                format!(
+                    "reject_if_under_maintenance(&state,&req.{bucket},crate::maintenance::gate::WriteKind::{kind},)?;"
+                )
+            };
+            assert_eq!(
+                flat.matches(&call("dest_bucket", "Store")).count(),
+                2,
+                "copy and move"
+            );
+            assert_eq!(
+                flat.matches(&call("source_bucket", "FreesSpace")).count(),
+                1,
+                "move source"
+            );
+            assert_eq!(
+                flat.matches(&call("bucket", "FreesSpace")).count(),
+                1,
+                "bulk delete"
+            );
+            assert_eq!(
+                flat.matches("reject_if_under_maintenance(&state,").count(),
+                4,
+                "no entry check without a named kind"
+            );
+        }
+
+        /// A job that WAITS FOR DISK SPACE holds bucket `b` (a re-encrypt row,
+        /// gate armed) with its wait on the gate: a write that frees space
+        /// passes, a write that stores bytes does not.
+        fn hold_for_disk(state: &std::sync::Arc<AppState>) {
+            let db = crate::config_db::JobsDb::in_memory("t").unwrap();
+            let id = db
+                .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
+                .unwrap()
+                .unwrap();
+            state.maintenance_gate.sync_from(&db);
+            state
+                .maintenance_gate
+                .mark_disk_deferred(id, crate::maintenance::store::current_unix_seconds() + 600);
+            assert!(state.maintenance_gate.is_busy("b"));
+        }
+
+        /// The per-item check of a bulk delete lets a delete pass a job's disk
+        /// wait: every key goes.
+        #[tokio::test]
+        async fn a_bulk_delete_passes_a_job_that_waits_for_disk() {
+            let (engine, _fake) = s3_engine().await;
+            let keys = store_deltas(&engine, "e2e/run-1", 4).await;
+            let state = AppState::for_tests(engine);
+            hold_for_disk(&state);
+
+            let res = run_bulk_delete(
+                &state,
+                "b",
+                &paths(&keys),
+                &BulkActor::Unrestricted,
+                &|_| {},
+            )
+            .await;
+
+            assert_eq!((res.deleted, res.failed), (4, 0), "{res:?}");
+            let engine = state.engine.load();
+            for key in &keys {
+                assert!(engine.head("b", key).await.is_err(), "{key} is deleted");
+            }
+        }
+
+        /// The per-item check of a bulk COPY refuses a job's disk wait: a copy
+        /// stores bytes. Every item is skipped.
+        #[tokio::test]
+        async fn a_bulk_copy_into_a_bucket_that_waits_for_disk_is_skipped() {
+            let (engine, _fake) = s3_engine().await;
+            let keys = sources(&engine).await;
+            let plan = copy_plan(&engine, &keys);
+            let state = AppState::for_tests(engine);
+            hold_for_disk(&state);
+
+            let (res, copied) = run_copy_loop(&state, &plan, &BulkActor::Unrestricted, false).await;
+
+            assert_eq!((res.succeeded, res.failed), (0, keys.len()), "{res:?}");
+            assert!(copied.iter().all(Option::is_none));
+        }
+
+        /// The source delete of a move passes a job's disk wait (it frees
+        /// space): the sources of the copies that were made are deleted.
+        #[tokio::test]
+        async fn a_move_deletes_its_sources_while_a_job_waits_for_disk() {
+            let (engine, _fake) = s3_engine().await;
+            let keys = store_deltas(&engine, "e2e/run-1", 4).await;
+            let mut copied = Vec::new();
+            for key in &keys {
+                copied.push(Some(engine.head("b", key).await.unwrap()));
+            }
+            let items: Vec<CopyItem> = paths(&keys)
+                .into_iter()
+                .map(|p| CopyItem {
+                    source_key: p.clone(),
+                    relative: p,
+                })
+                .collect();
+            let state = AppState::for_tests(engine);
+            hold_for_disk(&state);
+
+            let (deleted, _) = delete_moved_sources(&state, "b", &items, &copied, |_| false).await;
+
+            assert_eq!(deleted, keys.len(), "a delete passes the wait");
+        }
+
         /// A maintenance job armed on the source bucket stops the source
         /// deletes of a move: the copies are made, the sources stay (the
         /// per-item check of the delete batch, [`WriteKind::FreesSpace`]).

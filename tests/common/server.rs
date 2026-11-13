@@ -227,7 +227,15 @@ fn proxy_command(config_path: &std::path::Path, production_security: bool) -> Co
         // test that needs another level sets the seam itself; none depends on
         // the real free space of the machine (a 19 GiB host sits at level
         // high of the real thresholds).
-        .env("DGP_TEST_DISK_MONITOR_FREE_PERCENT", "50");
+        .env("DGP_TEST_DISK_MONITOR_FREE_PERCENT", "50")
+        // The boot sizing of the spool (budget, per-upload limit,
+        // `max_object_size`) reads the free space of the spool directory: the
+        // same 80 GiB on every host, so no limit depends on the machine. A
+        // test that needs another size sets the seam itself.
+        .env(
+            "DGP_TEST_DISK_FREE_BYTES",
+            (80u64 * 1024 * 1024 * 1024).to_string(),
+        );
     if !production_security {
         cmd.env("DGP_BACKEND_ALLOW_LOCAL", "true")
             .env("DGP_REPLAY_WINDOW_SECS", "0");
