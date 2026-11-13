@@ -593,6 +593,28 @@ async fn a_migrate_copy_waits_for_the_disk_of_its_target_backend() {
     assert_eq!(e.count("PUT") + e.count("COPY"), 0, "nothing was written");
 }
 
+/// The copy waits out a write that the gate admitted before it, every time
+/// it starts (a resume after a disk wait included): one that deletes a source
+/// key after the verify read it would bring the key back at the flip.
+#[tokio::test]
+async fn a_migrate_copy_starts_only_after_the_admitted_writes_end() {
+    let e = env_with("stage", 5, false).await;
+    let write = e.state.maintenance_gate.begin_detached_write("b");
+    let run = e.run();
+    let mut c = Counters::default();
+    {
+        let copy = run.copy(&mut c);
+        tokio::pin!(copy);
+        tokio::select! {
+            done = &mut copy => panic!("the copy started with a write in flight: {done:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(600)) => {}
+        }
+        drop(write);
+        copy.await.unwrap();
+    }
+    assert_eq!(c.done, 5, "{c:?}");
+}
+
 /// A copy that needs a spool file and meets the spool gate defers the job; a
 /// busy proxy with the gate open, and every other error, is the object's.
 #[test]
