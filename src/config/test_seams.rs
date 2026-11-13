@@ -17,6 +17,11 @@ pub struct TestSeams {
     /// `DGP_TEST_COMPLETE_STALL_MS`: sleep before a CompleteMultipartUpload
     /// stores, so a test can race the store window.
     pub complete_stall_ms: u64,
+    /// `DGP_TEST_COMPLETE_KEEPALIVE_AFTER_MS`: the time after which a
+    /// CompleteMultipartUpload answers 200 and keeps the connection alive
+    /// with whitespace (production: 5 s), so a test sees it with a short
+    /// stall.
+    pub complete_keepalive_after_ms: Option<u64>,
     /// `DGP_TEST_FAIL_PART_ONCE`: the part number of a streaming copy that
     /// fails once with a transient error.
     pub fail_part_once: Option<i32>,
@@ -86,6 +91,23 @@ pub struct TestSeams {
     /// largest): the part size of a multipart server-side copy (production:
     /// 512 MiB).
     pub copy_part_bytes: Option<u64>,
+    /// `DGP_TEST_PUT_SINGLE_MAX_BYTES` (5 MiB to 5 GiB): the size above
+    /// which an S3 backend stores a file body as a multipart upload
+    /// instead of one PutObject (production: 5 GiB, S3's limit), so a test
+    /// of a few MiB runs that path on MinIO.
+    pub put_single_max_bytes: Option<u64>,
+    /// `DGP_TEST_PUT_PART_BYTES` (5 MiB to 5 GiB): the part size of that
+    /// multipart upload (production: 64 MiB).
+    pub put_part_bytes: Option<u64>,
+    /// `DGP_TEST_PUT_FAIL_PART`: the number of the part of a backend
+    /// multipart upload that fails with a transient error, so a test sees
+    /// the upload aborted after earlier parts were stored.
+    pub put_fail_part: Option<i32>,
+    /// `DGP_TEST_PUT_DROP_COMPLETE_ANSWER=true`: the first
+    /// CompleteMultipartUpload of a backend multipart upload completes, and
+    /// the proxy treats its answer as lost, so a test sees that the proxy
+    /// finds its own object and does not upload the parts again.
+    pub put_drop_complete_answer: bool,
     /// `DGP_TEST_DISK_FREE_BYTES`: the free space of the spool directory at
     /// boot, so a test sees one auto-sized limit on every host. It also
     /// turns off the tmpfs, Kubernetes and shared-device facts
@@ -172,6 +194,7 @@ impl TestSeams {
         };
         Self {
             complete_stall_ms: lookup_parse(env, "DGP_TEST_COMPLETE_STALL_MS").unwrap_or(0),
+            complete_keepalive_after_ms: lookup_parse(env, "DGP_TEST_COMPLETE_KEEPALIVE_AFTER_MS"),
             fail_part_once: lookup_parse::<i32>(env, "DGP_TEST_FAIL_PART_ONCE").filter(|n| *n >= 0),
             part_delay_ms: delay("DGP_TEST_PART_BARRIER", "DGP_TEST_PART_DELAY_MS"),
             object_delay_ms: delay("DGP_TEST_OBJECT_BARRIER", "DGP_TEST_OBJECT_DELAY_MS"),
@@ -207,6 +230,14 @@ impl TestSeams {
                 "DGP_TEST_COPY_OBJECT_MAX_BYTES",
             )),
             copy_part_bytes: copy_seam_bytes(lookup_parse(env, "DGP_TEST_COPY_PART_BYTES")),
+            put_single_max_bytes: copy_seam_bytes(lookup_parse(
+                env,
+                "DGP_TEST_PUT_SINGLE_MAX_BYTES",
+            )),
+            put_part_bytes: copy_seam_bytes(lookup_parse(env, "DGP_TEST_PUT_PART_BYTES")),
+            put_fail_part: lookup_parse::<i32>(env, "DGP_TEST_PUT_FAIL_PART").filter(|n| *n >= 1),
+            put_drop_complete_answer: lookup_parse(env, "DGP_TEST_PUT_DROP_COMPLETE_ANSWER")
+                .unwrap_or(false),
             disk_free_bytes: lookup_parse(env, "DGP_TEST_DISK_FREE_BYTES"),
             disk_monitor_free_percent: lookup_parse::<u8>(
                 env,
@@ -228,6 +259,7 @@ impl TestSeams {
 /// and the parser in step.
 pub const SEAM_ENV_VARS: &[&str] = &[
     "DGP_TEST_COMPLETE_STALL_MS",
+    "DGP_TEST_COMPLETE_KEEPALIVE_AFTER_MS",
     "DGP_TEST_FAIL_PART_ONCE",
     "DGP_TEST_PART_BARRIER",
     "DGP_TEST_PART_DELAY_MS",
@@ -247,11 +279,21 @@ pub const SEAM_ENV_VARS: &[&str] = &[
     "DGP_TEST_ATOMICITY_PROBE_DELAY_MS",
     "DGP_TEST_COPY_OBJECT_MAX_BYTES",
     "DGP_TEST_COPY_PART_BYTES",
+    "DGP_TEST_PUT_SINGLE_MAX_BYTES",
+    "DGP_TEST_PUT_PART_BYTES",
+    "DGP_TEST_PUT_FAIL_PART",
+    "DGP_TEST_PUT_DROP_COMPLETE_ANSWER",
     "DGP_TEST_DISK_FREE_BYTES",
     "DGP_TEST_DISK_MONITOR_FREE_PERCENT",
     "DGP_TEST_DISK_MONITOR_FREE_FILE",
     "DGP_TEST_MAINTENANCE_DEFER_SECS",
 ];
+
+/// The wait of `DGP_TEST_PUT_FAIL_PART`: the parts before the failing one
+/// are on the backend by the time it fails.
+pub async fn let_earlier_parts_finish() {
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+}
 
 /// The seams of this process: parsed from the environment on first use in a
 /// debug build, all off in a release build.
@@ -318,6 +360,7 @@ mod tests {
     fn every_seam_is_read() {
         let t = from(&[
             ("DGP_TEST_COMPLETE_STALL_MS", "1500"),
+            ("DGP_TEST_COMPLETE_KEEPALIVE_AFTER_MS", "250"),
             ("DGP_TEST_FAIL_PART_ONCE", "2"),
             ("DGP_TEST_PART_BARRIER", "1"),
             ("DGP_TEST_OBJECT_BARRIER", "true"),
@@ -333,15 +376,23 @@ mod tests {
             ("DGP_TEST_REWRITE_STALL", "before-lock:3000"),
             ("DGP_TEST_COPY_OBJECT_MAX_BYTES", "5242880"),
             ("DGP_TEST_COPY_PART_BYTES", "6291456"),
+            ("DGP_TEST_PUT_SINGLE_MAX_BYTES", "5242880"),
+            ("DGP_TEST_PUT_PART_BYTES", "7340032"),
+            ("DGP_TEST_PUT_FAIL_PART", "3"),
+            ("DGP_TEST_PUT_DROP_COMPLETE_ANSWER", "true"),
             ("DGP_TEST_DISK_MONITOR_FREE_PERCENT", "8"),
             ("DGP_TEST_DISK_MONITOR_FREE_FILE", "/tmp/free"),
             ("DGP_TEST_MAINTENANCE_DEFER_SECS", "2"),
         ]);
+        assert_eq!(t.put_fail_part, Some(3));
+        assert!(t.put_drop_complete_answer);
         assert_eq!(t.disk_monitor_free_percent, Some(8));
         assert_eq!(t.disk_monitor_free_file, Some("/tmp/free".into()));
         assert_eq!(t.maintenance_defer_secs, Some(2));
         assert_eq!(t.copy_object_max_bytes, Some(5 * 1024 * 1024));
         assert_eq!(t.copy_part_bytes, Some(6 * 1024 * 1024));
+        assert_eq!(t.put_single_max_bytes, Some(5 * 1024 * 1024));
+        assert_eq!(t.put_part_bytes, Some(7 * 1024 * 1024));
         assert_eq!(
             t.rewrite_stall_at(RewriteStall::BeforeLock).map(|s| s.ms),
             Some(3000)
@@ -367,6 +418,7 @@ mod tests {
         assert_eq!(t.conversion_grace_secs, Some(0));
         assert_eq!(t.conversion_window_secs, Some(30));
         assert_eq!(t.complete_stall_ms, 1500);
+        assert_eq!(t.complete_keepalive_after_ms, Some(250));
         assert_eq!(t.fail_part_once, Some(2));
         assert_eq!(t.part_delay_ms, Some(150), "the default delay");
         assert_eq!(t.object_delay_ms, Some(20));
@@ -393,6 +445,9 @@ mod tests {
             // Under the 5 MiB floor: S3 would refuse such a part.
             ("DGP_TEST_COPY_OBJECT_MAX_BYTES", "5242879"),
             ("DGP_TEST_COPY_PART_BYTES", "1024"),
+            ("DGP_TEST_PUT_SINGLE_MAX_BYTES", "1024"),
+            ("DGP_TEST_PUT_PART_BYTES", "5368709121"),
+            ("DGP_TEST_PUT_FAIL_PART", "0"),
         ]);
         assert_eq!(t, TestSeams::default());
     }

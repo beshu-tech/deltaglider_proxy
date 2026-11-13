@@ -258,6 +258,14 @@ pub(super) fn classify_response(
     if code == "BucketNotEmpty" {
         return StorageError::BucketNotEmpty(bucket.to_string());
     }
+    // The backend refuses the object as too large (S3: a single PUT above
+    // 5 GiB, an object above 5 TiB; a provider's own cap): a client error
+    // that a retry gets again, not a 500 or a 503. Any status.
+    if code == "EntityTooLarge" {
+        return StorageError::EntityTooLarge(format!(
+            "{op} on bucket '{bucket}': the storage backend refused the object as too large"
+        ));
+    }
     // The backend refuses the key's length: a client error, not a 500.
     if code == "KeyTooLongError" {
         return StorageError::KeyTooLong(format!(

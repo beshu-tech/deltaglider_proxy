@@ -21,17 +21,32 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 /// Bytes read from a file per frame.
 const READ_BUFFER: usize = 256 * 1024;
 
+/// The part of one file that a body sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Segment {
+    path: PathBuf,
+    /// The size of the whole file when the PUT started: a file that has
+    /// another size when an attempt opens it fails that attempt.
+    size: u64,
+    /// Bytes of the file before the first byte that is sent.
+    skip: u64,
+    /// Bytes of the file that are sent, from `skip` on.
+    take: u64,
+}
+
 /// The local files of one PUT body, in order, with the size of each as it
-/// was when the PUT started.
+/// was when the PUT started. A body can also be a byte range of the
+/// concatenation of the files ([`Self::slice`]): one part of a multipart
+/// upload.
 #[derive(Clone)]
 pub(super) struct FileBody {
-    files: Arc<[(PathBuf, u64)]>,
+    files: Arc<[Segment]>,
     len: u64,
 }
 
@@ -45,7 +60,12 @@ impl FileBody {
         for path in paths {
             let size = tokio::fs::metadata(path).await?.len();
             len += size;
-            files.push((path.to_path_buf(), size));
+            files.push(Segment {
+                path: path.to_path_buf(),
+                size,
+                skip: 0,
+                take: size,
+            });
         }
         Ok(Self {
             files: files.into(),
@@ -56,6 +76,33 @@ impl FileBody {
     /// The number of bytes the body sends.
     pub(super) fn len(&self) -> u64 {
         self.len
+    }
+
+    /// The `len` bytes of this body that start at `offset`: the files (or
+    /// file ranges) that hold them, nothing copied. A range that reaches
+    /// past the end is cut at the end.
+    pub(super) fn slice(&self, offset: u64, len: u64) -> Self {
+        let end = offset.saturating_add(len).min(self.len);
+        let mut files = Vec::new();
+        let mut at = 0u64;
+        for seg in self.files.iter() {
+            let (from, to) = (at, at + seg.take);
+            at = to;
+            let (lo, hi) = (from.max(offset), to.min(end));
+            if lo < hi {
+                files.push(Segment {
+                    path: seg.path.clone(),
+                    size: seg.size,
+                    skip: seg.skip + (lo - from),
+                    take: hi - lo,
+                });
+            }
+        }
+        let len = end.saturating_sub(offset);
+        Self {
+            files: files.into(),
+            len,
+        }
     }
 
     /// A retryable request body of exactly [`Self::len`] bytes: each
@@ -75,8 +122,13 @@ impl FileBody {
         tokio::task::spawn_blocking(move || {
             use md5::Digest;
             let mut h = md5::Md5::new();
-            for (path, _) in files.iter() {
-                crate::deltaglider::spool::for_each_chunk_blocking(path, |c| h.update(c)).ok()?;
+            for seg in files.iter() {
+                if seg.skip == 0 && seg.take == seg.size {
+                    crate::deltaglider::spool::for_each_chunk_blocking(&seg.path, |c| h.update(c))
+                        .ok()?;
+                } else {
+                    md5_range(&seg.path, seg.skip, seg.take, &mut h)?;
+                }
             }
             Some(hex::encode(h.finalize()))
         })
@@ -84,6 +136,27 @@ impl FileBody {
         .ok()
         .flatten()
     }
+}
+
+/// Feed `take` bytes of a file, from `skip`, to an MD5; `None` when the
+/// file is shorter or cannot be read.
+fn md5_range(path: &Path, skip: u64, take: u64, h: &mut md5::Md5) -> Option<()> {
+    use md5::Digest;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(skip)).ok()?;
+    let mut left = take;
+    let mut buf = vec![0u8; READ_BUFFER];
+    while left > 0 {
+        let want = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
+        let n = file.read(&mut buf[..want]).ok()?;
+        if n == 0 {
+            return None;
+        }
+        h.update(&buf[..n]);
+        left -= n as u64;
+    }
+    Some(())
 }
 
 type OpenFile = Pin<Box<dyn Future<Output = io::Result<tokio::fs::File>> + Send + Sync>>;
@@ -102,7 +175,7 @@ enum State {
 
 /// One attempt's read of a [`FileBody`]: the files one after the other.
 struct ChainedFiles {
-    files: Arc<[(PathBuf, u64)]>,
+    files: Arc<[Segment]>,
     next: usize,
     state: State,
     /// Bytes of the whole body still to come.
@@ -110,7 +183,7 @@ struct ChainedFiles {
 }
 
 impl ChainedFiles {
-    fn new(files: Arc<[(PathBuf, u64)]>, len: u64) -> Self {
+    fn new(files: Arc<[Segment]>, len: u64) -> Self {
         Self {
             files,
             next: 0,
@@ -141,25 +214,28 @@ impl Body for ChainedFiles {
         loop {
             match &mut this.state {
                 State::Between => {
-                    let Some((path, size)) = this.files.get(this.next).cloned() else {
+                    let Some(seg) = this.files.get(this.next).cloned() else {
                         return Poll::Ready(None);
                     };
                     this.next += 1;
                     this.state = State::Opening(Box::pin(async move {
-                        let file = tokio::fs::File::open(&path).await?;
+                        let mut file = tokio::fs::File::open(&seg.path).await?;
                         let now = file.metadata().await?.len();
-                        if now != size {
-                            return Err(file_changed(&path, size, now));
+                        if now != seg.size {
+                            return Err(file_changed(&seg.path, seg.size, now));
+                        }
+                        if seg.skip > 0 {
+                            file.seek(io::SeekFrom::Start(seg.skip)).await?;
                         }
                         Ok(file)
                     }));
                 }
                 State::Opening(opening) => {
                     let file = ready!(opening.as_mut().poll(cx))?;
-                    let size = this.files[this.next - 1].1;
+                    let take = this.files[this.next - 1].take;
                     this.state = State::Reading {
-                        stream: ReaderStream::with_capacity(file.take(size), READ_BUFFER),
-                        left: size,
+                        stream: ReaderStream::with_capacity(file.take(take), READ_BUFFER),
+                        left: take,
                     };
                 }
                 State::Reading { stream, left } => {
@@ -171,8 +247,8 @@ impl Body for ChainedFiles {
                         }
                         Some(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
                         None if *left > 0 => {
-                            let (path, size) = &this.files[this.next - 1];
-                            let e = file_changed(path, *size, size - *left);
+                            let seg = &this.files[this.next - 1];
+                            let e = file_changed(&seg.path, seg.size, seg.skip + seg.take - *left);
                             return Poll::Ready(Some(Err(e.into())));
                         }
                         None => this.state = State::Between,
@@ -182,8 +258,11 @@ impl Body for ChainedFiles {
         }
     }
 
+    /// True as soon as the last byte is out, in any state: hyper stops
+    /// polling after the `Content-Length`, and the SDK's throughput check
+    /// takes the upload as complete only through this method.
     fn is_end_stream(&self) -> bool {
-        self.left == 0 && matches!(self.state, State::Between) && self.next >= self.files.len()
+        self.left == 0
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -280,12 +359,107 @@ mod tests {
         assert_eq!(body.md5_hex().await, None, "a missing part has no MD5");
     }
 
+    /// The body says that it is at its end as soon as its last byte is out,
+    /// in every state, also before the poll that returns `None` and with
+    /// empty files after the last data. The SDK marks an upload as complete
+    /// only through `is_end_stream` (aws-smithy-runtime 1.16.2,
+    /// `minimum_throughput/http_body_1_x.rs`: hyper stops polling a body
+    /// after its `Content-Length`, so `None` may never come). A body that
+    /// stays silent about it reads as stalled while the proxy waits for the
+    /// backend's answer.
+    #[tokio::test]
+    async fn the_body_is_at_its_end_when_its_last_byte_is_out() {
+        use http_body::Body as _;
+        let dir = tempfile::tempdir().unwrap();
+        for parts in [
+            vec![b"abc".to_vec()],
+            vec![b"abc".to_vec(), vec![9u8; 2 * READ_BUFFER + 5]],
+            vec![b"abc".to_vec(), Vec::new(), Vec::new()],
+            vec![Vec::new()],
+        ] {
+            let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            let paths = write_parts(dir.path(), &slices);
+            let body = body_of(&paths).await;
+            let total = body.len();
+            for (offset, len) in [(0, total), (1, total.saturating_sub(1))] {
+                let slice = body.slice(offset, len);
+                let mut chained = ChainedFiles::new(slice.files.clone(), slice.len());
+                let mut seen = 0u64;
+                while seen < slice.len() {
+                    assert!(!chained.is_end_stream(), "bytes are left ({seen}/{total})");
+                    let frame = std::future::poll_fn(|cx| Pin::new(&mut chained).poll_frame(cx))
+                        .await
+                        .expect("a frame")
+                        .unwrap();
+                    seen += frame.into_data().map_or(0, |d| d.len() as u64);
+                }
+                assert!(
+                    chained.is_end_stream(),
+                    "the last byte is out: {parts:?} slice {offset}+{len}",
+                    parts = parts.iter().map(Vec::len).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn no_parts_is_an_empty_body() {
         let body = FileBody::open(&[]).await.unwrap();
         let sdk = body.byte_stream().into_inner();
         assert_eq!(sdk.content_length(), Some(0));
         assert!(collect(sdk).await.unwrap().is_empty());
+    }
+
+    /// A slice is the bytes `offset..offset + len` of the concatenation:
+    /// across a file boundary, inside one file, and cut at the end. It is
+    /// streamed from the files (no copy), retryable, and has the MD5 of
+    /// those bytes.
+    #[tokio::test]
+    async fn a_slice_is_a_byte_range_of_the_concatenation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = write_parts(dir.path(), &[b"0123456789", b"", b"abcdefghij", b"KLMNOP"]);
+        let body = body_of(&paths).await;
+        let all = b"0123456789abcdefghijKLMNOP";
+        for (offset, len, want) in [
+            (0u64, 4u64, &all[0..4]),
+            (8, 6, &all[8..14]),
+            (10, 10, &all[10..20]),
+            (19, 7, &all[19..26]),
+            (20, 100, &all[20..26]),
+            (26, 5, &all[26..26]),
+            (3, 0, &all[3..3]),
+        ] {
+            let slice = body.slice(offset, len);
+            assert_eq!(slice.len(), want.len() as u64, "{offset}+{len}");
+            let sdk = slice.byte_stream().into_inner();
+            assert!(sdk.is_streaming(), "{offset}+{len}: read from the files");
+            assert_eq!(sdk.content_length(), Some(slice.len()), "{offset}+{len}");
+            let retry = sdk.try_clone().expect("a slice is retryable");
+            assert_eq!(collect(sdk).await.unwrap(), want, "{offset}+{len}");
+            assert_eq!(collect(retry).await.unwrap(), want, "{offset}+{len} again");
+            let md5 = hex::encode(<md5::Md5 as md5::Digest>::digest(want));
+            assert_eq!(slice.md5_hex().await.as_deref(), Some(md5.as_str()));
+        }
+        // A slice of a slice.
+        let inner = body.slice(5, 15).slice(5, 6);
+        assert_eq!(
+            collect(inner.byte_stream().into_inner()).await.unwrap(),
+            &all[10..16]
+        );
+    }
+
+    /// A file that changed size fails the slices that read it, as it fails
+    /// the whole body.
+    #[tokio::test]
+    async fn a_slice_of_a_changed_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = write_parts(dir.path(), &[b"first", b"second"]);
+        let body = body_of(&paths).await;
+        std::fs::write(&paths[1], b"seconds, longer").unwrap();
+        let e = collect(body.slice(5, 6).byte_stream().into_inner())
+            .await
+            .unwrap_err();
+        assert!(e.contains("changed while it was uploaded"), "{e}");
     }
 
     fn passthrough_meta(len: usize) -> crate::types::FileMetadata {
@@ -454,6 +628,32 @@ mod tests {
                 collect(body.byte_stream().into_inner()).await.unwrap()
             });
             proptest::prop_assert_eq!(got, parts.concat());
+        }
+
+        /// Any split into files and any range: the slice is that range of
+        /// the concatenation.
+        #[test]
+        fn any_slice_is_the_range_of_the_concatenation(
+            parts in proptest::collection::vec(
+                proptest::collection::vec(proptest::num::u8::ANY, 0..2048),
+                0..5,
+            ),
+            offset in 0u64..9000,
+            len in 0u64..9000,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            let paths = write_parts(dir.path(), &slices);
+            let all = parts.concat();
+            let from = (offset as usize).min(all.len());
+            let to = (offset.saturating_add(len) as usize).min(all.len());
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let got = rt.block_on(async {
+                let slice = body_of(&paths).await.slice(offset, len);
+                assert_eq!(slice.len(), (to - from) as u64);
+                collect(slice.byte_stream().into_inner()).await.unwrap()
+            });
+            proptest::prop_assert_eq!(got, all[from..to].to_vec());
         }
     }
 }

@@ -55,8 +55,13 @@ fn conditional_outcome(
     match out {
         WriteIf::Written => Ok(Some(Rewritten::Done { bytes })),
         WriteIf::Changed => Ok(Some(Rewritten::Changed)),
-        WriteIf::Unsupported if unconditional == Unconditional::Allowed => Ok(None),
+        WriteIf::Unsupported | WriteIf::UnprovenMultipart
+            if unconditional == Unconditional::Allowed =>
+        {
+            Ok(None)
+        }
         WriteIf::Unsupported => Err(no_conditional_writes(bucket)),
+        WriteIf::UnprovenMultipart => Err(unproven_multipart(bucket)),
     }
 }
 
@@ -442,9 +447,47 @@ fn no_conditional_writes(bucket: &str) -> EngineError {
     )))
 }
 
+/// The error of a rewrite of an object above 5 GiB that must be conditional
+/// on a backend that is not proven to enforce a condition on its multipart
+/// Complete.
+fn unproven_multipart(bucket: &str) -> EngineError {
+    EngineError::Storage(StorageError::ConditionalMultipartRefused(format!(
+        "the object is above the 5 GiB of one PUT request, so its rewrite needs a multipart \
+         upload, and the backend of bucket '{bucket}' is not proven to enforce a condition on \
+         CompleteMultipartUpload (`conditional_complete` in GET /_/api/admin/backends; \"Check \
+         again\" probes it); the rewrite is not stored without its condition"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A conditional rewrite that the backend could not send (an object
+    /// above 5 GiB, no proof of a conditional multipart Complete): a job that
+    /// holds the write gate writes without the condition (`Ok(None)`: the
+    /// caller does it), one that does not fails with the true reason, never
+    /// the "501" text.
+    #[test]
+    fn an_unproven_multipart_rewrite_follows_the_gate() {
+        let allowed =
+            conditional_outcome(WriteIf::UnprovenMultipart, 7, Unconditional::Allowed, "b");
+        assert!(matches!(allowed, Ok(None)), "{allowed:?}");
+        let refused =
+            conditional_outcome(WriteIf::UnprovenMultipart, 7, Unconditional::Refused, "b")
+                .unwrap_err()
+                .to_string();
+        assert!(
+            refused.contains("CompleteMultipartUpload") && refused.contains("5 GiB"),
+            "{refused}"
+        );
+        assert!(!refused.contains("501"), "{refused}");
+        // The 501 case keeps its own text.
+        let old = conditional_outcome(WriteIf::Unsupported, 7, Unconditional::Refused, "b")
+            .unwrap_err()
+            .to_string();
+        assert!(old.contains("501"), "{old}");
+    }
 
     #[test]
     fn md5_hex_shapes() {

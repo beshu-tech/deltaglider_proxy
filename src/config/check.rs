@@ -175,18 +175,16 @@ impl Config {
             if max_object_size == 0 {
                 warnings.push("max_object_size=0 will reject all uploads".to_string());
             }
-            // The proxy stores a client object, also a multipart object,
-            // with ONE backend request, and S3 stores at most 5 GiB in one
-            // request. A larger body goes to a spool file and is then
-            // refused by the backend.
-            const SINGLE_PUT_MAX_BYTES: u64 = limits::S3_SINGLE_PUT_MAX_BYTES;
-            if max_object_size > SINGLE_PUT_MAX_BYTES && self.has_s3_backend() {
+            // The proxy stores an object above 5 GiB as a backend multipart
+            // upload, and S3 stores at most 5 TiB in one object. A larger
+            // body goes to a spool file and is then refused by the backend.
+            const OBJECT_MAX_BYTES: u64 = limits::S3_OBJECT_MAX_BYTES;
+            if max_object_size > OBJECT_MAX_BYTES && self.has_s3_backend() {
                 warnings.push(format!(
-                    "max_object_size={max_object_size} is above 5 GiB ({SINGLE_PUT_MAX_BYTES} bytes), the most \
-                     that an S3 backend stores with one PUT request. The proxy stores a multipart \
-                     object with one backend PUT too, so a multipart object is limited to 5 GiB as \
-                     well. A larger body is read into a spool file (and fills the spool) and then \
-                     the backend refuses it. Set max_object_size to 5 GiB or less, or to auto"
+                    "max_object_size={max_object_size} is above 5 TiB ({OBJECT_MAX_BYTES} bytes), the \
+                     largest object that S3 stores. A larger body is read into a spool file (and \
+                     fills the spool) and then the backend refuses it. Set max_object_size to 5 TiB \
+                     or less, or to auto"
                 ));
             }
         }
@@ -785,12 +783,13 @@ impl Config {
 mod object_size_tests {
     use super::*;
 
-    /// A PUT is stored with one backend request, and S3 takes at most
-    /// 5 GiB in one request: a larger `max_object_size` only lets the proxy
-    /// buffer a body that the backend then refuses. `config check` says so.
+    /// S3 stores at most 5 TiB in one object (a backend multipart upload
+    /// above 5 GiB): a larger `max_object_size` only lets the proxy spool a
+    /// body that the backend then refuses. `config check` says so.
     #[test]
-    fn a_max_object_size_over_5_gib_warns() {
+    fn a_max_object_size_over_5_tib_warns() {
         const GIB: u64 = 1024 * 1024 * 1024;
+        const TIB: u64 = 1024 * GIB;
         let warns = |size: u64| {
             let mut c = Config {
                 max_object_size: limits::BytesOrAuto::Bytes(size),
@@ -807,23 +806,24 @@ mod object_size_tests {
             };
             c.check()
                 .into_iter()
-                .any(|w| w.contains("max_object_size") && w.contains("5 GiB"))
+                .any(|w| w.contains("max_object_size") && w.contains("5 TiB"))
         };
-        assert!(warns(5 * GIB + 1));
-        assert!(!warns(5 * GIB));
+        assert!(warns(5 * TIB + 1));
+        assert!(!warns(5 * TIB));
+        // 5 GiB is not a limit of an S3 backend any more.
+        assert!(!warns(5 * GIB + 1));
         assert!(!warns(Config::default().max_object_size_bytes()));
-        // A filesystem-only deployment has no 5 GiB limit.
+        // A filesystem-only deployment has no S3 limit.
         let mut fs = Config {
-            max_object_size: limits::BytesOrAuto::Bytes(50 * GIB),
+            max_object_size: limits::BytesOrAuto::Bytes(50 * TIB),
             ..Config::default()
         };
         assert!(!fs.has_s3_backend());
-        assert!(!fs.check().iter().any(|w| w.contains("5 GiB")));
+        assert!(!fs.check().iter().any(|w| w.contains("5 TiB")));
     }
 
     /// An `auto` value is never an operator's choice: no 5 GiB warning,
-    /// however large the spool makes it (the limit of a backend PUT is a
-    /// separate item).
+    /// however large the spool makes it.
     #[test]
     fn an_auto_max_object_size_does_not_warn_about_5_gib() {
         let mut c = Config::default();

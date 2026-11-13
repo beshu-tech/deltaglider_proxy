@@ -57,6 +57,22 @@ mod classify_tests {
             ),
             (object_op, Some(400), "InvalidObjectName", "InvalidKey"),
             (object_op, Some(400), "KeyTooLongError", "KeyTooLong"),
+            // The backend refuses the object as too large: a client error
+            // on every operation that writes bytes, whatever the status.
+            (object_op, Some(400), "EntityTooLarge", "EntityTooLarge"),
+            (
+                S3Op::UploadPart,
+                Some(400),
+                "EntityTooLarge",
+                "EntityTooLarge",
+            ),
+            (
+                S3Op::CompleteMpu,
+                Some(400),
+                "EntityTooLarge",
+                "EntityTooLarge",
+            ),
+            (object_op, Some(413), "EntityTooLarge", "EntityTooLarge"),
             // A bare 400 is not the key's fault (wrong region, expired token).
             (S3Op::HeadObject, Some(400), "", "S3"),
             // F16: a backend that gives up on the request, a retry can clear.
@@ -103,6 +119,7 @@ mod classify_tests {
                 E::NoSuchUpload(_) => "NoSuchUpload",
                 E::InvalidKey(_) => "InvalidKey",
                 E::KeyTooLong(_) => "KeyTooLong",
+                E::EntityTooLarge(_) => "EntityTooLarge",
                 E::Transient(_) => "Transient",
                 E::Throttled(_) => "Throttled",
                 E::QuotaExceeded(_) => "QuotaExceeded",
@@ -1736,6 +1753,92 @@ pub(crate) mod test_support {
         with_client(endpoint, Client::from_conf(conf.build()))
     }
 
+    /// The backend as production builds it (`S3Backend::new`), on `endpoint`.
+    pub(crate) async fn production_backend(endpoint: &str) -> S3Backend {
+        S3Backend::new(&production_config(endpoint), NativeEncryptionConfig::None)
+            .await
+            .unwrap()
+    }
+
+    fn production_config(endpoint: &str) -> BackendConfig {
+        BackendConfig::S3 {
+            session_token: None,
+            endpoint: Some(endpoint.to_string()),
+            region: "us-east-1".to_string(),
+            force_path_style: true,
+            access_key_id: Some("AKIA".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            allow_local: true,
+        }
+    }
+
+    /// [`production_backend`] with a read timeout of 1 s on the upload
+    /// client (production: 60 s) and a request deadline of 10 s on the
+    /// other (production: 30 s, which sizes the deadline of an upload).
+    pub(crate) async fn backend_with_short_read_timeout(endpoint: &str) -> S3Backend {
+        let mut s3 = production_backend(endpoint).await;
+        s3.client = S3Backend::build_client_with(
+            &production_config(endpoint),
+            Some(std::time::Duration::from_secs(10)),
+        )
+        .await
+        .unwrap();
+        let conf = s3
+            .bulk_client
+            .config()
+            .to_builder()
+            .timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .read_timeout(std::time::Duration::from_secs(1))
+                    .build(),
+            )
+            .build();
+        s3.bulk_client = Client::from_conf(conf);
+        s3
+    }
+
+    /// A listener that answers every request `delay` after its head, with
+    /// an empty `200`: a backend that works for `delay` (a server-side
+    /// copy) before it answers.
+    pub(crate) async fn slow_answer_server(delay: std::time::Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
+                    let line = String::from_utf8_lossy(&buf).to_lowercase();
+                    // A CompleteMultipartUpload has a body: an empty `200`
+                    // is an error to the SDK.
+                    let complete = line.starts_with("post ") && line.contains("uploadid=");
+                    let body = if complete {
+                        "<CompleteMultipartUploadResult><ETag>\"abc-1\"</ETag></CompleteMultipartUploadResult>"
+                    } else {
+                        ""
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\netag: \"abc\"\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        endpoint
+    }
+
     /// THE listing-cache scope of a test backend: the endpoint, the node,
     /// and a number unique in the process. The listing-size caches are
     /// process-wide, and a fake S3 server can get the port that an earlier
@@ -1806,6 +1909,8 @@ pub(crate) mod test_support {
             acl_support: Default::default(),
             copy_unsupported: Default::default(),
             copy_limits: Default::default(),
+            put_limits: Default::default(),
+            complete_timeout: std::time::Duration::from_secs(900),
             pinned_profile: None,
             bulk_client: client.clone(),
             health_key: None,
@@ -2075,6 +2180,8 @@ mod lost_response_tests {
             acl_support: Default::default(),
             copy_unsupported: Default::default(),
             copy_limits: Default::default(),
+            put_limits: Default::default(),
+            complete_timeout: std::time::Duration::from_secs(900),
             pinned_profile: None,
             bulk_client: client.clone(),
             health_key: None,
@@ -2335,6 +2442,8 @@ mod conditional_delete_tests {
             acl_support: Default::default(),
             copy_unsupported: Default::default(),
             copy_limits: Default::default(),
+            put_limits: Default::default(),
+            complete_timeout: std::time::Duration::from_secs(900),
             pinned_profile: None,
             bulk_client: client.clone(),
             health_key: None,

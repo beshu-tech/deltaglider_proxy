@@ -210,6 +210,20 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
             .as_ref()
             .map(crate::coordination::atomicity::verdict_words);
         b.atomic_writes_checking = b.capability.is_none() && encrypting.contains(&b.name);
+        // The conditional CompleteMultipartUpload of an S3 backend: what the
+        // capability probe found (absent: not probed in this process).
+        if b.backend_type == "s3" {
+            let def = cfg
+                .backends
+                .iter()
+                .find(|n| n.name == b.name)
+                .map(|n| &n.backend)
+                .unwrap_or(&cfg.backend);
+            b.conditional_complete =
+                crate::coordination::if_match::lookup_for(def).and_then(|p| p.conditional_complete);
+            b.conditional_complete_words =
+                Some(crate::coordination::if_match::complete_words(b.conditional_complete).into());
+        }
         b.bucket_encryption_modes = Some(modes);
         b.read_only_buckets = read_only.remove(&b.name).unwrap_or_default();
     }

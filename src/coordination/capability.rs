@@ -401,8 +401,11 @@ pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 ///
 /// NO witness object in the data bucket: a witness there is client-visible,
 /// blocks DeleteBucket with a ghost key, and lands unencrypted on encrypting
-/// backends. The probe is 7 requests once per (backend definition, boot) —
-/// the in-memory fingerprint cache absorbs repeats within a process.
+/// backends. The probe is about 7 requests for the conditional PUT plus
+/// about 15 for the conditional CompleteMultipartUpload (three tiny
+/// uploads), once per (backend definition, boot), both within ONE deadline
+/// (`PROBE_TIMEOUT`, 15 s) — the in-memory fingerprint cache absorbs repeats
+/// within a process.
 pub async fn establish_backend_verdict(
     name: &str,
     group: &ClientWritableGroup,
@@ -437,31 +440,48 @@ pub async fn establish_backend_verdict_within(
         }
     };
     let probe_key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
-    match tokio::time::timeout(
-        budget,
+    // ONE deadline for both stages: the callers (the boot gate, the hot-apply
+    // gate, the encrypted-bucket atomic-writes check that answers 503 while
+    // it runs) rely on a probe that ends within `budget`.
+    let deadline = tokio::time::Instant::now() + budget;
+    // A future that the deadline cuts is dropped, and its probe key is then
+    // removed by the probe's own drop guard (`cas_probe::SweepOnDrop`, with
+    // ALL its versions: a versioned bucket, as every B2 bucket is, keeps a
+    // noncurrent version of an unversioned DELETE), so no client-visible key
+    // stays in a data bucket.
+    match tokio::time::timeout_at(
+        deadline,
         super::cas_probe::probe_cas(&client, &group.probe_bucket, &probe_key),
     )
     .await
     {
-        Err(_) => {
-            // The timed-out future was cancelled mid-flight — possibly between
-            // its PUT and its cleanup. Sweep the probe key with ALL its
-            // versions (a versioned bucket, as every B2 bucket is, keeps a
-            // noncurrent version of an unversioned DELETE), so no
-            // client-visible key is left in a data bucket.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                super::cas_probe::remove_all_versions(&client, &group.probe_bucket, &probe_key),
-            )
-            .await;
-            CapabilityVerdict::Unknown {
-                reason: format!("capability probe timed out ({}s)", budget.as_secs()),
-            }
-        }
+        Err(_) => CapabilityVerdict::Unknown {
+            reason: format!("capability probe timed out ({}s)", budget.as_secs()),
+        },
         Ok(Ok(p)) => {
+            // A backend that enforces the conditional PUT is asked about the
+            // conditional CompleteMultipartUpload too: an object above 5 GiB
+            // is written with a multipart upload, and a write with a
+            // condition then needs the proof. It gets what is left of the
+            // deadline; no time left or a cut stage is "not proven".
+            let mut profile = p.profile();
+            if p.cas {
+                let key = format!("{probe_key}-mpu");
+                profile.conditional_complete = tokio::time::timeout_at(
+                    deadline,
+                    super::cas_probe::probe_conditional_complete(
+                        &client,
+                        &group.probe_bucket,
+                        &key,
+                        p.if_match,
+                    ),
+                )
+                .await
+                .unwrap_or(None);
+            }
             // Every conditional request of the backends built from this
             // definition uses what the probe found.
-            super::if_match::record_for(&group.backend, p.profile());
+            super::if_match::record_for(&group.backend, profile);
             if p.cas {
                 CapabilityVerdict::CasVerified {
                     via: VerifiedVia::Probe,
@@ -668,10 +688,54 @@ mod tests {
         )
         .await;
         assert!(matches!(v, CapabilityVerdict::Unknown { .. }), "{v:?}");
+        // The cleanup runs on a task of its own (the probe's drop guard).
+        for _ in 0..100 {
+            if counts.version_lists.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(
             counts.version_lists.load(Ordering::SeqCst) >= 1,
             "the cleanup lists and deletes the key's versions"
         );
+    }
+
+    /// The probe is ONE deadline, both stages: the callers (the boot gate,
+    /// the hot-apply gate, the atomic-writes check of an encrypted bucket,
+    /// which answers 503 meanwhile) rely on a probe that ends within its
+    /// budget. Stage 1 takes about 1.3 s here (a PUT takes 250 ms), stage 2
+    /// would take 10 s: with a fresh budget for it the call took 3.3 s.
+    #[tokio::test]
+    async fn the_whole_probe_ends_within_its_budget() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.set_delay_ms("PUT", 250);
+        fake.set_delay_ms("POST", 10_000);
+        let group = ClientWritableGroup {
+            backend: s3_backend(&endpoint),
+            buckets: Vec::new(),
+            probe_bucket: "b".into(),
+        };
+        let started = std::time::Instant::now();
+        let v = establish_backend_verdict_within(
+            "fake",
+            &group,
+            &Default::default(),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        let took = started.elapsed();
+        assert!(
+            matches!(v, CapabilityVerdict::CasVerified { .. }),
+            "stage 1 finished: {v:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(2_600),
+            "the probe took {took:?} of a 2 s budget"
+        );
+        // Stage 2 was cut: not proven.
+        let profile = super::super::if_match::lookup_for(&group.backend).unwrap();
+        assert_eq!(profile.conditional_complete, None);
     }
 
     /// `Unknown` never replaces a proven verdict of the same definition.
