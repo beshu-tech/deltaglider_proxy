@@ -2752,9 +2752,9 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
     /// writer can forge `!!1` markers), a listed size is the stored size,
     /// and the logical facts come from listing tokens that open under a key
     /// of this backend. In a bucket that writes plaintext the read rule
-    /// serves every unsealed object ([`seal::PlaintextRule::Serves`]), so
+    /// serves every unsealed object (`seal::PlaintextRule::Serves`), so
     /// the `!!1` facts of its objects are trusted as in a backend without a
-    /// key ([`Self::v1_facts_trusted`]).
+    /// key (`v1_facts_trusted`).
     async fn resolve_listed_sizes(
         &self,
         b: &str,
