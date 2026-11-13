@@ -243,7 +243,7 @@ impl FactsHealer {
                 Head::Learned(meta) => {
                     state.tried.insert(misses[i].dedup_key(), ());
                     learn(&misses[i], &meta, facts);
-                    learned[i] = Some(meta);
+                    learned[i] = Some(*meta);
                 }
             }
         }
@@ -299,7 +299,7 @@ impl FactsHealer {
 /// What a HEAD of a missed stored object answered.
 enum Head {
     /// The listed object, with DG metadata.
-    Learned(FileMetadata),
+    Learned(Box<FileMetadata>),
     /// Nothing to learn: deleted or overwritten since the LIST, or a
     /// foreign object without DG metadata.
     Nothing,
@@ -352,7 +352,7 @@ async fn head_miss(state: &State, miss: &Miss) -> Head {
         .map(|t| t.with_timezone(&Utc))
         .unwrap_or_else(Utc::now);
     match S3Backend::headers_to_metadata(user, created_at) {
-        Ok(meta) => Head::Learned(meta),
+        Ok(meta) => Head::Learned(Box::new(meta)),
         Err(_) => Head::Nothing,
     }
 }

@@ -1785,7 +1785,8 @@ impl StorageBackend for S3Backend {
         // A caller that HEADs its own misses learns their facts there; a
         // client LIST never shows a stored delta size.
         if !how.caller_heads_misses {
-            self.heal_listed_misses(bucket, objects, &mut sizes).await;
+            self.heal_listed_misses(bucket, objects, &mut sizes, how.inline_heads)
+                .await;
         }
         sizes
     }

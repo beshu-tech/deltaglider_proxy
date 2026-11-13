@@ -367,6 +367,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     &mut page.objects,
                     crate::storage::list_size_cache::ResolveListed {
                         caller_heads_misses: completion != Completion::Sizes,
+                        // A client LIST never shows a stored delta size.
+                        inline_heads: completion == Completion::Sizes,
                         ..Default::default()
                     },
                 )

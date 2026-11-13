@@ -429,12 +429,15 @@ impl S3Backend {
     /// [`decide_delta_miss`]: a HEAD now (the LIST waits for it, see
     /// `heal.rs`), else a background HEAD. The HEAD gives the logical
     /// size and ETag, and the facts are kept for the next LIST. A miss
-    /// that no HEAD answered lists its stored size once.
+    /// that no HEAD answered lists its stored size once. Without `inline`
+    /// (an internal scan that counts bytes) every miss is healed in the
+    /// background only.
     pub(super) async fn heal_listed_misses(
         &self,
         bucket: &str,
         objects: &mut [(String, FileMetadata)],
         sizes: &mut [ListedSize],
+        inline: bool,
     ) {
         use super::heal::{decide_delta_miss, MissDecision};
         let mut now: Vec<(usize, super::heal::Miss)> = Vec::new();
@@ -453,7 +456,7 @@ impl S3Backend {
             if list_size_cache::known_sealed(&miss.id()) {
                 continue;
             }
-            match decide_delta_miss(self.healer.may_head_inline(&miss)) {
+            match decide_delta_miss(inline && self.healer.may_head_inline(&miss)) {
                 MissDecision::HeadNow => now.push((i, miss)),
                 MissDecision::Keep { heal: true } => background.push(miss),
                 MissDecision::Keep { heal: false } | MissDecision::Invert(_) => {}
