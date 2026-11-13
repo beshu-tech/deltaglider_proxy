@@ -238,17 +238,17 @@ impl ObjectKey {
                 "Key must not contain empty path segments ('//')".to_string(),
             ));
         }
-        // `.dg` is the proxy's own directory name at any depth (F19): a
-        // listing never shows what is stored there, so a client key there
-        // would be stored but invisible, and would keep DeleteBucket from
-        // succeeding on a bucket that looks empty.
+        // `.dg` is the proxy's own directory name at any depth (F19): it
+        // holds the delta baselines and the listing facts, so a new client
+        // key there could be mistaken for one of them. A key that an older
+        // release stored there stays an ordinary listed key (L1, #171).
         let internal = crate::storage::listing_facts::INTERNAL_DIR;
         if crate::storage::listing_facts::has_internal_segment(&self.prefix)
             || self.filename == internal
         {
             return Err(KeyValidationError(format!(
                 "Object key '{}' is refused: '{internal}' is a reserved directory name, \
-                 because the proxy keeps its own files there and never lists them. See \
+                 because the proxy keeps its own files there. See \
                  {RESERVED_KEYS_DOC_URL}",
                 self.full_key()
             )));
@@ -1167,9 +1167,9 @@ mod tests {
     }
 
     /// F19 (epic #142): `.dg` is the proxy's own directory name at any
-    /// depth. A PUT refuses it (a listing never shows what is there); a
-    /// read or delete of an existing key stays possible, so a bucket that an
-    /// older release filled can be cleaned.
+    /// depth. A PUT refuses it; a read or delete of an existing key stays
+    /// possible (and a listing shows it, L1 #171), so a bucket that an older
+    /// release filled can be cleaned.
     #[test]
     fn a_dg_directory_is_refused_at_ingest_at_any_depth() {
         for key in [

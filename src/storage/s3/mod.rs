@@ -134,9 +134,10 @@ pub static LISTING_FACTS_REQUESTS: std::sync::LazyLock<prometheus::IntCounterVec
     });
 
 /// Listing-facts work that a full background queue dropped (see
-/// `storage::facts_cleanup`), by `queue`: `write` (a facts write; the LIST
-/// reports the stored size until a HEAD writes it) or `cleanup` (the facts
-/// of a deleted object; the facts GC removes them later).
+/// `storage::facts_cleanup`), by `queue`: `write` (a facts write; the next
+/// LIST of its object offers it again), `unwritten` (an entry of the registry
+/// of refused writes, dropped for room; a HEAD writes the facts later) or
+/// `cleanup` (the facts of a deleted object; the facts GC removes them later).
 pub static LISTING_FACTS_QUEUE_DROPPED: std::sync::LazyLock<prometheus::IntCounterVec> =
     std::sync::LazyLock::new(|| {
         prometheus::IntCounterVec::new(
@@ -459,7 +460,7 @@ impl S3Backend {
     /// The deltaspace whose reference is stored at `key`: the inverse of
     /// [`Self::reference_key`]. `None` for any other key.
     fn deltaspace_of_reference_key(key: &str) -> Option<&str> {
-        if key == "reference.bin" {
+        if key == crate::types::REFERENCE_FILE_NAME {
             Some("")
         } else {
             key.strip_suffix("/reference.bin")
@@ -1022,7 +1023,7 @@ impl StorageBackend for S3Backend {
         // A plain passthrough has facts too when its stored ETag is not the
         // logical one (a proxy-assembled multipart upload), and a ciphertext
         // always: queue the cleanup for every delete.
-        self.facts_cleanup.enqueue(bucket, &key, at);
+        self.enqueue_facts_cleanup(bucket, &key, at);
         let label = match variant {
             ObjectVariant::Delta => "delta",
             ObjectVariant::Passthrough => "passthrough",
@@ -1095,7 +1096,7 @@ impl StorageBackend for S3Backend {
                     ConditionalDeleteVerdict::Changed => return Ok(false),
                     ConditionalDeleteVerdict::Unsupported => {
                         let at = self.delete_s3_object_dated(bucket, &key).await?;
-                        self.facts_cleanup.enqueue(bucket, &key, at);
+                        self.enqueue_facts_cleanup(bucket, &key, at);
                         return Ok(true);
                     }
                     ConditionalDeleteVerdict::Other => {
@@ -1107,7 +1108,7 @@ impl StorageBackend for S3Backend {
                 }
             }
         }
-        self.facts_cleanup.enqueue(bucket, &key, date.get());
+        self.enqueue_facts_cleanup(bucket, &key, date.get());
         debug!("Deleted {key} in {bucket} if still {version}");
         Ok(true)
     }
@@ -1745,6 +1746,8 @@ impl StorageBackend for S3Backend {
                 .map(|(key, meta)| Self::listed_size_without_facts(key, meta))
                 .collect();
         }
+        // Before the cache rewrites the entries: their stored facts name them.
+        self.offer_refused_facts(bucket, objects);
         let mut sizes: Vec<ListedSize> = objects
             .iter_mut()
             .map(|(key, meta)| Self::resolve_one_listed(&self.list_cache_scope, bucket, key, meta))

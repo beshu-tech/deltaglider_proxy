@@ -802,6 +802,7 @@ mod delete_view_tests {
         Principal::User {
             access_key_id: ak.into(),
             client_ip: None,
+            user_id: None,
         }
     }
 

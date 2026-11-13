@@ -1456,6 +1456,8 @@ pub enum BulkSession {
     /// trusted client address, for `aws:SourceIp` conditions.
     IamUser {
         access_key_id: String,
+        /// The user's database id: it stays when the keys rotate (A2, #171).
+        user_id: i64,
         client_ip: Option<IpAddr>,
     },
     /// An open-mode browser session (`authentication: none`): the S3 API
@@ -1523,24 +1525,23 @@ fn non_admin_bulk_session(
         IamState::Iam(index) => Some(index),
         _ => None,
     };
-    let iam_user = |access_key_id: String, actor: String| {
+    let iam_user = |access_key_id: String, user_id: i64, actor: String| {
         let session = BulkSession::IamUser {
             access_key_id,
+            user_id,
             client_ip,
         };
         Some((session, actor))
     };
     match method? {
         AuthMethod::IamBrowserLift { access_key_id } => {
-            let actor = index
-                .and_then(|i| i.get(&access_key_id))
-                .map(|u| u.name.clone())
-                .unwrap_or_else(|| access_key_id.clone());
-            iam_user(access_key_id, actor)
+            // A key that is not (or no longer) an IAM user's names nobody.
+            let user = index?.get(&access_key_id)?;
+            iam_user(access_key_id, user.id, user.name.clone())
         }
         AuthMethod::External { user_id, .. } => {
             let user = index?.get_by_id(user_id)?;
-            iam_user(user.access_key_id.clone(), user.name.clone())
+            iam_user(user.access_key_id.clone(), user.id, user.name.clone())
         }
         AuthMethod::OpenLift if matches!(iam, IamState::Disabled) => {
             Some((BulkSession::Open, "anonymous".to_string()))
@@ -1559,10 +1560,12 @@ impl BulkSession {
             BulkSession::Open => Principal::Open,
             BulkSession::IamUser {
                 access_key_id,
+                user_id,
                 client_ip,
             } => Principal::User {
                 access_key_id: access_key_id.clone(),
                 client_ip: *client_ip,
+                user_id: Some(*user_id),
             },
         }
     }

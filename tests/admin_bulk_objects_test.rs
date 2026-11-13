@@ -1589,6 +1589,126 @@ async fn test_delete_job_cancel_compares_principals_not_names() {
     );
 }
 
+/// A2 (#171): after a key rotation the owner of a delete job still cancels
+/// it (the job names the user's id, not the old access key), and another
+/// user does not. The job also keeps acting as the user.
+#[tokio::test]
+async fn test_delete_job_owner_cancels_after_a_key_rotation() {
+    let server = TestServer::builder()
+        .auth("ROTCANCELKEY", "ROTCANCELSECRET")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let admin = admin_http_client(&ep).await;
+    let s3 = server.s3_client().await;
+    for i in 0..3 {
+        s3.put_object()
+            .bucket(&bucket)
+            .key(format!("a/{i}.txt"))
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+    let create = |name: &'static str| {
+        let admin = admin.clone();
+        let ep = ep.clone();
+        let bucket = bucket.clone();
+        async move {
+            let resp = admin
+                .post(format!("{ep}/_/api/admin/users"))
+                .json(&json!({
+                    "name": name,
+                    "permissions": [{
+                        "actions": ["read", "write", "delete", "list"],
+                        "resources": [format!("{bucket}/*")]
+                    }]
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 201);
+            resp.json::<Value>().await.unwrap()
+        }
+    };
+    let connect = |keys: Value| {
+        let ep = ep.clone();
+        async move {
+            let client = reqwest::Client::builder()
+                .cookie_store(true)
+                .no_proxy()
+                .build()
+                .unwrap();
+            let resp = client
+                .post(format!("{ep}/_/api/admin/session/browser-connect"))
+                .json(&json!({
+                    "access_key_id": keys["access_key_id"],
+                    "secret_access_key": keys["secret_access_key"],
+                    "endpoint": ep,
+                    "bucket": "",
+                    "region": "us-east-1",
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            client
+        }
+    };
+    let dana = create("dana").await;
+    let eve = create("eve").await;
+    let dana_session = connect(dana.clone()).await;
+    let eve_session = connect(eve).await;
+    let resp = dana_session
+        .post(format!("{ep}/_/api/admin/objects/delete-jobs"))
+        .json(&json!({ "bucket": bucket, "prefixes": ["a/"], "expected": 3 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+    let job_id = resp.json::<Value>().await.unwrap()["job_id"]
+        .as_i64()
+        .unwrap();
+    // The admin rotates dana's keys; dana connects again with the new pair.
+    let rotated: Value = admin
+        .post(format!(
+            "{ep}/_/api/admin/users/{}/rotate-keys",
+            dana["id"].as_i64().unwrap()
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(rotated["access_key_id"], dana["access_key_id"]);
+    let dana_again = connect(rotated).await;
+    let cancel = |client: reqwest::Client| {
+        let ep = ep.clone();
+        async move {
+            client
+                .post(format!(
+                    "{ep}/_/api/admin/objects/delete-jobs/{job_id}/cancel"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    // The job may be done already: 403 is the ownership refusal, any
+    // other answer (200, 409 "not active") means the check passed.
+    assert_eq!(cancel(eve_session).await, 403, "another user");
+    assert_ne!(
+        cancel(dana_again).await,
+        403,
+        "the owner, with the rotated keys"
+    );
+}
+
 /// A delete job refuses a key that is not a folder as a prefix, and an
 /// empty selection.
 #[tokio::test]

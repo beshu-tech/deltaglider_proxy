@@ -1054,3 +1054,357 @@ async fn test_copy_object_above_the_spool_threshold() {
         }
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// A1 (#171) — CopyObject judges the destination's If-Match / If-None-Match
+// ────────────────────────────────────────────────────────────────────────
+
+/// S3 answers a CopyObject whose `If-None-Match: *` meets an existing
+/// destination with 412, and `If-Match` with another ETag with 412; the
+/// destination stays as it was. s3s 0.14 drops these two headers, so the
+/// adapter reads them itself. Both write paths: a passthrough key (the
+/// backend copies) and a delta-eligible key (the store).
+#[tokio::test]
+async fn test_copy_object_judges_the_destination_conditionals() {
+    let server = TestServer::filesystem().await;
+    let client = server.s3_client().await;
+    let bucket = server.bucket();
+    let put = |key: &'static str, body: &'static [u8]| {
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        async move {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(body))
+                .send()
+                .await
+                .unwrap()
+                .e_tag()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let read = |key: &'static str| {
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        async move {
+            client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap()
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes()
+        }
+    };
+    put("src.bin", b"NEW-SOURCE").await;
+    for dest in ["dst.bin", "dst.zip"] {
+        let dest_etag = put(dest, b"EXISTING-DEST").await;
+        let copy = |if_match: Option<&str>, if_none_match: Option<&str>| {
+            let mut req = client
+                .copy_object()
+                .bucket(bucket)
+                .key(dest)
+                .copy_source(format!("{bucket}/src.bin"));
+            if let Some(v) = if_match {
+                req = req.if_match(v);
+            }
+            if let Some(v) = if_none_match {
+                req = req.if_none_match(v);
+            }
+            async move { req.send().await }
+        };
+        let code = |r: Result<_, aws_sdk_s3::error::SdkError<_>>| match r {
+            Ok(_) => "ok".to_string(),
+            Err(e) => e
+                .raw_response()
+                .map(|r| r.status().as_u16().to_string())
+                .unwrap_or_else(|| format!("{e:?}")),
+        };
+        assert_eq!(code(copy(None, Some("*")).await), "412", "{dest}: *");
+        assert_eq!(
+            code(copy(Some("\"00000000000000000000000000000000\""), None).await),
+            "412",
+            "{dest}: wrong ETag"
+        );
+        assert_eq!(
+            &read(if dest == "dst.bin" {
+                "dst.bin"
+            } else {
+                "dst.zip"
+            })
+            .await[..],
+            b"EXISTING-DEST",
+            "{dest}: refused copies change nothing"
+        );
+        // The right ETag, then the copy goes through.
+        assert_eq!(code(copy(Some(&dest_etag), None).await), "ok", "{dest}");
+        assert_eq!(
+            &read(if dest == "dst.bin" {
+                "dst.bin"
+            } else {
+                "dst.zip"
+            })
+            .await[..],
+            b"NEW-SOURCE"
+        );
+    }
+    // A missing destination: `If-None-Match: *` creates it, `If-Match` is 404.
+    let r = client
+        .copy_object()
+        .bucket(bucket)
+        .key("fresh.bin")
+        .copy_source(format!("{bucket}/src.bin"))
+        .if_none_match("*")
+        .send()
+        .await;
+    assert!(r.is_ok(), "{r:?}");
+    let r = client
+        .copy_object()
+        .bucket(bucket)
+        .key("never.bin")
+        .copy_source(format!("{bucket}/src.bin"))
+        .if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await;
+    assert_eq!(
+        r.unwrap_err().raw_response().map(|r| r.status().as_u16()),
+        Some(404)
+    );
+}
+
+/// A1 (#171), every write path of a CopyObject: the passthrough server copy
+/// (`.jpg` to `.jpg`: the backend copies the stored file), the delta fast
+/// path (a stored delta to a `.zip` key: the `.delta` ships), a metadata
+/// REPLACE self-copy, and the copy through the store (`.bin`, in the test
+/// above). On each: `If-None-Match: *` on an existing destination, a wrong
+/// ETag and a weak ETag give `412` and change nothing; the right ETag goes
+/// through; `If-Match` on a missing destination gives `404`; `*` on a missing
+/// one creates it.
+#[tokio::test]
+async fn test_copy_object_destination_conditionals_on_every_write_path() {
+    use aws_sdk_s3::types::MetadataDirective;
+    let server = TestServer::filesystem().await;
+    let client = server.s3_client().await;
+    let bucket = server.bucket().to_string();
+    // Poorly compressible bytes, and a second version that differs a little,
+    // so that the second PUT is stored as a delta.
+    let mut x: u32 = 0x9E37_79B9;
+    let base: Vec<u8> = (0..256 * 1024)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 8) as u8
+        })
+        .collect();
+    let mut v2 = base.clone();
+    v2[1000..1100].fill(7);
+    let put = |key: &str, body: Vec<u8>| {
+        let (client, bucket, key) = (client.clone(), bucket.clone(), key.to_string());
+        async move {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(body))
+                .send()
+                .await
+                .unwrap()
+                .e_tag()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let etag_of = |key: &str| {
+        let (client, bucket, key) = (client.clone(), bucket.clone(), key.to_string());
+        async move {
+            client
+                .head_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap()
+                .e_tag()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let status = |r: Result<_, aws_sdk_s3::error::SdkError<_>>| match r {
+        Ok(_) => 200u16,
+        Err(e) => e.raw_response().map(|r| r.status().as_u16()).unwrap_or(0),
+    };
+    let copy = |src: &str,
+                dst: &str,
+                replace: bool,
+                if_match: Option<String>,
+                none_match: Option<&str>| {
+        let mut req = client
+            .copy_object()
+            .bucket(&bucket)
+            .key(dst)
+            .copy_source(format!("{bucket}/{src}"));
+        if replace {
+            req = req
+                .metadata_directive(MetadataDirective::Replace)
+                .metadata("note", "replaced");
+        }
+        if let Some(v) = if_match {
+            req = req.if_match(v);
+        }
+        if let Some(v) = none_match {
+            req = req.if_none_match(v);
+        }
+        async move { status(req.send().await) }
+    };
+
+    put("src.jpg", b"JPEG-SOURCE".to_vec()).await;
+    put("v1.zip", base.clone()).await;
+    put("v2.zip", v2).await;
+    put("self.jpg", b"SELF".to_vec()).await;
+    // (name, source, existing destination, REPLACE self-copy)
+    let cases = [
+        ("passthrough server copy", "src.jpg", "dst.jpg", false),
+        ("delta fast path", "v2.zip", "dst.zip", false),
+        ("metadata REPLACE self-copy", "self.jpg", "self.jpg", true),
+    ];
+    for (name, src, dst, replace) in cases {
+        if src != dst {
+            put(dst, b"EXISTING-DEST".to_vec()).await;
+        }
+        let before = etag_of(dst).await;
+        assert_eq!(
+            copy(src, dst, replace, None, Some("*")).await,
+            412,
+            "{name}: *"
+        );
+        assert_eq!(
+            copy(
+                src,
+                dst,
+                replace,
+                Some("\"00000000000000000000000000000000\"".into()),
+                None
+            )
+            .await,
+            412,
+            "{name}: wrong ETag"
+        );
+        let weak = format!("W/{before}");
+        assert_eq!(
+            copy(src, dst, replace, Some(weak), None).await,
+            412,
+            "{name}: weak ETag"
+        );
+        assert_eq!(
+            etag_of(dst).await,
+            before,
+            "{name}: refused copies change nothing"
+        );
+        assert_eq!(
+            copy(src, dst, replace, Some(before.clone()), None).await,
+            200,
+            "{name}: right ETag"
+        );
+        // A missing destination: `*` creates it, `If-Match` is 404.
+        if src != dst {
+            let fresh = format!("fresh-{dst}");
+            assert_eq!(
+                copy(src, &fresh, false, None, Some("*")).await,
+                200,
+                "{name}: create"
+            );
+            let never = format!("never-{dst}");
+            assert_eq!(
+                copy(
+                    src,
+                    &never,
+                    false,
+                    Some("\"00000000000000000000000000000000\"".into()),
+                    None
+                )
+                .await,
+                404,
+                "{name}: If-Match on a missing destination"
+            );
+        }
+    }
+}
+
+/// L2 (#171) on MinIO: a delimiter other than `/` over keys that start with a
+/// dot or have a `/.x` segment. MinIO refuses a LIST whose prefix is `.` or
+/// `a/.` (`XMinioInvalidResourceName`), so a check of such a prefix must never
+/// fail the client's LIST (it answered `500`). The prefixes are shown.
+#[tokio::test]
+async fn test_a_delimiter_list_over_dot_keys_does_not_fail_on_minio() {
+    skip_unless_minio!();
+    let bucket = common::unique_bucket("dotlist");
+    let server = TestServer::builder()
+        .bucket(&bucket)
+        .s3_endpoint(&common::minio_endpoint_url())
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for key in [".env", ".well-known/x", "a/.hidden", "top.txt", "a/x"] {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+    for (prefix, delimiter, want) in [
+        ("", ".", vec![".", "a/.", "a/x", "top."]),
+        ("a/", ".", vec!["a/.", "a/x"]),
+        (
+            "",
+            "/.",
+            vec![".env", ".well-known/x", "a/.", "a/x", "top.txt"],
+        ),
+    ] {
+        let mut got: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = client
+                .list_objects_v2()
+                .bucket(&bucket)
+                .prefix(prefix)
+                .delimiter(delimiter)
+                .set_continuation_token(token.clone())
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{prefix:?} {delimiter:?}: {e:?}"));
+            got.extend(
+                page.contents()
+                    .iter()
+                    .filter_map(|o| o.key())
+                    .map(String::from),
+            );
+            got.extend(
+                page.common_prefixes()
+                    .iter()
+                    .filter_map(|p| p.prefix())
+                    .map(String::from),
+            );
+            if page.is_truncated().unwrap_or(false) {
+                token = page.next_continuation_token().map(String::from);
+            } else {
+                break;
+            }
+        }
+        got.sort();
+        let mut want: Vec<String> = want.into_iter().map(String::from).collect();
+        want.sort();
+        assert_eq!(got, want, "{prefix:?} {delimiter:?}");
+    }
+}

@@ -25,6 +25,9 @@ pub(super) async fn copy_object(
         client_ip,
         &req.headers,
     )?;
+    // The destination's `If-Match` / `If-None-Match`: s3s models them for
+    // no copy request, so they come from the raw headers (A1, #171).
+    let precondition = destination_precondition(&req.headers)?;
     // Gate on the DESTINATION bucket first — copy-into is a client write,
     // refused regardless of backend reachability (403-before-404).
     crate::api::handlers::object_helpers::check_client_store_allowed(&svc.state, &input.bucket)
@@ -84,7 +87,6 @@ pub(super) async fn copy_object(
     // ships, no reconstruction, no re-encode), a passthrough object into a
     // key that does not (the backend copies it server-side). Otherwise, or
     // when that is not possible, the copy goes through the store.
-    let precondition = crate::deltaglider::Precondition::none();
     let tries_delta = engine.write_tries_delta(
         &input.bucket,
         &input.key,
@@ -131,6 +133,7 @@ pub(super) async fn copy_object(
                 &input,
                 directive,
                 &source_meta,
+                &precondition,
             )
             .await?
         }
@@ -156,6 +159,7 @@ async fn copy_through_store(
     input: &s3s::dto::CopyObjectInput,
     directive: &str,
     source_meta: &FileMetadata,
+    precondition: &crate::deltaglider::Precondition,
 ) -> s3s::S3Result<crate::types::StoreResult> {
     let (body, metadata) = read_copy_source(
         engine,
@@ -173,8 +177,7 @@ async fn copy_through_store(
     )?;
     // A copy creates a new object at the destination: the same client
     // write as a PUT (quota on the destination, the object's write lock,
-    // the ObjectCreated event). s3s models no conditional headers for it.
-    let precondition = crate::deltaglider::Precondition::none();
+    // the ObjectCreated event), and the destination's conditional headers.
     Ok(crate::api::handlers::object_helpers::store_client_write(
         &svc.state,
         crate::api::handlers::object_helpers::ClientWrite {
@@ -183,11 +186,40 @@ async fn copy_through_store(
             body,
             content_type,
             user_metadata,
-            precondition: &precondition,
+            precondition,
             early_quota: None,
         },
     )
     .await?)
+}
+
+/// Pure: the write preconditions of a CopyObject destination, from the raw
+/// request headers. S3 judges `If-Match` and `If-None-Match` of a CopyObject
+/// against the destination key, as it does for a PutObject (`412
+/// PreconditionFailed`, `404 NoSuchKey` for `If-Match` on a missing key).
+/// s3s 0.14 reads only the `x-amz-copy-source-if-*` headers into the input,
+/// so these two would be dropped silently. A header that does not parse is an
+/// `InvalidArgument`, as for a PutObject.
+pub(super) fn destination_precondition(
+    headers: &axum::http::HeaderMap,
+) -> s3s::S3Result<crate::deltaglider::Precondition> {
+    let read = |name: &'static str| -> s3s::S3Result<Option<s3s::dto::ETagCondition>> {
+        headers
+            .get(name)
+            .map(|value| {
+                s3s::dto::ETagCondition::parse_http_header(value.as_bytes()).map_err(|_| {
+                    s3s::s3_error!(
+                        InvalidArgument,
+                        "the {name} header is not a valid ETag condition"
+                    )
+                })
+            })
+            .transpose()
+    };
+    Ok(crate::deltaglider::Precondition {
+        if_match: read("if-match")?,
+        if_none_match: read("if-none-match")?,
+    })
 }
 
 /// The content type and user metadata of a CopyObject destination: the
@@ -667,5 +699,35 @@ mod large_copy_tests {
         copy_object(&svc, request(copy("b/app.zip"))).await.unwrap();
         let meta = state.engine.load().head("dst", "b/app.zip").await.unwrap();
         assert!(!meta.is_delta());
+    }
+}
+
+#[cfg(test)]
+mod destination_precondition_tests {
+    use super::*;
+
+    fn headers(pairs: &[(&'static str, &str)]) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    /// A1 (#171): the two destination headers, from the raw request.
+    #[test]
+    fn the_destination_headers_become_a_precondition() {
+        let none = destination_precondition(&headers(&[])).unwrap();
+        assert!(none.if_match.is_none() && none.if_none_match.is_none());
+        let star = destination_precondition(&headers(&[("if-none-match", "*")])).unwrap();
+        assert!(star.if_none_match.as_ref().unwrap().is_any() && star.if_match.is_none());
+        let etag = destination_precondition(&headers(&[("if-match", "\"abc\"")])).unwrap();
+        assert!(etag.if_match.is_some() && etag.if_none_match.is_none());
+        // The copy SOURCE conditionals are another pair of headers.
+        let src = destination_precondition(&headers(&[("x-amz-copy-source-if-match", "\"abc\"")]))
+            .unwrap();
+        assert!(src.if_match.is_none() && src.if_none_match.is_none());
+        let e = destination_precondition(&headers(&[("if-match", "\"abc")])).unwrap_err();
+        assert_eq!(*e.code(), s3s::S3ErrorCode::InvalidArgument);
     }
 }

@@ -194,13 +194,13 @@ async fn test_quota_delete_frees_space() {
     // smaller fills are not reliable: once the usage cache knows the first,
     // the quota check rejects the second up front (403), which leaves the
     // bucket UNDER quota and the probe below is never blocked.
+    let http = reqwest::Client::new();
+    let endpoint = server.endpoint();
     put_sized(&server, "fill1.bin", 12000)
         .await
         .expect("first PUT is allowed optimistically");
 
     // Signal-driven poll for the scanner to catch up and enforce quota.
-    let http = reqwest::Client::new();
-    let endpoint = server.endpoint();
     let mut blocked = false;
     for _ in 0..20 {
         let baseline = common::get_usage_scan_version(&http, &endpoint).await;
@@ -523,21 +523,101 @@ async fn test_quota_counts_delta_baselines_and_answers_403() {
         .expect("first 3 MiB build fits a 5 MiB quota");
 
     let client = server.s3_client().await;
-    let err = client
-        .put_object()
-        .bucket(server.bucket())
-        .key("builds/v2/firmware.tar")
-        .body(aws_sdk_s3::primitives::ByteStream::from(vec![
-            1u8;
-            three_mib
-        ]))
-        .send()
-        .await
-        .expect_err("a second 3 MiB baseline must exceed a 5 MiB quota");
+    // The proxy refuses a write over the quota before it has read the whole
+    // body, and then it may close the connection while the client still
+    // sends: the client sees a broken pipe, not the 403 (the test client
+    // never retries). A transport failure is sent again; the answer to the
+    // second try is the 403.
+    let mut attempts = 0;
+    let err = loop {
+        attempts += 1;
+        let err = client
+            .put_object()
+            .bucket(server.bucket())
+            .key("builds/v2/firmware.tar")
+            .body(aws_sdk_s3::primitives::ByteStream::from(vec![
+                1u8;
+                three_mib
+            ]))
+            .send()
+            .await
+            .expect_err("a second 3 MiB baseline must exceed a 5 MiB quota");
+        if err.raw_response().is_some() || attempts >= 3 {
+            break err;
+        }
+    };
     let status = err.raw_response().map(|r| r.status().as_u16());
     assert_eq!(
         status,
         Some(403),
         "quota rejection must be 403, got {status:?}: {err:?}"
     );
+}
+
+/// A bucket with a quota and one writer after the other gets a TRUSTED
+/// counter from the scan that its first PUT starts. The PUT's quota check
+/// spawns the scan inside the PUT, so the scan often ends while the PUT is
+/// between its storage write and the record of its size; such a scan is
+/// not trusted, and it is repeated once the PUT is done. The trusted
+/// counter is exact (every object once) and stays exact for the next
+/// PUTs, which start no more scans. A bucket whose every scan was refused
+/// would leave the quota to the scanner's snapshot, up to the cache TTL old.
+#[tokio::test]
+async fn a_serial_writer_gets_a_trusted_exact_counter() {
+    let server = TestServer::builder()
+        .bucket(BUCKET)
+        .bucket_policy(BUCKET, "quota_bytes: 1000000000")
+        .env("DGP_USAGE_CACHE_TTL_SECS", "1")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let admin = common::admin_http_client(&endpoint).await;
+    let usage_url = format!("{endpoint}/_/api/admin/usage/bucket/{}", server.bucket());
+    let counter = || async {
+        let body: serde_json::Value = admin
+            .get(&usage_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        body
+    };
+
+    // The first PUT starts the scan. The scan publishes its snapshot at
+    // once and, when it ended inside the PUT, repeats after the PUT: wait
+    // (bounded) until the counter is trusted.
+    put_sized(&server, "serial-0.dat", 3000).await.expect("PUT");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let body = loop {
+        let body = counter().await;
+        if body["never_scanned"] == false || std::time::Instant::now() > deadline {
+            break body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        body["never_scanned"], false,
+        "the scan of a serial writer was not trusted: {body}"
+    );
+    assert_eq!(
+        (body["object_count"].as_u64(), body["stored_bytes"].as_u64()),
+        (Some(1), Some(3000)),
+        "a trusted counter must be exact: {body}"
+    );
+
+    // And it stays trusted and exact for the next writes.
+    for n in 2..=5u64 {
+        put_sized(&server, &format!("serial-{n}.dat"), 3000)
+            .await
+            .expect("PUT");
+        let body = counter().await;
+        assert_eq!(body["never_scanned"], false, "{body}");
+        assert_eq!(
+            (body["object_count"].as_u64(), body["stored_bytes"].as_u64()),
+            (Some(n), Some(3000 * n)),
+            "{body}"
+        );
+    }
 }

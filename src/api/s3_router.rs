@@ -722,11 +722,14 @@ mod backend_share_tests {
              default_backend: hetzner-fsn1\n"
         ))
         .unwrap();
+        // The setup runs through a router with the default limits: a
+        // one-second request limit would cut a setup request on a busy host.
+        let setup_app = router(&config).await;
         config.tuning.max_concurrent_requests = 1;
         config.tuning.request_timeout_secs = 1;
         let app = router(&config).await;
         let ok = |r: &axum::response::Response| r.status().is_success();
-        let created = app
+        let created = setup_app
             .clone()
             .oneshot(request("PUT", "/releases"))
             .await
@@ -739,7 +742,7 @@ mod backend_share_tests {
         const KEYS: usize = 4;
         for i in 0..BATCHES {
             for k in 0..KEYS {
-                let put = app
+                let put = setup_app
                     .clone()
                     .oneshot(with_body(
                         "PUT",
@@ -805,37 +808,78 @@ mod backend_share_tests {
         .unwrap();
         config.tuning.max_concurrent_requests = 4;
         let app = router(&config).await;
-        fake.set_delay_ms("HEAD", 3_000);
+        // The backend holds every HEAD until the test lets it go: the slow
+        // requests have no length to out-run on a busy host.
+        fake.stall("HEAD", "releases/");
 
+        let ended = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let slow: Vec<_> = (0..4)
-            .map(|_| tokio::spawn(app.clone().oneshot(request("HEAD", "/releases/v1.zip"))))
+            .map(|_| {
+                let (app, ended) = (app.clone(), ended.clone());
+                tokio::spawn(async move {
+                    let resp = app.oneshot(request("HEAD", "/releases/v1.zip")).await;
+                    ended.lock().push(format!("{:?}", resp.map(|r| r.status())));
+                })
+            })
             .collect();
-        // Every slow request has its slot (or its answer) before the probe.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline
-            && fake
-                .requests()
-                .iter()
-                .filter(|r| r.starts_with("HEAD /releases/"))
-                .count()
-                < 3
-        {
+        // The slow backend keeps its share of the slots, and the request
+        // above the share is refused at once: the share's worth of HEADs is
+        // held at the backend. (A count of the HEADs that arrived would also
+        // count a retry of one request.)
+        // The share is a fixed number here, not a value computed as the
+        // product does: 75% of 4 slots is 3. A share of 2 or 4 fails below.
+        const SHARE: usize = 3;
+        assert_eq!(
+            (
+                config.tuning.max_concurrent_requests,
+                config.tuning.backend_share_percent
+            ),
+            (4, crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT)
+        );
+        assert_eq!(crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT, 75);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        // The request above the share is refused at once, and the share's
+        // worth of HEADs is held.
+        // A HEAD of an object asks the backend for the key and for its delta
+        // form at once: two HEADs for each held request.
+        const HEADS_PER_REQUEST: usize = 2;
+        while fake.peak_in_flight("HEAD") < SHARE * HEADS_PER_REQUEST || ended.lock().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the slow requests never reached the backend: {:?} / {:?}",
+                fake.requests(),
+                ended.lock()
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            fake.peak_in_flight("HEAD"),
+            SHARE * HEADS_PER_REQUEST,
+            "more or fewer requests than the share were held"
+        );
+        assert_eq!(
+            *ended.lock(),
+            vec!["Ok(503)".to_string()],
+            "exactly the request above the share is refused"
+        );
 
-        let started = std::time::Instant::now();
-        let resp = app
-            .clone()
-            .oneshot(request("GET", "/downloads/notes.txt"))
-            .await
-            .unwrap();
-        let waited = started.elapsed();
+        // The local-disk GET is answered while every slow request is still
+        // held. Behind a full cap it would never be answered: the long
+        // limit only turns that hang into a failure.
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            app.clone().oneshot(request("GET", "/downloads/notes.txt")),
+        )
+        .await
+        .expect("a local-disk GET waited behind a slow backend")
+        .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert!(
-            waited < std::time::Duration::from_secs(1),
-            "a local-disk GET waited {waited:?} behind a slow backend"
+            slow.iter().filter(|h| !h.is_finished()).count() == SHARE,
+            "a held request ended before the GET: the test proved nothing; ended: {:?}",
+            ended.lock()
         );
+        fake.release_stalls();
         for h in slow {
             let _ = h.await;
         }

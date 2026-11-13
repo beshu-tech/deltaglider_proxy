@@ -949,9 +949,23 @@ mod delete_objects_tests {
         db.event_outbox_count(None).unwrap()
     }
 
-    /// Wait (10 s at most) until `folder` has no reference.bin.
+    /// The events of a detached batch are stored by its task, after its last
+    /// delete and its reclaim: wait (30 s at most) until `want` are stored,
+    /// and return the count then.
+    async fn wait_for_deleted_events(svc: &DeltaGliderS3Service, want: i64) -> i64 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let n = deleted_events(svc).await;
+            if n >= want || tokio::time::Instant::now() > deadline {
+                return n;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait (30 s at most) until `folder` has no reference.bin.
     async fn reclaimed(svc: &DeltaGliderS3Service, folder: &str) -> bool {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let engine = svc.state().engine.load_full();
         while engine.storage().has_reference("b", folder).await.unwrap() {
             if tokio::time::Instant::now() > deadline {
@@ -986,7 +1000,7 @@ mod delete_objects_tests {
         for key in &keys {
             assert!(engine.head("b", key).await.unwrap_err().is_not_found());
         }
-        assert_eq!(deleted_events(&svc).await, 3);
+        assert_eq!(wait_for_deleted_events(&svc, 3).await, 3);
     }
 
     /// One DELETE per key, and the folders of one request at once. Each

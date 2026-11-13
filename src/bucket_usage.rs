@@ -30,7 +30,7 @@ use dashmap::DashMap;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
 
 /// SCHEMA_VERSION for the usage DB — independent of the config DB's version.
@@ -121,6 +121,8 @@ pub struct BucketUsage {
     pending: DashMap<String, Pending>,
     /// Source of [`ScanTicket`] ids.
     next_scan: AtomicU64,
+    /// Woken when a [`WriteWindow`] ends ([`Self::wait_windows_closed`]).
+    window_closed: tokio::sync::Notify,
 }
 
 /// A signed (count, logical, stored) delta — the triple `apply_delta` takes.
@@ -144,6 +146,18 @@ struct Pending {
     /// flushed or not. One shard lock guards all fields, so a change can
     /// never reach one and miss the other.
     scans: Vec<(u64, Journal)>,
+    /// Writes of this bucket between their first storage write and the
+    /// record of their change ([`WriteWindow`]). In the same entry as the
+    /// delta and the journals, so a scan reads it in the same critical
+    /// section that cuts them.
+    windows: u32,
+}
+
+impl Pending {
+    /// Nothing in the entry: it can go.
+    fn is_idle(&self) -> bool {
+        self.scans.is_empty() && self.delta == (0, 0, 0) && !self.recount && self.windows == 0
+    }
 }
 
 /// The changes of a bucket since one Refresh scan started.
@@ -163,6 +177,100 @@ pub struct ScanTicket<'a> {
     bucket: String,
     id: u64,
     consumed: bool,
+}
+
+/// THE rule for a scan result to be stamped as the trusted counter
+/// (`last_scan_at`): the bucket did not change while the scan ran (the
+/// journal is empty), AND no write sits between its storage write and the
+/// record of its change when the scan ends (`writes_in_window`).
+///
+/// A write stores its object first and records its change a moment later.
+/// A scan that lists in between sees the object, finds an empty journal, and
+/// would be stamped; the writer's change then lands on top and the object
+/// is counted twice (or, for a delete, the change lands after a scan that
+/// no longer lists the object, and it is counted too few), with no later
+/// scan to repair it.
+///
+/// Only that window matters. The window is the whole hold of the object
+/// write lock or the deltaspace lock (a copy holds the lock of its
+/// destination while it reads its source). A client write that is still
+/// receiving its body holds no lock and has stored nothing, and a write
+/// that has recorded its change is in the pending delta or the journal;
+/// neither blocks a stamp. A write that
+/// entered and left the window during the scan recorded its change during
+/// the scan, so the journal has it. The count is read in the same critical
+/// section that cuts the journal ([`BucketUsage::cut_scan`]), so a write
+/// cannot record between the two.
+pub(crate) fn scan_is_quiet(journal_is_empty: bool, writes_in_window: u32) -> bool {
+    journal_is_empty && writes_in_window == 0
+}
+
+/// A write between its first storage write and the record of its change.
+/// Made by [`BucketUsage::open_write_window`] BEFORE the storage write (the
+/// object is visible to a listing from the write on), and dropped after the
+/// record. The engine holds one inside every object write lock and every
+/// deltaspace lock, which is where every storage write and its record sit.
+/// It spans the whole hold of the lock, so it is wider than the span from
+/// the storage write to the record: a copy holds its destination lock while
+/// it reads its source, and counts for that time too.
+#[must_use = "the window ends when the guard drops"]
+pub struct WriteWindow {
+    /// `None`: a bucket the counter skips.
+    open: Option<(Arc<BucketUsage>, String)>,
+}
+
+impl Drop for WriteWindow {
+    fn drop(&mut self) {
+        let Some((db, bucket)) = self.open.take() else {
+            return;
+        };
+        if let Some(mut p) = db.pending.get_mut(&bucket) {
+            p.windows = p.windows.saturating_sub(1);
+        }
+        db.pending.remove_if(&bucket, |_, p| p.is_idle());
+        db.window_closed.notify_waiters();
+    }
+}
+
+/// A test hook at the two ends of the cut of a scan.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutStep {
+    BeforeCut,
+    AfterCut,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Counter changes recorded on this thread with no write in a window.
+    /// The engine tests assert that it stays 0 across the write paths
+    /// (`every_counter_change_of_the_engine_is_recorded_in_a_window`).
+    pub(crate) static UNWINDOWED_CHANGES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_unwindowed(windows: u32) {
+    if windows == 0 {
+        UNWINDOWED_CHANGES.with(|c| c.set(c.get() + 1));
+    }
+}
+
+#[cfg(test)]
+type CutHook = Box<dyn FnMut(CutStep)>;
+
+#[cfg(test)]
+thread_local! {
+    static CUT_HOOK: std::cell::RefCell<Option<CutHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn cut_hook(step: CutStep) {
+    // Taken out while it runs: a hook that scans again does not re-enter.
+    if let Some(mut hook) = CUT_HOOK.with(|h| h.borrow_mut().take()) {
+        hook(step);
+        CUT_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+    }
 }
 
 impl Drop for ScanTicket<'_> {
@@ -199,6 +307,7 @@ impl BucketUsage {
             conn: Mutex::new(conn),
             pending: DashMap::new(),
             next_scan: AtomicU64::new(0),
+            window_closed: tokio::sync::Notify::new(),
         };
         db.migrate()?;
         Ok(db)
@@ -212,6 +321,7 @@ impl BucketUsage {
             conn: Mutex::new(conn),
             pending: DashMap::new(),
             next_scan: AtomicU64::new(0),
+            window_closed: tokio::sync::Notify::new(),
         };
         db.migrate()?;
         Ok(db)
@@ -250,6 +360,8 @@ impl BucketUsage {
         }
         let d = (d_count, d_logical, d_stored);
         let mut e = self.pending.entry(bucket.to_string()).or_default();
+        #[cfg(test)]
+        note_unwindowed(e.windows);
         add(&mut e.delta, d);
         for (_, journal) in e.scans.iter_mut() {
             add(&mut journal.delta, d);
@@ -266,6 +378,8 @@ impl BucketUsage {
             return;
         }
         let mut e = self.pending.entry(bucket.to_string()).or_default();
+        #[cfg(test)]
+        note_unwindowed(e.windows);
         e.recount = true;
         for (_, journal) in e.scans.iter_mut() {
             journal.recount = true;
@@ -397,7 +511,7 @@ impl BucketUsage {
     fn take_delta(&self, bucket: &str) -> Option<(Triple, bool)> {
         let removed = self
             .pending
-            .remove_if(bucket, |_, p| p.scans.is_empty())
+            .remove_if(bucket, |_, p| p.scans.is_empty() && p.windows == 0)
             .map(|(_, p)| (p.delta, p.recount));
         removed.or_else(|| {
             self.pending
@@ -414,9 +528,7 @@ impl BucketUsage {
             let i = p.scans.iter().position(|(sid, _)| *sid == id)?;
             p.scans.swap_remove(i).1
         };
-        self.pending.remove_if(bucket, |_, p| {
-            p.scans.is_empty() && p.delta == (0, 0, 0) && !p.recount
-        });
+        self.pending.remove_if(bucket, |_, p| p.is_idle());
         Some(journal)
     }
 
@@ -437,6 +549,84 @@ impl BucketUsage {
             id,
             consumed: false,
         }
+    }
+
+    /// The writes of `bucket` in their window now.
+    pub(crate) fn writes_in_window(&self, bucket: &str) -> u32 {
+        self.pending.get(bucket).map_or(0, |p| p.windows)
+    }
+
+    /// Wait until no write of `bucket` is in its window, at most `max`.
+    /// A scan that ended inside a window is repeated after this, so that
+    /// the repeat does not meet the same write.
+    pub(crate) async fn wait_windows_closed(&self, bucket: &str, max: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + max;
+        loop {
+            let closed = self.window_closed.notified();
+            tokio::pin!(closed);
+            // Armed before the check: a window that ends in between wakes us.
+            closed.as_mut().enable();
+            if self.writes_in_window(bucket) == 0 {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, closed).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// A write of `bucket` is about to store an object: open its
+    /// [`WriteWindow`]. Call it BEFORE the first storage write; drop the
+    /// guard after the record of the change.
+    pub fn open_write_window(self: &Arc<Self>, bucket: &str) -> WriteWindow {
+        if is_transient_bucket(bucket) {
+            return WriteWindow { open: None };
+        }
+        self.pending.entry(bucket.to_string()).or_default().windows += 1;
+        WriteWindow {
+            open: Some((Arc::clone(self), bucket.to_string())),
+        }
+    }
+
+    /// End a scan, in ONE critical section of the bucket's entry: cut its
+    /// journal, read the writes in their window, and (unless the scan is
+    /// not going to replace the row) take the un-flushed delta. Returns
+    /// the journal and whether the scan is quiet ([`scan_is_quiet`]).
+    ///
+    /// One section, because a writer's `apply_delta` takes this same lock,
+    /// so a write records its change either wholly before the section or
+    /// wholly after it:
+    /// - before: its change is in the journal or in the delta that the
+    ///   replace supersedes;
+    /// - after: its change lands on the new row, and the write is still in
+    ///   its window while the section reads it (the window ends after the
+    ///   record), so a write that the scan may have listed makes the scan
+    ///   not quiet.
+    ///
+    /// Read in two steps, a write that began after the listing could record
+    /// between them, and its change would be dropped with the old delta.
+    fn cut_scan(&self, bucket: &str, id: u64, quiet_only: bool) -> (Journal, bool) {
+        let (journal, quiet) = match self.pending.get_mut(bucket) {
+            None => (Journal::default(), true),
+            Some(mut p) => {
+                let journal = p
+                    .scans
+                    .iter()
+                    .position(|(sid, _)| *sid == id)
+                    .map(|i| p.scans.swap_remove(i).1)
+                    .unwrap_or_default();
+                let quiet =
+                    scan_is_quiet(journal.delta == (0, 0, 0) && !journal.recount, p.windows);
+                // A scan that will not replace the row keeps the delta.
+                if !(quiet_only && !quiet) {
+                    p.delta = (0, 0, 0);
+                    p.recount = false;
+                }
+                (journal, quiet)
+            }
+        };
+        self.pending.remove_if(bucket, |_, p| p.is_idle());
+        (journal, quiet)
     }
 
     /// Read one bucket's counters (clamped at 0), merging any un-flushed
@@ -574,18 +764,21 @@ impl BucketUsage {
         // between the journal take and the REPLACE.
         let conn = self.conn.lock().unwrap();
         let bucket = std::mem::take(&mut ticket.bucket);
-        let journal = self.end_scan(&bucket, ticket.id).unwrap_or_default();
+        #[cfg(test)]
+        cut_hook(CutStep::BeforeCut);
+        // Quiet: the bucket did not change while the scan ran, and no write
+        // sits between its storage write and its record ([`scan_is_quiet`]).
+        // Only a quiet scan stamps `last_scan_at`, the mark that the quota
+        // gate trusts. The journal, the writes in their window and the
+        // un-flushed delta are read in ONE critical section.
+        let (journal, quiet) = self.cut_scan(&bucket, ticket.id, quiet_only);
         ticket.consumed = true;
-        // Quiet: the bucket did not change while the scan ran. Only a quiet
-        // scan stamps `last_scan_at`, the mark that the quota gate trusts.
-        let quiet = journal.delta == (0, 0, 0) && !journal.recount;
+        #[cfg(test)]
+        cut_hook(CutStep::AfterCut);
         if quiet_only && !quiet {
             return Ok(false);
         }
         let (jc, jl, js) = journal.delta;
-        let _ = self.take_delta(&bucket);
-        self.pending
-            .remove_if(&bucket, |_, p| p.scans.is_empty() && p.delta == (0, 0, 0));
         let scanned_at = quiet.then_some(now);
         // object_count = user-visible only (delta + passthrough); logical =
         // original_bytes; stored = stored_bytes (incl references). Same
@@ -635,7 +828,8 @@ impl BucketUsage {
         // write the dropped delta back.
         let conn = self.conn.lock().unwrap();
         let _ = self.take_delta(bucket);
-        self.pending.remove_if(bucket, |_, p| p.scans.is_empty());
+        self.pending
+            .remove_if(bucket, |_, p| p.scans.is_empty() && p.windows == 0);
         conn.execute(
             "DELETE FROM bucket_usage WHERE bucket = ?1",
             params![bucket],
@@ -788,6 +982,241 @@ mod tests {
         let row = db.read("b").unwrap().unwrap();
         assert_eq!(row.object_count, 0, "clamped at 0, not negative");
         assert_eq!(row.logical_bytes, 0);
+    }
+
+    /// The whole truth table of the stamp rule: a scan is trusted only when
+    /// the journal is empty AND no write sits in its window at the end.
+    #[test]
+    fn a_scan_is_quiet_only_without_journal_and_without_writes_in_the_window() {
+        for (journal_is_empty, writes, quiet) in [
+            (true, 0, true),
+            (true, 1, false),
+            (true, 7, false),
+            (false, 0, false),
+            (false, 1, false),
+        ] {
+            assert_eq!(
+                scan_is_quiet(journal_is_empty, writes),
+                quiet,
+                "journal empty: {journal_is_empty}, writes in their window: {writes}"
+            );
+        }
+    }
+
+    /// Run `f` as the hook of the next scan cut on this thread.
+    fn with_cut_hook<R>(hook: impl FnMut(CutStep) + 'static, f: impl FnOnce() -> R) -> R {
+        CUT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        let out = f();
+        CUT_HOOK.with(|h| *h.borrow_mut() = None);
+        out
+    }
+
+    fn totals_of(metas: &[FileMetadata]) -> SavingsTotals {
+        let mut totals = SavingsTotals::default();
+        for m in metas {
+            totals.accumulate(m);
+        }
+        totals
+    }
+
+    /// Stress: three writers store (S) and record (R) inside a window while
+    /// a scanner lists and asks for a quiet stamp, over and over. After
+    /// every stamp, with the writers parked, the row must equal what was
+    /// stored: a stamp never loses a write and never counts one twice.
+    /// Red when the cut reads the window count in a second step.
+    #[test]
+    fn a_stamp_is_exact_under_concurrent_writers() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
+        const WRITERS: usize = 3;
+        let db = Arc::new(BucketUsage::in_memory().unwrap());
+        // Objects stored so far (what a listing sees).
+        let visible = Arc::new(AtomicU64::new(0));
+        let pause = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let parked = Arc::new(AtomicUsize::new(0));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let (db, visible, pause, stop, parked) = (
+                    db.clone(),
+                    visible.clone(),
+                    pause.clone(),
+                    stop.clone(),
+                    parked.clone(),
+                );
+                std::thread::spawn(move || {
+                    let meta = meta_passthrough(10);
+                    while !stop.load(SeqCst) {
+                        if pause.load(SeqCst) {
+                            parked.fetch_add(1, SeqCst);
+                            while pause.load(SeqCst) && !stop.load(SeqCst) {
+                                std::thread::yield_now();
+                            }
+                            parked.fetch_sub(1, SeqCst);
+                            continue;
+                        }
+                        let window = db.open_write_window("b");
+                        visible.fetch_add(1, SeqCst); // the storage write
+                        db.apply_object("b", &meta, 1); // its record
+                        drop(window);
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let (mut tries, mut stamps, mut wrong) = (0u32, 0u32, 0u32);
+        while start.elapsed() < std::time::Duration::from_secs(2) && wrong == 0 {
+            tries += 1;
+            let ticket = db.begin_scan("b");
+            let listed = visible.load(SeqCst);
+            let totals = SavingsTotals {
+                original_bytes: 10 * listed,
+                stored_bytes: 10 * listed,
+                passthrough_bytes: 10 * listed,
+                passthrough_count: listed,
+                ..Default::default()
+            };
+            if db.overwrite_from_quiet_scan(ticket, &totals, 5).unwrap() {
+                stamps += 1;
+                pause.store(true, SeqCst);
+                while parked.load(SeqCst) < WRITERS {
+                    std::thread::yield_now();
+                }
+                let row = db.read("b").unwrap().unwrap();
+                if row.object_count != visible.load(SeqCst) {
+                    wrong += 1;
+                    eprintln!(
+                        "stamped row {} != stored {}",
+                        row.object_count,
+                        visible.load(SeqCst)
+                    );
+                }
+                pause.store(false, SeqCst);
+            }
+        }
+        stop.store(true, SeqCst);
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert_eq!(wrong, 0, "a stamped scan disagrees with what was stored");
+        assert!(stamps > 0, "no scan was stamped in {tries} tries");
+    }
+
+    /// A window is a count in the bucket's entry: it blocks the stamp while
+    /// open, a flush keeps it, and the entry goes with the last window.
+    #[test]
+    fn a_write_window_blocks_the_stamp_and_survives_a_flush() {
+        let db = Arc::new(BucketUsage::in_memory().unwrap());
+        let window = db.open_write_window("b");
+        db.apply_object("b", &meta_passthrough(10), 1);
+        db.flush_pending();
+        assert_eq!(
+            db.pending.get("b").map(|p| p.windows),
+            Some(1),
+            "the flush dropped the open window"
+        );
+        let two = db.open_write_window("b");
+        assert_eq!(db.pending.get("b").map(|p| p.windows), Some(2));
+        drop(two);
+        let ticket = db.begin_scan("b");
+        let totals = totals_of(&[meta_passthrough(10)]);
+        assert!(
+            !db.overwrite_from_quiet_scan(ticket, &totals, 5).unwrap(),
+            "stamped with a write in its window"
+        );
+        drop(window);
+        assert!(db.pending.is_empty(), "the last window leaves an entry");
+        let ticket = db.begin_scan("b");
+        assert!(db.overwrite_from_quiet_scan(ticket, &totals, 6).unwrap());
+        assert!(
+            db.open_write_window("__dgmigrate_x").open.is_none(),
+            "a transient bucket has no window"
+        );
+    }
+
+    /// A write that stores its object before the cut and records after it:
+    /// the scan is not stamped (S2: the window is read in the cut, not
+    /// before; here the write enters its window after the earliest point
+    /// where a count could have been read).
+    #[test]
+    fn a_write_that_enters_its_window_before_the_cut_blocks_the_stamp() {
+        let db = Arc::new(BucketUsage::in_memory().unwrap());
+        let totals = totals_of(&[meta_passthrough(40)]); // the scan listed it
+        let ticket = db.begin_scan("b");
+        let writer = db.clone();
+        let window: std::rc::Rc<std::cell::RefCell<Option<WriteWindow>>> = Default::default();
+        let held = window.clone();
+        let stamped = with_cut_hook(
+            move |step| {
+                if step == CutStep::BeforeCut {
+                    *held.borrow_mut() = Some(writer.open_write_window("b"));
+                }
+            },
+            || db.overwrite_from_quiet_scan(ticket, &totals, 9).unwrap(),
+        );
+        assert!(
+            !stamped,
+            "stamped a scan that ended inside a write's window"
+        );
+        // The writer records its change and leaves.
+        db.apply_object("b", &meta_passthrough(40), 1);
+        window.borrow_mut().take();
+        let row = db.read("b").unwrap().unwrap();
+        assert_eq!((row.object_count, row.logical_bytes), (1, 40), "{row:?}");
+    }
+
+    /// A write that starts after the listing and records right after the
+    /// cut lands on the new row: the old delta goes with the cut, in the
+    /// same critical section, not before or after it (S1: the windows
+    /// between the cut and the take).
+    #[test]
+    fn a_write_that_records_right_after_the_cut_is_kept() {
+        let db = Arc::new(BucketUsage::in_memory().unwrap());
+        db.apply_object("b", &meta_passthrough(100), 1);
+        let totals = totals_of(&[meta_passthrough(100)]);
+        let ticket = db.begin_scan("b");
+        let writer = db.clone();
+        let stamped = with_cut_hook(
+            move |step| {
+                if step == CutStep::AfterCut {
+                    // Not listed by the scan, recorded and finished.
+                    let w = writer.open_write_window("b");
+                    writer.apply_object("b", &meta_passthrough(7), 1);
+                    drop(w);
+                }
+            },
+            || db.overwrite_from_quiet_scan(ticket, &totals, 9).unwrap(),
+        );
+        assert!(stamped, "the scan was quiet at its cut");
+        let row = db.read("b").unwrap().unwrap();
+        assert_eq!(
+            (row.object_count, row.logical_bytes, row.last_scan_at),
+            (2, 107, Some(9)),
+            "the late write was dropped or counted twice: {row:?}"
+        );
+    }
+
+    /// The same write, recorded just BEFORE the cut and after the scan
+    /// began: the journal has it, the scan is not stamped, the row is exact.
+    #[test]
+    fn a_write_that_records_right_before_the_cut_is_in_the_journal() {
+        let db = Arc::new(BucketUsage::in_memory().unwrap());
+        let totals = totals_of(&[meta_passthrough(100), meta_passthrough(7)]);
+        let ticket = db.begin_scan("b");
+        let writer = db.clone();
+        let stamped = with_cut_hook(
+            move |step| {
+                if step == CutStep::BeforeCut {
+                    let w = writer.open_write_window("b");
+                    writer.apply_object("b", &meta_passthrough(7), 1);
+                    drop(w);
+                }
+            },
+            || db.overwrite_from_quiet_scan(ticket, &totals, 9).unwrap(),
+        );
+        assert!(!stamped);
+        let row = db.read("b").unwrap().unwrap();
+        assert_eq!(row.last_scan_at, None, "{row:?}");
     }
 
     #[test]

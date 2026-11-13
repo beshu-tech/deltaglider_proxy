@@ -104,6 +104,11 @@ async fn what_counts_as_empty_on_the_filesystem() {
         (&["a/reference.bin", "a/x.zip"], Some("a/x.zip")),
         (&["docs/"], Some("docs/")),
         (&[".env"], Some(".env")),
+        // L1 (#171): a legacy key below `.dg` is a key; the folder's own
+        // baseline there is not.
+        (&["a/.dg/reference.bin"], None),
+        (&["a/.dg/old.jpg"], Some("a/.dg/old.jpg")),
+        (&["a/.dg/reference.bin", ".dg/old.jpg"], Some(".dg/old.jpg")),
     ];
     for (files, want) in cases {
         let (dir, engine) = fs_engine().await;
@@ -143,6 +148,13 @@ async fn what_counts_as_empty_on_s3_and_its_cost() {
         (&["a/reference.bin", "a/x.zip.delta"], Some("a/x.zip")),
         (&["docs/"], Some("docs/")),
         (&[".env"], Some(".env")),
+        // L1 (#171): a legacy key below `.dg` is a key, before or after the
+        // facts; a baseline is not.
+        (&[".dg/old.jpg"], Some(".dg/old.jpg")),
+        (&[".dg/facts/x", ".dg/old.jpg"], Some(".dg/old.jpg")),
+        (&[".dg/facts/x", ".dg/zz.jpg"], Some(".dg/zz.jpg")),
+        (&[".dg/facts/x", "a/.dg/old.jpg"], Some("a/.dg/old.jpg")),
+        (&[".dg/facts/x", "a/.dg/reference.bin"], None),
     ];
     for (keys, want) in cases {
         let (engine, fake, endpoint) = fake_s3_engine().await;

@@ -345,6 +345,11 @@ mod tests {
                 "its callers pass the gated view",
             ),
             (
+                "src/api/admin/objects.rs",
+                "for_principal",
+                "its caller (the delete job) passes the gated view",
+            ),
+            (
                 "src/api/admin/config/mod.rs",
                 "remove_bootstrap_credentials",
                 "a warning text, no login",

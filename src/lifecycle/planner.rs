@@ -409,8 +409,7 @@ pub fn is_internal_key(key: &str) -> bool {
         || key == ".dg"
         || key.starts_with(".dg/")
         || key.contains("/.dg/")
-        || key.ends_with("/reference.bin")
-        || key == "reference.bin"
+        || crate::types::is_reference_key(key)
         || key.ends_with(".delta")
 }
 
@@ -543,6 +542,32 @@ pub fn plan_retain_newest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The storage artifacts a lifecycle rule never touches. The baseline
+    /// rule is the last path segment, whole (`types::is_reference_key`): a
+    /// suffix test would take the client key `myreference.bin`, and a
+    /// substring test `x/reference.bin/y`.
+    #[test]
+    fn is_internal_key_takes_only_a_whole_reference_segment_as_a_baseline() {
+        let table: &[(&str, bool)] = &[
+            ("reference.bin", true),
+            ("a/reference.bin", true),
+            ("a/b/reference.bin", true),
+            ("myreference.bin", false),
+            ("a/api-reference.bin", false),
+            ("x/reference.bin/y", false),
+            ("reference.bin.delta", true), // a delta artifact, by its suffix
+            ("a/x.zip.delta", true),
+            ("reference.bin.bak", false),
+            (".dg/x", true),
+            ("a/.dg/x", true),
+            (".deltaglider/x", true),
+            ("a/x.txt", false),
+        ];
+        for (key, want) in table {
+            assert_eq!(is_internal_key(key), *want, "{key}");
+        }
+    }
 
     #[test]
     fn claimed_rule_is_current_truth_table() {

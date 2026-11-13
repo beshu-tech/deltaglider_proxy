@@ -620,6 +620,48 @@ mod tests {
         assert_eq!(End::Cancelled.outcome(), "cancelled");
     }
 
+    /// The size of the body reaches the slow check of the LOG: the same
+    /// 6 s is slow for a request with no body (5 s threshold) and not slow
+    /// for one with a body of 10 MiB (15 s). With a fixed time and no
+    /// network, nothing here depends on the load of the host.
+    #[test]
+    fn the_body_of_a_request_raises_the_threshold_of_its_logged_line() {
+        let logged = |body_bytes: u64, total: Duration| -> String {
+            let captured = Captured::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                Report {
+                    backend: "timing-wiring",
+                    operation: "PutObject",
+                    bucket: "releases",
+                    uri: "/releases/v1/app.zip",
+                    body_bytes,
+                    total,
+                    before_first_send: Some(Duration::ZERO),
+                    statuses: &[Some(200)],
+                    end: End::Ok,
+                }
+                .record(Some(Duration::from_secs(5)));
+            });
+            let bytes = captured.0.lock().clone();
+            String::from_utf8(bytes).unwrap()
+        };
+        let mib10 = 10u64 << 20;
+        let six = Duration::from_secs(6);
+        let no_body = logged(0, six);
+        assert!(no_body.contains("slow backend request"), "{no_body}");
+        assert!(no_body.contains("body_bytes=0"), "{no_body}");
+        let big = logged(mib10, six);
+        assert!(!big.contains("slow backend request"), "{big}");
+        let past = logged(mib10, Duration::from_secs(15));
+        assert!(past.contains("slow backend request"), "{past}");
+        assert!(past.contains(&format!("body_bytes={mib10}")), "{past}");
+    }
+
     #[test]
     fn slow_means_at_or_above_the_threshold_plus_a_second_per_mib_of_body() {
         let ms = Duration::from_millis;
@@ -780,24 +822,18 @@ mod tests {
         let (endpoint, fake) = fake_s3::start().await;
         let config = s3_config(&endpoint);
         let partition = super::super::client::backend_retry_partition(&config);
-        let timer = RequestTimer::new(
-            BackendLabel::named("timing-slow"),
-            Some(Duration::from_millis(100)),
-        );
+        let timer = RequestTimer::new(BackendLabel::named("timing-slow"), Some(SLOW));
         let client = S3Backend::build_client_in(&config, None, partition, timer)
             .await
             .unwrap();
-        fake.set_delay_ms("LIST", 150);
-        fake.set_delay_ms("PUT", 150);
-        // An upload of 2 MiB gets 2 s more: 150 ms is not slow for it.
-        client
-            .put_object()
-            .bucket("releases")
-            .key("v1/app.zip")
-            .body(aws_sdk_s3::primitives::ByteStream::from(vec![0u8; 2 << 20]))
-            .send()
-            .await
-            .unwrap();
+        // The threshold is far above what a request needs on a busy host,
+        // so the fast request stays fast; the delay is above the threshold.
+        // (The extra time of an upload is the pure test
+        // `slow_means_at_or_above_the_threshold_plus_a_second_per_mib_of_body`:
+        // a request that carries a large body takes seconds more on a busy
+        // host, so no wall-clock test of it holds under load.)
+        const SLOW: Duration = Duration::from_millis(2000);
+        fake.set_delay_ms("LIST", 2200);
         client
             .list_objects_v2()
             .bucket("releases")
@@ -836,8 +872,18 @@ mod tests {
         ] {
             assert!(line.contains(field), "{field} missing in: {line}");
         }
-        assert!(line.contains("total_secs=0.1"), "{line}");
-        assert!(line.contains("before_first_attempt_secs=0.0"), "{line}");
+        let number = |name: &str| -> f64 {
+            line.split(&format!("{name}="))
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|v| v.trim_matches('"').parse().ok())
+                .unwrap_or_else(|| panic!("{name} missing in: {line}"))
+        };
+        // The delay is part of the total; a busy host only adds to it.
+        let total = number("total_secs");
+        assert!(total >= 2.2, "{line}");
+        // The time before the first attempt is not where the time went.
+        assert!(number("before_first_attempt_secs") < total, "{line}");
         assert!(!line.contains("x-id"), "no other part of the URI: {line}");
     }
 

@@ -557,13 +557,19 @@ pub(super) fn engine_to_storage(e: EngineError) -> StorageError {
     }
 }
 
+/// The per-deltaspace lock of [`DeltaGliderEngine::acquire_prefix_lock`]. It
+/// also holds the write window of the bucket's usage counter: a reference
+/// write or a reclaim stores or removes a file and records its size under
+/// this lock, and a usage scan must not be trusted when it ends between the
+/// two ([`crate::bucket_usage::scan_is_quiet`]).
+pub(super) struct PrefixLockGuard {
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+    _window: Option<crate::bucket_usage::WriteWindow>,
+}
+
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Acquire a per-deltaspace async lock. Different prefixes do not contend.
-    pub(super) async fn acquire_prefix_lock(
-        &self,
-        bucket: &str,
-        prefix: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(super) async fn acquire_prefix_lock(&self, bucket: &str, prefix: &str) -> PrefixLockGuard {
         // Periodic cleanup on every lock acquisition (cheap — just checks len())
         self.cleanup_prefix_locks();
         // A deltaspace is (storage, prefix): keyed by the prefix alone, the
@@ -573,7 +579,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .entry(self.cache_key(bucket, prefix))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
-        mutex.lock_owned().await
+        let lock = mutex.lock_owned().await;
+        PrefixLockGuard {
+            _lock: lock,
+            _window: self.open_write_window(bucket),
+        }
     }
 
     /// Acquire the CROSS-INSTANCE reference lock for a deltaspace, INSIDE the

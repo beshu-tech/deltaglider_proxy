@@ -1128,7 +1128,7 @@ async fn a_downgrade_needs_confirmation_and_every_change_is_audited() {
             args.push("--confirm-encryption-downgrade".into());
             args.push(c.to_string());
         }
-        std::process::Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
+        common::proxy_binary()
             .current_dir(std::env::temp_dir())
             .args(args)
             .env("DGP_BOOTSTRAP_PASSWORD", common::TEST_BOOTSTRAP_PASSWORD)
@@ -1286,7 +1286,7 @@ fn cli_publish(env: &Env, subjects: &[&str], confirm: &[&str]) -> std::process::
     }
     args.push("--server".into());
     args.push(env.server.endpoint());
-    std::process::Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
+    common::proxy_binary()
         .current_dir(std::env::temp_dir())
         .args(args)
         .env("DGP_BOOTSTRAP_PASSWORD", common::TEST_BOOTSTRAP_PASSWORD)

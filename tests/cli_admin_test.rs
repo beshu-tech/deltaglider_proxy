@@ -11,9 +11,6 @@
 use crate::common;
 
 use common::TestServer;
-use std::process::Command;
-
-const BIN: &str = env!("CARGO_BIN_EXE_deltaglider_proxy");
 
 /// Known-good bcrypt hash for plaintext "dgptest". Verified via the
 /// bcrypt crate; the test harness threads it into the server via
@@ -62,7 +59,7 @@ async fn test_config_apply_happy_path() {
     let yaml_path = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(yaml_path.path(), modified).unwrap();
 
-    let output = Command::new(BIN)
+    let output = common::proxy_binary()
         .current_dir(std::env::temp_dir())
         .args([
             "config",
@@ -122,7 +119,7 @@ async fn test_config_apply_prints_the_existing_warnings() {
         .unwrap();
     let yaml_path = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(yaml_path.path(), exported).unwrap();
-    let output = Command::new(BIN)
+    let output = common::proxy_binary()
         .current_dir(std::env::temp_dir())
         .args([
             "config",
@@ -167,7 +164,7 @@ async fn test_config_lint_and_apply_refuse_the_removed_plaintext_reads() {
         vec!["config", "lint", path],
         vec!["config", "apply", path, "--server", &endpoint],
     ] {
-        let output = Command::new(BIN)
+        let output = common::proxy_binary()
             .current_dir(std::env::temp_dir())
             .args(&args)
             .env("DGP_BOOTSTRAP_PASSWORD", TEST_PASSWORD)
@@ -209,7 +206,7 @@ async fn test_config_apply_missing_password_exits_7() {
     )
     .unwrap();
 
-    let output = Command::new(BIN)
+    let output = common::proxy_binary()
         .current_dir(std::env::temp_dir())
         .args(["config", "apply", yaml_path.path().to_str().unwrap()])
         // Explicitly clear the env var; rustc inherits the parent environment
@@ -235,7 +232,7 @@ async fn test_config_apply_wrong_password_exits_7() {
     let yaml_path = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(yaml_path.path(), "listen_addr: \"127.0.0.1:9999\"\n").unwrap();
 
-    let output = Command::new(BIN)
+    let output = common::proxy_binary()
         .current_dir(std::env::temp_dir())
         .args([
             "config",
@@ -258,7 +255,7 @@ async fn test_config_apply_empty_file_rejected_before_hitting_server() {
     let yaml_path = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(yaml_path.path(), "   \n\n   \n").unwrap();
 
-    let output = Command::new(BIN)
+    let output = common::proxy_binary()
         .current_dir(std::env::temp_dir())
         .args(["config", "apply", yaml_path.path().to_str().unwrap()])
         .env("DGP_BOOTSTRAP_PASSWORD", TEST_PASSWORD)
@@ -284,7 +281,7 @@ async fn test_admission_trace_smoke() {
         .build()
         .await;
 
-    let output = Command::new(BIN)
+    let output = common::proxy_binary()
         .current_dir(std::env::temp_dir())
         .args([
             "admission",
@@ -366,7 +363,7 @@ async fn test_admission_trace_matches_public_prefix_after_apply() {
     let yaml_path = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(yaml_path.path(), patched).unwrap();
 
-    let apply = Command::new(BIN)
+    let apply = common::proxy_binary()
         .current_dir(std::env::temp_dir())
         .args([
             "config",
@@ -387,7 +384,7 @@ async fn test_admission_trace_matches_public_prefix_after_apply() {
 
     // 3. Trace an anonymous GET on the public path. Must now be
     //    `allow-anonymous` with the synthesised block matched.
-    let trace = Command::new(BIN)
+    let trace = common::proxy_binary()
         .current_dir(std::env::temp_dir())
         .args([
             "admission",
@@ -431,7 +428,7 @@ async fn test_s3_verbs_refuse_a_deltaglider_proxy_endpoint() {
         vec!["s3", "get-bucket-acl", "s3://releases"],
         vec!["s3", "put-bucket-acl", "s3://releases", "--acl", "private"],
     ] {
-        let out = Command::new(BIN)
+        let out = common::proxy_binary()
             .args(&args)
             .args(["--endpoint-url", &server.endpoint()])
             .env("AWS_ACCESS_KEY_ID", "CLIPROXYK")

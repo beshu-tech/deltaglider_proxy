@@ -3560,7 +3560,7 @@ async fn trust_proxy_headers_without_cidrs_refuses_to_boot() {
     .unwrap();
     for cidrs in [None, Some(""), Some("not-a-network")] {
         let port = common::lease_free_port();
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
+        let mut cmd = common::proxy_binary();
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("DGP_") {
                 cmd.env_remove(key);

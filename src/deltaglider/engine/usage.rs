@@ -114,6 +114,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
+    /// Open the [`crate::bucket_usage::WriteWindow`] of a write to `bucket`
+    /// (`None` without a counter). The object write lock and the deltaspace
+    /// lock each hold one, from their acquisition until they drop: every
+    /// storage write of the engine, and the record of its change, happen
+    /// under one of the two, so a usage scan can tell that it ended between
+    /// a write and its record.
+    pub(super) fn open_write_window(
+        &self,
+        bucket: &str,
+    ) -> Option<crate::bucket_usage::WriteWindow> {
+        self.bucket_usage
+            .as_ref()
+            .map(|u| u.open_write_window(bucket))
+    }
+
     /// Record a reference.bin that a write created (`+bytes`) or removed
     /// (`-bytes`), right after that storage write. The size is exact, so it
     /// is recorded also when the object's own change is unknown.
@@ -267,6 +282,80 @@ mod tests {
                 .with_bucket_usage(Some(usage.clone()));
         engine.create_bucket("b").await.unwrap();
         (Arc::new(engine), fake, usage)
+    }
+
+    /// THE place of the write window: the object write lock and the
+    /// deltaspace lock each hold one from their acquisition to their drop,
+    /// and a bucket that the counter skips holds none. Every storage write
+    /// of the engine and the record of its change sit under one of the two.
+    #[tokio::test]
+    async fn the_engine_locks_hold_the_write_window() {
+        let (engine, _fake, usage) = counted_s3_engine(None).await;
+        assert_eq!(usage.writes_in_window("b"), 0);
+        let object = engine.lock_object_write("b", "run/a.zip").await;
+        assert_eq!(usage.writes_in_window("b"), 1, "the object write lock");
+        let prefix = engine.acquire_prefix_lock("b", "run").await;
+        assert_eq!(usage.writes_in_window("b"), 2, "the deltaspace lock");
+        drop(prefix);
+        drop(object);
+        assert_eq!(
+            usage.writes_in_window("b"),
+            0,
+            "the windows end with the locks"
+        );
+        // A write that stores and records leaves no window behind.
+        engine
+            .store("b", "run/a.zip", &[1u8; 5000], None, Default::default())
+            .await
+            .unwrap();
+        engine.delete("b", "run/a.zip").await.unwrap();
+        assert_eq!(usage.writes_in_window("b"), 0);
+    }
+
+    /// Fix the class: a usage scan is trusted only when no write sits in its
+    /// window, so EVERY counter change of the engine must be recorded inside
+    /// a window. Across the write paths (a passthrough PUT, a PUT that
+    /// makes a baseline, an overwrite, a delete, the delete that reclaims
+    /// the baseline, a batch delete) no change is recorded outside one.
+    #[tokio::test]
+    async fn every_counter_change_of_the_engine_is_recorded_in_a_window() {
+        use crate::bucket_usage::UNWINDOWED_CHANGES;
+        let (engine, _fake, usage) = counted_s3_engine(None).await;
+        UNWINDOWED_CHANGES.with(|c| c.set(0));
+        let put = |key: &'static str, body: Vec<u8>| {
+            let engine = engine.clone();
+            async move {
+                engine
+                    .store("b", key, &body, None, Default::default())
+                    .await
+                    .unwrap()
+            }
+        };
+        put("img/a.jpg", noise(1, 3000)).await;
+        put("img/a.jpg", noise(2, 4000)).await; // an overwrite
+        put("run/build-0.zip", noise(3, 12_000)).await; // makes the baseline
+        put("run/build-1.zip", noise(3, 12_100)).await; // a delta
+        engine.delete("b", "run/build-0.zip").await.unwrap();
+        engine.delete("b", "run/build-1.zip").await.unwrap(); // reclaims the baseline
+        put("run/build-2.zip", noise(4, 12_000)).await;
+        put("run/build-3.zip", noise(4, 12_050)).await;
+        engine
+            .delete_batch(
+                "b",
+                ["run/build-2.zip", "run/build-3.zip", "img/a.jpg"]
+                    .into_iter()
+                    .map(crate::deltaglider::DeleteItem::new)
+                    .collect(),
+                crate::deltaglider::DeleteHooks::default(),
+            )
+            .await;
+        assert_eq!(
+            UNWINDOWED_CHANGES.with(|c| c.get()),
+            0,
+            "a counter change was recorded outside a write window"
+        );
+        assert_eq!(usage.writes_in_window("b"), 0);
+        assert_eq!(row(&usage).object_count, 0, "the counter ends at zero");
     }
 
     fn row(usage: &BucketUsage) -> BucketUsageRow {

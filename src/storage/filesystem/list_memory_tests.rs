@@ -301,21 +301,37 @@ mod listing_model {
                 .build()
                 .unwrap();
             rt.block_on(async {
-                let (_tmp, engine) = engine_with_folder(0).await;
+                let (tmp, engine) = engine_with_folder(0).await;
                 let mut stored = BTreeSet::new();
                 for (dirs, file) in &files {
                     let mut parts: Vec<&str> = dirs.iter().map(|&d| SEGS[d]).collect();
                     parts.push(SEGS[*file]);
+                    // A key below a `.dg` directory: the write path refuses
+                    // it now; an older release stored it (L1, #171).
+                    let legacy = parts[..parts.len() - 1].contains(&".dg");
                     let key = parts.join("/");
-                    // A refused key (a reserved name) is not stored: it is
-                    // not in the model either.
                     if engine
                         .store("b", &key, b"x", None, Default::default())
                         .await
                         .is_ok()
                     {
                         stored.insert(key);
+                    } else if legacy {
+                        // Below the write path's validation, as an older
+                        // release left it. A path that clashes with another
+                        // key (a file where a folder goes) is skipped.
+                        let path = tmp.path().join("b").join("deltaspaces").join(&key);
+                        let made = path
+                            .parent()
+                            .is_some_and(|p| std::fs::create_dir_all(p).is_ok())
+                            && !path.exists()
+                            && std::fs::write(&path, b"x").is_ok();
+                        if made {
+                            stored.insert(key);
+                        }
                     }
+                    // Any other refused key (a reserved name) is not stored:
+                    // it is not in the model either.
                 }
                 let flat = engine
                     .list_objects("b", "", None, 1000, None, false)
@@ -339,6 +355,46 @@ mod listing_model {
                 for cp in &by_x.common_prefixes {
                     prop_assert!(flat.iter().any(|k| k.starts_with(cp.as_str())), "{cp}");
                 }
+                // L3 (#171): a delimiter other than `/` pages like the model
+                // (the flat keys collapsed by hand): no key and no common
+                // prefix twice, none missing, at every page size.
+                for delimiter in ["_", "-", ".", "b"] {
+                    let mut want_objects = BTreeSet::new();
+                    let mut want_prefixes = BTreeSet::new();
+                    for k in &flat {
+                        match k.find(delimiter) {
+                            Some(i) => {
+                                want_prefixes.insert(format!("{}{delimiter}", &k[..i]));
+                            }
+                            None => {
+                                want_objects.insert(k.clone());
+                            }
+                        }
+                    }
+                    let mut objects = Vec::new();
+                    let mut prefixes = Vec::new();
+                    let mut token: Option<String> = None;
+                    for pages in 0.. {
+                        // A page that repeats its token never ends.
+                        prop_assert!(pages < 200, "paging does not end, delimiter {}", delimiter);
+                        let page = engine
+                            .list_objects("b", "", Some(delimiter), max_keys, token.as_deref(), false)
+                            .await
+                            .unwrap();
+                        objects.extend(page.objects.into_iter().map(|(k, _)| k));
+                        prefixes.extend(page.common_prefixes);
+                        if !page.is_truncated {
+                            break;
+                        }
+                        token = page.next_continuation_token;
+                    }
+                    let got_objects: BTreeSet<String> = objects.iter().cloned().collect();
+                    let got_prefixes: BTreeSet<String> = prefixes.iter().cloned().collect();
+                    prop_assert_eq!(objects.len(), got_objects.len(), "an object twice, delimiter {}", delimiter);
+                    prop_assert_eq!(prefixes.len(), got_prefixes.len(), "a prefix twice, delimiter {}: {:?}", delimiter, prefixes);
+                    prop_assert_eq!(got_objects, want_objects, "objects, delimiter {}", delimiter);
+                    prop_assert_eq!(got_prefixes, want_prefixes, "prefixes, delimiter {}", delimiter);
+                }
                 // The bucket deletes once the walk sees nothing.
                 for key in &walked {
                     engine.delete("b", key).await.unwrap();
@@ -354,4 +410,90 @@ mod listing_model {
             scan::set_chunk_for_test(None);
         }
     }
+}
+
+/// L1 (#171): a key that an older release stored below a `.dg` directory is
+/// an ordinary object. Flat, by level and with another delimiter, LIST shows
+/// it; a client reads and deletes it; the bucket deletes after that, and not
+/// before. The folder with only a baseline stays unlisted.
+#[tokio::test]
+async fn a_legacy_dg_key_is_listed_readable_and_deletable() {
+    let (tmp, engine) = engine_with_folder(0).await;
+    let ds = tmp.path().join("b").join("deltaspaces").join("x");
+    std::fs::create_dir_all(ds.join(".dg")).unwrap();
+    std::fs::write(ds.join(".dg").join("foo.jpg"), b"legacy").unwrap();
+    // The baseline of folder `x` shares the directory; `y` has only one.
+    std::fs::write(ds.join(".dg").join("reference.bin"), b"ref").unwrap();
+    let only_baseline = tmp
+        .path()
+        .join("b")
+        .join("deltaspaces")
+        .join("y")
+        .join(".dg");
+    std::fs::create_dir_all(&only_baseline).unwrap();
+    std::fs::write(only_baseline.join("reference.bin"), b"ref").unwrap();
+
+    let names = |page: &crate::deltaglider::ListObjectsPage| {
+        let mut v: Vec<String> = page.objects.iter().map(|(k, _)| k.clone()).collect();
+        v.extend(page.common_prefixes.iter().cloned());
+        v
+    };
+    let list = |prefix: &'static str, delimiter: Option<&'static str>| {
+        let engine = &engine;
+        async move {
+            engine
+                .list_objects("b", prefix, delimiter, 1000, None, false)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(names(&list("", None).await), ["x/.dg/foo.jpg"]);
+    assert_eq!(names(&list("", Some("/")).await), ["x/"]);
+    assert_eq!(names(&list("x/", Some("/")).await), ["x/.dg/"]);
+    assert_eq!(names(&list("x/.dg/", Some("/")).await), ["x/.dg/foo.jpg"]);
+    assert_eq!(names(&list("x/", Some("g")).await), ["x/.dg"]);
+    assert_eq!(names(&list("", Some(".")).await), ["x/."]);
+    assert_eq!(names(&list("y/", Some("/")).await), Vec::<String>::new());
+
+    assert!(engine.head("b", "x/.dg/foo.jpg").await.is_ok());
+    // The bucket holds a key that LIST shows: it does not delete.
+    assert!(matches!(
+        engine.delete_bucket("b").await,
+        Err(crate::deltaglider::EngineError::Storage(
+            crate::storage::StorageError::BucketNotEmpty(_)
+        ))
+    ));
+    engine.delete("b", "x/.dg/foo.jpg").await.unwrap();
+    assert!(names(&list("", None).await).is_empty());
+    // The test baselines have no metadata: the engine cannot reclaim them.
+    std::fs::remove_dir_all(ds.join(".dg")).unwrap();
+    std::fs::remove_dir_all(&only_baseline).unwrap();
+    engine.delete_bucket("b").await.unwrap();
+}
+
+/// L3 (#171): the page after a common prefix starts after it. The key
+/// `big/a_1.jpg` sorts after the token `big/a_`, and still collapses into the
+/// prefix that the token ended.
+#[tokio::test]
+async fn a_collapsed_page_never_repeats_the_prefix_of_the_token() {
+    let (tmp, engine) = engine_with_folder(0).await;
+    let ds = tmp.path().join("b").join("deltaspaces").join("big");
+    for k in ["a_1.jpg", "a_2.jpg", "a_3.jpg", "b.jpg"] {
+        std::fs::write(ds.join(k), b"x").unwrap();
+    }
+    let mut got = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..10 {
+        let page = engine
+            .list_objects("b", "big/", Some("_"), 1, token.as_deref(), false)
+            .await
+            .unwrap();
+        got.extend(page.objects.into_iter().map(|(k, _)| k));
+        got.extend(page.common_prefixes);
+        if !page.is_truncated {
+            break;
+        }
+        token = page.next_continuation_token;
+    }
+    assert_eq!(got, ["big/a_", "big/b.jpg"]);
 }

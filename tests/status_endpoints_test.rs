@@ -128,15 +128,23 @@ async fn fake_s3() -> (String, Arc<AtomicU8>) {
     (format!("http://{addr}"), mode)
 }
 
+/// `DGP_READY_TIMEOUT_SECS` of the servers below.
+const READY_TIMEOUT_SECS: u64 = 5;
+
 async fn ready(ep: &str) -> (u16, Value) {
     get_json(&reqwest::Client::new(), &format!("{ep}/_/ready")).await
 }
 
 /// `/_/ready` once its answer shows the backend's new state. One live
 /// probe answers every readiness check for 5 s (single flight), so a
-/// change shows within that time; give up after 15 s.
+/// change shows within that time ([`READY_PROBE_TTL`]), plus the two
+/// requests of a probe that each wait for their timeout. The limit adds
+/// 45 s for a busy host: on a loaded one the bare sum (15 s) was too short.
 async fn ready_after_change(ep: &str, backend: &[&str]) -> (u16, Value) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let limit = deltaglider_proxy::coordination::health::READY_PROBE_TTL
+        + 2 * std::time::Duration::from_secs(READY_TIMEOUT_SECS)
+        + std::time::Duration::from_secs(45);
+    let deadline = std::time::Instant::now() + limit;
     loop {
         let (code, r) = ready(ep).await;
         let seen = r["backend"].as_str().unwrap_or("");
@@ -153,7 +161,7 @@ async fn ready_is_503_when_the_backend_is_down() {
     let (s3, mode) = fake_s3().await;
     let server = TestServer::builder()
         .s3_endpoint(&s3)
-        .env("DGP_READY_TIMEOUT_SECS", "5")
+        .env("DGP_READY_TIMEOUT_SECS", &READY_TIMEOUT_SECS.to_string())
         .env("DGP_READY_RETRIES", "0")
         .build()
         .await;
@@ -188,7 +196,7 @@ async fn ready_rides_out_a_list_throttle_and_a_short_outage_with_a_window() {
     let (s3, mode) = fake_s3().await;
     let server = TestServer::builder()
         .s3_endpoint(&s3)
-        .env("DGP_READY_TIMEOUT_SECS", "5")
+        .env("DGP_READY_TIMEOUT_SECS", &READY_TIMEOUT_SECS.to_string())
         .env("DGP_READY_RETRIES", "0")
         .env("DGP_READY_CACHE_TTL_SECS", "300")
         .build()
