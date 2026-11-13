@@ -3290,6 +3290,40 @@ storage:
         assert_eq!(gate.inflight_writes("dst"), 0);
     }
 
+    /// A refusal that is NOT a full disk (a read-only encrypted destination)
+    /// makes the catch-up walk due at once: it may end on its own, and only a
+    /// full disk waits for the retry floor.
+    #[tokio::test]
+    async fn a_refusal_that_is_not_a_full_disk_makes_the_rule_due_at_once() {
+        let mut f = fixture(true).await;
+        let copy_event = f.put("n.bin").await;
+        let now = crate::replication::current_unix_seconds();
+        {
+            let db = f.db.lock().await;
+            db.replication_ensure_state("r", now).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE replication_state SET next_due_at = ?1 WHERE rule_name = 'r'",
+                    [now + 86_400],
+                )
+                .unwrap();
+        }
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::default());
+        gate.set_write_refusal_probe(Arc::new(|b: &str| {
+            (b == "dst").then(|| "the bucket is read-only".to_string())
+        }));
+        f.drain_gated_at(None, &gate, now).await;
+        assert!(f.cursor().await >= copy_event, "the event is skipped");
+        let due =
+            f.db.lock()
+                .await
+                .replication_load_state("r")
+                .unwrap()
+                .unwrap()
+                .next_due_at;
+        assert_eq!(due, now, "due at once");
+    }
+
     /// A refused copy does not starve the events behind it. 509 copy events
     /// (more than one drain reads) and a mirror delete behind them, with the
     /// destination disk full: the copies are skipped, the cursor moves past

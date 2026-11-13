@@ -1016,7 +1016,12 @@ async fn a_reencrypt_without_the_write_gate_sets_no_mark_and_never_drains() {
     }
     assert!(!gate.arms_job(id), "a conditional job holds no bucket");
     e.run_waiting(job, 1).await;
-    assert_eq!(row(id).await.status, "queued");
+    let r = row(id).await;
+    assert_eq!(r.status, "queued");
+    assert!(
+        !r.params.as_deref().unwrap_or("").contains("disk_wait"),
+        "an ungated job records no wait: {r:?}"
+    );
     assert!(!gate.arms_job(id), "the run kept the job conditional");
     assert!(!gate.has_disk_mark(id), "no gate, so no wait to mark");
 
