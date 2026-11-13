@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 616b52e0eb0ffb18de9827871e427ec2e9818ab65f224016b4fe45f55e3c7c2a # shrinks to raw = RawRequest { method: POST, path_and_query: "/alpha-bucket/%74?delete&uploadId=u1", headers: [], body: [], auth: V4Header(User { ak: "AKALICE0000000000001", sk: "alice-secret-0000000000000000000000001" }, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") }
+cc 7a78f43e47ac6efd842cb2f29b96b1c6fd6a9e9ac87ee3e88802c51c93e7ee3e # shrinks to raw = RawRequest { method: POST, path_and_query: "/Alpha-Bucket", headers: [("content-type", "multipart/form-data; boundary=XBOUNDARYX")], body: [45, 45, 88, 66, 79, 85, 78, 68, 65, 82, 89, 88, 13, 10, 67, 111, 110, 116, 101, 110, 116, 45, 68, 105, 115, 112, 111, 115, 105, 116, 105, 111, 110, 58, 32, 102, 111, 114, 109, 45, 100, 97, 116, 97, 59, 32, 110, 97, 109, 101, 61, 34, 107, 101, 121, 34, 13, 10, 13, 10, 107, 46, 116, 120, 116, 13, 10, 45, 45, 88, 66, 79, 85, 78, 68, 65, 82, 89, 88, 13, 10, 67, 111, 110, 116, 101, 110, 116, 45, 68, 105, 115, 112, 111, 115, 105, 116, 105, 111, 110, 58, 32, 102, 111, 114, 109, 45, 100, 97, 116, 97, 59, 32, 110, 97, 109, 101, 61, 34, 102, 105, 108, 101, 34, 59, 32, 102, 105, 108, 101, 110, 97, 109, 101, 61, 34, 107, 46, 116, 120, 116, 34, 13, 10, 67, 111, 110, 116, 101, 110, 116, 45, 84, 121, 112, 101, 58, 32, 116, 101, 120, 116, 47, 112, 108, 97, 105, 110, 13, 10, 13, 10, 104, 101, 108, 108, 111, 13, 10, 45, 45, 88, 66, 79, 85, 78, 68, 65, 82, 89, 88, 45, 45, 13, 10], auth: None }
