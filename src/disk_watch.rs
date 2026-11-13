@@ -191,6 +191,7 @@ pub fn raw_level(facts: Facts, th: &Thresholds) -> Level {
 /// * else it stays. A value inside the band between the entry threshold
 ///   and the entry threshold plus the margin never changes the level, so a
 ///   value that moves in the band does not flap.
+///
 /// A disk of unknown size (`total` = 0) keeps the level.
 pub fn next_level(prev: Level, facts: Facts, th: &Thresholds) -> Level {
     if facts.total == 0 {
