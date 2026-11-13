@@ -374,14 +374,13 @@ impl S3Backend {
 
     /// Read the durable listing facts for the unresolved entries of one
     /// listing page and apply them. `candidates` are indices into `objects`
-    /// with their stored keys. With `heal`, a miss gets a background HEAD
-    /// (the caller sends none of its own). Returns the indices it resolved.
+    /// with their stored keys. A miss is marked (see
+    /// [`Self::heal_listed_misses`]). Returns the indices it resolved.
     pub(super) async fn apply_durable_listing_facts(
         &self,
         bucket: &str,
         objects: &mut [(String, FileMetadata)],
         candidates: &[(usize, String)],
-        heal: bool,
     ) -> Vec<usize> {
         if candidates.is_empty() {
             return Vec::new();
@@ -418,24 +417,71 @@ impl S3Backend {
                 None => {
                     LISTING_FACTS_MISSES.inc();
                     list_size_cache::mark_missing_facts(&id);
-                    if !heal {
-                        continue;
-                    }
-                    // One background HEAD learns the facts for good.
-                    let _ = self.healer.queue(
-                        super::heal::Miss {
-                            scope: self.list_cache_scope.clone(),
-                            bucket: bucket.to_string(),
-                            stored_key: stored_key.clone(),
-                            etag: meta.md5.clone(),
-                            size: meta.stored_size(),
-                        },
-                        &self.facts_cleanup.writer(),
-                    );
                 }
             }
         }
         resolved
+    }
+
+    /// Resolve the delta entries of a LIST that no facts name (`sizes` is
+    /// `StoredOnly`), for a client that sends no HEAD of its own: a client
+    /// never sees the stored size of a delta. Each miss follows
+    /// [`decide_delta_miss`]: a HEAD now (the LIST waits for it, see
+    /// `heal.rs`), else a background HEAD. The HEAD gives the logical
+    /// size and ETag, and the facts are kept for the next LIST. A miss
+    /// that no HEAD answered lists its stored size once.
+    pub(super) async fn heal_listed_misses(
+        &self,
+        bucket: &str,
+        objects: &mut [(String, FileMetadata)],
+        sizes: &mut [ListedSize],
+    ) {
+        use super::heal::{decide_delta_miss, MissDecision};
+        let mut now: Vec<(usize, super::heal::Miss)> = Vec::new();
+        let mut background = Vec::new();
+        for (i, ((key, meta), size)) in objects.iter().zip(sizes.iter()).enumerate() {
+            if *size != ListedSize::StoredOnly {
+                continue;
+            }
+            let miss = super::heal::Miss {
+                scope: self.list_cache_scope.clone(),
+                bucket: bucket.to_string(),
+                stored_key: format!("{key}.delta"),
+                etag: meta.md5.clone(),
+                size: meta.stored_size(),
+            };
+            if list_size_cache::known_sealed(&miss.id()) {
+                continue;
+            }
+            match decide_delta_miss(self.healer.may_head_inline(&miss)) {
+                MissDecision::HeadNow => now.push((i, miss)),
+                MissDecision::Keep { heal: true } => background.push(miss),
+                MissDecision::Keep { heal: false } | MissDecision::Invert(_) => {}
+            }
+        }
+        let writer = self.facts_cleanup.writer();
+        if !now.is_empty() {
+            let (at, misses): (Vec<usize>, Vec<_>) = now.into_iter().unzip();
+            // The mark a HEAD takes when it writes the facts.
+            for miss in &misses {
+                list_size_cache::mark_missing_facts(&miss.id());
+            }
+            let learned = self.healer.head_inline(&misses, &writer).await;
+            for ((i, miss), meta) in at.into_iter().zip(misses).zip(learned) {
+                match meta.as_ref().and_then(LogicalFacts::of) {
+                    Some(facts) => {
+                        list_size_cache::apply(&mut objects[i].1, &facts);
+                        sizes[i] = ListedSize::Cached;
+                    }
+                    // No answer in time: the next LIST is right.
+                    None if meta.is_none() => background.push(miss),
+                    None => {}
+                }
+            }
+        }
+        for miss in background {
+            let _ = self.healer.queue(miss, &writer);
+        }
     }
 }
 

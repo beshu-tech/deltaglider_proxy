@@ -539,10 +539,10 @@ async fn cold_list_of_an_encrypted_backend_reports_plaintext_facts() {
     }
 }
 
-/// Review C3 + P1.6b: an object stored without listing facts (before they
-/// existed) lists with its stored size on the first LIST that finds the
-/// facts missing. That LIST queues one background HEAD, which writes the
-/// facts, and every node then lists the original size. No client HEAD.
+/// An object stored without listing facts (before they existed) lists its
+/// ORIGINAL size on the first LIST that finds the facts missing: that LIST
+/// HEADs the object, and its HEAD writes the facts, so every node then
+/// lists the original size from the facts, with no HEAD.
 #[tokio::test]
 async fn a_list_heals_missing_listing_facts() {
     skip_unless_minio!();
@@ -621,13 +621,17 @@ async fn a_list_heals_missing_listing_facts() {
         .build()
         .await;
     let (size, misses) = list_on(&node).await;
-    assert!(size < variant.len(), "no facts: stored size");
-    assert_eq!(misses, 1, "one entry without facts");
+    assert_eq!(
+        size,
+        variant.len(),
+        "the first LIST shows the original size"
+    );
+    assert_eq!(misses, 0, "no entry lists its stored size");
     assert!(
         scrape_counter(&node.endpoint(), "deltaglider_listing_facts_misses_total").await >= 1,
         "the miss is counted"
     );
-    // The LIST's background HEAD writes the facts.
+    // The LIST's HEAD keeps the facts.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while facts_keys(raw.clone(), prefix.clone()).await.is_empty() {
         assert!(std::time::Instant::now() < deadline, "facts not backfilled");
@@ -644,6 +648,103 @@ async fn a_list_heals_missing_listing_facts() {
         list_on(&other).await,
         (variant.len(), 0),
         "the facts are there"
+    );
+}
+
+/// Delete every listing-facts object under `prefix`: deltas as an older
+/// release stored them, before the facts existed.
+async fn drop_facts(raw: &aws_sdk_s3::Client, prefix: &str) {
+    for k in marker_keys(raw, MINIO_BUCKET, &format!("{prefix}/")).await {
+        raw.delete_object()
+            .bucket(MINIO_BUCKET)
+            .key(k)
+            .send()
+            .await
+            .unwrap();
+    }
+}
+
+/// Store `n` deltas under a fresh prefix through the proxy (the write
+/// path), then drop their facts. Returns the prefix and the original size
+/// of each key (every size is different).
+async fn deltas_without_facts(
+    writer: &TestServer,
+    n: usize,
+) -> (String, std::collections::BTreeMap<String, i64>) {
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+    let base = generate_binary(100_000, 33);
+    let mut sizes = std::collections::BTreeMap::new();
+    for i in 0..=n {
+        let body = if i == 0 {
+            base.clone()
+        } else {
+            mutate_binary(&base[..100_000 - i * 7], 0.01)
+        };
+        let name = format!("v{i:03}.zip");
+        let url = format!("{}/{}/{prefix}/{name}", writer.endpoint(), writer.bucket());
+        let resp = http.put(&url).body(body.clone()).send().await.unwrap();
+        assert!(resp.status().is_success());
+        sizes.insert(format!("{prefix}/{name}"), body.len() as i64);
+    }
+    let raw = minio_client().await;
+    wait_for_facts(&raw, &format!("{prefix}/"), n).await;
+    drop_facts(&raw, &prefix).await;
+    assert!(marker_keys(&raw, MINIO_BUCKET, &format!("{prefix}/"))
+        .await
+        .is_empty());
+    (prefix, sizes)
+}
+
+async fn listed_sizes(
+    server: &TestServer,
+    prefix: &str,
+) -> std::collections::BTreeMap<String, i64> {
+    let out = server
+        .s3_client()
+        .await
+        .list_objects_v2()
+        .bucket(server.bucket())
+        .prefix(format!("{prefix}/"))
+        .send()
+        .await
+        .unwrap();
+    out.contents()
+        .iter()
+        .map(|o| (o.key().unwrap().to_string(), o.size().unwrap()))
+        .collect()
+}
+
+async fn s3_proxy() -> TestServer {
+    TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await
+}
+
+/// A page with more deltas without facts than any small HEAD budget (the
+/// delta objects of an old bucket): the first LIST lists the original size
+/// of EVERY one, and the facts of all of them exist afterwards.
+#[tokio::test]
+async fn a_page_of_many_deltas_without_facts_lists_only_original_sizes() {
+    skip_unless_minio!();
+    const N: usize = 24;
+    let writer = s3_proxy().await;
+    let (prefix, sizes) = deltas_without_facts(&writer, N).await;
+    let node = s3_proxy().await;
+    assert_eq!(listed_sizes(&node, &prefix).await, sizes);
+    // Each delta was HEADed once, and each has its facts now.
+    wait_for_facts(&minio_client().await, &format!("{prefix}/"), N).await;
+    let other = s3_proxy().await;
+    let before = backend_heads(&other.endpoint()).await;
+    assert_eq!(listed_sizes(&other, &prefix).await, sizes);
+    assert_eq!(
+        backend_heads(&other.endpoint()).await,
+        before,
+        "the next node lists from the facts, with no HEAD"
     );
 }
 

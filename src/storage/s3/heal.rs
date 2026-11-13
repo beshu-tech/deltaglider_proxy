@@ -1,23 +1,33 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! The facts healer: a LIST that finds no durable listing facts for an
-//! entry (an object stored before the facts existed, or whose facts write
-//! failed) queues one background HEAD of that stored object. The HEAD
-//! learns the logical size and ETag, which go into the listing-size cache
+//! The facts healer: a LIST that finds no durable listing facts for a
+//! delta (an object stored before the facts existed, or whose facts write
+//! failed) HEADs that stored object ([`MissDecision::HeadNow`]). The HEAD
+//! learns the logical size and ETag. They go into the listing-size cache
 //! and, through the bounded facts drain, into a durable facts object. The
 //! object then lists its logical size on every node, for good.
 //!
-//! Off the client's path, and bounded: [`HEAL_CONCURRENCY`] HEADs in flight
+//! A client never sees the stored size of a delta, so the LIST waits for
+//! those HEADs ([`FactsHealer::head_inline`]): every miss of the page, at
+//! most [`INLINE_CONCURRENCY`] HEADs in flight per backend, and at most
+//! [`INLINE_BUDGET`] of waiting per page. A miss that the budget cuts off,
+//! or that a failing backend did not answer, lists its stored size once and
+//! is healed in the background ([`FactsHealer::queue`]), so the next LIST
+//! is right.
+//!
+//! The background path is bounded: [`HEAL_CONCURRENCY`] HEADs in flight
 //! per backend, [`MAX_PENDING`] queued, one HEAD per stored object (key,
 //! ETag, size) per [`TRIED_TTL`], none for an object that another HEAD
 //! learned meanwhile, nothing during a graceful shutdown, and
 //! nothing for [`PAUSE`] after a HEAD fails (a backend that fails requests
 //! is not sent more background work; its passive health signal comes from
-//! client requests).
+//! client requests). The encrypting wrapper's token healer shares
+//! [`decide_delta_miss`], [`admit`] and [`Skip`].
 
 use super::facts::{backfill_facts, remember_facts};
 use super::*;
 use crate::storage::facts_cleanup::FactsWriter;
+use futures::StreamExt;
 use moka::sync::Cache;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -25,6 +35,12 @@ use std::time::{Duration, Instant};
 
 /// Background HEADs in flight per backend.
 pub(super) const HEAL_CONCURRENCY: usize = 4;
+/// HEADs in flight per backend for the misses of a LIST (the bound of every
+/// HEAD sweep: see `S3Backend::bounded_head_calls`).
+pub(super) const INLINE_CONCURRENCY: usize = S3Backend::MAX_CONCURRENT_HEADS;
+/// How long one listing page waits for its HEADs. A page has at most 1000
+/// entries, so on a healthy backend it never runs out.
+pub(super) const INLINE_BUDGET: Duration = Duration::from_secs(15);
 /// Queued HEADs per backend; a miss past it waits for a later LIST.
 const MAX_PENDING: usize = 1024;
 /// How long one stored object is not HEADed again (a foreign object
@@ -62,9 +78,37 @@ pub(in crate::storage) fn admit(
     }
 }
 
+/// What a LIST does with one delta entry that has no listing facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage) enum MissDecision {
+    /// List this plaintext size (exact; the ETag stays the stored one
+    /// until a background HEAD keeps the token). Encrypted buckets only.
+    Invert(u64),
+    /// HEAD the stored object now.
+    HeadNow,
+    /// List the stored size. With `heal`, a background HEAD keeps the
+    /// facts for the next LIST.
+    Keep { heal: bool },
+}
+
+/// THE decision for a delta without listing facts, for a plain and for a
+/// sealed bucket. Pure. `may_head`: the page has HEAD budget left and this
+/// stored object was not tried a short time ago. A delta that gets no HEAD
+/// now is healed in the background.
+pub(in crate::storage) fn decide_delta_miss(may_head: bool) -> MissDecision {
+    if may_head {
+        MissDecision::HeadNow
+    } else {
+        MissDecision::Keep { heal: true }
+    }
+}
+
 struct State {
     client: Client,
     permits: tokio::sync::Semaphore,
+    /// HEADs in flight for the misses of a LIST (see [`INLINE_CONCURRENCY`]).
+    inline_permits: tokio::sync::Semaphore,
+    inline_budget: Duration,
     pending: Mutex<HashSet<String>>,
     tried: Cache<String, ()>,
     paused_until: Mutex<Option<Instant>>,
@@ -96,7 +140,7 @@ pub(super) struct Miss {
 }
 
 impl Miss {
-    fn id(&self) -> StoredObjectId<'_> {
+    pub(super) fn id(&self) -> StoredObjectId<'_> {
         StoredObjectId {
             scope: &self.scope,
             bucket: &self.bucket,
@@ -130,6 +174,8 @@ impl FactsHealer {
             state: Arc::new(State {
                 client,
                 permits: tokio::sync::Semaphore::new(HEAL_CONCURRENCY),
+                inline_permits: tokio::sync::Semaphore::new(INLINE_CONCURRENCY),
+                inline_budget: INLINE_BUDGET,
                 pending: Mutex::new(HashSet::new()),
                 tried: Cache::builder()
                     .max_capacity(100_000)
@@ -138,6 +184,70 @@ impl FactsHealer {
                 paused_until: Mutex::new(None),
             }),
         }
+    }
+
+    /// The same healer with another page budget (tests).
+    #[cfg(test)]
+    pub(super) fn with_inline_budget(client: Client, budget: Duration) -> Self {
+        let healer = Self::new(client);
+        let mut state = Arc::try_unwrap(healer.state).ok().expect("fresh healer");
+        state.inline_budget = budget;
+        Self {
+            state: Arc::new(state),
+        }
+    }
+
+    /// May a LIST HEAD `miss` now? Not during a shutdown, not while the
+    /// healer is paused after a failed HEAD, and not when a HEAD of this
+    /// exact stored object answered less than [`TRIED_TTL`] ago (a foreign
+    /// object without DG metadata never heals).
+    pub(super) fn may_head_inline(&self, miss: &Miss) -> bool {
+        !crate::shutdown::is_shutting_down()
+            && !self.state.paused()
+            && !self.state.tried.contains_key(&miss.dedup_key())
+    }
+
+    /// HEAD the stored objects of `misses` for the LIST that waits, at most
+    /// [`INLINE_CONCURRENCY`] at once and for at most the page budget. Per
+    /// miss: `Some(metadata)` when the HEAD learned the facts (they are
+    /// remembered and written, as the background heal does), else `None`:
+    /// nothing to learn, a failed HEAD (which pauses the healer), or no time
+    /// left. A miss that no HEAD answered is not marked tried, so a later
+    /// LIST or the background queue HEADs it.
+    pub(super) async fn head_inline(
+        &self,
+        misses: &[Miss],
+        facts: &FactsWriter,
+    ) -> Vec<Option<FileMetadata>> {
+        let mut learned: Vec<Option<FileMetadata>> = vec![None; misses.len()];
+        let state = &self.state;
+        let mut heads: futures::stream::FuturesUnordered<_> = misses
+            .iter()
+            .enumerate()
+            .map(|(i, miss)| async move {
+                let _permit = state.inline_permits.acquire().await.ok()?;
+                if crate::shutdown::is_shutting_down() || state.paused() {
+                    return None;
+                }
+                Some((i, head_miss(state, miss).await))
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + state.inline_budget;
+        while let Ok(Some(done)) = tokio::time::timeout_at(deadline, heads.next()).await {
+            let Some((i, head)) = done else { continue };
+            match head {
+                Head::Failed => state.pause(),
+                Head::Nothing => {
+                    state.tried.insert(misses[i].dedup_key(), ());
+                }
+                Head::Learned(meta) => {
+                    state.tried.insert(misses[i].dedup_key(), ());
+                    learn(&misses[i], &meta, facts);
+                    learned[i] = Some(meta);
+                }
+            }
+        }
+        learned
     }
 
     /// Queue a background HEAD for `miss`, unless [`admit`] refuses it.
@@ -186,9 +296,19 @@ impl FactsHealer {
     }
 }
 
-/// HEAD the stored object; when it still is the listed one and carries DG
-/// metadata, remember and write its facts.
-async fn heal_one(state: &State, miss: &Miss, facts: &FactsWriter) {
+/// What a HEAD of a missed stored object answered.
+enum Head {
+    /// The listed object, with DG metadata.
+    Learned(FileMetadata),
+    /// Nothing to learn: deleted or overwritten since the LIST, or a
+    /// foreign object without DG metadata.
+    Nothing,
+    /// The backend failed the HEAD.
+    Failed,
+}
+
+/// HEAD the stored object of `miss`.
+async fn head_miss(state: &State, miss: &Miss) -> Head {
     BACKEND_HEAD_REQUESTS.inc();
     let response = match state
         .client
@@ -206,7 +326,7 @@ async fn heal_one(state: &State, miss: &Miss, facts: &FactsWriter) {
                 aws_sdk_s3::operation::head_object::HeadObjectError::NotFound(_)
             ) =>
         {
-            return;
+            return Head::Nothing;
         }
         Err(e) => {
             let err = S3Backend::classify_s3_error(&miss.bucket, &e, S3Op::HeadObject);
@@ -214,32 +334,47 @@ async fn heal_one(state: &State, miss: &Miss, facts: &FactsWriter) {
                 "facts healer: HEAD {}/{} failed, pausing: {err}",
                 miss.bucket, miss.stored_key
             );
-            state.pause();
-            return;
+            return Head::Failed;
         }
     };
     // Overwritten since the LIST: the new object has its own facts.
     let same = response.e_tag().map(|e| e.trim_matches('"')) == Some(miss.etag.trim_matches('"'))
         && response.content_length() == Some(miss.size as i64);
     if !same {
-        return;
+        return Head::Nothing;
     }
     let Some(user) = response.metadata().filter(|m| !m.is_empty()) else {
-        return; // a foreign object: nothing to learn
+        return Head::Nothing; // a foreign object: nothing to learn
     };
     let created_at = response
         .last_modified()
         .and_then(|t| DateTime::parse_from_rfc3339(&t.to_string()).ok())
         .map(|t| t.with_timezone(&Utc))
         .unwrap_or_else(Utc::now);
-    let Ok(meta) = S3Backend::headers_to_metadata(user, created_at) else {
-        return;
-    };
+    match S3Backend::headers_to_metadata(user, created_at) {
+        Ok(meta) => Head::Learned(meta),
+        Err(_) => Head::Nothing,
+    }
+}
+
+/// Remember the facts that a HEAD of `miss` learned and hand them to the
+/// bounded facts drain.
+fn learn(miss: &Miss, meta: &FileMetadata, facts: &FactsWriter) {
     let id = miss.id();
-    remember_facts(&id, &meta);
-    backfill_facts(&id, &meta, |facts_key| {
+    remember_facts(&id, meta);
+    backfill_facts(&id, meta, |facts_key| {
         facts.write(&miss.bucket, &miss.stored_key, facts_key)
     });
+}
+
+/// HEAD the stored object; when it still is the listed one and carries DG
+/// metadata, remember and write its facts.
+async fn heal_one(state: &State, miss: &Miss, facts: &FactsWriter) {
+    match head_miss(state, miss).await {
+        Head::Learned(meta) => learn(miss, &meta, facts),
+        Head::Nothing => {}
+        Head::Failed => state.pause(),
+    }
 }
 
 #[cfg(test)]
@@ -384,36 +519,131 @@ mod tests {
         assert_eq!(per_list[1..], [0, 0], "facts LISTs per client LIST");
     }
 
-    /// A LIST that misses the facts of a delta queues one background HEAD
-    /// of it; the HEAD writes the durable facts, so another node lists the
-    /// logical size from one facts LIST and no HEAD.
+    /// A client LIST never shows a stored delta size: the first LIST of a
+    /// delta without durable facts HEADs it on the LIST's path, lists the
+    /// logical size and ETag, and keeps the facts for the next LIST.
     #[tokio::test]
-    async fn a_missed_entry_heals_for_good() {
+    async fn the_first_list_of_a_delta_without_facts_shows_its_logical_size() {
         let (engine, fake, endpoint) = deltas_without_facts("rel", 5).await;
         fake.clear();
         let page = list(&engine, "rel/").await;
-        assert!(page.objects.iter().all(|(_, m)| m.file_size < 65_536));
-        assert!(
-            wait_count(&fake, 5, delta_heads).await,
-            "{:?}",
-            fake.requests()
-        );
-        assert!(wait_stored(&fake, 5, "b/.dg/facts/").await);
+        assert_eq!(page.objects.len(), 5);
+        for (key, meta) in &page.objects {
+            assert_eq!(meta.file_size, 65_536, "{key}");
+            let head = engine.head("b", key).await.unwrap();
+            assert_eq!(meta.etag(), head.etag(), "{key} etag");
+        }
+        assert!(page.facts_missing_keys.is_empty(), "{page:?}");
+        assert!(wait_stored(&fake, 5, "b/.dg/facts/").await, "facts kept");
         // This node: from its process cache, no request but the LIST.
         fake.clear();
         let page = list(&engine, "rel/").await;
         assert!(page.objects.iter().all(|(_, m)| m.file_size == 65_536));
         assert_eq!(facts_lists(&fake), 0);
-        // Another node: from the durable facts.
+        assert_eq!(fake.requests().iter().filter(|r| delta_heads(r)).count(), 0);
+        // Another node lists them from the facts, with no HEAD.
         let other = reader(&endpoint, "third-node");
         fake.clear();
         let page = list(&other, "rel/").await;
         assert!(page.objects.iter().all(|(_, m)| m.file_size == 65_536));
-        assert!(page.facts_missing_keys.is_empty());
         assert_eq!(fake.requests().iter().filter(|r| delta_heads(r)).count(), 0);
     }
 
-    /// The background HEADs run at most HEAL_CONCURRENCY at once, one per
+    /// More misses than one page of HEAD workers: every one is resolved
+    /// before the page answers, each HEADed once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_page_with_many_misses_shows_no_stored_size() {
+        const N: usize = 40;
+        let (engine, fake, _) = deltas_without_facts("rel", N).await;
+        fake.clear();
+        let page = list(&engine, "rel/").await;
+        assert_eq!(page.objects.len(), N);
+        assert!(
+            page.objects.iter().all(|(_, m)| m.file_size == 65_536),
+            "{:?}",
+            page.objects
+                .iter()
+                .map(|(_, m)| m.file_size)
+                .collect::<Vec<_>>()
+        );
+        assert!(page.facts_missing_keys.is_empty());
+        assert!(fake.peak_in_flight("HEAD") <= S3Backend::MAX_CONCURRENT_HEADS);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let heads = fake.requests().iter().filter(|r| delta_heads(r)).count();
+        assert_eq!(heads, N, "one HEAD per stored object");
+    }
+
+    /// A page whose HEADs do not finish in the page budget answers on time
+    /// with the stored size of the unfinished entries, and heals them in
+    /// the background: the next LIST is right.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_page_past_its_budget_answers_and_heals_in_the_background() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        fake.fail("PUT", "/.dg/facts/", 500, "InternalError", u32::MAX);
+        let writer = engine_on(test_support::for_test_endpoint(&endpoint));
+        writer.create_bucket("b").await.unwrap();
+        crate::deltaglider::store_deltas(&writer, "rel", 6).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while fake.faulted("PUT", "/.dg/facts/") < 6 {
+            assert!(tokio::time::Instant::now() < deadline, "facts PUTs failed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        fake.clear_faults();
+        let mut slow = test_support::for_test_endpoint(&endpoint);
+        slow.list_cache_scope = test_support::test_scope(&endpoint, "slow-node");
+        slow.healer = FactsHealer::with_inline_budget(
+            slow.client.clone(),
+            std::time::Duration::from_millis(100),
+        );
+        let engine = engine_on(slow);
+        fake.set_delay_ms("HEAD", 400);
+        let started = std::time::Instant::now();
+        let page = list(&engine, "rel/").await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the page waited for every HEAD"
+        );
+        assert_eq!(page.objects.len(), 6);
+        assert!(page.objects.iter().all(|(_, m)| m.file_size < 65_536));
+        fake.set_delay_ms("HEAD", 0);
+        let healed = async {
+            loop {
+                let page = list(&engine, "rel/").await;
+                if page.objects.iter().all(|(_, m)| m.file_size == 65_536) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), healed)
+            .await
+            .expect("the background heal finished the page");
+    }
+
+    /// A backend that throttles the HEADs of a LIST does not fail the LIST:
+    /// the entries list their stored size, the healer pauses, and a later
+    /// LIST is right.
+    #[tokio::test]
+    async fn a_throttled_head_does_not_fail_the_list() {
+        let (_, fake, endpoint) = deltas_without_facts("rel", 3).await;
+        let mut s3 = test_support::for_test_endpoint(&endpoint);
+        s3.list_cache_scope = test_support::test_scope(&endpoint, "throttled-node");
+        let healer = s3.healer.clone();
+        let engine = engine_on(s3);
+        fake.fail("HEAD", ".delta", 503, "SlowDown", u32::MAX);
+        let page = list(&engine, "rel/").await;
+        assert_eq!(page.objects.len(), 3);
+        assert!(page.objects.iter().all(|(_, m)| m.file_size < 65_536));
+        assert!(healer.state.paused(), "a failed HEAD pauses the healer");
+        // The backend recovers and the pause ends: the same page is right,
+        // so the failed HEADs were not marked tried.
+        fake.clear_faults();
+        *healer.state.paused_until.lock().unwrap() = None;
+        let page = list(&engine, "rel/").await;
+        assert!(page.objects.iter().all(|(_, m)| m.file_size == 65_536));
+    }
+
+    /// The HEADs of a LIST run at most INLINE_CONCURRENCY at once, one per
     /// stored object.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn healing_is_bounded_and_heads_each_object_once() {
@@ -426,7 +656,7 @@ mod tests {
             "{:#?}",
             fake.requests()
         );
-        assert!(fake.peak_in_flight("HEAD") <= HEAL_CONCURRENCY);
+        assert!(fake.peak_in_flight("HEAD") <= INLINE_CONCURRENCY);
         list(&engine, "rel/").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let heads = fake.requests().iter().filter(|r| delta_heads(r)).count();
@@ -792,6 +1022,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(!fake.requests().iter().any(|r| r.contains("h.delta")));
+    }
+
+    /// THE decision of both healers for a delta without facts: a HEAD while
+    /// it may, else the stored size and a background heal; never "no heal".
+    #[test]
+    fn decide_delta_miss_truth_table() {
+        assert_eq!(decide_delta_miss(true), MissDecision::HeadNow);
+        assert_eq!(decide_delta_miss(false), MissDecision::Keep { heal: true });
     }
 
     #[test]

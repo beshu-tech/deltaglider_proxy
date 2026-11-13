@@ -5,6 +5,12 @@
 //! writes the proxy serves via `FileMetadata::fallback()` (empty
 //! `dg-file-sha256`).
 //!
+//! The walk also writes the missing LISTING FACTS of delta objects (an
+//! object stored before the facts existed): each page is completed as a
+//! client LIST completes it, which HEADs a delta without facts and keeps
+//! them (`paged::list_job_keys_healing_facts`). No object is rewritten for
+//! that; a delta counts as skipped, as before.
+//!
 //! The bytes are read ONCE, only to compute the content hashes (the one
 //! part of the canonical set that cannot be derived without them), then the
 //! metadata is written IN PLACE: the S3 backend does a server-side
@@ -235,6 +241,10 @@ impl Backfill<'_> {
 }
 
 impl super::worker::ObjectVisitor for Backfill<'_> {
+    // The walk's pages also write the missing listing facts of their deltas
+    // (an object stored before the facts existed), so one run heals a bucket.
+    const HEALS_LISTING_FACTS: bool = true;
+
     async fn visit(
         &self,
         engine: &std::sync::Arc<crate::deltaglider::DynEngine>,

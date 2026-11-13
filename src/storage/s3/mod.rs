@@ -1776,11 +1776,16 @@ impl StorageBackend for S3Backend {
             .collect();
         if !candidates.is_empty() {
             for i in self
-                .apply_durable_listing_facts(bucket, objects, &candidates, !how.caller_heads_misses)
+                .apply_durable_listing_facts(bucket, objects, &candidates)
                 .await
             {
                 sizes[i] = ListedSize::Cached;
             }
+        }
+        // A caller that HEADs its own misses learns their facts there; a
+        // client LIST never shows a stored delta size.
+        if !how.caller_heads_misses {
+            self.heal_listed_misses(bucket, objects, &mut sizes).await;
         }
         sizes
     }
