@@ -211,7 +211,7 @@ storage:
     )
     .expect("write config");
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
+    let mut child = common::proxy_binary()
         .current_dir(dir.path())
         .env("DGP_CONFIG", &config_path)
         .env("DGP_BOOT_BACKEND_PROBE", "enforce")

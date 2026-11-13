@@ -132,6 +132,57 @@ pub struct TestServer {
     test_name: Option<String>,
 }
 
+/// THE command for the proxy binary in a test: every test that runs the
+/// binary builds its command here (source guard
+/// `integration_test_spawns_end_with_their_parent`). A child of this command
+/// ends with the thread that spawned it, so a killed or crashed `cargo test`
+/// leaves no proxy behind (one such proxy ran for 31 hours and held a host
+/// build slot).
+pub fn proxy_binary() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
+    end_with_parent(&mut cmd);
+    cmd
+}
+
+/// Linux: the kernel sends the child a signal when the thread that spawned
+/// it ends (`PR_SET_PDEATHSIG`; the test thread or runtime worker lives as
+/// long as its test, and `TestServer` drops inside it). The signal is
+/// SIGKILL, and SIGTERM under coverage, where the proxy must exit in a
+/// normal way to write its profile. Other systems have no such call: there a
+/// child still ends through [`TestServer`]'s `Drop`, but not when the test
+/// process is killed.
+#[cfg(target_os = "linux")]
+fn end_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let signal = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        libc::SIGTERM
+    } else {
+        libc::SIGKILL
+    };
+    // SAFETY: getpid has no preconditions.
+    let parent = unsafe { libc::getpid() };
+    // SAFETY: the closure runs between fork and exec and calls only
+    // async-signal-safe functions (prctl, getppid, raise).
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, signal as libc::c_ulong) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent can end between fork and prctl: the signal is then
+            // never sent, so the child checks it here. The check covers the
+            // parent process (its id), not the spawning thread: a thread that
+            // ends in this gap, in a process that goes on, is not seen.
+            if libc::getppid() != parent {
+                libc::raise(signal);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn end_with_parent(_cmd: &mut Command) {}
+
 /// The proxy child command every spawn path shares (first spawn and both
 /// respawns), so the harness env is defined once.
 ///
@@ -146,7 +197,7 @@ pub struct TestServer {
 ///
 /// `production_security` leaves both at their production defaults.
 fn proxy_command(config_path: &std::path::Path, production_security: bool) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
+    let mut cmd = proxy_binary();
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("DGP_") {
             cmd.env_remove(key);
@@ -185,6 +236,11 @@ impl TestServer {
     /// Returns a builder for configuring and spawning a test server.
     pub fn builder() -> TestServerBuilder {
         TestServerBuilder::default()
+    }
+
+    /// The process id of the proxy child.
+    pub fn pid(&self) -> u32 {
+        self.process.id()
     }
 
     // ── Convenience factory methods (delegate to builder) ──
