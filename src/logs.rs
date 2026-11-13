@@ -376,10 +376,11 @@ mod tests {
         };
         let subscriber = tracing_subscriber::registry().with(layer);
         let target_marker = "logs_layer_test";
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = crate::test_log_capture::install(subscriber);
             tracing::debug!(target: "logs_layer_test", "dropped-debug");
             tracing::info!(target: "logs_layer_test", bucket_key = "1.2.3.4", "kept-info");
-        });
+        }
         let mine: Vec<_> = recent_logs(500)
             .into_iter()
             .filter(|e| e.target == target_marker)

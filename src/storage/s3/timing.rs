@@ -669,29 +669,21 @@ mod tests {
     #[test]
     fn the_body_of_a_request_raises_the_threshold_of_its_logged_line() {
         let logged = |body_bytes: u64, total: Duration| -> String {
-            let captured = Captured::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(captured.clone())
-                .with_ansi(false)
-                .with_max_level(tracing::Level::WARN)
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
-                Report {
-                    backend: "timing-wiring",
-                    operation: "PutObject",
-                    bucket: "releases",
-                    uri: "/releases/v1/app.zip",
-                    body_bytes,
-                    total,
-                    before_first_send: Some(Duration::ZERO),
-                    statuses: &[Some(200)],
-                    attempt_details: "6.0s ok".to_string(),
-                    end: End::Ok,
-                }
-                .record(Some(Duration::from_secs(5)));
-            });
-            let bytes = captured.0.lock().clone();
-            String::from_utf8(bytes).unwrap()
+            let captured = warn_capture();
+            Report {
+                backend: "timing-wiring",
+                operation: "PutObject",
+                bucket: "releases",
+                uri: "/releases/v1/app.zip",
+                body_bytes,
+                total,
+                before_first_send: Some(Duration::ZERO),
+                statuses: &[Some(200)],
+                attempt_details: "6.0s ok".to_string(),
+                end: End::Ok,
+            }
+            .record(Some(Duration::from_secs(5)));
+            captured.text()
         };
         let mib10 = 10u64 << 20;
         let six = Duration::from_secs(6);
@@ -829,38 +821,22 @@ mod tests {
         );
     }
 
-    /// A `fmt` subscriber that writes into a buffer.
-    #[derive(Clone, Default)]
-    struct Captured(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = Captured;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
+    /// The WARN lines this thread logs, as text.
+    fn warn_capture() -> crate::test_log_capture::LogCapture {
+        crate::test_log_capture::capture_with(|sink| {
+            tracing_subscriber::fmt()
+                .with_writer(sink)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish()
+        })
     }
 
     /// An operation over the threshold logs one WARN line that says where
     /// the time went; a fast one logs nothing.
     #[tokio::test(flavor = "current_thread")]
     async fn a_slow_request_logs_one_line_that_explains_it() {
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let captured = warn_capture();
 
         let (endpoint, fake) = fake_s3::start().await;
         let config = s3_config(&endpoint);
@@ -893,7 +869,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        let text = String::from_utf8(captured.0.lock().clone()).unwrap();
+        let text = captured.text();
         let lines: Vec<&str> = text
             .lines()
             .filter(|l| l.contains("slow backend request"))

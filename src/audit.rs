@@ -319,51 +319,20 @@ mod audit_filter_tests {
 
 #[cfg(test)]
 mod pinned_directive_tests {
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone, Default)]
-    struct Sink(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Sink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
-        type Writer = Sink;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     /// E10/F36: the s3s modules that log the request or the expected
     /// signature at DEBUG stay at INFO under any operator level, `trace`
     /// included. `s3s::ops::signature` logs `expected=` (the valid
     /// signature of the request) when s3s's own check disagrees with ours.
     #[test]
     fn s3s_request_and_signature_logs_stay_at_info_under_trace() {
-        let sink = Sink::default();
-        let filter: tracing_subscriber::EnvFilter =
-            super::with_pinned_directives("trace").parse().unwrap();
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .with_writer(sink.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
+        let capture = crate::test_log_capture::capture(&super::with_pinned_directives("trace"));
         tracing::debug!(target: "s3s::service", "service-debug SECRET1");
         tracing::debug!(target: "s3s::ops", "ops-debug SECRET2");
         tracing::debug!(target: "s3s::ops::signature", "signature-debug SECRET3");
         tracing::trace!(target: "s3s::ops::signature", "signature-trace SECRET4");
         tracing::debug!(target: "other_crate", "other-debug");
         tracing::info!(target: "s3s::ops::signature", "signature-info");
-        let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let logged = capture.text();
         for hidden in ["SECRET1", "SECRET2", "SECRET3", "SECRET4"] {
             assert!(
                 !logged.contains(hidden),
