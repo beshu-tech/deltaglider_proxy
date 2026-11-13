@@ -154,8 +154,180 @@ impl ProbeResult {
         super::if_match::ConditionalProfile {
             if_match: self.if_match,
             conditional_delete: self.conditional_delete,
+            // Not part of this probe: see [`probe_conditional_complete`].
+            conditional_complete: None,
         }
     }
+}
+
+/// Pure: does CompleteMultipartUpload enforce a condition? `create` is the
+/// answer to a Complete with `If-None-Match: *` over an existing key,
+/// `wrong` the one with an `If-Match` of another ETag (both must be 412 and
+/// leave the old object), `right` the one with the current ETag (it must
+/// write: a backend that refuses every condition proves nothing, and a
+/// dialect that does not fit the backend shows here). `Some(true)`: proven.
+/// `Some(false)`: a condition is ignored or refused. `None`: the probe
+/// could not tell (no answer, an unclear one): never a proof, so the write
+/// with a condition of a large object stays refused.
+pub fn classify_conditional_complete(
+    create: &StepOutcome,
+    wrong: &StepOutcome,
+    right: &StepOutcome,
+) -> Option<bool> {
+    use StepOutcome::*;
+    for outcome in [create, wrong] {
+        match outcome {
+            PreconditionFailed => {}
+            Written | NotImplemented => return Some(false),
+            Dropped(_) | Other(_) => return None,
+        }
+    }
+    match right {
+        Written => Some(true),
+        PreconditionFailed | NotImplemented => Some(false),
+        Dropped(_) | Other(_) => None,
+    }
+}
+
+/// One tiny upload (one part of 3 bytes) of `key`, completed with the
+/// condition that `condition` sets. The upload is aborted when the Complete
+/// did not write it, so the backend keeps no open upload.
+async fn complete_with<F>(client: &Client, bucket: &str, key: &str, condition: F) -> StepOutcome
+where
+    F: FnOnce(
+        aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
+    ) -> aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
+{
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+    let created = match client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return StepOutcome::Other(format!("CreateMultipartUpload: {e:?}")),
+    };
+    let Some(upload_id) = created.upload_id().map(str::to_string) else {
+        return StepOutcome::Other("CreateMultipartUpload returned no upload id".into());
+    };
+    // Armed until the Complete wrote the object: every other way out, a
+    // cut included, aborts the upload (no open upload stays on the backend).
+    let guard = {
+        let (client, bucket, key, upload_id) = (
+            client.clone(),
+            bucket.to_string(),
+            key.to_string(),
+            upload_id.clone(),
+        );
+        crate::storage::mpu_guard::MpuAbortGuard::new(move || {
+            let (client, bucket, key, upload_id) = (
+                client.clone(),
+                bucket.clone(),
+                key.clone(),
+                upload_id.clone(),
+            );
+            async move {
+                let _ = client
+                    .abort_multipart_upload()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await;
+            }
+        })
+    };
+    let part = match client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"new"))
+        .send()
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            guard.abort().await;
+            return StepOutcome::Other(format!("UploadPart: {e:?}"));
+        }
+    };
+    let request = client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .set_e_tag(part.e_tag().map(str::to_string))
+                        .build(),
+                )
+                .build(),
+        );
+    let result = condition(request).send().await;
+    let step = outcome(&result);
+    if step == StepOutcome::Written {
+        guard.disarm();
+    } else {
+        guard.abort().await;
+    }
+    step
+}
+
+/// Probe whether CompleteMultipartUpload enforces `If-None-Match` and
+/// `If-Match` on `bucket/key` (a key of its own: the probe writes it and
+/// removes it with every version). Three tiny uploads, each of one part:
+/// a Complete with `If-None-Match: *` over the existing key and one with a
+/// wrong `If-Match` (both must get 412 and leave the old object, and no
+/// upload stays open), then one with the current ETag (must write). Run it
+/// after [`probe_cas`] proved the conditional PUT, with its `dialect`.
+/// The verdict is [`classify_conditional_complete`].
+pub async fn probe_conditional_complete(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    dialect: IfMatchDialect,
+) -> Option<bool> {
+    let seed = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"old"))
+        .send()
+        .await
+        .ok()?;
+    let etag = seed.e_tag().unwrap_or_default().to_string();
+    let verdict = async {
+        let create = complete_with(client, bucket, key, |r| r.if_none_match("*")).await;
+        // The old object must be intact after each refusal.
+        if create == StepOutcome::PreconditionFailed
+            && !key_holds(client, bucket, key, b"old").await
+        {
+            return Some(false);
+        }
+        let wrong = complete_with(client, bucket, key, |r| {
+            r.if_match_etag(WRONG_ETAG, dialect)
+        })
+        .await;
+        if wrong == StepOutcome::PreconditionFailed && !key_holds(client, bucket, key, b"old").await
+        {
+            return Some(false);
+        }
+        if etag.is_empty() {
+            return None;
+        }
+        let right = complete_with(client, bucket, key, |r| r.if_match_etag(&etag, dialect)).await;
+        classify_conditional_complete(&create, &wrong, &right)
+    }
+    .await;
+    remove_all_versions(client, bucket, key).await;
+    verdict
 }
 
 /// What a probe that gave no verdict says about the bucket.
@@ -493,6 +665,55 @@ pub async fn probe_cas(
         conditional_delete: classify_conditional_delete(&delete_wrong),
         if_match,
     })
+}
+
+#[cfg(test)]
+mod conditional_complete_tests {
+    use super::StepOutcome::*;
+    use super::*;
+
+    /// The verdict over the three Completes of the probe: proven only when
+    /// both conditions are refused (412) AND the right one writes. A
+    /// condition that is ignored or refused is a definite `false`; an
+    /// answer that is unclear is no verdict (`None`), never a proof.
+    #[test]
+    fn the_conditional_complete_verdict_truth_table() {
+        let d = || Dropped("reset".into());
+        let o = || Other("500".into());
+        let table: &[(StepOutcome, StepOutcome, StepOutcome, Option<bool>)] = &[
+            (PreconditionFailed, PreconditionFailed, Written, Some(true)),
+            // A condition that the backend ignores.
+            (Written, PreconditionFailed, Written, Some(false)),
+            (PreconditionFailed, Written, Written, Some(false)),
+            (NotImplemented, PreconditionFailed, Written, Some(false)),
+            (PreconditionFailed, NotImplemented, Written, Some(false)),
+            // Refuses the correct condition too (or a wrong dialect).
+            (
+                PreconditionFailed,
+                PreconditionFailed,
+                PreconditionFailed,
+                Some(false),
+            ),
+            (
+                PreconditionFailed,
+                PreconditionFailed,
+                NotImplemented,
+                Some(false),
+            ),
+            // No clear answer.
+            (d(), PreconditionFailed, Written, None),
+            (PreconditionFailed, o(), Written, None),
+            (PreconditionFailed, PreconditionFailed, d(), None),
+            (PreconditionFailed, PreconditionFailed, o(), None),
+        ];
+        for (create, wrong, right, want) in table {
+            assert_eq!(
+                classify_conditional_complete(create, wrong, right),
+                *want,
+                "{create:?} {wrong:?} {right:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

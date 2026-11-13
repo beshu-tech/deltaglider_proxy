@@ -318,6 +318,210 @@ async fn a_lost_backend_complete_answer_is_a_success_not_a_second_upload() {
     assert!(open_backend_uploads(server.bucket(), &key).await.is_empty());
 }
 
+/// The proxy's S3 backend on MinIO with a single-PUT limit of 5 MiB (the
+/// library method `with_put_limits` instead of the process-wide seam).
+async fn minio_backend() -> deltaglider_proxy::storage::S3Backend {
+    let cfg: deltaglider_proxy::config::BackendConfig = serde_yaml::from_str(&format!(
+        "type: s3\nendpoint: \"{}\"\nregion: us-east-1\nforce_path_style: true\n\
+         access_key_id: {}\nsecret_access_key: {}\nallow_local: true\n",
+        common::minio_endpoint_url(),
+        common::MINIO_ACCESS_KEY,
+        common::MINIO_SECRET_KEY
+    ))
+    .unwrap();
+    deltaglider_proxy::storage::S3Backend::new(
+        &cfg,
+        deltaglider_proxy::storage::NativeEncryptionConfig::None,
+    )
+    .await
+    .unwrap()
+    .with_put_limits(5 * MIB as u64, 5 * MIB as u64)
+}
+
+/// The probe that boot and "Check again" run: MinIO enforces `If-None-Match`
+/// and `If-Match` on CompleteMultipartUpload, and the probe leaves no open
+/// upload and no key.
+#[tokio::test]
+async fn the_probe_proves_the_conditional_complete_on_minio() {
+    skip_unless_minio!();
+    let raw = common::minio_client().await;
+    let key = format!("{}/probe", common::unique_bucket("mpu-probe"));
+    let verdict = deltaglider_proxy::coordination::cas_probe::probe_conditional_complete(
+        &raw,
+        common::MINIO_BUCKET,
+        &key,
+        deltaglider_proxy::coordination::if_match::IfMatchDialect::Quoted,
+    )
+    .await;
+    assert_eq!(verdict, Some(true));
+    assert!(open_backend_uploads(common::MINIO_BUCKET, &key)
+        .await
+        .is_empty());
+    assert!(raw
+        .head_object()
+        .bucket(common::MINIO_BUCKET)
+        .key(&key)
+        .send()
+        .await
+        .is_err());
+}
+
+/// A baseline of more than the single-PUT limit, written with a condition
+/// on a backend that the probe proved: the multipart Complete carries the
+/// condition. Over an existing key, `Absent` (`If-None-Match: *`) and a
+/// wrong `If-Match` both lose (a retryable refusal), the old bytes stay and
+/// no backend upload stays open. The same write with the right ETag lands.
+#[tokio::test]
+async fn a_conditional_multipart_complete_never_overwrites() {
+    use deltaglider_proxy::deltaglider::spool::{SpoolBudget, SpoolDir};
+    use deltaglider_proxy::storage::{
+        RefFence, RefWrite, StorageBackend, StorageBackendExt, StorageError,
+    };
+    skip_unless_minio!();
+    let s3 = minio_backend().await.with_conditional_profile(
+        deltaglider_proxy::coordination::if_match::ConditionalProfile {
+            conditional_complete: Some(true),
+            ..Default::default()
+        },
+    );
+    let ds = format!("fence/{}", common::unique_bucket("mpu-fence"));
+    let meta = |len: u64| {
+        deltaglider_proxy::types::FileMetadata::new_reference(
+            "reference.bin".into(),
+            "a.zip".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            len,
+            None,
+        )
+    };
+    let proof = deltaglider_proxy::deltaglider::RefWriteProof::unguarded();
+    let old = bytes::Bytes::from_static(b"OLD");
+    let seeded = s3
+        .write_reference_fenced(
+            common::MINIO_BUCKET,
+            &ds,
+            RefWrite::Put {
+                data: &old,
+                metadata: &meta(3),
+            },
+            &RefFence::Absent,
+            proof,
+        )
+        .await
+        .unwrap();
+    let RefFence::ETag(etag) = seeded else {
+        panic!("{seeded:?}")
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let big = common::big_passthrough_body(7 * MIB);
+    let path = dir.path().join("big.bin");
+    std::fs::write(&path, &big).unwrap();
+    let spool_dir = SpoolDir::new(dir.path().join("spool"), 64 << 20).unwrap();
+    let write = |fence: RefFence| {
+        let (s3, path, spool_dir, meta) = (&s3, &path, &spool_dir, meta(big.len() as u64));
+        let ds = ds.clone();
+        async move {
+            s3.write_reference_fenced(
+                common::MINIO_BUCKET,
+                &ds,
+                RefWrite::PutFile {
+                    path,
+                    metadata: &meta,
+                    spool: SpoolBudget::new(spool_dir, None, None),
+                },
+                &fence,
+                proof,
+            )
+            .await
+        }
+    };
+    let key = format!("{ds}/reference.bin");
+    for fence in [
+        RefFence::Absent,
+        RefFence::ETag("\"00000000000000000000000000000000\"".into()),
+    ] {
+        let err = write(fence.clone()).await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::Throttled(_)),
+            "{fence:?}: a refused condition is a retryable refusal, got {err:?}"
+        );
+        assert_eq!(
+            s3.get_reference(common::MINIO_BUCKET, &ds).await.unwrap(),
+            b"OLD",
+            "{fence:?}: the old bytes stay"
+        );
+        assert!(
+            open_backend_uploads(common::MINIO_BUCKET, &key)
+                .await
+                .is_empty(),
+            "{fence:?}: no open upload"
+        );
+    }
+    // The right ETag writes.
+    let landed = write(RefFence::ETag(etag)).await.unwrap();
+    assert!(matches!(landed, RefFence::ETag(_)), "{landed:?}");
+    assert_eq!(
+        s3.get_reference(common::MINIO_BUCKET, &ds).await.unwrap(),
+        big
+    );
+    s3.write_reference_fenced(
+        common::MINIO_BUCKET,
+        &ds,
+        RefWrite::Delete,
+        &RefFence::Unfenced,
+        proof,
+    )
+    .await
+    .unwrap();
+}
+
+/// Without that proof the same write sends nothing: a true refusal that
+/// names the gap, and the old bytes stay.
+#[tokio::test]
+async fn an_unproven_backend_refuses_a_conditional_multipart_write() {
+    use deltaglider_proxy::deltaglider::spool::{SpoolBudget, SpoolDir};
+    use deltaglider_proxy::storage::{RefFence, RefWrite, StorageBackend, StorageError};
+    skip_unless_minio!();
+    let s3 = minio_backend().await;
+    let ds = format!("fence/{}", common::unique_bucket("mpu-unproven"));
+    let meta = deltaglider_proxy::types::FileMetadata::new_reference(
+        "reference.bin".into(),
+        "a.zip".into(),
+        "0".repeat(64),
+        "0".repeat(32),
+        (7 * MIB) as u64,
+        None,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.bin");
+    std::fs::write(&path, common::big_passthrough_body(7 * MIB)).unwrap();
+    let spool_dir = SpoolDir::new(dir.path().join("spool"), 64 << 20).unwrap();
+    let err = s3
+        .write_reference_fenced(
+            common::MINIO_BUCKET,
+            &ds,
+            RefWrite::PutFile {
+                path: &path,
+                metadata: &meta,
+                spool: SpoolBudget::new(&spool_dir, None, None),
+            },
+            &RefFence::Absent,
+            deltaglider_proxy::deltaglider::RefWriteProof::unguarded(),
+        )
+        .await
+        .unwrap_err();
+    let StorageError::ConditionalMultipartRefused(why) = err else {
+        panic!("{err:?}")
+    };
+    assert!(
+        why.contains("5 GiB") && why.contains("CompleteMultipartUpload"),
+        "{why}"
+    );
+    assert!(!s3.has_reference(common::MINIO_BUCKET, &ds).await.unwrap());
+}
+
 /// A client with a short read timeout (the AWS CLI waits 60 s) completes an
 /// upload whose store takes longer: the proxy answers 200 at once and sends
 /// whitespace until the store ends, then the result document.

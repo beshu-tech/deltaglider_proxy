@@ -4053,64 +4053,108 @@ mod source_guards {
         );
     }
 
-    /// A request on the upload client (`bulk_client`) whose body or whose
-    /// server-side work grows with the object (PutObject, UploadPart,
-    /// CopyObject, UploadPartCopy, CompleteMultipartUpload) carries its own
-    /// timeouts through `.customize().config_override(..)`
-    /// (`upload_config`, `long_upload_config`): the client's read timeout
-    /// (60 s) is a deadline for the whole request, so without them a part,
-    /// a copy or a Complete that needs longer never gets its answer. The
-    /// scan reads every `bulk_client` use of `src/storage/s3`.
+    /// The S3 requests whose body or whose server-side work grows with the
+    /// object (PutObject, UploadPart, CopyObject, UploadPartCopy,
+    /// CompleteMultipartUpload), on ANY client in `src/storage/s3`, carry
+    /// their own timeouts: the `config_override(..)` that follows the
+    /// request in its function names `upload_config`, `part_config` or
+    /// `complete_config`. The client's read timeout (60 s) is a deadline for
+    /// the whole request, so without them a part, a copy or a Complete that
+    /// needs longer never gets its answer. A request that is deliberately
+    /// without them is listed in `EXEMPT` with its reason.
     #[test]
     fn size_dependent_requests_carry_their_own_timeouts() {
-        const GROWING: [&str; 5] = [
-            "put_object()",
-            "upload_part()",
-            "copy_object()",
-            "upload_part_copy()",
-            "complete_multipart_upload()",
+        const OPS: [&str; 5] = [
+            "put_object",
+            "upload_part",
+            "copy_object",
+            "upload_part_copy",
+            "complete_multipart_upload",
+        ];
+        const HELPERS: [&str; 3] = ["upload_config", "part_config", "complete_config"];
+        // (file, function, reason): empty or tiny bodies on the plain
+        // client, whose 30 s request deadline is the right limit. An empty
+        // function name exempts the whole file.
+        const EXEMPT: [(&str, &str, &str); 3] = [
+            (
+                "src/storage/s3/facts.rs",
+                "put_facts_object",
+                "a listing-facts object: a few bytes",
+            ),
+            (
+                "src/storage/s3/claim.rs",
+                "",
+                "the claim object of a bucket: a few bytes",
+            ),
+            (
+                "src/storage/s3/mod.rs",
+                "put_directory_marker",
+                "a directory marker: an empty object",
+            ),
         ];
         let mut offenders = Vec::new();
         let mut checked = 0;
-        for (rel, text) in crate::source_scan::prod_sources("src/storage/s3") {
-            let lines = crate::source_scan::prod_lines(&text);
-            for (i, (n, line)) in lines.iter().enumerate() {
-                if !line.contains("bulk_client") {
-                    continue;
-                }
-                let near = lines[i..lines.len().min(i + 6)]
+        let mut exempted = std::collections::BTreeSet::new();
+        for src in crate::source_scan::ast::src() {
+            if !src.rel.starts_with("src/storage/s3/") {
+                continue;
+            }
+            let calls = &src.prod.calls;
+            for op in calls
+                .iter()
+                .filter(|c| c.method && OPS.contains(&c.name.as_str()))
+            {
+                let func = src.fn_name(op.func);
+                if let Some((file, f, _)) = EXEMPT
                     .iter()
-                    .map(|(_, l)| *l)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !GROWING.iter().any(|op| near.contains(op)) {
+                    .find(|(file, f, _)| *file == src.rel && (f.is_empty() || *f == func))
+                {
+                    exempted.insert((*file, *f));
                     continue;
                 }
                 checked += 1;
-                // Up to the next use of the client: the statement or the
-                // `request.customize()` that sends what it built.
-                let end = lines[i + 1..]
+                // The next request of the function: the override of this
+                // one comes before it.
+                let next_op = calls
                     .iter()
-                    .position(|(_, l)| l.contains("bulk_client"))
-                    .map_or(lines.len(), |p| i + 1 + p)
-                    .min(i + 45);
-                let window = lines[i..end]
-                    .iter()
-                    .map(|(_, l)| *l)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !window.contains("config_override(") {
-                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
+                    .filter(|c| {
+                        c.method
+                            && c.func == op.func
+                            && OPS.contains(&c.name.as_str())
+                            && c.line > op.line
+                    })
+                    .map(|c| c.line)
+                    .min()
+                    .unwrap_or(usize::MAX);
+                let named = calls.iter().any(|o| {
+                    o.method
+                        && o.name == "config_override"
+                        && o.func == op.func
+                        && o.line >= op.line
+                        && o.line < next_op
+                        && o.arg_idents_all
+                            .iter()
+                            .any(|a| HELPERS.contains(&a.as_str()))
+                });
+                if !named {
+                    offenders.push(format!("{}:{}: .{}() in {func}", src.rel, op.line, op.name));
                 }
             }
         }
         assert!(
-            checked >= 8,
+            checked >= 10,
             "the scan saw only {checked} size-dependent requests: it is blind"
         );
+        for (file, f, why) in EXEMPT {
+            assert!(
+                exempted.contains(&(file, f)),
+                "the exemption of {file} `{f}` ({why}) matches no request: remove it"
+            );
+        }
         assert!(
             offenders.is_empty(),
-            "a size-dependent request without `.customize().config_override(upload_config(..))`:\n{}",
+            "a size-dependent request without `.customize().config_override(<upload_config | \
+             part_config | complete_config>)`:\n{}",
             offenders.join("\n")
         );
     }

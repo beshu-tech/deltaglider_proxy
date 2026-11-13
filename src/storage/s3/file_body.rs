@@ -258,8 +258,11 @@ impl Body for ChainedFiles {
         }
     }
 
+    /// True as soon as the last byte is out, in any state: hyper stops
+    /// polling after the `Content-Length`, and the SDK's throughput check
+    /// takes the upload as complete only through this method.
     fn is_end_stream(&self) -> bool {
-        self.left == 0 && matches!(self.state, State::Between) && self.next >= self.files.len()
+        self.left == 0
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -354,6 +357,49 @@ mod tests {
         std::fs::remove_file(&paths[0]).unwrap();
         assert!(collect(body.byte_stream().into_inner()).await.is_err());
         assert_eq!(body.md5_hex().await, None, "a missing part has no MD5");
+    }
+
+    /// The body says that it is at its end as soon as its last byte is out,
+    /// in every state, also before the poll that returns `None` and with
+    /// empty files after the last data. The SDK marks an upload as complete
+    /// only through `is_end_stream` (aws-smithy-runtime 1.16.2,
+    /// `minimum_throughput/http_body_1_x.rs`: hyper stops polling a body
+    /// after its `Content-Length`, so `None` may never come). A body that
+    /// stays silent about it reads as stalled while the proxy waits for the
+    /// backend's answer.
+    #[tokio::test]
+    async fn the_body_is_at_its_end_when_its_last_byte_is_out() {
+        use http_body::Body as _;
+        let dir = tempfile::tempdir().unwrap();
+        for parts in [
+            vec![b"abc".to_vec()],
+            vec![b"abc".to_vec(), vec![9u8; 2 * READ_BUFFER + 5]],
+            vec![b"abc".to_vec(), Vec::new(), Vec::new()],
+            vec![Vec::new()],
+        ] {
+            let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            let paths = write_parts(dir.path(), &slices);
+            let body = body_of(&paths).await;
+            let total = body.len();
+            for (offset, len) in [(0, total), (1, total.saturating_sub(1))] {
+                let slice = body.slice(offset, len);
+                let mut chained = ChainedFiles::new(slice.files.clone(), slice.len());
+                let mut seen = 0u64;
+                while seen < slice.len() {
+                    assert!(!chained.is_end_stream(), "bytes are left ({seen}/{total})");
+                    let frame = std::future::poll_fn(|cx| Pin::new(&mut chained).poll_frame(cx))
+                        .await
+                        .expect("a frame")
+                        .unwrap();
+                    seen += frame.into_data().map_or(0, |d| d.len() as u64);
+                }
+                assert!(
+                    chained.is_end_stream(),
+                    "the last byte is out: {parts:?} slice {offset}+{len}",
+                    parts = parts.iter().map(Vec::len).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[tokio::test]

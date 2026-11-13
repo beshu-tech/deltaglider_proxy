@@ -593,18 +593,19 @@ impl S3Backend {
         let stored_size = body.len();
         // One PutObject takes at most 5 GiB: a larger body is a backend
         // multipart upload, with the same condition on its Complete.
+        // Boxed: the future of the multipart upload stays out of the frame
+        // of every file PUT (the stack of a test thread is 2 MiB).
         if stored_size > self.put_limits().0 {
-            return self
-                .put_file_multipart(&super::mpu_put::MultipartPut {
-                    bucket,
-                    key,
-                    files: &body,
-                    headers: &headers,
-                    metadata,
-                    fence: &fence,
-                    on_unsupported,
-                })
-                .await;
+            return Box::pin(self.put_file_multipart(&super::mpu_put::MultipartPut {
+                bucket,
+                key,
+                files: &body,
+                headers: &headers,
+                metadata,
+                fence: &fence,
+                on_unsupported,
+            }))
+            .await;
         }
         let mut backoff = UNIDENTIFIED_400_BACKOFF_MS.iter();
         loop {

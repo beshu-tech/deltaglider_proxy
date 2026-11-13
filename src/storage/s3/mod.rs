@@ -324,6 +324,9 @@ pub struct S3Backend {
     /// multipart upload; `None`: the production constants (or the debug
     /// test seams). Set by [`S3Backend::with_put_limits`].
     put_limits: Option<(u64, u64)>,
+    /// How long one attempt of a CompleteMultipartUpload waits for its
+    /// answer (`DGP_S3_COMPLETE_TIMEOUT_SECS`).
+    complete_timeout: std::time::Duration,
     /// A conditional-request profile fixed at construction
     /// ([`S3Backend::with_conditional_profile`]); `None` = the one that
     /// the capability probe found for this definition
@@ -376,6 +379,7 @@ impl S3Backend {
             copy_unsupported: Default::default(),
             copy_limits: None,
             put_limits: None,
+            complete_timeout: client::complete_timeout(),
             pinned_profile: None,
             client,
             bulk_client,
@@ -461,6 +465,15 @@ impl S3Backend {
     pub(crate) fn conditional_delete_proven(&self) -> bool {
         self.conditional_profile()
             .is_some_and(|p| p.conditional_delete)
+    }
+
+    /// Does CompleteMultipartUpload enforce `If-None-Match` and `If-Match`
+    /// here? Only the probe proves it (`probe_conditional_complete`); until
+    /// then a write with a condition of an object above 5 GiB is not stored
+    /// with a multipart upload.
+    pub(crate) fn conditional_complete_proven(&self) -> bool {
+        self.conditional_profile()
+            .is_some_and(|p| p.conditional_complete == Some(true))
     }
 
     // === Key generation helpers ===
@@ -1343,7 +1356,7 @@ impl StorageBackend for S3Backend {
             .upload_id(&upload.upload_id)
             .multipart_upload(completed)
             .customize()
-            .config_override(Self::long_upload_config())
+            .config_override(self.complete_config())
             .send()
             .await
             .map_err(|e| self.classify(&upload.bucket, &e, S3Op::CompleteMpu))?;

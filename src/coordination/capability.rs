@@ -459,9 +459,42 @@ pub async fn establish_backend_verdict_within(
             }
         }
         Ok(Ok(p)) => {
+            // A backend that enforces the conditional PUT is asked about the
+            // conditional CompleteMultipartUpload too: an object above 5 GiB
+            // is written with a multipart upload, and a write with a
+            // condition then needs the proof (bounded like the CAS probe).
+            let mut profile = p.profile();
+            if p.cas {
+                let key = format!("{probe_key}-mpu");
+                profile.conditional_complete = match tokio::time::timeout(
+                    budget,
+                    super::cas_probe::probe_conditional_complete(
+                        &client,
+                        &group.probe_bucket,
+                        &key,
+                        p.if_match,
+                    ),
+                )
+                .await
+                {
+                    Ok(verdict) => verdict,
+                    Err(_) => {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            super::cas_probe::remove_all_versions(
+                                &client,
+                                &group.probe_bucket,
+                                &key,
+                            ),
+                        )
+                        .await;
+                        None
+                    }
+                };
+            }
             // Every conditional request of the backends built from this
             // definition uses what the probe found.
-            super::if_match::record_for(&group.backend, p.profile());
+            super::if_match::record_for(&group.backend, profile);
             if p.cas {
                 CapabilityVerdict::CasVerified {
                     via: VerifiedVia::Probe,

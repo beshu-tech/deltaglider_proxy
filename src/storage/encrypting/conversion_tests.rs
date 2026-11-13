@@ -795,6 +795,7 @@ async fn on_rgw_the_marker_is_replaced_and_closed_by_identity() {
     let profile = ConditionalProfile {
         if_match: IfMatchDialect::Unquoted,
         conditional_delete: false,
+        ..Default::default()
     };
     let s3 =
         crate::storage::s3_test_support::for_test_endpoint(&ep).with_conditional_profile(profile);

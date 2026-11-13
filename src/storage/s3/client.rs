@@ -162,6 +162,29 @@ pub(super) fn upload_timeouts(
     timeouts.build()
 }
 
+/// `DGP_S3_COMPLETE_TIMEOUT_SECS` (default 900): how long one attempt of a
+/// CompleteMultipartUpload may wait for its answer. The backend joins the
+/// parts before it answers. Read when a backend is built.
+pub(super) fn complete_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        crate::config::env_parse_with_default("DGP_S3_COMPLETE_TIMEOUT_SECS", 900u64).max(1),
+    )
+}
+
+/// Pure: the timeouts of a CompleteMultipartUpload: an attempt and its read
+/// timeout last `wait`, and the operation has no deadline of its own. The
+/// SDK sends at most 3 attempts (`RetryConfig::adaptive`, `max=3` in the
+/// `amz-sdk-request` header), so a hung backend holds the object lock, the
+/// detached slot and the spool for at most 3 x `wait` (45 min by default).
+pub(super) fn complete_timeouts(
+    wait: std::time::Duration,
+) -> aws_sdk_s3::config::timeout::TimeoutConfig {
+    aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+        .operation_attempt_timeout(wait)
+        .read_timeout(wait)
+        .build()
+}
+
 /// A retry partition of its own for one backend definition. The SDK's
 /// default partition is process-wide per region (`s3-<region>`): its retry
 /// token bucket and its adaptive rate limiter were shared by every backend
@@ -346,5 +369,19 @@ mod upload_timeout_tests {
         assert_eq!(none.operation_timeout(), None);
         assert_eq!(none.operation_attempt_timeout(), Some(LONG_TIMEOUT));
         assert_eq!(none.read_timeout(), Some(LONG_TIMEOUT));
+    }
+
+    /// A Complete waits `DGP_S3_COMPLETE_TIMEOUT_SECS` (900 s by default)
+    /// for its answer, not an hour.
+    #[test]
+    fn a_complete_waits_its_own_bounded_time() {
+        let t = complete_timeouts(Duration::from_secs(900));
+        assert_eq!(
+            t.operation_attempt_timeout(),
+            Some(Duration::from_secs(900))
+        );
+        assert_eq!(t.read_timeout(), Some(Duration::from_secs(900)));
+        assert_eq!(t.operation_timeout(), None);
+        assert!(complete_timeout() < LONG_TIMEOUT, "the default is bounded");
     }
 }

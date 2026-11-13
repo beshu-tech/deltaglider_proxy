@@ -264,6 +264,14 @@ pub struct BackendInfoResponse {
     /// verdict yet: writes to them answer 503 until the check ends.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub atomic_writes_checking: bool,
+    /// The probe's verdict on a conditional CompleteMultipartUpload (S3
+    /// backends; `GET /backends` only). `true`: an object above 5 GiB can be
+    /// written with a condition. `false` or absent: such a write is refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conditional_complete: Option<bool>,
+    /// [`Self::conditional_complete`] in plain words (also "not proven").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conditional_complete_words: Option<String>,
 }
 
 impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
@@ -288,6 +296,8 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 capability_words: None,
                 proxy_unavailable: None,
                 atomic_writes_checking: false,
+                conditional_complete: None,
+                conditional_complete_words: None,
             },
             crate::config::BackendConfig::S3 {
                 endpoint,
@@ -313,6 +323,8 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 capability_words: None,
                 proxy_unavailable: None,
                 atomic_writes_checking: false,
+                conditional_complete: None,
+                conditional_complete_words: None,
             },
         }
     }

@@ -20,15 +20,20 @@
 //! 64 MiB that needs longer to leave never gets an answer, and each retry
 //! sends it again (measured against Hetzner Object Storage, where all 20
 //! UploadPart requests of a 5.5 GiB upload ended with no status). So a part
-//! and the Complete carry [`upload_timeouts`] without a deadline for the
-//! operation: an attempt and its read timeout may last
-//! [`super::client::LONG_TIMEOUT`], and the stalled-stream protection
-//! (`DGP_S3_STALL_GRACE_SECS`) ends a part that does not move. The
-//! Complete answers after the backend joined the parts, which takes
-//! minutes for an object of many GiB.
+//! carries [`upload_timeouts`] without a deadline for the operation: an
+//! attempt and its read timeout may last [`super::client::LONG_TIMEOUT`].
+//! The stalled-stream protection (`DGP_S3_STALL_GRACE_SECS`) ends a part
+//! whose body does not move (the body says that it is at its end as soon as
+//! its last byte is out, `FileBody`: a wait for the answer is no stall); the
+//! wait for the answer of a part is bounded by its attempt timeout. The
+//! Complete answers after the backend joined the parts, which takes minutes
+//! for an object of many GiB: an attempt waits
+//! `DGP_S3_COMPLETE_TIMEOUT_SECS` (900 s) for it, and the SDK sends at most
+//! 3 attempts.
 //!
-//! A write with a condition (`If-None-Match`, `If-Match`) is not stored
-//! with a multipart upload: see [`fence_is_conditional`].
+//! A write with a condition (`If-None-Match`, `If-Match`) is stored with a
+//! multipart upload only on a backend whose probe proved a conditional
+//! Complete: see [`fence_is_conditional`].
 
 use super::client::upload_timeouts;
 use super::file_body::FileBody;
@@ -54,14 +59,14 @@ pub(super) const MAX_PARTS: u64 = 10_000;
 /// Parts of one upload that are in flight together.
 pub(super) const PARALLEL_PARTS: usize = 4;
 
-/// Pure: does a write carry a condition? A conditional write is not stored
-/// with a multipart upload. The proxy knows that a backend enforces a
-/// condition on PutObject (the CAS probe, `coordination/cas_probe.rs`),
-/// but it has no proof for CompleteMultipartUpload, and a backend that
-/// ignores the header there would store a baseline over a peer's. So an
-/// object above the single-PUT limit is written with a condition on no
-/// backend: a caller that asks for `Report` gets "no conditional writes",
-/// and any other caller gets `EntityTooLarge`.
+/// Pure: does a write carry a condition? Such a write is stored with a
+/// multipart upload only when the backend is proven to enforce a condition
+/// on CompleteMultipartUpload ([`S3Backend::conditional_complete_proven`],
+/// the probe `cas_probe::probe_conditional_complete`): a backend that
+/// ignores the header there would store a baseline over a peer's. Without
+/// the proof nothing is sent and the caller gets
+/// [`StorageError::ConditionalMultipartRefused`], never an unconditional
+/// write where a conditional one was required.
 pub(super) fn fence_is_conditional(fence: &RefFence) -> bool {
     match fence {
         RefFence::Unfenced => false,
@@ -172,6 +177,41 @@ where
     }
 }
 
+/// `CompleteMultipartUpload` with the write condition of a PUT: the same
+/// two headers (`If-None-Match: *` for [`RefFence::Absent`], `If-Match` in
+/// the backend's dialect for an ETag). Only a backend that the probe proved
+/// ([`S3Backend::conditional_complete_proven`]) gets them.
+fn apply_complete_fence(
+    req: aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
+    fence: &RefFence,
+    dialect: crate::coordination::if_match::IfMatchDialect,
+) -> aws_sdk_s3::operation::complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder
+{
+    use crate::coordination::if_match::IfMatchRequest;
+    match fence {
+        RefFence::Absent => req.if_none_match("*"),
+        RefFence::ETag(e) if !e.is_empty() => req.if_match_etag(e, dialect),
+        _ => req,
+    }
+}
+
+/// Pure: is the object that a HEAD found the one that this write made? Its
+/// ETag is the composite of this write's part ETags (`expected`: the same
+/// BYTES), and its user metadata is exactly what this write sent (`wanted`:
+/// the same write: `dg-created-at` is the time of this store). The bytes
+/// alone prove nothing: an older object with the same bytes and other
+/// metadata is at the key when this Complete really failed, and taking it
+/// for ours would report a write that the backend did not make (and cache
+/// the new metadata over the old object).
+pub(super) fn is_own_multipart_write(
+    head_etag: &str,
+    head_metadata: Option<&HashMap<String, String>>,
+    expected: &str,
+    wanted: &HashMap<String, String>,
+) -> bool {
+    head_etag.trim().trim_matches('"') == expected && user_metadata_equal(head_metadata, wanted)
+}
+
 /// What a multipart store of a file body is given.
 pub(super) struct MultipartPut<'a> {
     pub bucket: &'a str,
@@ -245,19 +285,23 @@ impl S3Backend {
             ..
         } = *put;
         let total = files.len();
-        if fence_is_conditional(put.fence) {
-            warn!(
-                "S3 PUT {bucket}/{key}: {total} bytes need a multipart upload, which is stored \
-                 without a condition on no backend; refusing the conditional write"
+        // A write with a condition needs a backend that enforces one on
+        // CompleteMultipartUpload; nothing is sent otherwise (never an
+        // unconditional write where a conditional one was required).
+        if fence_is_conditional(put.fence) && !self.conditional_complete_proven() {
+            let backend = self
+                .health_key
+                .as_ref()
+                .map_or(String::new(), |(name, _)| format!(" '{name}'"));
+            let why = format!(
+                "{bucket}/{key}: a write with a condition (If-None-Match or If-Match) of \
+                 {total} bytes, more than the 5 GiB of one PUT request, needs a multipart \
+                 upload, and the storage backend{backend} is not proven to enforce a condition \
+                 on CompleteMultipartUpload (the capability probe checks it at start and at \
+                 \"Check again\"; GET /_/api/admin/backends shows `conditional_complete`)"
             );
-            return match put.on_unsupported {
-                OnUnsupported::Report => Ok(FencedPut::Unsupported),
-                OnUnsupported::Unfenced => Err(StorageError::EntityTooLarge(format!(
-                    "{bucket}/{key}: an object of {total} bytes needs a multipart upload on the \
-                     storage backend, and a write with a condition (a delta baseline, a rewrite \
-                     of a stored version) cannot use one"
-                ))),
-            };
+            warn!("S3 PUT: {why}");
+            return Err(StorageError::ConditionalMultipartRefused(why));
         }
         let preferred = self.put_limits().1;
         let Some(ranges) = plan_parts(total, preferred) else {
@@ -343,7 +387,7 @@ impl S3Backend {
                 // No deadline of the whole operation: see the module docs.
                 request
                     .customize()
-                    .config_override(Self::long_upload_config())
+                    .config_override(Self::part_config())
                     .send()
                     .await
             },
@@ -393,19 +437,25 @@ impl S3Backend {
         let drop_first_answer = crate::config::test_seams::test_seams().put_drop_complete_answer;
         let mut backoff = UNIDENTIFIED_400_BACKOFF_MS.iter();
         for attempt in 0.. {
-            let sent = self
-                .bulk_client
-                .complete_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .multipart_upload(
-                    CompletedMultipartUpload::builder()
-                        .set_parts(Some(completed.clone()))
-                        .build(),
-                )
+            // The write's condition (only a proven backend gets one: see
+            // `put_file_multipart`).
+            let request = apply_complete_fence(
+                self.bulk_client
+                    .complete_multipart_upload()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .set_parts(Some(completed.clone()))
+                            .build(),
+                    ),
+                put.fence,
+                self.if_match_dialect(),
+            );
+            let sent = request
                 .customize()
-                .config_override(Self::long_upload_config())
+                .config_override(self.complete_config())
                 .send()
                 .await;
             // A debug seam: the backend completed the upload, and its
@@ -426,7 +476,7 @@ impl S3Backend {
             // that is a success, and the client does not upload every part
             // again.
             if let Some(etag) = self
-                .landed_multipart(bucket, key, expected.as_deref())
+                .landed_multipart(bucket, key, expected.as_deref(), put.headers)
                 .await
             {
                 self.remember_listed_facts(bucket, key, &etag, stored_size, metadata);
@@ -440,6 +490,19 @@ impl S3Backend {
                         .into(),
                 ));
             };
+            // A refused condition: another writer changed the object (the
+            // backend proved it enforces the condition). Never an overwrite.
+            let signal = crate::coordination::cas::sdk_error_signal(&e);
+            match fenced_write_verdict(put.fence, &signal) {
+                FencedWriteVerdict::Lost => return Ok(FencedPut::Lost),
+                FencedWriteVerdict::Other
+                    if put.on_unsupported == OnUnsupported::Report
+                        && conditional_target_gone(put.fence, &signal) =>
+                {
+                    return Ok(FencedPut::Lost);
+                }
+                FencedWriteVerdict::Unsupported | FencedWriteVerdict::Other => {}
+            }
             // A 400 without a request id (Hetzner): sent again, now that
             // the object is known not to be there.
             if let Some(ms) = is_unidentified_400(&e).then(|| backoff.next()).flatten() {
@@ -452,23 +515,31 @@ impl S3Backend {
         unreachable!("the loop returns on every path")
     }
 
-    /// The config of a part and of a CompleteMultipartUpload (also of a
-    /// copy): no deadline for the operation, a long attempt and read timeout
-    /// ([`upload_timeouts`]); the connect timeout stays.
-    pub(super) fn long_upload_config() -> aws_sdk_s3::config::Builder {
+    /// The config of a part: no deadline for the operation, a long attempt
+    /// and read timeout ([`upload_timeouts`]); the connect timeout stays.
+    /// The stalled-stream protection ends a part that does not move.
+    pub(super) fn part_config() -> aws_sdk_s3::config::Builder {
         aws_sdk_s3::config::Builder::new().timeout_config(upload_timeouts(None))
     }
 
-    /// The ETag of the object at `key` when it is the object that a
-    /// Complete of parts with the ETag `expected` makes (the ETag of the
-    /// object is [`multipart_etag`] of its parts); `None` for no object, for
-    /// another ETag, for an ETag that proves nothing (`expected` is `None`)
-    /// and for a failed HEAD.
+    /// The config of a CompleteMultipartUpload (also of a copy's): an
+    /// attempt waits `DGP_S3_COMPLETE_TIMEOUT_SECS` for its answer
+    /// ([`complete_timeouts`]).
+    pub(super) fn complete_config(&self) -> aws_sdk_s3::config::Builder {
+        aws_sdk_s3::config::Builder::new()
+            .timeout_config(super::client::complete_timeouts(self.complete_timeout))
+    }
+
+    /// The ETag of the object at `key` when it is the object that THIS
+    /// write made: see [`is_own_multipart_write`]. `None` for no object,
+    /// for another one, for an ETag that proves nothing (`expected` is
+    /// `None`) and for a failed HEAD.
     async fn landed_multipart(
         &self,
         bucket: &str,
         key: &str,
         expected: Option<&str>,
+        wanted: &HashMap<String, String>,
     ) -> Option<String> {
         let expected = expected?;
         BACKEND_HEAD_REQUESTS.inc();
@@ -481,7 +552,7 @@ impl S3Backend {
             .await
             .ok()?;
         let etag = head.e_tag()?;
-        (etag.trim().trim_matches('"') == expected).then(|| etag.to_string())
+        is_own_multipart_write(etag, head.metadata(), expected, wanted).then(|| etag.to_string())
     }
 }
 
@@ -562,21 +633,103 @@ mod tests {
                             Ok(n) => buf.extend_from_slice(&chunk[..n]),
                         }
                     }
-                    let line = String::from_utf8_lossy(&buf)
+                    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    // Take the whole body before the answer: a reply that
+                    // leaves a body unread resets the connection, and the SDK
+                    // sends the request again.
+                    let len: usize = head
                         .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    let n = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    let mut got = buf.len() - end;
+                    while got < len {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => got += n,
+                        }
+                    }
+                    // A HEAD or a DELETE gets the plain answer and takes no
+                    // place in the script: how many attempts the SDK makes
+                    // is not the test's business.
+                    let scripted = !(line.starts_with("head ") || line.starts_with("delete "));
+                    let n = if scripted {
+                        next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    } else {
+                        usize::MAX
+                    };
                     let _ = tx.send(line);
                     let reply = responses.get(n).cloned().unwrap_or_else(|| {
                         "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".to_string()
                     });
+                    // `@<ms>@HTTP/1.1 ...`: answer after `<ms>`.
+                    let reply = match reply.strip_prefix('@').and_then(|r| r.split_once('@')) {
+                        Some((ms, rest)) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                ms.parse().unwrap(),
+                            ))
+                            .await;
+                            rest.to_string()
+                        }
+                        None => reply,
+                    };
                     let _ = sock.write_all(reply.as_bytes()).await;
                 });
             }
         });
         (endpoint, rx)
+    }
+
+    /// A Complete that the backend does not answer ends at
+    /// `DGP_S3_COMPLETE_TIMEOUT_SECS` (here 1 s; the backend answers after
+    /// 20 s), not at the hour of an upload without a deadline: a hung Complete
+    /// would hold the object lock, the detached slot and the spool.
+    #[tokio::test]
+    async fn a_complete_that_is_not_answered_ends_at_the_complete_timeout() {
+        let xml = "<?xml version=\"1.0\"?><InitiateMultipartUploadResult><Bucket>b</Bucket>\
+                   <Key>k</Key><UploadId>uid1</UploadId></InitiateMultipartUploadResult>";
+        let created = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\n\r\n{xml}",
+            xml.len()
+        );
+        let part = "HTTP/1.1 200 OK\r\netag: \"900150983cd24fb0d6963f7d28e17f72\"\r\ncontent-length: 0\r\n\r\n";
+        let (endpoint, mut lines) = scripted_server(vec![
+            created,
+            part.to_string(),
+            part.to_string(),
+            format!("@20000@{part}"),
+            format!("@20000@{part}"),
+            format!("@20000@{part}"),
+        ])
+        .await;
+        let mut s3 = production_backend(&endpoint)
+            .await
+            .with_put_limits(MIN_PART_BYTES, MIN_PART_BYTES);
+        s3.complete_timeout = std::time::Duration::from_secs(1);
+        let (_dir, path, meta) = file_and_meta(MIN_PART_BYTES as usize + 1);
+        let started = std::time::Instant::now();
+        let err = s3
+            .put_object_file_with_metadata("b", "k", &[path.as_path()], &meta)
+            .await
+            .expect_err("no answer");
+        let mut completes = 0;
+        while let Ok(l) = lines.try_recv() {
+            completes += usize::from(l.starts_with("post /b/k?uploadid="));
+        }
+        // A timeout is a 503 for the client; the SDK's attempts (up to 3)
+        // are each cut at 1 s.
+        assert!(matches!(err, StorageError::Unavailable(_)), "{err:?}");
+        assert!(
+            (1..=3).contains(&completes),
+            "{completes} Complete attempts"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "ended after {:?}",
+            started.elapsed()
+        );
     }
 
     /// A Hetzner 400 without a request id is sent again by the
@@ -614,9 +767,10 @@ mod tests {
         assert!(seen[2].starts_with("put /b/k?x-id=uploadpart"), "{seen:?}");
     }
 
-    /// A listener that takes a request body at about 100 KB/s (a read of at
-    /// most 4 KiB every 40 ms) and answers `200` when it has it all.
-    async fn slow_upload_server() -> String {
+    /// A listener that takes a request body with a read of at most 4 KiB
+    /// every `read_delay_ms` (40 ms: about 100 KB/s) and answers `200`
+    /// `answer_delay_ms` after it has it all.
+    async fn slow_upload_server(read_delay_ms: u64, answer_delay_ms: u64) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -645,13 +799,13 @@ mod tests {
                         .unwrap();
                     let mut got = buf.len() - end;
                     while got < len {
-                        // 100 KB/s
-                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(read_delay_ms)).await;
                         match sock.read(&mut chunk).await {
                             Ok(0) | Err(_) => return,
                             Ok(n) => got += n,
                         }
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(answer_delay_ms)).await;
                     let _ = sock
                         .write_all(b"HTTP/1.1 200 OK\r\netag: \"abc\"\r\ncontent-length: 0\r\n\r\n")
                         .await;
@@ -669,7 +823,7 @@ mod tests {
     /// parts).
     #[tokio::test]
     async fn a_part_that_outlasts_the_read_timeout_completes() {
-        let endpoint = slow_upload_server().await;
+        let endpoint = slow_upload_server(40, 0).await;
         let s3 = backend_with_short_read_timeout(&endpoint).await;
         let (_dir, path, meta) = file_and_meta(300_000);
         upload_part_with(&s3, &path, &meta, 300_000, 300_000)
@@ -681,7 +835,7 @@ mod tests {
     /// rule (`upload_config`) for every upload.
     #[tokio::test]
     async fn a_put_that_outlasts_the_read_timeout_completes() {
-        let endpoint = slow_upload_server().await;
+        let endpoint = slow_upload_server(40, 0).await;
         let s3 = backend_with_short_read_timeout(&endpoint).await;
         let (_dir, path, meta) = file_and_meta(300_000);
         s3.put_object_file_with_metadata("b", "k", &[path.as_path()], &meta)
@@ -804,10 +958,14 @@ mod tests {
             .expect("the part waits for the backend: no deadline of the whole operation");
     }
 
-    /// A write with a condition above the single-PUT limit sends no
-    /// request: `Report` callers read "no conditional writes", the others
-    /// get `EntityTooLarge`. An unconditional write of the same body is
-    /// stored with a multipart upload (its first request is the Create).
+    /// A write with a condition above the single-PUT limit, on a backend
+    /// whose conditional Complete is not proven, sends no request and gets a
+    /// true error (`ConditionalMultipartRefused`, naming the 5 GiB and the
+    /// gap) from every caller: never an unconditional write where a
+    /// conditional one was required, never a false "no conditional writes".
+    /// An unconditional write of the same body is stored with a multipart
+    /// upload (its first request is the Create), and so is a conditional one
+    /// on a backend that the probe proved.
     #[tokio::test]
     async fn a_conditional_write_above_the_limit_is_refused_before_any_request() {
         let (endpoint, mut heads) = head_recorder(std::time::Duration::ZERO).await;
@@ -817,32 +975,59 @@ mod tests {
         let (_dir, path, meta) = file_and_meta(MIN_PART_BYTES as usize + 1);
         let files = [path.as_path()];
         for fence in [RefFence::Absent, RefFence::ETag("\"abc\"".into())] {
-            let reported = s3
-                .put_object_file_with_metadata_fenced_with(
-                    "b",
-                    "k",
-                    &files,
-                    &meta,
-                    &fence,
-                    OnUnsupported::Report,
-                )
-                .await
-                .unwrap();
-            assert_eq!(reported, FencedPut::Unsupported, "{fence:?}");
-            let err = s3
-                .put_object_file_with_metadata_fenced_with(
-                    "b",
-                    "k",
-                    &files,
-                    &meta,
-                    &fence,
-                    OnUnsupported::Unfenced,
-                )
-                .await
-                .expect_err("a conditional multipart write is refused");
-            assert!(matches!(err, StorageError::EntityTooLarge(_)), "{err:?}");
+            for on_unsupported in [OnUnsupported::Report, OnUnsupported::Unfenced] {
+                let err = s3
+                    .put_object_file_with_metadata_fenced_with(
+                        "b",
+                        "k",
+                        &files,
+                        &meta,
+                        &fence,
+                        on_unsupported,
+                    )
+                    .await
+                    .expect_err("a conditional multipart write is refused");
+                let StorageError::ConditionalMultipartRefused(why) = &err else {
+                    panic!("{err:?}");
+                };
+                assert!(
+                    why.contains("5 GiB") && why.contains("CompleteMultipartUpload"),
+                    "{why}"
+                );
+            }
         }
         assert!(heads.try_recv().is_err(), "no request was sent");
+        // A probe that proved the conditional Complete opens the path: the
+        // first request is the Create (the answer is no upload, so it ends).
+        let proven = production_backend(&endpoint)
+            .await
+            .with_put_limits(MIN_PART_BYTES, MIN_PART_BYTES)
+            .with_conditional_profile(crate::coordination::if_match::ConditionalProfile {
+                conditional_complete: Some(true),
+                ..Default::default()
+            });
+        let _ = proven
+            .put_object_file_with_metadata_fenced_with(
+                "b",
+                "k",
+                &files,
+                &meta,
+                &RefFence::Absent,
+                OnUnsupported::Report,
+            )
+            .await;
+        let first = heads.recv().await.unwrap();
+        assert!(first.starts_with("post /b/k?uploads"), "{first}");
+        // Unknown (the probe could not tell) is no proof either.
+        let unknown = production_backend(&endpoint)
+            .await
+            .with_put_limits(MIN_PART_BYTES, MIN_PART_BYTES)
+            .with_conditional_profile(crate::coordination::if_match::ConditionalProfile {
+                conditional_complete: None,
+                ..Default::default()
+            });
+        assert!(!unknown.conditional_complete_proven());
+        while heads.try_recv().is_ok() {}
         // An empty ETag is no condition (a backend that does not fence).
         assert!(!fence_is_conditional(&RefFence::ETag(String::new())));
         assert!(!fence_is_conditional(&RefFence::Unfenced));
@@ -860,6 +1045,48 @@ mod tests {
             .await;
         let first = heads.recv().await.unwrap();
         assert!(first.starts_with("post /b/k?uploads"), "{first}");
+    }
+
+    /// The object that a HEAD finds is this write's only when its bytes AND
+    /// its metadata are this write's: an older object with the same bytes
+    /// and another `dg-created-at` is not (a real Complete failure would
+    /// then be reported as a success).
+    #[test]
+    fn an_older_object_with_the_same_bytes_is_not_this_write() {
+        let m = |created: &str| -> HashMap<String, String> {
+            [
+                ("dg-created-at".to_string(), created.to_string()),
+                ("dg-file-sha256".to_string(), "abc".to_string()),
+            ]
+            .into()
+        };
+        let part = hex::encode(<md5::Md5 as md5::Digest>::digest(b"p"));
+        let expected = multipart_etag(&[part]).unwrap();
+        let quoted = format!("\"{expected}\"");
+        let ours = m("2026-11-13T10:00:00Z");
+        // This write's object.
+        assert!(is_own_multipart_write(
+            &quoted,
+            Some(&ours),
+            &expected,
+            &ours
+        ));
+        // The same bytes from an earlier write.
+        let older = m("2026-11-12T10:00:00Z");
+        assert!(!is_own_multipart_write(
+            &quoted,
+            Some(&older),
+            &expected,
+            &ours
+        ));
+        // Other bytes, or no metadata at all.
+        assert!(!is_own_multipart_write(
+            "\"other-1\"",
+            Some(&ours),
+            &expected,
+            &ours
+        ));
+        assert!(!is_own_multipart_write(&quoted, None, &expected, &ours));
     }
 
     /// The ETag of a multipart object: the MD5 of the parts' MD5s and the

@@ -176,6 +176,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Storage",
     },
     EnvVarEntry {
+        name: "DGP_S3_COMPLETE_TIMEOUT_SECS",
+        description: "Longest wait for the answer of one attempt of a CompleteMultipartUpload that the proxy sends to a backend, or of the Complete of a server-side copy (seconds, default 900, at least 1; the SDK sends up to 3 attempts)",
+        example: "900",
+        category: "Storage",
+    },
+    EnvVarEntry {
         name: "DGP_S3_STALL_GRACE_SECS",
         description: "S3 stalled-stream protection grace period (seconds)",
         example: "20",

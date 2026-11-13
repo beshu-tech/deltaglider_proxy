@@ -353,7 +353,7 @@ impl S3Backend {
                     .build(),
             )
             .customize()
-            .config_override(Self::long_upload_config())
+            .config_override(self.complete_config())
             .send()
             .await
             .map_err(|e| {

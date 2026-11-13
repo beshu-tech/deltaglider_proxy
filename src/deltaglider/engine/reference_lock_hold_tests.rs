@@ -512,6 +512,10 @@ struct FencingFs {
     /// review3: the peer's baseline lands right before our next DELTA
     /// write (not a reference write) lands.
     peer_race_on_delta: AtomicBool,
+    /// A conditional reference write is refused as an S3 backend does that
+    /// has no proof of a conditional multipart Complete (a baseline above
+    /// 5 GiB): `ConditionalMultipartRefused`, nothing written.
+    refuse_conditional_baseline: AtomicBool,
 }
 
 impl FencingFs {
@@ -682,6 +686,14 @@ impl crate::storage::StorageBackend for FencingFs {
         fence: &RefFence,
         proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<RefFence, StorageError> {
+        if self.refuse_conditional_baseline.load(Ordering::SeqCst)
+            && matches!(op, RefWrite::Put { .. } | RefWrite::PutFile { .. })
+            && matches!(fence, RefFence::Absent | RefFence::ETag(_))
+        {
+            return Err(StorageError::ConditionalMultipartRefused(
+                "a write with a condition of more than 5 GiB: the backend is not proven".into(),
+            ));
+        }
         self.maybe_peer_write(b, p).await;
         let now = self.reference_fence(b, p).await?;
         if *fence != RefFence::Unfenced && *fence != now {
@@ -839,6 +851,7 @@ async fn fencing_engine(
         versions: parking_lot::Mutex::new(HashMap::new()),
         peer_race: AtomicBool::new(false),
         peer_race_on_delta: AtomicBool::new(false),
+        refuse_conditional_baseline: AtomicBool::new(false),
     };
     let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
         .with_reference_lock(Some(DynReferenceLock::from_arc(lock)));
@@ -876,6 +889,42 @@ async fn a_peer_baseline_written_under_us_is_never_overwritten() {
         b"PEER",
         "the peer's reference.bin was overwritten"
     );
+}
+
+/// A first baseline that the backend refuses to write with a condition (an
+/// object above 5 GiB, a backend with no proof of a conditional multipart
+/// Complete) does not fail the PUT: the object is stored whole, with the
+/// reason `delta-unavailable`, and no reference.bin is written.
+#[tokio::test]
+async fn a_first_baseline_the_backend_refuses_is_stored_whole() {
+    let lock = ScriptedLock::new(true, Duration::from_secs(60));
+    let (_tmp, engine) = fencing_engine(lock).await;
+    engine
+        .storage
+        .refuse_conditional_baseline
+        .store(true, Ordering::SeqCst);
+    let body = vec![7u8; 4096];
+    let stored = engine
+        .store("releases", "v1/app.zip", &body, None, HashMap::new())
+        .await
+        .expect("the PUT does not fail");
+    let _ = stored;
+    assert!(
+        !engine
+            .storage
+            .has_reference("releases", "v1")
+            .await
+            .unwrap(),
+        "no baseline was written"
+    );
+    let head = engine.head("releases", "v1/app.zip").await.unwrap();
+    assert_eq!(
+        head.passthrough_reason.as_deref(),
+        Some("delta-unavailable"),
+        "{head:?}"
+    );
+    let (data, _) = engine.retrieve("releases", "v1/app.zip").await.unwrap();
+    assert_eq!(data, body);
 }
 
 /// The fence covers reference.bin writes only. A delta PUT against an

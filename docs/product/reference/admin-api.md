@@ -151,6 +151,7 @@ A config write that makes a bucket store new objects in plaintext where it encry
 
 - `capability`: the verdict of the backend's current definition (a filesystem backend shows `cas-verified` with `via: local-filesystem` without a probe; absent: not checked yet).
 - `capability_words`: the verdict in plain words, which the admin UI shows as it is.
+- `conditional_complete`, `conditional_complete_words` (S3 backends): whether the probe proved that CompleteMultipartUpload enforces `If-None-Match` and `If-Match` (`true`; `false`: a condition is ignored; absent: not proven). Without the proof, a write with a condition of an object above 5 GiB is refused (a first delta baseline is stored whole; the re-encrypt job fails the object).
 - `proxy_unavailable`: why `aes256-gcm-proxy` is not offered on the backend, with the doc link; absent when it is offered.
 - `atomic_writes_checking`: `true` while the backend holds buckets that encrypt with the proxy and has no verdict yet; absent otherwise.
 - `read_only_buckets`: the buckets that are read-only because the verdict is `non-cas` (absent when empty).
