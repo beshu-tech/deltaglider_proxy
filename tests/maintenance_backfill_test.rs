@@ -268,6 +268,92 @@ async fn listed_etag(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> St
         .to_string()
 }
 
+/// The listing-facts objects (`.dg/facts/...`) under `prefix`, read directly
+/// from MinIO.
+async fn facts_under(raw: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> Vec<String> {
+    raw.list_objects_v2()
+        .bucket(bucket)
+        .prefix(format!(".dg/facts/{prefix}/"))
+        .send()
+        .await
+        .expect("LIST facts")
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect()
+}
+
+/// A backfill run writes the missing listing facts of the bucket's deltas
+/// (objects stored before the facts existed), so one run heals the whole
+/// bucket: no client LIST has run, and every delta has its facts after it.
+#[tokio::test]
+async fn backfill_writes_the_missing_listing_facts_of_deltas() {
+    skip_unless_minio!();
+    const N: usize = 12;
+    let bucket = "backfill-facts-heal";
+    // The writer's process cache knows every size, so the job runs on
+    // another proxy (a node that never wrote them).
+    let writer = TestServer::s3_with_endpoint(&common::minio_endpoint_url(), bucket).await;
+    let client = writer.s3_client().await;
+    let raw = common::minio_client().await;
+    let prefix = format!(
+        "rel-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    let base = common::generate_binary(100_000, 44);
+    for i in 0..=N {
+        let body = if i == 0 {
+            base.clone()
+        } else {
+            common::mutate_binary(&base[..100_000 - i * 7], 0.01)
+        };
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(format!("{prefix}/v{i:03}.zip"))
+            .body(aws_sdk_s3::primitives::ByteStream::from(body))
+            .send()
+            .await
+            .expect("PUT");
+    }
+    // The facts are written in the background; then drop them, as an older
+    // release left the bucket.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while facts_under(&raw, bucket, &prefix).await.len() < N {
+        assert!(std::time::Instant::now() < deadline, "facts not written");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    for k in facts_under(&raw, bucket, &prefix).await {
+        raw.delete_object()
+            .bucket(bucket)
+            .key(k)
+            .send()
+            .await
+            .expect("drop facts");
+    }
+    assert!(facts_under(&raw, bucket, &prefix).await.is_empty());
+
+    let server = TestServer::s3_with_endpoint(&common::minio_endpoint_url(), bucket).await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    start_backfill(&admin, &server.endpoint(), server.bucket(), false).await;
+    wait_job_done(&admin, &server.endpoint(), server.bucket()).await;
+
+    // The facts are written in the background after the HEADs: give them a
+    // moment.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while facts_under(&raw, bucket, &prefix).await.len() < N {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the job wrote {} of {N} facts",
+            facts_under(&raw, bucket, &prefix).await.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn backfill_stamps_canonical_metadata_and_preserves_served_time() {
     let server = TestServer::builder()

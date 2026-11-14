@@ -46,8 +46,8 @@ use crate::deltaglider::Rewritten;
 use crate::storage::ObjectVariant;
 
 use super::paged::{
-    list_job_keys, paged_phase, BackgroundCount, JobCtx, KeyPage, ListError, PageStep, PhaseSpec,
-    CANCEL_CHECK_EVERY, PAGE_CONCURRENCY,
+    list_job_keys, list_job_keys_healing_facts, paged_phase, BackgroundCount, JobCtx, KeyPage,
+    ListError, PageStep, PhaseSpec, CANCEL_CHECK_EVERY, PAGE_CONCURRENCY,
 };
 use super::store::{current_unix_seconds, Lane, MaintenanceJob};
 use super::{needs_rewrite, resolve_desired, DesiredEncryption};
@@ -1240,6 +1240,9 @@ pub(crate) fn rewrite_error_visit(
 pub(crate) trait ObjectVisitor {
     /// Objects of a page in flight at once.
     const CONCURRENCY: usize = PAGE_CONCURRENCY;
+    /// Also write the missing listing facts of each page's deltas
+    /// ([`list_job_keys_healing_facts`]).
+    const HEALS_LISTING_FACTS: bool = false;
     /// Does a visit STORE bytes into the bucket (a re-encrypt rewrite)? Then
     /// the walk defers while the disk it writes to is at level critical
     /// ([`crate::maintenance::probes::backend_store_refusal`]). A backfill stamps
@@ -1467,8 +1470,12 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
 
     async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, ListError> {
         let engine = self.engine.as_ref().expect("begin_page runs first");
-        let (page, forms, references) =
-            list_job_keys(engine, &self.job.bucket, token, "object list failed").await?;
+        let (page, forms, references) = if V::HEALS_LISTING_FACTS {
+            list_job_keys_healing_facts(engine, &self.job.bucket, token, "object list failed")
+                .await?
+        } else {
+            list_job_keys(engine, &self.job.bucket, token, "object list failed").await?
+        };
         self.forms = forms;
         match (self.references.as_mut(), references) {
             (Some(seen), Some(page_refs)) => seen.extend(page_refs),

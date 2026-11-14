@@ -33,7 +33,7 @@
 
 use super::{listing_facts_of, seal, v2, EncryptionConfig};
 use crate::storage::list_size_cache::bare_etag;
-use crate::storage::s3::heal::{admit, Skip};
+use crate::storage::s3::heal::{admit, decide_delta_miss, Skip};
 use crate::storage::traits::{ListedToken, StorageBackend, StorageError, StoredObject};
 use crate::types::FileMetadata;
 use arc_swap::ArcSwap;
@@ -78,18 +78,9 @@ pub(super) fn count(kind: &str) {
     LISTING_TOKEN_MISSES.with_label_values(&[kind]).inc();
 }
 
-/// What a LIST does with one entry that has no listing token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MissDecision {
-    /// List this plaintext size (exact; the ETag stays the stored one
-    /// until a background HEAD keeps the token).
-    Invert(u64),
-    /// HEAD the stored object now.
-    HeadNow,
-    /// List the stored size. With `heal`, a background HEAD keeps the
-    /// token for the next LIST.
-    Keep { heal: bool },
-}
+/// What a LIST does with one entry that has no listing token (the type of a
+/// plain bucket's facts miss too, see `storage::s3::heal`).
+pub(super) use crate::storage::s3::heal::MissDecision;
 
 /// THE listed-size decision for an entry without a listing token. Pure.
 ///
@@ -113,11 +104,7 @@ pub(super) fn decide_miss(
     may_head: bool,
 ) -> MissDecision {
     if is_delta {
-        return if may_head {
-            MissDecision::HeadNow
-        } else {
-            MissDecision::Keep { heal: true }
-        };
+        return decide_delta_miss(may_head);
     }
     if plaintext_ok {
         return MissDecision::Keep { heal: false };

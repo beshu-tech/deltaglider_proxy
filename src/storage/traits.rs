@@ -1321,7 +1321,12 @@ pub trait StorageBackend: Send + Sync {
     ///
     /// S3: the PUT carries `If-Match: version`; 412, 409 and 404 (the
     /// object is gone) are [`WriteIf::Changed`], 501 is
-    /// [`WriteIf::Unsupported`]; nothing is written in either case.
+    /// [`WriteIf::Unsupported`]; nothing is written in either case. An
+    /// object above the single-PUT limit needs a multipart upload: when the
+    /// backend is not proven to enforce a condition on
+    /// CompleteMultipartUpload, nothing is sent and the answer is
+    /// [`WriteIf::UnprovenMultipart`] (the caller decides, as for
+    /// `Unsupported`).
     /// Filesystem: the file's version is checked, then the file written.
     /// The engine's in-process locks make the two one step: every write of
     /// an object takes its object write lock, and every write of a delta or

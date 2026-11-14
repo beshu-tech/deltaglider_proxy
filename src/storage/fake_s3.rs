@@ -365,6 +365,15 @@ impl FakeS3 {
             .count()
     }
 
+    /// Remove every stored object whose `bucket/key` starts with `prefix`
+    /// (a test that drops the listing facts of a bucket). Returns how many.
+    pub(crate) fn remove_prefix(&self, prefix: &str) -> usize {
+        let mut objects = self.objects.lock();
+        let before = objects.len();
+        objects.retain(|k, _| !k.starts_with(prefix));
+        before - objects.len()
+    }
+
     /// Set the `Last-Modified` (unix seconds) of the stored `bucket/key`.
     /// Panics when it is absent.
     pub(crate) fn set_modified(&self, path: &str, unix: i64) {

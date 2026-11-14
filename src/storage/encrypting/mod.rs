@@ -315,6 +315,21 @@ impl EncryptionConfig {
         })
     }
 
+    /// Can `bucket` hold a sealed object under this config? Only when a key
+    /// is configured for it: its own key or legacy key, or the backend's
+    /// key or legacy key, whether or not the bucket has an override. A
+    /// bucket that inherited the backend key and then got `mode: none`
+    /// (an override with no key) may hold objects sealed under the backend
+    /// key, and a bucket that stopped encrypting keeps its key as
+    /// `legacy_key_id` until a re-encrypt job has converted it. Pure.
+    pub(crate) fn bucket_may_hold_sealed(&self, bucket: &str) -> bool {
+        let own = self
+            .buckets
+            .get(bucket)
+            .is_some_and(|b| b.key.is_some() || b.legacy_key_id.is_some());
+        own || self.key.is_some() || self.legacy_key.is_some()
+    }
+
     /// The prepared key of `key` (from the ring; a key that is not there,
     /// which the engine never builds, is prepared on the spot).
     fn site_of(&self, key: &EncryptionKey) -> Arc<v2::SiteKey> {
@@ -1367,6 +1382,22 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             WriteMode::Refuse => false,
             WriteMode::Encrypt => key.is_none(),
         }
+    }
+
+    /// May a LIST of `bucket` trust the unauthenticated `!!1` listing facts?
+    /// Only where no sealed object can exist and the read rule
+    /// ([`seal::read_verdict`]) serves every unsealed object to a client:
+    /// the bucket writes plaintext ([`seal::PlaintextRule::Serves`]) and no
+    /// key can have sealed it: none of its own and none of its backend
+    /// ([`EncryptionConfig::bucket_may_hold_sealed`]). The bytes of such an
+    /// object are as unauthenticated as its facts, so the facts add no
+    /// trust. A bucket that encrypts refuses unsealed objects outside a
+    /// conversion window (`PlaintextRule::Encrypts`), and a bucket that
+    /// stopped encrypting, or left the backend key with `mode: none`, may
+    /// hold sealed history: a forged marker would choose the size of a
+    /// sealed object, so these keep the `!!2` tokens only.
+    fn v1_facts_trusted(&self, bucket: &str) -> bool {
+        self.writes_plaintext(bucket) && !self.config.load().bucket_may_hold_sealed(bucket)
     }
 
     /// The plaintext rule of `bucket` with the conversion `window`.
@@ -2735,10 +2766,15 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
         page.objects = self.present_listed(b, std::mem::take(&mut page.objects));
         Ok(Some(page))
     }
-    /// With a key, the inner listing may hold ciphertext: its own facts are
-    /// not trusted (a backend writer can forge `!!1` markers), a listed
-    /// size is the stored size, and the logical facts come from listing
-    /// tokens that open under a key of this backend.
+    /// With a key, the inner listing may hold ciphertext. In a bucket that
+    /// encrypts (or converts), its own facts are not trusted (a backend
+    /// writer can forge `!!1` markers), a listed size is the stored size,
+    /// and the logical facts come from listing tokens that open under a key
+    /// of this backend. A bucket that writes plaintext and has no key
+    /// configured can hold no sealed object, and the read rule serves every
+    /// unsealed object there (`seal::PlaintextRule::Serves`), so the `!!1`
+    /// facts of its objects are trusted as in a backend without a key
+    /// (`v1_facts_trusted`).
     async fn resolve_listed_sizes(
         &self,
         b: &str,
@@ -2754,7 +2790,7 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
                 b,
                 objects,
                 ResolveListed {
-                    trust_v1_facts: false,
+                    trust_v1_facts: self.v1_facts_trusted(b),
                     ..how
                 },
             )

@@ -3185,6 +3185,7 @@ mod sealed_shape_tests {
                     ResolveListed {
                         trust_v1_facts: trust,
                         caller_heads_misses: true,
+                        inline_heads: false,
                     },
                 )
                 .await;
@@ -3223,6 +3224,7 @@ mod sealed_shape_tests {
                 ResolveListed {
                     trust_v1_facts: true,
                     caller_heads_misses: true,
+                    inline_heads: false,
                 },
             )
             .await;
@@ -3307,6 +3309,7 @@ mod sealed_shape_tests {
                 ResolveListed {
                     trust_v1_facts: true,
                     caller_heads_misses: true,
+                    inline_heads: false,
                 },
             )
             .await;
@@ -3403,6 +3406,7 @@ mod sealed_shape_tests {
                 ResolveListed {
                     trust_v1_facts: true,
                     caller_heads_misses: true,
+                    inline_heads: false,
                 },
             )
             .await;
@@ -3521,6 +3525,7 @@ mod sealed_shape_tests {
         let resolve = ResolveListed {
             trust_v1_facts: true,
             caller_heads_misses: true,
+            inline_heads: false,
         };
         s3.resolve_listed_sizes("b", &mut objects, resolve).await;
         // The request path escapes the `!!` of the key.

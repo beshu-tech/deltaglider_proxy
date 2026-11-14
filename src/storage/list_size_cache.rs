@@ -684,6 +684,12 @@ pub struct ResolveListed {
     /// backend queues no background HEAD of its own: two HEADs per object
     /// otherwise.
     pub caller_heads_misses: bool,
+    /// A client waits for this page (a client LIST, a maintenance walk):
+    /// the backend HEADs the deltas whose facts stay unknown on the page's
+    /// own path, so no entry lists a stored size. `false` (an internal
+    /// scan that counts bytes): such a delta is healed in the background
+    /// only. Ignored when `caller_heads_misses` is set.
+    pub inline_heads: bool,
     /// Use the `!!1` listing facts and the in-process entries learned from
     /// them. `false` in a bucket whose objects are sealed (format v2): any
     /// `!!1` entry there is unauthenticated, and the wrapper resolves the
@@ -695,6 +701,7 @@ impl Default for ResolveListed {
     fn default() -> Self {
         Self {
             caller_heads_misses: false,
+            inline_heads: false,
             trust_v1_facts: true,
         }
     }
