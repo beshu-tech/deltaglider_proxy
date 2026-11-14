@@ -66,7 +66,24 @@ jobs:
           cluster_name: dgp-smoke
       - name: Load the operator image into kind
         run: kind load docker-image --name dgp-smoke "beshultd/deltaglider-operator:${{ steps.ver.outputs.version }}"
+      # A release commit names a proxy image that release.yml publishes later:
+      # then use the newest published proxy release instead.
+      - name: Pick a published proxy image
+        id: proxy
+        run: |
+          img=$(sed -n 's/^pub const DEFAULT_IMAGE: &str = "\(.*\)";/\1/p' operator/src/crd.rs)
+          [[ -n "$img" ]] || { echo "::error::DEFAULT_IMAGE not found in operator/src/crd.rs"; exit 1; }
+          hub=https://hub.docker.com/v2/repositories/beshultd/deltaglider_proxy/tags
+          if ! curl -fsS "$hub/${img##*:}" >/dev/null; then
+            tag=$(curl -fsS "$hub?page_size=25&ordering=last_updated" | jq -r '[.results[].name | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))][0]')
+            [[ -n "$tag" && "$tag" != null ]] || { echo "::error::no published proxy release found"; exit 1; }
+            echo "::notice::$img is not published yet; the smoke uses ${img%:*}:$tag"
+            img="${img%:*}:$tag"
+          fi
+          echo "image=$img" >> "$GITHUB_OUTPUT"
       - name: Smoke (Ready, then a spec.image rollout)
+        env:
+          PROXY_IMAGE: ${{ steps.proxy.outputs.image }}
         run: ./operator/scripts/kind-smoke.sh
 
   # Publish beshultd/deltaglider-operator — but ONLY when the version in

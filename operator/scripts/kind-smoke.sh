@@ -6,7 +6,8 @@
 # 1. Install the CRD and the operator from deploy/ (the real RBAC).
 # 2. Pre-create a bootstrap Secret without dbKey, as an operator before
 #    0.3.24 left it. The operator must patch it (needs `patch` on secrets).
-# 3. Create one DeltaGliderProxy and wait for phase Ready.
+# 3. Create one DeltaGliderProxy (spec.image = $PROXY_IMAGE when set) and
+#    wait for phase Ready.
 # 4. Change spec.image and wait for the StatefulSet rollout and Ready again.
 set -euo pipefail
 
@@ -55,7 +56,8 @@ spec:
       filesystem: /data/storage
     advanced:
       listen_addr: "0.0.0.0:9000"
-  envFromSecret: dgp-env
+  envFromSecret: dgp-env${PROXY_IMAGE:+
+  image: $PROXY_IMAGE}
   bootstrapPassword:
     autoGenerate: true
   storage:
