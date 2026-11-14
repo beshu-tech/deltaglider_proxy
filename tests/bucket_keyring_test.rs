@@ -686,6 +686,209 @@ async fn buckets_in_different_modes_on_one_backend_minio() {
     .await;
 }
 
+// ── Scenario: listing facts on a backend with a keyed bucket ────────────
+
+/// The keys under `.dg/facts/{prefix}` of `bucket`, read from MinIO.
+async fn facts_keys(raw: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> Vec<String> {
+    raw.list_objects_v2()
+        .bucket(bucket)
+        .prefix(format!(".dg/facts/{prefix}"))
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect()
+}
+
+/// `n + 1` objects `rel/v000.zip` .. under `bucket` (the first is the
+/// base, the rest delta against it), and the size of each.
+async fn put_versions(
+    env: &Env,
+    bucket: &str,
+    n: usize,
+) -> std::collections::BTreeMap<String, i64> {
+    let base = generate_binary(100_000, 55);
+    let mut sizes = std::collections::BTreeMap::new();
+    for i in 0..=n {
+        let body = if i == 0 {
+            base.clone()
+        } else {
+            mutate_binary(&base[..100_000 - i * 7], 0.01)
+        };
+        let key = format!("rel/v{i:03}.zip");
+        env.put(bucket, &key, &body).await;
+        sizes.insert(key, body.len() as i64);
+    }
+    sizes
+}
+
+async fn listed(env: &Env, bucket: &str) -> std::collections::BTreeMap<String, i64> {
+    let out = env
+        .server
+        .s3_client()
+        .await
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix("rel/")
+        .send()
+        .await
+        .unwrap();
+    out.contents()
+        .iter()
+        .map(|o| (o.key().unwrap().to_string(), o.size().unwrap()))
+        .collect()
+}
+
+/// One MinIO backend, a plain bucket and a proxy-encrypted bucket (the
+/// production shape: the wrapper holds a key, yet the plain bucket's
+/// objects are plaintext by the read rule):
+///
+/// * An old delta of the plain bucket (its facts gone) lists its original
+///   size on the FIRST LIST of a node that never saw it, and has its facts
+///   afterwards.
+/// * A sealed object of the encrypted bucket lists its plaintext size from
+///   its `!!2` token, as before, and writes no `!!1` facts.
+/// * A `!!1` facts object planted next to a sealed object is ignored.
+#[tokio::test]
+async fn a_plain_bucket_next_to_an_encrypted_one_lists_original_sizes_minio() {
+    skip_unless_minio!();
+    const N: usize = 10;
+    let (plain, enc) = (common::unique_bucket("kf-p"), common::unique_bucket("kf-e"));
+    let buckets = format!(
+        "    {plain}: {{ backend: local-disk }}\n    {enc}: {{ backend: local-disk, encryption: {{ mode: aes256-gcm-proxy, key: \"{KA}\", key_id: kf-a }} }}\n"
+    );
+    let node = || spawn(Shape::NamedMinio, None, &buckets, "", &plain);
+    let writer = node().await;
+    writer.create(&enc).await;
+    let plain_sizes = put_versions(&writer, &plain, N).await;
+    let enc_sizes = put_versions(&writer, &enc, 3).await;
+
+    // The facts are written in the background.
+    let raw = common::minio_client().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while facts_keys(&raw, &plain, "rel/").await.len() < N
+        || facts_keys(&raw, &enc, "rel/").await.len() < 3
+    {
+        assert!(std::time::Instant::now() < deadline, "facts written");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // The encrypted bucket holds `!!2` tokens only.
+    let enc_markers = facts_keys(&raw, &enc, "rel/").await;
+    assert!(
+        enc_markers.iter().all(|k| !k.contains("!!1")),
+        "sealed objects write no !!1 facts: {enc_markers:?}"
+    );
+    // An old release's plain deltas: no facts.
+    for k in facts_keys(&raw, &plain, "rel/").await {
+        raw.delete_object()
+            .bucket(&plain)
+            .key(k)
+            .send()
+            .await
+            .unwrap();
+    }
+    assert!(facts_keys(&raw, &plain, "rel/").await.is_empty());
+    // A forged `!!1` entry for a sealed delta (exact stored ETag and size).
+    let stored = "rel/v001.zip.delta";
+    let head = raw
+        .head_object()
+        .bucket(&enc)
+        .key(stored)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("sealed delta {stored}: {e:?}"));
+    let forged = deltaglider_proxy::storage::listing_facts::asked_facts_key(
+        stored,
+        head.e_tag().unwrap(),
+        head.content_length().unwrap() as u64,
+        &deltaglider_proxy::storage::list_size_cache::LogicalFacts {
+            size: 12_345,
+            etag: "0".repeat(32),
+        },
+    )
+    .expect("a facts key");
+    raw.put_object()
+        .bucket(&enc)
+        .key(forged)
+        .body(ByteStream::from_static(b""))
+        .send()
+        .await
+        .unwrap();
+    drop(writer);
+
+    // A node that never saw these objects.
+    let reader = node().await;
+    assert_eq!(listed(&reader, &plain).await, plain_sizes, "plain bucket");
+    assert_eq!(
+        listed(&reader, &enc).await,
+        enc_sizes,
+        "the forged !!1 entry is ignored in the encrypted bucket"
+    );
+    // The plain bucket's first LIST wrote the facts.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while facts_keys(&raw, &plain, "rel/").await.len() < N {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "facts written by the first LIST"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// A metadata backfill of the plain bucket on a backend with a keyed bucket
+/// writes the missing listing facts of its deltas: no client LIST has run.
+#[tokio::test]
+async fn a_backfill_writes_the_facts_of_a_plain_bucket_next_to_an_encrypted_one_minio() {
+    skip_unless_minio!();
+    const N: usize = 8;
+    let (plain, enc) = (common::unique_bucket("kb-p"), common::unique_bucket("kb-e"));
+    let buckets = format!(
+        "    {plain}: {{ backend: local-disk }}\n    {enc}: {{ backend: local-disk, encryption: {{ mode: aes256-gcm-proxy, key: \"{KA}\", key_id: kb-a }} }}\n"
+    );
+    let node = || spawn(Shape::NamedMinio, None, &buckets, "", &plain);
+    let writer = node().await;
+    writer.create(&enc).await;
+    put_versions(&writer, &plain, N).await;
+    let raw = common::minio_client().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while facts_keys(&raw, &plain, "rel/").await.len() < N {
+        assert!(std::time::Instant::now() < deadline, "facts written");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    for k in facts_keys(&raw, &plain, "rel/").await {
+        raw.delete_object()
+            .bucket(&plain)
+            .key(k)
+            .send()
+            .await
+            .unwrap();
+    }
+    drop(writer);
+
+    let runner = node().await;
+    let endpoint = runner.server.endpoint();
+    let resp = runner
+        .admin
+        .post(format!("{endpoint}/_/api/admin/jobs/backfill-metadata"))
+        .json(&json!({ "buckets": [&plain] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "backfill: {}", resp.status());
+    wait_job_done(&runner.admin, &endpoint, &plain).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while facts_keys(&raw, &plain, "rel/").await.len() < N {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the job wrote {} of {N} facts",
+            facts_keys(&raw, &plain, "rel/").await.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 // ── Scenario: migrate keeps the bucket's mode ───────────────────────────
 
 /// A migrate moves the override with its bucket: the copies on the target

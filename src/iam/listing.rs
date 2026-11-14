@@ -32,6 +32,34 @@ pub(crate) trait Lister: Sync {
         metadata: bool,
     ) -> impl Future<Output = Result<ListObjectsPage, EngineError>> + Send;
 
+    /// [`Self::list`] for a page that a client waits for: a delta without
+    /// listing facts is HEADed on the page's path (see
+    /// `DeltaGliderEngine::finish_listed_page_for_client`). The default is
+    /// [`Self::list`]: only the engine HEADs.
+    #[allow(clippy::too_many_arguments)]
+    fn list_for_client(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        cursor: Option<&str>,
+        metadata: bool,
+    ) -> impl Future<Output = Result<ListObjectsPage, EngineError>> + Send {
+        self.list(bucket, prefix, delimiter, max_keys, cursor, metadata)
+    }
+
+    /// [`Self::finish`] for a page that a client waits for; the default is
+    /// [`Self::finish`].
+    fn finish_for_client(
+        &self,
+        bucket: &str,
+        page: ListObjectsPage,
+        metadata: bool,
+    ) -> impl Future<Output = Result<ListObjectsPage, EngineError>> + Send {
+        self.finish(bucket, page, metadata)
+    }
+
     /// One page as the storage lists it, before [`Self::finish`]: the scan
     /// of a filtered LIST reads hidden keys that need no logical size and no
     /// HEAD. Also returns the requests the page sent to the backend, which
@@ -81,6 +109,30 @@ impl<S: crate::storage::StorageBackend> Lister for crate::deltaglider::DeltaGlid
     ) -> Result<ListObjectsPage, EngineError> {
         self.list_objects(bucket, prefix, delimiter, max_keys, cursor, metadata)
             .await
+    }
+
+    async fn list_for_client(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        cursor: Option<&str>,
+        metadata: bool,
+    ) -> Result<ListObjectsPage, EngineError> {
+        self.list_objects_for_client(bucket, prefix, delimiter, max_keys, cursor, metadata)
+            .await
+    }
+
+    async fn finish_for_client(
+        &self,
+        bucket: &str,
+        mut page: ListObjectsPage,
+        metadata: bool,
+    ) -> Result<ListObjectsPage, EngineError> {
+        self.finish_listed_page_for_client(bucket, &mut page, metadata)
+            .await?;
+        Ok(page)
     }
 
     async fn list_lite(
@@ -347,7 +399,7 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
     let Some(Visibility { user, context }) = Visibility::of(scope) else {
         return Ok(CallerPage {
             page: lister
-                .list(bucket, prefix, delimiter, max_keys, cursor, metadata)
+                .list_for_client(bucket, prefix, delimiter, max_keys, cursor, metadata)
                 .await?,
             hidden_cursor: false,
             proof: None,
@@ -399,7 +451,7 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
     };
     // Sizes and metadata for the visible page only.
     Ok(CallerPage {
-        page: lister.finish(bucket, page, metadata).await?,
+        page: lister.finish_for_client(bucket, page, metadata).await?,
         hidden_cursor: budget_spent,
         proof: if budget_spent { scan.proof } else { None },
     })

@@ -142,6 +142,55 @@ pub(crate) async fn list_job_keys(
         .map_err(|e| ListError::engine(context, &e))
 }
 
+/// Rounds that [`list_job_keys_healing_facts`] gives one page.
+const FACTS_HEAL_ROUNDS: usize = 3;
+
+/// [`list_job_keys`], and the listing facts of the page's deltas: the page
+/// is completed as a client LIST completes it, which HEADs each delta that
+/// has no durable facts and keeps its facts. A round that the backend's
+/// HEAD budget cut short is repeated while it makes progress (at most
+/// [`FACTS_HEAL_ROUNDS`] times). A foreign `.delta` object without DG
+/// metadata has no facts to learn and stays missing; it never fails the
+/// job.
+pub(crate) async fn list_job_keys_healing_facts(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    token: Option<&str>,
+    context: &str,
+) -> Result<
+    (
+        KeyPage,
+        crate::deltaglider::ListedPageForms,
+        Option<Vec<String>>,
+    ),
+    ListError,
+> {
+    let listed = engine
+        .list_job_page(bucket, super::worker::PAGE_SIZE, token)
+        .await
+        .map_err(|e| ListError::engine(context, &e))?;
+    let mut missing = usize::MAX;
+    for _ in 0..FACTS_HEAL_ROUNDS {
+        // A completed page no longer shows the stored size and ETag that
+        // name its stored objects: each round completes the listed page.
+        let mut round = listed.page.clone();
+        engine
+            .finish_listed_page_for_client(bucket, &mut round, false)
+            .await
+            .map_err(|e| ListError::engine(context, &e))?;
+        let now = round.facts_missing_keys.len();
+        if now == 0 || now >= missing {
+            break;
+        }
+        missing = now;
+    }
+    Ok((
+        KeyPage::from(listed.page),
+        listed.forms,
+        listed.reference_prefixes,
+    ))
+}
+
 /// A page listing that failed: what the failure means for the loop, and
 /// the text that becomes the job's error when the listing does not recover.
 #[derive(Debug)]
