@@ -713,6 +713,32 @@ pub async fn sweep_probes_older_than(
                     .send()
                     .await;
             }
+        } else {
+            // A backend that cannot list versions (Cloudflare R2): list the
+            // keys of the folder and delete each match without a version id.
+            // Same shape rule, backend clock, page bound and deadline.
+            let date = super::server_clock::ServerDate::default();
+            if let Ok(page) = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(PROBE_PREFIX)
+                .max_keys(100)
+                .customize()
+                .interceptor(date.clone())
+                .send()
+                .await
+            {
+                let keys = page.contents().iter().filter_map(|o| {
+                    Some((
+                        o.key()?.to_string(),
+                        String::new(),
+                        o.last_modified()?.secs(),
+                    ))
+                });
+                for (key, _) in stale_probe_entries(date.get(), min_age_secs, keys) {
+                    let _ = client.delete_object().bucket(bucket).key(key).send().await;
+                }
+            }
         }
         let date = super::server_clock::ServerDate::default();
         if let Ok(page) = client
@@ -1833,6 +1859,31 @@ mod stale_probe_tests {
             .await
             .unwrap();
         assert_eq!(fake.stored_count(&key), 0, "the litter stays");
+    }
+
+    /// A backend that cannot list versions (R2) still gets its old probe key
+    /// removed, through a plain listing; a client key and a fresh probe key stay.
+    #[tokio::test]
+    async fn without_a_versions_listing_the_sweep_lists_keys() {
+        let (client, fake) = fake_client().await;
+        fake.fail("LIST_VERSIONS", "", 501, "NotImplemented", u32::MAX);
+        let now = chrono::Utc::now().timestamp();
+        let old = now - STALE_PROBE_AGE_SECS - 60;
+        let (old_key, fresh_key) = (
+            format!("b/{}", new_probe_key()),
+            format!("b/{}", new_probe_key()),
+        );
+        let client_key = format!("b/{PROBE_PREFIX}report.pdf");
+        for (p, at) in [(&old_key, old), (&fresh_key, now), (&client_key, old)] {
+            fake.insert_object(p, b"1", &[]);
+            fake.set_modified(p, at);
+        }
+
+        sweep_stale_probes(&client, "b", in_ten_seconds()).await;
+
+        assert_eq!(fake.stored_count(&old_key), 0, "the old probe key stays");
+        assert_eq!(fake.stored_count(&fresh_key), 1, "a live probe's key went");
+        assert_eq!(fake.stored_count(&client_key), 1, "a client key went");
     }
 
     /// A sweep that the backend delays ends at its budget.
