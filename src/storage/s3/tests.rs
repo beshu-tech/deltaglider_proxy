@@ -3686,9 +3686,12 @@ mod stored_last_modified_tests {
         let s3 = test_support::for_test_endpoint(&ep);
         fake.insert_object("b/p/foreign.bin", b"xyz", &[]);
         fake.insert_object("b/p/dir/", b"", &[]);
+        let jan = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).single();
+        for path in ["b/p/foreign.bin", "b/p/dir/"] {
+            fake.set_modified(path, jan.unwrap().timestamp());
+        }
         let listed = s3.bulk_list_objects("b", "p/").await.unwrap();
         assert_eq!(listed.len(), 2, "{listed:?}");
-        let jan = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).single();
         for (key, meta) in &listed {
             assert_eq!(meta.stored_last_modified, jan, "{key}");
         }

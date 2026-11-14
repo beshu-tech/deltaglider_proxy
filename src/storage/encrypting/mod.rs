@@ -1447,7 +1447,10 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             }
             Ok(_) => {}
             Err(_) => {
-                tracing::warn!("encryption: refused plaintext {bucket}/{prefix} {object:?}");
+                // The capability probe's own keys are not objects of the bucket.
+                if !crate::coordination::cas_probe::is_probe_folder(prefix) {
+                    tracing::warn!("encryption: refused plaintext {bucket}/{prefix} {object:?}");
+                }
                 conversion::PLAINTEXT_READS
                     .with_label_values(&[conversion::REFUSED])
                     .inc();

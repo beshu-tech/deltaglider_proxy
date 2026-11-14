@@ -1217,7 +1217,14 @@ async fn validate_cas_bucket_as(
     }
 
     // ── 2. Isolated probe on a random key (fail-closed) ──
-    let probe_key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
+    crate::coordination::cas_probe::sweep_stale_probes(
+        client,
+        bucket,
+        now,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .await;
+    let probe_key = crate::coordination::cas_probe::new_probe_key();
     let profile = match crate::coordination::cas_probe::probe_cas(client, bucket, &probe_key).await
     {
         Ok(p) if p.cas => p.profile(),

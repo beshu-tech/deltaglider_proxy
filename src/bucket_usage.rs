@@ -466,28 +466,29 @@ impl BucketUsage {
             )?;
         }
         if (d_count, d_logical, d_stored) != (0, 0, 0) {
-            let (oc, lb, sb) = conn.query_row(
+            let (oc, lb, sb, scanned) = conn.query_row(
                 "INSERT INTO bucket_usage (bucket, object_count, logical_bytes, stored_bytes)
                      VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(bucket) DO UPDATE SET
                      object_count  = object_count  + excluded.object_count,
                      logical_bytes = logical_bytes + excluded.logical_bytes,
                      stored_bytes  = stored_bytes  + excluded.stored_bytes
-                 RETURNING object_count, logical_bytes, stored_bytes",
+                 RETURNING object_count, logical_bytes, stored_bytes, last_scan_at IS NOT NULL",
                 params![bucket, d_count, d_logical, d_stored],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
                         r.get::<_, i64>(1)?,
                         r.get::<_, i64>(2)?,
+                        r.get::<_, bool>(3)?,
                     ))
                 },
             )?;
-            // A negative column is ALWAYS a real accounting bug (a
-            // missed-count upstream), never a steady state — warn
-            // loudly. The read path still clamps at 0 for display;
-            // this surfaces the drift instead of hiding it.
-            if oc < 0 || lb < 0 || sb < 0 {
+            // A scanned row holds a baseline, so a negative column there is a
+            // miscount. A never-scanned row holds only the deltas since
+            // counting began: deleting an older object makes it negative by
+            // design. The read path clamps at 0 for display.
+            if scanned && (oc < 0 || lb < 0 || sb < 0) {
                 warn!(
                     "bucket_usage: counter for '{}' went negative (count={}, logical={}, stored={}) — \
                      an upstream mutation was miscounted; run Refresh to reconcile",
@@ -1100,6 +1101,34 @@ mod tests {
         }
         assert_eq!(wrong, 0, "a stamped scan disagrees with what was stored");
         assert!(stamps > 0, "no scan was stamped in {tries} tries");
+    }
+
+    /// A never-scanned row holds only deltas since counting began, so a delete
+    /// of an older object makes it negative by design: no warning. A scanned
+    /// row has a baseline, so there a negative count is a miscount: warn.
+    #[test]
+    fn only_a_scanned_row_warns_when_it_goes_negative() {
+        let log = crate::test_log_capture::capture("warn");
+        let db = Arc::new(BucketUsage::in_memory().unwrap());
+        db.apply_object("fresh", &meta_passthrough(10), -1);
+        db.flush_pending();
+        assert!(
+            !log.text().contains("went negative"),
+            "a never-scanned row warned:\n{}",
+            log.text()
+        );
+
+        let ticket = db.begin_scan("scanned");
+        let totals = totals_of(&[meta_passthrough(10)]);
+        assert!(db.overwrite_from_quiet_scan(ticket, &totals, 5).unwrap());
+        db.apply_object("scanned", &meta_passthrough(10), -1);
+        db.apply_object("scanned", &meta_passthrough(10), -1);
+        db.flush_pending();
+        assert!(
+            log.text().contains("went negative"),
+            "a scanned row did not warn:\n{}",
+            log.text()
+        );
     }
 
     /// A window is a count in the bucket's entry: it blocks the stamp while

@@ -542,7 +542,10 @@ async fn raw_versions(bucket: &str) -> Vec<(String, bool, bool)> {
     let mut out = Vec::new();
     for v in page.versions() {
         let key = v.key().unwrap().to_string();
-        if key.starts_with(".dg/facts/") {
+        // The capability probe's own keys (live while it runs) are no objects of the bucket.
+        if key.starts_with(".dg/facts/")
+            || deltaglider_proxy::coordination::cas_probe::is_probe_key(&key)
+        {
             continue;
         }
         let head = minio

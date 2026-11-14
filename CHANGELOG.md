@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A stopped capability probe no longer leaves objects in a data bucket.** A probe that the process abandoned before its own cleanup (a stop during boot) left keys under `.deltaglider/_cwprobe/`; on a bucket that encrypts, the next boot then warned that the bucket holds objects that are not encrypted. Each capability probe, and the probe of the coordination bucket, now first removes the keys there (all versions) and the open multipart uploads there that are older than one hour, within a third of the probe deadline and without failing the probe. The boot sample of plaintext objects and the "refused plaintext" log line skip those keys.
+- The "counter went negative" warning of the bucket usage counters now fires only for a row that a scan has set. A row that was never scanned holds only the changes since counting began, so deleting an older object makes it negative by design.
+- `scripts/test-prod-config.sh` waits up to 20 seconds for the proxy to exit after SIGTERM before it sends SIGKILL.
+
 ## v2.2.1 — 2026-11-14
 
 ### Upgrade steps for the next release
