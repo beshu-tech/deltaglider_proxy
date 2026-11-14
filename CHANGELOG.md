@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.2.2 — 2026-11-14
+
 ### Fixed
 
 - **A stopped capability probe no longer leaves objects in a data bucket.** A probe that the process abandoned before its own cleanup (a stop during boot) left keys under `.deltaglider/_cwprobe/`; on a bucket that encrypts, the next boot then warned that the bucket holds objects that are not encrypted. Each capability probe, and the probe of the coordination bucket, now first lists the versions (with delete markers) and the open multipart uploads under that folder and removes those that are older than one hour on the clock of the backend (the `Date` of the listing; without it nothing is removed). It reads one page of each and never fails the probe. A capability probe gives the sweep a third of its 15 seconds; the probe of the coordination bucket gives it a fixed 5 seconds, and that probe has no overall deadline. A backend that cannot list versions (Cloudflare R2) gets a plain key listing instead, with the same rules. It removes only keys of the exact probe shape (a UUID with an optional `-mpu`). The boot sample of plaintext objects and the "refused plaintext" log line skip those keys.
