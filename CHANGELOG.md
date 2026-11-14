@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A stopped capability probe no longer leaves objects in a data bucket.** A probe that the process abandoned before its own cleanup (a stop during boot) left keys under `.deltaglider/_cwprobe/`; on a bucket that encrypts, the next boot then warned that the bucket holds objects that are not encrypted. Each capability probe, and the probe of the coordination bucket, now first lists the versions (with delete markers) and the open multipart uploads under that folder and removes those that are older than one hour on the clock of the backend (the `Date` of the listing; without it nothing is removed). It reads one page of each and never fails the probe. A capability probe gives the sweep a third of its 15 seconds; the probe of the coordination bucket gives it a fixed 5 seconds, and that probe has no overall deadline. A backend that cannot list versions (Cloudflare R2) gets a plain key listing instead, with the same rules. It removes only keys of the exact probe shape (a UUID with an optional `-mpu`). The boot sample of plaintext objects and the "refused plaintext" log line skip those keys.
+- **A client write under `.deltaglider/_cwprobe/` is refused with `400`**, like the other reserved keys. A key that an older release stored there stays readable and deletable. The probe sweep removes only a key whose name is exactly a UUID with an optional `-mpu` and that is older than one hour, so an old client key of that exact shape is removed too. Every other key there stays.
+- A migrate, a re-encrypt job and a backfill job skip a capability probe key that a stopped probe left in the bucket. Before, a migrate of such a bucket failed on that key, because the proxy refuses to store it.
+- The "counter went negative" warning of the bucket usage counters now fires only for a row that a scan has ever set (a new `baselined` column; usage database schema 2). A row with no scan ever holds only the changes since counting began, so deleting an older object makes it negative by design. The schema step adds the column only when it is missing, runs in one transaction and never stamps a lower version, so an upgrade after a downgrade opens the database.
+- `scripts/test-prod-config.sh` waits up to 20 seconds for the proxy to exit after SIGTERM before it sends SIGKILL.
+
 ## v2.2.1 — 2026-11-14
 
 ### Upgrade steps for the next release

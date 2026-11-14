@@ -110,7 +110,15 @@ pub(crate) struct KeyPage {
 impl From<crate::deltaglider::ListObjectsPage> for KeyPage {
     fn from(p: crate::deltaglider::ListObjectsPage) -> Self {
         Self {
-            keys: p.objects.into_iter().map(|(k, _)| k).collect(),
+            // THE skip rule of every job lister (migrate copy, verify and
+            // prune; re-encrypt; backfill): the capability probe's own keys
+            // are no objects of the bucket, and the engine refuses to store them.
+            keys: p
+                .objects
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| !crate::coordination::cas_probe::is_probe_key(k))
+                .collect(),
             is_truncated: p.is_truncated,
             next_token: p.next_continuation_token,
         }

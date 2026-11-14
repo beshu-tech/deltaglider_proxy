@@ -4333,6 +4333,74 @@ mod source_guards {
         }
     }
 
+    /// The probe folder is spelled in `coordination/cas_probe.rs` only
+    /// (`PROBE_PREFIX`, `new_probe_key`, `is_probe_key`): a second spelling
+    /// is a site that can drift from the sweep and from the plaintext checks.
+    #[test]
+    fn the_probe_folder_is_spelled_in_one_place() {
+        use crate::source_scan::{files, root};
+        let name = ["_cw", "probe"].concat();
+        let mut bad = Vec::new();
+        let mut scanned = 0;
+        for path in files("src", "rs") {
+            scanned += 1;
+            let rel = path
+                .strip_prefix(root())
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            if rel == "src/coordination/cas_probe.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                if line.contains(&name) {
+                    bad.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(scanned > 200, "the scan found the sources ({scanned})");
+        assert!(
+            bad.is_empty(),
+            "name the probe folder through `cas_probe::PROBE_PREFIX` / `is_probe_key`:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// Every page of a job lister becomes a `KeyPage` through its `From`
+    /// impl in `maintenance/paged.rs`, which skips the probe's own keys. A
+    /// lister that built a `KeyPage` by hand would copy them and fail.
+    #[test]
+    fn job_pages_are_made_by_the_one_from_impl() {
+        use crate::source_scan::{files, root};
+        let mut bad = Vec::new();
+        let mut scanned = 0;
+        for path in files("src/maintenance", "rs") {
+            scanned += 1;
+            let rel = path
+                .strip_prefix(root())
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let prod = text.split("#[cfg(test)]").next().unwrap_or("");
+            let literal = ["KeyPage", " {"].concat();
+            for (n, line) in prod.lines().enumerate() {
+                let t = line.trim_start();
+                let declares = t.starts_with("pub(crate) struct") || t.starts_with("impl");
+                if t.contains(&literal) && !declares {
+                    bad.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(scanned > 5, "the scan found the sources ({scanned})");
+        assert!(
+            bad.is_empty(),
+            "build a job page through `KeyPage::from` (it skips the probe keys):\n{}",
+            bad.join("\n")
+        );
+    }
+
     #[test]
     fn request_path_reads_no_env() {
         // A file of the request path that reads the environment on purpose

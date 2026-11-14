@@ -439,11 +439,19 @@ pub async fn establish_backend_verdict_within(
             }
         }
     };
-    let probe_key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
+    let probe_key = super::cas_probe::new_probe_key();
     // ONE deadline for both stages: the callers (the boot gate, the hot-apply
     // gate, the encrypted-bucket atomic-writes check that answers 503 while
     // it runs) rely on a probe that ends within `budget`.
     let deadline = tokio::time::Instant::now() + budget;
+    // Litter of an earlier probe that never ended goes first, within a third
+    // of the budget, so the probe itself keeps the rest.
+    super::cas_probe::sweep_stale_probes(
+        &client,
+        &group.probe_bucket,
+        tokio::time::Instant::now() + budget / 3,
+    )
+    .await;
     // A future that the deadline cuts is dropped, and its probe key is then
     // removed by the probe's own drop guard (`cas_probe::SweepOnDrop`, with
     // ALL its versions: a versioned bucket, as every B2 bucket is, keeps a

@@ -308,3 +308,90 @@ fn test_noncas_default_backend_without_policies_fails_boot() {
         "FATAL line must name the backend, output:\n{output}"
     );
 }
+
+/// On a VERSIONED bucket a probe key that a stopped probe left has noncurrent
+/// versions and a delete marker. The sweep removes every one of them (each
+/// by its version id), and leaves every version of a client key under the same
+/// folder. The age is a parameter here so that the test need not wait an hour.
+#[tokio::test]
+async fn test_sweep_removes_every_version_and_marker_of_a_probe_key() {
+    skip_unless_minio!();
+    use aws_sdk_s3::primitives::ByteStream;
+    use deltaglider_proxy::coordination::cas_probe::{
+        new_probe_key, sweep_probes_older_than, PROBE_PREFIX,
+    };
+
+    let bucket = common::unique_bucket("sweepver");
+    let minio = common::minio_client().await;
+    minio.create_bucket().bucket(&bucket).send().await.unwrap();
+    minio
+        .put_bucket_versioning()
+        .bucket(&bucket)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let probe = new_probe_key();
+    let client_key = format!("{PROBE_PREFIX}report.pdf");
+    for key in [&probe, &client_key] {
+        for body in ["one", "two"] {
+            minio
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(body.as_bytes()))
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+    minio
+        .delete_object()
+        .bucket(&bucket)
+        .key(&probe)
+        .send()
+        .await
+        .unwrap();
+    let under_prefix = || async {
+        let page = minio
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix(PROBE_PREFIX)
+            .send()
+            .await
+            .unwrap();
+        let versions = page
+            .versions()
+            .iter()
+            .filter_map(|v| v.key().map(str::to_string))
+            .collect::<Vec<_>>();
+        let markers = page
+            .delete_markers()
+            .iter()
+            .filter_map(|m| m.key().map(str::to_string))
+            .collect::<Vec<_>>();
+        (versions, markers)
+    };
+    let (versions, markers) = under_prefix().await;
+    assert_eq!(versions.iter().filter(|k| **k == probe).count(), 2);
+    assert_eq!(markers.len(), 1, "a delete marker is there");
+    assert_eq!(markers[0], probe);
+
+    // The listing's own Date and times are whole seconds: wait past one.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    sweep_probes_older_than(
+        &minio,
+        &bucket,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+        1,
+    )
+    .await;
+
+    let (versions, markers) = under_prefix().await;
+    assert_eq!(versions, [client_key.clone(), client_key], "{versions:?}");
+    assert!(markers.is_empty(), "a delete marker stays: {markers:?}");
+}

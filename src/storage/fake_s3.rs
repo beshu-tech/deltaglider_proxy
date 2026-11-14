@@ -6,7 +6,8 @@
 //! It answers PUT, CopyObject, GET (with `Range: bytes=a-b` / `bytes=a-`),
 //! HEAD, DELETE and ListObjectsV2 (`prefix`,
 //! `delimiter`, `start-after`, `max-keys` (up to 1000) and
-//! `continuation-token`, paged like S3) and ListBuckets. Other
+//! `continuation-token`, paged like S3), ListBuckets and ListMultipartUploads
+//! (`?uploads`, with the abort of an upload by id). Other
 //! bucket-level requests get an empty listing. Tests can delay each
 //! operation, read its peak concurrency, and inject faults
 //! ([`FakeS3::set_delay_ms`], [`FakeS3::peak_in_flight`], [`FakeS3::fail`]).
@@ -91,9 +92,38 @@ pub(crate) struct FakeS3 {
     /// Overwrites armed by [`FakeS3::overwrite_after_reads`]: (object,
     /// source, GETs and HEADs of the object still to answer first).
     overwrites: parking_lot::Mutex<Vec<(String, String, u32)>>,
+    /// Open multipart uploads: (`bucket/key`, upload id, initiated unix
+    /// seconds), from [`FakeS3::insert_upload`]. `GET /bucket?uploads` lists
+    /// them and `DELETE /bucket/key?uploadId=..` aborts one.
+    uploads: parking_lot::Mutex<Vec<(String, String, i64)>>,
+    /// The `Date` header that every response carries, when set
+    /// ([`FakeS3::set_clock`]); else the HTTP server's own.
+    clock: parking_lot::Mutex<Option<i64>>,
 }
 
 impl FakeS3 {
+    /// Every response carries `Date` = `unix` from now on: the backend's
+    /// clock, apart from the test process's.
+    pub(crate) fn set_clock(&self, unix: i64) {
+        *self.clock.lock() = Some(unix);
+    }
+
+    /// Open a multipart upload on `bucket/key`, initiated at `unix`.
+    pub(crate) fn insert_upload(&self, path: &str, id: &str, unix: i64) {
+        self.uploads
+            .lock()
+            .push((path.to_string(), id.to_string(), unix));
+    }
+
+    /// How many multipart uploads are open under `prefix` (`bucket/key` form).
+    pub(crate) fn open_uploads(&self, prefix: &str) -> usize {
+        self.uploads
+            .lock()
+            .iter()
+            .filter(|(p, _, _)| p.starts_with(prefix))
+            .count()
+    }
+
     /// Object body bytes since the last [`FakeS3::clear`]: (downloaded by
     /// GET, uploaded by PUT). A server-side copy moves none. The listing
     /// facts that background tasks keep under `.dg/` do not count: they
@@ -550,9 +580,10 @@ fn list_page(
         entries += 1;
         next_token = Some(k);
         contents.push_str(&format!(
-            "<Contents><Key>{}</Key><LastModified>2025-01-01T00:00:00.000Z</LastModified>\
+            "<Contents><Key>{}</Key><LastModified>{}</LastModified>\
              <ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
             xml_escape(k),
+            iso_time(o.modified),
             xml_escape(&o.etag),
             o.body.len()
         ));
@@ -589,6 +620,87 @@ fn list_page(
          <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Name>{bucket}</Name><Prefix>{}</Prefix><MaxKeys>{max_keys}</MaxKeys>\
          <IsTruncated>{truncated}</IsTruncated>{token}{contents}{common}</ListBucketResult>",
+        xml_escape(prefix)
+    )
+}
+
+/// Unix seconds as the ISO 8601 time of a listing.
+fn iso_time(unix: i64) -> String {
+    chrono::DateTime::from_timestamp(unix, 0)
+        .unwrap_or_default()
+        .format("%Y-%m-%dT%H:%M:%S.000Z")
+        .to_string()
+}
+
+/// Unix seconds as an HTTP date (`Sat, 26 Sep 2026 01:02:03 GMT`).
+fn http_date(unix: i64) -> String {
+    chrono::DateTime::from_timestamp(unix, 0)
+        .unwrap_or_default()
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
+}
+
+/// A ListObjectVersions answer for `bucket` under the `prefix` query: every
+/// stored object under it, as the one version `null`.
+fn list_versions(
+    objects: &HashMap<String, Stored>,
+    bucket: &str,
+    query: &HashMap<String, String>,
+) -> String {
+    let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+    let own = format!("{bucket}/");
+    let mut keys: Vec<(&str, &Stored)> = objects
+        .iter()
+        .filter_map(|(p, o)| Some((p.strip_prefix(&own)?, o)))
+        .filter(|(k, _)| k.starts_with(prefix))
+        .collect();
+    keys.sort_by_key(|(k, _)| *k);
+    let items: String = keys
+        .into_iter()
+        .map(|(k, o)| {
+            format!(
+                "<Version><Key>{}</Key><VersionId>null</VersionId><IsLatest>true</IsLatest>\
+                 <LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size></Version>",
+                xml_escape(k),
+                iso_time(o.modified),
+                xml_escape(&o.etag),
+                o.body.len()
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>{bucket}</Name><Prefix>{}</Prefix><IsTruncated>false</IsTruncated>{items}\
+         </ListVersionsResult>",
+        xml_escape(prefix)
+    )
+}
+
+/// A ListMultipartUploads answer for `bucket` under the `prefix` query.
+fn list_uploads(f: &FakeS3, bucket: &str, query: &HashMap<String, String>) -> String {
+    let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+    let own = format!("{bucket}/");
+    let items: String = f
+        .uploads
+        .lock()
+        .iter()
+        .filter_map(|(p, id, at)| Some((p.strip_prefix(&own)?, id, at)))
+        .filter(|(k, _, _)| k.starts_with(prefix))
+        .map(|(k, id, at)| {
+            format!(
+                "<Upload><Key>{}</Key><UploadId>{}</UploadId><Initiated>{}</Initiated></Upload>",
+                xml_escape(k),
+                xml_escape(id),
+                iso_time(*at)
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Bucket>{bucket}</Bucket><Prefix>{}</Prefix><IsTruncated>false</IsTruncated>{items}\
+         </ListMultipartUploadsResult>",
         xml_escape(prefix)
     )
 }
@@ -763,8 +875,12 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                 let bucket = params.get("bucket").cloned().unwrap_or_default();
                 let is_list = method == Method::GET
                     && query.get("list-type").map(String::as_str) == Some("2");
+                let is_uploads = method == Method::GET && query.contains_key("uploads");
+                let is_versions = method == Method::GET && query.contains_key("versions");
                 let op = match method {
                     _ if is_list => "LIST",
+                    _ if is_versions => "LIST_VERSIONS",
+                    _ if is_uploads => "LIST_UPLOADS",
                     Method::HEAD => "HEAD_BUCKET",
                     _ => "BUCKET",
                 };
@@ -776,6 +892,15 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                     return (
                         StatusCode::OK,
                         list_page(&f.objects.lock(), &bucket, &query),
+                    );
+                }
+                if is_uploads {
+                    return (StatusCode::OK, list_uploads(&f, &bucket, &query));
+                }
+                if is_versions {
+                    return (
+                        StatusCode::OK,
+                        list_versions(&f.objects.lock(), &bucket, &query),
                     );
                 }
                 if method == Method::PUT {
@@ -946,6 +1071,12 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                                 ),
                             },
                             Method::DELETE => {
+                                let upload =
+                                    query.split('&').find_map(|q| q.strip_prefix("uploadId="));
+                                if let Some(id) = upload {
+                                    f.uploads.lock().retain(|(_, i, _)| i != id);
+                                    return (StatusCode::NO_CONTENT, HeaderMap::new(), Vec::new());
+                                }
                                 f.objects.lock().remove(&path);
                                 (StatusCode::NO_CONTENT, HeaderMap::new(), Vec::new())
                             }
@@ -1002,7 +1133,13 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                 async move {
                     let chunked = req.method() == Method::GET
                         && f.chunked_gets.load(std::sync::atomic::Ordering::SeqCst);
-                    let resp = next.run(req).await;
+                    let mut resp = next.run(req).await;
+                    // A backend whose clock differs from the test's own.
+                    if let Some(unix) = *f.clock.lock() {
+                        if let Ok(v) = http_date(unix).parse() {
+                            resp.headers_mut().insert(axum::http::header::DATE, v);
+                        }
+                    }
                     if !chunked {
                         return resp;
                     }

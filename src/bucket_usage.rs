@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
 
 /// SCHEMA_VERSION for the usage DB — independent of the config DB's version.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Path to the usage DB — beside the config DB (same dir-derivation rule).
 pub fn bucket_usage_db_path() -> PathBuf {
@@ -332,18 +332,38 @@ impl BucketUsage {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap_or(0);
-        if version < 1 {
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS bucket_usage (
-                    bucket        TEXT PRIMARY KEY,
-                    object_count  INTEGER NOT NULL DEFAULT 0,
-                    logical_bytes INTEGER NOT NULL DEFAULT 0,
-                    stored_bytes  INTEGER NOT NULL DEFAULT 0,
-                    last_scan_at  INTEGER
-                );",
+        // A DB of a newer release is left as it is, never stamped down.
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        // One transaction: a crash leaves the old version. An older release
+        // stamps version 1 over a DB that already has the column, so the
+        // column is added only when `table_info` does not list it.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bucket_usage (
+                bucket        TEXT PRIMARY KEY,
+                object_count  INTEGER NOT NULL DEFAULT 0,
+                logical_bytes INTEGER NOT NULL DEFAULT 0,
+                stored_bytes  INTEGER NOT NULL DEFAULT 0,
+                last_scan_at  INTEGER
+            );",
+        )?;
+        let has_column: bool = tx.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('bucket_usage') WHERE name = 'baselined'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_column {
+            tx.execute_batch(
+                "ALTER TABLE bucket_usage ADD COLUMN baselined INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        // A scanned row has a baseline; a row with no stamp is unknown. A row
+        // that an older release scanned lost its mark: the stamp restores it.
+        tx.execute_batch("UPDATE bucket_usage SET baselined = 1 WHERE last_scan_at IS NOT NULL;")?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -466,28 +486,30 @@ impl BucketUsage {
             )?;
         }
         if (d_count, d_logical, d_stored) != (0, 0, 0) {
-            let (oc, lb, sb) = conn.query_row(
+            let (oc, lb, sb, scanned) = conn.query_row(
                 "INSERT INTO bucket_usage (bucket, object_count, logical_bytes, stored_bytes)
                      VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(bucket) DO UPDATE SET
                      object_count  = object_count  + excluded.object_count,
                      logical_bytes = logical_bytes + excluded.logical_bytes,
                      stored_bytes  = stored_bytes  + excluded.stored_bytes
-                 RETURNING object_count, logical_bytes, stored_bytes",
+                 RETURNING object_count, logical_bytes, stored_bytes, baselined",
                 params![bucket, d_count, d_logical, d_stored],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
                         r.get::<_, i64>(1)?,
                         r.get::<_, i64>(2)?,
+                        r.get::<_, bool>(3)?,
                     ))
                 },
             )?;
-            // A negative column is ALWAYS a real accounting bug (a
-            // missed-count upstream), never a steady state — warn
-            // loudly. The read path still clamps at 0 for display;
-            // this surfaces the drift instead of hiding it.
-            if oc < 0 || lb < 0 || sb < 0 {
+            // A row that a scan ever set has a baseline (`baselined`, kept
+            // when `last_scan_at` is cleared), so a negative column there is a
+            // miscount. A row with no scan ever holds only the deltas since
+            // counting began: deleting an older object makes it negative by
+            // design. The read path clamps at 0 for display.
+            if scanned && (oc < 0 || lb < 0 || sb < 0) {
                 warn!(
                     "bucket_usage: counter for '{}' went negative (count={}, logical={}, stored={}) — \
                      an upstream mutation was miscounted; run Refresh to reconcile",
@@ -786,8 +808,8 @@ impl BucketUsage {
         let object_count = (totals.delta_count + totals.passthrough_count) as i64;
         conn.execute(
             "INSERT OR REPLACE INTO bucket_usage
-                (bucket, object_count, logical_bytes, stored_bytes, last_scan_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                (bucket, object_count, logical_bytes, stored_bytes, last_scan_at, baselined)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
             params![
                 bucket,
                 object_count + jc,
@@ -1100,6 +1122,167 @@ mod tests {
         }
         assert_eq!(wrong, 0, "a stamped scan disagrees with what was stored");
         assert!(stamps > 0, "no scan was stamped in {tries} tries");
+    }
+
+    /// A never-scanned row holds only deltas since counting began, so a delete
+    /// of an older object makes it negative by design: no warning. A scanned
+    /// row has a baseline, so there a negative count is a miscount: warn.
+    #[test]
+    fn only_a_scanned_row_warns_when_it_goes_negative() {
+        let log = crate::test_log_capture::capture("warn");
+        let db = Arc::new(BucketUsage::in_memory().unwrap());
+        db.apply_object("fresh", &meta_passthrough(10), -1);
+        db.flush_pending();
+        assert!(
+            !log.text().contains("went negative"),
+            "a never-scanned row warned:\n{}",
+            log.text()
+        );
+
+        let ticket = db.begin_scan("scanned");
+        let totals = totals_of(&[meta_passthrough(10)]);
+        assert!(db.overwrite_from_quiet_scan(ticket, &totals, 5).unwrap());
+        db.apply_object("scanned", &meta_passthrough(10), -1);
+        db.apply_object("scanned", &meta_passthrough(10), -1);
+        db.flush_pending();
+        assert!(
+            log.text().contains("went negative"),
+            "a scanned row did not warn:\n{}",
+            log.text()
+        );
+    }
+
+    /// A row that a scan set keeps its baseline when `last_scan_at` is empty
+    /// (a busy scan stamps none; a recount mark clears it): a negative
+    /// count there is a miscount, so it warns.
+    #[test]
+    fn a_row_with_a_baseline_warns_without_a_scan_stamp() {
+        let totals = totals_of(&[meta_passthrough(10)]);
+        for how in ["busy scan", "recount mark"] {
+            let log = crate::test_log_capture::capture("warn");
+            let db = Arc::new(BucketUsage::in_memory().unwrap());
+            let ticket = db.begin_scan("b");
+            if how == "busy scan" {
+                db.apply_object("b", &meta_passthrough(10), 1);
+                db.overwrite_from_scan(ticket, &totals, 5).unwrap();
+            } else {
+                db.overwrite_from_scan(ticket, &totals, 5).unwrap();
+                db.mark_for_recount("b");
+                db.flush_pending();
+            }
+            assert_eq!(db.read("b").unwrap().unwrap().last_scan_at, None, "{how}");
+            for _ in 0..3 {
+                db.apply_object("b", &meta_passthrough(10), -1);
+            }
+            db.flush_pending();
+            assert!(
+                log.text().contains("went negative"),
+                "{how}: a row with a baseline did not warn:\n{}",
+                log.text()
+            );
+        }
+    }
+
+    /// A row of the first schema gets the baseline mark from its scan stamp.
+    #[test]
+    fn the_baseline_mark_follows_the_stamp_of_an_older_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE bucket_usage (
+                    bucket TEXT PRIMARY KEY,
+                    object_count INTEGER NOT NULL DEFAULT 0,
+                    logical_bytes INTEGER NOT NULL DEFAULT 0,
+                    stored_bytes INTEGER NOT NULL DEFAULT 0,
+                    last_scan_at INTEGER);
+                 INSERT INTO bucket_usage VALUES ('scanned', 1, 1, 1, 7);
+                 INSERT INTO bucket_usage VALUES ('fresh', 1, 1, 1, NULL);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let db = BucketUsage::open(&path).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let mark = |b: &str| -> i64 {
+            conn.query_row(
+                "SELECT baselined FROM bucket_usage WHERE bucket = ?1",
+                params![b],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!((mark("scanned"), mark("fresh")), (1, 0));
+    }
+
+    /// A DB with the `baselined` column and `user_version = 1` (an upgrade, a
+    /// downgrade to a release that stamps 1, an upgrade again; or a crash
+    /// after the ALTER) opens, and the marks that the older release lost return.
+    #[test]
+    fn the_migration_runs_again_over_a_partly_applied_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE bucket_usage (
+                    bucket TEXT PRIMARY KEY,
+                    object_count INTEGER NOT NULL DEFAULT 0,
+                    logical_bytes INTEGER NOT NULL DEFAULT 0,
+                    stored_bytes INTEGER NOT NULL DEFAULT 0,
+                    last_scan_at INTEGER,
+                    baselined INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO bucket_usage VALUES ('rescanned', 1, 1, 1, 7, 0);
+                 INSERT INTO bucket_usage VALUES ('fresh', 1, 1, 1, NULL, 0);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let mark = |db: &BucketUsage, b: &str| -> i64 {
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT baselined FROM bucket_usage WHERE bucket = ?1",
+                    params![b],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let db = BucketUsage::open(&path).expect("a DB with the column opens");
+        assert_eq!((mark(&db, "rescanned"), mark(&db, "fresh")), (1, 0));
+        drop(db);
+        // And again: the second open changes nothing.
+        let db = BucketUsage::open(&path).unwrap();
+        assert_eq!((mark(&db, "rescanned"), mark(&db, "fresh")), (1, 0));
+    }
+
+    /// A DB of a newer release is never stamped to a lower version.
+    #[test]
+    fn a_newer_database_keeps_its_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE bucket_usage (
+                    bucket TEXT PRIMARY KEY,
+                    object_count INTEGER NOT NULL DEFAULT 0,
+                    logical_bytes INTEGER NOT NULL DEFAULT 0,
+                    stored_bytes INTEGER NOT NULL DEFAULT 0,
+                    last_scan_at INTEGER,
+                    baselined INTEGER NOT NULL DEFAULT 0);
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+        }
+        drop(BucketUsage::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        let v: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 9);
     }
 
     /// A window is a count in the bucket's entry: it blocks the stamp while

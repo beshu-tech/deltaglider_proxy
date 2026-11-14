@@ -51,8 +51,21 @@ ok()   { PASS=$((PASS+1)); printf '\033[32m ok \033[0m %s\n' "$*"; }
 bad()  { FAIL=$((FAIL+1)); printf '\033[31mFAIL\033[0m %s\n' "$*"; }
 check(){ if "$@" >/dev/null 2>&1; then ok "${ASSERT}"; else bad "${ASSERT}"; fi; }
 
+# SIGTERM, then up to ~20 s for the exit (the capability probe removes its keys), then SIGKILL.
+stop_proxy() {
+  local pid
+  [[ -f "${DIR}/proxy.pid" ]] || return 0
+  pid="$(cat "${DIR}/proxy.pid")"
+  kill "${pid}" 2>/dev/null || return 0
+  for _ in $(seq 1 40); do
+    kill -0 "${pid}" 2>/dev/null || return 0
+    sleep 0.5
+  done
+  kill -9 "${pid}" 2>/dev/null || true
+}
+
 cleanup() {
-  [[ -f "${DIR}/proxy.pid" ]] && kill "$(cat "${DIR}/proxy.pid")" 2>/dev/null || true
+  stop_proxy
   rm -rf "${DIR}"
 }
 trap cleanup EXIT
@@ -165,7 +178,7 @@ EOF
     -H 'Content-Type: application/json' -d "{\"password\":\"${PW}\"}" -o /dev/null
   curl -fsS -b "${COOKIES}" -X POST "${BASE}/_/api/admin/backup?mode=preserve-bootstrap" \
     -H 'Content-Type: application/zip' --data-binary "@${BACKUP}" -o /dev/null
-  kill "$(cat "${DIR}/proxy.pid")" 2>/dev/null || true
+  stop_proxy
   for _ in $(seq 1 20); do
     port_in_use "${PORT}" || break
     sleep 0.5

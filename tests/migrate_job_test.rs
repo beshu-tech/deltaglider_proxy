@@ -1466,6 +1466,56 @@ async fn test_migrate_meets_a_legacy_dg_key_and_stops_before_the_flip() {
     assert_eq!(job["status"], "succeeded", "job: {job}");
 }
 
+/// A capability probe key that a stopped probe left in the source bucket is
+/// no object of the bucket: the engine refuses to store it, so the copy skips it
+/// and the migrate completes.
+#[tokio::test]
+async fn test_migrate_skips_a_probe_key_in_the_source() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migbkt";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    seed(&http, &endpoint, bucket, 3).await;
+    let probe = format!(
+        "{}{}",
+        deltaglider_proxy::coordination::cas_probe::PROBE_PREFIX,
+        "0b9f5a52-3c1e-4d7a-9a6e-2f4c8d1e7b30"
+    );
+    let (folder, name) = probe.rsplit_once('/').unwrap();
+    let planted = dir_a.path().join(bucket).join("deltaspaces").join(folder);
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(planted.join(name), b"probe litter").unwrap();
+    let listing = listed_keys(&http, &endpoint, bucket).await;
+    assert!(listing.contains(&probe), "the key is listed: {listing}");
+
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(job["progress"]["failed"], 0, "job: {job}");
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+    assert!(
+        !dir_b
+            .path()
+            .join(bucket)
+            .join("deltaspaces")
+            .join(&probe)
+            .exists(),
+        "the probe key was copied"
+    );
+}
+
 /// A migrate whose copy waits for DISK space does not keep the bucket from
 /// deleting. The job holds the write gate for its whole life, so a delete of
 /// the source that the gate refused would wait for the job, and the job for

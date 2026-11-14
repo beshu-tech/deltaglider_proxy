@@ -84,7 +84,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?;
         let mut out = PlaintextSample::default();
         for (key, _) in page.objects {
-            if key.ends_with('/') {
+            if key.ends_with('/') || crate::coordination::cas_probe::is_probe_key(&key) {
                 continue;
             }
             match self.head(bucket, &key).await {
