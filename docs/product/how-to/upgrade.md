@@ -502,6 +502,14 @@ What to do:
 - **Read the warnings of `config lint` and of the start.** An input of the disk monitor that is not taken as written is named: a size with a unit such as `10GiB` (write bytes), a percent outside 1 to 50, a ceiling or a percent below the one of a higher level.
 - **Read the new warning at start.** When the spool directory has less free space than the spool budget, the proxy logs a line that starts with `[disk]`. Lower `DGP_SPOOL_MAX_BYTES` or move `DGP_SPOOL_DIR` to a larger disk.
 
+## Keys under `.deltaglider/_cwprobe/` are reserved (2.2.2)
+
+The proxy checks each S3 backend with a capability probe, which writes small objects under `.deltaglider/_cwprobe/` in a bucket of that backend and removes them again. A probe that stops before its own cleanup, for example because the process is killed during the start, leaves those objects behind. Since 2.2.2, every probe first removes the leftovers that are older than one hour, judged by the clock of the backend.
+
+Because the proxy now removes objects in that folder, it refuses a client write there: a PUT, a copy, a multipart upload or a browser upload to a key under `.deltaglider/_cwprobe/` gets `400 InvalidArgument`, with a message that names the folder. Before you upgrade, move any of your own objects out of that folder. An object that an older release stored there stays readable and deletable. The sweep removes only a key whose name is exactly a UUID, optionally followed by `-mpu`, so such a client key is removed too once it is older than one hour. Every other key in the folder stays.
+
+A bucket migrate, a re-encrypt job and a backfill job skip the probe keys. The bucket usage counters now warn that a counter "went negative" only when a scan once set that counter; the usage database gets a new column for this, and a downgrade to 2.2.1 still opens it.
+
 ## Common gotchas
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.
