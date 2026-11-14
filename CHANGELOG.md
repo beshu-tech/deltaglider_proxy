@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.2.1 — 2026-11-14
+
 ### Upgrade steps for the next release
 
 - **The spool and upload limits follow the disk.** `DGP_SPOOL_MAX_BYTES` and `max_object_size` now default to `auto` (the spool was 16 GiB and `max_object_size` 100 MB). At start, after the sweep of the spool directory, the proxy sets the spool budget to 50% of the free space of its filesystem (25% when the spool shares a device with a filesystem backend or the data directory; at least 1 GiB; whole MiB). The largest multipart object and the total of open multipart uploads are each half of the budget, and `max_object_size` is the lowest of the per-upload limit, the multipart total and, with any S3 backend, 5 TiB (the largest S3 object). With 60 GiB free: spool 30 GiB, per upload 15 GiB, `max_object_size` 15 GiB; an object above a third of the budget (10 GiB here, the delta ceiling) is stored whole, not as a delta. A deployment with an explicit spool and the default `max_object_size` gets `max_object_size` = the derived limit (Helm default chart: 100 MiB to 768 MiB); set `max_object_size: 104857600` to keep 100 MiB. On a tmpfs or under Kubernetes with no value, the proxy uses 1 GiB and warns; the Helm chart and the operator set the value. To keep the old limits, set `DGP_SPOOL_MAX_BYTES=17179869184` and `max_object_size: 104857600`. See [the upgrade notes](docs/product/how-to/upgrade.md#the-spool-and-upload-limits-follow-the-disk-221).
