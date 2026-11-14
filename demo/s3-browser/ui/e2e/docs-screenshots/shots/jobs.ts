@@ -251,8 +251,10 @@ export const JOBS_SHOTS: Shot[] = [
     route: `${REPLICATION}?job=replication:releases-to-dr&tab=definition`,
     alt: 'The Advanced part of the releases-to-dr rule is open; one box marks Batch size, and the other box marks the Conflict policy choices.',
     setup: async (page) => {
-      await inDrawer(page).locator('summary', { hasText: /^Advanced/ }).click();
-      await inDrawer(page).getByText('Newer wins — safest default').scrollIntoViewIfNeeded();
+      const advanced = inDrawer(page).locator('summary', { hasText: /^Advanced/ });
+      await advanced.click();
+      // Top of the drawer: the whole Advanced block (batch size, conflict policy) fits the viewport.
+      await advanced.evaluate((el) => el.scrollIntoView({ block: 'start' }));
       await calm(page);
     },
     annotations: [
@@ -454,6 +456,8 @@ export const JOBS_SHOTS: Shot[] = [
     id: 'migrate-jobs-row',
     clip: { union: [{ role: 'button', name: 'New job' }, { text: 'Show runs that changed nothing', exact: true }, { role: 'table' }] },
     clipPadding: 24,
+    // The Jobs table needs about 930 px; the default 1040 px viewport leaves the card less.
+    viewport: { width: 1440, height: 820 },
     route: '/_/admin/jobs',
     alt: 'The Jobs page lists the running migrate job of db-archive to hetzner-fsn1; the box marks the job row.',
     setup: migrateRunning,

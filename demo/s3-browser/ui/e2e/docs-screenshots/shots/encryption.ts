@@ -229,7 +229,12 @@ export const ENCRYPTION_SHOTS: Shot[] = [
     setup: async (page) => {
       await hetznerIsAes(page, false);
       await stubStoragePut(page);
+      // The seed backend is not really encrypted; a rotation previews no conversion.
+      await fakeJson(page, `${STORAGE}/validate`, 'POST', { ok: true, warnings: [], conversion_preview: [] });
       await hetznerBucketsAfterApply(page, 'hetzner-2026-06', 'hetzner-2026-10');
+      // The page read /buckets before the patch; reload so "before" is the old key.
+      await page.reload();
+      await cardLoc(page, 'hetzner-fsn1').waitFor();
       await cardLoc(page, 'hetzner-fsn1').getByRole('button', { name: 'Rotate key' }).click();
       await page.getByTestId('encryption-key-stored').check();
       await page.getByTestId('encryption-apply').click();

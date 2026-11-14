@@ -26,10 +26,10 @@ const WEBP = arg('--webp');
 const COMMITTED = arg('--committed');
 const UPDATE = process.argv.includes('--update');
 const FILE_BUDGET = 150 * 1024;
-// 12 MB: the 90 shots of the docs take 11.3 MB at quality 65 (September
-// 2026), with room for a few more. A new shot that does not fit replaces or
+// 12.5 MB: the 100 shots of the docs take 12.1 MB at quality 65 (November
+// 2026), with a little room. A new shot that does not fit replaces or
 // crops an old one; raising the budget grows every binary download.
-const FOLDER_BUDGET = 12 * 1024 * 1024;
+const FOLDER_BUDGET = 12.5 * 1024 * 1024;
 const CHANNEL_DELTA = 26;
 const STALE_FRACTION = 0.005;
 
