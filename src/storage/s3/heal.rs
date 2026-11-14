@@ -103,18 +103,117 @@ pub(in crate::storage) fn decide_delta_miss(may_head: bool) -> MissDecision {
     }
 }
 
+/// What a LIST learned about one miss that it waited for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Answer {
+    /// The logical size and ETag.
+    Facts(LogicalFacts),
+    /// Nothing to learn (deleted, overwritten, foreign, sealed).
+    Nothing,
+    /// No answer: a failed HEAD, or the page budget ended first.
+    Unfinished,
+}
+
+/// How one inline miss ended.
+enum Done {
+    Facts(LogicalFacts),
+    Head(Arc<Head>),
+    /// The HEAD that this miss waited for never answered.
+    Gone,
+}
+
+/// The HEAD in flight for one stored object, shared by every LIST that
+/// misses it.
+type Flight = tokio::sync::watch::Receiver<Option<Arc<Head>>>;
+
+/// The LIST that sends the HEAD of a stored object. It tells the others
+/// ([`Leading::finish`]); a LIST that is dropped first (its page budget
+/// ended) leaves them without an answer.
+struct Leading {
+    state: Arc<State>,
+    key: String,
+    tx: tokio::sync::watch::Sender<Option<Arc<Head>>>,
+}
+
+impl Leading {
+    /// Publish the answer. A HEAD that answered marks the object tried
+    /// before the flight ends, so no LIST sends a second one.
+    fn finish(self, head: Arc<Head>) {
+        if !matches!(*head, Head::Failed) {
+            self.state.tried.insert(self.key.clone(), ());
+        }
+        self.tx.send_replace(Some(head));
+    }
+}
+
+impl Drop for Leading {
+    fn drop(&mut self) {
+        if let Ok(mut flights) = self.state.inflight.lock() {
+            flights.remove(&self.key);
+        }
+    }
+}
+
+enum Claim {
+    Lead(Leading),
+    Follow(Flight),
+}
+
 struct State {
     client: Client,
     permits: tokio::sync::Semaphore,
     /// HEADs in flight for the misses of a LIST (see [`INLINE_CONCURRENCY`]).
     inline_permits: tokio::sync::Semaphore,
     inline_budget: Duration,
+    /// The inline HEAD in flight of each stored object.
+    inflight: Mutex<std::collections::HashMap<String, Flight>>,
     pending: Mutex<HashSet<String>>,
     tried: Cache<String, ()>,
     paused_until: Mutex<Option<Instant>>,
 }
 
 impl State {
+    /// Join the HEAD in flight of `key`, or become the one that sends it.
+    fn claim(self: &Arc<Self>, key: &str) -> Claim {
+        let mut flights = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rx) = flights.get(key) {
+            return Claim::Follow(rx.clone());
+        }
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        flights.insert(key.to_string(), rx);
+        Claim::Lead(Leading {
+            state: self.clone(),
+            key: key.to_string(),
+            tx,
+        })
+    }
+
+    /// The answer for one inline miss: from the listing-size cache when a
+    /// HEAD learned it meanwhile, from the HEAD in flight, or from a HEAD of
+    /// its own.
+    async fn head_once(self: &Arc<Self>, miss: &Miss) -> Done {
+        if let Some(facts) = list_size_cache::lookup(&miss.id()) {
+            return Done::Facts(facts);
+        }
+        match self.claim(&miss.dedup_key()) {
+            Claim::Follow(mut flight) => match flight.wait_for(|v| v.is_some()).await {
+                Ok(head) => head.clone().map_or(Done::Gone, Done::Head),
+                Err(_) => Done::Gone,
+            },
+            Claim::Lead(lead) => {
+                let Ok(_permit) = self.inline_permits.acquire().await else {
+                    return Done::Gone;
+                };
+                if crate::shutdown::is_shutting_down() || self.paused() {
+                    return Done::Gone;
+                }
+                let head = Arc::new(head_miss(self, miss).await);
+                lead.finish(head.clone());
+                Done::Head(head)
+            }
+        }
+    }
+
     fn paused(&self) -> bool {
         self.paused_until
             .lock()
@@ -176,6 +275,7 @@ impl FactsHealer {
                 permits: tokio::sync::Semaphore::new(HEAL_CONCURRENCY),
                 inline_permits: tokio::sync::Semaphore::new(INLINE_CONCURRENCY),
                 inline_budget: INLINE_BUDGET,
+                inflight: Mutex::new(Default::default()),
                 pending: Mutex::new(HashSet::new()),
                 tried: Cache::builder()
                     .max_capacity(100_000)
@@ -208,46 +308,45 @@ impl FactsHealer {
     }
 
     /// HEAD the stored objects of `misses` for the LIST that waits, at most
-    /// [`INLINE_CONCURRENCY`] at once and for at most the page budget. Per
-    /// miss: `Some(metadata)` when the HEAD learned the facts (they are
-    /// remembered and written, as the background heal does), else `None`:
-    /// nothing to learn, a failed HEAD (which pauses the healer), or no time
-    /// left. A miss that no HEAD answered is not marked tried, so a later
-    /// LIST or the background queue HEADs it.
-    pub(super) async fn head_inline(
-        &self,
-        misses: &[Miss],
-        facts: &FactsWriter,
-    ) -> Vec<Option<FileMetadata>> {
-        let mut learned: Vec<Option<FileMetadata>> = vec![None; misses.len()];
+    /// [`INLINE_CONCURRENCY`] at once and for at most the page budget. One
+    /// HEAD serves every LIST that misses the same stored object at the
+    /// same time: the first LIST sends it, the others wait for its answer.
+    /// Per miss: [`Answer::Facts`] when a HEAD learned the facts (they are
+    /// remembered and written, as the background heal does),
+    /// [`Answer::Nothing`] when there is nothing to learn, else
+    /// [`Answer::Unfinished`]: a failed HEAD (which pauses the healer) or no
+    /// time left. A miss that no HEAD answered is not marked tried, so a
+    /// later LIST or the background queue HEADs it.
+    pub(super) async fn head_inline(&self, misses: &[Miss], facts: &FactsWriter) -> Vec<Answer> {
+        let mut answers: Vec<Answer> = misses.iter().map(|_| Answer::Unfinished).collect();
         let state = &self.state;
         let mut heads: futures::stream::FuturesUnordered<_> = misses
             .iter()
             .enumerate()
-            .map(|(i, miss)| async move {
-                let _permit = state.inline_permits.acquire().await.ok()?;
-                if crate::shutdown::is_shutting_down() || state.paused() {
-                    return None;
-                }
-                Some((i, head_miss(state, miss).await))
+            .map(|(i, miss)| {
+                let state = state.clone();
+                async move { (i, state.head_once(miss).await) }
             })
             .collect();
         let deadline = tokio::time::Instant::now() + state.inline_budget;
-        while let Ok(Some(done)) = tokio::time::timeout_at(deadline, heads.next()).await {
-            let Some((i, head)) = done else { continue };
-            match head {
-                Head::Failed => state.pause(),
-                Head::Nothing => {
-                    state.tried.insert(misses[i].dedup_key(), ());
-                }
-                Head::Learned(meta) => {
-                    state.tried.insert(misses[i].dedup_key(), ());
-                    learn(&misses[i], &meta, facts);
-                    learned[i] = Some(*meta);
-                }
-            }
+        while let Ok(Some((i, done))) = tokio::time::timeout_at(deadline, heads.next()).await {
+            answers[i] = match done {
+                Done::Facts(f) => Answer::Facts(f),
+                Done::Gone => Answer::Unfinished,
+                Done::Head(head) => match &*head {
+                    Head::Failed => {
+                        state.pause();
+                        Answer::Unfinished
+                    }
+                    Head::Nothing => Answer::Nothing,
+                    Head::Learned(meta) => {
+                        learn(&misses[i], meta, facts);
+                        LogicalFacts::of(meta).map_or(Answer::Nothing, Answer::Facts)
+                    }
+                },
+            };
         }
-        learned
+        answers
     }
 
     /// Queue a background HEAD for `miss`, unless [`admit`] refuses it.
@@ -483,11 +582,83 @@ mod tests {
         crate::usage_scanner::test_support::facts_lists(fake)
     }
 
+    /// A client LIST page (the only kind that HEADs its misses inline).
     async fn list(engine: &DynEngine, prefix: &str) -> crate::deltaglider::ListObjectsPage {
+        engine
+            .list_objects_for_client("b", prefix, None, 1000, None, false)
+            .await
+            .unwrap()
+    }
+
+    /// A walk page (a folder listing, a scan, a job): no inline HEAD.
+    async fn walk(engine: &DynEngine, prefix: &str) -> crate::deltaglider::ListObjectsPage {
         engine
             .list_objects("b", prefix, None, 1000, None, false)
             .await
             .unwrap()
+    }
+
+    /// An engine on the fake behind the encrypting wrapper with `cfg`, with
+    /// its own listing-cache scope.
+    fn wrapped(endpoint: &str, node: &str, cfg: crate::storage::EncryptionConfig) -> DynEngine {
+        let mut s3 = test_support::for_test_endpoint(endpoint);
+        s3.list_cache_scope = test_support::test_scope(endpoint, node);
+        let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(cfg)));
+        let backend: Box<DynStorageBackend<'static>> =
+            DynStorageBackend::new_box(crate::storage::EncryptingBackend::new(s3, cfg));
+        DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &crate::config::Config::default(),
+            None,
+        )
+    }
+
+    /// Bucket `b` encrypts under key `kid` (`stopped`: it stopped, and keeps
+    /// `kid` as its legacy key until a re-encrypt job has converted it).
+    fn bucket_b_config(stopped: bool) -> crate::storage::EncryptionConfig {
+        use crate::storage::{BucketKeys, EncryptionConfig, EncryptionKey};
+        let key = EncryptionKey::from_hex(&"ef".repeat(32)).unwrap();
+        let bucket = if stopped {
+            BucketKeys {
+                legacy_key_id: Some("kid".into()),
+                ..Default::default()
+            }
+        } else {
+            BucketKeys {
+                key: Some(key.clone()),
+                key_id: Some("kid".into()),
+                ..Default::default()
+            }
+        };
+        EncryptionConfig {
+            buckets: std::collections::HashMap::from([("b".to_string(), bucket)]),
+            keyring: std::collections::HashMap::from([("kid".to_string(), key)]),
+            ..Default::default()
+        }
+    }
+
+    /// Plant a `!!1` facts object (size 7) for each stored delta under `rel/`
+    /// of bucket `b`, next to the object, as a backend writer would.
+    async fn plant_facts(endpoint: &str, fake: &FakeS3) -> usize {
+        let plain = engine_on(test_support::for_test_endpoint(endpoint));
+        let stub = plain
+            .list_objects_lite("b", "rel/", None, 1000, None)
+            .await
+            .unwrap();
+        for (key, meta) in &stub.objects {
+            let facts_key = crate::storage::listing_facts::asked_facts_key(
+                &format!("{key}.delta"),
+                &meta.md5,
+                meta.stored_size(),
+                &LogicalFacts {
+                    size: 7,
+                    etag: "0".repeat(32),
+                },
+            )
+            .expect("a facts key");
+            fake.insert_object(&format!("b/{facts_key}"), &[], &[]);
+        }
+        stub.objects.len()
     }
 
     /// The setup helper leaves NO durable facts, whatever the host load:
@@ -644,17 +815,152 @@ mod tests {
         };
         assert_eq!(sizes(&page), [65_536; 3], "from the facts");
         assert_eq!(fake.remove_prefix("b/.dg/facts/"), 3);
+        // Facts of another stored object (another ETag) are no answer.
+        let plain = engine_on(test_support::for_test_endpoint(&endpoint));
+        let stubs = plain
+            .list_objects_lite("b", "rel/", None, 1000, None)
+            .await
+            .unwrap();
+        for (key, meta) in &stubs.objects {
+            let stale = crate::storage::listing_facts::asked_facts_key(
+                &format!("{key}.delta"),
+                &"1".repeat(32),
+                meta.stored_size(),
+                &LogicalFacts {
+                    size: 7,
+                    etag: "0".repeat(32),
+                },
+            )
+            .expect("a facts key");
+            fake.insert_object(&format!("b/{stale}"), &[], &[]);
+        }
         let without = bucket_keyed_reader(&endpoint, "keyed-node-2");
         fake.clear();
         let page = list(&without, "rel/").await;
         assert_eq!(sizes(&page), [65_536; 3], "from one HEAD each");
         assert!(page.facts_missing_keys.is_empty(), "{page:?}");
-        assert!(wait_stored(&fake, 3, "b/.dg/facts/").await, "facts kept");
+        assert!(wait_stored(&fake, 6, "b/.dg/facts/").await, "facts kept");
         let other = bucket_keyed_reader(&endpoint, "keyed-node-3");
         fake.clear();
         let page = list(&other, "rel/").await;
         assert_eq!(sizes(&page), [65_536; 3]);
         assert_eq!(fake.requests().iter().filter(|r| delta_heads(r)).count(), 0);
+    }
+
+    /// Sealed deltas of bucket `b` with their `!!2` tokens and a planted
+    /// `!!1` entry (size 7) for each: the writer's cache is not the
+    /// reader's. Returns the number of deltas.
+    async fn sealed_deltas_with_planted_facts(
+        endpoint: &str,
+        fake: &FakeS3,
+        keep_tokens: bool,
+    ) -> usize {
+        let writer = wrapped(endpoint, "sealed-writer", bucket_b_config(false));
+        writer.create_bucket("b").await.unwrap();
+        crate::deltaglider::store_deltas(&writer, "rel", 3).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fake.stored_count("b/.dg/facts/") < 3 {
+            assert!(tokio::time::Instant::now() < deadline, "tokens written");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if !keep_tokens {
+            fake.remove_prefix("b/.dg/facts/");
+        }
+        plant_facts(endpoint, fake).await
+    }
+
+    fn sizes_of(p: &crate::deltaglider::ListObjectsPage) -> Vec<u64> {
+        p.objects.iter().map(|(_, m)| m.file_size).collect()
+    }
+
+    /// A bucket that stopped encrypting keeps its key as a legacy key, so it
+    /// may hold sealed objects: a planted `!!1` entry next to a sealed delta
+    /// with a valid token lists the token's size, not the planted one.
+    #[tokio::test]
+    async fn a_planted_facts_object_never_sizes_a_sealed_delta() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let n = sealed_deltas_with_planted_facts(&endpoint, &fake, true).await;
+        assert_eq!(n, 3);
+        let reader = wrapped(&endpoint, "stopped-reader", bucket_b_config(true));
+        let page = list(&reader, "rel/").await;
+        assert_eq!(sizes_of(&page), [65_536; 3]);
+    }
+
+    /// A `!!2` token beats a `!!1` entry for the same stored object on the
+    /// raw backend too, whatever its caller trusts.
+    #[tokio::test]
+    async fn a_token_beats_planted_facts_on_the_raw_backend() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        sealed_deltas_with_planted_facts(&endpoint, &fake, true).await;
+        let raw = reader(&endpoint, "raw-reader");
+        let page = list(&raw, "rel/").await;
+        assert!(
+            sizes_of(&page).iter().all(|s| *s != 7),
+            "{:?}",
+            sizes_of(&page)
+        );
+    }
+
+    /// A bucket that may hold sealed objects ignores `!!1` entries even
+    /// where no token exists: the entry cannot size the sealed delta.
+    #[tokio::test]
+    async fn a_bucket_that_stopped_encrypting_ignores_planted_facts() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        sealed_deltas_with_planted_facts(&endpoint, &fake, false).await;
+        let reader = wrapped(&endpoint, "stopped-reader-2", bucket_b_config(true));
+        let page = list(&reader, "rel/").await;
+        assert!(
+            sizes_of(&page).iter().all(|s| *s != 7),
+            "{:?}",
+            sizes_of(&page)
+        );
+    }
+
+    /// A walk (a folder listing, a scan, a job) sends no inline HEAD: its
+    /// misses list their stored size and are healed in the background. A
+    /// client LIST of the same page lists the original sizes.
+    #[tokio::test]
+    async fn a_walk_sends_no_inline_head_but_a_client_list_does() {
+        let (engine, fake, _) = deltas_without_facts("rel", 6).await;
+        fake.set_delay_ms("HEAD", 300);
+        fake.clear();
+        let started = std::time::Instant::now();
+        let page = walk(&engine, "rel/").await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "a walk page waited for HEADs"
+        );
+        assert!(sizes_of(&page).iter().all(|s| *s < 65_536));
+        // The background healer repairs them; a client LIST is right.
+        fake.set_delay_ms("HEAD", 0);
+        let healed = async {
+            loop {
+                let page = list(&engine, "rel/").await;
+                if sizes_of(&page) == [65_536; 6] {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), healed)
+            .await
+            .expect("a client LIST is right once the heal ran");
+    }
+
+    /// LISTs of one page at the same time share the HEAD of each miss: one
+    /// HEAD per stored object, however many LISTs wait for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_lists_share_one_head_per_object() {
+        const N: usize = 40;
+        let (engine, fake, _) = deltas_without_facts("rel", N).await;
+        fake.set_delay_ms("HEAD", 100);
+        fake.clear();
+        let pages = futures::future::join_all((0..5).map(|_| list(&engine, "rel/"))).await;
+        for page in &pages {
+            assert_eq!(sizes_of(page), [65_536; N]);
+        }
+        let heads = fake.requests().iter().filter(|r| delta_heads(r)).count();
+        assert_eq!(heads, N, "one HEAD per stored object");
     }
 
     /// A backend that throttles the HEADs of a LIST does not fail the LIST:

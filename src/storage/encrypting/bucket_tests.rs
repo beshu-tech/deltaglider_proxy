@@ -448,3 +448,67 @@ async fn presentation_keeps_the_stored_last_modified() {
     assert_eq!(r.stamp("releases", "x").await.as_deref(), Some("local-a"));
     assert_eq!(r.stamp("downloads", "y").await, None);
 }
+
+/// Which buckets can hold a sealed object under a config: only a bucket
+/// that has a key or a legacy key (its own, or the backend's when it has no
+/// override). The LIST trusts `!!1` facts of the others only.
+#[test]
+fn a_bucket_may_hold_sealed_objects_only_with_a_configured_key() {
+    let a = key(0xaa);
+    let none = EncryptionConfig::default();
+    assert!(!none.bucket_may_hold_sealed("any"));
+    // Backend key: every bucket without an override may.
+    let backend = EncryptionConfig {
+        key: Some(a.clone()),
+        key_id: Some("a".into()),
+        ..Default::default()
+    };
+    assert!(backend.bucket_may_hold_sealed("any"));
+    let backend_legacy = EncryptionConfig {
+        legacy_key: Some(a.clone()),
+        legacy_key_id: Some("a".into()),
+        ..Default::default()
+    };
+    assert!(backend_legacy.bucket_may_hold_sealed("any"));
+    // Overrides: its own key, its legacy key, or neither (plaintext, even
+    // on a backend that holds a key).
+    let overrides = EncryptionConfig {
+        key: Some(a.clone()),
+        buckets: HashMap::from([
+            (
+                "keyed".to_string(),
+                BucketKeys {
+                    key: Some(key(0xbb)),
+                    key_id: Some("b".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "stopped".to_string(),
+                BucketKeys {
+                    legacy_key_id: Some("b".into()),
+                    ..Default::default()
+                },
+            ),
+            ("plain".to_string(), BucketKeys::default()),
+        ]),
+        ..Default::default()
+    };
+    assert!(overrides.bucket_may_hold_sealed("keyed"));
+    assert!(overrides.bucket_may_hold_sealed("stopped"));
+    assert!(!overrides.bucket_may_hold_sealed("plain"));
+    // A bucket on a backend that holds keys only for other buckets.
+    let others = EncryptionConfig {
+        buckets: HashMap::from([(
+            "keyed".to_string(),
+            BucketKeys {
+                key: Some(key(0xbb)),
+                key_id: Some("b".into()),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    assert!(!others.bucket_may_hold_sealed("beshu"));
+    assert!(others.bucket_may_hold_sealed("keyed"));
+}

@@ -315,6 +315,18 @@ impl EncryptionConfig {
         })
     }
 
+    /// Can `bucket` hold a sealed object under this config? Only when a key
+    /// is configured for it: its own key or legacy key, or, for a bucket
+    /// without an override, the backend's key or legacy key. A bucket that
+    /// stopped encrypting keeps its key as `legacy_key_id` until a
+    /// re-encrypt job has converted it, so it still counts. Pure.
+    pub(crate) fn bucket_may_hold_sealed(&self, bucket: &str) -> bool {
+        match self.buckets.get(bucket) {
+            Some(b) => b.key.is_some() || b.legacy_key_id.is_some(),
+            None => self.key.is_some() || self.legacy_key.is_some(),
+        }
+    }
+
     /// The prepared key of `key` (from the ring; a key that is not there,
     /// which the engine never builds, is prepared on the spot).
     fn site_of(&self, key: &EncryptionKey) -> Arc<v2::SiteKey> {
@@ -1370,15 +1382,18 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     }
 
     /// May a LIST of `bucket` trust the unauthenticated `!!1` listing facts?
-    /// Only where the read rule ([`seal::read_verdict`]) serves every
-    /// unsealed object to a client: the bucket writes plaintext
-    /// ([`seal::PlaintextRule::Serves`]). The bytes of such an object are as
-    /// unauthenticated as its facts, so the facts add no trust. A bucket that
-    /// encrypts refuses unsealed objects outside a conversion window
-    /// (`PlaintextRule::Encrypts`); there a forged marker would choose the
-    /// size of a sealed object, so it keeps the `!!2` tokens only.
+    /// Only where no sealed object can exist and the read rule
+    /// ([`seal::read_verdict`]) serves every unsealed object to a client:
+    /// the bucket writes plaintext ([`seal::PlaintextRule::Serves`]) and no
+    /// key is configured for it ([`EncryptionConfig::bucket_may_hold_sealed`]).
+    /// The bytes of such an object are as unauthenticated as its facts, so
+    /// the facts add no trust. A bucket that encrypts refuses unsealed
+    /// objects outside a conversion window (`PlaintextRule::Encrypts`), and
+    /// a bucket that stopped encrypting may hold sealed history: a forged
+    /// marker would choose the size of a sealed object, so both keep the
+    /// `!!2` tokens only.
     fn v1_facts_trusted(&self, bucket: &str) -> bool {
-        self.writes_plaintext(bucket)
+        self.writes_plaintext(bucket) && !self.config.load().bucket_may_hold_sealed(bucket)
     }
 
     /// The plaintext rule of `bucket` with the conversion `window`.
@@ -2751,10 +2766,11 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
     /// encrypts (or converts), its own facts are not trusted (a backend
     /// writer can forge `!!1` markers), a listed size is the stored size,
     /// and the logical facts come from listing tokens that open under a key
-    /// of this backend. In a bucket that writes plaintext the read rule
-    /// serves every unsealed object (`seal::PlaintextRule::Serves`), so
-    /// the `!!1` facts of its objects are trusted as in a backend without a
-    /// key (`v1_facts_trusted`).
+    /// of this backend. A bucket that writes plaintext and has no key
+    /// configured can hold no sealed object, and the read rule serves every
+    /// unsealed object there (`seal::PlaintextRule::Serves`), so the `!!1`
+    /// facts of its objects are trusted as in a backend without a key
+    /// (`v1_facts_trusted`).
     async fn resolve_listed_sizes(
         &self,
         b: &str,

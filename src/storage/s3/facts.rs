@@ -391,13 +391,6 @@ impl S3Backend {
         let mut resolved = Vec::new();
         for (i, stored_key) in candidates {
             let meta = &mut objects[*i].1;
-            let found = entries.get(stored_key).and_then(|e| {
-                let facts = e.iter().filter_map(|m| match m {
-                    listing_facts::Marker::Facts(f) => Some(f),
-                    listing_facts::Marker::Token(_) => None,
-                });
-                listing_facts::facts_for(facts, &meta.md5, meta.stored_size())
-            });
             let id = StoredObjectId {
                 scope: &self.list_cache_scope,
                 bucket,
@@ -405,6 +398,28 @@ impl S3Backend {
                 etag: &meta.md5,
                 size: meta.stored_size(),
             };
+            // A `!!2` listing token names a sealed object, and the
+            // encrypting wrapper lists it from the token. A `!!1` entry
+            // for the same stored object is never read, whoever planted it.
+            let has_token = list_size_cache::lookup_token(&id).is_some()
+                || entries.get(stored_key).is_some_and(|e| {
+                    let tokens = e.iter().filter_map(|m| match m {
+                        listing_facts::Marker::Token(t) => Some(t),
+                        listing_facts::Marker::Facts(_) => None,
+                    });
+                    listing_facts::token_for(tokens, &meta.md5, meta.stored_size()).is_some()
+                });
+            if has_token {
+                list_size_cache::mark_sealed(&id);
+                continue;
+            }
+            let found = entries.get(stored_key).and_then(|e| {
+                let facts = e.iter().filter_map(|m| match m {
+                    listing_facts::Marker::Facts(f) => Some(f),
+                    listing_facts::Marker::Token(_) => None,
+                });
+                listing_facts::facts_for(facts, &meta.md5, meta.stored_size())
+            });
             match found {
                 Some(facts) => {
                     list_size_cache::record(&id, facts.clone());
@@ -439,9 +454,12 @@ impl S3Backend {
         sizes: &mut [ListedSize],
         inline: bool,
     ) {
-        use super::heal::{decide_delta_miss, MissDecision};
+        use super::heal::{decide_delta_miss, Answer, MissDecision};
         let mut now: Vec<(usize, super::heal::Miss)> = Vec::new();
         let mut background = Vec::new();
+        // A HEAD of another LIST may have learned a miss since this page
+        // read the cache.
+        let mut learned_meanwhile: Vec<(usize, LogicalFacts)> = Vec::new();
         for (i, ((key, meta), size)) in objects.iter().zip(sizes.iter()).enumerate() {
             if *size != ListedSize::StoredOnly {
                 continue;
@@ -456,11 +474,19 @@ impl S3Backend {
             if list_size_cache::known_sealed(&miss.id()) {
                 continue;
             }
+            if let Some(facts) = list_size_cache::lookup(&miss.id()) {
+                learned_meanwhile.push((i, facts));
+                continue;
+            }
             match decide_delta_miss(inline && self.healer.may_head_inline(&miss)) {
                 MissDecision::HeadNow => now.push((i, miss)),
                 MissDecision::Keep { heal: true } => background.push(miss),
                 MissDecision::Keep { heal: false } | MissDecision::Invert(_) => {}
             }
+        }
+        for (i, facts) in learned_meanwhile {
+            list_size_cache::apply(&mut objects[i].1, &facts);
+            sizes[i] = ListedSize::Cached;
         }
         let writer = self.facts_cleanup.writer();
         if !now.is_empty() {
@@ -469,16 +495,16 @@ impl S3Backend {
             for miss in &misses {
                 list_size_cache::mark_missing_facts(&miss.id());
             }
-            let learned = self.healer.head_inline(&misses, &writer).await;
-            for ((i, miss), meta) in at.into_iter().zip(misses).zip(learned) {
-                match meta.as_ref().and_then(LogicalFacts::of) {
-                    Some(facts) => {
+            let answers = self.healer.head_inline(&misses, &writer).await;
+            for ((i, miss), answer) in at.into_iter().zip(misses).zip(answers) {
+                match answer {
+                    Answer::Facts(facts) => {
                         list_size_cache::apply(&mut objects[i].1, &facts);
                         sizes[i] = ListedSize::Cached;
                     }
+                    Answer::Nothing => {}
                     // No answer in time: the next LIST is right.
-                    None if meta.is_none() => background.push(miss),
-                    None => {}
+                    Answer::Unfinished => background.push(miss),
                 }
             }
         }

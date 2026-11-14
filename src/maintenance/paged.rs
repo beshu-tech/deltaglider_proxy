@@ -175,7 +175,7 @@ pub(crate) async fn list_job_keys_healing_facts(
         // name its stored objects: each round completes the listed page.
         let mut round = listed.page.clone();
         engine
-            .finish_listed_page(bucket, &mut round, false)
+            .finish_listed_page_for_client(bucket, &mut round, false)
             .await
             .map_err(|e| ListError::engine(context, &e))?;
         let now = round.facts_missing_keys.len();

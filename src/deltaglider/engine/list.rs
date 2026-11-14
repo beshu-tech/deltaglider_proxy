@@ -179,6 +179,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(page)
     }
 
+    /// [`Self::list_objects`] for a client that waits for the page: a delta
+    /// without listing facts is HEADed on the page's path
+    /// (`finish_listed_page_for_client`).
+    pub async fn list_objects_for_client(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys_raw: u32,
+        continuation_token: Option<&str>,
+        metadata: bool,
+    ) -> Result<ListObjectsPage, EngineError> {
+        let mut page = self
+            .list_objects_lite(bucket, prefix, delimiter, max_keys_raw, continuation_token)
+            .await?;
+        self.finish_listed_page_for_client(bucket, &mut page, metadata)
+            .await?;
+        Ok(page)
+    }
+
     /// One [`Self::list_objects`] page as the storage lists it: STORED sizes
     /// (no listing-size cache, no listing facts, no HEAD), and an empty
     /// `facts_missing_keys`. A caller that drops most entries (the filtered
@@ -320,12 +340,39 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         page: &mut ListObjectsPage,
         metadata: bool,
     ) -> Result<(), EngineError> {
+        self.finish_page(bucket, page, metadata, false).await
+    }
+
+    /// [`Self::finish_listed_page`] for a page that a CLIENT waits for (an S3
+    /// ListObjects response) or that heals the listing facts of its bucket
+    /// (the metadata backfill walk): a delta without listing facts is
+    /// HEADed on the page's path, so no entry lists a stored size. Every
+    /// other walk (folder listings, scans, delete and migrate jobs) uses
+    /// [`Self::finish_listed_page`] and sends no such HEAD. The callers of
+    /// this method are listed in the guard `inline_heads_have_few_callers`.
+    pub(crate) async fn finish_listed_page_for_client(
+        &self,
+        bucket: &str,
+        page: &mut ListObjectsPage,
+        metadata: bool,
+    ) -> Result<(), EngineError> {
+        self.finish_page(bucket, page, metadata, true).await
+    }
+
+    async fn finish_page(
+        &self,
+        bucket: &str,
+        page: &mut ListObjectsPage,
+        metadata: bool,
+        inline_heads: bool,
+    ) -> Result<(), EngineError> {
         let completion = if metadata {
             Completion::StorageFacts
         } else {
             Completion::Sizes
         };
-        self.complete_listed_page(bucket, page, completion).await
+        self.complete_listed_page(bucket, page, completion, inline_heads)
+            .await
     }
 
     /// [`Self::finish_listed_page`] with the HEAD metadata of every delta
@@ -338,7 +385,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         page: &mut ListObjectsPage,
     ) -> Result<(), EngineError> {
-        self.complete_listed_page(bucket, page, Completion::HeadMetadata)
+        self.complete_listed_page(bucket, page, Completion::HeadMetadata, false)
             .await
     }
 
@@ -347,6 +394,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         page: &mut ListObjectsPage,
         completion: Completion,
+        inline_heads: bool,
     ) -> Result<(), EngineError> {
         // Transparency without a HEAD per key: a lite LIST on an S3 backend
         // reports the STORED object (a delta's `.delta`, a ciphertext). Swap
@@ -367,8 +415,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     &mut page.objects,
                     crate::storage::list_size_cache::ResolveListed {
                         caller_heads_misses: completion != Completion::Sizes,
-                        // A client LIST never shows a stored delta size.
-                        inline_heads: completion == Completion::Sizes,
+                        // Only a page that a client waits for (or a
+                        // backfill) HEADs its misses on its own path.
+                        inline_heads: inline_heads && completion == Completion::Sizes,
                         ..Default::default()
                     },
                 )
@@ -661,6 +710,79 @@ pub(crate) fn stored_size_only_keys(
         .filter(|(_, size)| !size.is_known())
         .map(|((key, _), _)| key.clone())
         .collect()
+}
+
+/// A page HEADs its facts misses on its own path only for the callers that
+/// wait for sizes: a client LIST and the backfill walk. A walk that lists
+/// every key (a folder listing, a scan, a delete or a migrate job) must not,
+/// or one listing of an old bucket sends one HEAD per delta.
+#[cfg(test)]
+mod inline_heads_guard {
+    use crate::source_scan::{out_of_line_test_modules, prod_text, read, rel, rust_files};
+
+    #[test]
+    fn inline_heads_have_few_callers() {
+        const ALLOWED: &[(&str, &str)] = &[
+            (
+                "src/deltaglider/engine/list.rs",
+                "defines the client variants",
+            ),
+            (
+                "src/iam/listing.rs",
+                "the Lister of the client LIST (`list_page_for_caller`)",
+            ),
+            (
+                "src/maintenance/paged.rs",
+                "the backfill walk heals the facts of its bucket",
+            ),
+        ];
+        // Each needle is split so this guard does not match itself.
+        let needles = [
+            ["finish_listed_page_", "for_client("].concat(),
+            ["list_objects_", "for_client("].concat(),
+            [".list_", "for_client("].concat(),
+            [".finish_", "for_client("].concat(),
+        ];
+        let files = rust_files("src");
+        let tests = out_of_line_test_modules(&files);
+        let hits: std::collections::BTreeSet<String> = files
+            .iter()
+            .filter(|f| !tests.contains(f))
+            .filter(|f| {
+                let text = prod_text(&read(&rel(f)));
+                needles.iter().any(|n| text.contains(n))
+            })
+            .map(|f| rel(f))
+            .collect();
+        let allowed: std::collections::BTreeSet<String> =
+            ALLOWED.iter().map(|(f, _)| f.to_string()).collect();
+        assert_eq!(
+            hits, allowed,
+            "a walk that opts in to inline HEADs must be named in ALLOWED with its reason"
+        );
+        // The client variants of the `Lister` have one caller: the client LIST.
+        let page = ["list_page_for_", "caller("].concat();
+        let callers: Vec<String> = files
+            .iter()
+            .filter(|f| !tests.contains(f))
+            .filter(|f| prod_text(&read(&rel(f))).contains(&page))
+            .map(|f| rel(f))
+            .collect();
+        assert_eq!(
+            callers,
+            ["src/s3_adapter_s3s/list.rs"],
+            "only the client LIST pages through `list_page_for_caller`"
+        );
+        // The flag is set in one place.
+        let flag = ["inline_heads: ", "inline_heads"].concat();
+        let setters: Vec<String> = files
+            .iter()
+            .filter(|f| !tests.contains(f))
+            .filter(|f| prod_text(&read(&rel(f))).contains(&flag))
+            .map(|f| rel(f))
+            .collect();
+        assert_eq!(setters, ["src/deltaglider/engine/list.rs"]);
+    }
 }
 
 #[cfg(test)]

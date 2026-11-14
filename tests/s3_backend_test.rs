@@ -671,7 +671,7 @@ async fn deltas_without_facts(
     writer: &TestServer,
     n: usize,
 ) -> (String, std::collections::BTreeMap<String, i64>) {
-    let http = reqwest::Client::new();
+    let http = writer.http();
     let prefix = unique_prefix();
     let base = generate_binary(100_000, 33);
     let mut sizes = std::collections::BTreeMap::new();
@@ -682,8 +682,15 @@ async fn deltas_without_facts(
             mutate_binary(&base[..100_000 - i * 7], 0.01)
         };
         let name = format!("v{i:03}.zip");
-        let url = format!("{}/{}/{prefix}/{name}", writer.endpoint(), writer.bucket());
-        let resp = http.put(&url).body(body.clone()).send().await.unwrap();
+        let resp = common::put_object(
+            &http,
+            &writer.endpoint(),
+            writer.bucket(),
+            &format!("{prefix}/{name}"),
+            body.clone(),
+            "application/zip",
+        )
+        .await;
         assert!(resp.status().is_success());
         sizes.insert(format!("{prefix}/{name}"), body.len() as i64);
     }
@@ -717,10 +724,8 @@ async fn listed_sizes(
 
 async fn s3_proxy() -> TestServer {
     TestServer::builder()
-        .open_access()
         .s3_endpoint(&common::minio_endpoint_url())
         .bucket(common::MINIO_BUCKET)
-        .open_access()
         .build()
         .await
 }
