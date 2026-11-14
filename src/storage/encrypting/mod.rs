@@ -316,15 +316,18 @@ impl EncryptionConfig {
     }
 
     /// Can `bucket` hold a sealed object under this config? Only when a key
-    /// is configured for it: its own key or legacy key, or, for a bucket
-    /// without an override, the backend's key or legacy key. A bucket that
-    /// stopped encrypting keeps its key as `legacy_key_id` until a
-    /// re-encrypt job has converted it, so it still counts. Pure.
+    /// is configured for it: its own key or legacy key, or the backend's
+    /// key or legacy key, whether or not the bucket has an override. A
+    /// bucket that inherited the backend key and then got `mode: none`
+    /// (an override with no key) may hold objects sealed under the backend
+    /// key, and a bucket that stopped encrypting keeps its key as
+    /// `legacy_key_id` until a re-encrypt job has converted it. Pure.
     pub(crate) fn bucket_may_hold_sealed(&self, bucket: &str) -> bool {
-        match self.buckets.get(bucket) {
-            Some(b) => b.key.is_some() || b.legacy_key_id.is_some(),
-            None => self.key.is_some() || self.legacy_key.is_some(),
-        }
+        let own = self
+            .buckets
+            .get(bucket)
+            .is_some_and(|b| b.key.is_some() || b.legacy_key_id.is_some());
+        own || self.key.is_some() || self.legacy_key.is_some()
     }
 
     /// The prepared key of `key` (from the ring; a key that is not there,
@@ -1385,13 +1388,14 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     /// Only where no sealed object can exist and the read rule
     /// ([`seal::read_verdict`]) serves every unsealed object to a client:
     /// the bucket writes plaintext ([`seal::PlaintextRule::Serves`]) and no
-    /// key is configured for it ([`EncryptionConfig::bucket_may_hold_sealed`]).
-    /// The bytes of such an object are as unauthenticated as its facts, so
-    /// the facts add no trust. A bucket that encrypts refuses unsealed
-    /// objects outside a conversion window (`PlaintextRule::Encrypts`), and
-    /// a bucket that stopped encrypting may hold sealed history: a forged
-    /// marker would choose the size of a sealed object, so both keep the
-    /// `!!2` tokens only.
+    /// key can have sealed it: none of its own and none of its backend
+    /// ([`EncryptionConfig::bucket_may_hold_sealed`]). The bytes of such an
+    /// object are as unauthenticated as its facts, so the facts add no
+    /// trust. A bucket that encrypts refuses unsealed objects outside a
+    /// conversion window (`PlaintextRule::Encrypts`), and a bucket that
+    /// stopped encrypting, or left the backend key with `mode: none`, may
+    /// hold sealed history: a forged marker would choose the size of a
+    /// sealed object, so these keep the `!!2` tokens only.
     fn v1_facts_trusted(&self, bucket: &str) -> bool {
         self.writes_plaintext(bucket) && !self.config.load().bucket_may_hold_sealed(bucket)
     }

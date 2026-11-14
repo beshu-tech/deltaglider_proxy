@@ -496,19 +496,25 @@ fn a_bucket_may_hold_sealed_objects_only_with_a_configured_key() {
     };
     assert!(overrides.bucket_may_hold_sealed("keyed"));
     assert!(overrides.bucket_may_hold_sealed("stopped"));
-    assert!(!overrides.bucket_may_hold_sealed("plain"));
+    // A plaintext override on a backend that holds a key may hold objects
+    // that were sealed under that key before the override.
+    assert!(overrides.bucket_may_hold_sealed("plain"));
     // A bucket on a backend that holds keys only for other buckets.
     let others = EncryptionConfig {
-        buckets: HashMap::from([(
-            "keyed".to_string(),
-            BucketKeys {
-                key: Some(key(0xbb)),
-                key_id: Some("b".into()),
-                ..Default::default()
-            },
-        )]),
+        buckets: HashMap::from([
+            (
+                "keyed".to_string(),
+                BucketKeys {
+                    key: Some(key(0xbb)),
+                    key_id: Some("b".into()),
+                    ..Default::default()
+                },
+            ),
+            ("plain".to_string(), BucketKeys::default()),
+        ]),
         ..Default::default()
     };
     assert!(!others.bucket_may_hold_sealed("beshu"));
+    assert!(!others.bucket_may_hold_sealed("plain"));
     assert!(others.bucket_may_hold_sealed("keyed"));
 }

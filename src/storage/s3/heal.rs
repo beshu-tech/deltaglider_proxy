@@ -118,7 +118,7 @@ pub(super) enum Answer {
 enum Done {
     Facts(LogicalFacts),
     Head(Arc<Head>),
-    /// The HEAD that this miss waited for never answered.
+    /// No HEAD can be sent now (a shutdown, a pause).
     Gone,
 }
 
@@ -148,9 +148,11 @@ impl Leading {
 
 impl Drop for Leading {
     fn drop(&mut self) {
-        if let Ok(mut flights) = self.state.inflight.lock() {
-            flights.remove(&self.key);
-        }
+        self.state
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
     }
 }
 
@@ -192,24 +194,31 @@ impl State {
     /// HEAD learned it meanwhile, from the HEAD in flight, or from a HEAD of
     /// its own.
     async fn head_once(self: &Arc<Self>, miss: &Miss) -> Done {
-        if let Some(facts) = list_size_cache::lookup(&miss.id()) {
-            return Done::Facts(facts);
-        }
-        match self.claim(&miss.dedup_key()) {
-            Claim::Follow(mut flight) => match flight.wait_for(|v| v.is_some()).await {
-                Ok(head) => head.clone().map_or(Done::Gone, Done::Head),
-                Err(_) => Done::Gone,
-            },
-            Claim::Lead(lead) => {
-                let Ok(_permit) = self.inline_permits.acquire().await else {
-                    return Done::Gone;
-                };
-                if crate::shutdown::is_shutting_down() || self.paused() {
-                    return Done::Gone;
+        // A follower whose leader was dropped (its client left, or its page
+        // budget ended) claims the HEAD again and leads it. The caller's
+        // page budget bounds the loop; a leader that cannot send (shutdown,
+        // pause) ends it with `Gone`.
+        loop {
+            if let Some(facts) = list_size_cache::lookup(&miss.id()) {
+                return Done::Facts(facts);
+            }
+            match self.claim(&miss.dedup_key()) {
+                Claim::Follow(mut flight) => {
+                    if let Ok(Some(head)) = flight.wait_for(|v| v.is_some()).await.as_deref() {
+                        return Done::Head(head.clone());
+                    }
                 }
-                let head = Arc::new(head_miss(self, miss).await);
-                lead.finish(head.clone());
-                Done::Head(head)
+                Claim::Lead(lead) => {
+                    let Ok(_permit) = self.inline_permits.acquire().await else {
+                        return Done::Gone;
+                    };
+                    if crate::shutdown::is_shutting_down() || self.paused() {
+                        return Done::Gone;
+                    }
+                    let head = Arc::new(head_miss(self, miss).await);
+                    lead.finish(head.clone());
+                    return Done::Head(head);
+                }
             }
         }
     }
@@ -854,8 +863,9 @@ mod tests {
         endpoint: &str,
         fake: &FakeS3,
         keep_tokens: bool,
+        writer_config: crate::storage::EncryptionConfig,
     ) -> usize {
-        let writer = wrapped(endpoint, "sealed-writer", bucket_b_config(false));
+        let writer = wrapped(endpoint, "sealed-writer", writer_config);
         writer.create_bucket("b").await.unwrap();
         crate::deltaglider::store_deltas(&writer, "rel", 3).await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -879,7 +889,8 @@ mod tests {
     #[tokio::test]
     async fn a_planted_facts_object_never_sizes_a_sealed_delta() {
         let (endpoint, fake) = crate::storage::fake_s3::start().await;
-        let n = sealed_deltas_with_planted_facts(&endpoint, &fake, true).await;
+        let n =
+            sealed_deltas_with_planted_facts(&endpoint, &fake, true, bucket_b_config(false)).await;
         assert_eq!(n, 3);
         let reader = wrapped(&endpoint, "stopped-reader", bucket_b_config(true));
         let page = list(&reader, "rel/").await;
@@ -891,7 +902,7 @@ mod tests {
     #[tokio::test]
     async fn a_token_beats_planted_facts_on_the_raw_backend() {
         let (endpoint, fake) = crate::storage::fake_s3::start().await;
-        sealed_deltas_with_planted_facts(&endpoint, &fake, true).await;
+        sealed_deltas_with_planted_facts(&endpoint, &fake, true, bucket_b_config(false)).await;
         let raw = reader(&endpoint, "raw-reader");
         let page = list(&raw, "rel/").await;
         assert!(
@@ -906,7 +917,7 @@ mod tests {
     #[tokio::test]
     async fn a_bucket_that_stopped_encrypting_ignores_planted_facts() {
         let (endpoint, fake) = crate::storage::fake_s3::start().await;
-        sealed_deltas_with_planted_facts(&endpoint, &fake, false).await;
+        sealed_deltas_with_planted_facts(&endpoint, &fake, false, bucket_b_config(false)).await;
         let reader = wrapped(&endpoint, "stopped-reader-2", bucket_b_config(true));
         let page = list(&reader, "rel/").await;
         assert!(
@@ -914,6 +925,67 @@ mod tests {
             "{:?}",
             sizes_of(&page)
         );
+    }
+
+    /// The backend key `kid` (no override); with `mode_none`, bucket `b`
+    /// also has a plaintext override (`encryption: {mode: none}`: no key,
+    /// no legacy key id of its own).
+    fn backend_key_config(mode_none: bool) -> crate::storage::EncryptionConfig {
+        use crate::storage::{BucketKeys, EncryptionConfig, EncryptionKey};
+        let key = EncryptionKey::from_hex(&"12".repeat(32)).unwrap();
+        EncryptionConfig {
+            key: Some(key.clone()),
+            key_id: Some("kid".into()),
+            buckets: if mode_none {
+                std::collections::HashMap::from([("b".to_string(), BucketKeys::default())])
+            } else {
+                Default::default()
+            },
+            keyring: std::collections::HashMap::from([("kid".to_string(), key)]),
+            ..Default::default()
+        }
+    }
+
+    /// A bucket that inherited the backend key, sealed deltas under it, and
+    /// then got `encryption: {mode: none}` has no key of its own, yet it
+    /// may hold sealed objects: a planted `!!1` entry next to a sealed delta
+    /// without a token sizes nothing.
+    #[tokio::test]
+    async fn a_bucket_that_left_the_backend_key_ignores_planted_facts() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        sealed_deltas_with_planted_facts(&endpoint, &fake, false, backend_key_config(false)).await;
+        let reader = wrapped(&endpoint, "left-reader", backend_key_config(true));
+        let page = list(&reader, "rel/").await;
+        assert!(
+            sizes_of(&page).iter().all(|s| *s != 7),
+            "{:?}",
+            sizes_of(&page)
+        );
+    }
+
+    /// The leader of a shared HEAD ends (its client left): a LIST that
+    /// waited for it sends the HEAD itself and lists the original size.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_heads_itself_when_the_leader_is_dropped() {
+        let (engine, fake, _) = deltas_without_facts("rel", 3).await;
+        let engine = Arc::new(engine);
+        fake.set_delay_ms("HEAD", 600);
+        let leader = {
+            let engine = engine.clone();
+            tokio::spawn(async move { list(&engine, "rel/").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let follower = {
+            let engine = engine.clone();
+            tokio::spawn(async move { list(&engine, "rel/").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        leader.abort();
+        let page = tokio::time::timeout(std::time::Duration::from_secs(10), follower)
+            .await
+            .expect("the follower answered")
+            .unwrap();
+        assert_eq!(sizes_of(&page), [65_536; 3]);
     }
 
     /// A walk (a folder listing, a scan, a job) sends no inline HEAD: its
