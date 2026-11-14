@@ -607,15 +607,20 @@ pub fn new_probe_key() -> String {
     format!("{PROBE_PREFIX}{}", uuid::Uuid::new_v4())
 }
 
-/// Is `key` one of the probe's own keys (or its `-mpu` sibling)?
+/// Is `key` the exact shape of a probe key: [`PROBE_PREFIX`], a lowercase
+/// hyphenated UUID, and an optional `-mpu`, nothing more? A client key under
+/// the folder (the folder is reserved for new writes, but an older release
+/// may have stored one) is never a probe key, so nothing removes it.
 pub fn is_probe_key(key: &str) -> bool {
-    key.starts_with(PROBE_PREFIX)
-}
-
-/// Is `prefix` (a deltaspace folder, with or without its trailing `/`) the
-/// probe folder?
-pub fn is_probe_folder(prefix: &str) -> bool {
-    is_probe_key(&format!("{}/", prefix.trim_end_matches('/')))
+    let Some(rest) = key.strip_prefix(PROBE_PREFIX) else {
+        return false;
+    };
+    let id = rest.strip_suffix("-mpu").unwrap_or(rest);
+    // 36 characters can only be the hyphenated form; the lowercase test
+    // keeps `new_probe_key`'s exact text.
+    id.len() == 36
+        && !id.bytes().any(|b| b.is_ascii_uppercase())
+        && uuid::Uuid::parse_str(id).is_ok()
 }
 
 /// A probe key or open upload older than this is litter of a probe that
@@ -628,58 +633,95 @@ pub fn is_stale_probe(written_unix: i64, now_unix: i64) -> bool {
     now_unix.saturating_sub(written_unix) > STALE_PROBE_AGE_SECS
 }
 
+/// Pure: which of `entries` (key, version or upload id, written unix
+/// seconds) to remove. `now` is the BACKEND's clock (the `Date` of the
+/// listing), never this node's: a node clock that runs fast must not make a
+/// live probe look stale. Without a backend time, nothing goes. Only the
+/// exact probe shape ([`is_probe_key`]) and only older than
+/// [`STALE_PROBE_AGE_SECS`].
+pub fn stale_probe_entries(
+    now: Option<i64>,
+    entries: impl IntoIterator<Item = (String, String, i64)>,
+) -> Vec<(String, String)> {
+    let Some(now) = now else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter(|(key, _, at)| is_probe_key(key) && is_stale_probe(*at, now))
+        .map(|(key, id, _)| (key, id))
+        .collect()
+}
+
 /// Remove the litter of probes that never ended (the process stopped
-/// before the probe's own cleanup ran): the keys under [`PROBE_PREFIX`] of
-/// `bucket` and its open multipart uploads there, each older than
-/// [`STALE_PROBE_AGE_SECS`]. Best effort and bounded: one page of each
-/// listing, and it ends at `deadline`. It never fails a probe.
-pub async fn sweep_stale_probes(
-    client: &Client,
-    bucket: &str,
-    now_unix: i64,
-    deadline: tokio::time::Instant,
-) {
+/// before the probe's own cleanup ran): every version and delete marker of
+/// a probe key under [`PROBE_PREFIX`] of `bucket`, and its open multipart
+/// uploads, each older than [`STALE_PROBE_AGE_SECS`] on the backend's clock.
+/// Best effort and bounded: one page of each listing, and it ends at
+/// `deadline`. It never fails a probe.
+pub async fn sweep_stale_probes(client: &Client, bucket: &str, deadline: tokio::time::Instant) {
     let _ = tokio::time::timeout_at(deadline, async {
+        let date = super::server_clock::ServerDate::default();
         if let Ok(page) = client
-            .list_objects_v2()
+            .list_object_versions()
             .bucket(bucket)
             .prefix(PROBE_PREFIX)
             .max_keys(100)
+            .customize()
+            .interceptor(date.clone())
             .send()
             .await
         {
-            for object in page.contents() {
-                let (Some(key), Some(at)) = (object.key(), object.last_modified()) else {
-                    continue;
-                };
-                if is_probe_key(key) && is_stale_probe(at.secs(), now_unix) {
-                    remove_all_versions(client, bucket, key).await;
-                }
+            let versions = page.versions().iter().filter_map(|v| {
+                Some((
+                    v.key()?.to_string(),
+                    v.version_id()?.to_string(),
+                    v.last_modified()?.secs(),
+                ))
+            });
+            let markers = page.delete_markers().iter().filter_map(|m| {
+                Some((
+                    m.key()?.to_string(),
+                    m.version_id()?.to_string(),
+                    m.last_modified()?.secs(),
+                ))
+            });
+            for (key, id) in stale_probe_entries(date.get(), versions.chain(markers)) {
+                let _ = client
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .version_id(id)
+                    .send()
+                    .await;
             }
         }
+        let date = super::server_clock::ServerDate::default();
         if let Ok(page) = client
             .list_multipart_uploads()
             .bucket(bucket)
             .prefix(PROBE_PREFIX)
             .max_uploads(100)
+            .customize()
+            .interceptor(date.clone())
             .send()
             .await
         {
-            for upload in page.uploads() {
-                let (Some(key), Some(id), Some(at)) =
-                    (upload.key(), upload.upload_id(), upload.initiated())
-                else {
-                    continue;
-                };
-                if is_probe_key(key) && is_stale_probe(at.secs(), now_unix) {
-                    let _ = client
-                        .abort_multipart_upload()
-                        .bucket(bucket)
-                        .key(key)
-                        .upload_id(id)
-                        .send()
-                        .await;
-                }
+            let uploads = page.uploads().iter().filter_map(|u| {
+                Some((
+                    u.key()?.to_string(),
+                    u.upload_id()?.to_string(),
+                    u.initiated()?.secs(),
+                ))
+            });
+            for (key, id) in stale_probe_entries(date.get(), uploads) {
+                let _ = client
+                    .abort_multipart_upload()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(id)
+                    .send()
+                    .await;
             }
         }
     })
@@ -1557,22 +1599,46 @@ mod stale_probe_tests {
     }
 
     #[test]
-    fn only_the_probe_folder_is_a_probe_key() {
+    fn only_the_exact_probe_shape_is_a_probe_key() {
         assert!(is_probe_key(&new_probe_key()));
         assert!(is_probe_key(&format!("{}-mpu", new_probe_key())));
-        assert!(!is_probe_key("_cwprobe/x"));
-        assert!(!is_probe_key(".deltaglider/other/x"));
-        assert!(!is_probe_key("releases/.deltaglider/_cwprobe/x"));
-        assert!(is_probe_folder(".deltaglider/_cwprobe"));
-        assert!(is_probe_folder(".deltaglider/_cwprobe/"));
-        assert!(!is_probe_folder(".deltaglider"));
-        assert!(!is_probe_folder("a/.deltaglider/_cwprobe"));
+        let id = uuid::Uuid::new_v4().to_string();
+        for not in [
+            "_cwprobe/x".to_string(),
+            ".deltaglider/other/x".to_string(),
+            "releases/.deltaglider/_cwprobe/x".to_string(),
+            format!("{PROBE_PREFIX}report.pdf"),
+            format!("{PROBE_PREFIX}old"),
+            format!("{PROBE_PREFIX}{id}.pdf"),
+            format!("{PROBE_PREFIX}{id}-mpu-x"),
+            format!("{PROBE_PREFIX}{id}/more"),
+            format!("{PROBE_PREFIX}sub/{id}"),
+            format!("{PROBE_PREFIX}{}", id.to_uppercase()),
+            format!("{PROBE_PREFIX}{}", id.replace('-', "")),
+            format!("{PROBE_PREFIX}{id}-"),
+            PROBE_PREFIX.to_string(),
+        ] {
+            assert!(!is_probe_key(&not), "{not}");
+        }
     }
 
-    /// An old probe key and an old open upload go; a fresh pair and a
-    /// foreign key stay.
-    #[tokio::test]
-    async fn the_sweep_removes_stale_probe_keys_and_uploads_only() {
+    #[test]
+    fn no_backend_time_removes_nothing() {
+        let old = || [("k".to_string(), "v".to_string(), 0)];
+        let key = new_probe_key();
+        let entries = [(key.clone(), "v".to_string(), 0)];
+        assert!(stale_probe_entries(None, entries.clone()).is_empty());
+        assert_eq!(
+            stale_probe_entries(Some(STALE_PROBE_AGE_SECS + 1), entries),
+            [(key, "v".to_string())]
+        );
+        assert!(
+            stale_probe_entries(Some(STALE_PROBE_AGE_SECS + 1), old()).is_empty(),
+            "a key that is no probe key"
+        );
+    }
+
+    async fn fake_client() -> (aws_sdk_s3::Client, std::sync::Arc<crate::storage::FakeS3>) {
         let (endpoint, fake) = crate::storage::fake_s3::start().await;
         let client =
             crate::config_db_sync::ConfigDbSync::build_client(&crate::config::BackendConfig::S3 {
@@ -1586,33 +1652,178 @@ mod stale_probe_tests {
             })
             .await
             .unwrap();
+        (client, fake)
+    }
+
+    fn in_ten_seconds() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(10)
+    }
+
+    /// An old probe key and an old open upload go; a fresh pair and every
+    /// client key (also one under the probe folder, also an old upload of a
+    /// client) stay.
+    #[tokio::test]
+    async fn the_sweep_removes_stale_probe_keys_and_uploads_only() {
+        let (client, fake) = fake_client().await;
         let now = chrono::Utc::now().timestamp();
         let old = now - STALE_PROBE_AGE_SECS - 60;
-        let (old_key, old_mpu, fresh) = (
-            format!("b/{PROBE_PREFIX}old"),
-            format!("b/{PROBE_PREFIX}old-mpu"),
-            format!("b/{PROBE_PREFIX}fresh"),
+        let path = |key: &str| format!("b/{PROBE_PREFIX}{key}");
+        let (old_id, fresh_id) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
         );
-        for path in [&old_key, &fresh, "b/releases/app.bin".to_string().as_str()] {
-            fake.insert_object(path, b"1", &[]);
+        let (old_key, fresh_key) = (path(&old_id), path(&fresh_id));
+        let clients = [
+            path("report.pdf"),
+            path(&format!("x{old_id}.pdf")),
+            path(&format!("sub/{old_id}")),
+            "b/releases/app.bin".to_string(),
+        ];
+        for p in [&old_key, &fresh_key].into_iter().chain(&clients) {
+            fake.insert_object(p, b"1", &[]);
+            fake.set_modified(p, if *p == fresh_key { now } else { old });
         }
-        fake.set_modified(&old_key, old);
+        let old_mpu = path(&format!("{old_id}-mpu"));
         fake.insert_upload(&old_mpu, "u-old", old);
-        fake.insert_upload(&format!("b/{PROBE_PREFIX}fresh-mpu"), "u-fresh", now);
-        fake.insert_upload("b/releases/big.bin", "u-foreign", old);
+        fake.insert_upload(&path(&format!("{fresh_id}-mpu")), "u-fresh", now);
+        fake.insert_upload(&path("big.iso"), "u-client-1", old);
+        fake.insert_upload("b/releases/big.bin", "u-client-2", old);
 
+        sweep_stale_probes(&client, "b", in_ten_seconds()).await;
+
+        assert_eq!(fake.stored_count(&old_key), 0, "the old probe key stays");
+        assert_eq!(fake.stored_count(&fresh_key), 1, "a live probe's key went");
+        for c in &clients {
+            assert_eq!(fake.stored_count(c), 1, "the client key {c} went");
+        }
+        assert_eq!(fake.open_uploads(&old_mpu), 0, "the old upload stays");
+        assert_eq!(fake.open_uploads("b/"), 3, "a fresh or client upload went");
+    }
+
+    /// A node clock that runs an hour fast must not make a live probe look
+    /// stale: the age is judged by the backend's `Date`.
+    #[tokio::test]
+    async fn a_fast_node_clock_does_not_make_a_live_probe_stale() {
+        let (client, fake) = fake_client().await;
+        let backend_now = chrono::Utc::now().timestamp() - 2 * STALE_PROBE_AGE_SECS;
+        fake.set_clock(backend_now);
+        let key = format!("b/{}", new_probe_key());
+        fake.insert_object(&key, b"1", &[]);
+        fake.set_modified(&key, backend_now - 5);
+        let mpu = format!("{key}-mpu");
+        fake.insert_upload(&mpu, "u", backend_now - 5);
+        assert!(
+            chrono::Utc::now().timestamp() - (backend_now - 5) > STALE_PROBE_AGE_SECS,
+            "by this node's clock the probe looks old"
+        );
+
+        sweep_stale_probes(&client, "b", in_ten_seconds()).await;
+
+        assert_eq!(fake.stored_count(&key), 1, "a live probe's key went");
+        assert_eq!(fake.open_uploads(&mpu), 1, "a live probe's upload went");
+        // The backend's clock moves on past the limit: now it is litter.
+        fake.set_clock(backend_now + STALE_PROBE_AGE_SECS + 60);
+        sweep_stale_probes(&client, "b", in_ten_seconds()).await;
+        assert_eq!(fake.stored_count(&key), 0);
+        assert_eq!(fake.open_uploads(&mpu), 0);
+    }
+
+    fn litter(fake: &crate::storage::FakeS3) -> String {
+        let key = format!("b/{}", new_probe_key());
+        fake.insert_object(&key, b"1", &[]);
+        fake.set_modified(
+            &key,
+            chrono::Utc::now().timestamp() - 2 * STALE_PROBE_AGE_SECS,
+        );
+        key
+    }
+
+    fn group(endpoint: String) -> crate::coordination::capability::ClientWritableGroup {
+        crate::coordination::capability::ClientWritableGroup {
+            backend: crate::config::BackendConfig::S3 {
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("k".into()),
+                secret_access_key: Some("s".into()),
+                allow_local: true,
+                session_token: None,
+            },
+            buckets: vec![],
+            probe_bucket: "b".into(),
+        }
+    }
+
+    /// The capability probe sweeps first (its own entry point).
+    #[tokio::test]
+    async fn the_capability_probe_removes_old_litter_first() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let key = litter(&fake);
+        let verdict = crate::coordination::capability::establish_backend_verdict_within(
+            "n",
+            &group(endpoint),
+            &Default::default(),
+            std::time::Duration::from_secs(15),
+        )
+        .await;
+        assert!(
+            matches!(
+                verdict,
+                crate::coordination::CapabilityVerdict::CasVerified { .. }
+            ),
+            "{verdict:?}"
+        );
+        assert_eq!(fake.stored_count(&key), 0, "the litter stays");
+    }
+
+    /// A sweep that the backend delays stops at its share of the budget; the
+    /// probe still ends with its verdict.
+    #[tokio::test]
+    async fn a_slow_sweep_leaves_the_capability_verdict_unchanged() {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        // The upload listing is the sweep's alone (the probe's own cleanup lists versions).
+        fake.set_delay_ms("LIST_UPLOADS", 30_000);
+        let started = std::time::Instant::now();
+        let verdict = crate::coordination::capability::establish_backend_verdict_within(
+            "n",
+            &group(endpoint),
+            &Default::default(),
+            std::time::Duration::from_secs(6),
+        )
+        .await;
+        assert!(
+            matches!(
+                verdict,
+                crate::coordination::CapabilityVerdict::CasVerified { .. }
+            ),
+            "{verdict:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(6));
+    }
+
+    /// The probe of the coordination bucket sweeps first too.
+    #[tokio::test]
+    async fn the_coordination_probe_removes_old_litter_first() {
+        let (client, fake) = fake_client().await;
+        let key = litter(&fake);
+        crate::config_db_sync::validate_cas_bucket(&client, "b", "witness-test")
+            .await
+            .unwrap();
+        assert_eq!(fake.stored_count(&key), 0, "the litter stays");
+    }
+
+    /// A sweep that the backend delays ends at its budget.
+    #[tokio::test]
+    async fn a_slow_sweep_ends_at_its_deadline() {
+        let (client, fake) = fake_client().await;
+        fake.set_delay_ms("LIST_VERSIONS", 5000);
+        let started = std::time::Instant::now();
         sweep_stale_probes(
             &client,
             "b",
-            now,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(300),
         )
         .await;
-
-        assert_eq!(fake.stored_count(&old_key), 0, "the old probe key stays");
-        assert_eq!(fake.stored_count(&fresh), 1, "a live probe's key went");
-        assert_eq!(fake.stored_count("b/releases/"), 1, "a client key went");
-        assert_eq!(fake.open_uploads(&old_mpu), 0, "the old upload stays");
-        assert_eq!(fake.open_uploads("b/"), 2, "a fresh or foreign upload went");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 }

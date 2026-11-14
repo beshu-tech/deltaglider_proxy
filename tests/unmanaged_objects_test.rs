@@ -355,6 +355,34 @@ async fn test_put_reserved_filename_dot_delta_rejected() {
     );
 }
 
+/// A client write under the capability probe's folder is refused: the probe
+/// sweep owns that folder.
+#[tokio::test]
+async fn test_put_under_the_probe_folder_rejected() {
+    let server = TestServer::builder().build().await;
+    let client = server.http();
+
+    let url = format!(
+        "{}/{}/.deltaglider/_cwprobe/report.pdf",
+        server.endpoint(),
+        server.bucket()
+    );
+    let resp = client
+        .put(&url)
+        .header("content-type", "application/octet-stream")
+        .body(b"should be rejected".to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "PUT under the probe folder should be rejected with 400, got {}",
+        resp.status()
+    );
+}
+
 /// Regression test for M5: copy_object must enforce size limits even when
 /// source metadata reports file_size=0 (fallback metadata for unmanaged objects).
 #[tokio::test]

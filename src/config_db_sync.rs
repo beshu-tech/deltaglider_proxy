@@ -1220,7 +1220,6 @@ async fn validate_cas_bucket_as(
     crate::coordination::cas_probe::sweep_stale_probes(
         client,
         bucket,
-        now,
         tokio::time::Instant::now() + std::time::Duration::from_secs(5),
     )
     .await;

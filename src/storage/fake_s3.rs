@@ -96,9 +96,18 @@ pub(crate) struct FakeS3 {
     /// seconds), from [`FakeS3::insert_upload`]. `GET /bucket?uploads` lists
     /// them and `DELETE /bucket/key?uploadId=..` aborts one.
     uploads: parking_lot::Mutex<Vec<(String, String, i64)>>,
+    /// The `Date` header that every response carries, when set
+    /// ([`FakeS3::set_clock`]); else the HTTP server's own.
+    clock: parking_lot::Mutex<Option<i64>>,
 }
 
 impl FakeS3 {
+    /// Every response carries `Date` = `unix` from now on: the backend's
+    /// clock, apart from the test process's.
+    pub(crate) fn set_clock(&self, unix: i64) {
+        *self.clock.lock() = Some(unix);
+    }
+
     /// Open a multipart upload on `bucket/key`, initiated at `unix`.
     pub(crate) fn insert_upload(&self, path: &str, id: &str, unix: i64) {
         self.uploads
@@ -623,6 +632,51 @@ fn iso_time(unix: i64) -> String {
         .to_string()
 }
 
+/// Unix seconds as an HTTP date (`Sat, 26 Sep 2026 01:02:03 GMT`).
+fn http_date(unix: i64) -> String {
+    chrono::DateTime::from_timestamp(unix, 0)
+        .unwrap_or_default()
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
+}
+
+/// A ListObjectVersions answer for `bucket` under the `prefix` query: every
+/// stored object under it, as the one version `null`.
+fn list_versions(
+    objects: &HashMap<String, Stored>,
+    bucket: &str,
+    query: &HashMap<String, String>,
+) -> String {
+    let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+    let own = format!("{bucket}/");
+    let mut keys: Vec<(&str, &Stored)> = objects
+        .iter()
+        .filter_map(|(p, o)| Some((p.strip_prefix(&own)?, o)))
+        .filter(|(k, _)| k.starts_with(prefix))
+        .collect();
+    keys.sort_by_key(|(k, _)| *k);
+    let items: String = keys
+        .into_iter()
+        .map(|(k, o)| {
+            format!(
+                "<Version><Key>{}</Key><VersionId>null</VersionId><IsLatest>true</IsLatest>\
+                 <LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size></Version>",
+                xml_escape(k),
+                iso_time(o.modified),
+                xml_escape(&o.etag),
+                o.body.len()
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>{bucket}</Name><Prefix>{}</Prefix><IsTruncated>false</IsTruncated>{items}\
+         </ListVersionsResult>",
+        xml_escape(prefix)
+    )
+}
+
 /// A ListMultipartUploads answer for `bucket` under the `prefix` query.
 fn list_uploads(f: &FakeS3, bucket: &str, query: &HashMap<String, String>) -> String {
     let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
@@ -822,8 +876,10 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                 let is_list = method == Method::GET
                     && query.get("list-type").map(String::as_str) == Some("2");
                 let is_uploads = method == Method::GET && query.contains_key("uploads");
+                let is_versions = method == Method::GET && query.contains_key("versions");
                 let op = match method {
                     _ if is_list => "LIST",
+                    _ if is_versions => "LIST_VERSIONS",
                     _ if is_uploads => "LIST_UPLOADS",
                     Method::HEAD => "HEAD_BUCKET",
                     _ => "BUCKET",
@@ -840,6 +896,12 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                 }
                 if is_uploads {
                     return (StatusCode::OK, list_uploads(&f, &bucket, &query));
+                }
+                if is_versions {
+                    return (
+                        StatusCode::OK,
+                        list_versions(&f.objects.lock(), &bucket, &query),
+                    );
                 }
                 if method == Method::PUT {
                     f.buckets.lock().insert(bucket);
@@ -1071,7 +1133,13 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                 async move {
                     let chunked = req.method() == Method::GET
                         && f.chunked_gets.load(std::sync::atomic::Ordering::SeqCst);
-                    let resp = next.run(req).await;
+                    let mut resp = next.run(req).await;
+                    // A backend whose clock differs from the test's own.
+                    if let Some(unix) = *f.clock.lock() {
+                        if let Ok(v) = http_date(unix).parse() {
+                            resp.headers_mut().insert(axum::http::header::DATE, v);
+                        }
+                    }
                     if !chunked {
                         return resp;
                     }

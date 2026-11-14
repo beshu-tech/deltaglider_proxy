@@ -238,6 +238,19 @@ impl ObjectKey {
                 "Key must not contain empty path segments ('//')".to_string(),
             ));
         }
+        // The capability probe writes and removes its keys here, and a sweep
+        // removes the stale ones of its own shape: a client key must not live there.
+        if self
+            .full_key()
+            .starts_with(crate::coordination::cas_probe::PROBE_PREFIX)
+        {
+            return Err(KeyValidationError(format!(
+                "Object key '{}' is refused: keys under '{}' are reserved, because the proxy \
+                 writes its capability probe there. See {RESERVED_KEYS_DOC_URL}",
+                self.full_key(),
+                crate::coordination::cas_probe::PROBE_PREFIX
+            )));
+        }
         // `.dg` is the proxy's own directory name at any depth (F19): it
         // holds the delta baselines and the listing facts, so a new client
         // key there could be mistaken for one of them. A key that an older
@@ -1229,6 +1242,34 @@ mod tests {
             .to_string();
         assert!(e.contains("listing facts"), "{e}");
         assert!(e.contains(RESERVED_KEYS_DOC_URL), "{e}");
+    }
+
+    /// The capability probe's folder takes no client write, but a key that
+    /// an older release stored there stays readable and deletable.
+    #[test]
+    fn the_probe_folder_takes_no_new_client_key() {
+        use crate::coordination::cas_probe::PROBE_PREFIX;
+        for key in [
+            format!("{PROBE_PREFIX}report.pdf"),
+            format!("{PROBE_PREFIX}sub/x"),
+        ] {
+            let e = ObjectKey::parse("b", &key)
+                .validate_ingest()
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(PROBE_PREFIX), "{e}");
+            assert!(e.contains(RESERVED_KEYS_DOC_URL), "{e}");
+            assert!(
+                ObjectKey::parse("b", &key).validate_object().is_ok(),
+                "{key}"
+            );
+        }
+        assert!(ObjectKey::parse("b", ".deltaglider/other/x")
+            .validate_ingest()
+            .is_ok());
+        assert!(ObjectKey::parse("b", &format!("a/{PROBE_PREFIX}x"))
+            .validate_ingest()
+            .is_ok());
     }
 
     #[test]

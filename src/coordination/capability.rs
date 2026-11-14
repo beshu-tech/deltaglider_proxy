@@ -449,7 +449,6 @@ pub async fn establish_backend_verdict_within(
     super::cas_probe::sweep_stale_probes(
         &client,
         &group.probe_bucket,
-        chrono::Utc::now().timestamp(),
         tokio::time::Instant::now() + budget / 3,
     )
     .await;
