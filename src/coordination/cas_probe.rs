@@ -630,7 +630,11 @@ pub const STALE_PROBE_AGE_SECS: i64 = 3600;
 
 /// Pure: is something that was written at `written_unix` litter at `now_unix`?
 pub fn is_stale_probe(written_unix: i64, now_unix: i64) -> bool {
-    now_unix.saturating_sub(written_unix) > STALE_PROBE_AGE_SECS
+    is_older_than(written_unix, now_unix, STALE_PROBE_AGE_SECS)
+}
+
+fn is_older_than(written_unix: i64, now_unix: i64, min_age_secs: i64) -> bool {
+    now_unix.saturating_sub(written_unix) > min_age_secs
 }
 
 /// Pure: which of `entries` (key, version or upload id, written unix
@@ -638,9 +642,10 @@ pub fn is_stale_probe(written_unix: i64, now_unix: i64) -> bool {
 /// listing), never this node's: a node clock that runs fast must not make a
 /// live probe look stale. Without a backend time, nothing goes. Only the
 /// exact probe shape ([`is_probe_key`]) and only older than
-/// [`STALE_PROBE_AGE_SECS`].
+/// `min_age_secs` (production: [`STALE_PROBE_AGE_SECS`]).
 pub fn stale_probe_entries(
     now: Option<i64>,
+    min_age_secs: i64,
     entries: impl IntoIterator<Item = (String, String, i64)>,
 ) -> Vec<(String, String)> {
     let Some(now) = now else {
@@ -648,7 +653,7 @@ pub fn stale_probe_entries(
     };
     entries
         .into_iter()
-        .filter(|(key, _, at)| is_probe_key(key) && is_stale_probe(*at, now))
+        .filter(|(key, _, at)| is_probe_key(key) && is_older_than(*at, now, min_age_secs))
         .map(|(key, id, _)| (key, id))
         .collect()
 }
@@ -660,6 +665,18 @@ pub fn stale_probe_entries(
 /// Best effort and bounded: one page of each listing, and it ends at
 /// `deadline`. It never fails a probe.
 pub async fn sweep_stale_probes(client: &Client, bucket: &str, deadline: tokio::time::Instant) {
+    sweep_probes_older_than(client, bucket, deadline, STALE_PROBE_AGE_SECS).await;
+}
+
+/// [`sweep_stale_probes`] with the age as an argument, so that a test of a
+/// real versioned backend does not wait an hour. No caller in the proxy
+/// passes another age.
+pub async fn sweep_probes_older_than(
+    client: &Client,
+    bucket: &str,
+    deadline: tokio::time::Instant,
+    min_age_secs: i64,
+) {
     let _ = tokio::time::timeout_at(deadline, async {
         let date = super::server_clock::ServerDate::default();
         if let Ok(page) = client
@@ -686,7 +703,8 @@ pub async fn sweep_stale_probes(client: &Client, bucket: &str, deadline: tokio::
                     m.last_modified()?.secs(),
                 ))
             });
-            for (key, id) in stale_probe_entries(date.get(), versions.chain(markers)) {
+            for (key, id) in stale_probe_entries(date.get(), min_age_secs, versions.chain(markers))
+            {
                 let _ = client
                     .delete_object()
                     .bucket(bucket)
@@ -714,7 +732,7 @@ pub async fn sweep_stale_probes(client: &Client, bucket: &str, deadline: tokio::
                     u.initiated()?.secs(),
                 ))
             });
-            for (key, id) in stale_probe_entries(date.get(), uploads) {
+            for (key, id) in stale_probe_entries(date.get(), min_age_secs, uploads) {
                 let _ = client
                     .abort_multipart_upload()
                     .bucket(bucket)
@@ -1627,13 +1645,18 @@ mod stale_probe_tests {
         let old = || [("k".to_string(), "v".to_string(), 0)];
         let key = new_probe_key();
         let entries = [(key.clone(), "v".to_string(), 0)];
-        assert!(stale_probe_entries(None, entries.clone()).is_empty());
+        assert!(stale_probe_entries(None, STALE_PROBE_AGE_SECS, entries.clone()).is_empty());
         assert_eq!(
-            stale_probe_entries(Some(STALE_PROBE_AGE_SECS + 1), entries),
+            stale_probe_entries(
+                Some(STALE_PROBE_AGE_SECS + 1),
+                STALE_PROBE_AGE_SECS,
+                entries
+            ),
             [(key, "v".to_string())]
         );
         assert!(
-            stale_probe_entries(Some(STALE_PROBE_AGE_SECS + 1), old()).is_empty(),
+            stale_probe_entries(Some(STALE_PROBE_AGE_SECS + 1), STALE_PROBE_AGE_SECS, old())
+                .is_empty(),
             "a key that is no probe key"
         );
     }

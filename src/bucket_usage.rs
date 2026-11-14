@@ -332,25 +332,38 @@ impl BucketUsage {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap_or(0);
-        if version < 1 {
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS bucket_usage (
-                    bucket        TEXT PRIMARY KEY,
-                    object_count  INTEGER NOT NULL DEFAULT 0,
-                    logical_bytes INTEGER NOT NULL DEFAULT 0,
-                    stored_bytes  INTEGER NOT NULL DEFAULT 0,
-                    last_scan_at  INTEGER,
-                    baselined     INTEGER NOT NULL DEFAULT 0
-                );",
-            )?;
-        } else if version < 2 {
-            // A scanned row has a baseline; an older row with no stamp is unknown.
-            conn.execute_batch(
-                "ALTER TABLE bucket_usage ADD COLUMN baselined INTEGER NOT NULL DEFAULT 0;
-                 UPDATE bucket_usage SET baselined = 1 WHERE last_scan_at IS NOT NULL;",
+        // A DB of a newer release is left as it is, never stamped down.
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        // One transaction: a crash leaves the old version. An older release
+        // stamps version 1 over a DB that already has the column, so the
+        // column is added only when `table_info` does not list it.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bucket_usage (
+                bucket        TEXT PRIMARY KEY,
+                object_count  INTEGER NOT NULL DEFAULT 0,
+                logical_bytes INTEGER NOT NULL DEFAULT 0,
+                stored_bytes  INTEGER NOT NULL DEFAULT 0,
+                last_scan_at  INTEGER
+            );",
+        )?;
+        let has_column: bool = tx.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('bucket_usage') WHERE name = 'baselined'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_column {
+            tx.execute_batch(
+                "ALTER TABLE bucket_usage ADD COLUMN baselined INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        // A scanned row has a baseline; a row with no stamp is unknown. A row
+        // that an older release scanned lost its mark: the stamp restores it.
+        tx.execute_batch("UPDATE bucket_usage SET baselined = 1 WHERE last_scan_at IS NOT NULL;")?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1201,6 +1214,75 @@ mod tests {
             .unwrap()
         };
         assert_eq!((mark("scanned"), mark("fresh")), (1, 0));
+    }
+
+    /// A DB with the `baselined` column and `user_version = 1` (an upgrade, a
+    /// downgrade to a release that stamps 1, an upgrade again; or a crash
+    /// after the ALTER) opens, and the marks that the older release lost return.
+    #[test]
+    fn the_migration_runs_again_over_a_partly_applied_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE bucket_usage (
+                    bucket TEXT PRIMARY KEY,
+                    object_count INTEGER NOT NULL DEFAULT 0,
+                    logical_bytes INTEGER NOT NULL DEFAULT 0,
+                    stored_bytes INTEGER NOT NULL DEFAULT 0,
+                    last_scan_at INTEGER,
+                    baselined INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO bucket_usage VALUES ('rescanned', 1, 1, 1, 7, 0);
+                 INSERT INTO bucket_usage VALUES ('fresh', 1, 1, 1, NULL, 0);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let mark = |db: &BucketUsage, b: &str| -> i64 {
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT baselined FROM bucket_usage WHERE bucket = ?1",
+                    params![b],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let db = BucketUsage::open(&path).expect("a DB with the column opens");
+        assert_eq!((mark(&db, "rescanned"), mark(&db, "fresh")), (1, 0));
+        drop(db);
+        // And again: the second open changes nothing.
+        let db = BucketUsage::open(&path).unwrap();
+        assert_eq!((mark(&db, "rescanned"), mark(&db, "fresh")), (1, 0));
+    }
+
+    /// A DB of a newer release is never stamped to a lower version.
+    #[test]
+    fn a_newer_database_keeps_its_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE bucket_usage (
+                    bucket TEXT PRIMARY KEY,
+                    object_count INTEGER NOT NULL DEFAULT 0,
+                    logical_bytes INTEGER NOT NULL DEFAULT 0,
+                    stored_bytes INTEGER NOT NULL DEFAULT 0,
+                    last_scan_at INTEGER,
+                    baselined INTEGER NOT NULL DEFAULT 0);
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+        }
+        drop(BucketUsage::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        let v: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 9);
     }
 
     /// A window is a count in the bucket's entry: it blocks the stamp while

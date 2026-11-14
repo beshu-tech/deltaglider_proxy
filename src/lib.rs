@@ -4367,6 +4367,40 @@ mod source_guards {
         );
     }
 
+    /// Every page of a job lister becomes a `KeyPage` through its `From`
+    /// impl in `maintenance/paged.rs`, which skips the probe's own keys. A
+    /// lister that built a `KeyPage` by hand would copy them and fail.
+    #[test]
+    fn job_pages_are_made_by_the_one_from_impl() {
+        use crate::source_scan::{files, root};
+        let mut bad = Vec::new();
+        let mut scanned = 0;
+        for path in files("src/maintenance", "rs") {
+            scanned += 1;
+            let rel = path
+                .strip_prefix(root())
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let prod = text.split("#[cfg(test)]").next().unwrap_or("");
+            let literal = ["KeyPage", " {"].concat();
+            for (n, line) in prod.lines().enumerate() {
+                let t = line.trim_start();
+                let declares = t.starts_with("pub(crate) struct") || t.starts_with("impl");
+                if t.contains(&literal) && !declares {
+                    bad.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(scanned > 5, "the scan found the sources ({scanned})");
+        assert!(
+            bad.is_empty(),
+            "build a job page through `KeyPage::from` (it skips the probe keys):\n{}",
+            bad.join("\n")
+        );
+    }
+
     #[test]
     fn request_path_reads_no_env() {
         // A file of the request path that reads the environment on purpose
