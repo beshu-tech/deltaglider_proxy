@@ -136,6 +136,19 @@ if [[ -n "${BACKUP}" && -f "${BACKUP}" ]]; then
   neutralize_backup "${BACKUP}" "${DIR}/backup-safe.zip"
   BACKUP="${DIR}/backup-safe.zip"
   mkdir -p "${DIR}/data"
+  # A restore resolves only the `${env:NAME}` refs that the boot config uses,
+  # so a config with refs boots from itself (its secrets come from this env).
+  REFS="$(unzip -p "${BACKUP}" config.yaml | grep -oE '\$\{env:[A-Za-z0-9_]+' | sed 's/^\${env://' | sort -u)"
+  MISSING=()
+  for n in ${REFS}; do [[ -n "${!n:-}" ]] || MISSING+=("${n}"); done
+  if ((${#MISSING[@]})); then
+    echo "ERROR: the prod config references env vars that are unset here: ${MISSING[*]}" >&2
+    echo "       run under the prod secret env with the names the deployment uses" >&2
+    exit 1
+  fi
+  if [[ -n "${REFS}" ]]; then
+    unzip -p "${BACKUP}" config.yaml > "${DIR}/deltaglider_proxy.yaml"
+  else
   cat > "${DIR}/deltaglider_proxy.yaml" <<EOF
 access:
   access_key_id: admin
@@ -145,6 +158,7 @@ storage:
     type: filesystem
     path: ${DIR}/data
 EOF
+  fi
   ( cd "${DIR}" && printf '%s\n' "${PW}" | "${BIN}" --set-bootstrap-password >/dev/null )
   start_proxy
   curl -fsS -c "${COOKIES}" -X POST "${BASE}/_/api/admin/login" \
