@@ -144,7 +144,7 @@ function ShareDurationButton({
   useOnClickOutside([ref], () => setOpen(false), open);
 
   return (
-    <div ref={ref} style={{ display: 'flex', width: '100%' }}>
+    <div ref={ref} className="dg-share-split" style={{ display: 'flex', width: '100%' }}>
       {/* Main button — default 7 days */}
       <button
         onClick={() => { onSelect(durations[durations.length - 1].seconds); setOpen(false); }}
@@ -540,7 +540,7 @@ export default function InspectorPanel({
             dialogTabWrap (installed by ThemeProvider). */}
         <div className="animate-slide-in" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
           {/* Header */}
-          <div style={{
+          <div className="dg-inspector-header" style={{
             padding: `${SPACE.md}px ${SPACE.lg}px`,
             borderBottom: `1px solid ${BORDER}`,
             display: 'flex',
@@ -843,6 +843,7 @@ export default function InspectorPanel({
             <div style={{ padding: `${SPACE.md}px ${SPACE.lg}px`, borderTop: `1px solid ${BORDER}` }}>
               <Button
                 block
+                className="dg-danger-action"
                 icon={<DeleteOutlined />}
                 onClick={() => confirmDelete(objectDeleteConfirmText(object.key), handleDelete)}
                 style={{

@@ -22,7 +22,11 @@
  * narrow column may then ellipse past the column, which is acceptable).
  */
 
+import type { ThemeStyle } from './ThemeContext';
+
 const DIGIT_EM = 0.58;
+/** Digit advance of a style whose display face is wider than Manrope (Windows XP: Trebuchet, or DejaVu Sans where it is missing). */
+export const HERO_DIGIT_EM: Partial<Record<ThemeStyle, number>> = { xp: 0.72 };
 const SEPARATOR_EM = 0.3;
 const SUFFIX_EM = 0.42;
 const MIN_PX = 40;
@@ -48,11 +52,11 @@ const FALLBACK_WIDTH_PX = 240; // grid column min — used before first measure
  * @returns Font size in px, clamped to [40, 138]. Below the ceiling the
  *          estimated rendered width never exceeds the container width.
  */
-export function heroFontPx(charCount: number, containerWidthPx: number): number {
+export function heroFontPx(charCount: number, containerWidthPx: number, digitEm: number = DIGIT_EM): number {
   const chars = Math.max(1, Math.floor(charCount));
   const separators = Math.floor(chars / 4);
   const digits = chars - separators;
-  const emWidth = digits * DIGIT_EM + separators * SEPARATOR_EM + SUFFIX_EM;
+  const emWidth = digits * digitEm + separators * SEPARATOR_EM + SUFFIX_EM;
   const width =
     Number.isFinite(containerWidthPx) && containerWidthPx > 0
       ? containerWidthPx

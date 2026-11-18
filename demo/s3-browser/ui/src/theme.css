@@ -2042,3 +2042,57 @@ code, kbd, pre, samp, .ant-typography code,
 [data-theme-style="xp"] .ant-layout-sider nav[aria-label='Bucket list'] > :first-child * {
   color: var(--dg-accent-blue-light) !important;
 }
+
+/* ── Inspector drawer: Luna title bar, XP split Share button, XP Delete button ── */
+[data-theme-style="xp"] .dg-inspector-header {
+  background: var(--xp-title-bg);
+  border-bottom: 1px solid var(--xp-window-border) !important;
+  align-items: center !important;
+}
+[data-theme-style="xp"] .dg-inspector-header :is(h2, h2 + div) {
+  color: var(--xp-title-text) !important;
+  text-shadow: var(--xp-title-shadow);
+}
+[data-theme-style="xp"] .dg-inspector-header .ant-btn {
+  width: 22px;
+  min-width: 22px;
+  height: 22px;
+  padding: 0;
+  background: var(--xp-close-bg) !important;
+  border: 1px solid var(--dg-bg-card) !important;
+  color: var(--xp-title-text) !important;
+}
+[data-theme-style="xp"] .dg-share-split > button {
+  height: 34px !important;
+  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--xp-primary-fill) !important;
+  border: 1px solid var(--xp-btn-border) !important;
+  color: var(--xp-primary-text) !important;
+}
+[data-theme-style="xp"] .dg-share-split > button:first-child {
+  border-radius: 3px 0 0 3px !important;
+}
+[data-theme-style="xp"] .dg-share-split > button:last-of-type {
+  border-radius: 0 3px 3px 0 !important;
+}
+[data-theme-style="xp"] .dg-share-split > button:hover {
+  box-shadow: inset 0 0 0 2px var(--xp-hot);
+}
+[data-theme-style="xp"] .dg-danger-action {
+  background: var(--xp-btn-bg) !important;
+  border-color: var(--xp-btn-border) !important;
+}
+[data-theme-style="xp"] .dg-danger-action:not(:disabled):hover {
+  box-shadow: inset 0 0 0 2px var(--xp-hot);
+}
+/* A selected row stays Luna blue under the pointer (the hover fill outranks the selected one). */
+[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']):hover > :is(td, .ant-table-cell) {
+  background: var(--xp-select-bg) !important;
+}
+/* The row open in the inspector (selected + keyboard cursor) keeps the Luna blue: the cursor fill would outrank it. */
+[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']).dg-row-cursor > :is(td, .ant-table-cell) {
+  background: var(--xp-select-bg) !important;
+}
+[data-theme-style="xp"] .dg-inspector-header > div:first-child {
+  background: var(--dg-bg-card) !important;
+  border-color: var(--xp-window-border) !important;
+}

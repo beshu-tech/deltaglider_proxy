@@ -41,9 +41,9 @@ import {
 } from 'motion/react';
 import { Button } from 'antd';
 import { SettingOutlined } from '@ant-design/icons';
-import { useColors } from '../ThemeContext';
+import { useColors, useTheme } from '../ThemeContext';
 import { formatBytes, clamp, noun } from '../utils';
-import { heroFontPx } from '../heroNumberSize';
+import { HERO_DIGIT_EM, heroFontPx } from '../heroNumberSize';
 import { biggestSaveSentence, heroPresentation, monthlyCost, savingsColors } from '../savings';
 import { useFixedOverlayPosition } from '../useFixedOverlayPosition';
 import { readStorage, writeStorage } from '../safeStorage';
@@ -134,6 +134,7 @@ function HeroInner({
   liveScanning,
 }: Props) {
   const colors = useColors();
+  const { style: themeStyle } = useTheme();
   const hasData = totalOriginal > 0;
 
   // ─── Motion values ────────────────────────────────────────────────
@@ -237,7 +238,7 @@ function HeroInner({
   const leadString = targetPercent.toFixed(1);
   const [leftCol, setLeftCol] = useState<HTMLDivElement | null>(null);
   const leftColWidth = useElementWidth(leftCol);
-  const heroFontSize = heroFontPx(leadString.length, leftColWidth);
+  const heroFontSize = heroFontPx(leadString.length, leftColWidth, HERO_DIGIT_EM[themeStyle]);
   const [root, setRoot] = useState<HTMLDivElement | null>(null);
   const rootWidth = useElementWidth(root);
   const stacked = rootWidth > 0 && rootWidth < STACK_BELOW_PX;
