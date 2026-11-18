@@ -20,4 +20,4 @@ pub use iam::*;
 pub use jobs::*;
 pub use minio::*;
 pub use server::*;
-pub use signed_http::{S3Http, S3Requests};
+pub use signed_http::{sign_raw, S3Http, S3Requests};

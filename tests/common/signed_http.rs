@@ -143,6 +143,24 @@ impl S3Requests for reqwest::Client {
     }
 }
 
+/// SigV4 headers (`authorization`, `x-amz-date`, `x-amz-content-sha256`) for a
+/// hand-written HTTP request. The body is signed as `UNSIGNED-PAYLOAD`.
+pub fn sign_raw(method: Method, url: &str, key: &str, secret: &str) -> Vec<(String, String)> {
+    let mut request = reqwest::Client::new()
+        .request(method, url)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+        .build()
+        .expect("request");
+    sign_in_place(&mut request, key, secret);
+    ["authorization", "x-amz-date", "x-amz-content-sha256"]
+        .iter()
+        .map(|n| {
+            let v = request.headers().get(*n).expect("signed header");
+            (n.to_string(), v.to_str().unwrap().to_string())
+        })
+        .collect()
+}
+
 fn sign_in_place(request: &mut reqwest::Request, key: &str, secret: &str) {
     let presigned = request
         .url()

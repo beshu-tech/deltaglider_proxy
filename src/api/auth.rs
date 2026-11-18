@@ -274,6 +274,11 @@ impl AuthOutcome {
         self.0.store(OUTCOME_AUTHZ_DENIED, Ordering::Release);
     }
 
+    /// s3s verified a signature (an anonymous request never gets here).
+    pub fn is_verified(&self) -> bool {
+        self.state() == OUTCOME_VERIFIED
+    }
+
     fn state(&self) -> u8 {
         self.0.load(Ordering::Acquire)
     }
@@ -728,7 +733,7 @@ fn parse_presigned_expires(expires: &str) -> Result<i64, String> {
 
 /// Check whether the query string contains presigned URL parameters.
 /// Uses proper key-level parsing instead of substring matching.
-fn has_presigned_query_params(query: &str) -> bool {
+pub(crate) fn has_presigned_query_params(query: &str) -> bool {
     RequestTarget::parse("/", Some(query)).is_ok_and(|t| t.is_presigned_v4())
 }
 
@@ -1104,8 +1109,15 @@ pub async fn sigv4_auth_middleware(
     // Success and failure are recorded only after that (see `AuthOutcome`):
     // resetting the limiter here, before verification, meant a wrong-secret
     // loop on a known key was never counted (S19).
-    let outcome = AuthOutcome::default();
-    request.extensions_mut().insert(outcome.clone());
+    // The drain middleware outside this layer may have put one already.
+    let outcome = match request.extensions().get::<AuthOutcome>() {
+        Some(existing) => existing.clone(),
+        None => {
+            let fresh = AuthOutcome::default();
+            request.extensions_mut().insert(fresh.clone());
+            fresh
+        }
+    };
 
     // Replay attack detection: reject a duplicate signature of a MUTATING
     // request within DGP_REPLAY_WINDOW_SECS (the default and its reason:
@@ -1393,6 +1405,17 @@ mod tests {
             limiter_verdict(&shared, StatusCode::OK, false),
             LimiterVerdict::Success
         );
+    }
+
+    /// The drain middleware reads what the s3s hook marked: clones share state.
+    #[test]
+    fn auth_outcome_is_verified_through_a_clone() {
+        let outcome = AuthOutcome::default();
+        assert!(!outcome.is_verified());
+        outcome.clone().mark_authz_denied();
+        assert!(!outcome.is_verified());
+        outcome.clone().mark_verified();
+        assert!(outcome.is_verified());
     }
 
     /// Truth table for binding the resolved identity to the s3s-verified key.

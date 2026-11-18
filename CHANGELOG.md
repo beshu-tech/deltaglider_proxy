@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A write refused before its body is read no longer resets the connection behind a reverse proxy** (#187). For a signed request, the proxy now reads up to 64 MiB of the body (30 seconds at most) before it answers with the error; a request that declares a larger body is not read. The body of an anonymous request or of a presigned request is not read, so the connection closes after the answer.
+
 ## v2.2.3 — 2026-11-18
 
 ### Fixed

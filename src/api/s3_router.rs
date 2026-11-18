@@ -605,6 +605,8 @@ where
         ))
         .layer(middleware::from_fn(sigv4_auth_middleware))
         .layer(middleware::from_fn(crate::admission::admission_middleware))
+        // Outside admission and SigV4: reads the body of a refused signed request.
+        .layer(middleware::from_fn(crate::api::drain::drain_after_refusal))
         .layer(axum::Extension(iam_state.clone()))
         .layer(axum::Extension(public_prefix_snapshot.clone()))
         .layer(axum::Extension(admission_chain.clone()))

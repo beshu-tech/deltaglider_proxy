@@ -10,7 +10,8 @@ use crate::common;
 
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, wait_for_run_after, TestServer};
+use common::{admin_http_client, sign_raw, wait_for_run_after, TestServer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const RULE_YAML: &str = "
 replication:
@@ -475,4 +476,149 @@ async fn a_refused_large_put_answers_403_not_a_closed_connection() {
         .await
         .expect_err("PUT to marked bucket must fail");
     assert_access_denied(&err, "large PutObject");
+}
+
+const RAW_BODY: usize = 32 * 1024 * 1024;
+
+/// A PUT head for `/rto-dst/big.bin` with a 32 MiB body, signed or not.
+fn raw_put_head(ep: &str, signed: bool) -> String {
+    let url = format!("{ep}/rto-dst/big.bin");
+    let host = ep.trim_start_matches("http://");
+    let mut head =
+        format!("PUT /rto-dst/big.bin HTTP/1.1\r\nHost: {host}\r\nContent-Length: {RAW_BODY}\r\n");
+    if signed {
+        for (k, v) in sign_raw(
+            reqwest::Method::PUT,
+            &url,
+            "bootstrap_key",
+            "bootstrap_secret",
+        ) {
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+    } else {
+        head.push_str("x-amz-content-sha256: UNSIGNED-PAYLOAD\r\n");
+    }
+    head.push_str("\r\n");
+    head
+}
+
+/// Read one HTTP response (status line, headers, Content-Length body).
+async fn read_raw_response(s: &mut tokio::net::TcpStream) -> Option<(u16, String)> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).to_string();
+            let len = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while buf.len() < end + 4 + len {
+                let n = s.read(&mut tmp).await.ok()?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let status = head.split_whitespace().nth(1)?.parse().ok()?;
+            return Some((status, head));
+        }
+        let n = tokio::time::timeout(std::time::Duration::from_secs(20), s.read(&mut tmp))
+            .await
+            .ok()?
+            .ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+async fn rto_server() -> TestServer {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .bucket_policy("rto-dst", "replication_target_only: true")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    client.create_bucket().bucket("rto-dst").send().await.ok();
+    server
+}
+
+/// #187 item 4: the body of a refused SIGNED request is read, so the
+/// connection survives for the next request (the proxy before a reverse
+/// proxy sees an answer, not a reset).
+#[tokio::test]
+async fn a_refused_signed_put_body_is_read_and_the_connection_stays_open() {
+    let server = rto_server().await;
+    let ep = server.endpoint();
+    let mut s = tokio::net::TcpStream::connect(ep.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    s.write_all(raw_put_head(&ep, true).as_bytes())
+        .await
+        .unwrap();
+    let chunk = vec![7u8; 1024 * 1024];
+    for _ in 0..RAW_BODY / chunk.len() {
+        s.write_all(&chunk).await.expect("the whole body is read");
+    }
+    let (status, _) = read_raw_response(&mut s).await.expect("first response");
+    assert_eq!(status, 403);
+    // Keep-alive: a second signed request on the same socket gets an answer.
+    let head = sign_raw(
+        reqwest::Method::GET,
+        &format!("{ep}/"),
+        "bootstrap_key",
+        "bootstrap_secret",
+    );
+    let mut req = format!(
+        "GET / HTTP/1.1\r\nHost: {}\r\n",
+        ep.trim_start_matches("http://")
+    );
+    for (k, v) in head {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let (status, _) = read_raw_response(&mut s).await.expect("second response");
+    assert_eq!(status, 200);
+}
+
+/// The DoS guard: an anonymous refused request is not drained, so its
+/// connection closes.
+#[tokio::test]
+async fn a_refused_anonymous_put_body_is_not_read() {
+    let server = rto_server().await;
+    let ep = server.endpoint();
+    let mut s = tokio::net::TcpStream::connect(ep.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    s.write_all(raw_put_head(&ep, false).as_bytes())
+        .await
+        .unwrap();
+    let chunk = vec![7u8; 1024 * 1024];
+    let mut written = 0usize;
+    for _ in 0..RAW_BODY / chunk.len() {
+        if s.write_all(&chunk).await.is_err() {
+            break;
+        }
+        written += chunk.len();
+    }
+    // The server stops reading: the socket closes before all bytes are taken
+    // or right after the answer, and a second request gets no reply.
+    let first = read_raw_response(&mut s).await;
+    let second = if first.is_some() {
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await.ok();
+        read_raw_response(&mut s).await
+    } else {
+        None
+    };
+    assert!(
+        second.is_none(),
+        "anonymous connection must close (written {written}, first {first:?})"
+    );
 }

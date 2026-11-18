@@ -101,6 +101,12 @@ sudo docker compose -f /data/coolify/proxy/docker-compose.yml up -d
 
 Mitigation without operator access: the embedded uploader uploads one file at a time, so that each part gets a fair share of the upload link. For typical workloads, each part then completes within the default 60 s window. For very slow links or larger parts, you must still raise the reverse-proxy timeout.
 
+## A refused upload shows as a connection reset behind a reverse proxy
+
+A proxy such as Traefik can report "connection reset" instead of `403 AccessDenied` for a large upload that DeltaGlider Proxy refuses, for example a `PUT` to a `replication_target_only` bucket. The reason is that the refusal comes before the proxy reads the body, and the connection closes with the body unread.
+
+For a signed request, the proxy now reads up to 64 MiB of the body, for at most 30 seconds, before it sends the error response. It does not read the body of an anonymous request, of a presigned request, or of a request that declares more than 64 MiB. A client that still sees a reset in these cases must read the response before it sends the whole body, or must send `Expect: 100-continue`.
+
 ## Uploads fail with 411 MissingContentLength
 
 The proxy reserves memory or spool space for an upload body before it reads the body, so the request must declare the length of its body. A `PutObject` request declares it in `Content-Length`, or in `x-amz-decoded-content-length` for an aws-chunked body. A request that sends its body with plain `Transfer-Encoding: chunked` declares neither, so it gets `411 MissingContentLength`, as on S3. A browser form upload must send `Content-Length` too. The AWS SDKs and the usual S3 tools always send the length, so check the client that sends the request, for example a script that streams from a pipe without a known size.

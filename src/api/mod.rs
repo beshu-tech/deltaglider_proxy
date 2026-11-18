@@ -7,6 +7,7 @@ pub mod auth;
 pub(crate) mod aws_chunked;
 pub(crate) mod body_ingest;
 pub(crate) mod checksum;
+pub(crate) mod drain;
 pub mod error_page;
 pub(crate) mod errors;
 pub mod handlers;
