@@ -98,7 +98,8 @@ pub struct Facts {
 /// below `min(max(percent of the disk, floor), ceiling)`:
 /// * the percent follows the size of the disk;
 /// * the floor (bytes taken from the spool limits) keeps a small disk from
-///   running out under one upload;
+///   running out under one upload; the fixed critical floor counts up to
+///   twice the critical percent, so a disk below 1 GiB can be at level ok;
 /// * the ceiling (bytes) keeps a huge disk from refusing writes while it
 ///   still has plenty of room: 5% of a 10 TiB volume is 512 GiB.
 ///
@@ -125,6 +126,14 @@ pub struct Thresholds {
 
 fn percent_of(total: u64, percent: u8) -> u64 {
     (u128::from(total) * u128::from(percent) / 100) as u64
+}
+
+/// The fixed critical floor counts up to twice the critical percent of the
+/// disk: 1 GiB on a 900 MiB disk kept it at level critical forever (R8,
+/// #171). From 10 GiB up (5%) it applies whole. The high and low floors
+/// stay whole: they keep one upload from filling the disk.
+fn critical_floor_on_disk(floor: u64, total: u64, percent: u8) -> u64 {
+    floor.min(percent_of(total, percent.saturating_mul(2)))
 }
 
 impl Thresholds {
@@ -204,7 +213,10 @@ impl Thresholds {
                 Level::Ok => return 0,
                 Level::Low => (self.low_percent, self.low_floor),
                 Level::High => (self.high_percent, self.high_floor),
-                Level::Critical => (self.critical_percent, self.critical_floor),
+                Level::Critical => (
+                    self.critical_percent,
+                    critical_floor_on_disk(self.critical_floor, total, self.critical_percent),
+                ),
             };
             if !self.enabled(l) {
                 return 0;

@@ -53,7 +53,7 @@ Each disk has one of four levels. A level starts when the free space of the disk
 | ok | 0 | | | | Nothing |
 | low | 1 | 15% (`DGP_DISK_LOW_PERCENT`) | Twice the largest spool reservation that one upload can make | 50 GiB (`DGP_DISK_LOW_MAX_BYTES`) | Logs a warning once |
 | high | 2 | 10% (`DGP_DISK_HIGH_PERCENT`) | The largest spool reservation that one upload can make | 25 GiB (`DGP_DISK_HIGH_MAX_BYTES`) | Refuses new spool reservations (see below) |
-| critical | 3 | 5% (`DGP_DISK_CRITICAL_PERCENT`) | 1 GiB | 10 GiB (`DGP_DISK_CRITICAL_MAX_BYTES`) | Also refuses the writes that store bytes on that disk (see below) |
+| critical | 3 | 5% (`DGP_DISK_CRITICAL_PERCENT`) | 1 GiB, but at most twice the percent of the disk (so on a disk smaller than 10 GiB the floor is smaller) | 10 GiB (`DGP_DISK_CRITICAL_MAX_BYTES`) | Also refuses the writes that store bytes on that disk (see below) |
 
 A ceiling of `0` turns its level off. With `DGP_DISK_HIGH_MAX_BYTES=0` the free space of the disk never makes the spool refuse an upload, and with `DGP_DISK_CRITICAL_MAX_BYTES=0` no write to a filesystem backend is refused for want of space. A level that is off is skipped when a level falls. The ceilings fit the 5 GiB that one backend `PUT` can hold: critical leaves room for two such uploads, high for five and low for ten. A ceiling that is lower than the ceiling of a level below it is raised to meet it, so the levels never overlap. When a floor is larger than its ceiling, the ceiling wins: it is the setting that you chose.
 

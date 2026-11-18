@@ -4,6 +4,7 @@ use super::*;
 use proptest::prelude::*;
 
 const GIB: u64 = 1024 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
 const TOTAL: u64 = 100 * GIB;
 
 fn tuning() -> DiskMonitorTuning {
@@ -93,6 +94,24 @@ fn the_floors_come_from_the_spool_limits() {
     assert_eq!(
         next_level(Level::Ok, small, &Thresholds::new(&tuning(), 0)),
         Level::Critical
+    );
+    // R8: the critical floor scales on a disk below 10 GiB. A 900 MiB disk
+    // with 600 MiB free is ok (it was critical forever), and is critical
+    // below 10% of it.
+    let tiny = |free: u64| Facts {
+        free,
+        total: 900 * MIB,
+    };
+    let none = Thresholds::new(&tuning(), 0);
+    assert_eq!(next_level(Level::Ok, tiny(600 * MIB), &none), Level::Ok);
+    assert_eq!(
+        next_level(Level::Ok, tiny(80 * MIB), &none),
+        Level::Critical
+    );
+    assert_eq!(
+        none.enter(Level::Critical, 10 * GIB),
+        GIB,
+        "whole from 10 GiB"
     );
     // A settings mistake cannot make the levels overlap: high above low
     // raises low to meet it (the ceiling of high, 25 GiB, caps both).
@@ -721,7 +740,6 @@ fn readiness_does_not_read_the_disk_level() {
 /// its end): a spike that ends admits at once.
 #[test]
 fn the_spool_is_judged_live_by_its_use_where_the_free_space_hides_the_limit() {
-    const MIB: u64 = 1024 * 1024;
     let dir = tempfile::tempdir().unwrap();
     let spool = crate::deltaglider::spool::SpoolDir::new(dir.path().join("s"), 100 * MIB).unwrap();
     let watch = DiskWatch::new(spool.gate().clone());
@@ -794,7 +812,6 @@ fn the_spool_is_judged_live_by_its_use_where_the_free_space_hides_the_limit() {
 /// Pure: the live refusal over `used / budget`, by table.
 #[test]
 fn the_use_refusal_table() {
-    const MIB: u64 = 1024 * 1024;
     let th = Thresholds::percent_only(&tuning());
     let dir = Path::new("/spool");
     // (used MiB of 100, refused?): high starts below 10% left.
