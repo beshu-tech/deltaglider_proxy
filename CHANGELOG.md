@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.2.4 — 2026-11-18
+
 ### Upgrade steps for the next release
 
 - Before you upgrade, copy each object that you need from a key below a `.dg` directory to another key. The new release answers `400` for such a key. See [Upgrade](docs/product/how-to/upgrade.md).
