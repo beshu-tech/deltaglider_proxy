@@ -483,7 +483,7 @@ async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, AdminErr
         users: users
             .into_iter()
             .map(|u| BackupUser {
-                id: Some(u.id),
+                id: u.id,
                 name: u.name,
                 access_key_id: u.access_key_id,
                 secret_access_key: u.secret_access_key,
@@ -710,13 +710,13 @@ pub async fn import_backup(
     }
 
     // Legacy JSON body — deserialise then run the existing flow.
-    let backup: IamBackup = serde_json::from_slice(&body).map_err(|e| {
-        tracing::warn!("import_backup: malformed JSON body: {}", e);
+    let backup = crate::config_db::restore::parse_iam_backup(&body).map_err(|e| {
+        tracing::warn!("import_backup: refused JSON body: {}", e);
         import_fail(
             StatusCode::BAD_REQUEST,
             "parse_legacy_json",
             "request body",
-            format!("malformed IAM backup JSON: {e}"),
+            e,
         )
     })?;
     import_backup_iam(state, headers, backup, query.iam, false)
@@ -1147,24 +1147,6 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
     for named in &mut cfg.backends {
         if let Some(s) = secrets.storage_backends.get(&named.name) {
             fill_s3_backend_credentials(&mut named.backend, s);
-        }
-    }
-
-    // Backward compatibility for v1 backups exported before named backend
-    // credentials were included in secrets.json: if there is exactly one named
-    // S3 backend and the legacy singleton storage secret exists, it is the only
-    // unambiguous credential source we can restore.
-    if secrets.storage_backends.is_empty() {
-        if let Some(s) = &secrets.storage {
-            let s3_named: Vec<usize> = cfg
-                .backends
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, b)| matches!(b.backend, BackendConfig::S3 { .. }).then_some(idx))
-                .collect();
-            if let [idx] = s3_named.as_slice() {
-                fill_s3_backend_credentials(&mut cfg.backends[*idx].backend, s);
-            }
         }
     }
 
@@ -1652,14 +1634,10 @@ fn parse_backup_parts(
         None
     };
     let iam_backup: Option<IamBackup> = if let Some(iam_bytes) = files.get("iam.json") {
-        Some(serde_json::from_slice(iam_bytes).map_err(|e| {
-            import_fail(
-                StatusCode::BAD_REQUEST,
-                "parse_iam",
-                "iam.json",
-                format!("malformed JSON: {e}"),
-            )
-        })?)
+        Some(
+            crate::config_db::restore::parse_iam_backup(iam_bytes)
+                .map_err(|e| import_fail(StatusCode::BAD_REQUEST, "parse_iam", "iam.json", e))?,
+        )
     } else {
         None
     };
@@ -2061,7 +2039,6 @@ mod tests {
     use crate::config_db::auth_providers::{
         AuthProviderConfig, ExternalIdentity, GroupMappingRule,
     };
-    use crate::config_db::restore::resolve_backup_user_id;
 
     /// A refused restore tells the operator why; a server error keeps its
     /// detail in the log.
@@ -2265,9 +2242,9 @@ advanced:\n  event_delivery:\n    enabled: true\n    format: slack\n    webhook_
         let iam: IamBackup = serde_json::from_value(serde_json::json!({
             "version": 2,
             "users": [
-                {"name":"ci-uploader","access_key_id":"AKCIUPLOADER","secret_access_key":USER_SK,"enabled":true,"permissions":[],"group_ids":[]},
-                {"name":"backup-bot","access_key_id":"AKBACKUPBOT","secret_access_key":REF_SK,"enabled":true,"permissions":[],"group_ids":[]},
-                {"name":"dana","access_key_id":"AKDANA","secret_access_key":DB_ONLY_SK,"enabled":true,"permissions":[],"group_ids":[]}
+                {"id":1,"name":"ci-uploader","access_key_id":"AKCIUPLOADER","secret_access_key":USER_SK,"enabled":true,"permissions":[],"group_ids":[]},
+                {"id":2,"name":"backup-bot","access_key_id":"AKBACKUPBOT","secret_access_key":REF_SK,"enabled":true,"permissions":[],"group_ids":[]},
+                {"id":3,"name":"dana","access_key_id":"AKDANA","secret_access_key":DB_ONLY_SK,"enabled":true,"permissions":[],"group_ids":[]}
             ],
             "groups": [],
             "auth_providers": [
@@ -2306,43 +2283,6 @@ advanced:\n  event_delivery:\n    enabled: true\n    format: slack\n    webhook_
             Some(CLIENT_SECRET),
             "{restored}"
         );
-    }
-
-    /// S16: a legacy backup (no `users[].id`) where Alice is in no group and
-    /// Bob and Carol are. The old fallback took the idx-th group member id,
-    /// so Alice resolved to Bob's id and Bob's OAuth identity was bound to
-    /// Alice. An id that cannot be proven must not be guessed.
-    #[test]
-    fn legacy_backup_never_guesses_another_users_id() {
-        let backup: IamBackup = serde_json::from_value(serde_json::json!({
-            "version": 2,
-            "users": [
-                {"name":"alice","access_key_id":"A","secret_access_key":"a","enabled":true,"permissions":[],"group_ids":[]},
-                {"name":"bob","access_key_id":"B","secret_access_key":"b","enabled":true,"permissions":[],"group_ids":[1]},
-                {"name":"carol","access_key_id":"C","secret_access_key":"c","enabled":true,"permissions":[],"group_ids":[1]}
-            ],
-            "groups": [{"id":1,"name":"eng","permissions":[],"member_ids":[2,3]}]
-        }))
-        .unwrap();
-        let ids: Vec<Option<i64>> = backup
-            .users
-            .iter()
-            .enumerate()
-            .map(|(i, u)| resolve_backup_user_id(u, i, &backup))
-            .collect();
-        assert_eq!(ids, [None, None, None], "unprovable ids must not resolve");
-
-        // Every user in a group: the member-id set IS the id list.
-        let mut all = backup;
-        all.groups[0].member_ids = vec![1, 5, 9];
-        all.users[0].group_ids = vec![1];
-        let ids: Vec<Option<i64>> = all
-            .users
-            .iter()
-            .enumerate()
-            .map(|(i, u)| resolve_backup_user_id(u, i, &all))
-            .collect();
-        assert_eq!(ids, [Some(1), Some(5), Some(9)]);
     }
 
     /// #92 M1: `secrets.json` never carries an env-supplied value, and a
@@ -2412,7 +2352,7 @@ advanced:\n  event_delivery:\n    enabled: true\n    format: slack\n    webhook_
     }
 
     #[test]
-    fn restore_hydrates_single_named_s3_backend_from_legacy_storage_secret() {
+    fn restore_never_fills_a_named_backend_from_the_singleton_storage_secret() {
         let yaml = r#"
 storage:
   backends:
@@ -2447,8 +2387,8 @@ storage:
                 secret_access_key,
                 ..
             } => {
-                assert_eq!(access_key_id.as_deref(), Some("AKIA_BACKUP"));
-                assert_eq!(secret_access_key.as_deref(), Some("SECRET_BACKUP"));
+                assert_eq!(access_key_id.as_deref(), None);
+                assert_eq!(secret_access_key.as_deref(), None);
             }
             other => panic!("expected S3 backend, got {other:?}"),
         }
@@ -2561,7 +2501,7 @@ storage:
         let backup = IamBackup {
             version: 2,
             users: vec![BackupUser {
-                id: Some(1),
+                id: 1,
                 name: "alice".into(),
                 access_key_id: "AK1".into(),
                 secret_access_key: "SK1".into(),

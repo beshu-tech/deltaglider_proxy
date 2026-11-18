@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Button, ConfigProvider, Input, Typography, Space, Alert, Spin, message } from 'antd';
-import { WarningOutlined, CheckCircleOutlined, CopyOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
+import { WarningOutlined, CheckCircleOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession, getBucket } from '../s3client';
 import { adminLogin, loginAs, isNotAdminDenial, whoami, isConfigDbLocked, recoverDb, browserSessionConnect, openBrowserConnect } from '../adminApi';
 import type { ExternalProviderInfo, WhoamiResponse } from '../adminApi';
@@ -14,7 +14,6 @@ import PlainErrorAlert from './PlainErrorAlert';
 import MaskedSecretInput from './MaskedSecretInput';
 import { SPACE } from './shared-styles';
 import { readStorage, removeStorage, writeStorage } from '../safeStorage';
-import { useCopyToClipboard } from '../useCopyToClipboard';
 
 const { Text } = Typography;
 
@@ -93,17 +92,11 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   // Seeded from sessionStorage once on mount and intentionally NOT refetched when
   // `showRecovery` later flips true: a successful recovery survives a page refresh
   // (whoami() still reports config_db_mismatch until the operator updates the server
-  // config), so the user keeps seeing the hash they need to copy. We must not clear it
-  // when re-entering the wizard or that recovered hash would be lost.
-  // kind 'config_db_key' carries no key: the operator typed it, and a key is
-  // never written to sessionStorage.
-  const [recoveredHash, setRecoveredHash] = useState<{ kind?: string; hash: string; base64: string } | null>(() => {
-    const saved = readStorage('dg-recovered-hash', 'session');
-    try {
-      return saved ? JSON.parse(saved) : null;
-    } catch { return null; }
-  });
-  const { copy } = useCopyToClipboard();
+  // config), so the user keeps seeing the notice. We must not clear it
+  // when re-entering the wizard or the "key found" notice would be lost.
+  // Only the flag is stored: the operator typed the key, and a key is never
+  // written to sessionStorage.
+  const [keyFound, setKeyFound] = useState<boolean>(() => readStorage('dg-recovered-key', 'session') === '1');
 
   const runOpenModeConnect = useCallback(async (): Promise<{ ok: true } | { ok: false; error: string }> => {
     const endpoint = detectDefaultEndpoint().replace(/\/+$/, '');
@@ -326,14 +319,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     setRecoveryError(null);
     try {
       const result = await recoverDb(recoveryPassword);
-      if (result.success && (result.correct_hash || result.key_kind === 'config_db_key')) {
-        const recovered = {
-          kind: result.key_kind,
-          hash: result.correct_hash || '',
-          base64: result.correct_hash_base64 || '',
-        };
-        setRecoveredHash(recovered);
-        writeStorage('dg-recovered-hash', JSON.stringify(recovered), 'session');
+      if (result.success) {
+        setKeyFound(true);
+        writeStorage('dg-recovered-key', '1', 'session');
       } else {
         setRecoveryError(plainError(result.error ?? '', 'The key does not open the database.'));
       }
@@ -342,10 +330,6 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     } finally {
       setRecoveryLoading(false);
     }
-  };
-
-  const copyToClipboard = (text: string, label: string) => {
-    void copy(text, { successMessage: `${label} copied to clipboard` });
   };
 
   const choices = signInChoices(authMode);
@@ -390,7 +374,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100dvh', padding: 24, boxSizing: 'border-box' }}>
         <div className="dg-login-card animate-fade-in" style={{ boxShadow: LOGIN_CARD_SHADOW, borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 520 }}>
           <Space orientation="vertical" size="large" style={{ width: '100%' }}>
-            {recoveredHash?.kind === 'config_db_key' ? (
+            {keyFound ? (
               <>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
                   <CheckCircleOutlined style={{ fontSize: 28, color: 'var(--dg-accent-green)', flexShrink: 0 }} />
@@ -405,47 +389,6 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   <code>deltaglider_config.db.key</code> next to the database, and restart. At
                   startup the server moves the preserved database back into place.
                 </div>
-              </>
-            ) : recoveredHash ? (
-              <>
-                <div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-                    <CheckCircleOutlined style={{ fontSize: 28, color: 'var(--dg-accent-green)', flexShrink: 0 }} />
-                    <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
-                      Database recovered
-                    </div>
-                  </div>
-                  <div style={{ color: TEXT_SECONDARY, fontSize: 14, fontFamily: "var(--font-ui)", lineHeight: 1.7 }}>
-                    This database is from a release that encrypted it with the admin password
-                    hash. Set this hash as your admin password hash (env{' '}
-                    <code>DGP_BOOTSTRAP_PASSWORD_HASH</code> or the config), then restart. At
-                    startup the server re-encrypts the preserved database{' '}
-                    (<code>deltaglider_config.db.bak</code>) with the config DB key and moves it
-                    back into place.
-                  </div>
-                </div>
-                <div style={{ background: 'color-mix(in srgb, var(--input-bg) 78%, var(--glass-bg) 22%)', borderRadius: 12, padding: 16 }}>
-                  <div style={{ marginBottom: 12 }}>
-                    <label htmlFor="recovered-hash" style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Hash</label>
-                    <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-                      <Input id="recovered-hash" value={recoveredHash.hash} readOnly style={{ ...recoveryInputStyle, flex: 1, fontSize: 11 }} />
-                      <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(recoveredHash.hash, 'Hash')} />
-                    </div>
-                  </div>
-                  <div>
-                    <label htmlFor="recovered-hash-base64" style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Base64 (for Docker / env vars)</label>
-                    <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-                      <Input id="recovered-hash-base64" value={recoveredHash.base64} readOnly style={{ ...recoveryInputStyle, flex: 1, fontSize: 11 }} />
-                      <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(recoveredHash.base64, 'Base64 hash')} />
-                    </div>
-                  </div>
-                </div>
-                <Alert type="info" showIcon title={
-                  <span style={{ fontFamily: "var(--font-ui)", fontSize: 12 }}>
-                    Set <code style={{ fontFamily: "var(--font-mono)" }}>DGP_BOOTSTRAP_PASSWORD_HASH</code> in your environment
-                    or <code style={{ fontFamily: "var(--font-mono)" }}>advanced.bootstrap_password_hash</code> in your YAML config, then restart.
-                  </span>
-                } />
               </>
             ) : (
               <>
@@ -467,10 +410,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   <div style={{ color: TEXT_SECONDARY, fontSize: 13, marginTop: 12, lineHeight: 1.7, fontFamily: "var(--font-ui)" }}>
                     Paste the key that encrypted the database: an earlier value of{' '}
                     <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>DGP_CONFIG_DB_KEY</code>,
-                    or the content of a backup of the key file. A database from an older release
-                    is encrypted with the admin password hash: paste that exact hash (from{' '}
-                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>.deltaglider_bootstrap_hash</code>{' '}
-                    or your old env vars).
+                    or the content of a backup of the key file.
                   </div>
                   <div style={{ color: TEXT_MUTED, fontSize: 12, marginTop: 8, lineHeight: 1.6, fontFamily: "var(--font-ui)" }}>
                     Lost the key? It cannot be recovered, but the old database stays on the server as{' '}
@@ -480,13 +420,13 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 {recoveryError && <PlainErrorAlert error={recoveryError} />}
                 <div>
                   <label htmlFor="recovery-key" style={{ fontSize: 13, fontWeight: 600, color: TEXT_SECONDARY, fontFamily: "var(--font-ui)", marginBottom: SPACE.xs, display: 'block' }}>
-                    Config DB key or legacy password hash
+                    Config DB key
                   </label>
                   <Input.TextArea
                     id="recovery-key"
                     value={recoveryPassword}
                     onChange={(e) => setRecoveryPassword(e.target.value)}
-                    placeholder="config DB key, or $2b$12$... / base64-encoded hash"
+                    placeholder="config DB key"
                     autoFocus
                     rows={2}
                     className="dg-recovery-hash-input"

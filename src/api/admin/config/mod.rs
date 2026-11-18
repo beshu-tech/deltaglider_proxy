@@ -1664,8 +1664,6 @@ advanced:
         let check = env
             .iter()
             .filter(|(n, _)| !BOOLEANS.contains(&n.as_str()))
-            // DGP_ADMIN_PASSWORD_HASH is shadowed by DGP_BOOTSTRAP_PASSWORD_HASH.
-            .filter(|(n, _)| n.as_str() != "DGP_ADMIN_PASSWORD_HASH")
             .map(|(n, v)| (n.clone(), v.clone()))
             .collect();
         (env, check)

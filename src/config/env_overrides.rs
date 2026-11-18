@@ -332,16 +332,10 @@ pub const DATA_DIR: &str = "DGP_DATA_DIR";
 
 /// Variables `apply_env_overrides_with` reads that the GUI never shows,
 /// with the reason. The drift test accepts these and nothing else unbound.
-pub const NOT_GUI_VISIBLE: &[(&str, &str)] = &[
-    (
-        "DGP_BOOTSTRAP_PASSWORD_HASH",
-        "infra secret; never persisted, rotated with PUT /api/admin/password",
-    ),
-    (
-        "DGP_ADMIN_PASSWORD_HASH",
-        "legacy alias of DGP_BOOTSTRAP_PASSWORD_HASH",
-    ),
-];
+pub const NOT_GUI_VISIBLE: &[(&str, &str)] = &[(
+    "DGP_BOOTSTRAP_PASSWORD_HASH",
+    "infra secret; never persisted, rotated with PUT /api/admin/password",
+)];
 
 /// YAML path of a backend's encryption field. The singleton backend
 /// ("default" with no named list) lives under `storage.backend_encryption`.

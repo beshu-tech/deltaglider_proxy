@@ -17,6 +17,7 @@ const REDIRECTS = {
   '/docs/production-deployment': '/docs/how-to/go-to-production',
   '/docs/production-security-checklist': '/docs/tutorials/secure-your-proxy',
   '/docs/upgrade-guide': '/docs/how-to/upgrade',
+  '/docs/how-to/upgrade-to-2-0': '/docs/how-to/upgrade',
   '/docs/kubernetes-helm': '/docs/how-to/deploy-on-kubernetes',
   '/docs/docker-compose': '/docs/how-to/deploy-with-docker-compose',
   '/docs/monitoring-and-alerts': '/docs/how-to/monitor-with-prometheus',

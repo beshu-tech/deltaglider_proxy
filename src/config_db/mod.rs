@@ -196,8 +196,8 @@ pub(crate) fn open_encrypted(
 }
 
 /// Open (or create) the file at `local_path` with `keys.primary`, through
-/// `open`. A file that opens only with a fallback key (the legacy bootstrap
-/// hash, a key file that an env key replaces, `DGP_CONFIG_DB_KEY_PREVIOUS`)
+/// `open`. A file that opens only with a fallback key (a key file that an
+/// env key replaces, `DGP_CONFIG_DB_KEY_PREVIOUS`)
 /// is re-encrypted with the primary key first, see [`rekey_file`], and its
 /// companions follow ([`heal_companions`]). A file that opens with no key is
 /// `WrongPassphrase`. The config DB and the jobs DB both open here, so a
@@ -355,8 +355,8 @@ impl ConfigDb {
     }
 
     /// Open (or create) the DB with `keys.primary`. A DB that opens only with a
-    /// fallback key (the legacy bootstrap hash, or a key file that an env key
-    /// replaces) is re-encrypted with the primary key first, see
+    /// fallback key (a key file that an env key
+    /// replaces, or `DGP_CONFIG_DB_KEY_PREVIOUS`) is re-encrypted with the primary key first, see
     /// [`rekey_file`]. A DB that opens with no key is `WrongPassphrase`.
     pub(crate) fn open_with_keys(
         local_path: &Path,
@@ -2415,31 +2415,31 @@ mod tests {
 
     // === S8: key migration ===
 
-    const HASH: &str = "$2b$04$legacyhashlegacyhashlegacyhashlegacyhash";
+    const OLD_KEY: &str = "old-config-db-key-0123456789abcdef0123456789";
     const NEW_KEY: &str = "new-config-db-key-0123456789abcdef0123456789";
 
-    fn legacy_db(dir: &std::path::Path) -> std::path::PathBuf {
+    fn old_key_db(dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join("deltaglider_config.db");
-        let db = ConfigDb::open_or_create(&path, HASH).unwrap();
+        let db = ConfigDb::open_or_create(&path, OLD_KEY).unwrap();
         db.create_user("alice", "AKALICE1", "secret", true, &[])
             .unwrap();
         path
     }
 
     fn keys() -> ConfigDbKeys {
-        ConfigDbKeys::primary_only(NEW_KEY).with_fallback(FallbackKind::LegacyBootstrapHash, HASH)
+        ConfigDbKeys::primary_only(NEW_KEY).with_fallback(FallbackKind::PreviousKey, OLD_KEY)
     }
 
     #[test]
-    fn legacy_hash_keyed_db_migrates_to_the_primary_key() {
+    fn previous_key_db_migrates_to_the_primary_key() {
         let dir = tempfile::tempdir().unwrap();
-        let path = legacy_db(dir.path());
+        let path = old_key_db(dir.path());
         let (db, how) = ConfigDb::open_with_keys(&path, &keys()).unwrap();
-        assert_eq!(how, OpenedWith::Migrated(FallbackKind::LegacyBootstrapHash));
+        assert_eq!(how, OpenedWith::Migrated(FallbackKind::PreviousKey));
         assert_eq!(db.load_users().unwrap()[0].name, "alice");
         drop(db);
         assert!(probe_key(&path, NEW_KEY).unwrap());
-        assert!(!probe_key(&path, HASH).unwrap());
+        assert!(!probe_key(&path, OLD_KEY).unwrap());
         assert!(!dir.path().join("deltaglider_config.db.rekey.tmp").exists());
         // A second open is a plain primary open.
         let (_, how) = ConfigDb::open_with_keys(&path, &keys()).unwrap();
@@ -2449,7 +2449,7 @@ mod tests {
     #[test]
     fn a_failed_rekey_leaves_the_original_intact() {
         let dir = tempfile::tempdir().unwrap();
-        let path = legacy_db(dir.path());
+        let path = old_key_db(dir.path());
         let before = std::fs::read(&path).unwrap();
         // The rekey step fails after the copy is re-encrypted.
         let err = ConfigDb::open_with_keys_hooked(&path, &keys(), |_| {
@@ -2472,13 +2472,13 @@ mod tests {
         .expect("a corrupt copy must not be swapped in");
         assert!(!matches!(err, ConfigDbError::Other(ref m) if m.contains("injected")));
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        // The original still opens with the legacy key, and a clean retry
+        // The original still opens with the previous key, and a clean retry
         // migrates it.
-        let db = ConfigDb::open_or_create(&path, HASH).unwrap();
+        let db = ConfigDb::open_or_create(&path, OLD_KEY).unwrap();
         assert_eq!(db.load_users().unwrap().len(), 1);
         drop(db);
         let (_, how) = ConfigDb::open_with_keys(&path, &keys()).unwrap();
-        assert_eq!(how, OpenedWith::Migrated(FallbackKind::LegacyBootstrapHash));
+        assert_eq!(how, OpenedWith::Migrated(FallbackKind::PreviousKey));
     }
 
     #[test]
@@ -2504,7 +2504,7 @@ mod tests {
     #[test]
     fn migration_rekeys_the_sync_merge_base() {
         let dir = tempfile::tempdir().unwrap();
-        let path = legacy_db(dir.path());
+        let path = old_key_db(dir.path());
         let base = crate::config_db_sync::sync_base_path(&path);
         assert_eq!(key_companions(&path)[0], (base.clone(), true));
         std::fs::copy(&path, &base).unwrap();
@@ -2517,7 +2517,7 @@ mod tests {
         std::fs::remove_file(&base).unwrap();
         drop(ConfigDb::open_or_create(&base, "a-foreign-key").unwrap());
         let db2 = dir.path().join("second.db");
-        drop(ConfigDb::open_or_create(&db2, HASH).unwrap());
+        drop(ConfigDb::open_or_create(&db2, OLD_KEY).unwrap());
         let base2 = crate::config_db_sync::sync_base_path(&db2);
         std::fs::copy(&base, &base2).unwrap();
         ConfigDb::open_with_keys(&db2, &keys()).unwrap();
@@ -2548,7 +2548,7 @@ mod tests {
     #[test]
     fn a_leftover_rekey_copy_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
-        let path = legacy_db(dir.path());
+        let path = old_key_db(dir.path());
         std::fs::write(dir.path().join("deltaglider_config.db.rekey.tmp"), b"stale").unwrap();
         let (db, _) = ConfigDb::open_with_keys(&path, &keys()).unwrap();
         assert_eq!(db.load_users().unwrap().len(), 1);
@@ -2559,11 +2559,11 @@ mod tests {
 mod review3_tests {
     use super::*;
 
-    const HASH: &str = "$2b$04$legacyhashlegacyhashlegacyhashlegacyhash";
+    const OLD_KEY: &str = "old-config-db-key-0123456789abcdef0123456789";
     const NEW_KEY: &str = "new-config-db-key-0123456789abcdef0123456789";
 
     /// Kill between the DB rename and `rekey_companions`: the DB is under the
-    /// new key, the merge base still under the legacy hash. The next boot
+    /// new key, the merge base still under the previous key. The next boot
     /// opens the DB with the primary key and never looks at the companion
     /// again, so the base stays unreadable for good and every later 412
     /// reconcile runs base-less (remote wins, local unsynced edits lost).
@@ -2571,16 +2571,16 @@ mod review3_tests {
     fn review3_a_crash_before_the_companion_rekey_heals_on_the_next_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deltaglider_config.db");
-        ConfigDb::open_or_create(&path, HASH)
+        ConfigDb::open_or_create(&path, OLD_KEY)
             .unwrap()
             .create_user("alice", "AKALICE1", "secret", true, &[])
             .unwrap();
         let base = crate::config_db_sync::sync_base_path(&path);
-        drop(ConfigDb::open_or_create(&base, HASH).unwrap());
+        drop(ConfigDb::open_or_create(&base, OLD_KEY).unwrap());
         // The crash: the DB moved, its companion did not.
-        rekey_file(&path, HASH, NEW_KEY).unwrap();
+        rekey_file(&path, OLD_KEY, NEW_KEY).unwrap();
         let keys = ConfigDbKeys::primary_only(NEW_KEY)
-            .with_fallback(key::FallbackKind::LegacyBootstrapHash, HASH);
+            .with_fallback(key::FallbackKind::PreviousKey, OLD_KEY);
         let (_db, _how) = ConfigDb::open_with_keys(&path, &keys).unwrap();
         assert!(
             probe_key(&base, NEW_KEY).unwrap(),
@@ -2595,12 +2595,12 @@ mod review3_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deltaglider_config.db");
         let bak = path.with_extension("db.bak");
-        ConfigDb::open_or_create(&bak, HASH)
+        ConfigDb::open_or_create(&bak, OLD_KEY)
             .unwrap()
             .create_user("alice", "AKALICE1", "secret", true, &[])
             .unwrap();
         let keys = ConfigDbKeys::primary_only(NEW_KEY)
-            .with_fallback(key::FallbackKind::LegacyBootstrapHash, HASH);
+            .with_fallback(key::FallbackKind::PreviousKey, OLD_KEY);
         drop(ConfigDb::open_with_keys(&path, &keys).unwrap());
         assert!(probe_key(&bak, NEW_KEY).unwrap());
 

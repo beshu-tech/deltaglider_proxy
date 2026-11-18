@@ -953,7 +953,7 @@ async fn password_rotation_ends_the_other_bootstrap_sessions() {
 }
 
 #[tokio::test]
-async fn recover_db_answers_only_under_a_mismatch_and_names_the_key_kind() {
+async fn recover_db_answers_only_under_a_mismatch() {
     const KEY_GOOD: &str = "recover-good-key-0123456789abcdef0123456789ab";
     const KEY_WRONG: &str = "recover-wrong-key-0123456789abcdef012345678a";
     let mut server = TestServer::builder()
@@ -988,9 +988,8 @@ async fn recover_db_answers_only_under_a_mismatch_and_names_the_key_kind() {
     let (code, v) = json_of(resp).await;
     assert_eq!(code, StatusCode::OK, "{v}");
     assert_eq!(v["success"], true);
-    assert_eq!(v["key_kind"], "config_db_key");
     assert!(
-        v.get("correct_hash").is_none(),
+        !v.to_string().contains(KEY_GOOD),
         "a typed key is never echoed: {v}"
     );
     assert_audited(&admin, &ep, "recover_db_success", "").await;

@@ -206,7 +206,7 @@ pub struct Config {
 
     /// Bcrypt hash of the bootstrap password.
     /// Seeds DB encryption, admin GUI access, and session signing.
-    /// Set via DGP_BOOTSTRAP_PASSWORD_HASH (or legacy DGP_ADMIN_PASSWORD_HASH).
+    /// Set via DGP_BOOTSTRAP_PASSWORD_HASH.
     #[serde(default, alias = "admin_password_hash")]
     pub bootstrap_password_hash: Option<String>,
 
@@ -1857,9 +1857,7 @@ impl Config {
         }
 
         // Admin GUI password hash
-        if let Some(v) =
-            env("DGP_BOOTSTRAP_PASSWORD_HASH").or_else(|| env("DGP_ADMIN_PASSWORD_HASH"))
-        {
+        if let Some(v) = env("DGP_BOOTSTRAP_PASSWORD_HASH") {
             self.bootstrap_password_hash = Some(v);
             applied.push(slot(&["bootstrap_password_hash"]));
         }
@@ -2496,7 +2494,7 @@ impl Config {
 
     /// Ensure bootstrap_password_hash is set. Resolution order:
     /// 1. Already set in config (env var or config file) — use it.
-    /// 2. Persisted state file `.deltaglider_bootstrap_hash` (or legacy `.deltaglider_admin_hash`).
+    /// 2. Persisted state file `.deltaglider_bootstrap_hash`.
     /// 3. Generate a random password, hash it, persist, and print to stderr.
     ///
     /// Accepts both raw bcrypt hash (`$2b$12$...`) and base64-encoded bcrypt hash.
@@ -2506,18 +2504,14 @@ impl Config {
     /// boot): the hash file cannot be written and stderr is not a terminal,
     /// so the operator would never learn the generated password.
     pub fn ensure_bootstrap_password_hash(&mut self) -> Result<String, String> {
-        // Check new file first, fall back to legacy file name
         let new_file = std::path::Path::new(".deltaglider_bootstrap_hash");
-        let legacy_file = std::path::Path::new(".deltaglider_admin_hash");
         if let Some(ref hash) = self.bootstrap_password_hash {
             let hash = Self::decode_hash(hash);
             // Every persist drops the hash from the config file
             // (`redact_for_persist`), so a hash that only the file carries
             // would be gone at the next boot, and the admin password with
             // it. Keep it in the state file too.
-            let on_disk = std::fs::read_to_string(new_file)
-                .or_else(|_| std::fs::read_to_string(legacy_file))
-                .ok();
+            let on_disk = std::fs::read_to_string(new_file).ok();
             if file_hash_needs_write(self.tuning.bootstrap_hash_env, on_disk.as_deref(), &hash) {
                 if let Err(e) = write_bootstrap_hash_file(new_file, &hash) {
                     eprintln!(
@@ -2530,11 +2524,7 @@ impl Config {
             return Ok(hash);
         }
 
-        let state_file = if new_file.exists() {
-            new_file
-        } else {
-            legacy_file
-        };
+        let state_file = new_file;
         if state_file.exists() {
             if let Ok(raw) = std::fs::read_to_string(state_file) {
                 let hash = Self::decode_hash(raw.trim());

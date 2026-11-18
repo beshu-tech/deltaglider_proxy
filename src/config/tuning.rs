@@ -432,9 +432,10 @@ impl RuntimeTuning {
 /// D15: the env var that pins the bootstrap hash, if one is set. That hash
 /// wins at every boot, so a GUI change would be lost at the next start.
 pub fn env_pinned_hash_var(env: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
-    ["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_ADMIN_PASSWORD_HASH"]
-        .into_iter()
-        .find(|n| env(n).is_some_and(|v| !v.trim().is_empty()))
+    let name = "DGP_BOOTSTRAP_PASSWORD_HASH";
+    env(name)
+        .is_some_and(|v| !v.trim().is_empty())
+        .then_some(name)
 }
 
 #[cfg(test)]

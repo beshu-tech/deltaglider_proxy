@@ -335,12 +335,6 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         example: "<the old DGP_CONFIG_DB_KEY>",
         category: "Authentication",
     },
-    EnvVarEntry {
-        name: "DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC",
-        description: "Transitional, for a rolling upgrade from a release before DGP_CONFIG_DB_KEY: accept a synced config DB that opens only with the bootstrap password hash (default false). Remove it when every instance runs this release",
-        example: "true",
-        category: "Authentication",
-    },
     // ── TLS ─────────────────────────────────────────────────
     EnvVarEntry {
         name: "DGP_TLS_ENABLED",
@@ -697,12 +691,6 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         description: "Secure flag on admin session cookies: true always, false never (default: automatic — set when the listener serves TLS, from YAML or env, or a trusted X-Forwarded-Proto: https arrives)",
         example: "true",
         category: "Security",
-    },
-    EnvVarEntry {
-        name: "DGP_ADMIN_PASSWORD_HASH",
-        description: "Legacy alias of DGP_BOOTSTRAP_PASSWORD_HASH (used when that is unset)",
-        example: "$2b$12$...",
-        category: "Authentication",
     },
     EnvVarEntry {
         name: "DGP_BOOTSTRAP_PASSWORD",

@@ -10,11 +10,9 @@
 //! 2. the key file `<db>.key` next to the DB (mode 0600), generated on the
 //!    first boot.
 //!
-//! Earlier releases keyed the DB with the bootstrap password hash. That hash,
 //! `DGP_CONFIG_DB_KEY_PREVIOUS` (rotation) and a key file that an env key
-//! replaces stay as FALLBACK keys: a DB that
-//! opens only with a fallback is re-encrypted with the primary key on boot
-//! (see `super::ConfigDb::open_with_keys`).
+//! replaces are FALLBACK keys: a DB that opens only with a fallback is
+//! re-encrypted with the primary key on boot (see `super::ConfigDb::open_with_keys`).
 
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -26,14 +24,6 @@ pub const CONFIG_DB_KEY_ENV: &str = "DGP_CONFIG_DB_KEY";
 /// is re-encrypted with the current key. Remove it once every node and the
 /// synced copy use the new key.
 pub const PREVIOUS_CONFIG_DB_KEY_ENV: &str = "DGP_CONFIG_DB_KEY_PREVIOUS";
-
-/// Transitional switch for a rolling upgrade from a release before the
-/// config DB key: when `true`, a SYNCED copy that opens only with the legacy
-/// bootstrap hash is accepted (and re-encrypted). Off by default, because the
-/// hash is not a secret of the same class as the key (it sits in configs and
-/// backups): with it, anyone who can write to the sync bucket and knows the
-/// hash could plant an IAM database on every node.
-pub const ACCEPT_LEGACY_SYNC_ENV: &str = "DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC";
 
 /// Minimum length of a `DGP_CONFIG_DB_KEY` value. `openssl rand -hex 32`
 /// gives 64 characters.
@@ -66,8 +56,6 @@ pub enum FallbackKind {
     PreviousKey,
     /// The key file, when `DGP_CONFIG_DB_KEY` replaces it.
     KeyFile,
-    /// The bootstrap password hash (the key of earlier releases).
-    LegacyBootstrapHash,
 }
 
 impl FallbackKind {
@@ -75,7 +63,6 @@ impl FallbackKind {
         match self {
             FallbackKind::PreviousKey => "DGP_CONFIG_DB_KEY_PREVIOUS",
             FallbackKind::KeyFile => "the key file",
-            FallbackKind::LegacyBootstrapHash => "the bootstrap password hash (legacy key)",
         }
     }
 }
@@ -126,17 +113,12 @@ impl ConfigDbKeys {
 
     /// The keys that may open a copy downloaded from the sync bucket: the
     /// primary key and `DGP_CONFIG_DB_KEY_PREVIOUS`. The key file is per node
-    /// and never keys a shared copy. The legacy bootstrap hash counts only
-    /// with `accept_legacy` ([`ACCEPT_LEGACY_SYNC_ENV`]).
-    pub fn for_synced_copy(&self, accept_legacy: bool) -> Self {
+    /// and never keys a shared copy.
+    pub fn for_synced_copy(&self) -> Self {
         let fallbacks = self
             .fallbacks
             .iter()
-            .filter(|(kind, _)| match kind {
-                FallbackKind::PreviousKey => true,
-                FallbackKind::KeyFile => false,
-                FallbackKind::LegacyBootstrapHash => accept_legacy,
-            })
+            .filter(|(kind, _)| matches!(kind, FallbackKind::PreviousKey))
             .cloned()
             .collect();
         Self {
@@ -196,8 +178,7 @@ pub fn check_sync_needs_env_key(
              is encrypted with that key, so every instance must set {CONFIG_DB_KEY_ENV} to the \
              same value (at least {MIN_CONFIG_DB_KEY_LEN} characters, for example from \
              `openssl rand -hex 32`). On the first start with it, each instance re-encrypts \
-             its local config DB to the new key from the key it had (its key file, or the \
-             bootstrap password hash for a DB from before 2.0)"
+             its local config DB to the new key from the key it had (its key file)"
         ));
     }
     Ok(())
@@ -225,7 +206,6 @@ pub fn check_sync_bucket_change(
 /// unreadable. When `DGP_CONFIG_DB_KEY` is set, such a file is skipped.
 pub fn resolve_config_db_keys(
     db_path: &Path,
-    legacy_bootstrap_hash: Option<&str>,
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<ConfigDbKeys, String> {
     let key_file = key_file_path(db_path);
@@ -273,9 +253,6 @@ pub fn resolve_config_db_keys(
             keys.fallbacks
                 .insert(0, (FallbackKind::PreviousKey, DbSecret::new(p)));
         }
-    }
-    if let Some(h) = legacy_bootstrap_hash {
-        keys = keys.with_fallback(FallbackKind::LegacyBootstrapHash, h);
     }
     Ok(keys)
 }
@@ -401,11 +378,10 @@ mod tests {
     fn first_boot_generates_a_0600_key_file_and_reuses_it() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("deltaglider_config.db");
-        let a = resolve_config_db_keys(&db, Some("$2b$hash"), no_env).unwrap();
+        let a = resolve_config_db_keys(&db, no_env).unwrap();
         assert!(matches!(a.source, DbKeySource::Generated(_)));
         assert_eq!(a.primary.expose().len(), 64);
-        assert_eq!(a.fallbacks.len(), 1);
-        assert_eq!(a.fallbacks[0].0, FallbackKind::LegacyBootstrapHash);
+        assert!(a.fallbacks.is_empty());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -415,7 +391,7 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        let b = resolve_config_db_keys(&db, None, no_env).unwrap();
+        let b = resolve_config_db_keys(&db, no_env).unwrap();
         assert!(matches!(b.source, DbKeySource::File(_)));
         assert_eq!(
             a.primary, b.primary,
@@ -427,12 +403,11 @@ mod tests {
     fn env_key_wins_and_keeps_the_key_file_as_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("deltaglider_config.db");
-        let file = resolve_config_db_keys(&db, None, no_env).unwrap();
+        let file = resolve_config_db_keys(&db, no_env).unwrap();
         let env_key = "e".repeat(40);
-        let keys = resolve_config_db_keys(&db, Some("$2b$hash"), |n| {
-            (n == CONFIG_DB_KEY_ENV).then(|| env_key.clone())
-        })
-        .unwrap();
+        let keys =
+            resolve_config_db_keys(&db, |n| (n == CONFIG_DB_KEY_ENV).then(|| env_key.clone()))
+                .unwrap();
         assert_eq!(keys.source, DbKeySource::Env);
         assert_eq!(keys.primary.expose(), env_key);
         assert_eq!(
@@ -440,10 +415,7 @@ mod tests {
                 .iter()
                 .map(|(k, s)| (*k, s.expose().to_string()))
                 .collect::<Vec<_>>(),
-            vec![
-                (FallbackKind::KeyFile, file.primary.expose().to_string()),
-                (FallbackKind::LegacyBootstrapHash, "$2b$hash".to_string()),
-            ]
+            vec![(FallbackKind::KeyFile, file.primary.expose().to_string())]
         );
     }
 
@@ -455,7 +427,7 @@ mod tests {
         let db = dir.path().join("deltaglider_config.db");
         let new_key = "n".repeat(40);
         let old_key = "o".repeat(40);
-        let keys = resolve_config_db_keys(&db, Some("$2b$hash"), |n| match n {
+        let keys = resolve_config_db_keys(&db, |n| match n {
             CONFIG_DB_KEY_ENV => Some(new_key.clone()),
             PREVIOUS_CONFIG_DB_KEY_ENV => Some(old_key.clone()),
             _ => None,
@@ -464,9 +436,9 @@ mod tests {
         assert_eq!(keys.primary.expose(), new_key);
         assert_eq!(keys.fallbacks[0].0, FallbackKind::PreviousKey);
         assert_eq!(keys.fallbacks[0].1.expose(), old_key);
-        assert_eq!(keys.fallbacks[1].0, FallbackKind::LegacyBootstrapHash);
+        assert_eq!(keys.fallbacks.len(), 1);
         // Blank = unset; equal to the primary = no fallback.
-        let keys = resolve_config_db_keys(&db, None, |n| match n {
+        let keys = resolve_config_db_keys(&db, |n| match n {
             CONFIG_DB_KEY_ENV | PREVIOUS_CONFIG_DB_KEY_ENV => Some(new_key.clone()),
             _ => None,
         })
@@ -479,7 +451,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("deltaglider_config.db");
         let env_key = "e".repeat(40);
-        resolve_config_db_keys(&db, None, |_| Some(env_key.clone())).unwrap();
+        resolve_config_db_keys(&db, |_| Some(env_key.clone())).unwrap();
         assert!(!key_file_path(&db).exists());
     }
 
@@ -488,7 +460,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("deltaglider_config.db");
         std::fs::write(key_file_path(&db), "  \n").unwrap();
-        let err = resolve_config_db_keys(&db, None, no_env).unwrap_err();
+        let err = resolve_config_db_keys(&db, no_env).unwrap_err();
         assert!(err.contains("is empty"), "{err}");
         assert_eq!(std::fs::read_to_string(key_file_path(&db)).unwrap(), "  \n");
     }
@@ -497,7 +469,7 @@ mod tests {
     fn short_env_key_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("deltaglider_config.db");
-        let err = resolve_config_db_keys(&db, None, |_| Some("short".into())).unwrap_err();
+        let err = resolve_config_db_keys(&db, |_| Some("short".into())).unwrap_err();
         assert!(err.contains(CONFIG_DB_KEY_ENV), "{err}");
     }
 
@@ -511,26 +483,21 @@ mod tests {
     fn a_synced_copy_opens_only_with_the_key_and_the_previous_key() {
         let keys = ConfigDbKeys::primary_only("primary")
             .with_fallback(FallbackKind::PreviousKey, "previous")
-            .with_fallback(FallbackKind::KeyFile, "file")
-            .with_fallback(FallbackKind::LegacyBootstrapHash, "hash");
+            .with_fallback(FallbackKind::KeyFile, "file");
         let kinds = |k: ConfigDbKeys| k.fallbacks.iter().map(|(k, _)| *k).collect::<Vec<_>>();
         assert_eq!(
-            kinds(keys.for_synced_copy(false)),
+            kinds(keys.for_synced_copy()),
             vec![FallbackKind::PreviousKey]
         );
-        assert_eq!(
-            kinds(keys.for_synced_copy(true)),
-            vec![FallbackKind::PreviousKey, FallbackKind::LegacyBootstrapHash]
-        );
-        assert_eq!(keys.for_synced_copy(false).primary.expose(), "primary");
+        assert_eq!(keys.for_synced_copy().primary.expose(), "primary");
     }
 
     #[test]
     fn fallback_dedup() {
         let k = ConfigDbKeys::primary_only("a")
             .with_fallback(FallbackKind::KeyFile, "a")
-            .with_fallback(FallbackKind::LegacyBootstrapHash, "")
-            .with_fallback(FallbackKind::LegacyBootstrapHash, "b")
+            .with_fallback(FallbackKind::PreviousKey, "")
+            .with_fallback(FallbackKind::PreviousKey, "b")
             .with_fallback(FallbackKind::KeyFile, "b");
         assert_eq!(k.fallbacks.len(), 1);
     }
@@ -549,9 +516,8 @@ mod review3_tests {
         let db = dir.path().join("deltaglider_config.db");
         std::fs::write(key_file_path(&db), "").unwrap();
         let env_key = "e".repeat(MIN_CONFIG_DB_KEY_LEN + 8);
-        let keys = resolve_config_db_keys(&db, Some("$2b$04$hash"), |n| {
-            (n == CONFIG_DB_KEY_ENV).then(|| env_key.clone())
-        });
+        let keys =
+            resolve_config_db_keys(&db, |n| (n == CONFIG_DB_KEY_ENV).then(|| env_key.clone()));
         assert!(keys.is_ok(), "boot refused: {:?}", keys.err());
     }
 }

@@ -98,7 +98,7 @@ A restore of users, groups and OIDC providers is point-in-time by default (`iam=
 
 Only the `full` mode restores the admin password: when the zip's `secrets.json` carries a bootstrap password hash that differs from the running instance's, the instance adopts it, and the backup's admin password works from then on. The hash does not encrypt anything, so this is safe. There is one exception: when `DGP_BOOTSTRAP_PASSWORD_HASH` is set, it sets the hash at every start, so the restore keeps the running password and logs a warning. The modes `preserve-bootstrap`, `config-only` and `iam-only` keep this instance's admin password.
 
-The zip carries the IAM state as plain JSON (`iam.json`), so a restore onto a **fresh instance** does not need the old instance's config DB key: the fresh instance writes the imported users into its own database, under its own key. The zip's `secrets.json` holds the bootstrap password hash only when the config file held it; a hash that came from the environment is not in the backup.
+The zip carries the IAM state as plain JSON (`iam.json`). Every user in it has an `id`. A backup whose users have no `id` (from a release before the id was exported) is refused with `400`; restore it with release 2.2.3, export a new backup there, and restore that one. So a restore onto a **fresh instance** does not need the old instance's config DB key: the fresh instance writes the imported users into its own database, under its own key. The zip's `secrets.json` holds the bootstrap password hash only when the config file held it; a hash that came from the environment is not in the backup.
 
 ## Snapshot the DB file
 

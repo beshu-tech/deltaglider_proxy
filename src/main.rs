@@ -415,14 +415,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hashing failed");
-        // A DB from before S8 is keyed with the OLD hash: re-encrypt it with
-        // the config DB key first, so that the new hash does not strand it.
-        if let Err(e) = migrate_legacy_config_db_key() {
-            eprintln!("Error: {e}");
-            eprintln!("The bootstrap password is NOT changed.");
-            std::process::exit(1);
-        }
-        // Write to new file, keep old file name as fallback for existing deployments
         let state_file = ".deltaglider_bootstrap_hash";
         deltaglider_proxy::config::write_bootstrap_hash_file(
             std::path::Path::new(state_file),
@@ -870,7 +862,7 @@ async fn async_main(
         move || sessions.cleanup_expired()
     });
     let shared_config = config.clone().into_shared();
-    let db_keys = resolve_config_db_keys_or_exit(&config, &admin_password_hash);
+    let db_keys = resolve_config_db_keys_or_exit(&config);
     // Config versions (ETags) keyed from the DB key: stable across restarts.
     deltaglider_proxy::api::admin::install_config_version_key(db_keys.primary.expose());
     // LIST continuation tokens that carry a scan position are sealed with a

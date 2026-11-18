@@ -41,11 +41,9 @@ pub struct IamBackup {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BackupUser {
-    /// Source user id. Present in exports so `external_identities.user_id`
-    /// and `groups.member_ids` can be remapped by the importer. Optional
-    /// for compatibility with older backups that never exposed it.
-    #[serde(default)]
-    pub id: Option<i64>,
+    /// Source user id: the importer remaps `external_identities.user_id`
+    /// and `groups.member_ids` through it.
+    pub id: i64,
     pub name: String,
     pub access_key_id: String,
     pub secret_access_key: String,
@@ -117,46 +115,30 @@ pub struct ImportResult {
     pub stale_user_ids: Vec<i64>,
 }
 
-/// Resolve a backup user's original database id, or `None` when the
-/// backup does not PROVE it.
-///
-/// Old backups (before the Wave-11 fix) never carried `BackupUser.id`.
-/// The id is only used to re-attach `external_identities`, so a wrong
-/// guess binds one user's OAuth identity to another user (S16: Bob logs in
-/// as Alice). A missing id only drops the binding, and the next OAuth login
-/// re-provisions it. So only provable answers count:
-///
-///   1. `bu.id` — authoritative when present (new exports).
-///   2. Every user is a member of some group: then the distinct
-///      `groups[].member_ids` set IS the set of user ids, and the export
-///      writes users in id order, so the `idx`-th smallest is this user's.
-pub(crate) fn resolve_backup_user_id(
-    bu: &BackupUser,
-    idx: usize,
-    backup: &IamBackup,
-) -> Option<i64> {
-    if let Some(id) = bu.id {
-        return Some(id);
+/// Release that still converts a backup whose users carry no `id`.
+const BACKUP_ID_CONVERTER_RELEASE: &str = "2.2.3";
+
+/// Parse an IAM backup. A user without `id` (a backup from before the id was
+/// exported) is refused with a message that names the release that converts it.
+pub fn parse_iam_backup(bytes: &[u8]) -> Result<IamBackup, String> {
+    match serde_json::from_slice::<IamBackup>(bytes) {
+        Ok(b) => Ok(b),
+        Err(e) => {
+            let missing_id = serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .and_then(|v| v.get("users")?.as_array().cloned())
+                .is_some_and(|us| us.iter().any(|u| u.get("id").is_none()));
+            if missing_id {
+                Err(format!(
+                    "this backup has no user ids (it comes from an old release). Restore it with \
+                     release {BACKUP_ID_CONVERTER_RELEASE}, export a new backup there, and restore \
+                     that backup here"
+                ))
+            } else {
+                Err(format!("malformed IAM backup JSON: {e}"))
+            }
+        }
     }
-    let member_ids: Vec<i64> = backup
-        .groups
-        .iter()
-        .flat_map(|g| g.member_ids.iter().copied())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let every_user_is_a_member = member_ids.len() == backup.users.len()
-        && backup.users.iter().all(|u| !u.group_ids.is_empty());
-    if every_user_is_a_member {
-        return member_ids.get(idx).copied();
-    }
-    tracing::warn!(
-        "Backup user '{}' (access_key_id {}) has no id, and the backup does not prove it; \
-         its external_identities are not restored (the next OAuth login re-creates them).",
-        bu.name,
-        bu.access_key_id,
-    );
-    None
 }
 
 /// `(id, access_key_id)` of every user: the identity a live session names.
@@ -284,19 +266,12 @@ fn restore_on(
     let mut user_ids_taken: HashSet<i64> = existing_users.iter().map(|(id, _)| *id).collect();
     let mut taken_names: HashSet<String> = name_ids(conn, "users")?.into_keys().collect();
     let mut user_id_map: HashMap<i64, i64> = HashMap::new();
-    for (idx, bu) in backup.users.iter().enumerate() {
+    for bu in &backup.users {
         if let Some(&uid) = existing_keys.get(&bu.access_key_id) {
-            if let Some(old_id) = resolve_backup_user_id(bu, idx, backup) {
-                user_id_map.insert(old_id, uid);
-            }
+            user_id_map.insert(bu.id, uid);
         }
     }
-    // Users that carry an id go first, so a user without one never takes an
-    // id that a later user of the backup holds.
-    let mut order: Vec<usize> = (0..backup.users.len()).collect();
-    order.sort_by_key(|&i| backup.users[i].id.is_none());
-    for idx in order {
-        let bu = &backup.users[idx];
+    for bu in &backup.users {
         if crate::iam::types::is_reserved_principal_name(&bu.name) {
             tracing::warn!("Skipping user '{}': reserved name", bu.name);
             result.users_skipped += 1;
@@ -331,7 +306,7 @@ fn restore_on(
         // User names are unique (`${iam:username}` isolation). A name in use
         // gets the same `-N` suffix as the v25 upgrade, not a silent skip.
         let name = first_free_user_name(&bu.name, |c| taken_names.contains(c));
-        let id = keep_id(replace, bu.id, &user_ids_taken);
+        let id = keep_id(replace, Some(bu.id), &user_ids_taken);
         conn.execute(
             "INSERT INTO users (id, name, access_key_id, secret_access_key, enabled, auth_source) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -347,9 +322,7 @@ fn restore_on(
         let uid = conn.last_insert_rowid();
         ConfigDb::insert_permissions(conn, uid, &perms)?;
         user_ids_taken.insert(uid);
-        if let Some(old_id) = resolve_backup_user_id(bu, idx, backup) {
-            user_id_map.insert(old_id, uid);
-        }
+        user_id_map.insert(bu.id, uid);
         for old_gid in &bu.group_ids {
             match group_id_map.get(old_gid) {
                 Some(&gid) => {
@@ -576,7 +549,7 @@ mod tests {
 
     fn backup_user(id: i64, name: &str, key: &str, groups: Vec<i64>) -> BackupUser {
         BackupUser {
-            id: Some(id),
+            id,
             name: name.into(),
             access_key_id: key.into(),
             secret_access_key: format!("{key}-secret"),
@@ -851,5 +824,23 @@ mod tests {
             .restore_iam(&backup, IamRestoreMode::Replace, None, true)
             .is_err());
         assert_eq!(names(&db), ["dana"]);
+    }
+}
+
+#[cfg(test)]
+mod backup_parse_tests {
+    use super::*;
+
+    /// A backup whose users carry no id is refused, naming the release that converts it.
+    #[test]
+    fn a_backup_without_user_ids_is_refused_naming_the_release() {
+        let old = br#"{"version":2,"users":[{"name":"alice","access_key_id":"A","secret_access_key":"a","enabled":true,"permissions":[],"group_ids":[]}],"groups":[]}"#;
+        let err = parse_iam_backup(old).err().expect("refused");
+        assert!(err.contains(BACKUP_ID_CONVERTER_RELEASE), "{err}");
+        assert!(err.contains("no user ids"), "{err}");
+        let ok = br#"{"version":2,"users":[{"id":4,"name":"alice","access_key_id":"A","secret_access_key":"a","enabled":true,"permissions":[],"group_ids":[]}],"groups":[]}"#;
+        assert_eq!(parse_iam_backup(ok).unwrap().users[0].id, 4);
+        let junk = parse_iam_backup(b"{").err().unwrap();
+        assert!(junk.contains("malformed"), "{junk}");
     }
 }

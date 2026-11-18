@@ -126,10 +126,10 @@ async fn bootstrap_password_change_keeps_the_config_db() {
     );
 }
 
-/// S8 upgrade path: a DB encrypted with the previous hash-derived key opens
-/// on boot and is re-encrypted with the new key (here: a fresh key file).
+/// A DB that only the bootstrap hash opens (a release before 2.0) is no
+/// longer migrated: the boot parks it and reports a mismatch.
 #[tokio::test]
-async fn legacy_hash_keyed_db_is_rekeyed_on_boot() {
+async fn legacy_hash_keyed_db_is_parked_on_boot() {
     let mut server = TestServer::builder()
         .auth("testkey", "testsecret")
         .build()
@@ -142,9 +142,6 @@ async fn legacy_hash_keyed_db_is_rekeyed_on_boot() {
     let key_path = dir.join("deltaglider_config.db.key");
     server.kill();
 
-    // Rebuild the pre-upgrade state: the DB keyed with the bootstrap hash, no
-    // key file on disk, and no jobs DB (a pre-S8 release had none; one keyed
-    // with the removed key file would stop the boot).
     let file_key = std::fs::read_to_string(&key_path).expect("first boot writes the key file");
     {
         let db = deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_path, file_key.trim())
@@ -157,30 +154,13 @@ async fn legacy_hash_keyed_db_is_rekeyed_on_boot() {
 
     server.respawn_with_env(&[]).await;
     let who = whoami(&endpoint).await;
-    assert_ne!(
+    assert_eq!(
         who["config_db_mismatch"], true,
-        "a legacy hash-keyed DB must migrate, not lock, got: {who}"
-    );
-    let admin = admin_http_client(&endpoint).await;
-    let names = user_names(&admin, &endpoint).await;
-    assert!(
-        names.iter().any(|n| n == "alice"),
-        "the migrated DB must keep its users, got {names:?}"
-    );
-    server.kill();
-
-    let new_key = std::fs::read_to_string(&key_path).expect("boot writes a new key file");
-    assert!(
-        deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_path, new_key.trim()).is_ok(),
-        "the DB must be re-encrypted with the key-file key"
+        "a hash-keyed DB must lock, not migrate, got: {who}"
     );
     assert!(
-        deltaglider_proxy::config_db::ConfigDb::open_or_create(
-            &db_path,
-            common::TEST_BOOTSTRAP_PASSWORD_HASH
-        )
-        .is_err(),
-        "the DB must no longer open with the bootstrap hash"
+        dir.join("deltaglider_config.db.bak").exists(),
+        "the hash-keyed DB must be parked"
     );
 }
 

@@ -1037,7 +1037,6 @@ mod tests {
             "DGP_CONFIG_DB_KEY",
             "DGP_CONFIG_DB_KEY_PREVIOUS",
             "DGP_METRICS_BEARER_TOKEN",
-            "DGP_ADMIN_PASSWORD_HASH",
         ] {
             for list in ["*", "DGP_*", "DGP_CONFIG_*", never] {
                 assert!(!env_name_allowlisted(never, list), "{never} via {list}");

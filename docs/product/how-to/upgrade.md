@@ -66,7 +66,7 @@ Patch and minor upgrades inside one major version (for example from 1.18 to 1.19
 
 Schema migrations of the config DB run automatically on the first start. The config DB is on schema v29 in 2.0. A migration is one-way: a binary refuses a config DB whose schema is newer than the one it knows, so an older binary cannot open a database that a newer binary migrated.
 
-A major upgrade (for example from 1.19 to 2.0) has steps that you must do before the new version starts. Follow the upgrade guide of that version ([How to upgrade to 2.0](upgrade-to-2-0.md)) and the [release notes](https://github.com/beshu-tech/deltaglider_proxy/releases), and always export a Full Backup before you start.
+A major upgrade (for example from 1.19 to 2.0) has steps that you must do before the new version starts. Follow the upgrade notes of that version in this guide and the [release notes](https://github.com/beshu-tech/deltaglider_proxy/releases), and always export a Full Backup before you start.
 
 ## TOML to YAML migration (mandatory before v1.4.1)
 
@@ -162,14 +162,9 @@ When upgrading across instances with `DGP_CONFIG_SYNC_BUCKET` set, the *newer* b
 - Upgrade all instances before you make IAM changes, or
 - Accept that the instances on the older release lose the IAM changes of the rollout until they upgrade too.
 
-## Upgrade to the separate config DB key
+## A config DB that only the bootstrap hash opens
 
-Earlier releases encrypted `deltaglider_config.db` with the bootstrap password hash. Current releases use a separate key: `DGP_CONFIG_DB_KEY`, or the key file `deltaglider_config.db.key` next to the database. The first start after the upgrade re-encrypts the database from the hash to the new key. That step works on a copy of the database, and the copy replaces the original only after it opens with the new key.
-
-- **One instance:** nothing to do. The proxy generates the key file on the first start and re-encrypts the database with it. Back up the key file together with the database from then on.
-- **Several instances with `config_sync_bucket`:** generate one key (`openssl rand -hex 32`) and set it as `DGP_CONFIG_DB_KEY` on every instance before you start the new release. An instance with a sync bucket but without the variable refuses to start. Upgrade all instances together and avoid IAM changes during the rollout, because instances on the old release cannot read uploads under the new key. During the rollout, also set `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true` on every instance. Without that variable, the new release refuses a synced database that an old instance wrote under the hash, because the hash is not a secret: it is in configuration files and backups, and anyone who can write to the bucket and knows the hash could plant an IAM database. Remove the variable and restart when every instance runs the new release.
-- **Kubernetes operator with `bootstrapPassword.autoGenerate`:** the operator adds a `dbKey` to the `<name>-bootstrap` Secret and injects it into every pod. Without `autoGenerate`, add `DGP_CONFIG_DB_KEY` to your env Secret; the operator refuses to scale beyond one pod without it.
-- **Before the upgrade, keep the hash that encrypted the database.** The first start needs it once, to open the database. After the upgrade, the hash is only the admin password, and a change of the password no longer touches the database.
+Releases before 2.0 encrypted `deltaglider_config.db` with the bootstrap password hash. This release no longer opens such a database with the hash, and it ignores `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC`. Start release 2.2.3 once first, with `DGP_CONFIG_DB_KEY` set (several instances with `config_sync_bucket` need the same key on every instance). That release re-encrypts the database with the key. Then upgrade. If you start this release on a database that only the hash opens, the proxy keeps the database as `deltaglider_config.db.bak` and locks the S3 API until the right key is available.
 
 ## Several instances and encryption (the encryption witness)
 
@@ -584,7 +579,6 @@ After any upgrade or migration:
 
 ## Related
 
-- [How to upgrade to 2.0](upgrade-to-2-0.md): the steps for the 1.19 to 2.0 upgrade
 - [How to back up and restore](back-up-and-restore.md): the backup you take in step 1
 - [Configuration reference](../reference/configuration.md): the complete YAML field reference
 - [CLI reference](../reference/cli.md): `config lint` exit codes

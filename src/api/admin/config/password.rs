@@ -187,48 +187,15 @@ pub struct RecoverDbRequest {
 #[derive(Serialize, Default)]
 pub struct RecoverDbResponse {
     success: bool,
-    /// What the candidate is: `config_db_key` (set it as `DGP_CONFIG_DB_KEY`
-    /// or write it to the key file) or `bootstrap_hash` (a DB from before S8,
-    /// keyed with the bootstrap password hash: set it as the bootstrap hash).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    key_kind: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    correct_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    correct_hash_base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-}
-
-/// Pure: the keys to try for a recovery candidate, with the kind of each.
-/// The candidate as typed is a config DB key; a bcrypt hash (raw or base64)
-/// is also tried as the legacy key.
-fn recovery_candidates(candidate: &str) -> Vec<(&'static str, String)> {
-    let candidate = candidate.trim();
-    if candidate.is_empty() {
-        return Vec::new();
-    }
-    if candidate.starts_with("$2") {
-        return vec![("bootstrap_hash", candidate.to_string())];
-    }
-    let mut out = vec![("config_db_key", candidate.to_string())];
-    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, candidate)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .filter(|s| s.starts_with("$2"));
-    if let Some(hash) = decoded {
-        out.push(("bootstrap_hash", hash));
-    }
-    out
 }
 
 /// POST /api/admin/recover-db — try a candidate key against the parked config DB.
 ///
 /// Only available when `config_db_mismatch` is true. The candidate is a config
-/// DB key (an earlier `DGP_CONFIG_DB_KEY` or key-file value) or, for a DB from
-/// before S8, the bootstrap password hash (raw or base64). Read-only: the
-/// response says which it is; the operator sets it and restarts, and the boot
-/// promotes the parked DB.
+/// DB key (an earlier `DGP_CONFIG_DB_KEY` or key-file value). Read-only: the
+/// operator sets it and restarts, and the boot promotes the parked DB.
 pub async fn recover_db(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
@@ -253,8 +220,7 @@ pub async fn recover_db(
     // brute-force-sensitive endpoint, and "no proxy headers → no rate
     // limiting" used to leave deployments without a reverse proxy exposed.
     // Per-IP + per-account: recover_db tests candidate keys of the
-    // config DB (a DB key, or the bootstrap hash that was the DB key
-    // before S8). A distributed attack against the same proxy's recovery
+    // config DB. A distributed attack against the same proxy's recovery
     // flow could otherwise burn through the per-IP budget across a
     // botnet — the "bootstrap" subject ties this back to the single
     // account.
@@ -272,13 +238,13 @@ pub async fn recover_db(
         Err(blocked) => return blocked.into_response(),
     };
 
-    let candidates = recovery_candidates(&body.candidate_password);
-    if candidates.is_empty() {
+    let candidate = body.candidate_password.trim().to_string();
+    if candidate.is_empty() {
         guard.record_failure();
         return (
             StatusCode::BAD_REQUEST,
             Json(RecoverDbResponse {
-                error: Some("Provide a config DB key or a bootstrap password hash.".into()),
+                error: Some("Provide a config DB key.".into()),
                 ..Default::default()
             }),
         )
@@ -334,30 +300,18 @@ pub async fn recover_db(
     };
 
     // Read-only probe: the parked DB is never migrated or re-encrypted here.
-    let matched = candidates
-        .into_iter()
-        .find(|(_, key)| crate::config_db::probe_key(&db_path, key).unwrap_or(false));
+    let matched = crate::config_db::probe_key(&db_path, &candidate).unwrap_or(false);
 
     // The recovery temp file (from the S3 download) goes now, whatever
     // the outcome.
     drop(recovery_temp);
 
     match matched {
-        Some((kind, key)) => {
+        true => {
             guard.record_proven();
             audit_log("recover_db_success", "admin", "", &headers);
-            let (correct_hash, correct_hash_base64) = if kind == "bootstrap_hash" {
-                let b64 = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    key.as_bytes(),
-                );
-                (Some(key), Some(b64))
-            } else {
-                // The operator typed the key; never echo it back.
-                (None, None)
-            };
             // `no-store` keeps intermediaries and the browser's bfcache from
-            // retaining a recovered hash.
+            // retaining the answer.
             (
                 StatusCode::OK,
                 [
@@ -369,15 +323,12 @@ pub async fn recover_db(
                 ],
                 Json(RecoverDbResponse {
                     success: true,
-                    key_kind: Some(kind),
-                    correct_hash,
-                    correct_hash_base64,
                     error: None,
                 }),
             )
                 .into_response()
         }
-        None => {
+        false => {
             guard.record_failure();
             (
                 StatusCode::UNAUTHORIZED,
@@ -492,28 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn recovery_candidates_truth_table() {
-        use super::recovery_candidates as f;
-        assert!(f("  ").is_empty());
-        assert_eq!(
-            f("$2b$04$abc"),
-            vec![("bootstrap_hash", "$2b$04$abc".to_string())]
-        );
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "$2b$04$abc");
-        assert_eq!(
-            f(&b64),
-            vec![
-                ("config_db_key", b64.clone()),
-                ("bootstrap_hash", "$2b$04$abc".to_string())
-            ]
-        );
-        assert_eq!(
-            f(" 0123abcd "),
-            vec![("config_db_key", "0123abcd".to_string())]
-        );
-    }
-
-    #[test]
     fn env_pinned_hash_blocks_password_change() {
         use super::env_pinned_hash_var as f;
         assert_eq!(f(|_| None), None);
@@ -522,8 +451,14 @@ mod tests {
             None
         );
         assert_eq!(
-            f(|n| (n == "DGP_ADMIN_PASSWORD_HASH").then(|| "$2b$x".into())),
-            Some("DGP_ADMIN_PASSWORD_HASH")
+            f(|n| (n == "DGP_BOOTSTRAP_PASSWORD_HASH").then(|| "$2b$x".into())),
+            Some("DGP_BOOTSTRAP_PASSWORD_HASH")
+        );
+        let old_alias = format!("{}_ADMIN_PASSWORD_HASH", "DGP");
+        assert_eq!(
+            f(|n| (n == old_alias).then(|| "$2b$x".into())),
+            None,
+            "the old alias is not read"
         );
     }
 }

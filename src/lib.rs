@@ -4306,7 +4306,7 @@ mod source_guards {
                 "open_with_keys(",
                 &["src/config_db/mod.rs", "src/config_db_sync.rs"],
             ),
-            // Boot, the recovery promotion and `--set-bootstrap-password`,
+            // Boot and the recovery promotion,
             // each with the lock as an argument (the compiler checks that).
             (
                 "open_live_db(",

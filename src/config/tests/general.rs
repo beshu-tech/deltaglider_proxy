@@ -2489,6 +2489,19 @@ fn the_state_file_keeps_a_hash_that_only_the_config_file_carries() {
     ));
 }
 
+/// The pre-rename alias of the bootstrap hash env var is not read.
+#[test]
+fn the_old_admin_password_hash_alias_is_ignored() {
+    let alias = format!("{}_ADMIN_PASSWORD_HASH", "DGP");
+    let mut cfg = Config::default();
+    let env = |n: &str| {
+        (n == alias)
+            .then(|| "$2b$12$aliasaliasaliasaliasaliasaliasaliasaliasaliasaliasaliasa".to_string())
+    };
+    cfg.apply_env_overrides_with(&env);
+    assert_eq!(cfg.bootstrap_password_hash, None);
+}
+
 /// A root key missing from `FLAT_ROOT_KEYS` makes a mixed document fail with
 /// "unknown field" instead of the mixed-shape error that names both halves.
 #[test]

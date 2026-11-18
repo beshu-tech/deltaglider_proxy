@@ -95,19 +95,10 @@ pub(super) fn derive_list_token_key(db_key: &str) -> TokenKey {
 
 /// Pure: the token keys for the config DB keys; the first one seals. A
 /// token sealed before a key rotation (`DGP_CONFIG_DB_KEY_PREVIOUS`), or
-/// before a move from the key file to `DGP_CONFIG_DB_KEY`, still opens. The
-/// legacy bootstrap hash never sealed a token, so it is not a token key.
+/// before a move from the key file to `DGP_CONFIG_DB_KEY`, still opens.
 fn token_keys_for(keys: &crate::config_db::ConfigDbKeys) -> Vec<TokenKey> {
-    use crate::config_db::key::FallbackKind;
     std::iter::once(keys.primary.expose())
-        .chain(
-            keys.fallbacks
-                .iter()
-                .filter(|(kind, _)| {
-                    matches!(kind, FallbackKind::PreviousKey | FallbackKind::KeyFile)
-                })
-                .map(|(_, k)| k.expose()),
-        )
+        .chain(keys.fallbacks.iter().map(|(_, k)| k.expose()))
         .map(derive_list_token_key)
         .collect()
 }
@@ -594,13 +585,12 @@ mod tests {
     }
 
     /// The installed keys: the primary seals; a rotation's previous key and
-    /// a replaced key file still open; the legacy bootstrap hash is not one.
+    /// a replaced key file still open.
     #[test]
     fn the_token_keys_follow_the_config_db_keys() {
         use crate::config_db::key::FallbackKind;
         let keys = crate::config_db::ConfigDbKeys::primary_only(&"p".repeat(40))
             .with_fallback(FallbackKind::PreviousKey, &"q".repeat(40))
-            .with_fallback(FallbackKind::LegacyBootstrapHash, "hash")
             .with_fallback(FallbackKind::KeyFile, &"f".repeat(40));
         assert_eq!(
             token_keys_for(&keys),

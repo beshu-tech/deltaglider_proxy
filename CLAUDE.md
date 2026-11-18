@@ -266,7 +266,7 @@ The **bootstrap password** is an infrastructure secret that:
 1. Signs admin GUI session cookies
 2. Gates admin GUI access in bootstrap mode (before IAM users exist)
 
-It does NOT encrypt the config DB (S8). The SQLCipher key is `DGP_CONFIG_DB_KEY` (required + identical on every node when `config_sync_bucket` is set — boot refuses otherwise) else the key file `<db>.key` (0600, generated on first boot, never regenerated when present-but-empty) — `src/config_db/key.rs`. `ConfigDb::open_with_keys` tries the primary key, then FALLBACKS (`DGP_CONFIG_DB_KEY_PREVIOUS` = rotation; a key file that the env key replaces; the bootstrap hash = the pre-S8 key) and re-encrypts a fallback-opened DB to the primary via `rekey_file` (rekey a COPY → verify → atomic rename; the original is never at risk). A boot that re-keyed the DB with a sync bucket set parks an upload (`config_db_sync::park_upload`) so the synced copy moves to the new key while the old one is still a fallback. The sync download path uses the same keyring (a legacy-hash peer upload is accepted and re-keyed; another key → `Err` naming `DGP_CONFIG_DB_KEY`). No key opens the DB → `.db.bak` park + mismatch lock + recovery wizard (`recover-db` accepts a DB key or a legacy hash, read-only probe); a later boot with the right key promotes the bak (Err branch, or Ok branch when the live DB is empty).
+It does NOT encrypt the config DB (S8). The SQLCipher key is `DGP_CONFIG_DB_KEY` (required + identical on every node when `config_sync_bucket` is set — boot refuses otherwise) else the key file `<db>.key` (0600, generated on first boot, never regenerated when present-but-empty) — `src/config_db/key.rs`. `ConfigDb::open_with_keys` tries the primary key, then FALLBACKS (`DGP_CONFIG_DB_KEY_PREVIOUS` = rotation; a key file that the env key replaces) and re-encrypts a fallback-opened DB to the primary via `rekey_file` (rekey a COPY → verify → atomic rename; the original is never at risk). A boot that re-keyed the DB with a sync bucket set parks an upload (`config_db_sync::park_upload`) so the synced copy moves to the new key while the old one is still a fallback. The sync download path uses the same keyring (a peer upload under another key → `Err` naming `DGP_CONFIG_DB_KEY`). No key opens the DB → `.db.bak` park + mismatch lock + recovery wizard (`recover-db` accepts a DB key, read-only probe); a later boot with the right key promotes the bak (Err branch, or Ok branch when the live DB is empty).
 
 Auto-generated on first run (printed to stderr when stderr is a TTY; hidden in containers/CI; the operator reads `.deltaglider_bootstrap_hash` or runs `--set-bootstrap-password`). `--set-bootstrap-password` and `PUT /api/admin/password` never touch the DB (the CLI first migrates a still-hash-keyed DB to the DB key).
 
@@ -308,8 +308,7 @@ single-instance planes below are addressed.
   `sync_generation` (v29, one row in `sync_state`, bumped before every upload
   above the local DB and the base) is below the base's; a copy without one
   (a pre-v29 peer) keeps the row-age rule (`is_rollback`, 5-min tolerance). A synced copy opens only with
-  `DGP_CONFIG_DB_KEY` or `DGP_CONFIG_DB_KEY_PREVIOUS` (the legacy
-  bootstrap-hash key only with `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true`). Mapping rules are keyed by `rule_uid` (v28: random
+  `DGP_CONFIG_DB_KEY` or `DGP_CONFIG_DB_KEY_PREVIOUS`. Mapping rules are keyed by `rule_uid` (v28: random
   on GUI insert via trigger, content-derived for the declarative reconcile and
   the v28 backfill so equal rules on two nodes share one uid; an edit keeps
   it). `session_revocations` stays a monotonic `MAX`

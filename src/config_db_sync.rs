@@ -257,7 +257,6 @@ impl ConfigDbSync {
         object_key: String,
         local_path: PathBuf,
         db_keys: crate::config_db::ConfigDbKeys,
-        accept_legacy_sync: bool,
     ) -> Result<Self, String> {
         let client = Self::build_client(backend_config).await?;
 
@@ -274,10 +273,8 @@ impl ConfigDbSync {
             }
         }
 
-        // S8: a synced copy opens only with a real key, never with the
-        // bootstrap hash, unless the operator opts in for a rolling upgrade
-        // (DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC, read and logged by the boot).
-        let db_keys = db_keys.for_synced_copy(accept_legacy_sync);
+        // A synced copy opens only with a real key (primary or previous).
+        let db_keys = db_keys.for_synced_copy();
 
         // A park from before a restart comes back with the ETag its change
         // was based on, so the flush can still CAS on top of it.
@@ -664,8 +661,7 @@ impl ConfigDbSync {
 
         // Validate that the downloaded DB opens with our config DB key. A DB
         // under another key must NOT reach the merge — it would be unreadable.
-        // A DB under an accepted fallback key (DGP_CONFIG_DB_KEY_PREVIOUS, or
-        // the bootstrap hash with DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC) is
+        // A DB under DGP_CONFIG_DB_KEY_PREVIOUS is
         // re-encrypted with our key here, so the merge attaches it with the
         // primary key.
         // Read the peer's schema version BEFORE the open below migrates the
@@ -1841,7 +1837,7 @@ async fn pull_locked(
     if applied {
         sync.commit_downloaded_etag(dl.etag).await;
         // The synced object is under a fallback key (a rotation's previous
-        // key, or the legacy hash): queue an upload so it moves to the
+        // key): queue an upload so it moves to the
         // primary key while the old key is still accepted.
         if dl.migrated {
             sync.mark_needs_upload().await;
@@ -2135,7 +2131,6 @@ mod tests {
             "k.db".into(),
             dir.path().join("deltaglider_config.db"),
             crate::config_db::ConfigDbKeys::primary_only(&"k".repeat(40)),
-            false,
         )
         .await
         .unwrap()
@@ -2235,7 +2230,6 @@ mod tests {
             "k.db".into(),
             dir.path().join("deltaglider_config.db"),
             crate::config_db::ConfigDbKeys::primary_only(&"k".repeat(40)),
-            false,
         )
         .await
         .unwrap()
@@ -2434,7 +2428,6 @@ mod tests {
             "db".into(),
             dir.path().join("config.db"),
             crate::config_db::ConfigDbKeys::primary_only(&"k".repeat(40)),
-            false,
         )
         .await
         .unwrap()
@@ -2695,7 +2688,6 @@ mod tests {
             "k.db".into(),
             db_path.clone(),
             crate::config_db::ConfigDbKeys::primary_only(&key),
-            false,
         )
         .await
         .unwrap();
@@ -2741,7 +2733,6 @@ mod tests {
             "k.db".into(),
             db_path.clone(),
             crate::config_db::ConfigDbKeys::primary_only(&key),
-            false,
         )
         .await
         .unwrap();
@@ -2795,11 +2786,11 @@ mod tests {
     /// copy to the new key (only with a sync bucket).
     #[test]
     fn a_live_db_that_moves_key_parks_one_upload() {
-        const HASH: &str = "$2b$04$legacyhashlegacyhashlegacyhashlegacyhash";
+        const HASH: &str = "old-config-db-key-0123456789abcdef0123456789";
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("deltaglider_config.db");
         let keys = crate::config_db::ConfigDbKeys::primary_only(&"k".repeat(40))
-            .with_fallback(crate::config_db::FallbackKind::LegacyBootstrapHash, HASH);
+            .with_fallback(crate::config_db::FallbackKind::PreviousKey, HASH);
         drop(ConfigDb::open_or_create(&db_path, HASH).unwrap());
         let marker = pending_marker_path(&db_path);
         let lock = crate::data_dir_lock::acquire(dir.path(), std::time::Duration::ZERO, || {})
@@ -2840,43 +2831,6 @@ mod tests {
         );
     }
 
-    /// S8: the bootstrap hash sits in configs and backups, so it must not
-    /// open a copy from the shared bucket: with it, anyone who can write to
-    /// the bucket and knows the hash plants an IAM DB on every node. The
-    /// boot fallback list still has it (local DB migration); the sync does not.
-    #[tokio::test]
-    async fn a_synced_copy_under_the_legacy_hash_is_refused_by_default() {
-        const HASH: &str = "$2b$04$legacyhashlegacyhashlegacyhashlegacyhash";
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("deltaglider_config.db");
-        let keys = crate::config_db::ConfigDbKeys::primary_only(&"k".repeat(40))
-            .with_fallback(crate::config_db::FallbackKind::LegacyBootstrapHash, HASH);
-        let sync = ConfigDbSync::new(
-            &dead_s3_backend(),
-            "sync".into(),
-            "k.db".into(),
-            db_path.clone(),
-            keys,
-            false,
-        )
-        .await
-        .unwrap();
-        // A planted copy: encrypted with the hash, carrying an admin user.
-        let planted = dir.path().join("planted.db");
-        ConfigDb::open_or_create(&planted, HASH)
-            .unwrap()
-            .create_user("intruder", "AKINTRUDER01", "s", true, &[])
-            .unwrap();
-        let opened = ConfigDb::open_with_keys(&planted, &sync.db_keys);
-        assert!(
-            matches!(
-                opened,
-                Err(crate::config_db::ConfigDbError::WrongPassphrase(_))
-            ),
-            "the sync accepted a copy under the bootstrap hash"
-        );
-    }
-
     /// D16: an upload that exhausts its retries (S3 down) is parked for the
     /// poll flush. The park must survive a restart, together with the ETag
     /// the change was based on: otherwise the next boot downloads the remote
@@ -2893,7 +2847,6 @@ mod tests {
             "k.db".into(),
             db_path.clone(),
             crate::config_db::ConfigDbKeys::primary_only("pw"),
-            false,
         )
         .await
         .unwrap();
@@ -2913,7 +2866,6 @@ mod tests {
             "k.db".into(),
             db_path.clone(),
             crate::config_db::ConfigDbKeys::primary_only("pw"),
-            false,
         )
         .await
         .unwrap();
@@ -2964,7 +2916,6 @@ mod tests {
             "k.db".into(),
             db_path.clone(),
             crate::config_db::ConfigDbKeys::primary_only("pw"),
-            false,
         )
         .await
         .unwrap();
@@ -2981,7 +2932,6 @@ mod tests {
             "k.db".into(),
             db_path.clone(),
             crate::config_db::ConfigDbKeys::primary_only("pw"),
-            false,
         )
         .await
         .unwrap();
@@ -3003,7 +2953,6 @@ mod tests {
             "k.db".into(),
             db_path,
             crate::config_db::ConfigDbKeys::primary_only("pw"),
-            false,
         )
         .await
         .unwrap();

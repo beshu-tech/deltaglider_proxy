@@ -513,7 +513,7 @@ Bcrypt hash of the bootstrap password (it signs session cookies and gates admin 
 
 | | |
 |---|---|
-| **Env var** | `DGP_BOOTSTRAP_PASSWORD_HASH` (legacy alias: `DGP_ADMIN_PASSWORD_HASH`) |
+| **Env var** | `DGP_BOOTSTRAP_PASSWORD_HASH` |
 | **YAML** | `advanced.bootstrap_password_hash` (an infra secret, which canonical exports strip) |
 | **Default** | Auto-generated on first run |
 
@@ -1296,10 +1296,9 @@ These variables tune the streaming multipart copy of large objects (replication 
 | `DGP_AUTHENTICATION` | — | `"none"` for open access; absent = auto-detect |
 | `DGP_ACCESS_KEY_ID` | — | Proxy SigV4 access key |
 | `DGP_SECRET_ACCESS_KEY` | — | Proxy SigV4 secret key |
-| `DGP_BOOTSTRAP_PASSWORD_HASH` | auto | Bcrypt hash (legacy alias: `DGP_ADMIN_PASSWORD_HASH`) |
+| `DGP_BOOTSTRAP_PASSWORD_HASH` | auto | Bcrypt hash |
 | `DGP_CONFIG_DB_KEY` | key file | Encryption key of the IAM config DB, at least 32 characters; required and identical on every instance when `config_sync_bucket` is set |
 | `DGP_CONFIG_DB_KEY_PREVIOUS` | — | The previous config DB key during a key rotation; a DB or synced copy that opens only with it is re-encrypted with `DGP_CONFIG_DB_KEY`. Remove it after the rotation |
-| `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC` | `false` | Only for a rolling upgrade from a release before `DGP_CONFIG_DB_KEY`: accept a synced config DB that opens only with the bootstrap password hash. The proxy logs a warning at start while it is set. Remove it when every instance runs the new release |
 | `DGP_BOOTSTRAP_PASSWORD` | — | Plaintext password for admin CLI only |
 
 ### Security variables

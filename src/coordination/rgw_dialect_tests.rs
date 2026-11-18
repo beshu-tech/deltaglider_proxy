@@ -365,7 +365,6 @@ async fn the_config_sync_uploads_twice() {
         "k.db".into(),
         dir.path().join("deltaglider_config.db"),
         crate::config_db::ConfigDbKeys::primary_only(&key),
-        false,
     )
     .await
     .unwrap();

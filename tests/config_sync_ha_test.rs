@@ -641,11 +641,11 @@ async fn ha_replica_with_wrong_db_key_refuses_the_synced_db() {
     assert!(resp.status().is_success());
 }
 
-/// S8 upgrade path: the sync object was written by a node on the release
-/// before S8, so it is keyed with the bootstrap password hash.
-/// Seed the sync object with a DB under the legacy bootstrap hash, boot a
-/// node on it, and return whether the node merged the seeded user.
-async fn boot_on_a_legacy_sync_object(accept_legacy: bool) -> bool {
+/// The hash is not a secret, so it never opens a synced copy: a copy that an
+/// old-release node wrote under the bootstrap hash does not merge.
+#[tokio::test]
+async fn ha_legacy_hash_keyed_sync_object_is_refused() {
+    skip_unless_minio!();
     let sync_key = unique_config_sync_object_key();
     let user_name = unique_user_name("ha-legacy");
     let dir = tempfile::tempdir().unwrap();
@@ -669,47 +669,14 @@ async fn boot_on_a_legacy_sync_object(accept_legacy: bool) -> bool {
         .await
         .expect("seed the legacy sync object");
 
-    let mut builder = TestServer::builder()
+    let server = TestServer::builder()
         .auth("HAKEY-L1", "HASECRET-L1-1234567890")
         .s3_endpoint(&minio_endpoint_url())
         .bucket(MINIO_BUCKET)
         .config_sync_bucket(MINIO_BUCKET)
-        .config_sync_object_key(&sync_key);
-    if accept_legacy {
-        builder = builder.env("DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC", "true");
-    }
-    let server = builder.build().await;
-    if accept_legacy {
-        // The merged copy was under a fallback key: the boot re-uploads it
-        // under the config DB key, so the bucket leaves the hash.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            let body = common::minio_client()
-                .await
-                .get_object()
-                .bucket(MINIO_BUCKET)
-                .key(&sync_key)
-                .send()
-                .await
-                .unwrap()
-                .body
-                .collect()
-                .await
-                .unwrap()
-                .into_bytes();
-            std::fs::write(&legacy, &body).unwrap();
-            if deltaglider_proxy::config_db::probe_key(&legacy, common::TEST_CONFIG_DB_KEY)
-                .unwrap_or(false)
-            {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the synced copy stays under the legacy hash"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    }
+        .config_sync_object_key(&sync_key)
+        .build()
+        .await;
     let users: Vec<serde_json::Value> = admin_http_client(&server.endpoint())
         .await
         .get(format!("{}/_/api/admin/users", server.endpoint()))
@@ -719,27 +686,9 @@ async fn boot_on_a_legacy_sync_object(accept_legacy: bool) -> bool {
         .json()
         .await
         .unwrap();
-    users.iter().any(|u| u["name"] == user_name)
-}
-
-/// Rolling upgrade: with DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true, a copy that an
-/// old-release node wrote under the bootstrap hash merges.
-#[tokio::test]
-async fn ha_legacy_hash_keyed_sync_object_is_accepted_when_opted_in() {
-    skip_unless_minio!();
     assert!(
-        boot_on_a_legacy_sync_object(true).await,
-        "a legacy hash-keyed sync object must merge with the opt-in"
-    );
-}
-
-/// S8: the hash is not a secret, so by default it never opens a synced copy.
-#[tokio::test]
-async fn ha_legacy_hash_keyed_sync_object_is_refused_by_default() {
-    skip_unless_minio!();
-    assert!(
-        !boot_on_a_legacy_sync_object(false).await,
-        "a copy under the bootstrap hash must not merge without the opt-in"
+        !users.iter().any(|u| u["name"] == user_name),
+        "a copy under the bootstrap hash must not merge"
     );
 }
 

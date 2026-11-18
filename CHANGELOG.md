@@ -16,6 +16,10 @@
 ### Fixed
 
 - **A write refused before its body is read no longer resets the connection behind a reverse proxy** (#187). For a request whose signature the proxy verified, the proxy now reads up to 64 MiB of the body (30 seconds at most) before it answers with the error; a request that declares a larger body is not read. The body is not read for an anonymous request, a presigned request, a request with `Expect: 100-continue` (the client then sends no body), a request that an IAM policy denies, or a request that an admission block refuses; the connection closes after the answer.
+- **A config DB that only the bootstrap password hash opens is no longer migrated.** Releases before 2.0 encrypted `deltaglider_config.db` with the hash. Start release 2.2.3 once with `DGP_CONFIG_DB_KEY` set (or with the key file), so that it re-encrypts the database; then upgrade. A database that only the hash opens is now kept as `deltaglider_config.db.bak` and the S3 API stays locked. `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC` is removed, and the recovery wizard (`POST /_/api/admin/recover-db`) accepts a config DB key only: its answer no longer has `key_kind`, `correct_hash` or `correct_hash_base64`. `--set-bootstrap-password` no longer re-encrypts the database; it only writes the hash.
+- **`DGP_ADMIN_PASSWORD_HASH` and `.deltaglider_admin_hash` are no longer read.** Use `DGP_BOOTSTRAP_PASSWORD_HASH` and `.deltaglider_bootstrap_hash`.
+- **An IAM backup whose users have no `id` is refused with `400`.** The message names release 2.2.3, which converts such a backup: restore it there, export a new backup, and restore that one. A backup `secrets.json` that only has the singleton `storage` secret no longer fills a named S3 backend.
+- **The page `how-to/upgrade-to-2-0` is removed** (its address redirects to the upgrade guide).
 
 ## v2.2.3 — 2026-11-18
 

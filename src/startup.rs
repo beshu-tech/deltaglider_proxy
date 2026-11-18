@@ -584,88 +584,12 @@ fn promote_backup_db(
     Ok(db)
 }
 
-/// `--set-bootstrap-password` helper: if the config DB still opens only with
-/// the CURRENT bootstrap hash (a DB from before S8), re-encrypt it with the
-/// config DB key now. Without this, the new hash would leave no key that
-/// opens the DB. No DB, or a DB already on the config DB key: no-op.
-pub fn migrate_legacy_config_db_key() -> Result<(), String> {
-    use deltaglider_proxy::config_db::key;
-    let db_path = config_db_path();
-    if !db_path.exists() {
-        return Ok(());
-    }
-    // The hash this node boots with today: env, then the state files. (A hash
-    // in the YAML config also works: the boot migrates with it.)
-    let current_hash = ["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_ADMIN_PASSWORD_HASH"]
-        .iter()
-        .find_map(|n| deltaglider_proxy::config::process_env(n).filter(|v| !v.trim().is_empty()))
-        .or_else(|| {
-            [".deltaglider_bootstrap_hash", ".deltaglider_admin_hash"]
-                .iter()
-                .find_map(|f| std::fs::read_to_string(f).ok())
-        })
-        .map(|raw| Config::decode_hash(raw.trim()));
-    let keys = key::resolve_config_db_keys(
-        &db_path,
-        current_hash.as_deref(),
-        deltaglider_proxy::config::process_env,
-    )?;
-    rekey_under_state_lock(&db_path, &keys)
-}
-
-/// Re-encrypt the DB at `db_path` to `keys.primary` when it does not open
-/// with it yet. A re-encrypt replaces the DB file, and a running server keeps
-/// its handle on the old file and would lose every later write. So this takes
-/// the state directory lock, as a server does, and refuses while a server
-/// runs. A DB that already opens with the primary key needs no lock.
-fn rekey_under_state_lock(
-    db_path: &std::path::Path,
-    keys: &deltaglider_proxy::config_db::ConfigDbKeys,
-) -> Result<(), String> {
-    use deltaglider_proxy::config_db::{probe_key, OpenedWith};
-    if probe_key(db_path, keys.primary.expose()).unwrap_or(false) {
-        return Ok(());
-    }
-    let dir = db_path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let lock =
-        deltaglider_proxy::data_dir_lock::acquire(dir, Duration::ZERO, || {}).map_err(|e| {
-            format!(
-                "the config DB must be re-encrypted before the password changes, and that \
-                 needs the state directory lock: {e}. Stop the server, run this command \
-                 again, then start the server"
-            )
-        })?;
-    // The CLI does not know whether the config has a sync bucket, so it
-    // always parks the upload: without a sync bucket the marker is inert.
-    match deltaglider_proxy::config_db_sync::open_live_db(db_path, keys, true, &lock) {
-        Ok((_, OpenedWith::Migrated(kind))) => {
-            eprintln!(
-                "Config DB {} re-encrypted: it opened with {}, now with {}.",
-                db_path.display(),
-                kind.describe(),
-                keys.source.describe()
-            );
-            Ok(())
-        }
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!(
-            "the config DB {} does not open with the config DB key or the current \
-             bootstrap hash ({e}); fix that before changing the password",
-            db_path.display()
-        )),
-    }
-}
-
 /// Resolve the config DB keys (`DGP_CONFIG_DB_KEY`, else the key file, with
-/// the bootstrap hash as the legacy fallback). Exits on a configuration that
+/// `DGP_CONFIG_DB_KEY_PREVIOUS` as the rotation fallback). Exits on a configuration that
 /// would make the DB unreadable: a short env key, an empty key file, or a
 /// config sync bucket without the env key.
 pub fn resolve_config_db_keys_or_exit(
     config: &Config,
-    admin_password_hash: &str,
 ) -> deltaglider_proxy::config_db::ConfigDbKeys {
     use deltaglider_proxy::config_db::key::{
         check_sync_needs_env_key, resolve_config_db_keys, CONFIG_DB_KEY_ENV,
@@ -677,11 +601,7 @@ pub fn resolve_config_db_keys_or_exit(
     {
         exit_with_boot_error(&e);
     }
-    match resolve_config_db_keys(
-        &config_db_path(),
-        Some(admin_password_hash),
-        deltaglider_proxy::config::process_env,
-    ) {
+    match resolve_config_db_keys(&config_db_path(), deltaglider_proxy::config::process_env) {
         Ok(keys) => {
             info!("  Config DB key: {}", keys.source.describe());
             keys
@@ -696,7 +616,7 @@ pub fn resolve_config_db_keys_or_exit(
 /// users, switch to IAM mode immediately.
 ///
 /// Returns `(config_db, mismatch)` where `mismatch` is true if no config DB
-/// key (`DGP_CONFIG_DB_KEY`, key file, legacy bootstrap hash) opens the DB.
+/// key (`DGP_CONFIG_DB_KEY`, key file, previous key) opens the DB.
 pub fn init_config_db(
     keys: &deltaglider_proxy::config_db::ConfigDbKeys,
     iam_state: &SharedIamState,
@@ -1137,15 +1057,6 @@ pub fn init_jobs_db(
         }
     }
     Some(Arc::new(tokio::sync::Mutex::new(db)))
-}
-
-/// `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC` (S8, transitional): may a synced copy
-/// open with the legacy bootstrap hash?
-fn accept_legacy_sync() -> bool {
-    deltaglider_proxy::config::env_bool(
-        deltaglider_proxy::config_db::key::ACCEPT_LEGACY_SYNC_ENV,
-        false,
-    )
 }
 
 /// Startup gate (guard B): under multi-instance, every NAMED S3 backend that
@@ -1627,7 +1538,6 @@ pub async fn build_coordination_lease(
             }),
         config_db_path(),
         db_keys.clone(),
-        accept_legacy_sync(),
     )
     .await
     {
@@ -1898,7 +1808,6 @@ pub async fn init_config_sync(
             object_key.clone(),
             db_file.clone(),
             db_keys.clone(),
-            accept_legacy_sync(),
         )
         .await
         .map(|s| {
@@ -1927,14 +1836,6 @@ pub async fn init_config_sync(
     };
 
     info!("Config DB S3 sync: enabled (bucket={})", sync_bucket);
-    if accept_legacy_sync() {
-        warn!(
-            "{}=true: a synced config DB under the bootstrap password hash is accepted. \
-             Remove it when every instance runs this release — the hash is not a secret \
-             that should open the shared IAM database",
-            deltaglider_proxy::config_db::key::ACCEPT_LEGACY_SYNC_ENV
-        );
-    }
 
     // Boot gate: PROVE the coordination bucket enforces atomic conditional
     // writes before any HA feature (leases, single-writer locks) hinges on it.
@@ -2462,36 +2363,6 @@ mod tests {
         }
     }
 
-    /// `--set-bootstrap-password` must not re-encrypt the config DB while a
-    /// server holds the state directory lock: the server would keep writing
-    /// to the replaced file. The CLI refuses and leaves the DB alone; with
-    /// no server it re-encrypts.
-    #[test]
-    fn a_rekey_refuses_while_a_server_holds_the_state_lock() {
-        use deltaglider_proxy::config_db::{ConfigDb, ConfigDbKeys, FallbackKind};
-        const HASH: &str = "$2b$04$legacyhashlegacyhashlegacyhashlegacyhash";
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("deltaglider_config.db");
-        drop(ConfigDb::open_or_create(&db_path, HASH).unwrap());
-        let keys = ConfigDbKeys::primary_only(&"k".repeat(40))
-            .with_fallback(FallbackKind::LegacyBootstrapHash, HASH);
-        let server =
-            deltaglider_proxy::data_dir_lock::acquire(dir.path(), Duration::ZERO, || {}).unwrap();
-        let err = rekey_under_state_lock(&db_path, &keys).expect_err("a server runs");
-        assert!(err.contains("Stop the server"), "{err}");
-        assert!(
-            deltaglider_proxy::config_db::probe_key(&db_path, HASH).unwrap(),
-            "the DB is still on the old key"
-        );
-        drop(server);
-        rekey_under_state_lock(&db_path, &keys).expect("no server: it re-encrypts");
-        assert!(deltaglider_proxy::config_db::probe_key(&db_path, keys.primary.expose()).unwrap());
-        // On the primary key already: no lock needed, also while a server runs.
-        let _server =
-            deltaglider_proxy::data_dir_lock::acquire(dir.path(), Duration::ZERO, || {}).unwrap();
-        rekey_under_state_lock(&db_path, &keys).expect("nothing to re-encrypt");
-    }
-
     use super::*;
     use deltaglider_proxy::config::Config;
 
@@ -2652,21 +2523,24 @@ mod tests {
         );
     }
 
-    /// A bak under the legacy bootstrap-hash key is found through the
+    /// A bak under the previous key is found through the
     /// fallback, and promotion re-encrypts it with the primary key.
     #[test]
-    fn legacy_keyed_bak_is_probed_and_promoted_with_the_primary_key() {
+    fn previous_keyed_bak_is_probed_and_promoted_with_the_primary_key() {
         use deltaglider_proxy::config_db::{probe_key, ConfigDb, ConfigDbKeys, FallbackKind};
         let dir = tempfile::tempdir().unwrap();
         let db_file = dir.path().join("deltaglider_config.db");
         let bak = db_file.with_extension("db.bak");
-        let db = ConfigDb::open_or_create(&bak, "$2b$04$legacy").unwrap();
+        let db =
+            ConfigDb::open_or_create(&bak, "old-config-db-key-0123456789abcdef0123456789").unwrap();
         db.create_user("alice", "AKALICE1", "s", true, &[]).unwrap();
         drop(db);
         let primary = "primary-key-0123456789abcdef0123456789";
         drop(ConfigDb::open_or_create(&db_file, primary).unwrap());
-        let keys = ConfigDbKeys::primary_only(primary)
-            .with_fallback(FallbackKind::LegacyBootstrapHash, "$2b$04$legacy");
+        let keys = ConfigDbKeys::primary_only(primary).with_fallback(
+            FallbackKind::PreviousKey,
+            "old-config-db-key-0123456789abcdef0123456789",
+        );
         assert_eq!(probe_bak_users(&bak, &keys), Some(1));
         drop(promote_backup_db(&db_file, &bak, &keys, false, lock_of(&db_file)).unwrap());
         assert!(probe_key(&db_file, primary).unwrap());
@@ -2706,18 +2580,21 @@ mod tests {
     /// A promoted backup that opened only with a fallback key is re-encrypted,
     /// so the synced copy (still under the old key) must be re-uploaded.
     #[test]
-    fn a_promoted_legacy_backup_parks_the_sync_upload() {
+    fn a_promoted_previous_key_backup_parks_the_sync_upload() {
         use deltaglider_proxy::config_db::{ConfigDb, ConfigDbKeys, FallbackKind};
         let dir = tempfile::tempdir().unwrap();
         let db_file = dir.path().join("deltaglider_config.db");
         let bak = db_file.with_extension("db.bak");
-        let db = ConfigDb::open_or_create(&bak, "$2b$04$legacy").unwrap();
+        let db =
+            ConfigDb::open_or_create(&bak, "old-config-db-key-0123456789abcdef0123456789").unwrap();
         db.create_user("alice", "AKALICE1", "s", true, &[]).unwrap();
         drop(db);
         let primary = "primary-key-0123456789abcdef0123456789";
         drop(ConfigDb::open_or_create(&db_file, primary).unwrap());
-        let keys = ConfigDbKeys::primary_only(primary)
-            .with_fallback(FallbackKind::LegacyBootstrapHash, "$2b$04$legacy");
+        let keys = ConfigDbKeys::primary_only(primary).with_fallback(
+            FallbackKind::PreviousKey,
+            "old-config-db-key-0123456789abcdef0123456789",
+        );
         drop(promote_backup_db(&db_file, &bak, &keys, true, lock_of(&db_file)).unwrap());
         assert!(
             db_file.with_extension("db.sync-pending").exists(),

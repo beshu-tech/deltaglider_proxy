@@ -32,17 +32,6 @@ The synced database, and the local database of every instance, move to the new k
 
 Instances that have not restarted yet cannot read uploads under the new key, so avoid IAM changes during step 3.
 
-## Move a fleet from a release before the config DB key
-
-Releases before the config DB key encrypted the database with the bootstrap password hash. To move such a fleet:
-
-1. Set the same new `DGP_CONFIG_DB_KEY` on every instance.
-2. Also set `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true` on every instance for the rollout. On the first start, each instance re-encrypts its local database with the new key. The variable lets it also accept a synced database under the old hash. Without the variable, an instance refuses such a synced database, because the hash is in configuration files and backups, so it cannot protect a database that other instances trust.
-3. Restart all instances.
-4. When the rollout is complete, remove `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC` and restart again.
-
-Until the last instance runs the new release, the old instances cannot read the uploads of the new ones, so avoid IAM changes during the rollout.
-
 ## Verify
 
 1. Check the log of every instance for the line `re-encrypted with DGP_CONFIG_DB_KEY` after the first restart, once for `deltaglider_config.db` and once for `deltaglider_jobs.db`.
