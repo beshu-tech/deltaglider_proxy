@@ -280,52 +280,6 @@ async fn a_failed_delete_of_the_newest_variant_keeps_the_object() {
     ));
 }
 
-/// B012: the legacy-reference migration must not overwrite a live object
-/// that a client stored at the reference's original name.
-#[tokio::test]
-async fn legacy_reference_migration_keeps_a_live_object() {
-    let tmp = tempfile::tempdir().unwrap();
-    let backend = Arc::new(
-        FilesystemBackend::new(tmp.path().to_path_buf())
-            .await
-            .unwrap(),
-    );
-    backend.create_bucket("b").await.unwrap();
-    let engine = DeltaGliderEngine::new_with_backend(backend.clone(), &Config::default(), None);
-    let v1 = noise(4, 200_000);
-    let legacy = crate::types::FileMetadata::new_reference(
-        "a.zip".into(),
-        "a.zip".into(),
-        hex::encode(Sha256::digest(&v1)),
-        hex::encode(Md5::digest(&v1)),
-        v1.len() as u64,
-        None,
-    );
-    backend
-        .put_reference(
-            "b",
-            "rel",
-            bytes::Bytes::copy_from_slice(&v1),
-            &legacy,
-            crate::deltaglider::RefWriteProof::for_tests(),
-        )
-        .await
-        .unwrap();
-    let v2 = near(&v1, 9);
-    engine
-        .store("b", "rel/a.zip", &v2, None, HashMap::new())
-        .await
-        .unwrap();
-    assert_eq!(engine.retrieve("b", "rel/a.zip").await.unwrap().0, v2);
-    engine.migrate_legacy_references("b").await.unwrap();
-    engine.metadata_cache.invalidate("b", "rel/a.zip");
-    assert_eq!(
-        engine.retrieve("b", "rel/a.zip").await.unwrap().0,
-        v2,
-        "the migration put the legacy bytes back over the live object"
-    );
-}
-
 /// Review B11: a read error on reference.bin is not "no reference". Read as
 /// absent, the PUT wrote a new baseline over the live one, and the deltas
 /// against it stopped decoding. The PUT reads the reference once (its

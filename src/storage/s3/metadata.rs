@@ -87,23 +87,8 @@ fn decode_q(text: &str) -> Option<Vec<u8>> {
 /// Metadata keys DG owns: the new metadata restates them, so stale values
 /// from the HEAD are dropped (the pre-D17 behaviour for these keys).
 pub(super) fn is_dg_owned_meta_key(key: &str) -> bool {
-    const LEGACY: &[&str] = &[
-        "tool",
-        "original-name",
-        "source-name",
-        "file-sha256",
-        "file-size",
-        "created-at",
-        "note",
-        "ref-path",
-        "ref-key",
-        "ref-sha256",
-        "delta-size",
-        "delta-cmd",
-        "content-type",
-    ];
     let k = key.to_ascii_lowercase();
-    k.starts_with("dg-") || k.starts_with("user-") || LEGACY.contains(&k.as_str())
+    k.starts_with("dg-") || k.starts_with("user-")
 }
 
 /// An object ACL as the `x-amz-grant-*` headers of a copy request: each
@@ -313,64 +298,40 @@ impl S3Backend {
             None
         };
 
-        let tool = get_value(&[mk::TOOL, "tool"])
+        let tool = get_value(&[mk::TOOL])
             .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::TOOL)))?;
-        let original_name = get_value(&[
-            mk::ORIGINAL_NAME,
-            "original-name",
-            mk::SOURCE_NAME,
-            "source-name",
-        ])
-        .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::ORIGINAL_NAME)))?;
-        let file_sha256 = get_value(&[mk::FILE_SHA256, "file-sha256"])
+        let original_name = get_value(&[mk::ORIGINAL_NAME, mk::SOURCE_NAME])
+            .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::ORIGINAL_NAME)))?;
+        let file_sha256 = get_value(&[mk::FILE_SHA256])
             .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::FILE_SHA256)))?;
-        let file_size_str =
-            get_value(&[mk::FILE_SIZE, "file-size"]).unwrap_or_else(|| "0".to_string());
+        let file_size_str = get_value(&[mk::FILE_SIZE]).unwrap_or_else(|| "0".to_string());
         let file_size: u64 = file_size_str
             .parse()
             .map_err(|_| StorageError::Other(format!("Invalid file size: {}", file_size_str)))?;
         // Missing/malformed `dg-created-at` → the object's stable S3
         // LastModified, NOT `now()` (see the doc-comment above + the RCA).
-        let created_at = resolve_created_at(
-            get_value(&[mk::CREATED_AT, "created-at"]),
-            created_at_fallback,
-        );
+        let created_at = resolve_created_at(get_value(&[mk::CREATED_AT]), created_at_fallback);
 
-        let note = get_value(&[mk::NOTE, "note"]);
-        // Read ref path: try new name (dg-ref-path) first, fall back to legacy (dg-ref-key, ref-key)
-        let ref_path_opt = get_value(&[mk::REF_PATH, mk::REF_KEY, "ref-path", "ref-key"]);
+        let note = get_value(&[mk::NOTE]);
+        let ref_path_opt = get_value(&[mk::REF_PATH]);
         let is_reference = note.as_deref() == Some("reference");
-        let is_delta = ref_path_opt.is_some()
-            || note
-                .as_ref()
-                .map(|n| n == "delta" || n.starts_with("zero-diff"))
-                .unwrap_or(false);
+        let is_delta =
+            ref_path_opt.is_some() || note.as_ref().map(|n| n == "delta").unwrap_or(false);
 
         let storage_info = if is_reference {
-            let source_name = get_value(&[mk::SOURCE_NAME, "source-name"])
-                .unwrap_or_else(|| original_name.clone());
+            let source_name =
+                get_value(&[mk::SOURCE_NAME]).unwrap_or_else(|| original_name.clone());
             StorageInfo::Reference { source_name }
         } else if is_delta {
-            let raw_ref_path = ref_path_opt
+            let ref_path = ref_path_opt
                 .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_PATH)))?;
-            // Normalize: if absolute (legacy), extract just the filename (typically "reference.bin")
-            let ref_path = if raw_ref_path.contains('/') {
-                raw_ref_path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&raw_ref_path)
-                    .to_string()
-            } else {
-                raw_ref_path
-            };
-            let ref_sha256 = get_value(&[mk::REF_SHA256, "ref-sha256"])
+            let ref_sha256 = get_value(&[mk::REF_SHA256])
                 .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_SHA256)))?;
-            let delta_size_str =
-                get_value(&[mk::DELTA_SIZE, "delta-size"]).unwrap_or_else(|| "0".to_string());
+            let delta_size_str = get_value(&[mk::DELTA_SIZE]).unwrap_or_else(|| "0".to_string());
             let delta_size: u64 = delta_size_str.parse().map_err(|_| {
                 StorageError::Other(format!("Invalid delta size: {}", delta_size_str))
             })?;
-            let delta_cmd = get_value(&[mk::DELTA_CMD, "delta-cmd"]).unwrap_or_default();
+            let delta_cmd = get_value(&[mk::DELTA_CMD]).unwrap_or_default();
             StorageInfo::Delta {
                 ref_path,
                 ref_sha256,
@@ -807,6 +768,60 @@ mod user_value_tests {
                 .map(|b| format!("={b:02X}"))
                 .collect();
             prop_assert_eq!(decode_user_value(&format!("=?UTF-8?q?{q}?=")), text);
+        }
+    }
+}
+
+#[cfg(test)]
+mod dg_names_only_tests {
+    use super::*;
+
+    fn bare(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn unprefixed_names_do_not_make_dg_metadata() {
+        let old = bare(&[
+            ("tool", "deltaglider/5.0"),
+            ("original-name", "a.zip"),
+            ("file-sha256", "abc"),
+            ("file-size", "3"),
+        ]);
+        assert!(S3Backend::headers_to_metadata(&old, Utc::now()).is_err());
+        let current = bare(&[
+            ("dg-tool", "deltaglider/5.0"),
+            ("dg-original-name", "a.zip"),
+            ("dg-file-sha256", "abc"),
+            ("dg-file-size", "3"),
+        ]);
+        assert!(S3Backend::headers_to_metadata(&current, Utc::now()).is_ok());
+    }
+
+    #[test]
+    fn a_ref_path_with_a_slash_is_kept_as_written() {
+        let h = bare(&[
+            ("dg-tool", "t"),
+            ("dg-original-name", "a.zip"),
+            ("dg-file-sha256", "abc"),
+            ("dg-note", "delta"),
+            ("dg-ref-path", "p/reference.bin"),
+            ("dg-ref-sha256", "def"),
+        ]);
+        let m = S3Backend::headers_to_metadata(&h, Utc::now()).unwrap();
+        assert!(matches!(m.storage_info,
+            StorageInfo::Delta { ref ref_path, .. } if ref_path == "p/reference.bin"));
+    }
+
+    #[test]
+    fn only_dg_and_user_names_are_dg_owned() {
+        assert!(is_dg_owned_meta_key("dg-note"));
+        assert!(is_dg_owned_meta_key("User-x"));
+        for k in ["tool", "original-name", "ref-key", "note", "content-type"] {
+            assert!(!is_dg_owned_meta_key(k), "{k}");
         }
     }
 }

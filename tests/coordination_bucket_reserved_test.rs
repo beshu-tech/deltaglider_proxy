@@ -256,12 +256,6 @@ async fn admin_jobs_and_scans_refuse_the_coordination_bucket() {
             "savings",
             admin.get(format!("{ep}/_/api/admin/deltaspace/savings?bucket={SYNC}")),
         ),
-        (
-            "legacy migrate",
-            admin
-                .post(format!("{ep}/_/api/admin/migrate"))
-                .json(&serde_json::json!({"bucket": SYNC})),
-        ),
     ] {
         let r = request.send().await.unwrap();
         assert_eq!(r.status(), 403, "{what} reached the coordination bucket");

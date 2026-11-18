@@ -109,8 +109,8 @@ pub use objects::{
 };
 pub use savings::{get_savings, SavingsCache};
 pub use scanner::{
-    get_all_bucket_usage, get_bucket_usage, get_usage, migrate_legacy, refresh_bucket_usage,
-    scan_usage, ScanUsageRequest, UsageQuery,
+    get_all_bucket_usage, get_bucket_usage, get_usage, refresh_bucket_usage, scan_usage,
+    ScanUsageRequest, UsageQuery,
 };
 pub use sessions::{list_sessions, revoke_session, revoke_user_sessions};
 pub use users::{

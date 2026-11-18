@@ -502,10 +502,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let _object_lock = self.lock_object_write(bucket, key).await;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
-        // No migration: we already hold the prefix lock, and
-        // tokio::sync::Mutex is not reentrant, so resolve_metadata_with_migration
-        // here would deadlock. Legacy objects that haven't been migrated yet will appear
-        // as NotFound; a prior GET/HEAD on the key will have triggered migration.
         let Some((metadata, forms, refusal)) = self
             .resolve_forms_to_delete(bucket, &deltaspace_id, &obj_key.filename)
             .await?

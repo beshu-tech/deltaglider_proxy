@@ -1743,25 +1743,18 @@ async fn usage_scan_counter_refresh_and_legacy_migrate() {
     assert_eq!(v["never_scanned"], true, "{v}");
     assert_eq!(v["object_count"], 0, "{v}");
 
-    let (code, v) = json_of(
-        admin
-            .post(format!("{ep}/_/api/admin/migrate"))
-            .json(&json!({ "bucket": b }))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(code, StatusCode::OK, "{v}");
-    assert_eq!(v["migrated"], 0, "nothing legacy to migrate: {v}");
+    // The old-reference migration route is gone.
     let code = admin
         .post(format!("{ep}/_/api/admin/migrate"))
-        .json(&json!({ "bucket": "../escape" }))
+        .json(&json!({ "bucket": b }))
         .send()
         .await
         .unwrap()
         .status();
-    assert_eq!(code, StatusCode::BAD_REQUEST, "an invalid bucket name");
+    assert!(
+        code == StatusCode::NOT_FOUND || code == StatusCode::METHOD_NOT_ALLOWED,
+        "{code}"
+    );
 }
 
 // ── External auth ───────────────────────────────────────────────────────

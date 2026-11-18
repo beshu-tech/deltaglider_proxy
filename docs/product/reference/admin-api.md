@@ -240,7 +240,6 @@ A config write that makes a bucket that holds objects start to encrypt with a pr
 | `GET` | `/_/api/admin/ext-auth/identities` | List external identities (read-only, not gated) |
 | `POST` | `/_/api/admin/ext-auth/sync-memberships` | Re-evaluate mapping rules and sync group memberships |
 | `GET` | `/_/api/admin/ext-auth/version` | Monotonic external-auth rebuild counter (sibling of `iam/version`) for deterministic diagnostics/tests |
-| `POST` | `/_/api/admin/migrate` | Migrate legacy bootstrap creds into an IAM user |
 
 No response carries a provider's `client_secret`: it reads `****`. An OIDC provider's `extra_config` takes `allow_local` and `ca_cert_path` for an identity provider in a private network (see [How to set up SSO](../how-to/set-up-sso.md#an-identity-provider-in-a-private-network)).
 

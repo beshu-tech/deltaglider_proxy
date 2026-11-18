@@ -360,41 +360,6 @@ async fn a_small_put_against_a_large_reference_at_a_full_spool_disk_is_stored_wh
     budget_is_free(&engine);
 }
 
-/// The legacy-reference migration of a reference above the spool
-/// threshold encodes it against itself from a spool file: the reference
-/// cache refuses a reference this large, so the migration must not go
-/// through it.
-#[tokio::test]
-async fn a_large_legacy_reference_migrates_from_a_spool_file() {
-    let (_dir, engine, _) = engine(64 * 1024).await;
-    let body = noise(10, 200 * 1024);
-    let legacy = crate::types::FileMetadata::new_reference(
-        "a.zip".into(),
-        "a.zip".into(),
-        hex::encode(Sha256::digest(&body)),
-        hex::encode(Md5::digest(&body)),
-        body.len() as u64,
-        None,
-    );
-    engine
-        .storage()
-        .put_reference(
-            "b",
-            "rel",
-            Bytes::copy_from_slice(&body),
-            &legacy,
-            crate::deltaglider::RefWriteProof::for_tests(),
-        )
-        .await
-        .unwrap();
-    let (migrated, _, errors) = engine.migrate_legacy_references("b").await.unwrap();
-    assert_eq!((migrated, errors), (1, 0));
-    let (got, meta) = engine.retrieve("b", "rel/a.zip").await.unwrap();
-    assert!(meta.is_delta());
-    assert_eq!(got, body);
-    budget_is_free(&engine);
-}
-
 /// A GET of a large reference object reserves its spool file BEFORE it
 /// takes the cache slot of the folder's reference. The streaming PUTs and
 /// delta GETs of the folder join that slot while they hold spool budget;

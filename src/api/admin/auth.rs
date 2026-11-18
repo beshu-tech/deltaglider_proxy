@@ -1638,7 +1638,6 @@ fn session_actor_label(method: &AuthMethod, iam: &IamState) -> String {
 ///   - `/api/admin/ext-auth/mappings/*` (not `mappings/preview`: a POST
 ///     that only reads, routed outside the gate)
 ///   - `/api/admin/ext-auth/sync-memberships`
-///   - `/api/admin/migrate`
 ///
 /// Read endpoints (`GET`) are allowed — the GUI should still be able
 /// to display the DB state for diagnostics. Write endpoints return

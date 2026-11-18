@@ -35,10 +35,8 @@ pub mod meta_keys {
     pub const CREATED_AT: &str = "dg-created-at";
     pub const NOTE: &str = "dg-note";
     pub const SOURCE_NAME: &str = "dg-source-name";
-    /// New canonical name — relative path to reference (e.g. "reference.bin")
+    /// Relative path to the reference (e.g. "reference.bin")
     pub const REF_PATH: &str = "dg-ref-path";
-    /// Legacy name — kept for backward compatibility on read
-    pub const REF_KEY: &str = "dg-ref-key";
     pub const REF_SHA256: &str = "dg-ref-sha256";
     pub const DELTA_SIZE: &str = "dg-delta-size";
     pub const DELTA_CMD: &str = "dg-delta-cmd";
@@ -61,7 +59,6 @@ pub mod meta_keys {
     pub const H_NOTE: &str = concat!("x-amz-meta-", "dg-note");
     pub const H_SOURCE_NAME: &str = concat!("x-amz-meta-", "dg-source-name");
     pub const H_REF_PATH: &str = concat!("x-amz-meta-", "dg-ref-path");
-    pub const H_REF_KEY: &str = concat!("x-amz-meta-", "dg-ref-key");
     pub const H_REF_SHA256: &str = concat!("x-amz-meta-", "dg-ref-sha256");
     pub const H_DELTA_SIZE: &str = concat!("x-amz-meta-", "dg-delta-size");
     pub const H_DELTA_CMD: &str = concat!("x-amz-meta-", "dg-delta-cmd");

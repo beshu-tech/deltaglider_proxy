@@ -600,10 +600,9 @@ pub(crate) fn folder_of(key: &str) -> &str {
 
 /// The metadata keys that describe how an object is stored relative to its
 /// folder: hidden from every reader that [`Reader::sees_delta_facts`] refuses.
-const DELTA_FACT_KEYS: [&str; 8] = [
+const DELTA_FACT_KEYS: [&str; 7] = [
     crate::types::meta_keys::NOTE,
     crate::types::meta_keys::REF_PATH,
-    crate::types::meta_keys::REF_KEY,
     crate::types::meta_keys::REF_SHA256,
     crate::types::meta_keys::DELTA_SIZE,
     crate::types::meta_keys::DELTA_CMD,

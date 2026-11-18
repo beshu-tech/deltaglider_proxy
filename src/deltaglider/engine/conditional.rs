@@ -6,7 +6,7 @@
 //! Every write of one object takes the same per-object lock: the client
 //! writes (PutObject, CompleteMultipartUpload, CopyObject, form POST), the
 //! admin bulk copy, every engine-routed copy (replication, lifecycle,
-//! maintenance), the delete, and the legacy-reference migration. So a
+//! maintenance), and the delete. So a
 //! conditional check and the store that follows it are one step for that
 //! key on this process, and two writes of one key never interleave their
 //! stored forms. Other instances are not covered.
@@ -730,7 +730,6 @@ mod tests {
             "copy_object_known(",
             "copy_object_from(",
             "copy_object_with_retries(",
-            ".migrate_legacy_references(",
         ];
         let mut offenders = Vec::new();
         let mut holders = 0;

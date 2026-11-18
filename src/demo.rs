@@ -35,7 +35,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
     // Admin API routes that require session authentication
     // Phase 3c.2: split admin routes into "always-on" (config, session,
     // backup-read, usage, diagnostics) and "iam-gated" (users / groups /
-    // ext-auth mutations / legacy migrate). The iam-gated subrouter
+    // ext-auth mutations). The iam-gated subrouter
     // layers `require_not_declarative` so every IAM mutation returns
     // 403 when `access.iam_mode` is `Declarative`. Read routes on the
     // same resources are intentionally NOT gated — the GUI must still
@@ -89,7 +89,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             admin::MAX_IMPORT_BODY_BYTES,
         ))
         // Legacy migration: mutates IAM state as its whole purpose.
-        .route("/_/api/admin/migrate", post(admin::migrate_legacy))
         // External auth provider management.
         .route(
             "/_/api/admin/ext-auth/providers",

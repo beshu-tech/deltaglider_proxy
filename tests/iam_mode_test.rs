@@ -13,8 +13,7 @@
 //!    cached flag.
 //! 3. Read endpoints (GET /users, GET /groups) keep working in
 //!    declarative mode.
-//! 4. Legacy-migrate is also gated (IAM mutation).
-//! 5. Non-IAM routes (config, backend, session) are unaffected.
+//! 4. Non-IAM routes (config, backend, session) are unaffected.
 
 use crate::common;
 

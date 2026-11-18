@@ -259,16 +259,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
 /// Usage-counter accounting at the commit, on a fake S3: the prior-object
 /// read, a write whose future the caller drops, the metrics of a failed
-/// commit, and the legacy-reference migration.
+/// commit.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bucket_usage::{usage_delta_for, BucketUsage, BucketUsageRow};
     use crate::deltaglider::savings::SavingsTotals;
     use crate::metrics::Metrics;
-    use crate::storage::{DynStorageBackend, FakeS3, FilesystemBackend, StorageBackendExt};
-    use md5::Md5;
-    use sha2::Sha256;
+    use crate::storage::{DynStorageBackend, FakeS3};
 
     /// An engine on a fake S3 with bucket `b` and a usage counter.
     async fn counted_s3_engine(
@@ -540,52 +538,6 @@ mod tests {
             1
         );
         assert!(metrics.delta_bytes_saved_total.get() > 0);
-    }
-
-    /// The legacy-reference migration writes a user-visible delta: it is
-    /// counted like any other new object (before: not at all, and its later
-    /// delete drove the row negative).
-    #[tokio::test]
-    async fn legacy_reference_migration_counts_the_delta_it_creates() {
-        let tmp = tempfile::tempdir().unwrap();
-        let backend = Arc::new(
-            FilesystemBackend::new(tmp.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
-        backend.create_bucket("b").await.unwrap();
-        let usage = Arc::new(BucketUsage::in_memory().unwrap());
-        let engine = DeltaGliderEngine::new_with_backend(backend.clone(), &Config::default(), None)
-            .with_bucket_usage(Some(usage.clone()));
-        let v1 = noise(4, 200_000);
-        let legacy = FileMetadata::new_reference(
-            "a.zip".into(),
-            "a.zip".into(),
-            hex::encode(Sha256::digest(&v1)),
-            hex::encode(Md5::digest(&v1)),
-            v1.len() as u64,
-            None,
-        );
-        backend
-            .put_reference(
-                "b",
-                "rel",
-                bytes::Bytes::copy_from_slice(&v1),
-                &legacy,
-                crate::deltaglider::RefWriteProof::for_tests(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            engine.migrate_legacy_references("b").await.unwrap(),
-            (1, 0, 0)
-        );
-        let head = engine.head("b", "rel/a.zip").await.unwrap();
-        let r = row(&usage);
-        assert_eq!(
-            (r.object_count, r.logical_bytes, r.stored_bytes as i64),
-            (1, v1.len() as u64, usage_delta_for(&head, 1).2),
-        );
     }
 
     /// The storage writes in `store.rs` that commit an object or change a

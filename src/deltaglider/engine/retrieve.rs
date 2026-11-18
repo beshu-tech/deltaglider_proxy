@@ -57,12 +57,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<RetrieveResponse, EngineError> {
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
 
-        // Check metadata cache first (avoids resolve_metadata_with_migration I/O)
+        // Check metadata cache first (avoids resolve_metadata I/O)
         let (metadata, from_cache) = if let Some(cached) = self.metadata_cache.get(bucket, key) {
             (Some(cached), true)
         } else {
             let resolved = self
-                .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                .resolve_metadata(bucket, &deltaspace_id, &obj_key)
                 .await?;
             (resolved, false)
         };
@@ -125,7 +125,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 );
                 self.metadata_cache.invalidate(bucket, key);
                 let fresh = self
-                    .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                    .resolve_metadata(bucket, &deltaspace_id, &obj_key)
                     .await?;
                 match fresh {
                     Some(m) => {
@@ -1027,14 +1027,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 (Some(cached), true)
             } else {
                 (
-                    self.resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                    self.resolve_metadata(bucket, &deltaspace_id, &obj_key)
                         .await?,
                     false,
                 )
             }
         } else {
             (
-                self.resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                self.resolve_metadata(bucket, &deltaspace_id, &obj_key)
                     .await?,
                 false,
             )
@@ -1105,7 +1105,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         );
                         self.metadata_cache.invalidate(bucket, key);
                         let fresh = self
-                            .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                            .resolve_metadata(bucket, &deltaspace_id, &obj_key)
                             .await?;
                         let Some(fresh_meta) = fresh else {
                             return Ok(None);

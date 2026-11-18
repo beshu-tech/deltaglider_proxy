@@ -1684,9 +1684,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Bytes are UNCHANGED — every existing sibling delta was encoded against
     /// these bytes and must still reconstruct (the decode uses the reference
     /// bytes, not its `ref_sha256`). Caller MUST hold the per-deltaspace prefix
-    /// lock. `original_name` is pinned to `INTERNAL_REFERENCE_NAME` — the
-    /// legacy-reference migrator keys off that to skip already-internal
-    /// references; any other value would trigger a spurious migration.
+    /// lock. `original_name` is pinned to `INTERNAL_REFERENCE_NAME`.
     async fn heal_reference_if_corrupt(
         &self,
         bucket: &str,
@@ -2377,218 +2375,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .delete_passthrough(bucket, deltaspace_id, filename)
                 .await,
         )
-    }
-
-    /// `lock`: the write lock of `filename`'s key: the check that no
-    /// object holds the name and the write of the delta are one step.
-    pub(super) async fn migrate_legacy_reference_object_if_needed(
-        &self,
-        lock: &ObjectWriteGuard,
-        bucket: &str,
-        deltaspace_id: &str,
-        filename: &str,
-        xnode: &super::ReferenceLockGuard,
-    ) -> Result<bool, EngineError> {
-        lock.covers(bucket, deltaspace_id, filename)?;
-        let Some(mut ref_meta) = self
-            .reference_metadata_if_present(bucket, deltaspace_id)
-            .await?
-        else {
-            return Ok(false);
-        };
-        if ref_meta.original_name == Self::INTERNAL_REFERENCE_NAME {
-            return Ok(false);
-        }
-        if ref_meta.original_name != filename {
-            return Ok(false);
-        }
-        // Its delta would record the reference's size and SHA-256: a
-        // reference with broken metadata waits for the heal (#187).
-        if Self::reference_metadata_is_corrupt(&ref_meta) {
-            return Ok(false);
-        }
-
-        // A client stored `filename` after the legacy reference: that
-        // variant is the object now. Only restamp the reference; writing
-        // its bytes as `filename` would put the legacy version back over it.
-        if self
-            .resolve_object_metadata(bucket, deltaspace_id, filename)
-            .await?
-            .is_some()
-        {
-            ref_meta.original_name = Self::INTERNAL_REFERENCE_NAME.to_string();
-            xnode
-                .put_reference_metadata(&*self.storage, bucket, deltaspace_id, &ref_meta)
-                .await?;
-            self.cache
-                .invalidate(&self.cache_key(bucket, deltaspace_id));
-            return Ok(true);
-        }
-
-        // The object's bytes ARE the reference: its delta is the reference
-        // encoded against itself (a few copy instructions).
-        let delta = if ref_meta.file_size > self.spool_threshold() {
-            self.self_delta_from_file(bucket, deltaspace_id, &ref_meta)
-                .await?
-        } else {
-            let (reference, _cache_hit) = self
-                .get_reference_cached(bucket, deltaspace_id, &ref_meta.file_sha256)
-                .await?;
-            let source_file = self.codec_source_spool_now(reference.len())?;
-            let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
-                EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
-            })?;
-            self.codec
-                .encode_spooled(&source_file, &reference, &reference)?
-        };
-
-        let delta_meta = FileMetadata::new_delta(
-            filename.to_string(),
-            ref_meta.file_sha256.clone(),
-            ref_meta.md5.clone(),
-            ref_meta.file_size,
-            "reference.bin".to_string(),
-            ref_meta.file_sha256.clone(),
-            delta.len() as u64,
-            ref_meta.content_type.clone(),
-        );
-
-        // Write the delta BEFORE deleting the passthrough. If put_delta fails,
-        // the passthrough still exists and the object remains accessible.
-        xnode
-            .put_delta(
-                &*self.storage,
-                bucket,
-                deltaspace_id,
-                filename,
-                crate::storage::PutBody::Bytes(Bytes::from(delta)),
-                &delta_meta,
-            )
-            .await?;
-        // A new user-visible object (the reference stays, already counted or
-        // out of band): no variant of `filename` existed (checked above).
-        self.record_commit(bucket, &CounterPrior::Absent, &delta_meta);
-        self.delete_passthrough_idempotent(bucket, deltaspace_id, filename)
-            .await?;
-
-        ref_meta.original_name = Self::INTERNAL_REFERENCE_NAME.to_string();
-        xnode
-            .put_reference_metadata(&*self.storage, bucket, deltaspace_id, &ref_meta)
-            .await?;
-
-        // Invalidate cache — reference metadata changed (though data is unchanged,
-        // the cached Bytes doesn't include metadata, so this is precautionary).
-        let cache_key = self.cache_key(bucket, deltaspace_id);
-        self.cache.invalidate(&cache_key);
-
-        Ok(true)
-    }
-
-    /// The delta of a reference above the spool threshold against itself,
-    /// from a spool file (the reference cache holds no reference this
-    /// large). Under the deltaspace lock: the spool is taken without
-    /// waiting (a full budget is SlowDown), and the file is checked
-    /// against the reference's SHA-256 before the encode.
-    async fn self_delta_from_file(
-        &self,
-        bucket: &str,
-        deltaspace_id: &str,
-        ref_meta: &FileMetadata,
-    ) -> Result<Vec<u8>, EngineError> {
-        let file = self.codec_source_spool_large_now(ref_meta.file_size as usize)?;
-        self.storage
-            .get_reference_to_file(bucket, deltaspace_id, file.path())
-            .await?;
-        let (actual, _, _) = Self::hash_spool_file(file.path()).await?;
-        if actual != ref_meta.file_sha256 {
-            return Err(EngineError::ChecksumMismatch {
-                key: format!("{deltaspace_id}/.dg/reference.bin"),
-                expected: ref_meta.file_sha256.clone(),
-                actual,
-            });
-        }
-        let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
-            EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
-        })?;
-        let codec = self.codec.clone();
-        let path = file.path().to_path_buf();
-        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, EngineError> {
-            let target = std::fs::File::open(&path).map_err(StorageError::from)?;
-            let mut delta = Vec::new();
-            codec
-                .encode_from_reader(&path, target, &mut delta)
-                .map_err(EngineError::Codec)?;
-            Ok(delta)
-        })
-        .await
-        .map_err(|e| EngineError::Storage(StorageError::Other(format!("encode task: {e}"))))?
-    }
-
-    /// Batch-migrate all legacy reference objects in a bucket. Visits only
-    /// the deltaspaces that hold a reference.
-    /// Returns (migrated_count, skipped_count, error_count).
-    pub async fn migrate_legacy_references(
-        &self,
-        bucket: &str,
-    ) -> Result<(u32, u32, u32), EngineError> {
-        let deltaspaces = self.storage.list_reference_prefixes(bucket, "").await?;
-        let mut migrated = 0u32;
-        let mut skipped = 0u32;
-        let mut errors = 0u32;
-
-        for ds in &deltaspaces {
-            // One read: is there a reference, and does it need migration?
-            // (The migration reads it again under the deltaspace lock.)
-            let Some(ref_meta) = self.reference_metadata_if_present(bucket, ds).await? else {
-                skipped += 1;
-                continue;
-            };
-
-            if ref_meta.original_name == Self::INTERNAL_REFERENCE_NAME {
-                skipped += 1;
-                continue;
-            }
-
-            // This is a legacy reference — migrate it
-            let filename = ref_meta.original_name.clone();
-            // Lock order: the object's write lock, then the deltaspace.
-            let object_lock = self
-                .lock_object_write(bucket, &ObjectKey::join(ds, &filename))
-                .await;
-            let _guard = self.acquire_prefix_lock(bucket, ds).await;
-            let xnode = match self.acquire_reference_lock(bucket, ds).await {
-                Ok(g) => g,
-                Err(e) => {
-                    tracing::warn!("Failed to migrate {}/{}: {}", bucket, ds, e);
-                    errors += 1;
-                    continue;
-                }
-            };
-            match self
-                .migrate_legacy_reference_object_if_needed(
-                    &object_lock,
-                    bucket,
-                    ds,
-                    &filename,
-                    &xnode,
-                )
-                .await
-            {
-                Ok(true) => {
-                    tracing::info!("Migrated legacy reference in {}/{}", bucket, ds);
-                    migrated += 1;
-                }
-                Ok(false) => {
-                    skipped += 1;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to migrate {}/{}: {}", bucket, ds, e);
-                    errors += 1;
-                }
-            }
-        }
-
-        Ok((migrated, skipped, errors))
     }
 }
 
@@ -3726,14 +3512,10 @@ mod other_form_tests {
             }
         }
         sites.sort();
-        // The legacy-reference migration deletes the passthrough form that
-        // it has just converted to a delta.
-        assert_eq!(
-            sites.len(),
-            1,
+        assert!(
+            sites.is_empty(),
             "the engine deletes another form outside drop_other_form at {sites:?}"
         );
-        assert!(sites[0].starts_with("src/deltaglider/engine/store.rs:"));
     }
 }
 

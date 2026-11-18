@@ -53,7 +53,6 @@ async fn a_new_write_reservation_is_refused_at_high_and_critical() {
             .await
             .unwrap();
         engine.codec_source_spool_now(1024).unwrap();
-        engine.codec_source_spool_large_now(1024).unwrap();
     }
     for level in [Level::High, Level::Critical] {
         set_level(&engine, level);
@@ -61,8 +60,6 @@ async fn a_new_write_reservation_is_refused_at_high_and_critical() {
             let m = refused(engine.reserve_ingest_spool(MIB, 0, wait).await);
             assert!(m.contains(level.name()), "{m}");
         }
-        let m = refused(engine.codec_source_spool_large_now(1024));
-        assert!(m.contains(level.name()), "{m}");
         // A small codec source (a reference of at most the threshold) is no
         // new body: the rule is "larger than the threshold".
         engine.codec_source_spool_now(1024).unwrap();
@@ -150,11 +147,6 @@ const SPOOL_SITES: &[(&str, &str, Spool)] = &[
         "src/deltaglider/engine/resources.rs",
         "codec_source_spool_now",
         Spool::SmallCodec,
-    ),
-    (
-        "src/deltaglider/engine/resources.rs",
-        "codec_source_spool_large_now",
-        Spool::Gated,
     ),
     // Asks the gate, and degrades to a whole store (`NoSpool`) instead of failing.
     (

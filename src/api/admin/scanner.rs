@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Usage scanner handlers: scan_usage, get_usage, migrate_legacy, plus the
+//! Usage scanner handlers: scan_usage, get_usage, plus the
 //! O(1) bucket-usage COUNTER (`get_bucket_usage`) and its full-scan
 //! `refresh_bucket_usage` (the dashboard bucket scan, joined or started).
 
@@ -56,32 +56,6 @@ pub async fn scan_usage(
         )
             .into_response()
     }
-}
-
-/// POST /_/api/admin/migrate — batch-migrate legacy reference objects.
-/// Converts old-format references (original_name != "__reference__") to the new format.
-/// This is a potentially long-running operation — runs synchronously and returns results.
-pub async fn migrate_legacy(
-    State(state): State<Arc<AdminState>>,
-    AdminJson(req): AdminJson<MigrateRequest>,
-) -> Result<Json<serde_json::Value>, AdminError> {
-    let bucket = req.bucket.admit(&state)?;
-    let engine = state.s3_state.engine.load();
-    let (migrated, skipped, errors) = engine
-        .migrate_legacy_references(&bucket)
-        .await
-        .map_err(|e| AdminError::internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "bucket": bucket,
-        "migrated": migrated,
-        "skipped": skipped,
-        "errors": errors,
-    })))
-}
-
-#[derive(Deserialize)]
-pub struct MigrateRequest {
-    bucket: AdminBucket,
 }
 
 /// GET /_/api/admin/usage?bucket=X&prefix=Y — return cached usage entry.

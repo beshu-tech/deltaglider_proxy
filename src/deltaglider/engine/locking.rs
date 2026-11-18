@@ -389,17 +389,6 @@ mod reference_writes {
             self.write_reference(storage, bucket, deltaspace, op).await
         }
 
-        pub(crate) async fn put_reference_metadata<B: StorageBackend + ?Sized>(
-            &self,
-            storage: &B,
-            bucket: &str,
-            deltaspace: &str,
-            meta: &FileMetadata,
-        ) -> Result<(), EngineError> {
-            let op = crate::storage::RefWrite::Metadata { metadata: meta };
-            self.write_reference(storage, bucket, deltaspace, op).await
-        }
-
         pub(crate) async fn delete_reference<B: StorageBackend + ?Sized>(
             &self,
             storage: &B,

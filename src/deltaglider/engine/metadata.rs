@@ -301,11 +301,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// Resolve metadata for an object key, with no migration attempt.
-    ///
-    /// Use this from callers that **already hold** the per-deltaspace prefix lock
-    /// (e.g. `delete()`). Calling `resolve_metadata_with_migration` from such a
-    /// caller would deadlock because tokio's async Mutex is not reentrant.
+    /// Resolve metadata for an object key.
     pub(super) async fn resolve_metadata(
         &self,
         bucket: &str,
@@ -315,40 +311,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(self
             .resolve_object_metadata(bucket, deltaspace_id, &obj_key.full_key())
             .await?)
-    }
-
-    /// Resolve metadata with legacy migration fallback, acquiring the per-deltaspace
-    /// prefix lock before migration to prevent races with concurrent `store()` calls.
-    ///
-    /// Uses double-checked locking:
-    /// 1. Fast path: look up metadata without the lock.
-    /// 2. If not found, acquire the prefix lock.
-    /// 3. Re-check under the lock (a concurrent writer may have already migrated).
-    /// 4. If still not found, attempt migration under the lock.
-    ///
-    /// **Do not call this from a caller that already holds the prefix lock** — use
-    /// `resolve_metadata` instead to avoid a deadlock.
-    pub(super) async fn resolve_metadata_with_migration(
-        &self,
-        bucket: &str,
-        deltaspace_id: &str,
-        obj_key: &ObjectKey,
-    ) -> Result<Option<FileMetadata>, EngineError> {
-        // Fast path: most objects are found immediately without acquiring the lock.
-        let metadata = self
-            .resolve_object_metadata(bucket, deltaspace_id, &obj_key.full_key())
-            .await?;
-        if metadata.is_some() {
-            return Ok(metadata);
-        }
-
-        // Legacy migration removed from GET hot path — it was blocking downloads
-        // for 60+ seconds on large reference files. Migration is now batch-only
-        // via the /_/api/admin/migrate endpoint.
-        //
-        // If the object still isn't found, return None and let the caller
-        // fall through to the unmanaged passthrough path.
-        Ok(None)
     }
 
     /// Drop the cached metadata for one key. Used by the metadata-backfill

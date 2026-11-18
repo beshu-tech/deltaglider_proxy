@@ -71,7 +71,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                              Product logic lives below it: conditional writes + the per-key object write lock in
                              `engine/conditional.rs` (`store_conditional`, reached by PutObject, CopyObject, form POST via
                              `object_helpers::store_client_write`). EVERY object write takes that lock (client, multipart, admin
-                             bulk, every `transfer.rs` copy, delete, backfill, legacy migration): the store methods ask for the
+                             bulk, every `transfer.rs` copy, delete, backfill): the store methods ask for the
                              `ObjectWriteGuard` (only `lock_object_write` makes one; `store()`, delete and `copy_object_*` lock
                              themselves — not re-entrant). Lock order: object → deltaspace prefix → cross-instance reference
                              (source guards in conditional.rs). A client body is ingested BEFORE every lock (source guard
@@ -385,8 +385,8 @@ single-instance planes below are addressed.
   (`reference_lock_keys`, `previous_storage_identity`); the next release drops the old key.
   Every engine write of reference.bin (and of a delta) goes through a guard method:
   the backend write takes a `RefWriteProof` that only the guard's
-  `reference_writes` module in `engine/locking.rs` makes, incl. delete-reclaim, sweep-reclaim,
-  legacy-reference migration and the replication fast-path seed
+  `reference_writes` module in `engine/locking.rs` makes, incl. delete-reclaim, sweep-reclaim, the heal
+  and the replication fast-path seed
   (`with_dest_prefix_lock` holds both locks).
   FENCED: the acquire observes reference.bin
   (`StorageBackend::reference_fence_with_metadata`: one HEAD gives the fence AND the

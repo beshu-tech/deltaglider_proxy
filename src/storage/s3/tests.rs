@@ -285,9 +285,11 @@ mod classify_tests {
         assert_eq!(plan.metadata.get("owner").map(String::as_str), Some("bob"));
         assert_eq!(plan.metadata.get("dg-tool").map(String::as_str), Some("t"));
         assert_eq!(plan.metadata.get("user-new").map(String::as_str), Some("v"));
-        for gone in ["dg-note", "user-old", "file-sha256"] {
+        for gone in ["dg-note", "user-old"] {
             assert!(!plan.metadata.contains_key(gone), "stale {gone} kept");
         }
+        // An unprefixed name is the client's own metadata now.
+        assert!(plan.metadata.contains_key("file-sha256"));
         assert_eq!(plan.cache_control.as_deref(), Some("max-age=60"));
         assert_eq!(plan.content_disposition.as_deref(), Some("attachment"));
         assert_eq!(plan.content_encoding.as_deref(), Some("gzip"));

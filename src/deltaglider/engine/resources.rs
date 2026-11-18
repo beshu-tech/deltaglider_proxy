@@ -218,22 +218,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// the spool threshold (16 MiB by default), so this file is small and the
     /// disk level does not gate it: the rule of the disk gate is "a body, a
     /// ciphertext or a reference LARGER than the threshold goes to a spool
-    /// file" ([`Self::codec_source_spool_large_now`]).
+    /// file".
     pub(crate) fn codec_source_spool_now(
         &self,
         bytes: usize,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
-        self.spool.try_acquire(bytes as u64).map_err(spool_error)
-    }
-
-    /// [`Self::codec_source_spool_now`] for a source above the spool
-    /// threshold (a large reference that the streaming codec reads from a
-    /// file): a new write that the disk gate refuses at level high.
-    pub(crate) fn codec_source_spool_large_now(
-        &self,
-        bytes: usize,
-    ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
-        self.admit_new_spool_write(0)?;
         self.spool.try_acquire(bytes as u64).map_err(spool_error)
     }
 

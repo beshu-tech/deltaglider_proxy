@@ -6,6 +6,7 @@
 
 - Before you upgrade, copy each object that you need from a key below a `.dg` directory to another key. The new release answers `400` for such a key. See [Upgrade](docs/product/how-to/upgrade.md).
 - A file named `.tmpAb12Cd` (a temporary name of releases before 2.0) in a filesystem data directory is now a listed object and is never swept. Remove such files by hand if you do not need them.
+- **The old reference format and the Python-toolchain metadata names are gone.** Before you upgrade, on v2.2.3: run `POST /_/api/admin/migrate` for each bucket until it answers `migrated: 0`, and run Jobs → New job → Heal metadata. After the upgrade, `POST /_/api/admin/migrate` answers `404` (the bucket migrate job, `POST /_/api/admin/buckets/:bucket/migrate`, stays). The proxy no longer reads the metadata names `tool`, `original-name`, `source-name`, `file-sha256`, `file-size`, `created-at`, `note`, `ref-path`, `ref-key`, `ref-sha256`, `delta-size`, `delta-cmd` and `dg-ref-key`, an absolute `dg-ref-path`, or the note `zero-diff*`. An object that an old toolchain stored with only those names is served as a plain object, with its stored bytes.
 
 ### Changed
 

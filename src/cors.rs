@@ -48,7 +48,6 @@ pub const EXPOSED_HEADERS: &[&str] = &[
     meta_keys::H_NOTE,
     meta_keys::H_SOURCE_NAME,
     meta_keys::H_REF_PATH,
-    meta_keys::H_REF_KEY,
     meta_keys::H_REF_SHA256,
     meta_keys::H_DELTA_SIZE,
     meta_keys::H_DELTA_CMD,
