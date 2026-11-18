@@ -453,3 +453,26 @@ async fn test_admin_bulk_ops_respect_marker() {
         "bulk delete on unmarked bucket"
     );
 }
+
+/// #187 item 4: a refused PUT with a body larger than the socket buffers
+/// must reach the client as 403, not as a closed connection. The gate
+/// refuses before the body is read.
+#[tokio::test]
+async fn a_refused_large_put_answers_403_not_a_closed_connection() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .bucket_policy("rto-dst", "replication_target_only: true")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    client.create_bucket().bucket("rto-dst").send().await.ok();
+    let err = client
+        .put_object()
+        .bucket("rto-dst")
+        .key("big.bin")
+        .body(ByteStream::from(vec![7u8; 32 * 1024 * 1024]))
+        .send()
+        .await
+        .expect_err("PUT to marked bucket must fail");
+    assert_access_denied(&err, "large PutObject");
+}

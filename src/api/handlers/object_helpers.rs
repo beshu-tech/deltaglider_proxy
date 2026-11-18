@@ -306,7 +306,11 @@ pub(crate) async fn check_client_write_allowed(
     bucket: &str,
 ) -> Result<(), S3Error> {
     if let Some(block) = state.atomic_write_block(bucket).await {
-        return Err(block.to_s3_error(bucket, false));
+        let err = block.to_s3_error(bucket, false);
+        // A refusal before any handler logs: without this line the request
+        // leaves no trace in the proxy log (#187).
+        tracing::warn!("client write to bucket {bucket} refused: {err}");
+        return Err(err);
     }
     let engine = state.engine.load();
     // Blocks the configured marked name AND an unconfigured name that resolves
@@ -315,6 +319,7 @@ pub(crate) async fn check_client_write_allowed(
         .bucket_policy_registry()
         .client_write_block_reason(bucket)
     {
+        tracing::warn!("client write to bucket {bucket} refused: {reason}");
         return Err(S3Error::AccessDeniedReason(reason));
     }
     Ok(())

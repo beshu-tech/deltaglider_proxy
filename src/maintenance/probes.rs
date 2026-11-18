@@ -120,6 +120,43 @@ mod tests {
         (dir, AppState::for_tests(engine))
     }
 
+    /// #187: a refused client write leaves a line in the log that names
+    /// the bucket and the reason; before, it left none.
+    #[tokio::test]
+    async fn a_refused_client_write_is_logged() {
+        let log = crate::test_log_capture::capture("warn");
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<crate::storage::DynStorageBackend<'static>> =
+            crate::storage::DynStorageBackend::new_box(
+                crate::storage::FilesystemBackend::new(dir.path().join("data"))
+                    .await
+                    .unwrap(),
+            );
+        let mut config = crate::config::Config::default();
+        config.buckets.insert(
+            "mirror".into(),
+            crate::bucket_policy::BucketPolicyConfig {
+                replication_target_only: true,
+                ..Default::default()
+            },
+        );
+        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &config,
+            None,
+        );
+        let state = AppState::for_tests(engine);
+        crate::api::handlers::object_helpers::check_client_write_allowed(&state, "mirror")
+            .await
+            .expect_err("a marked bucket refuses client writes");
+        let text = log.text();
+        assert!(
+            text.contains("client write to bucket mirror refused")
+                && text.contains("replication targets only"),
+            "{text}"
+        );
+    }
+
     fn tick(watch: &DiskWatch, free_gib: u64) {
         let tuning = crate::config::tuning::RuntimeTuning::default().disk_monitor;
         let targets = Targets {
