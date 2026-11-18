@@ -1898,3 +1898,31 @@ async fn an_error_after_the_commit_never_erases_the_success() {
         _ => panic!("a retry gets the tombstone"),
     }
 }
+
+/// A cut after `finish_upload` and `completing.finish()` and before the
+/// publish leaves the tombstone: the retry is `AlreadyDone`, not NoSuchUpload.
+#[tokio::test]
+async fn a_cut_between_finish_and_publish_keeps_the_tombstone() {
+    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let id = store.create("b", "k", None, Default::default()).unwrap();
+    let etag = put(&store, &id, "b", "k", 1, b"data").unwrap();
+    let parts = vec![(1, etag)];
+    let owner = match store.begin_complete(&id, "b", "k", &parts).unwrap() {
+        BeginComplete::Owner(p) => p,
+        _ => panic!("first begin_complete must be Owner"),
+    };
+    let completed = store.complete_parts(&id, "b", "k", &parts).unwrap();
+    let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let guard = store.completing_guard(&id, &completed.etag, committed);
+    store.finish_upload(&id);
+    guard.finish();
+    // The request is cut here: the publisher drops unpublished.
+    drop(owner);
+    match store.begin_complete(&id, "b", "k", &parts) {
+        Ok(BeginComplete::AlreadyDone { etag }) => assert_eq!(etag, completed.etag),
+        other => panic!(
+            "the retry of a stored object must be AlreadyDone: {:?}",
+            other.err()
+        ),
+    }
+}

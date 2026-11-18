@@ -182,8 +182,8 @@ pub(super) async fn complete_multipart_upload(
         .multipart
         .set_max_object_size(svc.state.engine.load().max_object_size());
 
-    // Completion registry: exactly one request runs the store pipeline, on a
-    // the request itself (a dropped connection stops it, the upload stays Open);
+    // Completion registry: exactly one request runs the store pipeline, inside
+    // the request (a dropped connection stops it, the upload stays Open);
     // identical retries join the in-flight outcome or hit the tombstone.
     let begin = svc.state.multipart.begin_complete(
         &input.upload_id,
@@ -230,6 +230,13 @@ pub(super) async fn complete_multipart_upload(
             .await
         }
         crate::multipart::BeginComplete::Owner(publisher) => {
+            // A first try that a drop cut after the backend committed left its
+            // object at the key: confirm it instead of storing it again.
+            if let Some(etag) = adopt_landed_completion(&svc.state, &input, &requested_parts).await
+            {
+                publisher.publish(Ok(etag.clone()));
+                return complete_response(&etag, None);
+            }
             // Admission (quota) + routing decisions run ONLY for the owner: a
             // tombstone/join retry must never be re-admitted — its bytes are
             // already committed, and the freeze/quota gates would wrongly
@@ -405,6 +412,45 @@ where
             Ok(response)
         }
     }
+}
+
+/// The object of a first try of this Complete that a drop cut after the
+/// backend committed: the key holds the composite ETag and the size of this
+/// upload's parts, written after the upload began. It is confirmed as a
+/// normal commit would end: the upload is finished, the bucket usage is
+/// counted again and the `ObjectCreated` event is queued. Returns its ETag.
+async fn adopt_landed_completion(
+    state: &Arc<AppState>,
+    input: &s3s::dto::CompleteMultipartUploadInput,
+    requested_parts: &[(u32, String)],
+) -> Option<String> {
+    let (expected, size, created) = state.multipart.expected_completion(
+        &input.upload_id,
+        &input.bucket,
+        &input.key,
+        requested_parts,
+    )?;
+    let engine = state.engine.load_full();
+    let meta = engine.head(&input.bucket, &input.key).await.ok()?;
+    let slack = chrono::Duration::seconds(2);
+    let own = meta.etag().trim_matches('"') == expected.trim_matches('"')
+        && meta.file_size == size
+        && meta.created_at + slack >= created;
+    if !own {
+        return None;
+    }
+    state.multipart.finish_upload(&input.upload_id);
+    engine.note_unrecorded_write(&input.bucket);
+    let stored = meta.stored_size();
+    let result = crate::types::StoreResult::new(meta.clone(), stored);
+    crate::api::handlers::object_helpers::store_client_multipart_commit(
+        state,
+        &input.bucket,
+        &input.key,
+        &result,
+    )
+    .await;
+    Some(expected)
 }
 
 /// A request that joins a completion, or hits its tombstone, is the same
@@ -1178,6 +1224,65 @@ mod multipart_cost_tests {
             .await
             .expect("the retry of a cut Complete completes");
         assert!(state.engine.load().head("b", "a/photo.jpg").await.is_ok());
+    }
+
+    /// A drop after the backend committed the object and before the answer:
+    /// the retry (also with `If-None-Match: *`) finds its own object and
+    /// confirms it, with the event of a normal commit, and PUTs nothing.
+    #[tokio::test]
+    async fn a_retry_confirms_the_object_that_a_cut_try_landed() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let mut state = AppState::for_tests(engine);
+        Arc::get_mut(&mut state).unwrap().jobs_db = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::config_db::JobsDb::in_memory("test").unwrap(),
+        )));
+        let svc = service(state.clone());
+        let id = state
+            .multipart
+            .create("b", "a/photo.jpg", None, Default::default())
+            .unwrap();
+        let etag = upload_part(&svc, request(part(&id, 1)))
+            .await
+            .unwrap()
+            .output
+            .e_tag
+            .unwrap();
+        let first = complete_input(&id, &etag, true);
+        fake.set_put_answer_delay_ms(60_000);
+        let landed = async {
+            while fake.stored_count("b/a/photo.jpg") == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = landed => {}
+            _ = complete_multipart_upload(&svc, request(first.clone())) => panic!("answered"),
+        }
+        // The cut dropped the first try: the object is stored, the upload is Open.
+        assert_eq!(state.multipart.count_uploads(), 1);
+        fake.set_put_answer_delay_ms(0);
+        let puts = || {
+            fake.requests()
+                .iter()
+                .filter(|r| r.starts_with("PUT /b/a/photo.jpg"))
+                .count()
+        };
+        assert_eq!(puts(), 1);
+
+        let retry = complete_multipart_upload(&svc, request(first))
+            .await
+            .expect("create-only retry finds its own object");
+        assert!(retry.output.e_tag.is_some());
+        assert_eq!(puts(), 1, "the retry stored nothing");
+        assert_eq!(state.multipart.count_uploads(), 0, "the upload is finished");
+        let db = state.jobs_db.as_ref().unwrap();
+        crate::event_outbox::flush_appends(db).await;
+        assert_eq!(db.lock().await.event_outbox_count(None).unwrap(), 1);
+        // A second retry hits the tombstone.
+        complete_multipart_upload(&svc, request(complete_input(&id, &etag, false)))
+            .await
+            .expect("the tombstone answers");
     }
 
     /// F10 (epic #143): parallel UploadParts of 24 MiB each (and the

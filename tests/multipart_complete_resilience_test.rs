@@ -282,3 +282,95 @@ async fn a_late_complete_body_holds_the_request_slot() {
         "the GET was answered while the Complete body still held the only slot"
     );
 }
+
+/// The client closes the socket AFTER the `200` headers of a long Complete:
+/// the store stops, the object is absent, the upload is Open, the retry
+/// completes, and the next request gets the only slot at once.
+#[tokio::test]
+async fn a_cut_after_the_200_headers_stops_the_store_and_frees_the_slot() {
+    let server = TestServer::builder()
+        .env("DGP_MAX_CONCURRENT_REQUESTS", "1")
+        .env("DGP_TEST_COMPLETE_STALL_MS", "4000")
+        .env("DGP_TEST_COMPLETE_KEEPALIVE_AFTER_MS", "200")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    let http = server.http();
+    let bucket = server.bucket().to_string();
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("other.txt")
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let key = "resilience/latecut.bin";
+    let (upload_id, completed) = seed_multipart(&client, &bucket, key).await;
+    let etag = completed.parts()[0].e_tag().unwrap().to_string();
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let resp = http
+        .post(format!(
+            "{}/{bucket}/{key}?uploadId={upload_id}",
+            server.endpoint()
+        ))
+        .body(body)
+        .send()
+        .await
+        .expect("the 200 headers arrive");
+    assert_eq!(resp.status().as_u16(), 200);
+    // Headers are out, the store still stalls: close the socket.
+    drop(resp);
+
+    // The slot is free as soon as the proxy sees the close, long before the stall ends.
+    let started = std::time::Instant::now();
+    client
+        .get_object()
+        .bucket(&bucket)
+        .key("other.txt")
+        .send()
+        .await
+        .expect("the next GET gets the slot");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "the GET waited for the stalled store: {:?}",
+        started.elapsed()
+    );
+
+    // Past the stall window: a store that ran on would have landed.
+    tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+    assert!(client
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .is_err());
+    let open = client
+        .list_parts()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .expect("the upload is Open");
+    assert_eq!(open.parts().len(), 1);
+    client
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .expect("the retry completes");
+    assert!(client
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .is_ok());
+}

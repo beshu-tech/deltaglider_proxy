@@ -685,7 +685,7 @@ mod tests {
     /// A Complete that the backend does not answer ends at
     /// `DGP_S3_COMPLETE_TIMEOUT_SECS` (here 1 s; the backend answers after
     /// 20 s), not at the hour of an upload without a deadline: a hung Complete
-    /// would hold the object lock, the detached slot and the spool.
+    /// would hold the object lock, the request slots and the spool.
     #[tokio::test]
     async fn a_complete_that_is_not_answered_ends_at_the_complete_timeout() {
         let xml = "<?xml version=\"1.0\"?><InitiateMultipartUploadResult><Bucket>b</Bucket>\

@@ -267,6 +267,8 @@ impl CompletingGuard {
     /// The store succeeded and `finish_upload` ended the `Completing` state.
     pub fn finish(mut self) {
         self.finished = true;
+        // The tombstone is written here: a cut before the publish still has it.
+        self.store.mark_done(&self.upload_id, &self.etag);
     }
 }
 
@@ -1034,11 +1036,11 @@ impl MultipartStore {
     }
 
     /// Route a CompleteMultipartUpload request through the completion registry.
-    /// Exactly one request becomes the Owner and runs the store pipeline (on a
-    /// DETACHED task, so a client disconnect cannot cancel it); identical retries
-    /// Join the in-flight outcome or hit the success tombstone. This is what makes
-    /// Complete disconnect-proof and retry-idempotent (found live: a router dying
-    /// mid-Complete used to destroy the upload and poison the retry).
+    /// Exactly one request becomes the Owner and runs the store pipeline (inside
+    /// the request: a dropped connection stops it and the upload rolls back to
+    /// Open); identical retries Join the in-flight outcome or hit the success
+    /// tombstone. This makes a retry of a dropped Complete safe (found live: a
+    /// router dying mid-Complete left the upload in `Completing`).
     pub fn begin_complete(
         self: &std::sync::Arc<Self>,
         upload_id: &str,
@@ -1215,6 +1217,12 @@ impl MultipartStore {
     /// complete the upload here and keep the success for retries and
     /// joiners.
     fn commit_unwound(&self, upload_id: &str, etag: &str) {
+        self.mark_done(upload_id, etag);
+        self.finish_upload(upload_id);
+    }
+
+    /// Turn the in-flight slot of `upload_id` into the success tombstone.
+    fn mark_done(&self, upload_id: &str, etag: &str) {
         {
             let mut slots = self.completions.lock();
             if let Some(CompletionSlot::InFlight {
@@ -1236,7 +1244,22 @@ impl MultipartStore {
                 );
             }
         }
-        self.finish_upload(upload_id);
+    }
+
+    /// The part list, size and creation time that a Complete of `upload_id`
+    /// with `requested_parts` would store. Changes no state.
+    pub fn expected_completion(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+        requested_parts: &[(u32, String)],
+    ) -> Option<(String, u64, DateTime<Utc>)> {
+        let uploads = self.uploads.read();
+        let (validated, upload) = self
+            .validate_parts(&uploads, upload_id, bucket, key, requested_parts)
+            .ok()?;
+        Some((validated.etag, validated.total_size, upload.created_at))
     }
 
     /// The success that [`Self::commit_unwound`] kept for the completion

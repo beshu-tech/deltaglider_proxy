@@ -129,6 +129,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .map(|u| u.open_write_window(bucket))
     }
 
+    /// A write of `bucket` landed that no counter recorded (a cut request
+    /// dropped its store after the backend committed): count the bucket again.
+    pub fn note_unrecorded_write(&self, bucket: &str) {
+        if let Some(u) = &self.bucket_usage {
+            u.mark_for_recount(bucket);
+        }
+    }
+
     /// Record a reference.bin that a write created (`+bytes`) or removed
     /// (`-bytes`), right after that storage write. The size is exact, so it
     /// is recorded also when the object's own change is unknown.

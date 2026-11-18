@@ -1417,6 +1417,12 @@ async fn append_events_capped(
     }
     let n = events.len();
     queued.fetch_add(n, SeqCst);
+    // A cut request drops this future at the await below: the guard gives the count back.
+    let mut unsent = UnsentCount {
+        queued: &queued,
+        n,
+        armed: true,
+    };
     let sent = match tx.try_send(events) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(events)) => {
@@ -1425,9 +1431,26 @@ async fn append_events_capped(
         }
         Err(TrySendError::Closed(_)) => Err(()),
     };
-    if sent.is_err() {
-        queued.fetch_sub(n, SeqCst);
+    if sent.is_ok() {
+        unsent.armed = false;
+    } else {
         tracing::warn!("event outbox: the writer has stopped; {n} event(s) dropped");
+    }
+}
+
+/// Gives back `n` queued events that were never sent (an error, or a dropped future).
+struct UnsentCount<'a> {
+    queued: &'a std::sync::atomic::AtomicUsize,
+    n: usize,
+    armed: bool,
+}
+
+impl Drop for UnsentCount<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.queued
+                .fetch_sub(self.n, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -2328,6 +2351,32 @@ mod tests {
         waiting.await.unwrap();
         flush_appends(&db).await;
         assert_eq!(outbox_keys(&*db.lock().await), ["k0", "k1", "k2", "k3"]);
+    }
+
+    /// A request cut while its append waits for room gives its count back:
+    /// the flush then sees 0 and a stop does not wait for events that never queued.
+    #[tokio::test]
+    async fn a_cut_append_gives_its_count_back() {
+        let db = shared(JobsDb::in_memory("pw").unwrap());
+        let held = db.lock().await;
+        append_events_capped(&db, vec![event_at(1, "k0")], 2).await;
+        tokio::task::yield_now().await;
+        for i in 1..=2 {
+            append_events_capped(&db, vec![event_at(1, &format!("k{i}"))], 2).await;
+        }
+        assert_eq!(queued_events(&db), 3);
+        // The queue is full: this append waits, and is dropped there.
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            append_events_capped(&db, vec![event_at(1, "cut")], 2),
+        )
+        .await;
+        assert!(cut.is_err(), "the append did not wait");
+        assert_eq!(queued_events(&db), 3, "the cut append leaked its count");
+        drop(held);
+        flush_appends(&db).await;
+        assert_eq!(queued_events(&db), 0);
+        assert_eq!(outbox_keys(&*db.lock().await), ["k0", "k1", "k2"]);
     }
 
     /// The gauge source: the events queued and not written yet, which a

@@ -59,6 +59,8 @@ pub(crate) struct FakeS3 {
     buckets: parking_lot::Mutex<std::collections::BTreeSet<String>>,
     /// Delay per operation in ms (see [`FakeS3::set_delay_ms`]).
     delays: parking_lot::Mutex<HashMap<String, u64>>,
+    /// Milliseconds an object PUT waits AFTER it committed, before it answers.
+    answer_delay_ms: std::sync::atomic::AtomicU64,
     /// Requests in flight per operation, and the peak: a test can see
     /// whether a client sends requests concurrently.
     in_flight: parking_lot::Mutex<HashMap<String, (usize, usize)>>,
@@ -135,6 +137,13 @@ impl FakeS3 {
     /// Every request so far, in order.
     pub(crate) fn requests(&self) -> Vec<String> {
         self.requests.lock().clone()
+    }
+
+    /// Make every object PUT answer `ms` milliseconds after it committed: a
+    /// cut in that window leaves the object stored and the client unanswered.
+    pub(crate) fn set_put_answer_delay_ms(&self, ms: u64) {
+        self.answer_delay_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Make every request of operation `op` take `ms` milliseconds.
@@ -1017,6 +1026,12 @@ pub(crate) async fn start() -> (String, Arc<FakeS3>) {
                                 );
                                 let mut h = HeaderMap::new();
                                 h.insert("etag", etag.parse().unwrap());
+                                let wait =
+                                    f.answer_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+                                if wait > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(wait))
+                                        .await;
+                                }
                                 (StatusCode::OK, h, Vec::new())
                             }
                             Method::GET | Method::HEAD => match current {
