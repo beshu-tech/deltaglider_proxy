@@ -1969,6 +1969,42 @@ mod tests {
         );
     }
 
+    /// Normalised `sqlite_master` of a DB: one `;`-ended statement per line,
+    /// whitespace collapsed and removed around `(`, `)` and `,`.
+    fn schema_dump(conn: &Connection) -> String {
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, sql FROM sqlite_master
+                  WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL
+                  ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name",
+            )
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|sql| normalise_sql(&sql.unwrap()))
+            .collect();
+        let mut out = rows.join(";\n");
+        out.push_str(";\n");
+        out
+    }
+
+    fn normalise_sql(sql: &str) -> String {
+        let mut s = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        for p in ["( ", " )", " ,", ", "] {
+            s = s.replace(p, p.trim());
+        }
+        s
+    }
+
+    /// A fresh DB has exactly the schema of the golden v29 dump.
+    #[test]
+    fn fresh_db_equals_the_golden_v29_schema() {
+        let db = ConfigDb::in_memory("pw").unwrap();
+        let golden = include_str!("../../tests/fixtures/config_db_schema_v29.sql");
+        assert_eq!(schema_dump(&db.conn), golden);
+    }
+
     #[test]
     fn migration_plan_truth_table() {
         assert_eq!(migration_plan(0), MigrationPlan::Migrate);
