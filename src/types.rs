@@ -37,6 +37,7 @@ pub mod meta_keys {
     pub const SOURCE_NAME: &str = "dg-source-name";
     /// Relative path to the reference (e.g. "reference.bin")
     pub const REF_PATH: &str = "dg-ref-path";
+    pub const REF_KEY: &str = "dg-ref-key";
     pub const REF_SHA256: &str = "dg-ref-sha256";
     pub const DELTA_SIZE: &str = "dg-delta-size";
     pub const DELTA_CMD: &str = "dg-delta-cmd";

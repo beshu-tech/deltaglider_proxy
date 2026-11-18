@@ -313,7 +313,8 @@ impl S3Backend {
         let created_at = resolve_created_at(get_value(&[mk::CREATED_AT]), created_at_fallback);
 
         let note = get_value(&[mk::NOTE]);
-        let ref_path_opt = get_value(&[mk::REF_PATH]);
+        // prod deltas carry dg-ref-key; drop after a conversion job
+        let ref_path_opt = get_value(&[mk::REF_PATH, mk::REF_KEY]);
         let is_reference = note.as_deref() == Some("reference");
         let is_delta =
             ref_path_opt.is_some() || note.as_ref().map(|n| n == "delta").unwrap_or(false);
@@ -323,8 +324,14 @@ impl S3Backend {
                 get_value(&[mk::SOURCE_NAME]).unwrap_or_else(|| original_name.clone());
             StorageInfo::Reference { source_name }
         } else if is_delta {
-            let ref_path = ref_path_opt
+            let raw_ref_path = ref_path_opt
                 .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_PATH)))?;
+            // dg-ref-key holds a path ("rel/reference.bin"); keep the file name.
+            let ref_path = raw_ref_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&raw_ref_path)
+                .to_string();
             let ref_sha256 = get_value(&[mk::REF_SHA256])
                 .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_SHA256)))?;
             let delta_size_str = get_value(&[mk::DELTA_SIZE]).unwrap_or_else(|| "0".to_string());
@@ -802,18 +809,18 @@ mod dg_names_only_tests {
     }
 
     #[test]
-    fn a_ref_path_with_a_slash_is_kept_as_written() {
+    fn a_delta_with_only_dg_ref_key_is_a_delta() {
         let h = bare(&[
             ("dg-tool", "t"),
             ("dg-original-name", "a.zip"),
             ("dg-file-sha256", "abc"),
-            ("dg-note", "delta"),
-            ("dg-ref-path", "p/reference.bin"),
+            ("dg-ref-key", "p/reference.bin"),
             ("dg-ref-sha256", "def"),
         ]);
         let m = S3Backend::headers_to_metadata(&h, Utc::now()).unwrap();
+        assert!(m.is_delta());
         assert!(matches!(m.storage_info,
-            StorageInfo::Delta { ref ref_path, .. } if ref_path == "p/reference.bin"));
+            StorageInfo::Delta { ref ref_path, .. } if ref_path == "reference.bin"));
     }
 
     #[test]

@@ -88,7 +88,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(
             admin::MAX_IMPORT_BODY_BYTES,
         ))
-        // Legacy migration: mutates IAM state as its whole purpose.
         // External auth provider management.
         .route(
             "/_/api/admin/ext-auth/providers",

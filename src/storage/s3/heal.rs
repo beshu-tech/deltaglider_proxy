@@ -1209,6 +1209,10 @@ mod tests {
         assert_eq!(fake.requests().iter().filter(|r| delta_heads(r)).count(), 0);
         for (key, listed) in &page.objects {
             let head = fresh.head("b", key).await.unwrap();
+            assert!(
+                head.is_delta(),
+                "{key}: a dg-ref-key delta reads as a delta"
+            );
             assert_eq!(listed.file_size, head.file_size, "{key} size");
             assert_eq!(listed.etag(), head.etag(), "{key} etag");
         }
