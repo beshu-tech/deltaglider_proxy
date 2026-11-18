@@ -45,6 +45,14 @@ pub fn should_drain(
         && declared_len.is_none_or(|n| n <= DRAIN_CAP_BYTES)
 }
 
+/// Pure: any `Expect` header says `100-continue` (hyper honours the last one).
+pub fn expects_continue(headers: &axum::http::HeaderMap) -> bool {
+    headers.get_all(header::EXPECT).iter().any(|v| {
+        v.to_str()
+            .is_ok_and(|s| s.trim().eq_ignore_ascii_case("100-continue"))
+    })
+}
+
 /// How a drain ended.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DrainEnd {
@@ -129,11 +137,7 @@ pub async fn drain_after_refusal(mut request: Request, next: Next) -> Response {
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    let expect_continue = request
-        .headers()
-        .get(header::EXPECT)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("100-continue"));
+    let expect_continue = expects_continue(request.headers());
     let shared = Arc::new(Mutex::new(None));
     let request = request.map(|body| {
         *shared.lock().expect("body lock") = Some(body);
@@ -211,6 +215,21 @@ mod tests {
                 "{status} verified={verified} presigned={presigned} declared={declared:?}"
             );
         }
+    }
+
+    #[test]
+    fn expects_continue_reads_every_header() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        assert!(!expects_continue(&h));
+        h.append(header::EXPECT, HeaderValue::from_static("other"));
+        assert!(!expects_continue(&h));
+        h.append(header::EXPECT, HeaderValue::from_static(" 100-Continue "));
+        assert!(expects_continue(&h));
+        let mut first = HeaderMap::new();
+        first.append(header::EXPECT, HeaderValue::from_static("100-continue"));
+        first.append(header::EXPECT, HeaderValue::from_static("other"));
+        assert!(expects_continue(&first));
     }
 
     #[tokio::test]

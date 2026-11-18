@@ -482,17 +482,20 @@ const RAW_BODY: usize = 32 * 1024 * 1024;
 
 /// A PUT head for `/rto-dst/big.bin` with a 32 MiB body, signed or not.
 fn raw_put_head(ep: &str, signed: bool, expect: bool) -> String {
+    raw_put_head_as(
+        ep,
+        signed.then_some(("bootstrap_key", "bootstrap_secret")),
+        expect,
+    )
+}
+
+fn raw_put_head_as(ep: &str, creds: Option<(&str, &str)>, expect: bool) -> String {
     let url = format!("{ep}/rto-dst/big.bin");
     let host = ep.trim_start_matches("http://");
     let mut head =
         format!("PUT /rto-dst/big.bin HTTP/1.1\r\nHost: {host}\r\nContent-Length: {RAW_BODY}\r\n");
-    if signed {
-        for (k, v) in sign_raw(
-            reqwest::Method::PUT,
-            &url,
-            "bootstrap_key",
-            "bootstrap_secret",
-        ) {
+    if let Some((key, secret)) = creds {
+        for (k, v) in sign_raw(reqwest::Method::PUT, &url, key, secret) {
             head.push_str(&format!("{k}: {v}\r\n"));
         }
     } else {
@@ -640,4 +643,44 @@ async fn a_refused_expect_continue_put_gets_403_not_100() {
         .unwrap();
     let (status, head) = read_raw_response(&mut s).await.expect("first response");
     assert_eq!(status, 403, "first status line: {head}");
+}
+
+/// Open access: a caller that signs with key == secret has no principal,
+/// so its refused request is not drained and the connection closes.
+#[tokio::test]
+async fn an_open_access_signed_refused_put_body_is_not_read() {
+    let server = TestServer::builder()
+        .open_access()
+        .bucket_policy("rto-dst", "replication_target_only: true")
+        .build()
+        .await;
+    server
+        .s3_client()
+        .await
+        .create_bucket()
+        .bucket("rto-dst")
+        .send()
+        .await
+        .ok();
+    let ep = server.endpoint();
+    let mut s = tokio::net::TcpStream::connect(ep.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    s.write_all(raw_put_head_as(&ep, Some(("k", "k")), false).as_bytes())
+        .await
+        .unwrap();
+    let chunk = vec![7u8; 1024 * 1024];
+    for _ in 0..RAW_BODY / chunk.len() {
+        if s.write_all(&chunk).await.is_err() {
+            break;
+        }
+    }
+    let first = read_raw_response(&mut s).await;
+    let second = if first.is_some() {
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await.ok();
+        read_raw_response(&mut s).await
+    } else {
+        None
+    };
+    assert!(second.is_none(), "connection must close (first {first:?})");
 }
