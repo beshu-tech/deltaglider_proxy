@@ -43,7 +43,7 @@ function collectErrors(page: Page): string[] {
 }
 
 function jobRow(page: Page) {
-  return page.getByRole('row').filter({ hasText: 'Backfill metadata' }).filter({ hasText: BUCKET });
+  return page.getByRole('row').filter({ hasText: 'Heal metadata' }).filter({ hasText: BUCKET });
 }
 
 test('jobs overview: palette, second tab sees a new job, 390 px layout', async ({ browser }) => {

@@ -467,9 +467,9 @@ export const JOBS_SHOTS: Shot[] = [
   {
     id: 'adopt-bucket-backfill',
     route: '/_/admin/jobs',
-    alt: 'The dialog Backfill object metadata with the releases bucket selected; the arrow points at Start now.',
+    alt: 'The dialog Heal metadata with the releases bucket selected; the arrow points at Start now.',
     setup: async (page) => {
-      await newJob(page, /^Backfill metadata/);
+      await newJob(page, /^Heal metadata/);
       await page.getByRole('checkbox', { name: 'releases', exact: true }).check();
       // check() may scroll the page behind the dialog; put it back.
       await page.evaluate(() => window.scrollTo(0, 0));

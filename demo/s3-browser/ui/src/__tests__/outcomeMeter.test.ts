@@ -108,10 +108,10 @@ test('replication deletes count as work', () => {
 
 // Regression: every kind used replication words ("straight copy", "in sync").
 test('words per kind', () => {
-  assert.equal(m({ kind: 'backfill-metadata', scanned: 4003, copied: 4003 }).label, '4,003 stamped');
+  assert.equal(m({ kind: 'backfill-metadata', scanned: 4003, copied: 4003 }).label, '4,003 healed');
   assert.equal(
     m({ kind: 'backfill-metadata', scanned: 7, skipped: 7 }).label,
-    'all already stamped · 7 checked',
+    'all already complete · 7 checked',
   );
   assert.equal(
     m({ kind: 'reencrypt', scanned: 10_003, copied: 3, skipped: 10_000 }).label,
@@ -147,7 +147,7 @@ test('running: skipped objects show, phase words for migrate', () => {
   // Regression: 3,996 skipped in 1.5 s while the row said "0 copied…".
   assert.equal(
     m({ kind: 'backfill-metadata', status: 'running', scanned: 3996, skipped: 3996 }).label,
-    'running · 0 stamped · 3,996 already stamped…',
+    'running · 0 healed · 3,996 already complete…',
   );
   assert.equal(
     m({ kind: 'migrate', status: 'running', phase: 'verify', scanned: 4000, copied: 4000 }).label,

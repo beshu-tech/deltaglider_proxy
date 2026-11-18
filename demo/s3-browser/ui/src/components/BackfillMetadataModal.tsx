@@ -1,9 +1,10 @@
 /**
- * Start the one-off `backfill-metadata` job (Jobs → New job → Backfill
+ * Start the one-off `backfill-metadata` job (Jobs → New job → Heal
  * metadata…). The job stamps DeltaGlider's metadata (content hashes, sizes,
  * created-at) onto objects that were written to the backend without the
- * proxy, reading each object once to hash it and rewriting only its
- * metadata. POST /_/api/admin/jobs/backfill-metadata.
+ * proxy, and re-stamps delta references whose metadata is broken, reading
+ * each such object once to hash it and rewriting only its metadata.
+ * POST /_/api/admin/jobs/backfill-metadata.
  *
  * The bucket list has a search box and the backend of each bucket, and it
  * scrolls on its own so Start stays in view. After a start, only the
@@ -83,7 +84,7 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
       title={
         <span>
           <TagsOutlined style={{ marginRight: 8, color: colors.ACCENT_BLUE }} />
-          Backfill object metadata
+          Heal metadata
         </span>
       }
       footer={[
@@ -99,9 +100,12 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
       <Text type="secondary" style={{ fontSize: 13, display: 'block', marginBottom: 12 }}>
         Objects that were written to the backend without the proxy (before it was installed, or by
         another tool) carry none of DeltaGlider&apos;s metadata, so the proxy cannot show their
-        checksum or verify them. This one-off job reads each such object once to compute its
-        hashes, then writes only the metadata. The object bytes are not uploaded again, and
-        objects the proxy wrote are skipped.
+        checksum or verify them. A delta reference that was copied without its metadata, or that
+        records no size, breaks the downloads of the files stored as deltas against it. This
+        one-off job finds both kinds, reads each one once to compute its hashes, and then writes
+        only the metadata. The bytes are not uploaded again, and objects with complete metadata are
+        skipped. A reference whose bytes do not match the checksum that it records is left as it
+        is and listed as a failure.
       </Text>
       <Alert
         type="warning"
@@ -121,7 +125,7 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
         style={{ marginBottom: 12 }}
       >
         <Text style={{ fontSize: 13 }}>
-          Show backfilled objects as modified now. Leave this off to keep each object&apos;s
+          Show healed objects as modified now. Leave this off to keep each object&apos;s
           Last-Modified time, so that sync tools and replication do not copy them again.
         </Text>
       </Checkbox>

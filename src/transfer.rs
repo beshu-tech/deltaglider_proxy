@@ -1804,6 +1804,9 @@ async fn delta_passthrough_copy(
                 // (encrypt) or leaves plaintext (passthrough); a surviving
                 // source marker would corrupt the reference read.
                 strip_encryption_markers(&mut ref_meta.user_metadata);
+                // The bytes, not the recorded size: a reference that records
+                // none (`0`) still counts its real size (#187).
+                let ref_len = ref_data.len() as u64;
                 engine2
                     .put_reference_raw(
                         &dest_bucket,
@@ -1813,8 +1816,8 @@ async fn delta_passthrough_copy(
                     )
                     .await?;
                 // Counted at its write: a ship that fails below leaves it.
-                engine2.record_seeded_reference(&dest_bucket, ref_meta.file_size);
-                seeded = ref_meta.file_size;
+                engine2.record_seeded_reference(&dest_bucket, ref_len);
+                seeded = ref_len;
             }
             engine2
                 .put_delta_raw(

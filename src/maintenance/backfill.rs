@@ -151,9 +151,8 @@ pub async fn hash_object_content<S: crate::storage::StorageBackend>(
 
 /// The backfill phase machine: `counting` → `objects`, on the shared
 /// driver (page-granular resume, per-object failures recorded and skipped
-/// over, cancellation checked per page). No `references` phase —
-/// references either carry intact metadata or are healed by the write
-/// path's `heal_reference_if_corrupt`.
+/// over, cancellation checked per page), then `references`: the
+/// deltaspace references whose metadata is broken.
 pub(crate) async fn execute_backfill_phases(
     db: &std::sync::Arc<tokio::sync::Mutex<crate::config_db::JobsDb>>,
     state: &std::sync::Arc<crate::api::handlers::AppState>,
@@ -188,8 +187,81 @@ pub(crate) async fn execute_backfill_phases(
         bucket: &job.bucket,
         refresh_last_modified: params.refresh_last_modified,
     };
-    run_count_then_walk(db, state, holder, job, "backfill", &mut visitor).await?;
+    let walked = run_count_then_walk(db, state, holder, job, "backfill", &mut visitor).await?;
+    heal_references(db, state, holder, job, walked).await
+}
+
+/// Phase `references`: re-stamp every deltaspace reference whose type,
+/// SHA-256 or size is missing, from its own bytes (#187). A healthy one
+/// is skipped with one HEAD; one whose bytes do not match its recorded
+/// SHA-256 is a failure and stays as it is.
+async fn heal_references(
+    db: &std::sync::Arc<tokio::sync::Mutex<crate::config_db::JobsDb>>,
+    state: &std::sync::Arc<crate::api::handlers::AppState>,
+    holder: super::worker::Holder<'_>,
+    job: &super::store::MaintenanceJob,
+    walked: super::worker::Walked,
+) -> Result<(), super::worker::PhaseStop> {
+    use super::worker::{check_cancel, heartbeat, persist, record_failure, stop_if_shutting_down};
+    use crate::deltaglider::ReferenceHeal;
+
+    let bucket = job.bucket.as_str();
+    let mut c = walked.c;
+    if job.phase != "references" {
+        persist(db, job, "references", &c, None).await;
+    }
+    let engine = state.engine.load().clone();
+    // The objects walk saw them (one listing of the bucket); a resumed job
+    // lists them.
+    let deltaspaces: Vec<String> = match walked.references {
+        Some(seen) => seen.into_iter().collect(),
+        None => engine
+            .storage()
+            .list_reference_prefixes(bucket, "")
+            .await
+            .map_err(|e| format!("list references failed: {e}"))?,
+    };
+    if let Some(total) = c.total.as_mut() {
+        *total += deltaspaces.len() as i64;
+    }
+    for prefix in deltaspaces {
+        stop_if_shutting_down()?;
+        check_cancel(db, job.id).await?;
+        let key = if prefix.is_empty() {
+            ".dg/reference.bin".to_string()
+        } else {
+            format!("{prefix}/.dg/reference.bin")
+        };
+        match engine.heal_reference_metadata(bucket, &prefix).await {
+            Ok(ReferenceHeal::Healed(meta)) => {
+                tracing::info!("heal: re-stamped the metadata of {bucket}/{key}");
+                c.done += 1;
+                c.bytes += meta.file_size as i64;
+            }
+            Ok(ReferenceHeal::Healthy | ReferenceHeal::Absent) => c.skipped += 1,
+            Ok(ReferenceHeal::Mismatch { recorded, actual }) => {
+                let reason = reference_mismatch_reason(&recorded, &actual);
+                record_failure(db, job.id, &key, &reason).await?;
+                c.failed += 1;
+            }
+            Err(e) => {
+                record_failure(db, job.id, &key, &format!("reference heal failed: {e}")).await?;
+                c.failed += 1;
+            }
+        }
+        heartbeat(db, job.id, holder).await?;
+    }
+    persist(db, job, "references", &c, None).await;
     Ok(())
+}
+
+/// Pure: the failure text of a reference whose bytes are not the ones its
+/// metadata records.
+pub fn reference_mismatch_reason(recorded: &str, actual: &str) -> String {
+    format!(
+        "the reference bytes do not match its recorded SHA-256 (recorded {recorded}, \
+         actual {actual}); not re-stamped, because its deltas may not decode against it"
+    )
 }
 
 /// The backfill per-object step: hash the content once, stamp the

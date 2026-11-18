@@ -1,7 +1,7 @@
 /**
  * Jobs — every run, live and past, on one list: the runs of replication and
  * lifecycle rules, and the one-off jobs (bulk delete, re-encrypt, migrate,
- * metadata backfill; a one-off is a run without a rule). The rules
+ * metadata heal; a one-off is a run without a rule). The rules
  * themselves are on the Replication and Lifecycle pages (RulesPanel).
  *
  * Reads `GET /jobs/runs` page by page; it polls fast while a run in it is
@@ -204,7 +204,7 @@ export default function JobsPanel({ search }: Props) {
     items: [
       { key: 'reencrypt', label: 'Re-encrypt buckets… — one-off rewrite' },
       { key: 'migrate', label: 'Migrate bucket… — one-off move' },
-      { key: 'backfill', label: 'Backfill metadata… — for objects written without the proxy' },
+      { key: 'backfill', label: 'Heal metadata… — for objects written without the proxy, and broken references' },
       { type: 'divider' as const },
       { key: 'replication', label: 'Replication rule… — on the Replication page' },
       { key: 'lifecycle', label: 'Lifecycle rule… — on the Lifecycle page' },

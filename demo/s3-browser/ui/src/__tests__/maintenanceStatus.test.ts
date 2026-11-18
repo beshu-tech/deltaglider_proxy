@@ -79,7 +79,7 @@ test('phaseLabel: migrate phase words', () => {
   assert.equal(phaseLabel(job({ kind: 'migrate', phase: 'verify' })), 'Verifying the copies…');
   assert.equal(phaseLabel(job({ kind: 'migrate', phase: 'copy', objects_done: 1200, objects_skipped: 0 })), 'Copying · 1,200 objects');
   assert.equal(phaseLabel(job({ kind: 'migrate', phase: 'flip' })), 'Switching to the new backend…');
-  assert.ok(browserBannerText(job({ kind: 'backfill-metadata' }), true).startsWith('Adding metadata'));
+  assert.ok(browserBannerText(job({ kind: 'backfill-metadata' }), true).startsWith('Healing the metadata'));
 });
 
 // Regression: after a 401 the poll stopped for good, so the banner froze

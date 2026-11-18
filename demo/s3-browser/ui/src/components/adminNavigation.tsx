@@ -193,7 +193,7 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         label: 'Jobs',
         icon: <SyncOutlined />,
         description:
-          'Every run, live and past: replication and lifecycle runs, bulk deletes, re-encryptions, migrations, metadata backfills.',
+          'Every run, live and past: replication and lifecycle runs, bulk deletes, re-encryptions, migrations, metadata heals.',
       },
     ],
   },

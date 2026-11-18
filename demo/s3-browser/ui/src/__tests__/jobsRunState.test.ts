@@ -187,7 +187,7 @@ test('oneOffDefinition: parameters, counts, bytes, duration', () => {
     detail: { refresh_last_modified: true },
   });
   const b = Object.fromEntries(oneOffDefinition(bf, 200));
-  assert.equal(b['Last-Modified'], 'set to the time of the backfill');
+  assert.equal(b['Last-Modified'], 'set to the time of the heal');
   assert.equal(b['Phase'], 'counting objects');
   assert.equal(b['Running for'], '10s');
 });

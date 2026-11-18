@@ -317,9 +317,9 @@ jobs:
               admin_login_as_test::
               auth_integration_test::
               aws_chunked_upload_test::
+              broken_reference_metadata_test::
               cli_s3_migrate_test::
               cli_s3_purge_test::
-              python_cli_reference_test::
               cli_s3_rm_test::
               common::
               coordination_bucket_reserved_test::

@@ -430,7 +430,7 @@ export async function startBackfillMetadata(
   return adminJson('/api/admin/jobs/backfill-metadata', {
     method: 'POST',
     body: { buckets, refresh_last_modified: refreshLastModified },
-    context: 'Start metadata backfill',
+    context: 'Start metadata heal',
   });
 }
 

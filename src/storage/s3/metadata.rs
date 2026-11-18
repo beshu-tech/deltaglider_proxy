@@ -545,13 +545,6 @@ impl S3Backend {
                 Ok(mut meta) => {
                     meta.stored_last_modified = stored_last_modified;
                     meta.backend_version = response.e_tag.map(str::to_string);
-                    // #187: a reference IS its whole body, so an absent or
-                    // "0" dg-file-size reads as the stored length; a copy
-                    // of this metadata then never writes "0". Sealed
-                    // objects take their size from the seal.
-                    if !carries_encryption_marker(&headers) {
-                        meta.file_size = reference_size_or_stored(&meta, stored_size);
-                    }
                     // No size, no facts: a wrong stored size would make the
                     // listing facts disagree with the object.
                     if let Some(stored_size) = stored_size {
@@ -767,57 +760,6 @@ pub(super) fn fit_metadata(
         )));
     }
     Ok(())
-}
-
-/// Pure: the size of `meta` once its stored length is known. A reference
-/// that records none (`0`) is its stored length; every other object keeps
-/// what it records (a delta records its reconstructed size).
-pub(super) fn reference_size_or_stored(meta: &FileMetadata, stored_size: Option<u64>) -> u64 {
-    match stored_size {
-        Some(stored) if meta.is_reference() && meta.file_size == 0 => stored,
-        _ => meta.file_size,
-    }
-}
-
-#[cfg(test)]
-mod reference_size_tests {
-    use super::*;
-
-    fn reference(size: u64) -> FileMetadata {
-        FileMetadata::new_reference(
-            "r".into(),
-            "s".into(),
-            "a".repeat(64),
-            "b".repeat(32),
-            size,
-            None,
-        )
-    }
-
-    #[test]
-    fn only_a_reference_without_a_size_takes_the_stored_length() {
-        assert_eq!(
-            reference_size_or_stored(&reference(0), Some(49_765)),
-            49_765
-        );
-        assert_eq!(reference_size_or_stored(&reference(10), Some(49_765)), 10);
-        assert_eq!(reference_size_or_stored(&reference(0), None), 0);
-        let delta = FileMetadata::new_delta(
-            "a.zip".into(),
-            "a".repeat(64),
-            "b".repeat(32),
-            0,
-            "reference.bin".into(),
-            "c".repeat(64),
-            5,
-            None,
-        );
-        assert_eq!(
-            reference_size_or_stored(&delta, Some(5)),
-            0,
-            "a delta records its output size"
-        );
-    }
 }
 
 #[cfg(test)]

@@ -2918,8 +2918,8 @@ mod source_guards {
     fn test_fixtures_come_from_the_write_path() {
         const ALLOWED: [(&str, &str); 4] = [
             (
-                "tests/python_cli_reference_test.rs",
-                "plants a Python-CLI reference with no dg-file-size on purpose (#187)",
+                "tests/broken_reference_metadata_test.rs",
+                "plants reference metadata that a copy outside the proxy broke (#187)",
             ),
             (
                 "tests/replication_test.rs",

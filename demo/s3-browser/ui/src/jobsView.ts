@@ -350,7 +350,7 @@ export function kindLabel(kind: JobKind): string {
     case 'migrate':
       return 'Migrate';
     case 'backfill-metadata':
-      return 'Backfill metadata';
+      return 'Heal metadata';
     case 'delete':
       return 'Delete';
     default:
@@ -974,7 +974,7 @@ function kindWords(kind: JobKind, verb?: LifecycleVerb): KindWords {
         nothing: 'nothing due',
       };
     case 'backfill-metadata':
-      return { done: 'stamped', skipped: 'already stamped', nothing: 'all already stamped' };
+      return { done: 'healed', skipped: 'already complete', nothing: 'all already complete' };
     case 'reencrypt':
       return { done: 're-encrypted', skipped: 'already current', nothing: 'all already current' };
     case 'migrate':
@@ -1345,7 +1345,7 @@ export function oneOffDefinition(row: JobRow, nowSec: number): Array<[string, st
   if (row.kind === 'backfill-metadata' && typeof d.refresh_last_modified === 'boolean')
     out.push([
       'Last-Modified',
-      d.refresh_last_modified ? 'set to the time of the backfill' : 'kept as it was',
+      d.refresh_last_modified ? 'set to the time of the heal' : 'kept as it was',
     ]);
   const phase = phaseWord(row.kind, row.phase);
   if (phase && isActiveJobStatus(row.status)) out.push(['Phase', phase]);

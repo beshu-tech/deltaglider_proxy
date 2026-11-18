@@ -144,7 +144,7 @@ test('a deep link to a one-off the list does not carry loads it by id', async ()
   http.on('GET', '/_/api/admin/jobs/maintenance%3A3/failures', json({ failures: [] }));
   renderWithQuery(<JobsPanel search="?job=maintenance:3" />);
   const dialog = await screen.findByRole('dialog');
-  expect(await within(dialog).findByText(/Backfill metadata/)).toBeInTheDocument();
+  expect(await within(dialog).findByText(/Heal metadata/)).toBeInTheDocument();
   expect(within(dialog).queryByText('draft')).not.toBeInTheDocument();
   expect(within(dialog).queryByText(/Lifecycle/)).not.toBeInTheDocument();
   expect(within(dialog).getByText('kept as it was')).toBeInTheDocument();

@@ -20,7 +20,7 @@ pub use cache::ReferenceCache;
 pub use codec::{CodecError, DeltaCodec};
 pub use engine::conditional::{ConditionalError, ObjectWriteGuard, Precondition};
 pub use engine::store::{
-    KnownSha256, MultipartObjectFacts, PassthroughMultipartHandle, RelayPart,
+    KnownSha256, MultipartObjectFacts, PassthroughMultipartHandle, ReferenceHeal, RelayPart,
     BLOCKING_HASH_THRESHOLD,
 };
 pub(crate) use engine::{

@@ -299,6 +299,19 @@ impl KnownSha256 {
     }
 }
 
+/// What [`DeltaGliderEngine::heal_reference_metadata`] did.
+#[derive(Debug, Clone)]
+pub enum ReferenceHeal {
+    /// No reference in the deltaspace.
+    Absent,
+    /// The metadata is complete: nothing written.
+    Healthy,
+    /// Re-stamped from the bytes.
+    Healed(Box<FileMetadata>),
+    /// The bytes do not match the recorded SHA-256: left as they are.
+    Mismatch { recorded: String, actual: String },
+}
+
 #[cfg(test)]
 thread_local! {
     /// How many times this thread hashed a body by reading its spool file
@@ -1657,9 +1670,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// SHA reads as a Reference with an empty `file_sha256`. A HEALTHY reference
     /// always carries a non-empty `file_sha256`. NB: a transient backend error
     /// surfaces as `Err` from `get_reference_metadata`, never as this shape —
-    /// so this can never mistake a 503/timeout for corruption.
-    fn reference_metadata_is_corrupt(m: &FileMetadata) -> bool {
-        !m.is_reference() || m.file_sha256.is_empty()
+    /// so this can never mistake a 503/timeout for corruption. A size of `0`
+    /// is a missing `dg-file-size` (#187).
+    pub(crate) fn reference_metadata_is_corrupt(m: &FileMetadata) -> bool {
+        !m.is_reference() || m.file_sha256.is_empty() || m.file_size == 0
     }
 
     /// Heal a reference whose DG metadata was stripped, RE-STAMPING it (same
@@ -1690,17 +1704,43 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
              so replication stops re-copying this deltaspace",
             bucket, deltaspace_id
         );
-        // Materialise the intact reference bytes to a spool, re-hash, re-put
-        // with correct metadata. Reserve the spool at the reference's on-disk
-        // size (fall back to the fallback-reported size, which is the object's
-        // content length — accurate for the reference object).
-        let spool = self
-            .spool_acquire_beside(held, ref_meta.file_size.max(1))
+        match self
+            .restamp_reference(bucket, deltaspace_id, &ref_meta, held, xnode, false)
+            .await?
+        {
+            ReferenceHeal::Healed(healed) => Ok(*healed),
+            other => Err(EngineError::Storage(StorageError::Other(format!(
+                "reference {bucket}/{deltaspace_id}: unexpected heal outcome {other:?}"
+            )))),
+        }
+    }
+
+    /// Re-stamp a reference from its own bytes (same bytes, canonical
+    /// metadata). With `verify`, bytes that do not match the recorded
+    /// SHA-256 are left as they are: [`ReferenceHeal::Mismatch`].
+    async fn restamp_reference(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        ref_meta: &FileMetadata,
+        held: Option<&crate::deltaglider::spool::Spool>,
+        xnode: &super::ReferenceLockGuard,
+        verify: bool,
+    ) -> Result<ReferenceHeal, EngineError> {
+        // The size from the read itself: a broken reference may record none.
+        let source = self
+            .storage
+            .open_reference_source(bucket, deltaspace_id)
             .await?;
-        self.storage
-            .get_reference_to_file(bucket, deltaspace_id, spool.path())
-            .await?;
+        let spool = self.spool_acquire_beside(held, source.size.max(1)).await?;
+        source.write_to(spool.path()).await?;
         let (sha256, md5, size) = Self::hash_spool_file(spool.path()).await?;
+        if verify && !ref_meta.file_sha256.is_empty() && ref_meta.file_sha256 != sha256 {
+            return Ok(ReferenceHeal::Mismatch {
+                recorded: ref_meta.file_sha256.clone(),
+                actual: sha256,
+            });
+        }
         let healed = FileMetadata::new_reference(
             Self::INTERNAL_REFERENCE_NAME.to_string(),
             // source_name is cosmetic (display/label only; not used by decode,
@@ -1729,7 +1769,35 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?;
         self.cache
             .invalidate(&self.cache_key(bucket, deltaspace_id));
-        Ok(healed)
+        Ok(ReferenceHeal::Healed(Box::new(healed)))
+    }
+
+    /// The metadata heal job's step for one deltaspace: under the deltaspace
+    /// locks, re-stamp a reference whose type, SHA-256 or size is missing,
+    /// from its own bytes. A reference whose bytes do not match its recorded
+    /// SHA-256 stays as it is (its deltas may not decode against it).
+    pub async fn heal_reference_metadata(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+    ) -> Result<ReferenceHeal, EngineError> {
+        let _lock = self.acquire_prefix_lock(bucket, deltaspace_id).await;
+        let xnode = self.acquire_reference_lock(bucket, deltaspace_id).await?;
+        let read = match xnode.observed_reference() {
+            Some(observed) => observed,
+            None => {
+                self.reference_metadata_if_present(bucket, deltaspace_id)
+                    .await?
+            }
+        };
+        let Some(read) = read else {
+            return Ok(ReferenceHeal::Absent);
+        };
+        if !Self::reference_metadata_is_corrupt(&read) {
+            return Ok(ReferenceHeal::Healthy);
+        }
+        self.restamp_reference(bucket, deltaspace_id, &read, None, &xnode, true)
+            .await
     }
 
     /// Stream-hash a spool file → (sha256_hex, md5_hex, byte_len). Bounded
@@ -2332,6 +2400,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(false);
         }
         if ref_meta.original_name != filename {
+            return Ok(false);
+        }
+        // Its delta would record the reference's size and SHA-256: a
+        // reference with broken metadata waits for the heal (#187).
+        if Self::reference_metadata_is_corrupt(&ref_meta) {
             return Ok(false);
         }
 

@@ -44,6 +44,8 @@ mod backend_multipart_test;
 mod boot_resilience_test;
 #[path = "bootstrap_password_hash_invariant_test.rs"]
 mod bootstrap_password_hash_invariant_test;
+#[path = "broken_reference_metadata_test.rs"]
+mod broken_reference_metadata_test;
 #[path = "browser_session_connect_test.rs"]
 mod browser_session_connect_test;
 #[path = "bucket_existence_test.rs"]
@@ -162,8 +164,6 @@ mod prod_shape_matrix_test;
 mod public_prefix_list_test;
 #[path = "public_prefix_test.rs"]
 mod public_prefix_test;
-#[path = "python_cli_reference_test.rs"]
-mod python_cli_reference_test;
 #[path = "quota_test.rs"]
 mod quota_test;
 #[path = "race_conditions_test.rs"]

@@ -104,7 +104,7 @@ export function phaseLabel(job: MaintenanceJobView): string {
  * says that uploads work follows `writesBlocked` (the server's answer).
  */
 export function browserBannerText(job: MaintenanceJobView, writesBlocked: boolean): string {
-  const noun = job.kind === 'migrate' ? 'migration' : job.kind === 'backfill-metadata' ? 'metadata backfill' : 're-encryption';
+  const noun = job.kind === 'migrate' ? 'migration' : job.kind === 'backfill-metadata' ? 'metadata heal' : 're-encryption';
   if (job.status === 'cancelling') {
     return writesBlocked
       ? `The ${noun} of this bucket is being cancelled. Files stay readable; uploads and deletes work again when it stops.`
@@ -119,7 +119,7 @@ export function browserBannerText(job: MaintenanceJobView, writesBlocked: boolea
     job.kind === 'migrate'
       ? 'Migrating this bucket to another backend'
       : job.kind === 'backfill-metadata'
-        ? 'Adding metadata to the objects of this bucket'
+        ? 'Healing the metadata of this bucket'
         : 'Re-encrypting this bucket';
   const tail = writesBlocked
     ? 'Files stay readable; uploads and deletes are temporarily unavailable.'

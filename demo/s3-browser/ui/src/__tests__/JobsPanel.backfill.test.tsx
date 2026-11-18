@@ -24,12 +24,12 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllGlobals());
 
-test('New job → Backfill metadata starts the job for the chosen buckets', async () => {
+test('New job → Heal metadata starts the job for the chosen buckets', async () => {
   const user = userEvent.setup();
   renderWithQuery(<JobsPanel />);
   await user.click(await screen.findByRole('button', { name: /New job/ }));
-  await user.click(await screen.findByText(/Backfill metadata…/));
-  const dialog = await screen.findByRole('dialog', { name: /Backfill object metadata/ });
+  await user.click(await screen.findByText(/Heal metadata…/));
+  const dialog = await screen.findByRole('dialog', { name: /Heal metadata/ });
   await user.click(await within(dialog).findByRole('checkbox', { name: 'downloads' }));
   await user.click(within(dialog).getByRole('button', { name: /Start now/ }));
   await waitFor(() => expect(http.callsTo('POST', '/_/api/admin/jobs/backfill-metadata')).toHaveLength(1));
