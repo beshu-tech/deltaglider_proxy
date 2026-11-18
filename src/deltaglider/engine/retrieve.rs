@@ -1385,14 +1385,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                                     deltaspace_id
                                 ))
                             })?;
-                        let size = read.metadata.file_size;
+                        let size = super::metadata::reference_read_size(
+                            read.metadata.file_size,
+                            read.stored_total,
+                        );
                         if size > self.spool_threshold() {
                             return Err(EngineError::ReferenceNotInMemory {
                                 deltaspace: deltaspace_id.to_string(),
                                 size,
                             });
                         }
-                        let bytes = super::metadata::collect_sized(read.stream, size).await?;
+                        let bytes = super::metadata::collect_sized(
+                            read.stream,
+                            size,
+                            &format!("{bucket}/{deltaspace_id}/reference.bin"),
+                        )
+                        .await?;
                         tracing::info!(
                             "Reference passthrough fallback succeeded ({} bytes)",
                             bytes.len()

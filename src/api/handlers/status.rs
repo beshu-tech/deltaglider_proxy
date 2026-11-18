@@ -1260,13 +1260,6 @@ mod readiness_tests {
             "the copy source changed during a copy (the one answer, `copy_source_changed`)",
         ),
         (
-            "src/deltaglider/engine/metadata.rs",
-            "return Err(StorageError::Throttled(format!(",
-            1,
-            Reach::PerRequest,
-            "a stored object changed while it was read",
-        ),
-        (
             "src/deltaglider/engine/store.rs",
             "Err(EngineError::Overloaded(why)) => {",
             1,

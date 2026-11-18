@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A delta GET serves a deltaspace whose reference records no size** (#187). The Python `deltaglider` CLI wrote `reference.bin` without `dg-file-size`, and some copies carry `dg-file-size: "0"`. Since 2.2.0 the proxy read that as a limit of 0 bytes and answered every delta GET of the deltaspace with a permanent `503 SlowDown`. The proxy now reads such a reference up to the length of the stored object, and the reference's SHA-256 still checks the bytes.
+- **A reference that is longer than its recorded size answers `500`, not `503 SlowDown`.** The size and the body come from the same response, so a retry cannot help. The log names the object and says to fix its `dg-file-size` metadata.
+
 ## v2.2.2 — 2026-11-14
 
 ### Fixed

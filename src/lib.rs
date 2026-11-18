@@ -2916,7 +2916,11 @@ mod source_guards {
     /// `dg-no-delta` store hint (not stored).
     #[test]
     fn test_fixtures_come_from_the_write_path() {
-        const ALLOWED: [(&str, &str); 3] = [
+        const ALLOWED: [(&str, &str); 4] = [
+            (
+                "tests/python_cli_reference_test.rs",
+                "plants a Python-CLI reference with no dg-file-size on purpose (#187)",
+            ),
             (
                 "tests/replication_test.rs",
                 "plants a foreign writer's partial dg-* metadata on purpose",

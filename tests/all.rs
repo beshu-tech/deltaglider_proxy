@@ -162,6 +162,8 @@ mod prod_shape_matrix_test;
 mod public_prefix_list_test;
 #[path = "public_prefix_test.rs"]
 mod public_prefix_test;
+#[path = "python_cli_reference_test.rs"]
+mod python_cli_reference_test;
 #[path = "quota_test.rs"]
 mod quota_test;
 #[path = "race_conditions_test.rs"]

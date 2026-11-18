@@ -499,7 +499,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let crate::storage::ObjectRead {
             stream,
             metadata: recorded,
-            ..
+            stored_total,
         } = self
             .storage
             .open_object(
@@ -514,13 +514,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 }
                 other => EngineError::Storage(other),
             })?;
-        if recorded.file_size > self.spool_threshold() {
+        let size = reference_read_size(recorded.file_size, stored_total);
+        if size > self.spool_threshold() {
             return Err(EngineError::ReferenceNotInMemory {
                 deltaspace: deltaspace_id.to_string(),
-                size: recorded.file_size,
+                size,
             });
         }
-        let data = collect_sized(stream, recorded.file_size).await?;
+        let label = format!("{bucket}/{deltaspace_id}/reference.bin");
+        let data = collect_sized(stream, size, &label).await?;
 
         // Validate against the reference's own recorded checksum when present.
         // An empty checksum (out-of-band / CLI-uploaded references) is
@@ -547,26 +549,81 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 }
 
-/// Collect a stream of `size` bytes (the size its metadata records) into
-/// ONE buffer, allocated once. A stream longer than `size` fails: the
-/// object changed while it was read, and the buffer stays bounded.
+/// Pure: how many bytes a reference read may take. The recorded size, or,
+/// when the metadata records none (`dg-file-size` absent or `"0"`, as the
+/// Python CLI wrote it), the stored object's length; its SHA-256 still
+/// checks the bytes (issue #187).
+pub(super) fn reference_read_size(recorded: u64, stored_total: u64) -> u64 {
+    if recorded == 0 {
+        stored_total
+    } else {
+        recorded
+    }
+}
+
+/// Collect a stream of at most `size` bytes into ONE buffer, allocated
+/// once. A longer stream fails: the metadata of `label` (from the same
+/// response) is wrong, so a retry cannot help. A 500 that names it.
 pub(super) async fn collect_sized(
     mut stream: crate::storage::ByteStream,
     size: u64,
+    label: &str,
 ) -> Result<Bytes, StorageError> {
     use futures::StreamExt;
     let mut buf = bytes::BytesMut::with_capacity(usize::try_from(size).unwrap_or(0));
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         if (buf.len() + chunk.len()) as u64 > size {
-            return Err(StorageError::Throttled(format!(
-                "a stored object is longer than its recorded size ({size} bytes); \
-                 it changed while read, retry the request"
+            return Err(StorageError::Other(format!(
+                "{label}: the stored object is longer than its recorded size \
+                 ({size} bytes); fix its dg-file-size metadata"
             )));
         }
         buf.extend_from_slice(&chunk);
     }
     Ok(buf.freeze())
+}
+
+#[cfg(test)]
+mod collect_sized_tests {
+    use super::*;
+
+    fn stream_of(chunks: &[&'static [u8]]) -> crate::storage::ByteStream {
+        let items: Vec<Result<Bytes, StorageError>> =
+            chunks.iter().map(|c| Ok(Bytes::from_static(c))).collect();
+        Box::pin(futures::stream::iter(items))
+    }
+
+    #[test]
+    fn a_missing_recorded_size_reads_the_stored_length() {
+        assert_eq!(reference_read_size(0, 49_765), 49_765);
+        assert_eq!(reference_read_size(10, 49_765), 10);
+        assert_eq!(reference_read_size(0, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn an_overrun_is_a_500_that_names_the_object() {
+        let err = collect_sized(stream_of(&[b"abc", b"def"]), 4, "b/ds/reference.bin")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, StorageError::Other(m) if m.contains("b/ds/reference.bin")),
+            "{err:?}"
+        );
+        let s3: crate::api::S3Error = crate::deltaglider::EngineError::Storage(err).into();
+        assert!(
+            matches!(s3, crate::api::S3Error::InternalError(_)),
+            "{s3:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exact_stream_is_collected() {
+        let got = collect_sized(stream_of(&[b"abc", b"def"]), 6, "x")
+            .await
+            .unwrap();
+        assert_eq!(&got[..], b"abcdef");
+    }
 }
 
 /// Pure: after the reconstruction of a delta failed its checksum, can the
