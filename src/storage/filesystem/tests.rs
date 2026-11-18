@@ -594,9 +594,8 @@ mod backend_tests {
         assert!(backend.bulk_list_objects("bucket", "a/").await.is_ok());
     }
 
-    /// The boot sweep deletes `.dg-tmp.*` and `.tmpXXXXXX` files that are old
-    /// enough. That is safe only because no client can store a key with such
-    /// a file name: the backend refuses it on every write path (passthrough
+    /// The boot sweep deletes `.dg-tmp.*` files that are old enough. That is
+    /// safe only because no client can store a key with such a file name: the backend refuses it on every write path (passthrough
     /// and delta-eligible names alike).
     #[tokio::test]
     async fn a_key_with_a_temp_file_name_is_refused() {
@@ -605,7 +604,7 @@ mod backend_tests {
             .await
             .expect("new backend");
         backend.create_bucket("bucket").await.expect("create");
-        for filename in [".dg-tmp.x", ".tmpAb12Cd", ".dg-tmp.x.zip"] {
+        for filename in [".dg-tmp.x", ".dg-tmp.x.zip"] {
             let put = backend
                 .put_passthrough(
                     "bucket",
@@ -732,7 +731,7 @@ mod backend_tests {
             .join("bucket")
             .join("deltaspaces")
             .join("ghost")
-            .join(".tmpSt4le0");
+            .join(".dg-tmp.St4le0");
         fs::write(hidden, b"tmp").await.expect("write hidden");
         fs::create_dir_all(
             tmp.path()
@@ -1084,11 +1083,8 @@ mod backend_tests {
             )
             .await
             .expect("put cfg/.gitignore");
-        // Temp residue of an interrupted atomic write (old and new names).
+        // Temp residue of an interrupted atomic write.
         let ds = tmp.path().join("bucket").join("deltaspaces");
-        fs::write(ds.join("cfg").join(".tmpAb12Cd"), b"t")
-            .await
-            .unwrap();
         fs::write(ds.join("cfg").join(".dg-tmp.Zz99xx"), b"t")
             .await
             .unwrap();
@@ -1122,10 +1118,12 @@ mod backend_tests {
 
     #[test]
     fn internal_temp_names() {
-        for n in [".tmpAb12Cd", ".tmp000000", ".dg-tmp.x", ".dg-tmp.Zz99xx"] {
+        for n in [".dg-tmp.x", ".dg-tmp.Zz99xx"] {
             assert!(is_internal_temp_name(n), "{n}");
         }
         for n in [
+            ".tmpAb12Cd",
+            ".tmp000000",
             ".env",
             ".gitignore",
             ".tmp",

@@ -298,6 +298,10 @@ async fn read_chunk(
             Err(e) if fsio::absent(&e) => continue, // deleted during the walk
             Err(e) => return Err(io_to_storage_error(e)),
         };
+        // The proxy's own `.dg` entry is no key and holds none.
+        if super::is_internal_dir_name(&name) {
+            continue;
+        }
         let (key_name, is_delta) = if is_dir {
             (name.clone(), false)
         } else {
@@ -347,8 +351,7 @@ pub(super) fn collapse_key(key: &str, prefix: &str, delimiter: &str) -> Option<S
 
 /// Pure: does the flat walk keep this entry? A file is kept when its key
 /// starts with `prefix` and sorts after `token`; a directory when its
-/// subtree may hold such a key. A `.dg` directory is an ordinary folder: its
-/// `reference.bin` is no key, a legacy key in it is (L1, #171).
+/// subtree may hold such a key. The walk never yields a `.dg` entry.
 ///
 /// `skip`: the common prefix just listed. Every key that starts with it is
 /// collapsed already, so it is dropped while the directory is read; without

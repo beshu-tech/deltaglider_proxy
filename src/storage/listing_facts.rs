@@ -92,19 +92,17 @@ pub fn skip_past_facts(last_key: &str) -> Option<&'static str> {
     is_facts_key(last_key).then_some(PAST_FACTS)
 }
 
-/// Is a CommonPrefix of a listing inside the facts namespace? Such a prefix
-/// holds only the proxy's own keys, whatever else the bucket holds: no client
-/// key lives there (the namespace is reserved for every request).
+/// Is a CommonPrefix of a listing inside the proxy's namespace? True when a
+/// complete `.dg` directory lies in it (the part before its last `/`; `.dg`
+/// alone could still be `.dgx`). No client key lives there.
 pub fn is_internal_common_prefix(p: &str) -> bool {
-    p.starts_with(FACTS_ROOT)
+    has_internal_segment(p.rsplit_once('/').map_or("", |(dir, _)| dir))
 }
 
-/// The proxy's own directory name. Since v2.2.0 a client key below a `.dg`
-/// directory is refused at ingest (F19, epic #142). A key that an older
-/// release stored there is a client object like any other: LIST shows it, a
-/// client can read it and delete it, and nothing can write it again. Only the
-/// proxy's own files are hidden: the listing facts and the delta baseline
-/// (see [`is_hidden_key`], [`shows_in_listing`]).
+/// The proxy's own directory name. A client key below a `.dg` directory is
+/// refused on every request (F19, epic #142; L1, #171) and no listing shows
+/// one, whoever stored it: the facts, the markers and any other key there are
+/// the proxy's own.
 pub const INTERNAL_DIR: &str = ".dg";
 
 /// Does a path (a key's directory part, a prefix, a common prefix) go
@@ -113,42 +111,19 @@ pub fn has_internal_segment(path: &str) -> bool {
     path.split('/').any(|s| s == INTERNAL_DIR)
 }
 
-/// THE rule of what a LIST hides: the proxy's own files, which are the
-/// listing facts (under `.dg/facts/` at the root of the bucket) and the delta
-/// baselines (`<folder>/reference.bin`). Everything else, a legacy key below a
-/// `.dg` directory included, is an object. The S3 flat path and probe, the
-/// filesystem walk and the bucket-empty check all follow it (differential
-/// test `s3_and_the_filesystem_list_the_same_keys`).
+/// THE rule of what a LIST hides: every key below a `.dg` directory at any
+/// depth (the listing facts and markers are under `.dg/` at the root of the
+/// bucket) and the delta baselines (`<folder>/reference.bin`). The S3 flat
+/// path and probe, the filesystem walk and the bucket-empty check all follow
+/// it (differential test `s3_and_the_filesystem_list_the_same_keys`).
 pub fn is_own_file(key: &str) -> bool {
-    is_facts_key(key) || crate::types::is_reference_key(key)
+    has_internal_segment(key) || crate::types::is_reference_key(key)
 }
 
-/// A CommonPrefix that no client write can ever extend: a key below it has a
-/// `.dg` directory, and every write path refuses such a key at ingest
-/// (`ObjectKey::validate_ingest`). Only such a prefix is remembered by the
-/// probe (`S3Backend::holds_listed_key`): the remembered answer stays true
-/// whatever the clients write, on every node, with no invalidation. A prefix
-/// like `a/r` or `.` can gain a key at any time and is probed again each time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnwritablePrefix<'a>(&'a str);
-
-impl<'a> UnwritablePrefix<'a> {
-    /// `Some` when a complete `.dg` directory lies in `prefix` (the part
-    /// before its last `/`; `.dg` alone could still be `.dgx`).
-    pub fn of(prefix: &'a str) -> Option<Self> {
-        let dir = prefix.rsplit_once('/').map_or("", |(dir, _)| dir);
-        has_internal_segment(dir).then_some(Self(prefix))
-    }
-
-    pub fn as_str(&self) -> &'a str {
-        self.0
-    }
-}
-
-/// The listing facts alone (a baseline is reported apart by the S3
+/// Every key below a `.dg` directory (a baseline is reported apart by the S3
 /// classifier, so it needs its own answer).
 pub fn is_hidden_key(key: &str) -> bool {
-    is_facts_key(key)
+    has_internal_segment(key)
 }
 
 /// Does a raw backend key make an entry of a LIST? Not one of the proxy's own
@@ -158,12 +133,11 @@ pub fn shows_in_listing(key: &str) -> bool {
 }
 
 /// Pure: could every key under the CommonPrefix `p` be one of the proxy's own
-/// files? True when `p` is a leading part of the facts namespace
-/// (`.dg/facts/`) or ends in a leading part of a baseline name after a
-/// complete folder part (`a/refer` of `a/reference.bin`). With a delimiter
-/// other than `/` such a prefix may also cover a legacy client key (`.` covers
-/// `.dg/facts/...` and `.dg/old.txt`), so the listing looks under it before it
-/// shows it.
+/// files? True when `p` ends in a leading part of `.dg` or of a baseline name
+/// after a complete folder part (`.` or `a/.d` of `a/.dg/x`, `a/refer` of
+/// `a/reference.bin`). With a delimiter other than `/` such a prefix may also
+/// cover a client key (`.` covers `.dg/x` and `.well-known/x`), so the listing
+/// looks under it before it shows it.
 ///
 /// This is the whole of what the text of a prefix can prove. Two shapes need a
 /// request per prefix to prove, and are NOT checked (a LIST page would cost
@@ -179,7 +153,7 @@ pub fn may_hold_only_own_keys(p: &str) -> bool {
             let tail = &p[start..];
             !tail.is_empty()
                 && (crate::types::REFERENCE_FILE_NAME.starts_with(tail)
-                    || (start == 0 && FACTS_ROOT.starts_with(tail)))
+                    || INTERNAL_DIR.starts_with(tail))
         })
 }
 
@@ -899,52 +873,45 @@ mod tests {
     }
 
     #[test]
-    fn facts_common_prefixes_are_internal() {
-        for p in [".dg/facts/", ".dg/facts/zz/", ".dg/facts/x.d"] {
-            assert!(is_internal_common_prefix(p), "{p}");
-        }
-        // A leading part of the namespace may also cover a client key.
+    fn dg_common_prefixes_are_internal() {
         for p in [
             ".dg/",
+            ".dg/facts/",
+            ".dg/facts/zz/",
+            ".dg/facts/x.d",
             ".dg/fac",
-            ".dg/facts",
-            ".d",
-            "",
+            "a/.dg/",
             "a/.dg/facts/x/",
-            ".well-known/",
-            ".dgx/",
+            "a/b/.dg/c.",
         ] {
+            assert!(is_internal_common_prefix(p), "{p}");
+        }
+        // A leading part of `.dg` may also cover a client key.
+        for p in [".dg", ".d", ".", "", "a/.dg", ".well-known/", ".dgx/", "a/"] {
             assert!(!is_internal_common_prefix(p), "{p}");
         }
     }
 
-    /// L1 (#171): the one rule of what a listing hides. Only the proxy's own
-    /// files are hidden: the facts, and the delta baselines (reported
-    /// apart). A key that an older release stored below a `.dg` directory is
-    /// an object like any other.
+    /// L1 (#171): the one rule of what a listing hides: every key below a
+    /// `.dg` directory at any depth, and the delta baselines.
     #[test]
     fn only_the_proxys_own_files_are_hidden_from_listings() {
         for key in [
             ".dg/facts/x!!1.e.1.2.e",
             KEY_CLAIM_KEY,
             CONVERSION_MARKER_KEY,
-        ] {
-            assert!(is_hidden_key(key), "{key}");
-            assert!(!shows_in_listing(key), "{key}");
-        }
-        for key in [
             ".dg/foo",
             "a/.dg/foo",
             "a/b/.dg/c/d.txt",
             ".dg/sub/x",
             "a/.dg/facts/x",
-            ".dgx/a",
             ".dg",
             "a/.dg",
-            ".well-known/a",
-            "dg/a",
-            "a.dg/b",
         ] {
+            assert!(is_hidden_key(key), "{key}");
+            assert!(!shows_in_listing(key), "{key}");
+        }
+        for key in [".dgx/a", ".well-known/a", "dg/a", "a.dg/b", ".dg-x"] {
             assert!(!is_hidden_key(key), "{key}");
             assert!(shows_in_listing(key), "{key}");
         }
@@ -956,10 +923,7 @@ mod tests {
             "a/b/reference.bin",
         ] {
             assert!(!shows_in_listing(key), "{key}");
-            assert!(
-                is_own_file(key) && crate::types::is_reference_key(key),
-                "{key}"
-            );
+            assert!(is_own_file(key), "{key}");
         }
         for key in [
             "a/reference.bin.delta",
@@ -976,57 +940,20 @@ mod tests {
         }
     }
 
-    /// Which prefixes the probe may remember (`UnwritablePrefix`): only those
-    /// below a complete `.dg` directory, where no client write can add a key.
-    #[test]
-    fn only_a_prefix_below_a_dg_directory_is_unwritable() {
-        for p in [
-            ".dg/",
-            ".dg/f",
-            ".dg/facts/",
-            "a/.dg/",
-            "a/.dg/x",
-            "a/.dg/b/c",
-        ] {
-            assert_eq!(UnwritablePrefix::of(p).map(|u| u.as_str()), Some(p), "{p}");
-        }
-        for p in [
-            "",
-            ".",
-            ".d",
-            ".dg",
-            ".dgx/",
-            "a/",
-            "a/r",
-            "a/.",
-            "a/.dg",
-            ".env",
-            "r",
-            "dg/",
-            ".well-known/",
-            "a/.hidden",
-        ] {
-            assert_eq!(UnwritablePrefix::of(p), None, "{p}");
-        }
-    }
-
     /// L2 (#171): which CommonPrefixes need a look under them. Table.
     #[test]
     fn a_common_prefix_that_may_hold_only_own_files_is_checked() {
         for p in [
-            ".dg/",
-            ".dg/f",
-            ".dg/facts",
             ".",
             ".d",
             ".dg",
             "r",
             "ref",
             "a/r",
+            "a/.",
+            "a/b/.d",
             "a/reference.",
             "a/b/reference.b",
-            "a/.dg/r",
-            "a/.dg/reference",
         ] {
             assert!(may_hold_only_own_keys(p), "{p}");
         }
@@ -1047,8 +974,8 @@ mod tests {
             // Not provable from the text (see the function): a folder, and
             // an incomplete folder part.
             "a/.dg/",
-            "a/.",
-            "a/b/.d",
+            ".dg/",
+            ".dg/f",
             "x",
             "a/x",
         ] {
@@ -1072,7 +999,7 @@ mod tests {
                 // `aa/reference.bin` names no folder (see the function).
                 for (own, folder) in [
                     (format!("{dir}reference.bin"), dir.len()),
-                    (format!("{dir}.dg/reference.bin"), dir.len() + ".dg/".len()),
+                    (format!("{dir}.dg/reference.bin"), dir.len()),
                     (".dg/facts/x!!1.e.1.2.e".to_string(), 0),
                 ] {
                     let cut = (folder + cut).min(own.len() - 1);
@@ -1084,8 +1011,8 @@ mod tests {
                         continue;
                     }
                     // A prefix that ends with `/` is a folder (not proven by
-                    // its text), except the root `.dg/` of the facts.
-                    if p.ends_with('/') && !FACTS_ROOT.starts_with(p) {
+                    // its text).
+                    if p.ends_with('/') {
                         continue;
                     }
                     prop_assert!(may_hold_only_own_keys(p), "{p} of {own}");

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Upgrade steps for the next release
+
+- Before you upgrade, copy each object that you need from a key below a `.dg` directory to another key. The new release answers `400` for such a key. See [Upgrade](docs/product/how-to/upgrade.md).
+- A file named `.tmpAb12Cd` (a temporary name of releases before 2.0) in a filesystem data directory is now a listed object and is never swept. Remove such files by hand if you do not need them.
+
+### Changed
+
+- **A key below a `.dg` directory belongs to the proxy.** `.dg` is the proxy's own namespace. A key below a `.dg` directory at any depth, or a file named `.dg`, gets `400` on every request that names it (`GetObject`, `HeadObject`, `DeleteObject`, a copy source), as a write already did. No listing shows such a key, on an S3 backend or on a filesystem backend, with any delimiter. `DeleteBucket` removes such keys when the bucket holds no other key, where it answered `409` before. A migrate does not meet such a key. This removes the exception that release 2.2.1 added for keys that an older release stored there.
+- **Only `.dg-tmp.*` is a temporary file name.** The start-up sweep no longer removes `.tmpXXXXXX` files, and a filesystem backend lists them as ordinary objects.
+
 ### Fixed
 
 - **A write refused before its body is read no longer resets the connection behind a reverse proxy** (#187). For a request whose signature the proxy verified, the proxy now reads up to 64 MiB of the body (30 seconds at most) before it answers with the error; a request that declares a larger body is not read. The body is not read for an anonymous request, a presigned request, a request with `Expect: 100-continue` (the client then sends no body), a request that an IAM policy denies, or a request that an admission block refuses; the connection closes after the answer.

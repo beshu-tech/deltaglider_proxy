@@ -268,3 +268,84 @@ async fn an_encoding_type_url_listing_is_well_formed_for_any_key() {
         assert!(is_xml10(&body), "{query}: {body:?}");
     }
 }
+
+/// L1 (#171): a key below `.dg` that an older release left on disk is the
+/// proxy's own. LIST hides it for every delimiter, no request reads, deletes
+/// or copies it, and DeleteBucket removes it.
+#[tokio::test]
+async fn a_key_below_dg_is_hidden_refused_and_removed_with_the_bucket() {
+    let server = TestServer::builder().build().await;
+    let client = server.s3_client().await;
+    let bucket = server.bucket();
+    let legacy = server
+        .data_dir()
+        .unwrap()
+        .join(bucket)
+        .join("deltaspaces/old/.dg");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("keep.jpg"), b"legacy").unwrap();
+    client
+        .put_object()
+        .bucket(bucket)
+        .key("old/live.txt")
+        .body(b"x".to_vec().into())
+        .send()
+        .await
+        .unwrap();
+
+    for delimiter in [None, Some("/"), Some("."), Some("g")] {
+        for prefix in ["", "old/", "old/.dg/"] {
+            let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
+            if let Some(d) = delimiter {
+                req = req.delimiter(d);
+            }
+            let out = req.send().await.unwrap();
+            let mut seen: Vec<String> = out
+                .contents()
+                .iter()
+                .filter_map(|o| o.key().map(String::from))
+                .collect();
+            seen.extend(
+                out.common_prefixes()
+                    .iter()
+                    .filter_map(|p| p.prefix().map(String::from)),
+            );
+            assert!(
+                seen.iter().all(|k| !k.contains(".dg")),
+                "{delimiter:?} {prefix:?}: {seen:?}"
+            );
+        }
+    }
+    fn status<E: std::fmt::Debug>(e: aws_sdk_s3::error::SdkError<E>) -> u16 {
+        e.raw_response()
+            .unwrap_or_else(|| panic!("{e:?}"))
+            .status()
+            .as_u16()
+    }
+    let key = "old/.dg/keep.jpg";
+    let got = client.get_object().bucket(bucket).key(key).send().await;
+    assert_eq!(status(got.err().unwrap()), 400);
+    let head = client.head_object().bucket(bucket).key(key).send().await;
+    assert_eq!(status(head.err().unwrap()), 400);
+    let del = client.delete_object().bucket(bucket).key(key).send().await;
+    assert_eq!(status(del.err().unwrap()), 400);
+    let copy = client
+        .copy_object()
+        .bucket(bucket)
+        .key("old/copy.jpg")
+        .copy_source(format!("{bucket}/{key}"))
+        .send()
+        .await;
+    assert_eq!(status(copy.err().unwrap()), 400);
+    assert!(legacy.join("keep.jpg").exists());
+
+    client
+        .delete_object()
+        .bucket(bucket)
+        .key("old/live.txt")
+        .send()
+        .await
+        .unwrap();
+    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    assert!(!legacy.exists(), "DeleteBucket removed the leftover");
+}

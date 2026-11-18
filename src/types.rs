@@ -186,6 +186,19 @@ impl ObjectKey {
                 crate::storage::listing_facts::FACTS_ROOT
             )));
         }
+        // `.dg` is the proxy's own directory name at any depth (F19): no
+        // client request names a key below it, and no listing shows one.
+        let internal = crate::storage::listing_facts::INTERNAL_DIR;
+        if crate::storage::listing_facts::has_internal_segment(&self.prefix)
+            || self.filename == internal
+        {
+            return Err(KeyValidationError(format!(
+                "Object key '{}' is refused: '{internal}' is a reserved directory name, \
+                 because the proxy keeps its own files there. See \
+                 {RESERVED_KEYS_DOC_URL}",
+                self.full_key()
+            )));
+        }
         if self.is_directory_marker() {
             return Ok(());
         }
@@ -249,21 +262,6 @@ impl ObjectKey {
                  writes its capability probe there. See {RESERVED_KEYS_DOC_URL}",
                 self.full_key(),
                 crate::coordination::cas_probe::PROBE_PREFIX
-            )));
-        }
-        // `.dg` is the proxy's own directory name at any depth (F19): it
-        // holds the delta baselines and the listing facts, so a new client
-        // key there could be mistaken for one of them. A key that an older
-        // release stored there stays an ordinary listed key (L1, #171).
-        let internal = crate::storage::listing_facts::INTERNAL_DIR;
-        if crate::storage::listing_facts::has_internal_segment(&self.prefix)
-            || self.filename == internal
-        {
-            return Err(KeyValidationError(format!(
-                "Object key '{}' is refused: '{internal}' is a reserved directory name, \
-                 because the proxy keeps its own files there. See \
-                 {RESERVED_KEYS_DOC_URL}",
-                self.full_key()
             )));
         }
         Ok(())
@@ -1180,11 +1178,10 @@ mod tests {
     }
 
     /// F19 (epic #142): `.dg` is the proxy's own directory name at any
-    /// depth. A PUT refuses it; a read or delete of an existing key stays
-    /// possible (and a listing shows it, L1 #171), so a bucket that an older
-    /// release filled can be cleaned.
+    /// depth. Every request that names a key refuses it: PUT, GET, HEAD,
+    /// DELETE and a copy source (L1, #171).
     #[test]
-    fn a_dg_directory_is_refused_at_ingest_at_any_depth() {
+    fn a_dg_directory_is_refused_on_every_key_request_at_any_depth() {
         for key in [
             ".dg/other.txt",
             "a/.dg/facts/x",
@@ -1195,8 +1192,12 @@ mod tests {
             ".dg",
         ] {
             let k = ObjectKey::parse("b", key);
-            let e = k.validate_ingest().unwrap_err().to_string();
-            assert!(e.contains("reserved directory name"), "{key}: {e}");
+            for e in [
+                k.validate_ingest().unwrap_err().to_string(),
+                k.validate_object().unwrap_err().to_string(),
+            ] {
+                assert!(e.contains("reserved directory name"), "{key}: {e}");
+            }
         }
         for key in [
             ".dgx/a",
@@ -1211,11 +1212,12 @@ mod tests {
                 "{key}"
             );
         }
-        // Reads and deletes only refuse the facts namespace.
-        assert!(ObjectKey::parse("b", ".dg/other.txt")
-            .validate_object()
-            .is_ok());
-        assert!(ObjectKey::parse("b", "a/.dg/x").validate_object().is_ok());
+        for key in [".dgx/a", "a.dg/b"] {
+            assert!(
+                ObjectKey::parse("b", key).validate_object().is_ok(),
+                "{key}"
+            );
+        }
     }
 
     /// Explore #13: the refusal names the rule it applies and links the

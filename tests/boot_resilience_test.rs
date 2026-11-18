@@ -534,7 +534,7 @@ fn temp_files_below(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
-/// The boot sweep removes old `.dg-tmp.*` and `.tmpXXXXXX` files. A client
+/// The boot sweep removes old `.dg-tmp.*` files. A client
 /// must not be able to store such a key, or the next boot would delete it.
 #[tokio::test]
 async fn a_client_cannot_store_a_key_that_the_temp_sweep_would_delete() {
@@ -544,7 +544,7 @@ async fn a_client_cannot_store_a_key_that_the_temp_sweep_would_delete() {
     let data = server.data_dir().expect("data dir").to_path_buf();
     let http = server.http();
     // Passthrough names and a delta-eligible one.
-    for key in ["a/.dg-tmp.x", "a/.tmpAb12Cd", "a/.dg-tmp.y.zip"] {
+    for key in ["a/.dg-tmp.x", "a/.dg-tmp.y.zip"] {
         let r = http
             .s3_request(reqwest::Method::PUT, &format!("{ep}/{bucket}/{key}"))
             .body(b"payload".to_vec())
@@ -596,27 +596,29 @@ async fn a_restart_after_sigkill_sweeps_the_stale_temp_file() {
         path
     };
     let stale = plant(".dg-tmp.killed0", 7200);
-    let stale_old_name = plant(".tmpAb12Cd", 7200);
+    let old_release_name = plant(".tmpAb12Cd", 7200);
     let fresh = plant(".dg-tmp.fresh0", 0);
     let kept = plant("photo.jpg", 7200);
 
     server.respawn_with_env(&[]).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while stale.exists() || stale_old_name.exists() {
+    while stale.exists() {
         assert!(
             std::time::Instant::now() < deadline,
-            "a stale temp file is still there after the restart: {} {}",
-            stale.exists(),
-            stale_old_name.exists()
+            "a stale temp file is still there after the restart"
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(fresh.exists(), "a fresh temp file must be kept");
     assert!(kept.exists(), "an old file with a normal name must be kept");
+    assert!(
+        old_release_name.exists(),
+        "a `.tmpXXXXXX` file is no temp file of this release"
+    );
 
     let listing = common::list_objects_raw(&server.http(), &ep, &bucket, "").await;
     assert!(
-        !listing.contains(".dg-tmp.") && !listing.contains(".tmpAb12Cd"),
+        !listing.contains(".dg-tmp."),
         "LIST shows a temp file: {listing}"
     );
 }

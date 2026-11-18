@@ -1416,13 +1416,11 @@ async fn test_migrate_moves_a_read_only_bucket_with_plaintext_history() {
 }
 
 /// L1 (#171): a key that an older release stored below a `.dg` directory is
-/// an object: LIST shows it, so a migrate meets it. The destination refuses
-/// to write it again, so the job stops before the flip and the source stays
-/// authoritative with its data. The owner deletes the key (a delete is
-/// allowed), and the migrate then completes.
+/// the proxy's own. No request names it, LIST hides it, so the migrate does
+/// not meet it: it completes, the key is not copied, and it goes with the
+/// source bucket.
 #[tokio::test]
-async fn test_migrate_meets_a_legacy_dg_key_and_stops_before_the_flip() {
-    crate::common::expect_server_errors("the legacy key's copy is refused (asserted)");
+async fn test_migrate_ignores_a_key_below_dg() {
     let dir_a = tempfile::TempDir::new().unwrap();
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migbkt";
@@ -1439,31 +1437,31 @@ async fn test_migrate_meets_a_legacy_dg_key_and_stops_before_the_flip() {
     std::fs::create_dir_all(&legacy_dir).unwrap();
     std::fs::write(legacy_dir.join("keep.jpg"), b"legacy bytes").unwrap();
     let listing = listed_keys(&http, &endpoint, bucket).await;
-    assert!(listing.contains("old/.dg/keep.jpg"), "{listing}");
+    assert!(!listing.contains(".dg"), "{listing}");
+    let url = format!("{endpoint}/{bucket}/old/.dg/keep.jpg");
+    for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
+        let resp = http.request(method.clone(), &url).send().await.unwrap();
+        assert_eq!(resp.status(), 400, "{method}");
+    }
 
     let admin = admin_http_client(&endpoint).await;
     let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
     assert_eq!(resp.status(), 202);
     wait_job_done(&admin, &endpoint, bucket).await;
     let job = newest_job(&admin, &endpoint).await;
-    assert_ne!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(job["status"], "succeeded", "job: {job}");
     assert_eq!(
         bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
-        None,
-        "no flip"
+        Some("dst"),
+        "flipped"
     );
-    assert_eq!(
-        get_bytes(&http, &endpoint, bucket, "old/.dg/keep.jpg").await,
-        b"legacy bytes"
-    );
+    assert!(!dir_b
+        .path()
+        .join(bucket)
+        .join("deltaspaces/old/.dg")
+        .exists());
+    assert!(!listed_keys(&http, &endpoint, bucket).await.contains(".dg"));
     assert!(transient_keys(&admin, &endpoint).await.is_empty());
-
-    delete_object(&http, &endpoint, bucket, "old/.dg/keep.jpg").await;
-    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
-    assert_eq!(resp.status(), 202);
-    wait_job_done(&admin, &endpoint, bucket).await;
-    let job = newest_job(&admin, &endpoint).await;
-    assert_eq!(job["status"], "succeeded", "job: {job}");
 }
 
 /// A capability probe key that a stopped probe left in the source bucket is

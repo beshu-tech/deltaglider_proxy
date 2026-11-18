@@ -163,16 +163,23 @@ fn note_held(n: usize) {
 #[cfg(not(test))]
 fn note_held(_n: usize) {}
 
-/// Is `name` one of this backend's temp files, and so never a user object?
-/// `.dg-tmp.*` (current) or tempfile's default `.tmpXXXXXX` (older
-/// releases). Every other `.`-name (`.env`, `.gitignore`) is a user object:
-/// LIST shows it and DeleteBucket must not erase it.
+/// Is `name` one of this backend's temp files (`.dg-tmp.*`), and so never a
+/// user object? Every other `.`-name (`.env`, `.gitignore`, `.tmpAb12Cd`) is
+/// a user object: LIST shows it and DeleteBucket must not erase it.
 pub(crate) fn is_internal_temp_name(name: &str) -> bool {
-    if name.starts_with(INTERNAL_TEMP_PREFIX) {
-        return true;
-    }
-    name.strip_prefix(".tmp")
-        .is_some_and(|r| r.len() == 6 && r.bytes().all(|b| b.is_ascii_alphanumeric()))
+    name.starts_with(INTERNAL_TEMP_PREFIX)
+}
+
+/// Is `name` the proxy's own `.dg` entry? A walk never reads it: no client
+/// key lives below it, and DeleteBucket removes it.
+pub(crate) fn is_internal_dir_name(name: &str) -> bool {
+    name == crate::storage::listing_facts::INTERNAL_DIR
+}
+
+/// Does a listing prefix name a place below a `.dg` directory? Such a
+/// prefix lists nothing.
+fn prefix_is_below_internal_dir(dir_part: &str) -> bool {
+    crate::storage::listing_facts::has_internal_segment(dir_part)
 }
 
 /// Refuse a prefix or filename that the OS path join would resolve to a
@@ -742,10 +749,9 @@ impl FilesystemBackend {
     /// Return true when a deltaspace subtree contains at least one user-visible
     /// data file. Empty physical directories are not S3 prefixes and must not
     /// leak into delimiter listings as undeletable "folders". Every file
-    /// counts, a `.dg` directory's too (a legacy key is one that LIST shows);
-    /// a `reference.bin` and a temp file do not. This is the one check of the
-    /// listing's folders and of the bucket delete, which must never erase
-    /// what it cannot name.
+    /// counts; a `.dg` entry, a `reference.bin` and a temp file do not. This
+    /// is the one check of the listing's folders and of the bucket delete,
+    /// which must never erase what it cannot name.
     fn dir_has_visible_data_recursive<'a>(
         current_dir: &'a Path,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
@@ -756,6 +762,13 @@ impl FilesystemBackend {
             let mut entries = fs::read_dir(current_dir).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_internal_dir_name)
+                {
+                    continue;
+                }
                 let ft = entry.file_type().await?;
                 if ft.is_dir() {
                     if Self::dir_has_visible_data_recursive(&path).await? {
@@ -801,6 +814,24 @@ impl FilesystemBackend {
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
                 let ft = entry.file_type().await?;
+                // The proxy's own `.dg` entry holds no client key: remove it.
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_internal_dir_name)
+                {
+                    let removed = if ft.is_dir() {
+                        fs::remove_dir_all(&path).await
+                    } else {
+                        fsio::remove_file(&path).await
+                    };
+                    match removed {
+                        Ok(()) => {}
+                        Err(e) if fsio::absent(&e) => {}
+                        Err(e) => return Err(io_to_storage_error(e)),
+                    }
+                    continue;
+                }
                 if ft.is_dir() {
                     if Self::prune_invisible_data_recursive(&path).await? {
                         match fs::remove_dir(&path).await {
@@ -887,6 +918,9 @@ impl FilesystemBackend {
 
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
+                if entry.file_name().to_str().is_some_and(is_internal_dir_name) {
+                    continue;
+                }
                 let ft = entry.file_type().await?;
                 if ft.is_dir() {
                     Self::find_deltaspaces_recursive(base_dir, &path, prefixes).await?;
@@ -925,6 +959,9 @@ impl FilesystemBackend {
                 Err(e) => return Err(io_to_storage_error(e)),
             };
             while let Some(entry) = entries.next_entry().await? {
+                if entry.file_name().to_str().is_some_and(is_internal_dir_name) {
+                    continue;
+                }
                 if entry.file_type().await?.is_dir() {
                     Self::find_references_recursive(base_dir, &entry.path(), prefixes).await?;
                 } else if entry.file_name() == crate::types::REFERENCE_FILE_NAME {
@@ -950,6 +987,9 @@ impl FilesystemBackend {
             let mut entries = fs::read_dir(current_dir).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
+                if entry.file_name().to_str().is_some_and(is_internal_dir_name) {
+                    continue;
+                }
                 let ft = entry.file_type().await?;
                 if ft.is_dir() {
                     Self::bulk_walk_recursive(deltaspaces_dir, &path, results, baselines).await?;
@@ -1035,6 +1075,9 @@ impl FilesystemBackend {
         // the prefix names completely, keep the keys that start with it.
         let dir_part = prefix.rfind('/').map_or("", |i| &prefix[..i]);
         check_path_segments(dir_part, "")?;
+        if prefix_is_below_internal_dir(dir_part) {
+            return Ok(empty);
+        }
         let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
         let walk_root = if dir_part.is_empty() {
             deltaspaces_dir
@@ -2129,6 +2172,9 @@ impl StorageBackend for FilesystemBackend {
         // A `.`/empty segment would walk another directory and report its
         // keys under the alias.
         check_path_segments(dir_part, "")?;
+        if prefix_is_below_internal_dir(dir_part) {
+            return Ok(BulkListing::default());
+        }
         let walk_root = if dir_part.is_empty() {
             deltaspaces_dir.clone()
         } else {
@@ -2229,7 +2275,7 @@ impl StorageBackend for FilesystemBackend {
         };
         // A directory that does not exist is an empty result, not an error.
         // A stat error is an error, never "no keys" (review B11).
-        if !fsio::exists(&read_dir_path).await? {
+        if prefix_is_below_internal_dir(dir_part) || !fsio::exists(&read_dir_path).await? {
             return Ok(Some(no_keys()));
         }
         let token = continuation_token.unwrap_or("");
@@ -2333,9 +2379,8 @@ impl StorageBackend for FilesystemBackend {
 
 /// Pure: does the single-level listing (`delimiter = /`) keep this entry of
 /// the directory `dir_key`? A name must start with the filter and its entry
-/// (`dir/name` or `dir/name/`) sort after the token. A `.dg` directory is an
-/// ordinary folder: its `reference.bin` is no key, and a legacy key in it is
-/// (L1, #171). A marker file at the bucket root names no key.
+/// (`dir/name` or `dir/name/`) sort after the token. The walk never yields a `.dg` entry. A marker file
+/// at the bucket root names no key.
 fn level_keep(name_filter: &str, token: &str, dir_key: &str, e: &WalkEntry) -> bool {
     if !e.key_name.starts_with(name_filter) || (dir_key.is_empty() && e.key_name.is_empty()) {
         return false;
@@ -2371,7 +2416,7 @@ impl FilesystemBackend {
         let want = max_keys as usize + 1;
         let mut objects: Vec<(String, FileMetadata)> = Vec::new();
         let mut prefixes: Vec<String> = Vec::new();
-        let walk = if !fsio::exists(&walk_root).await? {
+        let walk = if prefix_is_below_internal_dir(dir_part) || !fsio::exists(&walk_root).await? {
             None
         } else {
             FlatWalk::open(

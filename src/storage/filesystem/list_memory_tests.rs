@@ -307,7 +307,8 @@ mod listing_model {
                     let mut parts: Vec<&str> = dirs.iter().map(|&d| SEGS[d]).collect();
                     parts.push(SEGS[*file]);
                     // A key below a `.dg` directory: the write path refuses
-                    // it now; an older release stored it (L1, #171).
+                    // it. It goes on disk as leftover and is in no listing
+                    // (L1, #171).
                     let legacy = parts[..parts.len() - 1].contains(&".dg");
                     let key = parts.join("/");
                     if engine
@@ -321,14 +322,11 @@ mod listing_model {
                         // release left it. A path that clashes with another
                         // key (a file where a folder goes) is skipped.
                         let path = tmp.path().join("b").join("deltaspaces").join(&key);
-                        let made = path
+                        let _ = path
                             .parent()
                             .is_some_and(|p| std::fs::create_dir_all(p).is_ok())
                             && !path.exists()
                             && std::fs::write(&path, b"x").is_ok();
-                        if made {
-                            stored.insert(key);
-                        }
                     }
                     // Any other refused key (a reserved name) is not stored:
                     // it is not in the model either.
@@ -413,25 +411,16 @@ mod listing_model {
 }
 
 /// L1 (#171): a key that an older release stored below a `.dg` directory is
-/// an ordinary object. Flat, by level and with another delimiter, LIST shows
-/// it; a client reads and deletes it; the bucket deletes after that, and not
-/// before. The folder with only a baseline stays unlisted.
+/// the proxy's own. Flat, by level and with another delimiter, LIST shows
+/// nothing of it; a client cannot read or delete it; DeleteBucket removes it.
 #[tokio::test]
-async fn a_legacy_dg_key_is_listed_readable_and_deletable() {
+async fn a_key_below_dg_is_hidden_refused_and_removed_with_the_bucket() {
     let (tmp, engine) = engine_with_folder(0).await;
     let ds = tmp.path().join("b").join("deltaspaces").join("x");
     std::fs::create_dir_all(ds.join(".dg")).unwrap();
     std::fs::write(ds.join(".dg").join("foo.jpg"), b"legacy").unwrap();
-    // The baseline of folder `x` shares the directory; `y` has only one.
     std::fs::write(ds.join(".dg").join("reference.bin"), b"ref").unwrap();
-    let only_baseline = tmp
-        .path()
-        .join("b")
-        .join("deltaspaces")
-        .join("y")
-        .join(".dg");
-    std::fs::create_dir_all(&only_baseline).unwrap();
-    std::fs::write(only_baseline.join("reference.bin"), b"ref").unwrap();
+    std::fs::write(ds.join("kept.txt"), b"k").unwrap();
 
     let names = |page: &crate::deltaglider::ListObjectsPage| {
         let mut v: Vec<String> = page.objects.iter().map(|(k, _)| k.clone()).collect();
@@ -447,28 +436,31 @@ async fn a_legacy_dg_key_is_listed_readable_and_deletable() {
                 .unwrap()
         }
     };
-    assert_eq!(names(&list("", None).await), ["x/.dg/foo.jpg"]);
-    assert_eq!(names(&list("", Some("/")).await), ["x/"]);
-    assert_eq!(names(&list("x/", Some("/")).await), ["x/.dg/"]);
-    assert_eq!(names(&list("x/.dg/", Some("/")).await), ["x/.dg/foo.jpg"]);
-    assert_eq!(names(&list("x/", Some("g")).await), ["x/.dg"]);
-    assert_eq!(names(&list("", Some(".")).await), ["x/."]);
-    assert_eq!(names(&list("y/", Some("/")).await), Vec::<String>::new());
+    assert_eq!(names(&list("", None).await), ["x/kept.txt"]);
+    assert_eq!(names(&list("x/", Some("/")).await), ["x/kept.txt"]);
+    assert!(names(&list("x/.dg/", Some("/")).await).is_empty());
+    assert!(names(&list("x/.dg/", None).await).is_empty());
+    assert_eq!(names(&list("x/", Some("g")).await), ["x/kept.txt"]);
+    assert_eq!(names(&list("", Some(".")).await), ["x/kept."]);
 
-    assert!(engine.head("b", "x/.dg/foo.jpg").await.is_ok());
-    // The bucket holds a key that LIST shows: it does not delete.
+    assert!(engine.head("b", "x/.dg/foo.jpg").await.is_err());
+    assert!(engine.retrieve_stream("b", "x/.dg/foo.jpg").await.is_err());
+    assert!(engine.delete("b", "x/.dg/foo.jpg").await.is_err());
+    assert!(ds.join(".dg").join("foo.jpg").exists());
+    // A client key keeps the bucket.
     assert!(matches!(
         engine.delete_bucket("b").await,
         Err(crate::deltaglider::EngineError::Storage(
             crate::storage::StorageError::BucketNotEmpty(_)
         ))
     ));
-    engine.delete("b", "x/.dg/foo.jpg").await.unwrap();
-    assert!(names(&list("", None).await).is_empty());
-    // The test baselines have no metadata: the engine cannot reclaim them.
-    std::fs::remove_dir_all(ds.join(".dg")).unwrap();
-    std::fs::remove_dir_all(&only_baseline).unwrap();
+    assert!(
+        ds.join(".dg").join("foo.jpg").exists(),
+        "kept with the bucket"
+    );
+    engine.delete("b", "x/kept.txt").await.unwrap();
     engine.delete_bucket("b").await.unwrap();
+    assert!(!tmp.path().join("b").exists());
 }
 
 /// L3 (#171): the page after a common prefix starts after it. The key

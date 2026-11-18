@@ -427,9 +427,20 @@ A coordination bucket that the boot probe proves to have no atomic conditional w
 
 Three of these reasons stop a configuration that started before: the spool directory, the backend name that resolves to a refused address, and the coordination bucket that the backend refuses. They stay fatal. The proxy lists the buckets of every backend, so a backend that cannot be reached fails requests in another place if the start does not stop. A coordination bucket that the backend refuses leaves the lease, the reference lock and the config sync without a store. If you see no safe way to change one of them, start the previous version and report the case.
 
-## A key below a `.dg` directory (2.2.0, listed again in 2.2.1)
+## A key below a `.dg` directory is hidden and refused (2.2.0, next release)
 
-Since 2.2.0, a request that writes a key with a directory named `.dg` at any depth, or a file named `.dg`, gets `400 InvalidArgument`: `PutObject`, `CopyObject` to that key, `CreateMultipartUpload` and a browser form upload. The proxy keeps its own files in directories with this name (the delta baselines and, on an S3 backend, the listing facts). A key such as `releases/.dg/notes.txt` that an older release stored stays in the bucket. Release 2.2.0 listed no such key, so a bucket that held only these keys looked empty, and `DeleteBucket` answered `409 BucketNotEmpty` for it. From release 2.2.1 on, a listing shows these keys like any other key, a client can read them and delete them, and `DeleteBucket` names the first one in its `409` message. The proxy never shows its own files, which are the listing facts and the delta baselines (`reference.bin`). A migrate stops with a failure that names such a key, because the new place refuses to store it, and the job does not flip the bucket. Delete the key (or copy it to a key outside `.dg`) and start the migrate again. A replication rule records the same failure for such a key. A lifecycle rule ignores such a key: it never expires it and never moves it. During a rolling upgrade, a node of a release before 2.2.0 (or a writer outside the proxy) can still write below a `.dg` directory. A listing can miss such a key for up to 60 seconds, because the proxy remembers for that time that the root `.dg/` folder holds only its own files.
+The proxy keeps its own files in directories named `.dg`: the delta baselines and, on an S3 backend, the listing facts. Since 2.2.0, a request that writes a key with a directory named `.dg` at any depth, or a file named `.dg`, gets `400 InvalidArgument`. Release 2.2.1 listed a key that an older release had stored there, such as `releases/.dg/notes.txt`, and allowed a read and a delete of it. The next release removes that exception. A key below a `.dg` directory is the proxy's own, whoever stored it.
+
+- No listing shows such a key, on an S3 backend or on a filesystem backend.
+- `GetObject`, `HeadObject`, `DeleteObject` and a copy of such a key get `400`, as a write does.
+- `DeleteBucket` removes such keys when the bucket holds no other key. It no longer answers `409 BucketNotEmpty` because of them.
+- A migrate does not meet such a key. It is not copied, and it is removed with the source bucket.
+
+Before you upgrade, copy every object that you need from a key below `.dg` to another key, with a release before this one. The new release cannot read the object. The proxy never deletes such a key while the bucket holds other keys, so the object stays on the backend and you can still read it with a tool that does not use the proxy.
+
+## A temporary file named `.tmpXXXXXX` is a user object (next release)
+
+The start-up sweep of a filesystem backend removes only files named `.dg-tmp.*`. Release 2.2.1 also removed an old file named like `.tmpAb12Cd` when it carried no proxy metadata. That name was the temporary name of releases before 2.0. The next release treats it as an ordinary name: a listing shows such a file, and nothing removes it. Remove old files of that name yourself if a release before 2.0 left some in your data directory.
 
 ## A name of 255 bytes on every backend (2.2.0)
 

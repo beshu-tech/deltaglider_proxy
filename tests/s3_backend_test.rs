@@ -1231,6 +1231,84 @@ async fn review3_the_facts_namespace_is_not_listed() {
     );
 }
 
+/// L1 (#171): a key below `.dg` that an older release left in the bucket is
+/// the proxy's own. LIST hides it, a read answers 400, and DeleteBucket
+/// removes it once the bucket holds no other key.
+#[tokio::test]
+async fn l1_a_key_below_dg_is_hidden_refused_and_removed_with_the_bucket() {
+    skip_unless_minio!();
+    let bucket = review3_bucket("dgleft").await;
+    let raw = minio_client().await;
+    for key in [
+        ".dg/old.txt",
+        ".dg/facts/x!!1.e.1.2.e",
+        "a/.dg/y.bin",
+        "a/live.txt",
+    ] {
+        raw.put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+    let server = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(&bucket)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for delimiter in [None, Some("/"), Some(".")] {
+        let mut req = client.list_objects_v2().bucket(&bucket);
+        if let Some(d) = delimiter {
+            req = req.delimiter(d);
+        }
+        let out = req.send().await.unwrap();
+        let mut seen: Vec<String> = out
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(String::from))
+            .collect();
+        seen.extend(
+            out.common_prefixes()
+                .iter()
+                .filter_map(|p| p.prefix().map(String::from)),
+        );
+        assert!(
+            seen.iter().all(|k| !k.contains(".dg")),
+            "{delimiter:?}: {seen:?}"
+        );
+    }
+    let got = client
+        .get_object()
+        .bucket(&bucket)
+        .key("a/.dg/y.bin")
+        .send()
+        .await
+        .expect_err("a `.dg` key is refused");
+    assert_eq!(got.raw_response().unwrap().status().as_u16(), 400);
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key("a/live.txt")
+        .send()
+        .await
+        .unwrap();
+    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    let left = raw
+        .list_objects_v2()
+        .bucket(&bucket)
+        .send()
+        .await
+        .err()
+        .map(|e| format!("{e:?}"));
+    assert!(
+        left.is_some_and(|e| e.contains("NoSuchBucket")),
+        "bucket gone"
+    );
+}
+
 /// Review3 C3: a plain (unencrypted) passthrough whose stored ETag is not
 /// its logical ETag (a proxy-assembled multipart upload: MD5 stored, `-N`
 /// logical) gets a facts object on PUT, but the raw `delete_passthrough`

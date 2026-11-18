@@ -177,55 +177,63 @@ impl S3Backend {
         });
     }
 
-    /// Delete every listing-facts object of `bucket` when nothing else is
-    /// stored in it (the keys before and after the facts namespace are
-    /// checked first). A bucket with objects keeps its facts, and
-    /// DeleteBucket then fails as it must.
-    pub(super) async fn purge_listing_facts_if_only_ones(
+    /// Delete every key below a `.dg` directory (the listing facts, the key
+    /// claim, the conversion marker and any older client key there) when
+    /// nothing else is stored in the bucket. The first pass proves that: it
+    /// reads every key, jumping past the facts namespace, and stops at a key
+    /// outside `.dg`. A bucket with such a key keeps all of its own files,
+    /// and DeleteBucket then fails as it must. A baseline is not a `.dg` key:
+    /// only the engine deletes it.
+    pub(super) async fn purge_own_keys_if_only_ones(
         &self,
         bucket: &str,
     ) -> Result<(), StorageError> {
-        let first_key = |start_after: Option<&str>| {
-            let request = self
-                .client
-                .list_objects_v2()
-                .bucket(bucket)
-                .max_keys(1)
-                .set_start_after(start_after.map(String::from));
-            async move {
-                request
-                    .send()
-                    .await
-                    .map(|r| r.contents().first().and_then(|o| o.key()).map(String::from))
-                    .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))
-            }
-        };
-        match first_key(None).await? {
-            Some(k) if listing_facts::is_facts_key(&k) => {}
-            _ => return Ok(()),
-        }
-        // Past every key under `.dg/facts/` (`0` follows `/`).
-        let after_facts = format!("{}0", listing_facts::FACTS_ROOT.trim_end_matches('/'));
-        if first_key(Some(&after_facts)).await?.is_some() {
-            return Ok(());
-        }
+        let mut start_after: Option<String> = None;
         let mut token: Option<String> = None;
         loop {
             let resp = self
                 .client
                 .list_objects_v2()
                 .bucket(bucket)
-                .prefix(listing_facts::FACTS_ROOT)
+                .set_start_after(start_after.take())
                 .set_continuation_token(token.take())
                 .send()
                 .await
                 .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
-            // One DeleteObjects per page, not a DELETE per facts object. A
-            // key left behind makes DeleteBucket fail, as it must.
+            let keys: Vec<&str> = resp.contents().iter().filter_map(|o| o.key()).collect();
+            if keys.iter().any(|k| !listing_facts::is_hidden_key(k)) {
+                return Ok(());
+            }
+            if !resp.is_truncated().unwrap_or(false) {
+                break;
+            }
+            match keys.last().and_then(|k| listing_facts::skip_past_facts(k)) {
+                Some(past) => start_after = Some(past.to_string()),
+                None => match resp.next_continuation_token() {
+                    Some(t) => token = Some(t.to_string()),
+                    None => return Err(super::listing::truncated_without_token(bucket)),
+                },
+            }
+        }
+        // Only `.dg` keys exist. A page of the second pass deletes only keys
+        // that the rule names, so a key written meanwhile is never touched.
+        let mut token: Option<String> = None;
+        loop {
+            let resp = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .set_continuation_token(token.take())
+                .send()
+                .await
+                .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
+            // One DeleteObjects per page, not a DELETE per key. A key left
+            // behind makes DeleteBucket fail, as it must.
             let keys: Vec<String> = resp
                 .contents()
                 .iter()
                 .filter_map(|o| o.key().map(str::to_string))
+                .filter(|k| listing_facts::is_hidden_key(k))
                 .collect();
             super::super::facts_cleanup::delete_facts_keys(&self.client, bucket, keys).await;
             match resp.next_continuation_token() {

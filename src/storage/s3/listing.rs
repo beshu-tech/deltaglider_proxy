@@ -647,24 +647,9 @@ const PROBE_PAGE: i32 = 16;
 /// Requests one probe of a prefix may send, over both of its ranges.
 const PROBE_REQUESTS_MAX: u32 = 6;
 /// Prefixes one LIST page probes: the extra requests of a page are at most
-/// `PROBES_PER_PAGE x PROBE_REQUESTS_MAX` (the common case is 2 for the root
-/// `.dg/`, 0 once it is remembered).
+/// `PROBES_PER_PAGE x PROBE_REQUESTS_MAX` (a prefix below `.dg` is decided by
+/// its text and sends none).
 pub(super) const PROBES_PER_PAGE: u32 = 8;
-/// How long an [`UnwritablePrefix`] with no listed key is remembered. No
-/// client write adds a key below it (every write path refuses a `.dg`
-/// directory), so only an older release writing at the same time could make
-/// the answer stale, and it shows in at most this long.
-const OWN_ONLY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// [`UnwritablePrefix`]es (`scope\0bucket\0prefix`) found to hold only the
-/// proxy's own files. Nothing else is stored here: see `holds_listed_key`.
-static OWN_ONLY_PREFIXES: std::sync::LazyLock<moka::sync::Cache<String, ()>> =
-    std::sync::LazyLock::new(|| {
-        moka::sync::Cache::builder()
-            .max_capacity(10_000)
-            .time_to_live(OWN_ONLY_TTL)
-            .build()
-    });
 
 /// What a range of a probe found.
 enum ProbeVerdict {
@@ -693,15 +678,9 @@ impl S3Backend {
     ///   two ranges, past the facts (`start_after = PAST_FACTS`, one request
     ///   when nothing lies there) and up to the first facts key. The facts
     ///   (hundreds, in a busy bucket) are never paged through.
-    /// * A prefix with no listed key is remembered for `OWN_ONLY_TTL` ONLY
-    ///   when it is an [`UnwritablePrefix`] (below a `.dg` directory, where
-    ///   no client write adds a key), so the next LIST of the level sends no
-    ///   probe and the answer cannot go stale. Any other prefix (`a/r`, `.`)
-    ///   is probed each time: a client can write a key under it at any moment.
     /// * A probe that fails because the backend refuses the PREFIX as a name
     ///   (MinIO answers `XMinioInvalidResourceName` for `prefix=.`) shows the
-    ///   prefix, unchecked, unless it is an [`UnwritablePrefix`], the proxy's
-    ///   own namespace, which is then hidden. Every other error (a `503`, a
+    ///   prefix, unchecked. Every other error (a `503`, a
     ///   timeout, an auth error) is the error of the page, as a failed page
     ///   request is: a retryable error stays retryable, and a dying backend
     ///   costs one request timeout, not eight.
@@ -714,15 +693,6 @@ impl S3Backend {
         requests: &mut u32,
         budget: &mut u32,
     ) -> Result<bool, StorageError> {
-        let unwritable = listing_facts::UnwritablePrefix::of(prefix);
-        let remembered =
-            unwritable.map(|u| format!("{}\0{bucket}\0{}", self.list_cache_scope, u.as_str()));
-        if remembered
-            .as_ref()
-            .is_some_and(|key| OWN_ONLY_PREFIXES.contains_key(key))
-        {
-            return Ok(false);
-        }
         if *budget == 0 {
             return Ok(true);
         }
@@ -746,8 +716,7 @@ impl S3Backend {
                 Ok(ProbeVerdict::Refused) => {
                     *requests += sent;
                     debug!("the backend refuses the prefix {prefix:?} of {bucket} as a name");
-                    // The proxy's own namespace is never shown.
-                    return Ok(unwritable.is_none());
+                    return Ok(true);
                 }
                 Ok(ProbeVerdict::Nothing) => {}
                 Err(e) => {
@@ -757,9 +726,6 @@ impl S3Backend {
             }
         }
         *requests += sent;
-        if let Some(key) = remembered {
-            OWN_ONLY_PREFIXES.insert(key, ());
-        }
         Ok(false)
     }
 
@@ -1317,13 +1283,13 @@ mod delegated_cost_tests {
         assert_eq!(page.reference_prefixes, None);
     }
 
-    /// L1 (#171, S3 backend): keys that an older release stored under a
-    /// `.dg` directory are ordinary keys, listed flat and with a delimiter,
-    /// and the recursive delimiter walk equals the flat listing at every
-    /// page size. The facts and the baselines are listed nowhere. Unicode and
-    /// a dot-dir stay ordinary keys.
+    /// L1 (#171, S3 backend): a key below a `.dg` directory, whoever stored
+    /// it, is in no listing, flat or with a delimiter, and the recursive
+    /// delimiter walk equals the flat listing at every page size. The facts
+    /// and the baselines are listed nowhere. Unicode and a dot-dir stay
+    /// ordinary keys.
     #[tokio::test]
-    async fn a_legacy_dg_key_is_listed_the_same_way_flat_and_with_a_delimiter() {
+    async fn a_key_below_dg_is_in_no_listing() {
         let keys: Vec<String> = [
             ".dg/facts/x!!1.e.1.2.e",
             ".dg/foo",
@@ -1342,11 +1308,9 @@ mod delegated_cost_tests {
         .to_vec();
         let (s3, _fake) = backend_with_keys(&keys).await;
         let want: Vec<String> = [
-            ".dg/foo",
             ".dgx/k",
             ".well-known/w",
             "a-b/y",
-            "a/.dg/bar",
             "a/x",
             "a_b/z",
             "top",
@@ -1391,15 +1355,18 @@ mod delegated_cost_tests {
             walked.sort();
             assert_eq!(walked, want, "walk, max_keys {max_keys}");
         }
-        // Asked for by name, the proxy's directory lists the legacy key,
-        // never the facts or a baseline.
-        let page = s3
-            .list_objects_delegated("b", ".dg/", None, 1000, None)
-            .await
-            .unwrap()
-            .unwrap();
-        let names: Vec<_> = page.objects.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(names, [".dg/foo"]);
+        // Asked for by name, the proxy's directory lists nothing.
+        for prefix in [".dg/", "a/.dg/"] {
+            for delimiter in [None, Some("/")] {
+                let page = s3
+                    .list_objects_delegated("b", prefix, delimiter, 1000, None)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(page.objects.is_empty(), "{prefix} {delimiter:?}");
+                assert!(page.common_prefixes.is_empty(), "{prefix} {delimiter:?}");
+            }
+        }
     }
 
     /// L2 (#171): a CommonPrefix is shown only when a key that LIST shows
@@ -1426,6 +1393,7 @@ mod delegated_cost_tests {
                 ".dg/old.txt",
                 "a/.dg/bar",
                 "a/.dg/reference.bin",
+                "a/x",
                 ".dgx/k",
                 ".dg-x",
             ],
@@ -1518,10 +1486,10 @@ mod delegated_cost_tests {
     /// keys give the same objects and the same CommonPrefixes on the S3
     /// backend (fake) and on the filesystem backend, for every delimiter and
     /// page size. The S3 side holds the listing facts too (the filesystem has
-    /// none); both hold the baselines of today (`<folder>/reference.bin`) and
-    /// of the legacy layout (`<folder>/.dg/reference.bin`), and legacy client
-    /// keys below `.dg`. A folder that holds ONLY a baseline is the one case
-    /// they differ in (`an_s3_listing_shows_a_folder_with_only_a_baseline`).
+    /// none); both hold the baselines (`<folder>/reference.bin`) and keys
+    /// below `.dg`, which neither lists. A folder that holds ONLY a baseline
+    /// or keys below `.dg` is the one case they differ in
+    /// (`an_s3_listing_shows_a_folder_with_only_own_files`).
     #[tokio::test]
     async fn s3_and_the_filesystem_list_the_same_keys() {
         let sets: &[&[&str]] = &[
@@ -1532,6 +1500,7 @@ mod delegated_cost_tests {
                 ".dg/old.txt",
                 "a/.dg/bar",
                 "a/.dg/reference.bin",
+                "a/x",
                 ".dgx/k",
                 ".dg-x",
                 "a-b/y",
@@ -1635,14 +1604,16 @@ mod delegated_cost_tests {
                 .filter(|k| !all.iter().any(|o| o.starts_with(&format!("{k}/"))))
                 .cloned()
                 .collect();
+            // Comparable only when every folder (not below `.dg`) holds a
+            // listed key: S3 shows a folder of only own files.
             let only_a_baseline = keys.iter().any(|k| {
-                crate::types::is_reference_key(k) && {
-                    let folder = k.trim_end_matches(crate::types::REFERENCE_FILE_NAME);
-                    !folder.is_empty()
+                k.match_indices('/').any(|(i, _)| {
+                    let folder = &k[..=i];
+                    !listing_facts::has_internal_segment(folder)
                         && !keys
                             .iter()
-                            .any(|o| o.starts_with(folder) && !crate::types::is_reference_key(o))
-                }
+                            .any(|o| o.starts_with(folder) && listing_facts::shows_in_listing(o))
+                })
             });
             if only_a_baseline {
                 continue;
@@ -1673,15 +1644,19 @@ mod delegated_cost_tests {
     }
 
     /// The one case where the backends differ: a folder that holds ONLY a
-    /// baseline (an orphan that DeleteBucket reclaims). The filesystem knows
+    /// baseline (an orphan that DeleteBucket reclaims) or keys below `.dg`. The filesystem knows
     /// it for free; on S3 it takes a request per folder, which a LIST page
     /// does not send. Pinned so that a change is a decision.
     #[tokio::test]
-    async fn an_s3_listing_shows_a_folder_with_only_a_baseline() {
-        let keys = vec!["ba/reference.bin".to_string(), "top".to_string()];
+    async fn an_s3_listing_shows_a_folder_with_only_own_files() {
+        let keys = vec![
+            "ba/reference.bin".to_string(),
+            "bd/.dg/old".to_string(),
+            "top".to_string(),
+        ];
         let (s3, _fake) = backend_with_keys(&keys).await;
         let (_, prefixes) = walk_pages(&s3, "", Some("/"), 1000).await;
-        assert_eq!(prefixes, ["ba/"]);
+        assert_eq!(prefixes, ["ba/", "bd/"]);
         let dir = tempfile::tempdir().unwrap();
         let fs = crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
             .await
@@ -1690,21 +1665,29 @@ mod delegated_cost_tests {
         let ba = dir.path().join("b").join("deltaspaces").join("ba");
         std::fs::create_dir_all(&ba).unwrap();
         std::fs::write(ba.join("reference.bin"), b"x").unwrap();
+        let bd = dir
+            .path()
+            .join("b")
+            .join("deltaspaces")
+            .join("bd")
+            .join(".dg");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(bd.join("old"), b"x").unwrap();
         let (_, prefixes) = walk_pages(&fs, "", Some("/"), 1000).await;
         assert!(prefixes.is_empty(), "{prefixes:?}");
     }
 
-    /// Request cost of the root `.dg/` CommonPrefix (the listing facts): the
-    /// probe jumps past the facts, so it costs two requests (past the facts,
-    /// and up to the first facts key) however many facts there are, and none
-    /// once the answer is remembered. A legacy key next to the facts is found.
+    /// Request cost of the root `.dg/` CommonPrefix: its text decides, so a
+    /// `/` listing sends no probe however many facts or other `.dg` keys
+    /// there are. With another delimiter the prefix `.` is probed, and a key
+    /// below `.dg` never makes it show.
     #[tokio::test]
-    async fn a_root_delimiter_list_probes_past_the_facts() {
+    async fn a_dg_common_prefix_is_decided_by_its_text() {
         for facts in [3usize, 40, 400] {
             let mut keys: Vec<String> = (0..facts)
                 .map(|i| format!(".dg/facts/k{i:04}!!1.e.1.2.e"))
                 .collect();
-            keys.extend(["top".to_string(), "a/x".to_string()]);
+            keys.extend([".dg/old.txt", "top", "a/x"].map(String::from));
             let (s3, fake) = backend_with_keys(&keys).await;
             let page = s3
                 .list_objects_delegated("b", "", Some("/"), 1000, None)
@@ -1712,36 +1695,93 @@ mod delegated_cost_tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(page.common_prefixes, ["a/"], "{facts} facts");
-            assert_eq!(lists(&fake), 3, "{facts} facts: {:?}", fake.requests());
-            assert_eq!(page.upstream_requests, 3, "{facts} facts");
-            // Remembered: the next LIST of the level is the one request.
-            fake.clear();
-            s3.list_objects_delegated("b", "", Some("/"), 1000, None)
-                .await
-                .unwrap();
-            assert_eq!(lists(&fake), 1, "{facts} facts, again");
+            assert_eq!(lists(&fake), 1, "{facts} facts: {:?}", fake.requests());
+            assert_eq!(page.upstream_requests, 1, "{facts} facts");
         }
-        // A legacy key after the facts (`.dg/z`) is found by the first range,
-        // one before them (`.dg/a`) by the second.
-        for legacy in [".dg/z", ".dg/a"] {
+        for key_below_dg in [".dg/z", ".dg/a", "a/.dg/z"] {
             let keys = vec![
                 ".dg/facts/k0!!1.e.1.2.e".to_string(),
-                legacy.to_string(),
+                key_below_dg.to_string(),
                 "top".to_string(),
             ];
-            let (s3, fake) = backend_with_keys(&keys).await;
+            let (s3, _fake) = backend_with_keys(&keys).await;
             let page = s3
-                .list_objects_delegated("b", "", Some("/"), 1000, None)
+                .list_objects_delegated("b", "", Some("."), 1000, None)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(page.common_prefixes, [".dg/"], "{legacy}");
-            assert_eq!(
-                lists(&fake),
-                if legacy == ".dg/z" { 2 } else { 3 },
-                "{legacy}: {:?}",
-                fake.requests()
-            );
+            assert!(page.common_prefixes.is_empty(), "{key_below_dg}");
+            assert_eq!(page.objects.len(), 1, "{key_below_dg}");
+        }
+        // A client dot-dir still shows under the same delimiter.
+        let keys = vec![".dg/old".to_string(), ".well-known/w".to_string()];
+        let (s3, _fake) = backend_with_keys(&keys).await;
+        let page = s3
+            .list_objects_delegated("b", "", Some("."), 1000, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.common_prefixes, ["."]);
+    }
+
+    /// L1 (#171): DeleteBucket removes every key below `.dg` once nothing
+    /// else is stored, and removes none while a client key or a baseline
+    /// is.
+    #[tokio::test]
+    async fn the_purge_of_a_bucket_takes_every_dg_key_and_only_when_nothing_else_is_there() {
+        let own = [
+            ".dg/facts/x!!1.e.1.2.e",
+            ".dg/old.jpg",
+            "a/.dg/y",
+            "z/.dg/reference.bin",
+        ];
+        let raw = |endpoint: String| async move {
+            reqwest::get(format!("{endpoint}/b?list-type=2"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        };
+        let keys: Vec<String> = own.iter().map(|k| k.to_string()).collect();
+        let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let http = reqwest::Client::new();
+        for k in &keys {
+            http.put(format!("{endpoint}/b/{k}"))
+                .body("x")
+                .send()
+                .await
+                .unwrap();
+        }
+        let s3 = test_support::for_test_endpoint(&endpoint);
+        s3.purge_own_keys_if_only_ones("b").await.unwrap();
+        let left = raw(endpoint.clone()).await;
+        assert!(!left.contains("<Key>"), "{left}");
+        for keeper in ["top", "a/reference.bin", "a/x.zip.delta"] {
+            for k in &keys {
+                http.put(format!("{endpoint}/b/{k}"))
+                    .body("x")
+                    .send()
+                    .await
+                    .unwrap();
+            }
+            http.put(format!("{endpoint}/b/{keeper}"))
+                .body("x")
+                .send()
+                .await
+                .unwrap();
+            s3.purge_own_keys_if_only_ones("b").await.unwrap();
+            let left = raw(endpoint.clone()).await;
+            for k in &keys {
+                assert!(
+                    left.contains(&format!("<Key>{k}</Key>")),
+                    "{keeper}: {k} gone"
+                );
+            }
+            http.delete(format!("{endpoint}/b/{keeper}"))
+                .send()
+                .await
+                .unwrap();
         }
     }
 
@@ -1803,8 +1843,7 @@ mod delegated_cost_tests {
 
     /// A LIST must not depend on what an earlier LIST found: a client writes
     /// a key under a prefix that held only the proxy's own files a moment
-    /// ago, and the next LIST shows it. (A remembered answer is kept only for
-    /// a prefix below `.dg`, where no client write adds a key.)
+    /// ago, and the next LIST shows it. No answer is remembered.
     #[tokio::test]
     async fn a_key_written_after_a_probe_shows_in_the_next_list() {
         let facts = ".dg/facts/x!!1.e.1.2.e";
@@ -1873,10 +1912,10 @@ mod delegated_cost_tests {
     }
 
     /// A probe that the backend refuses AS A NAME (MinIO answers
-    /// `XMinioInvalidResourceName` for `prefix=.`) shows the prefix, and
-    /// hides the proxy's own namespace (`.dg/`), which is never shown.
+    /// `XMinioInvalidResourceName` for `prefix=.`) shows the prefix. The
+    /// proxy's own `.dg/` is never shown: its text decides, with no probe.
     #[tokio::test]
-    async fn a_prefix_the_backend_refuses_as_a_name_is_shown_but_not_the_proxys_own() {
+    async fn a_prefix_the_backend_refuses_as_a_name_is_shown() {
         let (s3, fake) = backend_with_keys(&probe_keys()).await;
         // The probes ask for 16 keys; the page itself for more.
         fake.fail(
@@ -1901,8 +1940,8 @@ mod delegated_cost_tests {
     }
 
     /// Any other probe error is the error of the page: a retryable `503`
-    /// stays retryable, no answer lists `.dg/`, and the page stops at the
-    /// first failed probe (one request timeout, not eight).
+    /// stays retryable, and the page stops at the first failed probe (one
+    /// request timeout, not eight). A `/` listing sends no probe.
     #[tokio::test]
     async fn a_failed_probe_fails_the_page_with_its_own_error() {
         for (status, code) in [
@@ -1912,7 +1951,7 @@ mod delegated_cost_tests {
         ] {
             let (s3, fake) = backend_with_keys(&probe_keys()).await;
             fake.fail("LIST", "max-keys=16", status, code, u32::MAX);
-            for (prefix, delimiter) in [("", "/"), ("", "r"), ("", ".")] {
+            for (prefix, delimiter) in [("", "r"), ("", ".")] {
                 let page = s3
                     .list_objects_delegated("b", prefix, Some(delimiter), 1000, None)
                     .await;
@@ -1927,7 +1966,13 @@ mod delegated_cost_tests {
                 }
             }
             // Each LIST stopped at its first probe.
-            assert_eq!(fake.faulted("LIST", "max-keys=16"), 3, "{status} {code}");
+            assert_eq!(fake.faulted("LIST", "max-keys=16"), 2, "{status} {code}");
+            let page = s3
+                .list_objects_delegated("b", "", Some("/"), 1000, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(page.common_prefixes, ["a/"], "{status} {code}");
         }
     }
 
