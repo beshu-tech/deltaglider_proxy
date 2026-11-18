@@ -282,6 +282,52 @@ mod reference_writes {
         }
     }
 
+    /// A reference records the length of its body (#187): every reference
+    /// write with a body stamps it here, so no writer can record a wrong
+    /// size (a copied `0` made every later read of the deltaspace fail).
+    pub(super) fn sized_reference(
+        meta: &FileMetadata,
+        body_len: u64,
+    ) -> std::borrow::Cow<'_, FileMetadata> {
+        if meta.file_size == body_len {
+            return std::borrow::Cow::Borrowed(meta);
+        }
+        if meta.file_size != 0 {
+            tracing::warn!(
+                "reference metadata of {} records {} bytes, its body has {body_len}; \
+                 the body length is written",
+                meta.original_name,
+                meta.file_size
+            );
+        }
+        let mut fixed = meta.clone();
+        fixed.file_size = body_len;
+        std::borrow::Cow::Owned(fixed)
+    }
+
+    async fn file_len(path: &std::path::Path) -> Result<u64, EngineError> {
+        Ok(tokio::fs::metadata(path)
+            .await
+            .map_err(StorageError::Io)?
+            .len())
+    }
+
+    async fn body_len(body: &crate::storage::PutBody<'_>) -> Result<u64, EngineError> {
+        use crate::storage::PutBody;
+        Ok(match body {
+            PutBody::Bytes(b) => b.len() as u64,
+            PutBody::Chunks(c) => c.iter().map(|b| b.len() as u64).sum(),
+            PutBody::File { path, .. } => file_len(path).await?,
+            PutBody::Parts { paths, .. } => {
+                let mut n = 0;
+                for p in paths.iter() {
+                    n += file_len(p).await?;
+                }
+                n
+            }
+        })
+    }
+
     impl ReferenceLockGuard {
         /// One reference write: fenced under a cross-instance hold, plain
         /// otherwise (single instance: the in-process lock is the whole story).
@@ -317,9 +363,10 @@ mod reference_writes {
             data: &Bytes,
             meta: &FileMetadata,
         ) -> Result<(), EngineError> {
+            let meta = sized_reference(meta, data.len() as u64);
             let op = crate::storage::RefWrite::Put {
                 data,
-                metadata: meta,
+                metadata: &meta,
             };
             self.write_reference(storage, bucket, deltaspace, op).await
         }
@@ -333,9 +380,10 @@ mod reference_writes {
             meta: &FileMetadata,
             spool: crate::deltaglider::spool::SpoolBudget<'_>,
         ) -> Result<(), EngineError> {
+            let meta = sized_reference(meta, file_len(path).await?);
             let op = crate::storage::RefWrite::PutFile {
                 path,
-                metadata: meta,
+                metadata: &meta,
                 spool,
             };
             self.write_reference(storage, bucket, deltaspace, op).await
@@ -404,6 +452,7 @@ mod reference_writes {
         ) -> Result<crate::storage::WriteIf, EngineError> {
             use crate::storage::{RefFence, WriteIf};
             self.ensure_held().await?;
+            let meta = &*sized_reference(meta, body_len(&body).await?);
             if let Some(h) = &self.hold {
                 match &*h.fence.lock() {
                     RefFence::ETag(e) if e != version => return Ok(WriteIf::Changed),

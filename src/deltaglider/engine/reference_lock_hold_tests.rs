@@ -184,6 +184,44 @@ async fn delete_reclaim_and_sweep_reclaim_take_the_lock() {
         .unwrap());
 }
 
+/// #187: a writer that hands the guard reference metadata recording `0`
+/// bytes (the fast path copied a source's) stores the body's length.
+#[tokio::test]
+async fn a_reference_write_records_its_body_length() {
+    let lock = ScriptedLock::new(true, Duration::from_secs(30));
+    let (_tmp, engine) = engine_with(lock.clone()).await;
+    for (recorded, body) in [(0u64, &b"abc"[..]), (7, &b"abcd"[..])] {
+        let meta = FileMetadata::new_reference(
+            "__reference__".into(),
+            "v1/app.zip".into(),
+            "00".repeat(32),
+            "00".repeat(16),
+            recorded,
+            None,
+        );
+        engine
+            .with_dest_prefix_lock("releases", "v1", || async {
+                Ok::<_, EngineError>(
+                    engine
+                        .put_reference_raw(
+                            "releases",
+                            "v1",
+                            crate::storage::PutBody::Bytes(bytes::Bytes::copy_from_slice(body)),
+                            &meta,
+                        )
+                        .await?,
+                )
+            })
+            .await
+            .unwrap();
+        let stored = engine
+            .reference_metadata_raw("releases", "v1")
+            .await
+            .unwrap();
+        assert_eq!(stored.file_size, body.len() as u64, "recorded {recorded}");
+    }
+}
+
 /// The replication fast path seeds a reference inside
 /// `with_dest_prefix_lock`: it must hold the cross-instance lock, and a
 /// lock it cannot take must stop the closure.
