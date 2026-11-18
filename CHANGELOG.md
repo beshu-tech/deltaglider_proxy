@@ -187,6 +187,7 @@
 ### Added — The Windows XP theme
 
 - The admin UI has a third theme style, **Windows XP**. In light mode it is Luna: the beige window face, Luna blue title bars on dialogs, drawers and the admin header, glossy buttons with the orange hot-track, the Explorer-style table header, the green Start button in the sidebar footer, a Welcome-screen sign-in page and Luna scrollbars. In dark mode it is Royale Noir. Select the style in the account menu or with ⌘K. The browser saves the choice and applies it before the first paint. **Instrument** stays the default.
+- Checkboxes and radios have the XP green tick and dot, the selected file row is Luna blue with white text, the account menu opens with a blue user header, and cards, fields, buttons, segmented controls and alerts have square corners.
 - The style uses Tahoma, Trebuchet MS and Lucida Console from the system, and falls back to DejaVu Sans where they are not installed. The UI still loads nothing from another origin.
 
 ### Changed — Error answers for faults that a retry can clear

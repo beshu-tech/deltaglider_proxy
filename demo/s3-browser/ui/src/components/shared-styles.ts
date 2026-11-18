@@ -22,7 +22,8 @@ import { useColors } from '../ThemeContext';
 export const SPACE = { xxs: 4, xs: 8, sm: 12, md: 16, lg: 24, xl: 32 } as const;
 /** The allowed values, for the source test (0 is always allowed). */
 export const SPACING_SCALE: readonly number[] = [0, ...Object.values(SPACE)];
-export const CARD_RADIUS = 12;
+/** A CSS variable, so a theme style sets the card corner (theme.css `--card-radius`: 12 px by default). */
+export const CARD_RADIUS = 'var(--card-radius)';
 
 /**
  * TYPE SCALE — the font sizes of the app (UX audit P3). AntD's body is 14.

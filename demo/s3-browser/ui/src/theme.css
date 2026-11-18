@@ -73,6 +73,8 @@ code, kbd, pre, samp, .ant-typography code,
   /* Display type (.dg-display, headings): the style sets weight and optical axes. */
   --display-weight: 700;
   --display-variation: normal;
+  /* The radius of a dashboard card and of the inspector's panels (CARD_RADIUS in shared-styles.ts). */
+  --card-radius: 12px;
 }
 
 /* ───── Theme-only tints ───── */
@@ -1392,6 +1394,7 @@ code, kbd, pre, samp, .ant-typography code,
   --focus-ring: var(--dg-text-primary);
   --focus-ring-width: 1px;
   --focus-ring-offset: 2px;
+  --card-radius: 3px;
   --xp-flag: linear-gradient(#f0502a 0 0) 0 0 / 46% 46% no-repeat, linear-gradient(#7ac143 0 0) 100% 0 / 46% 46% no-repeat, linear-gradient(#1b9be0 0 0) 0 100% / 46% 46% no-repeat, linear-gradient(#fdb913 0 0) 100% 100% / 46% 46% no-repeat;
   --xp-seg-mask: repeating-linear-gradient(90deg, #000 0 7px, transparent 7px 9px);
 }
@@ -1413,6 +1416,8 @@ code, kbd, pre, samp, .ant-typography code,
   --xp-menu-border: #aca899;
   --xp-select-bg: #316ac5;
   --xp-select-text: #ffffff;
+  --xp-primary-fill: var(--dg-accent-blue);
+  --xp-primary-text: var(--dg-on-accent);
   --xp-hover-row: #e8effc;
   --xp-check: #21a121;
   --xp-check-box: linear-gradient(135deg, #dcdcd7 0%, #ffffff 100%);
@@ -1453,6 +1458,8 @@ code, kbd, pre, samp, .ant-typography code,
   --xp-menu-border: #55648e;
   --xp-select-bg: #2f62c4;
   --xp-select-text: #ffffff;
+  --xp-primary-fill: #2f62c4;
+  --xp-primary-text: #ffffff;
   --xp-hover-row: #232c49;
   --xp-check: #6fd36f;
   --xp-check-box: linear-gradient(135deg, #2c3657 0%, #3a4568 100%);
@@ -1486,9 +1493,14 @@ code, kbd, pre, samp, .ant-typography code,
   color: var(--xp-select-text);
 }
 /* Focus is the XP dotted rectangle. */
-[data-theme-style="xp"] :focus-visible:not(input, textarea, select, [tabindex='-1']),
-[data-theme-style="xp"] :is(.ant-checkbox-input, .ant-radio-input):focus-visible + :is(.ant-checkbox-inner, .ant-radio-inner) {
+[data-theme-style="xp"] :focus-visible:not(input, textarea, select, [tabindex='-1']) {
   outline-style: dotted !important;
+}
+/* AntD 6 hides the checkbox/radio input: the ring goes on the drawn box. */
+[data-theme-style="xp"] :is(.ant-checkbox, .ant-radio):has(> input:focus-visible) {
+  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline-style: dotted;
+  outline-offset: var(--focus-ring-offset);
 }
 
 /* Text fields: the same dotted rectangle, drawn outside the dark frame. */
@@ -1520,13 +1532,13 @@ code, kbd, pre, samp, .ant-typography code,
   box-shadow: inset 1px 1px 2px var(--xp-btn-border);
 }
 [data-theme-style="xp"] .ant-btn-primary.ant-btn-variant-solid:not(.ant-btn-dangerous) {
-  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--dg-accent-blue);
+  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--xp-primary-fill);
   border: 1px solid var(--xp-btn-border);
-  color: var(--dg-on-accent);
+  color: var(--xp-primary-text);
   border-radius: 3px;
 }
 [data-theme-style="xp"] .ant-btn-primary.ant-btn-variant-solid:not(.ant-btn-dangerous):not(:disabled):hover {
-  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--dg-accent-blue);
+  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--xp-primary-fill);
   box-shadow: inset 0 0 0 2px var(--xp-hot);
 }
 [data-theme-style="xp"] .ant-btn-dangerous.ant-btn-variant-solid {
@@ -1557,33 +1569,30 @@ code, kbd, pre, samp, .ant-typography code,
   border-color: var(--xp-btn-border);
 }
 
-/* ── Checkbox and radio: the XP box with a green tick, the round radio with a green dot ── */
-[data-theme-style="xp"] .ant-checkbox-inner {
+/* ── Checkbox and radio: the XP box with a green tick, the round radio with a green dot ──
+   AntD 6 draws both on the `.ant-checkbox` / `.ant-radio` span itself (no `-inner`). */
+[data-theme-style="xp"] .ant-checkbox,
+[data-theme-style="xp"] .ant-radio {
   border: 1px solid var(--xp-btn-border);
-  border-radius: 2px;
   background: var(--xp-check-box);
 }
-[data-theme-style="xp"] .ant-checkbox-checked .ant-checkbox-inner,
-[data-theme-style="xp"] .ant-checkbox-indeterminate .ant-checkbox-inner {
+[data-theme-style="xp"] .ant-checkbox {
+  border-radius: 2px;
+}
+[data-theme-style="xp"] :is(.ant-checkbox-checked, .ant-checkbox-indeterminate, .ant-radio-checked),
+[data-theme-style="xp"] :is(.ant-checkbox-wrapper:hover, .ant-radio-wrapper:hover) :is(.ant-checkbox-checked, .ant-radio-checked):not(.ant-checkbox-disabled, .ant-radio-disabled) {
   background: var(--xp-check-box);
   border-color: var(--xp-btn-border);
 }
-[data-theme-style="xp"] .ant-checkbox-checked .ant-checkbox-inner::after {
+[data-theme-style="xp"] .ant-checkbox-checked::after {
   border-color: var(--xp-check);
   border-width: 2.5px;
 }
-[data-theme-style="xp"] .ant-checkbox-indeterminate .ant-checkbox-inner::after {
+[data-theme-style="xp"] .ant-checkbox-indeterminate::after {
   background: var(--xp-check);
 }
-[data-theme-style="xp"] .ant-radio-inner {
-  border: 1px solid var(--xp-btn-border);
-  background: var(--xp-check-box);
-}
-[data-theme-style="xp"] .ant-radio-checked .ant-radio-inner {
-  background: var(--xp-check-box);
-  border-color: var(--xp-btn-border);
-}
-[data-theme-style="xp"] .ant-radio-inner::after {
+[data-theme-style="xp"] .ant-radio::after,
+[data-theme-style="xp"] .ant-radio-checked::after {
   background-color: var(--xp-check);
 }
 
@@ -1606,15 +1615,18 @@ code, kbd, pre, samp, .ant-typography code,
   box-shadow: inset 0 -2px 0 var(--xp-hot);
 }
 [data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']) > :is(td, .ant-table-cell),
-[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']) > :is(td, .ant-table-cell) :not(.ant-tag, .ant-tag *, .ant-btn, .ant-btn *, .ant-checkbox-inner) {
+[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']) > :is(td, .ant-table-cell) :not(.ant-tag, .ant-tag *, .ant-btn, .ant-btn *, .ant-checkbox, .ant-checkbox *) {
   color: var(--xp-select-text) !important;
 }
 [data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).ant-table-row > :is(td, .ant-table-cell):first-child::before {
-  background: var(--xp-hot);
+  display: none;
 }
 
-[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr > td, .ant-table-tbody-virtual .ant-table-cell) {
+[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr > td, .ant-table-tbody-virtual .ant-table-cell, .ant-table-tbody-virtual .ant-table-row) {
   border-bottom-color: color-mix(in srgb, var(--dg-border) 35%, transparent);
+}
+[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table, .ant-table-container, .ant-table-content) {
+  border-radius: 0;
 }
 
 /* ── Cards, tags ── */
@@ -1874,7 +1886,8 @@ code, kbd, pre, samp, .ant-typography code,
   height: 34px !important;
   border: 1px solid var(--xp-btn-border) !important;
   border-radius: 3px !important;
-  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--dg-accent-blue) !important;
+  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--xp-primary-fill) !important;
+  color: var(--xp-primary-text) !important;
   box-shadow: none !important;
   font: 700 14px/1 var(--font-ui) !important;
 }
@@ -1957,4 +1970,53 @@ code, kbd, pre, samp, .ant-typography code,
 }
 [data-theme-style="xp"] .account-menu-avatar {
   border-radius: 3px;
+}
+
+/* ── Square corners on controls that carry an inline radius, error frames, switch, alerts ── */
+[data-theme-style="xp"] :is(.ant-btn, .ant-input, .ant-input-affix-wrapper, .ant-input-number, .ant-select-selector, .ant-picker, .ant-segmented, .ant-segmented-item, .ant-segmented-thumb, .ant-alert) {
+  border-radius: 3px !important;
+}
+[data-theme-style="xp"] :is(.ant-input, .ant-input-affix-wrapper, .ant-input-number, .ant-picker):is(.ant-input-status-error, .ant-input-affix-wrapper-status-error, .ant-input-number-status-error, .ant-picker-status-error),
+[data-theme-style="xp"] .ant-select-status-error .ant-select-selector {
+  border-color: var(--dg-accent-red);
+}
+[data-theme-style="xp"] .ant-switch {
+  border: 1px solid var(--xp-btn-border);
+  border-radius: 3px;
+}
+[data-theme-style="xp"] .ant-switch .ant-switch-handle::before {
+  border-radius: 2px;
+  background: var(--xp-btn-bg);
+}
+[data-theme-style="xp"] .ant-btn:focus-visible {
+  outline-offset: -4px !important;
+}
+/* The sign-in field sits in a 34 px wrapper: its input must not add its own height. */
+[data-theme-style="xp"] .dg-login-card .ant-input-affix-wrapper > .ant-input {
+  height: auto !important;
+}
+/* Task-pane group labels: bold sentence case, not tracked capitals. */
+[data-theme-style="xp"] .dg-eyebrow {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  font-weight: 700;
+}
+/* The Start-menu header: the user block of the account menu is a title bar. */
+[data-theme-style="xp"] .account-menu-panel > :first-child {
+  margin: -2px -2px 2px;
+  padding: 8px 12px;
+  background: var(--xp-title-bg);
+  color: var(--xp-title-text);
+  text-shadow: var(--xp-title-shadow);
+}
+[data-theme-style="xp"] .account-menu-panel > :first-child * {
+  color: var(--xp-title-text) !important;
+}
+/* The bulk-action bar: a docked toolbar, not a floating pill. */
+[data-theme-style="xp"] [role='toolbar'][aria-label='Selection actions'] {
+  border-radius: 0 !important;
+  background: var(--xp-toolbar-bg) !important;
+  border: 1px solid var(--xp-menu-border) !important;
+  box-shadow: var(--dg-elev-shadow) !important;
 }
