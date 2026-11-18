@@ -68,6 +68,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
   → HEAD-`/` + POST form-data interceptors (shapes s3s rejects: Cyberduck probe, browser PostObject → api/handlers/form_post.rs)
   → s3_adapter_s3s/          fallback_service: the `s3s::S3` adapter (mod.rs = one-line delegations to free fns in object/list/copy/
                              multipart/bucket.rs) — owns S3 parse/DTO/XML only; `From<S3Error> for s3s::S3Error` is the one error bridge.
+                             No S3 request work is spawned (guard `request_work_is_never_spawned`): DeleteObjects runs inline and a Complete's store runs in the response body that the keepalive polls, so a dropped connection stops it; the `request_slots` middleware (`api/s3_router.rs`) holds the global and backend-share slots until a `LateBody` response ends.
                              Product logic lives below it: conditional writes + the per-key object write lock in
                              `engine/conditional.rs` (`store_conditional`, reached by PutObject, CopyObject, form POST via
                              `object_helpers::store_client_write`). EVERY object write takes that lock (client, multipart, admin

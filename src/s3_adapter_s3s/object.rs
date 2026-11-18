@@ -460,57 +460,40 @@ pub(super) async fn delete_objects(
         }
         keys.push(key);
     }
-    // The batch runs in a spawned task that this request awaits: a client
-    // disconnect or the request timeout drops this future, not the task.
-    // So every key that the batch deletes gets its ObjectDeleted event (one
-    // per key as it ends, never only after the loop), and each folder gets
-    // its reference reclaim. The write guard keeps a maintenance job's
-    // drain waiting for the task, not just for this request.
+    // The batch runs inside the request: a cut request stops it. Each key
+    // that the batch deleted has its ObjectDeleted event (one per key as it
+    // ends), and a stopped batch leaves the later keys in place.
     let state = svc.state.clone();
     let bucket = input.bucket.clone();
-    // A slot of detached request work, held by the task (F56): the task
-    // outlives the request's slot of the global cap.
-    let slot = crate::api::handlers::DetachedWork::reserve(&req.extensions).await;
-    let write = state.maintenance_gate.begin_detached_write(&bucket);
-    let batch = slot.spawn_detached(async move {
-        let _write = write;
-        let engine = state.engine.load_full();
-        let on_outcome =
-            |key: &str, outcome: &DeleteOutcome| -> futures::future::BoxFuture<'static, ()> {
-                if !matches!(outcome, DeleteOutcome::Deleted(_)) {
-                    return Box::pin(async {});
-                }
-                let event = crate::event_outbox::NewEvent::new(
-                    crate::event_outbox::EventKind::ObjectDeleted,
-                    bucket.as_str(),
-                    key,
-                    crate::event_outbox::EventSource::S3Api,
-                    crate::replication::current_unix_seconds(),
-                    serde_json::json!({}),
-                );
-                let state = state.clone();
-                Box::pin(async move {
-                    crate::api::handlers::object_helpers::enqueue_object_event(&state, event).await
-                })
-            };
-        engine
-            .delete_batch(
-                &bucket,
-                keys.into_iter().map(DeleteItem::new).collect(),
-                DeleteHooks {
-                    on_outcome: Some(&on_outcome),
-                    ..Default::default()
-                },
-            )
-            .await
-    });
-    let mut outcomes = batch
+    let engine = state.engine.load_full();
+    let on_outcome =
+        |key: &str, outcome: &DeleteOutcome| -> futures::future::BoxFuture<'static, ()> {
+            if !matches!(outcome, DeleteOutcome::Deleted(_)) {
+                return Box::pin(async {});
+            }
+            let event = crate::event_outbox::NewEvent::new(
+                crate::event_outbox::EventKind::ObjectDeleted,
+                bucket.as_str(),
+                key,
+                crate::event_outbox::EventSource::S3Api,
+                crate::replication::current_unix_seconds(),
+                serde_json::json!({}),
+            );
+            let state = state.clone();
+            Box::pin(async move {
+                crate::api::handlers::object_helpers::enqueue_object_event(&state, event).await
+            })
+        };
+    let mut outcomes = engine
+        .delete_batch(
+            &bucket,
+            keys.into_iter().map(DeleteItem::new).collect(),
+            DeleteHooks {
+                on_outcome: Some(&on_outcome),
+                ..Default::default()
+            },
+        )
         .await
-        .map_err(|e| {
-            s3s::S3Error::from(crate::api::S3Error::InternalError(format!(
-                "DeleteObjects task failed: {e}"
-            )))
-        })?
         .into_iter();
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
@@ -949,40 +932,11 @@ mod delete_objects_tests {
         db.event_outbox_count(None).unwrap()
     }
 
-    /// The events of a detached batch are stored by its task, after its last
-    /// delete and its reclaim: wait (30 s at most) until `want` are stored,
-    /// and return the count then.
-    async fn wait_for_deleted_events(svc: &DeltaGliderS3Service, want: i64) -> i64 {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            let n = deleted_events(svc).await;
-            if n >= want || tokio::time::Instant::now() > deadline {
-                return n;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-
-    /// Wait (30 s at most) until `folder` has no reference.bin.
-    async fn reclaimed(svc: &DeltaGliderS3Service, folder: &str) -> bool {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let engine = svc.state().engine.load_full();
-        while engine.storage().has_reference("b", folder).await.unwrap() {
-            if tokio::time::Instant::now() > deadline {
-                return false;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        true
-    }
-
-    /// A request cut by a client disconnect or the request timeout does
-    /// not cut the batch: every key goes, with its ObjectDeleted event,
-    /// and the folder's reference.bin is reclaimed. The batch ran inside
-    /// the request and stored the events after its loop, so a cut lost
-    /// the events and the reclaim, and left a folder that lists no key.
+    /// A request cut by a client disconnect or the request timeout stops
+    /// the batch: the later keys stay, and each key that went has its
+    /// ObjectDeleted event.
     #[tokio::test]
-    async fn a_cut_request_still_deletes_every_key_with_its_event() {
+    async fn a_cut_request_stops_the_batch() {
         let (svc, fake) = service().await;
         let keys = store_deltas(&svc.state().engine.load(), "run", 3).await;
         fake.set_delete_delay_ms(300);
@@ -993,14 +947,24 @@ mod delete_objects_tests {
                 r.starts_with("DELETE /b/run/")
             })
             .await;
-
         assert!(cut, "the request was cut");
-        assert!(reclaimed(&svc, "run").await, "run/reference.bin stays");
+
+        // Nothing runs on after the cut: the state is the same later.
+        // Longer than the three DELETEs take (3 x 300 ms): a batch that ran on is done.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let engine = svc.state().engine.load_full();
+        let mut gone = 0;
         for key in &keys {
-            assert!(engine.head("b", key).await.unwrap_err().is_not_found());
+            if engine.head("b", key).await.is_err() {
+                gone += 1;
+            }
         }
-        assert_eq!(wait_for_deleted_events(&svc, 3).await, 3);
+        assert!(gone < keys.len(), "the batch ran on after the cut");
+        assert_eq!(
+            deleted_events(&svc).await,
+            gone as i64,
+            "one event per deleted key"
+        );
     }
 
     /// One DELETE per key, and the folders of one request at once. Each

@@ -1142,8 +1142,6 @@ async fn async_main(
         );
 
     // --- S3 router ---
-    let detached =
-        deltaglider_proxy::api::handlers::DetachedWork::new(config.tuning.max_concurrent_requests);
     let app = deltaglider_proxy::api::s3_router::build_s3_router(
         deltaglider_proxy::api::s3_router::RouterDeps {
             state: &state,
@@ -1155,7 +1153,6 @@ async fn async_main(
             public_prefix_snapshot: &public_prefix_snapshot,
             admission_chain: &admission_chain,
             shared_config: &shared_config,
-            detached: &detached,
         },
     );
 
@@ -1354,20 +1351,6 @@ async fn async_main(
             config.listen_addr
         );
         deltaglider_proxy::serve::serve_plain(listener, app, shutdown_signal(), limits).await?;
-    }
-
-    // Work that outlives its request (DeleteObjects batches, Complete
-    // stores) ends before the process does, so a stop never cuts an
-    // object in half. Bounded: see `DETACHED_DRAIN_DEADLINE`.
-    let cut = detached
-        .drain(deltaglider_proxy::serve::DETACHED_DRAIN_DEADLINE)
-        .await;
-    if cut > 0 {
-        tracing::warn!(
-            "{cut} detached task(s) (DeleteObjects batches or CompleteMultipartUpload stores) \
-             were still running {}s after the stop signal and are cut; the clients retry",
-            deltaglider_proxy::serve::DETACHED_DRAIN_DEADLINE.as_secs()
-        );
     }
 
     // Let a running maintenance job reach its stop point and hand its row

@@ -1611,8 +1611,8 @@ async fn record_changed(
 /// Wait for the gated bucket's in-flight writes to reach zero: the S3
 /// writes admitted before the gate armed, and the writes that run on
 /// without a request (background writers: replication copies and mirror
-/// deletes, lifecycle acts, `admit_all`; detached request work: DeleteObjects
-/// batches and CompleteMultipartUpload stores, `begin_detached_write`). The
+/// deletes, lifecycle acts, `admit_all`; the store of a long
+/// CompleteMultipartUpload, `begin_body_write`). The
 /// wait is bounded by the server's request timeout. A request that is
 /// still open cannot outlive it, so a drain that times out on request
 /// writes alone fails the job. The writes that run on without a request
@@ -1673,7 +1673,7 @@ pub(crate) async fn drain_inflight_writes_within(
 /// Pure: how a drain that timed out stops its job, from the in-flight
 /// counts read after the deadline (one sample; the drain takes three). Nothing
 /// in flight on the re-read: no stop (`None`). Background
-/// or detached writes in flight: deferred (they end on their own, the job
+/// or body writes in flight: deferred (they end on their own, the job
 /// retries later). Request writes only: failed (no open request outlives
 /// the request timeout).
 pub(crate) fn drain_timeout_stop(
@@ -1687,7 +1687,7 @@ pub(crate) fn drain_timeout_stop(
     } else if background_inflight > 0 {
         Some(PhaseStop::Deferred(format!(
             "{background_inflight} background write(s) to '{bucket}' (replication, lifecycle, \
-             detached DeleteObjects or CompleteMultipartUpload) still in flight after {}s",
+             a long CompleteMultipartUpload) still in flight after {}s",
             ceiling.as_secs()
         )))
     } else {
@@ -2196,9 +2196,7 @@ mod tests {
         // Phase 1: guards only start.
         let stop = Arc::new(AtomicBool::new(false));
         let watcher = rising_reader(gate.clone(), stop.clone());
-        let guards: Vec<_> = (0..GUARDS)
-            .map(|_| gate.begin_detached_write("b"))
-            .collect();
+        let guards: Vec<_> = (0..GUARDS).map(|_| gate.begin_body_write("b")).collect();
         stop.store(true, Ordering::Relaxed);
         assert_eq!(
             watcher.join().unwrap(),

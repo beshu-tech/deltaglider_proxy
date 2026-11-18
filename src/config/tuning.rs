@@ -218,8 +218,7 @@ pub const DISK_HIGH_MAX_DEFAULT: u64 = 25 * 1024 * 1024 * 1024;
 pub const DISK_CRITICAL_MAX_DEFAULT: u64 = 10 * 1024 * 1024 * 1024;
 
 /// The default of `DGP_SHUTDOWN_TIMEOUT_SECS`. The drain steps before this
-/// wait take up to 10 s each, and the detached-work wait up to 15 s, so the
-/// longest stop is 10 + 15 + 10 + 10 + 10 = 55 s.
+/// wait take up to 10 s each, so the longest stop is 10 + 10 + 10 + 10 = 40 s.
 /// The Helm chart gives a pod 60 s (`terminationGracePeriodSeconds`), which is
 /// more than that sum.
 pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 10;

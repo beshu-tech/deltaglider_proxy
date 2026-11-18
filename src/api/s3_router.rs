@@ -233,30 +233,96 @@ impl BackendShare {
     }
 }
 
-/// Middleware of [`BackendShare`].
-async fn backend_share(
-    axum::extract::State(share): axum::extract::State<BackendShare>,
+/// A response whose body does request work (a long CompleteMultipartUpload
+/// polls its store from the body). Its request keeps its slots until the
+/// body ends, not until the headers go out.
+#[derive(Clone, Copy)]
+pub(crate) struct LateBody;
+
+/// A response body that holds the request's slots until it ends or drops.
+struct SlotsHeldBody {
+    inner: axum::body::Body,
+    permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl http_body::Body for SlotsHeldBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(polled, std::task::Poll::Ready(None | Some(Err(_)))) {
+            self.permits.clear();
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// The request slots: the global cap (`DGP_MAX_CONCURRENT_REQUESTS`) and,
+/// with more than one backend, the share of the bucket's backend. The wait
+/// for a global slot counts against the request deadline (the timeout layer
+/// is outside). A full backend share answers 503 SlowDown at once. The
+/// slots go back when the response headers go out, or, for a response
+/// marked [`LateBody`], when its body ends: a dropped connection drops the
+/// body and its work with it.
+#[derive(Clone)]
+struct RequestSlots {
+    global: Arc<tokio::sync::Semaphore>,
+    share: BackendShare,
+}
+
+async fn request_slots(
+    axum::extract::State(slots): axum::extract::State<RequestSlots>,
     request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let Some(backend) = share.backend_of(request.uri().path()) else {
-        return next.run(request).await;
+    // The semaphore is never closed: a failed acquire holds no slot.
+    let global = slots.global.clone().acquire_owned().await.ok();
+    let share = &slots.share;
+    let mut permits: Vec<_> = global.into_iter().collect();
+    let mut backend_name = None;
+    if let Some(backend) = share.backend_of(request.uri().path()) {
+        let Ok(permit) = share.semaphore(&backend).try_acquire_owned() else {
+            tracing::warn!(
+                "backend '{backend}' holds its share of the request slots ({}); a request to it got 503 SlowDown",
+                share.cap
+            );
+            // The message does not name the backend: the caller is not verified yet.
+            let mut response = crate::api::S3Error::SlowDown(
+                "Too many concurrent requests to the storage of this bucket; retry shortly".into(),
+            )
+            .into_response();
+            crate::api::errors::ensure_retry_after(response.status(), response.headers_mut());
+            return response;
+        };
+        permits.push(permit);
+        backend_name = Some(backend);
+    }
+    let response = match backend_name {
+        Some(backend) => crate::deltaglider::spool::scoped(&backend, next.run(request)).await,
+        None => next.run(request).await,
     };
-    let Ok(_slot) = share.semaphore(&backend).try_acquire_owned() else {
-        tracing::warn!(
-            "backend '{backend}' holds its share of the request slots ({}); a request to it got 503 SlowDown",
-            share.cap
-        );
-        // The message does not name the backend: the caller is not verified yet.
-        let mut response = crate::api::S3Error::SlowDown(
-            "Too many concurrent requests to the storage of this bucket; retry shortly".into(),
-        )
-        .into_response();
-        crate::api::errors::ensure_retry_after(response.status(), response.headers_mut());
+    if response.extensions().get::<LateBody>().is_none() {
         return response;
-    };
-    crate::deltaglider::spool::scoped(&backend, next.run(request)).await
+    }
+    response.map(|body| {
+        axum::body::Body::new(SlotsHeldBody {
+            inner: body,
+            permits,
+        })
+    })
 }
 
 /// The span of one request. The default `TraceLayer` span records the full
@@ -319,10 +385,6 @@ pub struct RouterDeps<'a> {
     pub admission_chain: &'a crate::admission::SharedAdmissionChain,
     /// The live, hot-reloaded config.
     pub shared_config: &'a crate::config::SharedConfig,
-    /// The slots of work that outlives its request (see
-    /// [`crate::api::handlers::DetachedWork`]). The caller keeps a clone to
-    /// wait for the work at shutdown.
-    pub detached: &'a crate::api::handlers::DetachedWork,
 }
 
 /// [`build_s3_router`] with the `S3` impl and the s3s access hook given
@@ -342,7 +404,6 @@ where
         public_prefix_snapshot,
         admission_chain,
         shared_config,
-        detached,
     } = deps;
     use crate::api::s3s_hooks::DeltaGliderS3sAuth;
     use axum::error_handling::HandleError;
@@ -629,24 +690,22 @@ where
     }
 
     router
-        .layer(axum::Extension(detached.clone()))
         .layer(axum::Extension(replay_cache.clone()))
         .layer(axum::Extension(crate::api::auth::ReplayWindow(
             config.tuning.replay_window(),
         )))
         .layer(axum::Extension(rate_limiter.clone()))
         .layer(axum::Extension(metrics.clone()))
-        // Inside the global cap: a request takes its backend's slot only
-        // once it has a global one, and gives a full share back at once.
+        // Inside the timeout: the wait for a slot counts against the request deadline.
         .layer(middleware::from_fn_with_state(
-            BackendShare::new(config, shared_config, state),
-            backend_share,
+            RequestSlots {
+                global: Arc::new(tokio::sync::Semaphore::new(
+                    config.tuning.max_concurrent_requests.max(1),
+                )),
+                share: BackendShare::new(config, shared_config, state),
+            },
+            request_slots,
         ))
-        .layer(tower::limit::ConcurrencyLimitLayer::new(
-            config.tuning.max_concurrent_requests,
-        ))
-        // OUTSIDE the global cap: the wait for a slot counts against the
-        // request deadline. Inside, a queued request waited without one.
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::GATEWAY_TIMEOUT,
             std::time::Duration::from_secs(config.tuning.request_timeout_secs),
@@ -712,9 +771,6 @@ mod backend_share_tests {
             public_prefix_snapshot: &snapshot,
             admission_chain: &chain,
             shared_config: &shared_config,
-            detached: &crate::api::handlers::DetachedWork::new(
-                config.tuning.max_concurrent_requests,
-            ),
         });
         (app, state)
     }
@@ -798,84 +854,160 @@ mod backend_share_tests {
         b.body(axum::body::Body::from(body)).unwrap()
     }
 
-    /// F56 (epic #143): DeleteObjects runs its batch on a detached task (so
-    /// a disconnect cannot cut a batch in half), and the task outlived the
-    /// request's slot of the global cap: with a cap of one, requests that
-    /// timed out left their batches running, more batches than slots.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn detached_delete_batches_stay_inside_the_request_cap() {
-        let (endpoint, fake) = crate::storage::fake_s3::start().await;
-        let mut config = Config::from_yaml_str(&format!(
-            "storage:\n  backends:\n    - name: hetzner-fsn1\n      type: s3\n      \
-             endpoint: \"{endpoint}\"\n      region: us-east-1\n      force_path_style: true\n      \
-             access_key_id: k\n      secret_access_key: s\n      allow_local: true\n  \
-             default_backend: hetzner-fsn1\n"
+    /// A router of the production `request_slots` middleware around a
+    /// handler whose body the test holds: `/<bucket>/late` answers with a
+    /// [`LateBody`] response, `/<bucket>/plain` with the same body and no
+    /// marker, anything else with a short `200`. The senders end the held bodies.
+    async fn slots_app(
+        config: &Config,
+    ) -> (
+        Router,
+        Arc<
+            parking_lot::Mutex<
+                Vec<tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>,
+            >,
+        >,
+    ) {
+        use axum::response::IntoResponse;
+        let (_, state) = router_and_state(config).await;
+        let shared = config.clone().into_shared();
+        let senders = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let held = senders.clone();
+        let handler =
+            move |axum::extract::Path((_bucket, key)): axum::extract::Path<(String, String)>| {
+                let held = held.clone();
+                async move {
+                    if key != "late" && key != "plain" {
+                        return "ok".into_response();
+                    }
+                    let (tx, mut rx) =
+                        tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+                    held.lock().push(tx);
+                    let body = axum::body::Body::from_stream(futures::stream::poll_fn(move |cx| {
+                        rx.poll_recv(cx)
+                    }));
+                    let mut response = axum::response::Response::new(body);
+                    if key == "late" {
+                        response.extensions_mut().insert(LateBody);
+                    }
+                    response
+                }
+            };
+        let app = Router::new()
+            .route("/:bucket/:key", axum::routing::get(handler))
+            .layer(middleware::from_fn_with_state(
+                RequestSlots {
+                    global: Arc::new(tokio::sync::Semaphore::new(
+                        config.tuning.max_concurrent_requests,
+                    )),
+                    share: BackendShare::new(config, &shared, &state),
+                },
+                request_slots,
+            ));
+        (app, senders)
+    }
+
+    fn two_disk_backends(disk: &std::path::Path) -> Config {
+        let (a, b) = (disk.join("a"), disk.join("b"));
+        Config::from_yaml_str(&format!(
+            "storage:\n  backends:\n    - name: local-a\n      type: filesystem\n      \
+             path: {}\n    - name: local-b\n      type: filesystem\n      path: {}\n  \
+             default_backend: local-a\n  buckets:\n    releases: {{ backend: local-a }}\n    \
+             downloads: {{ backend: local-b }}\n",
+            a.display(),
+            b.display()
         ))
-        .unwrap();
-        // The setup runs through a router with the default limits: a
-        // one-second request limit would cut a setup request on a busy host.
-        let setup_app = router(&config).await;
-        config.tuning.max_concurrent_requests = 1;
-        config.tuning.request_timeout_secs = 1;
-        let app = router(&config).await;
-        let ok = |r: &axum::response::Response| r.status().is_success();
-        let created = setup_app
+        .unwrap()
+    }
+
+    /// D3: a response with a late body keeps its backend share until the
+    /// body ends. The share went back when the headers went out, so the
+    /// stores that late bodies still ran were beyond the share.
+    #[tokio::test]
+    async fn a_late_body_holds_its_backend_share() {
+        let disk = tempfile::tempdir().unwrap();
+        let mut config = two_disk_backends(disk.path());
+        // 75% of 2 slots is a share of 1 per backend.
+        config.tuning.max_concurrent_requests = 2;
+        let (app, senders) = slots_app(&config).await;
+        let status = |path: &'static str| {
+            let app = app.clone();
+            async move { app.oneshot(request("GET", path)).await.unwrap().status() }
+        };
+
+        let late = app
             .clone()
-            .oneshot(request("PUT", "/releases"))
+            .oneshot(request("GET", "/releases/late"))
             .await
             .unwrap();
-        assert!(ok(&created), "{:?}", created.status());
-        // Each batch deletes the keys of one folder, one after another: a
-        // batch outlives its request (every DELETE stalls up to the backend
-        // timeout).
-        const BATCHES: usize = 3;
-        const KEYS: usize = 4;
-        for i in 0..BATCHES {
-            for k in 0..KEYS {
-                let put = setup_app
-                    .clone()
-                    .oneshot(with_body(
-                        "PUT",
-                        &format!("/releases/d{i}/k{k}.bin"),
-                        b"x".to_vec(),
-                        &[],
-                    ))
-                    .await
-                    .unwrap();
-                assert!(ok(&put), "{:?}", put.status());
-            }
-        }
-        fake.stall("DELETE", "releases/");
-        for i in 0..BATCHES {
-            let objects: String = (0..KEYS)
-                .map(|k| format!("<Object><Key>d{i}/k{k}.bin</Key></Object>"))
-                .collect();
-            let body = format!("<Delete>{objects}</Delete>").into_bytes();
-            let md5 = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                <md5::Md5 as md5::Digest>::digest(&body),
-            );
-            let resp = app
-                .clone()
-                .oneshot(with_body(
-                    "POST",
-                    "/releases?delete",
-                    body,
-                    &[("content-md5", md5)],
-                ))
-                .await
-                .unwrap();
-            // The batch is stalled: the request ends at its deadline.
-            assert_eq!(resp.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
-        }
-        // One batch sends one DELETE at a time: more in flight at once is
-        // more than one batch running.
-        let peak = fake.peak_in_flight("DELETE");
-        fake.release_stalls();
-        assert!(
-            peak <= 1,
-            "{peak} detached DeleteObjects batches ran at once with one request slot"
+        assert_eq!(late.status(), 200);
+        assert_eq!(
+            status("/releases/x").await,
+            503,
+            "the late body holds the share"
         );
+        assert_eq!(status("/downloads/x").await, 200, "another backend passes");
+
+        // The share goes back when the body ends.
+        senders.lock().clear();
+        axum::body::to_bytes(late.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status("/releases/x").await, 200);
+
+        // Control: a response without the marker gives its share back at the headers.
+        let plain = app
+            .clone()
+            .oneshot(request("GET", "/releases/plain"))
+            .await
+            .unwrap();
+        assert_eq!(status("/releases/x").await, 200, "no marker, no hold");
+        drop(plain);
+
+        // A dropped body gives its share back as well.
+        let late = app
+            .clone()
+            .oneshot(request("GET", "/releases/late"))
+            .await
+            .unwrap();
+        assert_eq!(status("/releases/x").await, 503);
+        drop(late);
+        assert_eq!(status("/releases/x").await, 200);
+    }
+
+    /// D2: a late body also holds its request's slot of the global cap.
+    #[tokio::test]
+    async fn a_late_body_holds_its_global_slot() {
+        let disk = tempfile::tempdir().unwrap();
+        let mut config = two_disk_backends(disk.path());
+        config.tuning.max_concurrent_requests = 1;
+        let (app, senders) = slots_app(&config).await;
+        let late = app
+            .clone()
+            .oneshot(request("GET", "/releases/late"))
+            .await
+            .unwrap();
+        let waiting = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.oneshot(request("GET", "/downloads/x"))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiting.is_finished(),
+            "the next request ran past the held slot"
+        );
+        senders.lock().clear();
+        axum::body::to_bytes(late.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(waiting.await.unwrap(), 200);
     }
 
     /// One global cap of request slots for every bucket: requests to a

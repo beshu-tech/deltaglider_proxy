@@ -478,11 +478,11 @@ impl MaintenanceGate {
         }
     }
 
-    /// A write of request work that runs on detached from its request (a
-    /// DeleteObjects batch, the store of a CompleteMultipartUpload): no
-    /// request deadline bounds it, so the drain counts it as background
-    /// (a drain that times out on it defers its job instead of failing).
-    pub fn begin_detached_write(self: &Arc<Self>, bucket: &str) -> WriteGuard {
+    /// A write that a response body runs (the store of a long
+    /// CompleteMultipartUpload): no request deadline bounds it, so the drain
+    /// counts it as background (a drain that times out on it defers its job
+    /// instead of failing).
+    pub fn begin_body_write(self: &Arc<Self>, bucket: &str) -> WriteGuard {
         self.begin_background_write(bucket)
     }
 
@@ -1172,6 +1172,14 @@ mod tests {
         "takes the bulk loop's DestWrite",
     )];
 
+    /// Request-scoped writers that run inside their request, which
+    /// `RequestWriteCount` counts to its end (nothing outlives the request).
+    const REQUEST_COUNTED: [(&str, &str, &str); 1] = [(
+        "src/s3_adapter_s3s/object.rs",
+        "delete_objects",
+        "the batch runs inside the request, which the gate middleware counts",
+    )];
+
     /// Code exempt from [`background_writers_are_admitted`], with why.
     const ADMISSION_EXEMPT: [(&str, &str); 5] = [
         ("src/deltaglider/", "the engine: its callers are admitted"),
@@ -1315,7 +1323,7 @@ mod tests {
                 "admit_stores",
                 "admit_buckets",
                 "begin_write",
-                "begin_detached_write",
+                "begin_body_write",
             ];
             for call in writers {
                 let counted =
@@ -1326,7 +1334,10 @@ mod tests {
                 let proven = PROOF_PARAMETER
                     .iter()
                     .any(|(rel, f, _)| *rel == src.rel && *f == name && takes_write_guard(rel, f));
-                if !counted && !proven {
+                let request_counted = REQUEST_COUNTED
+                    .iter()
+                    .any(|(rel, f, _)| *rel == src.rel && *f == name);
+                if !counted && !proven && !request_counted {
                     offenders.push(format!(
                         "{}:{} in {name} (needs one of {names:?} in the same function)",
                         src.rel, call.line

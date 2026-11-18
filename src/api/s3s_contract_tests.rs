@@ -348,9 +348,6 @@ async fn harness_layers(
             public_prefix_snapshot: &snapshot,
             admission_chain: &chain,
             shared_config: &shared_config,
-            detached: &crate::api::handlers::DetachedWork::new(
-                config.tuning.max_concurrent_requests,
-            ),
         },
         NopS3,
         RecordingAccess,

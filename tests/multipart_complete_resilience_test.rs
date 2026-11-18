@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! CompleteMultipartUpload must survive a client disconnect and tolerate retries.
+//! CompleteMultipartUpload stops on a client disconnect and tolerates retries.
 //!
-//! Found live (killing an HAProxy router mid-Complete on Kubernetes): the broken
-//! client connection cancelled the handler future mid-store, the upload rolled
-//! back, and the SDK's automatic retry got `InvalidRequest: Upload is already
-//! being completed` — the object was lost and the retry poisoned. The fix runs
-//! the store pipeline on a detached task (disconnect-proof) and routes retries
-//! through a completion registry (join in-flight work / hit the success
-//! tombstone). `DGP_TEST_COMPLETE_STALL_MS` holds the store window open so these
+//! Requests are stateless: a dropped connection drops the store, the upload
+//! rolls back to Open, and the retry completes it (found live: killing an
+//! HAProxy router mid-Complete on Kubernetes left the upload in `Completing`
+//! and the retry got `InvalidRequest`). Retries go through a completion
+//! registry (join in-flight work / hit the success tombstone). `DGP_TEST_COMPLETE_STALL_MS` holds the store window open so these
 //! tests can hit it deterministically.
 
 use crate::common;
@@ -55,10 +53,10 @@ async fn seed_multipart(
     (upload_id, completed)
 }
 
-/// The client vanishes mid-Complete; the store must finish anyway, and a retried
-/// Complete must return 200 with the object present and intact.
+/// The client vanishes mid-Complete; the store stops, the object is absent, the
+/// upload is Open, and a retried Complete returns 200 with the object intact.
 #[tokio::test]
-async fn complete_survives_client_disconnect_and_retry_succeeds() {
+async fn a_dropped_complete_stops_and_the_retry_succeeds() {
     let server = TestServer::builder()
         .env("DGP_TEST_COMPLETE_STALL_MS", STALL_MS)
         .build()
@@ -85,28 +83,29 @@ async fn complete_survives_client_disconnect_and_retry_succeeds() {
         "the first Complete must be abandoned mid-flight"
     );
 
-    // The detached task is still storing; poll until the object lands (10s
-    // deadline) instead of guessing a fixed sleep — slow CI runners need slack.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if client
+    // Wait past the stall window: a store that ran on would have landed.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    assert!(
+        client
             .head_object()
             .bucket(bucket)
             .key(key)
             .send()
             .await
-            .is_ok()
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "detached completion never landed the object"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
+            .is_err(),
+        "a dropped Complete stored the object"
+    );
+    let open = client
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .expect("the upload is Open again");
+    assert_eq!(open.parts().len(), 1);
 
-    // The SDK's retry: must be a clean 200 (tombstone), never
+    // The SDK's retry completes the upload, never
     // "Upload is already being completed" / NoSuchUpload.
     let retry = client
         .complete_multipart_upload()
@@ -116,7 +115,7 @@ async fn complete_survives_client_disconnect_and_retry_succeeds() {
         .multipart_upload(completed)
         .send()
         .await
-        .expect("retried Complete must succeed after a disconnect");
+        .expect("a retried Complete must succeed after a disconnect");
     let etag = retry.e_tag().expect("etag").to_string();
 
     let head = client
@@ -226,4 +225,60 @@ async fn tombstone_rejects_mismatched_part_list() {
     // The completed upload no longer exists: NoSuchUpload, as on S3.
     let msg = format!("{:?}", err.into_service_error());
     assert!(msg.contains("NoSuchUpload"), "unexpected error: {msg}");
+}
+
+/// A Complete whose `200` is out (keepalive) still holds its request slot until
+/// its body ends: with one slot, a GET sent after the `200` answers after the
+/// Complete ends. Tower gave the slot back when the headers went out.
+#[tokio::test]
+async fn a_late_complete_body_holds_the_request_slot() {
+    let server = TestServer::builder()
+        .env("DGP_MAX_CONCURRENT_REQUESTS", "1")
+        .env("DGP_TEST_COMPLETE_STALL_MS", "3000")
+        .env("DGP_TEST_COMPLETE_KEEPALIVE_AFTER_MS", "300")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    let bucket = server.bucket().to_string();
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("other.txt")
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let key = "resilience/slot.bin";
+    let (upload_id, completed) = seed_multipart(&client, &bucket, key).await;
+
+    let complete = {
+        let (client, bucket) = (client.clone(), bucket.clone());
+        tokio::spawn(async move {
+            client
+                .complete_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .multipart_upload(completed)
+                .send()
+                .await
+                .expect("complete");
+            std::time::Instant::now()
+        })
+    };
+    // Past the keepalive: the 200 is out, the store still runs.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    client
+        .get_object()
+        .bucket(&bucket)
+        .key("other.txt")
+        .send()
+        .await
+        .expect("get");
+    let got = std::time::Instant::now();
+    let complete_ended = complete.await.unwrap();
+    assert!(
+        got >= complete_ended,
+        "the GET was answered while the Complete body still held the only slot"
+    );
 }

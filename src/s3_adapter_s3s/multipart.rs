@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Multipart upload verbs: create, upload part, abort, list parts, list
-//! uploads, and the detached CompleteMultipartUpload pipeline.
+//! uploads, and the CompleteMultipartUpload pipeline.
 
 use super::*;
 
@@ -167,7 +167,6 @@ pub(super) async fn complete_multipart_upload(
     req: s3s::S3Request<s3s::dto::CompleteMultipartUploadInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
     let writer = Reader::for_object(&req.extensions, &req.input.bucket, &req.input.key);
-    let extensions = req.extensions;
     let input = req.input;
     // Defense-in-depth: the marker can be hot-applied mid-upload, so
     // Complete (the moment bytes reach the backend) re-checks. Create and
@@ -184,7 +183,7 @@ pub(super) async fn complete_multipart_upload(
         .set_max_object_size(svc.state.engine.load().max_object_size());
 
     // Completion registry: exactly one request runs the store pipeline, on a
-    // DETACHED task (a client disconnect must not cancel a half-done store);
+    // the request itself (a dropped connection stops it, the upload stays Open);
     // identical retries join the in-flight outcome or hit the tombstone.
     let begin = svc.state.multipart.begin_complete(
         &input.upload_id,
@@ -231,13 +230,6 @@ pub(super) async fn complete_multipart_upload(
             .await
         }
         crate::multipart::BeginComplete::Owner(publisher) => {
-            // The slot of the detached store (F56) BEFORE the object lock:
-            // a detached DeleteObjects batch holds a slot while it takes
-            // each key's object lock, so holding this key's lock while
-            // waiting for a slot deadlocked with it. A Complete that the
-            // quota or a precondition then refuses waited for the slot for
-            // nothing: acceptable, the wait is bounded by its deadline.
-            let slot = crate::api::handlers::DetachedWork::reserve(&extensions).await;
             // Admission (quota) + routing decisions run ONLY for the owner: a
             // tombstone/join retry must never be re-admitted — its bytes are
             // already committed, and the freeze/quota gates would wrongly
@@ -293,14 +285,12 @@ pub(super) async fn complete_multipart_upload(
                 input.upload_id.clone(),
             );
             let parts = requested_parts.clone();
-            // The detached store is a write of the bucket until it ends, also
-            // after the request is gone (client disconnect, request timeout):
-            // the maintenance drain (`drain_inflight_writes`) must wait for it.
-            let gate_write = svc
-                .state
-                .maintenance_gate
-                .begin_detached_write(&input.bucket);
-            let handle = slot.spawn_detached(async move {
+            // The store is a write of the bucket until its body ends, also
+            // after the 200 went out: the maintenance drain waits for it.
+            let gate_write = svc.state.maintenance_gate.begin_body_write(&input.bucket);
+            // The response body polls this work, outside the request task.
+            let scope = crate::deltaglider::spool::current_scope();
+            let work = crate::deltaglider::spool::scoped_in(scope, async move {
                 let _gate_write = gate_write;
                 let result = run_multipart_completion(
                     &write_lock,
@@ -322,19 +312,8 @@ pub(super) async fn complete_multipart_upload(
                     Ok((etag, _)) => publisher.publish(Ok(etag.clone())),
                     Err(e) => publisher.publish(Err(crate::multipart::CompletionFailure::of(e))),
                 }
-                result
+                result.map(|(etag, stored)| (etag, Some(stored)))
             });
-            let work = async move {
-                match handle.await {
-                    Ok(Ok((etag, stored))) => Ok((etag, Some(stored))),
-                    Ok(Err(e)) => Err(e),
-                    Err(join_err) => Err(s3s::S3Error::from(
-                        crate::api::errors::S3Error::InternalError(format!(
-                            "completion task failed: {join_err}"
-                        )),
-                    )),
-                }
-            };
             answer_in_time(
                 after,
                 work,
@@ -417,12 +396,13 @@ where
                 })?;
                 completion_output(&bucket, &key, &etag)
             };
-            Ok(s3s::S3Response::new(
-                s3s::dto::CompleteMultipartUploadOutput {
-                    future: Some(Box::pin(late)),
-                    ..Default::default()
-                },
-            ))
+            let mut response = s3s::S3Response::new(s3s::dto::CompleteMultipartUploadOutput {
+                future: Some(Box::pin(late)),
+                ..Default::default()
+            });
+            // The request keeps its slots until the body ends.
+            response.extensions.insert(crate::api::s3_router::LateBody);
+            Ok(response)
         }
     }
 }
@@ -551,9 +531,9 @@ pub(super) async fn await_completion_outcome(
     }
 }
 
-/// The CompleteMultipartUpload store pipeline. Runs on a DETACHED tokio task so a
-/// client disconnect cannot cancel a half-done store (which used to roll back the
-/// whole upload and poison the SDK's retry). Owns finish/rollback + event emission.
+/// The CompleteMultipartUpload store pipeline. Runs inside the response body, so a
+/// dropped connection drops it; the guard rolls the upload back to Open. Owns
+/// finish/rollback + event emission.
 /// `write_lock`: the object's write lock, held until the store ends.
 pub(super) async fn run_multipart_completion(
     write_lock: &crate::deltaglider::ObjectWriteGuard,
@@ -938,10 +918,12 @@ mod multipart_cost_tests {
             .e_tag
             .unwrap();
         super::panic_after_store::arm(&id);
-        let owner = complete_multipart_upload(&svc, request(complete_input(&id, &etag, false)))
-            .await
-            .expect_err("the owner's task panicked");
-        assert_eq!(*owner.code(), s3s::S3ErrorCode::InternalError);
+        // The panic unwinds the request (the connection ends, as in production).
+        let owner = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            complete_multipart_upload(&svc, request(complete_input(&id, &etag, false))),
+        ))
+        .await;
+        assert!(owner.is_err(), "the owner's request panicked");
 
         assert_eq!(state.multipart.count_uploads(), 0, "completed, not open");
         let puts = fake
@@ -1158,11 +1140,10 @@ mod multipart_cost_tests {
     }
 
     /// A CompleteMultipartUpload whose request is gone (client disconnect,
-    /// request timeout) still counts as an in-flight write of its bucket
-    /// while its detached store runs: the maintenance drain waits for it.
-    /// It counted as none once the request future was dropped.
+    /// request timeout) stops: its store is dropped, no write of the bucket
+    /// stays in flight, and the upload is Open again for a retry.
     #[tokio::test]
-    async fn a_detached_completion_is_an_inflight_write() {
+    async fn a_cut_completion_stops_and_leaves_the_upload_open() {
         let (engine, fake) = crate::deltaglider::s3_engine().await;
         let state = AppState::for_tests(engine);
         let svc = service(state.clone());
@@ -1176,44 +1157,27 @@ mod multipart_cost_tests {
             .output
             .e_tag
             .unwrap();
-        let input = s3s::dto::CompleteMultipartUploadInput::builder()
-            .bucket("b".into())
-            .key("a/photo.jpg".into())
-            .upload_id(id)
-            .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
-                parts: Some(vec![s3s::dto::CompletedPart {
-                    part_number: Some(1),
-                    e_tag: Some(etag),
-                    ..Default::default()
-                }]),
-            }))
-            .build()
-            .unwrap();
-        // Cut while the object's PUT is in flight; it stays in flight long
-        // enough for the next assertion.
+        let input = complete_input(&id, &etag, false);
+        // Cut while the object's PUT is in flight.
         fake.set_delay_ms("PUT", 2_000);
         let cut = fake
-            .cut_at(complete_multipart_upload(&svc, request(input)), |r| {
-                r.starts_with("PUT /b/a/photo.jpg")
-            })
+            .cut_at(
+                complete_multipart_upload(&svc, request(input.clone())),
+                |r| r.starts_with("PUT /b/a/photo.jpg"),
+            )
             .await;
         assert!(cut, "the store ended before the request was cut");
-        assert_eq!(state.maintenance_gate.inflight_writes("b"), 1);
-        // No request deadline bounds it: a drain counts it as background
-        // (a timeout on it defers the job, never fails it).
-        assert_eq!(state.maintenance_gate.inflight_background_writes("b"), 1);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while state.maintenance_gate.inflight_writes("b") > 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the write never ended"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(fake
-            .requests()
-            .iter()
-            .any(|r| r.starts_with("PUT /b/a/photo.jpg")));
+        assert_eq!(state.maintenance_gate.inflight_writes("b"), 0);
+        assert!(
+            state.engine.load().head("b", "a/photo.jpg").await.is_err(),
+            "a cut request stored the object"
+        );
+        // The retry completes the same upload.
+        fake.set_delay_ms("PUT", 0);
+        complete_multipart_upload(&svc, request(input))
+            .await
+            .expect("the retry of a cut Complete completes");
+        assert!(state.engine.load().head("b", "a/photo.jpg").await.is_ok());
     }
 
     /// F10 (epic #143): parallel UploadParts of 24 MiB each (and the
@@ -1345,93 +1309,5 @@ mod multipart_cost_tests {
                 "a runtime worker stalled {tick_worst:?} (blocking I/O on the reactor)"
             );
         }
-    }
-
-    /// Review of #166: CompleteMultipartUpload took the key's object lock
-    /// and THEN waited for a detached slot, while a detached DeleteObjects
-    /// batch held the only slot and waited for that key's object lock: both
-    /// hung. The Complete reserves its slot before the lock now.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_complete_and_a_delete_batch_share_one_slot_without_deadlock() {
-        let (engine, fake) = crate::deltaglider::s3_engine().await;
-        engine
-            .store("b", "a/k0.bin", b"x", None, Default::default())
-            .await
-            .unwrap();
-        let state = AppState::for_tests(engine);
-        let svc = Arc::new(service(state.clone()));
-        let work = crate::api::handlers::DetachedWork::new(1);
-        fn with<T>(work: &crate::api::handlers::DetachedWork, input: T) -> s3s::S3Request<T> {
-            let mut req = request(input);
-            req.extensions.insert(work.clone());
-            req
-        }
-        let id = state
-            .multipart
-            .create("b", "a/photo.jpg", None, Default::default())
-            .unwrap();
-        let etag = upload_part(&svc, request(part(&id, 1)))
-            .await
-            .unwrap()
-            .output
-            .e_tag
-            .unwrap();
-        // The batch takes the slot and stalls on its first key; its second
-        // key is the upload's.
-        fake.stall("DELETE", "b/a/k0");
-        let delete = s3s::dto::DeleteObjectsInput::builder()
-            .bucket("b".into())
-            .delete(s3s::dto::Delete {
-                objects: ["a/k0.bin", "a/photo.jpg"]
-                    .into_iter()
-                    .map(|k| s3s::dto::ObjectIdentifier {
-                        key: k.into(),
-                        ..Default::default()
-                    })
-                    .collect(),
-                quiet: None,
-            })
-            .build()
-            .unwrap();
-        let batch = {
-            let (svc, req) = (svc.clone(), with(&work, delete));
-            tokio::spawn(async move { super::super::object::delete_objects(&svc, req).await })
-        };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !fake
-            .requests()
-            .iter()
-            .any(|r| r.starts_with("DELETE /b/a/k0"))
-        {
-            assert!(std::time::Instant::now() < deadline, "the batch never sent");
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let input = s3s::dto::CompleteMultipartUploadInput::builder()
-            .bucket("b".into())
-            .key("a/photo.jpg".into())
-            .upload_id(id)
-            .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
-                parts: Some(vec![s3s::dto::CompletedPart {
-                    part_number: Some(1),
-                    e_tag: Some(etag),
-                    ..Default::default()
-                }]),
-            }))
-            .build()
-            .unwrap();
-        let complete = {
-            let (svc, req) = (svc.clone(), with(&work, input));
-            tokio::spawn(async move { complete_multipart_upload(&svc, req).await })
-        };
-        // Let the Complete reach its wait (for the slot, or with the bug,
-        // for the slot while it holds the key's lock).
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        fake.release_stalls();
-        let both = async { (batch.await.unwrap(), complete.await.unwrap()) };
-        let (deleted, completed) = tokio::time::timeout(std::time::Duration::from_secs(10), both)
-            .await
-            .expect("the Complete and the delete batch deadlocked on the slot and the object lock");
-        deleted.unwrap();
-        completed.unwrap();
     }
 }

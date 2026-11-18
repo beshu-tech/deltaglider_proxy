@@ -599,7 +599,7 @@ async fn a_migrate_copy_waits_for_the_disk_of_its_target_backend() {
 #[tokio::test]
 async fn a_migrate_copy_starts_only_after_the_admitted_writes_end() {
     let e = env_with("stage", 5, false).await;
-    let write = e.state.maintenance_gate.begin_detached_write("b");
+    let write = e.state.maintenance_gate.begin_body_write("b");
     let run = e.run();
     let mut c = Counters::default();
     {

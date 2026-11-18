@@ -175,7 +175,7 @@ pub(super) fn complete_timeout() -> std::time::Duration {
 /// timeout last `wait`, and the operation has no deadline of its own. The
 /// SDK sends at most 3 attempts (`RetryConfig::adaptive`, `max=3` in the
 /// `amz-sdk-request` header), so a hung backend holds the object lock, the
-/// detached slot and the spool for at most 3 x `wait` (45 min by default).
+/// request slots and the spool for at most 3 x `wait` (45 min by default).
 pub(super) fn complete_timeouts(
     wait: std::time::Duration,
 ) -> aws_sdk_s3::config::timeout::TimeoutConfig {

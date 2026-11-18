@@ -55,103 +55,6 @@ pub use status::{
 // Re-export for use by metrics module
 pub(crate) use status::get_peak_rss_bytes;
 
-/// The slots of request work that runs on after its request is gone: a
-/// DeleteObjects batch and the store of a CompleteMultipartUpload run on a
-/// detached task, so a client disconnect or the request timeout cannot cut
-/// them in half. The task gave its request's slot of the global cap back
-/// when the request ended, so requests that timed out left more detached
-/// tasks running than the cap has slots (F56 of epic #143). The S3 router
-/// installs one per process, sized like the global cap
-/// (`max_concurrent_requests`).
-///
-/// Use: `DetachedWork::reserve` a slot, then
-/// `DetachedSlot::spawn_detached` the task, which moves the slot into the
-/// task (no slot, no spawn). The wait for a slot counts against the
-/// request's deadline. Lock order: reserve the slot BEFORE any object write
-/// lock. A detached DeleteObjects batch holds a slot while it takes each
-/// key's object lock, so a request that held a key's lock while it waited
-/// for a slot deadlocked with it. Source guard
-/// `detached_request_work_holds_a_slot`.
-///
-/// Known limitation: the pool is global, not per backend. Detached work on
-/// one slow backend can hold every slot, and the DeleteObjects and
-/// CompleteMultipartUpload requests of the other backends then wait for a
-/// slot until their deadline (the request slots have per-backend shares,
-/// the detached slots do not).
-#[derive(Clone)]
-pub struct DetachedWork {
-    slots: Arc<tokio::sync::Semaphore>,
-    total: usize,
-}
-
-/// A reserved slot of [`DetachedWork`] (empty without a router: unit tests
-/// call handlers directly).
-#[must_use = "a reserved slot does nothing until it spawns its task"]
-pub struct DetachedSlot {
-    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    /// The backend share of the spool budget the request ran in, captured
-    /// at reserve time: `tokio::spawn` drops a task-local, and the detached
-    /// store must count against the same share as its request.
-    spool_scope: Option<Arc<str>>,
-}
-
-impl DetachedWork {
-    pub fn new(slots: usize) -> Self {
-        let total = slots.max(1);
-        Self {
-            slots: Arc::new(tokio::sync::Semaphore::new(total)),
-            total,
-        }
-    }
-
-    /// Slots held now: the detached tasks that run (or wait to start).
-    pub fn in_flight(&self) -> usize {
-        self.total.saturating_sub(self.slots.available_permits())
-    }
-
-    /// Wait until no detached task runs, at most `bound`. Returns the
-    /// tasks still running at the end (0: all finished). Used at shutdown,
-    /// after the listener stopped: no new task can start meanwhile.
-    pub async fn drain(&self, bound: std::time::Duration) -> usize {
-        let all = u32::try_from(self.total).unwrap_or(u32::MAX);
-        match tokio::time::timeout(bound, self.slots.acquire_many(all)).await {
-            Ok(_) => 0,
-            Err(_) => self.in_flight(),
-        }
-    }
-
-    /// Wait for a slot for one detached task of the request with
-    /// `extensions`. Call it before taking any object write lock.
-    pub(crate) async fn reserve(extensions: &axum::http::Extensions) -> DetachedSlot {
-        let Some(work) = extensions.get::<DetachedWork>() else {
-            return DetachedSlot {
-                _permit: None,
-                spool_scope: crate::deltaglider::spool::current_scope(),
-            };
-        };
-        DetachedSlot {
-            _permit: work.slots.clone().acquire_owned().await.ok(),
-            spool_scope: crate::deltaglider::spool::current_scope(),
-        }
-    }
-}
-
-impl DetachedSlot {
-    /// THE spawn of the S3 request paths: run `task` detached, holding
-    /// this slot until it ends.
-    pub(crate) fn spawn_detached<F>(self, task: F) -> tokio::task::JoinHandle<F::Output>
-    where
-        F: std::future::Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        let scope = self.spool_scope.clone();
-        tokio::spawn(crate::deltaglider::spool::scoped_in(scope, async move {
-            let _slot = self;
-            task.await
-        }))
-    }
-}
-
 /// Application state shared across handlers
 #[cfg(test)]
 impl AppState {
@@ -461,10 +364,9 @@ mod bucket_exists_tests {
 }
 
 #[cfg(test)]
-mod detached_work_tests {
-    /// The spawns that the S3 request paths may not call directly: a task
-    /// they start outlives the request, so it goes through
-    /// `DetachedSlot::spawn_detached`, which carries a slot.
+mod request_work_tests {
+    /// The spawn family: a task that an S3 request path starts outlives
+    /// its request. Requests are stateless: no work survives a dropped one.
     const SPAWNS: [&str; 5] = [
         "spawn",
         "spawn_blocking",
@@ -473,160 +375,50 @@ mod detached_work_tests {
         "spawn_blocking_on",
     ];
 
-    /// Calls that take an object write lock (directly or as the first step
-    /// of a client write); a detached slot is reserved before them.
-    const OBJECT_LOCKS: [&str; 4] = [
-        "lock_object_write",
-        "store_client_multipart_admit",
-        "store_conditional",
-        "store_client_write",
-    ];
+    /// `(file, fn, reason)`: the spawns that are allowed, each with its reason.
+    const ALLOWED: [(&str, &str, &str); 0] = [];
 
     fn in_scope(rel: &str) -> bool {
         rel.starts_with("src/s3_adapter_s3s/") || rel.starts_with("src/api/handlers/")
     }
 
-    /// Offenders: a spawn-family call (path or method form, any receiver:
-    /// `tokio::spawn`, `JoinSet::spawn`, `handle.spawn`, `spawn_blocking`)
-    /// outside `spawn_detached`, and a `DetachedWork::reserve` after an
-    /// object lock in the same fn.
+    /// Offenders: a spawn-family call (path or method form, any receiver)
+    /// that is not in [`ALLOWED`].
     fn offenders(sources: &[crate::source_scan::ast::Source]) -> Vec<String> {
         let mut out = Vec::new();
         for src in sources.iter().filter(|s| in_scope(&s.rel)) {
             for c in &src.prod.calls {
-                if SPAWNS.iter().any(|n| c.named(n)) && src.fn_name(c.func) != "spawn_detached" {
-                    out.push(format!(
-                        "{}:{} {} in {}",
-                        src.rel,
-                        c.line,
-                        c.name,
-                        src.fn_name(c.func)
-                    ));
-                }
-            }
-            for reserve in src.prod.calls_named("reserve").filter(|c| {
-                !c.method
-                    && c.segs
-                        .ends_with(&["DetachedWork".to_string(), "reserve".to_string()])
-            }) {
-                for lock in src.prod.calls.iter().filter(|c| {
-                    c.func == reserve.func
-                        && c.pos < reserve.pos
-                        && OBJECT_LOCKS.iter().any(|n| c.named(n))
-                }) {
-                    out.push(format!(
-                        "{}:{} DetachedWork::reserve after {} (line {}) in {}",
-                        src.rel,
-                        reserve.line,
-                        lock.name,
-                        lock.line,
-                        src.fn_name(reserve.func)
-                    ));
+                let func = src.fn_name(c.func);
+                let allowed = ALLOWED.iter().any(|(f, n, _)| *f == src.rel && *n == func);
+                if SPAWNS.iter().any(|n| c.named(n)) && !allowed {
+                    out.push(format!("{}:{} {} in {}", src.rel, c.line, c.name, func));
                 }
             }
         }
         out
     }
 
-    /// Source guard (F56 of epic #143): request work that an S3 request
-    /// path spawns outlives the request's slot of the global cap, so it
-    /// runs through `DetachedSlot::spawn_detached` (the slot moves into the
-    /// task; a slot taken and dropped cannot spawn), and its slot is
-    /// reserved before any object write lock (deadlock with a detached
-    /// DeleteObjects batch that holds a slot and takes object locks).
+    /// Source guard: S3 request work runs inside its request (or inside
+    /// the response body that the request returns), so a dropped
+    /// connection stops it.
     #[test]
-    fn detached_request_work_holds_a_slot() {
+    fn request_work_is_never_spawned() {
         let sources = crate::source_scan::ast::src();
         let found = offenders(sources);
-        assert!(
-            found.is_empty(),
-            "detached work outside the rule: {found:?}"
-        );
-        // The scan sees the two detached tasks it is about.
-        let spawning: Vec<String> = sources
-            .iter()
-            .filter(|s| s.rel.starts_with("src/s3_adapter_s3s/"))
-            .flat_map(|s| {
-                s.prod
-                    .calls_named("spawn_detached")
-                    .map(|c| s.fn_name(c.func).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        for expected in ["delete_objects", "complete_multipart_upload"] {
-            assert!(
-                spawning.iter().any(|f| f == expected),
-                "the scan missed {expected}: {spawning:?}"
-            );
-        }
+        assert!(found.is_empty(), "request work is spawned: {found:?}");
         let fixture = [crate::source_scan::ast::parse(
             "src/s3_adapter_s3s/x.rs",
-            "async fn ok(e: E) { \
-                 let s = crate::api::handlers::DetachedWork::reserve(&e).await; \
-                 let _l = store_client_multipart_admit(a).await; \
-                 s.spawn_detached(async {}); } \
-             async fn a() { tokio::spawn(async {}); } \
+            "async fn a() { tokio::spawn(async {}); } \
              async fn b(h: H) { h.spawn_blocking(|| ()); } \
              async fn c(j: J) { j.spawn(async {}); } \
              async fn d() { tokio::task::spawn_blocking(|| ()); } \
-             async fn e(x: E) { let _l = store_client_multipart_admit(a).await; \
-                 let s = DetachedWork::reserve(&x).await; s.spawn_detached(async {}); }",
+             async fn ok() { work().await; }",
         )];
         let caught = offenders(&fixture);
         let fns: Vec<&str> = caught
             .iter()
             .map(|o| o.rsplit(" in ").next().unwrap())
             .collect();
-        assert_eq!(fns, ["a", "b", "c", "d", "e"], "{caught:?}");
-    }
-
-    /// The spool scope of the request reaches the detached task: a store
-    /// that outlives its request counts against the same backend share.
-    #[tokio::test]
-    async fn a_detached_task_keeps_the_spool_scope_of_its_request() {
-        let extensions = axum::http::Extensions::new();
-        let slot = crate::deltaglider::spool::scoped("hetzner-fsn1", async {
-            super::DetachedWork::reserve(&extensions).await
-        })
-        .await;
-        let seen = slot
-            .spawn_detached(async { crate::deltaglider::spool::current_scope() })
-            .await
-            .unwrap();
-        assert_eq!(seen.as_deref(), Some("hetzner-fsn1"));
-
-        let slot = super::DetachedWork::reserve(&extensions).await;
-        let seen = slot
-            .spawn_detached(async { crate::deltaglider::spool::current_scope() })
-            .await
-            .unwrap();
-        assert_eq!(seen, None, "no scope at reserve time, none in the task");
-    }
-
-    /// The shutdown wait: idle work drains at once, a running task is
-    /// waited for, and a task past the bound is counted, not waited for.
-    #[tokio::test(start_paused = true)]
-    async fn the_shutdown_drain_waits_for_detached_tasks_within_its_bound() {
-        use std::time::Duration;
-        let work = super::DetachedWork::new(4);
-        assert_eq!(work.drain(Duration::from_secs(1)).await, 0, "idle");
-
-        let mut extensions = axum::http::Extensions::new();
-        extensions.insert(work.clone());
-        let slot = super::DetachedWork::reserve(&extensions).await;
-        let task = slot.spawn_detached(async {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        });
-        assert_eq!(work.in_flight(), 1);
-        assert_eq!(work.drain(Duration::from_secs(60)).await, 0, "waited");
-        task.await.unwrap();
-
-        let slot = super::DetachedWork::reserve(&extensions).await;
-        let _stuck = slot.spawn_detached(std::future::pending::<()>());
-        assert_eq!(
-            work.drain(Duration::from_secs(2)).await,
-            1,
-            "cut at the bound"
-        );
+        assert_eq!(fns, ["a", "b", "c", "d"], "{caught:?}");
     }
 }
