@@ -2273,11 +2273,8 @@ impl Config {
     }
 
     /// Backend that hosts `config_sync_bucket` (IAM sync, leases, reference
-    /// locks). An S3 singleton keeps the role even beside named backends:
-    /// that is where older releases always put the coordination bucket.
-    /// Otherwise the sync bucket resolves like any bucket. The old
-    /// singleton-only rule built a client for the unused filesystem default
-    /// when only named backends existed, so HA was off with no error.
+    /// locks). An S3 singleton keeps the role even beside named backends.
+    /// Otherwise the sync bucket resolves like any bucket.
     pub fn coordination_backend(&self) -> Option<&BackendConfig> {
         if self.backends.is_empty() || matches!(self.backend, BackendConfig::S3 { .. }) {
             return Some(&self.backend);

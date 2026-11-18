@@ -741,9 +741,6 @@ impl Metrics {
                 crate::storage::encrypting::conversion::ADOPTED_AFTER_CUTOFF.clone(),
             ))
             .expect("duplicate metric name");
-        registry
-            .register(Box::new(crate::s3_adapter_s3s::LEGACY_V2_TOKENS.clone()))
-            .expect("duplicate metric name");
         // Event-outbox writer backpressure (a static: the append path has no
         // Metrics handle).
         registry

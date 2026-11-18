@@ -225,35 +225,14 @@ pub(super) fn encode_v2_token(key: &str) -> String {
     )
 }
 
-/// The engine cursor of a V2 continuation token, and whether it came from
-/// the raw-key fallback.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct V2Cursor {
-    pub key: String,
-    pub legacy: bool,
-}
-
-/// Pure: the engine cursor for a V2 continuation token. A token without the
-/// prefix (or that does not decode) is the old raw-key form, accepted for
-/// one release so a listing that spans the upgrade goes on.
-pub(super) fn decode_v2_token(token: Option<&str>) -> Option<V2Cursor> {
+/// Pure: the engine cursor of a `dg1.` V2 continuation token. A token
+/// without the prefix, or that does not decode, is `None`.
+pub(super) fn decode_v2_token(token: &str) -> Option<String> {
     use base64::Engine as _;
-    let token = token?;
-    let opaque = token
-        .strip_prefix(V2_TOKEN_PREFIX)
-        .and_then(|b| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(b)
-                .ok()
-        })
-        .and_then(|bytes| String::from_utf8(bytes).ok());
-    Some(match opaque {
-        Some(key) => V2Cursor { key, legacy: false },
-        None => V2Cursor {
-            key: token.to_string(),
-            legacy: true,
-        },
-    })
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token.strip_prefix(V2_TOKEN_PREFIX)?)
+        .ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Pure: the client token for the next page of `listed`, if any. The last
@@ -272,17 +251,6 @@ pub(super) fn client_token(
         visible(cursor)
     })
 }
-
-/// ListObjectsV2 requests whose continuation token took the raw-key
-/// fallback. When it stays at zero, a later release can refuse such tokens.
-pub static LEGACY_V2_TOKENS: std::sync::LazyLock<prometheus::IntCounter> =
-    std::sync::LazyLock::new(|| {
-        prometheus::IntCounter::new(
-            "deltaglider_list_legacy_continuation_tokens_total",
-            "ListObjectsV2 continuation tokens accepted in the old raw-key form",
-        )
-        .expect("valid metric")
-    });
 
 /// Where a LIST continues: the engine cursor, and the proof of a folded
 /// name to go on with (only a sealed token carries one).
@@ -322,8 +290,8 @@ fn split_cursor(
 
 /// The cursor of a V2 continuation token. A sealed token (`dg2.`, with or without a proof)
 /// must open for this listing, else `InvalidArgument`: it never falls back
-/// to another start. Otherwise [`decode_v2_token`], with a log line and a
-/// count for the raw-key fallback.
+/// to another start. Any other token must be a `dg1.` token ([`decode_v2_token`]), else
+/// `InvalidArgument` too.
 pub(super) fn v2_cursor(
     token: Option<&str>,
     binding: list_token::TokenBinding<'_>,
@@ -334,18 +302,19 @@ pub(super) fn v2_cursor(
     if token.starts_with(list_token::SEALED_TOKEN_PREFIX) {
         return list_token::open(token, binding).map(|c| Some(c.into()));
     }
-    let Some(cursor) = decode_v2_token(Some(token)) else {
-        return Ok(None);
-    };
-    if cursor.legacy {
-        LEGACY_V2_TOKENS.inc();
-        tracing::info!(
-            bucket = binding.bucket,
-            "ListObjectsV2 continuation token in the old raw-key form (not `{V2_TOKEN_PREFIX}`); \
-             accepted in this release only"
-        );
+    match decode_v2_token(token) {
+        Some(key) => Ok(Some(ListCursor::plain(key))),
+        None => {
+            tracing::info!(
+                bucket = binding.bucket,
+                "ListObjectsV2 continuation token is not a `{V2_TOKEN_PREFIX}` or sealed token"
+            );
+            Err(s3s::s3_error!(
+                InvalidArgument,
+                "The continuation token provided is incorrect"
+            ))
+        }
     }
-    Ok(Some(ListCursor::plain(cursor.key)))
 }
 
 /// The cursor of a V1 `marker`. A marker is a key, except one with

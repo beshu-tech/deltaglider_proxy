@@ -15,7 +15,7 @@ interface MappingRuleRowProps {
   /** Runs after the row's menu confirms; handles its own errors. */
   onDelete: () => void | Promise<void>;
   /** Locks all inputs while a Save rules round-trip is in flight, so a
-   *  concurrent edit can't be lost when loadData() resyncs afterwards. */
+   *  concurrent edit can't be lost when the list resyncs afterwards. */
   disabled?: boolean;
 }
 

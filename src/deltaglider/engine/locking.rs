@@ -8,10 +8,9 @@ use crate::coordination::ReferenceLock;
 
 /// RAII guard for the optional cross-instance reference lock. Held for the
 /// duration of a reference read-modify-write, inside the in-process prefix
-/// mutex. It holds one lock object, or two while a bucket's lock key changes
-/// (`reference_lock_keys`: old key first). While held, a heartbeat task per
-/// lock object renews it every `renew_interval`; [`Self::ensure_held`] runs
-/// before each commit and checks every object, so a holder whose lock lapsed
+/// mutex. It holds one lock object. While held, a heartbeat task
+/// renews it every `renew_interval`; [`Self::ensure_held`] runs
+/// before each commit and checks it, so a holder whose lock lapsed
 /// (a long streaming encode, a coordination-bucket outage) stops before it
 /// writes. On drop it stops the heartbeats and spawns a best-effort async
 /// release in reverse order (Drop cannot be async); the lock's TTL backstops
@@ -642,12 +641,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let Some(lock) = self.reference_lock.clone() else {
             return Ok(ReferenceLockGuard::inert());
         };
-        // Old key first while it differs (see `reference_lock_keys`).
-        let keys = crate::coordination::reference_lock::reference_lock_keys(
+        let keys = [crate::coordination::reference_lock::lock_object_key(
             &self.storage.storage_identity(bucket),
-            self.storage.previous_storage_identity(bucket).as_deref(),
             deltaspace,
-        );
+        )];
         let owner = format!("ref-{}", uuid::Uuid::new_v4());
         let deadline = std::time::Instant::now() + lock.acquire_timeout();
         let now_fn = || crate::event_outbox::current_unix_seconds();

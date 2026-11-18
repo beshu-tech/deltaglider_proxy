@@ -24,8 +24,7 @@
 //! that PUT answers 412 (a lock object exists). The holder keeps the ETag
 //! of its last write, and the release is one `DELETE If-Match` on it. A free
 //! lock therefore costs 2 requests per hold (it cost 4: GET + PUT, GET +
-//! DELETE). The body format is unchanged, so nodes of the previous release
-//! read these locks as before.
+//! DELETE).
 //!
 //! ## Layering with the in-process lock
 //!
@@ -66,9 +65,8 @@
 //! node clocks do not matter. The holder renews every `renew_interval`
 //! (`ttl / 4`). A commit trusts a confirmation younger than that (a
 //! monotonic clock) and renews synchronously otherwise; the heartbeat
-//! declares the hold lost after `ttl / 2` of failed renews. A body from the
-//! previous release (no `ttl_secs`) is still judged by its writer-clock
-//! `expires_at`.
+//! declares the hold lost after `ttl / 2` of failed renews. A body without
+//! `ttl_secs` is judged by this node's TTL on the same server clock.
 //!
 //! ## Fencing
 //!
@@ -114,11 +112,10 @@ pub struct RefLock {
     pub owner: String,
     pub node_id: String,
     pub epoch: u64,
-    /// The writer's clock + TTL. Kept for readers on the previous release;
-    /// this release judges expiry by the server clock (`ttl_secs`).
+    /// The writer's clock + TTL. The fallback when the server sends no `Date`.
     pub expires_at: i64,
     /// The TTL the writer granted. With it, expiry is `server age > ttl`
-    /// (see `server_clock`). Absent in a body from the previous release.
+    /// (see `server_clock`). Absent: this node's TTL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<i64>,
 }
@@ -288,25 +285,6 @@ pub fn lock_object_key(bucket: &str, deltaspace: &str) -> String {
     format!("_dgp/locks/reference/{}.json", hex::encode(h.finalize()))
 }
 
-/// The lock objects of a deltaspace, in the order to take them. This
-/// release changes the identity of a routed bucket without an alias; while
-/// the previous identity differs, both lock objects are taken so that a
-/// node of the previous release (old key only) and a node of the next one
-/// (new key only) are both excluded. The old key comes first on every node,
-/// so two nodes of this release cannot deadlock (each waits for the old key
-/// before it holds anything). Release in reverse order.
-pub fn reference_lock_keys(
-    identity: &str,
-    previous: Option<&str>,
-    deltaspace: &str,
-) -> Vec<String> {
-    let new = lock_object_key(identity, deltaspace);
-    match previous.map(|p| lock_object_key(p, deltaspace)) {
-        Some(old) if old != new => vec![old, new],
-        _ => vec![new],
-    }
-}
-
 /// The concrete lock over a CAS-capable coordination bucket.
 pub struct S3ReferenceLock {
     client: Client,
@@ -414,6 +392,7 @@ impl S3ReferenceLock {
                         lock.expires_at = super::server_clock::effective_expires_at(
                             lock.expires_at,
                             lock.ttl_secs,
+                            self.ttl_secs,
                             age,
                             now,
                         );
@@ -678,25 +657,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reference_lock_keys_take_the_old_key_first() {
-        let old = lock_object_key("releases", "v1");
-        let new = lock_object_key("hetzner-fsn1\u{0}releases", "v1");
-        assert_eq!(
-            reference_lock_keys("hetzner-fsn1\u{0}releases", Some("releases"), "v1"),
-            vec![old, new.clone()]
-        );
-        assert_eq!(
-            reference_lock_keys("hetzner-fsn1\u{0}releases", None, "v1"),
-            vec![new]
-        );
-        let same = lock_object_key("db-archive", "v1");
-        assert_eq!(
-            reference_lock_keys("db-archive", Some("db-archive"), "v1"),
-            vec![same]
-        );
-    }
-
     /// The body stays readable both ways for one release: the previous
     /// release's struct (no `ttl_secs`) reads a new body, and a body without
     /// `ttl_secs` reads here.
@@ -896,6 +856,31 @@ mod tests {
         .with_profile(Default::default());
         assert!(lock.try_acquire("k", "peer", now).await.unwrap());
         assert_eq!(canned.puts(), 1);
+    }
+
+    /// A body without `ttl_secs` is judged by this node's TTL on the server
+    /// clock, not by the writer's `expires_at` (here far in the past).
+    #[tokio::test]
+    async fn a_lock_without_ttl_is_judged_by_the_server_clock() {
+        let now = crate::event_outbox::current_unix_seconds();
+        let body = serde_json::json!({
+            "owner": "holder", "node_id": "nodeB", "epoch": 3, "expires_at": now - 10_000
+        });
+        let canned = crate::coordination::test_s3::Canned {
+            body: serde_json::to_vec(&body).unwrap(),
+            date: now,
+            last_modified: now - 10,
+            seen: Default::default(),
+        };
+        let lock = S3ReferenceLock::new(
+            crate::coordination::test_s3::client(&canned),
+            "coord".into(),
+            "nodeA".into(),
+        )
+        .with_profile(Default::default());
+        let got = lock.try_acquire("k", "peer", now).await.unwrap();
+        assert!(!got, "a live lock (server age 10 s < node ttl) was stolen");
+        assert_eq!(canned.puts(), 0);
     }
 
     #[test]
@@ -1166,11 +1151,11 @@ mod tests {
         let (lock, fake) = fake_lock_proven().await;
         let now = crate::event_outbox::current_unix_seconds();
         assert!(lock.try_acquire("k", "holder", now).await.unwrap());
-        // The hold lapses (a body without `ttl_secs` is judged by its
-        // `expires_at`, the previous release's form): the holder's kept
+        // The hold lapses (a body with `ttl_secs: 0` is judged by its
+        // `expires_at`): the holder's kept
         // ETag is now stale, as after a lapse and a peer's write.
         let lapsed = serde_json::json!({
-            "owner": "holder", "node_id": "node", "epoch": 1, "expires_at": now - 1
+            "owner": "holder", "node_id": "node", "epoch": 1, "expires_at": now - 1, "ttl_secs": 0
         });
         lock.client
             .put_object()
@@ -1203,7 +1188,7 @@ mod tests {
         let now = crate::event_outbox::current_unix_seconds();
         assert!(lock.try_acquire("k", "holder", now).await.unwrap());
         let lapsed = serde_json::json!({
-            "owner": "holder", "node_id": "node", "epoch": 1, "expires_at": now - 1
+            "owner": "holder", "node_id": "node", "epoch": 1, "expires_at": now - 1, "ttl_secs": 0
         });
         lock.client
             .put_object()
@@ -1446,7 +1431,7 @@ mod tests {
         fake.set_delete_if_match_ignored(true);
         let now = crate::event_outbox::current_unix_seconds();
         let lapsed = serde_json::json!({
-            "owner": "holder", "node_id": "node", "epoch": 1, "expires_at": now - 1
+            "owner": "holder", "node_id": "node", "epoch": 1, "expires_at": now - 1, "ttl_secs": 0
         });
         lock.client
             .put_object()

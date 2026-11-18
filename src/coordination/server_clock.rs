@@ -8,12 +8,9 @@
 //! one clock for every node: the object's `Last-Modified` (the time of the
 //! last acquire or renew) and the `Date` of the GET response (the server's
 //! now) give the lock's age with no node clock in it. A body that carries
-//! `ttl_secs` is expired when that age is over the TTL.
-//!
-//! Compatibility: writers still put `expires_at` in the body, so a node on
-//! the previous release (which ignores `ttl_secs`) reads a new lock as
-//! before; a body from such a node (no `ttl_secs`) is judged by its
-//! `expires_at`, as before.
+//! `ttl_secs` (or this node's TTL, when the body has none) is expired when
+//! that age is over the TTL. The writer's `expires_at` stays in the body as
+//! the fallback when the server sends no `Date`.
 
 use aws_sdk_s3::config::ConfigBag;
 use aws_smithy_runtime_api::box_error::BoxError;
@@ -72,14 +69,17 @@ pub fn server_age(date: Option<i64>, last_modified: Option<i64>) -> Option<i64> 
 /// With `ttl_secs` in the body and a server age, the lock has
 /// `ttl - age` seconds left, so it expires at `now + ttl - age`: the
 /// planners' `expires_at < now` then means exactly `age > ttl`, on the
-/// server's clock. Without either, the writer's `expires_at` stays.
+/// server's clock. A body without `ttl_secs` uses this node's TTL. Without a
+/// server age, the writer's `expires_at` stays.
 pub fn effective_expires_at(
     written_expires_at: i64,
-    ttl_secs: Option<i64>,
+    body_ttl_secs: Option<i64>,
+    node_ttl_secs: i64,
     age: Option<i64>,
     now: i64,
 ) -> i64 {
-    match (ttl_secs.filter(|t| *t > 0), age) {
+    let ttl = body_ttl_secs.unwrap_or(node_ttl_secs);
+    match (Some(ttl).filter(|t| *t > 0), age) {
         (Some(ttl), Some(age)) => now.saturating_add(ttl).saturating_sub(age),
         _ => written_expires_at,
     }
@@ -134,13 +134,28 @@ mod tests {
     #[test]
     fn effective_expiry_is_ttl_minus_server_age() {
         // Server says 10 s old, TTL 120: 110 s left on any reader clock.
-        assert_eq!(effective_expires_at(-5, Some(120), Some(10), 1000), 1110);
+        assert_eq!(
+            effective_expires_at(-5, Some(120), 60, Some(10), 1000),
+            1110
+        );
         // Exactly at the TTL: expires_at == now → still live (strict <).
-        assert_eq!(effective_expires_at(0, Some(120), Some(120), 1000), 1000);
-        assert_eq!(effective_expires_at(0, Some(120), Some(121), 1000), 999);
-        // An old body (no ttl) or no server age: the writer's clock.
-        assert_eq!(effective_expires_at(77, None, Some(10), 1000), 77);
-        assert_eq!(effective_expires_at(77, Some(120), None, 1000), 77);
-        assert_eq!(effective_expires_at(77, Some(0), Some(1), 1000), 77);
+        assert_eq!(
+            effective_expires_at(0, Some(120), 60, Some(120), 1000),
+            1000
+        );
+        assert_eq!(effective_expires_at(0, Some(120), 60, Some(121), 1000), 999);
+        // No server age: the writer's clock.
+        assert_eq!(effective_expires_at(77, Some(120), 60, None, 1000), 77);
+        assert_eq!(effective_expires_at(77, Some(0), 0, Some(1), 1000), 77);
+    }
+
+    #[test]
+    fn a_body_without_ttl_is_judged_by_the_node_ttl_on_the_server_clock() {
+        // Writer clock says long expired (77), server says 10 s old, node TTL 60.
+        assert_eq!(effective_expires_at(77, None, 60, Some(10), 1000), 1050);
+        assert_eq!(
+            effective_expires_at(1_000_000, None, 60, Some(61), 1000),
+            999
+        );
     }
 }

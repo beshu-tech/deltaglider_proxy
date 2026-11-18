@@ -150,8 +150,8 @@ where
 }
 
 /// Config-time lifecycle gate for apply paths: errors are FATAL only when the
-/// lifecycle content actually CHANGED vs the running config; an unchanged (e.g.
-/// pre-existing pre-v1.9.0) invalid lifecycle downgrades to warnings so it
+/// lifecycle content actually CHANGED vs the running config; an unchanged
+/// invalid lifecycle downgrades to warnings so it
 /// cannot block unrelated config edits. `Ok(warnings)` / `Err(fatal)`.
 pub fn lifecycle_gate(
     old: &LifecycleConfig,

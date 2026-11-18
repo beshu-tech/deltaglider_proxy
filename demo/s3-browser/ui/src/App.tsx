@@ -46,16 +46,8 @@ export default function App() {
   const colors = useColors();
 
   const { view, subPath, browser, navigate, search } = useUrlRouter();
-  // Stable "go back to browser" callback. Previously inlined into
-  // AdminPage props as `() => navigate('browse')`, which
-  // allocated a fresh arrow every App render and propagated as
-  // `onBack` / `onSessionExpired` to ~10 admin panels. Each panel's
-  // `loadData` `useCallback` lists `onSessionExpired` in its deps,
-  // so a fresh prop → fresh callback → `useEffect([loadData])` fires
-  // → re-fetches → setState → re-render wave. This one-line fix
-  // eliminates the most visible cause of excessive re-renders when
-  // navigating between admin sub-pages. `navigate` is stable, and
-  // `buildViewUrl('browser')` is a constant, so this stays stable too.
+  // Stable "go back to browser" callback: a fresh arrow per render would
+  // propagate to every admin panel and re-render them all.
   const navigateToBrowse = useCallback(() => navigate(buildViewUrl('browser')), [navigate]);
   const [siderOpen, setSiderOpen] = useState(false);
   const [needsConnect, setNeedsConnect] = useState(true); // start true, resolved in useEffect

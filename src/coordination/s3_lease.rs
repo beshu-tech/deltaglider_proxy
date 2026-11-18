@@ -16,13 +16,13 @@
 //!
 //! Clock skew: expiry is judged by the S3 server's clock (the lease object's
 //! `Last-Modified` against the GET's `Date`, see `server_clock`), so node
-//! clocks do not matter. A body from the previous release (no `ttl_secs`) is
-//! still judged by its writer-clock `expires_at`.
+//! clocks do not matter. A body without `ttl_secs` is judged by this node's
+//! TTL on the same clock.
 //!
 //! Cost: the acquire sends the create-only PUT first and reads the lease
 //! only when that PUT answers 412. The holder keeps the ETag of its last
 //! write, and the release is one `DELETE If-Match` on it. A free lease costs
-//! 2 requests per hold (it cost 4). The body format is unchanged.
+//! 2 requests per hold (it cost 4).
 
 use super::if_match::IfMatchRequest;
 use aws_sdk_s3::primitives::ByteStream;
@@ -42,16 +42,19 @@ pub struct Lease {
     pub expires_at: i64,
     /// Per-PROCESS id of the writer. Self-reclaim needs it: a lease that THIS
     /// process wrote belongs to a live worker in it (scheduler, event
-    /// consumer, run-now) and must block the others. Absent (older writer) →
-    /// empty, which never equals a live process's id.
-    #[serde(default)]
+    /// consumer, run-now) and must block the others. A body without it does
+    /// not parse and reads as corrupt.
     pub boot_id: String,
     /// The TTL the writer granted: expiry is `server age > ttl` (see
-    /// `server_clock`). Absent in a body from the previous release, which is
-    /// judged by `expires_at` (still written, for that release's readers).
+    /// `server_clock`). Absent: this node's TTL. `expires_at` is the fallback
+    /// when the server sends no `Date`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<i64>,
 }
+
+/// TTL for a body without `ttl_secs`, on a read that has no TTL of its own
+/// (release, `is_held`): the default lease TTL.
+const READ_TTL_SECS: i64 = 300;
 
 /// Bounded retries for a renew PUT against a transient coordination-bucket blip,
 /// so one failed round-trip doesn't drop a lease the owner still legitimately
@@ -272,7 +275,12 @@ impl S3Lease {
     /// Read the lease object + its ETag. The lease's `expires_at` comes back
     /// re-based onto the caller's clock `now` from the server-clock age
     /// (`server_clock::effective_expires_at`).
-    async fn read_lease(&self, key: &str, now: i64) -> Result<LeaseRead, LeaseError> {
+    async fn read_lease(
+        &self,
+        key: &str,
+        now: i64,
+        node_ttl_secs: i64,
+    ) -> Result<LeaseRead, LeaseError> {
         match super::server_clock::get_with_server_age(&self.client, &self.bucket, key).await {
             Ok((out, age)) => {
                 let etag = out.e_tag().map(str::to_string).unwrap_or_default();
@@ -287,6 +295,7 @@ impl S3Lease {
                         lease.expires_at = super::server_clock::effective_expires_at(
                             lease.expires_at,
                             lease.ttl_secs,
+                            node_ttl_secs,
                             age,
                             now,
                         );
@@ -372,7 +381,7 @@ impl CoordinationLease for S3Lease {
         {
             return Ok(true);
         }
-        let current = self.read_lease(&key, now).await?;
+        let current = self.read_lease(&key, now, ttl_secs).await?;
         match plan_acquire_read(
             &current,
             now,
@@ -432,7 +441,7 @@ impl CoordinationLease for S3Lease {
             let elapsed_secs = started.elapsed().as_secs() as i64;
             let effective_now = now.saturating_add(elapsed_secs);
             let expires_at = effective_now.saturating_add(ttl_secs.max(1));
-            let current = match self.read_lease(&key, effective_now).await {
+            let current = match self.read_lease(&key, effective_now, ttl_secs).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_err = Some(e);
@@ -495,7 +504,7 @@ impl CoordinationLease for S3Lease {
         // that may ignore `If-Match` on DELETE: read first, delete only our
         // own LIVE lease (see `cas::read_first_release_may_delete`).
         let now = crate::event_outbox::current_unix_seconds();
-        if let LeaseRead::Valid { lease, etag } = self.read_lease(&key, now).await? {
+        if let LeaseRead::Valid { lease, etag } = self.read_lease(&key, now, READ_TTL_SECS).await? {
             if super::cas::read_first_release_may_delete(&lease.owner, lease.expires_at, owner, now)
             {
                 let _ = self
@@ -521,7 +530,7 @@ impl CoordinationLease for S3Lease {
         // Held = the lease object exists AND hasn't lapsed. A transient read
         // error is surfaced (the caller treats an Err conservatively).
         Ok(self
-            .read_lease(&key, now)
+            .read_lease(&key, now, READ_TTL_SECS)
             .await?
             .valid()
             .is_some_and(|(lease, _etag)| lease.expires_at >= now))
@@ -634,7 +643,8 @@ mod tests {
         let now = crate::event_outbox::current_unix_seconds();
         assert!(lease.try_acquire(sub, "r", "old", now, 300).await.unwrap());
         let lapsed = serde_json::json!({
-            "owner": "old", "node_id": "node", "epoch": 1, "expires_at": now - 1
+            "owner": "old", "node_id": "node", "epoch": 1, "expires_at": now - 1,
+            "boot_id": "boot-old", "ttl_secs": 0
         });
         lease
             .client
@@ -719,7 +729,8 @@ mod tests {
         let sub = LeaseSubsystem::Replication;
         let now = crate::event_outbox::current_unix_seconds();
         let lapsed = serde_json::json!({
-            "owner": "old", "node_id": "node", "epoch": 1, "expires_at": now - 1
+            "owner": "old", "node_id": "node", "epoch": 1, "expires_at": now - 1,
+            "boot_id": "boot-old", "ttl_secs": 0
         });
         lease
             .client
@@ -754,7 +765,7 @@ mod tests {
         let now = crate::event_outbox::current_unix_seconds();
         let canned = canned_lease(
             serde_json::json!({"owner": "leader", "node_id": "nodeB", "epoch": 2,
-                "expires_at": now - 1000 + 300, "ttl_secs": 300}),
+                "expires_at": now - 1000 + 300, "ttl_secs": 300, "boot_id": "b"}),
             20,
         );
         let l = S3Lease::new(
@@ -778,7 +789,7 @@ mod tests {
         let now = crate::event_outbox::current_unix_seconds();
         let canned = canned_lease(
             serde_json::json!({"owner": "leader", "node_id": "nodeB", "epoch": 2,
-                "expires_at": now + 50_000, "ttl_secs": 300}),
+                "expires_at": now + 50_000, "ttl_secs": 300, "boot_id": "b"}),
             400,
         );
         let l = S3Lease::new(
@@ -847,7 +858,7 @@ mod tests {
             plan_acquire(Some((&l, "etag1")), 100, "me", "nodeA", Some("boot-before")),
             AcquireAction::Blocked
         );
-        // A lease body from an older release has no boot id: never ours.
+        // An empty boot id is never ours.
         let old = Lease {
             boot_id: String::new(),
             ..l.clone()

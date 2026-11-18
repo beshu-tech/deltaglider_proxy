@@ -1179,18 +1179,15 @@ async fn validate_cas_bucket_as(
     // `refreshing_stale` = we saw an EXISTING witness that aged out. It
     // matters for step 3: a stale witness must be OVERWRITTEN (its key already
     // exists, so a create-if-absent write would 412 and never bump the stamp).
-    // A witness from a release before the conditional-DELETE step or the
-    // `If-Match` dialect has no verdict for it: it counts as stale, so the
-    // probe runs once more. (A witness with no dialect may come from a
-    // release whose probe never tested `If-Match` with the right ETag: it
-    // must not vouch for the quoted form.)
+    // A witness that does not parse (a field missing) counts as stale: the
+    // probe runs once more and its write overwrites it.
     let mut refreshing_stale = false;
     match read_witness(client, bucket, witness_key).await {
-        Ok(Some(Witness {
+        Ok(WitnessRead::Parsed(Witness {
             validated_at_unix,
             validated_by,
-            conditional_delete: Some(conditional_delete),
-            if_match: Some(if_match),
+            conditional_delete,
+            if_match,
             ..
         })) if witness_is_fresh(validated_at_unix, now, WITNESS_MAX_AGE_SECS) => {
             return Ok(CoordinationValidation::CachedWitness {
@@ -1203,8 +1200,8 @@ async fn validate_cas_bucket_as(
                 },
             });
         }
-        Ok(Some(_)) => refreshing_stale = true, // aged out or a verdict missing → overwrite
-        Ok(None) => {}                          // absent → create-if-absent
+        Ok(WitnessRead::Parsed(_) | WitnessRead::Unparsed) => refreshing_stale = true, // aged out or unreadable → overwrite
+        Ok(WitnessRead::Absent) => {} // absent → create-if-absent
         Err(e) => {
             // A read error is not itself a validation failure (transient), but
             // don't fail on it — fall through to the probe, the real gate.
@@ -1241,8 +1238,16 @@ async fn validate_cas_bucket_as(
     Ok(CoordinationValidation::Probed { profile })
 }
 
-/// Read + parse a witness object. `Ok(None)` = absent (a 404/NoSuchKey).
-async fn read_witness(client: &Client, bucket: &str, key: &str) -> Result<Option<Witness>, String> {
+/// What a read of the witness object found.
+enum WitnessRead {
+    Absent,
+    /// The object exists but is not a witness of this shape.
+    Unparsed,
+    Parsed(Witness),
+}
+
+/// Read + parse a witness object.
+async fn read_witness(client: &Client, bucket: &str, key: &str) -> Result<WitnessRead, String> {
     match client.get_object().bucket(bucket).key(key).send().await {
         Ok(out) => {
             let bytes = out
@@ -1251,11 +1256,12 @@ async fn read_witness(client: &Client, bucket: &str, key: &str) -> Result<Option
                 .await
                 .map_err(|e| format!("witness body read: {e}"))?
                 .into_bytes();
-            Ok(serde_json::from_slice::<Witness>(&bytes).ok())
+            Ok(serde_json::from_slice::<Witness>(&bytes)
+                .map_or(WitnessRead::Unparsed, WitnessRead::Parsed))
         }
         Err(e) => {
             if is_object_absent(&sdk_error_signal(&e)) {
-                Ok(None)
+                Ok(WitnessRead::Absent)
             } else {
                 Err(format!("{e:?}"))
             }
@@ -1286,8 +1292,8 @@ async fn write_witness(
         validated_at_unix: now,
         validated_by,
         primitive: "if-none-match-cas".to_string(),
-        conditional_delete: Some(profile.conditional_delete),
-        if_match: Some(profile.if_match),
+        conditional_delete: profile.conditional_delete,
+        if_match: profile.if_match,
     })
     .unwrap_or_default();
     let mut put = client
@@ -1348,14 +1354,10 @@ struct Witness {
     validated_at_unix: i64,
     validated_by: String,
     primitive: String,
-    /// The conditional-DELETE verdict of the probe. Absent in a witness
-    /// from an older release: the next boot probes again.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    conditional_delete: Option<bool>,
-    /// The `If-Match` dialect the probe found. Absent in a witness from an
-    /// older release: the next boot probes again.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    if_match: Option<crate::coordination::if_match::IfMatchDialect>,
+    /// The conditional-DELETE verdict of the probe.
+    conditional_delete: bool,
+    /// The `If-Match` dialect the probe found.
+    if_match: crate::coordination::if_match::IfMatchDialect,
 }
 
 /// Pure freshness check — extracted so the TTL decision is unit-testable.
@@ -3074,13 +3076,19 @@ mod tests {
             validated_at_unix: 1_783_000_000,
             validated_by: "node-abc".into(),
             primitive: "if-none-match-cas".into(),
-            conditional_delete: Some(false),
-            if_match: Some(crate::coordination::if_match::IfMatchDialect::Unquoted),
+            conditional_delete: false,
+            if_match: crate::coordination::if_match::IfMatchDialect::Unquoted,
         };
         let bytes = serde_json::to_vec(&w).unwrap();
         let back: Witness = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.validated_at_unix, w.validated_at_unix);
         assert_eq!(back.primitive, "if-none-match-cas");
+    }
+
+    #[test]
+    fn a_witness_without_a_verdict_does_not_parse() {
+        let old = br#"{"version":1,"validated_at_unix":1,"validated_by":"n","primitive":"p"}"#;
+        assert!(serde_json::from_slice::<Witness>(old).is_err());
     }
 
     #[test]

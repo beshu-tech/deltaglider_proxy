@@ -27,9 +27,8 @@ pub struct WriteEncryption {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
     /// The key check value of a proxy key ([`key_check_value`]): two
-    /// configs with one key id and different key bytes differ here. Since
-    /// format v2 (issue #120) it is the key's v2 fingerprint, so a node of
-    /// an older release (whose value differs) disagrees and refuses writes.
+    /// configs with one key id and different key bytes differ here. It is
+    /// the key's v2 fingerprint (issue #120).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kcv: Option<String>,
 }

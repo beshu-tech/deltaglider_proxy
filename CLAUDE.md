@@ -375,13 +375,12 @@ single-instance planes below are addressed.
   (HOSTNAME twins, engine rebuilds). Expiry (this lock AND `S3Lease`) is judged
   by the S3 SERVER clock — the object's `Last-Modified` vs the GET response
   `Date` (`src/coordination/server_clock.rs`, body field `ttl_secs`) — so node
-  clock skew does not matter; `expires_at` is still written for the previous
-  release's readers, and a body without `ttl_secs` is judged by it. MinIO tests
+  clock skew does not matter; `expires_at` is still written (the fallback when the server sends no
+  `Date`), and a body without `ttl_secs` is judged by this node's TTL on the same clock. MinIO tests
   therefore wait real time (TTL 2 s), a simulated `now` no longer expires a lock.
   Lock key = `lock_object_key(storage_identity, deltaspace)`; a routed bucket's identity is
-  `backend\0real_bucket` (before this release a route without an alias used the bare name), so
-  this release takes BOTH lock objects while they differ, old first, released in reverse
-  (`reference_lock_keys`, `previous_storage_identity`); the next release drops the old key.
+  `backend\0real_bucket`, and a hold takes that one lock object. A lease body without `boot_id`
+  and a coordination witness without both verdict fields read as corrupt / absent (re-probe).
   Every engine write of reference.bin (and of a delta) goes through a guard method:
   the backend write takes a `RefWriteProof` that only the guard's
   `reference_writes` module in `engine/locking.rs` makes, incl. delete-reclaim, sweep-reclaim, the heal

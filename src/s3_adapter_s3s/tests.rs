@@ -124,33 +124,23 @@ fn list_metadata_goes_into_its_own_contents_block() {
 }
 
 #[test]
-fn v2_tokens_are_opaque_and_accept_the_raw_form() {
-    let cursor = |t: &str| decode_v2_token(Some(t)).map(|c| (c.key, c.legacy));
+fn v2_tokens_are_opaque_and_a_raw_key_is_refused() {
     for key in ["p/a.txt", "ctl/a\u{1}b.txt", "", "é/<x>&"] {
         let t = encode_v2_token(key);
         assert!(t.bytes().all(|b| b.is_ascii_graphic()), "{t}");
-        assert_eq!(cursor(&t), Some((key.to_string(), false)));
+        assert_eq!(decode_v2_token(&t).as_deref(), Some(key));
     }
-    // The raw fallback says so, so the caller can count it.
-    assert_eq!(cursor("p/a.txt"), Some(("p/a.txt".into(), true)));
-    assert_eq!(cursor("dg1.!!"), Some(("dg1.!!".into(), true)));
-    assert!(decode_v2_token(None).is_none());
+    assert_eq!(decode_v2_token("p/a.txt"), None);
+    assert_eq!(decode_v2_token("dg1.!!"), None);
 }
 
-/// Each raw-token fallback bumps the counter that tells when the
-/// fallback can go; an opaque token does not.
+/// A token from before 2.0 (the raw key) answers 400 InvalidArgument.
 #[test]
-fn the_raw_token_fallback_is_counted() {
-    let counter = &*super::list::LEGACY_V2_TOKENS;
-    let before = counter.get();
-    assert_eq!(
-        super::list::v2_cursor(Some("p/a.txt"), BINDING)
-            .unwrap()
-            .map(|c| c.key)
-            .as_deref(),
-        Some("p/a.txt")
-    );
-    assert!(counter.get() > before, "the fallback must be counted");
+fn a_raw_key_v2_token_answers_invalid_argument() {
+    for t in ["p/a.txt", "dg1.!!", ""] {
+        let err = super::list::v2_cursor(Some(t), BINDING).unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidArgument", "{t:?}");
+    }
 }
 
 const BINDING: super::list_token::TokenBinding<'static> = super::list_token::TokenBinding {
@@ -201,7 +191,6 @@ fn v2_tokens_open_sealed_positions_and_refuse_bad_ones() {
         code(super::list::v2_cursor(Some("dg2.!!"), BINDING)),
         "InvalidArgument"
     );
-    // The previous release's token form.
     assert_eq!(
         super::list::v2_cursor(Some(&encode_v2_token("v/1")), BINDING)
             .unwrap()
@@ -322,7 +311,7 @@ mod released_2_1_0 {
         if token.starts_with("dg2.") {
             return open(key, token, b);
         }
-        Ok(super::list::decode_v2_token(Some(token)).unwrap().key)
+        Ok(super::list::decode_v2_token(token).unwrap_or_else(|| token.to_string()))
     }
 
     /// The start key the release takes from a V1 `marker`.

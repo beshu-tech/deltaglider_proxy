@@ -47,12 +47,6 @@ pub(crate) fn backend_storage_identity(backend: &str, real: &str) -> String {
     format!("{backend}\u{0}{real}")
 }
 
-/// Pure: the identity of the previous release, when it differs. It was the
-/// bare bucket name for a route without an alias.
-fn previous_route_identity(bucket: &str, route: &BucketRoute) -> Option<String> {
-    route.real_bucket.is_none().then(|| bucket.to_string())
-}
-
 /// Pure: every virtual name whose route maps to `(backend_name,
 /// real_bucket)`, in name order. Two names share one storage when one is an
 /// `alias` of the other; both are bucket names a client can use.
@@ -1524,11 +1518,6 @@ impl StorageBackend for RoutingBackend {
         }
     }
 
-    fn previous_storage_identity(&self, bucket: &str) -> Option<String> {
-        let route = self.routes.get(bucket)?;
-        previous_route_identity(bucket, route)
-    }
-
     async fn bucket_home(&self, bucket: &str) -> crate::storage::BucketHome {
         use crate::storage::BucketHome;
         if let Some(route) = self.routes.get(bucket) {
@@ -2215,13 +2204,7 @@ mod tests {
             routing.storage_identity("releases"),
             "an alias and its target are one storage"
         );
-        assert_eq!(
-            routing.previous_storage_identity("releases").as_deref(),
-            Some("releases")
-        );
-        assert_eq!(routing.previous_storage_identity("downloads"), None);
         assert_eq!(routing.storage_identity("db-archive"), "db-archive");
-        assert_eq!(routing.previous_storage_identity("db-archive"), None);
     }
 
     /// Two configured names on one storage (`downloads` is an alias of

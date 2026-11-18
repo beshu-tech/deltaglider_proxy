@@ -15,12 +15,9 @@
 //!   ([`client_headers`]). The tool, the original name, the note and the
 //!   reference path are not covered: a backend writer can change them;
 //! - holds an identity token in `dg-file-sha256` (and `dg-ref-sha256` of a
-//!   delta): unique per seal, never a hash of the content. Older releases
-//!   require a non-empty value there; without one they would treat the
-//!   object as unmanaged and serve its ciphertext;
-//! - carries `dg-encrypted: aes-256-gcm-chunked-v1` ([`DISK_MARKER`]), the
-//!   value of the previous format: a binary of an older release then fails
-//!   on the `DGE2` body instead of serving it as plaintext.
+//!   delta): unique per seal, never a hash of the content. A non-empty value
+//!   keeps the object managed;
+//! - carries `dg-encrypted: aes-256-gcm-chunked-v1` ([`DISK_MARKER`]).
 //!
 //! The presented metadata is the logical object again, with the markers
 //! `dg-encrypted: v2` and `dg-encryption-key-id: <id of the key>`.
@@ -39,9 +36,7 @@ pub const SEALED_KEY: &str = crate::types::meta_keys::SEALED;
 /// encrypted object.
 pub const PRESENTED_MARKER_VALUE: &str = "v2";
 
-/// The `dg-encrypted` value stored with a v2 object: the previous
-/// format's value, so that an older release refuses the object (see the
-/// module doc).
+/// The `dg-encrypted` value stored with a v2 object.
 pub const DISK_MARKER: &str = "aes-256-gcm-chunked-v1";
 
 /// Every user-metadata key that the wrapper owns. A write stores only its

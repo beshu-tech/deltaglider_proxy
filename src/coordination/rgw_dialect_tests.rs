@@ -333,7 +333,7 @@ async fn a_reference_lock_round_trip() {
 
     // A lapsed lock is stolen with If-Match on its ETag.
     let lapsed = serde_json::json!({
-        "owner": "gone", "node_id": "node", "epoch": 1, "expires_at": now - 1
+        "owner": "gone", "node_id": "node", "epoch": 1, "expires_at": now - 1, "ttl_secs": 0
     });
     client
         .put_object()

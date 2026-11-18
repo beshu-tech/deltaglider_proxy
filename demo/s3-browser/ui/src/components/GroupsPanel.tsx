@@ -57,7 +57,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
 
   // Groups + users are read from the shared query cache; the form's mutations
   // (create/update/delete/clone + membership add/remove) invalidate these keys
-  // on success, so there's no manual loadData()-after-every-mutation reload.
+  // on success.
   const groupsQuery = useGroups();
   const usersQuery = useUsers();
   // Memoize so the `?? []` fallback doesn't hand a fresh array identity to the

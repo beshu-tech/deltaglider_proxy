@@ -41,7 +41,7 @@ use self::{bucket::*, list::*, object::*};
 use self::{copy::*, multipart::*};
 #[cfg(test)]
 pub(crate) use copy::copy_source_bucket_key;
-pub use list::{ListMetadataXmlExtensions, LEGACY_V2_TOKENS};
+pub use list::ListMetadataXmlExtensions;
 pub use list_token::install_list_token_keys;
 
 /// THE one way to give an s3s error extra response headers. s3s writes the

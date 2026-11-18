@@ -1043,8 +1043,7 @@ mod source_guards {
     }
 
     /// #120: the v1 at-rest formats have no reader and no writer. Their
-    /// names may appear only as the stored marker that keeps older releases
-    /// failing closed (`seal::DISK_MARKER`).
+    /// names may appear only as the stored marker (`seal::DISK_MARKER`).
     #[test]
     fn no_v1_encryption_format_remains() {
         let mut bad = Vec::new();

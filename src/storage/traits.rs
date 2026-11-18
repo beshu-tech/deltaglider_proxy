@@ -1685,15 +1685,6 @@ pub trait StorageBackend: Send + Sync {
         bucket.to_string()
     }
 
-    /// The identity that the previous release used for `bucket`, when it
-    /// differs from [`Self::storage_identity`]. The reference lock takes the
-    /// lock object of both during this release, so a node of the previous
-    /// release and a node of this one exclude each other in a rolling
-    /// upgrade. Remove in the next release (CHANGELOG).
-    fn previous_storage_identity(&self, _bucket: &str) -> Option<String> {
-        None
-    }
-
     // === Scanning operations ===
 
     /// Scan a deltaspace directory and return all file metadata

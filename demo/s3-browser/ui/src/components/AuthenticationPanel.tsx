@@ -43,7 +43,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
 
   // All four IAM-DB resources come from the shared query cache. Mutations
   // (provider + mapping-rule hooks) invalidate the relevant list key on
-  // success, so there's no manual loadData()-after-every-mutation reload.
+  // success.
   const providersQuery = useAuthProviders();
   const rulesQuery = useGroupMappingRules();
   const identitiesQuery = useExternalIdentities();
