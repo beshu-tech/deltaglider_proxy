@@ -614,7 +614,14 @@ async fn clients_read_the_history_through_the_window_while_the_job_converts() {
         "a refused read of an unopened sealed object answers 500 (asserted)",
     );
     const N: usize = 24;
-    let c = Conv::start("convread", N, &[STALL], false).await;
+    // 8 objects convert at once, so 24 take 3 stalls; 500 ms keeps the mixed state > 1 s.
+    let c = Conv::start(
+        "convread",
+        N,
+        &[("DGP_TEST_MAINTENANCE_OBJECT_STALL_MS", "500")],
+        false,
+    )
+    .await;
     let (status, _) = c.get("h-00.txt").await;
     assert_eq!(status, 500, "no window: refused");
 
@@ -633,21 +640,34 @@ async fn clients_read_the_history_through_the_window_while_the_job_converts() {
 
     let id = c.reencrypt(true).await;
     // During the job: every object reads, plaintext or converted.
-    let mut seen_mid = false;
-    for round in 0..200 {
+    // Poll until the job has converted everything; count the reads made while
+    // the bucket held both kinds of object.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let (mut reads_mid, mut round) = (0usize, 0usize);
+    loop {
         let left = c.plaintext_left(N);
         if left == 0 {
             break;
         }
-        seen_mid |= left < N;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the job did not convert within 120 s: {left} plaintext left"
+        );
+        if left < N {
+            reads_mid += 1;
+        }
         let i = round % N;
+        round += 1;
         assert_eq!(
             c.get(&format!("h-{i:02}.txt")).await,
             (200, body_of(i)),
             "{left} plaintext left"
         );
+        if left == N {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
-    assert!(seen_mid, "the reads ran while the job converted");
+    assert!(reads_mid > 0, "the reads ran while the job converted");
     c.wait_done().await;
     let job = c.job(id).await;
     assert_eq!(job["status"], "succeeded", "{job}");
