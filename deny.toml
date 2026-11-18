@@ -31,6 +31,12 @@ ignore = [
     # rustls-pemfile unmaintained (repo archived Aug 2025); thin wrapper pulled
     # transitively by axum-server, no safe upgrade published yet.
     "RUSTSEC-2025-0134",
+    # chrono unmaintained (2026-09). No fix exists; s3s 0.14 and iam-rs use it
+    # in their public APIs, so it stays until both move to jiff or time.
+    "RUSTSEC-2026-0543",
+    # humantime unmaintained only because of chrono (same announcement). It
+    # parses our config durations; a swap changes the accepted syntax.
+    "RUSTSEC-2026-0542",
 ]
 
 [licenses]
