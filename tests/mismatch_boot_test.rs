@@ -466,3 +466,38 @@ async fn a_mismatch_boot_leaves_the_jobs_db_alone() {
     server.kill();
     assert_eq!(replication_cursor(&jobs_path), 777);
 }
+
+/// A live config DB below schema v29 ends the boot with the "open it with
+/// 2.2.3" text. It is no key mismatch: no `.db.bak`, and the file stays as it
+/// was.
+#[tokio::test]
+async fn a_boot_on_a_v28_config_db_exits_and_leaves_the_file() {
+    let mut server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_CONFIG_DB_KEY", KEY_GOOD)
+        .build()
+        .await;
+    create_alice(&server.endpoint()).await;
+    let dir = data_dir(&server);
+    let db_path = dir.join("deltaglider_config.db");
+    server.kill();
+    {
+        let conn = deltaglider_proxy::sqlite_open::open(&db_path).unwrap();
+        conn.pragma_update(None, "key", KEY_GOOD).unwrap();
+        conn.pragma_update(None, "user_version", 28).unwrap();
+    }
+    let before = std::fs::read(&db_path).unwrap();
+
+    let (status, output) = server
+        .spawn_expect_exit(&[("DGP_CONFIG_DB_KEY", KEY_GOOD)], 60)
+        .await;
+    let status = status.expect("the proxy must exit");
+    assert!(!status.success(), "exit status {status:?}\n{output}");
+    assert!(
+        output.contains("schema v28") && output.contains("2.2.3"),
+        "the boot error must say to open the DB with 2.2.3:\n{output}"
+    );
+    assert_eq!(std::fs::read(&db_path).unwrap(), before, "the file changed");
+    assert!(!dir.join("deltaglider_config.db.bak").exists());
+    assert!(!dir.join("deltaglider_config.db.discarded").exists());
+}

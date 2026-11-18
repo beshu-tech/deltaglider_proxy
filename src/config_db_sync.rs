@@ -692,18 +692,31 @@ impl ConfigDbSync {
             Some(v) if v < crate::config_db::SCHEMA_VERSION => {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 warn!(
-                    "Config DB downloaded from S3 has schema v{v}, older than this binary's \
-                     v{} (a peer on a release before 2.2) — NOT merging it",
+                    "Config DB in the sync bucket has schema v{v}, older than this binary's \
+                     v{} (a release before 2.2): NOT merging it. The local DB replaces it at \
+                     the next upload",
                     crate::config_db::SCHEMA_VERSION
+                );
+                crate::audit::audit_log(
+                    "config_sync_replace_old_copy",
+                    "config-sync",
+                    &format!("bucket copy at schema v{v}"),
+                    &axum::http::HeaderMap::new(),
+                    "",
+                    "",
                 );
                 self.record_pull_failure(
                     PullFailure::RemoteSchemaOlder,
                     format!(
-                        "the synced copy has schema v{v}, older than this binary's v{}: open it \
-                         with DeltaGlider Proxy 2.2.3 first, or upgrade the peer",
+                        "the synced copy has schema v{v}, older than this binary's v{}: it is \
+                         replaced by the local DB at the next upload",
                         crate::config_db::SCHEMA_VERSION
                     ),
                 );
+                // Take its ETag as the base of the next upload (If-Match), so the
+                // upload overwrites it instead of failing with 412 forever.
+                *self.last_etag.write().await = remote_etag;
+                self.mark_needs_upload().await;
                 return Ok(None);
             }
             _ => {}
@@ -3118,5 +3131,139 @@ mod tests {
             classify_upload_error("status=409 code=BucketNotEmpty"),
             UploadError::Other(_)
         ));
+    }
+
+    /// A synced copy of another schema: its bucket object, a node with a v29
+    /// DB and a sync base.
+    async fn node_and_bucket_copy(
+        schema: i32,
+    ) -> (
+        Arc<crate::storage::fake_s3::FakeS3>,
+        ConfigDbSync,
+        tempfile::TempDir,
+        Vec<u8>,
+    ) {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let key = "k".repeat(40);
+        let db_path = dir.path().join("deltaglider_config.db");
+        {
+            let db = ConfigDb::open_or_create(&db_path, &key).unwrap();
+            db.create_user("local", "AKLOCAL00001", "s1", true, &[])
+                .unwrap();
+        }
+        std::fs::write(sync_base_path(&db_path), b"base-bytes").unwrap();
+        let copy = dir.path().join("bucket-copy.db");
+        {
+            let db = ConfigDb::open_or_create(&copy, &key).unwrap();
+            db.conn.pragma_update(None, "user_version", schema).unwrap();
+        }
+        let copy_bytes = std::fs::read(&copy).unwrap();
+        let cell = crate::coordination::if_match::ProfileCell::unknown();
+        cell.prove(Default::default());
+        let sync = ConfigDbSync::new(
+            &BackendConfig::S3 {
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("k".into()),
+                secret_access_key: Some("s".into()),
+                allow_local: true,
+                session_token: None,
+            },
+            "b".into(),
+            "k.db".into(),
+            db_path,
+            crate::config_db::ConfigDbKeys::primary_only(&key),
+        )
+        .await
+        .unwrap()
+        .with_profile_cell(cell);
+        sync.s3_client
+            .put_object()
+            .bucket("b")
+            .key("k.db")
+            .body(ByteStream::from(copy_bytes.clone()))
+            .send()
+            .await
+            .unwrap();
+        (fake, sync, dir, copy_bytes)
+    }
+
+    async fn bucket_bytes(sync: &ConfigDbSync) -> Vec<u8> {
+        sync.s3_client
+            .get_object()
+            .bucket("b")
+            .key("k.db")
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes()
+            .to_vec()
+    }
+
+    fn only_the_node_files(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "bucket-copy.db")
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A bucket copy below v29 is not merged and changes nothing locally; the
+    /// next upload replaces it with the local v29 DB (If-Match its ETag).
+    #[tokio::test]
+    async fn the_local_db_replaces_a_bucket_copy_below_v29() {
+        let (_fake, sync, dir, old_bytes) = node_and_bucket_copy(28).await;
+        let db_path = dir.path().join("deltaglider_config.db");
+        let local_before = std::fs::read(&db_path).unwrap();
+        let files_before = only_the_node_files(dir.path());
+        assert!(sync.download_if_newer().await.unwrap().is_none());
+        assert_eq!(std::fs::read(&db_path).unwrap(), local_before);
+        assert_eq!(
+            std::fs::read(sync_base_path(&db_path)).unwrap(),
+            b"base-bytes"
+        );
+        assert_eq!(only_the_node_files(dir.path()), {
+            let mut f = files_before;
+            f.push("deltaglider_config.db.sync-pending".into());
+            f.sort();
+            f
+        });
+        assert!(sync.needs_upload.load(Ordering::SeqCst));
+        assert_eq!(bucket_bytes(&sync).await, old_bytes);
+        // The upload is conditional on the old copy's ETag, and wins.
+        sync.upload(local_before.clone()).await.unwrap();
+        let replaced = bucket_bytes(&sync).await;
+        assert_eq!(replaced, local_before);
+        let copy = dir.path().join("replaced.db");
+        std::fs::write(&copy, &replaced).unwrap();
+        let opened = ConfigDb::open_or_create(&copy, &"k".repeat(40)).unwrap();
+        assert_eq!(opened.load_users().unwrap()[0].name, "local");
+    }
+
+    /// The twin: a bucket copy from a NEWER release is refused, nothing
+    /// changes, and it is never overwritten.
+    #[tokio::test]
+    async fn a_bucket_copy_above_v29_is_refused_and_never_overwritten() {
+        let (_fake, sync, dir, new_bytes) = node_and_bucket_copy(30).await;
+        let db_path = dir.path().join("deltaglider_config.db");
+        let local_before = std::fs::read(&db_path).unwrap();
+        let files_before = only_the_node_files(dir.path());
+        assert!(sync.download_if_newer().await.unwrap().is_none());
+        assert_eq!(std::fs::read(&db_path).unwrap(), local_before);
+        assert_eq!(
+            std::fs::read(sync_base_path(&db_path)).unwrap(),
+            b"base-bytes"
+        );
+        assert_eq!(only_the_node_files(dir.path()), files_before);
+        assert!(!sync.needs_upload.load(Ordering::SeqCst));
+        assert_eq!(bucket_bytes(&sync).await, new_bytes);
     }
 }

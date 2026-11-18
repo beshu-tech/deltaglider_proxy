@@ -772,3 +772,17 @@ fn failure_commit_rate() {
         "MEASURE {N} failure records: journal+FULL {old:?} ({old_rate:.0}/s), WAL+NORMAL {new:?} ({new_rate:.0}/s)"
     );
 }
+
+/// A rollback to 2.2.3 runs its `adopt_from` when `adopted = 0`, which would
+/// delete every jobs table first: a new jobs DB is born adopted.
+#[test]
+fn a_new_jobs_db_is_born_adopted() {
+    let jobs = JobsDb::in_memory(KEY).unwrap();
+    let adopted: i64 = jobs
+        .conn
+        .query_row("SELECT adopted FROM jobs_meta WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(adopted, 1);
+}

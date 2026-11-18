@@ -448,7 +448,8 @@ CREATE TABLE IF NOT EXISTS jobs_meta (
     id      INTEGER PRIMARY KEY CHECK (id = 1),
     adopted INTEGER NOT NULL DEFAULT 0
 );
-INSERT OR IGNORE INTO jobs_meta (id, adopted) VALUES (1, 0);
+-- adopted = 1: a rollback to 2.2.3 must not run its adopt_from (it clears the jobs tables).
+INSERT OR IGNORE INTO jobs_meta (id, adopted) VALUES (1, 1);
 
 CREATE TABLE IF NOT EXISTS replication_state (
     rule_name               TEXT PRIMARY KEY,
