@@ -92,6 +92,25 @@ pub fn skip_past_facts(last_key: &str) -> Option<&'static str> {
     is_facts_key(last_key).then_some(PAST_FACTS)
 }
 
+/// Where a client listing continues when the page it read ends at `last_key`
+/// below a `.dg` directory: past the whole directory, which holds no listed
+/// key. It is `<dir>/.dg/` + U+10FFFF, never `.dg0`: a client key `a/.dg0`
+/// and `a/.dg-x` sort outside the directory. `None` when `last_key` has no
+/// complete `.dg` directory (a file named `.dg` is no directory).
+pub fn skip_past_internal_dir(last_key: &str) -> Option<String> {
+    let mut end = 0;
+    let mut parts = last_key.split('/').peekable();
+    while let Some(seg) = parts.next() {
+        end += seg.len();
+        parts.peek()?;
+        end += 1;
+        if seg == INTERNAL_DIR {
+            return Some(format!("{}{}", &last_key[..end], '\u{10FFFF}'));
+        }
+    }
+    None
+}
+
 /// Is a CommonPrefix of a listing inside the proxy's namespace? True when a
 /// complete `.dg` directory lies in it (the part before its last `/`; `.dg`
 /// alone could still be `.dgx`). No client key lives there.
@@ -869,6 +888,25 @@ mod tests {
             assert!(parse_marker(key).is_none(), "{key}");
             assert!(parse_facts_key(key).is_none(), "{key}");
             assert!(parse_token_key(key).is_none(), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_listing_skips_past_a_dg_directory_and_nothing_else() {
+        let past = |k: &str| skip_past_internal_dir(k);
+        assert_eq!(past(".dg/facts/x"), Some(".dg/\u{10FFFF}".into()));
+        assert_eq!(past("a/b/.dg/c/d"), Some("a/b/.dg/\u{10FFFF}".into()));
+        for k in ["a/.dg", ".dg", "a/.dgx/k", "a/.dg-x", "a/.dg0", "a/b"] {
+            assert_eq!(past(k), None, "{k}");
+        }
+        // The target sits after every key of the directory, before its siblings.
+        let target = past("a/.dg/x").unwrap();
+        assert!("a/.dg/zz\u{10FFFE}" < target.as_str());
+        for sibling in ["a/.dg0", "a/.dg0/x", "a/.dgz", "a/.e"] {
+            assert!(sibling > target.as_str(), "{sibling}");
+        }
+        for before in ["a/.dg", "a/.dg-x", "a/.dg.txt"] {
+            assert!(before < target.as_str(), "{before}");
         }
     }
 

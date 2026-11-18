@@ -434,7 +434,7 @@ The proxy keeps its own files in directories named `.dg`: the delta baselines an
 - No listing shows such a key, on an S3 backend or on a filesystem backend.
 - `GetObject`, `HeadObject`, `DeleteObject` and a copy of such a key get `400`, as a write does.
 - `DeleteBucket` removes such keys when the bucket holds no other key. It no longer answers `409 BucketNotEmpty` because of them.
-- A migrate does not meet such a key. It is not copied, and it is removed with the source bucket.
+- A migrate does not meet such a key. It is not copied to the new place, and the migrate never deletes it from the old one, so it stays on the old backend, invisible to the proxy.
 
 Before you upgrade, copy every object that you need from a key below `.dg` to another key, with a release before this one. The new release cannot read the object. The proxy never deletes such a key while the bucket holds other keys, so the object stays on the backend and you can still read it with a tool that does not use the proxy.
 

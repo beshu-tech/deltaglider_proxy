@@ -1417,8 +1417,8 @@ async fn test_migrate_moves_a_read_only_bucket_with_plaintext_history() {
 
 /// L1 (#171): a key that an older release stored below a `.dg` directory is
 /// the proxy's own. No request names it, LIST hides it, so the migrate does
-/// not meet it: it completes, the key is not copied, and it goes with the
-/// source bucket.
+/// not meet it: it completes, the key is not copied, and the migrate
+/// leaves it on the source.
 #[tokio::test]
 async fn test_migrate_ignores_a_key_below_dg() {
     let dir_a = tempfile::TempDir::new().unwrap();
@@ -1460,6 +1460,10 @@ async fn test_migrate_ignores_a_key_below_dg() {
         .join(bucket)
         .join("deltaspaces/old/.dg")
         .exists());
+    assert!(
+        legacy_dir.join("keep.jpg").exists(),
+        "the migrate never deletes the source key"
+    );
     assert!(!listed_keys(&http, &endpoint, bucket).await.contains(".dg"));
     assert!(transient_keys(&admin, &endpoint).await.is_empty());
 }

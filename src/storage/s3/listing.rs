@@ -426,7 +426,7 @@ impl S3Backend {
         let mut results = Vec::new();
         let mut continuation_token: Option<String> = None;
 
-        let mut skip_to: Option<&'static str> = None;
+        let mut skip_to: Option<String> = None;
 
         loop {
             let mut request = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
@@ -455,7 +455,7 @@ impl S3Backend {
                 continuation_token = response.next_continuation_token;
                 skip_to = page_last
                     .as_deref()
-                    .and_then(listing_facts::skip_past_facts);
+                    .and_then(listing_facts::skip_past_internal_dir);
                 if continuation_token.is_none() && skip_to.is_none() {
                     return Err(truncated_without_token(bucket));
                 }
@@ -805,6 +805,20 @@ impl S3Backend {
         max_keys: u32,
         continuation_token: Option<&str>,
     ) -> Result<DelegatedListResult, StorageError> {
+        // Nothing below a `.dg` directory is listed: no request.
+        if listing_facts::has_internal_segment(prefix.rsplit_once('/').map_or("", |(d, _)| d)) {
+            return Ok(DelegatedListResult {
+                objects: Vec::new(),
+                common_prefixes: Vec::new(),
+                is_truncated: false,
+                next_continuation_token: None,
+                upstream_requests: 0,
+                forms: crate::storage::ListedForms::Reported {
+                    ambiguous: Vec::new(),
+                },
+                reference_prefixes: None,
+            });
+        }
         let mut all_common_prefixes = std::collections::BTreeSet::new();
         let mut raw_objects: Vec<S3ListedObject> = Vec::new();
         let mut upstream_token: Option<String> = None;
@@ -813,7 +827,7 @@ impl S3Backend {
         // below `max_keys` at the end of the upstream page.
         let mut settled_anchor: Option<String> = None;
         let mut short = false;
-        let mut skip_to: Option<&'static str> = None;
+        let mut skip_to: Option<String> = None;
         // Every request this call sends: its pages and its probes.
         let mut upstream_requests = 0u32;
         // The prefixes this call may still probe (see `holds_listed_key`).
@@ -896,7 +910,7 @@ impl S3Backend {
             upstream_token = response.next_continuation_token;
             skip_to = page_last
                 .as_deref()
-                .and_then(listing_facts::skip_past_facts);
+                .and_then(listing_facts::skip_past_internal_dir);
             if upstream_token.is_none() && skip_to.is_none() {
                 return Err(truncated_without_token(bucket));
             }
@@ -1783,6 +1797,119 @@ mod delegated_cost_tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// L1 review: the purge pages through more than 1000 facts keys, jumps
+    /// past `.dg/` to find a client key that sorts after them, and then
+    /// deletes nothing; with no client key it deletes them all.
+    #[tokio::test]
+    async fn the_purge_pages_and_jumps_past_a_thousand_facts() {
+        let mut keys: Vec<String> = (0..1100)
+            .map(|i| format!(".dg/facts/k{i:05}!!1.e.1.2.e"))
+            .collect();
+        keys.push(".dg/zz".to_string());
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let http = reqwest::Client::new();
+        for k in &keys {
+            http.put(format!("{endpoint}/b/{k}"))
+                .body("x")
+                .send()
+                .await
+                .unwrap();
+        }
+        http.put(format!("{endpoint}/b/top"))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        let s3 = test_support::for_test_endpoint(&endpoint);
+        fake.clear();
+        s3.purge_own_keys_if_only_ones("b").await.unwrap();
+        let reqs = fake.requests();
+        assert_eq!(
+            lists(&fake),
+            2,
+            "first page, then the jump past `.dg/`: {reqs:?}"
+        );
+        assert!(
+            reqs.iter().all(|r| r.starts_with("GET")),
+            "nothing deleted: {reqs:?}"
+        );
+        http.delete(format!("{endpoint}/b/top"))
+            .send()
+            .await
+            .unwrap();
+        s3.purge_own_keys_if_only_ones("b").await.unwrap();
+        let left = reqwest::get(format!("{endpoint}/b?list-type=2"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!left.contains("<Key>"), "all {} keys purged", keys.len());
+    }
+
+    /// L1 review: the second pass deletes only keys below `.dg`, so a client
+    /// key written after the first pass survives.
+    #[tokio::test]
+    async fn the_second_pass_of_the_purge_never_deletes_a_client_key() {
+        let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let http = reqwest::Client::new();
+        for k in [".dg/facts/x!!1.e.1.2.e", "a/.dg/y", "late.txt", "z/.dg0"] {
+            http.put(format!("{endpoint}/b/{k}"))
+                .body("x")
+                .send()
+                .await
+                .unwrap();
+        }
+        let s3 = test_support::for_test_endpoint(&endpoint);
+        s3.delete_internal_keys("b").await.unwrap();
+        let left = reqwest::get(format!("{endpoint}/b?list-type=2"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            left.contains("<Key>late.txt</Key>") && left.contains("<Key>z/.dg0</Key>"),
+            "{left}"
+        );
+        assert!(!left.contains(".dg/"), "{left}");
+    }
+
+    /// L1 review: a LIST costs nothing for a prefix below `.dg`, and a flat
+    /// LIST that starts among old `.dg` keys jumps past them, keeping the
+    /// client keys `a/.dg0` and `a/.dg-x` that sort around the directory.
+    #[tokio::test]
+    async fn a_list_never_reads_a_dg_directory() {
+        let mut keys: Vec<String> = (0..1200).map(|i| format!(".dg/old{i:05}")).collect();
+        keys.extend(["a/.dg-x", "a/.dg0", "a/.dg/n1", "a/.dg/n2", "top"].map(String::from));
+        let (s3, fake) = backend_with_keys(&keys).await;
+        for prefix in [".dg/", "a/.dg/", "a/.dg/n", ".dg/old000"] {
+            let page = s3
+                .list_objects_delegated("b", prefix, None, 1000, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(page.objects.is_empty() && !page.is_truncated, "{prefix}");
+            assert_eq!(lists(&fake), 0, "{prefix}: {:?}", fake.requests());
+        }
+        let mut got = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = s3
+                .list_objects_delegated("b", "", None, 2, token.as_deref())
+                .await
+                .unwrap()
+                .unwrap();
+            got.extend(page.objects.into_iter().map(|(k, _)| k));
+            if !page.is_truncated {
+                break;
+            }
+            token = page.next_continuation_token;
+        }
+        assert_eq!(got, ["a/.dg-x", "a/.dg0", "top"]);
+        assert!(lists(&fake) < 12, "read the hidden keys: {}", lists(&fake));
     }
 
     /// A page probes at most `PROBES_PER_PAGE` prefixes: 12 folders that each

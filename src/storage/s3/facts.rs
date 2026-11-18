@@ -188,6 +188,14 @@ impl S3Backend {
         &self,
         bucket: &str,
     ) -> Result<(), StorageError> {
+        if self.holds_only_internal_keys(bucket).await? {
+            self.delete_internal_keys(bucket).await?;
+        }
+        Ok(())
+    }
+
+    /// First pass of the purge: is every key of the bucket below `.dg`?
+    async fn holds_only_internal_keys(&self, bucket: &str) -> Result<bool, StorageError> {
         let mut start_after: Option<String> = None;
         let mut token: Option<String> = None;
         loop {
@@ -202,21 +210,28 @@ impl S3Backend {
                 .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
             let keys: Vec<&str> = resp.contents().iter().filter_map(|o| o.key()).collect();
             if keys.iter().any(|k| !listing_facts::is_hidden_key(k)) {
-                return Ok(());
+                return Ok(false);
             }
             if !resp.is_truncated().unwrap_or(false) {
-                break;
+                return Ok(true);
             }
-            match keys.last().and_then(|k| listing_facts::skip_past_facts(k)) {
-                Some(past) => start_after = Some(past.to_string()),
+            match keys
+                .last()
+                .and_then(|k| listing_facts::skip_past_internal_dir(k))
+            {
+                Some(past) => start_after = Some(past),
                 None => match resp.next_continuation_token() {
                     Some(t) => token = Some(t.to_string()),
                     None => return Err(super::listing::truncated_without_token(bucket)),
                 },
             }
         }
-        // Only `.dg` keys exist. A page of the second pass deletes only keys
-        // that the rule names, so a key written meanwhile is never touched.
+    }
+
+    /// Second pass of the purge: delete the keys below `.dg`. A page deletes
+    /// only keys that the rule names, so a client key that was written since
+    /// the first pass is never touched.
+    pub(super) async fn delete_internal_keys(&self, bucket: &str) -> Result<(), StorageError> {
         let mut token: Option<String> = None;
         loop {
             let resp = self
