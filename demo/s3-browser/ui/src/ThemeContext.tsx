@@ -148,10 +148,10 @@ const editorialDarkColors: ColorTokens = {
 // Media Center "Royale Noir": black glass with bright blue. The beveled
 // look (title bars, glossy buttons, Luna scrollbars) is in theme.css.
 const xpLightColors: ColorTokens = {
-  BG_BASE: '#ece9d8',
-  BG_SIDEBAR: '#dbe5fa',
-  BG_CARD: '#ffffff',
-  BG_ELEVATED: '#ffffff',
+  BG_BASE: '#f1efe2',
+  BG_SIDEBAR: '#e9e6d3',
+  BG_CARD: '#fbfaf4',
+  BG_ELEVATED: '#fbfaf4',
   BORDER: '#aca899',
   TEXT_PRIMARY: '#000000',
   TEXT_SECONDARY: '#262626',
@@ -167,7 +167,7 @@ const xpLightColors: ColorTokens = {
   HERO_NUM_GRADIENT: 'linear-gradient(180deg, #2f9e2f 0%, #1b6f1b 100%)',
   BAR_KEPT: 'linear-gradient(180deg, #2a6cdc 0%, #0a3fb0 100%)',
   BAR_SAVED: 'linear-gradient(180deg, #7fe07f 0%, #3dbb3d 50%, #2a9a2a 100%)',
-  BAR_TRACK: '#ffffff',
+  BAR_TRACK: '#fbfaf4',
   INSET_SHADOW: 'inset 1px 1px 0 #aca899',
   GLOW_GREEN: 'rgba(61,187,61,0.40)',
   ELEV_SHADOW: '1px 1px 2px rgba(0,0,0,0.28)',

@@ -1403,9 +1403,9 @@ code, kbd, pre, samp, .ant-typography code,
   --xp-title-bg: linear-gradient(180deg, #0058ee 0%, #3593ff 4%, #288eff 6%, #127dff 8%, #036ffc 10%, #0262ee 14%, #0057e5 20%, #0054e3 24%, #0055eb 56%, #005bf5 66%, #026afe 76%, #0062ef 86%, #0052d6 92%, #0040ab 94%, #003092 100%);
   --xp-title-text: #ffffff;
   --xp-title-shadow: 1px 1px 0 #0f1089;
-  --xp-toolbar-bg: linear-gradient(180deg, #ffffff 0%, #f7f5ec 55%, #ece9d8 100%);
+  --xp-toolbar-bg: linear-gradient(180deg, #fbfaf4 0%, #f5f3e8 55%, #ece9d8 100%);
   --xp-toolbar-hover: linear-gradient(180deg, #ffffff 0%, #f4f2e8 100%);
-  --xp-sider-bg: linear-gradient(180deg, #f3f7ff 0%, #dbe5fa 55%, #c8d8f6 100%);
+  --xp-sider-bg: linear-gradient(180deg, #7ba2e7 0%, #6a8ae0 45%, #6375d6 100%);
   --xp-pane-head-bg: linear-gradient(90deg, #ffffff 0%, #c6d3f7 100%);
   --xp-btn-bg: linear-gradient(180deg, #ffffff 0%, #f6f5ef 55%, #ece9d8 85%, #d6d0c5 100%);
   --xp-btn-bg-pressed: linear-gradient(180deg, #cdcac3 0%, #e3e3db 10%, #e5e5de 92%, #f2f2f1 100%);
@@ -2019,4 +2019,26 @@ code, kbd, pre, samp, .ant-typography code,
   background: var(--xp-toolbar-bg) !important;
   border: 1px solid var(--xp-menu-border) !important;
   box-shadow: var(--dg-elev-shadow) !important;
+}
+
+/* ── Explorer task pane: a blue pane with the bucket list in a cream box ── */
+[data-theme-style="xp"] .ant-layout-sider .dot-grid-bg {
+  background: transparent !important;
+  background-image: none;
+}
+[data-theme-style="xp"] .ant-layout-sider nav[aria-label='Bucket list'] {
+  flex: 0 1 auto !important;
+  margin: 12px 10px 0;
+  background: var(--dg-bg-card);
+  border: 1px solid var(--xp-window-border);
+  border-radius: 6px 6px 0 0;
+  overflow: hidden;
+}
+[data-theme-style="xp"] .ant-layout-sider nav[aria-label='Bucket list'] > :first-child {
+  margin: 0 !important;
+  padding: 6px 10px !important;
+  background: var(--xp-pane-head-bg);
+}
+[data-theme-style="xp"] .ant-layout-sider nav[aria-label='Bucket list'] > :first-child * {
+  color: var(--dg-accent-blue-light) !important;
 }
