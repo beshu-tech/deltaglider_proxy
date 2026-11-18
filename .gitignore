@@ -48,7 +48,6 @@ data/
 deltaglider_proxy.yaml
 deltaglider_proxy.yml
 deltaglider_proxy.toml
-.deltaglider_admin_hash
 .deltaglider_bootstrap_hash
 
 # Personal notes (not part of the project)

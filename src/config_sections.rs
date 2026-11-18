@@ -1643,7 +1643,6 @@ macro_rules! config_projection {
             $(stringify!($eli),)*
             "buckets",
             "admission_blocks",
-            "admin_password_hash", // serde alias of bootstrap_password_hash
         ];
 
         impl SectionedConfig {

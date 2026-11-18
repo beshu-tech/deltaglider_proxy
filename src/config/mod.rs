@@ -207,7 +207,7 @@ pub struct Config {
     /// Bcrypt hash of the bootstrap password.
     /// Seeds DB encryption, admin GUI access, and session signing.
     /// Set via DGP_BOOTSTRAP_PASSWORD_HASH.
-    #[serde(default, alias = "admin_password_hash")]
+    #[serde(default)]
     pub bootstrap_password_hash: Option<String>,
 
     /// Maximum concurrent delta encode/decode operations.
@@ -1309,7 +1309,6 @@ pub fn unknown_flat_root_keys(doc: &serde_yaml::Value) -> Vec<String> {
     let known = schema.schema.object.as_ref().map(|o| &o.properties);
     map.keys()
         .filter_map(|k| k.as_str())
-        .filter(|k| *k != "admin_password_hash") // serde alias
         .filter(|k| !known.is_some_and(|p| p.contains_key(*k)))
         .map(str::to_string)
         .collect()
@@ -1436,6 +1435,14 @@ impl Config {
             return Err(ConfigError::Parse(removed_encryption_field_message(Some(
                 &at,
             ))));
+        }
+
+        if doc.get("admin_password_hash").is_some() {
+            return Err(ConfigError::Parse(
+                "`admin_password_hash` was removed: use `advanced.bootstrap_password_hash` \
+                 (flat shape: `bootstrap_password_hash`)"
+                    .into(),
+            ));
         }
 
         let mut cfg = match classify_shape(&doc) {

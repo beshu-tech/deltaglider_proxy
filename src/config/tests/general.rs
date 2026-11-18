@@ -1899,10 +1899,9 @@ storage:
 /// named: in the load log and in `config lint`.
 #[test]
 fn unknown_flat_root_keys_are_named() {
-    let doc: serde_yaml::Value = serde_yaml::from_str(
-        "cache_size_mbb: 5\nlisten_addr: 0.0.0.0:9000\nadmin_password_hash: x\ndefaults: v1\n",
-    )
-    .unwrap();
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str("cache_size_mbb: 5\nlisten_addr: 0.0.0.0:9000\ndefaults: v1\n")
+            .unwrap();
     assert_eq!(
         unknown_flat_root_keys(&doc),
         vec!["cache_size_mbb".to_string()]
@@ -2487,6 +2486,13 @@ fn the_state_file_keeps_a_hash_that_only_the_config_file_carries() {
         None,
         h
     ));
+}
+
+/// The removed YAML key `admin_password_hash` fails the load with a clear message.
+#[test]
+fn the_old_admin_password_hash_yaml_key_is_refused() {
+    let err = Config::from_yaml_str("admin_password_hash: x\n").unwrap_err();
+    assert!(err.to_string().contains("bootstrap_password_hash"), "{err}");
 }
 
 /// The pre-rename alias of the bootstrap hash env var is not read.
