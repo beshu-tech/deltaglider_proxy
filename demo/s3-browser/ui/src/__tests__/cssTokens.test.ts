@@ -8,7 +8,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { expect, test } from 'vitest';
 import { darkColors, lightColors, PALETTES, parseThemeStyle, THEME_STYLES, type ThemeStyle } from '../ThemeContext';
-import { cssVarName, FONT_DISPLAY, FONT_MONO, FONT_UI, paletteDeclarations, themeSelector, themeStylesheet, tint } from '../themeVars';
+import { cssVarName, FONT_DISPLAY, FONT_MONO, FONT_UI, FONT_UI_XP, paletteDeclarations, themeSelector, themeStylesheet, tint } from '../themeVars';
 import { BREAKPOINT } from '../components/shared-styles';
 
 const SRC = join(__dirname, '..');
@@ -63,6 +63,9 @@ test('every style publishes both palettes and its display face', () => {
   expect(css).toContain('[data-theme-style="editorial"] { --font-display: ' + FONT_DISPLAY.editorial + '; }');
   expect(themeSelector('instrument', 'dark')).toBe('[data-theme="dark"]');
   expect(parseThemeStyle('editorial')).toBe('editorial');
+  expect(parseThemeStyle('xp')).toBe('xp');
+  // Windows XP swaps the UI and code faces too, from the system.
+  expect(css).toContain('[data-theme-style="xp"] { --font-ui: ' + FONT_UI_XP);
   expect(parseThemeStyle('neon')).toBe('instrument');
   expect(parseThemeStyle(null)).toBe('instrument');
 });

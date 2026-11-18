@@ -142,6 +142,74 @@ const editorialDarkColors: ColorTokens = {
   ON_SAVED: '#1b1a17',
 };
 
+// ── Windows XP: Luna (light) and Royale Noir (dark) ───────────────────
+// Light is the Luna blue theme: the beige window face (#ece9d8), white
+// content, Luna blue, the XP green and the orange hot-track. Dark is the
+// Media Center "Royale Noir": black glass with bright blue. The beveled
+// look (title bars, glossy buttons, Luna scrollbars) is in theme.css.
+const xpLightColors: ColorTokens = {
+  BG_BASE: '#ece9d8',
+  BG_SIDEBAR: '#dbe5fa',
+  BG_CARD: '#ffffff',
+  BG_ELEVATED: '#ffffff',
+  BORDER: '#aca899',
+  TEXT_PRIMARY: '#000000',
+  TEXT_SECONDARY: '#262626',
+  TEXT_MUTED: '#4d4d4d',
+  TEXT_FAINT: '#595959',
+  ACCENT_BLUE: '#0054e3', // Luna blue
+  ACCENT_BLUE_LIGHT: '#0a3fb0',
+  ACCENT_GREEN: '#1b6f1b',
+  ACCENT_RED: '#b3201a',
+  ACCENT_PURPLE: '#6a3a9c',
+  ACCENT_AMBER: '#8a4b00',
+  ON_ACCENT: '#ffffff',
+  HERO_NUM_GRADIENT: 'linear-gradient(180deg, #2f9e2f 0%, #1b6f1b 100%)',
+  BAR_KEPT: 'linear-gradient(180deg, #2a6cdc 0%, #0a3fb0 100%)',
+  BAR_SAVED: 'linear-gradient(180deg, #7fe07f 0%, #3dbb3d 50%, #2a9a2a 100%)',
+  BAR_TRACK: '#ffffff',
+  INSET_SHADOW: 'inset 1px 1px 0 #aca899',
+  GLOW_GREEN: 'rgba(61,187,61,0.40)',
+  ELEV_SHADOW: '1px 1px 2px rgba(0,0,0,0.28)',
+  FLOAT_SHADOW: '3px 4px 8px rgba(0,0,0,0.42)',
+  CARD_HIGHLIGHT: 'rgba(255,255,255,0.85)',
+  KEPT_TEXT: '#0a3fb0',
+  ON_KEPT: '#ffffff',
+  ON_SAVED: '#000000',
+};
+
+const xpDarkColors: ColorTokens = {
+  BG_BASE: '#0f1320',
+  BG_SIDEBAR: '#161b2c',
+  BG_CARD: '#1c2236',
+  BG_ELEVATED: '#252d46',
+  BORDER: '#3d4868',
+  TEXT_PRIMARY: '#f2f5fc',
+  TEXT_SECONDARY: '#cfd6e8',
+  TEXT_MUTED: '#adb8d0',
+  TEXT_FAINT: '#a1adc8',
+  // AntD darkens a night seed by about 12 % for links and the primary fill: this derived colour reads 4.5:1 on the cards.
+  ACCENT_BLUE: '#84b9ff',
+  ACCENT_BLUE_LIGHT: '#a9d1ff',
+  ACCENT_GREEN: '#6fd36f',
+  ACCENT_RED: '#ff8a80',
+  ACCENT_PURPLE: '#c3a2ff',
+  ACCENT_AMBER: '#ffc83c', // the XP hot-track orange
+  ON_ACCENT: '#0a1428',
+  HERO_NUM_GRADIENT: 'linear-gradient(180deg, #9cef9c 0%, #6fd36f 55%, #3dbb3d 100%)',
+  BAR_KEPT: 'linear-gradient(180deg, #b8d9ff 0%, #84b9ff 100%)',
+  BAR_SAVED: 'linear-gradient(180deg, #8ceb8c 0%, #4fc94f 55%, #36ad36 100%)',
+  BAR_TRACK: '#0f1320',
+  INSET_SHADOW: 'inset 1px 1px 2px rgba(0,0,0,0.6)',
+  GLOW_GREEN: 'rgba(111,211,111,0.30)',
+  ELEV_SHADOW: '1px 1px 3px rgba(0,0,0,0.6)',
+  FLOAT_SHADOW: '3px 5px 10px rgba(0,0,0,0.65)',
+  CARD_HIGHLIGHT: 'rgba(255,255,255,0.06)',
+  KEPT_TEXT: '#a9d1ff',
+  ON_KEPT: '#0a1428',
+  ON_SAVED: '#0a1428',
+};
+
 /**
  * A theme is a STYLE (the look) times a MODE (light / dark). Every style has
  * both palettes, every palette has every token (ColorTokens), and the tests
@@ -149,15 +217,17 @@ const editorialDarkColors: ColorTokens = {
  * pair here, an entry in THEME_STYLES, and (only if it needs one) a
  * `[data-theme-style="<id>"]` block in theme.css.
  */
-export type ThemeStyle = 'instrument' | 'editorial';
+export type ThemeStyle = 'instrument' | 'editorial' | 'xp';
 export const DEFAULT_THEME_STYLE: ThemeStyle = 'instrument';
 export const THEME_STYLES: readonly { id: ThemeStyle; label: string; hint: string }[] = [
   { id: 'instrument', label: 'Instrument', hint: 'Navy and teal, sans-serif' },
   { id: 'editorial', label: 'Editorial', hint: 'Cream paper, serif headlines, coral' },
+  { id: 'xp', label: 'Windows XP', hint: 'Luna blue, beveled buttons, Royale Noir by night' },
 ];
 export const PALETTES: Record<ThemeStyle, { dark: ColorTokens; light: ColorTokens }> = {
   instrument: { dark: darkColors, light: lightColors },
   editorial: { dark: editorialDarkColors, light: editorialLightColors },
+  xp: { dark: xpDarkColors, light: xpLightColors },
 };
 
 /** Pure: a stored value as a style (anything unknown → the default). */

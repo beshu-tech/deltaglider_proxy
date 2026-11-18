@@ -25,7 +25,7 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
   // header below names the page, so the bar drops the title there.
   const phone = useIsNarrow(BREAKPOINT.phone);
   return (
-    <div style={{
+    <div className="dg-fullscreen-header" style={{
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'space-between',

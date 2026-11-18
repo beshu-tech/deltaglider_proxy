@@ -3,7 +3,7 @@
  * incl. `target-size`, the 24×24 px rule) runs on every admin page and on the
  * object browser, in the light and the dark theme. A serious or critical
  * violation fails the spec. The sign-in page is checked before sign-in, every
- * style is checked (Instrument and Editorial), and every popup a page offers
+ * style is checked (Instrument, Editorial and Windows XP), and every popup a page offers
  * (`aria-haspopup` triggers: account menu, row and bucket actions) is opened
  * and checked too: a closed menu is invisible to axe.
  *
@@ -98,7 +98,7 @@ async function signIn(page: Page) {
   await expect(page.getByRole('navigation', { name: 'Bucket list' })).toBeVisible({ timeout: 30_000 });
 }
 
-const STYLES = ['instrument', 'editorial'] as const;
+const STYLES = ['instrument', 'editorial', 'xp'] as const;
 const MODES = ['light', 'dark'] as const;
 
 async function setTheme(page: Page, style: (typeof STYLES)[number], mode: (typeof MODES)[number]) {

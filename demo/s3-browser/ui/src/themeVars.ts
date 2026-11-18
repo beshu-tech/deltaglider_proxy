@@ -21,8 +21,18 @@ export const FONT_UI = "'Manrope Variable', -apple-system, BlinkMacSystemFont, '
 export const FONT_MONO = "'JetBrains Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace";
 /** The serif of the Editorial style: headlines, panel titles, big numbers. Never body text. */
 const FONT_SERIF = "'Fraunces Variable', Georgia, 'Times New Roman', serif";
+/**
+ * Windows XP: Tahoma for the UI (Verdana, then the metric-alike DejaVu Sans where neither exists),
+ * Trebuchet for titles, Lucida Console for code. System faces on purpose: they ship with the OS the
+ * style imitates, and a missing one falls back to the bundled mono.
+ */
+export const FONT_UI_XP = "Tahoma, Verdana, 'DejaVu Sans', 'Segoe UI', sans-serif";
+const FONT_TITLE_XP = "'Trebuchet MS', Tahoma, Verdana, 'DejaVu Sans', sans-serif";
+const FONT_MONO_XP = "'Lucida Console', 'Courier New', 'JetBrains Mono Variable', monospace";
 /** `--font-display` of each style: the face of headings and display numbers (`.dg-display`). */
-export const FONT_DISPLAY: Record<ThemeStyle, string> = { instrument: 'var(--font-ui)', editorial: FONT_SERIF };
+export const FONT_DISPLAY: Record<ThemeStyle, string> = { instrument: 'var(--font-ui)', editorial: FONT_SERIF, xp: FONT_TITLE_XP };
+/** The styles that replace the UI and code faces too (the others keep Manrope and JetBrains Mono). */
+const FONT_FACES: Partial<Record<ThemeStyle, { ui: string; mono: string }>> = { xp: { ui: FONT_UI_XP, mono: FONT_MONO_XP } };
 
 /** Pure: the custom-property name of a palette token (`BG_CARD` → `--dg-bg-card`). */
 export function cssVarName(token: keyof ColorTokens | string): string {
@@ -76,7 +86,13 @@ export function themeStylesheet(): string {
     `:root { --font-ui: ${FONT_UI}; --font-mono: ${FONT_MONO}; --font-display: ${FONT_DISPLAY[DEFAULT_THEME_STYLE]}; }`,
     ...styles
       .filter((st) => st !== DEFAULT_THEME_STYLE)
-      .map((st) => `[data-theme-style="${st}"] { --font-display: ${FONT_DISPLAY[st]}; }`),
+      .flatMap((st) => {
+        const faces = FONT_FACES[st];
+        return [
+          `[data-theme-style="${st}"] { --font-display: ${FONT_DISPLAY[st]}; }`,
+          ...(faces ? [`[data-theme-style="${st}"] { --font-ui: ${faces.ui}; --font-mono: ${faces.mono}; }`] : []),
+        ];
+      }),
     ...styles.flatMap((st) =>
       (['dark', 'light'] as const).map((mode) => `${themeSelector(st, mode)} { ${paletteDeclarations(PALETTES[st][mode])} }`),
     ),

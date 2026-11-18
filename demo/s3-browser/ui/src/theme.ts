@@ -1,6 +1,6 @@
 import { theme } from 'antd';
 import { darkColors as D, lightColors as L, PALETTES, type ThemeStyle } from './ThemeContext';
-import { FONT_MONO, FONT_UI } from './themeVars';
+import { FONT_MONO, FONT_UI, FONT_UI_XP } from './themeVars';
 
 /**
  * Stacking: the unsaved-changes bar (StickyDirtyBar) sits over a top-level
@@ -108,6 +108,7 @@ export const lightTheme = {
  */
 export function antdTheme(style: ThemeStyle, isDark: boolean) {
   if (style === 'instrument') return isDark ? darkTheme : lightTheme;
+  if (style === 'xp') return xpTheme(isDark);
   const c = PALETTES[style][isDark ? 'dark' : 'light'];
   return {
     algorithm: isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,
@@ -153,6 +154,60 @@ export function antdTheme(style: ThemeStyle, isDark: boolean) {
       ...COMPONENTS,
       Button: { borderRadius: 999, borderRadiusLG: 999, borderRadiusSM: 999, fontWeight: 600 },
       Modal: { ...COMPONENTS.Modal, borderRadiusLG: 24 },
+    },
+  };
+}
+
+/**
+ * Windows XP: square-ish 3 px controls, Tahoma at 13 px, Luna blue. The
+ * glossy buttons, title bars and scrollbars are CSS (theme.css); AntD gets the
+ * palette, the radii and the dense control height. Status seeds are the XP
+ * green, red and orange; Info is Luna blue.
+ */
+function xpTheme(isDark: boolean) {
+  const c = PALETTES.xp[isDark ? 'dark' : 'light'];
+  return {
+    algorithm: isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,
+    token: {
+      ...DG_BRAND,
+      fontFamily: FONT_UI_XP,
+      colorPrimary: c.ACCENT_BLUE,
+      colorPrimaryHover: c.ACCENT_BLUE_LIGHT,
+      colorPrimaryActive: c.ACCENT_BLUE_LIGHT,
+      colorLink: c.ACCENT_BLUE,
+      colorLinkHover: c.ACCENT_BLUE_LIGHT,
+      colorLinkActive: c.ACCENT_BLUE_LIGHT,
+      colorTextLightSolid: c.ON_ACCENT,
+      colorBgBase: c.BG_BASE,
+      colorBgContainer: c.BG_CARD,
+      colorBgElevated: c.BG_ELEVATED,
+      colorBgLayout: c.BG_BASE,
+      // XP text fields have a steel-blue frame; the face-coloured BORDER stays for dividers.
+      colorBorder: isDark ? c.BORDER : '#7f9db9',
+      colorBorderSecondary: c.BORDER,
+      colorTextBase: c.TEXT_PRIMARY,
+      colorTextSecondary: c.TEXT_MUTED,
+      colorTextTertiary: c.TEXT_MUTED,
+      colorTextPlaceholder: c.TEXT_FAINT,
+      ...(isDark
+        ? { colorSuccess: c.ACCENT_GREEN, colorError: c.ACCENT_RED, colorWarning: c.ACCENT_AMBER }
+        : { colorSuccess: '#2f9a2f', colorError: '#c8342a', colorWarning: '#e08a00' }),
+      colorInfo: c.ACCENT_BLUE,
+      fontSize: 13,
+      controlHeight: 28,
+      controlHeightSM: 24,
+      controlHeightLG: 34,
+      borderRadius: 3,
+      borderRadiusLG: 6,
+      borderRadiusSM: 2,
+      boxShadow: 'none',
+      boxShadowSecondary: c.FLOAT_SHADOW,
+      motionDurationMid: '0.08s',
+    },
+    components: {
+      ...COMPONENTS,
+      Button: { fontWeight: 400, primaryShadow: 'none', defaultShadow: 'none', dangerShadow: 'none' },
+      Modal: { ...COMPONENTS.Modal, borderRadiusLG: 8 },
     },
   };
 }

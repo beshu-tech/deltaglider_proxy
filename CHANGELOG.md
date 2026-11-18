@@ -183,6 +183,11 @@
 - An upload body in the aws-chunked framing that the proxy decodes itself (an anonymous or open-access `STREAMING-*` upload) now goes through a decoder that reads the body as it arrives. It refuses a chunk header line longer than 4 KiB and a trailer section longer than 16 KiB or 64 lines with `400 InvalidArgument`. AWS SDKs send header lines of about 90 bytes and one or two trailer lines, so no SDK upload reaches these limits. A body whose chunks hold more bytes than `x-amz-decoded-content-length` now fails at the chunk that goes past that length.
 - A CopyObject of a large source, a replication or lifecycle copy, and a CLI copy now compute the SHA-256 and MD5 of the object while they write it to the spool file. Before, the store read the whole spool file a second time to compute them.
 
+### Added — The Windows XP theme
+
+- The admin UI has a third theme style, **Windows XP**. In light mode it is Luna: the beige window face, Luna blue title bars on dialogs, drawers and the admin header, glossy buttons with the orange hot-track, the Explorer-style table header, the green Start button in the sidebar footer, a Welcome-screen sign-in page and Luna scrollbars. In dark mode it is Royale Noir. Select the style in the account menu or with ⌘K. The browser saves the choice and applies it before the first paint. **Instrument** stays the default.
+- The style uses Tahoma, Trebuchet MS and Lucida Console from the system, and falls back to DejaVu Sans where they are not installed. The UI still loads nothing from another origin.
+
 ### Changed — Error answers for faults that a retry can clear
 
 - A full disk, a used-up storage quota, a lock that another writer holds, a copy source that changed during the copy, a delta codec timeout and a backend `RequestTimeout` or `OperationAborted` now answer `503` with `Retry-After`. Before, they answered `500 InternalError`. A full disk and a used-up quota answer `503 ServiceUnavailable` with a text that names the condition. The cause goes to the log.

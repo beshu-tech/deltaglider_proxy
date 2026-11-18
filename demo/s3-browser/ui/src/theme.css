@@ -1353,3 +1353,608 @@ code, kbd, pre, samp, .ant-typography code,
     font-size: 16px !important;
   }
 }
+
+/* ───── Windows XP style (data-theme-style="xp") ─────
+   Luna by day (beige window face, Luna blue title bars, glossy beveled
+   buttons, the green Start button) and Royale Noir by night. Every colour is
+   a palette token or a `--xp-*` role declared in the blocks below; the rules
+   only read them. No blur, no glow, 3 px corners, dotted focus, Luna scrollbars. */
+[data-theme-style="xp"] {
+  --display-weight: 700;
+  --display-variation: normal;
+  --surface-blur: none;
+  --surface-blur-strong: none;
+  --card-shadow: var(--dg-elev-shadow);
+  --glass-bg: var(--dg-bg-card);
+  --glass-border: var(--dg-border);
+  --overlay-bg: color-mix(in srgb, var(--dg-bg-base) 90%, transparent);
+  --group-header-bg: var(--xp-pane-head-bg);
+  --group-bg: var(--dg-bg-card);
+  --group-border: var(--dg-border);
+  --group-rail: var(--dg-border);
+  --docs-code-bg: var(--dg-bg-sidebar);
+  --login-panel-bg: var(--dg-bg-base);
+  --login-card-border: var(--xp-window-border);
+  --login-hero-text: var(--dg-text-primary);
+  --login-submit-blend: var(--dg-accent-blue);
+  --login-shadow: var(--dg-float-shadow);
+  --menu-panel-bg: var(--dg-bg-card);
+  --menu-border: var(--xp-menu-border);
+  --menu-shadow: var(--dg-float-shadow);
+  --menu-item-text: var(--dg-text-primary);
+  --menu-item-hover: var(--xp-select-bg);
+  --menu-trigger-bg: var(--xp-btn-bg);
+  --menu-trigger-hover-border: var(--xp-hot);
+  --menu-avatar-bg: var(--xp-pane-head-bg);
+  --menu-avatar-text: var(--dg-accent-blue-light);
+  --table-row-hover: var(--xp-hover-row);
+  --table-row-selected: var(--xp-select-bg);
+  --focus-ring: var(--dg-text-primary);
+  --focus-ring-width: 1px;
+  --focus-ring-offset: 2px;
+  --xp-flag: linear-gradient(#f0502a 0 0) 0 0 / 46% 46% no-repeat, linear-gradient(#7ac143 0 0) 100% 0 / 46% 46% no-repeat, linear-gradient(#1b9be0 0 0) 0 100% / 46% 46% no-repeat, linear-gradient(#fdb913 0 0) 100% 100% / 46% 46% no-repeat;
+  --xp-seg-mask: repeating-linear-gradient(90deg, #000 0 7px, transparent 7px 9px);
+}
+[data-theme-style="xp"][data-theme="light"] {
+  --xp-window-border: #0831d9;
+  --xp-title-bg: linear-gradient(180deg, #0058ee 0%, #3593ff 4%, #288eff 6%, #127dff 8%, #036ffc 10%, #0262ee 14%, #0057e5 20%, #0054e3 24%, #0055eb 56%, #005bf5 66%, #026afe 76%, #0062ef 86%, #0052d6 92%, #0040ab 94%, #003092 100%);
+  --xp-title-text: #ffffff;
+  --xp-title-shadow: 1px 1px 0 #0f1089;
+  --xp-toolbar-bg: linear-gradient(180deg, #ffffff 0%, #f7f5ec 55%, #ece9d8 100%);
+  --xp-toolbar-hover: linear-gradient(180deg, #ffffff 0%, #f4f2e8 100%);
+  --xp-sider-bg: linear-gradient(180deg, #f3f7ff 0%, #dbe5fa 55%, #c8d8f6 100%);
+  --xp-pane-head-bg: linear-gradient(90deg, #ffffff 0%, #c6d3f7 100%);
+  --xp-btn-bg: linear-gradient(180deg, #ffffff 0%, #f6f5ef 55%, #ece9d8 85%, #d6d0c5 100%);
+  --xp-btn-bg-pressed: linear-gradient(180deg, #cdcac3 0%, #e3e3db 10%, #e5e5de 92%, #f2f2f1 100%);
+  --xp-btn-border: #003c74;
+  --xp-gloss: rgba(255, 255, 255, 0.2);
+  --xp-hot: #f8b330;
+  --xp-field-border: #7f9db9;
+  --xp-menu-border: #aca899;
+  --xp-select-bg: #316ac5;
+  --xp-select-text: #ffffff;
+  --xp-hover-row: #e8effc;
+  --xp-check: #21a121;
+  --xp-check-box: linear-gradient(135deg, #dcdcd7 0%, #ffffff 100%);
+  --xp-close-bg: linear-gradient(180deg, #e8856d 0%, #d9553a 50%, #c13c20 100%);
+  --xp-min-bg: linear-gradient(180deg, #5c9bff 0%, #2b6ee6 55%, #1a52c9 100%);
+  --xp-taskbar-bg: linear-gradient(180deg, #245edb 0%, #3f8cf3 9%, #245edb 18%, #245edb 92%, #1941a5 100%);
+  --xp-tray-bg: linear-gradient(180deg, #0c59b9 0%, #139ee9 9%, #18b5f2 18%, #139beb 50%, #1290e8 86%, #0d8dea 92%, #0d7bd9 100%);
+  --xp-start-bg: linear-gradient(180deg, #5cb94c 0%, #3f9d2f 18%, #378f29 80%, #2c7a20 100%);
+  --xp-start-border: #1f5a14;
+  --xp-scroll-track: #f4f2ec;
+  --xp-scroll-thumb-v: linear-gradient(90deg, #d4e0fc 0%, #bfd2fa 20%, #a9c0f5 60%, #95b0ee 100%);
+  --xp-scroll-thumb-h: linear-gradient(180deg, #d4e0fc 0%, #bfd2fa 20%, #a9c0f5 60%, #95b0ee 100%);
+  --xp-scroll-border: #8aa6e2;
+  --login-shell-bg: linear-gradient(90deg, transparent 0%, #99a9e0 30%, #f3a53a 50%, #99a9e0 70%, transparent 100%) 0 80px / 100% 2px no-repeat, linear-gradient(#00309c, #00309c) 0 0 / 100% 80px no-repeat, linear-gradient(#003399, #003399) 0 100% / 100% 80px no-repeat, radial-gradient(ellipse at 22% 45%, #9db4f2 0%, #6f8fe4 38%, #5a7edc 62%, #4468c8 100%);
+  --login-soft-line: #aca899;
+  --hljs-number: var(--dg-accent-amber);
+  --hljs-builtin: #1d4f9f;
+  --xp-arrow-up: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='17' height='17'%3E%3Cpolygon points='4,10.5 8.5,6 13,10.5' fill='%234d6185'/%3E%3C/svg%3E");
+  --xp-arrow-down: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='17' height='17'%3E%3Cpolygon points='4,6.5 8.5,11 13,6.5' fill='%234d6185'/%3E%3C/svg%3E");
+  --xp-arrow-left: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='17' height='17'%3E%3Cpolygon points='10.5,4 6,8.5 10.5,13' fill='%234d6185'/%3E%3C/svg%3E");
+  --xp-arrow-right: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='17' height='17'%3E%3Cpolygon points='6.5,4 11,8.5 6.5,13' fill='%234d6185'/%3E%3C/svg%3E");
+}
+[data-theme-style="xp"][data-theme="dark"] {
+  --xp-window-border: #1d2c5c;
+  --xp-title-bg: linear-gradient(180deg, #3a4670 0%, #4a5a8e 6%, #2c3760 14%, #232c4e 50%, #2a3560 86%, #1a2140 100%);
+  --xp-title-text: #f2f5fc;
+  --xp-title-shadow: 1px 1px 0 #05070f;
+  --xp-toolbar-bg: linear-gradient(180deg, #2b3453 0%, #1f2742 100%);
+  --xp-toolbar-hover: linear-gradient(180deg, #38426a 0%, #2a3354 100%);
+  --xp-sider-bg: linear-gradient(180deg, #1c2338 0%, #161b2c 60%, #121726 100%);
+  --xp-pane-head-bg: linear-gradient(90deg, #2d3a62 0%, #1f2846 100%);
+  --xp-btn-bg: linear-gradient(180deg, #3a4568 0%, #2c3657 55%, #232c49 100%);
+  --xp-btn-bg-pressed: linear-gradient(180deg, #1a2038 0%, #232b47 100%);
+  --xp-btn-border: #0a0e1c;
+  --xp-gloss: rgba(255, 255, 255, 0.22);
+  --xp-hot: #ffc83c;
+  --xp-field-border: #55648e;
+  --xp-menu-border: #55648e;
+  --xp-select-bg: #2f62c4;
+  --xp-select-text: #ffffff;
+  --xp-hover-row: #232c49;
+  --xp-check: #6fd36f;
+  --xp-check-box: linear-gradient(135deg, #2c3657 0%, #3a4568 100%);
+  --xp-close-bg: linear-gradient(180deg, #d9715a 0%, #bf4a30 55%, #9e3219 100%);
+  --xp-min-bg: linear-gradient(180deg, #4d7fd6 0%, #2f5cb8 55%, #223f8c 100%);
+  --xp-taskbar-bg: linear-gradient(180deg, #1c2542 0%, #2f3b66 9%, #1c2542 18%, #1c2542 92%, #0f1428 100%);
+  --xp-tray-bg: linear-gradient(180deg, #0f1a38 0%, #1c2c58 20%, #162349 100%);
+  --xp-start-bg: linear-gradient(180deg, #4aa83b 0%, #348a27 25%, #2b7620 80%, #225f19 100%);
+  --xp-start-border: #0f3a0a;
+  --xp-scroll-track: #141a2c;
+  --xp-scroll-thumb-v: linear-gradient(90deg, #5a6fa8 0%, #4a5d92 30%, #3b4c7c 100%);
+  --xp-scroll-thumb-h: linear-gradient(180deg, #5a6fa8 0%, #4a5d92 30%, #3b4c7c 100%);
+  --xp-scroll-border: #7387bd;
+  --login-shell-bg: linear-gradient(90deg, transparent 0%, #3b4d86 30%, #f3a53a 50%, #3b4d86 70%, transparent 100%) 0 80px / 100% 2px no-repeat, linear-gradient(#05070f, #05070f) 0 0 / 100% 80px no-repeat, linear-gradient(#05070f, #05070f) 0 100% / 100% 80px no-repeat, radial-gradient(ellipse at 22% 45%, #2b4a96 0%, #1a2c5e 40%, #0f1730 70%, #0a0f20 100%);
+  --login-soft-line: #3d4868;
+  --xp-arrow-up: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='17' height='17'%3E%3Cpolygon points='4,10.5 8.5,6 13,10.5' fill='%23cfd6e8'/%3E%3C/svg%3E");
+  --xp-arrow-down: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='17' height='17'%3E%3Cpolygon points='4,6.5 8.5,11 13,6.5' fill='%23cfd6e8'/%3E%3C/svg%3E");
+  --xp-arrow-left: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='17' height='17'%3E%3Cpolygon points='10.5,4 6,8.5 10.5,13' fill='%23cfd6e8'/%3E%3C/svg%3E");
+  --xp-arrow-right: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='17' height='17'%3E%3Cpolygon points='6.5,4 11,8.5 6.5,13' fill='%23cfd6e8'/%3E%3C/svg%3E");
+}
+
+/* Type: Trebuchet bold titles; the wordmark is a brand, not a heading, so it only loses its wide tracking. */
+[data-theme-style="xp"] :is(h1, h2, h3, h4, .ant-typography:is(h1, h2, h3, h4, h5), .ant-modal-title, .ant-drawer-title, .ant-card-head-title, .dg-display) {
+  font-weight: var(--display-weight);
+}
+[data-theme-style="xp"] :is(.dg-wordmark, .dg-wordmark-product) {
+  letter-spacing: 0.1em;
+}
+[data-theme-style="xp"] ::selection {
+  background: var(--xp-select-bg);
+  color: var(--xp-select-text);
+}
+/* Focus is the XP dotted rectangle. */
+[data-theme-style="xp"] :focus-visible:not(input, textarea, select, [tabindex='-1']),
+[data-theme-style="xp"] :is(.ant-checkbox-input, .ant-radio-input):focus-visible + :is(.ant-checkbox-inner, .ant-radio-inner) {
+  outline-style: dotted !important;
+}
+
+/* Text fields: the same dotted rectangle, drawn outside the dark frame. */
+[data-theme-style="xp"] .ant-input:not(.ant-input-affix-wrapper .ant-input, .ant-input-number .ant-input):focus,
+[data-theme-style="xp"] :is(.ant-input-affix-wrapper-focused, .ant-input-number-focused, .ant-select-focused:not(.ant-select-disabled), .ant-picker-focused),
+[data-theme-style="xp"] :is(input, textarea, select):focus-visible:not([class*="ant-"], [type='checkbox'], [type='radio'], [tabindex='-1']) {
+  outline-style: dotted !important;
+}
+
+/* ── Buttons: glossy, steel-blue frame, orange hot-track, no motion ── */
+[data-theme-style="xp"] .ant-btn {
+  transition: none;
+  box-shadow: none;
+}
+[data-theme-style="xp"] .ant-btn:is(.ant-btn-default, .ant-btn-dashed) {
+  background: var(--xp-btn-bg);
+  border: 1px solid var(--xp-btn-border);
+  color: var(--dg-text-primary);
+  border-radius: 3px;
+}
+[data-theme-style="xp"] .ant-btn:is(.ant-btn-default, .ant-btn-dashed):not(:disabled):hover {
+  background: var(--xp-btn-bg);
+  border-color: var(--xp-btn-border);
+  color: var(--dg-text-primary);
+  box-shadow: inset 0 0 0 2px var(--xp-hot);
+}
+[data-theme-style="xp"] .ant-btn:is(.ant-btn-default, .ant-btn-dashed, .ant-btn-primary):not(:disabled):active {
+  background: var(--xp-btn-bg-pressed);
+  box-shadow: inset 1px 1px 2px var(--xp-btn-border);
+}
+[data-theme-style="xp"] .ant-btn-primary.ant-btn-variant-solid:not(.ant-btn-dangerous) {
+  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--dg-accent-blue);
+  border: 1px solid var(--xp-btn-border);
+  color: var(--dg-on-accent);
+  border-radius: 3px;
+}
+[data-theme-style="xp"] .ant-btn-primary.ant-btn-variant-solid:not(.ant-btn-dangerous):not(:disabled):hover {
+  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--dg-accent-blue);
+  box-shadow: inset 0 0 0 2px var(--xp-hot);
+}
+[data-theme-style="xp"] .ant-btn-dangerous.ant-btn-variant-solid {
+  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--dg-accent-red);
+  border: 1px solid var(--xp-btn-border);
+  color: var(--dg-on-accent);
+  border-radius: 3px;
+}
+[data-theme-style="xp"] .ant-btn-dangerous.ant-btn-variant-solid:not(:disabled):hover {
+  box-shadow: inset 0 0 0 2px var(--xp-hot);
+}
+[data-theme-style="xp"] .ant-btn:is(.ant-btn-default, .ant-btn-dashed):disabled {
+  background: var(--dg-bg-base);
+  border-color: var(--dg-border);
+}
+/* Toolbar buttons (text, icon-only): flat until hot, then a framed gradient. */
+[data-theme-style="xp"] .ant-btn.ant-btn-variant-text:not(:disabled):hover {
+  background: var(--xp-toolbar-hover);
+  box-shadow: inset 0 0 0 1px var(--xp-field-border);
+}
+
+/* ── Fields: steel-blue frame, square ── */
+[data-theme-style="xp"] :is(.ant-input, .ant-input-affix-wrapper, .ant-input-number, .ant-select:not(.ant-select-customize-input) .ant-select-selector, .ant-picker, .ant-input-textarea textarea) {
+  border-color: var(--xp-field-border);
+  border-radius: 2px;
+}
+[data-theme-style="xp"] :is(.ant-input, .ant-input-affix-wrapper, .ant-input-number, .ant-select-selector, .ant-picker):not(:focus, :focus-within, .ant-select-focused):hover {
+  border-color: var(--xp-btn-border);
+}
+
+/* ── Checkbox and radio: the XP box with a green tick, the round radio with a green dot ── */
+[data-theme-style="xp"] .ant-checkbox-inner {
+  border: 1px solid var(--xp-btn-border);
+  border-radius: 2px;
+  background: var(--xp-check-box);
+}
+[data-theme-style="xp"] .ant-checkbox-checked .ant-checkbox-inner,
+[data-theme-style="xp"] .ant-checkbox-indeterminate .ant-checkbox-inner {
+  background: var(--xp-check-box);
+  border-color: var(--xp-btn-border);
+}
+[data-theme-style="xp"] .ant-checkbox-checked .ant-checkbox-inner::after {
+  border-color: var(--xp-check);
+  border-width: 2.5px;
+}
+[data-theme-style="xp"] .ant-checkbox-indeterminate .ant-checkbox-inner::after {
+  background: var(--xp-check);
+}
+[data-theme-style="xp"] .ant-radio-inner {
+  border: 1px solid var(--xp-btn-border);
+  background: var(--xp-check-box);
+}
+[data-theme-style="xp"] .ant-radio-checked .ant-radio-inner {
+  background: var(--xp-check-box);
+  border-color: var(--xp-btn-border);
+}
+[data-theme-style="xp"] .ant-radio-inner::after {
+  background-color: var(--xp-check);
+}
+
+/* ── Tables: the Explorer details view ── */
+[data-theme-style="xp"] .ant-table-wrapper .ant-table-thead > tr > th {
+  background: var(--xp-toolbar-bg);
+  border-bottom: 1px solid var(--dg-border);
+  border-inline-end: 1px solid var(--dg-border);
+  color: var(--dg-text-primary);
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+  font-size: 12px !important;
+  font-weight: 400 !important;
+}
+[data-theme-style="xp"] .ant-table-wrapper .ant-table-thead > tr > th::before {
+  display: none;
+}
+[data-theme-style="xp"] .ant-table-wrapper .ant-table-thead > tr > th:hover {
+  background: var(--xp-toolbar-hover);
+  box-shadow: inset 0 -2px 0 var(--xp-hot);
+}
+[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']) > :is(td, .ant-table-cell),
+[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']) > :is(td, .ant-table-cell) :not(.ant-tag, .ant-tag *, .ant-btn, .ant-btn *, .ant-checkbox-inner) {
+  color: var(--xp-select-text) !important;
+}
+[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).ant-table-row > :is(td, .ant-table-cell):first-child::before {
+  background: var(--xp-hot);
+}
+
+[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr > td, .ant-table-tbody-virtual .ant-table-cell) {
+  border-bottom-color: color-mix(in srgb, var(--dg-border) 35%, transparent);
+}
+
+/* ── Cards, tags ── */
+[data-theme-style="xp"] .ant-card {
+  border: 1px solid var(--dg-border);
+  border-radius: 6px 6px 0 0;
+  box-shadow: var(--dg-elev-shadow);
+}
+[data-theme-style="xp"] .ant-card-head {
+  background: var(--xp-pane-head-bg);
+  border-bottom: 0;
+  border-radius: 6px 6px 0 0;
+  min-height: 0;
+}
+[data-theme-style="xp"] .ant-card-head-title {
+  color: var(--dg-accent-blue-light);
+}
+[data-theme-style="xp"] .ant-tag {
+  border-radius: 2px;
+}
+
+/* ── Windows: dialogs and drawers get the Luna title bar ── */
+[data-theme-style="xp"] .ant-modal-container {
+  padding: 0;
+  overflow: hidden;
+  background: var(--dg-bg-base);
+  border: 1px solid var(--xp-window-border);
+  border-radius: 8px 8px 0 0;
+  box-shadow: var(--dg-float-shadow);
+}
+[data-theme-style="xp"] .ant-modal-header,
+[data-theme-style="xp"] .ant-drawer-header {
+  margin: 0;
+  padding: 6px 36px 6px 10px;
+  background: var(--xp-title-bg);
+  border: 0;
+  border-radius: 7px 7px 0 0;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+}
+[data-theme-style="xp"] .ant-drawer-header {
+  border-radius: 0;
+}
+[data-theme-style="xp"] :is(.ant-modal-title, .ant-drawer-title) {
+  color: var(--xp-title-text);
+  text-shadow: var(--xp-title-shadow);
+  font-size: 14px;
+}
+[data-theme-style="xp"] .ant-modal-body {
+  padding: 16px 20px;
+}
+[data-theme-style="xp"] .ant-modal-footer {
+  padding: 0 20px 16px;
+}
+[data-theme-style="xp"] :is(.ant-modal-close, .ant-drawer-close) {
+  top: 4px;
+  inset-inline-end: 5px;
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  background: var(--xp-close-bg);
+  border: 1px solid var(--dg-bg-card);
+  border-radius: 3px;
+  color: var(--xp-title-text);
+}
+[data-theme-style="xp"] .ant-drawer-close {
+  position: absolute;
+  inset-inline-start: auto;
+}
+[data-theme-style="xp"] :is(.ant-modal-close, .ant-drawer-close):hover {
+  background: var(--xp-close-bg);
+  box-shadow: inset 0 0 0 2px var(--xp-hot);
+  color: var(--xp-title-text);
+}
+
+/* ── Menus and dropdowns: white, framed, blue hot-track with white text ── */
+[data-theme-style="xp"] :is(.ant-dropdown-menu, .ant-select-dropdown, .ant-picker-dropdown .ant-picker-panel-container) {
+  border: 1px solid var(--xp-menu-border);
+  border-radius: 0;
+  box-shadow: var(--dg-float-shadow);
+}
+[data-theme-style="xp"] .ant-dropdown-menu-item:hover,
+[data-theme-style="xp"] .ant-dropdown-menu-item:hover .ant-dropdown-menu-title-content,
+[data-theme-style="xp"] .ant-select-item-option-active:not(.ant-select-item-option-disabled),
+[data-theme-style="xp"] .ant-select-item-option-active:not(.ant-select-item-option-disabled) .ant-select-item-option-content {
+  background: var(--xp-select-bg);
+  color: var(--xp-select-text);
+}
+[data-theme-style="xp"] .ant-select-item-option-selected:not(.ant-select-item-option-disabled) {
+  background: var(--xp-hover-row);
+  font-weight: 700;
+}
+
+/* ── Tabs: the orange hot-track on the active tab ── */
+[data-theme-style="xp"] .ant-tabs-ink-bar {
+  background: var(--xp-hot);
+  height: 3px;
+}
+
+/* ── Progress: the green XP blocks ── */
+[data-theme-style="xp"] .ant-progress-outer .ant-progress-inner {
+  border: 1px solid var(--xp-btn-border);
+  border-radius: 3px;
+  background: var(--dg-bar-track);
+  padding: 1px;
+}
+[data-theme-style="xp"] .ant-progress-bg {
+  background: var(--dg-bar-saved);
+  border-radius: 1px;
+  mask-image: var(--xp-seg-mask);
+}
+
+/* ── Shell: toolbar, Explorer pane, the taskbar with its Start button ── */
+[data-theme-style="xp"] .ant-layout-header {
+  background: var(--xp-toolbar-bg) !important;
+  border-bottom: 1px solid var(--dg-border) !important;
+}
+[data-theme-style="xp"] .ant-layout-sider {
+  background: var(--xp-sider-bg) !important;
+  border-right: 1px solid var(--dg-border) !important;
+}
+[data-theme-style="xp"] .dg-fullscreen-header {
+  background: var(--xp-title-bg) !important;
+  border-bottom: 1px solid var(--xp-window-border) !important;
+}
+[data-theme-style="xp"] .dg-fullscreen-header :is(.dg-wordmark, .dg-wordmark-product, .ant-btn, .anticon) {
+  color: var(--xp-title-text) !important;
+  text-shadow: var(--xp-title-shadow);
+}
+[data-theme-style="xp"] .dg-fullscreen-header .ant-btn.ant-btn-variant-text:not(:disabled):hover {
+  background: var(--xp-min-bg);
+  box-shadow: inset 0 0 0 1px var(--xp-title-text);
+}
+[data-theme-style="xp"] .dg-sidebar-footer {
+  padding: 0 !important;
+  height: 32px;
+  box-sizing: border-box;
+  gap: 0 !important;
+  align-items: stretch !important;
+  justify-content: space-between;
+  background: var(--xp-taskbar-bg);
+  border-top: 1px solid var(--xp-window-border) !important;
+  overflow: hidden;
+}
+[data-theme-style="xp"] .dg-sidebar-footer .dg-wordmark {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 18px 0 10px;
+  background: var(--xp-start-bg);
+  border: 1px solid var(--xp-start-border);
+  border-radius: 0 12px 12px 0;
+  box-shadow: 1px 0 2px var(--xp-start-border);
+  color: var(--xp-title-text) !important;
+  font-family: var(--font-display);
+  font-size: 16px !important;
+  font-style: italic;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+  text-shadow: 1px 1px 2px var(--xp-start-border);
+}
+[data-theme-style="xp"] .dg-sidebar-footer .dg-wordmark::before {
+  content: '';
+  width: 16px;
+  height: 16px;
+  background: var(--xp-flag);
+  transform: skewY(-8deg);
+}
+[data-theme-style="xp"] .dg-sidebar-footer .dg-wordmark ~ span {
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  background: var(--xp-tray-bg);
+  border-left: 1px solid var(--xp-window-border);
+  color: var(--xp-title-text);
+  font-size: 12px;
+}
+
+/* ── Bucket groups: the task-pane box ── */
+[data-theme-style="xp"] .dg-bucket-group {
+  border-radius: 6px 6px 0 0;
+  overflow: hidden;
+}
+[data-theme-style="xp"] .dg-bucket-group-header {
+  border-radius: 0;
+}
+
+/* ── Login: the Welcome screen, with the form as a Log On window ── */
+[data-theme-style="xp"] .dg-login-shell::before,
+[data-theme-style="xp"] :is(.dg-login-orb, .dg-login-grid) {
+  display: none;
+}
+[data-theme-style="xp"] .dg-login-card {
+  padding-top: calc(28px + clamp(24px, 3vw, 32px));
+  border: 1px solid var(--xp-window-border);
+  border-radius: 8px 8px 0 0;
+  overflow: hidden;
+}
+[data-theme-style="xp"] .dg-login-card::before {
+  content: 'Log On to DeltaGlider';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 28px;
+  box-sizing: border-box;
+  padding: 0 40px 0 10px;
+  display: flex;
+  align-items: center;
+  background: var(--xp-title-bg);
+  color: var(--xp-title-text);
+  font: 700 14px/1 var(--font-display);
+  text-shadow: var(--xp-title-shadow);
+}
+[data-theme-style="xp"] .dg-login-theme-toggle {
+  top: 3px;
+  right: 5px;
+  width: 22px !important;
+  height: 22px !important;
+  min-width: 22px !important;
+  background: var(--xp-min-bg) !important;
+  border: 1px solid var(--dg-bg-card) !important;
+  border-radius: 3px !important;
+  color: var(--xp-title-text) !important;
+}
+[data-theme-style="xp"] .dg-login-theme-toggle:hover {
+  background: var(--xp-min-bg) !important;
+  border-color: var(--dg-bg-card) !important;
+  box-shadow: inset 0 0 0 2px var(--xp-hot);
+}
+[data-theme-style="xp"] :is(.dg-login-brand, .dg-login-product) {
+  font-family: var(--font-display);
+  font-style: italic;
+  letter-spacing: 0.06em;
+  text-shadow: none;
+}
+[data-theme-style="xp"] .dg-login-card :is(.ant-input, .ant-input-affix-wrapper) {
+  height: 34px !important;
+  border-radius: 2px !important;
+  border-color: var(--xp-field-border) !important;
+  background: var(--dg-bg-card) !important;
+}
+[data-theme-style="xp"] .dg-login-sso-button {
+  border: 1px solid var(--xp-btn-border);
+  border-radius: 3px;
+  background: var(--xp-btn-bg);
+  box-shadow: none;
+  transition: none;
+  transform: none;
+}
+[data-theme-style="xp"] .dg-login-sso-button:hover {
+  background: var(--xp-btn-bg);
+  box-shadow: inset 0 0 0 2px var(--xp-hot);
+  transform: none;
+}
+[data-theme-style="xp"] .dg-login-submit {
+  height: 34px !important;
+  border: 1px solid var(--xp-btn-border) !important;
+  border-radius: 3px !important;
+  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--dg-accent-blue) !important;
+  box-shadow: none !important;
+  font: 700 14px/1 var(--font-ui) !important;
+}
+[data-theme-style="xp"] .dg-login-submit:not(:disabled):hover {
+  box-shadow: inset 0 0 0 2px var(--xp-hot) !important;
+}
+[data-theme-style="xp"] .dg-login-submit:disabled {
+  background: var(--dg-bg-base) !important;
+  border: 1px solid var(--dg-border) !important;
+  color: var(--dg-text-faint) !important;
+  box-shadow: none !important;
+}
+
+/* ── Luna scrollbars: 17 px, a blue thumb, arrow buttons ── */
+[data-theme-style="xp"] ::-webkit-scrollbar {
+  width: 17px;
+  height: 17px;
+}
+[data-theme-style="xp"] ::-webkit-scrollbar-track {
+  background: var(--xp-scroll-track);
+}
+[data-theme-style="xp"] ::-webkit-scrollbar-thumb {
+  border: 1px solid var(--xp-scroll-border);
+  border-radius: 3px;
+  box-shadow: inset 0 0 0 1px var(--dg-card-highlight);
+}
+[data-theme-style="xp"] ::-webkit-scrollbar-thumb:vertical {
+  background: var(--xp-scroll-thumb-v);
+}
+[data-theme-style="xp"] ::-webkit-scrollbar-thumb:horizontal {
+  background: var(--xp-scroll-thumb-h);
+}
+[data-theme-style="xp"] ::-webkit-scrollbar-thumb:hover {
+  border-color: var(--xp-hot);
+}
+[data-theme-style="xp"] ::-webkit-scrollbar-button:single-button {
+  display: block;
+  width: 17px;
+  height: 17px;
+  border: 1px solid var(--xp-scroll-border);
+  border-radius: 3px;
+  background-color: transparent;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+[data-theme-style="xp"] ::-webkit-scrollbar-button:vertical:single-button {
+  background-image: var(--xp-arrow-up), var(--xp-scroll-thumb-v);
+}
+[data-theme-style="xp"] ::-webkit-scrollbar-button:vertical:increment:single-button {
+  background-image: var(--xp-arrow-down), var(--xp-scroll-thumb-v);
+}
+[data-theme-style="xp"] ::-webkit-scrollbar-button:horizontal:single-button {
+  background-image: var(--xp-arrow-left), var(--xp-scroll-thumb-h);
+}
+[data-theme-style="xp"] ::-webkit-scrollbar-button:horizontal:increment:single-button {
+  background-image: var(--xp-arrow-right), var(--xp-scroll-thumb-h);
+}
+[data-theme-style="xp"] ::-webkit-scrollbar-corner {
+  background: var(--xp-scroll-track);
+}
+
+/* ── Account menu: the XP start-menu panel, blue hot-track rows ── */
+[data-theme-style="xp"] .account-menu-panel {
+  padding: 2px;
+  border-radius: 0;
+}
+[data-theme-style="xp"] .account-menu-item {
+  border-radius: 0;
+  padding: 6px 12px;
+  transition: none;
+}
+[data-theme-style="xp"] .account-menu-item:is(:hover, :focus-visible) {
+  background: var(--xp-select-bg);
+  color: var(--xp-select-text);
+}
+[data-theme-style="xp"] .account-menu-trigger,
+[data-theme-style="xp"] .account-menu-wrap--compact .account-menu-trigger {
+  border-radius: 3px;
+  transition: none;
+}
+[data-theme-style="xp"] .account-menu-avatar {
+  border-radius: 3px;
+}

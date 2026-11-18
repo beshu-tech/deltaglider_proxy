@@ -671,6 +671,7 @@ export default function Sidebar({
             constant, which would bake the build identity into the public JS
             bundle. Blank until whoami resolves. */}
         <div
+          className="dg-sidebar-footer"
           style={{
             display: 'flex', alignItems: 'baseline', gap: 8,
             padding: '12px 16px', borderTop: `1px solid ${BORDER}`,
