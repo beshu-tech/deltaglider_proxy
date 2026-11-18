@@ -195,7 +195,10 @@ impl S3Backend {
     }
 
     /// First pass of the purge: is every key of the bucket below `.dg`?
-    async fn holds_only_internal_keys(&self, bucket: &str) -> Result<bool, StorageError> {
+    pub(super) async fn holds_only_internal_keys(
+        &self,
+        bucket: &str,
+    ) -> Result<bool, StorageError> {
         let mut start_after: Option<String> = None;
         let mut token: Option<String> = None;
         loop {

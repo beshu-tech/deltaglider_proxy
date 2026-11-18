@@ -1912,6 +1912,56 @@ mod delegated_cost_tests {
         assert!(lists(&fake) < 12, "read the hidden keys: {}", lists(&fake));
     }
 
+    /// L1 re-review: keys below `.dg` whose names start with U+10FFFF sort at
+    /// the jump target. The three paging loops follow their token and end.
+    #[tokio::test]
+    async fn keys_that_sort_at_the_jump_target_do_not_loop() {
+        let mut keys: Vec<String> = (0..1001)
+            .map(|i| format!("a/.dg/{}{i:04}", '\u{10FFFF}'))
+            .collect();
+        keys.extend(["a/live.txt", "b/z"].map(String::from));
+        let (s3, _fake) = backend_with_keys(&keys).await;
+        let all = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            s3.list_objects_full("b", ""),
+        )
+        .await
+        .expect("list_objects_full ends")
+        .unwrap();
+        let got: Vec<&str> = all.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(got, ["a/live.txt", "b/z"]);
+        let mut got = Vec::new();
+        let mut token: Option<String> = None;
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let page = s3
+                    .list_objects_delegated("b", "", None, 1000, token.as_deref())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                got.extend(page.objects.into_iter().map(|(k, _)| k));
+                if !page.is_truncated {
+                    break;
+                }
+                token = page.next_continuation_token;
+            }
+        })
+        .await
+        .expect("the delegated LIST ends");
+        assert_eq!(got, ["a/live.txt", "b/z"]);
+        // Only `.dg` keys: the purge's first pass ends and says so.
+        let only: Vec<String> = keys[..1001].to_vec();
+        let (s3, _fake) = backend_with_keys(&only).await;
+        let clean = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            s3.holds_only_internal_keys("b"),
+        )
+        .await
+        .expect("the purge scan ends")
+        .unwrap();
+        assert!(clean);
+    }
+
     /// A page probes at most `PROBES_PER_PAGE` prefixes: 12 folders that each
     /// hold a baseline (so the delimiter `r` makes a prefix `dN/r` of only a
     /// baseline) send 8 probes; the other 4 prefixes are shown, unchecked.

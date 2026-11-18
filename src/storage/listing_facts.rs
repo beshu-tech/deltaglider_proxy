@@ -96,7 +96,8 @@ pub fn skip_past_facts(last_key: &str) -> Option<&'static str> {
 /// below a `.dg` directory: past the whole directory, which holds no listed
 /// key. It is `<dir>/.dg/` + U+10FFFF, never `.dg0`: a client key `a/.dg0`
 /// and `a/.dg-x` sort outside the directory. `None` when `last_key` has no
-/// complete `.dg` directory (a file named `.dg` is no directory).
+/// complete `.dg` directory (a file named `.dg` is no directory), or when the
+/// target does not sort after `last_key`.
 pub fn skip_past_internal_dir(last_key: &str) -> Option<String> {
     let mut end = 0;
     let mut parts = last_key.split('/').peekable();
@@ -105,7 +106,10 @@ pub fn skip_past_internal_dir(last_key: &str) -> Option<String> {
         parts.peek()?;
         end += 1;
         if seg == INTERNAL_DIR {
-            return Some(format!("{}{}", &last_key[..end], '\u{10FFFF}'));
+            let target = format!("{}{}", &last_key[..end], '\u{10FFFF}');
+            // A key that sorts at or after the target (its name starts with
+            // U+10FFFF) gets no jump: the caller follows its token.
+            return (target.as_str() > last_key).then_some(target);
         }
     }
     None
@@ -896,6 +900,7 @@ mod tests {
         let past = |k: &str| skip_past_internal_dir(k);
         assert_eq!(past(".dg/facts/x"), Some(".dg/\u{10FFFF}".into()));
         assert_eq!(past("a/b/.dg/c/d"), Some("a/b/.dg/\u{10FFFF}".into()));
+        assert_eq!(past("a/.dg/\u{10FFFF}x"), None, "no jump back or in place");
         for k in ["a/.dg", ".dg", "a/.dgx/k", "a/.dg-x", "a/.dg0", "a/b"] {
             assert_eq!(past(k), None, "{k}");
         }
