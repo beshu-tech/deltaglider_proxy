@@ -80,6 +80,9 @@ impl S3Access for VerifiedIdentityS3sAccess {
             if verified.is_some() {
                 if let Some(outcome) = cx.extensions_mut().get::<crate::api::auth::AuthOutcome>() {
                     outcome.mark_verified();
+                    if resolved.as_deref().is_some_and(|u| !u.is_anonymous()) {
+                        outcome.mark_identified();
+                    }
                 }
             }
             // The maintenance + backend-health gates run HERE, after s3s

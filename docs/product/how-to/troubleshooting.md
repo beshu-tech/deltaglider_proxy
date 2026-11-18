@@ -105,7 +105,7 @@ Mitigation without operator access: the embedded uploader uploads one file at a 
 
 A proxy such as Traefik can report "connection reset" instead of `403 AccessDenied` for a large upload that DeltaGlider Proxy refuses, for example a `PUT` to a `replication_target_only` bucket. The reason is that the refusal comes before the proxy reads the body, and the connection closes with the body unread.
 
-For a signed request, the proxy now reads up to 64 MiB of the body, for at most 30 seconds, before it sends the error response. It does not read the body of an anonymous request, of a presigned request, or of a request that declares more than 64 MiB. A client that still sees a reset in these cases must read the response before it sends the whole body, or must send `Expect: 100-continue`.
+For a request whose signature the proxy verified, the proxy now reads up to 64 MiB of the body, for at most 30 seconds, before it sends the error response. It does not read the body of an anonymous request, of a presigned request, of a request that declares more than 64 MiB, of a request with `Expect: 100-continue`, of a request that an IAM policy denies, or of a request that an admission block refuses. A client that still sees a reset in these cases must read the response before it sends the whole body, or must send `Expect: 100-continue`.
 
 ## Uploads fail with 411 MissingContentLength
 

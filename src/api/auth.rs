@@ -256,7 +256,7 @@ pub fn resolved_identity_is_verified(
 /// after the inner layers ran: success is a signature s3s verified, failure
 /// is a 403 that never reached that point.
 #[derive(Clone, Default)]
-pub struct AuthOutcome(Arc<AtomicU8>);
+pub struct AuthOutcome(Arc<AtomicU8>, Arc<std::sync::atomic::AtomicBool>);
 
 // 0 (the `Default`) is pending: nothing verified or denied yet.
 const OUTCOME_VERIFIED: u8 = 1;
@@ -274,9 +274,18 @@ impl AuthOutcome {
         self.0.store(OUTCOME_AUTHZ_DENIED, Ordering::Release);
     }
 
-    /// s3s verified a signature (an anonymous request never gets here).
+    /// s3s verified a signature.
     pub fn is_verified(&self) -> bool {
         self.state() == OUTCOME_VERIFIED
+    }
+
+    /// The verified request resolved to a real principal (not open access).
+    pub fn mark_identified(&self) {
+        self.1.store(true, Ordering::Release);
+    }
+
+    pub fn is_identified(&self) -> bool {
+        self.1.load(Ordering::Acquire)
     }
 
     fn state(&self) -> u8 {

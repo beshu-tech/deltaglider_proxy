@@ -27,14 +27,20 @@ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 /// Pure: whether a response is held back until the request body is read.
 /// Only a verified, non-presigned request is drained: an anonymous caller
 /// (or the holder of a shared link) must not make the proxy read 64 MiB.
+/// An `Expect: 100-continue` request is never drained: reading the body
+/// makes hyper send `100 Continue`, and the client would upload it all.
 pub fn should_drain(
     status: StatusCode,
     verified: bool,
+    identified: bool,
     presigned: bool,
+    expect_continue: bool,
     declared_len: Option<u64>,
 ) -> bool {
     status.as_u16() >= 400
         && verified
+        && identified
+        && !expect_continue
         && !presigned
         && declared_len.is_none_or(|n| n <= DRAIN_CAP_BYTES)
 }
@@ -123,6 +129,11 @@ pub async fn drain_after_refusal(mut request: Request, next: Next) -> Response {
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
+    let expect_continue = request
+        .headers()
+        .get(header::EXPECT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("100-continue"));
     let shared = Arc::new(Mutex::new(None));
     let request = request.map(|body| {
         *shared.lock().expect("body lock") = Some(body);
@@ -132,7 +143,9 @@ pub async fn drain_after_refusal(mut request: Request, next: Next) -> Response {
     if should_drain(
         response.status(),
         outcome.is_verified(),
+        outcome.is_identified(),
         presigned,
+        expect_continue,
         declared_len,
     ) {
         let rest = shared.lock().expect("body lock").take();
@@ -153,21 +166,47 @@ mod tests {
         let big = Some(DRAIN_CAP_BYTES + 1);
         let ok = StatusCode::OK;
         let denied = StatusCode::FORBIDDEN;
-        // (status, verified, presigned, declared, want)
+        // (status, verified, identified, presigned, expect_continue, declared, want)
         let rows = [
-            (denied, true, false, Some(10), true),
-            (denied, true, false, None, true),
-            (denied, true, false, Some(DRAIN_CAP_BYTES), true),
-            (denied, true, false, big, false),
-            (denied, false, false, Some(10), false),
-            (denied, true, true, Some(10), false),
-            (ok, true, false, Some(10), false),
-            (StatusCode::SERVICE_UNAVAILABLE, true, false, Some(10), true),
-            (StatusCode::BAD_REQUEST, false, true, None, false),
+            (denied, true, true, false, false, Some(10), true),
+            (denied, true, true, false, false, None, true),
+            (
+                denied,
+                true,
+                true,
+                false,
+                false,
+                Some(DRAIN_CAP_BYTES),
+                true,
+            ),
+            (denied, true, true, false, false, big, false),
+            (denied, false, true, false, false, Some(10), false),
+            (denied, true, true, true, false, Some(10), false),
+            (ok, true, true, false, false, Some(10), false),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+                true,
+                false,
+                false,
+                Some(10),
+                true,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                false,
+                true,
+                true,
+                false,
+                None,
+                false,
+            ),
+            (denied, true, true, false, true, Some(10), false),
+            (denied, true, false, false, false, Some(10), false),
         ];
-        for (status, verified, presigned, declared, want) in rows {
+        for (status, verified, identified, presigned, expect, declared, want) in rows {
             assert_eq!(
-                should_drain(status, verified, presigned, declared),
+                should_drain(status, verified, identified, presigned, expect, declared),
                 want,
                 "{status} verified={verified} presigned={presigned} declared={declared:?}"
             );

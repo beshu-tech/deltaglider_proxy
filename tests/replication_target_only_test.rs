@@ -481,7 +481,7 @@ async fn a_refused_large_put_answers_403_not_a_closed_connection() {
 const RAW_BODY: usize = 32 * 1024 * 1024;
 
 /// A PUT head for `/rto-dst/big.bin` with a 32 MiB body, signed or not.
-fn raw_put_head(ep: &str, signed: bool) -> String {
+fn raw_put_head(ep: &str, signed: bool, expect: bool) -> String {
     let url = format!("{ep}/rto-dst/big.bin");
     let host = ep.trim_start_matches("http://");
     let mut head =
@@ -497,6 +497,9 @@ fn raw_put_head(ep: &str, signed: bool) -> String {
         }
     } else {
         head.push_str("x-amz-content-sha256: UNSIGNED-PAYLOAD\r\n");
+    }
+    if expect {
+        head.push_str("Expect: 100-continue\r\n");
     }
     head.push_str("\r\n");
     head
@@ -559,7 +562,7 @@ async fn a_refused_signed_put_body_is_read_and_the_connection_stays_open() {
     let mut s = tokio::net::TcpStream::connect(ep.trim_start_matches("http://"))
         .await
         .unwrap();
-    s.write_all(raw_put_head(&ep, true).as_bytes())
+    s.write_all(raw_put_head(&ep, true, false).as_bytes())
         .await
         .unwrap();
     let chunk = vec![7u8; 1024 * 1024];
@@ -597,7 +600,7 @@ async fn a_refused_anonymous_put_body_is_not_read() {
     let mut s = tokio::net::TcpStream::connect(ep.trim_start_matches("http://"))
         .await
         .unwrap();
-    s.write_all(raw_put_head(&ep, false).as_bytes())
+    s.write_all(raw_put_head(&ep, false, false).as_bytes())
         .await
         .unwrap();
     let chunk = vec![7u8; 1024 * 1024];
@@ -621,4 +624,20 @@ async fn a_refused_anonymous_put_body_is_not_read() {
         second.is_none(),
         "anonymous connection must close (written {written}, first {first:?})"
     );
+}
+
+/// A client that sends `Expect: 100-continue` must get the 403 first, never
+/// `100 Continue`: the drain must not invite the body.
+#[tokio::test]
+async fn a_refused_expect_continue_put_gets_403_not_100() {
+    let server = rto_server().await;
+    let ep = server.endpoint();
+    let mut s = tokio::net::TcpStream::connect(ep.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    s.write_all(raw_put_head(&ep, true, true).as_bytes())
+        .await
+        .unwrap();
+    let (status, head) = read_raw_response(&mut s).await.expect("first response");
+    assert_eq!(status, 403, "first status line: {head}");
 }
