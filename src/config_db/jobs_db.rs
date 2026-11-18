@@ -12,22 +12,19 @@
 //! Same SQLCipher key as the config DB ([`ConfigDbKeys`]), opened through the
 //! same keyed open (`config_db::open_keyed`), so a key rotation moves both.
 //!
-//! An older release kept these tables in the config DB. [`JobsDb::adopt_from`]
-//! moves the rows over once, at boot, from the LIVE config DB only. The
-//! config DB keeps the tables, empty: an older peer that downloads the synced
-//! copy, or an older binary after a downgrade, still finds them. See
-//! `docs/plan/node-local-db-split.md`.
+//! The config DB keeps the same tables, empty: a 2.2.x peer that downloads
+//! the synced copy still finds them. See `docs/plan/node-local-db-split.md`.
 
-use super::{open_encrypted, open_keyed, ConfigDb, ConfigDbError, ConfigDbKeys, OpenedWith};
-use rusqlite::{Connection, OptionalExtension};
+use super::{open_encrypted, open_keyed, ConfigDbError, ConfigDbKeys, OpenedWith};
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 /// Schema version of the jobs DB (independent of the config DB's).
 pub(crate) const JOBS_SCHEMA_VERSION: i32 = 1;
 
-/// The node-local tables, parents before children (the copy order; the
-/// delete order is the reverse).
+/// The node-local tables, parents before children. Tests read it.
+#[cfg(test)]
 pub(crate) const NODE_LOCAL_TABLES: &[&str] = &[
     "replication_state",
     "replication_run_history",
@@ -45,8 +42,7 @@ pub(crate) const NODE_LOCAL_TABLES: &[&str] = &[
     "maintenance_failures",
 ];
 
-/// Tables only the jobs DB has: never in the config DB, so never adopted
-/// from it. Created at every open (`CREATE TABLE IF NOT EXISTS`) without a
+/// Tables only the jobs DB has: never in the config DB. Created at every open (`CREATE TABLE IF NOT EXISTS`) without a
 /// schema version bump: an older binary ignores them and still opens the
 /// file after a downgrade. Tests read it: the table-shape check and the
 /// node-local SQL source guard.
@@ -70,8 +66,8 @@ pub(crate) const JOBS_ONLY_COLUMNS: &[(&str, &str, &str)] = &[
 ];
 
 /// The most a `-wal` file keeps after a checkpoint (`journal_size_limit`).
-/// Without it the file keeps the size of its largest transaction (the
-/// one-time `adopt_from` copy, a parity-cache clear) until the process stops.
+/// Without it the file keeps the size of its largest transaction (a
+/// parity-cache clear) until the process stops.
 pub(crate) const JOURNAL_SIZE_LIMIT_BYTES: i64 = 16 * 1024 * 1024;
 
 /// The node-local job database. Shared as `Arc<tokio::sync::Mutex<JobsDb>>`;
@@ -148,19 +144,6 @@ impl Drop for SavepointGuard<'_> {
     }
 }
 
-/// What [`JobsDb::adopt_from`] did.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct AdoptReport {
-    /// Rows copied from the config DB (first adoption only), per table.
-    pub copied: Vec<(String, i64)>,
-    /// Rows deleted from the config DB's node-local tables, per table.
-    pub cleared: Vec<(String, i64)>,
-    /// The leftovers were deleted after an earlier adoption (a crash between
-    /// the copy and the delete, or rows an older binary wrote after a
-    /// downgrade).
-    pub leftovers: bool,
-}
-
 /// The path of the jobs DB: next to the config DB.
 pub fn jobs_db_path() -> PathBuf {
     super::config_db_path().with_file_name("deltaglider_jobs.db")
@@ -220,7 +203,6 @@ impl JobsDb {
     /// * the Slack delivery record (Slack cannot deduplicate);
     /// * every migrate phase save (the flip and the source delete come
     ///   after it, see `maintenance::migrate`);
-    /// * the `adopt_from` copy (the config DB rows are deleted after it).
     ///
     /// The `-wal` file keeps the size of its largest transaction until the
     /// process stops, unless `journal_size_limit` cuts it after a
@@ -381,205 +363,13 @@ impl JobsDb {
             tx.commit()?;
         }
         conn.execute_batch(SCHEMA_JOBS_ONLY)?;
-        // JOBS_ONLY_COLUMNS: additive, outside the schema version (an older
-        // binary ignores them, and the copy from the config DB copies the
-        // columns both have).
+        // JOBS_ONLY_COLUMNS: additive, outside the schema version.
         for (table, column, decl) in JOBS_ONLY_COLUMNS {
             if !columns(conn, "main", table)?.iter().any(|c| c == column) {
                 conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
             }
         }
         Ok(())
-    }
-
-    fn adopted(&self) -> Result<bool, ConfigDbError> {
-        let v: i64 =
-            self.conn
-                .query_row("SELECT adopted FROM jobs_meta WHERE id = 1", [], |r| {
-                    r.get(0)
-                })?;
-        Ok(v != 0)
-    }
-
-    /// Move the node-local rows of the LIVE config DB `config` (opened with
-    /// `key`) into this DB, once, and empty the config DB's copies. Boot
-    /// only, before any job subsystem runs. Crash-safe in any order:
-    ///
-    /// 1. one transaction HERE: clear this DB's tables (not authoritative
-    ///    before adoption), copy every row (columns matched by name), raise
-    ///    the AUTOINCREMENT sequences to the config DB's, set `adopted`;
-    /// 2. one transaction in the config DB: delete those rows;
-    /// 3. VACUUM the config DB (best effort).
-    ///
-    /// A crash before 1 commits re-runs 1 from scratch. After 1 commits,
-    /// this DB is the truth: any row left in the config DB (a crash before 2,
-    /// or rows an older binary wrote after a downgrade) is deleted.
-    pub fn adopt_from(&self, config: &ConfigDb, key: &str) -> Result<AdoptReport, ConfigDbError> {
-        let mut report = AdoptReport::default();
-        if !self.adopted()? {
-            report.copied = self.copy_from_config(config.local_path(), key)?;
-        } else {
-            report.leftovers = true;
-        }
-        report.cleared = config.clear_node_local_tables()?;
-        let cleared: i64 = report.cleared.iter().map(|(_, n)| n).sum();
-        if report.leftovers && cleared == 0 {
-            report.leftovers = false;
-            return Ok(report);
-        }
-        if report.leftovers {
-            warn!(
-                "Config DB {}: deleted {cleared} job row(s) left after the move to {} ({}): \
-                 the jobs DB is the source of job state",
-                config.local_path().display(),
-                self.local_path.display(),
-                describe(&report.cleared)
-            );
-        } else {
-            let copied: i64 = report.copied.iter().map(|(_, n)| n).sum();
-            info!(
-                "Moved {copied} job row(s) from {} to {} ({})",
-                config.local_path().display(),
-                self.local_path.display(),
-                describe(&report.copied)
-            );
-        }
-        if cleared > 0 {
-            config.vacuum();
-        }
-        Ok(report)
-    }
-
-    /// Step 1 of [`Self::adopt_from`]: copy, in ONE transaction of this DB.
-    pub(crate) fn copy_from_config(
-        &self,
-        config_path: &Path,
-        key: &str,
-    ) -> Result<Vec<(String, i64)>, ConfigDbError> {
-        let path = config_path.to_string_lossy().replace('\'', "''");
-        self.conn.execute_batch(&format!(
-            "ATTACH DATABASE '{path}' AS cfg KEY '{}';",
-            key.replace('\'', "''")
-        ))?;
-        // The copy keeps the config DB's rows as they are: a dangling
-        // reference there (a row from a binary without FK checks) must not
-        // fail the boot. Outside the transaction: the pragma is a no-op
-        // inside one.
-        self.conn.pragma_update(None, "foreign_keys", "OFF")?;
-        // FULL: the next step deletes the config DB's copies (FULL there). A
-        // copy that a power loss reverts after that would lose every row.
-        let result = self.durable(|c| {
-            super::iam_merge::immediate_tx(c, |conn| {
-                for t in NODE_LOCAL_TABLES.iter().rev() {
-                    conn.execute(&format!("DELETE FROM main.{t}"), [])?;
-                }
-                let mut copied = Vec::new();
-                for t in NODE_LOCAL_TABLES {
-                    let cfg_cols = columns(conn, "cfg", t)?;
-                    if cfg_cols.is_empty() {
-                        continue; // a config DB from before this table existed
-                    }
-                    let main_cols = columns(conn, "main", t)?;
-                    let common: Vec<&String> =
-                        cfg_cols.iter().filter(|c| main_cols.contains(c)).collect();
-                    if common.is_empty() {
-                        continue;
-                    }
-                    let list = common
-                        .iter()
-                        .map(|c| format!("\"{c}\""))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let n = conn.execute(
-                        &format!("INSERT INTO main.{t} ({list}) SELECT {list} FROM cfg.{t}"),
-                        [],
-                    )?;
-                    copied.push((t.to_string(), n as i64));
-                }
-                // Ids keep growing past every id the config DB handed out: a
-                // listener cursor on a pruned outbox points above the last row.
-                let has_seq: bool = conn
-                    .query_row(
-                        "SELECT 1 FROM cfg.sqlite_master WHERE name = 'sqlite_sequence'",
-                        [],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some();
-                if has_seq {
-                    let mut stmt = conn.prepare("SELECT name, seq FROM cfg.sqlite_sequence")?;
-                    let seqs = stmt
-                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-                        .collect::<Result<Vec<_>, _>>()?;
-                    drop(stmt);
-                    for (name, seq) in seqs {
-                        if !NODE_LOCAL_TABLES.contains(&name.as_str()) {
-                            continue;
-                        }
-                        let updated = conn.execute(
-                            "UPDATE main.sqlite_sequence SET seq = MAX(seq, ?2) WHERE name = ?1",
-                            rusqlite::params![name, seq],
-                        )?;
-                        if updated == 0 {
-                            conn.execute(
-                                "INSERT INTO main.sqlite_sequence (name, seq) VALUES (?1, ?2)",
-                                rusqlite::params![name, seq],
-                            )?;
-                        }
-                    }
-                }
-                conn.execute("UPDATE main.jobs_meta SET adopted = 1 WHERE id = 1", [])?;
-                Ok(copied)
-            })
-        });
-        let _ = self.conn.pragma_update(None, "foreign_keys", "ON");
-        let _ = self.conn.execute_batch("DETACH DATABASE cfg;");
-        result
-    }
-}
-
-impl ConfigDb {
-    /// Step 2 of [`JobsDb::adopt_from`]: delete every row of the node-local
-    /// tables of this (live) config DB, in one transaction, children first.
-    /// The tables stay (empty) for older peers and downgrades. Returns the
-    /// non-zero counts.
-    pub(crate) fn clear_node_local_tables(&self) -> Result<Vec<(String, i64)>, ConfigDbError> {
-        super::iam_merge::immediate_tx(&self.conn, |conn| {
-            let mut cleared = Vec::new();
-            for t in NODE_LOCAL_TABLES.iter().rev() {
-                if columns(conn, "main", t)?.is_empty() {
-                    continue;
-                }
-                let n = conn.execute(&format!("DELETE FROM main.{t}"), [])?;
-                if n > 0 {
-                    cleared.push((t.to_string(), n as i64));
-                }
-            }
-            Ok(cleared)
-        })
-    }
-
-    /// Rewrite the file without its free pages (once, after the move).
-    /// Atomic: a failure (a full disk) leaves the file as it was.
-    pub(crate) fn vacuum(&self) {
-        let started = std::time::Instant::now();
-        let pages = |c: &Connection| -> i64 {
-            c.pragma_query_value(None, "page_count", |r| r.get(0))
-                .unwrap_or(-1)
-        };
-        let before = pages(&self.conn);
-        match self.conn.execute_batch("VACUUM;") {
-            Ok(()) => info!(
-                "Config DB {}: vacuumed after the job rows moved out ({before} -> {} pages, {:.1?})",
-                self.local_path().display(),
-                pages(&self.conn),
-                started.elapsed()
-            ),
-            Err(e) => warn!(
-                "Config DB {}: VACUUM after the move failed (the file keeps its free pages): {e}",
-                self.local_path().display()
-            ),
-        }
     }
 }
 
@@ -593,15 +383,6 @@ fn columns(conn: &Connection, schema: &str, table: &str) -> Result<Vec<String>, 
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(cols)
-}
-
-fn describe(counts: &[(String, i64)]) -> String {
-    counts
-        .iter()
-        .filter(|(_, n)| *n > 0)
-        .map(|(t, n)| format!("{t}: {n}"))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Pure: the boot error when no config DB key opens the jobs DB at `path`

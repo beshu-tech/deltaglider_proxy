@@ -12,7 +12,7 @@ use super::{ConfigDb, ConfigDbError};
 /// `base`, or the first of `base-2`, `base-3`, … that `taken` does not hold.
 /// User names are unique (schema v25), because `${iam:username}` expands to
 /// the name and so must give each user their own prefix. Used where the
-/// proxy picks a name itself: OAuth provisioning and the v25 upgrade.
+/// proxy picks a name itself: OAuth provisioning.
 pub(crate) fn first_free_user_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
     if !taken(base) {
         return base.to_string();
@@ -21,39 +21,6 @@ pub(crate) fn first_free_user_name(base: &str, taken: impl Fn(&str) -> bool) -> 
         .map(|n| format!("{base}-{n}"))
         .find(|candidate| !taken(candidate))
         .expect("an unbounded range always yields a free name")
-}
-
-/// Rename every user but one in each same-name group, with
-/// [`first_free_user_name`]. Returns `(id, old name, new name)` per rename.
-/// The v25 upgrade runs this before it creates the unique index.
-///
-/// Who keeps the name: a `local` user before an `external` (OAuth) one — the
-/// IdP name claim is the one a user could pick to squat another user's
-/// `${iam:username}` prefix — then the older row (lower id).
-pub(crate) fn dedupe_user_names(
-    conn: &rusqlite::Connection,
-) -> Result<Vec<(i64, String, String)>, rusqlite::Error> {
-    let rows: Vec<(i64, String)> = conn
-        .prepare(
-            "SELECT id, name FROM users \
-             ORDER BY CASE WHEN auth_source = 'external' THEN 1 ELSE 0 END, id",
-        )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-    let mut all: std::collections::HashSet<String> = rows.iter().map(|(_, n)| n.clone()).collect();
-    let mut kept = std::collections::HashSet::new();
-    let mut renamed = Vec::new();
-    for (id, name) in rows {
-        if kept.insert(name.clone()) {
-            continue;
-        }
-        let new = first_free_user_name(&name, |c| all.contains(c));
-        conn.execute("UPDATE users SET name = ?1 WHERE id = ?2", params![new, id])?;
-        all.insert(new.clone());
-        kept.insert(new.clone());
-        renamed.push((id, name, new));
-    }
-    Ok(renamed)
 }
 
 impl ConfigDb {
@@ -326,73 +293,5 @@ mod unique_name_tests {
         // An admin create or rename to a taken name is refused by the index.
         assert!(db.create_user("dana", "AKOTHER", "s", true, &[]).is_err());
         assert!(db.update_user(first.id, Some("dana"), None, None).is_err());
-    }
-
-    /// A local user keeps the name before an OAuth-created one, even when the
-    /// OAuth row is older: the IdP name is the one a user can pick to squat.
-    #[test]
-    fn v25_upgrade_prefers_the_local_user_over_an_older_oauth_user() {
-        let db = ConfigDb::in_memory("testpass").unwrap();
-        db.conn.execute_batch("DROP INDEX idx_users_name;").unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO users (name, access_key_id, secret_access_key, auth_source) \
-                 VALUES ('dana', 'EXT', 's', 'external'), ('dana', 'LOCAL', 's', 'local')",
-                [],
-            )
-            .unwrap();
-        db.conn.pragma_update(None, "user_version", 24).unwrap();
-        ConfigDb::migrate(&db.conn).unwrap();
-        let name = |ak: &str| {
-            db.conn
-                .query_row(
-                    "SELECT name FROM users WHERE access_key_id = ?1",
-                    params![ak],
-                    |r| r.get::<_, String>(0),
-                )
-                .unwrap()
-        };
-        assert_eq!(name("LOCAL"), "dana");
-        assert_eq!(name("EXT"), "dana-2");
-    }
-
-    /// The v25 upgrade keeps the older user's name and renames the newer ones.
-    #[test]
-    fn v25_upgrade_renames_the_newer_user_of_each_same_name_pair() {
-        let db = ConfigDb::in_memory("testpass").unwrap();
-        db.conn.execute_batch("DROP INDEX idx_users_name;").unwrap();
-        for (name, ak) in [
-            ("dana", "A1"),
-            ("ops", "A2"),
-            ("dana", "A3"),
-            ("dana-2", "A4"),
-            ("dana", "A5"),
-        ] {
-            db.conn
-                .execute(
-                    "INSERT INTO users (name, access_key_id, secret_access_key) VALUES (?1, ?2, 's')",
-                    params![name, ak],
-                )
-                .unwrap();
-        }
-        db.conn.pragma_update(None, "user_version", 24).unwrap();
-        ConfigDb::migrate(&db.conn).unwrap();
-
-        let by_key = |ak: &str| {
-            db.conn
-                .query_row(
-                    "SELECT name FROM users WHERE access_key_id = ?1",
-                    params![ak],
-                    |r| r.get::<_, String>(0),
-                )
-                .unwrap()
-        };
-        assert_eq!(by_key("A1"), "dana");
-        assert_eq!(by_key("A2"), "ops");
-        assert_eq!(by_key("A4"), "dana-2");
-        let renamed = [by_key("A3"), by_key("A5")];
-        assert_eq!(renamed, ["dana-3".to_string(), "dana-4".to_string()]);
-        // Enforced from now on.
-        assert!(db.create_user("ops", "A6", "s", true, &[]).is_err());
     }
 }

@@ -44,9 +44,6 @@ pub struct DownloadedDb {
     /// merge: the synced object is still under the old key, so it must be
     /// uploaded again (under the primary key) after the merge.
     pub migrated: bool,
-    /// The schema version the peer wrote, read BEFORE the copy was migrated
-    /// for the merge.
-    pub peer_schema: Option<i32>,
 }
 
 /// The schema version of a downloaded copy as the peer wrote it, read with
@@ -123,6 +120,8 @@ pub enum PullFailure {
     NoAnswer,
     /// The copy in the store comes from a newer release (after a downgrade).
     RemoteSchemaNewer,
+    /// The copy in the store is below schema v29 (a release before 2.2).
+    RemoteSchemaOlder,
     /// The copy is older than the last one this node merged.
     RefusedAsRollback,
     /// The copy cannot be read or opened, or the merge failed.
@@ -131,29 +130,26 @@ pub enum PullFailure {
 
 /// Pure: does this pull outcome CONFIRM the local IAM database? Yes when the
 /// store answered and this release can do nothing better with its copy than
-/// keep the local database: a copy from a newer release, or one refused as a
-/// rollback. Then the local database is the best one this release has, and
+/// keep the local database: a copy from a newer or an older release, or one
+/// refused as a rollback. Then the local database is the best one this release has, and
 /// holding the node unready would keep the whole fleet out of service for a
 /// copy that no retry changes. No answer from the store, a copy that cannot
 /// be read, a wrong key and a failed merge all leave it unconfirmed.
 pub fn pull_failure_confirms_local_db(failure: PullFailure) -> bool {
     matches!(
         failure,
-        PullFailure::RemoteSchemaNewer | PullFailure::RefusedAsRollback
+        PullFailure::RemoteSchemaNewer
+            | PullFailure::RemoteSchemaOlder
+            | PullFailure::RefusedAsRollback
     )
 }
 
-/// Pure: the kind of a merge error. Only a copy refused by SYNC GENERATION
-/// (exact, v29 and later) is a rollback that confirms the local database; the
-/// row-age rule of a copy from before v29 is a guess with a tolerance, so it
-/// keeps the node unconfirmed.
+/// Pure: the kind of a merge error. A copy refused by SYNC GENERATION is a
+/// rollback that confirms the local database.
 pub fn merge_failure_kind(error: &crate::config_db::ConfigDbError) -> PullFailure {
-    use crate::config_db::{ConfigDbError, RollbackBy};
+    use crate::config_db::ConfigDbError;
     match error {
-        ConfigDbError::RollbackRefused {
-            by: RollbackBy::Generation,
-            ..
-        } => PullFailure::RefusedAsRollback,
+        ConfigDbError::RollbackRefused { .. } => PullFailure::RefusedAsRollback,
         _ => PullFailure::Other,
     }
 }
@@ -693,13 +689,23 @@ impl ConfigDbSync {
                 );
                 return Ok(None);
             }
-            Some(v) if v < crate::config_db::SCHEMA_VERSION => warn!(
-                "Config DB downloaded from S3 has schema v{v}, older than this binary's v{} \
-                 (a peer on an older release): a copy is migrated for the merge. Its rows \
-                 without a sync_mtime have an unknown age, so a conflict with them goes to \
-                 the bucket's copy",
-                crate::config_db::SCHEMA_VERSION
-            ),
+            Some(v) if v < crate::config_db::SCHEMA_VERSION => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                warn!(
+                    "Config DB downloaded from S3 has schema v{v}, older than this binary's \
+                     v{} (a peer on a release before 2.2) — NOT merging it",
+                    crate::config_db::SCHEMA_VERSION
+                );
+                self.record_pull_failure(
+                    PullFailure::RemoteSchemaOlder,
+                    format!(
+                        "the synced copy has schema v{v}, older than this binary's v{}: open it \
+                         with DeltaGlider Proxy 2.2.3 first, or upgrade the peer",
+                        crate::config_db::SCHEMA_VERSION
+                    ),
+                );
+                return Ok(None);
+            }
             _ => {}
         }
         let migrated = match ConfigDb::open_with_keys(&tmp_path, &self.db_keys) {
@@ -760,7 +766,6 @@ impl ConfigDbSync {
             temp_path: tmp_path,
             etag: remote_etag,
             migrated,
-            peer_schema,
         }))
     }
 
@@ -2167,6 +2172,7 @@ mod tests {
         for (failure, confirms) in [
             (NoAnswer, false),
             (RemoteSchemaNewer, true),
+            (RemoteSchemaOlder, true),
             (RefusedAsRollback, true),
             (Other, false),
         ] {
@@ -2179,21 +2185,17 @@ mod tests {
     }
 
     /// A merge error confirms the local database only when the copy is
-    /// refused by sync GENERATION. The row-age rule of a copy from before v29
-    /// (a 5-minute tolerance, a guess) and any other error keep it
-    /// unconfirmed.
+    /// refused by sync GENERATION. Any other error keeps it unconfirmed.
     #[test]
     fn only_a_refusal_by_generation_is_a_rollback_that_confirms() {
-        use crate::config_db::{ConfigDbError, RollbackBy};
+        use crate::config_db::ConfigDbError;
         use PullFailure::*;
-        let refused = |by| ConfigDbError::RollbackRefused {
-            by,
+        let refused = ConfigDbError::RollbackRefused {
             detail: "old".into(),
         };
         // (error, failure kind, confirms)
         for (error, kind, confirms) in [
-            (refused(RollbackBy::Generation), RefusedAsRollback, true),
-            (refused(RollbackBy::RowAge), Other, false),
+            (refused, RefusedAsRollback, true),
             (ConfigDbError::Other("disk full".into()), Other, false),
             (ConfigDbError::Refused("no".into()), Other, false),
         ] {
@@ -2760,11 +2762,10 @@ mod tests {
         assert_eq!(opened.load_users().unwrap().len(), 1);
     }
 
-    /// D16: the schema version of a peer copy is read before the download
-    /// check migrates it; after the migration it always reads as current, so
-    /// a check made then can never see an older peer.
+    /// A peer copy below v29 reads as its own version and does not open: the
+    /// download refuses it instead of migrating it.
     #[test]
-    fn an_older_peer_copy_is_detected_before_its_migration() {
+    fn an_older_peer_copy_is_read_and_not_migrated() {
         let dir = tempfile::tempdir().unwrap();
         let copy = dir.path().join("peer.db");
         let key = "k".repeat(40);
@@ -2774,12 +2775,11 @@ mod tests {
         }
         let keys = crate::config_db::ConfigDbKeys::primary_only(&key);
         assert_eq!(peer_schema_version(&copy, &keys).unwrap(), Some(25));
-        drop(ConfigDb::open_with_keys(&copy, &keys).unwrap());
-        assert_eq!(
-            peer_schema_version(&copy, &keys).unwrap(),
-            Some(crate::config_db::SCHEMA_VERSION),
-            "the migration hides the peer's version"
-        );
+        assert!(matches!(
+            ConfigDb::open_with_keys(&copy, &keys),
+            Err(crate::config_db::ConfigDbError::SchemaTooOld { found: 25 })
+        ));
+        assert_eq!(peer_schema_version(&copy, &keys).unwrap(), Some(25));
         let other = crate::config_db::ConfigDbKeys::primary_only(&"x".repeat(40));
         assert_eq!(peer_schema_version(&copy, &other).unwrap(), None);
     }

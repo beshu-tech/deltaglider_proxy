@@ -950,16 +950,12 @@ fn init_config_db_attempt(
     }
 }
 
-/// Open the node-local jobs DB next to the config DB (same keys), move the
-/// job rows of an older release out of the live config DB once
-/// ([`JobsDb::adopt_from`]), then reconcile the job state a previous process
-/// left behind. `None` when there is no config DB, or when its key does not
-/// open it (mismatch: the jobs DB has the same key, so it stays untouched
+/// Open the node-local jobs DB next to the config DB (same keys), then
+/// reconcile the job state a previous process left behind. `None` when there
+/// is no config DB, or when its key does not open it (mismatch: the jobs DB has the same key, so it stays untouched
 /// until the operator restores the key). Exits when no key of the keyring
 /// opens the jobs DB (it holds the running jobs: without it, their write
 /// gates would open) and on an I/O error: the files are left as they are.
-///
-/// [`JobsDb::adopt_from`]: deltaglider_proxy::config_db::JobsDb::adopt_from
 pub fn init_jobs_db(
     keys: &deltaglider_proxy::config_db::ConfigDbKeys,
     config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
@@ -967,7 +963,7 @@ pub fn init_jobs_db(
     config: &Config,
 ) -> Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::JobsDb>>> {
     use deltaglider_proxy::config_db::{jobs_db_path, JobsDb};
-    let config_db = config_db.as_ref()?;
+    config_db.as_ref()?;
     if config_db_mismatch {
         warn!(
             "The config DB key does not open the config DB: the jobs DB {} is not opened \
@@ -992,21 +988,6 @@ pub fn init_jobs_db(
             ));
         }
     };
-    {
-        // Boot: nothing else holds the config DB yet.
-        let Ok(cfg_db) = config_db.try_lock() else {
-            exit_with_boot_error("the config DB is locked during boot");
-        };
-        if let Err(e) = db.adopt_from(&cfg_db, keys.primary.expose()) {
-            exit_with_boot_error(&format!(
-                "moving the job rows from the config DB {} to the jobs DB {} failed: \
-                 {e}. Both files are left consistent (the move is one transaction per \
-                 file); fix the cause and restart.",
-                cfg_db.local_path().display(),
-                path.display()
-            ));
-        }
-    }
     match db.replication_reconcile_on_boot(config.replication.max_failures_retained) {
         Ok(count) if count > 0 => {
             warn!("Reconciled {count} replication run(s) left running by a previous process");

@@ -50,6 +50,305 @@ pub(crate) struct ChangeToken {
 /// Schema version — bump when adding migrations.
 pub(crate) const SCHEMA_VERSION: i32 = 29;
 
+/// The whole v29 schema. `tests/fixtures/config_db_schema_v29.sql` is its
+/// golden dump: a fresh DB must equal it (whitespace aside).
+const SCHEMA_V29: &str = r#"
+CREATE TABLE auth_providers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    provider_type TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 0,
+    display_name TEXT,
+    client_id TEXT,
+    client_secret TEXT,
+    issuer_url TEXT,
+    scopes TEXT DEFAULT 'openid email profile',
+    extra_config TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    sync_mtime INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE event_deliveries (
+    outbox_id INTEGER NOT NULL REFERENCES event_outbox(id) ON DELETE CASCADE,
+    endpoint_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (outbox_id,endpoint_id)
+);
+CREATE TABLE event_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    bucket TEXT NOT NULL,
+    object_key TEXT NOT NULL,
+    source TEXT NOT NULL,
+    occurred_at INTEGER NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER,
+    claimed_by TEXT,
+    claimed_at INTEGER,
+    delivered_at INTEGER,
+    last_error TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE TABLE external_identities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider_id INTEGER NOT NULL REFERENCES auth_providers(id) ON DELETE CASCADE,
+    external_sub TEXT NOT NULL,
+    email TEXT,
+    display_name TEXT,
+    last_login TEXT,
+    raw_claims TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    email_verified INTEGER NOT NULL DEFAULT 0,
+    sync_mtime INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(provider_id,external_sub)
+);
+CREATE TABLE group_mapping_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_id INTEGER REFERENCES auth_providers(id) ON DELETE CASCADE,
+    priority INTEGER NOT NULL DEFAULT 0,
+    match_type TEXT NOT NULL,
+    match_field TEXT NOT NULL DEFAULT 'email',
+    match_value TEXT NOT NULL,
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    sync_mtime INTEGER NOT NULL DEFAULT 0,
+    rule_uid TEXT
+);
+CREATE TABLE group_members (
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (group_id,user_id)
+);
+CREATE TABLE group_permissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    actions TEXT NOT NULL,
+    resources TEXT NOT NULL,
+    effect TEXT NOT NULL DEFAULT 'Allow',
+    conditions_json TEXT
+);
+CREATE TABLE groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    sync_mtime INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE lifecycle_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_name TEXT NOT NULL,
+    run_id INTEGER,
+    occurred_at INTEGER NOT NULL,
+    bucket TEXT NOT NULL,
+    object_key TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    FOREIGN KEY (rule_name) REFERENCES lifecycle_state(rule_name) ON DELETE CASCADE,
+    FOREIGN KEY (run_id) REFERENCES lifecycle_run_history(id) ON DELETE SET NULL
+);
+CREATE TABLE lifecycle_run_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_name TEXT NOT NULL,
+    triggered_by TEXT NOT NULL DEFAULT 'unknown',
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    objects_scanned INTEGER NOT NULL DEFAULT 0,
+    objects_affected INTEGER NOT NULL DEFAULT 0,
+    objects_skipped INTEGER NOT NULL DEFAULT 0,
+    bytes_affected INTEGER NOT NULL DEFAULT 0,
+    errors INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    FOREIGN KEY (rule_name) REFERENCES lifecycle_state(rule_name) ON DELETE CASCADE
+);
+CREATE TABLE lifecycle_state (
+    rule_name TEXT PRIMARY KEY,
+    last_run_at INTEGER,
+    next_due_at INTEGER NOT NULL,
+    last_status TEXT NOT NULL,
+    objects_affected_lifetime INTEGER NOT NULL DEFAULT 0,
+    bytes_affected_lifetime INTEGER NOT NULL DEFAULT 0,
+    leader_instance_id TEXT,
+    leader_expires_at INTEGER,
+    continuation_token TEXT,
+    paused INTEGER NOT NULL DEFAULT 0,
+    cursor_scope TEXT
+);
+CREATE TABLE listener_cursors (
+    listener_name TEXT PRIMARY KEY,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE TABLE maintenance_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
+    object_key TEXT NOT NULL,
+    error TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE maintenance_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL DEFAULT 'reencrypt',
+    bucket TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    phase TEXT NOT NULL DEFAULT 'counting',
+    objects_total INTEGER,
+    objects_done INTEGER NOT NULL DEFAULT 0,
+    objects_skipped INTEGER NOT NULL DEFAULT 0,
+    objects_failed INTEGER NOT NULL DEFAULT 0,
+    bytes_done INTEGER NOT NULL DEFAULT 0,
+    continuation_token TEXT,
+    last_error TEXT,
+    triggered_by TEXT,
+    leader_instance_id TEXT,
+    leader_expires_at INTEGER,
+    created_at INTEGER NOT NULL,
+    started_at INTEGER,
+    finished_at INTEGER,
+    updated_at INTEGER NOT NULL,
+    params TEXT
+);
+CREATE TABLE permissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    actions TEXT NOT NULL,
+    resources TEXT NOT NULL,
+    effect TEXT NOT NULL DEFAULT 'Allow',
+    conditions_json TEXT
+);
+CREATE TABLE replication_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_name TEXT NOT NULL,
+    run_id INTEGER,
+    occurred_at INTEGER NOT NULL,
+    source_key TEXT NOT NULL,
+    dest_key TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    FOREIGN KEY (rule_name) REFERENCES replication_state(rule_name) ON DELETE CASCADE
+);
+CREATE TABLE replication_object_failures (
+    rule_name TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_failed_at INTEGER,
+    PRIMARY KEY (rule_name,source_key)
+);
+CREATE TABLE replication_parity (
+    rule_name TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'idle',
+    scanned_at INTEGER,
+    progress_scanned INTEGER NOT NULL DEFAULT 0,
+    in_sync INTEGER NOT NULL DEFAULT 0,
+    outcome_json TEXT,
+    last_error TEXT,
+    leader_instance_id TEXT,
+    leader_expires_at INTEGER,
+    updated_at INTEGER,
+    progress_total INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE replication_parity_objects (
+    rule_name TEXT NOT NULL,
+    side TEXT NOT NULL,
+    dest_key TEXT NOT NULL,
+    sha256 TEXT,
+    size INTEGER NOT NULL,
+    etag TEXT,
+    stored_etag TEXT,
+    updated_at INTEGER NOT NULL,
+    created_at INTEGER,
+    PRIMARY KEY (rule_name,side,dest_key)
+);
+CREATE TABLE replication_run_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_name TEXT NOT NULL,
+    triggered_by TEXT NOT NULL DEFAULT 'unknown',
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    objects_scanned INTEGER NOT NULL DEFAULT 0,
+    objects_copied INTEGER NOT NULL DEFAULT 0,
+    objects_skipped INTEGER NOT NULL DEFAULT 0,
+    objects_deleted INTEGER NOT NULL DEFAULT 0,
+    bytes_copied INTEGER NOT NULL DEFAULT 0,
+    errors INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    delta_passthrough INTEGER NOT NULL DEFAULT 0,
+    bytes_egress_saved INTEGER NOT NULL DEFAULT 0,
+    reconstructed INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (rule_name) REFERENCES replication_state(rule_name) ON DELETE CASCADE
+);
+CREATE TABLE replication_state (
+    rule_name TEXT PRIMARY KEY,
+    last_run_at INTEGER,
+    next_due_at INTEGER NOT NULL,
+    last_status TEXT NOT NULL,
+    objects_copied_lifetime INTEGER NOT NULL DEFAULT 0,
+    bytes_copied_lifetime INTEGER NOT NULL DEFAULT 0,
+    paused INTEGER NOT NULL DEFAULT 0,
+    continuation_token TEXT,
+    leader_instance_id TEXT,
+    leader_expires_at INTEGER
+);
+CREATE TABLE session_revocations (
+    identity TEXT PRIMARY KEY,
+    revoked_since INTEGER NOT NULL
+);
+CREATE TABLE sync_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    sync_generation INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    access_key_id TEXT NOT NULL UNIQUE,
+    secret_access_key TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    auth_source TEXT NOT NULL DEFAULT 'local',
+    sync_mtime INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_event_outbox_object ON event_outbox(bucket,object_key,occurred_at DESC);
+CREATE INDEX idx_event_outbox_recent ON event_outbox(occurred_at DESC,id DESC);
+CREATE INDEX idx_event_outbox_status_due ON event_outbox(status,next_attempt_at,occurred_at,id);
+CREATE INDEX idx_ext_identity_lookup ON external_identities(provider_id,external_sub);
+CREATE INDEX idx_ext_identity_user ON external_identities(user_id);
+CREATE INDEX idx_failures_rule ON replication_failures(rule_name,occurred_at DESC);
+CREATE INDEX idx_group_mapping_provider ON group_mapping_rules(provider_id);
+CREATE INDEX idx_lifecycle_failures_rule ON lifecycle_failures(rule_name,occurred_at DESC);
+CREATE INDEX idx_lifecycle_failures_run ON lifecycle_failures(rule_name,run_id,occurred_at DESC);
+CREATE INDEX idx_lifecycle_run_history_rule ON lifecycle_run_history(rule_name,started_at DESC);
+CREATE UNIQUE INDEX idx_maint_active_bucket ON maintenance_jobs(bucket) WHERE status IN ('queued','running','cancelling');
+CREATE INDEX idx_maint_failures_job ON maintenance_failures(job_id,created_at DESC);
+CREATE UNIQUE INDEX idx_mapping_rule_uid ON group_mapping_rules(rule_uid);
+CREATE INDEX idx_permissions_user ON permissions(user_id);
+CREATE INDEX idx_run_history_rule ON replication_run_history(rule_name,started_at DESC);
+CREATE INDEX idx_users_access_key ON users(access_key_id);
+CREATE UNIQUE INDEX idx_users_name ON users(name);
+CREATE TRIGGER trg_auth_providers_mtime_ins AFTER INSERT ON auth_providers WHEN NEW.sync_mtime = 0 BEGIN UPDATE auth_providers SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.id; END;
+CREATE TRIGGER trg_auth_providers_mtime_upd AFTER UPDATE ON auth_providers WHEN NEW.sync_mtime = OLD.sync_mtime BEGIN UPDATE auth_providers SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.id; END;
+CREATE TRIGGER trg_external_identities_mtime_ins AFTER INSERT ON external_identities WHEN NEW.sync_mtime = 0 BEGIN UPDATE external_identities SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.id; END;
+CREATE TRIGGER trg_external_identities_mtime_upd AFTER UPDATE ON external_identities WHEN NEW.sync_mtime = OLD.sync_mtime BEGIN UPDATE external_identities SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.id; END;
+CREATE TRIGGER trg_group_mapping_rules_mtime_ins AFTER INSERT ON group_mapping_rules WHEN NEW.sync_mtime = 0 BEGIN UPDATE group_mapping_rules SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.id; END;
+CREATE TRIGGER trg_group_mapping_rules_mtime_upd AFTER UPDATE ON group_mapping_rules WHEN NEW.sync_mtime = OLD.sync_mtime BEGIN UPDATE group_mapping_rules SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.id; END;
+CREATE TRIGGER trg_group_mapping_rules_uid AFTER INSERT ON group_mapping_rules WHEN NEW.rule_uid IS NULL BEGIN UPDATE group_mapping_rules SET rule_uid = lower(hex(randomblob(16))) WHERE id = NEW.id; END;
+CREATE TRIGGER trg_group_permissions_delete_mtime AFTER DELETE ON group_permissions BEGIN UPDATE groups SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = OLD.group_id; END;
+CREATE TRIGGER trg_group_permissions_insert_mtime AFTER INSERT ON group_permissions BEGIN UPDATE groups SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.group_id; END;
+CREATE TRIGGER trg_group_permissions_update_mtime AFTER UPDATE ON group_permissions BEGIN UPDATE groups SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.group_id; END;
+CREATE TRIGGER trg_groups_mtime_ins AFTER INSERT ON groups WHEN NEW.sync_mtime = 0 BEGIN UPDATE groups SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.id; END;
+CREATE TRIGGER trg_groups_mtime_upd AFTER UPDATE ON groups WHEN NEW.sync_mtime = OLD.sync_mtime BEGIN UPDATE groups SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.id; END;
+CREATE TRIGGER trg_permissions_delete_mtime AFTER DELETE ON permissions BEGIN UPDATE users SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = OLD.user_id; END;
+CREATE TRIGGER trg_permissions_insert_mtime AFTER INSERT ON permissions BEGIN UPDATE users SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.user_id; END;
+CREATE TRIGGER trg_permissions_update_mtime AFTER UPDATE ON permissions BEGIN UPDATE users SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.user_id; END;
+CREATE TRIGGER trg_users_mtime_ins AFTER INSERT ON users WHEN NEW.sync_mtime = 0 BEGIN UPDATE users SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.id; END;
+CREATE TRIGGER trg_users_mtime_upd AFTER UPDATE ON users WHEN NEW.sync_mtime = OLD.sync_mtime BEGIN UPDATE users SET sync_mtime = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) WHERE id = NEW.id; END;
+INSERT INTO sync_state (id, sync_generation) VALUES (1, 0);
+"#;
+
 pub(crate) mod auth_providers;
 mod declarative;
 mod groups;
@@ -268,62 +567,6 @@ pub(crate) fn is_safe_sql_ident(ident: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn rename_column_if_exists(
-    conn: &Connection,
-    table: &str,
-    old_column: &str,
-    new_column: &str,
-) -> Result<(), ConfigDbError> {
-    for ident in [table, old_column, new_column] {
-        if !is_safe_sql_ident(ident) {
-            return Err(ConfigDbError::Other(format!(
-                "refusing to interpolate unsafe SQL identifier: {ident:?}"
-            )));
-        }
-    }
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if columns.iter().any(|c| c == new_column) {
-        return Ok(());
-    }
-    if columns.iter().any(|c| c == old_column) {
-        conn.execute(
-            &format!("ALTER TABLE {table} RENAME COLUMN {old_column} TO {new_column}"),
-            [],
-        )?;
-    }
-    Ok(())
-}
-
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    decl: &str,
-) -> Result<(), ConfigDbError> {
-    for ident in [table, column] {
-        if !is_safe_sql_ident(ident) {
-            return Err(ConfigDbError::Other(format!(
-                "refusing to interpolate unsafe SQL identifier: {ident:?}"
-            )));
-        }
-    }
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if columns.iter().any(|c| c == column) {
-        return Ok(());
-    }
-    conn.execute(
-        &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
-        [],
-    )?;
-    Ok(())
-}
-
 impl ConfigDb {
     /// Open an existing DB or create a new one at `local_path`.
     /// The `passphrase` is used as the SQLCipher encryption key.
@@ -388,741 +631,27 @@ impl ConfigDb {
         })
     }
 
-    /// Bring the schema to `SCHEMA_VERSION` in ONE transaction: a crash or a
-    /// failed step leaves the DB exactly at its old version, so the next boot
-    /// retries from a clean state. A DB from a newer binary is refused, never
-    /// stamped down.
+    /// Create the schema of an empty DB in ONE transaction (a crash leaves it
+    /// empty). A DB below `SCHEMA_VERSION` is refused: open it with 2.2.3
+    /// first. A DB from a newer binary is refused, never stamped down.
     fn migrate(conn: &Connection) -> Result<(), ConfigDbError> {
         let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match migration_plan(version) {
             MigrationPlan::UpToDate => return Ok(()),
+            MigrationPlan::TooOld => return Err(ConfigDbError::SchemaTooOld { found: version }),
             MigrationPlan::TooNew => {
                 return Err(ConfigDbError::SchemaTooNew {
                     found: version,
                     supported: SCHEMA_VERSION,
                 })
             }
-            MigrationPlan::Migrate => {}
+            MigrationPlan::Create => {}
         }
         let tx = conn.unchecked_transaction()?;
-        Self::migrate_steps(&tx, version)?;
+        tx.execute_batch(SCHEMA_V29)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
-        debug!("Config DB schema at version {}", SCHEMA_VERSION);
-        Ok(())
-    }
-
-    /// The per-version steps. Runs inside `migrate`'s transaction; a step must
-    /// not open its own. ADD COLUMN steps go through `add_column_if_missing`
-    /// so a DB half-migrated by an older (non-transactional) binary still opens.
-    fn migrate_steps(conn: &Connection, version: i32) -> Result<(), ConfigDbError> {
-        if version < 1 {
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS users (
-                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name              TEXT NOT NULL,
-                    access_key_id     TEXT NOT NULL UNIQUE,
-                    secret_access_key TEXT NOT NULL,
-                    enabled           INTEGER NOT NULL DEFAULT 1,
-                    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
-                );
-
-                CREATE TABLE IF NOT EXISTS permissions (
-                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    actions   TEXT NOT NULL,
-                    resources TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_users_access_key ON users(access_key_id);
-                CREATE INDEX IF NOT EXISTS idx_permissions_user ON permissions(user_id);",
-            )?;
-        }
-
-        if version < 2 {
-            conn.execute_batch(
-                "ALTER TABLE permissions ADD COLUMN effect TEXT NOT NULL DEFAULT 'Allow';",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v2 (added effect column)",
-                version
-            );
-        }
-
-        if version < 3 {
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS groups (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name        TEXT NOT NULL UNIQUE,
-                    description TEXT DEFAULT '',
-                    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-                );
-
-                CREATE TABLE IF NOT EXISTS group_members (
-                    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-                    user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    PRIMARY KEY (group_id, user_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS group_permissions (
-                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                    group_id  INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-                    actions   TEXT NOT NULL,
-                    resources TEXT NOT NULL,
-                    effect    TEXT NOT NULL DEFAULT 'Allow'
-                );",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v3 (added groups tables)",
-                version
-            );
-        }
-
-        if version < 4 {
-            conn.execute_batch(
-                "ALTER TABLE permissions ADD COLUMN conditions_json TEXT;
-                 ALTER TABLE group_permissions ADD COLUMN conditions_json TEXT;",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v4 (added conditions column)",
-                version
-            );
-        }
-
-        if version < 5 {
-            conn.execute_batch(
-                "ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'local';
-
-                CREATE TABLE IF NOT EXISTS auth_providers (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name          TEXT NOT NULL UNIQUE,
-                    provider_type TEXT NOT NULL,
-                    enabled       INTEGER NOT NULL DEFAULT 1,
-                    priority      INTEGER NOT NULL DEFAULT 0,
-                    display_name  TEXT,
-                    client_id     TEXT,
-                    client_secret TEXT,
-                    issuer_url    TEXT,
-                    scopes        TEXT DEFAULT 'openid email profile',
-                    extra_config  TEXT,
-                    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-                    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
-                );
-
-                CREATE TABLE IF NOT EXISTS group_mapping_rules (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    provider_id  INTEGER REFERENCES auth_providers(id) ON DELETE CASCADE,
-                    priority     INTEGER NOT NULL DEFAULT 0,
-                    match_type   TEXT NOT NULL,
-                    match_field  TEXT NOT NULL DEFAULT 'email',
-                    match_value  TEXT NOT NULL,
-                    group_id     INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-                    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
-                );
-                CREATE INDEX IF NOT EXISTS idx_group_mapping_provider ON group_mapping_rules(provider_id);
-
-                CREATE TABLE IF NOT EXISTS external_identities (
-                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    provider_id    INTEGER NOT NULL REFERENCES auth_providers(id) ON DELETE CASCADE,
-                    external_sub   TEXT NOT NULL,
-                    email          TEXT,
-                    display_name   TEXT,
-                    last_login     TEXT,
-                    raw_claims     TEXT,
-                    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
-                    UNIQUE(provider_id, external_sub)
-                );
-                CREATE INDEX IF NOT EXISTS idx_ext_identity_user ON external_identities(user_id);
-                CREATE INDEX IF NOT EXISTS idx_ext_identity_lookup ON external_identities(provider_id, external_sub);",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v5 (added external auth tables)",
-                version
-            );
-        }
-
-        if version < 6 {
-            // v6: Replication runtime state. Rules themselves live in
-            // YAML; only progress/history/failures land here.
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS replication_state (
-                    rule_name               TEXT PRIMARY KEY,
-                    last_run_at             INTEGER,
-                    next_due_at             INTEGER NOT NULL,
-                    last_status             TEXT NOT NULL,
-                    objects_copied_lifetime INTEGER NOT NULL DEFAULT 0,
-                    bytes_copied_lifetime   INTEGER NOT NULL DEFAULT 0,
-                    paused                  INTEGER NOT NULL DEFAULT 0,
-                    continuation_token      TEXT,
-                    leader_instance_id      TEXT,
-                    leader_expires_at       INTEGER
-                );
-
-                CREATE TABLE IF NOT EXISTS replication_run_history (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    rule_name       TEXT NOT NULL,
-                    triggered_by    TEXT NOT NULL DEFAULT 'unknown',
-                    started_at      INTEGER NOT NULL,
-                    finished_at     INTEGER,
-                    objects_scanned INTEGER NOT NULL DEFAULT 0,
-                    objects_copied  INTEGER NOT NULL DEFAULT 0,
-                    objects_skipped INTEGER NOT NULL DEFAULT 0,
-                    objects_deleted INTEGER NOT NULL DEFAULT 0,
-                    bytes_copied    INTEGER NOT NULL DEFAULT 0,
-                    errors          INTEGER NOT NULL DEFAULT 0,
-                    status          TEXT NOT NULL,
-                    FOREIGN KEY (rule_name) REFERENCES replication_state(rule_name) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_run_history_rule
-                    ON replication_run_history(rule_name, started_at DESC);
-
-                CREATE TABLE IF NOT EXISTS replication_failures (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    rule_name     TEXT NOT NULL,
-                    run_id        INTEGER,
-                    occurred_at   INTEGER NOT NULL,
-                    source_key    TEXT NOT NULL,
-                    dest_key      TEXT NOT NULL,
-                    error_message TEXT NOT NULL,
-                    FOREIGN KEY (rule_name) REFERENCES replication_state(rule_name) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_failures_rule
-                    ON replication_failures(rule_name, occurred_at DESC);",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v6 (added replication state tables)",
-                version
-            );
-        }
-
-        if version < 7 {
-            let has_triggered_by = {
-                let mut stmt = conn.prepare("PRAGMA table_info(replication_run_history)")?;
-                let columns = stmt
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                columns.iter().any(|c| c == "triggered_by")
-            };
-            if !has_triggered_by {
-                conn.execute(
-                    "ALTER TABLE replication_run_history
-                        ADD COLUMN triggered_by TEXT NOT NULL DEFAULT 'unknown'",
-                    [],
-                )?;
-            }
-            info!(
-                "Migrated config DB schema from v{} to v7 (added replication run trigger source)",
-                version
-            );
-        }
-
-        if version < 8 {
-            let has_run_id = {
-                let mut stmt = conn.prepare("PRAGMA table_info(replication_failures)")?;
-                let columns = stmt
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                columns.iter().any(|c| c == "run_id")
-            };
-            if !has_run_id {
-                conn.execute(
-                    "ALTER TABLE replication_failures ADD COLUMN run_id INTEGER",
-                    [],
-                )?;
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_failures_run
-                        ON replication_failures(rule_name, run_id, occurred_at DESC)",
-                    [],
-                )?;
-            }
-            info!(
-                "Migrated config DB schema from v{} to v8 (linked replication failures to runs)",
-                version
-            );
-        }
-
-        if version < 9 {
-            // v9: Durable event outbox. Dispatchers are intentionally not
-            // implemented here; this only persists object lifecycle facts
-            // after successful mutations so future notification workers can
-            // claim and deliver them without touching request handlers.
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS event_outbox (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kind            TEXT NOT NULL,
-                    bucket          TEXT NOT NULL,
-                    object_key      TEXT NOT NULL,
-                    source          TEXT NOT NULL,
-                    occurred_at     INTEGER NOT NULL,
-                    payload_json    TEXT NOT NULL DEFAULT '{}',
-                    status          TEXT NOT NULL DEFAULT 'pending',
-                    attempts        INTEGER NOT NULL DEFAULT 0,
-                    next_attempt_at INTEGER,
-                    claimed_by      TEXT,
-                    claimed_at      INTEGER,
-                    delivered_at    INTEGER,
-                    last_error      TEXT,
-                    created_at      INTEGER NOT NULL DEFAULT (unixepoch())
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_event_outbox_status_due
-                    ON event_outbox(status, next_attempt_at, occurred_at, id);
-                CREATE INDEX IF NOT EXISTS idx_event_outbox_recent
-                    ON event_outbox(occurred_at DESC, id DESC);
-                CREATE INDEX IF NOT EXISTS idx_event_outbox_object
-                    ON event_outbox(bucket, object_key, occurred_at DESC);",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v9 (added event outbox)",
-                version
-            );
-        }
-
-        if version < 10 {
-            // v10: Lifecycle runtime observability. Rules remain YAML-owned;
-            // the DB stores scheduler state, run history, per-object failures,
-            // and a per-rule lease so multi-instance schedulers do not execute
-            // the same delete rule concurrently.
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS lifecycle_state (
-                    rule_name                 TEXT PRIMARY KEY,
-                    last_run_at               INTEGER,
-                    next_due_at               INTEGER NOT NULL,
-                    last_status               TEXT NOT NULL,
-                    objects_affected_lifetime INTEGER NOT NULL DEFAULT 0,
-                    bytes_affected_lifetime   INTEGER NOT NULL DEFAULT 0,
-                    leader_instance_id        TEXT,
-                    leader_expires_at         INTEGER
-                );
-
-                CREATE TABLE IF NOT EXISTS lifecycle_run_history (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    rule_name       TEXT NOT NULL,
-                    triggered_by    TEXT NOT NULL DEFAULT 'unknown',
-                    started_at      INTEGER NOT NULL,
-                    finished_at     INTEGER,
-                    objects_scanned INTEGER NOT NULL DEFAULT 0,
-                    objects_affected INTEGER NOT NULL DEFAULT 0,
-                    objects_skipped INTEGER NOT NULL DEFAULT 0,
-                    bytes_affected   INTEGER NOT NULL DEFAULT 0,
-                    errors          INTEGER NOT NULL DEFAULT 0,
-                    status          TEXT NOT NULL,
-                    FOREIGN KEY (rule_name) REFERENCES lifecycle_state(rule_name) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_lifecycle_run_history_rule
-                    ON lifecycle_run_history(rule_name, started_at DESC);
-
-                CREATE TABLE IF NOT EXISTS lifecycle_failures (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    rule_name     TEXT NOT NULL,
-                    run_id        INTEGER,
-                    occurred_at   INTEGER NOT NULL,
-                    bucket        TEXT NOT NULL,
-                    object_key    TEXT NOT NULL,
-                    error_message TEXT NOT NULL,
-                    FOREIGN KEY (rule_name) REFERENCES lifecycle_state(rule_name) ON DELETE CASCADE,
-                    FOREIGN KEY (run_id) REFERENCES lifecycle_run_history(id) ON DELETE SET NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_lifecycle_failures_rule
-                    ON lifecycle_failures(rule_name, occurred_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_lifecycle_failures_run
-                    ON lifecycle_failures(rule_name, run_id, occurred_at DESC);",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v10 (added lifecycle runtime tables)",
-                version
-            );
-        }
-
-        if version < 11 {
-            // v11: Lifecycle v2 can delete or transition/archive. The old
-            // v10 column names were delete-specific and never shipped, so
-            // rename them to action-neutral counters.
-            rename_column_if_exists(
-                conn,
-                "lifecycle_state",
-                "objects_expired_lifetime",
-                "objects_affected_lifetime",
-            )?;
-            rename_column_if_exists(
-                conn,
-                "lifecycle_state",
-                "bytes_expired_lifetime",
-                "bytes_affected_lifetime",
-            )?;
-            rename_column_if_exists(
-                conn,
-                "lifecycle_run_history",
-                "objects_expired",
-                "objects_affected",
-            )?;
-            rename_column_if_exists(
-                conn,
-                "lifecycle_run_history",
-                "bytes_expired",
-                "bytes_affected",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v11 (renamed lifecycle counters)",
-                version
-            );
-        }
-
-        if version < 12 {
-            // v12: per-listener cursors over the append-only event_outbox.
-            // Event-driven replication consumes the outbox via its own
-            // high-water `last_event_id` (independent of the webhook
-            // dispatcher's global delivery status), so multiple listeners can
-            // drain the same append-only log without contention.
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS listener_cursors (
-                    listener_name TEXT PRIMARY KEY,
-                    last_event_id INTEGER NOT NULL DEFAULT 0,
-                    updated_at    INTEGER NOT NULL DEFAULT (unixepoch())
-                );",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v12 (added listener_cursors)",
-                version
-            );
-        }
-
-        if version < 13 {
-            // v13: one-off maintenance jobs (initially: re-encrypt a bucket's
-            // existing objects after a backend encryption change). Modeled on
-            // the replication tables: continuation token for resume, leader
-            // lease for HA single-flight, a bounded failure ring. The partial
-            // unique index enforces at most ONE active job per bucket.
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS maintenance_jobs (
-                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kind               TEXT NOT NULL DEFAULT 'reencrypt',
-                    bucket             TEXT NOT NULL,
-                    status             TEXT NOT NULL DEFAULT 'queued',
-                    phase              TEXT NOT NULL DEFAULT 'counting',
-                    objects_total      INTEGER,
-                    objects_done       INTEGER NOT NULL DEFAULT 0,
-                    objects_skipped    INTEGER NOT NULL DEFAULT 0,
-                    objects_failed     INTEGER NOT NULL DEFAULT 0,
-                    bytes_done         INTEGER NOT NULL DEFAULT 0,
-                    continuation_token TEXT,
-                    last_error         TEXT,
-                    triggered_by       TEXT,
-                    leader_instance_id TEXT,
-                    leader_expires_at  INTEGER,
-                    created_at         INTEGER NOT NULL,
-                    started_at         INTEGER,
-                    finished_at        INTEGER,
-                    updated_at         INTEGER NOT NULL
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_maint_active_bucket
-                    ON maintenance_jobs(bucket)
-                    WHERE status IN ('queued','running','cancelling');
-                CREATE TABLE IF NOT EXISTS maintenance_failures (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id      INTEGER NOT NULL,
-                    object_key  TEXT NOT NULL,
-                    error       TEXT NOT NULL,
-                    created_at  INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_maint_failures_job
-                    ON maintenance_failures(job_id, created_at DESC);",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v13 (added maintenance job tables)",
-                version
-            );
-        }
-
-        if version < 14 {
-            // v14: one-job-model consolidation groundwork.
-            //  * lifecycle gains a resumable cursor + a pause flag (parity
-            //    with replication — a crash no longer re-runs a whole rule
-            //    from page 0, and operators can pause a rule).
-            //  * maintenance jobs gain kind-specific JSON `params`
-            //    (migrate: target backend / delete_source / transient key).
-            add_column_if_missing(conn, "lifecycle_state", "continuation_token", "TEXT")?;
-            add_column_if_missing(
-                conn,
-                "lifecycle_state",
-                "paused",
-                "INTEGER NOT NULL DEFAULT 0",
-            )?;
-            add_column_if_missing(conn, "maintenance_jobs", "params", "TEXT")?;
-            info!(
-                "Migrated config DB schema from v{} to v14 (lifecycle cursor/pause + job params)",
-                version
-            );
-        }
-
-        if version < 15 {
-            // v15: the lifecycle cursor is stamped with the `bucket|prefix`
-            // scope that produced it. A token is only valid for the listing
-            // it came from — redefining a same-named rule to a different
-            // bucket/prefix must not replay the old cursor (it would
-            // silently skip everything below it on the new listing).
-            add_column_if_missing(conn, "lifecycle_state", "cursor_scope", "TEXT")?;
-            info!(
-                "Migrated config DB schema from v{} to v15 (lifecycle cursor scope)",
-                version
-            );
-        }
-
-        if version < 16 {
-            // v16: per-object replication failure ledger. Tracks CONSECUTIVE
-            // failures per (rule, source_key) so a poison object that fails
-            // every run can be skipped after a threshold instead of re-blocking
-            // the queue head. Cleared on any successful copy.
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS replication_object_failures (
-                    rule_name            TEXT NOT NULL,
-                    source_key           TEXT NOT NULL,
-                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
-                    last_error           TEXT,
-                    last_failed_at       INTEGER,
-                    PRIMARY KEY (rule_name, source_key)
-                );",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v16 (replication object-failure ledger)",
-                version
-            );
-        }
-
-        if version < 17 {
-            // v17: delta-passthrough fast-path run stats. Additive, idempotent.
-            // Other strategies are derivable (objects_copied - delta_passthrough),
-            // so only the fast-path count + egress saved are persisted.
-            for col in ["delta_passthrough", "bytes_egress_saved"] {
-                add_column_if_missing(
-                    conn,
-                    "replication_run_history",
-                    col,
-                    "INTEGER NOT NULL DEFAULT 0",
-                )?;
-            }
-            info!(
-                "Migrated config DB schema from v{} to v17 (delta-passthrough run stats)",
-                version
-            );
-        }
-
-        if version < 18 {
-            // v18: per-object parity logical-metadata cache, so a re-verify is
-            // HEAD-free. Stores logical (sha256, size, etag) keyed by
-            // (rule, side, dest_key) — `side` keeps source/dest rows distinct
-            // even for a whole-bucket mirror. `stored_etag` is the cheap
-            // content-version token: a hit is trusted only while the stored blob
-            // is unchanged, so an in-place overwrite re-reads instead of
-            // reporting a stale "in sync".
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS replication_parity_objects (
-                    rule_name   TEXT NOT NULL,
-                    side        TEXT NOT NULL,
-                    dest_key    TEXT NOT NULL,
-                    sha256      TEXT,
-                    size        INTEGER NOT NULL,
-                    etag        TEXT,
-                    stored_etag TEXT,
-                    updated_at  INTEGER NOT NULL,
-                    PRIMARY KEY (rule_name, side, dest_key)
-                );",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v18 (replication parity cache)",
-                version
-            );
-        }
-
-        if version < 19 {
-            // v19: parity RESULT cache — one row per rule holding the last audit
-            // verdict (outcome_json) + a leader lease so a verify runs as a
-            // background job (not in the request) and survives navigation /
-            // restart. `status` is idle|running|done|failed; a crashed run's
-            // stale lease is cleared on boot.
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS replication_parity (
-                    rule_name           TEXT PRIMARY KEY,
-                    status              TEXT NOT NULL DEFAULT 'idle',
-                    scanned_at          INTEGER,
-                    progress_scanned    INTEGER NOT NULL DEFAULT 0,
-                    in_sync             INTEGER NOT NULL DEFAULT 0,
-                    outcome_json        TEXT,
-                    last_error          TEXT,
-                    leader_instance_id  TEXT,
-                    leader_expires_at   INTEGER,
-                    updated_at          INTEGER
-                );",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v19 (replication parity result cache)",
-                version
-            );
-        }
-
-        if version < 20 {
-            // v20: persist the IdP-asserted `email_verified` per external
-            // identity so re-evaluation paths (admin sync-memberships,
-            // declarative reconcile) can gate email-based group mappings the
-            // same way the live OAuth callback does. DEFAULT 0 is deliberate
-            // and fail-closed: an identity stored before this column existed
-            // has unknown verification status, so it must NOT grant email-based
-            // groups until its next login re-asserts a verified claim.
-            add_column_if_missing(
-                conn,
-                "external_identities",
-                "email_verified",
-                "INTEGER NOT NULL DEFAULT 0",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v20 (external_identities.email_verified)",
-                version
-            );
-        }
-
-        if version < 21 {
-            // v21: cross-instance session revocation. `identity` is the
-            // access_key_id (IAM) or `provider:user_id` (external); a session is
-            // invalid iff `revoked_since >= its created_at`. Synced across
-            // instances (IAM_SYNC_TABLES) with a MAX-upsert merge so a revocation
-            // on any node reaches every node — the stolen-cookie escape hatch.
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS session_revocations (
-                    identity      TEXT PRIMARY KEY,
-                    revoked_since INTEGER NOT NULL
-                );",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v21 (session_revocations)",
-                version
-            );
-        }
-
-        if version < 22 {
-            // v22: parity progress denominator. `progress_total` is the object
-            // count to compare once listing finishes (0 = unknown → the UI shows
-            // an indeterminate bar). Additive, node-local (not in IAM_SYNC_TABLES).
-            add_column_if_missing(
-                conn,
-                "replication_parity",
-                "progress_total",
-                "INTEGER NOT NULL DEFAULT 0",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v22 (replication_parity.progress_total)",
-                version
-            );
-        }
-
-        if version < 23 {
-            // v23: parity object created_at (epoch millis). Without it, the cache
-            // fell back to the lite list's created_at, which on S3 is
-            // last_modified — wrong for parity remediation's newer-wins conflict
-            // resolution on Transforming rules (H49). Additive, node-local.
-            add_column_if_missing(conn, "replication_parity_objects", "created_at", "INTEGER")?;
-            info!(
-                "Migrated config DB schema from v{} to v23 (replication_parity_objects.created_at)",
-                version
-            );
-        }
-
-        if version < 24 {
-            // v24: reconstructed run stat. Splits the "copied but not
-            // delta-verbatim" bucket into rebuilt (decompress+re-store) vs
-            // straight passthrough, so the run drawer can name the algorithm
-            // applied. Straight = objects_copied − delta_passthrough − reconstructed.
-            add_column_if_missing(
-                conn,
-                "replication_run_history",
-                "reconstructed",
-                "INTEGER NOT NULL DEFAULT 0",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v24 (reconstructed run stat)",
-                version
-            );
-        }
-
-        if version < 25 {
-            // v25: unique user names. `${iam:username}` expands to the name, so
-            // two users with one name shared one prefix — and an OAuth user
-            // could pick another user's name at the identity provider. Rename
-            // the newer user of each same-name pair, then enforce uniqueness.
-            for (id, old, new) in users::dedupe_user_names(conn)? {
-                warn!(
-                    "Config DB v25: user id={id} renamed from '{old}' to '{new}' — another \
-                     user already had that name, and user names are now unique. Its \
-                     ${{iam:username}} prefix changes with the name."
-                );
-            }
-            conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name ON users(name);")?;
-            info!(
-                "Migrated config DB schema from v{} to v25 (unique user names)",
-                version
-            );
-        }
-
-        if version < 26 {
-            // v26: per-row modification time for the three-way IAM sync merge
-            // (last-writer-wins on a true conflict). Triggers keep it current,
-            // so every write path (admin API, OAuth login, declarative
-            // reconcile, backup import) stamps it without code at the call
-            // site. A permission row change counts as a change of its owner.
-            iam_merge::install_mtime_schema(conn)?;
-            info!(
-                "Migrated config DB schema from v{} to v26 (IAM sync_mtime)",
-                version
-            );
-        }
-
-        if version < 27 {
-            // v27: per-endpoint raw-webhook delivery. One outbox row fans out
-            // to N endpoints; a retry posts only to the endpoints that have
-            // not succeeded, so one dead endpoint neither blocks the others
-            // nor makes them receive duplicates. Node-local (not synced).
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS event_deliveries (
-                    outbox_id   INTEGER NOT NULL REFERENCES event_outbox(id) ON DELETE CASCADE,
-                    endpoint_id TEXT NOT NULL,
-                    status      TEXT NOT NULL,
-                    attempts    INTEGER NOT NULL DEFAULT 0,
-                    last_error  TEXT,
-                    updated_at  INTEGER NOT NULL,
-                    PRIMARY KEY (outbox_id, endpoint_id)
-                );",
-            )?;
-            info!(
-                "Migrated config DB schema from v{} to v27 (event_deliveries)",
-                version
-            );
-        }
-
-        if version < 28 {
-            // v28: `group_mapping_rules.rule_uid` (+ sync_mtime). Rules have no
-            // name, so the sync merge keyed them by content, and two nodes
-            // editing one rule kept both versions. Existing rules get a
-            // content-derived uid, so equal rules on two nodes get one uid.
-            iam_merge::install_rule_uid_schema(conn)?;
-            info!(
-                "Migrated config DB schema from v{} to v28 (mapping rule uid)",
-                version
-            );
-        }
-
-        if version < 29 {
-            // v29: per-upload `sync_generation`. The sync merge orders two
-            // copies by it, not by node wall clocks (a node clock behind a
-            // peer's made its copies look like a rollback). Additive: a copy
-            // from an older peer migrates with 0 = "unknown", and is judged
-            // by the old row-age rule.
-            iam_merge::install_generation_schema(conn)?;
-            info!(
-                "Migrated config DB schema from v{} to v29 (sync_generation)",
-                version
-            );
-        }
-
+        debug!("Config DB schema created at version {}", SCHEMA_VERSION);
         Ok(())
     }
 
@@ -1536,7 +1065,9 @@ fn checkpoint_wal(path: &Path, key: &str) -> Result<(), ConfigDbError> {
 #[derive(Debug, PartialEq, Eq)]
 enum MigrationPlan {
     UpToDate,
-    Migrate,
+    /// An empty DB (`user_version` 0).
+    Create,
+    TooOld,
     TooNew,
 }
 
@@ -1544,7 +1075,8 @@ enum MigrationPlan {
 fn migration_plan(version: i32) -> MigrationPlan {
     match version.cmp(&SCHEMA_VERSION) {
         std::cmp::Ordering::Equal => MigrationPlan::UpToDate,
-        std::cmp::Ordering::Less => MigrationPlan::Migrate,
+        std::cmp::Ordering::Less if version == 0 => MigrationPlan::Create,
+        std::cmp::Ordering::Less => MigrationPlan::TooOld,
         std::cmp::Ordering::Greater => MigrationPlan::TooNew,
     }
 }
@@ -1575,6 +1107,10 @@ pub enum ConfigDbError {
         found: i32,
         supported: i32,
     },
+    /// The DB was written by a release before schema v29 (`found` < 29).
+    SchemaTooOld {
+        found: i32,
+    },
     NotFound(String),
     Io(std::io::Error),
     /// Structural / invariant violations detected by reconcile helpers.
@@ -1584,22 +1120,11 @@ pub enum ConfigDbError {
     /// The write would leave the DB in a state the caller refuses (HTTP
     /// 409): nothing was committed.
     Refused(String),
-    /// A synced copy that is older than the last one this node merged: not
-    /// merged. `by` says how the age was judged.
+    /// A synced copy with a lower sync generation than the last one this node
+    /// merged: not merged.
     RollbackRefused {
-        by: RollbackBy,
         detail: String,
     },
-}
-
-/// How a synced copy was found to be older than the last merged one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RollbackBy {
-    /// By sync generation (v29 and later): exact.
-    Generation,
-    /// By the age of its rows (a copy from before v29, no generation): a
-    /// guess with a 5-minute tolerance.
-    RowAge,
 }
 
 impl std::fmt::Display for ConfigDbError {
@@ -1612,10 +1137,15 @@ impl std::fmt::Display for ConfigDbError {
                 "config DB schema v{found} is newer than this binary supports (v{supported}); \
                  upgrade the binary or restore a backup"
             ),
+            Self::SchemaTooOld { found } => write!(
+                f,
+                "config DB schema v{found} is older than this binary supports (v{SCHEMA_VERSION}); \
+                 open it with DeltaGlider Proxy 2.2.3 first, then upgrade"
+            ),
             Self::NotFound(what) => write!(f, "Not found: {}", what),
             Self::Io(e) => write!(f, "I/O error: {}", e),
             Self::Other(msg) | Self::Refused(msg) => write!(f, "{}", msg),
-            Self::RollbackRefused { detail, .. } => {
+            Self::RollbackRefused { detail } => {
                 write!(f, "{detail}: refusing it as a rollback")
             }
         }
@@ -2007,8 +1537,9 @@ mod tests {
 
     #[test]
     fn migration_plan_truth_table() {
-        assert_eq!(migration_plan(0), MigrationPlan::Migrate);
-        assert_eq!(migration_plan(SCHEMA_VERSION - 1), MigrationPlan::Migrate);
+        assert_eq!(migration_plan(0), MigrationPlan::Create);
+        assert_eq!(migration_plan(1), MigrationPlan::TooOld);
+        assert_eq!(migration_plan(SCHEMA_VERSION - 1), MigrationPlan::TooOld);
         assert_eq!(migration_plan(SCHEMA_VERSION), MigrationPlan::UpToDate);
         assert_eq!(migration_plan(SCHEMA_VERSION + 1), MigrationPlan::TooNew);
     }
@@ -2051,85 +1582,35 @@ mod tests {
         conn
     }
 
-    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
-        let mut stmt = conn
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .unwrap();
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        cols.iter().any(|c| c == column)
-    }
-
-    /// D14: a failed migration must roll back EVERY step it ran, so the next
-    /// boot retries from a clean state instead of re-running a half-applied
-    /// ALTER (duplicate column → the DB never opens again).
+    /// A DB below v29 is refused with `SchemaTooOld`, and its version stays.
     #[test]
-    fn failed_migration_rolls_back_all_steps() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("partial.db");
-        {
-            let conn = db_stamped_at(&path, 21);
-            // v22 re-adds this column; v24 fails because its table is gone.
-            conn.execute_batch(
-                "ALTER TABLE replication_parity DROP COLUMN progress_total;
-                 DROP TABLE replication_run_history;",
-            )
-            .unwrap();
-        }
-        assert!(ConfigDb::open_or_create(&path, "pw").is_err());
-        let conn = crate::sqlite_open::open(&path).unwrap();
-        conn.pragma_update(None, "key", "pw").unwrap();
-        assert!(
-            !has_column(&conn, "replication_parity", "progress_total"),
-            "the v22 ALTER must roll back with the failed v24 step"
-        );
-        let v: i32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(v, 21);
-    }
-
-    /// D14: a DB that an OLDER binary left half-migrated (column added, version
-    /// not stamped) must still open — ADD COLUMN steps are idempotent.
-    #[test]
-    fn migration_tolerates_columns_already_present() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("half.db");
-        drop(db_stamped_at(&path, 19));
-        let db = ConfigDb::open_or_create(&path, "pw").expect("re-run of v20..v25 must succeed");
-        let v: i32 = db
-            .conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(v, SCHEMA_VERSION);
-    }
-
-    /// v29 is additive: a v28 DB (no `sync_state`) opens, gains the table
-    /// with generation 0 ("unknown"), and keeps its IAM rows.
-    #[test]
-    fn v29_adds_sync_generation_to_a_v28_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v28.db");
-        {
-            let db = ConfigDb::open_or_create(&path, "pw").unwrap();
-            db.create_user("u1", "AKU1000000001", "s1", true, &[])
+    fn open_refuses_an_older_schema_and_keeps_its_version() {
+        for old in [1, 21, SCHEMA_VERSION - 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("old.db");
+            drop(db_stamped_at(&path, old));
+            let err = ConfigDb::open_or_create(&path, "pw")
+                .err()
+                .expect("must refuse");
+            assert!(
+                matches!(err, ConfigDbError::SchemaTooOld { found } if found == old),
+                "expected SchemaTooOld for v{old}, got: {err}"
+            );
+            assert!(err.to_string().contains("2.2.3"), "{err}");
+            let conn = crate::sqlite_open::open(&path).unwrap();
+            conn.pragma_update(None, "key", "pw").unwrap();
+            let v: i32 = conn
+                .pragma_query_value(None, "user_version", |r| r.get(0))
                 .unwrap();
-            drop(db);
-            let conn = db_stamped_at(&path, 28);
-            conn.execute_batch("DROP TABLE sync_state;").unwrap();
-            assert_eq!(iam_merge::read_generation(&conn, "main").unwrap(), 0);
+            assert_eq!(v, old, "version must not be stamped up");
         }
-        let db = ConfigDb::open_or_create(&path, "pw").expect("v28 -> v29");
-        let v: i32 = db
-            .conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// A new DB starts with its one `sync_state` row at generation 0.
+    #[test]
+    fn a_new_db_has_the_sync_state_row() {
+        let db = ConfigDb::in_memory("pw").unwrap();
         assert_eq!(db.sync_generation().unwrap(), 0);
-        assert_eq!(db.load_users().unwrap().len(), 1);
         assert_eq!(db.next_sync_generation(None, "pw").unwrap(), 1);
     }
 
