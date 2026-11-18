@@ -166,6 +166,18 @@ When upgrading across instances with `DGP_CONFIG_SYNC_BUCKET` set, the *newer* b
 
 Releases before 2.0 encrypted `deltaglider_config.db` with the bootstrap password hash. This release no longer opens such a database with the hash, and it ignores `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC`. Start release 2.2.3 once first, with `DGP_CONFIG_DB_KEY` set (several instances with `config_sync_bucket` need the same key on every instance). That release re-encrypts the database with the key. Then upgrade. If you start this release on a database that only the hash opens, the proxy keeps the database as `deltaglider_config.db.bak` and locks the S3 API until the right key is available.
 
+## Three names of the bootstrap password hash are removed
+
+Three older names of the bootstrap password hash are no longer read. Each one has a replacement:
+
+| Removed | Replacement |
+|---|---|
+| The environment variable `DGP_ADMIN_PASSWORD_HASH` | `DGP_BOOTSTRAP_PASSWORD_HASH` |
+| The state file `.deltaglider_admin_hash` | `.deltaglider_bootstrap_hash` |
+| The YAML key `admin_password_hash` | `advanced.bootstrap_password_hash` |
+
+Rename them before you start the new release. The proxy checks for them at start, because an ignored hash would change the admin password without a message. It refuses to start when `DGP_ADMIN_PASSWORD_HASH` is set, also when a new hash exists. It refuses to start when `.deltaglider_admin_hash` exists and no new hash exists. It refuses to load a YAML file that has `admin_password_hash`. Each error says which name to replace.
+
 ## Several instances and encryption (the encryption witness)
 
 With `config_sync_bucket` set, this release keeps a witness of each bucket's encryption in the sync bucket, and an instance that disagrees with it refuses writes to that bucket ([How to run multiple instances](run-multiple-instances.md#8-keep-the-encryption-of-each-bucket-the-same-on-every-instance)). This changes the behaviour of clusters that use backend-level encryption only, too:

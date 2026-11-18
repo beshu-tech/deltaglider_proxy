@@ -62,6 +62,10 @@ No key that the proxy has opens `deltaglider_config.db`. The proxy moves the dat
 
 The admin GUI shows a recovery wizard while the database is locked. In Kubernetes, `/_/ready` answers `503` in this state, so the Service sends no traffic to the pod. Reach the wizard through `kubectl port-forward pod/<name> 9000:9000` (or the container port directly) and open `http://localhost:9000/_/admin`. It sends the candidate to `POST /_/api/admin/recover-db`, which tests it against the preserved database without changing anything and says whether it opens the database. The endpoint is public but rate-limited.
 
+## Startup fails: `the bootstrap hash is still under its old name`
+
+The proxy no longer reads the environment variable `DGP_ADMIN_PASSWORD_HASH` or the file `.deltaglider_admin_hash`. If the variable is set, or the file exists and there is no new hash, the proxy refuses to start, because it would otherwise use a different admin password without a message. Remove the old variable and set `DGP_BOOTSTRAP_PASSWORD_HASH` to the same value, or rename the file to `.deltaglider_bootstrap_hash`, and start again. A YAML file with the key `admin_password_hash` fails to load in the same way; rename the key to `advanced.bootstrap_password_hash`.
+
 ## Startup fails: `config_sync_bucket is set, but DGP_CONFIG_DB_KEY is not`
 
 All instances that share a sync bucket share one encrypted database, so they need one key. Set `DGP_CONFIG_DB_KEY` to the same value on every instance (at least 32 characters, for example from `openssl rand -hex 32`) and restart. See [How to run multiple instances](run-multiple-instances.md).

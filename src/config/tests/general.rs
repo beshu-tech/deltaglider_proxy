@@ -2492,9 +2492,18 @@ fn the_state_file_keeps_a_hash_that_only_the_config_file_carries() {
 /// a new random password: the boot refuses and names the new names.
 #[test]
 fn an_old_hash_name_without_a_new_hash_refuses_the_boot() {
-    assert!(refuse_old_hash_names(false, false).is_ok());
-    for (file, env) in [(true, false), (false, true), (true, true)] {
-        let err = refuse_old_hash_names(file, env).unwrap_err();
+    assert!(refuse_old_hash_names(false, false, false).is_ok());
+    assert!(
+        refuse_old_hash_names(false, true, true).is_ok(),
+        "old file, new hash present"
+    );
+    for (env, file, new) in [
+        (false, true, false),
+        (true, false, false),
+        (true, false, true),
+        (true, true, true),
+    ] {
+        let err = refuse_old_hash_names(env, file, new).unwrap_err();
         assert!(err.contains(".deltaglider_bootstrap_hash"), "{err}");
         assert!(err.contains("DGP_BOOTSTRAP_PASSWORD_HASH"), "{err}");
     }

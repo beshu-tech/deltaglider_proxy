@@ -2512,6 +2512,14 @@ impl Config {
     /// so the operator would never learn the generated password.
     pub fn ensure_bootstrap_password_hash(&mut self) -> Result<String, String> {
         let new_file = std::path::Path::new(".deltaglider_bootstrap_hash");
+        let old_env = format!("{}_ADMIN_PASSWORD_HASH", "DGP");
+        let has_new_hash = self.bootstrap_password_hash.is_some()
+            || std::fs::read_to_string(new_file).is_ok_and(|raw| !raw.trim().is_empty());
+        refuse_old_hash_names(
+            process_env(&old_env).is_some_and(|v| !v.trim().is_empty()),
+            std::path::Path::new(".deltaglider_admin_hash").exists(),
+            has_new_hash,
+        )?;
         if let Some(ref hash) = self.bootstrap_password_hash {
             let hash = Self::decode_hash(hash);
             // Every persist drops the hash from the config file
@@ -2541,12 +2549,6 @@ impl Config {
                 }
             }
         }
-
-        let old_env = format!("{}_ADMIN_PASSWORD_HASH", "DGP");
-        refuse_old_hash_names(
-            std::path::Path::new(".deltaglider_admin_hash").exists(),
-            process_env(&old_env).is_some_and(|v| !v.trim().is_empty()),
-        )?;
 
         // Generate a random 16-character password
         use rand::Rng;
@@ -3426,14 +3428,20 @@ fn first_run_banner(
     Ok(out)
 }
 
-/// Pure: the pre-rename hash sources are no longer read, and with no new hash
-/// the boot would mint a random password nobody sees. Refuse and say so.
-pub(crate) fn refuse_old_hash_names(old_file: bool, old_env: bool) -> Result<(), String> {
-    if old_file || old_env {
+/// Pure: the pre-rename hash sources are no longer read. A set old env var
+/// always refuses (it would change the password silently); the old file
+/// refuses only without a new hash (the boot would mint a random password).
+pub(crate) fn refuse_old_hash_names(
+    old_env: bool,
+    old_file: bool,
+    has_new_hash: bool,
+) -> Result<(), String> {
+    if old_env || (old_file && !has_new_hash) {
         return Err(
-            "the bootstrap hash is still under its old name (`.deltaglider_admin_hash` or the \
-             old admin password hash env var) and is no longer read. Rename the file to \
-             `.deltaglider_bootstrap_hash`, or set `DGP_BOOTSTRAP_PASSWORD_HASH`, then start again"
+            "the bootstrap hash is still under its old name (the old admin password hash env var \
+             or `.deltaglider_admin_hash`) and is no longer read. Remove the old env var and set \
+             `DGP_BOOTSTRAP_PASSWORD_HASH` instead, or rename the file to \
+             `.deltaglider_bootstrap_hash`, then start again"
                 .into(),
         );
     }
