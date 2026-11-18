@@ -5,8 +5,8 @@
 //! The bootstrap password hash verifies admin-GUI logins and signs session
 //! cookies. It is NOT the SQLCipher key of the IAM database (that is
 //! `DGP_CONFIG_DB_KEY` or the key file, see `config_db::key`), so a password
-//! change never touches the database. Recovery tries a candidate key (or a
-//! legacy bootstrap hash) against a parked config DB.
+//! change never touches the database. Recovery tries a candidate key against a
+//! parked config DB.
 
 use crate::api::admin::extract::AdminJson;
 use axum::extract::{ConnectInfo, State};

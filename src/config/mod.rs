@@ -2542,6 +2542,12 @@ impl Config {
             }
         }
 
+        let old_env = format!("{}_ADMIN_PASSWORD_HASH", "DGP");
+        refuse_old_hash_names(
+            std::path::Path::new(".deltaglider_admin_hash").exists(),
+            process_env(&old_env).is_some_and(|v| !v.trim().is_empty()),
+        )?;
+
         // Generate a random 16-character password
         use rand::Rng;
         let mut rng = rand::thread_rng();
@@ -3418,6 +3424,20 @@ fn first_run_banner(
     }
     out.push(String::new());
     Ok(out)
+}
+
+/// Pure: the pre-rename hash sources are no longer read, and with no new hash
+/// the boot would mint a random password nobody sees. Refuse and say so.
+pub(crate) fn refuse_old_hash_names(old_file: bool, old_env: bool) -> Result<(), String> {
+    if old_file || old_env {
+        return Err(
+            "the bootstrap hash is still under its old name (`.deltaglider_admin_hash` or the \
+             old admin password hash env var) and is no longer read. Rename the file to \
+             `.deltaglider_bootstrap_hash`, or set `DGP_BOOTSTRAP_PASSWORD_HASH`, then start again"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Write the bootstrap hash file with restrictive permissions (0600).

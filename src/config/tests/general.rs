@@ -2488,6 +2488,18 @@ fn the_state_file_keeps_a_hash_that_only_the_config_file_carries() {
     ));
 }
 
+/// An install that has only the old hash file or env var must not boot with
+/// a new random password: the boot refuses and names the new names.
+#[test]
+fn an_old_hash_name_without_a_new_hash_refuses_the_boot() {
+    assert!(refuse_old_hash_names(false, false).is_ok());
+    for (file, env) in [(true, false), (false, true), (true, true)] {
+        let err = refuse_old_hash_names(file, env).unwrap_err();
+        assert!(err.contains(".deltaglider_bootstrap_hash"), "{err}");
+        assert!(err.contains("DGP_BOOTSTRAP_PASSWORD_HASH"), "{err}");
+    }
+}
+
 /// The removed YAML key `admin_password_hash` fails the load with a clear message.
 #[test]
 fn the_old_admin_password_hash_yaml_key_is_refused() {

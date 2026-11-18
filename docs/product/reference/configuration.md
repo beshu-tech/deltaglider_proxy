@@ -519,7 +519,7 @@ Bcrypt hash of the bootstrap password (it signs session cookies and gates admin 
 
 ### Config DB key
 
-The SQLCipher key of the IAM config DB (`deltaglider_config.db`). When the variable is unset, the proxy uses the key file `deltaglider_config.db.key` next to the DB, and it generates that file (mode 0600) on the first start. When `config_sync_bucket` is set, the variable is required and must be identical on every instance, because all instances share one encrypted DB. The value needs at least 32 characters. See [Config database key](authentication.md#config-database-key) for the upgrade from the hash-keyed DB of earlier releases.
+The SQLCipher key of the IAM config DB (`deltaglider_config.db`). When the variable is unset, the proxy uses the key file `deltaglider_config.db.key` next to the DB, and it generates that file (mode 0600) on the first start. When `config_sync_bucket` is set, the variable is required and must be identical on every instance, because all instances share one encrypted DB. The value needs at least 32 characters. See [Config database key](authentication.md#config-database-key).
 
 | | |
 |---|---|

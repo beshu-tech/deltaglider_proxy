@@ -643,7 +643,7 @@ fn init_config_db_attempt(
     bool,
 ) {
     let db_file = config_db_path();
-    // A DB that moves to a new key (rotation, key-file → env, legacy hash)
+    // A DB that moves to a new key (rotation, key-file → env)
     // parks one upload, so the synced copy follows (see `open_live_db`).
     let has_sync = config
         .config_sync_bucket
@@ -1902,7 +1902,7 @@ pub async fn init_config_sync(
             warn!("Config DB S3 sync: startup download failed: {}", e);
         }
     }
-    // A synced copy under an old key (rotation, legacy hash) merged above and
+    // A synced copy under an old key (rotation) merged above and
     // queued its re-upload: do it now, not at the first poll tick, so the
     // bucket leaves the old key while the peers still accept it.
     if sync.take_needs_upload() {
