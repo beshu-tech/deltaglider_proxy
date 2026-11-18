@@ -208,6 +208,10 @@ enum MultipartState {
     Completing,
 }
 
+/// The internal `dg-` metadata key that names the upload which stored an
+/// object (hidden from clients like the other `dg-` keys, dropped by a copy).
+pub(crate) const UPLOAD_ID_METADATA_KEY: &str = "dg-mpu-upload-id";
+
 /// State for an in-progress multipart upload
 struct MultipartUpload {
     upload_id: String,
@@ -230,6 +234,9 @@ struct MultipartUpload {
     /// is separately bounded (request timeout + codec watchdog), so this flag
     /// can never wedge an upload forever.
     store_in_progress: bool,
+    /// A store of this upload started and was rolled back: its object may
+    /// have landed (a cut after the backend committed). The retry looks for it.
+    store_tried: bool,
 }
 
 /// RAII: clears an upload's `store_in_progress` flag on drop so a store that
@@ -280,7 +287,7 @@ impl Drop for CompletingGuard {
         if self.committed.load(std::sync::atomic::Ordering::SeqCst) {
             self.store.commit_unwound(&self.upload_id, &self.etag);
         } else {
-            self.store.rollback_upload(&self.upload_id);
+            self.store.rollback_after_store(&self.upload_id);
         }
     }
 }
@@ -714,6 +721,7 @@ impl MultipartStore {
             parts: HashMap::new(),
             state: MultipartState::Open,
             store_in_progress: false,
+            store_tried: false,
         };
 
         uploads.insert(upload_id.clone(), upload);
@@ -1022,7 +1030,12 @@ impl MultipartStore {
             etag: validated.etag,
             total_size: validated.total_size,
             content_type: upload.content_type.clone(),
-            user_metadata: upload.user_metadata.clone(),
+            user_metadata: {
+                // The stored object names its upload: a retry finds its own object by it.
+                let mut meta = upload.user_metadata.clone();
+                meta.insert(UPLOAD_ID_METADATA_KEY.to_string(), upload_id.to_string());
+                meta
+            },
         };
 
         // Flip to Completing under the same write lock that performed the
@@ -1196,6 +1209,23 @@ impl MultipartStore {
         }
     }
 
+    /// [`Self::rollback_upload`] of an upload whose store started: the
+    /// retry then looks for the object that this try may have landed.
+    fn rollback_after_store(&self, upload_id: &str) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.state = MultipartState::Open;
+            u.store_tried = true;
+        }
+    }
+
+    /// Whether a store of this upload started and was rolled back.
+    pub fn store_was_tried(&self, upload_id: &str) -> bool {
+        self.uploads
+            .read()
+            .get(upload_id)
+            .is_some_and(|u| u.store_tried)
+    }
+
     /// The guard of an upload that `complete_parts` flipped to `Completing`
     /// (see [`CompletingGuard`]); `committed` is set when the write commits.
     pub fn completing_guard(
@@ -1246,20 +1276,20 @@ impl MultipartStore {
         }
     }
 
-    /// The part list, size and creation time that a Complete of `upload_id`
-    /// with `requested_parts` would store. Changes no state.
-    pub fn expected_completion(
+    /// The composite ETag that a Complete of `upload_id` with
+    /// `requested_parts` would store. Changes no state.
+    pub fn expected_etag(
         &self,
         upload_id: &str,
         bucket: &str,
         key: &str,
         requested_parts: &[(u32, String)],
-    ) -> Option<(String, u64, DateTime<Utc>)> {
+    ) -> Option<String> {
         let uploads = self.uploads.read();
-        let (validated, upload) = self
+        let (validated, _) = self
             .validate_parts(&uploads, upload_id, bucket, key, requested_parts)
             .ok()?;
-        Some((validated.etag, validated.total_size, upload.created_at))
+        Some(validated.etag)
     }
 
     /// The success that [`Self::commit_unwound`] kept for the completion

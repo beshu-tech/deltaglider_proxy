@@ -230,13 +230,18 @@ pub(super) async fn complete_multipart_upload(
             .await
         }
         crate::multipart::BeginComplete::Owner(publisher) => {
-            // A first try that a drop cut after the backend committed left its
-            // object at the key: confirm it instead of storing it again.
-            if let Some(etag) = adopt_landed_completion(&svc.state, &input, &requested_parts).await
-            {
-                publisher.publish(Ok(etag.clone()));
-                return complete_response(&etag, None);
+            // A first try of this upload that a drop cut after the backend
+            // committed left its object at the key: confirm it, store nothing.
+            let mut publisher = Some(publisher);
+            if svc.state.multipart.store_was_tried(&input.upload_id) {
+                if let Some(etag) =
+                    adopt_landed_completion(&svc.state, &input, &requested_parts, &mut publisher)
+                        .await
+                {
+                    return complete_response(&etag, None);
+                }
             }
+            let publisher = publisher.expect("the publisher is kept unless the object was adopted");
             // Admission (quota) + routing decisions run ONLY for the owner: a
             // tombstone/join retry must never be re-admitted — its bytes are
             // already committed, and the freeze/quota gates would wrongly
@@ -414,35 +419,41 @@ where
     }
 }
 
-/// The object of a first try of this Complete that a drop cut after the
-/// backend committed: the key holds the composite ETag and the size of this
-/// upload's parts, written after the upload began. It is confirmed as a
-/// normal commit would end: the upload is finished, the bucket usage is
-/// counted again and the `ObjectCreated` event is queued. Returns its ETag.
+/// The object of an earlier try of THIS upload that a drop cut after the
+/// backend committed: the key holds the composite ETag and names this upload
+/// id in its metadata. Under the key's write lock it is confirmed as a normal
+/// commit ends: the tombstone first, then the finished upload, the usage
+/// recount and the `ObjectCreated` event (lost when a cut hits the queue wait:
+/// delivery is at most once). Takes `publisher`; returns the ETag.
 async fn adopt_landed_completion(
     state: &Arc<AppState>,
     input: &s3s::dto::CompleteMultipartUploadInput,
     requested_parts: &[(u32, String)],
+    publisher: &mut Option<crate::multipart::CompletionPublisher>,
 ) -> Option<String> {
-    let (expected, size, created) = state.multipart.expected_completion(
+    let expected = state.multipart.expected_etag(
         &input.upload_id,
         &input.bucket,
         &input.key,
         requested_parts,
     )?;
     let engine = state.engine.load_full();
+    let _lock = engine.lock_object_write(&input.bucket, &input.key).await;
     let meta = engine.head(&input.bucket, &input.key).await.ok()?;
-    let slack = chrono::Duration::seconds(2);
     let own = meta.etag().trim_matches('"') == expected.trim_matches('"')
-        && meta.file_size == size
-        && meta.created_at + slack >= created;
+        && meta
+            .user_metadata
+            .get(crate::multipart::UPLOAD_ID_METADATA_KEY)
+            .is_some_and(|id| *id == input.upload_id);
     if !own {
         return None;
     }
+    if let Some(publisher) = publisher.take() {
+        publisher.publish(Ok(expected.clone()));
+    }
     state.multipart.finish_upload(&input.upload_id);
     engine.note_unrecorded_write(&input.bucket);
-    let stored = meta.stored_size();
-    let result = crate::types::StoreResult::new(meta.clone(), stored);
+    let result = crate::types::StoreResult::new(meta.clone(), meta.stored_size());
     crate::api::handlers::object_helpers::store_client_multipart_commit(
         state,
         &input.bucket,
@@ -1279,10 +1290,89 @@ mod multipart_cost_tests {
         let db = state.jobs_db.as_ref().unwrap();
         crate::event_outbox::flush_appends(db).await;
         assert_eq!(db.lock().await.event_outbox_count(None).unwrap(), 1);
+        // The upload id is stored on the object and hidden from the client.
+        let meta = state.engine.load().head("b", "a/photo.jpg").await.unwrap();
+        assert_eq!(
+            meta.user_metadata
+                .get(crate::multipart::UPLOAD_ID_METADATA_KEY),
+            Some(&id)
+        );
+        let shown = response_metadata_map(&meta, Reader::of_principal(None));
+        assert!(!shown.keys().any(|k| k.contains("upload-id")), "{shown:?}");
         // A second retry hits the tombstone.
         complete_multipart_upload(&svc, request(complete_input(&id, &etag, false)))
             .await
             .expect("the tombstone answers");
+    }
+
+    /// An upload U2 of the same parts as the object at the key (a completed
+    /// U1, or a copy that carries no upload id) whose first try was cut is NOT
+    /// adopted: its create-only retry is refused (412), as for any other writer.
+    #[tokio::test]
+    async fn a_retry_never_adopts_an_object_of_another_write() {
+        for via_copy in [false, true] {
+            let (engine, fake) = crate::deltaglider::s3_engine().await;
+            let state = AppState::for_tests(engine);
+            let svc = service(state.clone());
+            let new_upload = || async {
+                let id = state
+                    .multipart
+                    .create("b", "a/photo.jpg", None, Default::default())
+                    .unwrap();
+                let etag = upload_part(&svc, request(part(&id, 1)))
+                    .await
+                    .unwrap()
+                    .output
+                    .e_tag
+                    .unwrap();
+                (id, etag)
+            };
+            // The object at the key: a completed upload, or a copy of its bytes.
+            let (id1, etag1) = new_upload().await;
+            let done =
+                complete_multipart_upload(&svc, request(complete_input(&id1, &etag1, false)))
+                    .await
+                    .unwrap();
+            if via_copy {
+                let (s3s::dto::ETag::Strong(v) | s3s::dto::ETag::Weak(v)) =
+                    done.output.e_tag.clone().unwrap();
+                let engine = state.engine.load_full();
+                let lock = engine.lock_object_write("b", "a/photo.jpg").await;
+                engine
+                    .store_with_multipart_etag(
+                        &lock,
+                        "b",
+                        "a/photo.jpg",
+                        &[1u8; 1024],
+                        None,
+                        Default::default(),
+                        format!("\"{v}\""),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // U2: same parts, first try cut at its PUT, then a create-only retry.
+            let (id2, etag2) = new_upload().await;
+            fake.set_delay_ms("PUT", 5_000);
+            let cut = fake
+                .cut_at(
+                    complete_multipart_upload(&svc, request(complete_input(&id2, &etag2, false))),
+                    |r| r.starts_with("PUT /b/a/photo.jpg"),
+                )
+                .await;
+            assert!(cut);
+            assert!(state.multipart.store_was_tried(&id2));
+            fake.set_delay_ms("PUT", 0);
+            let retry =
+                complete_multipart_upload(&svc, request(complete_input(&id2, &etag2, true)))
+                    .await
+                    .expect_err("another write's object is not adopted");
+            assert_eq!(
+                *retry.code(),
+                s3s::S3ErrorCode::PreconditionFailed,
+                "via_copy={via_copy}"
+            );
+        }
     }
 
     /// F10 (epic #143): parallel UploadParts of 24 MiB each (and the

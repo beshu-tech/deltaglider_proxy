@@ -71,7 +71,11 @@ pub(crate) const LIFECYCLE_RULE_METADATA_KEY: &str = "dg-lifecycle-rule";
 /// paths act on it; a copy made by a client (CopyObject, the CLI) was not
 /// written by the rule.
 pub(crate) fn strip_rule_provenance(meta: &mut std::collections::HashMap<String, String>) {
-    for key in [REPLICATION_RULE_METADATA_KEY, LIFECYCLE_RULE_METADATA_KEY] {
+    for key in [
+        REPLICATION_RULE_METADATA_KEY,
+        LIFECYCLE_RULE_METADATA_KEY,
+        crate::multipart::UPLOAD_ID_METADATA_KEY,
+    ] {
         meta.remove(key);
     }
 }
