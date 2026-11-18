@@ -3962,12 +3962,22 @@ async fn test_list_v2_honours_start_after() {
         .await
         .unwrap();
     assert_eq!(keys(out), vec!["sa/b.txt", "sa/c.txt"]);
+    let first = s3
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix("sa/")
+        .start_after("sa/a.txt")
+        .max_keys(1)
+        .send()
+        .await
+        .unwrap();
+    let token = first.next_continuation_token().unwrap().to_string();
     let out = s3
         .list_objects_v2()
         .bucket(bucket)
         .prefix("sa/")
         .start_after("sa/a.txt")
-        .continuation_token("sa/b.txt")
+        .continuation_token(token)
         .send()
         .await
         .unwrap();

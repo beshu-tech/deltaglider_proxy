@@ -900,6 +900,15 @@ mod tests {
         assert_eq!(T.renew_interval(), Duration::from_secs(30));
     }
 
+    /// The lock object name is shared with every other node: pinned.
+    #[test]
+    fn the_lock_object_key_of_a_routed_bucket_is_pinned() {
+        assert_eq!(
+            lock_object_key("hetzner-fsn1\u{0}releases", "v1"),
+            "_dgp/locks/reference/e09a47337d353b26dc6157a7484a24513b7ad708541204ef20aebfc1944ac0e7.json"
+        );
+    }
+
     #[test]
     fn lock_key_is_stable_bucket_scoped_and_safe() {
         let a = lock_object_key("bucket-a", "ror/builds");

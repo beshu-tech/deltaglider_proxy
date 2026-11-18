@@ -38,7 +38,7 @@ forwards each copy.
 | Metadata rewrite in place | `get_passthrough_metadata_for_rewrite`, `put_passthrough_metadata` | 2 |
 | Form-generic object ops | `open_object`, `copy_within`, `variant_version`, `delete_variant_if` | 4 |
 | Multipart + capability flags | `create_multipart_upload`, `upload_part`, `complete_multipart_upload`, `abort_multipart_upload`, `multipart_storage_label`, `supports_native_multipart`, `lite_list_carries_logical_facts` | 7 |
-| Routing identity | `resolved_backend_name`, `storage_identity`, `previous_storage_identity` | 3 |
+| Routing identity | `resolved_backend_name`, `storage_identity` | 2 |
 | Encryption control | `write_refusal`, `read_key_claim`, `write_key_claim` | 3 |
 | Deltaspace scans | `scan_deltaspace`, `scan_deltaspace_lite`, `holds_only_reference`, `list_deltaspaces`, `list_reference_prefixes` | 5 |
 | Listing | `bulk_list_objects`, `bulk_list_objects_with_baselines`, `resolve_listed_sizes`, `listing_tokens`, `enrich_list_metadata`, `list_objects_delegated`, `put_directory_marker`, `total_size` | 8 |
@@ -59,7 +59,7 @@ Facts that shape the options:
   (`ReferenceLockGuard::write_reference` in `engine/locking.rs`), as a
   `match` over `RefWrite`; `unfenced_reference_write` repeats that match.
 - The routing-only methods (`list_bucket_origins`, `resolved_backend_name`,
-  `storage_identity`, `previous_storage_identity`) are asked through the
+  `storage_identity`) are asked through the
   engine's `DynStorageBackend`, which may or may not be a router.
 
 ## 3. Options

@@ -134,10 +134,16 @@ fn v2_tokens_are_opaque_and_a_raw_key_is_refused() {
     assert_eq!(decode_v2_token("dg1.!!"), None);
 }
 
+/// An empty continuation token is a first page, as in `list_cursor`.
+#[test]
+fn an_empty_v2_token_is_a_first_page() {
+    assert_eq!(super::list::v2_cursor(Some(""), BINDING).unwrap(), None);
+}
+
 /// A token from before 2.0 (the raw key) answers 400 InvalidArgument.
 #[test]
 fn a_raw_key_v2_token_answers_invalid_argument() {
-    for t in ["p/a.txt", "dg1.!!", ""] {
+    for t in ["p/a.txt", "dg1.!!"] {
         let err = super::list::v2_cursor(Some(t), BINDING).unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidArgument", "{t:?}");
     }

@@ -296,7 +296,8 @@ pub(super) fn v2_cursor(
     token: Option<&str>,
     binding: list_token::TokenBinding<'_>,
 ) -> s3s::S3Result<Option<ListCursor>> {
-    let Some(token) = token else {
+    // s3s parses an empty `?continuation-token=` as `Some("")`: a first page.
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
         return Ok(None);
     };
     if token.starts_with(list_token::SEALED_TOKEN_PREFIX) {

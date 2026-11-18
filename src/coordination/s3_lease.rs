@@ -748,6 +748,31 @@ mod tests {
         assert_eq!(methods(&fake), ["GET"], "an expired lease was deleted");
     }
 
+    /// A body without `boot_id` does not parse: it reads as corrupt, and the
+    /// acquire replaces it with `If-Match`.
+    #[tokio::test]
+    async fn a_lease_body_without_boot_id_is_corrupt_and_stolen() {
+        let now = crate::event_outbox::current_unix_seconds();
+        let canned = canned_lease(
+            serde_json::json!({"owner": "leader", "node_id": "nodeB", "epoch": 2,
+                "expires_at": now + 300, "ttl_secs": 300}),
+            1,
+        );
+        let l = S3Lease::new(
+            crate::coordination::test_s3::client(&canned),
+            "coord".into(),
+            "nodeA".into(),
+        )
+        .with_profile(Default::default());
+        let key = S3Lease::object_key(LeaseSubsystem::Replication, "r");
+        let read = l.read_lease(&key, now, 300).await.unwrap();
+        assert!(matches!(read, LeaseRead::Corrupt { .. }), "{read:?}");
+        assert!(matches!(
+            plan_acquire_read(&read, now, "peer", "nodeA", None),
+            AcquireAction::Steal { next_epoch: 1, .. }
+        ));
+    }
+
     fn canned_lease(body: serde_json::Value, age: i64) -> crate::coordination::test_s3::Canned {
         let now = crate::event_outbox::current_unix_seconds();
         crate::coordination::test_s3::Canned {
