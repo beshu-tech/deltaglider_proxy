@@ -198,6 +198,14 @@ pub(crate) type CopyLock = Arc<crate::deltaglider::ObjectWriteGuard>;
 /// write needs, `pin` (the created-at a keeping copy pins) included: a
 /// count is passed, not ambient. Without a `count` (a client copy, a
 /// maintenance job) it runs inline.
+///
+/// Every background commit point (each calls this):
+/// - buffered store (`copy_object_once`)
+/// - multipart Complete (`stream_copy_passthrough`)
+/// - server-side passthrough copy (`server_side_copy`)
+/// - delta fast path seed + ship (`delta_passthrough_copy`)
+/// - stripped-delta heal re-PUT (`heal_stripped_dest_delta`)
+/// - spooled store (`spooled_copy`)
 pub(crate) async fn detached_commit<T: Send + 'static>(
     count: Option<Arc<crate::maintenance::gate::CommitCount>>,
     pin: Option<chrono::DateTime<chrono::Utc>>,
@@ -1989,7 +1997,7 @@ async fn delta_passthrough_copy(
         counter_meta.multipart_etag.as_deref(),
     )?;
     if accepted == VerifyAccepted::StrippedDelta {
-        heal_stripped_dest_delta(engine, lock, request, &counter_meta, src_delta_size).await;
+        heal_stripped_dest_delta(engine, lock, request, &counter_meta, src_delta_size, pin).await;
     }
 
     let bytes_egress_saved = source_head.file_size.saturating_sub(src_delta_size);
@@ -2032,52 +2040,69 @@ async fn heal_stripped_dest_delta(
     request: ObjectTransferRequest<'_>,
     meta: &crate::types::FileMetadata,
     expected_delta_size: u64,
+    pin: Option<chrono::DateTime<chrono::Utc>>,
 ) {
     use crate::types::ObjectKey;
     let dest_key = ObjectKey::parse(request.destination_bucket, request.destination_key);
-    let bucket = request.destination_bucket;
-    let key = request.destination_key;
+    let bucket = request.destination_bucket.to_string();
+    let key = request.destination_key.to_string();
+    let (engine, lock, meta) = (engine.clone(), lock.clone(), meta.clone());
     // Re-fetch + re-PUT UNDER the deltaspace prefix lock so a concurrent same-key
     // writer can't slip a newer blob between our read and re-stamp (which would
     // re-stamp the newer bytes with the older source's metadata → unreconstructable).
     // Re-assert the stripped signature INSIDE the lock: if the object changed since
     // the pre-check, another writer already re-stamped it — nothing to heal.
-    engine
-        .with_dest_prefix_lock(bucket, &dest_key.prefix, || async {
-            match engine.head(bucket, key).await {
-                Ok(m) if m.file_size != expected_delta_size => return, // healed/changed under us
-                Ok(_) => {}
-                Err(_) => return,
-            }
-            let delta_bytes = match engine
-                .get_delta_raw(bucket, &dest_key.prefix, &dest_key.filename)
-                .await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("heal: could not read stripped dest delta {bucket}/{key}: {e}");
-                    return;
-                }
-            };
-            match engine
-                .put_delta_raw(
-                    lock,
-                    bucket,
-                    &dest_key.prefix,
-                    &dest_key.filename,
-                    crate::storage::PutBody::Bytes(Bytes::from(delta_bytes)),
-                    meta,
-                    // A re-stamp of a stored delta: no read says the
-                    // passthrough form is absent.
-                    &crate::deltaglider::CounterPrior::Unknown,
-                )
-                .await
-            {
-                Ok(_) => info!("heal: re-stamped stripped DG metadata on {bucket}/{key}"),
-                Err(e) => warn!("heal: could not re-stamp stripped dest delta {bucket}/{key}: {e}"),
-            }
-        })
-        .await;
+    // A commit point: it runs counted and detached, like the copy's other writes.
+    detached_commit(
+        request.commit_count.cloned(),
+        pin,
+        async move {
+            let (bucket, key) = (&bucket, &key);
+            let (lock, meta) = (&lock, &meta);
+            engine
+                .with_dest_prefix_lock(bucket, &dest_key.prefix, || async {
+                    match engine.head(bucket, key).await {
+                        Ok(m) if m.file_size != expected_delta_size => return, // healed/changed under us
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                    let delta_bytes = match engine
+                        .get_delta_raw(bucket, &dest_key.prefix, &dest_key.filename)
+                        .await
+                    {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!("heal: could not read stripped dest delta {bucket}/{key}: {e}");
+                            return;
+                        }
+                    };
+                    match engine
+                        .put_delta_raw(
+                            lock,
+                            bucket,
+                            &dest_key.prefix,
+                            &dest_key.filename,
+                            crate::storage::PutBody::Bytes(Bytes::from(delta_bytes)),
+                            meta,
+                            // A re-stamp of a stored delta: no read says the
+                            // passthrough form is absent.
+                            &crate::deltaglider::CounterPrior::Unknown,
+                        )
+                        .await
+                    {
+                        Ok(_) => info!("heal: re-stamped stripped DG metadata on {bucket}/{key}"),
+                        Err(e) => {
+                            warn!(
+                                "heal: could not re-stamp stripped dest delta {bucket}/{key}: {e}"
+                            )
+                        }
+                    }
+                })
+                .await;
+        }
+        .boxed(),
+    )
+    .await;
 }
 
 /// Bounded-memory copy for large objects (Phase 4.1): stream the source
@@ -2654,6 +2679,103 @@ mod tests {
             read.err()
         );
         assert_eq!(read.unwrap().0, versioned_bytes(2, n));
+    }
+
+    /// D1: the stripped-delta heal is a counted commit: a cut caller keeps
+    /// the background count until the heal's re-PUT returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_heal_keeps_its_write_count_until_its_write_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let faulty = crate::storage::FaultyFs::new(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let faults = faulty.faults.clone();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
+        let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &Config::default(),
+            None,
+        ));
+        engine.create_bucket("dst").await.unwrap();
+        let n = 256 * 1024;
+        for (key, seed) in [("p/a.zip", 1u8), ("p/a2.zip", 2)] {
+            engine
+                .store(
+                    "dst",
+                    key,
+                    &versioned_bytes(seed, n),
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let head = engine.head("dst", "p/a2.zip").await.unwrap();
+        assert!(
+            matches!(head.storage_info, crate::types::StorageInfo::Delta { .. }),
+            "fixture must store a2.zip as a delta"
+        );
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let admitted =
+            crate::maintenance::gate::admit_stores(Some(&gate), &["dst"]).expect("admitted");
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hook_release = release.clone();
+        faults.hook(
+            crate::storage::FaultPoint::PutDelta,
+            "dst/p/a2.zip",
+            Arc::new(move || {
+                let r = hook_release.clone();
+                async move { r.notified().await }.boxed()
+            }),
+        );
+        let eng = engine.clone();
+        let size = head.file_size;
+        let task = tokio::spawn(async move {
+            let count = Arc::new(admitted.commit_count());
+            let request = ObjectTransferRequest {
+                source_bucket: "src",
+                source_key: "p/a2.zip",
+                destination_bucket: "dst",
+                destination_key: "p/a2.zip",
+                provenance: None,
+                strip_user_metadata_keys: &[],
+                operation: "replication",
+                upload_concurrency: None,
+                keep_created_at: false,
+                commit_count: Some(&count),
+            };
+            let lock = Arc::new(
+                eng.lock_object_write(request.destination_bucket, request.destination_key)
+                    .await,
+            );
+            heal_stripped_dest_delta(&eng, &lock, request, &head, size, None).await;
+        });
+        let started = std::time::Instant::now();
+        while faults.fired(crate::storage::FaultPoint::PutDelta, "dst/p/a2.zip") == 0 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the heal never reached its write"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            gate.inflight_background_writes("dst") > 0,
+            "the count ended while the heal write was still pending"
+        );
+        release.notify_one();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while gate.inflight_writes("dst") > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the count never ended"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Round-2 review: `ReplicationObjectCopied` reported the stored delta
