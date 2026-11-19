@@ -6,6 +6,7 @@
 
 - On an S3 backend, a LIST with a delimiter that occurs inside the suffix `.delta` (for example `.` or `l`) now groups common prefixes by the original key, as the filesystem backend does. Before, the proxy returned a prefix of the stored name (`d/y.` for the delta `d/y.delta`) and could hide an object such as `a/x.zip`. Such a LIST can cost more backend requests. With such a delimiter, a folder that holds only the proxy's own files is now hidden, as on the filesystem backend; with `/` it is still shown.
 - Windows XP style: the file details header keeps the layout of the other styles, and only its look changes. The Luna title bar holds the icon, the file name on one line and the close button; the full object key is under it. Before, a long file name broke out of the title bar, and the key was cut to one line.
+- A background copy of replication or lifecycle now holds its write count until its final write has returned. The final write is the store, the multipart complete, or the delta ship with its reference seed. It runs in its own task, so a copy that is cut (object timeout, killed run, lost lease, shutdown) can no longer end the count while that write can still land. Before, a maintenance job could read a drained bucket and start while such a write was still pending. A cut copy no longer aborts a multipart upload whose complete is already sent.
 
 ## v2.2.4 — 2026-11-18
 

@@ -131,9 +131,11 @@ pub(crate) async fn store_client_delta_copy(
     check_quota_for_write(state, copy.bucket, copy.key, size).await?;
     let engine = state.engine.load_full();
     let result = {
-        let guard = engine
-            .lock_and_check(copy.bucket, copy.key, copy.precondition)
-            .await?;
+        let guard = std::sync::Arc::new(
+            engine
+                .lock_and_check(copy.bucket, copy.key, copy.precondition)
+                .await?,
+        );
         crate::transfer::client_delta_copy(
             &engine,
             &guard,

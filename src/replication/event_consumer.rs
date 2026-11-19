@@ -3191,7 +3191,9 @@ storage:
     /// it runs, so an armed maintenance job defers (and the bucket answers
     /// 503) for its whole length. It is bounded by
     /// `replication.object_timeout` like a walk copy: a copy that never
-    /// ends is cut, its events are held for a retry, and the count ends.
+    /// ends is cut and its events are held for a retry. The stalled write
+    /// is the copy's commit, so its count ends when that write returns
+    /// (D1), not at the cut.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_event_copy_is_cut_at_the_object_timeout() {
         let mut f = fixture(false).await;
@@ -3208,13 +3210,20 @@ storage:
         .await
         .expect("a copy that never ends held the drain past its object timeout");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        assert_eq!(
-            gate.inflight_writes("dst"),
-            0,
-            "the count ended with the copy"
+        assert!(
+            gate.inflight_writes("dst") > 0,
+            "the count ended while the commit was still pending"
         );
         assert_eq!(f.cursor().await, 0, "the event is held for a retry");
         f.fake.release_stalls();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while gate.inflight_writes("dst") > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the count outlived the commit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// Mirror deletes work at level critical: an event DELETE is admitted as

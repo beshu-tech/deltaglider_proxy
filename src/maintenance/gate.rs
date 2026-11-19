@@ -506,10 +506,32 @@ impl MaintenanceGate {
 pub struct Admitted {
     buckets: Vec<String>,
     /// `None` per bucket without a gate (no maintenance job can exist).
-    _guards: Vec<Option<WriteGuard>>,
+    guards: Vec<Option<WriteGuard>>,
+}
+
+/// A second count of an admission's writes, for a commit that runs in its
+/// own task ([`Admitted::commit_count`]). It ends when the task drops it,
+/// whatever became of the admission.
+#[derive(Debug)]
+pub struct CommitCount {
+    _guards: Vec<WriteGuard>,
 }
 
 impl Admitted {
+    /// One more count of every bucket this admission counts. A commit that
+    /// must land after its caller is dropped holds it until the commit
+    /// returns, so a drain never reads 0 while that write is pending.
+    pub fn commit_count(&self) -> CommitCount {
+        CommitCount {
+            _guards: self
+                .guards
+                .iter()
+                .flatten()
+                .map(WriteGuard::another)
+                .collect(),
+        }
+    }
+
     /// Does this admission cover writes into `bucket`?
     /// Names compare trimmed and case-insensitive, as the rule's write
     /// buckets are built (`lifecycle::planner::rule_write_buckets` trims).
@@ -571,7 +593,7 @@ pub fn admit_buckets(
     }
     Ok(Admitted {
         buckets: buckets.iter().map(|(b, _)| b.to_string()).collect(),
-        _guards: guards,
+        guards,
     })
 }
 
@@ -623,6 +645,16 @@ pub struct WriteGuard {
 }
 
 impl WriteGuard {
+    /// A second count of the same bucket and kind, taken while this one
+    /// lives, so the total never dips between them.
+    fn another(&self) -> WriteGuard {
+        if self.background {
+            self.gate.begin_background_write(&self.bucket)
+        } else {
+            self.gate.begin_write(&self.bucket)
+        }
+    }
+
     /// The proof of a write into `bucket`, if this count covers it
     /// (case-insensitive). A writer that takes a [`DestWrite`] cannot run
     /// outside the count of its destination bucket.
