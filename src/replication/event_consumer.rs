@@ -1720,7 +1720,7 @@ async fn apply_copy(
                 operation: "replication-event",
                 upload_concurrency: None,
                 keep_created_at: true,
-                commit_count: None,
+                commit_count: &crate::maintenance::gate::BY_ADMISSION,
             };
             // The copy starts from the HEAD above: no second source HEAD.
             let outcome = crate::transfer::admitted::copy_known(
@@ -2605,7 +2605,10 @@ mod per_rule_cursor_tests {
         tick(&config, &db, &engine, &lease).await; // copies both
         let mut last = 0;
         for k in ["d1", "d2"] {
-            engine.delete("src", k).await.unwrap();
+            engine
+                .delete("src", k, crate::maintenance::gate::Counted::for_test())
+                .await
+                .unwrap();
             last = db
                 .lock()
                 .await
@@ -3176,7 +3179,7 @@ storage:
             .delete_batch(
                 "src",
                 vec![crate::deltaglider::DeleteItem::new("k.bin")],
-                Default::default(),
+                crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
             )
             .await;
         f.event(EventKind::ObjectDeleted, "k.bin").await;
@@ -3244,7 +3247,7 @@ storage:
             .delete_batch(
                 "src",
                 vec![crate::deltaglider::DeleteItem::new("k.bin")],
-                Default::default(),
+                crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
             )
             .await;
         f.event(EventKind::ObjectDeleted, "k.bin").await;
@@ -3353,7 +3356,7 @@ storage:
             .delete_batch(
                 "src",
                 vec![crate::deltaglider::DeleteItem::new("gone.bin")],
-                Default::default(),
+                crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
             )
             .await;
         last = last.max(f.event(EventKind::ObjectDeleted, "gone.bin").await);
@@ -3517,7 +3520,11 @@ storage:
             .map(|k| crate::deltaglider::DeleteItem::new(k.clone()))
             .collect();
         f.engine
-            .delete_batch("src", items, Default::default())
+            .delete_batch(
+                "src",
+                items,
+                crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
+            )
             .await;
         for k in &keys {
             f.event(EventKind::ObjectDeleted, k).await;
@@ -3564,7 +3571,9 @@ storage:
                 .delete_batch(
                     "src",
                     vec![crate::deltaglider::DeleteItem::new(k.to_string())],
-                    Default::default(),
+                    crate::deltaglider::DeleteHooks::new(
+                        crate::maintenance::gate::Counted::for_test(),
+                    ),
                 )
                 .await;
             f.event(EventKind::ObjectDeleted, k).await;

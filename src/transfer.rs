@@ -117,7 +117,7 @@ pub(crate) struct ObjectTransferRequest<'a> {
     /// The second write count of an admitted background copy
     /// ([`admitted`] sets it); `None` = a client copy or a maintenance job.
     /// Required in every literal: a commit point cannot skip the decision.
-    pub commit_count: Option<&'a Arc<crate::maintenance::gate::CommitCount>>,
+    pub commit_count: &'a crate::maintenance::gate::Counted,
 }
 
 /// How one object was physically moved source→dest. Surfaced to the
@@ -213,7 +213,7 @@ pub(crate) type CopyLock = Arc<crate::deltaglider::ObjectWriteGuard>;
 /// The engine's commit entry points take the [`CommitTicket`] that only this
 /// helper makes.
 pub(crate) async fn detached_commit<T, F>(
-    count: Option<Arc<crate::maintenance::gate::CommitCount>>,
+    count: crate::maintenance::gate::Counted,
     pin: Option<chrono::DateTime<chrono::Utc>>,
     commit: F,
 ) -> T
@@ -228,7 +228,7 @@ where
             None => commit.await,
         }
     };
-    let Some(count) = count else {
+    let crate::maintenance::gate::Counted::By(count) = count else {
         return pinned.await;
     };
     let task = tokio::spawn(async move {
@@ -268,7 +268,7 @@ impl CommitTicket {
 
 pub(crate) mod admitted {
     use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome, DynEngine};
-    use crate::maintenance::gate::Admitted;
+    use crate::maintenance::gate::{Admitted, Counted};
     use crate::transfer::{CopyError, ObjectTransferOutcome, ObjectTransferRequest};
     use std::sync::Arc;
 
@@ -315,9 +315,9 @@ pub(crate) mod admitted {
         destination_prior: Option<&crate::deltaglider::CounterPrior>,
     ) -> Result<ObjectTransferOutcome, CopyError> {
         check(proof, request.destination_bucket);
-        let count = Arc::new(proof.commit_count());
+        let count = Counted::By(Arc::new(proof.commit_count()));
         let request = ObjectTransferRequest {
-            commit_count: Some(&count),
+            commit_count: &count,
             ..request
         };
         bounded(
@@ -335,9 +335,9 @@ pub(crate) mod admitted {
         source: Option<&crate::types::FileMetadata>,
     ) -> Result<ObjectTransferOutcome, CopyError> {
         check(proof, request.destination_bucket);
-        let count = Arc::new(proof.commit_count());
+        let count = Counted::By(Arc::new(proof.commit_count()));
         let request = ObjectTransferRequest {
-            commit_count: Some(&count),
+            commit_count: &count,
             ..request
         };
         bounded(
@@ -354,9 +354,9 @@ pub(crate) mod admitted {
         request: ObjectTransferRequest<'_>,
     ) -> Result<ObjectTransferOutcome, CopyError> {
         check(proof, request.destination_bucket);
-        let count = Arc::new(proof.commit_count());
+        let count = Counted::By(Arc::new(proof.commit_count()));
         let request = ObjectTransferRequest {
-            commit_count: Some(&count),
+            commit_count: &count,
             ..request
         };
         bounded(
@@ -370,13 +370,12 @@ pub(crate) mod admitted {
         proof: &Admitted,
         engine: &DynEngine,
         bucket: &str,
-        items: Vec<DeleteItem<'_>>,
+        items: Vec<DeleteItem>,
         hooks: DeleteHooks<'_>,
     ) -> Vec<DeleteOutcome> {
         check(proof, bucket);
-        let count = Arc::new(proof.commit_count());
         let hooks = DeleteHooks {
-            count: Some(&count),
+            counted: Counted::By(Arc::new(proof.commit_count())),
             ..hooks
         };
         engine.delete_batch(bucket, items, hooks).await
@@ -686,7 +685,7 @@ async fn copy_object_once(
         );
         let etag = meta.multipart_etag.clone();
         detached_commit(
-            request.commit_count.cloned(),
+            request.commit_count.clone(),
             pin_of(&request, source_head),
             move |ticket| {
                 async move {
@@ -902,7 +901,7 @@ async fn stream_copy_passthrough(
     let finished = {
         let (engine, lock, handle) = (engine.clone(), lock.clone(), handle.clone());
         detached_commit(
-            request.commit_count.cloned(),
+            request.commit_count.clone(),
             pin_of(&request, source_head),
             move |ticket| {
                 async move {
@@ -1720,7 +1719,7 @@ async fn server_side_copy(
         );
         let head = source_head.clone();
         detached_commit(
-            request.commit_count.cloned(),
+            request.commit_count.clone(),
             pin_of(&request, source_head),
             move |ticket| {
                 async move {
@@ -1779,7 +1778,7 @@ pub(crate) async fn client_delta_copy(
     source_head: &crate::types::FileMetadata,
     content_type: Option<String>,
     mut user_metadata: std::collections::HashMap<String, String>,
-    commit_count: Option<&Arc<crate::maintenance::gate::CommitCount>>,
+    commit_count: &crate::maintenance::gate::Counted,
 ) -> Result<Option<crate::types::StoreResult>, CopyError> {
     strip_rule_provenance(&mut user_metadata);
     let request = ObjectTransferRequest {
@@ -1969,7 +1968,7 @@ async fn delta_passthrough_copy(
     // the commit, so a caller cut still cancels the reads; a pre-lock gate on
     // the destination reference says whether the seed bytes are needed. An
     // inline commit (no count) reads inside it, after the locked gate.
-    let pre_read = if read_ahead && request.commit_count.is_some() {
+    let pre_read = if read_ahead && request.commit_count.reads_ahead() {
         let pre_ref = match engine
             .reference_meta(request.destination_bucket, &dest_prefix)
             .await
@@ -2013,7 +2012,7 @@ async fn delta_passthrough_copy(
     let ship_prefix = dest_prefix.clone();
     let pin = pin_of(&request, source_head);
     let shipped: Result<Option<u64>, CopyError> =
-        detached_commit(request.commit_count.cloned(), pin, move |ticket| {
+        detached_commit(request.commit_count.clone(), pin, move |ticket| {
             async move {
                 let ticket = &ticket;
                 let lock = &ship_lock;
@@ -2186,7 +2185,7 @@ async fn heal_stripped_dest_delta(
     // Re-assert the stripped signature INSIDE the lock: if the object changed since
     // the pre-check, another writer already re-stamped it — nothing to heal.
     // A commit point: it runs counted and detached, like the copy's other writes.
-    detached_commit(request.commit_count.cloned(), pin, move |ticket| {
+    detached_commit(request.commit_count.clone(), pin, move |ticket| {
         async move {
             let ticket = &ticket;
             let (bucket, key) = (&bucket, &key);
@@ -2346,7 +2345,7 @@ async fn spooled_copy(
         );
         let etag = meta.multipart_etag.clone();
         detached_commit(
-            request.commit_count.cloned(),
+            request.commit_count.clone(),
             pin_of(request, source_head),
             move |ticket| {
                 async move {
@@ -2469,7 +2468,7 @@ mod tests {
             operation: "replication",
             upload_concurrency: None,
             keep_created_at: true,
-            commit_count: None,
+            commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
         };
 
         let outcome = copy_object_with_retries(&engine, request).await.unwrap();
@@ -2510,7 +2509,7 @@ mod tests {
             operation: "replication",
             upload_concurrency: None,
             keep_created_at: false,
-            commit_count: None,
+            commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
         };
         let lock = Arc::new(
             engine
@@ -2658,7 +2657,7 @@ mod tests {
             operation: "replication",
             upload_concurrency: None,
             keep_created_at: false,
-            commit_count: None,
+            commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
         };
         let lock = Arc::new(
             engine
@@ -2784,7 +2783,7 @@ mod tests {
             operation: "replication",
             upload_concurrency: None,
             keep_created_at: false,
-            commit_count: None,
+            commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
         };
         let _ = delta_passthrough_copy(
             &engine,
@@ -2872,7 +2871,7 @@ mod tests {
         let eng = engine.clone();
         let size = head.file_size;
         let task = tokio::spawn(async move {
-            let count = Arc::new(admitted.commit_count());
+            let count = crate::maintenance::gate::Counted::By(Arc::new(admitted.commit_count()));
             let request = ObjectTransferRequest {
                 source_bucket: "src",
                 source_key: "p/a2.zip",
@@ -2883,7 +2882,7 @@ mod tests {
                 operation: "replication",
                 upload_concurrency: None,
                 keep_created_at: false,
-                commit_count: Some(&count),
+                commit_count: &count,
             };
             let lock = Arc::new(
                 eng.lock_object_write(request.destination_bucket, request.destination_key)
@@ -2965,7 +2964,7 @@ mod tests {
             crate::maintenance::gate::admit_stores(Some(&gate), &["dst"]).expect("admitted");
         let eng = engine.clone();
         let copy = async move {
-            let count = Arc::new(admitted.commit_count());
+            let count = crate::maintenance::gate::Counted::By(Arc::new(admitted.commit_count()));
             let request = ObjectTransferRequest {
                 source_bucket: "src",
                 source_key: "p/b.zip",
@@ -2976,7 +2975,7 @@ mod tests {
                 operation: "replication",
                 upload_concurrency: None,
                 keep_created_at: false,
-                commit_count: Some(&count),
+                commit_count: &count,
             };
             let lock = Arc::new(
                 eng.lock_object_write(request.destination_bucket, request.destination_key)
@@ -4039,7 +4038,7 @@ mod multipart_abort_tests {
             operation: "test",
             upload_concurrency: Some(2),
             keep_created_at: false,
-            commit_count: None,
+            commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
         }
     }
 
@@ -4187,9 +4186,9 @@ mod multipart_abort_tests {
         let admitted =
             crate::maintenance::gate::admit_stores(Some(&gate), &["dstb"]).expect("admitted");
         let task = tokio::spawn(async move {
-            let count = Arc::new(admitted.commit_count());
+            let count = crate::maintenance::gate::Counted::By(Arc::new(admitted.commit_count()));
             let req = ObjectTransferRequest {
-                commit_count: Some(&count),
+                commit_count: &count,
                 ..copy_request()
             };
             let lock = Arc::new(
@@ -4257,11 +4256,11 @@ mod multipart_abort_tests {
         let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
         let admitted =
             crate::maintenance::gate::admit_stores(Some(&gate), &["dstb"]).expect("admitted");
-        let count = Arc::new(admitted.commit_count());
+        let count = crate::maintenance::gate::Counted::By(Arc::new(admitted.commit_count()));
         drop(admitted);
         let task = tokio::spawn(async move {
             let req = ObjectTransferRequest {
-                commit_count: Some(&count),
+                commit_count: &count,
                 ..copy_request()
             };
             let lock = Arc::new(
@@ -4356,7 +4355,7 @@ mod request_count_tests {
             operation: "replication",
             upload_concurrency: None,
             keep_created_at: true,
-            commit_count: None,
+            commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
         }
     }
 
@@ -4716,7 +4715,7 @@ mod counted_delete_tests {
     use super::*;
     use crate::config::Config;
     use crate::deltaglider::{DeleteItem, DeltaGliderEngine};
-    use crate::storage::DynStorageBackend;
+    use crate::storage::{DynStorageBackend, StorageBackend};
     use futures::FutureExt;
     use std::time::Duration;
 
@@ -4760,7 +4759,7 @@ mod counted_delete_tests {
                 &engine,
                 "dst",
                 vec![DeleteItem::new("p/k.jpg")],
-                Default::default(),
+                crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
             ),
         )
         .await;
@@ -4792,5 +4791,205 @@ mod counted_delete_tests {
             .unwrap()
             .expect("drained");
         assert!(engine.head("dst", "p/k.jpg").await.is_err(), "deleted");
+    }
+
+    async fn faulty_engine(dir: &std::path::Path) -> (Arc<DynEngine>, crate::storage::Faults) {
+        let faulty = crate::storage::FaultyFs::new(
+            crate::storage::FilesystemBackend::new(dir.to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let faults = faulty.faults.clone();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
+        let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &Config::default(),
+            None,
+        ));
+        engine.create_bucket("dst").await.unwrap();
+        (engine, faults)
+    }
+
+    fn hold(
+        faults: &crate::storage::Faults,
+        point: crate::storage::FaultPoint,
+        key: &str,
+    ) -> Arc<tokio::sync::Notify> {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hook_release = release.clone();
+        faults.hook(
+            point,
+            key,
+            Arc::new(move || {
+                let r = hook_release.clone();
+                async move { r.notified().await }.boxed()
+            }),
+        );
+        release
+    }
+
+    async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if ready() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// D1 (6c): a client DELETE is one unit. Its request is dropped while the
+    /// backend DELETE is held: the object lock stays held (a PUT of the key
+    /// waits, and survives), the count stays, and the counters and the
+    /// metadata cache are updated when the DELETE returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_client_delete_holds_its_lock_and_count_and_finishes_its_bookkeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, faults) = faulty_engine(dir.path()).await;
+        engine
+            .store("dst", "p/k.jpg", &[7u8; 64], None, Default::default())
+            .await
+            .unwrap();
+        // Warm the metadata cache: a delete that skips its invalidation
+        // leaves this entry to answer the HEAD below.
+        engine.head("dst", "p/k.jpg").await.unwrap();
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let write = gate.begin_write("dst");
+        let counted = crate::maintenance::gate::Counted::By(Arc::new(write.commit_count()));
+        let release = hold(
+            &faults,
+            crate::storage::FaultPoint::DeletePassthrough,
+            "dst/p/k.jpg",
+        );
+        let deleting = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.delete("dst", "p/k.jpg", counted).await })
+        };
+        until("the DELETE to reach the backend", || {
+            faults.fired(crate::storage::FaultPoint::DeletePassthrough, "dst/p/k.jpg") > 0
+        })
+        .await;
+        // The request is dropped (its own count ends too).
+        deleting.abort();
+        let _ = deleting.await;
+        drop(write);
+        assert!(gate.inflight_writes("dst") > 0, "the count ended early");
+        // A client PUT of the same key waits for the object lock.
+        let put = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .store("dst", "p/k.jpg", &[9u8; 64], None, Default::default())
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !put.is_finished(),
+            "the PUT passed the delete's object lock"
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), put)
+            .await
+            .expect("the PUT runs once the DELETE returned")
+            .unwrap()
+            .unwrap();
+        until("the count to end", || gate.inflight_writes("dst") == 0).await;
+        let kept = engine.retrieve("dst", "p/k.jpg").await.unwrap();
+        assert_eq!(kept.0, vec![9u8; 64], "the DELETE removed the newer PUT");
+    }
+
+    /// The bookkeeping of a delete whose caller is dropped still runs: the
+    /// metadata cache forgets the object.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_client_delete_still_invalidates_the_metadata_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, faults) = faulty_engine(dir.path()).await;
+        engine
+            .store("dst", "p/k.jpg", &[7u8; 64], None, Default::default())
+            .await
+            .unwrap();
+        engine.head("dst", "p/k.jpg").await.unwrap();
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let counted =
+            crate::maintenance::gate::Counted::By(Arc::new(gate.begin_write("dst").commit_count()));
+        let release = hold(
+            &faults,
+            crate::storage::FaultPoint::DeletePassthrough,
+            "dst/p/k.jpg",
+        );
+        let deleting = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.delete("dst", "p/k.jpg", counted).await })
+        };
+        until("the DELETE to reach the backend", || {
+            faults.fired(crate::storage::FaultPoint::DeletePassthrough, "dst/p/k.jpg") > 0
+        })
+        .await;
+        deleting.abort();
+        let _ = deleting.await;
+        release.notify_one();
+        until("the count to end", || gate.inflight_writes("dst") == 0).await;
+        assert!(
+            engine.head("dst", "p/k.jpg").await.is_err(),
+            "the cache still serves a deleted object"
+        );
+    }
+
+    /// D1 (6c): the reference.bin reclaim of a batch is part of the unit: a
+    /// dropped batch whose reclaim DELETE is held keeps the count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_batch_keeps_its_count_until_its_reclaim_delete_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, faults) = faulty_engine(dir.path()).await;
+        let base: Vec<u8> = (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let mut other = base.clone();
+        other[100] ^= 0xff;
+        engine
+            .store("dst", "p/v1.zip", &base, None, Default::default())
+            .await
+            .unwrap();
+        engine
+            .store("dst", "p/v2.zip", &other, None, Default::default())
+            .await
+            .unwrap();
+        assert!(engine.storage().has_reference("dst", "p").await.unwrap());
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let admitted =
+            crate::maintenance::gate::admit_all(Some(&gate), &["dst"]).expect("admitted");
+        let release = hold(
+            &faults,
+            crate::storage::FaultPoint::DeleteReference,
+            "dst/p/",
+        );
+        let cut = tokio::time::timeout(
+            Duration::from_millis(1500),
+            admitted::delete_batch(
+                &admitted,
+                &engine,
+                "dst",
+                vec![DeleteItem::new("p/v1.zip"), DeleteItem::new("p/v2.zip")],
+                crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
+            ),
+        )
+        .await;
+        assert!(cut.is_err(), "the reclaim must still wait");
+        assert!(
+            faults.fired(crate::storage::FaultPoint::DeleteReference, "dst/p/") > 0,
+            "the reclaim never reached its DELETE"
+        );
+        drop(admitted);
+        assert!(
+            gate.inflight_background_writes("dst") > 0,
+            "the count ended while the reclaim DELETE was pending"
+        );
+        release.notify_one();
+        until("the count to end", || {
+            gate.inflight_background_writes("dst") == 0
+        })
+        .await;
+        assert!(!engine.storage().has_reference("dst", "p").await.unwrap());
     }
 }

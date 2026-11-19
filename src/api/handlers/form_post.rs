@@ -1227,7 +1227,7 @@ where
             user_metadata: head.user_metadata.clone(),
             precondition: &precondition,
             early_quota: Some(early_quota),
-            commit: None,
+            commit: crate::maintenance::gate::request_counted(extensions),
         },
     )
     .await?;

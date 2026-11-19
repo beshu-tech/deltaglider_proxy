@@ -75,7 +75,7 @@ pub(crate) struct ClientWrite<'a> {
     /// The request's write count: the store runs in its own task that holds
     /// it, so a dropped request never ends the count before the write
     /// returns. `None`: no count (form POST).
-    pub commit: Option<Arc<crate::maintenance::gate::CommitCount>>,
+    pub commit: crate::maintenance::gate::Counted,
 }
 
 /// THE client write of a whole body: the quota gate on the body's exact
@@ -128,7 +128,7 @@ pub(crate) struct ClientStoredCopy<'a> {
     pub user_metadata: std::collections::HashMap<String, String>,
     pub precondition: &'a crate::deltaglider::Precondition,
     /// The request's write count (see [`ClientWrite::commit`]).
-    pub commit: Option<Arc<crate::maintenance::gate::CommitCount>>,
+    pub commit: crate::maintenance::gate::Counted,
 }
 
 /// [`store_client_write`] of a CopyObject whose source is a delta: the
@@ -160,7 +160,7 @@ pub(crate) async fn store_client_delta_copy(
             copy.source_head,
             copy.content_type,
             copy.user_metadata,
-            copy.commit.as_ref(),
+            &copy.commit,
         )
         .await
         .map_err(crate::transfer::CopyError::into_s3_error)?
@@ -762,7 +762,7 @@ mod write_path_tests {
                 user_metadata: Default::default(),
                 precondition: &crate::deltaglider::Precondition::none(),
                 early_quota: None,
-                commit: None,
+                commit: crate::maintenance::gate::Counted::for_test(),
             },
         )
         .await

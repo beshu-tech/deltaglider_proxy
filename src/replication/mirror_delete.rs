@@ -240,13 +240,22 @@ pub(crate) async fn delete_mirrored(
         }
         Ok(proof) => Some(proof),
     };
-    let batch: Vec<DeleteItem<'_>> = to_delete
+    let batch: Vec<DeleteItem> = to_delete
         .iter()
         .map(|&i| DeleteItem::new(items[i].dest_key.clone()))
         .collect();
     let deleted = match &proof {
         Some(proof) => {
-            admitted::delete_batch(proof, engine, dst_bucket, batch, Default::default()).await
+            admitted::delete_batch(
+                proof,
+                engine,
+                dst_bucket,
+                batch,
+                crate::deltaglider::DeleteHooks::new(
+                    crate::maintenance::gate::BY_ADMISSION.clone(),
+                ),
+            )
+            .await
         }
         None => Vec::new(),
     };

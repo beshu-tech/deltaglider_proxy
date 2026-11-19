@@ -515,7 +515,11 @@ async fn a_failure_over_a_flipped_config_unwinds_nothing() {
     e.state
         .engine
         .load()
-        .delete("t", "run/k-001.txt")
+        .delete(
+            "t",
+            "run/k-001.txt",
+            crate::maintenance::gate::Counted::for_test(),
+        )
         .await
         .unwrap();
     let result = e.phases().await;

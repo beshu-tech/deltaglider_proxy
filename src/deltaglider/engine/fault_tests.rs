@@ -72,8 +72,22 @@ async fn reclaim_keeps_the_reference_of_an_unreadable_delta() {
     assert!(a.exists(), "fixture: a.zip is a delta at {a:?}");
     let saved = xattr::get(&a, crate::storage::xattr_meta::XATTR_NAME).unwrap();
     xattr::set(&a, crate::storage::xattr_meta::XATTR_NAME, b"not json {{{").unwrap();
-    engine.delete("b", "rel/b.zip").await.unwrap();
-    engine.delete("b", "rel/c.zip").await.unwrap();
+    engine
+        .delete(
+            "b",
+            "rel/b.zip",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await
+        .unwrap();
+    engine
+        .delete(
+            "b",
+            "rel/c.zip",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await
+        .unwrap();
     assert!(
         engine.storage().has_reference("b", "rel").await.unwrap(),
         "reference.bin was deleted under an unreadable delta"
@@ -106,7 +120,13 @@ async fn an_io_error_on_metadata_is_not_an_absent_object() {
         !matches!(head, Err(EngineError::NotFound(_))),
         "HEAD read an I/O error as an absent object: {head:?}"
     );
-    let del = engine.delete("b", "v/app-2.zip").await;
+    let del = engine
+        .delete(
+            "b",
+            "v/app-2.zip",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await;
     assert!(
         !matches!(del, Ok(_) | Err(EngineError::NotFound(_))),
         "DELETE read an I/O error as an absent object: {del:?}"
@@ -194,7 +214,15 @@ async fn a_conditional_delete_keeps_a_sibling_written_after_its_check() {
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(peer()));
         true
     };
-    let out = engine.delete_if("b", "p/k.zip", &still_ours).await.unwrap();
+    let out = engine
+        .delete_if(
+            "b",
+            "p/k.zip",
+            still_ours,
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await
+        .unwrap();
     assert!(matches!(out, ConditionalDelete::Deleted(_)), "{out:?}");
     engine.metadata_cache.invalidate("b", "p/k.zip");
     let read = engine.retrieve("b", "p/k.zip").await;
@@ -216,7 +244,15 @@ async fn a_conditional_delete_stops_when_its_sibling_changes() {
         "b/p/k.zip",
         peer_write(dir.path(), b"peer-bytes"),
     );
-    let out = engine.delete_if("b", "p/k.zip", &|_| true).await.unwrap();
+    let out = engine
+        .delete_if(
+            "b",
+            "p/k.zip",
+            |_: &FileMetadata| true,
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await
+        .unwrap();
     assert_eq!(faults.fired(FaultPoint::DeleteVariantIf, "b/p/k.zip"), 1);
     assert!(matches!(out, ConditionalDelete::Changed), "{out:?}");
     engine.metadata_cache.invalidate("b", "p/k.zip");
@@ -235,7 +271,13 @@ async fn a_conditional_delete_stops_when_its_sibling_changes() {
 async fn a_failed_sibling_cleanup_fails_the_delete() {
     let (_dir, engine, faults, v2) = object_with_a_stale_sibling().await;
     faults.arm(FaultPoint::DeletePassthrough, "b/p/k.zip", Fault::Throttled);
-    let del = engine.delete("b", "p/k.zip").await;
+    let del = engine
+        .delete(
+            "b",
+            "p/k.zip",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await;
     faults.disarm_all();
     assert_eq!(
         faults.fired(FaultPoint::DeletePassthrough, "b/p/k.zip"),
@@ -266,13 +308,26 @@ async fn a_failed_sibling_cleanup_fails_the_delete() {
 async fn a_failed_delete_of_the_newest_variant_keeps_the_object() {
     let (_dir, engine, faults, v2) = object_with_a_stale_sibling().await;
     faults.arm(FaultPoint::DeleteDelta, "b/p/k.zip", Fault::Io);
-    let del = engine.delete("b", "p/k.zip").await;
+    let del = engine
+        .delete(
+            "b",
+            "p/k.zip",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await;
     faults.disarm_all();
     assert_eq!(faults.fired(FaultPoint::DeleteDelta, "b/p/k.zip"), 1);
     assert!(del.is_err(), "DELETE answered success: {del:?}");
     engine.metadata_cache.invalidate("b", "p/k.zip");
     assert!(engine.retrieve("b", "p/k.zip").await.unwrap().0 == v2);
-    engine.delete("b", "p/k.zip").await.unwrap();
+    engine
+        .delete(
+            "b",
+            "p/k.zip",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await
+        .unwrap();
     engine.metadata_cache.invalidate("b", "p/k.zip");
     assert!(matches!(
         engine.retrieve("b", "p/k.zip").await,
@@ -347,7 +402,14 @@ async fn an_unreadable_deltaspace_dir_keeps_its_reference() {
             .unwrap();
     }
     let fault = fail_io(&dir.path().join("b/deltaspaces/rel"), libc::EIO);
-    engine.delete("b", "rel/a.zip").await.unwrap();
+    engine
+        .delete(
+            "b",
+            "rel/a.zip",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await
+        .unwrap();
     assert!(fault.fired() > 0);
     drop(fault);
     assert!(engine.storage().has_reference("b", "rel").await.unwrap());
@@ -362,7 +424,13 @@ async fn an_unreadable_deltaspace_dir_keeps_its_reference() {
 async fn a_sibling_disk_error_does_not_pass_for_deleted() {
     let (dir, engine, _faults, v2) = object_with_a_stale_sibling().await;
     let fault = fail_io(&dir.path().join("b/deltaspaces/p/k.zip"), libc::EIO);
-    let del = engine.delete("b", "p/k.zip").await;
+    let del = engine
+        .delete(
+            "b",
+            "p/k.zip",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await;
     assert!(fault.fired() > 0);
     drop(fault);
     assert!(del.is_err(), "DELETE answered success: {del:?}");
@@ -445,7 +513,10 @@ async fn delete_bucket_reclaims_an_orphan_reference() {
         engine.storage().has_reference("b", "rel").await.unwrap(),
         "fixture: the folder keeps its reference.bin alone"
     );
-    engine.delete_bucket("b").await.unwrap();
+    engine
+        .delete_bucket("b", &crate::maintenance::gate::Counted::for_test())
+        .await
+        .unwrap();
     assert!(
         !dir.path().join("b").exists(),
         "the bucket is still on disk"
@@ -475,7 +546,10 @@ async fn delete_bucket_keeps_the_reference_of_a_put_in_flight() {
         Arc::new(move || {
             let (e, tx) = (e.clone(), tx.clone());
             Box::pin(async move {
-                let task = tokio::spawn(async move { e.delete_bucket("b").await });
+                let task = tokio::spawn(async move {
+                    e.delete_bucket("b", &crate::maintenance::gate::Counted::for_test())
+                        .await
+                });
                 // Room for a DeleteBucket that does not wait for the lock
                 // to finish before the PUT writes its delta.
                 tokio::time::sleep(Duration::from_millis(300)).await;

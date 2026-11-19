@@ -8,6 +8,7 @@
 //! `src/lib.rs` refuses it).
 
 use super::*;
+use crate::maintenance::gate::Counted;
 use crate::storage::ObjectVariant;
 use futures::FutureExt;
 
@@ -18,18 +19,19 @@ pub const BULK_DELETE_CONCURRENCY: usize = 8;
 
 /// The condition of a [`DeleteItem`]: `true` while the stored object is
 /// still the one the caller means to delete.
-pub type StillOurs<'a> = dyn Fn(&FileMetadata) -> bool + Send + Sync + 'a;
+/// `'static`: the check runs inside the delete's own task.
+pub type StillOurs = dyn Fn(&FileMetadata) -> bool + Send + Sync;
 
 /// One key of a [`DeltaGliderEngine::delete_batch`].
-pub struct DeleteItem<'a> {
+pub struct DeleteItem {
     /// The object key, as a client names it.
     pub key: String,
     /// `Some`: delete the object only while this check accepts it, as read
     /// under the object's write lock (see [`DeltaGliderEngine::delete_if`]).
-    pub still_ours: Option<Box<StillOurs<'a>>>,
+    pub still_ours: Option<Arc<StillOurs>>,
 }
 
-impl<'a> DeleteItem<'a> {
+impl DeleteItem {
     /// Delete `key` whatever it holds.
     pub fn new(key: impl Into<String>) -> Self {
         Self {
@@ -42,11 +44,11 @@ impl<'a> DeleteItem<'a> {
     /// (a lifecycle rule's snapshot, the source of a move).
     pub fn only_if(
         key: impl Into<String>,
-        still_ours: impl Fn(&FileMetadata) -> bool + Send + Sync + 'a,
+        still_ours: impl Fn(&FileMetadata) -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {
             key: key.into(),
-            still_ours: Some(Box::new(still_ours)),
+            still_ours: Some(Arc::new(still_ours)),
         }
     }
 }
@@ -84,8 +86,9 @@ pub enum DeleteOutcome {
 pub type OnDeleteOutcome<'a> =
     dyn Fn(&str, &DeleteOutcome) -> futures::future::BoxFuture<'static, ()> + Send + Sync + 'a;
 
-/// Optional hooks of a [`DeltaGliderEngine::delete_batch`].
-#[derive(Default, Clone, Copy)]
+/// Hooks of a [`DeltaGliderEngine::delete_batch`]. There is no `Default`:
+/// the caller says which count its deletes hold.
+#[derive(Clone)]
 pub struct DeleteHooks<'a> {
     /// Asked before each key and before each folder's reclaim. `false`:
     /// the key is [`DeleteOutcome::Skipped`] and the folder keeps its
@@ -96,13 +99,23 @@ pub struct DeleteHooks<'a> {
     /// cut part-way has then published every key it deleted). Every key
     /// gets one call, in no particular order across folders.
     pub on_outcome: Option<&'a OnDeleteOutcome<'a>>,
-    /// A count of the caller's write: each backend DELETE runs in its own
-    /// task that holds it until the DELETE returns (a dropped caller never
-    /// ends the count while the DELETE can still land).
-    pub count: Option<&'a Arc<crate::maintenance::gate::CommitCount>>,
+    /// The caller's write count: each key's whole delete (locks, backend
+    /// DELETE, counters, cache) and each folder's reference reclaim run in
+    /// their own task that holds it to the end, so a dropped caller never
+    /// ends the count, or frees a lock, while a DELETE can still land.
+    pub counted: crate::maintenance::gate::Counted,
 }
 
-impl DeleteHooks<'_> {
+impl<'a> DeleteHooks<'a> {
+    /// No stop hook, no per-key hook.
+    pub fn new(counted: crate::maintenance::gate::Counted) -> Self {
+        Self {
+            proceed: None,
+            on_outcome: None,
+            counted,
+        }
+    }
+
     fn proceeds(&self) -> bool {
         self.proceed.is_none_or(|proceed| proceed())
     }
@@ -147,70 +160,6 @@ async fn delete_variant_on<S: StorageBackend>(
 }
 
 impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
-    /// Run one backend DELETE as a commit: with a `count` it runs in its own
-    /// task that holds the count until the DELETE returns, so a dropped
-    /// caller never ends the count while the DELETE can still land.
-    async fn counted_delete<T: Send + 'static>(
-        &self,
-        count: Option<&Arc<crate::maintenance::gate::CommitCount>>,
-        op: impl FnOnce(crate::transfer::CommitTicket, Arc<S>) -> futures::future::BoxFuture<'static, T>,
-    ) -> T {
-        let storage = self.storage.clone();
-        crate::transfer::detached_commit(count.cloned(), None, move |ticket| op(ticket, storage))
-            .await
-    }
-
-    /// Delete one stored variant of `filename`, unconditionally.
-    async fn delete_variant(
-        &self,
-        count: Option<&Arc<crate::maintenance::gate::CommitCount>>,
-        bucket: &str,
-        deltaspace_id: &str,
-        filename: &str,
-        variant: ObjectVariant,
-    ) -> Result<(), StorageError> {
-        let (bucket, prefix, filename) = (
-            bucket.to_string(),
-            deltaspace_id.to_string(),
-            filename.to_string(),
-        );
-        self.counted_delete(count, move |ticket, storage| {
-            async move {
-                delete_variant_on(&*storage, &ticket, &bucket, &prefix, &filename, variant).await
-            }
-            .boxed()
-        })
-        .await
-    }
-
-    /// [`StorageBackend::delete_variant_if`] as a commit (see
-    /// [`Self::counted_delete`]).
-    async fn delete_variant_if(
-        &self,
-        count: Option<&Arc<crate::maintenance::gate::CommitCount>>,
-        bucket: &str,
-        deltaspace_id: &str,
-        filename: &str,
-        variant: ObjectVariant,
-        version: &str,
-    ) -> Result<bool, StorageError> {
-        let (bucket, prefix, filename, version) = (
-            bucket.to_string(),
-            deltaspace_id.to_string(),
-            filename.to_string(),
-            version.to_string(),
-        );
-        self.counted_delete(count, move |_ticket, storage| {
-            async move {
-                storage
-                    .delete_variant_if(&bucket, &prefix, &filename, variant, &version)
-                    .await
-            }
-            .boxed()
-        })
-        .await
-    }
-
     /// Delete the sibling storage variant (the one NOT matched by
     /// resolve_metadata) so a stale passthrough/delta pair can't resurrect a
     /// deleted key. NotFound (the normal case: only one variant exists) is
@@ -218,15 +167,21 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
     /// (a retry finds the sibling and deletes it).
     async fn delete_sibling_variant(
         &self,
-        count: Option<&Arc<crate::maintenance::gate::CommitCount>>,
+        ticket: &crate::transfer::CommitTicket,
         bucket: &str,
         deltaspace_id: &str,
         filename: &str,
         sibling: ObjectVariant,
     ) -> Result<(), StorageError> {
-        match self
-            .delete_variant(count, bucket, deltaspace_id, filename, sibling)
-            .await
+        match delete_variant_on(
+            &*self.storage,
+            ticket,
+            bucket,
+            deltaspace_id,
+            filename,
+            sibling,
+        )
+        .await
         {
             Ok(()) | Err(StorageError::NotFound(_)) => Ok(()),
             Err(e) => {
@@ -244,8 +199,13 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
     /// object (the folder is still checked). For more than one key use
     /// [`Self::delete_batch`].
     #[instrument(skip(self))]
-    pub async fn delete(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
-        match self.delete_one(bucket, DeleteItem::new(key)).await {
+    pub async fn delete(
+        &self,
+        bucket: &str,
+        key: &str,
+        counted: Counted,
+    ) -> Result<FileMetadata, EngineError> {
+        match self.delete_one(bucket, DeleteItem::new(key), counted).await {
             DeleteOutcome::Deleted(meta) => Ok(*meta),
             DeleteOutcome::Failed(e) => Err(e),
             // NotFound (Changed and Skipped need a condition or a hook).
@@ -262,16 +222,17 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
     /// check saw; elsewhere (filesystem, a backend answering 501) the
     /// in-process lock is the only guard. For more than one key use
     /// [`Self::delete_batch`] with [`DeleteItem::only_if`].
-    #[instrument(skip(self, still_ours))]
+    #[instrument(skip(self, still_ours, counted))]
     pub async fn delete_if(
         &self,
         bucket: &str,
         key: &str,
-        still_ours: &(dyn Fn(&FileMetadata) -> bool + Send + Sync),
+        still_ours: impl Fn(&FileMetadata) -> bool + Send + Sync + 'static,
+        counted: Counted,
     ) -> Result<ConditionalDelete, EngineError> {
         Ok(
             match self
-                .delete_one(bucket, DeleteItem::only_if(key, still_ours))
+                .delete_one(bucket, DeleteItem::only_if(key, still_ours), counted)
                 .await
             {
                 DeleteOutcome::Deleted(meta) => ConditionalDelete::Deleted(meta),
@@ -283,9 +244,9 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
     }
 
     /// One key through [`Self::delete_batch`].
-    async fn delete_one(&self, bucket: &str, item: DeleteItem<'_>) -> DeleteOutcome {
+    async fn delete_one(&self, bucket: &str, item: DeleteItem, counted: Counted) -> DeleteOutcome {
         let mut outcomes = self
-            .delete_batch(bucket, vec![item], DeleteHooks::default())
+            .delete_batch(bucket, vec![item], DeleteHooks::new(counted))
             .await;
         // One outcome per item.
         outcomes.pop().unwrap_or(DeleteOutcome::Skipped)
@@ -320,7 +281,7 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
     pub async fn delete_batch(
         &self,
         bucket: &str,
-        items: Vec<DeleteItem<'_>>,
+        items: Vec<DeleteItem>,
         hooks: DeleteHooks<'_>,
     ) -> Vec<DeleteOutcome> {
         use futures::StreamExt;
@@ -340,7 +301,7 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         let items = &items;
         let done: Vec<Vec<(usize, DeleteOutcome)>> = futures::stream::iter(folders)
             .map(|(deltaspace_id, indexes)| {
-                self.delete_folder_items(bucket, deltaspace_id, indexes, items, hooks)
+                self.delete_folder_items(bucket, deltaspace_id, indexes, items, &hooks)
             })
             .buffer_unordered(BULK_DELETE_CONCURRENCY)
             .collect()
@@ -362,8 +323,8 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         bucket: &str,
         deltaspace_id: String,
         indexes: Vec<usize>,
-        items: &[DeleteItem<'_>],
-        hooks: DeleteHooks<'_>,
+        items: &[DeleteItem],
+        hooks: &DeleteHooks<'_>,
     ) -> Vec<(usize, DeleteOutcome)> {
         let mut out = Vec::with_capacity(indexes.len());
         let mut reclaim = false;
@@ -373,7 +334,7 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         for i in indexes {
             let item = &items[i];
             let outcome = if hooks.proceeds() {
-                self.delete_item(bucket, item, hooks.count).await
+                self.delete_item(bucket, item, &hooks.counted).await
             } else {
                 DeleteOutcome::Skipped
             };
@@ -392,7 +353,7 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         // reference.bin goes with a later delete in its folder.
         if reclaim && hooks.proceeds() {
             match self
-                .reclaim_empty_deltaspace(bucket, &deltaspace_id, reference)
+                .reclaim_empty_deltaspace(bucket, &deltaspace_id, reference, &hooks.counted)
                 .await
             {
                 Ok(()) => {}
@@ -405,16 +366,28 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         out
     }
 
+    /// One key's whole delete as ONE detached unit: its locks, the backend
+    /// DELETEs and the counters, cache and sibling cleanup that follow. A
+    /// caller dropped part-way neither frees a lock while a DELETE can
+    /// still land, nor skips the bookkeeping of one that did.
     async fn delete_item(
         &self,
         bucket: &str,
-        item: &DeleteItem<'_>,
-        count: Option<&Arc<crate::maintenance::gate::CommitCount>>,
+        item: &DeleteItem,
+        counted: &Counted,
     ) -> DeleteOutcome {
-        match self
-            .delete_inner(bucket, &item.key, item.still_ours.as_deref(), count)
-            .await
-        {
+        let (engine, bucket, key) = (self.clone(), bucket.to_string(), item.key.clone());
+        let still_ours = item.still_ours.clone();
+        let result = crate::transfer::detached_commit(counted.clone(), None, move |ticket| {
+            async move {
+                engine
+                    .delete_inner(&ticket, &bucket, &key, still_ours.as_deref())
+                    .await
+            }
+            .boxed()
+        })
+        .await;
+        match result {
             Ok(ConditionalDelete::Deleted(meta)) => DeleteOutcome::Deleted(meta),
             Ok(ConditionalDelete::Changed) => DeleteOutcome::Changed,
             Ok(ConditionalDelete::Gone) => DeleteOutcome::NotFound,
@@ -432,7 +405,11 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
     ) -> Result<FileMetadata, EngineError> {
-        match self.delete_inner(bucket, key, None, None).await? {
+        match crate::transfer::inline_commit(|ticket| async move {
+            self.delete_inner(&ticket, bucket, key, None).await
+        })
+        .await?
+        {
             ConditionalDelete::Deleted(meta) => Ok(*meta),
             ConditionalDelete::Changed | ConditionalDelete::Gone => {
                 Err(EngineError::NotFound(key.to_string()))
@@ -445,6 +422,27 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
     /// caller outside the engine reclaims on its own.
     /// Idempotent and safe when the deltaspace still holds objects (no-op).
     pub(super) async fn reclaim_empty_deltaspace(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        reference: ReferenceHint,
+        counted: &Counted,
+    ) -> Result<(), EngineError> {
+        let (engine, bucket, deltaspace_id) =
+            (self.clone(), bucket.to_string(), deltaspace_id.to_string());
+        crate::transfer::detached_commit(counted.clone(), None, move |_ticket| {
+            async move {
+                engine
+                    .reclaim_empty_deltaspace_inner(&bucket, &deltaspace_id, reference)
+                    .await
+            }
+            .boxed()
+        })
+        .await
+    }
+
+    /// The reclaim itself: both locks, the check, the reference DELETE.
+    async fn reclaim_empty_deltaspace_inner(
         &self,
         bucket: &str,
         deltaspace_id: &str,
@@ -561,10 +559,10 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
     /// such object. The counter forgets the object before this returns.
     async fn delete_inner(
         &self,
+        ticket: &crate::transfer::CommitTicket,
         bucket: &str,
         key: &str,
-        still_ours: Option<&(dyn Fn(&FileMetadata) -> bool + Send + Sync)>,
-        count: Option<&Arc<crate::maintenance::gate::CommitCount>>,
+        still_ours: Option<&StillOurs>,
     ) -> Result<ConditionalDelete, EngineError> {
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
 
@@ -664,14 +662,8 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
             SiblingPin::Absent => {}
             SiblingPin::Version(version) => {
                 if !self
-                    .delete_variant_if(
-                        count,
-                        bucket,
-                        &deltaspace_id,
-                        &obj_key.filename,
-                        sibling,
-                        version,
-                    )
+                    .storage
+                    .delete_variant_if(bucket, &deltaspace_id, &obj_key.filename, sibling, version)
                     .await?
                 {
                     return Ok(ConditionalDelete::Changed);
@@ -683,7 +675,7 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
             SiblingPin::Unpinned if !sibling_found => {}
             SiblingPin::Unpinned => {
                 self.delete_sibling_variant(
-                    count,
+                    ticket,
                     bucket,
                     &deltaspace_id,
                     &obj_key.filename,
@@ -695,22 +687,23 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         match &pinned {
             Some(version) => {
                 if !self
-                    .delete_variant_if(
-                        count,
-                        bucket,
-                        &deltaspace_id,
-                        &obj_key.filename,
-                        variant,
-                        version,
-                    )
+                    .storage
+                    .delete_variant_if(bucket, &deltaspace_id, &obj_key.filename, variant, version)
                     .await?
                 {
                     return Ok(ConditionalDelete::Changed);
                 }
             }
             None => {
-                self.delete_variant(count, bucket, &deltaspace_id, &obj_key.filename, variant)
-                    .await?
+                delete_variant_on(
+                    &*self.storage,
+                    ticket,
+                    bucket,
+                    &deltaspace_id,
+                    &obj_key.filename,
+                    variant,
+                )
+                .await?
             }
         }
 

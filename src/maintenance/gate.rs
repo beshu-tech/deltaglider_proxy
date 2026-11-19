@@ -517,6 +517,86 @@ pub struct CommitCount {
     _guards: Vec<WriteGuard>,
 }
 
+impl CommitCount {
+    /// A count of no bucket: a request that no gate counts (a read, or a
+    /// bucket without a gate) still passes a [`Counted`].
+    pub fn none() -> Self {
+        Self { _guards: vec![] }
+    }
+
+    /// Does it hold a background (maintenance) write count?
+    pub fn is_background(&self) -> bool {
+        self._guards.iter().any(|g| g.background)
+    }
+}
+
+/// The count a write holds while it runs, passed to every write point (a
+/// client or admin write, a copy, a delete): required, so a path cannot
+/// leave it out. A server request path passes [`request_counted`]; only
+/// the CLI and the maintenance jobs can say [`Counted::NoGate`] (source
+/// guard `no_gate_is_named_only_by_the_cli_and_the_jobs`).
+#[derive(Debug, Clone)]
+pub enum Counted {
+    /// The write runs in a task that holds this count to its end.
+    By(Arc<CommitCount>),
+    /// No gate can see this writer.
+    NoGate(NoGateReason),
+}
+
+/// Why a writer holds no count. Built only in the CLI and the maintenance
+/// jobs (see [`Counted`]).
+#[derive(Debug, Clone, Copy)]
+pub struct NoGateReason(NoGate);
+
+#[derive(Debug, Clone, Copy)]
+enum NoGate {
+    Cli,
+    MaintenanceJob,
+}
+
+impl NoGateReason {
+    /// The command line: no server, no gate.
+    pub(crate) fn cli() -> Self {
+        Self(NoGate::Cli)
+    }
+
+    /// A maintenance job whose admission supplies the count
+    /// (`transfer::admitted`) or that holds the bucket itself.
+    pub(crate) fn maintenance_job() -> Self {
+        Self(NoGate::MaintenanceJob)
+    }
+
+    /// Who runs without a count, for a log line.
+    pub fn label(&self) -> &'static str {
+        match self.0 {
+            NoGate::Cli => "the command line",
+            NoGate::MaintenanceJob => "a maintenance job",
+        }
+    }
+}
+
+/// The placeholder of a background copy's request: `transfer::admitted`
+/// replaces it with the admission's count before the copy runs.
+pub static BY_ADMISSION: Counted = Counted::NoGate(NoGateReason(NoGate::MaintenanceJob));
+
+/// [`Counted::for_test`] as a place a request can borrow.
+#[cfg(test)]
+pub(crate) static NO_GATE_FOR_TEST: Counted = Counted::NoGate(NoGateReason(NoGate::MaintenanceJob));
+
+impl Counted {
+    /// A writer under test that no gate counts.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self::NoGate(NoGateReason::maintenance_job())
+    }
+
+    /// Do background copies read the source before the commit task (a cut
+    /// then cancels the reads)? Only a maintenance admission counts so.
+    pub fn reads_ahead(&self) -> bool {
+        matches!(self, Self::By(c) if c.is_background())
+    }
+}
+
 impl Admitted {
     /// One more count of every bucket this admission counts. A commit that
     /// must land after its caller is dropped holds it until the commit
@@ -738,13 +818,16 @@ impl RequestWriteCount {
     }
 }
 
-/// The request's second write count, for a commit task (`None`: the request
-/// is not counted).
-pub fn request_commit_count(extensions: &axum::http::Extensions) -> Option<Arc<CommitCount>> {
-    extensions
-        .get::<RequestWriteCount>()
-        .and_then(RequestWriteCount::commit_count)
-        .map(Arc::new)
+/// The request's second write count, for a commit task. A request that no
+/// gate counts (a read, or no gate) gets a count of nothing: the write
+/// still runs in its own task.
+pub fn request_counted(extensions: &axum::http::Extensions) -> Counted {
+    Counted::By(Arc::new(
+        extensions
+            .get::<RequestWriteCount>()
+            .and_then(RequestWriteCount::commit_count)
+            .unwrap_or_else(CommitCount::none),
+    ))
 }
 
 /// Add `by` to `map[key]` (lowercased already); a count at 0 goes.
@@ -1410,6 +1493,46 @@ mod tests {
             }
         }
         offenders
+    }
+
+    /// A request's or an admin loop's count does not read the source ahead
+    /// (it would pay an extra reference HEAD); an admission's does.
+    #[test]
+    fn only_an_admission_reads_ahead() {
+        let gate = Arc::new(MaintenanceGate::new());
+        let request = Counted::By(Arc::new(gate.begin_write("b").commit_count()));
+        assert!(!request.reads_ahead());
+        assert!(!Counted::By(Arc::new(CommitCount::none())).reads_ahead());
+        assert!(!Counted::for_test().reads_ahead());
+        let admitted = admit_all(Some(&gate), &["b"]).expect("admitted");
+        assert!(Counted::By(Arc::new(admitted.commit_count())).reads_ahead());
+    }
+
+    /// Source guard (D1, D2): only the CLI and the background jobs build a
+    /// `NoGateReason`; a server request path passes `request_counted`.
+    #[test]
+    fn no_gate_is_named_only_by_the_cli_and_the_jobs() {
+        const ALLOWED: [&str; 5] = [
+            "src/cli/",
+            "src/maintenance/",
+            "src/lifecycle/",
+            "src/replication/",
+            "src/transfer.rs",
+        ];
+        let named: Vec<&str> = crate::source_scan::ast::src()
+            .iter()
+            .filter(|s| {
+                ["cli", "maintenance_job"]
+                    .iter()
+                    .any(|n| s.prod.calls_named(n).next().is_some())
+            })
+            .map(|s| s.rel.as_str())
+            .filter(|rel| !ALLOWED.iter().any(|a| rel.starts_with(a)))
+            .collect();
+        assert!(
+            named.is_empty(),
+            "a request path says NoGate (use request_counted): {named:?}"
+        );
     }
 
     /// Source guard (F9): every non-engine module that writes through

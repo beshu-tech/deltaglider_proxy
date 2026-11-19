@@ -108,7 +108,10 @@ async fn the_reclaim_check_reads_one_page_of_its_own_folder() {
         ("img-00000.jpg", ""),
     ] {
         fake.clear();
-        engine.delete("b", key).await.unwrap();
+        engine
+            .delete("b", key, crate::maintenance::gate::Counted::for_test())
+            .await
+            .unwrap();
         let lists = folder_lists(&fake);
         assert_eq!(lists.len(), 1, "{key}: {lists:#?}");
         assert!(
@@ -137,7 +140,7 @@ async fn a_folder_of_plain_files_is_checked_with_one_head() {
                 DeleteItem::new("clips/img-00000.jpg"),
                 DeleteItem::new("clips/img-00001.jpg"),
             ],
-            DeleteHooks::default(),
+            crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
         )
         .await;
     assert!(
@@ -166,7 +169,10 @@ async fn sub_folders_alone_do_not_keep_a_reference() {
         fill(&engine, &format!("run/sub-{i:03}"), 1).await;
     }
     for key in &keys {
-        engine.delete("b", key).await.unwrap();
+        engine
+            .delete("b", key, crate::maintenance::gate::Counted::for_test())
+            .await
+            .unwrap();
     }
     assert!(!engine.storage().has_reference("b", "run").await.unwrap());
 }
@@ -199,7 +205,10 @@ async fn reclaiming_an_encrypted_reference_takes_out_the_bytes_its_store_added()
     let before = usage.read("b").unwrap().unwrap();
 
     for key in store_deltas(&engine, "run", 2).await {
-        engine.delete("b", &key).await.unwrap();
+        engine
+            .delete("b", &key, crate::maintenance::gate::Counted::for_test())
+            .await
+            .unwrap();
     }
 
     assert!(!engine.storage().has_reference("b", "run").await.unwrap());
@@ -230,7 +239,10 @@ async fn deleting_a_folder_key_by_key_heads_each_object_a_bounded_number_of_time
     fake.clear();
 
     for key in &keys {
-        engine.delete("b", key).await.unwrap();
+        engine
+            .delete("b", key, crate::maintenance::gate::Counted::for_test())
+            .await
+            .unwrap();
     }
 
     let heads = count(&fake, "HEAD ");
@@ -277,7 +289,10 @@ async fn a_subfolder_with_objects_does_not_keep_the_parent_reference() {
         let parent = store_deltas(&engine, "run", 3).await;
         store_deltas(&engine, "run/trace", 3).await;
         for key in &parent {
-            engine.delete("b", key).await.unwrap();
+            engine
+                .delete("b", key, crate::maintenance::gate::Counted::for_test())
+                .await
+                .unwrap();
         }
         let s = engine.storage();
         assert!(
@@ -326,7 +341,10 @@ async fn a_delete_cut_in_its_reclaim_check_is_still_counted() {
     };
 
     let cut = fake
-        .cut_at(engine.delete("b", &keys[0]), reclaim_check)
+        .cut_at(
+            engine.delete("b", &keys[0], crate::maintenance::gate::Counted::for_test()),
+            reclaim_check,
+        )
         .await;
 
     assert!(cut, "the delete was cut in its reclaim check");
@@ -360,7 +378,10 @@ async fn a_delete_that_finds_nothing_reclaims_a_reference_left_alone() {
         let s = engine.storage();
         assert!(s.has_reference("b", "run").await.unwrap(), "{backend}");
 
-        let gone = engine.delete("b", &keys[0]).await.unwrap_err();
+        let gone = engine
+            .delete("b", &keys[0], crate::maintenance::gate::Counted::for_test())
+            .await
+            .unwrap_err();
 
         assert!(gone.is_not_found(), "{backend}: {gone}");
         assert!(
@@ -384,8 +405,18 @@ async fn a_delete_skips_the_variant_its_head_did_not_find() {
         .unwrap();
     fake.clear();
 
-    engine.delete("b", &keys[0]).await.unwrap();
-    engine.delete("b", "run/notes.txt").await.unwrap();
+    engine
+        .delete("b", &keys[0], crate::maintenance::gate::Counted::for_test())
+        .await
+        .unwrap();
+    engine
+        .delete(
+            "b",
+            "run/notes.txt",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await
+        .unwrap();
 
     let deletes: Vec<String> = fake
         .requests()

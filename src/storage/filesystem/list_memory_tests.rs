@@ -395,14 +395,14 @@ mod listing_model {
                 }
                 // The bucket deletes once the walk sees nothing.
                 for key in &walked {
-                    engine.delete("b", key).await.unwrap();
+                    engine.delete("b", key, crate::maintenance::gate::Counted::for_test()).await.unwrap();
                 }
                 let after = engine
                     .list_objects("b", "", Some("/"), 1000, None, false)
                     .await
                     .unwrap();
                 prop_assert!(after.objects.is_empty() && after.common_prefixes.is_empty());
-                engine.delete_bucket("b").await.unwrap();
+                engine.delete_bucket("b", &crate::maintenance::gate::Counted::for_test()).await.unwrap();
                 Ok(())
             })?;
             scan::set_chunk_for_test(None);
@@ -445,11 +445,20 @@ async fn a_key_below_dg_is_hidden_refused_and_removed_with_the_bucket() {
 
     assert!(engine.head("b", "x/.dg/foo.jpg").await.is_err());
     assert!(engine.retrieve_stream("b", "x/.dg/foo.jpg").await.is_err());
-    assert!(engine.delete("b", "x/.dg/foo.jpg").await.is_err());
+    assert!(engine
+        .delete(
+            "b",
+            "x/.dg/foo.jpg",
+            crate::maintenance::gate::Counted::for_test()
+        )
+        .await
+        .is_err());
     assert!(ds.join(".dg").join("foo.jpg").exists());
     // A client key keeps the bucket.
     assert!(matches!(
-        engine.delete_bucket("b").await,
+        engine
+            .delete_bucket("b", &crate::maintenance::gate::Counted::for_test())
+            .await,
         Err(crate::deltaglider::EngineError::Storage(
             crate::storage::StorageError::BucketNotEmpty(_)
         ))
@@ -458,8 +467,18 @@ async fn a_key_below_dg_is_hidden_refused_and_removed_with_the_bucket() {
         ds.join(".dg").join("foo.jpg").exists(),
         "kept with the bucket"
     );
-    engine.delete("b", "x/kept.txt").await.unwrap();
-    engine.delete_bucket("b").await.unwrap();
+    engine
+        .delete(
+            "b",
+            "x/kept.txt",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await
+        .unwrap();
+    engine
+        .delete_bucket("b", &crate::maintenance::gate::Counted::for_test())
+        .await
+        .unwrap();
     assert!(!tmp.path().join("b").exists());
 }
 

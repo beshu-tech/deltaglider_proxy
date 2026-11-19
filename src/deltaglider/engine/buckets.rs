@@ -30,10 +30,14 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
     /// waits for it, finds its delta, and keeps the reference; the storage
     /// then answers BucketNotEmpty. The storage never deletes a reference
     /// on its own.
-    pub async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError> {
+    pub async fn delete_bucket(
+        &self,
+        bucket: &str,
+        counted: &crate::maintenance::gate::Counted,
+    ) -> Result<(), EngineError> {
         for prefix in self.storage.list_reference_prefixes(bucket, "").await? {
             match self
-                .reclaim_empty_deltaspace(bucket, &prefix, ReferenceHint::Present)
+                .reclaim_empty_deltaspace(bucket, &prefix, ReferenceHint::Present, counted)
                 .await
             {
                 Ok(()) => {}

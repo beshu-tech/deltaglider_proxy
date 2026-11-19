@@ -150,7 +150,7 @@ pub(super) async fn delete_bucket(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::DeleteBucketInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteBucketOutput>> {
-    let bucket = req.input.bucket;
+    let bucket = req.input.bucket.clone();
     // A client must not delete a replication mirror (an object-empty or
     // freshly-marked destination would otherwise be destructible).
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &bucket).await?;
@@ -194,7 +194,12 @@ pub(super) async fn delete_bucket(
         }
     }
 
-    engine.delete_bucket(&bucket).await?;
+    engine
+        .delete_bucket(
+            &bucket,
+            &crate::maintenance::gate::request_counted(&req.extensions),
+        )
+        .await?;
     crate::api::handlers::forget_bucket(&bucket);
     // The usage row goes with the bucket: `/_/stats` sums every row, and a
     // bucket created again under this name must start at zero.
@@ -333,7 +338,10 @@ mod delete_bucket_usage_tests {
             .store("b", "k.txt", b"hello", None, Default::default())
             .await
             .unwrap();
-        engine.delete("b", "k.txt").await.unwrap();
+        engine
+            .delete("b", "k.txt", crate::maintenance::gate::Counted::for_test())
+            .await
+            .unwrap();
         // Residual drift (e.g. an orphan baseline): the row stays non-zero.
         usage.apply_delta("b", 0, 0, 28);
         usage.flush_pending();

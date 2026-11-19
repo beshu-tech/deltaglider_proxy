@@ -806,7 +806,14 @@ mod tests {
         };
         let deleting = {
             let e = engine.clone();
-            tokio::spawn(async move { e.delete("b", "d/k.jpg").await })
+            tokio::spawn(async move {
+                e.delete(
+                    "b",
+                    "d/k.jpg",
+                    crate::maintenance::gate::Counted::for_test(),
+                )
+                .await
+            })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!waiting.is_finished() && !deleting.is_finished());
@@ -817,7 +824,14 @@ mod tests {
                 .store("b", "d/a.jpg", b"a", None, HashMap::new())
                 .await
                 .unwrap();
-            engine.delete("b", "d/other.jpg").await.unwrap();
+            engine
+                .delete(
+                    "b",
+                    "d/other.jpg",
+                    crate::maintenance::gate::Counted::for_test(),
+                )
+                .await
+                .unwrap();
             let lock = engine.lock_object_write("b", "d/c.zip").await;
             engine
                 .store_known_prior(

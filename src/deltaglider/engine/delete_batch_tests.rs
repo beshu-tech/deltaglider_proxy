@@ -14,7 +14,7 @@ fn count(fake: &FakeS3, method: &str) -> usize {
         .count()
 }
 
-fn items(keys: &[String]) -> Vec<DeleteItem<'static>> {
+fn items(keys: &[String]) -> Vec<DeleteItem> {
     keys.iter().map(DeleteItem::new).collect()
 }
 
@@ -35,7 +35,11 @@ async fn a_batch_checks_each_folder_once() {
     fake.clear();
 
     let outcomes = engine
-        .delete_batch("b", items(&keys), DeleteHooks::default())
+        .delete_batch(
+            "b",
+            items(&keys),
+            crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
+        )
         .await;
 
     assert_eq!(deleted(&outcomes), keys.len(), "{outcomes:?}");
@@ -60,7 +64,11 @@ async fn outcomes_come_back_in_input_order() {
     ];
 
     let outcomes = engine
-        .delete_batch("b", batch, DeleteHooks::default())
+        .delete_batch(
+            "b",
+            batch,
+            crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
+        )
         .await;
 
     let kinds: Vec<&str> = outcomes
@@ -99,7 +107,11 @@ async fn a_batch_works_on_several_folders_at_once() {
     fake.set_delete_delay_ms(50);
 
     let outcomes = engine
-        .delete_batch("b", items(&keys), DeleteHooks::default())
+        .delete_batch(
+            "b",
+            items(&keys),
+            crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
+        )
         .await;
 
     assert_eq!(deleted(&outcomes), keys.len(), "{outcomes:?}");
@@ -120,7 +132,11 @@ async fn a_retry_reclaims_the_folder_of_keys_already_gone() {
     assert!(engine.storage().has_reference("b", "run").await.unwrap());
 
     let outcomes = engine
-        .delete_batch("b", items(&keys), DeleteHooks::default())
+        .delete_batch(
+            "b",
+            items(&keys),
+            crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
+        )
         .await;
 
     assert!(
@@ -157,7 +173,7 @@ async fn each_key_is_reported_as_it_ends() {
             items(&keys),
             DeleteHooks {
                 on_outcome: Some(&on_outcome),
-                ..Default::default()
+                ..DeleteHooks::new(crate::maintenance::gate::Counted::for_test())
             },
         )
         .await;
@@ -188,7 +204,7 @@ async fn a_batch_told_to_stop_skips_the_rest_and_the_reclaim() {
             items(&keys),
             DeleteHooks {
                 proceed: Some(&proceed),
-                ..Default::default()
+                ..DeleteHooks::new(crate::maintenance::gate::Counted::for_test())
             },
         )
         .await;

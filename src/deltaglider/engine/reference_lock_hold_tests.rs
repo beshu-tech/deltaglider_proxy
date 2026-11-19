@@ -146,7 +146,14 @@ async fn delete_reclaim_and_sweep_reclaim_take_the_lock() {
         .await
         .unwrap();
     let after_store = lock.acquires.load(Ordering::SeqCst);
-    engine.delete("releases", "v1/app.zip").await.unwrap();
+    engine
+        .delete(
+            "releases",
+            "v1/app.zip",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await
+        .unwrap();
     assert!(
         lock.acquires.load(Ordering::SeqCst) > after_store,
         "reclaim-on-delete must take the lock"
@@ -173,7 +180,12 @@ async fn delete_reclaim_and_sweep_reclaim_take_the_lock() {
         .unwrap();
     let before_sweep = lock.acquires.load(Ordering::SeqCst);
     engine
-        .reclaim_empty_deltaspace("releases", "v2", super::delete::ReferenceHint::Unknown)
+        .reclaim_empty_deltaspace(
+            "releases",
+            "v2",
+            super::delete::ReferenceHint::Unknown,
+            &crate::maintenance::gate::Counted::for_test(),
+        )
         .await
         .unwrap();
     assert!(lock.acquires.load(Ordering::SeqCst) > before_sweep);
@@ -528,7 +540,13 @@ async fn review2_lost_lock_during_reclaim_does_not_fail_the_delete() {
         .await
         .unwrap();
     lock.renew_ok.store(false, Ordering::SeqCst);
-    let res = engine.delete("releases", "v9/app.zip").await;
+    let res = engine
+        .delete(
+            "releases",
+            "v9/app.zip",
+            crate::maintenance::gate::Counted::for_test(),
+        )
+        .await;
     let gone = engine.head("releases", "v9/app.zip").await.is_err();
     assert!(gone, "precondition: the object is deleted");
     assert!(

@@ -138,10 +138,10 @@ impl DynEngine {
         };
 
         let mut engine = Self::new_with_backend(Arc::new(storage), config, metrics);
-        engine.encryption = EngineEncryption {
+        engine.encryption = Arc::new(EngineEncryption {
             policies,
             published,
-        };
+        });
         Ok(engine)
     }
 }
@@ -663,7 +663,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 DeltaCodec::new(config.max_object_size_bytes() as usize)
                     .with_timeouts(config.tuning.codec),
             ),
-            cache: ReferenceCache::new(config.cache_size_mb),
+            cache: Arc::new(ReferenceCache::new(config.cache_size_mb)),
             max_object_size: config.max_object_size_bytes(),
             max_passthrough_object_size: config.max_passthrough_object_size,
             codec_semaphore: Arc::new(Semaphore::new(codec_concurrency)),
@@ -671,17 +671,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             reference_lock: None,
             metrics,
             metadata_cache: MetadataCache::new((config.metadata_cache_mb as u64) * 1024 * 1024),
-            bucket_policies: crate::bucket_policy::BucketPolicyRegistry::new(
-                config.buckets.clone(),
-                config.max_delta_ratio,
-            )
-            .with_reserved_bucket(config.config_sync_bucket.as_deref()),
+            bucket_policies: Arc::new(
+                crate::bucket_policy::BucketPolicyRegistry::new(
+                    config.buckets.clone(),
+                    config.max_delta_ratio,
+                )
+                .with_reserved_bucket(config.config_sync_bucket.as_deref()),
+            ),
             bucket_usage: None,
             spool,
             range_spools,
             tuning: config.tuning.clone(),
             memory: Default::default(),
-            encryption: EngineEncryption::default(),
+            encryption: Arc::new(EngineEncryption::default()),
         }
     }
 
@@ -723,7 +725,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Reserve one more coordination bucket (builder; see
     /// [`crate::bucket_policy::BucketPolicyRegistry::with_reserved_bucket`]).
     pub fn with_reserved_bucket(mut self, bucket: &str) -> Self {
-        self.bucket_policies.reserve_bucket(Some(bucket));
+        // A builder: no clone of the engine exists yet.
+        Arc::get_mut(&mut self.bucket_policies)
+            .expect("builder runs before the engine is cloned")
+            .reserve_bucket(Some(bucket));
         self
     }
 

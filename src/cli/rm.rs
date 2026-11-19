@@ -84,7 +84,9 @@ async fn rm_one(engine: &DynEngine, args: &RmArgs, bucket: &str, key: &str) -> i
     if args.dryrun {
         return cli_exit::EXIT_OK;
     }
-    match engine.delete(bucket, key).await {
+    match engine
+        .delete(bucket, key, crate::maintenance::gate::Counted::NoGate(crate::maintenance::gate::NoGateReason::cli()))
+        .await {
         Ok(_) => cli_exit::EXIT_OK,
         Err(e) => {
             if let Some(what) = super::missing(&e) {
@@ -175,7 +177,13 @@ pub(crate) async fn delete_keys(
     use crate::deltaglider::{DeleteHooks, DeleteItem, DeleteOutcome};
     let items = keys.iter().map(|k| DeleteItem::new(*k)).collect();
     let outcomes = engine
-        .delete_batch(bucket, items, DeleteHooks::default())
+        .delete_batch(
+            bucket,
+            items,
+            DeleteHooks::new(crate::maintenance::gate::Counted::NoGate(
+                crate::maintenance::gate::NoGateReason::cli(),
+            )),
+        )
         .await;
     let (mut ok, mut bad) = (0, 0);
     for (key, outcome) in keys.iter().zip(outcomes) {

@@ -4,6 +4,7 @@
 //! object ACL and tagging stubs.
 
 use super::*;
+use futures::FutureExt;
 
 pub(super) async fn head_object(
     svc: &DeltaGliderS3Service,
@@ -387,35 +388,53 @@ pub(super) async fn delete_object(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::DeleteObjectInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteObjectOutput>> {
+    let counted = crate::maintenance::gate::request_counted(&req.extensions);
     let input = req.input;
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)
         .await?;
     // `DELETE photos/` deletes the folder marker `photos/` only, as on S3
     // (review D3). Folder deletes list and batch-delete the keys.
-    match svc
-        .state
-        .engine
-        .load()
-        .delete(&input.bucket, &input.key)
-        .await
-    {
-        // Only a REAL delete (Ok) emits an event — a NotFound deleted
-        // nothing, so there's nothing for replication to mirror.
-        Ok(_) => {
-            svc.emit_object_event(
-                crate::event_outbox::EventKind::ObjectDeleted,
-                &input.bucket,
-                &input.key,
-                serde_json::json!({}),
-            )
-            .await;
-            Ok(s3s::S3Response::new(s3s::dto::DeleteObjectOutput::default()))
+    // The delete and its event are one unit: a dropped request neither
+    // frees the object's lock early nor loses the event of a delete that
+    // landed.
+    let (unit_svc, engine) = (svc.clone(), svc.state.engine.load_full());
+    let (bucket, key, inner) = (input.bucket.clone(), input.key.clone(), counted.clone());
+    let result = crate::transfer::detached_commit(counted, None, move |_ticket| {
+        async move {
+            let result = engine.delete(&bucket, &key, inner).await;
+            // Only a REAL delete (Ok) emits an event: a NotFound deleted
+            // nothing, so there is nothing for replication to mirror.
+            if result.is_ok() {
+                unit_svc
+                    .emit_object_event(
+                        crate::event_outbox::EventKind::ObjectDeleted,
+                        &bucket,
+                        &key,
+                        serde_json::json!({}),
+                    )
+                    .await;
+            }
+            result
         }
+        .boxed()
+    })
+    .await;
+    match result {
+        Ok(_) => Ok(s3s::S3Response::new(s3s::dto::DeleteObjectOutput::default())),
         Err(crate::deltaglider::EngineError::NotFound(_)) => {
             crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
             Ok(s3s::S3Response::new(s3s::dto::DeleteObjectOutput::default()))
         }
         Err(e) => Err(s3s::S3Error::from(e)),
+    }
+}
+
+/// Sets its flag when dropped: the request ended (normally or cut).
+struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -463,38 +482,54 @@ pub(super) async fn delete_objects(
     // The batch runs inside the request: a cut request stops it. Each key
     // that the batch deleted has its ObjectDeleted event (one per key as it
     // ends), and a stopped batch leaves the later keys in place.
+    let counted = crate::maintenance::gate::request_counted(&req.extensions);
     let state = svc.state.clone();
     let bucket = input.bucket.clone();
     let engine = state.engine.load_full();
-    let on_outcome =
-        |key: &str, outcome: &DeleteOutcome| -> futures::future::BoxFuture<'static, ()> {
-            if !matches!(outcome, DeleteOutcome::Deleted(_)) {
-                return Box::pin(async {});
-            }
-            let event = crate::event_outbox::NewEvent::new(
-                crate::event_outbox::EventKind::ObjectDeleted,
-                bucket.as_str(),
-                key,
-                crate::event_outbox::EventSource::S3Api,
-                crate::replication::current_unix_seconds(),
-                serde_json::json!({}),
-            );
-            let state = state.clone();
-            Box::pin(async move {
-                crate::api::handlers::object_helpers::enqueue_object_event(&state, event).await
-            })
-        };
-    let mut outcomes = engine
-        .delete_batch(
-            &bucket,
-            keys.into_iter().map(DeleteItem::new).collect(),
-            DeleteHooks {
-                on_outcome: Some(&on_outcome),
-                ..Default::default()
-            },
-        )
-        .await
-        .into_iter();
+    let inner = counted.clone();
+    // A cut request lets the key in flight (and its event) finish and stops
+    // the batch before the next key.
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _stop_on_drop = StopOnDrop(stopped.clone());
+    let mut outcomes = crate::transfer::detached_commit(counted, None, move |_ticket| {
+        async move {
+            let proceed = move || !stopped.load(std::sync::atomic::Ordering::Relaxed);
+            let event_bucket = bucket.clone();
+            let on_outcome = move |key: &str,
+                                   outcome: &DeleteOutcome|
+                  -> futures::future::BoxFuture<'static, ()> {
+                if !matches!(outcome, DeleteOutcome::Deleted(_)) {
+                    return Box::pin(async {});
+                }
+                let event = crate::event_outbox::NewEvent::new(
+                    crate::event_outbox::EventKind::ObjectDeleted,
+                    event_bucket.as_str(),
+                    key,
+                    crate::event_outbox::EventSource::S3Api,
+                    crate::replication::current_unix_seconds(),
+                    serde_json::json!({}),
+                );
+                let state = state.clone();
+                Box::pin(async move {
+                    crate::api::handlers::object_helpers::enqueue_object_event(&state, event).await
+                })
+            };
+            engine
+                .delete_batch(
+                    &bucket,
+                    keys.into_iter().map(DeleteItem::new).collect(),
+                    DeleteHooks {
+                        proceed: Some(&proceed),
+                        on_outcome: Some(&on_outcome),
+                        ..DeleteHooks::new(inner)
+                    },
+                )
+                .await
+        }
+        .boxed()
+    })
+    .await
+    .into_iter();
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
     for (obj, allowed) in objects.into_iter().zip(allowed) {
@@ -564,7 +599,7 @@ pub(super) async fn put_object(
     )
     .await?;
     // Taken after the body is read: the commit's second count covers the write only.
-    let commit = crate::maintenance::gate::request_commit_count(&req.extensions);
+    let commit = crate::maintenance::gate::request_counted(&req.extensions);
     let result = crate::api::handlers::object_helpers::store_client_write(
         &svc.state,
         crate::api::handlers::object_helpers::ClientWrite {

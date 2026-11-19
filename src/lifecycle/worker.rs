@@ -1627,7 +1627,7 @@ async fn plan_action(
                     operation: "lifecycle transition",
                     upload_concurrency: None,
                     keep_created_at: true,
-                    commit_count: None,
+                    commit_count: &crate::maintenance::gate::BY_ADMISSION,
                 },
             )
             .await
@@ -1703,11 +1703,11 @@ async fn delete_planned(
     let items = deletes
         .iter()
         .map(|d| {
-            let snapshot = &d.snapshot;
+            let snapshot = d.snapshot.clone();
             DeleteItem::only_if(
                 d.key.as_str(),
                 move |current: &crate::types::FileMetadata| {
-                    classify_delete_check(snapshot, Ok(current)) == DeleteCheck::Proceed
+                    classify_delete_check(&snapshot, Ok(current)) == DeleteCheck::Proceed
                 },
             )
         })
@@ -1720,7 +1720,8 @@ async fn delete_planned(
         DeleteHooks {
             proceed: Some(proceed),
             on_outcome: Some(&on_outcome),
-            count: None,
+            // `admitted::delete_batch` supplies the admission's count.
+            counted: crate::maintenance::gate::BY_ADMISSION.clone(),
         },
     )
     .await;

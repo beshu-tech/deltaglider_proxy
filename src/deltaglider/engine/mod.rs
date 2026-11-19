@@ -242,7 +242,7 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     /// against the stored reference sha, so an overlap with the old engine
     /// cannot serve stale bytes, and a rebuild may re-route a bucket to
     /// another backend, whose references a shared cache would mask.
-    cache: ReferenceCache,
+    cache: Arc<ReferenceCache>,
     max_object_size: u64,
     /// Streaming-passthrough size ceiling (Phase B). Separate from
     /// `max_object_size` because multipart copies are O(part_size) memory.
@@ -264,7 +264,7 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     /// In-memory cache for object metadata (eliminates HEAD requests).
     metadata_cache: MetadataCache,
     /// Per-bucket compression policy overrides.
-    bucket_policies: crate::bucket_policy::BucketPolicyRegistry,
+    bucket_policies: Arc<crate::bucket_policy::BucketPolicyRegistry>,
     /// Per-instance running usage counter (None in tests / when unavailable).
     /// Updated best-effort after each successful store/delete.
     bucket_usage: Option<Arc<crate::bucket_usage::BucketUsage>>,
@@ -283,7 +283,34 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     memory: crate::deltaglider::memory_budget::MemoryBudget,
     /// The encryption-policy slots of the raw backends (issue #116 review
     /// D): shared with the engine this one replaces.
-    encryption: construction::EngineEncryption,
+    encryption: Arc<construction::EngineEncryption>,
+}
+
+/// A handle to the same engine: every field is shared, so a task that must
+/// outlive its caller (a counted write, see `transfer::detached_commit`)
+/// owns one.
+impl<S: StorageBackend> Clone for DeltaGliderEngine<S> {
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            codec: self.codec.clone(),
+            cache: self.cache.clone(),
+            max_object_size: self.max_object_size,
+            max_passthrough_object_size: self.max_passthrough_object_size,
+            codec_semaphore: self.codec_semaphore.clone(),
+            prefix_locks: self.prefix_locks.clone(),
+            reference_lock: self.reference_lock.clone(),
+            metrics: self.metrics.clone(),
+            metadata_cache: self.metadata_cache.clone(),
+            bucket_policies: self.bucket_policies.clone(),
+            bucket_usage: self.bucket_usage.clone(),
+            spool: self.spool.clone(),
+            range_spools: self.range_spools.clone(),
+            tuning: self.tuning.clone(),
+            memory: self.memory.clone(),
+            encryption: self.encryption.clone(),
+        }
+    }
 }
 
 /// Type alias for engine with dynamic backend dispatch

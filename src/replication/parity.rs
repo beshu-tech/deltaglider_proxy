@@ -3349,7 +3349,7 @@ mod request_count_tests {
                 operation: "replication",
                 upload_concurrency: None,
                 keep_created_at: true,
-                commit_count: None,
+                commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
             },
         )
         .await
@@ -3531,7 +3531,9 @@ mod request_count_tests {
                 .delete_batch(
                     bucket,
                     vec![crate::deltaglider::DeleteItem::new("c.bin")],
-                    Default::default(),
+                    crate::deltaglider::DeleteHooks::new(
+                        crate::maintenance::gate::Counted::for_test(),
+                    ),
                 )
                 .await;
         }

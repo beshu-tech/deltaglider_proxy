@@ -123,7 +123,10 @@ async fn reads_and_deletes_go_on_at_critical() {
     assert_eq!(body, b"hello");
     // The read path takes its spool without the write gate.
     engine.spool_acquire_ungated(MIB).await.unwrap();
-    engine.delete("b", "k.txt").await.unwrap();
+    engine
+        .delete("b", "k.txt", crate::maintenance::gate::Counted::for_test())
+        .await
+        .unwrap();
 }
 
 /// How a spool acquisition of `src/` relates to the disk gate.

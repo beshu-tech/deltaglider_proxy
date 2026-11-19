@@ -94,7 +94,7 @@ pub(super) async fn copy_object(
         source_meta.file_size,
     );
     // Taken here: the commit's second count covers the write, not the reads.
-    let commit = crate::maintenance::gate::request_commit_count(&req.extensions);
+    let commit = crate::maintenance::gate::request_counted(&req.extensions);
     let as_stored = source_meta.is_delta() == tries_delta
         && (source_meta.is_delta()
             || matches!(
@@ -165,7 +165,7 @@ async fn copy_through_store(
     directive: &str,
     source_meta: &FileMetadata,
     precondition: &crate::deltaglider::Precondition,
-    commit: Option<Arc<crate::maintenance::gate::CommitCount>>,
+    commit: crate::maintenance::gate::Counted,
 ) -> s3s::S3Result<crate::types::StoreResult> {
     let (body, metadata) = read_copy_source(
         engine,

@@ -117,9 +117,9 @@ impl Fixture {
     }
 
     /// A write count as a request holds it: the copies below run under one.
-    fn counted() -> Arc<crate::maintenance::gate::CommitCount> {
+    fn counted() -> crate::maintenance::gate::Counted {
         let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
-        Arc::new(gate.begin_write("b").commit_count())
+        crate::maintenance::gate::Counted::By(Arc::new(gate.begin_write("b").commit_count()))
     }
 
     /// The same copy through the store (the path every copy took before).
@@ -136,7 +136,7 @@ impl Fixture {
             "COPY",
             &head,
             &precondition,
-            Some(Fixture::counted()),
+            Fixture::counted(),
         )
         .await
         .unwrap();
@@ -480,7 +480,7 @@ async fn a_source_that_changes_under_a_fast_copy_answers_slowdown() {
             content_type: None,
             user_metadata: Default::default(),
             precondition: &precondition,
-            commit: Some(Fixture::counted()),
+            commit: Fixture::counted(),
         },
     )
     .await
@@ -744,7 +744,7 @@ async fn a_source_that_changes_under_a_server_side_copy_answers_slowdown() {
                 content_type: None,
                 user_metadata: Default::default(),
                 precondition: &precondition,
-                commit: Some(Fixture::counted()),
+                commit: Fixture::counted(),
             },
         )
         .await
@@ -902,4 +902,83 @@ async fn a_dropped_client_copy_keeps_its_write_count_until_its_write_lands() {
         f.engine().head("c1", "run/copy.zip").await.is_ok(),
         "the write landed whole"
     );
+}
+
+/// D1 (6c): a client DeleteObjects whose request is dropped while a backend
+/// DELETE is held keeps the bucket's write count until the DELETE returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_delete_objects_keeps_its_write_count_until_its_delete_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let faulty = crate::storage::FaultyFs::new(
+        crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let faults = faulty.faults.clone();
+    let f = Fixture::new(
+        DynStorageBackend::new_box(faulty),
+        crate::config::Config::default(),
+    )
+    .await;
+    let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let hook_release = release.clone();
+    let key = f.keys[1].clone();
+    faults.hook(
+        crate::storage::FaultPoint::DeleteDelta,
+        &format!("b/{key}"),
+        Arc::new(move || {
+            let r = hook_release.clone();
+            futures::FutureExt::boxed(async move { r.notified().await })
+        }),
+    );
+    let input = s3s::dto::DeleteObjectsInput::builder()
+        .bucket("b".into())
+        .delete(s3s::dto::Delete {
+            objects: vec![s3s::dto::ObjectIdentifier {
+                key: key.clone(),
+                ..Default::default()
+            }],
+            quiet: Some(true),
+        })
+        .build()
+        .unwrap();
+    let mut req = request(input);
+    req.extensions
+        .insert(crate::maintenance::gate::RequestWriteCount::admitted_for_test(&gate, "b"));
+    let cut = tokio::time::timeout(
+        std::time::Duration::from_millis(800),
+        object::delete_objects(&f.svc, req),
+    )
+    .await;
+    assert!(cut.is_err(), "the batch must still wait for its DELETE");
+    assert!(
+        faults.fired(crate::storage::FaultPoint::DeleteDelta, &format!("b/{key}")) > 0,
+        "the batch never reached its DELETE"
+    );
+    assert!(
+        gate.inflight_writes("b") > 0,
+        "the count ended while the DELETE was still pending"
+    );
+    release.notify_one();
+    for _ in 0..200 {
+        if gate.inflight_writes("b") == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(gate.inflight_writes("b"), 0);
+    assert!(f.engine().head("b", &key).await.is_err(), "deleted");
+}
+
+/// D2 (6c): every write point of a server request takes its count from the
+/// request. The form POST used to pass none; the type now refuses that, and
+/// this refuses the escape (a placeholder) in its handler.
+#[test]
+fn the_form_post_takes_its_count_from_the_request() {
+    let form = crate::source_scan::ast::src()
+        .iter()
+        .find(|s| s.rel == "src/api/handlers/form_post.rs")
+        .expect("form_post.rs is scanned");
+    assert!(form.prod.calls_named("request_counted").next().is_some());
 }

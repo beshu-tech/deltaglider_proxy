@@ -649,7 +649,7 @@ async fn run_copy_loop(
     let write = &write;
     // Each commit holds this second count to its end, whatever becomes of
     // this loop (the handler future is dropped when the browser closes).
-    let commit = &Arc::new(write.commit_count());
+    let commit = &crate::maintenance::gate::Counted::By(Arc::new(write.commit_count()));
     let mut folders: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
     for (idx, it) in req.items.iter().enumerate() {
         let dk = dest_key(&req.dest_prefix, &it.relative);
@@ -812,7 +812,7 @@ async fn copy_one(
     // The proof of the caller's count of the destination bucket: a copy
     // runs only inside one.
     write: crate::maintenance::gate::DestWrite<'_>,
-    commit: &Arc<crate::maintenance::gate::CommitCount>,
+    commit: &crate::maintenance::gate::Counted,
     s3: &Arc<AppState>,
     engine: &Arc<crate::deltaglider::DynEngine>,
     (src_bucket, src_key): (&str, &str),
@@ -848,7 +848,7 @@ async fn copy_one(
         operation: "admin bulk copy",
         upload_concurrency: None,
         keep_created_at: false,
-        commit_count: Some(commit),
+        commit_count: commit,
     };
     // `no_overwrite`: the existence check runs inside the transfer's own
     // lock hold, so nothing can land between the check and the write.
@@ -1043,7 +1043,7 @@ async fn delete_moved_sources(
     // RAII drain slot — released on drop even if the handler future is
     // cancelled mid-loop (H12).
     let _write = gate.begin_write(source_bucket);
-    let count = Arc::new(_write.commit_count());
+    let count = crate::maintenance::gate::Counted::By(Arc::new(_write.commit_count()));
     let mut keys = Vec::new();
     let mut batch = Vec::new();
     for (it, source) in items.iter().zip(copied) {
@@ -1061,10 +1061,11 @@ async fn delete_moved_sources(
         // Delete the source only while it holds the bytes we copied: a
         // client PUT since the copy is a new object, not ours to delete.
         keys.push(it.source_key.as_str());
+        let source = source.clone();
         batch.push(DeleteItem::only_if(
             it.source_key.to_string(),
             move |current: &crate::types::FileMetadata| {
-                crate::deltaglider::DynEngine::same_generation(source, current)
+                crate::deltaglider::DynEngine::same_generation(&source, current)
             },
         ));
     }
@@ -1086,7 +1087,7 @@ async fn delete_moved_sources(
             DeleteHooks {
                 proceed: Some(&proceed),
                 on_outcome: Some(&emit),
-                count: Some(&count),
+                counted: count.clone(),
             },
         )
         .await;
@@ -1530,7 +1531,7 @@ pub(crate) async fn run_bulk_delete(
     // cancelled mid-loop (H12).
     let _write = gate.begin_write(bucket);
     // Each backend DELETE holds this second count to its end.
-    let count = Arc::new(_write.commit_count());
+    let count = crate::maintenance::gate::Counted::By(Arc::new(_write.commit_count()));
     // Counted and reported under one lock, so the totals go out in order.
     let totals = std::sync::Mutex::new(DeleteProgress::default());
     let tally = |deleted: bool| {
@@ -1574,7 +1575,7 @@ pub(crate) async fn run_bulk_delete(
             DeleteHooks {
                 proceed: Some(&proceed),
                 on_outcome: Some(&emit),
-                count: Some(&count),
+                counted: count.clone(),
             },
         )
         .await;

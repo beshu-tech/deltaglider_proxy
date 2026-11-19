@@ -322,7 +322,14 @@ mod tests {
             .store("b", "run/a.zip", &[1u8; 5000], None, Default::default())
             .await
             .unwrap();
-        engine.delete("b", "run/a.zip").await.unwrap();
+        engine
+            .delete(
+                "b",
+                "run/a.zip",
+                crate::maintenance::gate::Counted::for_test(),
+            )
+            .await
+            .unwrap();
         assert_eq!(usage.writes_in_window("b"), 0);
     }
 
@@ -349,8 +356,22 @@ mod tests {
         put("img/a.jpg", noise(2, 4000)).await; // an overwrite
         put("run/build-0.zip", noise(3, 12_000)).await; // makes the baseline
         put("run/build-1.zip", noise(3, 12_100)).await; // a delta
-        engine.delete("b", "run/build-0.zip").await.unwrap();
-        engine.delete("b", "run/build-1.zip").await.unwrap(); // reclaims the baseline
+        engine
+            .delete(
+                "b",
+                "run/build-0.zip",
+                crate::maintenance::gate::Counted::for_test(),
+            )
+            .await
+            .unwrap();
+        engine
+            .delete(
+                "b",
+                "run/build-1.zip",
+                crate::maintenance::gate::Counted::for_test(),
+            )
+            .await
+            .unwrap(); // reclaims the baseline
         put("run/build-2.zip", noise(4, 12_000)).await;
         put("run/build-3.zip", noise(4, 12_050)).await;
         engine
@@ -360,7 +381,7 @@ mod tests {
                     .into_iter()
                     .map(crate::deltaglider::DeleteItem::new)
                     .collect(),
-                crate::deltaglider::DeleteHooks::default(),
+                crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
             )
             .await;
         assert_eq!(

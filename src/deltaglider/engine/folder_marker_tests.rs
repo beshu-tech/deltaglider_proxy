@@ -76,14 +76,27 @@ async fn a_folder_marker_is_an_object_of_its_own() {
         );
 
         // DELETE photos/ removes the marker and nothing under it.
-        engine.delete("b", "photos/").await.unwrap();
+        engine
+            .delete(
+                "b",
+                "photos/",
+                crate::maintenance::gate::Counted::for_test(),
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             engine.head("b", "photos/").await,
             Err(EngineError::NotFound(_))
         ));
         assert_eq!(keys(&engine, "", None).await, vec!["photos/a.txt"]);
         assert!(matches!(
-            engine.delete("b", "photos/").await,
+            engine
+                .delete(
+                    "b",
+                    "photos/",
+                    crate::maintenance::gate::Counted::for_test()
+                )
+                .await,
             Err(EngineError::NotFound(_))
         ));
     }
@@ -98,17 +111,37 @@ async fn an_empty_folder_keeps_its_marker_and_the_bucket_is_not_empty() {
             .unwrap();
         assert_eq!(keys(&engine, "", None).await, vec!["empty/sub/"]);
         assert_eq!(keys(&engine, "empty/", Some("/")).await, vec!["empty/sub/"]);
-        assert!(engine.delete_bucket("b").await.is_err());
+        assert!(engine
+            .delete_bucket("b", &crate::maintenance::gate::Counted::for_test())
+            .await
+            .is_err());
         // Deleting a child object must not prune the marker's directory.
         engine
             .store("b", "empty/sub/x.txt", b"x", None, Default::default())
             .await
             .unwrap();
-        engine.delete("b", "empty/sub/x.txt").await.unwrap();
+        engine
+            .delete(
+                "b",
+                "empty/sub/x.txt",
+                crate::maintenance::gate::Counted::for_test(),
+            )
+            .await
+            .unwrap();
         assert_eq!(keys(&engine, "", None).await, vec!["empty/sub/"]);
-        engine.delete("b", "empty/sub/").await.unwrap();
+        engine
+            .delete(
+                "b",
+                "empty/sub/",
+                crate::maintenance::gate::Counted::for_test(),
+            )
+            .await
+            .unwrap();
         assert!(keys(&engine, "", None).await.is_empty());
-        engine.delete_bucket("b").await.unwrap();
+        engine
+            .delete_bucket("b", &crate::maintenance::gate::Counted::for_test())
+            .await
+            .unwrap();
     }
 }
 

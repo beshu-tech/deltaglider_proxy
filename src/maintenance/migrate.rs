@@ -543,10 +543,10 @@ async fn list_page_retrying(
 /// per folder, several folders at once (a per-key delete listed the folder
 /// after every key). `proceed` stops the batch between keys (cancel,
 /// shutdown). Returns each key's outcome, in order.
-async fn delete_keys<'a>(
+async fn delete_keys(
     engine: &DynEngine,
     bucket: &str,
-    items: Vec<DeleteItem<'a>>,
+    items: Vec<DeleteItem>,
     proceed: &(dyn Fn() -> bool + Send + Sync),
 ) -> Vec<DeleteOutcome> {
     engine
@@ -556,7 +556,8 @@ async fn delete_keys<'a>(
             DeleteHooks {
                 proceed: Some(proceed),
                 on_outcome: None,
-                count: None,
+                // The job holds the transient route itself.
+                counted: super::gate::Counted::NoGate(super::gate::NoGateReason::maintenance_job()),
             },
         )
         .await
@@ -849,8 +850,9 @@ async fn remove_staged_copies(
         return;
     }
     let ours = provenance_value(params, job.id);
-    let ours =
-        |meta: &crate::types::FileMetadata| meta.user_metadata.get("dg-migration") == Some(&ours);
+    let ours = move |meta: &crate::types::FileMetadata| {
+        meta.user_metadata.get("dg-migration") == Some(&ours)
+    };
     let mut pager = Pager::resuming(None);
     let mut removed = 0u64;
     while pager.begin_page().is_some() {
@@ -873,7 +875,10 @@ async fn remove_staged_copies(
             .map(|(k, _)| k.as_str())
             .filter(|k| !k.ends_with('/'))
             .collect();
-        let items = keys.iter().map(|k| DeleteItem::only_if(*k, ours)).collect();
+        let items = keys
+            .iter()
+            .map(|k| DeleteItem::only_if(*k, ours.clone()))
+            .collect();
         let outcomes = delete_keys(&engine, &params.transient_key, items, &|| {
             !crate::shutdown::is_shutting_down()
         })
@@ -1624,7 +1629,7 @@ impl PageStep for CopyStep<'_, '_> {
             operation: "migrate",
             upload_concurrency: None,
             keep_created_at: true,
-            commit_count: None,
+            commit_count: &crate::maintenance::gate::BY_ADMISSION,
         };
         // No per-object fsync: `checkpoint` flushes the copies before any
         // progress that counts on them is saved.
