@@ -170,6 +170,29 @@ impl Faults {
 
     /// How many calls met the arm at `point` on `key` (failed, or ran the
     /// hook).
+    /// Poll `work` until the call at `point` on `key` has fired, then drop it:
+    /// the caller's cut. Waits on the stall itself, never a wall-clock guess;
+    /// `work` ending first is a failure. The 60 s bound only ends a hang.
+    pub(crate) async fn drive_until_fired<F: std::future::Future>(
+        &self,
+        work: F,
+        point: FaultPoint,
+        key: &str,
+    ) {
+        let mut work = Box::pin(work);
+        let started = std::time::Instant::now();
+        while self.fired(point, key) == 0 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "{point:?} on {key} never fired"
+            );
+            tokio::select! {
+                _ = &mut work => panic!("the work ended before {point:?} on {key} fired"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+        }
+    }
+
     pub(crate) fn fired(&self, point: FaultPoint, key: &str) -> usize {
         let state = self.0.lock().unwrap();
         state

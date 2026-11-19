@@ -2984,16 +2984,9 @@ mod tests {
             let fields = DestinationFields::of_transfer(&request, &head);
             delta_passthrough_copy(&eng, &lock, request, &head, None, fields, true).await
         };
-        let cut = tokio::time::timeout(std::time::Duration::from_millis(500), copy).await;
-        assert!(
-            cut.is_err(),
-            "the stalled read must still be pending: {:?}",
-            cut.as_ref().map(|r| r.as_ref().map(|o| o.is_some()))
-        );
-        assert!(
-            faults.fired(crate::storage::FaultPoint::OpenDelta, "src/p/b.zip") > 0,
-            "the copy never reached the source read"
-        );
+        faults
+            .drive_until_fired(copy, crate::storage::FaultPoint::OpenDelta, "src/p/b.zip")
+            .await;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while gate.inflight_writes("dst") > 0 {
             assert!(
@@ -4752,23 +4745,22 @@ mod counted_delete_tests {
                 async move { r.notified().await }.boxed()
             }),
         );
-        let cut = tokio::time::timeout(
-            Duration::from_millis(800),
-            admitted::delete_batch(
-                &admitted,
-                &engine,
-                "dst",
-                vec![DeleteItem::new("p/k.jpg")],
-                crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
-            ),
-        )
-        .await;
-        assert!(cut.is_err(), "the delete must still wait");
+        faults
+            .drive_until_fired(
+                admitted::delete_batch(
+                    &admitted,
+                    &engine,
+                    "dst",
+                    vec![DeleteItem::new("p/k.jpg")],
+                    crate::deltaglider::DeleteHooks::new(
+                        crate::maintenance::gate::Counted::for_test(),
+                    ),
+                ),
+                crate::storage::FaultPoint::DeletePassthrough,
+                "dst/p/k.jpg",
+            )
+            .await;
         drop(admitted);
-        assert!(
-            faults.fired(crate::storage::FaultPoint::DeletePassthrough, "dst/p/k.jpg") > 0,
-            "the delete never reached the backend"
-        );
         assert!(
             gate.inflight_background_writes("dst") > 0,
             "the count ended while the DELETE was still pending"
@@ -4964,22 +4956,21 @@ mod counted_delete_tests {
             crate::storage::FaultPoint::DeleteReference,
             "dst/p/",
         );
-        let cut = tokio::time::timeout(
-            Duration::from_millis(1500),
-            admitted::delete_batch(
-                &admitted,
-                &engine,
-                "dst",
-                vec![DeleteItem::new("p/v1.zip"), DeleteItem::new("p/v2.zip")],
-                crate::deltaglider::DeleteHooks::new(crate::maintenance::gate::Counted::for_test()),
-            ),
-        )
-        .await;
-        assert!(cut.is_err(), "the reclaim must still wait");
-        assert!(
-            faults.fired(crate::storage::FaultPoint::DeleteReference, "dst/p/") > 0,
-            "the reclaim never reached its DELETE"
-        );
+        faults
+            .drive_until_fired(
+                admitted::delete_batch(
+                    &admitted,
+                    &engine,
+                    "dst",
+                    vec![DeleteItem::new("p/v1.zip"), DeleteItem::new("p/v2.zip")],
+                    crate::deltaglider::DeleteHooks::new(
+                        crate::maintenance::gate::Counted::for_test(),
+                    ),
+                ),
+                crate::storage::FaultPoint::DeleteReference,
+                "dst/p/",
+            )
+            .await;
         drop(admitted);
         assert!(
             gate.inflight_background_writes("dst") > 0,
