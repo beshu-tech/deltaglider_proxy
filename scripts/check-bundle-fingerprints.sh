@@ -43,9 +43,11 @@ hits_of() {
   printf '%s' "$out"
 }
 
-# 1. The crate version, standalone (not a longer dotted number).
+# 1. The crate version, standalone: not part of a longer dotted number, and not
+#    a number in SVG path data, where `-` after a digit or dot only separates
+#    two numbers (`1.5.3-2.2.4-.2` in an icon). `name-2.2.4` still matches.
 escaped=$(printf '%s' "$version" | sed 's/\./\\./g')
-hits=$(hits_of "(^|[^0-9.])${escaped}([^0-9.]|$)")
+hits=$(hits_of "(^|[^0-9.-]|(^|[^0-9.])-)${escaped}([^0-9.]|$)")
 [ -z "$hits" ] || report "crate version ${version} baked into: $(echo "$hits" | tr '\n' ' ')"
 
 # 2. Build timestamp literals.
