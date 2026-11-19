@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- The proxy builds with Rust 1.100.0.
+
 ### Fixed
 
 - On an S3 backend, a LIST with a delimiter that occurs inside the suffix `.delta` (for example `.` or `l`) now groups common prefixes by the original key, as the filesystem backend does. Before, the proxy returned a prefix of the stored name (`d/y.` for the delta `d/y.delta`) and could hide an object such as `a/x.zip`. Such a LIST can cost more backend requests. With such a delimiter, a folder that holds only the proxy's own files is now hidden, as on the filesystem backend; with `/` it is still shown.
