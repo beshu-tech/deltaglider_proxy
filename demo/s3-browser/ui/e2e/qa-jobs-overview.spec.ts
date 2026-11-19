@@ -88,9 +88,9 @@ test('jobs overview: palette, second tab sees a new job, 390 px layout', async (
 
   // Tab B sees it without a reload: the idle poll is 10 s.
   await expect(jobRow(tabB)).toHaveCount(1, { timeout: 15_000 });
-  // It settles with backfill words: every object was written through the
-  // proxy, so all of them already carry the metadata.
-  await expect(jobRow(tabB)).toContainText(/already stamped/, { timeout: 30_000 });
+  // It settles with Heal metadata words: every object was written through the
+  // proxy, so all of them are already complete.
+  await expect(jobRow(tabB)).toContainText(/all already complete/, { timeout: 30_000 });
   await expect(jobRow(tabB)).not.toContainText(/in sync|straight copy/);
 
   // 390 px: nothing scrolls sideways, and the meter label is not cut.
