@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Windows XP style: the file details header keeps the layout of the other styles, and only its look changes. The Luna title bar holds the icon, the file name on one line and the close button; the full object key is under it. Before, a long file name broke out of the title bar, and the key was cut to one line.
+
 ## v2.2.4 — 2026-11-18
 
 ### Upgrade steps for the next release
