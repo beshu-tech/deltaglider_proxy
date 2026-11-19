@@ -1155,6 +1155,13 @@ mod readiness_tests {
             "the bridge: a proxy-owned upload vanished",
         ),
         (
+            "src/maintenance/backfill.rs",
+            "matches!(e, crate::deltaglider::EngineError::Overloaded(_))",
+            1,
+            Reach::PerRequest,
+            "a heal step meets the spool gate: the JOB defers the reference, no client request is refused",
+        ),
+        (
             "src/api/handlers/object_helpers.rs",
             "return Err(S3Error::SlowDown(message));",
             1,

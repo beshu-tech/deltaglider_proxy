@@ -885,6 +885,12 @@ impl HeldSpool {
         Self(held.into_iter().map(SpoolReservation::reserved_mib).sum())
     }
 
+    /// The budget the relay parts of an upload hold (one reservation each,
+    /// whole MiB per part); an upload with no parts holds nothing.
+    pub(crate) fn of_relay_parts(sizes: impl IntoIterator<Item = u64>) -> Self {
+        Self(sizes.into_iter().map(mib_ceil).sum())
+    }
+
     /// The budget of a stream that holds a spool file of `bytes`, rounded up
     /// to whole MiB; no bytes is `NOTHING`.
     pub(crate) fn of_stream_bytes(bytes: u64) -> Self {

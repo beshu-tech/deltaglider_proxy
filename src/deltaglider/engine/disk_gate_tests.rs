@@ -7,6 +7,7 @@ use super::resources::SpoolWait;
 use super::*;
 use crate::config::Config;
 use crate::deltaglider::spool::HeldSpool;
+use crate::deltaglider::RelayPart;
 use crate::disk_watch::Level;
 use crate::storage::{DynStorageBackend, FilesystemBackend};
 use std::collections::HashMap;
@@ -432,4 +433,50 @@ async fn a_large_rewrite_is_refused_at_a_full_spool_disk_and_a_small_one_is_not(
         rewrite("large.jpg").await,
         Ok(crate::deltaglider::Rewritten::Done { .. })
     ));
+}
+
+/// An empty multipart upload to a delta-eligible key stores whole when the
+/// disk gate refuses the joined spool (as a failed acquire did before).
+#[tokio::test]
+async fn relayed_delta_parts_refused_by_the_disk_gate_store_whole() {
+    let (dir, engine) = engine().await;
+    for level in [Level::High, Level::Critical] {
+        set_level(&engine, level);
+        let key = format!("empty-{}.zip", level.name());
+        let lock = engine.lock_object_write("b", &key).await;
+        let stored = engine
+            .store_relayed_parts_delta_with_multipart_etag(
+                &lock,
+                "b",
+                &key,
+                &[],
+                0,
+                None,
+                HashMap::new(),
+                "\"d41d8cd98f00b204e9800998ecf8427e-0\"".to_string(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{level:?}: {e}"));
+        drop(lock);
+        assert_eq!(stored.metadata.file_size, 0);
+
+        let part = dir.path().join(format!("part-{}", level.name()));
+        std::fs::write(&part, b"some bytes").unwrap();
+        let parts = [RelayPart::of_file(&part)];
+        let key = format!("full-{}.zip", level.name());
+        let lock = engine.lock_object_write("b", &key).await;
+        engine
+            .store_relayed_parts_delta_with_multipart_etag(
+                &lock,
+                "b",
+                &key,
+                &parts,
+                10,
+                None,
+                HashMap::new(),
+                "\"d41d8cd98f00b204e9800998ecf8427e-1\"".to_string(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{level:?} non-empty: {e}"));
+    }
 }

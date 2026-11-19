@@ -1925,8 +1925,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .await;
         }
         let parts_mib = crate::deltaglider::spool::mib_ceil(total_size);
-        let admission = self.admit_new_spool_write(HeldSpool::of_stream_bytes(total_size))?;
-        let joined = match self.spool_acquire_beside_mib(admission, total_size).await {
+        let held = HeldSpool::of_relay_parts(parts.iter().map(|p| p.size));
+        let acquired = match self.admit_new_spool_write(held) {
+            Ok(admission) => self.spool_acquire_beside_mib(admission, total_size).await,
+            Err(e) => Err(e),
+        };
+        let joined = match acquired {
             // The reservation is clamped to what the budget holds beside the
             // parts: never write a joined file larger than it.
             Ok(joined) if joined.reserved_mib() >= parts_mib => Some(joined),
@@ -2018,7 +2022,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 bucket,
                 total_size,
                 true,
-                HeldSpool::of_stream_bytes(total_size),
+                HeldSpool::of_relay_parts(parts.iter().map(|p| p.size)),
             )
             .await?;
         // The key's write lock only (P7.4): see `write_passthrough_locked`.

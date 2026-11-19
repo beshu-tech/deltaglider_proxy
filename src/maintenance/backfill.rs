@@ -244,6 +244,10 @@ async fn heal_references(
                 record_failure(db, job.id, &key, &reason).await?;
                 c.failed += 1;
             }
+            Err(e) if heal_error_is_deferred(&e) => {
+                tracing::warn!("heal: deferred {bucket}/{key} ({e}); the next run retries it");
+                c.skipped += 1;
+            }
             Err(e) => {
                 record_failure(db, job.id, &key, &format!("reference heal failed: {e}")).await?;
                 c.failed += 1;
@@ -253,6 +257,12 @@ async fn heal_references(
     }
     persist(db, job, "references", &c, None).await;
     Ok(())
+}
+
+/// Pure: a heal refused by the disk gate (`Overloaded`) is not a failure;
+/// the next run retries the reference.
+pub(crate) fn heal_error_is_deferred(e: &crate::deltaglider::EngineError) -> bool {
+    matches!(e, crate::deltaglider::EngineError::Overloaded(_))
 }
 
 /// Pure: the failure text of a reference whose bytes are not the ones its
@@ -371,6 +381,15 @@ impl super::worker::ObjectVisitor for Backfill<'_> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_heal_refused_at_disk_critical_is_deferred_not_failed() {
+        use crate::deltaglider::EngineError;
+        assert!(heal_error_is_deferred(&EngineError::Overloaded(
+            "at level critical".into()
+        )));
+        assert!(!heal_error_is_deferred(&EngineError::NotFound("x".into())));
+    }
 
     fn fallback_meta(md5: &str) -> FileMetadata {
         FileMetadata::fallback(
