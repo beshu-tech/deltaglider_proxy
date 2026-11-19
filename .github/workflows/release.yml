@@ -256,11 +256,11 @@ jobs:
         run: cd demo/s3-browser/ui && npm ci && npm run build
 
       - name: Build
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+        run: cargo build --profile dist --locked --target x86_64-unknown-linux-gnu
 
       - name: Prepare artifacts
         run: |
-          cd target/x86_64-unknown-linux-gnu/release
+          cd target/x86_64-unknown-linux-gnu/dist
           strip ${{ env.BINARY_NAME }} || true
           tar czvf ../../../${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz ${{ env.BINARY_NAME }}
 
@@ -326,11 +326,11 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked --target ${{ matrix.target }}
 
       - name: Prepare artifacts
         run: |
-          cd target/${{ matrix.target }}/release
+          cd target/${{ matrix.target }}/dist
           strip ${{ env.BINARY_NAME }} || true
           tar czvf ../../../${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
 

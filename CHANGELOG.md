@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- The released binary and the Docker image are smaller: the binary goes from 110.7 MB to 53.3 MB, and the compressed image from 80.5 MB to 66.0 MB. The shipped builds use a new `dist` build profile (fat LTO, one codegen unit, stripped symbols, size-optimised code with the hash, cipher, checksum and compression code kept at full speed). Benchmarks of the codec and of a 64 MiB upload and download show no measurable slowdown.
+
 ## v2.2.5 — 2026-11-19
 
 ### Changed

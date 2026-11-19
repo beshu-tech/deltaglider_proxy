@@ -54,7 +54,7 @@ RUN ./scripts/check-bundle-fingerprints.sh demo/s3-browser/ui/dist Cargo.toml
 # Parallel jobs from the memory budget, not the CPU count: cargo alone starts
 # one rustc per CPU and a build container with a modest memory limit is killed
 # mid-build (scripts/cargo-jobs.sh has the measured per-job peaks).
-RUN CARGO_BUILD_JOBS="$(./scripts/cargo-jobs.sh)" cargo build --release --locked
+RUN CARGO_BUILD_JOBS="$(./scripts/cargo-jobs.sh)" cargo build --profile dist --locked
 
 # ── Runtime ──
 # Security notes:
@@ -98,7 +98,7 @@ RUN apt-get -o Acquire::Retries=5 update && apt-get upgrade -y --no-install-reco
     ca-certificates curl ntpstat chrony \
     && rm -rf /var/lib/apt/lists/*
 RUN groupadd --system dg && useradd --system --gid dg --no-create-home dg
-COPY --from=rust-build /app/target/release/deltaglider_proxy /usr/local/bin/
+COPY --from=rust-build /app/target/dist/deltaglider_proxy /usr/local/bin/
 COPY --from=rust-build /usr/bin/xdelta3 /usr/bin/xdelta3
 RUN mkdir -p /data && chown dg:dg /data
 USER dg

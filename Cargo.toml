@@ -35,6 +35,68 @@ opt-level = 3
 [profile.dev.package.proc-macro2]
 opt-level = 3
 
+# Shipped binaries (Dockerfile, release.yml): `cargo build --profile dist`.
+# Fat LTO, one codegen unit, stripped symbols and size-optimised code, with the
+# byte-crunching crates (hash, cipher, checksum, deflate, bcrypt) kept at 3.
+# `release` stays fast to build for CI. Panic stays `unwind` (background.rs).
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+opt-level = "s"
+
+[profile.dist.package.sha2]
+opt-level = 3
+
+[profile.dist.package.sha1]
+opt-level = 3
+
+[profile.dist.package.md-5]
+opt-level = 3
+
+[profile.dist.package.hmac]
+opt-level = 3
+
+[profile.dist.package.aes]
+opt-level = 3
+
+[profile.dist.package.aes-gcm]
+opt-level = 3
+
+[profile.dist.package.aes-gcm-siv]
+opt-level = 3
+
+[profile.dist.package.ghash]
+opt-level = 3
+
+[profile.dist.package.polyval]
+opt-level = 3
+
+[profile.dist.package.ctr]
+opt-level = 3
+
+[profile.dist.package.cipher]
+opt-level = 3
+
+[profile.dist.package.crc32fast]
+opt-level = 3
+
+[profile.dist.package.crc-fast]
+opt-level = 3
+
+[profile.dist.package.miniz_oxide]
+opt-level = 3
+
+[profile.dist.package.flate2]
+opt-level = 3
+
+[profile.dist.package.bcrypt]
+opt-level = 3
+
+[profile.dist.package.blowfish]
+opt-level = 3
+
 # `tokio_unstable` is passed via RUSTFLAGS (nightly workflow + opt-in builds)
 # to unlock tokio's RuntimeMetrics API — the #87 runtime sampler. Declared
 # here so `unexpected_cfgs` doesn't warn on every build.
