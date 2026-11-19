@@ -757,8 +757,8 @@ async fn a_join_the_spool_cannot_hold_is_stored_whole() {
     let parts = relay(&dir, &body, 1 << 20);
     let mpe = "\"0123456789abcdef0123456789abcdef-3\"".to_string();
     let lock = engine.lock_object_write("b", "rel/b.zip").await;
-    let noted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stored = crate::deltaglider::commit_signal::watching(noted.clone(), async {
+    let noted = lock.commit_flag();
+    let stored = async {
         engine
             .store_relayed_parts_delta_with_multipart_etag(
                 &lock,
@@ -771,7 +771,7 @@ async fn a_join_the_spool_cannot_hold_is_stored_whole() {
                 mpe.clone(),
             )
             .await
-    })
+    }
     .await
     .unwrap();
     drop(lock);

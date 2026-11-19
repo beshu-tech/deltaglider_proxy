@@ -75,7 +75,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(None);
         }
         // Committed: count it before the next await.
-        self.record_commit(dst.0, &prior, &metadata);
+        self.record_commit(lock, dst.0, &prior, &metadata);
         self.drop_other_form(
             lock,
             dst.0,

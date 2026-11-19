@@ -861,6 +861,46 @@ impl Spool {
     }
 }
 
+/// Spool budget an op holds already, in MiB. The disk gate lets such an op
+/// run to its end (`DeltaGliderEngine::admit_new_spool_write`); made from a
+/// held spool, a held reservation, or the parts of an upload, never from a
+/// bare number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldSpool(usize);
+
+impl HeldSpool {
+    /// The op holds nothing: a new write.
+    pub const NOTHING: HeldSpool = HeldSpool(0);
+
+    pub(crate) fn of(spool: &Spool) -> Self {
+        Self(spool.reserved_mib())
+    }
+
+    pub fn of_reservation(r: &SpoolReservation) -> Self {
+        Self(r.reserved_mib())
+    }
+
+    /// The budget of every item the op holds (the relay parts of an upload).
+    pub fn of_all<'a>(held: impl IntoIterator<Item = &'a SpoolReservation>) -> Self {
+        Self(held.into_iter().map(SpoolReservation::reserved_mib).sum())
+    }
+
+    /// The budget of a stream that holds a spool file for `mib` (see
+    /// `stream_spool_mib`); `0` is `NOTHING`.
+    pub(crate) fn of_stream(mib: usize) -> Self {
+        Self(mib)
+    }
+
+    /// This and `other` together.
+    pub(crate) fn plus(self, other: HeldSpool) -> Self {
+        Self(self.0 + other.0)
+    }
+
+    pub fn mib(self) -> usize {
+        self.0
+    }
+}
+
 /// The write buffer of [`Spool::fill_from_stream`].
 const FILL_BUFFER: usize = 1024 * 1024;
 

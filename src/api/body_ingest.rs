@@ -35,6 +35,7 @@ use crate::api::S3Error;
 use crate::deltaglider::ingest::{
     self, Destination, IngestError, IngestPlan, IngestedBody, Sha256Need,
 };
+use crate::deltaglider::spool::HeldSpool;
 use crate::deltaglider::KnownSha256;
 
 /// True when s3s already removed the aws-chunked framing. It does so for
@@ -247,7 +248,9 @@ pub(crate) async fn ingest_client_body(
         body.declared(),
     )
     .await?;
-    let ingested = body.ingest(&engine, bucket, 0, Destination::Object).await?;
+    let ingested = body
+        .ingest(&engine, bucket, HeldSpool::NOTHING, Destination::Object)
+        .await?;
     Ok((ingested, quota))
 }
 
@@ -280,7 +283,7 @@ pub(crate) async fn ingest_part_body(
         .ingest(
             &engine,
             part.bucket,
-            admission.held_spool_mib,
+            admission.held_spool,
             Destination::MultipartPart,
         )
         .await?;
@@ -335,7 +338,7 @@ impl<'a> ClientBody<'a> {
         // The body alone, before the quota; the ingest judges it again with
         // the spool that its storage write needs (an encrypted copy).
         ingest::admit_declared::<S3Error>(
-            &this.plan(0, Destination::Object),
+            &this.plan(HeldSpool::NOTHING, Destination::Object),
             engine.spool_max_bytes(),
             0,
         )
@@ -348,7 +351,7 @@ impl<'a> ClientBody<'a> {
         self.declared
     }
 
-    fn plan(&self, held_spool_mib: usize, destination: Destination) -> IngestPlan {
+    fn plan(&self, held_spool: HeldSpool, destination: Destination) -> IngestPlan {
         IngestPlan {
             declared: self.declared,
             limit: self.limit,
@@ -360,7 +363,7 @@ impl<'a> ClientBody<'a> {
                     .as_ref()
                     .is_some_and(|signed| signed.is_verifiable_hex()),
             ),
-            held_spool_mib,
+            held_spool,
             strict_length: true,
             destination,
         }
@@ -371,10 +374,10 @@ impl<'a> ClientBody<'a> {
         self,
         engine: &crate::deltaglider::DynEngine,
         bucket: &str,
-        held_spool_mib: usize,
+        held_spool: HeldSpool,
         destination: Destination,
     ) -> Result<IngestedBody, S3Error> {
-        let plan = self.plan(held_spool_mib, destination);
+        let plan = self.plan(held_spool, destination);
         let Self {
             body,
             ctx,

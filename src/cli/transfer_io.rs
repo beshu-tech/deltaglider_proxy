@@ -12,6 +12,7 @@
 //! an object above `max_object_size` whole, so the one size ceiling is
 //! `max_passthrough_object_size`.
 
+use crate::deltaglider::spool::HeldSpool;
 use crate::deltaglider::{DynEngine, EngineError, RetrieveResponse};
 use crate::types::{FileMetadata, StoreResult};
 use futures::StreamExt;
@@ -276,17 +277,17 @@ pub(crate) async fn copy_object(
     // while it streams; when that is the destination engine too (`cp`,
     // `sync`), the copy holds that budget and never waits for more.
     use crate::deltaglider::ingest::{self, IngestError};
-    let held_spool_mib = if std::ptr::eq(src, dst) {
-        src.stream_spool_mib(&metadata)
+    let held_spool = if std::ptr::eq(src, dst) {
+        src.stream_held_spool(&metadata)
     } else {
-        0
+        HeldSpool::NOTHING
     };
     let plan = ingest::IngestPlan {
         declared: size,
         // The stored source sets the size; the store applies its limits.
         limit: u64::MAX,
         sha256: ingest::Sha256Need::Compute,
-        held_spool_mib,
+        held_spool,
         strict_length: true,
         destination: ingest::Destination::Object,
     };

@@ -4,7 +4,6 @@
 
 mod cache;
 mod codec;
-pub mod commit_signal;
 mod engine;
 mod file_router;
 pub(crate) mod ingest;

@@ -21,6 +21,7 @@ use super::conditional::ObjectWriteGuard;
 use super::*;
 use crate::config::test_seams::RewriteStall;
 use crate::deltaglider::ingest::BodyHashes;
+use crate::deltaglider::spool::HeldSpool;
 use crate::storage::{ObjectVariant, PutBody, RewriteTarget, StoredObject, StoredWrite, WriteIf};
 
 /// What a rewrite does on a backend without conditional writes (S3 501).
@@ -176,7 +177,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Taken before the GET, so no response waits for budget.
         let spool = if size > self.spool_threshold() {
             // A rewrite stores bytes: a new write for the disk gate.
-            self.admit_new_spool_write(0)?;
+            self.admit_new_spool_write(HeldSpool::NOTHING)?;
             Some(self.spool_acquire(size).await?)
         } else {
             None
@@ -216,7 +217,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // write never waits for budget).
         let reserved = match &spool {
             Some(s) => {
-                self.reserve_storage_spool(bucket, size, false, s.reserved_mib())
+                self.reserve_storage_spool(bucket, size, false, HeldSpool::of(s))
                     .await?
             }
             None => None,

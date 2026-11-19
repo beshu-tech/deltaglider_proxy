@@ -3,6 +3,7 @@
 //! Retrieve pipeline — delta reconstruction, streaming, and range requests.
 
 use super::*;
+use crate::deltaglider::spool::HeldSpool;
 use crate::storage::{ObjectVariant, StorageBackend};
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -552,15 +553,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// The spool budget, in MiB, that the stream of [`Self::retrieve_stream`]
-    /// for an object with `metadata` holds while it lives (`0`: the stream
+    /// for an object with `metadata` holds while it lives (nothing: the stream
     /// holds none). A caller that reserves more spool while it reads such a
     /// stream (a copy that ingests it) passes this as its held budget, so
     /// it never waits for budget while it holds some (hold-and-wait).
-    pub fn stream_spool_mib(&self, metadata: &FileMetadata) -> usize {
+    pub fn stream_held_spool(
+        &self,
+        metadata: &FileMetadata,
+    ) -> crate::deltaglider::spool::HeldSpool {
         if self.streams_from_spool(metadata) {
-            crate::deltaglider::spool::mib_ceil(metadata.file_size).max(1)
+            HeldSpool::of_stream(crate::deltaglider::spool::mib_ceil(metadata.file_size).max(1))
         } else {
-            0
+            HeldSpool::NOTHING
         }
     }
 

@@ -2,21 +2,21 @@
 
 use super::*;
 use crate::deltaglider::ingest::{BodyHashes, IngestedBody};
-use crate::deltaglider::spool::{mib_ceil, CONTENDED};
+use crate::deltaglider::spool::{mib_ceil, HeldSpool, CONTENDED};
 use bytes::Bytes;
 
 const MIB: u64 = 1024 * 1024;
 
 /// `data` as an ingested part body in `store`'s spool, the way the ingest
 /// of an UploadPart makes one: a reservation that covers the file only,
-/// taken without waiting beside the `held_mib` that the upload holds.
+/// taken without waiting beside the `held` budget that the upload holds.
 pub(super) fn spooled(
     store: &MultipartStore,
     data: &[u8],
-    held_mib: usize,
+    held: HeldSpool,
 ) -> Result<IngestedBody, S3Error> {
     let size = data.len() as u64;
-    let storage = store.spool().try_reserve(size, held_mib).map_err(|e| {
+    let storage = store.spool().try_reserve(size, held.mib()).map_err(|e| {
         assert_eq!(e.kind(), CONTENDED);
         S3Error::SlowDown(e.to_string())
     })?;
@@ -45,7 +45,7 @@ pub(super) fn put(
 ) -> Result<String, S3Error> {
     let data = data.as_ref();
     let admission = store.admit_part(upload_id, bucket, key, part_number, data.len() as u64)?;
-    let body = spooled(store, data, admission.held_spool_mib)?;
+    let body = spooled(store, data, admission.held_spool)?;
     store.upload_part(upload_id, bucket, key, part_number, body, admission)
 }
 
@@ -1210,7 +1210,7 @@ fn an_ingested_part_becomes_the_relay_part_with_one_reservation() {
     let spool = small_spool(&dir, 32);
     let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
-    let body = spooled(&store, &[7u8; 3 << 20], 0).unwrap();
+    let body = spooled(&store, &[7u8; 3 << 20], HeldSpool::NOTHING).unwrap();
     let IngestedBody::Spooled { spool: file, .. } = &body else {
         unreachable!()
     };
@@ -1280,7 +1280,7 @@ fn a_refused_part_leaves_no_file() {
     // Admitted at a declared size that fits, refused on the size that
     // arrived.
     let admission = store.admit_part(&id, "b", "k", 2, 1).unwrap();
-    let body = spooled(&store, &[2u8; 2 << 20], 3).unwrap();
+    let body = spooled(&store, &[2u8; 2 << 20], HeldSpool::of_stream(3)).unwrap();
     let err = store
         .upload_part(&id, "b", "k", 2, body, admission)
         .unwrap_err();
@@ -1291,7 +1291,7 @@ fn a_refused_part_leaves_no_file() {
     // Admitted, then refused because the upload is completing.
     let admission = store.admit_part(&id, "b", "k", 2, 4).unwrap();
     store.complete_parts(&id, "b", "k", &[(1, etag)]).unwrap();
-    let body = spooled(&store, b"late", 3).unwrap();
+    let body = spooled(&store, b"late", HeldSpool::of_stream(3)).unwrap();
     let err = store
         .upload_part(&id, "b", "k", 2, body, admission)
         .unwrap_err();
@@ -1306,7 +1306,7 @@ fn a_refused_part_leaves_no_file() {
 fn admit_part_refuses_before_the_body() {
     let store = MultipartStore::new_for_test(4 << 20, 6 << 20, Duration::hours(24));
     let code =
-        |r: Result<PartAdmission, S3Error>| r.map(|a| a.held_spool_mib).map_err(|e| e.code());
+        |r: Result<PartAdmission, S3Error>| r.map(|a| a.held_spool.mib()).map_err(|e| e.code());
     assert_eq!(
         code(store.admit_part("nope", "b", "k", 1, 1)),
         Err("NoSuchUpload")
@@ -1354,7 +1354,7 @@ fn an_abort_during_or_after_the_ingest_leaves_no_file_or_dir() {
     let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     let admission = store.admit_part(&id, "b", "k", 1, 5).unwrap();
-    let body = spooled(&store, b"hello", admission.held_spool_mib).unwrap();
+    let body = spooled(&store, b"hello", admission.held_spool).unwrap();
     store.abort(&id, "b", "k").unwrap();
     let err = store
         .upload_part(&id, "b", "k", 1, body, admission)
@@ -1503,7 +1503,7 @@ fn parallel_parts_cannot_pass_the_caps_together() {
     // Kept parts take over the charge of their admission: still 3 MiB.
     let mut kept = 0;
     for (i, admission) in held.into_iter().enumerate() {
-        let body = spooled(&store, b"x", admission.held_spool_mib).unwrap();
+        let body = spooled(&store, b"x", admission.held_spool).unwrap();
         store
             .upload_part(&ids[i], "b", &format!("k{i}"), 1, body, admission)
             .unwrap();
@@ -1542,7 +1542,7 @@ async fn an_admission_is_released_on_every_path() {
     let _ = task.await;
     // Refused when kept (aborted upload): the charge is released.
     let admission = store.admit_part(&id, "b", "k", 1, 2 * MIB).unwrap();
-    let body = spooled(&store, &[1u8; 2 << 20], 0).unwrap();
+    let body = spooled(&store, &[1u8; 2 << 20], HeldSpool::NOTHING).unwrap();
     store.abort(&id, "b", "k").unwrap();
     let err = store
         .upload_part(&id, "b", "k", 1, body, admission)

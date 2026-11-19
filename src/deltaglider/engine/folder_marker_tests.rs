@@ -187,12 +187,12 @@ async fn an_empty_delimiter_is_no_delimiter() {
 }
 
 /// The caller of a multipart Complete learns that the write committed from
-/// the engine (`commit_signal`): every store path of a Complete notes it,
+/// the engine (the commit flag of its `ObjectWriteGuard`): every store path of a Complete notes it,
 /// on a plain and on an encrypting backend. A path that lost the signal
 /// would let a panic after the commit roll back a stored object.
 #[tokio::test]
 async fn every_multipart_store_path_notes_its_commit() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
     for (_dir, engine) in engines().await {
         for (key, via_delta_store) in [
             ("img/a.jpg", false),
@@ -202,10 +202,10 @@ async fn every_multipart_store_path_notes_its_commit() {
             let relay = tempfile::NamedTempFile::new().unwrap();
             std::fs::write(relay.path(), b"multipart body").unwrap();
             let parts = [crate::deltaglider::RelayPart::of_file(relay.path())];
-            let flag = Arc::new(AtomicBool::new(false));
             let lock = engine.lock_object_write("b", key).await;
+            let flag = lock.commit_flag();
             let mpe = "\"0123456789abcdef0123456789abcdef-1\"".to_string();
-            let stored = crate::deltaglider::commit_signal::watching(flag.clone(), async {
+            let stored = async {
                 if via_delta_store {
                     engine
                         .store_relayed_parts_delta_with_multipart_etag(
@@ -233,7 +233,7 @@ async fn every_multipart_store_path_notes_its_commit() {
                         )
                         .await
                 }
-            })
+            }
             .await;
             drop(lock);
             stored.unwrap();
@@ -242,5 +242,47 @@ async fn every_multipart_store_path_notes_its_commit() {
                 "{key}: the commit was not noted"
             );
         }
+    }
+}
+
+/// A store that runs in a task of its own still sets the commit flag: the
+/// flag lives in the guard, not in the task that started the store (a
+/// task-local did not cross `tokio::spawn`, and a Complete then rolled back
+/// an object it had stored).
+#[tokio::test]
+async fn a_store_in_a_spawned_task_sets_the_commit_flag() {
+    for (_dir, engine) in engines().await {
+        let engine = Arc::new(engine);
+        let relay = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(relay.path(), b"multipart body").unwrap();
+        let path = relay.path().to_path_buf();
+        let lock = engine.lock_object_write("b", "img/s.jpg").await;
+        let flag = lock.commit_flag();
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        let task_engine = engine.clone();
+        let lock = tokio::spawn(async move {
+            let parts = [crate::deltaglider::RelayPart::of_file(&path)];
+            task_engine
+                .store_passthrough_relayed_parts_with_multipart_etag(
+                    &lock,
+                    "b",
+                    "img/s.jpg",
+                    &parts,
+                    14,
+                    None,
+                    Default::default(),
+                    "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
+                )
+                .await
+                .unwrap();
+            lock
+        })
+        .await
+        .unwrap();
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the commit of a spawned store was lost"
+        );
+        drop(lock);
     }
 }

@@ -8,6 +8,7 @@ use super::*;
 use crate::deltaglider::ingest::{ingest, IngestError, IngestPlan, IngestedBody};
 use crate::deltaglider::ingest_rig::{body, IngestRig, RigConfig};
 use crate::deltaglider::memory_budget::MemoryBudget;
+use crate::deltaglider::spool::HeldSpool;
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,7 +70,7 @@ fn plan(declared: u64) -> IngestPlan {
         declared,
         limit: 64 * MIB,
         sha256: crate::deltaglider::ingest::Sha256Need::Compute,
-        held_spool_mib: 0,
+        held_spool: HeldSpool::NOTHING,
         strict_length: true,
         destination: crate::deltaglider::ingest::Destination::Object,
     }

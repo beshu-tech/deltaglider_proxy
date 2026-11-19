@@ -6,6 +6,7 @@
 use super::resources::SpoolWait;
 use super::*;
 use crate::config::Config;
+use crate::deltaglider::spool::HeldSpool;
 use crate::disk_watch::Level;
 use crate::storage::{DynStorageBackend, FilesystemBackend};
 use std::collections::HashMap;
@@ -35,6 +36,16 @@ fn set_level(engine: &DynEngine, level: Level) {
         .set(level, format!("at level {}", level.name()));
 }
 
+/// The ingest reservation the way the ingest makes it: the gate, then the wrapper.
+async fn reserve(
+    engine: &DynEngine,
+    held: HeldSpool,
+    wait: SpoolWait,
+) -> Result<crate::deltaglider::spool::SpoolReservation, EngineError> {
+    let admission = engine.admit_new_spool_write(held)?;
+    engine.reserve_ingest_spool(MIB, admission, wait).await
+}
+
 fn refused<T>(r: Result<T, EngineError>) -> String {
     match r {
         Err(EngineError::Overloaded(m)) => m,
@@ -48,8 +59,7 @@ async fn a_new_write_reservation_is_refused_at_high_and_critical() {
     let (_dir, engine) = engine().await;
     for level in [Level::Ok, Level::Low] {
         set_level(&engine, level);
-        engine
-            .reserve_ingest_spool(MIB, 0, SpoolWait::Queue)
+        reserve(&engine, HeldSpool::NOTHING, SpoolWait::Queue)
             .await
             .unwrap();
         engine.codec_source_spool_now(1024).unwrap();
@@ -57,7 +67,7 @@ async fn a_new_write_reservation_is_refused_at_high_and_critical() {
     for level in [Level::High, Level::Critical] {
         set_level(&engine, level);
         for wait in [SpoolWait::Queue, SpoolWait::Now] {
-            let m = refused(engine.reserve_ingest_spool(MIB, 0, wait).await);
+            let m = refused(reserve(&engine, HeldSpool::NOTHING, wait).await);
             assert!(m.contains(level.name()), "{m}");
         }
         // A small codec source (a reference of at most the threshold) is no
@@ -70,22 +80,33 @@ async fn a_new_write_reservation_is_refused_at_high_and_critical() {
 async fn a_running_write_keeps_its_budget_and_a_recovery_admits_again() {
     let (_dir, engine) = engine().await;
     set_level(&engine, Level::Ok);
-    let held = engine
-        .reserve_ingest_spool(MIB, 0, SpoolWait::Queue)
+    let held = reserve(&engine, HeldSpool::NOTHING, SpoolWait::Queue)
         .await
         .unwrap();
     set_level(&engine, Level::Critical);
     // An op that holds a spool already (a multipart upload's next part)
     // runs to its end.
-    engine
-        .reserve_ingest_spool(MIB, held.reserved_mib(), SpoolWait::Queue)
+    reserve(&engine, HeldSpool::of_reservation(&held), SpoolWait::Queue)
         .await
         .unwrap();
     set_level(&engine, Level::Low);
-    engine
-        .reserve_ingest_spool(MIB, 0, SpoolWait::Queue)
+    reserve(&engine, HeldSpool::NOTHING, SpoolWait::Queue)
         .await
         .unwrap();
+}
+
+/// The admission is the gate's verdict: nothing held asks the level; a held
+/// real spool is a holder and runs to its end.
+#[tokio::test]
+async fn admission_refuses_critical_for_a_new_write_and_admits_a_holder() {
+    let (_dir, engine) = engine().await;
+    set_level(&engine, Level::Ok);
+    let spool = engine.spool_acquire(MIB).await.unwrap();
+    engine.admit_new_spool_write(HeldSpool::NOTHING).unwrap();
+    set_level(&engine, Level::Critical);
+    let m = refused(engine.admit_new_spool_write(HeldSpool::NOTHING));
+    assert!(m.contains(Level::Critical.name()), "{m}");
+    engine.admit_new_spool_write(HeldSpool::of(&spool)).unwrap();
 }
 
 #[tokio::test]
@@ -163,8 +184,9 @@ const SPOOL_SITES: &[(&str, &str, Spool)] = &[
 ];
 
 /// CLASS GUARD: every acquisition of spool space in `src/` is classified in
-/// [`SPOOL_SITES`]; each gated fn asks the gate, no other fn does, and the
-/// table has no row that no code matches.
+/// [`SPOOL_SITES`], and the table has no row that no code matches. (The
+/// gate itself is a type: the reserving wrappers take a `HeldSpool` or a
+/// `SpoolWriteAdmission`.)
 #[test]
 fn every_spool_acquisition_is_classified() {
     const ACQUIRING: &[&str] = &[
@@ -217,40 +239,15 @@ fn every_spool_acquisition_is_classified() {
             problems.push(format!("{file}::{name} acquires spool space: classify it"));
         }
     }
-    for (file, name, class) in SPOOL_SITES {
+    for (file, name, _class) in SPOOL_SITES {
         if !found.iter().any(|(f, n)| f == file && n == name) {
             problems.push(format!(
                 "{file}::{name} is in SPOOL_SITES but acquires nothing"
             ));
             continue;
         }
-        let body = crate::source_scan::prod_fn_text(file, name);
-        let asks = body.contains("admit_new_spool_write(");
-        match class {
-            Spool::Gated if !asks => {
-                problems.push(format!("{file}::{name} is a write and must ask the gate"))
-            }
-            Spool::SmallCodec | Spool::Primitive | Spool::NoMonitor if asks => problems.push(
-                format!("{file}::{name} is {class:?} and must not ask the gate"),
-            ),
-            _ => {}
-        }
-    }
-    for file in READ_FILES {
-        assert!(
-            !crate::source_scan::prod_text(&crate::source_scan::read(file))
-                .contains("admit_new_spool_write("),
-            "{file} serves reads and must not ask the write gate"
-        );
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
-    assert_eq!(
-        crate::source_scan::read("src/deltaglider/engine/resources.rs")
-            .matches("self.spool.admit_new_write()")
-            .count(),
-        1,
-        "one place asks the spool gate"
-    );
 }
 
 /// Files whose spool acquisitions are all reads (a GET and a range read):

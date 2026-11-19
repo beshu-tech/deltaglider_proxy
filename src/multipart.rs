@@ -311,7 +311,7 @@ pub struct CompletedParts {
 pub struct PartAdmission {
     /// The spool budget the upload holds already (its relay parts): its
     /// ingest never waits for more.
-    pub held_spool_mib: usize,
+    pub held_spool: crate::deltaglider::spool::HeldSpool,
     part: AdmittedPart,
 }
 
@@ -752,7 +752,9 @@ impl MultipartStore {
         let charge = part_charge(declared);
         admitted.add(upload_id, charge);
         Ok(PartAdmission {
-            held_spool_mib: upload.parts.values().map(|p| p.budget.reserved_mib()).sum(),
+            held_spool: crate::deltaglider::spool::HeldSpool::of_all(
+                upload.parts.values().map(|p| &p.budget),
+            ),
             part: AdmittedPart {
                 admitted: self.admitted.clone(),
                 upload_id: upload_id.to_string(),

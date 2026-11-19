@@ -299,7 +299,7 @@ pub(super) async fn read_copy_source(
         // the stream holds: the ingest of the copy holds that budget, so
         // it never waits for more (a wait there could wait on itself, or
         // on another copy that waits on it).
-        held_spool_mib: engine.stream_spool_mib(&metadata),
+        held_spool: engine.stream_held_spool(&metadata),
         strict_length: true,
         destination: Destination::Object,
     };
@@ -461,7 +461,7 @@ pub(super) async fn upload_part_copy(
             None,
             false,
         ),
-        held_spool_mib: admission.held_spool_mib,
+        held_spool: admission.held_spool,
         strict_length: true,
         destination: crate::deltaglider::ingest::Destination::MultipartPart,
     };

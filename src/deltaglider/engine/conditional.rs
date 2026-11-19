@@ -122,9 +122,25 @@ pub struct ObjectWriteGuard {
     /// The object as the precondition check read it under this lock
     /// (`Some(None)`: absent). `None`: no precondition, nothing read.
     checked: Option<Option<(FileMetadata, super::metadata::StoredForms)>>,
+    /// Set when a write under this guard commits (`record_commit`). A clone
+    /// of it ([`Self::commit_flag`]) lives wherever the guard's holder
+    /// needs to know, even from a task the write spawned.
+    committed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ObjectWriteGuard {
+    /// A handle on the commit flag: true once a write under this guard
+    /// committed.
+    pub(crate) fn commit_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.committed.clone()
+    }
+
+    /// The engine: a write under this guard just committed.
+    pub(super) fn note_commit(&self) {
+        self.committed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// `Ok` when this guard locks the object `deltaspace_id`/`filename` of
     /// `bucket`. A store checks it before it writes, so a guard of one key
     /// cannot stand in for another.
@@ -256,6 +272,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             lock: mutex,
             object,
             checked: None,
+            committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

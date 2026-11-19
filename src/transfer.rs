@@ -1837,7 +1837,7 @@ async fn delta_passthrough_copy(
             // The fast path bypasses the engine's store, so it records its
             // commit itself, at the commit (before the next await): the
             // delta, overwrite-aware.
-            engine2.record_fast_path_copy(&dest_bucket, &counter_prior, &meta, 0);
+            engine2.record_fast_path_copy(lock, &dest_bucket, &counter_prior, &meta, 0);
             Ok(Some(seeded))
         })
         .await;
@@ -2006,7 +2006,7 @@ async fn spooled_copy(
     // storage write's temp files. Exactly `source_size` bytes, hashed on
     // the way: the store must get the bytes the metadata names. The stream
     // of a large delta or reference source holds its spool file: the copy
-    // holds that budget (`held_spool_mib`), so it never waits for more, and
+    // holds that budget (`held_spool`), so it never waits for more, and
     // a copy that the budget cannot hold beside it fails now.
     use crate::deltaglider::ingest::{self, IngestError};
     let plan = ingest::IngestPlan {
@@ -2014,7 +2014,7 @@ async fn spooled_copy(
         // The stored source sets the size; the store applies its limits.
         limit: u64::MAX,
         sha256: ingest::Sha256Need::Compute,
-        held_spool_mib: engine.stream_spool_mib(&meta),
+        held_spool: engine.stream_held_spool(&meta),
         strict_length: true,
         destination: ingest::Destination::Object,
     };

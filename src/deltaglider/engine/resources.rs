@@ -28,6 +28,14 @@ fn spool_error(e: std::io::Error) -> EngineError {
     }
 }
 
+/// The disk gate's verdict for a new spool write: made only by
+/// `admit_new_spool_write`, taken by value by the reserving wrappers (one
+/// verdict, one reservation). It names the budget the op holds already.
+#[derive(Debug)]
+pub(crate) struct SpoolWriteAdmission {
+    held: crate::deltaglider::spool::HeldSpool,
+}
+
 /// Whether a spool reservation may queue for the budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpoolWait {
@@ -142,21 +150,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// storage write needs for its own temp files (the encrypting wrapper's
     /// ciphertext). Waiting for budget under the lock is hold-and-wait: a
     /// streaming PUT that holds its body spool can wait for the same lock.
-    /// `held_mib`: spool budget the op holds already (its body spool, or its
+    /// `held`: spool budget the op holds already (its body spool, or its
     /// relay parts); a holder never waits. `None`: no spool needed.
     pub(crate) async fn reserve_storage_spool(
         &self,
         bucket: &str,
         bytes: u64,
         parts: bool,
-        held_mib: usize,
+        held: crate::deltaglider::spool::HeldSpool,
     ) -> Result<Option<crate::deltaglider::spool::SpoolReservation>, EngineError> {
         let need = self.storage_spool_bytes(bucket, bytes, parts).await;
         if need == 0 {
             return Ok(None);
         }
-        self.admit_new_spool_write(held_mib)?;
-        self.with_spool_timeout(self.spool.reserve_beside(held_mib, need))
+        // Asked only when a spool is needed: a write without one is no spool write.
+        let admission = self.admit_new_spool_write(held)?;
+        self.with_spool_timeout(self.spool.reserve_beside(admission.held.mib(), need))
             .await
             .map(Some)
     }
@@ -167,15 +176,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// later uses it and never waits under a lock. [`SpoolWait::Queue`]:
     /// queue for the budget (timed); [`SpoolWait::Now`]: take free budget
     /// now, whatever the queue, or `Overloaded` (a small body never waits
-    /// behind a large one). `held_mib`: budget the op holds already; a
-    /// holder never waits.
+    /// behind a large one). `admission` names the budget the op holds
+    /// already; a holder never waits.
     pub(crate) async fn reserve_ingest_spool(
         &self,
         bytes: u64,
-        held_mib: usize,
+        admission: SpoolWriteAdmission,
         wait: SpoolWait,
     ) -> Result<crate::deltaglider::spool::SpoolReservation, EngineError> {
-        self.admit_new_spool_write(held_mib)?;
+        let held_mib = admission.held.mib();
         match wait {
             SpoolWait::Queue => {
                 self.with_spool_timeout(self.spool.reserve_beside(held_mib, bytes))
@@ -231,14 +240,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// reserved where the free space is no proof, an op that holds no spool
     /// yet (`held_mib` = 0) is refused with a retryable `Overloaded` that
     /// names the level. An op that holds a spool already runs to its end,
-    /// and reads and deletes never ask. Every spool acquisition in `src/`
-    /// is a gated write, a small codec source, or a read (source guard
-    /// `every_spool_acquisition_is_classified`).
-    pub(crate) fn admit_new_spool_write(&self, held_mib: usize) -> Result<(), EngineError> {
-        if held_mib > 0 {
-            return Ok(());
+    /// and reads and deletes never ask. The reserving wrappers take the
+    /// [`SpoolWriteAdmission`] this returns, so no write reserves without
+    /// the gate's verdict; `held` is made from a spool, never from a number.
+    pub(crate) fn admit_new_spool_write(
+        &self,
+        held: crate::deltaglider::spool::HeldSpool,
+    ) -> Result<SpoolWriteAdmission, EngineError> {
+        if held.mib() == 0 {
+            self.spool.admit_new_write().map_err(spool_error)?;
         }
-        self.spool.admit_new_write().map_err(spool_error)
+        Ok(SpoolWriteAdmission { held })
     }
 
     /// `spool_acquire` for an op that holds `held_mib` of the budget already

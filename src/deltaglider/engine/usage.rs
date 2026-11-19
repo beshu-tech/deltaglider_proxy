@@ -99,9 +99,16 @@ impl AsRef<CounterPrior> for CounterPrior {
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Record a committed object write: `added` replaces what `prior` says
     /// the key held. Call it right after the storage write commits, before
-    /// the next await (see the module doc).
-    pub(super) fn record_commit(&self, bucket: &str, prior: &CounterPrior, added: &FileMetadata) {
-        crate::deltaglider::commit_signal::note();
+    /// the next await (see the module doc). `lock` is the write's guard: the
+    /// commit sets its flag, which a task that holds a clone of it reads.
+    pub(super) fn record_commit(
+        &self,
+        lock: &super::conditional::ObjectWriteGuard,
+        bucket: &str,
+        prior: &CounterPrior,
+        added: &FileMetadata,
+    ) {
+        lock.note_commit();
         let Some(u) = &self.bucket_usage else { return };
         match prior.counted() {
             // `counted()` unwraps a ReadAhead: never one here.
@@ -255,12 +262,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// reference the copy seeded.
     pub fn record_fast_path_copy(
         &self,
+        lock: &super::conditional::ObjectWriteGuard,
         bucket: &str,
         prior: &CounterPrior,
         delta_meta: &FileMetadata,
         seeded_reference_bytes: u64,
     ) {
-        self.record_commit(bucket, prior, delta_meta);
+        self.record_commit(lock, bucket, prior, delta_meta);
         self.record_reference(bucket, seeded_reference_bytes as i64);
     }
 }

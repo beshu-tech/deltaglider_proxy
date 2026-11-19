@@ -6,7 +6,7 @@ use super::conditional::ObjectWriteGuard;
 use super::usage::CounterPrior;
 use super::*;
 use crate::deltaglider::ingest::BodyHashes;
-use crate::deltaglider::spool::SpoolBudget;
+use crate::deltaglider::spool::{HeldSpool, SpoolBudget};
 use crate::storage::mpu_guard::MpuAbortGuard;
 use crate::storage::{MultipartUpload, ObjectVariant, StorageBackend, UploadedPart};
 use crate::types::PassthroughReason;
@@ -451,11 +451,11 @@ enum EncodedDelta {
 }
 
 impl EncodedDelta {
-    /// Spool budget this delta holds, in MiB (the pair's one permit).
-    fn held_mib(&self) -> usize {
+    /// Spool budget this delta holds (the pair's one permit).
+    fn held_spool(&self) -> HeldSpool {
         match self {
-            EncodedDelta::Spooled { delta_spool, .. } => delta_spool.reserved_mib(),
-            EncodedDelta::InRam(_) | EncodedDelta::None => 0,
+            EncodedDelta::Spooled { delta_spool, .. } => HeldSpool::of(delta_spool),
+            EncodedDelta::InRam(_) | EncodedDelta::None => HeldSpool::NOTHING,
         }
     }
 
@@ -610,7 +610,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .put_directory_marker(bucket, &obj_key.full_key())
             .await?;
         let metadata = FileMetadata::directory_marker(&obj_key.full_key());
-        self.record_commit(bucket, &prior, &metadata);
+        self.record_commit(lock, bucket, &prior, &metadata);
         self.metadata_cache.insert(bucket, key, metadata.clone());
         Ok(StoreResult::new(metadata, 0).with_accounting(prior.replaced(), 0))
     }
@@ -1037,7 +1037,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<StoreResult, EngineError> {
         let reserved = match put.body {
             PutBody::Spooled(body) => {
-                self.storage_spool(put.storage, put.bucket, put.size, body.reserved_mib())
+                self.storage_spool(put.storage, put.bucket, put.size, HeldSpool::of(body))
                     .await?
             }
             PutBody::Buffered(_) => StorageSpool::Own(None),
@@ -1096,9 +1096,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // waits under the lock (a holder never waits).
                 let reserved = match &delta {
                     EncodedDelta::Spooled { .. } => {
-                        let held_mib =
-                            put.body.held().map_or(0, |b| b.reserved_mib()) + delta.held_mib();
-                        self.storage_spool(put.storage, put.bucket, delta_len, held_mib)
+                        let held = put
+                            .body
+                            .held()
+                            .map_or(HeldSpool::NOTHING, HeldSpool::of)
+                            .plus(delta.held_spool());
+                        self.storage_spool(put.storage, put.bucket, delta_len, held)
                             .await?
                     }
                     EncodedDelta::InRam(_) | EncodedDelta::None => StorageSpool::Own(None),
@@ -1127,7 +1130,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // never waits (a holder never waits): safe under the lock.
                 let reserved = match put.body {
                     PutBody::Spooled(body) => {
-                        self.storage_spool(put.storage, put.bucket, put.size, body.reserved_mib())
+                        self.storage_spool(put.storage, put.bucket, put.size, HeldSpool::of(body))
                             .await?
                     }
                     PutBody::Buffered(_) => StorageSpool::Own(None),
@@ -1253,7 +1256,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // disk gate says no like a full budget does: this PUT keeps no delta
         // (`NoSpool`: the body is stored whole as `delta-unavailable`, which
         // needs no spool). The write itself goes on.
-        if self.admit_new_spool_write(0).is_err() {
+        if self.admit_new_spool_write(HeldSpool::NOTHING).is_err() {
             debug!(
                 "PUT {}/{}: the spool disk is nearly full; no delta for the large-reference encode",
                 put.bucket, put.key
@@ -1440,20 +1443,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// The spool reservation of a storage write of `bytes`: the one the
     /// ingest of the body `carried`, else a new one. The op holds
-    /// `held_mib` already, so that one never waits (a holder never waits):
+    /// `held` already, so that one never waits (a holder never waits):
     /// safe under the locks.
     async fn storage_spool<'r>(
         &self,
         carried: Option<&'r crate::deltaglider::spool::SpoolReservation>,
         bucket: &str,
         bytes: u64,
-        held_mib: usize,
+        held: HeldSpool,
     ) -> Result<StorageSpool<'r>, EngineError> {
         if let Some(r) = carried {
             return Ok(StorageSpool::Carried(r));
         }
         Ok(StorageSpool::Own(
-            self.reserve_storage_spool(bucket, bytes, false, held_mib)
+            self.reserve_storage_spool(bucket, bytes, false, held)
                 .await?,
         ))
     }
@@ -1493,7 +1496,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // The body spool makes this op a holder, so the reservation
                 // for the storage write's own temp file never waits.
                 let reserved = self
-                    .storage_spool(put.storage, put.bucket, put.size, body.reserved_mib())
+                    .storage_spool(put.storage, put.bucket, put.size, HeldSpool::of(body))
                     .await?;
                 xnode
                     .put_reference_from_file(
@@ -1573,7 +1576,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?;
         // Committed: count it before the next await. The metrics count only
         // a delta that committed (a failed commit counted its savings).
-        self.record_commit(put.bucket, put.prior, &metadata);
+        self.record_commit(put.lock, put.bucket, put.prior, &metadata);
         self.with_metrics(|m| {
             m.delta_decisions_total.with_label_values(&["delta"]).inc();
             if fresh_baseline {
@@ -1647,7 +1650,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
         }
         // Committed: count it before the next await.
-        self.record_commit(bucket, prior, &metadata);
+        self.record_commit(lock, bucket, prior, &metadata);
         self.drop_other_form(
             lock,
             bucket,
@@ -1753,7 +1756,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // counter: unchanged (the same bytes under repaired metadata). The
         // heal holds its spool, so this reservation never waits.
         let reserved = self
-            .reserve_storage_spool(bucket, size, false, spool.reserved_mib())
+            .reserve_storage_spool(bucket, size, false, HeldSpool::of(&spool))
             .await?;
         xnode
             .put_reference_from_file(
@@ -2006,7 +2009,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // per part), so this op is a holder and never waits.
         let parts_mib = crate::deltaglider::spool::mib_ceil(total_size);
         let reserved = self
-            .reserve_storage_spool(bucket, total_size, true, parts_mib)
+            .reserve_storage_spool(bucket, total_size, true, HeldSpool::of_stream(parts_mib))
             .await?;
         // The key's write lock only (P7.4): see `write_passthrough_locked`.
         let reason =
@@ -2034,7 +2037,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             )
             .await?;
         // Committed: count it before the next await.
-        self.record_commit(bucket, prior, &metadata);
+        self.record_commit(lock, bucket, prior, &metadata);
         self.drop_other_form(
             lock,
             bucket,
@@ -2078,7 +2081,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let (sha256, md5) = (held.sha256.to_string(), held.md5.to_string());
         let source_path = held.spool.path();
         let reserved = self
-            .storage_spool(held.storage, bucket, total_size, held.spool.reserved_mib())
+            .storage_spool(held.storage, bucket, total_size, HeldSpool::of(held.spool))
             .await?;
         // The key's write lock only (P7.4): see `write_passthrough_locked`.
         let write = PassthroughWrite {
@@ -2242,7 +2245,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Err(e.into());
         }
         // Committed: count it before the next await.
-        self.record_commit(&handle.bucket, &prior, &metadata);
+        self.record_commit(lock, &handle.bucket, &prior, &metadata);
         self.drop_other_form(
             lock,
             &handle.bucket,

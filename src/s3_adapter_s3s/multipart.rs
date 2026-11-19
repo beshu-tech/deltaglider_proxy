@@ -616,10 +616,10 @@ pub(super) async fn run_multipart_completion(
     let store_guard = state.multipart.store_guard(&upload_id);
     // Armed from here: a pre-commit error, panic or drop rolls the upload
     // back; once the write committed, an exit completes it instead.
-    let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let committed = write_lock.commit_flag();
     let completing = state
         .multipart
-        .completing_guard(&upload_id, &etag, committed.clone());
+        .completing_guard(&upload_id, &etag, committed);
     let store = async {
         if stores_whole {
             engine
@@ -651,22 +651,12 @@ pub(super) async fn run_multipart_completion(
                 .await
         }
     };
-    let committed_seen = committed.clone();
-    let stored = crate::deltaglider::commit_signal::watching(committed, store).await;
+    let stored = store.await;
     drop(store_guard);
     let result = match stored {
         Ok(result) => result,
         Err(e) => return Err(e.into()),
     };
-    // A store that returned Ok has committed, so it noted its commit. If
-    // it did not, the signal is lost (a store that moved the commit to a
-    // task of its own): the guard would roll back a stored object.
-    if !committed_seen.load(std::sync::atomic::Ordering::SeqCst) {
-        tracing::error!(
-            "multipart completion of {bucket}/{key}: the store returned Ok without noting its commit"
-        );
-        debug_assert!(false, "the store of a Complete lost its commit signal");
-    }
     #[cfg(test)]
     if panic_after_store::armed(&upload_id) {
         panic!("injected panic after the store of {upload_id}");

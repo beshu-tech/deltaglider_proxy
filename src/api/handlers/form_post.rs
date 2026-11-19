@@ -46,6 +46,7 @@ use super::object_helpers::{check_client_store_allowed, store_client_write, Clie
 use super::{audit_log_s3, ensure_bucket_exists, AppState};
 use crate::api::errors::S3Error;
 use crate::deltaglider::ingest::{Destination, IngestError, IngestPlan, IngestedBody, Sha256Need};
+use crate::deltaglider::spool::HeldSpool;
 use crate::iam::{AuthenticatedUser, IamState, S3Action, SharedIamState};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
@@ -919,7 +920,7 @@ async fn ingest_form_file(
         declared: cap.bytes,
         limit: engine.max_object_size(),
         sha256: Sha256Need::decide(Destination::Object, None, false),
-        held_spool_mib: 0,
+        held_spool: HeldSpool::NOTHING,
         // The cap is an upper bound: the file's length is known only
         // after it has arrived.
         strict_length: false,

@@ -34,7 +34,7 @@ use md5::{Digest as _, Md5};
 use sha2::Sha256;
 
 use crate::deltaglider::memory_budget::MemoryPermit;
-use crate::deltaglider::spool::{mib_ceil, Spool, SpoolFillError, SpoolReservation};
+use crate::deltaglider::spool::{mib_ceil, HeldSpool, Spool, SpoolFillError, SpoolReservation};
 use crate::deltaglider::{
     DeltaGliderEngine, EngineError, KnownSha256, SpoolWait, BLOCKING_HASH_THRESHOLD,
 };
@@ -306,7 +306,7 @@ pub fn admit_declared<E>(
         });
     }
     let needed = plan.declared.saturating_add(storage_extra);
-    if !spool_admits(needed, spool_max_bytes, plan.held_spool_mib) {
+    if !spool_admits(needed, spool_max_bytes, plan.held_spool.mib()) {
         return Err(IngestError::SpoolTooSmall {
             declared: plan.declared,
             storage_extra,
@@ -373,7 +373,7 @@ pub struct IngestPlan {
     pub sha256: Sha256Need,
     /// Spool budget the op holds already (the other parts of a multipart
     /// upload); such an op never waits for more.
-    pub held_spool_mib: usize,
+    pub held_spool: HeldSpool,
     /// `true`: a body shorter than `declared` fails. `false`: `declared`
     /// is an upper bound (a form file), and a shorter body is the body.
     pub strict_length: bool,
@@ -563,8 +563,11 @@ where
     // (an op that holds spool budget already never waits). A small body
     // takes free budget now or is refused: it never queues behind a large
     // reservation.
+    let admission = engine
+        .admit_new_spool_write(plan.held_spool)
+        .map_err(IngestError::Engine)?;
     let storage = engine
-        .reserve_ingest_spool(reserve.bytes, plan.held_spool_mib, reserve.wait)
+        .reserve_ingest_spool(reserve.bytes, admission, reserve.wait)
         .await
         .map_err(IngestError::Engine)?;
     if storage.reserved_mib() < mib_ceil(plan.declared) {
@@ -609,7 +612,7 @@ pub(crate) async fn ingest_bytes<B: StorageBackend>(
         declared: data.len() as u64,
         limit,
         sha256: known_sha256.into(),
-        held_spool_mib: 0,
+        held_spool: HeldSpool::NOTHING,
         strict_length: true,
         destination: Destination::Object,
     };
@@ -727,7 +730,7 @@ mod tests {
             declared,
             limit,
             sha256: Sha256Need::Compute,
-            held_spool_mib: held,
+            held_spool: HeldSpool::of_stream(held),
             strict_length: true,
             destination: Destination::Object,
         };
