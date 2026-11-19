@@ -1757,6 +1757,43 @@ pub(crate) async fn client_delta_copy(
     ))
 }
 
+/// Reads the source delta (generation-pinned) and, when `seed`, the source
+/// reference. `Ok(None)` = the reference is not the delta's: fall back.
+async fn read_fast_path_source(
+    engine: &DynEngine,
+    bucket: &str,
+    prefix: &str,
+    filename: &str,
+    head: &crate::types::FileMetadata,
+    ref_sha256: &str,
+    seed: bool,
+) -> Result<Option<(Vec<u8>, Option<(Vec<u8>, crate::types::FileMetadata)>)>, CopyError> {
+    // Generation pin: `head` comes from the HEAD taken before this read. The
+    // GET returns the metadata stored with the bytes it returns; if that
+    // still names the HEAD's generation, the bytes are that generation.
+    let (delta_bytes, fresh) = engine
+        .get_delta_raw_with_metadata(bucket, prefix, filename)
+        .await?;
+    if !same_delta_generation(head, Some(&fresh), delta_bytes.len()) {
+        return Err(CopyError::source_changed(format_args!(
+            "{bucket}/{prefix}/{filename} was overwritten after HEAD"
+        )));
+    }
+    if !seed {
+        return Ok(Some((delta_bytes, None)));
+    }
+    let (ref_data, mut ref_meta) = engine
+        .get_reference_raw_with_metadata(bucket, prefix)
+        .await?;
+    if ref_meta.file_sha256 != ref_sha256 {
+        return Ok(None);
+    }
+    // The dest write re-stamps (encrypt) or leaves plaintext; a surviving
+    // source marker would corrupt the reference read.
+    strip_encryption_markers(&mut ref_meta.user_metadata);
+    Ok(Some((delta_bytes, Some((ref_data, ref_meta)))))
+}
+
 /// Try the delta fast path. `Ok(None)` = fell back; the caller runs the
 /// existing reconstruct path. Enforces three corruption-defense layers
 /// (gate sha-check, seed sha-assert, post-lock re-gate).
@@ -1868,51 +1905,47 @@ async fn delta_passthrough_copy(
         }
     };
     let counter_replaced = counter_prior.replaced();
-    // Source reads stay OUTSIDE the counted commit: the caller (object
-    // timeout, kill, shutdown) can still cut them. A pre-lock gate on the
-    // destination reference says whether the seed bytes are needed; the
-    // commit re-gates under the lock and falls back when they were not read.
-    let pre_ref = match engine
-        .reference_meta(request.destination_bucket, &dest_prefix)
-        .await
-    {
-        Ok(meta) => meta.map(|m| DestRefFacts {
-            file_sha256: m.file_sha256.clone(),
-            enc: enc_fingerprint(&m),
-        }),
-        Err(_) => return Ok(None),
-    };
-    let pre_decision = can_delta_passthrough(&src, pre_ref.as_ref());
-    if matches!(pre_decision, DeltaPassthroughDecision::Fallback { .. }) {
-        return Ok(None);
-    }
-    // Generation pin: `meta` comes from the HEAD taken before this read. The
-    // GET returns the metadata stored with the bytes it returns; if that
-    // still names the HEAD's generation, the bytes are that generation.
-    let (delta_bytes, fresh) = engine
-        .get_delta_raw_with_metadata(request.source_bucket, &src_prefix, &src_filename)
-        .await?;
-    if !same_delta_generation(&meta_generation, Some(&fresh), delta_bytes.len()) {
-        return Err(CopyError::source_changed(format_args!(
-            "{src_bucket}/{src_prefix}/{src_filename} was overwritten after HEAD"
-        )));
-    }
-    let seed_source: Option<(Vec<u8>, crate::types::FileMetadata)> =
-        if pre_decision == DeltaPassthroughDecision::SeedThenShip {
-            let (ref_data, mut ref_meta) = engine
-                .get_reference_raw_with_metadata(request.source_bucket, &src_prefix)
-                .await?;
-            if ref_meta.file_sha256 != src.ref_sha256 {
-                return Ok(None);
-            }
-            // Same marker strip as the delta: the dest write re-stamps
-            // (encrypt) or leaves plaintext (passthrough); a surviving
-            // source marker would corrupt the reference read.
-            strip_encryption_markers(&mut ref_meta.user_metadata);
-            Some((ref_data, ref_meta))
-        } else {
-            None
+    // A detached commit (admitted background copy) reads its source BEFORE
+    // the commit, so a caller cut still cancels the reads; a pre-lock gate on
+    // the destination reference says whether the seed bytes are needed. An
+    // inline commit (no count) reads inside it, after the locked gate.
+    let pre_read = if request.commit_count.is_some() {
+        let pre_ref = match engine
+            .reference_meta(request.destination_bucket, &dest_prefix)
+            .await
+        {
+            Ok(meta) => meta.map(|m| DestRefFacts {
+                file_sha256: m.file_sha256.clone(),
+                enc: enc_fingerprint(&m),
+            }),
+            Err(_) => return Ok(None),
         };
+        let pre_decision = can_delta_passthrough(&src, pre_ref.as_ref());
+        if matches!(pre_decision, DeltaPassthroughDecision::Fallback { .. }) {
+            return Ok(None);
+        }
+        let seed = pre_decision == DeltaPassthroughDecision::SeedThenShip;
+        match read_fast_path_source(
+            engine,
+            &src_bucket,
+            &src_prefix,
+            &src_filename,
+            &meta_generation,
+            &src.ref_sha256,
+            seed,
+        )
+        .await?
+        {
+            Some(read) => Some(read),
+            None => return Ok(None),
+        }
+    } else {
+        None
+    };
+    let src_prefix2 = src_prefix.clone();
+    let src_filename2 = src_filename.clone();
+    let src_bucket2 = src_bucket.clone();
+    let meta_generation2 = meta_generation.clone();
     // `Some(seeded reference bytes)` = shipped; `None` = fell back.
     let ship_lock = lock.clone();
     let ship_engine = engine.clone();
@@ -1942,18 +1975,35 @@ async fn delta_passthrough_copy(
                     if matches!(decision, DeltaPassthroughDecision::Fallback { .. }) {
                         return Ok(None);
                     }
+                    let seed = decision == DeltaPassthroughDecision::SeedThenShip;
+                    let (delta_bytes, seed_source) = match pre_read {
+                        Some(read) => read,
+                        None => match read_fast_path_source(
+                            &engine2,
+                            &src_bucket2,
+                            &src_prefix2,
+                            &src_filename2,
+                            &meta_generation2,
+                            &src.ref_sha256,
+                            seed,
+                        )
+                        .await?
+                        {
+                            Some(read) => read,
+                            None => return Ok(None),
+                        },
+                    };
                     let mut seeded = 0;
-                    if decision == DeltaPassthroughDecision::SeedThenShip {
+                    if seed {
                         // The seed moves the reference through the proxy and writes
                         // it with the fenced PUT. A server-side copy is NOT used:
                         // the seed must be create-only, and MinIO/silo ignores
                         // `If-None-Match: *` on CopyObject (verified 2026-10-13: the
                         // copy overwrote an existing key and answered 200), so a
                         // conditional copy cannot stand in for the fenced write.
-                        // The reference was read before the commit (asserted to
-                        // match src.ref_sha256, defense layer 2). A reference that
-                        // vanished from the destination since then was not read:
-                        // fall back.
+                        // The reference was asserted to match src.ref_sha256
+                        // (defense layer 2). One that vanished from the destination
+                        // since a pre-lock read was not read: fall back.
                         let Some((ref_data, ref_meta)) = seed_source else {
                             return Ok(None);
                         };
@@ -4373,7 +4423,7 @@ mod request_count_tests {
     /// delta alone, so the counter never got the reference's bytes.
     #[tokio::test]
     async fn a_seeded_reference_is_counted_when_the_ship_after_it_fails() {
-        seeded_reference_counted_despite("GET", "src/p/b.zip").await;
+        seeded_reference_counted_despite("GET", "src/p/b.zip.delta").await;
     }
 
     /// The same, with the failure after the seed: the PUT of the delta.
@@ -4426,8 +4476,7 @@ mod request_count_tests {
         assert_eq!(count(&fake, "HEAD /src/"), 0, "the pin is the GET: {r:#?}");
         assert_eq!(count(&fake, "HEAD /dst/p/b.zip.delta"), 1, "{r:#?}");
         assert!(!r.iter().any(|x| x == "HEAD /dst/p/b.zip"), "{r:#?}");
-        // Reference before the source read, reference under the lock, verify.
-        assert_eq!(count(&fake, "HEAD "), 3, "{r:#?}");
+        assert_eq!(count(&fake, "HEAD "), 2, "{r:#?}");
         assert_eq!(count(&fake, "GET "), 1, "{r:#?}");
         assert_eq!(count(&fake, "PUT "), 1, "{r:#?}");
         // The delta moves verbatim: what comes down goes up, no reference.
@@ -4461,9 +4510,8 @@ mod request_count_tests {
                 .await
                 .unwrap();
             let r = fake.requests();
-            // Reference HEAD before the source read, again under the lock,
-            // and the verify HEAD of the written form.
-            assert_eq!(count(&fake, "HEAD "), 3, "round {round}: {r:#?}");
+            // Reference HEAD + the verify HEAD of the written form.
+            assert_eq!(count(&fake, "HEAD "), 2, "round {round}: {r:#?}");
             assert!(!r.iter().any(|x| x == "HEAD /dst/p/b.zip"), "{r:#?}");
             assert_eq!(count(&fake, "DELETE "), 1, "{r:#?}");
             assert_eq!(count(&fake, "DELETE /dst/p/b.zip?"), 1, "{r:#?}");
