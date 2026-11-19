@@ -1623,6 +1623,7 @@ impl PageStep for CopyStep<'_, '_> {
             operation: "migrate",
             upload_concurrency: None,
             keep_created_at: true,
+            commit_count: None,
         };
         // No per-object fsync: `checkpoint` flushes the copies before any
         // progress that counts on them is saved.

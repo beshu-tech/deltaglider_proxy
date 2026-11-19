@@ -114,6 +114,10 @@ pub(crate) struct ObjectTransferRequest<'a> {
     /// transition (the archived object keeps its age). False only for the
     /// admin bulk copy, which makes a new object, as S3 CopyObject does.
     pub keep_created_at: bool,
+    /// The second write count of an admitted background copy
+    /// ([`admitted`] sets it); `None` = a client copy or a maintenance job.
+    /// Required in every literal: a commit point cannot skip the decision.
+    pub commit_count: Option<&'a Arc<crate::maintenance::gate::CommitCount>>,
 }
 
 /// How one object was physically moved source→dest. Surfaced to the
@@ -181,12 +185,6 @@ impl ObjectTransferOutcome {
 pub(crate) const DEFAULT_OBJECT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
 
-tokio::task_local! {
-    /// The second write count of the admitted background copy that runs
-    /// here ([`admitted::scoped`]); [`detached_commit`] hands it to its task.
-    static COMMIT_COUNT: Arc<crate::maintenance::gate::CommitCount>;
-}
-
 /// The lock a copy holds on its destination object. Shared, so a commit
 /// that runs in its own task ([`detached_commit`]) keeps it to its end.
 pub(crate) type CopyLock = Arc<crate::deltaglider::ObjectWriteGuard>;
@@ -198,9 +196,10 @@ pub(crate) type CopyLock = Arc<crate::deltaglider::ObjectWriteGuard>;
 /// lost lease, a shutdown) cannot end the count while the write can still
 /// land, so a drain never reads 0 before it. The task owns everything the
 /// write needs, `pin` (the created-at a keeping copy pins) included: a
-/// task-local does not cross `spawn`. Anywhere else (a client copy, a
+/// count is passed, not ambient. Without a `count` (a client copy, a
 /// maintenance job) it runs inline.
 pub(crate) async fn detached_commit<T: Send + 'static>(
+    count: Option<Arc<crate::maintenance::gate::CommitCount>>,
     pin: Option<chrono::DateTime<chrono::Utc>>,
     commit: futures::future::BoxFuture<'static, T>,
 ) -> T {
@@ -210,7 +209,7 @@ pub(crate) async fn detached_commit<T: Send + 'static>(
             None => commit.await,
         }
     };
-    let Ok(count) = COMMIT_COUNT.try_with(Arc::clone) else {
+    let Some(count) = count else {
         return pinned.await;
     };
     let task = tokio::spawn(async move {
@@ -264,17 +263,6 @@ pub(crate) mod admitted {
         }
     }
 
-    /// [`bounded`], with the admission's second count in reach of the
-    /// copy's commit ([`crate::transfer::detached_commit`]).
-    pub(crate) async fn scoped(
-        proof: &Admitted,
-        timeout: Option<std::time::Duration>,
-        copy: impl std::future::Future<Output = Result<ObjectTransferOutcome, CopyError>>,
-    ) -> Result<ObjectTransferOutcome, CopyError> {
-        let count = Arc::new(proof.commit_count());
-        bounded(timeout, crate::transfer::COMMIT_COUNT.scope(count, copy)).await
-    }
-
     pub(crate) async fn copy_known(
         proof: &Admitted,
         timeout: Option<std::time::Duration>,
@@ -284,8 +272,12 @@ pub(crate) mod admitted {
         destination_prior: Option<&crate::deltaglider::CounterPrior>,
     ) -> Result<ObjectTransferOutcome, CopyError> {
         check(proof, request.destination_bucket);
-        scoped(
-            proof,
+        let count = Arc::new(proof.commit_count());
+        let request = ObjectTransferRequest {
+            commit_count: Some(&count),
+            ..request
+        };
+        bounded(
             timeout,
             crate::transfer::copy_object_known(engine, request, source, destination_prior),
         )
@@ -300,8 +292,12 @@ pub(crate) mod admitted {
         source: Option<&crate::types::FileMetadata>,
     ) -> Result<ObjectTransferOutcome, CopyError> {
         check(proof, request.destination_bucket);
-        scoped(
-            proof,
+        let count = Arc::new(proof.commit_count());
+        let request = ObjectTransferRequest {
+            commit_count: Some(&count),
+            ..request
+        };
+        bounded(
             timeout,
             crate::transfer::copy_object_from(engine, request, source),
         )
@@ -315,8 +311,12 @@ pub(crate) mod admitted {
         request: ObjectTransferRequest<'_>,
     ) -> Result<ObjectTransferOutcome, CopyError> {
         check(proof, request.destination_bucket);
-        scoped(
-            proof,
+        let count = Arc::new(proof.commit_count());
+        let request = ObjectTransferRequest {
+            commit_count: Some(&count),
+            ..request
+        };
+        bounded(
             timeout,
             crate::transfer::copy_object_with_retries(engine, request),
         )
@@ -638,6 +638,7 @@ async fn copy_object_once(
         );
         let etag = meta.multipart_etag.clone();
         detached_commit(
+            request.commit_count.cloned(),
             pin_of(&request, source_head),
             async move {
                 engine
@@ -850,6 +851,7 @@ async fn stream_copy_passthrough(
     let finished = {
         let (engine, lock, handle) = (engine.clone(), lock.clone(), handle.clone());
         detached_commit(
+            request.commit_count.cloned(),
             pin_of(&request, source_head),
             async move {
                 match engine
@@ -1665,6 +1667,7 @@ async fn server_side_copy(
         );
         let head = source_head.clone();
         detached_commit(
+            request.commit_count.cloned(),
             pin_of(&request, source_head),
             async move {
                 engine
@@ -1724,6 +1727,7 @@ pub(crate) async fn client_delta_copy(
         operation: "client copy",
         upload_concurrency: None,
         keep_created_at: false,
+        commit_count: None,
     };
     let fields = DestinationFields {
         content_type,
@@ -1865,6 +1869,7 @@ async fn delta_passthrough_copy(
     let ship_prefix = dest_prefix.clone();
     let pin = pin_of(&request, source_head);
     let shipped: Result<Option<u64>, CopyError> = detached_commit(
+        request.commit_count.cloned(),
         pin,
         async move {
             let lock = &ship_lock;
@@ -2183,6 +2188,7 @@ async fn spooled_copy(
         );
         let etag = meta.multipart_etag.clone();
         detached_commit(
+            request.commit_count.cloned(),
             pin_of(request, source_head),
             async move {
                 engine
@@ -2302,6 +2308,7 @@ mod tests {
             operation: "replication",
             upload_concurrency: None,
             keep_created_at: true,
+            commit_count: None,
         };
 
         let outcome = copy_object_with_retries(&engine, request).await.unwrap();
@@ -2342,6 +2349,7 @@ mod tests {
             operation: "replication",
             upload_concurrency: None,
             keep_created_at: false,
+            commit_count: None,
         };
         let lock = Arc::new(
             engine
@@ -2489,6 +2497,7 @@ mod tests {
             operation: "replication",
             upload_concurrency: None,
             keep_created_at: false,
+            commit_count: None,
         };
         let lock = Arc::new(
             engine
@@ -2612,6 +2621,7 @@ mod tests {
             operation: "replication",
             upload_concurrency: None,
             keep_created_at: false,
+            commit_count: None,
         };
         let _ = delta_passthrough_copy(
             &engine,
@@ -3672,6 +3682,7 @@ mod multipart_abort_tests {
             operation: "test",
             upload_concurrency: Some(2),
             keep_created_at: false,
+            commit_count: None,
         }
     }
 
@@ -3819,14 +3830,18 @@ mod multipart_abort_tests {
         let admitted =
             crate::maintenance::gate::admit_stores(Some(&gate), &["dstb"]).expect("admitted");
         let task = tokio::spawn(async move {
-            let req = copy_request();
+            let count = Arc::new(admitted.commit_count());
+            let req = ObjectTransferRequest {
+                commit_count: Some(&count),
+                ..copy_request()
+            };
             let lock = Arc::new(
                 engine
                     .lock_object_write(req.destination_bucket, req.destination_key)
                     .await,
             );
             let copy = stream_copy_passthrough(&engine, &lock, req, &meta);
-            let _ = admitted::scoped(&admitted, None, copy).await;
+            let _ = admitted::bounded(None, copy).await;
         });
         let started = std::time::Instant::now();
         while spy.completes_started.load(Ordering::SeqCst) == 0 {
@@ -3872,6 +3887,45 @@ mod multipart_abort_tests {
             "the commit landed whole"
         );
         assert!(spy.aborts.lock().unwrap().is_empty());
+    }
+
+    /// D1: a commit point reached from a spawned task still holds the count
+    /// (a task-local would not cross the spawn).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_reached_from_a_spawned_task_holds_the_count() {
+        let spy = AbortSpy::new(vec![7u8; 64]);
+        spy.hold_complete.store(true, Ordering::Relaxed);
+        let (engine, spy) = spy_engine(spy);
+        let meta = spy.src_meta.clone();
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let admitted =
+            crate::maintenance::gate::admit_stores(Some(&gate), &["dstb"]).expect("admitted");
+        let count = Arc::new(admitted.commit_count());
+        drop(admitted);
+        let task = tokio::spawn(async move {
+            let req = ObjectTransferRequest {
+                commit_count: Some(&count),
+                ..copy_request()
+            };
+            let lock = Arc::new(
+                engine
+                    .lock_object_write(req.destination_bucket, req.destination_key)
+                    .await,
+            );
+            stream_copy_passthrough(&engine, &lock, req, &meta).await
+        });
+        let started = std::time::Instant::now();
+        while spy.completes_started.load(Ordering::SeqCst) == 0 {
+            assert!(started.elapsed() < Duration::from_secs(5), "no Complete");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            gate.inflight_background_writes("dstb") > 0,
+            "the count ended while the Complete was pending"
+        );
+        spy.release_complete.notify_one();
+        task.await.unwrap().expect("copy");
+        assert_eq!(spy.completes_done.load(Ordering::SeqCst), 1);
     }
 
     /// D1: a drain that starts while that commit is pending returns only
@@ -3945,6 +3999,7 @@ mod request_count_tests {
             operation: "replication",
             upload_concurrency: None,
             keep_created_at: true,
+            commit_count: None,
         }
     }
 

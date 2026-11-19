@@ -1720,6 +1720,7 @@ async fn apply_copy(
                 operation: "replication-event",
                 upload_concurrency: None,
                 keep_created_at: true,
+                commit_count: None,
             };
             // The copy starts from the HEAD above: no second source HEAD.
             let outcome = crate::transfer::admitted::copy_known(

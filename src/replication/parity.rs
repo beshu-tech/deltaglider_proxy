@@ -3349,6 +3349,7 @@ mod request_count_tests {
                 operation: "replication",
                 upload_concurrency: None,
                 keep_created_at: true,
+                commit_count: None,
             },
         )
         .await

@@ -843,6 +843,7 @@ async fn copy_one(
         operation: "admin bulk copy",
         upload_concurrency: None,
         keep_created_at: false,
+        commit_count: None,
     };
     // `no_overwrite`: the existence check runs inside the transfer's own
     // lock hold, so nothing can land between the check and the write.

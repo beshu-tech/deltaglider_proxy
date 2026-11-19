@@ -1627,6 +1627,7 @@ async fn plan_action(
                     operation: "lifecycle transition",
                     upload_concurrency: None,
                     keep_created_at: true,
+                    commit_count: None,
                 },
             )
             .await

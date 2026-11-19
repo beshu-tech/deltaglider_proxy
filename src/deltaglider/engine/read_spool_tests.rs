@@ -184,6 +184,7 @@ async fn a_large_reference_object_copies_through_the_spool() {
         operation: "replication",
         upload_concurrency: None,
         keep_created_at: false,
+        commit_count: None,
     };
     crate::transfer::copy_object_with_retries(&engine, request)
         .await
@@ -410,6 +411,7 @@ fn copy_request<'a>(source_key: &'a str) -> crate::transfer::ObjectTransferReque
         operation: "replication",
         upload_concurrency: None,
         keep_created_at: false,
+        commit_count: None,
     }
 }
 
