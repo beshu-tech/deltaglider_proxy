@@ -730,7 +730,7 @@ mod tests {
             declared,
             limit,
             sha256: Sha256Need::Compute,
-            held_spool: HeldSpool::of_stream(held),
+            held_spool: HeldSpool::of_stream_bytes(held as u64 * MIB),
             strict_length: true,
             destination: Destination::Object,
         };

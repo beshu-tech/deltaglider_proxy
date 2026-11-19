@@ -1280,7 +1280,7 @@ fn a_refused_part_leaves_no_file() {
     // Admitted at a declared size that fits, refused on the size that
     // arrived.
     let admission = store.admit_part(&id, "b", "k", 2, 1).unwrap();
-    let body = spooled(&store, &[2u8; 2 << 20], HeldSpool::of_stream(3)).unwrap();
+    let body = spooled(&store, &[2u8; 2 << 20], HeldSpool::of_stream_bytes(3 << 20)).unwrap();
     let err = store
         .upload_part(&id, "b", "k", 2, body, admission)
         .unwrap_err();
@@ -1291,7 +1291,7 @@ fn a_refused_part_leaves_no_file() {
     // Admitted, then refused because the upload is completing.
     let admission = store.admit_part(&id, "b", "k", 2, 4).unwrap();
     store.complete_parts(&id, "b", "k", &[(1, etag)]).unwrap();
-    let body = spooled(&store, b"late", HeldSpool::of_stream(3)).unwrap();
+    let body = spooled(&store, b"late", HeldSpool::of_stream_bytes(3 << 20)).unwrap();
     let err = store
         .upload_part(&id, "b", "k", 2, body, admission)
         .unwrap_err();

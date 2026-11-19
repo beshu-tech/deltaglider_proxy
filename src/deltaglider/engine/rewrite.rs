@@ -177,8 +177,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Taken before the GET, so no response waits for budget.
         let spool = if size > self.spool_threshold() {
             // A rewrite stores bytes: a new write for the disk gate.
-            self.admit_new_spool_write(HeldSpool::NOTHING)?;
-            Some(self.spool_acquire(size).await?)
+            let admission = self.admit_new_spool_write(HeldSpool::NOTHING)?;
+            Some(self.spool_acquire(size, admission).await?)
         } else {
             None
         };

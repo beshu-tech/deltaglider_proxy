@@ -101,7 +101,7 @@ async fn a_running_write_keeps_its_budget_and_a_recovery_admits_again() {
 async fn admission_refuses_critical_for_a_new_write_and_admits_a_holder() {
     let (_dir, engine) = engine().await;
     set_level(&engine, Level::Ok);
-    let spool = engine.spool_acquire(MIB).await.unwrap();
+    let spool = engine.spool_acquire_ungated(MIB).await.unwrap();
     engine.admit_new_spool_write(HeldSpool::NOTHING).unwrap();
     set_level(&engine, Level::Critical);
     let m = refused(engine.admit_new_spool_write(HeldSpool::NOTHING));
@@ -121,7 +121,7 @@ async fn reads_and_deletes_go_on_at_critical() {
     let (body, _) = engine.retrieve("b", "k.txt").await.unwrap();
     assert_eq!(body, b"hello");
     // The read path takes its spool without the write gate.
-    engine.spool_acquire(MIB).await.unwrap();
+    engine.spool_acquire_ungated(MIB).await.unwrap();
     engine.delete("b", "k.txt").await.unwrap();
 }
 
@@ -133,6 +133,8 @@ enum Spool {
     /// A reference or body that the buffered codec holds, at most the spool
     /// threshold: no gate (the rule is "LARGER than the threshold").
     SmallCodec,
+    /// A wrapper that takes the gate's verdict (`SpoolWriteAdmission`) by value.
+    Admitted,
     /// The primitive that the gated, small and read callers share.
     Primitive,
     /// A write of the CLI (`cp`): the CLI process runs no disk monitor, so
@@ -146,8 +148,33 @@ enum Spool {
 const SPOOL_SITES: &[(&str, &str, Spool)] = &[
     (
         "src/deltaglider/engine/resources.rs",
-        "spool_acquire",
+        "spool_acquire_ungated",
         Spool::Primitive,
+    ),
+    (
+        "src/deltaglider/engine/resources.rs",
+        "spool_acquire",
+        Spool::Admitted,
+    ),
+    (
+        "src/deltaglider/engine/resources.rs",
+        "spool_acquire_now",
+        Spool::Admitted,
+    ),
+    (
+        "src/deltaglider/engine/store.rs",
+        "encode_spooled",
+        Spool::Gated,
+    ),
+    (
+        "src/deltaglider/engine/store.rs",
+        "restamp_reference",
+        Spool::Gated,
+    ),
+    (
+        "src/deltaglider/engine/store.rs",
+        "store_relayed_parts_delta_with_multipart_etag",
+        Spool::Gated,
     ),
     (
         "src/deltaglider/engine/resources.rs",
@@ -162,7 +189,7 @@ const SPOOL_SITES: &[(&str, &str, Spool)] = &[
     (
         "src/deltaglider/engine/resources.rs",
         "reserve_ingest_spool",
-        Spool::Gated,
+        Spool::Admitted,
     ),
     (
         "src/deltaglider/engine/resources.rs",
@@ -192,6 +219,11 @@ fn every_spool_acquisition_is_classified() {
     const ACQUIRING: &[&str] = &[
         "spool_acquire",
         "spool_acquire_group",
+        "spool_acquire_ungated",
+        "spool_acquire_now",
+        "spool_acquire_beside",
+        "spool_acquire_beside_mib",
+        "spool_acquire_pair_beside",
         "reserve_beside",
         "try_reserve",
         "try_acquire",
@@ -203,7 +235,7 @@ fn every_spool_acquisition_is_classified() {
     // or one of the engine's own wrappers. The names also mean semaphores
     // and the memory budget, so the receiver decides.
     let on_spool = regex_lite::Regex::new(
-        r"spool\w*(?:\(\))?\s*\.\s*(?:try_acquire|acquire|acquire_pair|acquire_group|reserve_beside|try_reserve)\s*\(|\bspool_acquire(?:_group)?\s*\(",
+        r"spool\w*(?:\(\))?\s*\.\s*(?:try_acquire|acquire|acquire_pair|acquire_group|reserve_beside|try_reserve)\s*\(|\bspool_acquire\w*\s*\(",
     )
     .unwrap();
     let mut found: Vec<(String, String)> = Vec::new();
@@ -239,15 +271,67 @@ fn every_spool_acquisition_is_classified() {
             problems.push(format!("{file}::{name} acquires spool space: classify it"));
         }
     }
-    for (file, name, _class) in SPOOL_SITES {
+    for (file, name, class) in SPOOL_SITES {
         if !found.iter().any(|(f, n)| f == file && n == name) {
             problems.push(format!(
                 "{file}::{name} is in SPOOL_SITES but acquires nothing"
             ));
             continue;
         }
+        let body = crate::source_scan::prod_fn_text(file, name);
+        let asks = body.contains("admit_new_spool_write(");
+        match class {
+            Spool::Gated if !asks => {
+                problems.push(format!("{file}::{name} is a write and must ask the gate"))
+            }
+            Spool::SmallCodec | Spool::Primitive | Spool::NoMonitor | Spool::Admitted if asks => {
+                problems.push(format!(
+                    "{file}::{name} is {class:?} and must not ask the gate"
+                ))
+            }
+            _ => {}
+        }
+    }
+    for file in READ_FILES {
+        assert!(
+            !crate::source_scan::prod_text(&crate::source_scan::read(file))
+                .contains("admit_new_spool_write("),
+            "{file} serves reads and must not ask the write gate"
+        );
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert_eq!(
+        crate::source_scan::read("src/deltaglider/engine/resources.rs")
+            .matches("self.spool.admit_new_write()")
+            .count(),
+        1,
+        "one place asks the spool gate"
+    );
+}
+
+/// The gated acquire wrappers take the gate's verdict by value, and the one
+/// ungated acquire (reads, small codec sources) takes none.
+#[test]
+fn the_gated_acquire_wrappers_take_the_admission() {
+    let file = "src/deltaglider/engine/resources.rs";
+    for name in [
+        "spool_acquire",
+        "spool_acquire_now",
+        "spool_acquire_beside",
+        "spool_acquire_beside_mib",
+        "spool_acquire_pair_beside",
+    ] {
+        let body = crate::source_scan::prod_fn_text(file, name);
+        assert!(
+            body.contains("SpoolWriteAdmission"),
+            "{name} is gated: it must take a SpoolWriteAdmission"
+        );
+    }
+    let body = crate::source_scan::prod_fn_text(file, "spool_acquire_ungated");
+    assert!(
+        !body.contains("SpoolWriteAdmission"),
+        "spool_acquire_ungated takes no admission"
+    );
 }
 
 /// Files whose spool acquisitions are all reads (a GET and a range read):

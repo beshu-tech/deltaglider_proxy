@@ -116,7 +116,7 @@ async fn put_as(
             }
         },
         Path::Spooled => {
-            let spool = h.engine.spool_acquire(data.len() as u64).await?;
+            let spool = h.engine.spool_acquire_ungated(data.len() as u64).await?;
             tokio::fs::write(spool.path(), data).await.unwrap();
             h.engine
                 .store_spooled_delta(

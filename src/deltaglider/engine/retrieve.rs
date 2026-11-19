@@ -562,7 +562,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metadata: &FileMetadata,
     ) -> crate::deltaglider::spool::HeldSpool {
         if self.streams_from_spool(metadata) {
-            HeldSpool::of_stream(crate::deltaglider::spool::mib_ceil(metadata.file_size).max(1))
+            HeldSpool::of_stream_bytes(metadata.file_size).at_least_one_mib()
         } else {
             HeldSpool::NOTHING
         }
@@ -603,7 +603,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // waited for budget there would wait for them, and they for
                 // it, until the acquire timeout. A cached hit drops this
                 // reservation unused.
-                let spool = self.spool_acquire(metadata.file_size).await?;
+                let spool = self.spool_acquire_ungated(metadata.file_size).await?;
                 self.range_spools
                     .get_or_fill(key, move || {
                         self.fill_reference_object(bucket, deltaspace_id, obj_key, metadata, spool)
@@ -1437,7 +1437,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // The source file first (spool before codec slot, as on the
                 // streaming GET). A GET holds no spool and no lock here, so it
                 // may wait for budget, under the spool acquire timeout.
-                let source_file = self.spool_acquire(reference.len() as u64).await?;
+                let source_file = self.spool_acquire_ungated(reference.len() as u64).await?;
                 // Wait up to 60s for a codec slot (GET should queue, not fail fast)
                 let _codec_permit = self
                     .acquire_codec_timeout(std::time::Duration::from_secs(60))

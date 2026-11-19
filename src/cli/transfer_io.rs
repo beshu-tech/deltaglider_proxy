@@ -83,7 +83,7 @@ pub(crate) async fn upload_file(
             .map_err(TransferError::Dest);
     }
     let spool = engine
-        .spool_acquire(size)
+        .spool_acquire_ungated(size)
         .await
         .map_err(TransferError::Dest)?;
     let copied = tokio::fs::copy(local, spool.path())

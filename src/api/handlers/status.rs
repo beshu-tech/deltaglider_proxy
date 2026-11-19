@@ -1262,7 +1262,7 @@ mod readiness_tests {
         (
             "src/deltaglider/engine/store.rs",
             "Err(EngineError::Overloaded(why)) => {",
-            1,
+            2,
             Reach::PerRequest,
             "no spool for a delta: handled, the object is stored whole, no 503 is sent",
         ),

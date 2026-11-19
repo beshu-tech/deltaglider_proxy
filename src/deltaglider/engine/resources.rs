@@ -129,11 +129,33 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Acquire a spool file (timed). For the adapter to stage a large PUT/POST
     /// body before `store_spooled_delta`. Both ingest paths share it (B1.1).
-    pub async fn spool_acquire(
+    pub(crate) async fn spool_acquire(
+        &self,
+        bytes: u64,
+        admission: SpoolWriteAdmission,
+    ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
+        let SpoolWriteAdmission { held: _ } = admission;
+        self.spool_acquire_ungated(bytes).await
+    }
+
+    /// [`Self::spool_acquire`] without the disk gate: for reads, the CLI
+    /// (no disk monitor) and small codec sources.
+    pub async fn spool_acquire_ungated(
         &self,
         bytes: u64,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
         self.with_spool_timeout(self.spool.acquire(bytes)).await
+    }
+
+    /// A spool file taken WITHOUT waiting (the encode under a deltaspace lock):
+    /// no free budget is a retryable `Overloaded`.
+    pub(crate) fn spool_acquire_now(
+        &self,
+        admission: SpoolWriteAdmission,
+        bytes: u64,
+    ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
+        let SpoolWriteAdmission { held: _ } = admission;
+        self.spool.try_acquire(bytes).map_err(spool_error)
     }
 
     /// Acquire a deadlock-safe GROUP of spool files in one reservation
@@ -253,24 +275,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(SpoolWriteAdmission { held })
     }
 
-    /// `spool_acquire` for an op that holds `held_mib` of the budget already
+    /// `spool_acquire` for an op that holds the admission's budget already
     /// (the relay parts of a multipart upload): it never waits for its own
     /// budget, and a budget that other requests use is `Overloaded`.
     pub(crate) async fn spool_acquire_beside_mib(
         &self,
-        held_mib: usize,
+        admission: SpoolWriteAdmission,
         bytes: u64,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
-        self.with_spool_timeout(self.spool.acquire_beside_mib(held_mib, bytes))
+        self.with_spool_timeout(self.spool.acquire_beside_mib(admission.held.mib(), bytes))
             .await
     }
 
     /// `spool_acquire` for an op that may already hold a spool (`held`).
     pub(crate) async fn spool_acquire_beside(
         &self,
+        admission: SpoolWriteAdmission,
         held: Option<&crate::deltaglider::spool::Spool>,
         bytes: u64,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
+        let SpoolWriteAdmission { held: _ } = admission;
         self.with_spool_timeout(self.spool.acquire_beside(held, bytes))
             .await
     }
@@ -282,6 +306,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// the caller goes on without the pair.
     pub(crate) async fn spool_acquire_pair_beside(
         &self,
+        admission: SpoolWriteAdmission,
         held: &crate::deltaglider::spool::Spool,
         a: u64,
         b: u64,
@@ -292,6 +317,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         )>,
         EngineError,
     > {
+        let SpoolWriteAdmission { held: _ } = admission;
         match self
             .with_spool_timeout_io(self.spool.acquire_pair_beside(Some(held), a, b))
             .await?

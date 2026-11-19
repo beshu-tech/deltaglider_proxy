@@ -1256,23 +1256,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // disk gate says no like a full budget does: this PUT keeps no delta
         // (`NoSpool`: the body is stored whole as `delta-unavailable`, which
         // needs no spool). The write itself goes on.
-        if self.admit_new_spool_write(HeldSpool::NOTHING).is_err() {
+        let Ok(admission) = self.admit_new_spool_write(HeldSpool::NOTHING) else {
             debug!(
                 "PUT {}/{}: the spool disk is nearly full; no delta for the large-reference encode",
                 put.bucket, put.key
             );
             return Ok((EncodeOutcome::NoSpool, EncodedDelta::None));
-        }
-        let body = match self.spool.try_acquire(put.size) {
+        };
+        let body = match self.spool_acquire_now(admission, put.size) {
             Ok(body) => body,
-            Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => {
+            Err(EngineError::Overloaded(why)) => {
                 debug!(
-                    "PUT {}/{}: no spool for the large-reference encode",
+                    "PUT {}/{}: no spool for the large-reference encode: {why}",
                     put.bucket, put.key
                 );
                 return Ok((EncodeOutcome::NoSpool, EncodedDelta::None));
             }
-            Err(e) => return Err(EngineError::Storage(StorageError::from(e))),
+            Err(e) => return Err(e),
         };
         tokio::fs::write(body.path(), data)
             .await
@@ -1345,8 +1345,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         };
         // Clamped beside the body spool this op already holds (else body +
         // pair > budget waited on itself for the whole acquire timeout).
+        let admission = self.admit_new_spool_write(HeldSpool::of(body))?;
         let Some((ref_spool, delta_spool)) = self
-            .spool_acquire_pair_beside(body, ref_size, put.size)
+            .spool_acquire_pair_beside(admission, body, ref_size, put.size)
             .await?
         else {
             // No budget free now. Waiting while this PUT holds its body could
@@ -1733,7 +1734,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .storage
             .open_reference_source(bucket, deltaspace_id)
             .await?;
-        let spool = self.spool_acquire_beside(held, source.size.max(1)).await?;
+        let admission =
+            self.admit_new_spool_write(held.map_or(HeldSpool::NOTHING, HeldSpool::of))?;
+        let spool = self
+            .spool_acquire_beside(admission, held, source.size.max(1))
+            .await?;
         source.write_to(spool.path()).await?;
         let (sha256, md5, size) = Self::hash_spool_file(spool.path()).await?;
         if verify && !ref_meta.file_sha256.is_empty() && ref_meta.file_sha256 != sha256 {
@@ -1920,7 +1925,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .await;
         }
         let parts_mib = crate::deltaglider::spool::mib_ceil(total_size);
-        let joined = match self.spool_acquire_beside_mib(parts_mib, total_size).await {
+        let admission = self.admit_new_spool_write(HeldSpool::of_stream_bytes(total_size))?;
+        let joined = match self.spool_acquire_beside_mib(admission, total_size).await {
             // The reservation is clamped to what the budget holds beside the
             // parts: never write a joined file larger than it.
             Ok(joined) if joined.reserved_mib() >= parts_mib => Some(joined),
@@ -2007,9 +2013,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .into_parts();
         // The relay parts hold spool budget (the multipart store reserves it
         // per part), so this op is a holder and never waits.
-        let parts_mib = crate::deltaglider::spool::mib_ceil(total_size);
         let reserved = self
-            .reserve_storage_spool(bucket, total_size, true, HeldSpool::of_stream(parts_mib))
+            .reserve_storage_spool(
+                bucket,
+                total_size,
+                true,
+                HeldSpool::of_stream_bytes(total_size),
+            )
             .await?;
         // The key's write lock only (P7.4): see `write_passthrough_locked`.
         let reason =
@@ -2451,7 +2461,11 @@ mod counter_tests {
     }
 
     async fn spooled(h: &Harness, key: &str, data: &[u8]) {
-        let spool = h.engine.spool_acquire(data.len() as u64).await.unwrap();
+        let spool = h
+            .engine
+            .spool_acquire_ungated(data.len() as u64)
+            .await
+            .unwrap();
         tokio::fs::write(spool.path(), data).await.unwrap();
         h.engine
             .store_spooled_delta(
@@ -2575,7 +2589,11 @@ mod no_delta_hint_tests {
                 "{key}: buffered PUT with the hint must be passthrough"
             );
         }
-        let spool = h.engine.spool_acquire(v2.len() as u64).await.unwrap();
+        let spool = h
+            .engine
+            .spool_acquire_ungated(v2.len() as u64)
+            .await
+            .unwrap();
         tokio::fs::write(spool.path(), &v2).await.unwrap();
         let r = h
             .engine
@@ -2715,7 +2733,10 @@ mod spool_budget_tests {
         let mut v2 = v1.clone();
         v2[700_000..700_100].fill(0xAB);
         for (key, data) in [("rel/a.zip", &v1), ("rel/b.zip", &v2)] {
-            let body = engine.spool_acquire(data.len() as u64).await.unwrap();
+            let body = engine
+                .spool_acquire_ungated(data.len() as u64)
+                .await
+                .unwrap();
             tokio::fs::write(body.path(), data).await.unwrap();
             let lock = engine.lock_object_write("b", key).await;
             let put = engine.store_spooled_delta(
@@ -2771,7 +2792,10 @@ mod delta_ceiling_tests {
         let mut v2 = v1.clone();
         v2[size as usize / 2..size as usize / 2 + 100].fill(0xAB);
         for (key, data) in [("rel/a.zip", &v1), ("rel/b.zip", &v2)] {
-            let body = engine.spool_acquire(data.len() as u64).await.unwrap();
+            let body = engine
+                .spool_acquire_ungated(data.len() as u64)
+                .await
+                .unwrap();
             tokio::fs::write(body.path(), data).await.unwrap();
             let lock = engine.lock_object_write("b", key).await;
             engine
@@ -3037,8 +3061,8 @@ mod review2_tests {
                 .unwrap(),
         );
         let v: Vec<u8> = (0..1_500_000u32).map(|n| (n % 251) as u8).collect();
-        let body_a = engine.spool_acquire(v.len() as u64).await.unwrap();
-        let body_b = engine.spool_acquire(v.len() as u64).await.unwrap();
+        let body_a = engine.spool_acquire_ungated(v.len() as u64).await.unwrap();
+        let body_b = engine.spool_acquire_ungated(v.len() as u64).await.unwrap();
         tokio::fs::write(body_a.path(), &v).await.unwrap();
         tokio::fs::write(body_b.path(), &v).await.unwrap();
         let (lock_a, lock_b) = (
@@ -3112,8 +3136,8 @@ mod review2_tests {
         let tmp = tempfile::tempdir().unwrap();
         let engine = encrypted_engine(&tmp, 4 * 1024 * 1024).await;
         let v = vec![3u8; 1_500_000];
-        let body_a = engine.spool_acquire(v.len() as u64).await.unwrap();
-        let body_b = engine.spool_acquire(v.len() as u64).await.unwrap();
+        let body_a = engine.spool_acquire_ungated(v.len() as u64).await.unwrap();
+        let body_b = engine.spool_acquire_ungated(v.len() as u64).await.unwrap();
         tokio::fs::write(body_a.path(), &v).await.unwrap();
         tokio::fs::write(body_b.path(), &v).await.unwrap();
         {
@@ -3149,7 +3173,7 @@ mod review2_tests {
         }
         // With room for both, both store and read back.
         drop((body_a, body_b));
-        let body = engine.spool_acquire(v.len() as u64).await.unwrap();
+        let body = engine.spool_acquire_ungated(v.len() as u64).await.unwrap();
         tokio::fs::write(body.path(), &v).await.unwrap();
         engine
             .store_spooled_delta(
@@ -3231,7 +3255,10 @@ mod review2_tests {
         let mut v = base.clone();
         v[700_000..700_100].fill(9);
         for (key, body) in [("rel/a.zip", &base), ("rel/b.zip", &v)] {
-            let spool = engine.spool_acquire(body.len() as u64).await.unwrap();
+            let spool = engine
+                .spool_acquire_ungated(body.len() as u64)
+                .await
+                .unwrap();
             tokio::fs::write(spool.path(), body).await.unwrap();
             let lock = engine.lock_object_write("b", key).await;
             engine
@@ -3280,7 +3307,7 @@ mod review2_tests {
             .await
             .unwrap();
 
-        let full = engine.spool_acquire(4 * 1024 * 1024).await.unwrap();
+        let full = engine.spool_acquire_ungated(4 * 1024 * 1024).await.unwrap();
         let r = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             engine.store("b", "rel/b.zip", &v2, None, HashMap::new()),
@@ -3295,7 +3322,7 @@ mod review2_tests {
             .unwrap();
 
         // GET: waits for the budget, then decodes.
-        let full = engine.spool_acquire(4 * 1024 * 1024).await.unwrap();
+        let full = engine.spool_acquire_ungated(4 * 1024 * 1024).await.unwrap();
         let e = engine.clone();
         let get = tokio::spawn(async move { e.retrieve("b", "rel/b.zip").await });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -3336,7 +3363,7 @@ mod review2_tests {
                 )
                 .await
         };
-        let full = engine.spool_acquire(4 * 1024 * 1024).await.unwrap();
+        let full = engine.spool_acquire_ungated(4 * 1024 * 1024).await.unwrap();
         let r = tokio::time::timeout(std::time::Duration::from_secs(5), store())
             .await
             .expect("a relayed store must not wait for spool budget");
@@ -3441,7 +3468,7 @@ mod other_form_tests {
                 .unwrap();
         }
         // The streaming store, and the passthrough sinks of multipart.
-        let spool = engine.spool_acquire(v2.len() as u64).await.unwrap();
+        let spool = engine.spool_acquire_ungated(v2.len() as u64).await.unwrap();
         tokio::fs::write(spool.path(), &v2).await.unwrap();
         engine
             .store_spooled_delta(

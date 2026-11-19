@@ -619,7 +619,7 @@ pub(super) async fn run_multipart_completion(
     let committed = write_lock.commit_flag();
     let completing = state
         .multipart
-        .completing_guard(&upload_id, &etag, committed);
+        .completing_guard(&upload_id, &etag, committed.clone());
     let store = async {
         if stores_whole {
             engine
@@ -657,6 +657,14 @@ pub(super) async fn run_multipart_completion(
         Ok(result) => result,
         Err(e) => return Err(e.into()),
     };
+    // A store that returned Ok has committed, so it noted its commit. If
+    // it did not, the signal is lost and the guard would roll back a stored object.
+    if !committed.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::error!(
+            "multipart completion of {bucket}/{key}: the store returned Ok without noting its commit"
+        );
+        debug_assert!(false, "the store of a Complete lost its commit signal");
+    }
     #[cfg(test)]
     if panic_after_store::armed(&upload_id) {
         panic!("injected panic after the store of {upload_id}");

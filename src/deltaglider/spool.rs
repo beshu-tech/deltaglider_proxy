@@ -885,10 +885,15 @@ impl HeldSpool {
         Self(held.into_iter().map(SpoolReservation::reserved_mib).sum())
     }
 
-    /// The budget of a stream that holds a spool file for `mib` (see
-    /// `stream_spool_mib`); `0` is `NOTHING`.
-    pub(crate) fn of_stream(mib: usize) -> Self {
-        Self(mib)
+    /// The budget of a stream that holds a spool file of `bytes`, rounded up
+    /// to whole MiB; no bytes is `NOTHING`.
+    pub(crate) fn of_stream_bytes(bytes: u64) -> Self {
+        Self(mib_ceil(bytes))
+    }
+
+    /// This budget, at least 1 MiB (a stream holds a file even when empty).
+    pub(crate) fn at_least_one_mib(self) -> Self {
+        Self(self.0.max(1))
     }
 
     /// This and `other` together.
