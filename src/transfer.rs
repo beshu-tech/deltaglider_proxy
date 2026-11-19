@@ -1849,8 +1849,6 @@ async fn delta_passthrough_copy(
     // teardown/re-seed can't slip a wrong-sha reference under our delta.
     let dest_bucket = request.destination_bucket.to_string();
     let src_bucket = request.source_bucket.to_string();
-    let src_prefix2 = src_prefix.clone();
-    let src_filename2 = src_filename.clone();
     let dest_prefix2 = dest_prefix.clone();
     let dest_filename2 = dest_filename.clone();
     let engine2 = engine.clone();
@@ -1870,6 +1868,51 @@ async fn delta_passthrough_copy(
         }
     };
     let counter_replaced = counter_prior.replaced();
+    // Source reads stay OUTSIDE the counted commit: the caller (object
+    // timeout, kill, shutdown) can still cut them. A pre-lock gate on the
+    // destination reference says whether the seed bytes are needed; the
+    // commit re-gates under the lock and falls back when they were not read.
+    let pre_ref = match engine
+        .reference_meta(request.destination_bucket, &dest_prefix)
+        .await
+    {
+        Ok(meta) => meta.map(|m| DestRefFacts {
+            file_sha256: m.file_sha256.clone(),
+            enc: enc_fingerprint(&m),
+        }),
+        Err(_) => return Ok(None),
+    };
+    let pre_decision = can_delta_passthrough(&src, pre_ref.as_ref());
+    if matches!(pre_decision, DeltaPassthroughDecision::Fallback { .. }) {
+        return Ok(None);
+    }
+    // Generation pin: `meta` comes from the HEAD taken before this read. The
+    // GET returns the metadata stored with the bytes it returns; if that
+    // still names the HEAD's generation, the bytes are that generation.
+    let (delta_bytes, fresh) = engine
+        .get_delta_raw_with_metadata(request.source_bucket, &src_prefix, &src_filename)
+        .await?;
+    if !same_delta_generation(&meta_generation, Some(&fresh), delta_bytes.len()) {
+        return Err(CopyError::source_changed(format_args!(
+            "{src_bucket}/{src_prefix}/{src_filename} was overwritten after HEAD"
+        )));
+    }
+    let seed_source: Option<(Vec<u8>, crate::types::FileMetadata)> =
+        if pre_decision == DeltaPassthroughDecision::SeedThenShip {
+            let (ref_data, mut ref_meta) = engine
+                .get_reference_raw_with_metadata(request.source_bucket, &src_prefix)
+                .await?;
+            if ref_meta.file_sha256 != src.ref_sha256 {
+                return Ok(None);
+            }
+            // Same marker strip as the delta: the dest write re-stamps
+            // (encrypt) or leaves plaintext (passthrough); a surviving
+            // source marker would corrupt the reference read.
+            strip_encryption_markers(&mut ref_meta.user_metadata);
+            Some((ref_data, ref_meta))
+        } else {
+            None
+        };
     // `Some(seeded reference bytes)` = shipped; `None` = fell back.
     let ship_lock = lock.clone();
     let ship_engine = engine.clone();
@@ -1899,22 +1942,6 @@ async fn delta_passthrough_copy(
                     if matches!(decision, DeltaPassthroughDecision::Fallback { .. }) {
                         return Ok(None);
                     }
-                    // Read the source delta BEFORE any destination write: a failed
-                    // read then leaves no seeded reference.bin behind (its bytes
-                    // were added to no counter).
-                    // Generation pin: `meta` comes from the HEAD taken before this
-                    // read. The GET returns the metadata stored with the bytes it
-                    // returns; if that still names the HEAD's generation, the bytes
-                    // are that generation. Otherwise the dest would get new bytes
-                    // with the old sha. (A HEAD after the GET pinned it before.)
-                    let (delta_bytes, fresh) = engine2
-                        .get_delta_raw_with_metadata(&src_bucket, &src_prefix2, &src_filename2)
-                        .await?;
-                    if !same_delta_generation(&meta_generation, Some(&fresh), delta_bytes.len()) {
-                        return Err(CopyError::source_changed(format_args!(
-                            "{src_bucket}/{src_prefix2}/{src_filename2} was overwritten after HEAD"
-                        )));
-                    }
                     let mut seeded = 0;
                     if decision == DeltaPassthroughDecision::SeedThenShip {
                         // The seed moves the reference through the proxy and writes
@@ -1923,20 +1950,13 @@ async fn delta_passthrough_copy(
                         // `If-None-Match: *` on CopyObject (verified 2026-10-13: the
                         // copy overwrote an existing key and answered 200), so a
                         // conditional copy cannot stand in for the fenced write.
-                        // Seed the dest reference verbatim, asserting it matches
-                        // src.ref_sha256 before writing (defense layer 2).
-                        // The bytes and their metadata from one GET: a HEAD after
-                        // the GET could describe a reference re-seeded in between.
-                        let (ref_data, mut ref_meta) = engine2
-                            .get_reference_raw_with_metadata(&src_bucket, &src_prefix2)
-                            .await?;
-                        if ref_meta.file_sha256 != src.ref_sha256 {
+                        // The reference was read before the commit (asserted to
+                        // match src.ref_sha256, defense layer 2). A reference that
+                        // vanished from the destination since then was not read:
+                        // fall back.
+                        let Some((ref_data, ref_meta)) = seed_source else {
                             return Ok(None);
-                        }
-                        // Same marker strip as the delta: the dest write re-stamps
-                        // (encrypt) or leaves plaintext (passthrough); a surviving
-                        // source marker would corrupt the reference read.
-                        strip_encryption_markers(&mut ref_meta.user_metadata);
+                        };
                         // The bytes, not the recorded size: a reference that records
                         // none (`0`) still counts its real size (#187).
                         let ref_len = ref_data.len() as u64;
@@ -2776,6 +2796,102 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// D1: the fast path reads its SOURCE outside the counted commit. A
+    /// source read that stalls is cut with its caller (object timeout): the
+    /// count and the destination lock end, and nothing reaches the dest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_source_read_is_cut_with_its_caller_and_frees_the_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let faulty = crate::storage::FaultyFs::new(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let faults = faulty.faults.clone();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
+        let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &Config::default(),
+            None,
+        ));
+        engine.create_bucket("src").await.unwrap();
+        engine.create_bucket("dst").await.unwrap();
+        let n = 256 * 1024;
+        for (key, seed) in [("p/a.zip", 1u8), ("p/b.zip", 2)] {
+            engine
+                .store(
+                    "src",
+                    key,
+                    &versioned_bytes(seed, n),
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let head = engine.head("src", "p/b.zip").await.unwrap();
+        assert!(matches!(
+            head.storage_info,
+            crate::types::StorageInfo::Delta { .. }
+        ));
+        faults.hook(
+            crate::storage::FaultPoint::OpenDelta,
+            "src/p/b.zip",
+            Arc::new(|| futures::future::pending::<()>().boxed()),
+        );
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let admitted =
+            crate::maintenance::gate::admit_stores(Some(&gate), &["dst"]).expect("admitted");
+        let eng = engine.clone();
+        let copy = async move {
+            let count = Arc::new(admitted.commit_count());
+            let request = ObjectTransferRequest {
+                source_bucket: "src",
+                source_key: "p/b.zip",
+                destination_bucket: "dst",
+                destination_key: "p/b.zip",
+                provenance: None,
+                strip_user_metadata_keys: &[],
+                operation: "replication",
+                upload_concurrency: None,
+                keep_created_at: false,
+                commit_count: Some(&count),
+            };
+            let lock = Arc::new(
+                eng.lock_object_write(request.destination_bucket, request.destination_key)
+                    .await,
+            );
+            let fields = DestinationFields::of_transfer(&request, &head);
+            delta_passthrough_copy(&eng, &lock, request, &head, None, fields).await
+        };
+        let cut = tokio::time::timeout(std::time::Duration::from_millis(500), copy).await;
+        assert!(
+            cut.is_err(),
+            "the stalled read must still be pending: {:?}",
+            cut.as_ref().map(|r| r.as_ref().map(|o| o.is_some()))
+        );
+        assert!(
+            faults.fired(crate::storage::FaultPoint::OpenDelta, "src/p/b.zip") > 0,
+            "the copy never reached the source read"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while gate.inflight_writes("dst") > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a detached task still holds the count after the caller was cut"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            engine.head("dst", "p/b.zip").await.is_err(),
+            "nothing is written to the destination"
+        );
+        assert!(
+            engine.reference_meta("dst", "p").await.unwrap().is_none(),
+            "no reference is seeded"
+        );
     }
 
     /// Round-2 review: `ReplicationObjectCopied` reported the stored delta
@@ -4257,7 +4373,7 @@ mod request_count_tests {
     /// delta alone, so the counter never got the reference's bytes.
     #[tokio::test]
     async fn a_seeded_reference_is_counted_when_the_ship_after_it_fails() {
-        seeded_reference_counted_despite("GET", "src/p/b.zip.delta").await;
+        seeded_reference_counted_despite("GET", "src/p/b.zip").await;
     }
 
     /// The same, with the failure after the seed: the PUT of the delta.
@@ -4310,7 +4426,8 @@ mod request_count_tests {
         assert_eq!(count(&fake, "HEAD /src/"), 0, "the pin is the GET: {r:#?}");
         assert_eq!(count(&fake, "HEAD /dst/p/b.zip.delta"), 1, "{r:#?}");
         assert!(!r.iter().any(|x| x == "HEAD /dst/p/b.zip"), "{r:#?}");
-        assert_eq!(count(&fake, "HEAD "), 2, "{r:#?}");
+        // Reference before the source read, reference under the lock, verify.
+        assert_eq!(count(&fake, "HEAD "), 3, "{r:#?}");
         assert_eq!(count(&fake, "GET "), 1, "{r:#?}");
         assert_eq!(count(&fake, "PUT "), 1, "{r:#?}");
         // The delta moves verbatim: what comes down goes up, no reference.
@@ -4344,8 +4461,9 @@ mod request_count_tests {
                 .await
                 .unwrap();
             let r = fake.requests();
-            // Reference HEAD + the verify HEAD of the written form.
-            assert_eq!(count(&fake, "HEAD "), 2, "round {round}: {r:#?}");
+            // Reference HEAD before the source read, again under the lock,
+            // and the verify HEAD of the written form.
+            assert_eq!(count(&fake, "HEAD "), 3, "round {round}: {r:#?}");
             assert!(!r.iter().any(|x| x == "HEAD /dst/p/b.zip"), "{r:#?}");
             assert_eq!(count(&fake, "DELETE "), 1, "{r:#?}");
             assert_eq!(count(&fake, "DELETE /dst/p/b.zip?"), 1, "{r:#?}");

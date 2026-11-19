@@ -177,9 +177,10 @@ async fn a_copy_of_a_delta_ships_the_delta_verbatim() {
         panic!("fixture: a delta source");
     };
     assert_eq!(fake.bytes(), (delta_size, delta_size), "{r:#?}");
-    // Source HEAD (2), reference HEAD, GET, PUT, DELETE of the other
-    // form (no counter read said it is absent), verify HEAD.
-    assert_eq!(r.len(), 7, "{r:#?}");
+    // Source HEAD (2), reference HEAD before the source read, reference
+    // HEAD under the lock, GET, PUT, DELETE of the other form (no counter
+    // read said it is absent), verify HEAD.
+    assert_eq!(r.len(), 8, "{r:#?}");
     let etag = out.output.copy_object_result.unwrap().e_tag.unwrap();
     let (copied, meta) = engine.retrieve("b", "run/copy.zip").await.unwrap();
     assert_eq!(copied, engine.retrieve("b", &f.keys[1]).await.unwrap().0);

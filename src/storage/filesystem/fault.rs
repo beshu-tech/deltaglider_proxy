@@ -60,6 +60,8 @@ pub(crate) enum FaultPoint {
     /// The key is `"bucket/prefix/"`: a delete of reference.bin (fenced or
     /// not), before it deletes.
     DeleteReference,
+    /// The key is `"bucket/prefix/file"`: the read of a delta's bytes.
+    OpenDelta,
 }
 
 /// Work a test runs inside a storage call, before the call goes on: a
@@ -587,6 +589,9 @@ impl StorageBackend for FaultyFs {
         prefix: &str,
         object: StoredObject<'_>,
     ) -> Result<crate::storage::ObjectRead, StorageError> {
+        if let StoredObject::Delta(f) = object {
+            self.armed(FaultPoint::OpenDelta, bucket, prefix, f).await?;
+        }
         self.inner.open_object(bucket, prefix, object).await
     }
 
